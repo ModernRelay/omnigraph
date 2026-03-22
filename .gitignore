@@ -1,4 +1,5 @@
 /target
+**/target
 *.lance
 *.nano
 *.nanograph
