@@ -1,0 +1,6 @@
+/target
+*.lance
+*.nano
+*.nanograph
+.DS_Store
+.env

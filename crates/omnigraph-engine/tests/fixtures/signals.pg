@@ -1,0 +1,44 @@
+// Industry signals around AI models and major players.
+// Branch use case: main tracks confirmed signals, branches
+// model speculative or emerging interpretations.
+
+node Signal {
+    slug: String @key
+    title: String
+    source: String
+    strength: enum(strong, moderate, weak)
+    observed: Date?
+}
+
+node Pattern {
+    slug: String @key
+    name: String
+    category: enum(adoption, churn, expansion, contraction, convergence)
+}
+
+node Tech {
+    slug: String @key
+    name: String
+    kind: enum(model, platform, infra, framework, tool)
+    tier: enum(emerging, growth, mature, declining)
+}
+
+node Company {
+    slug: String @key
+    name: String
+    sector: enum(lab, hyperscaler, chipmaker, investor, startup)
+}
+
+edge Indicates: Signal -> Pattern
+
+edge Mentions: Signal -> Tech
+
+edge Involves: Pattern -> Tech
+
+edge Builds: Company -> Tech
+
+edge FundedBy: Company -> Company {
+    amount: String?
+}
+
+edge PartnersWith: Company -> Company

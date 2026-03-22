@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/omnigraph-engine",
+    "crates/omnigraph-repo",
+    "crates/omnigraph-cli",
+]
+default-members = [
+    "crates/omnigraph-repo",
+    "crates/omnigraph-cli",
+]
+
+[workspace.dependencies]
+arrow-array = "57"
+arrow-ipc = "57"
+arrow-schema = "57"
+arrow-select = "57"
+arrow-cast = { version = "57", features = ["prettyprint"] }
+arrow-ord = "57"
+
+datafusion-physical-plan = "52"
+datafusion-physical-expr = "52"
+datafusion-execution = "52"
+datafusion-common = "52"
+datafusion-expr = "52"
+datafusion-functions-aggregate = "52"
+
+lance = { version = "3.0", default-features = false }
+lance-file = "3.0"
+lance-index = "3.0"
+lance-linalg = "3.0"
+
+futures = "0.3"
+async-trait = "0.1"
+pest = "2"
+pest_derive = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+color-eyre = "0.6"
+tempfile = "3"
+ahash = "0.8"
+ariadne = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[profile.dev]
+debug = 0
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+codegen-units = 16
+strip = true

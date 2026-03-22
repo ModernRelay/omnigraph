@@ -1,0 +1,18 @@
+[package]
+name = "omnigraph-cli"
+version = "0.1.0"
+edition = "2024"
+description = "CLI for the Omnigraph branching prototype."
+license = "MIT"
+
+[[bin]]
+name = "omnigraph"
+path = "src/main.rs"
+
+[dependencies]
+omnigraph-repo = { path = "../omnigraph-repo", version = "0.1.0" }
+omnigraph-engine = { path = "../omnigraph-engine", version = "0.1.0" }
+clap = { workspace = true }
+color-eyre = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

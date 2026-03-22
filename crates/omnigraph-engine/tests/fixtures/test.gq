@@ -1,0 +1,78 @@
+// Basic: find person by name
+query get_person($name: String) {
+    match {
+        $p: Person { name: $name }
+    }
+    return { $p.name, $p.age }
+}
+
+// Filter by age
+query adults() {
+    match {
+        $p: Person
+        $p.age > 30
+    }
+    return { $p.name, $p.age }
+    order { $p.age desc }
+}
+
+// One hop traversal
+query friends_of($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows $f
+    }
+    return { $f.name, $f.age }
+}
+
+// Reverse traversal: who works at a company
+query employees_of($company: String) {
+    match {
+        $c: Company { name: $company }
+        $p worksAt $c
+    }
+    return { $p.name }
+}
+
+// Two hop: friends of friends
+query friends_of_friends($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows $mid
+        $mid knows $fof
+    }
+    return { $fof.name }
+}
+
+// Negation: people who don't work anywhere
+query unemployed() {
+    match {
+        $p: Person
+        not { $p worksAt $_ }
+    }
+    return { $p.name }
+}
+
+// Aggregation: friend count
+query friend_counts() {
+    match {
+        $p: Person
+        $p knows $f
+    }
+    return {
+        $p.name
+        count($f) as friends
+    }
+    order { friends desc }
+    limit 20
+}
+
+// Order and limit
+query top_by_age() {
+    match {
+        $p: Person
+    }
+    return { $p.name, $p.age }
+    order { $p.age desc }
+    limit 2
+}

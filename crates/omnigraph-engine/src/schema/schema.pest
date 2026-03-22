@@ -1,0 +1,43 @@
+// NanoGraph Schema Grammar (.pg files)
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT = _{ LINE_COMMENT | BLOCK_COMMENT }
+LINE_COMMENT = _{ "//" ~ (!"\n" ~ ANY)* }
+BLOCK_COMMENT = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
+
+schema_file = { SOI ~ schema_decl* ~ EOI }
+
+schema_decl = { node_decl | edge_decl }
+
+// node Person { ... }
+// node Employee : Person { ... }
+node_decl = { "node" ~ type_name ~ annotation* ~ (":" ~ type_name)? ~ "{" ~ prop_decl* ~ "}" }
+
+// edge Knows: Person -> Person { ... }
+// edge Knows: Person -> Person
+edge_decl = { "edge" ~ type_name ~ ":" ~ type_name ~ "->" ~ type_name ~ annotation* ~ ("{" ~ prop_decl* ~ "}")? }
+
+prop_decl = { ident ~ ":" ~ type_ref ~ annotation* }
+
+type_ref = { core_type ~ "?"? }
+core_type = { list_type | enum_type | vector_type | base_type }
+list_type = { "[" ~ base_type ~ "]" }
+enum_type = { "enum" ~ "(" ~ enum_value ~ ("," ~ enum_value)* ~ ")" }
+vector_type = { "Vector" ~ "(" ~ integer ~ ")" }
+enum_value = @{ (ASCII_ALPHANUMERIC | "_" | "-")+ }
+
+base_type = { "String" | "Bool" | "I32" | "I64" | "U32" | "U64" | "F32" | "F64" | "DateTime" | "Date" }
+
+annotation = { "@" ~ ident ~ ("(" ~ annotation_arg ~ ")")? }
+annotation_arg = { literal | ident }
+
+literal = { string_lit | float_lit | integer | bool_lit }
+
+string_lit = @{ "\"" ~ string_char* ~ "\"" }
+string_char = @{ !("\"" | "\\") ~ ANY | "\\" ~ ANY }
+float_lit = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+integer = @{ ASCII_DIGIT+ }
+bool_lit = { "true" | "false" }
+
+type_name = @{ ASCII_ALPHA_UPPER ~ (ASCII_ALPHANUMERIC | "_")* }
+ident = @{ (ASCII_ALPHA_LOWER | "_") ~ (ASCII_ALPHANUMERIC | "_")* }

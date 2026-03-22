@@ -1,0 +1,15 @@
+[package]
+name = "omnigraph-repo"
+version = "0.1.0"
+edition = "2024"
+description = "Repo and branch metadata layer for the Omnigraph prototype."
+license = "MIT"
+
+[dependencies]
+omnigraph-engine = { path = "../omnigraph-engine", version = "0.1.0" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
