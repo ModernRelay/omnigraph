@@ -1,10 +1,8 @@
 # AGENTS.md
 
-This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
-
 ## Project
 
-Omnigraph is a repo-native graph database prototype implementing a branching model for typed property graphs. It is intentionally separate from Nanograph (the embedded local-first version) — they share only the compiler/frontend layer while Omnigraph owns its own repo-aware runtime and storage.
+Omnigraph is a git-like graph database implementing a branching model for typed property graphs. It is intentionally separate from Nanograph (the embedded local-first version) — they share only the compiler/frontend layer while Omnigraph owns its own repo-aware runtime and storage.
 
 ## Build & Test Commands
 
@@ -115,3 +113,5 @@ poetry run lance-explore node ~/code/omnigraph-test cerebras # node properties +
 
 Architecture specification: `docs/dev/omnigraph-specs.md`
 Migration/split strategy: `docs/dev/nano-omni.md`
+Lance Spec: `docs/dev/lance-format-spec.md`
+Lance Guide: `docs/dev/lance-guide.md`
