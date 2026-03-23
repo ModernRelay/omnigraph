@@ -509,3 +509,39 @@ async fn query_unemployed() {
     unemployed.sort();
     assert_eq!(unemployed, vec!["Charlie", "Diana"]);
 }
+
+#[tokio::test]
+async fn query_anti_join_all_have_edges() {
+    let schema = r#"
+node Person { name: String @key }
+node Company { name: String @key }
+edge WorksAt: Person -> Company
+"#;
+    let data = r#"{"type": "Person", "data": {"name": "Alice"}}
+{"type": "Person", "data": {"name": "Bob"}}
+{"type": "Company", "data": {"name": "Acme"}}
+{"edge": "WorksAt", "from": "Alice", "to": "Acme"}
+{"edge": "WorksAt", "from": "Bob", "to": "Acme"}
+"#;
+    let queries = r#"
+query unemployed() {
+    match {
+        $p: Person
+        not { $p worksAt $_ }
+    }
+    return { $p.name }
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+
+    let result = db
+        .run_query(queries, "unemployed", &ParamMap::new())
+        .await
+        .unwrap();
+
+    // Everyone has a WorksAt edge → empty result
+    assert_eq!(result.num_rows(), 0);
+}

@@ -182,6 +182,9 @@ async fn load_jsonl_reader<R: BufRead>(
     // Phase 3: Atomic manifest commit
     db.manifest_mut().commit(&updates).await?;
 
+    // Phase 4: Ensure scalar indices on key columns
+    db.ensure_indices().await?;
+
     Ok(result)
 }
 

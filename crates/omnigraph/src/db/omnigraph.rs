@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use lance::Dataset;
+use lance_index::scalar::ScalarIndexParams;
+use lance_index::{DatasetIndexExt, IndexType};
 use omnigraph_compiler::build_catalog;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::schema::parser::parse_schema;
@@ -124,6 +127,53 @@ impl Omnigraph {
         let idx = Arc::new(GraphIndex::build(&snapshot, &edge_types).await?);
         self.cached_graph_index = Some(Arc::clone(&idx));
         Ok(idx)
+    }
+
+    /// Ensure BTree scalar indices exist on key columns.
+    /// Idempotent — Lance skips if index already exists.
+    pub async fn ensure_indices(&self) -> Result<()> {
+        let snapshot = self.snapshot();
+        let params = ScalarIndexParams::default();
+
+        for type_name in self.catalog.node_types.keys() {
+            let table_key = format!("node:{}", type_name);
+            let Some(entry) = snapshot.entry(&table_key) else {
+                continue;
+            };
+            let full_path = format!("{}/{}", self.root_uri, entry.table_path);
+            let mut ds = Dataset::open(&full_path)
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            if ds.count_rows(None).await.unwrap_or(0) > 0 {
+                let _ = ds
+                    .create_index_builder(&["id"], IndexType::BTree, &params)
+                    .replace(true)
+                    .await;
+            }
+        }
+
+        for edge_name in self.catalog.edge_types.keys() {
+            let table_key = format!("edge:{}", edge_name);
+            let Some(entry) = snapshot.entry(&table_key) else {
+                continue;
+            };
+            let full_path = format!("{}/{}", self.root_uri, entry.table_path);
+            let mut ds = Dataset::open(&full_path)
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            if ds.count_rows(None).await.unwrap_or(0) > 0 {
+                let _ = ds
+                    .create_index_builder(&["src"], IndexType::BTree, &params)
+                    .replace(true)
+                    .await;
+                let _ = ds
+                    .create_index_builder(&["dst"], IndexType::BTree, &params)
+                    .replace(true)
+                    .await;
+            }
+        }
+
+        Ok(())
     }
 
     pub fn manifest_mut(&mut self) -> &mut ManifestCoordinator {

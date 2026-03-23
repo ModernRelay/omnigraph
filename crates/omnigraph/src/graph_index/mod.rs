@@ -88,6 +88,12 @@ impl CsrIndex {
         let end = self.offsets[node as usize + 1] as usize;
         &self.targets[start..end]
     }
+
+    /// Check if a node has any outgoing edges. O(1), no allocation.
+    pub fn has_neighbors(&self, node: u32) -> bool {
+        let n = node as usize;
+        self.offsets[n + 1] > self.offsets[n]
+    }
 }
 
 /// Topology-only graph index. No node data cached — just adjacency.

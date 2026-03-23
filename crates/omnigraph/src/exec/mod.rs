@@ -280,6 +280,65 @@ async fn hydrate_nodes(
         .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
+/// Try bulk anti-join via CSR existence check. Returns Some if the inner
+/// pipeline is a single Expand from outer_var (the common negation pattern).
+fn try_bulk_anti_join(
+    outer_batch: &RecordBatch,
+    inner_pipeline: &[IROp],
+    graph_index: Option<&GraphIndex>,
+    catalog: &Catalog,
+    outer_var: &str,
+) -> Option<Result<RecordBatch>> {
+    if inner_pipeline.len() != 1 {
+        return None;
+    }
+    let IROp::Expand {
+        src_var,
+        edge_type,
+        direction,
+        ..
+    } = &inner_pipeline[0]
+    else {
+        return None;
+    };
+    if src_var != outer_var {
+        return None;
+    }
+    let gi = graph_index?;
+    let edge_def = catalog.edge_types.get(edge_type.as_str())?;
+
+    let src_type_name = match direction {
+        Direction::Out => &edge_def.from_type,
+        Direction::In => &edge_def.to_type,
+    };
+    let adj = match direction {
+        Direction::Out => gi.csr(edge_type),
+        Direction::In => gi.csc(edge_type),
+    }?;
+    let type_idx = gi.type_index(src_type_name)?;
+
+    let outer_ids = outer_batch
+        .column_by_name("id")?
+        .as_any()
+        .downcast_ref::<StringArray>()?;
+
+    let keep_mask: Vec<bool> = (0..outer_ids.len())
+        .map(|i| {
+            let id = outer_ids.value(i);
+            match type_idx.to_dense(id) {
+                Some(dense) => !adj.has_neighbors(dense),
+                None => true, // not in graph index = no edges = keep
+            }
+        })
+        .collect();
+
+    let mask = BooleanArray::from(keep_mask);
+    Some(
+        arrow_select::filter::filter_record_batch(outer_batch, &mask)
+            .map_err(|e| OmniError::Lance(e.to_string())),
+    )
+}
+
 /// Execute an AntiJoin: remove rows from outer_var where the inner pipeline finds matches.
 async fn execute_anti_join(
     bindings: &mut HashMap<String, RecordBatch>,
@@ -294,6 +353,13 @@ async fn execute_anti_join(
         OmniError::Manifest(format!("anti-join references unbound variable '{}'", outer_var))
     })?;
 
+    // Fast path: bulk CSR existence check (O(N), zero Lance I/O)
+    if let Some(result) = try_bulk_anti_join(outer_batch, inner_pipeline, graph_index, catalog, outer_var) {
+        bindings.insert(outer_var.to_string(), result?);
+        return Ok(());
+    }
+
+    // Slow path: per-row inner pipeline execution
     let outer_ids = outer_batch
         .column_by_name("id")
         .ok_or_else(|| OmniError::Manifest("outer batch missing 'id' column".to_string()))?
@@ -301,18 +367,13 @@ async fn execute_anti_join(
         .downcast_ref::<StringArray>()
         .ok_or_else(|| OmniError::Manifest("outer 'id' column is not Utf8".to_string()))?;
 
-    // For each outer row, run the inner pipeline and check if it produces results
     let mut keep_mask = vec![true; outer_batch.num_rows()];
 
     for i in 0..outer_ids.len() {
-        let outer_id = outer_ids.value(i);
-
-        // Create a single-row binding for the outer variable
         let single_row = outer_batch.slice(i, 1);
         let mut inner_bindings: HashMap<String, RecordBatch> = HashMap::new();
         inner_bindings.insert(outer_var.to_string(), single_row);
 
-        // Execute the inner pipeline
         execute_pipeline(
             inner_pipeline,
             params,
@@ -323,7 +384,6 @@ async fn execute_anti_join(
         )
         .await?;
 
-        // Check if any inner binding produced rows
         let has_match = inner_bindings
             .iter()
             .filter(|(k, _)| *k != outer_var)
@@ -334,7 +394,6 @@ async fn execute_anti_join(
         }
     }
 
-    // Apply mask
     let mask = BooleanArray::from(keep_mask);
     let filtered = arrow_select::filter::filter_record_batch(outer_batch, &mask)
         .map_err(|e| OmniError::Lance(e.to_string()))?;
