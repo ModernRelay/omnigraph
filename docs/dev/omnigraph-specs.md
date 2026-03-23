@@ -41,7 +41,7 @@ What does **not** carry forward:
 1. **Git-style graph database**: branch, merge, tag, clone, push, pull for typed property graphs
 2. **Local-first, remote-native**: works on a laptop, works on S3 — same API, same URI
 3. **Fast traversal without full-row residency**: in-memory topology, on-demand property hydration
-4. **Typed columnar execution**: DataFusion + LanceTableProvider with pushdown scans over per-type Lance tables
+4. **Typed columnar execution**: Lance Scanner with SQL filter pushdown over per-type Lance tables. BTree scalar indices on `id`, `src`, `dst`.
 5. **Indexed search**: Lance FTS, n-gram, and vector indexes replace brute-force in-memory search
 6. **Schema-as-code**: `.pg` remains readable and versioned with data
 7. **Two products, shared compiler**: Nanograph and Omnigraph share the `omnigraph-compiler` crate but own different storage/execution layers
@@ -54,34 +54,28 @@ What does **not** carry forward:
 
 - schema AST/parser (`.pg`)
 - query AST/parser (`.gq`)
-- typechecker
-- catalog + schema IR
-- IR lowering
+- typechecker (read queries + mutations)
+- catalog builder
+- IR lowering (QueryIR + MutationIR)
 - type system (ScalarType, PropType, Direction)
 - error types + diagnostics
-- result transport (QueryResult, MutationResult, Arrow → JSON)
+- result transport (QueryResult, MutationResult, RunResult, Arrow → JSON)
 - embedding client
-- query input helpers
+- query input helpers + `params!` macro
 
-**Zero Lance dependency.** This crate compiles fast, tests in milliseconds, and is the future shared boundary with Nanograph. When the time comes to extract `graph-schema`/`graph-query`/`graph-catalog`/`graph-ir`, they split out of this one crate.
-
-### Nanograph-Owned
-
-- embedded `Database` API
-- single-db manifest + WAL coordination
-- `GraphStorage` in-memory model
-- current loader/mutation flows
-- SDK wrappers around `Database`
+**Zero Lance dependency.** This crate compiles fast, tests in milliseconds, and is the future shared boundary with Nanograph.
 
 ### Omnigraph-Owned: `omnigraph`
 
-- `Omnigraph` top-level API (not "Repo" — it's a database)
+- `Omnigraph` top-level handle
+- `Snapshot` — immutable point-in-time view
 - `ManifestCoordinator` — Lance table for cross-dataset coordination
-- Lance-native branching, tagging, shallow clone
-- `QueryExecutor` — DataFusion SessionContext + LanceTableProvider
-- `GraphIndexManager` — lazy CSR/CSC with dense u32 indices
+- `GraphIndex` — lazy CSR/CSC with dense u32 indices
+- `execute_query()` — pure function executor
 - JSONL loader targeting per-type Lance tables
-- CLI and SDK semantics
+- `ensure_indices()` — BTree scalar index creation
+- Lance-native branching, tagging, shallow clone (planned)
+- CLI (planned)
 
 ---
 
@@ -93,94 +87,98 @@ Three types with separate lifecycles:
 Omnigraph (handle — one per connection, long-lived)
   ├── catalog: Catalog                              (immutable, from _schema.pg)
   ├── manifest: ManifestCoordinator                 (manages writes, known version)
-  ├── graph_index: RwLock<Option<Arc<GraphIndex>>>  (cached topology, single slot)
+  ├── cached_graph_index: Option<Arc<GraphIndex>>   (cached topology, single slot)
   │
-  ├── snapshot() → Snapshot        (cheap, no I/O — reads from known version)
-  ├── refresh()                    (re-reads manifest from storage)
-  └── graph_index(&snapshot)       (cache check, maybe rebuild from snapshot)
+  ├── snapshot() → Snapshot        (sync, no I/O — reads from known state)
+  ├── refresh()                    (async — re-reads manifest from storage)
+  ├── graph_index()                (async — cache check, maybe rebuild)
+  ├── run_query()                  (async — snapshot + compile + execute)
+  └── ensure_indices()             (async — create BTree indices)
 
 Snapshot (immutable read view, per-query, cheap)
   ├── version: u64
-  ├── entries: {key → (path, version)}
+  ├── entries: HashMap<String, SubTableEntry>
   └── open(key) → Dataset at pinned version
 
 GraphIndex (topology only, expensive to build, shared via Arc)
-  ├── type_indices: {type_name → TypeIndex}   (String → u32 dense mapping)
-  ├── csr: {edge_type → CsrIndex}             (outgoing adjacency)
-  └── csc: {edge_type → CsrIndex}             (incoming adjacency)
+  ├── type_indices: HashMap<String, TypeIndex>   (String → u32 dense mapping)
+  ├── csr: HashMap<String, CsrIndex>             (outgoing adjacency)
+  └── csc: HashMap<String, CsrIndex>             (incoming adjacency)
 ```
 
-- **`Omnigraph`** is the single entry point: init, open, load, query, branch, merge, tag, warm.
-- **`Snapshot`** is an immutable point-in-time view. Cheap to create (reads from known manifest state, no storage I/O). All reads within a query go through one Snapshot. Contains no caches, no datasets, no indexes.
-- **`GraphIndex`** is topology only — CSR/CSC offset arrays + TypeIndex mappings. No node data cached inside it. Expensive to build (scans edge tables), shared across queries via `Arc`. Keyed by edge sub-table versions, not manifest version — loading new node data does not invalidate the graph index.
-- **`ManifestCoordinator`** owns the manifest Lance table and commit protocol.
-- **`Catalog`** is built from `_schema.pg` by the compiler — no storage dependency.
-
+**Actual struct** (`crates/omnigraph/src/db/omnigraph.rs`):
 ```rust
-let db = Omnigraph::open("s3://bucket/my-graph").await?;   // remote
-let db = Omnigraph::open("/local/my-graph").await?;         // local
-let db = Omnigraph::init(uri, schema_source).await?;
-db.load(data_path, LoadMode::Merge).await?;
-
-db.query(query_source, "friends_of", &params).await?;  // snapshot + index internally
-
-db.branch_create("experiment").await?;
-db.refresh().await?;                         // see other writers' commits
-db.warm("main").await?;                      // pre-build graph index
+pub struct Omnigraph {
+    root_uri: String,
+    manifest: ManifestCoordinator,
+    catalog: Catalog,
+    schema_source: String,
+    cached_graph_index: Option<Arc<GraphIndex>>,
+}
 ```
 
-All methods accept `&str` URIs, not filesystem paths. Lance handles local and remote storage transparently.
-
-### Query Path
-
-A query is three steps:
-
+**Actual API** (`crates/omnigraph/src/db/omnigraph.rs` + `crates/omnigraph/src/exec/mod.rs`):
 ```rust
 impl Omnigraph {
-    pub async fn query(&self, source: &str, name: &str, params: &ParamMap) -> Result<QueryResult> {
-        let snapshot = self.snapshot().await?;                    // 1. cheap, no I/O
-        let graph_index = self.graph_index(&snapshot).await?;    // 2. cache check, maybe rebuild
-        let ir = compile_query(source, name, &self.catalog)?;   // 3. parse + typecheck + lower
-        execute_query(&ir, params, &snapshot, &graph_index, &self.catalog).await
+    pub async fn init(uri: &str, schema_source: &str) -> Result<Self>;
+    pub async fn open(uri: &str) -> Result<Self>;
+    pub fn snapshot(&self) -> Snapshot;                      // sync, no I/O
+    pub async fn refresh(&mut self) -> Result<()>;           // re-read from storage
+    pub async fn graph_index(&mut self) -> Result<Arc<GraphIndex>>;
+    pub async fn run_query(&mut self, source: &str, name: &str, params: &ParamMap) -> Result<QueryResult>;
+    pub async fn ensure_indices(&self) -> Result<()>;        // BTree on id/src/dst
+    pub fn catalog(&self) -> &Catalog;
+    pub fn uri(&self) -> &str;
+    pub fn version(&self) -> u64;
+    pub fn manifest_mut(&mut self) -> &mut ManifestCoordinator;
+}
+```
+
+### Query Path (Actual)
+
+```rust
+// crates/omnigraph/src/exec/mod.rs
+impl Omnigraph {
+    pub async fn run_query(&mut self, query_source: &str, query_name: &str, params: &ParamMap) -> Result<QueryResult> {
+        let snapshot = self.snapshot();                           // 1. sync, no I/O
+        let query_decl = find_named_query(query_source, query_name)?;
+        let type_ctx = typecheck_query(self.catalog(), &query_decl)?;
+        let ir = lower_query(self.catalog(), &query_decl, &type_ctx)?;
+
+        let needs_graph = ir.pipeline.iter().any(|op| matches!(op, IROp::Expand { .. } | IROp::AntiJoin { .. }));
+        let graph_index = if needs_graph { Some(self.graph_index().await?) } else { None };
+
+        execute_query(&ir, params, &snapshot, graph_index.as_deref(), self.catalog()).await
     }
 }
 ```
 
-The executor is a **pure function** — no state, no caches, no interior mutability. Takes everything as references. Thread-safe by construction.
+The executor `execute_query()` is a **public pure function** — no state, no caches, no interior mutability.
 
 ### Version Advancement
 
 - **`open()`** — reads manifest from storage, sets known version
 - **`commit()`** — advances manifest, updates known version (read-your-own-writes)
 - **`refresh()`** — re-reads manifest from storage, updates known version (see other writers)
-- **`snapshot()`** — returns Snapshot at the known version (no storage I/O, always fast)
+- **`snapshot()`** — returns Snapshot at the known version (sync, no storage I/O)
 
-### Graph Index Cache Key
+### Graph Index Invalidation
 
-The graph index is keyed by edge sub-table versions, not manifest version:
+The graph index is a single cache slot: `Option<Arc<GraphIndex>>`. It is:
+- **Built lazily** on first traversal query via `graph_index()`
+- **Shared** across queries via `Arc`
+- **Invalidated** by setting to `None` after edge mutations (insert edge, delete node with cascade, delete edge)
 
-```rust
-struct GraphIndexKey {
-    edge_versions: BTreeMap<String, u64>,  // edge table_key → table_version
-}
-```
-
-This means:
-- Loading new node data → same edge versions → **graph index reused** (no rebuild)
-- Adding/removing edges → edge versions change → **graph index rebuilt**
-- The graph index and node data have independent lifecycles
-
-Phase 1 uses a single cache slot (`Option<Arc<GraphIndex>>`). Multi-branch upgrades to `HashMap<GraphIndexKey, Arc<GraphIndex>>`.
+Phase 1 uses simple invalidation. Future: key by edge sub-table versions (`BTreeMap<String, u64>`) so node-only loads don't trigger rebuilds.
 
 ### Extension Points
 
 Every future optimization is additive — a new field on `Omnigraph` or a new parameter to the executor, not a restructuring:
 
 - Multi-branch → `HashMap<GraphIndexKey, Arc<GraphIndex>>` replaces `Option`
-- Node cache → new `RwLock<...>` field on Omnigraph, new parameter to executor
+- Node cache → new field on Omnigraph, new parameter to executor
 - DuckDB fallback → new field, new parameter
 - Persistent index → serialize/deserialize `GraphIndex` (it's just data)
-- Concurrent index build → build in background, swap `Arc` when done (`RwLock` handles this)
 
 ---
 
@@ -188,32 +186,37 @@ Every future optimization is additive — a new field on `Omnigraph` or a new pa
 
 ```
 crates/
-├── omnigraph-compiler/        # No Lance dependency. 149 tests. Compiles in seconds.
+├── omnigraph-compiler/        # No Lance dependency. 149 tests.
 │   └── src/
 │       ├── schema/            # .pg parser, AST, pest grammar
 │       ├── query/             # .gq parser, AST, typechecker, pest grammar
-│       ├── catalog/           # Catalog, build_catalog (no schema_ir)
-│       ├── ir/                # IR types, lowering
+│       ├── catalog/           # Catalog, build_catalog
+│       ├── ir/                # QueryIR, MutationIR, lowering
 │       ├── types.rs           # ScalarType, PropType, Direction
 │       ├── error.rs           # NanoError, ParseDiagnostic
 │       ├── embedding.rs       # OpenAI embedding client
-│       ├── json_output.rs     # Arrow → JSON
-│       ├── result.rs          # QueryResult, MutationResult
-│       └── query_input.rs     # Named query lookup, param parsing
+│       ├── json_output.rs     # Arrow → JSON (JS-safe integers)
+│       ├── result.rs          # QueryResult, MutationResult, RunResult
+│       └── query_input.rs     # Named query lookup, param parsing, params! macro
 │
-├── omnigraph/                 # The database. Lance-dependent.
+├── omnigraph/                 # The database. Lance-dependent. 35 tests.
 │   └── src/
-│       ├── db/                # Omnigraph handle, ManifestCoordinator, Snapshot
-│       ├── exec/              # Pure function executor: scan, filter, traverse, search, mutate
-│       ├── graph_index/       # CSR/CSC, TypeIndex (topology only, no node cache)
-│       └── loader/            # JSONL → per-type Lance tables
+│       ├── db/
+│       │   ├── manifest.rs    # Snapshot, ManifestCoordinator (known_state, snapshot, refresh, commit)
+│       │   └── omnigraph.rs   # Omnigraph handle (init, open, run_query, graph_index, ensure_indices)
+│       ├── exec/
+│       │   └── mod.rs         # execute_query, execute_pipeline, execute_expand, execute_anti_join, hydrate_nodes
+│       ├── graph_index/
+│       │   └── mod.rs         # GraphIndex, TypeIndex (String↔u32), CsrIndex (CSR adjacency)
+│       └── loader/
+│           └── mod.rs         # load_jsonl, load_jsonl_file, build_node_batch, write_batch_to_dataset
 │
-└── omnigraph-cli/             # Binary
+└── omnigraph-cli/             # Binary (stubbed, wired in Step 10)
     └── src/
         └── main.rs
 ```
 
-The boundary is the **Lance dependency line**. Everything above it (compiler) has zero Lance dependency and compiles in seconds. Everything below it (database) depends on Lance and Arrow. No circular dependencies. No artificial engine/repo split. DataFusion is a transitive dependency via Lance but not used directly.
+The boundary is the **Lance dependency line**. Everything above it (compiler) has zero Lance dependency and compiles in seconds. Everything below it (database) depends on Lance and Arrow.
 
 ---
 
@@ -227,21 +230,22 @@ graph-db/                               # repo root (local path or s3:// URI)
 ├── _manifest.lance/                    # Lance table: one row per sub-table
 │   ├── _versions/                      # MVCC — repo version = manifest version
 │   ├── _refs/branches/                 # Lance-native branch metadata
-│   ├── _refs/tags/                     # Lance-native tag metadata
-│   └── tree/{branch}/                  # Branch-specific manifest versions
+│   └── data/
 ├── nodes/
-│   ├── a1b2c3d4/                       # Per-type dataset. Hash of type name at creation.
+│   ├── {hash}/                         # Per-type dataset (FNV-1a hash of type name)
 │   │   ├── _versions/
 │   │   ├── data/
-│   │   ├── _indices/                   # BTree on id, FTS on @index properties
-│   │   └── tree/{branch}/             # Lazily created on first branch write
-│   └── e5f6a7b8/
+│   │   └── _indices/                   # BTree on id (created by ensure_indices)
+│   └── ...
 └── edges/
-    ├── f7012952/
-    └── 3c4d5e6f/
+    ├── {hash}/                         # Per-edge-type dataset
+    │   ├── _versions/
+    │   ├── data/
+    │   └── _indices/                   # BTree on src, BTree on dst
+    └── ...
 ```
 
-Sub-table directory names are stable hashes of the type name at creation time. On type rename, only the manifest row's `table_key` changes — the directory and all data files are untouched. This avoids directory renames (impossible on S3) and keeps paths stable across schema evolution.
+Sub-table directory names are FNV-1a hashes of the type name (`manifest.rs:type_name_hash`). On type rename, only the manifest row's `table_key` changes — directories are stable.
 
 ### Manifest Table
 
@@ -249,46 +253,45 @@ The manifest is a Lance table. One row per sub-table. A repo version is one mani
 
 | Column | Type | Description |
 |---|---|---|
-| `table_key` | Utf8 | `"node:Person"` or `"edge:Knows"`. Unenforced primary key. |
-| `table_path` | Utf8 | `"nodes/a1b2c3d4"` — relative to repo root, stable hash |
+| `table_key` | Utf8 | `"node:Person"` or `"edge:Knows"` |
+| `table_path` | Utf8 | `"nodes/a1b2c3d4"` — relative to repo root |
 | `table_version` | UInt64 | Pinned Lance version for this snapshot |
 | `table_branch` | Utf8 (nullable) | Lance branch name on sub-table (null = main) |
 | `row_count` | UInt64 | Rows in sub-table at this version |
 
-Branching = branching the manifest table. Tagging = tagging the manifest table. Time travel = checking out a prior manifest version.
+**Commit protocol** (`ManifestCoordinator::commit`):
+1. Read current state to resolve `table_path` for each key
+2. Build update batch
+3. `merge_insert` on `_manifest.lance` keyed by `table_key` (atomic commit point)
+4. Update `known_state` for read-your-own-writes
 
 ### Sub-Table Schemas
 
-**Nodes:**
+**Nodes** (from `Catalog::node_types[name].arrow_schema`):
 
 | Column | Type | Notes |
 |---|---|---|
-| `id` | Utf8 | `@key` value or ULID. Unenforced primary key. BTree index. |
+| `id` | Utf8 | `@key` value or ULID. BTree index. |
 | `{property}` | typed | One column per `.pg` property |
 
-**Edges:**
+**Edges** (from `Catalog::edge_types[name].arrow_schema`):
 
 | Column | Type | Notes |
 |---|---|---|
-| `id` | Utf8 | ULID. Unenforced primary key. |
+| `id` | Utf8 | ULID. |
 | `src` | Utf8 | Source node `id`. BTree index. |
 | `dst` | Utf8 | Destination node `id`. BTree index. |
 | `{property}` | typed | Edge properties |
 
 All datasets created with `enable_stable_row_ids = true` and `LanceFileVersion::V2_2`.
 
-### Commit Protocol
+### Scalar Indices
 
-Writes to multiple sub-tables are coordinated through the manifest:
+`Omnigraph::ensure_indices()` creates BTree indices after data load:
+- Node tables: BTree on `id`
+- Edge tables: BTree on `src`, BTree on `dst`
 
-```
-1. (parallel) write_fragments to each changed sub-table
-2. Commit each sub-table (LanceOperation.Append / MergeInsert / Delete)
-3. merge_insert on _manifest.lance with updated versions
-   → new manifest version = new repo version (atomic commit point)
-```
-
-If any step before 3 fails, the manifest still points to old versions. Orphaned sub-table versions are invisible to readers and cleaned up by compaction.
+Uses `lance_index::DatasetIndexExt::create_index_builder` with `IndexType::BTree` and `ScalarIndexParams::default()`. Idempotent (`replace=true`).
 
 ### Why Per-Type Tables
 
@@ -305,19 +308,19 @@ If any step before 3 fails, the manifest still points to old versions. Orphaned 
 
 ### Persisted Identity
 
-- every node/edge row has a String `id` column
-- `@key` types use the key property value as `id`
-- keyless types use generated ULIDs (no coordinator, branch-safe)
+- every node/edge row has a String `id` column (Utf8)
+- `@key` types use the key property value as `id` (e.g., `name: String @key` → `id = "Alice"`)
+- keyless types use generated ULIDs (`ulid::Ulid::new().to_string()`)
 - edge `src` / `dst` persist String IDs of referenced nodes
-- `id` has `unenforced_primary_key` for efficient `merge_insert`
+- `id` has BTree scalar index for efficient lookups and `merge_insert`
 
 ### Traversal Identity
 
-- per-type transient dense `u32` indices (not `u64`)
-- `TypeIndex`: `HashMap<String, u32>` + `Vec<String>` per node type
-- built lazily alongside the graph index on first traversal query
-- cached by `GraphIndexKey` — a `BTreeMap<String, u64>` of edge sub-table versions (not manifest version — node changes don't invalidate the topology)
-- offset arrays sized to actual node count per type — no waste
+- per-type transient dense `u32` indices
+- `TypeIndex`: `HashMap<String, u32>` (id → dense) + `Vec<String>` (dense → id)
+- built lazily during `GraphIndex::build` from edge `src`/`dst` columns
+- two-phase build: scan all edge types first (grows TypeIndices), then build CSR/CSC with final sizes
+- invalidated when `cached_graph_index` is set to `None`
 
 ### Future: Binary ULIDs
 
@@ -341,21 +344,47 @@ The current design stores all IDs as Utf8 strings — 26-byte Crockford Base32 f
 
 ## Query Execution
 
-Pipeline:
+### Pipeline
 
 ```text
-.gq → parse → typecheck → lower → execute(ir, params, snapshot, graph_index, catalog)
+.gq → parse → typecheck → lower → execute_query(ir, params, snapshot, graph_index, catalog)
 ```
 
-The executor is a pure function. All reads go through a single `Snapshot` (see Consistency Model). No DataFusion `SessionContext`, no `LanceTableProvider` registration, no pre-opened datasets. Each sub-table is opened on demand via `snapshot.open(key)` (~1ms local).
+The executor is a pure function (`crates/omnigraph/src/exec/mod.rs`). All reads go through a single `Snapshot`. Graph index is `Option<&GraphIndex>` — only built/passed when the pipeline contains `Expand` or `AntiJoin`.
 
-- **tabular scans**: IR `NodeScan` → Lance `Dataset::scan()` with SQL filter pushdown. Filters are converted from IR to Lance SQL strings (`name = 'Alice' AND age > 30`). Type casting is automatic (e.g., Int64 literal against Int32 column).
-- **graph traversal**: `GraphIndex` provides CSR/CSC topology with dense u32 indices. BFS/DFS is sub-millisecond. Destination nodes hydrated directly from Snapshot (no node cache in Phase 1).
-- **projection**: IR `PropAccess` expressions map to Arrow column extraction. Aliases applied from return clause.
-- **ordering**: Arrow `lexsort_to_indices` with `SortColumn` per ordering expression.
-- **limit**: batch slicing after ordering.
-- **search predicates**: Lance FTS (`contains_tokens`, `phrase`, `match` with BM25), n-gram for fuzzy, IVF-HNSW for vector. All indexed.
-- **mutations**: Lance native `merge_insert`, `append`, `delete` (deletion vectors). Schema-driven edge cascade.
+### IR Operations Supported
+
+| IR Op | Implementation | Lance API |
+|---|---|---|
+| `NodeScan` | `execute_node_scan()` — opens dataset via `snapshot.open()`, pushes SQL filter | `Dataset::scan().filter(sql)` |
+| `Filter` | `apply_filter()` — Arrow comparison kernels with auto type casting | `arrow_ord::cmp::eq/gt/lt/...` |
+| `Expand` | `execute_expand()` — BFS on CSR/CSC, then `hydrate_nodes()` | `Dataset::scan().filter("id IN (...)")` |
+| `AntiJoin` | `try_bulk_anti_join()` fast path (CSR offset check, O(N), zero I/O) or per-row fallback | `CsrIndex::has_neighbors()` |
+
+### Expand Details
+
+1. Extract source String IDs from binding batch
+2. Map to dense u32 via `TypeIndex::to_dense()`
+3. Select adjacency: CSR for `Direction::Out`, CSC for `Direction::In`
+4. BFS with hop bounds (`min_hops..=max_hops`), cross-type aware visited set
+5. Map result u32 back to String IDs via `TypeIndex::to_id()`
+6. Hydrate destination nodes: `snapshot.open("node:{type}")` with `id IN (...)` filter (BTree indexed)
+
+### AntiJoin Optimization
+
+**Fast path** (`try_bulk_anti_join`): If the inner pipeline is exactly one `Expand` whose `src_var == outer_var`, resolve entirely from CSR — `CsrIndex::has_neighbors(dense)` is O(1) per node, zero Lance I/O. This handles the common `not { $p worksAt $_ }` pattern.
+
+**Slow path**: Per-row inner pipeline execution for complex negations (e.g., `not { $p worksAt $c, $c.name = "Acme" }`).
+
+### Projection and Ordering
+
+- **Projection**: `PropAccess { variable, property }` → `bindings[variable].column_by_name(property)`
+- **Ordering**: `lexsort_to_indices` with `SortColumn` per ordering expression
+- **Limit**: `batch.slice(0, limit)`
+
+### Known Limitation: Row Correlation
+
+Each variable binding is an independent `RecordBatch`. Multi-variable returns across traversal hops work only when one side has exactly 1 row (filters down to a single source). General N×M cross-products require row-correlated bindings (deferred to v0.2.0).
 
 ---
 
@@ -364,23 +393,17 @@ The executor is a pure function. All reads go through a single `Snapshot` (see C
 ### Always In Memory
 
 - schema catalog (from `_schema.pg`, small)
-- known manifest version (u64 + entry metadata — refreshed explicitly)
+- known manifest state (version + entries — refreshed explicitly)
 
 ### Lazily Cached On Omnigraph Handle
 
-- `GraphIndex`: CSR/CSC offset arrays + TypeIndex mappings. Built on first traversal query. Keyed by edge sub-table versions. Single slot in Phase 1, `HashMap` later for multi-branch.
+- `GraphIndex`: CSR/CSC offset arrays + TypeIndex mappings. Built on first traversal query. Single slot, invalidated by edge mutations.
 
 ### Never Cached (Phase 1)
 
 - node data (hydrated on demand from Snapshot per query)
 - edge property data (read on demand)
 - Lance fragment data (managed by Lance's own cache)
-
-### Never Required At Open
-
-- any node or edge data
-- graph index (built lazily on first traversal)
-- full graph hydration
 
 ### Tiered Storage Model
 
@@ -390,133 +413,93 @@ The executor is a pure function. All reads go through a single `Snapshot` (see C
 | Local disk | < 1 ms | Lance fragment cache, Lance metadata cache | Lance SDK |
 | Object storage | 10-100 ms | Lance data fragments, manifests, indices | Lance SDK |
 
-The `warm(branch)` method pre-builds the graph index for a branch without waiting for a query.
-
-### Future: Node Cache (Not Phase 1)
-
-When profiling shows node hydration is a bottleneck, add a separate node cache keyed by `(node_type, node_table_version)`. This has an independent lifecycle from the graph index — edge changes don't invalidate node caches, and node changes don't invalidate the graph index. The cache is a new field on `Omnigraph` and a new parameter to the executor — no restructuring needed.
-
 ---
 
-## Branching Model
+## Branching Model (Planned — Step 9)
 
 ### Lance-Native Branching
 
 Branches are Lance branches on the manifest table. Sub-tables are branched lazily.
 
+**Lance APIs available** (verified in lance 3.0):
+- `Dataset::create_branch(name)` — zero-copy branch
+- `Dataset::checkout_branch(name)` — open at branch
+- `Dataset::list_branches()` — enumerate branches
+- `Dataset::delete_branch(name)` — remove branch
+- `Dataset::shallow_clone(dest, base_paths)` — cross-location clone
+
 **Create branch:**
-1. Create Lance branch on `_manifest.lance` (zero-copy — inherits all rows)
-2. No sub-tables branched yet
+1. `_manifest.lance` dataset: `ds.create_branch("experiment")` (zero-copy, inherits all rows)
+2. No sub-tables branched yet — `table_branch` remains null
 
 **First write on branch:**
-1. Sub-table has no branch → create Lance branch (shallow clone via `base_paths`)
-2. Write to the branched sub-table → new fragments at the branch's dataset root
+1. Sub-table has no branch → create Lance branch on the sub-table
+2. Write to the branched sub-table
 3. Update manifest row: set `table_branch`, commit manifest on the branch
 
 **Read from branch:**
-1. Open manifest at the branch
-2. For each sub-table: if `table_branch` is null, open at `table_version` on main. If set, open at that branch.
+1. Open manifest at the branch: `ds.checkout_branch("experiment")`
+2. For each sub-table: if `table_branch` is null, open at `table_version` on main. If set, checkout that branch.
+
+**Merge:**
+1. Read source and target manifest states
+2. For each sub-table that differs: `merge_insert` keyed by `id` to apply changes
+3. Commit target manifest
 
 Sub-tables not written to on a branch are never branched. Storage overhead is proportional to what changed.
 
-### Shallow Clone via `base_paths`
+---
 
-Lance's `base_paths` system handles cross-location data resolution at the fragment level:
+## Mutation Model (Planned — Step 7)
 
-- Inherited fragments: `DataFile { path: "fragment-0.lance", base_id: 1 }` → resolves to source
-- New fragments: `DataFile { path: "fragment-new.lance", base_id: 0 }` → lives at clone root
-- Reads see both seamlessly. Writes always go to the clone's own root.
-- Source dataset is never modified.
+### Compiler Support (Already Built)
 
-This applies to both branching (within a repo) and cloning (across locations).
+The compiler handles the full mutation pipeline — parsing, typechecking, IR lowering:
 
-### Merge
+**Grammar**: `insert Type { prop: value }`, `update Type set { prop: value } where pred`, `delete Type where pred`
 
-1. Read source and target manifest states
-2. For each sub-table branched on source:
-   - Diff using `_row_created_at_version` / `_row_last_updated_at_version`
-   - Apply changes to target via `merge_insert` keyed by `id`
-3. Update target manifest with new sub-table versions
+**IR**: `MutationIR { name, params, op: MutationOpIR }` with `Insert/Update/Delete` variants. `IRAssignment { property, value: IRExpr }`, `IRMutationPredicate { property, op, value: IRExpr }`.
+
+**Typechecker**:
+- Insert validates all non-nullable properties provided, validates edge `from`/`to` endpoints
+- Update validates property types, rejects edge updates (T16)
+- Delete validates predicate for both nodes and edges
+
+### Runtime (To Build)
+
+**Insert**: Build single-row RecordBatch → `Dataset::append()` → commit manifest.
+
+**Update**: Scan with predicate filter → apply assignments → `merge_insert` keyed by `id` → commit manifest.
+
+**Delete with edge cascade**:
+1. Scan for matching IDs
+2. `Dataset::delete(predicate_sql)` — Lance deletion vectors (soft delete)
+3. For each edge type referencing the deleted node type: `edge_ds.delete("src IN (...) OR dst IN (...)")` (BTree indexed)
+4. Commit manifest for all changed sub-tables
+5. Invalidate graph index: `self.cached_graph_index = None`
+
+**Lance APIs**: `ds.append()`, `MergeInsertBuilder`, `ds.delete(predicate)` — all already used in the loader.
 
 ---
 
-## Local/Remote Model
-
-Omnigraph works identically on local disk and remote storage. `Omnigraph::open(uri)` accepts local paths and `s3://`/`gs://` URIs — Lance handles both transparently.
-
-### Single Location (Simplest)
-
-Repo lives at one location (local or S3). All clients open it directly. Branches provide write isolation. No sync needed.
-
-### Clone + Push/Pull (Hub Model)
-
-**Clone:** Create a local repo that references the remote via `base_paths`. Metadata is local. Data stays remote, fetched on demand.
-
-**Work locally:** Writes create new fragments at the local root. Inherited remote fragments are read transparently via `base_paths`.
-
-**Push:** Copy local-only fragments to hub. Commit new hub manifest version including them.
-
-**Pull:** Fetch remote manifest. Update local manifest to reference new remote versions.
-
-Per-type tables mean only changed types need to sync — O(changed types), not O(all types).
-
-### Design Constraints for Remote
-
-- All methods accept `&str` URIs, not `&Path`
-- Sub-table paths in the manifest are relative to repo root
-- `base_paths` handles cross-location fragment resolution (Lance-native, not application code)
-- The graph index is always local/ephemeral — rebuilt from whatever sub-tables are accessible
-- Manifest metadata stores remote origin: `"omnigraph:remote:origin" → "s3://..."`
-
----
-
-## Change Tracking
-
-Based entirely on Lance-native capabilities:
-
-- `_row_created_at_version` — which manifest version a row was inserted
-- `_row_last_updated_at_version` — which manifest version a row was last modified
-- Deletion vectors — track deleted rows per fragment
-
-Change queries are standard filters:
-
-```sql
--- Inserts since version N
-WHERE _row_created_at_version > N AND _row_created_at_version <= current
-
--- Updates since version N (not newly created)
-WHERE _row_created_at_version <= N
-  AND _row_last_updated_at_version > N
-  AND _row_last_updated_at_version <= current
-```
-
-Cross-dataset change detection: compare manifest versions to find which sub-tables changed, then query each.
-
-No custom WAL. No custom CDC log. No inline JSON payloads.
-
-### Hooks
-
-Trigger families: change, schedule, manual.
-Executor families: shell, webhook.
-
-Hooks observe manifest version changes and dispatch. They are a thin layer on top of Lance's version tracking — not a separate change infrastructure.
-
----
-
-## Search
+## Search Model (Planned — Step 8)
 
 Lance-native indexed search replaces Nanograph's brute-force implementations:
 
-| Predicate | Nanograph (brute-force) | Omnigraph (Lance-indexed) |
+| Predicate | Omnigraph (Lance-indexed) | Lance Index Type |
 |---|---|---|
-| `search()` | O(rows × tokens) tokenize + set intersection | FTS `contains_tokens` on indexed column |
-| `fuzzy()` | O(rows × tokens²) Levenshtein per pair | N-gram FTS index |
-| `match_text()` | O(rows × tokens) sliding window | FTS `phrase` query |
-| `bm25()` | O(rows × tokens) BM25 per row | FTS `match` with BM25 scoring |
-| `nearest()` | Lance ANN (already indexed) | Lance IVF-HNSW (keep) |
-| `rrf()` | App-level fusion | App-level fusion (keep) |
+| `search()` | FTS `match_tokens` | `IndexType::Inverted` |
+| `fuzzy()` | N-gram FTS index | `IndexType::Inverted` (n-gram config) |
+| `match_text()` | FTS `match_phrase` | `IndexType::Inverted` |
+| `bm25()` | FTS `match` with BM25 scoring | `IndexType::Inverted` |
+| `nearest()` | Lance ANN | `IndexType::IvfHnswPq` |
+| `rrf()` | Application-level score fusion | N/A |
 
-This is an execution-backend upgrade, not a DSL change.
+Index creation extends `ensure_indices()`:
+- `@index` String properties → `IndexType::Inverted`
+- `Vector(N)` properties → `IndexType::IvfHnswPq`
+
+The compiler IR already supports all search expressions (`IRExpr::Search/Fuzzy/MatchText/Bm25/Nearest/Rrf`). Only the runtime execution is missing.
 
 ---
 
@@ -528,18 +511,11 @@ This is an execution-backend upgrade, not a DSL change.
 
 ### Snapshot Isolation
 
-A `Snapshot` is an immutable data structure: version `u64` + entries `HashMap<String, SubTableEntry>`. It is produced from the Omnigraph handle's known manifest state — no storage I/O, always fast. It can open any sub-table on demand via `open(table_key)`, which resolves the path and checks out the pinned version via Lance.
+`Snapshot` is created from `ManifestCoordinator::known_state` — sync, no storage I/O. It holds `version: u64` + `entries: HashMap<String, SubTableEntry>`. It can open any sub-table on demand via `open(table_key)`, which resolves the path and checks out the pinned version.
 
 **Within a query:** The executor takes one Snapshot at query start. All `NodeScan`, `Expand`, and `AntiJoin` operations read through it. Concurrent writes are invisible.
 
 **Across queries:** Each query takes its own Snapshot from the handle's known version. Successive queries see the latest committed state (if the handle committed) or the last known state (if another writer committed and `refresh()` hasn't been called).
-
-### Version Advancement
-
-- **`open()`** — reads manifest from storage, sets known version
-- **`commit()`** — advances manifest, updates known version (read-your-own-writes)
-- **`refresh()`** — re-reads manifest from storage, updates known version (see other writers)
-- **`snapshot()`** — returns Snapshot at the known version (no storage I/O, always fast)
 
 ### Multi-Reader
 
@@ -547,19 +523,15 @@ Multiple readers call `snapshot()` concurrently — each gets an immutable value
 
 ### Multi-Writer
 
-Multiple writers each open their own `Omnigraph::open(uri)` handle, getting their own `ManifestCoordinator` with their own Lance `Dataset` handle. When two writers commit:
+Multiple writers each open their own `Omnigraph::open(uri)` handle. When two writers commit:
 
-- **Different sub-tables** (e.g., one writes Person, other writes Company): Lance merges the manifest rows automatically. The `merge_insert` by `table_key` is non-conflicting for different keys.
-- **Same sub-table**: Lance's per-dataset optimistic concurrency handles it. Append+Append is rebasable (auto-merged). Same-row Update+Update is retryable.
-- **No application-level locking required.**
+- **Different sub-tables**: Lance merges manifest rows automatically (`merge_insert` by `table_key` is non-conflicting for different keys)
+- **Same sub-table**: Lance's optimistic concurrency handles it (Append+Append is rebasable, same-row Update is retryable)
+- **No application-level locking required**
 
 ### Read-After-Write
 
-After `commit()`, the coordinator's known version is updated. The next `snapshot()` sees the new version immediately. No `refresh()` needed for own writes.
-
-### Cross-Writer Visibility
-
-Writer A commits. Writer B calls `refresh()` (re-reads the manifest from storage). Writer B's next `snapshot()` sees A's changes. Without `refresh()`, Writer B continues reading from its last known version — stale but consistent.
+After `commit()`, the coordinator's `known_state` is updated. The next `snapshot()` sees the new version immediately. No `refresh()` needed for own writes.
 
 ### What Lance Provides Natively
 
@@ -571,11 +543,10 @@ Writer A commits. Writer B calls `refresh()` (re-reads the manifest from storage
 | Conflict resolution | Rebasable (auto-merge), retryable (re-execute), or incompatible (fail) |
 | Time travel | `checkout_version(N)` reads any historical version |
 | Deletion without rewrite | Deletion vectors (soft delete) |
-| Row-level change tracking | `_row_created_at_version`, `_row_last_updated_at_version` (with stable row IDs) |
 
 ### What Omnigraph Adds
 
-The manifest table is the single coordination layer that extends Lance's per-dataset MVCC to cross-dataset consistency. Without it, each sub-table has independent versioning with no guarantee that Person version 5 and Knows version 3 form a consistent graph. The manifest pins them together: manifest version N says "Person is at version 5 and Knows is at version 3" — that's the Snapshot.
+The manifest table extends Lance's per-dataset MVCC to **cross-dataset consistency**. Without it, each sub-table has independent versioning with no guarantee that Person version 5 and Knows version 3 form a consistent graph. The manifest pins them together.
 
 ---
 
@@ -588,43 +559,21 @@ Branches are the primary concurrency primitive. Progression:
 | Local/agent | Single writer, batch loads | Lance `merge_insert` per sub-table + manifest commit |
 | Multi-agent | Independent work streams | Branch-per-writer + merge (zero-copy fork, isolated writes) |
 | Collaboration | Same branch, low contention | Lance optimistic concurrency (Append+Append = rebasable, same-row Update = retryable) |
-| Streaming | High throughput on one branch | Lance MemWAL per sub-table (region-based, epoch fencing) |
-
-Omnigraph does not require a coordinator for the common case. The manifest table's MVCC handles concurrent access. MemWAL is only needed when write throughput exceeds what single-writer commits can sustain AND writes must land on the same branch.
+| Streaming | High throughput on one branch | Lance MemWAL per sub-table (deferred) |
 
 ---
 
-## Non-Goals For Phase 1
+## Implementation Status
 
-- preserving Nanograph's public API
-- reusing Nanograph's storage/runtime crates
-- implementing push/pull before local branching works
-- MemWAL or high-throughput concurrency
-- schema evolution / migration (deferred — Lance `add_columns`/`alter_columns` when needed)
-- DuckDB fallback for very large graphs
-- SDK wrappers (TS, Swift, Python)
+See `implementation-plan.md` for detailed step-by-step status, compiler types to reuse, runtime code to write, Lance APIs, and test cases for each remaining step.
 
----
-
-## Implementation Constraints
-
-Build order:
-
-1. ✅ Foundation types (String IDs, Utf8 schemas)
-2. ✅ Manifest coordinator (Lance table)
-3. ✅ `Omnigraph` init/open
-4. ✅ Data loading — JSONL → per-type Lance tables via manifest
-5. ✅ Query execution — Lance Scanner + Arrow kernels (no DataFusion SessionContext)
-5a. ▶ Snapshot refactor — extract `Snapshot`, pure function executor, `GraphIndexKey`
-6. Graph index — lazy CSR/CSC with dense u32, no node cache
-7. Mutations — insert/update/delete with cascade via manifest
-8. Search — Lance FTS/n-gram/ANN indexes
-9. Branching — Lance-native on manifest table, lazy sub-table branching
-10. Change tracking + CLI polish
-
-Critical path: 5a → 6 → 7 (snapshot → traversal → mutations). Steps 7, 8, 9 can parallel after 5a.
-
-See `implementation-plan.md` for detailed status, deviations, and test counts.
+```
+Steps 0–6 ✅ (184 tests)
+     ├→ Step 7: Mutations (insert/update/delete + edge cascade)
+     ├→ Step 8: Search predicates (Lance FTS/ANN)
+     └→ Step 9: Branching (Lance branches on manifest + sub-tables)
+          └→ Step 10: Change tracking + CLI
+```
 
 ---
 
@@ -632,11 +581,27 @@ See `implementation-plan.md` for detailed status, deviations, and test counts.
 
 Omnigraph is successful when:
 
-- `omnigraph init` creates a repo with per-type Lance tables, manifest, and stable row IDs
-- `omnigraph load` writes JSONL to per-type tables and commits the manifest atomically
-- `omnigraph run` executes queries with filter pushdown, graph traversal, and indexed search
+- `omnigraph init` creates a repo with per-type Lance tables, manifest, stable row IDs, and BTree indices
+- `omnigraph load` writes JSONL to per-type tables, commits the manifest atomically, and creates scalar indices
+- `omnigraph run` executes queries with filter pushdown, graph traversal (CSR/CSC), bulk anti-join, and indexed search
 - `omnigraph branch create` is O(1) regardless of data size (manifest branch only)
 - `omnigraph branch merge` applies net changes proportional to what changed
 - the same URI works for local and S3 repos
 - no custom WAL, no custom JSON manifest, no custom CDC — Lance-native throughout
 - the compiler crate has zero Lance dependency and can be shared with Nanograph
+
+---
+
+## Deferred
+
+1. **Remote sync (clone/push/pull).** URI-based open + `base_paths` make this architecturally possible. Deferred to after local branching works.
+2. **Schema evolution / migration.** Lance `add_columns`/`alter_columns`/`drop_columns` when needed.
+3. **Hook system.** Thin dispatch layer on Lance version tracking. Requires Step 10.
+4. **Compaction.** Lance handles natively. Wire up as CLI command.
+5. **SDKs (TS, Swift, Python).** Thin wrappers after API stabilizes.
+6. **DuckDB fallback.** For graphs > ~5M edges. Defer until scale demands.
+7. **MemWAL.** For high-throughput streaming ingest. Branch-per-writer handles multi-agent concurrency without it.
+8. **Service layer / HTTP API.** `Omnigraph` struct IS the cache — a service just keeps it alive.
+9. **Binary ULIDs.** Switch `id` from Utf8 to `FixedSizeBinary(16)` for performance. See Identity Model section.
+10. **Row-correlated bindings.** Tuple-based binding model for general N×M cross-variable returns. See Query Execution section.
+11. **take_rows() hydration.** Use Lance stable row ID addresses for O(1) node hydration. Scalar indices already cover the IN filter path.
