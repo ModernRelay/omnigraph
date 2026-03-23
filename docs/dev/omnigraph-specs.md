@@ -88,15 +88,22 @@ What does **not** carry forward:
 ## Top-Level Abstraction
 
 ```text
-Omnigraph
-  -> ManifestCoordinator  (Lance table tracking sub-table versions)
-  -> QueryExecutor         (DataFusion session + graph index)
-  -> Catalog               (from compiler, built from schema)
+Omnigraph (handle — one per connection)
+  ├── Catalog              (immutable, parsed from _schema.pg)
+  ├── ManifestCoordinator  (manages writes, holds Lance dataset handle)
+  │
+  ├── snapshot() → Snapshot   (immutable read view at a manifest version)
+  └── commit(writes) → u64   (atomic write, advances manifest version)
+
+Snapshot (immutable read view)
+  ├── version: u64                          (manifest version)
+  ├── entries: {key → (path, version)}      (pinned sub-table versions)
+  └── open("node:Person") → Dataset        (at pinned version)
 ```
 
 - **`Omnigraph`** is the single entry point: init, open, load, query, branch, merge, tag, warm
+- **`Snapshot`** is an immutable point-in-time view — the unit of read consistency. All reads within a query go through one Snapshot.
 - **`ManifestCoordinator`** owns the manifest Lance table, sub-table lifecycle, and commit protocol
-- **`QueryExecutor`** owns the DataFusion session, graph index, and tiered node cache
 - **`Catalog`** is built from `_schema.pg` by the compiler — no storage dependency
 
 ```rust
@@ -104,8 +111,12 @@ let db = Omnigraph::open("s3://bucket/my-graph").await?;   // remote
 let db = Omnigraph::open("/local/my-graph").await?;         // local
 let db = Omnigraph::init(uri, schema_source).await?;
 db.load(data_path, LoadMode::Merge).await?;
-db.query("friends_of", &params).await?;
+
+let snapshot = db.snapshot().await?;         // pinned read view
+db.run_query(query_source, "friends_of", &params).await?;  // takes snapshot internally
+
 db.branch_create("experiment").await?;
+db.refresh().await?;                         // see other writers' commits
 db.warm("main").await?;
 ```
 
@@ -258,17 +269,20 @@ Pipeline stays:
 .gq → parse → typecheck → lower → execute
 ```
 
-Backend changes from custom DataFusion operators to DataFusion SQL + Lance:
+All reads within a query go through a single `Snapshot` (see Consistency Model).
 
-- **tabular scans**: `SessionContext` with `LanceTableProvider` per sub-table. IR `NodeScan` → SQL `SELECT * FROM "nodes/Person" WHERE ...` with filter pushdown.
+Backend changes from custom DataFusion operators to Lance-native scans:
+
+- **tabular scans**: IR `NodeScan` → Lance `Scanner` with SQL filter pushdown. Filters are converted from IR to Lance SQL strings (`name = 'Alice' AND age > 30`). Type casting is automatic (e.g., Int64 literal against Int32 column).
 - **graph traversal**: lazy in-memory CSR/CSC topology indices with dense u32. BFS/DFS is sub-millisecond.
 - **hydration** is tiered:
   - `NodeCache::Full` — cached RecordBatch for small types (< 100K rows). Sub-millisecond take.
   - `NodeCache::OnDemand` — Lance `WHERE id IN (...)` for large types. Single-digit ms via BTree.
+- **projection**: IR `PropAccess` expressions map to Arrow column extraction. Aliases applied from return clause.
+- **ordering**: Arrow `lexsort_to_indices` with `SortColumn` per ordering expression.
+- **limit**: batch slicing after ordering.
 - **search predicates**: Lance FTS (`contains_tokens`, `phrase`, `match` with BM25), n-gram for fuzzy, IVF-HNSW for vector. All indexed.
 - **mutations**: Lance native `merge_insert`, `append`, `delete` (deletion vectors). Schema-driven edge cascade.
-
-A shared `Session` is passed when opening sub-tables to pool cache resources across all per-type datasets.
 
 ---
 
@@ -424,6 +438,72 @@ Lance-native indexed search replaces Nanograph's brute-force implementations:
 | `rrf()` | App-level fusion | App-level fusion (keep) |
 
 This is an execution-backend upgrade, not a DSL change.
+
+---
+
+## Consistency Model
+
+### Core Principle
+
+**A manifest version IS a database version.** One manifest version pins a consistent set of sub-table versions. That pinned set is an immutable `Snapshot` — the unit of read consistency.
+
+### Snapshot Isolation
+
+A `Snapshot` is produced by reading the manifest table at a specific version. It contains the `table_version` for every sub-table at that point in time. All reads through one Snapshot see a consistent cross-type view, regardless of concurrent writes.
+
+```rust
+pub struct Snapshot {
+    version: u64,
+    entries: HashMap<String, SubTableEntry>,
+}
+
+impl Snapshot {
+    pub async fn open(&self, table_key: &str) -> Result<Dataset> {
+        // Opens sub-table at the version pinned by this snapshot.
+        // Lance MVCC guarantees the read is isolated from concurrent writes.
+    }
+}
+```
+
+**Within a query:** A single Snapshot is taken at query start. All NodeScan, Expand, and AntiJoin operations read through it. No matter what writers do during the query, the reads are consistent.
+
+**Across queries:** Each query takes its own Snapshot (the latest manifest version). Successive queries see the latest committed state.
+
+### Multi-Reader
+
+Multiple readers call `snapshot()` concurrently — each gets an immutable view. Snapshots are `Clone + Send + Sync`. Readers never block writers. This is Lance MVCC for free.
+
+### Multi-Writer
+
+Multiple writers each open their own `Omnigraph::open(uri)` handle, getting their own `ManifestCoordinator` with their own Lance `Dataset` handle. When two writers commit:
+
+- **Different sub-tables** (e.g., one writes Person, other writes Company): Lance merges the manifest rows automatically. The `merge_insert` by `table_key` is non-conflicting for different keys.
+- **Same sub-table**: Lance's per-dataset optimistic concurrency handles it. Append+Append is rebasable (auto-merged). Same-row Update+Update is retryable.
+- **No application-level locking required.**
+
+### Read-After-Write
+
+After `commit()`, the coordinator's manifest dataset handle is updated. The next `snapshot()` sees the new version immediately.
+
+### Cross-Writer Visibility
+
+Writer A commits. Writer B calls `refresh()` (re-opens the manifest at the latest version). Writer B's next `snapshot()` sees A's changes. Without `refresh()`, Writer B continues reading from its last known version — stale but consistent.
+
+### What Lance Provides Natively
+
+| Capability | Lance mechanism |
+|---|---|
+| Snapshot isolation | Immutable versioned manifests in `_versions/` |
+| Atomic commits | `put-if-not-exists` or `rename-if-not-exists` on manifest file |
+| Conflict detection | Transaction files in `_transactions/` with compatibility matrix |
+| Conflict resolution | Rebasable (auto-merge), retryable (re-execute), or incompatible (fail) |
+| Time travel | `checkout_version(N)` reads any historical version |
+| Deletion without rewrite | Deletion vectors (soft delete) |
+| Row-level change tracking | `_row_created_at_version`, `_row_last_updated_at_version` (with stable row IDs) |
+
+### What Omnigraph Adds
+
+The manifest table is the single coordination layer that extends Lance's per-dataset MVCC to cross-dataset consistency. Without it, each sub-table has independent versioning with no guarantee that Person version 5 and Knows version 3 form a consistent graph. The manifest pins them together: manifest version N says "Person is at version 5 and Knows is at version 3" — that's the Snapshot.
 
 ---
 
