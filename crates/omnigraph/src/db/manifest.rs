@@ -10,6 +10,45 @@ use omnigraph_compiler::catalog::Catalog;
 
 use crate::error::{OmniError, Result};
 
+/// Immutable point-in-time view of the database.
+///
+/// Cheap to create (no storage I/O). All reads within a query go through one
+/// Snapshot to guarantee cross-type consistency.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    root_uri: String,
+    version: u64,
+    entries: HashMap<String, SubTableEntry>,
+}
+
+impl Snapshot {
+    /// Open a sub-table dataset at its pinned version.
+    pub async fn open(&self, table_key: &str) -> Result<Dataset> {
+        let entry = self.entries.get(table_key).ok_or_else(|| {
+            OmniError::Manifest(format!("no manifest entry for {}", table_key))
+        })?;
+        let full_path = format!("{}/{}", self.root_uri, entry.table_path);
+        let ds = Dataset::open(&full_path)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let ds = ds
+            .checkout_version(entry.table_version)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        Ok(ds)
+    }
+
+    /// Manifest version this snapshot was taken from.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Look up a sub-table entry by key.
+    pub fn entry(&self, table_key: &str) -> Option<&SubTableEntry> {
+        self.entries.get(table_key)
+    }
+}
+
 /// Schema for the manifest Lance table.
 fn manifest_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -50,9 +89,8 @@ pub struct SubTableUpdate {
     pub row_count: u64,
 }
 
-/// Snapshot of the full manifest state.
 #[derive(Debug, Clone)]
-pub struct ManifestState {
+struct ManifestState {
     pub version: u64,
     pub entries: Vec<SubTableEntry>,
 }
@@ -78,6 +116,7 @@ impl ManifestState {
 pub struct ManifestCoordinator {
     root_uri: String,
     dataset: Dataset,
+    known_state: ManifestState,
 }
 
 impl ManifestCoordinator {
@@ -136,9 +175,15 @@ impl ManifestCoordinator {
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
 
+        let known_state = ManifestState {
+            version: dataset.version().version,
+            entries: entries.clone(),
+        };
+
         Ok(Self {
             root_uri: root.to_string(),
             dataset,
+            known_state,
         })
     }
 
@@ -149,74 +194,41 @@ impl ManifestCoordinator {
         let dataset = Dataset::open(&manifest_uri)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let known_state = read_manifest_state(&dataset).await?;
         Ok(Self {
             root_uri: root.to_string(),
             dataset,
+            known_state,
         })
     }
 
-    /// Read the current manifest state.
-    pub async fn state(&self) -> Result<ManifestState> {
-        let version = self.dataset.version().version;
-        let batches: Vec<RecordBatch> = self
-            .dataset
-            .scan()
-            .try_into_stream()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?
-            .try_collect()
+    /// Return a Snapshot from the known manifest state. No storage I/O.
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            root_uri: self.root_uri.clone(),
+            version: self.known_state.version,
+            entries: self
+                .known_state
+                .entries
+                .iter()
+                .map(|e| (e.table_key.clone(), e.clone()))
+                .collect(),
+        }
+    }
+
+    /// Re-read manifest from storage to see other writers' commits.
+    pub async fn refresh(&mut self) -> Result<()> {
+        let manifest_uri = format!("{}/_manifest.lance", self.root_uri);
+        self.dataset = Dataset::open(&manifest_uri)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
+        self.known_state = read_manifest_state(&self.dataset).await?;
+        Ok(())
+    }
 
-        let mut entries = Vec::new();
-        for batch in &batches {
-            let keys = batch
-                .column_by_name("table_key")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let paths = batch
-                .column_by_name("table_path")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let versions = batch
-                .column_by_name("table_version")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .unwrap();
-            let branches = batch
-                .column_by_name("table_branch")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let row_counts = batch
-                .column_by_name("row_count")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .unwrap();
-
-            for i in 0..batch.num_rows() {
-                entries.push(SubTableEntry {
-                    table_key: keys.value(i).to_string(),
-                    table_path: paths.value(i).to_string(),
-                    table_version: versions.value(i),
-                    table_branch: if branches.is_null(i) {
-                        None
-                    } else {
-                        Some(branches.value(i).to_string())
-                    },
-                    row_count: row_counts.value(i),
-                });
-            }
-        }
-
-        Ok(ManifestState { version, entries })
+    /// Read manifest state from storage. Used internally by `commit()`.
+    async fn state(&self) -> Result<ManifestState> {
+        read_manifest_state(&self.dataset).await
     }
 
     /// Commit updated sub-table versions to the manifest.
@@ -285,21 +297,8 @@ impl ManifestCoordinator {
             .map_err(|e| OmniError::Lance(e.to_string()))?;
 
         self.dataset = new_ds.as_ref().clone();
+        self.known_state = read_manifest_state(&self.dataset).await?;
         Ok(self.version())
-    }
-
-    /// Open a sub-table dataset by resolving its path relative to the repo root.
-    pub async fn open_sub_table(&self, entry: &SubTableEntry) -> Result<Dataset> {
-        let full_path = format!("{}/{}", self.root_uri, entry.table_path);
-        let ds = Dataset::open(&full_path)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        // Pin to the version recorded in the manifest
-        let ds = ds
-            .checkout_version(entry.table_version)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        Ok(ds)
     }
 
     /// Current manifest version.
@@ -311,6 +310,69 @@ impl ManifestCoordinator {
     pub fn root_uri(&self) -> &str {
         &self.root_uri
     }
+}
+
+/// Read manifest state from a Lance dataset.
+async fn read_manifest_state(dataset: &Dataset) -> Result<ManifestState> {
+    let version = dataset.version().version;
+    let batches: Vec<RecordBatch> = dataset
+        .scan()
+        .try_into_stream()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?
+        .try_collect()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+    let mut entries = Vec::new();
+    for batch in &batches {
+        let keys = batch
+            .column_by_name("table_key")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let paths = batch
+            .column_by_name("table_path")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let versions = batch
+            .column_by_name("table_version")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let branches = batch
+            .column_by_name("table_branch")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let row_counts = batch
+            .column_by_name("row_count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+
+        for i in 0..batch.num_rows() {
+            entries.push(SubTableEntry {
+                table_key: keys.value(i).to_string(),
+                table_path: paths.value(i).to_string(),
+                table_version: versions.value(i),
+                table_branch: if branches.is_null(i) {
+                    None
+                } else {
+                    Some(branches.value(i).to_string())
+                },
+                row_count: row_counts.value(i),
+            });
+        }
+    }
+
+    Ok(ManifestState { version, entries })
 }
 
 /// Create an empty Lance dataset with the given schema.
@@ -391,17 +453,16 @@ edge WorksAt: Person -> Company {
         let catalog = build_test_catalog();
 
         let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
-        let state = mc.state().await.unwrap();
+        let snap = mc.snapshot();
 
-        // Should have 4 entries: 2 node types + 2 edge types
-        assert_eq!(state.entries.len(), 4);
-        assert!(state.entry("node:Person").is_some());
-        assert!(state.entry("node:Company").is_some());
-        assert!(state.entry("edge:Knows").is_some());
-        assert!(state.entry("edge:WorksAt").is_some());
+        assert!(snap.entry("node:Person").is_some());
+        assert!(snap.entry("node:Company").is_some());
+        assert!(snap.entry("edge:Knows").is_some());
+        assert!(snap.entry("edge:WorksAt").is_some());
 
         // All at version 1, 0 rows
-        for entry in &state.entries {
+        for key in &["node:Person", "node:Company", "edge:Knows", "edge:WorksAt"] {
+            let entry = snap.entry(key).unwrap();
             assert_eq!(entry.table_version, 1);
             assert_eq!(entry.row_count, 0);
             assert!(entry.table_branch.is_none());
@@ -418,8 +479,9 @@ edge WorksAt: Person -> Company {
 
         // Re-open
         let mc = ManifestCoordinator::open(uri).await.unwrap();
-        let state = mc.state().await.unwrap();
-        assert_eq!(state.entries.len(), 4);
+        let snap = mc.snapshot();
+        assert!(snap.entry("node:Person").is_some());
+        assert!(snap.entry("edge:Knows").is_some());
     }
 
     #[tokio::test]
@@ -443,28 +505,26 @@ edge WorksAt: Person -> Company {
 
         assert!(new_version > v1);
 
-        let state = mc.state().await.unwrap();
-        let person = state.entry("node:Person").unwrap();
+        let snap = mc.snapshot();
+        let person = snap.entry("node:Person").unwrap();
         assert_eq!(person.table_version, 2);
         assert_eq!(person.row_count, 10);
 
         // Other entries unchanged
-        let company = state.entry("node:Company").unwrap();
+        let company = snap.entry("node:Company").unwrap();
         assert_eq!(company.table_version, 1);
         assert_eq!(company.row_count, 0);
     }
 
     #[tokio::test]
-    async fn test_open_sub_table() {
+    async fn test_snapshot_open_sub_table() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let catalog = build_test_catalog();
 
         let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
-        let state = mc.state().await.unwrap();
-
-        let person_entry = state.entry("node:Person").unwrap();
-        let person_ds = mc.open_sub_table(person_entry).await.unwrap();
+        let snap = mc.snapshot();
+        let person_ds = snap.open("node:Person").await.unwrap();
 
         // Should have the correct schema (id + name + age = 3 fields)
         assert_eq!(person_ds.schema().fields.len(), 3);
@@ -478,7 +538,7 @@ edge WorksAt: Person -> Company {
         let catalog = build_test_catalog();
 
         let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
-        let state = mc.state().await.unwrap();
-        assert_eq!(mc.version(), state.version);
+        let snap = mc.snapshot();
+        assert_eq!(mc.version(), snap.version());
     }
 }

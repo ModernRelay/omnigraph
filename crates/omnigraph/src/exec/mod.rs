@@ -8,16 +8,15 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::TryStreamExt;
 use lance::Dataset;
-use omnigraph_compiler::build_catalog;
+use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::ir::{IRExpr, IRFilter, IROrdering, IRProjection, IROp, ParamMap, QueryIR};
 use omnigraph_compiler::lower_query;
 use omnigraph_compiler::query::ast::{CompOp, Literal};
-use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::query::typecheck::typecheck_query;
 use omnigraph_compiler::result::QueryResult;
-use omnigraph_compiler::schema::parser::parse_schema;
 
 use crate::db::Omnigraph;
+use crate::db::Snapshot;
 use crate::error::{OmniError, Result};
 
 impl Omnigraph {
@@ -28,22 +27,25 @@ impl Omnigraph {
         query_name: &str,
         params: &ParamMap,
     ) -> Result<QueryResult> {
+        let snapshot = self.snapshot();
+
         // Parse → typecheck → lower
         let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
             .map_err(|e| OmniError::Manifest(e.to_string()))?;
         let type_ctx = typecheck_query(self.catalog(), &query_decl)?;
         let ir = lower_query(self.catalog(), &query_decl, &type_ctx)?;
 
-        // Execute
-        execute_query_ir(&ir, params, self).await
+        // Execute as pure function
+        execute_query(&ir, params, &snapshot, self.catalog()).await
     }
 }
 
-/// Execute a lowered QueryIR against the database.
-async fn execute_query_ir(
+/// Execute a lowered QueryIR. Pure function — no state, no caches.
+pub async fn execute_query(
     ir: &QueryIR,
     params: &ParamMap,
-    db: &Omnigraph,
+    snapshot: &Snapshot,
+    catalog: &Catalog,
 ) -> Result<QueryResult> {
     // Walk the pipeline, building up variable bindings
     let mut bindings: HashMap<String, RecordBatch> = HashMap::new();
@@ -55,7 +57,8 @@ async fn execute_query_ir(
                 type_name,
                 filters,
             } => {
-                let batch = execute_node_scan(type_name, filters, params, db).await?;
+                let batch =
+                    execute_node_scan(type_name, filters, params, snapshot, catalog).await?;
                 bindings.insert(variable.clone(), batch);
             }
             IROp::Filter(filter) => {
@@ -96,14 +99,11 @@ async fn execute_node_scan(
     type_name: &str,
     filters: &[IRFilter],
     params: &ParamMap,
-    db: &Omnigraph,
+    snapshot: &Snapshot,
+    catalog: &Catalog,
 ) -> Result<RecordBatch> {
     let table_key = format!("node:{}", type_name);
-    let state = db.state().await?;
-    let entry = state.entry(&table_key).ok_or_else(|| {
-        OmniError::Manifest(format!("no manifest entry for {}", table_key))
-    })?;
-    let ds = db.manifest().open_sub_table(entry).await?;
+    let ds = snapshot.open(&table_key).await?;
 
     // Build Lance SQL filter string from IR filters
     let filter_sql = build_lance_filter(filters, params);
@@ -124,8 +124,7 @@ async fn execute_node_scan(
         .map_err(|e| OmniError::Lance(e.to_string()))?;
 
     if batches.is_empty() {
-        // Return empty batch with correct schema
-        let node_type = &db.catalog().node_types[type_name];
+        let node_type = &catalog.node_types[type_name];
         return Ok(RecordBatch::new_empty(node_type.arrow_schema.clone()));
     }
 

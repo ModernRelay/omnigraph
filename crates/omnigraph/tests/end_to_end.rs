@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
 
@@ -24,9 +22,8 @@ async fn init_and_load(dir: &tempfile::TempDir) -> Omnigraph {
 
 /// Helper: read all rows from a sub-table by table_key.
 async fn read_table(db: &Omnigraph, table_key: &str) -> Vec<RecordBatch> {
-    let state = db.state().await.unwrap();
-    let entry = state.entry(table_key).unwrap();
-    let ds = db.manifest().open_sub_table(entry).await.unwrap();
+    let snap = db.snapshot();
+    let ds = snap.open(table_key).await.unwrap();
     ds.scan()
         .try_into_stream()
         .await
@@ -73,26 +70,22 @@ async fn load_populates_all_types() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;
 
-    let state = db.state().await.unwrap();
+    let snap = db.snapshot();
 
     // 4 persons
-    let person = state.entry("node:Person").unwrap();
-    let person_ds = db.manifest().open_sub_table(person).await.unwrap();
+    let person_ds = snap.open("node:Person").await.unwrap();
     assert_eq!(person_ds.count_rows(None).await.unwrap(), 4);
 
     // 2 companies
-    let company = state.entry("node:Company").unwrap();
-    let company_ds = db.manifest().open_sub_table(company).await.unwrap();
+    let company_ds = snap.open("node:Company").await.unwrap();
     assert_eq!(company_ds.count_rows(None).await.unwrap(), 2);
 
     // 3 Knows edges
-    let knows = state.entry("edge:Knows").unwrap();
-    let knows_ds = db.manifest().open_sub_table(knows).await.unwrap();
+    let knows_ds = snap.open("edge:Knows").await.unwrap();
     assert_eq!(knows_ds.count_rows(None).await.unwrap(), 3);
 
     // 2 WorksAt edges
-    let works_at = state.entry("edge:WorksAt").unwrap();
-    let works_at_ds = db.manifest().open_sub_table(works_at).await.unwrap();
+    let works_at_ds = snap.open("edge:WorksAt").await.unwrap();
     assert_eq!(works_at_ds.count_rows(None).await.unwrap(), 2);
 }
 
@@ -245,9 +238,8 @@ async fn append_adds_rows() {
         .await
         .unwrap();
 
-    let state = db.state().await.unwrap();
-    let person = state.entry("node:Person").unwrap();
-    let ds = db.manifest().open_sub_table(person).await.unwrap();
+    let snap = db.snapshot();
+    let ds = snap.open("node:Person").await.unwrap();
     assert_eq!(ds.count_rows(None).await.unwrap(), 2);
 }
 
@@ -267,9 +259,8 @@ async fn load_from_file_works() {
         .await
         .unwrap();
 
-    let state = db.state().await.unwrap();
-    let person = state.entry("node:Person").unwrap();
-    let ds = db.manifest().open_sub_table(person).await.unwrap();
+    let snap = db.snapshot();
+    let ds = snap.open("node:Person").await.unwrap();
     assert_eq!(ds.count_rows(None).await.unwrap(), 4);
 }
 
@@ -287,11 +278,10 @@ async fn signals_fixture_loads_correctly() {
         .await
         .unwrap();
 
-    let state = db.state().await.unwrap();
+    let snap = db.snapshot();
 
     // Verify some types have data
-    let company = state.entry("node:Company").unwrap();
-    let company_ds = db.manifest().open_sub_table(company).await.unwrap();
+    let company_ds = snap.open("node:Company").await.unwrap();
     assert!(company_ds.count_rows(None).await.unwrap() > 0);
 
     // Verify node IDs are @key values (slug)

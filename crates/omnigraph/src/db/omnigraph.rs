@@ -6,7 +6,7 @@ use omnigraph_compiler::schema::parser::parse_schema;
 
 use crate::error::{OmniError, Result};
 
-use super::manifest::{ManifestCoordinator, ManifestState};
+use super::manifest::{ManifestCoordinator, Snapshot};
 
 const SCHEMA_FILENAME: &str = "_schema.pg";
 
@@ -89,12 +89,14 @@ impl Omnigraph {
         self.manifest.version()
     }
 
-    pub async fn state(&self) -> Result<ManifestState> {
-        self.manifest.state().await
+    /// Return an immutable Snapshot from the known manifest state. No storage I/O.
+    pub fn snapshot(&self) -> Snapshot {
+        self.manifest.snapshot()
     }
 
-    pub fn manifest(&self) -> &ManifestCoordinator {
-        &self.manifest
+    /// Re-read manifest from storage to see other writers' commits.
+    pub async fn refresh(&mut self) -> Result<()> {
+        self.manifest.refresh().await
     }
 
     pub fn manifest_mut(&mut self) -> &mut ManifestCoordinator {
@@ -154,10 +156,11 @@ edge WorksAt: Person -> Company
         assert!(dir.path().join("_schema.pg").exists());
 
         // Manifest created with correct entries
-        let state = db.state().await.unwrap();
-        assert_eq!(state.entries.len(), 4);
-        assert!(state.entry("node:Person").is_some());
-        assert!(state.entry("edge:Knows").is_some());
+        let snap = db.snapshot();
+        assert!(snap.entry("node:Person").is_some());
+        assert!(snap.entry("node:Company").is_some());
+        assert!(snap.entry("edge:Knows").is_some());
+        assert!(snap.entry("edge:WorksAt").is_some());
 
         // Catalog is correct
         assert_eq!(db.catalog().node_types.len(), 2);
@@ -179,13 +182,42 @@ edge WorksAt: Person -> Company
         let db = Omnigraph::open(uri).await.unwrap();
         assert_eq!(db.catalog().node_types.len(), 2);
         assert_eq!(db.catalog().edge_types.len(), 2);
-        let state = db.state().await.unwrap();
-        assert_eq!(state.entries.len(), 4);
+        let snap = db.snapshot();
+        assert!(snap.entry("node:Person").is_some());
+        assert!(snap.entry("edge:Knows").is_some());
     }
 
     #[tokio::test]
     async fn test_open_nonexistent_fails() {
         let result = Omnigraph::open("/tmp/nonexistent_omnigraph_test_xyz").await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_version_is_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+
+        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        // Take snapshot before any writes
+        let snap1 = db.snapshot();
+        let v1 = snap1.version();
+
+        // Load data — advances manifest version
+        crate::loader::load_jsonl(
+            &mut db,
+            r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}"#,
+            crate::loader::LoadMode::Overwrite,
+        )
+        .await
+        .unwrap();
+
+        // Snapshot from handle sees new version
+        let snap2 = db.snapshot();
+        assert!(snap2.version() > v1);
+
+        // But the old snapshot is still pinned
+        assert_eq!(snap1.version(), v1);
     }
 }

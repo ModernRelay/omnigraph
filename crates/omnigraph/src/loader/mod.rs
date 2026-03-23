@@ -127,7 +127,7 @@ async fn load_jsonl_reader<R: BufRead>(
 
     let mut updates = Vec::new();
     let mut result = LoadResult::default();
-    let state = db.state().await?;
+    let snapshot = db.snapshot();
 
     // Write nodes first (edges reference node IDs)
     for (type_name, rows) in &node_rows {
@@ -136,7 +136,7 @@ async fn load_jsonl_reader<R: BufRead>(
         let row_count = batch.num_rows();
 
         let table_key = format!("node:{}", type_name);
-        let entry = state.entry(&table_key).ok_or_else(|| {
+        let entry = snapshot.entry(&table_key).ok_or_else(|| {
             OmniError::Manifest(format!("no manifest entry for {}", table_key))
         })?;
 
@@ -161,7 +161,7 @@ async fn load_jsonl_reader<R: BufRead>(
         let row_count = batch.num_rows();
 
         let table_key = format!("edge:{}", edge_name);
-        let entry = state.entry(&table_key).ok_or_else(|| {
+        let entry = snapshot.entry(&table_key).ok_or_else(|| {
             OmniError::Manifest(format!("no manifest entry for {}", table_key))
         })?;
 
@@ -493,10 +493,9 @@ edge WorksAt: Person -> Company
             .await
             .unwrap();
 
-        // Read back via manifest
-        let state = db.state().await.unwrap();
-        let person_entry = state.entry("node:Person").unwrap();
-        let person_ds = db.manifest().open_sub_table(person_entry).await.unwrap();
+        // Read back via snapshot
+        let snap = db.snapshot();
+        let person_ds = snap.open("node:Person").await.unwrap();
 
         assert_eq!(person_ds.count_rows(None).await.unwrap(), 2);
 
@@ -532,9 +531,8 @@ edge WorksAt: Person -> Company
             .await
             .unwrap();
 
-        let state = db.state().await.unwrap();
-        let knows_entry = state.entry("edge:Knows").unwrap();
-        let knows_ds = db.manifest().open_sub_table(knows_entry).await.unwrap();
+        let snap = db.snapshot();
+        let knows_ds = snap.open("edge:Knows").await.unwrap();
 
         let batches: Vec<RecordBatch> = knows_ds
             .scan()
@@ -593,9 +591,8 @@ edge WorksAt: Person -> Company
             .await
             .unwrap();
 
-        let state = db.state().await.unwrap();
-        let person_entry = state.entry("node:Person").unwrap();
-        let person_ds = db.manifest().open_sub_table(person_entry).await.unwrap();
+        let snap = db.snapshot();
+        let person_ds = snap.open("node:Person").await.unwrap();
         assert_eq!(person_ds.count_rows(None).await.unwrap(), 2);
     }
 

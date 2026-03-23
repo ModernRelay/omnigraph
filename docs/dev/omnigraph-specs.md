@@ -319,6 +319,24 @@ If any step before 3 fails, the manifest still points to old versions. Orphaned 
 - cached by `GraphIndexKey` — a `BTreeMap<String, u64>` of edge sub-table versions (not manifest version — node changes don't invalidate the topology)
 - offset arrays sized to actual node count per type — no waste
 
+### Future: Binary ULIDs
+
+The current design stores all IDs as Utf8 strings — 26-byte Crockford Base32 for ULIDs, variable-length for `@key` values. This prioritizes simplicity and debuggability at v0.1.0 but has known performance costs at scale:
+
+- **Space:** Each edge row carries 78+ bytes of string IDs (`id` + `src` + `dst`). Binary ULIDs (`FixedSizeBinary(16)`) would cut this to 48 bytes — a 38% reduction on the ID columns.
+- **Speed:** String hashing/comparison for `TypeIndex` build, `merge_insert` keyed by `id`, and edge-to-node joins is ~3-5x slower than fixed-width binary comparison.
+- **GraphIndex build:** `HashMap<String, u32>` requires heap-allocated keys. `HashMap<u128, u32>` would be inline and faster to hash.
+
+**Recommended migration path** (not before Step 6 profiling justifies it):
+
+1. Separate external identity (`@key` — user-facing, indexed, human-readable) from internal identity (`id` — binary ULID, `FixedSizeBinary(16)`).
+2. Edge `src`/`dst` store binary ULIDs, not `@key` strings.
+3. `@key` becomes a unique indexed property column, not the `id` value.
+4. `TypeIndex` becomes `HashMap<u128, u32>` — faster build, less memory.
+5. Lookup by `@key` goes through a Lance scalar index on that column.
+
+**Trigger:** Profile the `TypeIndex` build in Step 6. If `HashMap<String, u32>` construction is measurable (>10ms for the target graph size), that's the signal to switch.
+
 ---
 
 ## Query Execution
