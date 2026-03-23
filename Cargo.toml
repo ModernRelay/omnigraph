@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/omnigraph-engine",
-    "crates/omnigraph-repo",
+    "crates/omnigraph-compiler",
+    "crates/omnigraph",
     "crates/omnigraph-cli",
 ]
 default-members = [
-    "crates/omnigraph-repo",
+    "crates/omnigraph",
     "crates/omnigraph-cli",
 ]
 
@@ -26,10 +26,12 @@ datafusion-expr = "52"
 datafusion-functions-aggregate = "52"
 
 lance = { version = "3.0", default-features = false }
+lance-datafusion = "3.0"
 lance-file = "3.0"
 lance-index = "3.0"
 lance-linalg = "3.0"
 
+ulid = "1"
 futures = "0.3"
 async-trait = "0.1"
 pest = "2"

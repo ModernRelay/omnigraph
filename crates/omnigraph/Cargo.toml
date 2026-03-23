@@ -1,0 +1,30 @@
+[package]
+name = "omnigraph"
+version = "0.1.0"
+edition = "2024"
+description = "Lance-native graph database with git-style branching."
+license = "MIT"
+
+[dependencies]
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.1.0" }
+lance = { workspace = true }
+lance-datafusion = { workspace = true }
+lance-file = { workspace = true }
+lance-index = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-ord = { workspace = true }
+arrow-select = { workspace = true }
+arrow-cast = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ulid = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.1.0" }
+tokio = { workspace = true }

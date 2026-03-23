@@ -132,6 +132,53 @@ The boundary is the **Lance dependency line**. `omnigraph-compiler` has zero Lan
 
 ## Build Order
 
+### Step 0: Crate Restructuring
+
+Create the new workspace structure before writing any code. This is mechanical but must happen first.
+
+**Actions:**
+
+1. Create `crates/omnigraph-compiler/` with its own `Cargo.toml`. Dependencies: `pest`, `pest_derive`, `arrow-schema`, `arrow-array`, `arrow-cast`, `arrow-select`, `arrow-ord`, `ariadne`, `thiserror`, `serde`, `serde_json`, `reqwest`, `ahash`.
+2. Move from `omnigraph-engine/src/` into `omnigraph-compiler/src/`:
+   - `schema/` (parser.rs, ast.rs, mod.rs, schema.pest)
+   - `query/` (parser.rs, ast.rs, typecheck.rs, mod.rs, query.pest)
+   - `catalog/mod.rs` (keep — this is the `build_catalog` path from parsed AST)
+   - `ir/` (mod.rs, lower.rs)
+   - `types.rs`, `error.rs`, `embedding.rs`, `json_output.rs`, `result.rs`, `query_input.rs`
+3. **Drop** `catalog/schema_ir.rs` (~600 lines). This module serializes the schema to `schema_ir.json` and rebuilds the catalog from it — a Nanograph persistence path. The new design stores `_schema.pg` directly and calls `build_catalog()` from the parsed AST on open. No IR serialization needed. (`store/migration.rs` depends on `schema_ir.rs` — both are deferred.)
+4. Create `crates/omnigraph/` with its own `Cargo.toml`. Dependencies: `omnigraph-compiler`, `lance`, `datafusion`, `lance-file`, `lance-index`, `arrow-*`, `tokio`, `serde`, `serde_json`, `futures`, `tracing`, `thiserror`, `tempfile`, `ulid` (or equivalent).
+5. Move `loader/jsonl.rs`, `loader/constraints.rs`, `loader/embeddings.rs` from `omnigraph-engine/src/store/loader/` into `omnigraph/src/loader/`. (These will be adapted in later steps but should be in the right crate from the start.)
+6. Move test fixtures (`tests/fixtures/`) into `omnigraph/tests/fixtures/` (they test the database, not the compiler).
+7. Update `crates/omnigraph-cli/Cargo.toml` to depend on `omnigraph` instead of `omnigraph-repo`.
+8. Delete `crates/omnigraph-engine/` and `crates/omnigraph-repo/` (all remaining code in `store/` and `plan/` is replaced by new code in `omnigraph/`).
+9. Update workspace `Cargo.toml`: members = `omnigraph-compiler`, `omnigraph`, `omnigraph-cli`.
+
+**New: `omnigraph/src/error.rs`** — define `OmniError` wrapping:
+- `omnigraph_compiler::error::NanoError` (compiler errors)
+- `lance::Error` (storage errors)
+- `datafusion::error::DataFusionError` (query errors)
+- `std::io::Error`
+
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum OmniError {
+    #[error("{0}")]
+    Compiler(#[from] omnigraph_compiler::error::NanoError),
+    #[error("storage: {0}")]
+    Lance(String),
+    #[error("query: {0}")]
+    DataFusion(String),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Manifest(String),
+}
+```
+
+**Test:** `cargo build --workspace` succeeds. `cargo test -p omnigraph-compiler` runs all parser/typechecker/IR tests. `cargo test -p omnigraph` runs (no tests yet, but compiles).
+
+**~100 lines new (error.rs + Cargo.toml files). Everything else is file moves.**
+
 ### Step 1: Foundation Types
 
 Change the identity model at the type level. This touches almost nothing but unblocks everything.
@@ -195,6 +242,8 @@ pub struct Omnigraph {
     manifest: ManifestCoordinator,
     catalog: Catalog,
     schema_source: String,
+    session: Session,                          // shared Lance session for cache pooling
+    executor: tokio::sync::OnceCell<QueryExecutor>,  // lazily created on first query
 }
 
 impl Omnigraph {
@@ -203,16 +252,37 @@ impl Omnigraph {
     pub fn catalog(&self) -> &Catalog;
     pub fn uri(&self) -> &str;
     pub async fn version(&self) -> u64;
+
+    // Data operations (delegate to loader/executor)
+    pub async fn load(&self, data_path: &str, mode: LoadMode) -> Result<LoadResult>;
+    pub async fn query(&self, name: &str, params: &ParamMap) -> Result<QueryResult>;
+    pub async fn mutate(&self, name: &str, params: &ParamMap) -> Result<MutationResult>;
+
+    // Version control (delegate to branch.rs)
+    pub async fn branch_create(&self, name: &str) -> Result<()>;
+    pub async fn branch_list(&self) -> Result<Vec<BranchInfo>>;
+    pub async fn merge(&self, source: &str) -> Result<MergeResult>;
+    pub async fn tag_create(&self, name: &str) -> Result<()>;
+
+    // Cache management
+    pub async fn warm(&self, branch: &str) -> Result<()>;
+
+    // Internals
+    async fn executor(&self) -> Result<&QueryExecutor>;  // lazy init via OnceCell
 }
 ```
+
+The `Session` is created at `open` time and shared across all sub-table opens. The `QueryExecutor` is lazily initialized on first `query()`/`mutate()` call — it registers `LanceTableProvider` for each sub-table using the shared `Session`. The `warm()` method forces executor + graph index initialization without waiting for a query.
 
 `init`:
 1. Parse schema → build catalog (uses Step 1 changes)
 2. Write `_schema.pg` to repo root
-3. Call `ManifestCoordinator::init()` with the catalog
+3. Create shared `Session`
+4. Call `ManifestCoordinator::init()` with the catalog
 
 `open`:
 1. Read `_schema.pg` from repo root → parse → build catalog
+2. Create shared `Session`
 2. Open `ManifestCoordinator`
 3. Validate manifest state against catalog
 
@@ -251,11 +321,15 @@ pub async fn load_jsonl(db: &Omnigraph, data_path: &str, mode: LoadMode) -> Resu
 
 **Adapt: `loader/embeddings.rs`** — unchanged (independent of storage).
 
+**Drop: `store/loader/merge.rs`** (~1,299 lines). The current merge logic builds a new `GraphStorage` by merging two complete in-memory snapshots with edge endpoint remapping when node IDs change. With String IDs that are stable (ULID or `@key` value), merge mode reduces to Lance `merge_insert` keyed by `id` — one call per sub-table. Edge `src`/`dst` are already String IDs referencing stable node IDs, so no endpoint remapping is needed. This eliminates the entire merge.rs module.
+
+**Drop: `store/loader.rs`** (~112 lines). The top-level `build_next_storage_for_load()` orchestrator. Replaced by `loader/mod.rs`.
+
 **Test:** Load `test.jsonl` into a fresh repo. Read back via Lance scan. All types populated. IDs are Utf8. Edge src/dst reference node IDs correctly. Test all three modes (overwrite, append, merge).
 
 **CLI: `omnigraph load --data ./data.jsonl /local/my-graph`**
 
-**~500 lines adapted, ~200 lines new orchestrator.**
+**~300 lines adapted (jsonl.rs + constraints.rs), ~200 lines new orchestrator.**
 
 ### Step 5: Query Execution — Tabular Operations
 
@@ -469,19 +543,93 @@ Same mechanism, specific version range.
 
 ---
 
+## Test Strategy
+
+Tests are written alongside each step, not deferred. Every step has its own tests that run before moving on.
+
+### Test locations
+
+```
+crates/
+├── omnigraph-compiler/
+│   └── src/                    # Inline unit tests (#[cfg(test)] mod tests)
+│       ├── schema/parser.rs    # 29 tests — carried forward unchanged
+│       ├── query/parser.rs     # 34 tests — carried forward unchanged
+│       ├── query/typecheck.rs  # 53 tests — carried forward unchanged
+│       ├── ir/lower.rs         # 6 tests — carried forward unchanged
+│       ├── catalog/mod.rs      # 6 tests — adapted (Utf8 id/src/dst)
+│       ├── types.rs            # 2 tests — carried forward
+│       ├── json_output.rs      # 5 tests — carried forward
+│       ├── result.rs           # 6 tests — carried forward
+│       └── query_input.rs      # 5 tests — carried forward
+│
+├── omnigraph/
+│   ├── src/                    # Inline unit tests for internal modules
+│   │   ├── db/manifest.rs      # NEW: ManifestCoordinator CRUD, commit, versioning
+│   │   ├── db/branch.rs        # NEW: branch create, lazy sub-table branching, merge
+│   │   ├── graph_index/csr.rs  # ADAPTED from store/csr.rs: u32 indices
+│   │   ├── loader/jsonl.rs     # ADAPTED: String IDs, Lance target
+│   │   └── loader/constraints.rs # ADAPTED: validate against Lance
+│   └── tests/                  # Integration tests
+│       ├── fixtures/           # test.pg, test.jsonl, test.gq, signals.pg, signals.jsonl
+│       ├── init_and_load.rs    # NEW: init → load → scan back, all modes
+│       ├── query.rs            # NEW: all test.gq queries against loaded data
+│       ├── traversal.rs        # NEW: multi-hop, negation, bounded expansion
+│       ├── mutations.rs        # NEW: insert/update/delete, cascade
+│       ├── branching.rs        # NEW: branch, write, merge, tag, time travel
+│       └── changes.rs          # NEW: version tracking, diff
+│
+└── omnigraph-cli/
+    └── tests/                  # CLI integration tests (optional, after core works)
+```
+
+### What happens to existing tests (250 total)
+
+| Category | Tests | Disposition |
+|---|---|---|
+| **Compiler tests (carried forward)** | 146 | schema/parser (29), query/parser (34), query/typecheck (53), ir/lower (6), types (2), json_output (5), result (6), query_input (5), catalog/mod (6). Move to `omnigraph-compiler`. All pass unchanged except catalog tests (adapt for Utf8). |
+| **Compiler tests (dropped)** | 12 | catalog/schema_ir (12). Module dropped — no IR serialization path. |
+| **Storage tests (dropped)** | 26 | store/txlog (7), store/manifest (2), store/graph (3), store/database/tests (1), store/loader/merge (10), plan/planner (23 — BUT some of these are query behavior tests worth reimplementing). Note: plan/planner tests that verify query behavior (not plan construction) should be reimplemented as integration tests in `omnigraph/tests/query.rs`. |
+| **Plan tests (dropped)** | 27 | plan/planner (23), plan/physical (1), plan/node_scan (3). Custom ExecutionPlan operators are gone. |
+| **Loader tests (adapted)** | 30 | loader/jsonl (16), loader/constraints (9), loader/embeddings (5). Move to `omnigraph/src/loader/`. Adapt for String IDs and Lance targets. |
+| **Integration tests (dropped)** | 4+ | engine_integration.rs, schema_migration.rs, index_perf.rs, write_amp_perf.rs, json_output_perf.rs. All coupled to Database/GraphStorage APIs. Replaced by new integration tests. |
+| **Repo tests (dropped)** | 5 | omnigraph-repo/src/repo.rs. Replaced by new db/ tests. |
+
+### Tests per step
+
+| Step | New tests | What they verify |
+|---|---|---|
+| 0 | 0 | `cargo build --workspace` + `cargo test -p omnigraph-compiler` (existing 146 tests pass) |
+| 1 | ~2 | `build_catalog()` produces Utf8 schemas. Adapted catalog tests pass. |
+| 2 | ~5 | ManifestCoordinator: init, state, commit, version advance, open_sub_table |
+| 3 | ~3 | Omnigraph: init creates repo, open reads back, catalog matches schema |
+| 4 | ~6 | Load all modes (overwrite/append/merge), String IDs, edge references, constraints |
+| 5 | ~5 | NodeScan with filters, projection, ordering, limit, aggregation via DataFusion SQL |
+| 6 | ~6 | Graph index build, CSR traversal, multi-hop, negation, tiered cache, warm() |
+| 7 | ~4 | Insert + query back, update + verify, delete cascade, graph index invalidation |
+| 8 | ~4 | search(), fuzzy(), bm25(), nearest() with Lance indexes |
+| 9 | ~6 | Branch create, branch write isolation, merge, tag, time travel, graph index per branch |
+| 10 | ~3 | changes --since, diff between versions, export round-trip |
+| **Total** | **~44 new** | |
+
+Combined with ~146 carried forward from the compiler: **~190 tests** at completion.
+
+---
+
 ## Dependency Graph
 
 ```
-Step 1 (types)
-  └→ Step 2 (manifest coordinator)
-       ├→ Step 3 (Omnigraph init/open)
-       │    ├→ Step 4 (loader)
-       │    │    └→ Step 8 (search indexes created during init/load)
-       │    ├→ Step 5 (query execution — tabular)
-       │    │    └→ Step 6 (graph index + traversal)
-       │    └→ Step 7 (mutations)
-       └→ Step 9 (branching)
-            └→ Step 10 (changes, diff, CLI polish)
+Step 0 (crate restructuring)
+  └→ Step 1 (types)
+       └→ Step 2 (manifest coordinator)
+            ├→ Step 3 (Omnigraph init/open)
+            │    ├→ Step 4 (loader)
+            │    │    └→ Step 8 (search indexes created during init/load)
+            │    ├→ Step 5 (query execution — tabular)
+            │    │    └→ Step 6 (graph index + traversal)
+            │    └→ Step 7 (mutations)
+            └→ Step 9 (branching)
+                 └→ Step 10 (changes, diff, CLI polish)
 ```
 
 Steps 4, 5, 7 can proceed in parallel after Step 3.
@@ -490,7 +638,7 @@ Step 8 can proceed in parallel with 5/6/7 (independent search path).
 Step 9 depends on Step 2 (manifest) but not on 4-8.
 Step 10 is last.
 
-**Critical path:** 1 → 2 → 3 → 5 → 6 (this gives you `init` + `load` + full query execution including traversal)
+**Critical path:** 0 → 1 → 2 → 3 → 5 → 6 (crate setup → types → manifest → open → query → traversal)
 
 ---
 
@@ -563,11 +711,14 @@ Everything in `store/` and `plan/` from the current `omnigraph-engine`:
 | `store/indexing.rs` | 200 | Lance index API |
 | `store/migration.rs` | 2,648 | Deferred |
 | `store/export.rs` | varies | Thin scan over manifest |
+| `store/loader.rs` | 112 | `loader/mod.rs` |
+| `store/loader/merge.rs` | 1,299 | Lance `merge_insert` by `id` (String IDs eliminate endpoint remapping) |
+| `catalog/schema_ir.rs` | ~600 | Not needed — `build_catalog()` from parsed AST, no IR serialization |
 | `plan/physical.rs` | varies | `exec/traverse.rs` + `exec/scan.rs` |
 | `plan/node_scan.rs` | varies | `exec/scan.rs` |
 | `plan/planner.rs` | varies | `exec/mod.rs` (SQL generation) |
 | `plan/bindings.rs` | varies | `exec/filter.rs` |
-| **Total** | **~12,000+** | |
+| **Total** | **~14,000+** | |
 
 ---
 
@@ -597,17 +748,20 @@ These are real requirements but not part of the initial build. The architecture 
 
 Each step has a concrete "it works when..." gate:
 
-| Step | Gate |
-|---|---|
-| 1 | `build_catalog()` produces Utf8 id/src/dst schemas. Existing parser/typecheck tests pass. |
-| 2 | `ManifestCoordinator::init()` creates repo at a URI. `state()` reads back correct entries. `commit()` advances version. |
-| 3 | `omnigraph init --schema ./test.pg /local/test` creates a valid repo. `open` reads it back. |
-| 4 | `omnigraph load --data ./test.jsonl /local/test` populates per-type tables. Data round-trips. |
-| 5 | `omnigraph run get_person --param name=Alice /local/test` returns correct result from Lance via DataFusion. |
-| 6 | `omnigraph run friends_of --param name=Alice /local/test` does multi-hop traversal via CSR. `warm()` pre-populates cache. |
-| 7 | Mutation queries insert/update/delete entities. Delete cascades edges. Graph index invalidated. |
-| 8 | `search()`, `fuzzy()`, `bm25()` return indexed results from Lance FTS. |
-| 9 | Branch, write on branch, merge back. Main sees merged data. Graph index per branch works. |
-| 10 | `omnigraph changes --since 0` shows all mutations. `omnigraph diff 1 3` shows changes between versions. |
+| Step | Gate | Tests |
+|---|---|---|
+| 0 | `cargo build --workspace` succeeds. `cargo test -p omnigraph-compiler` passes 146 tests. | 0 new, 146 carried forward |
+| 1 | `build_catalog()` produces Utf8 id/src/dst schemas. Existing parser/typecheck tests pass. | ~2 adapted |
+| 2 | `ManifestCoordinator::init()` creates repo at a URI. `state()` reads back correct entries. `commit()` advances version. | ~5 new |
+| 3 | `omnigraph init --schema ./test.pg /local/test` creates a valid repo. `open` reads it back. | ~3 new |
+| 4 | `omnigraph load --data ./test.jsonl /local/test` populates per-type tables. Data round-trips. All three modes work. | ~6 new |
+| 5 | `omnigraph run get_person --param name=Alice /local/test` returns correct result from Lance via DataFusion. | ~5 new |
+| 6 | `omnigraph run friends_of --param name=Alice /local/test` does multi-hop traversal via CSR. `warm()` pre-populates cache. | ~6 new |
+| 7 | Mutation queries insert/update/delete entities. Delete cascades edges. Graph index invalidated. | ~4 new |
+| 8 | `search()`, `fuzzy()`, `bm25()` return indexed results from Lance FTS. | ~4 new |
+| 9 | Branch, write on branch, merge back. Main sees merged data. Graph index per branch works. | ~6 new |
+| 10 | `omnigraph changes --since 0` shows all mutations. `omnigraph diff 1 3` shows changes between versions. | ~3 new |
+
+**Running total:** ~190 tests (146 carried forward + ~44 new).
 
 **End-to-end gate:** Both test fixtures (`test.pg`/`test.jsonl`/`test.gq` and `signals.pg`/`signals.jsonl`) load, query, traverse, and mutate correctly through the CLI — against both local and S3 URIs.
