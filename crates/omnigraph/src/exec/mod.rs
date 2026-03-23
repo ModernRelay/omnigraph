@@ -3,17 +3,21 @@ use std::sync::Arc;
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array,
-    Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
+    Int64Array, RecordBatch, RecordBatchIterator, StringArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::TryStreamExt;
 use lance::Dataset;
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::ir::{IRExpr, IRFilter, IROrdering, IRProjection, IROp, ParamMap, QueryIR};
+use omnigraph_compiler::ir::{
+    IRExpr, IRFilter, IROrdering, IRProjection, IROp, IRAssignment, IRMutationPredicate,
+    MutationOpIR, ParamMap, QueryIR,
+};
 use omnigraph_compiler::lower_query;
+use omnigraph_compiler::lower_mutation_query;
 use omnigraph_compiler::query::ast::{CompOp, Literal};
-use omnigraph_compiler::query::typecheck::typecheck_query;
-use omnigraph_compiler::result::QueryResult;
+use omnigraph_compiler::query::typecheck::{typecheck_query, typecheck_query_decl, CheckedQuery};
+use omnigraph_compiler::result::{MutationResult, QueryResult};
 use omnigraph_compiler::types::Direction;
 
 use crate::db::Omnigraph;
@@ -739,4 +743,724 @@ fn apply_ordering(
         .map_err(|e| OmniError::Lance(e.to_string()))?;
 
     RecordBatch::try_new(batch.schema(), columns).map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+// ─── Mutation helpers ────────────────────────────────────────────────────────
+
+/// Resolve an IRExpr to a concrete Literal value at runtime.
+fn resolve_expr_value(expr: &IRExpr, params: &ParamMap) -> Result<Literal> {
+    match expr {
+        IRExpr::Literal(lit) => Ok(lit.clone()),
+        IRExpr::Param(name) => params.get(name).cloned().ok_or_else(|| {
+            OmniError::Manifest(format!("parameter '{}' not provided", name))
+        }),
+        other => Err(OmniError::Manifest(format!(
+            "unsupported expression in mutation: {:?}",
+            other
+        ))),
+    }
+}
+
+/// Create a single-element or N-element array from a Literal, matching the target DataType.
+fn literal_to_typed_array(lit: &Literal, data_type: &DataType, num_rows: usize) -> Result<ArrayRef> {
+    Ok(match (lit, data_type) {
+        (Literal::String(s), DataType::Utf8) => {
+            Arc::new(StringArray::from(vec![s.as_str(); num_rows])) as ArrayRef
+        }
+        (Literal::Integer(n), DataType::Int32) => {
+            Arc::new(Int32Array::from(vec![*n as i32; num_rows]))
+        }
+        (Literal::Integer(n), DataType::Int64) => {
+            Arc::new(Int64Array::from(vec![*n; num_rows]))
+        }
+        (Literal::Integer(n), DataType::UInt32) => {
+            Arc::new(UInt32Array::from(vec![*n as u32; num_rows]))
+        }
+        (Literal::Integer(n), DataType::UInt64) => {
+            Arc::new(UInt64Array::from(vec![*n as u64; num_rows]))
+        }
+        (Literal::Float(f), DataType::Float32) => {
+            Arc::new(Float32Array::from(vec![*f as f32; num_rows]))
+        }
+        (Literal::Float(f), DataType::Float64) => {
+            Arc::new(Float64Array::from(vec![*f; num_rows]))
+        }
+        (Literal::Bool(b), DataType::Boolean) => {
+            Arc::new(BooleanArray::from(vec![*b; num_rows]))
+        }
+        (Literal::Date(s), DataType::Date32) => {
+            let days = parse_date32(s).ok_or_else(|| {
+                OmniError::Manifest(format!("invalid date: {}", s))
+            })?;
+            Arc::new(Date32Array::from(vec![days; num_rows]))
+        }
+        _ => {
+            return Err(OmniError::Manifest(format!(
+                "cannot convert {:?} to {:?}",
+                lit, data_type
+            )));
+        }
+    })
+}
+
+/// Parse "YYYY-MM-DD" to days since epoch (same algorithm as loader/mod.rs).
+fn parse_date32(s: &str) -> Option<i32> {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let y: i32 = parts[0].parse().ok()?;
+    let m: u32 = parts[1].parse().ok()?;
+    let d: u32 = parts[2].parse().ok()?;
+    let y2 = if m <= 2 { y - 1 } else { y };
+    let era = if y2 >= 0 { y2 } else { y2 - 399 } / 400;
+    let yoe = (y2 - era * 400) as u32;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some((era * 146097 + doe as i32 - 719468) as i32)
+}
+
+/// Build a single-row RecordBatch from resolved assignments.
+fn build_insert_batch(
+    schema: &SchemaRef,
+    id: &str,
+    assignments: &HashMap<String, Literal>,
+) -> Result<RecordBatch> {
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+
+    for field in schema.fields() {
+        if field.name() == "id" {
+            columns.push(Arc::new(StringArray::from(vec![id])));
+        } else if field.name() == "src" {
+            let lit = assignments.get("from").ok_or_else(|| {
+                OmniError::Manifest("missing required edge endpoint 'from'".to_string())
+            })?;
+            columns.push(literal_to_typed_array(lit, field.data_type(), 1)?);
+        } else if field.name() == "dst" {
+            let lit = assignments.get("to").ok_or_else(|| {
+                OmniError::Manifest("missing required edge endpoint 'to'".to_string())
+            })?;
+            columns.push(literal_to_typed_array(lit, field.data_type(), 1)?);
+        } else if let Some(lit) = assignments.get(field.name()) {
+            columns.push(literal_to_typed_array(lit, field.data_type(), 1)?);
+        } else if field.is_nullable() {
+            columns.push(arrow_array::new_null_array(field.data_type(), 1));
+        } else {
+            return Err(OmniError::Manifest(format!(
+                "missing required property '{}'",
+                field.name()
+            )));
+        }
+    }
+
+    RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+/// Convert an IRMutationPredicate to a Lance SQL filter string.
+fn predicate_to_sql(
+    predicate: &IRMutationPredicate,
+    params: &ParamMap,
+    is_edge: bool,
+) -> Result<String> {
+    let column = if is_edge {
+        match predicate.property.as_str() {
+            "from" => "src".to_string(),
+            "to" => "dst".to_string(),
+            other => other.to_string(),
+        }
+    } else {
+        predicate.property.clone()
+    };
+
+    let value = resolve_expr_value(&predicate.value, params)?;
+    let value_sql = literal_to_sql(&value);
+
+    let op = match predicate.op {
+        CompOp::Eq => "=",
+        CompOp::Ne => "!=",
+        CompOp::Gt => ">",
+        CompOp::Lt => "<",
+        CompOp::Ge => ">=",
+        CompOp::Le => "<=",
+        CompOp::Contains => {
+            return Err(OmniError::Manifest(
+                "contains predicate not supported in mutations".to_string(),
+            ));
+        }
+    };
+
+    Ok(format!("{} {} {}", column, op, value_sql))
+}
+
+/// Replace specific columns in a RecordBatch with new literal values.
+fn apply_assignments(
+    batch: &RecordBatch,
+    assignments: &HashMap<String, Literal>,
+) -> Result<RecordBatch> {
+    let schema = batch.schema();
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+
+    for (idx, field) in schema.fields().iter().enumerate() {
+        if let Some(lit) = assignments.get(field.name()) {
+            columns.push(literal_to_typed_array(lit, field.data_type(), batch.num_rows())?);
+        } else {
+            columns.push(batch.column(idx).clone());
+        }
+    }
+
+    RecordBatch::try_new(schema, columns)
+        .map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+// ─── Mutation execution ──────────────────────────────────────────────────────
+
+impl Omnigraph {
+    /// Run a named mutation from a .gq query source string.
+    pub async fn run_mutation(
+        &mut self,
+        query_source: &str,
+        query_name: &str,
+        params: &ParamMap,
+    ) -> Result<MutationResult> {
+        let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
+            .map_err(|e| OmniError::Manifest(e.to_string()))?;
+
+        let checked = typecheck_query_decl(self.catalog(), &query_decl)?;
+        match checked {
+            CheckedQuery::Mutation(_) => {}
+            CheckedQuery::Read(_) => {
+                return Err(OmniError::Manifest(
+                    "run_mutation called on a read query; use run_query instead".to_string(),
+                ));
+            }
+        }
+
+        let ir = lower_mutation_query(&query_decl)?;
+
+        match &ir.op {
+            MutationOpIR::Insert {
+                type_name,
+                assignments,
+            } => self.execute_insert(type_name, assignments, params).await,
+            MutationOpIR::Update {
+                type_name,
+                assignments,
+                predicate,
+            } => {
+                self.execute_update(type_name, assignments, predicate, params)
+                    .await
+            }
+            MutationOpIR::Delete {
+                type_name,
+                predicate,
+            } => self.execute_delete(type_name, predicate, params).await,
+        }
+    }
+
+    async fn execute_insert(
+        &mut self,
+        type_name: &str,
+        assignments: &[IRAssignment],
+        params: &ParamMap,
+    ) -> Result<MutationResult> {
+        let mut resolved: HashMap<String, Literal> = HashMap::new();
+        for a in assignments {
+            resolved.insert(a.property.clone(), resolve_expr_value(&a.value, params)?);
+        }
+
+        let is_node = self.catalog().node_types.contains_key(type_name);
+        let is_edge = self.catalog().edge_types.contains_key(type_name);
+
+        if is_node {
+            let node_type = &self.catalog().node_types[type_name];
+            let schema = node_type.arrow_schema.clone();
+            let id = if let Some(key_prop) = &node_type.key_property {
+                match resolved.get(key_prop) {
+                    Some(Literal::String(s)) => s.clone(),
+                    Some(other) => literal_to_sql(other).trim_matches('\'').to_string(),
+                    None => {
+                        return Err(OmniError::Manifest(format!(
+                            "insert missing @key property '{}'",
+                            key_prop
+                        )));
+                    }
+                }
+            } else {
+                ulid::Ulid::new().to_string()
+            };
+
+            let batch = build_insert_batch(&schema, &id, &resolved)?;
+            let has_key = node_type.key_property.is_some();
+            let (new_version, row_count) = if has_key {
+                self.upsert_batch(type_name, true, schema, batch).await?
+            } else {
+                self.append_batch(type_name, true, schema, batch).await?
+            };
+
+            let table_key = format!("node:{}", type_name);
+            self.manifest_mut()
+                .commit(&[crate::db::SubTableUpdate {
+                    table_key,
+                    table_version: new_version,
+                    table_branch: None,
+                    row_count,
+                }])
+                .await?;
+
+            Ok(MutationResult {
+                affected_nodes: 1,
+                affected_edges: 0,
+            })
+        } else if is_edge {
+            let edge_type = &self.catalog().edge_types[type_name];
+            let schema = edge_type.arrow_schema.clone();
+            let id = ulid::Ulid::new().to_string();
+
+            let batch = build_insert_batch(&schema, &id, &resolved)?;
+            let (new_version, row_count) =
+                self.append_batch(type_name, false, schema, batch).await?;
+
+            let table_key = format!("edge:{}", type_name);
+            self.manifest_mut()
+                .commit(&[crate::db::SubTableUpdate {
+                    table_key,
+                    table_version: new_version,
+                    table_branch: None,
+                    row_count,
+                }])
+                .await?;
+
+            self.invalidate_graph_index();
+
+            Ok(MutationResult {
+                affected_nodes: 0,
+                affected_edges: 1,
+            })
+        } else {
+            Err(OmniError::Manifest(format!(
+                "unknown type '{}'",
+                type_name
+            )))
+        }
+    }
+
+    /// Append a batch to a sub-table, returning (new_version, row_count).
+    async fn append_batch(
+        &self,
+        type_name: &str,
+        is_node: bool,
+        schema: SchemaRef,
+        batch: RecordBatch,
+    ) -> Result<(u64, u64)> {
+        let table_key = if is_node {
+            format!("node:{}", type_name)
+        } else {
+            format!("edge:{}", type_name)
+        };
+        let snapshot = self.snapshot();
+        let entry = snapshot.entry(&table_key).ok_or_else(|| {
+            OmniError::Manifest(format!("no manifest entry for {}", table_key))
+        })?;
+        let full_path = format!("{}/{}", self.uri(), entry.table_path);
+
+        let mut ds = Dataset::open(&full_path)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        ds.append(reader, None)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+        let ds = Dataset::open(&full_path)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let new_version = ds.version().version;
+        let row_count = ds
+            .count_rows(None)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
+
+        Ok((new_version, row_count))
+    }
+
+    /// Upsert a batch into a sub-table using merge_insert keyed by "id".
+    /// Used for @key node types to enforce uniqueness.
+    async fn upsert_batch(
+        &self,
+        type_name: &str,
+        is_node: bool,
+        schema: SchemaRef,
+        batch: RecordBatch,
+    ) -> Result<(u64, u64)> {
+        let table_key = if is_node {
+            format!("node:{}", type_name)
+        } else {
+            format!("edge:{}", type_name)
+        };
+        let snapshot = self.snapshot();
+        let entry = snapshot.entry(&table_key).ok_or_else(|| {
+            OmniError::Manifest(format!("no manifest entry for {}", table_key))
+        })?;
+        let full_path = format!("{}/{}", self.uri(), entry.table_path);
+
+        let ds = Dataset::open(&full_path)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let ds = Arc::new(ds);
+
+        let job = lance::dataset::MergeInsertBuilder::try_new(
+            ds,
+            vec!["id".to_string()],
+        )
+        .map_err(|e| OmniError::Lance(e.to_string()))?
+        .when_matched(lance::dataset::WhenMatched::UpdateAll)
+        .when_not_matched(lance::dataset::WhenNotMatched::InsertAll)
+        .try_build()
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let (new_ds, _stats) = job
+            .execute(lance_datafusion::utils::reader_to_stream(Box::new(reader)))
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+        let new_version = new_ds.version().version;
+        let row_count = new_ds
+            .count_rows(None)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
+
+        Ok((new_version, row_count))
+    }
+
+    async fn execute_update(
+        &mut self,
+        type_name: &str,
+        assignments: &[IRAssignment],
+        predicate: &IRMutationPredicate,
+        params: &ParamMap,
+    ) -> Result<MutationResult> {
+        // Reject updates to @key properties — identity is immutable
+        if let Some(key_prop) = &self.catalog().node_types[type_name].key_property {
+            if assignments.iter().any(|a| a.property == *key_prop) {
+                return Err(OmniError::Manifest(format!(
+                    "cannot update @key property '{}' — delete and re-insert instead",
+                    key_prop
+                )));
+            }
+        }
+
+        let pred_sql = predicate_to_sql(predicate, params, false)?;
+        let schema = self.catalog().node_types[type_name].arrow_schema.clone();
+
+        let snapshot = self.snapshot();
+        let table_key = format!("node:{}", type_name);
+        let entry = snapshot.entry(&table_key).ok_or_else(|| {
+            OmniError::Manifest(format!("no manifest entry for {}", table_key))
+        })?;
+        let full_path = format!("{}/{}", self.uri(), entry.table_path);
+
+        let ds = Dataset::open(&full_path)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+        let mut scanner = ds.scan();
+        scanner
+            .filter(&pred_sql)
+            .map_err(|e| OmniError::Lance(format!("update filter: {}", e)))?;
+
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+        if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
+            return Ok(MutationResult {
+                affected_nodes: 0,
+                affected_edges: 0,
+            });
+        }
+
+        let matched = if batches.len() == 1 {
+            batches.into_iter().next().unwrap()
+        } else {
+            let s = batches[0].schema();
+            arrow_select::concat::concat_batches(&s, &batches)
+                .map_err(|e| OmniError::Lance(e.to_string()))?
+        };
+
+        let affected_count = matched.num_rows();
+
+        let mut resolved: HashMap<String, Literal> = HashMap::new();
+        for a in assignments {
+            resolved.insert(a.property.clone(), resolve_expr_value(&a.value, params)?);
+        }
+        let updated = apply_assignments(&matched, &resolved)?;
+
+        let ds = Dataset::open(&full_path)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let ds = Arc::new(ds);
+
+        let job = lance::dataset::MergeInsertBuilder::try_new(
+            ds,
+            vec!["id".to_string()],
+        )
+        .map_err(|e| OmniError::Lance(e.to_string()))?
+        .when_matched(lance::dataset::WhenMatched::UpdateAll)
+        .when_not_matched(lance::dataset::WhenNotMatched::DoNothing)
+        .try_build()
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+        let reader = RecordBatchIterator::new(vec![Ok(updated)], schema.clone());
+        let (new_ds, _stats) = job
+            .execute(lance_datafusion::utils::reader_to_stream(Box::new(reader)))
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+        let new_version = new_ds.version().version;
+        let row_count = new_ds
+            .count_rows(None)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
+
+        self.manifest_mut()
+            .commit(&[crate::db::SubTableUpdate {
+                table_key,
+                table_version: new_version,
+                table_branch: None,
+                row_count,
+            }])
+            .await?;
+
+        Ok(MutationResult {
+            affected_nodes: affected_count,
+            affected_edges: 0,
+        })
+    }
+
+    async fn execute_delete(
+        &mut self,
+        type_name: &str,
+        predicate: &IRMutationPredicate,
+        params: &ParamMap,
+    ) -> Result<MutationResult> {
+        let is_node = self.catalog().node_types.contains_key(type_name);
+        if is_node {
+            self.execute_delete_node(type_name, predicate, params).await
+        } else {
+            self.execute_delete_edge(type_name, predicate, params).await
+        }
+    }
+
+    async fn execute_delete_node(
+        &mut self,
+        type_name: &str,
+        predicate: &IRMutationPredicate,
+        params: &ParamMap,
+    ) -> Result<MutationResult> {
+        let pred_sql = predicate_to_sql(predicate, params, false)?;
+
+        let snapshot = self.snapshot();
+        let table_key = format!("node:{}", type_name);
+        let entry = snapshot.entry(&table_key).ok_or_else(|| {
+            OmniError::Manifest(format!("no manifest entry for {}", table_key))
+        })?;
+        let full_path = format!("{}/{}", self.uri(), entry.table_path);
+
+        // Scan matching IDs for cascade
+        let ds = Dataset::open(&full_path)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let mut scanner = ds.scan();
+        scanner
+            .project(&["id"])
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        scanner
+            .filter(&pred_sql)
+            .map_err(|e| OmniError::Lance(format!("delete filter: {}", e)))?;
+
+        let batches: Vec<RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+        let deleted_ids: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                (0..ids.len())
+                    .map(|i| ids.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        if deleted_ids.is_empty() {
+            return Ok(MutationResult {
+                affected_nodes: 0,
+                affected_edges: 0,
+            });
+        }
+
+        let affected_nodes = deleted_ids.len();
+
+        // Delete nodes
+        let mut ds = Dataset::open(&full_path)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let delete_result = ds
+            .delete(&pred_sql)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+        let node_version = delete_result.new_dataset.version().version;
+        let node_row_count = delete_result
+            .new_dataset
+            .count_rows(None)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
+
+        let mut updates = vec![crate::db::SubTableUpdate {
+            table_key,
+            table_version: node_version,
+            table_branch: None,
+            row_count: node_row_count,
+        }];
+
+        // Edge cascade
+        let mut affected_edges = 0usize;
+        let escaped: Vec<String> = deleted_ids
+            .iter()
+            .map(|id| format!("'{}'", id.replace('\'', "''")))
+            .collect();
+        let id_list = escaped.join(", ");
+
+        let edge_info: Vec<(String, String, String)> = self
+            .catalog()
+            .edge_types
+            .iter()
+            .map(|(name, et)| (name.clone(), et.from_type.clone(), et.to_type.clone()))
+            .collect();
+
+        for (edge_name, from_type, to_type) in &edge_info {
+            let mut cascade_filters = Vec::new();
+            if from_type == type_name {
+                cascade_filters.push(format!("src IN ({})", id_list));
+            }
+            if to_type == type_name {
+                cascade_filters.push(format!("dst IN ({})", id_list));
+            }
+            if cascade_filters.is_empty() {
+                continue;
+            }
+
+            let edge_table_key = format!("edge:{}", edge_name);
+            let Some(edge_entry) = snapshot.entry(&edge_table_key) else {
+                continue;
+            };
+            let edge_full_path = format!("{}/{}", self.uri(), edge_entry.table_path);
+
+            let cascade_filter = cascade_filters.join(" OR ");
+            let mut edge_ds = Dataset::open(&edge_full_path)
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+            let edge_delete = edge_ds
+                .delete(&cascade_filter)
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+            affected_edges += edge_delete.num_deleted_rows as usize;
+
+            if edge_delete.num_deleted_rows > 0 {
+                let edge_version = edge_delete.new_dataset.version().version;
+                let edge_row_count = edge_delete
+                    .new_dataset
+                    .count_rows(None)
+                    .await
+                    .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
+
+                updates.push(crate::db::SubTableUpdate {
+                    table_key: edge_table_key,
+                    table_version: edge_version,
+                    table_branch: None,
+                    row_count: edge_row_count,
+                });
+            }
+        }
+
+        self.manifest_mut().commit(&updates).await?;
+
+        if affected_edges > 0 {
+            self.invalidate_graph_index();
+        }
+
+        Ok(MutationResult {
+            affected_nodes,
+            affected_edges,
+        })
+    }
+
+    async fn execute_delete_edge(
+        &mut self,
+        type_name: &str,
+        predicate: &IRMutationPredicate,
+        params: &ParamMap,
+    ) -> Result<MutationResult> {
+        let pred_sql = predicate_to_sql(predicate, params, true)?;
+
+        let snapshot = self.snapshot();
+        let table_key = format!("edge:{}", type_name);
+        let entry = snapshot.entry(&table_key).ok_or_else(|| {
+            OmniError::Manifest(format!("no manifest entry for {}", table_key))
+        })?;
+        let full_path = format!("{}/{}", self.uri(), entry.table_path);
+
+        let mut ds = Dataset::open(&full_path)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+        let delete_result = ds
+            .delete(&pred_sql)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+        let affected = delete_result.num_deleted_rows as usize;
+
+        if affected > 0 {
+            let new_version = delete_result.new_dataset.version().version;
+            let row_count = delete_result
+                .new_dataset
+                .count_rows(None)
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
+
+            self.manifest_mut()
+                .commit(&[crate::db::SubTableUpdate {
+                    table_key,
+                    table_version: new_version,
+                    table_branch: None,
+                    row_count,
+                }])
+                .await?;
+
+            self.invalidate_graph_index();
+        }
+
+        Ok(MutationResult {
+            affected_nodes: 0,
+            affected_edges: affected,
+        })
+    }
 }

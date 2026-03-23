@@ -545,3 +545,301 @@ query unemployed() {
     // Everyone has a WorksAt edge → empty result
     assert_eq!(result.num_rows(), 0);
 }
+
+// ─── Mutations ───────────────────────────────────────────────────────────────
+
+const MUTATION_QUERIES: &str = r#"
+query insert_person($name: String, $age: I32) {
+    insert Person { name: $name, age: $age }
+}
+
+query add_friend($from: String, $to: String) {
+    insert Knows { from: $from, to: $to }
+}
+
+query set_age($name: String, $age: I32) {
+    update Person set { age: $age } where name = $name
+}
+
+query remove_person($name: String) {
+    delete Person where name = $name
+}
+
+query remove_friendship($from: String) {
+    delete Knows where from = $from
+}
+"#;
+
+fn int_params(pairs: &[(&str, i64)]) -> ParamMap {
+    pairs
+        .iter()
+        .map(|(k, v)| {
+            let key = k.strip_prefix('$').unwrap_or(k);
+            (key.to_string(), Literal::Integer(*v))
+        })
+        .collect()
+}
+
+fn mixed_params(str_pairs: &[(&str, &str)], int_pairs: &[(&str, i64)]) -> ParamMap {
+    let mut map = params(str_pairs);
+    for (k, v) in int_pairs {
+        let key = k.strip_prefix('$').unwrap_or(k);
+        map.insert(key.to_string(), Literal::Integer(*v));
+    }
+    map
+}
+
+#[tokio::test]
+async fn mutation_insert_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let result = db
+        .run_mutation(
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(result.affected_edges, 0);
+
+    // Query it back
+    let qr = db
+        .run_query(TEST_QUERIES, "get_person", &params(&[("$name", "Eve")]))
+        .await
+        .unwrap();
+    assert_eq!(qr.num_rows(), 1);
+    let batch = &qr.batches()[0];
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(names.value(0), "Eve");
+}
+
+#[tokio::test]
+async fn mutation_insert_edge() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    // Insert Eve
+    db.run_mutation(
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+
+    // Add edge Eve → Alice
+    let result = db
+        .run_mutation(
+            MUTATION_QUERIES,
+            "add_friend",
+            &params(&[("$from", "Eve"), ("$to", "Alice")]),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.affected_nodes, 0);
+    assert_eq!(result.affected_edges, 1);
+
+    // Verify traversal
+    let qr = db
+        .run_query(TEST_QUERIES, "friends_of", &params(&[("$name", "Eve")]))
+        .await
+        .unwrap();
+    assert_eq!(qr.num_rows(), 1);
+    let batch = qr.concat_batches().unwrap();
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(names.value(0), "Alice");
+}
+
+#[tokio::test]
+async fn mutation_update_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let result = db
+        .run_mutation(
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Alice")], &[("$age", 31)]),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(result.affected_edges, 0);
+
+    // Verify the update
+    let qr = db
+        .run_query(TEST_QUERIES, "get_person", &params(&[("$name", "Alice")]))
+        .await
+        .unwrap();
+    assert_eq!(qr.num_rows(), 1);
+    let batch = &qr.batches()[0];
+    let ages = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(ages.value(0), 31);
+}
+
+#[tokio::test]
+async fn mutation_delete_node_cascades_edges() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    // Alice has: 2 outgoing Knows (Alice→Bob, Alice→Charlie) + 1 WorksAt (Alice→Acme) = 3 edges
+    let result = db
+        .run_mutation(
+            MUTATION_QUERIES,
+            "remove_person",
+            &params(&[("$name", "Alice")]),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.affected_nodes, 1);
+    assert!(result.affected_edges >= 3, "expected at least 3 cascaded edges, got {}", result.affected_edges);
+
+    // Alice should be gone
+    let qr = db
+        .run_query(TEST_QUERIES, "get_person", &params(&[("$name", "Alice")]))
+        .await
+        .unwrap();
+    assert_eq!(qr.num_rows(), 0);
+
+    // Verify no edges reference Alice
+    let snap = db.snapshot();
+    for edge_key in &["edge:Knows", "edge:WorksAt"] {
+        let ds = snap.open(edge_key).await.unwrap();
+        let batches: Vec<arrow_array::RecordBatch> = ds
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        for batch in &batches {
+            let srcs = batch
+                .column_by_name("src")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let dsts = batch
+                .column_by_name("dst")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                assert_ne!(srcs.value(i), "Alice", "found edge src=Alice in {}", edge_key);
+                assert_ne!(dsts.value(i), "Alice", "found edge dst=Alice in {}", edge_key);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn mutation_delete_edge() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    // Delete all Knows edges from Alice (Alice→Bob, Alice→Charlie)
+    let result = db
+        .run_mutation(
+            MUTATION_QUERIES,
+            "remove_friendship",
+            &params(&[("$from", "Alice")]),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.affected_nodes, 0);
+    assert_eq!(result.affected_edges, 2);
+
+    // Alice should still exist
+    let qr = db
+        .run_query(TEST_QUERIES, "get_person", &params(&[("$name", "Alice")]))
+        .await
+        .unwrap();
+    assert_eq!(qr.num_rows(), 1);
+
+    // But has no friends
+    let qr = db
+        .run_query(TEST_QUERIES, "friends_of", &params(&[("$name", "Alice")]))
+        .await
+        .unwrap();
+    assert_eq!(qr.num_rows(), 0);
+}
+
+#[tokio::test]
+async fn mutation_insert_duplicate_key_upserts() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    // Alice already exists with age=30. Insert again with age=99.
+    let result = db
+        .run_mutation(
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.affected_nodes, 1);
+
+    // Should still be exactly 1 Alice (upsert, not duplicate)
+    let qr = db
+        .run_query(TEST_QUERIES, "get_person", &params(&[("$name", "Alice")]))
+        .await
+        .unwrap();
+    assert_eq!(qr.num_rows(), 1);
+
+    // Age should be updated to 99
+    let batch = &qr.batches()[0];
+    let ages = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(ages.value(0), 99);
+}
+
+#[tokio::test]
+async fn mutation_update_key_property_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let queries = r#"
+query rename_person($old_name: String, $new_name: String) {
+    update Person set { name: $new_name } where name = $old_name
+}
+"#;
+
+    let result = db
+        .run_mutation(
+            queries,
+            "rename_person",
+            &params(&[("$old_name", "Alice"), ("$new_name", "Bob")]),
+        )
+        .await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("@key"), "error should mention @key: {}", err);
+}

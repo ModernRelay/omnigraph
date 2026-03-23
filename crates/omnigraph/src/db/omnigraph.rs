@@ -179,6 +179,11 @@ impl Omnigraph {
     pub fn manifest_mut(&mut self) -> &mut ManifestCoordinator {
         &mut self.manifest
     }
+
+    /// Invalidate the cached graph index. Called after edge mutations.
+    pub(crate) fn invalidate_graph_index(&mut self) {
+        self.cached_graph_index = None;
+    }
 }
 
 /// Write a file to a local path (extracted from a URI).

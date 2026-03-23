@@ -548,6 +548,38 @@ After `commit()`, the coordinator's `known_state` is updated. The next `snapshot
 
 The manifest table extends Lance's per-dataset MVCC to **cross-dataset consistency**. Without it, each sub-table has independent versioning with no guarantee that Person version 5 and Knows version 3 form a consistent graph. The manifest pins them together.
 
+### Streaming Consistency (MemWAL — Planned)
+
+When MemWAL is enabled on sub-table datasets, consistency operates at two levels:
+
+**Sub-table level (Lance MemWAL):** Each sub-table has its own LSM-tree. Readers must merge results from the base table + flushed MemTables + (optionally) the in-memory MemTable. Lance handles this transparently through its scanner — `Snapshot::open()` returns a `Dataset` whose scan already includes flushed MemTable data via LSM-tree deduplication by primary key.
+
+**Cross-table level (Omnigraph manifest):** The manifest pins sub-table versions into a consistent graph snapshot. With MemWAL, the manifest pins base table versions. Flushed-but-unmerged MemTable data is visible through the dataset's LSM-tree read but not explicitly tracked in the manifest — it rides along with the dataset version.
+
+**Read consistency spectrum:**
+
+| Mode | Mechanism | Freshness | Use case |
+|---|---|---|---|
+| Strong | `Snapshot` + in-memory MemTable access for all regions | All committed writes visible | Single-process, co-located reader-writer |
+| Checkpoint | `Snapshot` at last manifest commit | Writes visible up to last checkpoint | Multi-process readers, typical query workload |
+| Eventual | Stale `Snapshot` (no `refresh()`) | Writes visible up to last known version | Long-running analytics, time-travel queries |
+
+**Correctness guarantees preserved:**
+
+- Within a query: all reads go through one Snapshot — same as without MemWAL
+- Cross-type consistency: manifest still pins sub-table versions together
+- Stale MemWAL index is safe: reading already-merged MemTables from both flushed storage and base table produces correct results via LSM-tree deduplication by primary key. No data loss, just minor read amplification
+- Garbage-collected MemTables still in the MemWAL index: reader fails to open them and skips — safe because the data is already in the base table
+- Newly flushed MemTables not yet in the MemWAL index: not queried — result is eventually consistent but correct for the snapshot's point in time
+
+**Graph index interaction with MemWAL:**
+
+- `GraphIndex` is built from edge sub-tables via `Snapshot::open()` → `ds.scan()`
+- With MemWAL, the scan includes flushed MemTable data automatically (Lance LSM-tree merging read)
+- Unflushed in-memory MemTable edges are NOT in the graph index — they become visible after MemTable flush + next graph index rebuild
+- Graph index invalidation triggers on manifest checkpoint that includes edge sub-table version changes, not on every WAL write
+- The graph index cache key could be extended to include MemWAL generation numbers for finer-grained invalidation
+
 ---
 
 ## Concurrency Model
@@ -559,7 +591,54 @@ Branches are the primary concurrency primitive. Progression:
 | Local/agent | Single writer, batch loads | Lance `merge_insert` per sub-table + manifest commit |
 | Multi-agent | Independent work streams | Branch-per-writer + merge (zero-copy fork, isolated writes) |
 | Collaboration | Same branch, low contention | Lance optimistic concurrency (Append+Append = rebasable, same-row Update = retryable) |
-| Streaming | High throughput on one branch | Lance MemWAL per sub-table (deferred) |
+| Streaming | High throughput on one branch | Lance MemWAL per sub-table (see below) |
+
+### Streaming: Lance MemWAL (Planned)
+
+Lance MemWAL is a Lance-native LSM-tree architecture for high-throughput streaming writes. It enables multiple concurrent writers on a single branch without custom WAL or coordination logic in Omnigraph.
+
+**Architecture:**
+
+Each sub-table dataset (the "base table" in MemWAL terms) can independently have MemWAL enabled. Writers write to an in-memory MemTable backed by a durable WAL per region. MemTables flush to storage periodically; flushed MemTables merge into the base table asynchronously via `merge_insert`. The same Lance API surface (`append`, `merge_insert`, `delete`) works transparently — MemWAL routes writes through the WAL internally. Omnigraph does not build a custom WAL.
+
+**Region model and primary keys:**
+
+- Each MemWAL region has exactly one active writer at a time, enforced by epoch-based fencing
+- **Correctness invariant:** rows with the same primary key must go to the same region — otherwise merge order between regions can corrupt "last write wins" semantics
+- Omnigraph's `id` column (String, `@key` value or ULID) serves as the unenforced primary key required by MemWAL
+- Region assignment strategy: for node types, partition by `id`; for edge types, partition by `src` (ensures all edges from the same source node go to the same region, which aligns with CSR build patterns)
+- Region specs use Lance's `bucket(id, N)` transform to distribute rows across N regions
+- Multiple writers claim different regions → horizontal write scale-out on a single branch, no coordination between writers
+
+**Manifest coordination challenge:**
+
+The current model (Step 7) does one manifest commit per mutation. With streaming writes, hundreds of per-row commits per second would thrash `_manifest.lance`. The solution is **manifest commit batching**:
+
+- `ManifestCoordinator` accumulates `SubTableUpdate` entries in memory
+- Commits periodically (every N writes or every T seconds) via an explicit `checkpoint()` call
+- The manifest version represents a "checkpoint" rather than every individual write
+- Between checkpoints, readers using `Snapshot` see the last checkpoint — this matches MemWAL's own eventual consistency model (unflushed MemTable data is invisible to readers without in-memory access)
+
+**What changes vs what stays:**
+
+| Aspect | Current (Step 7) | Streaming (MemWAL) |
+|---|---|---|
+| Write path | `ds.append()` / `ds.delete()` | Same API, routed through WAL internally |
+| Commit granularity | Per mutation | Batched (periodic manifest checkpoint) |
+| Writer concurrency | `&mut Omnigraph` (exclusive) | Region-per-writer (epoch fencing) |
+| Read freshness | Snapshot at last commit | Snapshot at last checkpoint (eventual) |
+| Graph index | Invalidate on edge mutation | Invalidate on checkpoint that includes edge changes |
+| `run_mutation()` API | Unchanged | Unchanged (buffering is internal) |
+
+**Omnigraph integration steps** (when triggered):
+
+1. **Enable MemWAL on sub-table datasets** — configuration when creating datasets in `ManifestCoordinator::init()` or via post-creation setup
+2. **Region assignment** — partition by `id` column. Region specs use Lance's `bucket(id, N)` transform
+3. **Manifest commit batching** — replace per-mutation manifest commit with periodic checkpoint. `ManifestCoordinator` accumulates `SubTableUpdate` entries, flushes on interval or explicit `checkpoint()` call
+4. **Writer handle pool** — `Omnigraph` handle exposes region-aware write API. Each writer claims a region via epoch-based fencing. Multiple handles write concurrently to different regions on the same branch
+5. **Read path unchanged** — `Snapshot::open()` returns a `Dataset` that includes flushed MemTable data via Lance's LSM-tree merging read. Graph index builds from merged scan results
+
+**Trigger:** Profile write throughput on agent workloads. If per-mutation commit latency exceeds 10ms or throughput drops below 100 writes/sec, add manifest batching first, then MemWAL. **Prerequisite:** Step 7 (mutations) and Step 9 (branching).
 
 ---
 
@@ -600,7 +679,7 @@ Omnigraph is successful when:
 4. **Compaction.** Lance handles natively. Wire up as CLI command.
 5. **SDKs (TS, Swift, Python).** Thin wrappers after API stabilizes.
 6. **DuckDB fallback.** For graphs > ~5M edges. Defer until scale demands.
-7. **MemWAL.** For high-throughput streaming ingest. Branch-per-writer handles multi-agent concurrency without it.
+7. **MemWAL — Streaming concurrent writes on a single branch.** Lance MemWAL is an LSM-tree architecture enabling high-throughput streaming writes. Each sub-table dataset gets its own MemWAL with regions (one active writer per region, epoch-fenced). The same `append`/`merge_insert`/`delete` API surface works transparently — MemWAL routes writes through a durable WAL internally. Omnigraph integration requires: (1) enable MemWAL on sub-table datasets, (2) region assignment by `id` column using `bucket(id, N)` transform, (3) manifest commit batching — replace per-mutation commit with periodic checkpoint, (4) writer handle pool with region-aware API. The read path is unchanged — `Snapshot::open()` returns a Dataset that includes flushed MemTable data via Lance's LSM-tree merging read. See Concurrency Model and Consistency Model sections for full architecture. **Trigger:** per-mutation commit latency >10ms or throughput <100 writes/sec. **Prerequisite:** Step 7 + Step 9.
 8. **Service layer / HTTP API.** `Omnigraph` struct IS the cache — a service just keeps it alive.
 9. **Binary ULIDs.** Switch `id` from Utf8 to `FixedSizeBinary(16)` for performance. See Identity Model section.
 10. **Row-correlated bindings.** Tuple-based binding model for general N×M cross-variable returns. See Query Execution section.
