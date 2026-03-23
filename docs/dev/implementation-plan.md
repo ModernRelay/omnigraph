@@ -172,11 +172,19 @@ Built `exec/mod.rs` (~400 lines). Executes IR pipeline: `NodeScan` → Lance sca
 
 ## Next Steps
 
-### Step 5a: Snapshot Refactor
+### Step 5a: Snapshot Refactor + Executor Redesign
 
-**Why:** The current executor calls `db.state()` per NodeScan. For multi-type queries (graph traversal), this breaks cross-type consistency — concurrent writes between scans would produce inconsistent reads.
+**Why:** The current executor calls `db.state()` per NodeScan, breaking cross-type consistency for multi-scan queries. The executor is a method on `Omnigraph`, creating unnecessary coupling. The graph index needs a cache slot on the handle but the handle doesn't have one.
 
-**What:** Extract `Snapshot` as an immutable read view from `ManifestState`. A Snapshot is taken once at query start and threaded through all read operations.
+**Design principles:**
+
+1. **Three types with separate lifecycles:** `Snapshot` (per-query, cheap, immutable), `GraphIndex` (cached, expensive, topology only), `Omnigraph` (handle, caches the index).
+2. **Executor is a pure function:** `execute_query(ir, params, snapshot, graph_index, catalog)` — no state, no caches, no interior mutability.
+3. **Omnigraph handle owns one graph index cache slot:** `RwLock<Option<Arc<GraphIndex>>>` — single slot, upgrade to `HashMap` later for multi-branch.
+4. **No node cache in Phase 1:** Hydration opens the dataset from the Snapshot directly. Add node cache later when profiling shows it matters.
+5. **Don't pre-register anything:** No `SessionContext`, no `LanceTableProvider`, no `OnceCell`. Open Lance datasets on demand via `snapshot.open()` (~1ms local).
+
+**Snapshot:**
 
 ```rust
 pub struct Snapshot {
@@ -187,23 +195,81 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub async fn open(&self, table_key: &str) -> Result<Dataset>;
-}
-
-impl Omnigraph {
-    pub async fn snapshot(&self) -> Result<Snapshot>;
-    pub async fn refresh(&mut self) -> Result<()>;  // see other writers' commits
+    pub fn version(&self) -> u64;
+    pub fn entry(&self, key: &str) -> Option<&SubTableEntry>;
+    pub fn edge_versions(&self) -> BTreeMap<String, u64>;  // for GraphIndexKey
 }
 ```
 
-**Changes:**
-- `ManifestState` → `Snapshot` with `open()` method (combines state + open_sub_table)
-- `execute_query_ir()` takes `&Snapshot` instead of `&Omnigraph`
-- `execute_node_scan()` takes `&Snapshot` instead of calling `db.state()` each time
+- Contains no caches, no datasets, no indexes
+- Cheap to create: reads from known manifest state, no storage I/O
+- `open()` opens a Dataset at the pinned version on demand
+
+**ManifestCoordinator changes:**
+
+```rust
+impl ManifestCoordinator {
+    pub fn snapshot(&self) -> Result<Snapshot>;   // no I/O, reads known state
+    pub async fn refresh(&mut self) -> Result<()>; // re-read from storage
+    // state() and open_sub_table() removed — replaced by Snapshot
+}
+```
+
+- Holds `known_state: ManifestState` updated on `open`, `commit`, `refresh`
+- `snapshot()` is synchronous — wraps the known state in a `Snapshot`
+
+**Omnigraph changes:**
+
+```rust
+pub struct Omnigraph {
+    root_uri: String,
+    manifest: ManifestCoordinator,
+    catalog: Catalog,
+    schema_source: String,
+    graph_index: RwLock<Option<Arc<GraphIndex>>>,
+}
+
+impl Omnigraph {
+    pub fn snapshot(&self) -> Result<Snapshot>;  // delegates to manifest
+    pub async fn refresh(&mut self) -> Result<()>;  // delegates to manifest
+    pub async fn graph_index(&self, snapshot: &Snapshot) -> Result<Arc<GraphIndex>>;
+    pub async fn query(&self, source: &str, name: &str, params: &ParamMap) -> Result<QueryResult>;
+}
+```
+
+**Executor as pure function:**
+
+```rust
+pub async fn execute_query(
+    ir: &QueryIR,
+    params: &ParamMap,
+    snapshot: &Snapshot,
+    graph_index: &GraphIndex,
+    catalog: &Catalog,
+) -> Result<QueryResult>
+```
+
+**Query path:**
+
+```rust
+pub async fn query(&self, source: &str, name: &str, params: &ParamMap) -> Result<QueryResult> {
+    let snapshot = self.snapshot()?;                      // 1. cheap, no I/O
+    let graph_index = self.graph_index(&snapshot).await?; // 2. cache check, maybe rebuild
+    let ir = compile_query(source, name, &self.catalog)?; // 3. parse + typecheck + lower
+    execute_query(&ir, params, &snapshot, &graph_index, &self.catalog).await
+}
+```
+
+**Changes to existing code:**
+- `ManifestState` → `Snapshot` with `open()` method
+- `ManifestCoordinator` stores known state, `snapshot()` is sync, add `refresh()`
+- `execute_query_ir()` → `execute_query()` pure function taking `&Snapshot` + `&Catalog`
+- `Omnigraph` removes `state()`, adds `snapshot()`, `refresh()`, `graph_index` cache field
 - Loader continues using `ManifestCoordinator` directly for writes
 
-**Tests:** Existing tests pass unchanged. Add test verifying snapshot version is pinned across multiple reads.
+**Tests:** All existing tests pass. Add test verifying snapshot version is pinned.
 
-**~50 lines changed, 0 new files.**
+**~100 lines changed across db/manifest.rs, db/omnigraph.rs, exec/mod.rs.**
 
 ### Step 6: Graph Index + Traversal
 
@@ -211,24 +277,47 @@ The part that makes it a graph database. No Lance equivalent exists — this is 
 
 **New modules:**
 - `graph_index/mod.rs` — `GraphIndex` with `TypeIndex` (String→u32 mapping), CSR/CSC indices
-- `graph_index/csr.rs` — CSR with u32 dense indices (~40 lines, same algorithm as deleted `store/csr.rs`)
+- `graph_index/csr.rs` — CSR with u32 dense indices (~40 lines)
 
-**`GraphIndex` build process** (lazy, on first traversal query):
-1. For each edge type: scan `(src, dst)` columns from Snapshot
+**GraphIndex — topology only, no node data:**
+
+```rust
+pub struct GraphIndex {
+    type_indices: HashMap<String, TypeIndex>,
+    csr: HashMap<String, CsrIndex>,   // outgoing
+    csc: HashMap<String, CsrIndex>,   // incoming
+}
+
+pub struct TypeIndex {
+    id_to_dense: HashMap<String, u32>,
+    dense_to_id: Vec<String>,
+}
+
+// Cache key: only edge versions, not manifest version.
+// Loading new node data does NOT invalidate the graph index.
+pub struct GraphIndexKey {
+    edge_versions: BTreeMap<String, u64>,
+}
+```
+
+**Build process** (lazy, on first traversal query):
+1. For each edge type: open sub-table via Snapshot, scan `(src, dst)` columns only
 2. Build `TypeIndex` for source and destination node types (String → dense u32)
 3. Build CSR (outgoing) and CSC (incoming)
-4. Cache keyed by `(branch, manifest_version)`
+4. Cache on `Omnigraph` handle as `Arc<GraphIndex>`, keyed by `GraphIndexKey`
 
-**`Expand` execution:**
+**`Expand` execution** (in the pure function executor):
 1. Extract source String IDs from input batch
-2. Map to dense u32 via `TypeIndex`
+2. Map to dense u32 via `type_indices[src_type]`
 3. BFS/DFS on CSR/CSC (sub-millisecond, in-memory)
 4. Map result u32 back to String IDs
-5. Hydrate destination nodes from Snapshot
+5. Hydrate destination nodes by opening sub-table from Snapshot and scanning by ID
 
 **`AntiJoin` execution:**
-1. Execute inner pipeline (produces a set of IDs)
+1. Execute inner pipeline against the same Snapshot (produces a set of IDs)
 2. Filter outer binding: keep rows where ID is NOT in the inner set
+
+**`warm()`:** Pre-builds the graph index: take snapshot → build index → cache. Returns immediately if cached for current edge versions.
 
 **Test:** Execute `friends_of`, `friends_of_friends`, `employees_of`, `unemployed` from `test.gq`.
 
@@ -288,23 +377,18 @@ Lance-native branching on the manifest table + lazy sub-table branching.
 ## Dependency Graph
 
 ```
-Step 0  ✅ (crate restructuring)
-  └→ Step 1 ✅ (types)
-       └→ Step 2 ✅ (manifest coordinator)
-            ├→ Step 3 ✅ (Omnigraph init/open)
-            │    ├→ Step 4 ✅ (loader)
-            │    │    └→ Step 8 (search indexes created during init/load)
-            │    ├→ Step 5 ✅ (query execution — tabular)
-            │    │    └→ Step 5a ▶ (snapshot refactor)
-            │    │         └→ Step 6 (graph index + traversal)
-            │    └→ Step 7 (mutations)
-            └→ Step 9 (branching)
-                 └→ Step 10 (changes, diff, CLI polish)
+Steps 0–5 ✅
+  └→ Step 5a ▶ (snapshot + pure executor + graph index cache slot)
+       ├→ Step 6 (graph index + traversal — uses snapshot for reads, cache for index)
+       ├→ Step 7 (mutations — uses manifest for writes, invalidates graph index)
+       ├→ Step 8 (search — uses snapshot for reads)
+       └→ Step 9 (branching — uses manifest for branch ops)
+            └→ Step 10 (changes, diff, CLI)
 ```
 
-**Critical path:** 5a → 6 → 7 (snapshot → traversal → mutations)
+**Critical path:** 5a → 6 (snapshot refactor enables traversal)
 
-Steps 7, 8, 9 can proceed in parallel after 5a.
+Steps 6, 7, 8, 9 can proceed in parallel after 5a.
 
 ---
 
