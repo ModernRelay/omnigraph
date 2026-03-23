@@ -17,7 +17,7 @@ Living document tracking the build of the Lance-native graph database.
 
 ## Current Status
 
-**178 tests passing.** Steps 0–5 complete. Next: Snapshot refactor → Step 6 (graph traversal).
+**184 tests passing.** Steps 0–6 complete including Lance-native optimizations.
 
 ```
 Step 0  ✅  Crate restructuring
@@ -26,8 +26,8 @@ Step 2  ✅  ManifestCoordinator
 Step 3  ✅  Omnigraph init/open
 Step 4  ✅  Data loading
 Step 5  ✅  Query execution (tabular)
-Step 5a ▶  Snapshot refactor (read consistency)
-Step 6     Graph index + traversal
+Step 5a ✅  Snapshot refactor (read consistency)
+Step 6  ✅  Graph index + traversal + Lance-native optimizations
 Step 7     Mutations
 Step 8     Search predicates
 Step 9     Branching
@@ -76,29 +76,31 @@ All datasets created with `enable_stable_row_ids = true` and `LanceFileVersion::
 
 ```
 crates/
-├── omnigraph-compiler/        # No Lance dependency. 149 tests. Compiles in seconds.
+├── omnigraph-compiler/        # No Lance dependency. 149 tests.
 │   └── src/
 │       ├── schema/            # .pg parser, AST, pest grammar
 │       ├── query/             # .gq parser, AST, typechecker, pest grammar
-│       ├── catalog/           # Catalog, build_catalog (no schema_ir — dropped)
-│       ├── ir/                # IR types, lowering
+│       ├── catalog/           # Catalog, build_catalog
+│       ├── ir/                # IR types (QueryIR, MutationIR), lowering
 │       ├── types.rs           # ScalarType, PropType, Direction
 │       ├── error.rs           # NanoError, ParseDiagnostic
 │       ├── embedding.rs       # OpenAI embedding client
 │       ├── json_output.rs     # Arrow → JSON
-│       ├── result.rs          # QueryResult, MutationResult, MutationExecResult
+│       ├── result.rs          # QueryResult, MutationResult, RunResult
 │       └── query_input.rs     # Named query lookup, param parsing
 │
-├── omnigraph/                 # The database. Lance-dependent. 29 tests.
+├── omnigraph/                 # The database. Lance-dependent. 35 tests.
 │   └── src/
-│       ├── db/                # Omnigraph, ManifestCoordinator
+│       ├── db/                # Omnigraph, ManifestCoordinator, Snapshot
 │       │   ├── mod.rs
-│       │   ├── manifest.rs    # ManifestCoordinator — Lance table CRUD, commit protocol
-│       │   └── omnigraph.rs   # Omnigraph struct — init, open, snapshot, run_query
-│       ├── exec/              # Query executor
-│       │   └── mod.rs         # IR pipeline execution, Lance scan, Arrow filter/project/sort
+│       │   ├── manifest.rs    # Snapshot, ManifestCoordinator
+│       │   └── omnigraph.rs   # Omnigraph handle — init, open, snapshot, run_query, graph_index, ensure_indices
+│       ├── exec/              # Pure function executor
+│       │   └── mod.rs         # execute_query, execute_pipeline, execute_expand, execute_anti_join, hydrate_nodes
+│       ├── graph_index/       # Topology-only graph index
+│       │   └── mod.rs         # GraphIndex, TypeIndex, CsrIndex
 │       └── loader/            # JSONL → per-type Lance tables
-│           └── mod.rs         # Parse JSONL, build RecordBatches, write to Lance, commit
+│           └── mod.rs         # load_jsonl, load_jsonl_file, build_node_batch, write_batch_to_dataset
 │
 └── omnigraph-cli/             # Binary (stubbed, wired in Step 10)
     └── src/
@@ -111,284 +113,512 @@ crates/
 
 ### Step 0: Crate Restructuring ✅
 
-Moved compiler frontend from `omnigraph-engine` into `omnigraph-compiler`. Created `omnigraph` crate with `OmniError`. Deleted `omnigraph-engine` (~14,000 lines) and `omnigraph-repo` (~430 lines). CLI stubbed.
-
-**Deviations from plan:**
-- `DataFusion` error variant removed from compiler's `NanoError` (no datafusion dep in compiler)
-- `MutationExecResult` moved into `result.rs` (was in deleted `plan/physical.rs`)
-- `embedding.rs` test counted as compiler test (147 total, not 146)
-
-**Tests:** 147 compiler tests pass.
+Moved compiler frontend into `omnigraph-compiler`. Created `omnigraph` crate. Deleted `omnigraph-engine` + `omnigraph-repo`. Tests: 147.
 
 ### Step 1: Foundation Types ✅
 
-Removed `NodeId = u64` / `EdgeId = u64` aliases. Changed Arrow schemas: node `id` from `UInt64` → `Utf8`, edge `id`/`src`/`dst` from `UInt64` → `Utf8`. Added `key_property: Option<String>` to `NodeType`.
-
-**Tests:** +2 new (`test_id_fields_are_utf8`, `test_key_property_tracking`) → 149 compiler tests.
+String IDs everywhere: node `id` Utf8, edge `id`/`src`/`dst` Utf8. `key_property: Option<String>` on `NodeType`. Tests: 149.
 
 ### Step 2: ManifestCoordinator ✅
 
-Built `db/manifest.rs` (~300 lines). `ManifestCoordinator` manages a Lance table at `_manifest.lance/`. `init()` creates per-type empty Lance datasets + manifest table. `state()` reads manifest. `commit()` does `merge_insert` keyed by `table_key`. `open_sub_table()` opens a sub-table at its pinned version.
-
-**Deviations from plan:**
-- Used `MergeInsertBuilder::try_new()` + `try_build()` + `execute()` pattern (not the fluent `ds.merge_insert()` which doesn't exist on `Arc<Dataset>`)
-- Added `lance-datafusion` as dependency for `reader_to_stream` in merge_insert
-
-**Tests:** +5 new → 154 total.
+`_manifest.lance` table: init, state, commit (merge_insert by table_key), open_sub_table. Tests: 154.
 
 ### Step 3: Omnigraph Init/Open ✅
 
-Built `db/omnigraph.rs` (~120 lines). `Omnigraph::init()` parses schema, writes `_schema.pg`, creates ManifestCoordinator. `Omnigraph::open()` reads schema, rebuilds catalog, opens manifest.
-
-**Deviations from plan:**
-- No `Session` or `QueryExecutor` yet — deferred to when they're needed
-- File I/O uses `std::fs` directly (S3 support deferred to when Lance object_store is wired)
-
-**Tests:** +3 new → 157 total.
+`Omnigraph::init()` writes `_schema.pg` + creates manifest. `Omnigraph::open()` reads schema + opens manifest. Tests: 157.
 
 ### Step 4: Data Loading ✅
 
-Built `loader/mod.rs` (~400 lines). Parses JSONL, builds per-type `RecordBatch` vectors with String IDs, writes to Lance datasets, commits manifest atomically. Supports Overwrite/Append/Merge modes. Node `id` = `@key` value or ULID. Edge `id` = ULID, `src`/`dst` = node key values. Uses `ulid` crate for robust ID generation.
-
-**Deviations from plan:**
-- Wrote loader from scratch rather than adapting old `jsonl.rs` (old code was coupled to `u64` IDs and `GraphStorage`)
-- Old loader files (`jsonl.rs`, `constraints.rs`, `embeddings.rs`) remain as dormant files in `src/loader/` for reference
-- Updated `test.pg` fixture to add `@key` annotations (correct by design — no implicit name-based lookups)
-
-**Tests:** +6 unit + 11 integration (end_to_end.rs) → 178 total.
+JSONL loader: per-type RecordBatch building, Overwrite/Append/Merge modes, `@key` → id or ULID, atomic manifest commit. Tests: 178.
 
 ### Step 5: Query Execution (Tabular) ✅
 
-Built `exec/mod.rs` (~400 lines). Executes IR pipeline: `NodeScan` → Lance scan with SQL filter pushdown, `Filter` → Arrow comparison with auto type casting, projection via `PropAccess`, ordering via `lexsort_to_indices`, limit via batch slicing. Added `Omnigraph::run_query()`.
+Lance Scanner with SQL filter pushdown, Arrow filter/project/sort, limit. Tests: 178.
 
-**Deviations from plan:**
-- Used Lance `Scanner` API directly with SQL filter strings instead of DataFusion `SessionContext` + `LanceTableProvider`. Simpler, fewer dependencies, sufficient for current query patterns.
-- No separate `exec/scan.rs` / `exec/filter.rs` files — all in `exec/mod.rs` for now
-- Discovered param names are stored without `$` prefix (parser strips it)
+### Step 5a: Snapshot Refactor ✅
 
-**Tests:** +4 query tests in end_to_end.rs (`get_person`, `not_found`, `adults`, `top_by_age`) → 178 total.
+`Snapshot` struct (immutable, no I/O). `ManifestCoordinator` stores `known_state`, `snapshot()` sync, `refresh()` async. Executor is pure function: `execute_query(ir, params, snapshot, graph_index, catalog)`. Removed `state()`, `open_sub_table()`, `manifest()` from public API. Tests: 179.
+
+### Step 6: Graph Index + Traversal ✅
+
+`GraphIndex` with `TypeIndex` (String→u32), `CsrIndex` (CSR adjacency). Two-phase build: scan all edges → grow TypeIndices → build CSR/CSC with final sizes. `Expand` (BFS with hop bounds, cross-type aware visited). `AntiJoin` (per-row fallback + bulk CSR fast path). Node hydration via Lance `IN` filter. BTree scalar indices on `id`/`src`/`dst` via `ensure_indices()` after load. Graph index cached on `Omnigraph` handle. Tests: 184.
 
 ---
 
 ## Next Steps
 
-### Step 5a: Snapshot Refactor + Executor Redesign
-
-**Why:** The current executor calls `db.state()` per NodeScan, breaking cross-type consistency for multi-scan queries. The executor is a method on `Omnigraph`, creating unnecessary coupling. The graph index needs a cache slot on the handle but the handle doesn't have one.
-
-**Design principles:**
-
-1. **Three types with separate lifecycles:** `Snapshot` (per-query, cheap, immutable), `GraphIndex` (cached, expensive, topology only), `Omnigraph` (handle, caches the index).
-2. **Executor is a pure function:** `execute_query(ir, params, snapshot, graph_index, catalog)` — no state, no caches, no interior mutability.
-3. **Omnigraph handle owns one graph index cache slot:** `RwLock<Option<Arc<GraphIndex>>>` — single slot, upgrade to `HashMap` later for multi-branch.
-4. **No node cache in Phase 1:** Hydration opens the dataset from the Snapshot directly. Add node cache later when profiling shows it matters.
-5. **Don't pre-register anything:** No `SessionContext`, no `LanceTableProvider`, no `OnceCell`. Open Lance datasets on demand via `snapshot.open()` (~1ms local).
-
-**Snapshot:**
-
-```rust
-pub struct Snapshot {
-    root_uri: String,
-    version: u64,
-    entries: HashMap<String, SubTableEntry>,
-}
-
-impl Snapshot {
-    pub async fn open(&self, table_key: &str) -> Result<Dataset>;
-    pub fn version(&self) -> u64;
-    pub fn entry(&self, key: &str) -> Option<&SubTableEntry>;
-    pub fn edge_versions(&self) -> BTreeMap<String, u64>;  // for GraphIndexKey
-}
-```
-
-- Contains no caches, no datasets, no indexes
-- Cheap to create: reads from known manifest state, no storage I/O
-- `open()` opens a Dataset at the pinned version on demand
-
-**ManifestCoordinator changes:**
-
-```rust
-impl ManifestCoordinator {
-    pub fn snapshot(&self) -> Result<Snapshot>;   // no I/O, reads known state
-    pub async fn refresh(&mut self) -> Result<()>; // re-read from storage
-    // state() and open_sub_table() removed — replaced by Snapshot
-}
-```
-
-- Holds `known_state: ManifestState` updated on `open`, `commit`, `refresh`
-- `snapshot()` is synchronous — wraps the known state in a `Snapshot`
-
-**Omnigraph changes:**
-
-```rust
-pub struct Omnigraph {
-    root_uri: String,
-    manifest: ManifestCoordinator,
-    catalog: Catalog,
-    schema_source: String,
-    graph_index: RwLock<Option<Arc<GraphIndex>>>,
-}
-
-impl Omnigraph {
-    pub fn snapshot(&self) -> Result<Snapshot>;  // delegates to manifest
-    pub async fn refresh(&mut self) -> Result<()>;  // delegates to manifest
-    pub async fn graph_index(&self, snapshot: &Snapshot) -> Result<Arc<GraphIndex>>;
-    pub async fn query(&self, source: &str, name: &str, params: &ParamMap) -> Result<QueryResult>;
-}
-```
-
-**Executor as pure function:**
-
-```rust
-pub async fn execute_query(
-    ir: &QueryIR,
-    params: &ParamMap,
-    snapshot: &Snapshot,
-    graph_index: &GraphIndex,
-    catalog: &Catalog,
-) -> Result<QueryResult>
-```
-
-**Query path:**
-
-```rust
-pub async fn query(&self, source: &str, name: &str, params: &ParamMap) -> Result<QueryResult> {
-    let snapshot = self.snapshot()?;                      // 1. cheap, no I/O
-    let graph_index = self.graph_index(&snapshot).await?; // 2. cache check, maybe rebuild
-    let ir = compile_query(source, name, &self.catalog)?; // 3. parse + typecheck + lower
-    execute_query(&ir, params, &snapshot, &graph_index, &self.catalog).await
-}
-```
-
-**Changes to existing code:**
-- `ManifestState` → `Snapshot` with `open()` method
-- `ManifestCoordinator` stores known state, `snapshot()` is sync, add `refresh()`
-- `execute_query_ir()` → `execute_query()` pure function taking `&Snapshot` + `&Catalog`
-- `Omnigraph` removes `state()`, adds `snapshot()`, `refresh()`, `graph_index` cache field
-- Loader continues using `ManifestCoordinator` directly for writes
-
-**Tests:** All existing tests pass. Add test verifying snapshot version is pinned.
-
-**~100 lines changed across db/manifest.rs, db/omnigraph.rs, exec/mod.rs.**
-
-### Step 6: Graph Index + Traversal
-
-The part that makes it a graph database. No Lance equivalent exists — this is custom.
-
-**New modules:**
-- `graph_index/mod.rs` — `GraphIndex` with `TypeIndex` (String→u32 mapping), CSR/CSC indices
-- `graph_index/csr.rs` — CSR with u32 dense indices (~40 lines)
-
-**GraphIndex — topology only, no node data:**
-
-```rust
-pub struct GraphIndex {
-    type_indices: HashMap<String, TypeIndex>,
-    csr: HashMap<String, CsrIndex>,   // outgoing
-    csc: HashMap<String, CsrIndex>,   // incoming
-}
-
-pub struct TypeIndex {
-    id_to_dense: HashMap<String, u32>,
-    dense_to_id: Vec<String>,
-}
-
-// Cache key: only edge versions, not manifest version.
-// Loading new node data does NOT invalidate the graph index.
-pub struct GraphIndexKey {
-    edge_versions: BTreeMap<String, u64>,
-}
-```
-
-**Build process** (lazy, on first traversal query):
-1. For each edge type: open sub-table via Snapshot, scan `(src, dst)` columns only
-2. Build `TypeIndex` for source and destination node types (String → dense u32)
-3. Build CSR (outgoing) and CSC (incoming)
-4. Cache on `Omnigraph` handle as `Arc<GraphIndex>`, keyed by `GraphIndexKey`
-
-**`Expand` execution** (in the pure function executor):
-1. Extract source String IDs from input batch
-2. Map to dense u32 via `type_indices[src_type]`
-3. BFS/DFS on CSR/CSC (sub-millisecond, in-memory)
-4. Map result u32 back to String IDs
-5. Hydrate destination nodes by opening sub-table from Snapshot and scanning by ID
-
-**`AntiJoin` execution:**
-1. Execute inner pipeline against the same Snapshot (produces a set of IDs)
-2. Filter outer binding: keep rows where ID is NOT in the inner set
-
-**`warm()`:** Pre-builds the graph index: take snapshot → build index → cache. Returns immediately if cached for current edge versions.
-
-**Test:** Execute `friends_of`, `friends_of_friends`, `employees_of`, `unemployed` from `test.gq`.
-
-**~400 lines new (graph index), ~200 lines new (traverse/anti-join in exec).**
-
 ### Step 7: Mutations
 
-Insert, update, delete with schema-driven edge cascade.
+Insert, update, delete nodes and edges with schema-driven edge cascade.
 
-**Insert:** Generate `id` (`@key` or ULID), build RecordBatch, append to sub-table, commit manifest.
+#### Compiler Types Already Available
 
-**Update:** `merge_insert` on sub-table keyed by `id`, commit manifest.
+The full mutation pipeline exists in the compiler — parsing, typechecking, and IR lowering are done. Only the runtime execution is missing.
 
-**Delete with cascade:** Query sub-table for matching IDs, Lance `delete()` (deletion vectors), cascade to edge sub-tables where `src` or `dst` matches, commit manifest, invalidate graph index cache.
+**Query grammar** (`crates/omnigraph-compiler/src/query/query.pest:27-32`):
+```
+insert Person { name: $name, age: $age }
+update Person set { age: $age } where name = $name
+delete Person where name = $name
+```
 
-**Test:** Insert a Person, query it back. Update a property, verify. Delete a Person, verify cascade.
+**AST** (`crates/omnigraph-compiler/src/query/ast.rs:184-221`):
+- `Mutation::Insert(InsertMutation)` — type_name + assignments
+- `Mutation::Update(UpdateMutation)` — type_name + assignments + predicate
+- `Mutation::Delete(DeleteMutation)` — type_name + predicate
+- `MutationAssignment { property, value: MatchValue }`
+- `MutationPredicate { property, op: CompOp, value: MatchValue }`
 
-**~300 lines new.**
+**Typechecker** (`crates/omnigraph-compiler/src/query/typecheck.rs:180-393`):
+- `typecheck_query_decl()` → `CheckedQuery::Mutation(MutationTypeContext { target_type })`
+- Insert: validates all non-nullable properties provided, validates edge `from`/`to` endpoints
+- Update: validates property existence and types, validates predicate, **rejects edge updates** (T16)
+- Delete: validates predicate for both nodes and edges
+
+**IR** (`crates/omnigraph-compiler/src/ir/mod.rs:18-53`):
+- `MutationIR { name, params, op: MutationOpIR }`
+- `MutationOpIR::Insert { type_name, assignments: Vec<IRAssignment> }`
+- `MutationOpIR::Update { type_name, assignments, predicate: IRMutationPredicate }`
+- `MutationOpIR::Delete { type_name, predicate: IRMutationPredicate }`
+- `IRAssignment { property: String, value: IRExpr }`
+- `IRMutationPredicate { property: String, op: CompOp, value: IRExpr }`
+
+**Lowering** (`crates/omnigraph-compiler/src/ir/lower.rs:63-112`):
+- `lower_mutation_query(query: &QueryDecl) -> Result<MutationIR>`
+- Already handles params → `IRExpr::Param`, literals → `IRExpr::Literal`, `now()` → reserved param
+
+**Result types** (`crates/omnigraph-compiler/src/result.rs`):
+- `MutationResult { affected_nodes: usize, affected_edges: usize }`
+- `RunResult::Mutation(MutationResult)` — the return type for mutation queries
+
+**Public re-exports** (`crates/omnigraph-compiler/src/lib.rs`):
+- `omnigraph_compiler::lower_mutation_query`
+- `omnigraph_compiler::find_named_query`
+- `omnigraph_compiler::MutationResult`
+- `omnigraph_compiler::RunResult`
+- `omnigraph_compiler::query::typecheck::{typecheck_query_decl, CheckedQuery}`
+
+#### Runtime to Build
+
+**File: `crates/omnigraph/src/exec/mod.rs`** (~150 lines)
+
+Add `Omnigraph::run_mutation()`:
+
+```rust
+impl Omnigraph {
+    pub async fn run_mutation(
+        &mut self,
+        query_source: &str,
+        query_name: &str,
+        params: &ParamMap,
+    ) -> Result<MutationResult> {
+        let query_decl = find_named_query(query_source, query_name)...;
+        let checked = typecheck_query_decl(self.catalog(), &query_decl)?;
+        // Must be CheckedQuery::Mutation
+        let ir = lower_mutation_query(&query_decl)?;
+        execute_mutation(&ir, params, &mut self).await
+    }
+}
+```
+
+Add `execute_mutation()` pure function:
+
+```rust
+async fn execute_mutation(
+    ir: &MutationIR,
+    params: &ParamMap,
+    db: &mut Omnigraph,
+) -> Result<MutationResult> {
+    match &ir.op {
+        MutationOpIR::Insert { type_name, assignments } => { ... }
+        MutationOpIR::Update { type_name, assignments, predicate } => { ... }
+        MutationOpIR::Delete { type_name, predicate } => { ... }
+    }
+}
+```
+
+Note: `execute_mutation` takes `&mut Omnigraph` (not pure) because it writes to Lance and commits the manifest. This is intentional — mutations are side-effectful.
+
+#### Insert Implementation
+
+For **node insert**:
+1. Resolve param values from `IRExpr::Param` / `IRExpr::Literal` using the existing `literal_to_sql` pattern
+2. Build a single-row `RecordBatch` with the node schema:
+   - `id` = `@key` property value (from assignments) or `ulid::Ulid::new().to_string()`
+   - Property columns from assignments, nulls for unassigned nullable props
+   - Follow pattern: `loader/mod.rs:build_node_batch()` but for a single row from IR assignments
+3. Open the sub-table: `snapshot.entry("node:{type_name}").table_path` → `Dataset::open(full_path)`
+4. Append: `ds.append(reader, None).await` (follow `loader/mod.rs:375-387` pattern)
+5. Commit manifest with new version: `db.manifest_mut().commit(&[SubTableUpdate { ... }])`
+6. Return `MutationResult { affected_nodes: 1, affected_edges: 0 }`
+
+For **edge insert**:
+1. `from` and `to` assignments map to `src` and `dst` columns
+2. `id` = `ulid::Ulid::new().to_string()` (edges never have `@key`)
+3. Same append + commit pattern
+4. **Invalidate graph index**: `db.cached_graph_index = None`
+5. Return `MutationResult { affected_nodes: 0, affected_edges: 1 }`
+
+#### Update Implementation
+
+1. Resolve predicate: `IRMutationPredicate { property, op, value }` → Lance SQL filter string (reuse `ir_filter_to_sql` / `literal_to_sql` from exec)
+2. Build a RecordBatch of the rows to update:
+   - Scan with predicate filter to get existing rows
+   - For each matched row, apply assignments (overwrite column values)
+3. `merge_insert` keyed by `id` (follow `loader/mod.rs:389-411` pattern):
+   ```rust
+   MergeInsertBuilder::try_new(ds, vec!["id".to_string()])
+       .when_matched(WhenMatched::UpdateAll)
+       .when_not_matched(WhenNotMatched::DoNothing)
+   ```
+4. Commit manifest
+5. Return `MutationResult { affected_nodes: count, affected_edges: 0 }`
+
+Note: typechecker rejects edge updates (T16), so we only handle node updates.
+
+#### Delete Implementation
+
+1. Resolve predicate → Lance SQL filter string
+2. Scan to find matching IDs: `ds.scan().project(&["id"]).filter(sql).try_into_stream()`
+3. Delete: `ds.delete(&predicate_sql).await` — Lance uses deletion vectors (soft delete, no rewrite)
+4. **Edge cascade** (node deletes only):
+   - For each edge type where `from_type == deleted_type` or `to_type == deleted_type`:
+     - Build cascade filter: `src IN ({deleted_ids})` or `dst IN ({deleted_ids})`
+     - `edge_ds.delete(&cascade_filter).await`
+     - BTree indices on `src`/`dst` (from Step 6 `ensure_indices`) make this efficient
+5. Commit manifest with updated versions for all changed sub-tables
+6. **Invalidate graph index**: `db.cached_graph_index = None` (if any edges deleted)
+7. Return `MutationResult { affected_nodes: N, affected_edges: M }`
+
+Edge deletes: same as step 3 but no cascade. Set `affected_edges` only.
+
+#### Lance APIs Used
+
+- `Dataset::open(uri)` — open sub-table for writing
+- `ds.append(reader, None)` — insert rows (append mode)
+- `MergeInsertBuilder::try_new(ds, keys).when_matched(UpdateAll)` — upsert for updates
+- `ds.delete(predicate)` — soft delete with deletion vectors
+- `ds.count_rows(Some(filter))` — count affected rows before delete
+- All existing in the codebase from loader/manifest code
+
+#### Graph Index Invalidation
+
+After any mutation that changes edges (insert edge, delete node with cascade, delete edge):
+```rust
+self.cached_graph_index = None;
+```
+Next traversal query will rebuild. This is the single-slot cache pattern from Step 5a.
+
+#### Test Cases (`crates/omnigraph/tests/end_to_end.rs`)
+
+Use test schema from `test.pg` (Person @key name, Company @key name, Knows, WorksAt).
+
+```rust
+// 1. Insert node, query it back
+query insert_person($name: String, $age: I32) {
+    insert Person { name: $name, age: $age }
+}
+// Run with params name="Eve", age=22
+// Then run get_person("Eve") → should return 1 row
+
+// 2. Insert edge, verify traversal
+query add_friend($from: String, $to: String) {
+    insert Knows { from: $from, to: $to }
+}
+// Run add_friend("Eve", "Alice")
+// Then run friends_of("Eve") → should return Alice
+
+// 3. Update node property
+query set_age($name: String, $age: I32) {
+    update Person set { age: $age } where name = $name
+}
+// Run set_age("Alice", 31)
+// Then run get_person("Alice") → age should be 31
+
+// 4. Delete node with edge cascade
+query remove_person($name: String) {
+    delete Person where name = $name
+}
+// Run remove_person("Alice")
+// get_person("Alice") → 0 rows
+// Knows edges from/to Alice should be gone
+// WorksAt edges from Alice should be gone
+
+// 5. Delete edge
+query remove_friendship($from: String) {
+    delete Knows where src = $from
+}
+```
+
+**Expected: ~5 new tests, ~150 lines in exec/mod.rs, ~80 lines in end_to_end.rs. Total: ~190 tests.**
+
+---
 
 ### Step 8: Search Predicates
 
-Replace brute-force search with Lance FTS.
+Replace brute-force search with Lance FTS and vector indexes.
 
-- `search()` → Lance FTS `contains_tokens`
-- `fuzzy()` → Lance n-gram FTS index
-- `match_text()` → Lance FTS `phrase` query
-- `bm25()` → Lance FTS `match` with BM25 scoring
-- `nearest()` → Lance ANN via `scanner.nearest()`
-- `rrf()` → application-level score fusion
+#### Compiler Types Already Available
 
-**~300 lines new.**
+The query AST and IR already support all search expressions. Typechecking validates field types and parameter types. Only the runtime execution is missing.
+
+**IR expressions** (`crates/omnigraph-compiler/src/ir/mod.rs:91-131`):
+- `IRExpr::Nearest { variable, property, query }` — vector similarity
+- `IRExpr::Search { field, query }` — full-text search
+- `IRExpr::Fuzzy { field, query, max_edits }` — fuzzy text match
+- `IRExpr::MatchText { field, query }` — exact phrase match
+- `IRExpr::Bm25 { field, query }` — BM25 scoring
+- `IRExpr::Rrf { primary, secondary, k }` — reciprocal rank fusion
+
+**Query grammar examples** (`crates/omnigraph-compiler/src/query/query.pest`):
+```
+search($p.title, "machine learning")
+fuzzy($p.name, "alice", 2)
+match_text($p.bio, "data scientist")
+nearest($p.embedding, $query_vector)
+bm25($p.title, "AI models")
+rrf(nearest($p.embedding, $vec), bm25($p.title, $text))
+```
+
+#### Lance FTS APIs to Use
+
+Lance 3.0 provides FTS through scalar indices:
+
+**Index creation** (extend `ensure_indices` in `db/omnigraph.rs`):
+```rust
+// For @index String properties — create FTS inverted index
+ds.create_index_builder(&["title"], IndexType::Inverted, &params).await;
+
+// For Vector properties — create IVF-PQ or IVF-HNSW index
+// (requires lance::index::vector::VectorIndexParams)
+ds.create_index_builder(&["embedding"], IndexType::IvfHnswPq, &vector_params).await;
+```
+
+**Query execution** (Lance scanner filter syntax):
+- `search()` → `scanner.filter("match_tokens(title, 'machine learning')")`
+- `fuzzy()` → `scanner.filter("match_tokens(name, 'alice', fuzzy_max_edits=2)")`
+- `match_text()` → `scanner.filter("match_phrase(bio, 'data scientist')")`
+- `bm25()` → `scanner.full_text_search(FullTextSearchQuery { query: "AI models", columns: &["title"] })`
+- `nearest()` → `scanner.nearest("embedding", &query_vector, k)` — Lance native ANN
+
+**Note:** The exact Lance FTS filter syntax and `FullTextSearchQuery` API should be verified against Lance 3.0 docs at implementation time. The scanner `.nearest()` method is well-established.
+
+#### Runtime to Build
+
+**File: `crates/omnigraph/src/exec/mod.rs`** (~150 lines)
+
+1. In `execute_node_scan`: extend filter pushdown to handle search expressions in IRFilter
+2. Add `build_search_filter()` that converts `IRExpr::Search/Fuzzy/MatchText` to Lance filter strings
+3. For `nearest()` ordering: use `scanner.nearest(column, vector, k)` instead of post-scan sort
+4. For `bm25()`: use Lance full-text search API with BM25 scoring
+5. For `rrf()`: execute two sub-queries (nearest + bm25), fuse scores at application level
+
+**File: `crates/omnigraph/src/db/omnigraph.rs`** (~30 lines)
+
+Extend `ensure_indices()`:
+- For node properties with `@index` annotation and `ScalarType::String` → create `IndexType::Inverted`
+- For node properties with `ScalarType::Vector(dim)` → create `IndexType::IvfHnswPq`
+- Access `catalog.node_types[name].indexed_properties` and `catalog.node_types[name].properties[prop].scalar`
+
+#### Index Creation (Extend `ensure_indices`)
+
+The catalog already tracks which properties need indices:
+- `NodeType::indexed_properties: HashSet<String>` — properties with `@key` or `@index`
+- `PropType::scalar` — check if `ScalarType::String` (FTS) or `ScalarType::Vector(_)` (ANN)
+
+#### Test Cases
+
+Add to signals fixture (`test/fixtures/signals.pg` already has Signal with title/source/strength) or create a search-specific fixture:
+
+```rust
+// 1. Text search
+query search_signals($query: String) {
+    match { $s: Signal }
+    return { $s.title }
+    order { search($s.title, $query) }
+    limit 5
+}
+
+// 2. Nearest vector (needs a schema with Vector type)
+query similar($vec: Vector(3)) {
+    match { $d: Doc }
+    return { $d.title }
+    order { nearest($d.embedding, $vec) }
+    limit 5
+}
+```
+
+**Expected: ~150 lines in exec/mod.rs, ~30 lines in omnigraph.rs, ~50 lines in tests. Total: ~195 tests.**
+
+---
 
 ### Step 9: Branching
 
 Lance-native branching on the manifest table + lazy sub-table branching.
 
-**Create branch:** Create Lance branch on `_manifest.lance` (zero-copy). No sub-tables branched.
+#### Lance Branch APIs Available
 
-**First write on branch:** Create Lance branch on the sub-table (shallow clone via `base_paths`). Write to the branched sub-table. Update manifest row with `table_branch`.
+From `lance::Dataset` (verified in docs):
 
-**Read from branch:** Open manifest at the branch → Snapshot → open sub-tables at pinned versions.
+```rust
+// Create a new branch (zero-copy — inherits all data)
+ds.create_branch(branch_name: &str).await?;
 
-**Merge:** Diff using `_row_created_at_version` / `_row_last_updated_at_version`. Apply via `merge_insert` keyed by `id`.
+// Open dataset at a specific branch
+let ds = Dataset::open(uri).await?;
+let ds = ds.checkout_branch(branch_name).await?;
 
-**~500 lines new.**
+// List branches
+let branches: Vec<String> = ds.list_branches().await?;
+
+// Delete a branch
+ds.delete_branch(branch_name).await?;
+
+// Shallow clone (cross-location, uses base_paths)
+ds.shallow_clone(dest_uri, base_paths).await?;
+```
+
+#### Design
+
+**Create branch** (`Omnigraph::branch_create`):
+1. Open `_manifest.lance` dataset
+2. `ds.create_branch("experiment")` — zero-copy, inherits all manifest rows
+3. No sub-tables branched yet — `table_branch` remains null in all manifest rows
+
+**Open at branch** (`Omnigraph::open_branch` or modify `open`):
+1. Open `_manifest.lance`
+2. `ds.checkout_branch("experiment")`
+3. Read manifest state → build Snapshot
+4. For each sub-table: if `table_branch` is null, open at `table_version` on main. If set, `ds.checkout_branch(table_branch)`.
+
+**First write on branch** (in mutation/load path):
+1. Check if sub-table has been branched (entry's `table_branch` is null)
+2. If not: open sub-table, `ds.create_branch(branch_name)`, `ds.checkout_branch(branch_name)`
+3. Write data to the branched sub-table
+4. Update manifest row: set `table_branch = branch_name`, commit manifest on the branch
+
+**Merge** (`Omnigraph::branch_merge`):
+1. Read source branch manifest and target manifest
+2. For each sub-table that differs:
+   - Open both versions
+   - Use `merge_insert` keyed by `id` to apply source changes to target
+3. Commit target manifest with new sub-table versions
+
+#### Files to Modify
+
+**`crates/omnigraph/src/db/omnigraph.rs`** (~100 lines):
+- `Omnigraph::branch_create(&mut self, name: &str) -> Result<()>`
+- `Omnigraph::open_branch(uri: &str, branch: &str) -> Result<Self>` (or add `branch` param to `open`)
+- `Omnigraph::branch_list(&self) -> Result<Vec<String>>`
+
+**`crates/omnigraph/src/db/manifest.rs`** (~80 lines):
+- `ManifestCoordinator::create_branch(&mut self, name: &str) -> Result<()>`
+- `ManifestCoordinator::open_at_branch(uri: &str, branch: &str) -> Result<Self>`
+- `Snapshot::open()` must handle `entry.table_branch` — checkout branch on sub-table if set
+
+**`crates/omnigraph/src/loader/mod.rs`** (~30 lines):
+- On first write to a sub-table on a branch: create sub-table branch, set `table_branch` in manifest
+
+#### Test Cases
+
+```rust
+// 1. Create branch, verify it exists
+db.branch_create("experiment").await?;
+let branches = db.branch_list().await?;
+assert!(branches.contains(&"experiment".to_string()));
+
+// 2. Write to branch, verify main is unaffected
+let mut branch_db = Omnigraph::open_branch(uri, "experiment").await?;
+// insert a Person on the branch
+// verify it's visible on the branch
+// reopen main — verify the person is NOT there
+
+// 3. Merge branch back
+db.branch_merge("experiment").await?;
+// verify the person is now visible on main
+
+// 4. Branch read isolation
+// load data on main after branching — branch shouldn't see it until refresh
+```
+
+**Expected: ~210 lines across manifest/omnigraph/loader, ~80 lines in tests. Total: ~201 tests.**
+
+---
 
 ### Step 10: Change Tracking + CLI
 
-- `omnigraph changes --since N` — query `_row_created_at_version` / `_row_last_updated_at_version`
-- `omnigraph diff V1 V2` — version range changes
-- CLI commands: `init`, `load`, `run`, `branch create/list`, `snapshot`, `describe`, `compact`, `export`
+#### Change Tracking
 
-**~400 lines new.**
+Lance stable row IDs enable `_rowid` tracking. Version metadata on fragments enables change detection:
+
+**Changes since version N:**
+1. Compare manifest at version N vs current → find which sub-tables changed
+2. For each changed sub-table: scan with version-based filters
+
+**Diff between versions:**
+1. Checkout manifest at V1 and V2
+2. For each sub-table that differs: scan both, compute row-level diff by `id`
+
+#### CLI Commands
+
+**File: `crates/omnigraph-cli/src/main.rs`** — currently stubbed, all commands print "not yet implemented".
+
+Wire each command to the `Omnigraph` API:
+
+| Command | Implementation |
+|---|---|
+| `omnigraph init --schema <file> <uri>` | `Omnigraph::init(uri, &fs::read_to_string(schema)?)` |
+| `omnigraph load --data <file> <uri>` | `Omnigraph::open(uri)` → `load_jsonl_file(&mut db, data, LoadMode::Merge)` |
+| `omnigraph run --query <file> --name <name> [--param key=val] <uri>` | `db.run_query(source, name, &params)` → print JSON |
+| `omnigraph branch create <name> <uri>` | `db.branch_create(name)` |
+| `omnigraph branch list <uri>` | `db.branch_list()` → print |
+| `omnigraph snapshot [--branch <b>] [--json] <uri>` | `db.snapshot()` → print entries |
+| `omnigraph describe <uri>` | Print schema + catalog + manifest summary |
+| `omnigraph compact <uri>` | `Dataset::compact_files()` on each sub-table |
+
+**Tokio runtime:** The CLI main function needs `#[tokio::main]` since all Omnigraph methods are async. Currently uses sync `fn main()`.
+
+**Param parsing for `run`:** Parse `--param name=value` pairs into `ParamMap`. Handle `$` prefix stripping (params stored without `$`). Detect type from value format (quoted → String, numeric → Integer, etc.) or accept `--param-json` for typed params.
+
+#### Files to Modify
+
+**`crates/omnigraph-cli/src/main.rs`** (~200 lines):
+- Add `#[tokio::main]` to main
+- Wire each subcommand to the Omnigraph API
+- Add `Run` subcommand with `--query`, `--name`, `--param` args
+- Add `Describe` subcommand
+- JSON output formatting for query results
+
+**`crates/omnigraph/src/db/omnigraph.rs`** (~30 lines):
+- `Omnigraph::describe(&self) -> String` — human-readable summary
+
+#### Test Cases
+
+CLI tests can be integration tests using `assert_cmd` crate, or just verify the API layer works:
+
+```rust
+// 1. Init via CLI args → open → verify
+// 2. Load via CLI → query → verify results
+// 3. Branch create via CLI → list → verify
+```
+
+**Expected: ~230 lines in CLI, ~30 lines in omnigraph.rs. Total: ~205 tests.**
 
 ---
 
 ## Dependency Graph
 
 ```
-Steps 0–5 ✅
-  └→ Step 5a ▶ (snapshot + pure executor + graph index cache slot)
-       ├→ Step 6 (graph index + traversal — uses snapshot for reads, cache for index)
-       ├→ Step 7 (mutations — uses manifest for writes, invalidates graph index)
-       ├→ Step 8 (search — uses snapshot for reads)
-       └→ Step 9 (branching — uses manifest for branch ops)
-            └→ Step 10 (changes, diff, CLI)
+Steps 0–6 ✅
+     ├→ Step 7 (mutations — writes to Lance, edge cascade, index invalidation)
+     ├→ Step 8 (search — Lance FTS/ANN, index creation)
+     └→ Step 9 (branching — Lance branches on manifest + sub-tables)
+          └→ Step 10 (change tracking + CLI)
 ```
 
-**Critical path:** 5a → 6 (snapshot refactor enables traversal)
+Steps 7, 8, 9 can proceed in parallel. Step 10 depends on 9 (branching CLI) but the core CLI wiring can start anytime.
 
-Steps 6, 7, 8, 9 can proceed in parallel after 5a.
+**Critical path:** Step 7 (mutations make the database writable beyond initial load).
 
 ---
 
@@ -401,15 +631,40 @@ Steps 6, 7, 8, 9 can proceed in parallel after 5a.
 | 2 | +5 (manifest CRUD) | 154 |
 | 3 | +3 (init/open) | 157 |
 | 4 | +6 unit, +11 integration | 178 |
-| 5 | +4 query tests (in end_to_end.rs) | 178 (included above) |
-| 5a | ~1 new | ~179 |
-| 6 | ~6 new | ~185 |
-| 7 | ~4 new | ~189 |
-| 8 | ~4 new | ~193 |
-| 9 | ~6 new | ~199 |
-| 10 | ~3 new | ~202 |
+| 5 | +4 query tests (in end_to_end.rs) | 178 |
+| 5a | +1 (snapshot pinning) | 179 |
+| 6 | +5 (traversal + anti-join + optimizations) | 184 |
+| 7 | ~5 new (insert/update/delete/cascade) | ~189 |
+| 8 | ~4 new (search/fuzzy/nearest) | ~193 |
+| 9 | ~6 new (branch create/read/merge) | ~199 |
+| 10 | ~3 new (CLI) | ~202 |
 
-**Current: 178 tests passing.** Target: ~202 at completion.
+**Current: 184 tests passing.** Target: ~202 at completion.
+
+---
+
+## Key Patterns to Follow
+
+**Writing to Lance** — follow `loader/mod.rs:345-413` (`write_batch_to_dataset`):
+- Append: `ds.append(reader, None)`
+- Merge: `MergeInsertBuilder::try_new(Arc::new(ds), vec!["id".to_string()])`
+- Overwrite: `Dataset::write(reader, uri, Some(WriteParams { mode: WriteMode::Overwrite, ... }))`
+
+**Building RecordBatches** — follow `loader/mod.rs:188-251` (`build_node_batch`, `build_edge_batch`):
+- Schema from `catalog.node_types[name].arrow_schema`
+- `id` column first, then properties
+
+**Lance SQL filters** — follow `exec/mod.rs:399-443` (`build_lance_filter`, `literal_to_sql`):
+- String values: `format!("'{}'", s.replace('\'', "''"))`
+- IN filters: `format!("id IN ({})", escaped.join(", "))`
+
+**Manifest commit** — follow `loader/mod.rs:182-184`:
+- Collect `SubTableUpdate` per changed table
+- `db.manifest_mut().commit(&updates).await?`
+
+**Graph index invalidation** — set `self.cached_graph_index = None` after any edge mutation (field on `Omnigraph` struct in `db/omnigraph.rs:26`).
+
+**Error handling** — `OmniError::Lance(e.to_string())` for Lance errors, `OmniError::Manifest(msg)` for logic errors, `OmniError::Compiler(e)` for compiler errors (auto via `From`).
 
 ---
 
@@ -423,3 +678,6 @@ Steps 6, 7, 8, 9 can proceed in parallel after 5a.
 6. **DuckDB fallback.** For graphs > ~5M edges. Defer until scale demands.
 7. **MemWAL.** For high-throughput streaming ingest. Branch-per-writer handles multi-agent concurrency without it.
 8. **Service layer / HTTP API.** `Omnigraph` struct IS the cache — a service just keeps it alive.
+9. **Binary ULIDs.** Switch `id` from Utf8 to `FixedSizeBinary(16)` for performance. See `omnigraph-specs.md` Identity Model section. Trigger: profile TypeIndex build in production-scale graphs.
+10. **Row-correlated bindings.** The executor uses flat per-variable RecordBatches. Multi-variable returns across traversal hops break when row counts differ. Needs tuple-based binding model for v0.2.0.
+11. **take_rows() hydration.** Use Lance stable row ID addresses for O(1) node hydration instead of `IN (...)` filter. Deferred — scalar indices already make the IN filter fast.
