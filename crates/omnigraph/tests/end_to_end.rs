@@ -1,37 +1,13 @@
+mod helpers;
+
 use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
 
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::{LoadMode, load_jsonl, load_jsonl_file};
-use omnigraph_compiler::query::ast::Literal;
 use omnigraph_compiler::ir::ParamMap;
 
-const TEST_SCHEMA: &str = include_str!("fixtures/test.pg");
-const TEST_DATA: &str = include_str!("fixtures/test.jsonl");
-const TEST_QUERIES: &str = include_str!("fixtures/test.gq");
-
-/// Helper: init a repo and load the test data.
-async fn init_and_load(dir: &tempfile::TempDir) -> Omnigraph {
-    let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
-        .await
-        .unwrap();
-    db
-}
-
-/// Helper: read all rows from a sub-table by table_key.
-async fn read_table(db: &Omnigraph, table_key: &str) -> Vec<RecordBatch> {
-    let snap = db.snapshot();
-    let ds = snap.open(table_key).await.unwrap();
-    ds.scan()
-        .try_into_stream()
-        .await
-        .unwrap()
-        .try_collect()
-        .await
-        .unwrap()
-}
+use helpers::*;
 
 // ─── Init + Load ────────────────────────────────────────────────────────────
 
@@ -97,17 +73,9 @@ async fn node_ids_are_key_values() {
     let mut db = init_and_load(&dir).await;
 
     let batches = read_table(&db, "node:Person").await;
-    let batch = &batches[0];
-    let ids = batch
-        .column_by_name("id")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-
-    let mut id_values: Vec<&str> = (0..ids.len()).map(|i| ids.value(i)).collect();
-    id_values.sort();
-    assert_eq!(id_values, vec!["Alice", "Bob", "Charlie", "Diana"]);
+    let mut ids = collect_column_strings(&batches, "id");
+    ids.sort();
+    assert_eq!(ids, vec!["Alice", "Bob", "Charlie", "Diana"]);
 }
 
 #[tokio::test]
@@ -293,30 +261,13 @@ async fn signals_fixture_loads_correctly() {
         .try_collect()
         .await
         .unwrap();
-    let ids = batches[0]
-        .column_by_name("id")
-        .unwrap()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    let id_values: Vec<&str> = (0..ids.len()).map(|i| ids.value(i)).collect();
+    let ids = collect_column_strings(&batches, "id");
     // Should contain slug values like "aws", "openai", etc.
-    assert!(id_values.contains(&"aws"));
-    assert!(id_values.contains(&"openai"));
+    assert!(ids.contains(&"aws".to_string()));
+    assert!(ids.contains(&"openai".to_string()));
 }
 
 // ─── Query execution ────────────────────────────────────────────────────────
-
-fn params(pairs: &[(&str, &str)]) -> ParamMap {
-    pairs
-        .iter()
-        .map(|(k, v)| {
-            // Strip leading $ if present — the IR stores param names without $
-            let key = k.strip_prefix('$').unwrap_or(k);
-            (key.to_string(), Literal::String(v.to_string()))
-        })
-        .collect()
-}
 
 #[tokio::test]
 async fn query_get_person_by_name() {
@@ -547,47 +498,6 @@ query unemployed() {
 }
 
 // ─── Mutations ───────────────────────────────────────────────────────────────
-
-const MUTATION_QUERIES: &str = r#"
-query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
-}
-
-query add_friend($from: String, $to: String) {
-    insert Knows { from: $from, to: $to }
-}
-
-query set_age($name: String, $age: I32) {
-    update Person set { age: $age } where name = $name
-}
-
-query remove_person($name: String) {
-    delete Person where name = $name
-}
-
-query remove_friendship($from: String) {
-    delete Knows where from = $from
-}
-"#;
-
-fn int_params(pairs: &[(&str, i64)]) -> ParamMap {
-    pairs
-        .iter()
-        .map(|(k, v)| {
-            let key = k.strip_prefix('$').unwrap_or(k);
-            (key.to_string(), Literal::Integer(*v))
-        })
-        .collect()
-}
-
-fn mixed_params(str_pairs: &[(&str, &str)], int_pairs: &[(&str, i64)]) -> ParamMap {
-    let mut map = params(str_pairs);
-    for (k, v) in int_pairs {
-        let key = k.strip_prefix('$').unwrap_or(k);
-        map.insert(key.to_string(), Literal::Integer(*v));
-    }
-    map
-}
 
 #[tokio::test]
 async fn mutation_insert_node() {

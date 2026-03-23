@@ -14,7 +14,7 @@ pub struct TypeIndex {
 }
 
 impl TypeIndex {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             id_to_dense: HashMap::new(),
             dense_to_id: Vec::new(),
@@ -22,7 +22,7 @@ impl TypeIndex {
     }
 
     /// Get or insert a string ID, returning its dense index.
-    fn get_or_insert(&mut self, id: &str) -> u32 {
+    pub(crate) fn get_or_insert(&mut self, id: &str) -> u32 {
         if let Some(&idx) = self.id_to_dense.get(id) {
             return idx;
         }
@@ -55,7 +55,7 @@ pub struct CsrIndex {
 }
 
 impl CsrIndex {
-    fn build(num_nodes: usize, edges: &[(u32, u32)]) -> Self {
+    pub(crate) fn build(num_nodes: usize, edges: &[(u32, u32)]) -> Self {
         // Count outgoing edges per source
         let mut counts = vec![0u32; num_nodes];
         for &(src, _) in edges {
@@ -214,5 +214,75 @@ impl GraphIndex {
 
     pub fn csc(&self, edge_type: &str) -> Option<&CsrIndex> {
         self.csc.get(edge_type)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn type_index_round_trip() {
+        let mut idx = TypeIndex::new();
+        let a = idx.get_or_insert("Alice");
+        let b = idx.get_or_insert("Bob");
+        let c = idx.get_or_insert("Charlie");
+
+        assert_eq!(idx.to_dense("Alice"), Some(a));
+        assert_eq!(idx.to_dense("Bob"), Some(b));
+        assert_eq!(idx.to_dense("Charlie"), Some(c));
+
+        assert_eq!(idx.to_id(a), Some("Alice"));
+        assert_eq!(idx.to_id(b), Some("Bob"));
+        assert_eq!(idx.to_id(c), Some("Charlie"));
+        assert_eq!(idx.len(), 3);
+    }
+
+    #[test]
+    fn type_index_idempotent_insert() {
+        let mut idx = TypeIndex::new();
+        let a1 = idx.get_or_insert("Alice");
+        let a2 = idx.get_or_insert("Alice");
+        assert_eq!(a1, a2);
+        assert_eq!(idx.len(), 1);
+    }
+
+    #[test]
+    fn type_index_unknown_returns_none() {
+        let idx = TypeIndex::new();
+        assert_eq!(idx.to_dense("unknown"), None);
+        assert_eq!(idx.to_id(999), None);
+    }
+
+    #[test]
+    fn csr_neighbors_correct() {
+        // Graph: 0→1, 0→2, 1→2
+        let edges = vec![(0, 1), (0, 2), (1, 2)];
+        let csr = CsrIndex::build(3, &edges);
+
+        let mut n0: Vec<u32> = csr.neighbors(0).to_vec();
+        n0.sort();
+        assert_eq!(n0, vec![1, 2]);
+
+        assert_eq!(csr.neighbors(1), &[2]);
+        assert_eq!(csr.neighbors(2), &[] as &[u32]);
+    }
+
+    #[test]
+    fn csr_empty_graph() {
+        let csr = CsrIndex::build(3, &[]);
+        assert_eq!(csr.neighbors(0), &[] as &[u32]);
+        assert_eq!(csr.neighbors(1), &[] as &[u32]);
+        assert_eq!(csr.neighbors(2), &[] as &[u32]);
+        assert!(!csr.has_neighbors(0));
+    }
+
+    #[test]
+    fn csr_has_neighbors() {
+        // 0→1, 1→2
+        let csr = CsrIndex::build(3, &[(0, 1), (1, 2)]);
+        assert!(csr.has_neighbors(0));
+        assert!(csr.has_neighbors(1));
+        assert!(!csr.has_neighbors(2));
     }
 }

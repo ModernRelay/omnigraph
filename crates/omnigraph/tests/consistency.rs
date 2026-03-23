@@ -1,0 +1,276 @@
+mod helpers;
+
+use arrow_array::{Array, Int32Array, StringArray};
+use futures::TryStreamExt;
+
+use omnigraph::db::Omnigraph;
+use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph_compiler::ir::ParamMap;
+
+use helpers::*;
+
+// ─── Snapshot data-level isolation ──────────────────────────────────────────
+
+#[tokio::test]
+async fn snapshot_returns_stale_data_after_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    // Snapshot BEFORE mutation
+    let snap_before = db.snapshot();
+
+    // Insert a new person
+    db.run_mutation(
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+
+    // Snapshot AFTER mutation
+    let snap_after = db.snapshot();
+
+    // Old snapshot should still see 4 persons
+    let ds_before = snap_before.open("node:Person").await.unwrap();
+    assert_eq!(ds_before.count_rows(None).await.unwrap(), 4);
+
+    // New snapshot should see 5 persons
+    let ds_after = snap_after.open("node:Person").await.unwrap();
+    assert_eq!(ds_after.count_rows(None).await.unwrap(), 5);
+
+    // Verify Eve is NOT in old snapshot's data
+    let batches_before: Vec<arrow_array::RecordBatch> = ds_before
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let ids_before = collect_column_strings(&batches_before, "id");
+    assert!(!ids_before.contains(&"Eve".to_string()));
+
+    // Verify Eve IS in new snapshot's data
+    let batches_after: Vec<arrow_array::RecordBatch> = ds_after
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let ids_after = collect_column_strings(&batches_after, "id");
+    assert!(ids_after.contains(&"Eve".to_string()));
+}
+
+// ─── LoadMode::Merge ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn load_merge_upserts_existing_and_inserts_new() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+    // Load Alice(30) and Bob(25) via Overwrite
+    let initial = r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}
+{"type": "Person", "data": {"name": "Bob", "age": 25}}"#;
+    load_jsonl(&mut db, initial, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    assert_eq!(count_rows(&db, "node:Person").await, 2);
+
+    // Merge: Alice updated to age=31, Charlie is new
+    let merge_data = r#"{"type": "Person", "data": {"name": "Alice", "age": 31}}
+{"type": "Person", "data": {"name": "Charlie", "age": 35}}"#;
+    load_jsonl(&mut db, merge_data, LoadMode::Merge)
+        .await
+        .unwrap();
+
+    // Should have 3 persons total (not 4)
+    assert_eq!(count_rows(&db, "node:Person").await, 3);
+
+    // Verify individual values
+    let batches = read_table(&db, "node:Person").await;
+    let batch = &batches[0];
+    let ids = batch
+        .column_by_name("id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let ages = batch
+        .column_by_name("age")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+
+    for i in 0..batch.num_rows() {
+        match ids.value(i) {
+            "Alice" => assert_eq!(ages.value(i), 31, "Alice should be updated to 31"),
+            "Bob" => assert_eq!(ages.value(i), 25, "Bob should be unchanged"),
+            "Charlie" => assert_eq!(ages.value(i), 35, "Charlie should be inserted"),
+            other => panic!("unexpected person: {}", other),
+        }
+    }
+}
+
+// ─── Multi-writer refresh ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn refresh_sees_other_writer_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let _db = init_and_load(&dir).await;
+    drop(_db);
+
+    let uri = dir.path().to_str().unwrap();
+
+    // Two independent handles to the same repo
+    let mut db1 = Omnigraph::open(uri).await.unwrap();
+    let mut db2 = Omnigraph::open(uri).await.unwrap();
+
+    // Writer 1 inserts Eve
+    db1.run_mutation(
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+
+    // Writer 2 hasn't refreshed — should NOT see Eve
+    let qr = db2
+        .run_query(TEST_QUERIES, "get_person", &params(&[("$name", "Eve")]))
+        .await
+        .unwrap();
+    assert_eq!(qr.num_rows(), 0, "stale handle should not see Eve");
+
+    // Refresh writer 2
+    db2.refresh().await.unwrap();
+
+    // Now writer 2 should see Eve
+    let qr = db2
+        .run_query(TEST_QUERIES, "get_person", &params(&[("$name", "Eve")]))
+        .await
+        .unwrap();
+    assert_eq!(qr.num_rows(), 1, "refreshed handle should see Eve");
+}
+
+// ─── Null handling ──────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn null_values_in_filter_and_projection() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+    // Load data: Alice has age, Bob has null age, Charlie has age
+    let data = r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}
+{"type": "Person", "data": {"name": "Bob"}}
+{"type": "Person", "data": {"name": "Charlie", "age": 35}}"#;
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    // Filter: age > 30 should exclude Bob (null) and Alice (30), keep Charlie (35)
+    let queries = r#"
+query older_than_30() {
+    match {
+        $p: Person
+        $p.age > 30
+    }
+    return { $p.name, $p.age }
+    order { $p.age desc }
+}
+
+query all_persons() {
+    match { $p: Person }
+    return { $p.name, $p.age }
+    order { $p.age desc }
+}
+"#;
+
+    let result = db
+        .run_query(queries, "older_than_30", &ParamMap::new())
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 1);
+    let batch = &result.batches()[0];
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(names.value(0), "Charlie");
+
+    // Projection: Bob's age should be null
+    let all = db
+        .run_query(queries, "all_persons", &ParamMap::new())
+        .await
+        .unwrap();
+    let batch = &all.batches()[0];
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let ages = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+
+    for i in 0..batch.num_rows() {
+        if ids.value(i) == "Bob" {
+            assert!(ages.is_null(i), "Bob's age should be null");
+        }
+    }
+}
+
+// ─── Graph index after node+edge insert ─────────────────────────────────────
+
+#[tokio::test]
+async fn traversal_works_after_node_then_edge_insert() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    // Warm up the graph index cache by running a traversal
+    let _ = db
+        .run_query(TEST_QUERIES, "friends_of", &params(&[("$name", "Alice")]))
+        .await
+        .unwrap();
+
+    // Insert a new node (does NOT invalidate graph index)
+    db.run_mutation(
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Frank")], &[("$age", 40)]),
+    )
+    .await
+    .unwrap();
+
+    // Insert an edge from Frank → Alice (DOES invalidate graph index)
+    db.run_mutation(
+        MUTATION_QUERIES,
+        "add_friend",
+        &params(&[("$from", "Frank"), ("$to", "Alice")]),
+    )
+    .await
+    .unwrap();
+
+    // Traversal should work: Frank → Alice
+    let result = db
+        .run_query(TEST_QUERIES, "friends_of", &params(&[("$name", "Frank")]))
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 1);
+    let batch = result.concat_batches().unwrap();
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(names.value(0), "Alice");
+}
