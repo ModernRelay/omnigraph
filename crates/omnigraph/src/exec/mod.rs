@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{
@@ -14,15 +14,17 @@ use omnigraph_compiler::lower_query;
 use omnigraph_compiler::query::ast::{CompOp, Literal};
 use omnigraph_compiler::query::typecheck::typecheck_query;
 use omnigraph_compiler::result::QueryResult;
+use omnigraph_compiler::types::Direction;
 
 use crate::db::Omnigraph;
 use crate::db::Snapshot;
 use crate::error::{OmniError, Result};
+use crate::graph_index::GraphIndex;
 
 impl Omnigraph {
     /// Run a named query from a .gq query source string.
     pub async fn run_query(
-        &self,
+        &mut self,
         query_source: &str,
         query_name: &str,
         params: &ParamMap,
@@ -35,8 +37,17 @@ impl Omnigraph {
         let type_ctx = typecheck_query(self.catalog(), &query_decl)?;
         let ir = lower_query(self.catalog(), &query_decl, &type_ctx)?;
 
-        // Execute as pure function
-        execute_query(&ir, params, &snapshot, self.catalog()).await
+        // Build graph index if the query needs traversal
+        let needs_graph = ir.pipeline.iter().any(|op| {
+            matches!(op, IROp::Expand { .. } | IROp::AntiJoin { .. })
+        });
+        let graph_index = if needs_graph {
+            Some(self.graph_index().await?)
+        } else {
+            None
+        };
+
+        execute_query(&ir, params, &snapshot, graph_index.as_deref(), self.catalog()).await
     }
 }
 
@@ -45,37 +56,12 @@ pub async fn execute_query(
     ir: &QueryIR,
     params: &ParamMap,
     snapshot: &Snapshot,
+    graph_index: Option<&GraphIndex>,
     catalog: &Catalog,
 ) -> Result<QueryResult> {
-    // Walk the pipeline, building up variable bindings
     let mut bindings: HashMap<String, RecordBatch> = HashMap::new();
 
-    for op in &ir.pipeline {
-        match op {
-            IROp::NodeScan {
-                variable,
-                type_name,
-                filters,
-            } => {
-                let batch =
-                    execute_node_scan(type_name, filters, params, snapshot, catalog).await?;
-                bindings.insert(variable.clone(), batch);
-            }
-            IROp::Filter(filter) => {
-                apply_filter(&mut bindings, filter, params)?;
-            }
-            IROp::Expand { .. } => {
-                return Err(OmniError::Manifest(
-                    "graph traversal not yet implemented (Step 6)".to_string(),
-                ));
-            }
-            IROp::AntiJoin { .. } => {
-                return Err(OmniError::Manifest(
-                    "anti-join not yet implemented (Step 6)".to_string(),
-                ));
-            }
-        }
-    }
+    execute_pipeline(&ir.pipeline, params, snapshot, graph_index, catalog, &mut bindings).await?;
 
     // Project return expressions
     let mut result_batch = project_return(&bindings, &ir.return_exprs, params)?;
@@ -92,6 +78,269 @@ pub async fn execute_query(
     }
 
     Ok(QueryResult::new(result_batch.schema(), vec![result_batch]))
+}
+
+/// Execute a pipeline of IR operations, populating variable bindings.
+fn execute_pipeline<'a>(
+    pipeline: &'a [IROp],
+    params: &'a ParamMap,
+    snapshot: &'a Snapshot,
+    graph_index: Option<&'a GraphIndex>,
+    catalog: &'a Catalog,
+    bindings: &'a mut HashMap<String, RecordBatch>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
+    Box::pin(async move {
+    for op in pipeline {
+        match op {
+            IROp::NodeScan {
+                variable,
+                type_name,
+                filters,
+            } => {
+                let batch =
+                    execute_node_scan(type_name, filters, params, snapshot, catalog).await?;
+                bindings.insert(variable.clone(), batch);
+            }
+            IROp::Filter(filter) => {
+                apply_filter(bindings, filter, params)?;
+            }
+            IROp::Expand {
+                src_var,
+                dst_var,
+                edge_type,
+                direction,
+                dst_type,
+                min_hops,
+                max_hops,
+            } => {
+                let gi = graph_index.ok_or_else(|| {
+                    OmniError::Manifest("graph index required for traversal".to_string())
+                })?;
+                let batch = execute_expand(
+                    bindings, gi, snapshot, catalog, src_var, dst_var, edge_type,
+                    *direction, dst_type, *min_hops, *max_hops,
+                )
+                .await?;
+                bindings.insert(dst_var.clone(), batch);
+            }
+            IROp::AntiJoin { outer_var, inner } => {
+                let gi = graph_index;
+                execute_anti_join(
+                    bindings, inner, params, snapshot, gi, catalog, outer_var,
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(())
+    })
+}
+
+/// Execute a graph traversal (Expand).
+async fn execute_expand(
+    bindings: &HashMap<String, RecordBatch>,
+    graph_index: &GraphIndex,
+    snapshot: &Snapshot,
+    catalog: &Catalog,
+    src_var: &str,
+    _dst_var: &str,
+    edge_type: &str,
+    direction: Direction,
+    dst_type: &str,
+    min_hops: u32,
+    max_hops: Option<u32>,
+) -> Result<RecordBatch> {
+    let src_batch = bindings.get(src_var).ok_or_else(|| {
+        OmniError::Manifest(format!("expand references unbound variable '{}'", src_var))
+    })?;
+
+    let src_ids = src_batch
+        .column_by_name("id")
+        .ok_or_else(|| OmniError::Manifest("source batch missing 'id' column".to_string()))?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| OmniError::Manifest("source 'id' column is not Utf8".to_string()))?;
+
+    // Determine which type index to use for source and destination
+    let edge_def = catalog.edge_types.get(edge_type).ok_or_else(|| {
+        OmniError::Manifest(format!("unknown edge type '{}'", edge_type))
+    })?;
+
+    let (src_type_name, dst_type_name) = match direction {
+        Direction::Out => (&edge_def.from_type, &edge_def.to_type),
+        Direction::In => (&edge_def.to_type, &edge_def.from_type),
+    };
+
+    let src_type_idx = graph_index.type_index(src_type_name).ok_or_else(|| {
+        OmniError::Manifest(format!("no type index for '{}'", src_type_name))
+    })?;
+    let dst_type_idx = graph_index.type_index(dst_type_name).ok_or_else(|| {
+        OmniError::Manifest(format!("no type index for '{}'", dst_type_name))
+    })?;
+
+    let adj = match direction {
+        Direction::Out => graph_index.csr(edge_type),
+        Direction::In => graph_index.csc(edge_type),
+    }
+    .ok_or_else(|| {
+        OmniError::Manifest(format!("no adjacency index for edge '{}'", edge_type))
+    })?;
+
+    let max = max_hops.unwrap_or(min_hops.max(1));
+
+    let same_type = src_type_name == dst_type_name;
+
+    // BFS to collect reachable destination dense IDs
+    let mut result_dst_ids: Vec<String> = Vec::new();
+    for i in 0..src_ids.len() {
+        let src_id = src_ids.value(i);
+        let Some(src_dense) = src_type_idx.to_dense(src_id) else {
+            continue;
+        };
+
+        // BFS with hop tracking
+        let mut frontier: Vec<u32> = vec![src_dense];
+        let mut visited: HashSet<u32> = HashSet::new();
+        // Only track visited in the destination namespace for same-type edges
+        // (to avoid revisiting the source). For cross-type edges, dense indices
+        // are in different namespaces so collision is impossible.
+        if same_type {
+            visited.insert(src_dense);
+        }
+
+        for hop in 1..=max {
+            let mut next_frontier = Vec::new();
+            for &node in &frontier {
+                for &neighbor in adj.neighbors(node) {
+                    if !same_type || visited.insert(neighbor) {
+                        next_frontier.push(neighbor);
+                        if hop >= min_hops {
+                            if let Some(dst_id) = dst_type_idx.to_id(neighbor) {
+                                result_dst_ids.push(dst_id.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            frontier = next_frontier;
+            if frontier.is_empty() {
+                break;
+            }
+        }
+    }
+
+    // Hydrate destination nodes from the snapshot
+    hydrate_nodes(snapshot, catalog, dst_type, &result_dst_ids).await
+}
+
+/// Load full node rows for a set of IDs from a snapshot.
+async fn hydrate_nodes(
+    snapshot: &Snapshot,
+    catalog: &Catalog,
+    type_name: &str,
+    ids: &[String],
+) -> Result<RecordBatch> {
+    let node_type = catalog.node_types.get(type_name).ok_or_else(|| {
+        OmniError::Manifest(format!("unknown node type '{}'", type_name))
+    })?;
+
+    if ids.is_empty() {
+        return Ok(RecordBatch::new_empty(node_type.arrow_schema.clone()));
+    }
+
+    let table_key = format!("node:{}", type_name);
+    let ds = snapshot.open(&table_key).await?;
+
+    // Build filter: id IN ('a', 'b', 'c')
+    let escaped: Vec<String> = ids.iter().map(|id| format!("'{}'", id.replace('\'', "''"))).collect();
+    let filter_sql = format!("id IN ({})", escaped.join(", "));
+
+    let mut scanner = ds.scan();
+    scanner
+        .filter(&filter_sql)
+        .map_err(|e| OmniError::Lance(format!("hydrate filter: {}", e)))?;
+
+    let batches: Vec<RecordBatch> = scanner
+        .try_into_stream()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?
+        .try_collect()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+    if batches.is_empty() {
+        return Ok(RecordBatch::new_empty(node_type.arrow_schema.clone()));
+    }
+    if batches.len() == 1 {
+        return Ok(batches.into_iter().next().unwrap());
+    }
+
+    let schema = batches[0].schema();
+    arrow_select::concat::concat_batches(&schema, &batches)
+        .map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+/// Execute an AntiJoin: remove rows from outer_var where the inner pipeline finds matches.
+async fn execute_anti_join(
+    bindings: &mut HashMap<String, RecordBatch>,
+    inner_pipeline: &[IROp],
+    params: &ParamMap,
+    snapshot: &Snapshot,
+    graph_index: Option<&GraphIndex>,
+    catalog: &Catalog,
+    outer_var: &str,
+) -> Result<()> {
+    let outer_batch = bindings.get(outer_var).ok_or_else(|| {
+        OmniError::Manifest(format!("anti-join references unbound variable '{}'", outer_var))
+    })?;
+
+    let outer_ids = outer_batch
+        .column_by_name("id")
+        .ok_or_else(|| OmniError::Manifest("outer batch missing 'id' column".to_string()))?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| OmniError::Manifest("outer 'id' column is not Utf8".to_string()))?;
+
+    // For each outer row, run the inner pipeline and check if it produces results
+    let mut keep_mask = vec![true; outer_batch.num_rows()];
+
+    for i in 0..outer_ids.len() {
+        let outer_id = outer_ids.value(i);
+
+        // Create a single-row binding for the outer variable
+        let single_row = outer_batch.slice(i, 1);
+        let mut inner_bindings: HashMap<String, RecordBatch> = HashMap::new();
+        inner_bindings.insert(outer_var.to_string(), single_row);
+
+        // Execute the inner pipeline
+        execute_pipeline(
+            inner_pipeline,
+            params,
+            snapshot,
+            graph_index,
+            catalog,
+            &mut inner_bindings,
+        )
+        .await?;
+
+        // Check if any inner binding produced rows
+        let has_match = inner_bindings
+            .iter()
+            .filter(|(k, _)| *k != outer_var)
+            .any(|(_, batch)| batch.num_rows() > 0);
+
+        if has_match {
+            keep_mask[i] = false;
+        }
+    }
+
+    // Apply mask
+    let mask = BooleanArray::from(keep_mask);
+    let filtered = arrow_select::filter::filter_record_batch(outer_batch, &mask)
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+    bindings.insert(outer_var.to_string(), filtered);
+    Ok(())
 }
 
 /// Scan a node type's Lance dataset with optional filter pushdown.

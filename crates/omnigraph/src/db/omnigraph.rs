@@ -1,10 +1,13 @@
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use omnigraph_compiler::build_catalog;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::schema::parser::parse_schema;
 
 use crate::error::{OmniError, Result};
+use crate::graph_index::GraphIndex;
 
 use super::manifest::{ManifestCoordinator, Snapshot};
 
@@ -20,6 +23,7 @@ pub struct Omnigraph {
     manifest: ManifestCoordinator,
     catalog: Catalog,
     schema_source: String,
+    cached_graph_index: Option<Arc<GraphIndex>>,
 }
 
 impl Omnigraph {
@@ -45,6 +49,7 @@ impl Omnigraph {
             manifest,
             catalog,
             schema_source: schema_source.to_string(),
+            cached_graph_index: None,
         })
     }
 
@@ -70,6 +75,7 @@ impl Omnigraph {
             manifest,
             catalog,
             schema_source,
+            cached_graph_index: None,
         })
     }
 
@@ -97,6 +103,27 @@ impl Omnigraph {
     /// Re-read manifest from storage to see other writers' commits.
     pub async fn refresh(&mut self) -> Result<()> {
         self.manifest.refresh().await
+    }
+
+    /// Get or build the graph index for the current snapshot.
+    pub async fn graph_index(&mut self) -> Result<Arc<GraphIndex>> {
+        // For now, simple invalidation: rebuild if None.
+        // Future: key by edge sub-table versions.
+        if let Some(ref idx) = self.cached_graph_index {
+            return Ok(Arc::clone(idx));
+        }
+
+        let snapshot = self.snapshot();
+        let edge_types: HashMap<String, (String, String)> = self
+            .catalog
+            .edge_types
+            .iter()
+            .map(|(name, et)| (name.clone(), (et.from_type.clone(), et.to_type.clone())))
+            .collect();
+
+        let idx = Arc::new(GraphIndex::build(&snapshot, &edge_types).await?);
+        self.cached_graph_index = Some(Arc::clone(&idx));
+        Ok(idx)
     }
 
     pub fn manifest_mut(&mut self) -> &mut ManifestCoordinator {

@@ -68,7 +68,7 @@ async fn open_restores_full_state() {
 #[tokio::test]
 async fn load_populates_all_types() {
     let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
+    let mut db = init_and_load(&dir).await;
 
     let snap = db.snapshot();
 
@@ -94,7 +94,7 @@ async fn load_populates_all_types() {
 #[tokio::test]
 async fn node_ids_are_key_values() {
     let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
+    let mut db = init_and_load(&dir).await;
 
     let batches = read_table(&db, "node:Person").await;
     let batch = &batches[0];
@@ -113,7 +113,7 @@ async fn node_ids_are_key_values() {
 #[tokio::test]
 async fn node_properties_are_correct() {
     let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
+    let mut db = init_and_load(&dir).await;
 
     let batches = read_table(&db, "node:Person").await;
     let batch = &batches[0];
@@ -138,7 +138,7 @@ async fn node_properties_are_correct() {
 #[tokio::test]
 async fn edge_src_dst_reference_node_ids() {
     let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
+    let mut db = init_and_load(&dir).await;
 
     let batches = read_table(&db, "edge:Knows").await;
     let batch = &batches[0];
@@ -170,7 +170,7 @@ async fn edge_src_dst_reference_node_ids() {
 #[tokio::test]
 async fn edge_ids_are_unique_strings() {
     let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
+    let mut db = init_and_load(&dir).await;
 
     let batches = read_table(&db, "edge:Knows").await;
     let batch = &batches[0];
@@ -321,7 +321,7 @@ fn params(pairs: &[(&str, &str)]) -> ParamMap {
 #[tokio::test]
 async fn query_get_person_by_name() {
     let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
+    let mut db = init_and_load(&dir).await;
 
     let result = db
         .run_query(TEST_QUERIES, "get_person", &params(&[("$name", "Alice")]))
@@ -348,7 +348,7 @@ async fn query_get_person_by_name() {
 #[tokio::test]
 async fn query_get_person_not_found() {
     let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
+    let mut db = init_and_load(&dir).await;
 
     let result = db
         .run_query(
@@ -365,7 +365,7 @@ async fn query_get_person_not_found() {
 #[tokio::test]
 async fn query_adults_filtered_and_ordered() {
     let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
+    let mut db = init_and_load(&dir).await;
 
     let result = db
         .run_query(TEST_QUERIES, "adults", &ParamMap::new())
@@ -386,7 +386,7 @@ async fn query_adults_filtered_and_ordered() {
 #[tokio::test]
 async fn query_top_by_age_with_limit() {
     let dir = tempfile::tempdir().unwrap();
-    let db = init_and_load(&dir).await;
+    let mut db = init_and_load(&dir).await;
 
     let result = db
         .run_query(TEST_QUERIES, "top_by_age", &ParamMap::new())
@@ -411,4 +411,101 @@ async fn query_top_by_age_with_limit() {
         .unwrap();
     assert_eq!(ages.value(0), 35);
     assert_eq!(ages.value(1), 30);
+}
+
+// ─── Graph traversal ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn query_friends_of() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let result = db
+        .run_query(TEST_QUERIES, "friends_of", &params(&[("$name", "Alice")]))
+        .await
+        .unwrap();
+
+    // Alice knows Bob and Charlie
+    let batch = result.concat_batches().unwrap();
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut friend_names: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
+    friend_names.sort();
+    assert_eq!(friend_names, vec!["Bob", "Charlie"]);
+}
+
+#[tokio::test]
+async fn query_employees_of() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let result = db
+        .run_query(
+            TEST_QUERIES,
+            "employees_of",
+            &params(&[("$company", "Acme")]),
+        )
+        .await
+        .unwrap();
+
+    // Alice works at Acme (reverse traversal)
+    let batch = result.concat_batches().unwrap();
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(names.len(), 1);
+    assert_eq!(names.value(0), "Alice");
+}
+
+#[tokio::test]
+async fn query_friends_of_friends() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let result = db
+        .run_query(
+            TEST_QUERIES,
+            "friends_of_friends",
+            &params(&[("$name", "Alice")]),
+        )
+        .await
+        .unwrap();
+
+    // Alice→Bob→Diana (Alice→Charlie→nobody)
+    let batch = result.concat_batches().unwrap();
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut fof_names: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
+    fof_names.sort();
+    assert_eq!(fof_names, vec!["Diana"]);
+}
+
+#[tokio::test]
+async fn query_unemployed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let result = db
+        .run_query(TEST_QUERIES, "unemployed", &ParamMap::new())
+        .await
+        .unwrap();
+
+    // Charlie and Diana have no WorksAt edges
+    let batch = result.concat_batches().unwrap();
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut unemployed: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
+    unemployed.sort();
+    assert_eq!(unemployed, vec!["Charlie", "Diana"]);
 }
