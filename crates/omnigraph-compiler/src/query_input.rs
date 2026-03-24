@@ -419,6 +419,14 @@ fn json_value_to_literal_typed(
                 )),
             }),
         },
+        "Blob" => match value {
+            Value::String(value) => Ok(Literal::String(value.clone())),
+            other => Err(RunInputError::message(format!(
+                "param '{}': expected blob URI string, got {}",
+                key,
+                json_type_name(other)
+            ))),
+        },
         other if other.starts_with("Vector(") => {
             let expected_dim = parse_vector_dim(other).ok_or_else(|| match mode {
                 JsonParamMode::Standard => RunInputError::message(format!(

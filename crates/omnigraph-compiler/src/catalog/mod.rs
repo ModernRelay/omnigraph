@@ -24,6 +24,7 @@ pub struct NodeType {
     /// Maps @embed target property -> source text property.
     pub embed_sources: HashMap<String, String>,
     pub indexed_properties: HashSet<String>,
+    pub blob_properties: HashSet<String>,
     pub arrow_schema: SchemaRef,
 }
 
@@ -33,6 +34,7 @@ pub struct EdgeType {
     pub from_type: String,
     pub to_type: String,
     pub properties: HashMap<String, PropType>,
+    pub blob_properties: HashSet<String>,
     pub arrow_schema: SchemaRef,
 }
 
@@ -75,9 +77,13 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
             let mut properties = HashMap::new();
             let mut embed_sources = HashMap::new();
             let mut indexed_properties = HashSet::new();
+            let mut blob_properties = HashSet::new();
             let mut key_property: Option<String> = None;
             for prop in &node.properties {
                 properties.insert(prop.name.clone(), prop.prop_type.clone());
+                if matches!(prop.prop_type.scalar, ScalarType::Blob) {
+                    blob_properties.insert(prop.name.clone());
+                }
                 if prop.annotations.iter().any(|a| a.name == "key") {
                     key_property = Some(prop.name.clone());
                 }
@@ -90,7 +96,8 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                     embed_sources.insert(prop.name.clone(), source_prop);
                 }
                 let scalar_index_eligible =
-                    !prop.prop_type.list && !matches!(prop.prop_type.scalar, ScalarType::Vector(_));
+                    !prop.prop_type.list
+                    && !matches!(prop.prop_type.scalar, ScalarType::Vector(_) | ScalarType::Blob);
                 if scalar_index_eligible
                     && prop
                         .annotations
@@ -120,6 +127,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                     key_property,
                     embed_sources,
                     indexed_properties,
+                    blob_properties,
                     arrow_schema,
                 },
             );
@@ -149,6 +157,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
             }
 
             let mut properties = HashMap::new();
+            let mut blob_properties = HashSet::new();
             let mut fields = vec![
                 Field::new("id", DataType::Utf8, false),
                 Field::new("src", DataType::Utf8, false),
@@ -156,6 +165,9 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
             ];
             for prop in &edge.properties {
                 properties.insert(prop.name.clone(), prop.prop_type.clone());
+                if matches!(prop.prop_type.scalar, ScalarType::Blob) {
+                    blob_properties.insert(prop.name.clone());
+                }
                 fields.push(Field::new(
                     &prop.name,
                     prop.prop_type.to_arrow(),
@@ -173,6 +185,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                     from_type: edge.from_type.clone(),
                     to_type: edge.to_type.clone(),
                     properties,
+                    blob_properties,
                     arrow_schema: Arc::new(Schema::new(fields)),
                 },
             );

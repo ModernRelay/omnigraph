@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Cursor};
 use std::sync::Arc;
 
@@ -7,6 +7,8 @@ use arrow_array::{
     RecordBatch, RecordBatchIterator, StringArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, SchemaRef};
+use base64::Engine;
+use lance::blob::BlobArrayBuilder;
 use lance::dataset::{WriteMode, WriteParams};
 use lance::Dataset;
 use lance_file::version::LanceFileVersion;
@@ -216,8 +218,13 @@ fn build_node_batch(node_type: &NodeType, rows: &[JsonValue]) -> Result<RecordBa
 
     // Build property columns (skip "id" field at index 0)
     for field in schema.fields().iter().skip(1) {
-        let col = build_column_from_json(field.name(), field.data_type(), field.is_nullable(), rows)?;
-        columns.push(col);
+        if node_type.blob_properties.contains(field.name()) {
+            let col = build_blob_column(field.name(), field.is_nullable(), rows)?;
+            columns.push(col);
+        } else {
+            let col = build_column_from_json(field.name(), field.data_type(), field.is_nullable(), rows)?;
+            columns.push(col);
+        }
     }
 
     RecordBatch::try_new(schema, columns).map_err(|e| OmniError::Lance(e.to_string()))
@@ -241,16 +248,74 @@ fn build_edge_batch(
     // Build edge property columns (skip id, src, dst at indices 0-2)
     let data_values: Vec<JsonValue> = rows.iter().map(|(_, _, data)| data.clone()).collect();
     for field in schema.fields().iter().skip(3) {
-        let col = build_column_from_json(
-            field.name(),
-            field.data_type(),
-            field.is_nullable(),
-            &data_values,
-        )?;
-        columns.push(col);
+        if edge_type.blob_properties.contains(field.name()) {
+            let col = build_blob_column(field.name(), field.is_nullable(), &data_values)?;
+            columns.push(col);
+        } else {
+            let col = build_column_from_json(
+                field.name(),
+                field.data_type(),
+                field.is_nullable(),
+                &data_values,
+            )?;
+            columns.push(col);
+        }
     }
 
     RecordBatch::try_new(schema, columns).map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+/// Append a blob value (URI or base64 bytes) to a BlobArrayBuilder.
+pub(crate) fn append_blob_value(builder: &mut BlobArrayBuilder, value: &str) -> Result<()> {
+    if let Some(encoded) = value.strip_prefix("base64:") {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|e| OmniError::Manifest(format!("invalid base64 blob data: {}", e)))?;
+        builder
+            .push_bytes(bytes)
+            .map_err(|e| OmniError::Lance(e.to_string()))
+    } else {
+        // Treat as URI (file://, s3://, gs://, or any other scheme)
+        builder
+            .push_uri(value)
+            .map_err(|e| OmniError::Lance(e.to_string()))
+    }
+}
+
+/// Build a blob column from JSON values using Lance BlobArrayBuilder.
+fn build_blob_column(
+    name: &str,
+    nullable: bool,
+    rows: &[JsonValue],
+) -> Result<ArrayRef> {
+    let mut builder = BlobArrayBuilder::new(rows.len());
+    for row in rows {
+        match row.get(name) {
+            Some(JsonValue::String(s)) => {
+                append_blob_value(&mut builder, s)?;
+            }
+            Some(JsonValue::Null) | None if nullable => {
+                builder
+                    .push_null()
+                    .map_err(|e| OmniError::Lance(e.to_string()))?;
+            }
+            Some(JsonValue::Null) | None => {
+                return Err(OmniError::Manifest(format!(
+                    "non-nullable blob property '{}' has null values",
+                    name
+                )));
+            }
+            _ => {
+                return Err(OmniError::Manifest(format!(
+                    "blob property '{}' must be a URI string or base64: prefixed data",
+                    name
+                )));
+            }
+        }
+    }
+    builder
+        .finish()
+        .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
 fn build_column_from_json(
@@ -394,6 +459,7 @@ async fn write_batch_to_dataset(
                 mode: WriteMode::Overwrite,
                 enable_stable_row_ids: true,
                 data_storage_version: Some(LanceFileVersion::V2_2),
+                allow_external_blob_outside_bases: true,
                 ..Default::default()
             };
             let ds = Dataset::write(reader, uri, Some(params))

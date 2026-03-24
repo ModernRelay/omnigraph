@@ -753,3 +753,270 @@ query rename_person($old_name: String, $new_name: String) {
     let err = result.unwrap_err().to_string();
     assert!(err.contains("@key"), "error should mention @key: {}", err);
 }
+
+// ─── Blob support ────────────────────────────────────────────────────────────
+
+const BLOB_SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob?
+}
+"#;
+
+const BLOB_QUERIES: &str = r#"
+query all_docs() {
+    match { $d: Document }
+    return { $d.title, $d.content }
+}
+
+query get_doc($title: String) {
+    match { $d: Document { title: $title } }
+    return { $d.title, $d.content }
+}
+"#;
+
+const BLOB_MUTATIONS: &str = r#"
+query insert_doc($title: String, $content: Blob) {
+    insert Document { title: $title, content: $content }
+}
+
+query update_doc_content($title: String, $content: Blob) {
+    update Document set { content: $content } where title = $title
+}
+"#;
+
+#[tokio::test]
+async fn blob_schema_parses_and_init_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+
+    assert!(db.catalog().node_types["Document"]
+        .blob_properties
+        .contains("content"));
+    assert_eq!(db.catalog().node_types["Document"].properties.len(), 2);
+}
+
+#[tokio::test]
+async fn blob_load_base64_inline() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+
+    // "Hello World" = "SGVsbG8gV29ybGQ="
+    let data = r#"{"type": "Document", "data": {"title": "readme", "content": "base64:SGVsbG8gV29ybGQ="}}
+{"type": "Document", "data": {"title": "empty"}}
+"#;
+    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+
+    let snap = db.snapshot();
+    let ds = snap.open("node:Document").await.unwrap();
+    assert_eq!(ds.count_rows(None).await.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn blob_query_returns_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+
+    let data = r#"{"type": "Document", "data": {"title": "readme", "content": "base64:SGVsbG8gV29ybGQ="}}"#;
+    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+
+    let result = db
+        .run_query(BLOB_QUERIES, "get_doc", &params(&[("$title", "readme")]))
+        .await
+        .unwrap();
+
+    assert_eq!(result.num_rows(), 1);
+
+    let json = result.to_sdk_json();
+    let row = json.as_array().unwrap().first().unwrap();
+    assert_eq!(row["d.title"], "readme");
+    // Blob columns return null in query projections — data is accessed via take_blobs API.
+    // (Lance bug: BlobsDescriptions + filter triggers assertion, so blobs are excluded from scan)
+    assert!(row["d.content"].is_null(), "blob column should return null in query projection");
+}
+
+#[tokio::test]
+async fn blob_null_returns_null_in_query() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+
+    let data = r#"{"type": "Document", "data": {"title": "empty"}}"#;
+    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+
+    let result = db
+        .run_query(BLOB_QUERIES, "get_doc", &params(&[("$title", "empty")]))
+        .await
+        .unwrap();
+
+    assert_eq!(result.num_rows(), 1);
+    let json = result.to_sdk_json();
+    let row = json.as_array().unwrap().first().unwrap();
+    assert_eq!(row["d.title"], "empty");
+    // Nullable blob with no value should return null
+    assert!(row["d.content"].is_null(), "null blob should return null, got: {}", row["d.content"]);
+}
+
+#[tokio::test]
+async fn blob_insert_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+
+    let result = db
+        .run_mutation(
+            BLOB_MUTATIONS,
+            "insert_doc",
+            &params(&[("$title", "new-doc"), ("$content", "base64:AQID")]),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.affected_nodes, 1);
+
+    // Query it back
+    let qr = db
+        .run_query(BLOB_QUERIES, "get_doc", &params(&[("$title", "new-doc")]))
+        .await
+        .unwrap();
+    assert_eq!(qr.num_rows(), 1);
+    let json = qr.to_sdk_json();
+    let row = json.as_array().unwrap().first().unwrap();
+    assert_eq!(row["d.title"], "new-doc");
+    // Blob column present but null in query projection (data accessed via take_blobs)
+    assert!(row.get("d.content").is_some(), "content column should be present");
+}
+
+#[tokio::test]
+async fn blob_update_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+
+    // First insert a doc with blob
+    db.run_mutation(
+        BLOB_MUTATIONS,
+        "insert_doc",
+        &params(&[("$title", "updatable"), ("$content", "base64:AQID")]),
+    )
+    .await
+    .unwrap();
+
+    // Update the blob
+    let result = db
+        .run_mutation(
+            BLOB_MUTATIONS,
+            "update_doc_content",
+            &params(&[("$title", "updatable"), ("$content", "base64:BAUG")]),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.affected_nodes, 1);
+
+    // Query it back — blob metadata should still be present
+    let qr = db
+        .run_query(BLOB_QUERIES, "get_doc", &params(&[("$title", "updatable")]))
+        .await
+        .unwrap();
+    assert_eq!(qr.num_rows(), 1);
+    let json = qr.to_sdk_json();
+    let row = json.as_array().unwrap().first().unwrap();
+    // Blob column present (data was actually updated via separate merge_insert)
+    assert!(row.get("d.content").is_some(), "content column should be present after update");
+}
+
+// ─── Blob read API ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn blob_read_returns_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+
+    // "Hello World" = base64 "SGVsbG8gV29ybGQ="
+    let data = r#"{"type": "Document", "data": {"title": "readme", "content": "base64:SGVsbG8gV29ybGQ="}}"#;
+    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+
+    let blob = db.read_blob("Document", "readme", "content").await.unwrap();
+    assert_eq!(blob.size(), 11); // "Hello World" = 11 bytes
+
+    let bytes = blob.read().await.unwrap();
+    assert_eq!(&bytes[..], b"Hello World");
+}
+
+#[tokio::test]
+async fn blob_read_not_found_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+
+    let data = r#"{"type": "Document", "data": {"title": "readme", "content": "base64:SGVsbG8="}}"#;
+    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+
+    // Non-existent ID
+    let err = db.read_blob("Document", "nonexistent", "content").await;
+    assert!(err.is_err());
+
+    // Non-blob property
+    let err = db.read_blob("Document", "readme", "title").await;
+    assert!(err.is_err());
+}
+
+#[tokio::test]
+async fn blob_read_after_mutation_insert() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+
+    // Insert via mutation (base64 for bytes [1, 2, 3])
+    db.run_mutation(
+        BLOB_MUTATIONS,
+        "insert_doc",
+        &params(&[("$title", "inserted"), ("$content", "base64:AQID")]),
+    )
+    .await
+    .unwrap();
+
+    let blob = db.read_blob("Document", "inserted", "content").await.unwrap();
+    let bytes = blob.read().await.unwrap();
+    assert_eq!(&bytes[..], &[1, 2, 3]);
+}
+
+// ─── Blob low-level: probe BlobHandling::BlobsDescriptions ───────────────
+
+#[tokio::test]
+async fn blob_scan_with_descriptions_on_nonempty_dataset() {
+    use lance::datatypes::BlobHandling;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+
+    let data = r#"{"type": "Document", "data": {"title": "readme", "content": "base64:SGVsbG8gV29ybGQ="}}"#;
+    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+
+    // Open the dataset directly and try BlobsDescriptions
+    let snap = db.snapshot();
+    let ds = snap.open("node:Document").await.unwrap();
+    assert_eq!(ds.count_rows(None).await.unwrap(), 1);
+
+    // BlobsDescriptions works without filter
+    let mut scanner = ds.scan();
+    scanner.blob_handling(BlobHandling::BlobsDescriptions);
+    let stream = scanner.try_into_stream().await.unwrap();
+    let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 1);
+
+    // Blob descriptor is a struct with kind, position, size, blob_id, blob_uri
+    let content_col = batches[0].column_by_name("content").unwrap();
+    assert!(
+        matches!(content_col.data_type(), arrow_schema::DataType::Struct(_)),
+        "blob column should be Struct, got {:?}",
+        content_col.data_type()
+    );
+}

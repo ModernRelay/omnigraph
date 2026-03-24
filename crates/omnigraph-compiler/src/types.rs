@@ -15,6 +15,7 @@ pub enum ScalarType {
     Date,
     DateTime,
     Vector(u32),
+    Blob,
 }
 
 impl ScalarType {
@@ -38,6 +39,7 @@ impl ScalarType {
             "F64" => Some(Self::F64),
             "Date" => Some(Self::Date),
             "DateTime" => Some(Self::DateTime),
+            "Blob" => Some(Self::Blob),
             _ => None,
         }
     }
@@ -54,6 +56,7 @@ impl ScalarType {
             Self::F64 => DataType::Float64,
             Self::Date => DataType::Date32,
             Self::DateTime => DataType::Date64,
+            Self::Blob => DataType::LargeBinary,
             Self::Vector(dim) => {
                 let dim = i32::try_from(*dim)
                     .expect("vector dimension exceeds Arrow FixedSizeList i32 bound");
@@ -86,6 +89,7 @@ impl std::fmt::Display for ScalarType {
             Self::F64 => "F64",
             Self::Date => "Date",
             Self::DateTime => "DateTime",
+            Self::Blob => "Blob",
             Self::Vector(dim) => return write!(f, "Vector({})", dim),
         };
         write!(f, "{}", s)

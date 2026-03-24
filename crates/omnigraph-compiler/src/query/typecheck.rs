@@ -421,6 +421,12 @@ fn typecheck_mutation_predicate(
                 type_name, predicate.property
             ))
         })?;
+    if matches!(prop_type.scalar, ScalarType::Blob) {
+        return Err(NanoError::Type(format!(
+            "T11: blob property `{}` cannot be used in WHERE predicates",
+            predicate.property
+        )));
+    }
     check_match_value_type(
         &predicate.value,
         param_types,
@@ -478,7 +484,12 @@ fn check_match_value_type(
                     v
                 )));
             };
-            if !types_compatible(actual, expected) {
+            // Allow String param → Blob property (URI assignment)
+            let compatible = types_compatible(actual, expected)
+                || (matches!(expected.scalar, ScalarType::Blob)
+                    && matches!(actual.scalar, ScalarType::String)
+                    && !actual.list);
+            if !compatible {
                 return Err(NanoError::Type(format!(
                     "T7: cannot assign/compare {} with {} for property `{}`",
                     actual.display_name(),
@@ -583,6 +594,13 @@ fn typecheck_binding(
                 binding.type_name, pm.prop_name
             ))
         })?;
+
+        if matches!(prop.scalar, ScalarType::Blob) {
+            return Err(NanoError::Type(format!(
+                "T3: blob property `{}.{}` cannot be used in match patterns",
+                binding.type_name, pm.prop_name
+            )));
+        }
 
         // T3: check value type matches property type
         match &pm.value {
@@ -845,6 +863,11 @@ fn typecheck_filter(
         if matches!(l.scalar, ScalarType::Vector(_)) || matches!(r.scalar, ScalarType::Vector(_)) {
             return Err(NanoError::Type(
                 "T7: vector comparisons in filters are not supported".to_string(),
+            ));
+        }
+        if matches!(l.scalar, ScalarType::Blob) || matches!(r.scalar, ScalarType::Blob) {
+            return Err(NanoError::Type(
+                "T7: blob comparisons in filters are not supported".to_string(),
             ));
         }
         if !types_compatible(l, r) {

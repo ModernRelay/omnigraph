@@ -3409,6 +3409,7 @@ dependencies = [
  "arrow-ord",
  "arrow-schema",
  "arrow-select",
+ "base64",
  "futures",
  "lance",
  "lance-datafusion",

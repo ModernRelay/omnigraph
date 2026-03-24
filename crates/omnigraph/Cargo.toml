@@ -20,6 +20,7 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 ulid = { workspace = true }
+base64 = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }

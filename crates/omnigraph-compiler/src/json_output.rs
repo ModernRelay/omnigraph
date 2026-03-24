@@ -1,7 +1,7 @@
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, FixedSizeListArray, Float32Array,
-    Float64Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray, UInt32Array,
-    UInt64Array,
+    Float64Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray, StructArray,
+    UInt32Array, UInt64Array,
 };
 use arrow_schema::DataType;
 
@@ -166,6 +166,21 @@ fn array_value_to_json_with_mode(
             .as_any()
             .downcast_ref::<FixedSizeListArray>()
             .map(|a| fixed_size_list_value_to_json(a, row, integer_mode))
+            .unwrap_or(serde_json::Value::Null),
+        DataType::Struct(_) => array
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .map(|struct_arr| {
+                let mut obj = serde_json::Map::new();
+                for (i, field) in struct_arr.fields().iter().enumerate() {
+                    let col = struct_arr.column(i);
+                    obj.insert(
+                        field.name().clone(),
+                        array_value_to_json_with_mode(col, row, integer_mode),
+                    );
+                }
+                serde_json::Value::Object(obj)
+            })
             .unwrap_or(serde_json::Value::Null),
         _ => {
             let display =

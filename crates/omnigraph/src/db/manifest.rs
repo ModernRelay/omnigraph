@@ -384,6 +384,7 @@ async fn create_empty_dataset(uri: &str, schema: &SchemaRef) -> Result<Dataset> 
         mode: WriteMode::Create,
         enable_stable_row_ids: true,
         data_storage_version: Some(LanceFileVersion::V2_2),
+        allow_external_blob_outside_bases: true,
         ..Default::default()
     };
     Dataset::write(reader, uri, Some(params))

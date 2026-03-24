@@ -8,6 +8,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::TryStreamExt;
 use lance::Dataset;
+use lance::blob::BlobArrayBuilder;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::ir::{
     IRExpr, IRFilter, IROrdering, IRProjection, IROp, IRAssignment, IRMutationPredicate,
@@ -578,6 +579,21 @@ async fn hydrate_nodes(
     let filter_sql = format!("id IN ({})", escaped.join(", "));
 
     let mut scanner = ds.scan();
+    let has_blobs = !node_type.blob_properties.is_empty();
+
+    if has_blobs {
+        let non_blob_cols: Vec<&str> = node_type
+            .arrow_schema
+            .fields()
+            .iter()
+            .filter(|f| !node_type.blob_properties.contains(f.name()))
+            .map(|f| f.name().as_str())
+            .collect();
+        scanner
+            .project(&non_blob_cols)
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+    }
+
     scanner
         .filter(&filter_sql)
         .map_err(|e| OmniError::Lance(format!("hydrate filter: {}", e)))?;
@@ -590,16 +606,20 @@ async fn hydrate_nodes(
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
 
-    if batches.is_empty() {
+    let scan_result = if batches.is_empty() {
         return Ok(RecordBatch::new_empty(node_type.arrow_schema.clone()));
-    }
-    if batches.len() == 1 {
-        return Ok(batches.into_iter().next().unwrap());
-    }
+    } else if batches.len() == 1 {
+        batches.into_iter().next().unwrap()
+    } else {
+        let schema = batches[0].schema();
+        arrow_select::concat::concat_batches(&schema, &batches)
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+    };
 
-    let schema = batches[0].schema();
-    arrow_select::concat::concat_batches(&schema, &batches)
-        .map_err(|e| OmniError::Lance(e.to_string()))
+    if has_blobs {
+        return add_null_blob_columns(&scan_result, node_type);
+    }
+    Ok(scan_result)
 }
 
 /// Try bulk anti-join via CSR existence check. Returns Some if the inner
@@ -743,6 +763,25 @@ async fn execute_node_scan(
     let filter_sql = build_lance_filter(filters, params);
 
     let mut scanner = ds.scan();
+
+    // Blob columns must be excluded from scan when a filter is present
+    // (Lance bug: BlobsDescriptions + filter triggers a projection assertion).
+    // We exclude blob columns and add metadata post-scan via take_blobs_by_indices.
+    let node_type = &catalog.node_types[type_name];
+    let has_blobs = !node_type.blob_properties.is_empty();
+    if has_blobs {
+        let non_blob_cols: Vec<&str> = node_type
+            .arrow_schema
+            .fields()
+            .iter()
+            .filter(|f| !node_type.blob_properties.contains(f.name()))
+            .map(|f| f.name().as_str())
+            .collect();
+        scanner
+            .project(&non_blob_cols)
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+    }
+
     if let Some(sql) = &filter_sql {
         scanner
             .filter(sql.as_str())
@@ -790,17 +829,53 @@ async fn execute_node_scan(
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
 
-    if batches.is_empty() {
-        let node_type = &catalog.node_types[type_name];
-        return Ok(RecordBatch::new_empty(node_type.arrow_schema.clone()));
+    let scan_result = if batches.is_empty() {
+        RecordBatch::new_empty(batches.first().map(|b| b.schema()).unwrap_or_else(|| {
+            // Build a non-blob schema for empty result
+            let fields: Vec<_> = node_type.arrow_schema.fields().iter()
+                .filter(|f| !node_type.blob_properties.contains(f.name()))
+                .map(|f| f.as_ref().clone()).collect();
+            Arc::new(Schema::new(fields))
+        }))
+    } else if batches.len() == 1 {
+        batches.into_iter().next().unwrap()
+    } else {
+        let schema = batches[0].schema();
+        arrow_select::concat::concat_batches(&schema, &batches)
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+    };
+
+    // Add null placeholder columns for excluded blob properties
+    if has_blobs {
+        return add_null_blob_columns(&scan_result, node_type);
+    }
+    Ok(scan_result)
+}
+
+/// Add null Utf8 columns for blob properties excluded from a scan.
+/// Uses column_by_name (not positional) so it's order-independent.
+fn add_null_blob_columns(
+    batch: &RecordBatch,
+    node_type: &omnigraph_compiler::catalog::NodeType,
+) -> Result<RecordBatch> {
+    let num_rows = batch.num_rows();
+    let mut fields = Vec::with_capacity(node_type.arrow_schema.fields().len());
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(node_type.arrow_schema.fields().len());
+
+    for field in node_type.arrow_schema.fields() {
+        if node_type.blob_properties.contains(field.name()) {
+            fields.push(Field::new(field.name(), DataType::Utf8, true));
+            columns.push(Arc::new(StringArray::from(vec![None::<&str>; num_rows])));
+        } else if let Some(col) = batch.column_by_name(field.name()) {
+            let batch_schema = batch.schema();
+            let batch_field = batch_schema.field_with_name(field.name())
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            fields.push(batch_field.clone());
+            columns.push(col.clone());
+        }
     }
 
-    if batches.len() == 1 {
-        return Ok(batches.into_iter().next().unwrap());
-    }
-
-    let schema = batches[0].schema();
-    arrow_select::concat::concat_batches(&schema, &batches)
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
@@ -1249,17 +1324,49 @@ fn parse_date32(s: &str) -> Option<i32> {
     Some((era * 146097 + doe as i32 - 719468) as i32)
 }
 
+/// Build a single-element blob array from a URI or base64 value string.
+fn build_blob_array_from_value(value: &str) -> Result<ArrayRef> {
+    let mut builder = BlobArrayBuilder::new(1);
+    crate::loader::append_blob_value(&mut builder, value)?;
+    builder
+        .finish()
+        .map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+/// Build a null blob array with one element.
+fn build_null_blob_array() -> Result<ArrayRef> {
+    let mut builder = BlobArrayBuilder::new(1);
+    builder
+        .push_null()
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    builder
+        .finish()
+        .map_err(|e| OmniError::Lance(e.to_string()))
+}
+
 /// Build a single-row RecordBatch from resolved assignments.
 fn build_insert_batch(
     schema: &SchemaRef,
     id: &str,
     assignments: &HashMap<String, Literal>,
+    blob_properties: &HashSet<String>,
 ) -> Result<RecordBatch> {
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
 
     for field in schema.fields() {
         if field.name() == "id" {
             columns.push(Arc::new(StringArray::from(vec![id])));
+        } else if blob_properties.contains(field.name()) {
+            if let Some(Literal::String(uri)) = assignments.get(field.name()) {
+                columns.push(build_blob_array_from_value(uri)?);
+            } else if field.is_nullable() {
+                columns.push(build_null_blob_array()?);
+            } else {
+                return Err(OmniError::Manifest(format!(
+                    "missing required blob property '{}'",
+                    field.name()
+                )));
+            }
         } else if field.name() == "src" {
             let lit = assignments.get("from").ok_or_else(|| {
                 OmniError::Manifest("missing required edge endpoint 'from'".to_string())
@@ -1323,22 +1430,34 @@ fn predicate_to_sql(
 }
 
 /// Replace specific columns in a RecordBatch with new literal values.
+/// Apply scalar assignments to a batch. Blob columns are excluded from the
+/// scan result and handled separately via a second merge_insert in execute_update.
 fn apply_assignments(
     batch: &RecordBatch,
     assignments: &HashMap<String, Literal>,
+    blob_properties: &HashSet<String>,
 ) -> Result<RecordBatch> {
     let schema = batch.schema();
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
 
     for (idx, field) in schema.fields().iter().enumerate() {
-        if let Some(lit) = assignments.get(field.name()) {
+        if blob_properties.contains(field.name()) {
+            // Blob columns aren't in the scan result — skip
+            continue;
+        } else if let Some(lit) = assignments.get(field.name()) {
             columns.push(literal_to_typed_array(lit, field.data_type(), batch.num_rows())?);
         } else {
             columns.push(batch.column(idx).clone());
         }
     }
 
-    RecordBatch::try_new(schema, columns)
+    // Build schema without blob columns
+    let non_blob_fields: Vec<_> = schema.fields().iter()
+        .filter(|f| !blob_properties.contains(f.name()))
+        .map(|f| f.as_ref().clone())
+        .collect();
+
+    RecordBatch::try_new(Arc::new(Schema::new(non_blob_fields)), columns)
         .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
@@ -1404,6 +1523,7 @@ impl Omnigraph {
         if is_node {
             let node_type = &self.catalog().node_types[type_name];
             let schema = node_type.arrow_schema.clone();
+            let blob_props = node_type.blob_properties.clone();
             let id = if let Some(key_prop) = &node_type.key_property {
                 match resolved.get(key_prop) {
                     Some(Literal::String(s)) => s.clone(),
@@ -1419,7 +1539,7 @@ impl Omnigraph {
                 ulid::Ulid::new().to_string()
             };
 
-            let batch = build_insert_batch(&schema, &id, &resolved)?;
+            let batch = build_insert_batch(&schema, &id, &resolved, &blob_props)?;
             let has_key = node_type.key_property.is_some();
             let (new_version, row_count) = if has_key {
                 self.upsert_batch(type_name, true, schema, batch).await?
@@ -1444,9 +1564,10 @@ impl Omnigraph {
         } else if is_edge {
             let edge_type = &self.catalog().edge_types[type_name];
             let schema = edge_type.arrow_schema.clone();
+            let blob_props = edge_type.blob_properties.clone();
             let id = ulid::Ulid::new().to_string();
 
-            let batch = build_insert_batch(&schema, &id, &resolved)?;
+            let batch = build_insert_batch(&schema, &id, &resolved, &blob_props)?;
             let (new_version, row_count) =
                 self.append_batch(type_name, false, schema, batch).await?;
 
@@ -1582,6 +1703,7 @@ impl Omnigraph {
 
         let pred_sql = predicate_to_sql(predicate, params, false)?;
         let schema = self.catalog().node_types[type_name].arrow_schema.clone();
+        let blob_props = self.catalog().node_types[type_name].blob_properties.clone();
 
         let snapshot = self.snapshot();
         let table_key = format!("node:{}", type_name);
@@ -1595,6 +1717,17 @@ impl Omnigraph {
             .map_err(|e| OmniError::Lance(e.to_string()))?;
 
         let mut scanner = ds.scan();
+        if !blob_props.is_empty() {
+            let non_blob_cols: Vec<&str> = schema
+                .fields()
+                .iter()
+                .filter(|f| !blob_props.contains(f.name()))
+                .map(|f| f.name().as_str())
+                .collect();
+            scanner
+                .project(&non_blob_cols)
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
+        }
         scanner
             .filter(&pred_sql)
             .map_err(|e| OmniError::Lance(format!("update filter: {}", e)))?;
@@ -1628,7 +1761,7 @@ impl Omnigraph {
         for a in assignments {
             resolved.insert(a.property.clone(), resolve_expr_value(&a.value, params)?);
         }
-        let updated = apply_assignments(&matched, &resolved)?;
+        let updated = apply_assignments(&matched, &resolved, &blob_props)?;
 
         let ds = Dataset::open(&full_path)
             .await
@@ -1645,24 +1778,91 @@ impl Omnigraph {
         .try_build()
         .map_err(|e| OmniError::Lance(e.to_string()))?;
 
-        let reader = RecordBatchIterator::new(vec![Ok(updated)], schema.clone());
+        let update_schema = updated.schema();
+        let reader = RecordBatchIterator::new(vec![Ok(updated)], update_schema);
         let (new_ds, _stats) = job
             .execute(lance_datafusion::utils::reader_to_stream(Box::new(reader)))
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
 
-        let new_version = new_ds.version().version;
-        let row_count = new_ds
+        let mut final_version = new_ds.version().version;
+        let mut final_row_count = new_ds
             .count_rows(None)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
 
+        // Phase 2: If there are blob assignments, apply them separately
+        let blob_assignments: HashMap<&str, &Literal> = resolved
+            .iter()
+            .filter(|(k, _)| blob_props.contains(k.as_str()))
+            .map(|(k, v)| (k.as_str(), v))
+            .collect();
+
+        if !blob_assignments.is_empty() {
+            // Extract matched IDs from the scan result
+            let id_col = matched.column_by_name("id").ok_or_else(|| {
+                OmniError::Manifest("matched batch missing 'id' column".to_string())
+            })?;
+            let ids = id_col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                OmniError::Manifest("id column is not Utf8".to_string())
+            })?;
+
+            // Build batch: id + blob columns
+            let mut blob_fields = vec![Field::new("id", DataType::Utf8, false)];
+            let mut blob_columns: Vec<ArrayRef> = vec![Arc::new(ids.clone())];
+
+            for blob_prop in &blob_props {
+                if let Some(Literal::String(uri)) = blob_assignments.get(blob_prop.as_str()) {
+                    let mut builder = BlobArrayBuilder::new(ids.len());
+                    for _ in 0..ids.len() {
+                        crate::loader::append_blob_value(&mut builder, uri)?;
+                    }
+                    let blob_field = lance::blob::blob_field(blob_prop, true);
+                    blob_fields.push(blob_field);
+                    blob_columns.push(
+                        builder.finish().map_err(|e| OmniError::Lance(e.to_string()))?,
+                    );
+                }
+            }
+
+            let blob_schema = Arc::new(Schema::new(blob_fields));
+            let blob_batch = RecordBatch::try_new(blob_schema.clone(), blob_columns)
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+            let ds = Dataset::open(&full_path)
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            let ds = Arc::new(ds);
+
+            let job = lance::dataset::MergeInsertBuilder::try_new(
+                ds,
+                vec!["id".to_string()],
+            )
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+            .when_matched(lance::dataset::WhenMatched::UpdateAll)
+            .when_not_matched(lance::dataset::WhenNotMatched::DoNothing)
+            .try_build()
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+            let reader = RecordBatchIterator::new(vec![Ok(blob_batch)], blob_schema);
+            let (new_ds, _stats) = job
+                .execute(lance_datafusion::utils::reader_to_stream(Box::new(reader)))
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+            final_version = new_ds.version().version;
+            final_row_count = new_ds
+                .count_rows(None)
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
+        }
+
         self.manifest_mut()
             .commit(&[crate::db::SubTableUpdate {
                 table_key,
-                table_version: new_version,
+                table_version: final_version,
                 table_branch: None,
-                row_count,
+                row_count: final_row_count,
             }])
             .await?;
 

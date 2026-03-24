@@ -2,7 +2,12 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use arrow_array::{Array, UInt64Array};
+use arrow_schema::{Field, Schema};
+use futures::TryStreamExt;
 use lance::Dataset;
+use lance::blob::blob_field;
+use lance::dataset::BlobFile;
 use lance_index::scalar::ScalarIndexParams;
 use lance_index::{DatasetIndexExt, IndexType};
 use omnigraph_compiler::build_catalog;
@@ -39,7 +44,8 @@ impl Omnigraph {
 
         // Parse and validate schema
         let schema_ast = parse_schema(schema_source)?;
-        let catalog = build_catalog(&schema_ast)?;
+        let mut catalog = build_catalog(&schema_ast)?;
+        fixup_blob_schemas(&mut catalog);
 
         // Write _schema.pg
         let schema_path = format!("{}/{}", root, SCHEMA_FILENAME);
@@ -69,7 +75,8 @@ impl Omnigraph {
 
         // Parse and validate schema
         let schema_ast = parse_schema(&schema_source)?;
-        let catalog = build_catalog(&schema_ast)?;
+        let mut catalog = build_catalog(&schema_ast)?;
+        fixup_blob_schemas(&mut catalog);
 
         // Open manifest
         let manifest = ManifestCoordinator::open(root).await?;
@@ -195,6 +202,85 @@ impl Omnigraph {
         Ok(())
     }
 
+    /// Read a blob from a node by its string ID and property name.
+    ///
+    /// Returns a `BlobFile` handle with async `read()`, `seek()`, `tell()`,
+    /// and metadata accessors (`size()`, `kind()`, `uri()`).
+    ///
+    /// ```ignore
+    /// let blob = db.read_blob("Document", "readme", "content").await?;
+    /// let bytes = blob.read().await?;
+    /// ```
+    pub async fn read_blob(
+        &self,
+        type_name: &str,
+        id: &str,
+        property: &str,
+    ) -> Result<BlobFile> {
+        let node_type = self.catalog.node_types.get(type_name).ok_or_else(|| {
+            OmniError::Manifest(format!("unknown node type '{}'", type_name))
+        })?;
+        if !node_type.blob_properties.contains(property) {
+            return Err(OmniError::Manifest(format!(
+                "property '{}' on type '{}' is not a Blob",
+                property, type_name
+            )));
+        }
+
+        let snapshot = self.snapshot();
+        let table_key = format!("node:{}", type_name);
+        let ds = snapshot.open(&table_key).await?;
+
+        // Scan for the row with matching id, requesting _rowid
+        let filter_sql = format!("id = '{}'", id.replace('\'', "''"));
+        let mut scanner = ds.scan();
+        scanner.with_row_id();
+        scanner
+            .project(&["id"])
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        scanner
+            .filter(&filter_sql)
+            .map_err(|e| OmniError::Lance(format!("blob filter: {}", e)))?;
+
+        let batches: Vec<arrow_array::RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+        // Extract the row ID
+        let row_id = batches
+            .iter()
+            .find_map(|batch| {
+                batch
+                    .column_by_name("_rowid")
+                    .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+                    .and_then(|arr| if arr.len() > 0 { Some(arr.value(0)) } else { None })
+            })
+            .ok_or_else(|| {
+                OmniError::Manifest(format!(
+                    "no {} with id '{}' found",
+                    type_name, id
+                ))
+            })?;
+
+        // Use take_blobs to get the BlobFile handle
+        let ds = Arc::new(ds);
+        let mut blobs = ds
+            .take_blobs(&[row_id], property)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+        blobs.pop().ok_or_else(|| {
+            OmniError::Manifest(format!(
+                "blob '{}' on {} '{}' returned no data",
+                property, type_name, id
+            ))
+        })
+    }
+
     pub fn manifest_mut(&mut self) -> &mut ManifestCoordinator {
         &mut self.manifest
     }
@@ -202,6 +288,50 @@ impl Omnigraph {
     /// Invalidate the cached graph index. Called after edge mutations.
     pub(crate) fn invalidate_graph_index(&mut self) {
         self.cached_graph_index = None;
+    }
+}
+
+/// Replace placeholder `LargeBinary` fields with Lance blob v2 fields.
+///
+/// The compiler crate has no Lance dependency, so `ScalarType::Blob` maps to
+/// `DataType::LargeBinary` as a placeholder. This function replaces those
+/// fields with the real blob v2 struct type via `lance::blob::blob_field()`.
+fn fixup_blob_schemas(catalog: &mut Catalog) {
+    for node_type in catalog.node_types.values_mut() {
+        if node_type.blob_properties.is_empty() {
+            continue;
+        }
+        let fields: Vec<Field> = node_type
+            .arrow_schema
+            .fields()
+            .iter()
+            .map(|f| {
+                if node_type.blob_properties.contains(f.name()) {
+                    blob_field(f.name(), f.is_nullable())
+                } else {
+                    f.as_ref().clone()
+                }
+            })
+            .collect();
+        node_type.arrow_schema = Arc::new(Schema::new(fields));
+    }
+    for edge_type in catalog.edge_types.values_mut() {
+        if edge_type.blob_properties.is_empty() {
+            continue;
+        }
+        let fields: Vec<Field> = edge_type
+            .arrow_schema
+            .fields()
+            .iter()
+            .map(|f| {
+                if edge_type.blob_properties.contains(f.name()) {
+                    blob_field(f.name(), f.is_nullable())
+                } else {
+                    f.as_ref().clone()
+                }
+            })
+            .collect();
+        edge_type.arrow_schema = Arc::new(Schema::new(fields));
     }
 }
 
