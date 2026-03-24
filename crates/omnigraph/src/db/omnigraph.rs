@@ -158,19 +158,23 @@ impl Omnigraph {
                     .replace(true)
                     .await;
 
-                // Inverted (FTS) indices on @index String properties
+                // Indices from schema constraints
                 if let Some(node_type) = self.catalog.node_types.get(type_name) {
-                    for prop_name in &node_type.indexed_properties {
-                        if let Some(prop_type) = node_type.properties.get(prop_name) {
-                            if matches!(prop_type.scalar, ScalarType::String) && !prop_type.list {
-                                let _ = ds
-                                    .create_index_builder(
-                                        &[prop_name.as_str()],
-                                        IndexType::Inverted,
-                                        &params,
-                                    )
-                                    .replace(true)
-                                    .await;
+                    for index_cols in &node_type.indices {
+                        if index_cols.len() == 1 {
+                            let prop_name = &index_cols[0];
+                            if let Some(prop_type) = node_type.properties.get(prop_name) {
+                                if matches!(prop_type.scalar, ScalarType::String) && !prop_type.list
+                                {
+                                    let _ = ds
+                                        .create_index_builder(
+                                            &[prop_name.as_str()],
+                                            IndexType::Inverted,
+                                            &params,
+                                        )
+                                        .replace(true)
+                                        .await;
+                                }
                             }
                         }
                     }
@@ -397,7 +401,7 @@ edge WorksAt: Person -> Company
         assert_eq!(db.catalog().node_types.len(), 2);
         assert_eq!(db.catalog().edge_types.len(), 2);
         assert_eq!(
-            db.catalog().node_types["Person"].key_property.as_deref(),
+            db.catalog().node_types["Person"].key_property(),
             Some("name")
         );
     }

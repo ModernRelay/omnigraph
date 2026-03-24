@@ -112,6 +112,30 @@ edge TypeName: From -> To @card(0..1) {
 }
 ```
 
+### Property Types
+
+| Type | Syntax | Arrow Mapping | Notes |
+|---|---|---|---|
+| String | `String` | `Utf8` | |
+| Bool | `Bool` | `Boolean` | |
+| I32 | `I32` | `Int32` | |
+| I64 | `I64` | `Int64` | |
+| U32 | `U32` | `UInt32` | |
+| U64 | `U64` | `UInt64` | |
+| F32 | `F32` | `Float32` | |
+| F64 | `F64` | `Float64` | |
+| Date | `Date` | `Date32` | Days since epoch. JSONL: `"2024-01-15"` |
+| DateTime | `DateTime` | `Date64` | Milliseconds since epoch. JSONL: `"2024-01-15T12:00:00Z"` |
+| Vector | `Vector(N)` | `FixedSizeList(Float32, N)` | N-dimensional float vector for embeddings |
+| Blob | `Blob` | Lance blob v2 struct | Large binary objects. See Blob Type section |
+
+**Modifiers:**
+- `Type?` — nullable (column allows null values)
+- `[Type]` — list (Arrow `List<Type>`). Cannot contain Blob or Vector.
+- `enum(a, b, c)` — string enum. Stored as `Utf8`, validated at load/mutation time. Values sorted and deduplicated.
+
+All properties without `?` are required — the loader rejects null values for non-nullable properties.
+
 ### Interfaces
 
 Interfaces define shared property contracts. A node type declares `implements` to compose one or more interfaces:
@@ -136,7 +160,7 @@ node Pattern implements Slugged, Described {
 }
 ```
 
-**Phase 1 (Step 7a): compile-time property verification.** The parser verifies that Signal has all properties declared in Slugged and Described (or injects them if missing). The catalog sees a flat `NodeType` — no runtime awareness of interfaces. This is mixin behavior with interface syntax.
+**Phase 1 (Step 7a, complete): compile-time property verification.** The parser verifies that Signal has all properties declared in Slugged and Described (or injects them if missing). The catalog sees a flat `NodeType` — no runtime awareness of interfaces. This is mixin behavior with interface syntax.
 
 **Phase 2 (deferred): polymorphic queries and edge targets.** Same schema, no syntax changes. The catalog stores interface metadata. The typechecker allows `$e: Slugged` in queries (multi-dataset scan + union, projecting only interface properties). Edges accept interface types: `edge Mentions: Signal -> Slugged`.
 
@@ -159,6 +183,14 @@ node Pattern implements Slugged, Described {
 | `@embed` | `v: Vector(N) @embed(src)` | — | nodes | Auto-generate embedding from source property |
 
 `@range` and `@check` are body-level only (they require arguments). `@embed` is property-level only (it applies to one vector property).
+
+**Enforcement:**
+- `@key`: validated at parse time (non-nullable, non-list, non-vector, non-blob, at most 1 per type). At runtime, `@key` value becomes the `id` column; `@key` types use `merge_insert` (upsert) on insert.
+- `@unique`: validated at parse time (properties exist). Composite uniqueness enforcement at runtime is deferred.
+- `@index`: validated at parse time (properties exist, not blob). `ensure_indices()` creates BTree/Inverted/IVF-HNSW indices after load.
+- `@range`: validated at parse time (numeric property). At load/mutation time, every row is checked — violations are hard errors.
+- `@check`: validated at parse time (String property, valid regex). At load/mutation time, every row is checked — violations are hard errors.
+- `@embed`: validated at parse time (target is Vector, source is String, source exists). Embedding generation at load time (when embedding client is configured).
 
 ### Blob Type
 
@@ -289,11 +321,15 @@ Enforced at: loader (post-write validation), mutation insert (max bound check), 
 
 ### Annotations (Metadata)
 
-Annotations that do not affect storage or runtime behavior:
+Annotations provide metadata that does not affect storage or constraint enforcement:
 
-- `@description("...")` — human-readable documentation on types and properties
-- `@instruction("...")` — agent/LLM guidance on types
-- `@rename_from("...")` — schema evolution hint
+| Annotation | Targets | Purpose |
+|---|---|---|
+| `@description("...")` | nodes, edges, properties | Human-readable documentation |
+| `@instruction("...")` | nodes, edges | Agent/LLM guidance for query generation |
+| `@rename_from("...")` | nodes, edges, properties | Schema evolution — maps old name to new |
+
+`@description` can appear on both types and individual properties. `@instruction` is type-level only (not on properties). Each can appear at most once per target.
 
 ### Example Schema
 
@@ -933,11 +969,10 @@ The current model (Step 7) does one manifest commit per mutation. With streaming
 See `implementation-plan.md` for detailed step-by-step status, compiler types to reuse, runtime code to write, Lance APIs, and test cases for each remaining step.
 
 ```
-Steps 0–8 + Blob support + read_blob API ✅ (234 tests)
-     └→ Step 7a: Constraint system restructuring
-          ├→ Step 9: Branching (Lance branches on manifest + sub-tables)
-          │    └→ Step 10: Change tracking + CLI
-          └→ Step 10: CLI core wiring
+Steps 0–8 + 7a ✅ (262 tests)
+     ├→ Step 9: Branching (Lance branches on manifest + sub-tables)
+     │    └→ Step 10: Change tracking + CLI
+     └→ Step 10: CLI core wiring
 ```
 
 ---

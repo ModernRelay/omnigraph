@@ -4,7 +4,7 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use crate::error::{NanoError, Result};
-use crate::schema::ast::{SchemaDecl, SchemaFile};
+use crate::schema::ast::{Cardinality, Constraint, ConstraintBound, SchemaDecl, SchemaFile};
 use crate::types::{PropType, ScalarType};
 
 #[derive(Debug, Clone)]
@@ -13,19 +13,65 @@ pub struct Catalog {
     pub edge_types: HashMap<String, EdgeType>,
     /// Maps lowercase edge name -> EdgeType key (e.g. "knows" -> "Knows")
     pub edge_name_index: HashMap<String, String>,
+    /// Interface declarations (for Phase 2 polymorphic queries)
+    pub interfaces: HashMap<String, InterfaceType>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InterfaceType {
+    pub name: String,
+    pub properties: HashMap<String, PropType>,
 }
 
 #[derive(Debug, Clone)]
 pub struct NodeType {
     pub name: String,
+    /// Interface names this type implements
+    pub implements: Vec<String>,
     pub properties: HashMap<String, PropType>,
-    /// The `@key` property name, if declared. Used as the `id` column value.
-    pub key_property: Option<String>,
-    /// Maps @embed target property -> source text property.
+    /// Key property names (from `@key` or `@key(name)`). Usually 0 or 1 element.
+    pub key: Option<Vec<String>>,
+    /// Uniqueness constraints (each entry is a list of column names)
+    pub unique_constraints: Vec<Vec<String>>,
+    /// Index declarations (each entry is a list of column names)
+    pub indices: Vec<Vec<String>>,
+    /// Value range constraints
+    pub range_constraints: Vec<RangeConstraint>,
+    /// Regex check constraints
+    pub check_constraints: Vec<CheckConstraint>,
+    /// Maps @embed target property -> source text property
     pub embed_sources: HashMap<String, String>,
-    pub indexed_properties: HashSet<String>,
     pub blob_properties: HashSet<String>,
     pub arrow_schema: SchemaRef,
+}
+
+impl NodeType {
+    /// Backward-compatible accessor: returns the first (and typically only) key property name.
+    pub fn key_property(&self) -> Option<&str> {
+        self.key
+            .as_ref()
+            .and_then(|v| v.first())
+            .map(|s| s.as_str())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RangeConstraint {
+    pub property: String,
+    pub min: Option<LiteralValue>,
+    pub max: Option<LiteralValue>,
+}
+
+#[derive(Debug, Clone)]
+pub enum LiteralValue {
+    Integer(i64),
+    Float(f64),
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckConstraint {
+    pub property: String,
+    pub pattern: String,
 }
 
 #[derive(Debug, Clone)]
@@ -33,14 +79,18 @@ pub struct EdgeType {
     pub name: String,
     pub from_type: String,
     pub to_type: String,
+    pub cardinality: Cardinality,
     pub properties: HashMap<String, PropType>,
+    /// Uniqueness constraints on edge columns (e.g. `@unique(src, dst)`)
+    pub unique_constraints: Vec<Vec<String>>,
+    /// Index declarations on edge properties
+    pub indices: Vec<Vec<String>>,
     pub blob_properties: HashSet<String>,
     pub arrow_schema: SchemaRef,
 }
 
 impl Catalog {
     pub fn lookup_edge_by_name(&self, name: &str) -> Option<&EdgeType> {
-        // Try exact match first, then lowercase lookup
         if let Some(et) = self.edge_types.get(name) {
             return Some(et);
         }
@@ -59,12 +109,37 @@ fn lowercase_first_char(name: &str) -> String {
     first.to_lowercase().chain(chars).collect()
 }
 
+fn bound_to_literal(b: &ConstraintBound) -> LiteralValue {
+    match b {
+        ConstraintBound::Integer(n) => LiteralValue::Integer(*n),
+        ConstraintBound::Float(f) => LiteralValue::Float(*f),
+    }
+}
+
 pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
     let mut node_types = HashMap::new();
     let mut edge_types = HashMap::new();
     let mut edge_name_index = HashMap::new();
+    let mut interfaces = HashMap::new();
 
-    // First pass: collect all node types
+    // Pass 0: collect interfaces
+    for decl in &schema.declarations {
+        if let SchemaDecl::Interface(iface) = decl {
+            let mut properties = HashMap::new();
+            for prop in &iface.properties {
+                properties.insert(prop.name.clone(), prop.prop_type.clone());
+            }
+            interfaces.insert(
+                iface.name.clone(),
+                InterfaceType {
+                    name: iface.name.clone(),
+                    properties,
+                },
+            );
+        }
+    }
+
+    // Pass 1: collect node types
     for decl in &schema.declarations {
         if let SchemaDecl::Node(node) = decl {
             if node_types.contains_key(&node.name) {
@@ -76,17 +151,13 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
 
             let mut properties = HashMap::new();
             let mut embed_sources = HashMap::new();
-            let mut indexed_properties = HashSet::new();
             let mut blob_properties = HashSet::new();
-            let mut key_property: Option<String> = None;
             for prop in &node.properties {
                 properties.insert(prop.name.clone(), prop.prop_type.clone());
                 if matches!(prop.prop_type.scalar, ScalarType::Blob) {
                     blob_properties.insert(prop.name.clone());
                 }
-                if prop.annotations.iter().any(|a| a.name == "key") {
-                    key_property = Some(prop.name.clone());
-                }
+                // Extract @embed from property annotations (stays as annotation)
                 if let Some(source_prop) = prop
                     .annotations
                     .iter()
@@ -95,16 +166,41 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                 {
                     embed_sources.insert(prop.name.clone(), source_prop);
                 }
-                let scalar_index_eligible =
-                    !prop.prop_type.list
-                    && !matches!(prop.prop_type.scalar, ScalarType::Vector(_) | ScalarType::Blob);
-                if scalar_index_eligible
-                    && prop
-                        .annotations
-                        .iter()
-                        .any(|a| a.name == "key" || a.name == "index")
-                {
-                    indexed_properties.insert(prop.name.clone());
+            }
+
+            // Extract constraints from the typed Constraint enum
+            let mut key: Option<Vec<String>> = None;
+            let mut unique_constraints = Vec::new();
+            let mut indices = Vec::new();
+            let mut range_constraints = Vec::new();
+            let mut check_constraints = Vec::new();
+
+            for constraint in &node.constraints {
+                match constraint {
+                    Constraint::Key(cols) => {
+                        key = Some(cols.clone());
+                        // @key implies index on key columns
+                        indices.push(cols.clone());
+                    }
+                    Constraint::Unique(cols) => {
+                        unique_constraints.push(cols.clone());
+                    }
+                    Constraint::Index(cols) => {
+                        indices.push(cols.clone());
+                    }
+                    Constraint::Range { property, min, max } => {
+                        range_constraints.push(RangeConstraint {
+                            property: property.clone(),
+                            min: min.as_ref().map(bound_to_literal),
+                            max: max.as_ref().map(bound_to_literal),
+                        });
+                    }
+                    Constraint::Check { property, pattern } => {
+                        check_constraints.push(CheckConstraint {
+                            property: property.clone(),
+                            pattern: pattern.clone(),
+                        });
+                    }
                 }
             }
 
@@ -123,10 +219,14 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                 node.name.clone(),
                 NodeType {
                     name: node.name.clone(),
+                    implements: node.implements.clone(),
                     properties,
-                    key_property,
+                    key,
+                    unique_constraints,
+                    indices,
+                    range_constraints,
+                    check_constraints,
                     embed_sources,
-                    indexed_properties,
                     blob_properties,
                     arrow_schema,
                 },
@@ -134,7 +234,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
         }
     }
 
-    // Second pass: collect edge types, validate endpoints
+    // Pass 2: collect edge types, validate endpoints
     for decl in &schema.declarations {
         if let SchemaDecl::Edge(edge) = decl {
             if edge_types.contains_key(&edge.name) {
@@ -175,6 +275,17 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                 ));
             }
 
+            // Extract edge constraints
+            let mut unique_constraints = Vec::new();
+            let mut edge_indices = Vec::new();
+            for constraint in &edge.constraints {
+                match constraint {
+                    Constraint::Unique(cols) => unique_constraints.push(cols.clone()),
+                    Constraint::Index(cols) => edge_indices.push(cols.clone()),
+                    _ => {} // Key/Range/Check validated at parse time to not appear on edges
+                }
+            }
+
             let lowercase_name = lowercase_first_char(&edge.name);
             edge_name_index.insert(lowercase_name, edge.name.clone());
 
@@ -184,7 +295,10 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                     name: edge.name.clone(),
                     from_type: edge.from_type.clone(),
                     to_type: edge.to_type.clone(),
+                    cardinality: edge.cardinality.clone(),
                     properties,
+                    unique_constraints,
+                    indices: edge_indices,
                     blob_properties,
                     arrow_schema: Arc::new(Schema::new(fields)),
                 },
@@ -196,6 +310,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
         node_types,
         edge_types,
         edge_name_index,
+        interfaces,
     })
 }
 
@@ -310,10 +425,10 @@ edge Emits: Person -> Signal
         let schema = parse_schema(input).unwrap();
         let catalog = build_catalog(&schema).unwrap();
         assert_eq!(
-            catalog.node_types["Signal"].key_property.as_deref(),
+            catalog.node_types["Signal"].key_property(),
             Some("slug")
         );
-        assert_eq!(catalog.node_types["Person"].key_property, None);
+        assert_eq!(catalog.node_types["Person"].key_property(), None);
     }
 
     #[test]
@@ -323,23 +438,115 @@ edge Emits: Person -> Signal
                 SchemaDecl::Node(NodeDecl {
                     name: "Person".to_string(),
                     annotations: vec![],
-                    parent: None,
+                    implements: vec![],
                     properties: vec![crate::schema::ast::PropDecl {
                         name: "name".to_string(),
                         prop_type: PropType::scalar(ScalarType::String, false),
                         annotations: vec![],
                     }],
+                    constraints: vec![],
                 }),
                 SchemaDecl::Edge(EdgeDecl {
                     name: "Édges".to_string(),
                     from_type: "Person".to_string(),
                     to_type: "Person".to_string(),
+                    cardinality: Default::default(),
                     annotations: vec![],
                     properties: vec![],
+                    constraints: vec![],
                 }),
             ],
         };
         let catalog = build_catalog(&schema).unwrap();
         assert!(catalog.lookup_edge_by_name("édges").is_some());
+    }
+
+    #[test]
+    fn test_catalog_composite_unique() {
+        let input = r#"
+node Person {
+    first: String
+    last: String
+    @unique(first, last)
+}
+"#;
+        let schema = parse_schema(input).unwrap();
+        let catalog = build_catalog(&schema).unwrap();
+        let person = &catalog.node_types["Person"];
+        assert!(person.unique_constraints.contains(&vec!["first".to_string(), "last".to_string()]));
+    }
+
+    #[test]
+    fn test_catalog_composite_index() {
+        let input = r#"
+node Event {
+    category: String
+    date: Date
+    @index(category, date)
+}
+"#;
+        let schema = parse_schema(input).unwrap();
+        let catalog = build_catalog(&schema).unwrap();
+        let event = &catalog.node_types["Event"];
+        assert!(event.indices.contains(&vec!["category".to_string(), "date".to_string()]));
+    }
+
+    #[test]
+    fn test_catalog_edge_cardinality() {
+        let input = r#"
+node Person { name: String }
+node Company { name: String }
+edge WorksAt: Person -> Company @card(0..1)
+"#;
+        let schema = parse_schema(input).unwrap();
+        let catalog = build_catalog(&schema).unwrap();
+        let edge = &catalog.edge_types["WorksAt"];
+        assert_eq!(edge.cardinality.min, 0);
+        assert_eq!(edge.cardinality.max, Some(1));
+    }
+
+    #[test]
+    fn test_catalog_interfaces_stored() {
+        let input = r#"
+interface Named {
+    name: String
+}
+node Person implements Named {
+    age: I32?
+}
+"#;
+        let schema = parse_schema(input).unwrap();
+        let catalog = build_catalog(&schema).unwrap();
+        assert!(catalog.interfaces.contains_key("Named"));
+        assert!(catalog.interfaces["Named"].properties.contains_key("name"));
+    }
+
+    #[test]
+    fn test_catalog_node_implements() {
+        let input = r#"
+interface Named {
+    name: String
+}
+node Person implements Named {
+    age: I32?
+}
+"#;
+        let schema = parse_schema(input).unwrap();
+        let catalog = build_catalog(&schema).unwrap();
+        assert_eq!(catalog.node_types["Person"].implements, vec!["Named"]);
+    }
+
+    #[test]
+    fn test_key_implies_index() {
+        let input = r#"
+node Signal {
+    slug: String @key
+    title: String
+}
+"#;
+        let schema = parse_schema(input).unwrap();
+        let catalog = build_catalog(&schema).unwrap();
+        let signal = &catalog.node_types["Signal"];
+        assert!(signal.indices.contains(&vec!["slug".to_string()]));
     }
 }

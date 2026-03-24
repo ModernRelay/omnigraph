@@ -3416,6 +3416,7 @@ dependencies = [
  "lance-file",
  "lance-index",
  "omnigraph-compiler",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

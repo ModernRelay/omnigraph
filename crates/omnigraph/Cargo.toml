@@ -24,6 +24,7 @@ base64 = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+regex = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]

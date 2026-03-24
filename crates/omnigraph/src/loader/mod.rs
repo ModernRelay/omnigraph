@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+
 use std::io::{BufRead, BufReader, Cursor};
 use std::sync::Arc;
 
@@ -13,6 +14,7 @@ use lance::dataset::{WriteMode, WriteParams};
 use lance::Dataset;
 use lance_file::version::LanceFileVersion;
 use omnigraph_compiler::catalog::{Catalog, NodeType};
+use futures::TryStreamExt;
 use serde_json::Value as JsonValue;
 
 use crate::db::manifest::ManifestCoordinator;
@@ -135,6 +137,10 @@ async fn load_jsonl_reader<R: BufRead>(
     for (type_name, rows) in &node_rows {
         let node_type = &catalog.node_types[type_name];
         let batch = build_node_batch(node_type, rows)?;
+
+        // Validate value constraints before writing
+        validate_value_constraints(&batch, node_type)?;
+
         let row_count = batch.num_rows();
 
         let table_key = format!("node:{}", type_name);
@@ -184,7 +190,12 @@ async fn load_jsonl_reader<R: BufRead>(
     // Phase 3: Atomic manifest commit
     db.manifest_mut().commit(&updates).await?;
 
-    // Phase 4: Ensure scalar indices on key columns
+    // Phase 4: Validate edge cardinality constraints
+    for edge_name in edge_rows.keys() {
+        validate_edge_cardinality(db, edge_name).await?;
+    }
+
+    // Phase 5: Ensure scalar indices on key columns
     db.ensure_indices().await?;
 
     Ok(result)
@@ -197,7 +208,7 @@ fn build_node_batch(node_type: &NodeType, rows: &[JsonValue]) -> Result<RecordBa
     let ids: Vec<String> = rows
         .iter()
         .map(|row| {
-            if let Some(key_prop) = &node_type.key_property {
+            if let Some(key_prop) = node_type.key_property() {
                 row.get(key_prop)
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
@@ -536,6 +547,174 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> i32 {
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     (era * 146097 + doe as i32 - 719468) as i32
+}
+
+// ─── Value constraint validation ─────────────────────────────────────────────
+
+fn validate_value_constraints(
+    batch: &RecordBatch,
+    node_type: &omnigraph_compiler::catalog::NodeType,
+) -> Result<()> {
+    use arrow_array::Array;
+
+    // Range constraints
+    for rc in &node_type.range_constraints {
+        let Some(col) = batch.column_by_name(&rc.property) else {
+            continue;
+        };
+        for row in 0..batch.num_rows() {
+            if col.is_null(row) {
+                continue;
+            }
+            let value = extract_numeric_value(col, row);
+            if let Some(val) = value {
+                if let Some(ref min) = rc.min {
+                    let min_f = literal_value_to_f64(min);
+                    if val < min_f {
+                        return Err(OmniError::Manifest(format!(
+                            "@range violation on {}.{}: value {} < min {}",
+                            node_type.name, rc.property, val, min_f
+                        )));
+                    }
+                }
+                if let Some(ref max) = rc.max {
+                    let max_f = literal_value_to_f64(max);
+                    if val > max_f {
+                        return Err(OmniError::Manifest(format!(
+                            "@range violation on {}.{}: value {} > max {}",
+                            node_type.name, rc.property, val, max_f
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    // Check constraints (regex)
+    for cc in &node_type.check_constraints {
+        let re = regex::Regex::new(&cc.pattern).map_err(|e| {
+            OmniError::Manifest(format!(
+                "@check on {}.{} has invalid regex '{}': {}",
+                node_type.name, cc.property, cc.pattern, e
+            ))
+        })?;
+        let Some(col) = batch.column_by_name(&cc.property) else {
+            continue;
+        };
+        let str_col = col
+            .as_any()
+            .downcast_ref::<StringArray>();
+        if let Some(str_col) = str_col {
+            for row in 0..str_col.len() {
+                if str_col.is_null(row) {
+                    continue;
+                }
+                let val = str_col.value(row);
+                if !re.is_match(val) {
+                    return Err(OmniError::Manifest(format!(
+                        "@check violation on {}.{}: value '{}' does not match pattern '{}'",
+                        node_type.name, cc.property, val, cc.pattern
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn extract_numeric_value(col: &ArrayRef, row: usize) -> Option<f64> {
+    use arrow_array::{Array, Int32Array, Int64Array, UInt32Array, UInt64Array, Float32Array, Float64Array};
+    if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
+        return Some(a.value(row) as f64);
+    }
+    if let Some(a) = col.as_any().downcast_ref::<Int64Array>() {
+        return Some(a.value(row) as f64);
+    }
+    if let Some(a) = col.as_any().downcast_ref::<UInt32Array>() {
+        return Some(a.value(row) as f64);
+    }
+    if let Some(a) = col.as_any().downcast_ref::<UInt64Array>() {
+        return Some(a.value(row) as f64);
+    }
+    if let Some(a) = col.as_any().downcast_ref::<Float32Array>() {
+        return Some(a.value(row) as f64);
+    }
+    if let Some(a) = col.as_any().downcast_ref::<Float64Array>() {
+        return Some(a.value(row));
+    }
+    None
+}
+
+fn literal_value_to_f64(v: &omnigraph_compiler::catalog::LiteralValue) -> f64 {
+    use omnigraph_compiler::catalog::LiteralValue;
+    match v {
+        LiteralValue::Integer(n) => *n as f64,
+        LiteralValue::Float(f) => *f,
+    }
+}
+
+// ─── Edge cardinality validation ─────────────────────────────────────────────
+
+async fn validate_edge_cardinality(
+    db: &crate::db::Omnigraph,
+    edge_name: &str,
+) -> Result<()> {
+    use arrow_array::Array;
+    let catalog = db.catalog();
+    let edge_type = &catalog.edge_types[edge_name];
+    if edge_type.cardinality.is_default() {
+        return Ok(());
+    }
+
+    let snapshot = db.snapshot();
+    let table_key = format!("edge:{}", edge_name);
+    let ds = snapshot.open(&table_key).await?;
+
+    // Scan src column, count per source
+    let batches: Vec<RecordBatch> = ds
+        .scan()
+        .project(&["src"])
+        .map_err(|e| OmniError::Lance(e.to_string()))?
+        .try_into_stream()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?
+        .try_collect()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for batch in &batches {
+        let srcs = batch
+            .column_by_name("src")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..srcs.len() {
+            *counts.entry(srcs.value(i).to_string()).or_insert(0) += 1;
+        }
+    }
+
+    let card = &edge_type.cardinality;
+    for (src, count) in &counts {
+        if let Some(max) = card.max {
+            if *count > max {
+                return Err(OmniError::Manifest(format!(
+                    "@card violation on edge {}: source '{}' has {} edges (max {})",
+                    edge_name, src, count, max
+                )));
+            }
+        }
+        if *count < card.min {
+            return Err(OmniError::Manifest(format!(
+                "@card violation on edge {}: source '{}' has {} edges (min {})",
+                edge_name, src, count, card.min
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

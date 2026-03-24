@@ -1020,3 +1020,132 @@ async fn blob_scan_with_descriptions_on_nonempty_dataset() {
         content_col.data_type()
     );
 }
+
+// ─── Constraint enforcement ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn range_constraint_rejects_out_of_bounds() {
+    let schema = r#"
+node Person {
+    name: String @key
+    age: I32?
+    @range(age, 0..200)
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+
+    // age = 300 exceeds max of 200
+    let data = r#"{"type": "Person", "data": {"name": "Old", "age": 300}}"#;
+    let result = load_jsonl(&mut db, data, LoadMode::Overwrite).await;
+    assert!(result.is_err(), "expected range violation");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("@range violation"), "error: {}", err);
+}
+
+#[tokio::test]
+async fn range_constraint_allows_within_bounds() {
+    let schema = r#"
+node Person {
+    name: String @key
+    age: I32?
+    @range(age, 0..200)
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+
+    let data = r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}"#;
+    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+
+    let snap = db.snapshot();
+    let ds = snap.open("node:Person").await.unwrap();
+    assert_eq!(ds.count_rows(None).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn check_constraint_rejects_bad_pattern() {
+    let schema = r#"
+node Order {
+    code: String @key
+    @check(code, "^[A-Z]{3}-[0-9]+$")
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+
+    let data = r#"{"type": "Order", "data": {"code": "invalid"}}"#;
+    let result = load_jsonl(&mut db, data, LoadMode::Overwrite).await;
+    assert!(result.is_err(), "expected check violation");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("@check violation"), "error: {}", err);
+}
+
+#[tokio::test]
+async fn check_constraint_allows_matching_pattern() {
+    let schema = r#"
+node Order {
+    code: String @key
+    @check(code, "^[A-Z]{3}-[0-9]+$")
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+
+    let data = r#"{"type": "Order", "data": {"code": "ABC-123"}}"#;
+    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+
+    let snap = db.snapshot();
+    let ds = snap.open("node:Order").await.unwrap();
+    assert_eq!(ds.count_rows(None).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn edge_cardinality_max_enforced() {
+    let schema = r#"
+node Person { name: String @key }
+node Company { name: String @key }
+edge WorksAt: Person -> Company @card(0..1)
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+
+    // Alice works at two companies — violates @card(0..1)
+    let data = r#"{"type": "Person", "data": {"name": "Alice"}}
+{"type": "Company", "data": {"name": "Acme"}}
+{"type": "Company", "data": {"name": "Globex"}}
+{"edge": "WorksAt", "from": "Alice", "to": "Acme"}
+{"edge": "WorksAt", "from": "Alice", "to": "Globex"}
+"#;
+    let result = load_jsonl(&mut db, data, LoadMode::Overwrite).await;
+    assert!(result.is_err(), "expected cardinality violation");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("@card violation"), "error: {}", err);
+}
+
+#[tokio::test]
+async fn edge_cardinality_allows_within_bounds() {
+    let schema = r#"
+node Person { name: String @key }
+node Company { name: String @key }
+edge WorksAt: Person -> Company @card(0..1)
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+
+    let data = r#"{"type": "Person", "data": {"name": "Alice"}}
+{"type": "Company", "data": {"name": "Acme"}}
+{"edge": "WorksAt", "from": "Alice", "to": "Acme"}
+"#;
+    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+
+    let snap = db.snapshot();
+    let ds = snap.open("edge:WorksAt").await.unwrap();
+    assert_eq!(ds.count_rows(None).await.unwrap(), 1);
+}

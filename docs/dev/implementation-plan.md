@@ -9,7 +9,7 @@ Living document tracking the build of the Lance-native graph database.
 1. **Build each layer correctly once.** No temporary implementations that get replaced.
 2. **Lance-native from the start.** Manifest is a Lance table. Stable row IDs on every dataset. Shallow clone branching. No custom WAL, no custom JSON manifest, no custom CDC.
 3. **Carry forward the compiler.** The schema parser, query parser, typechecker, and IR lowering are proven and unchanged. Everything below the IR is new.
-4. **String IDs everywhere.** `key()` values or ULIDs. No `u64` counters, no ID coordination across branches.
+4. **String IDs everywhere.** `@key` values or ULIDs. No `u64` counters, no ID coordination across branches.
 5. **Snapshot consistency.** A manifest version IS a database version. All reads within a query go through one immutable Snapshot.
 6. **URIs not paths.** Every `open`/`init` accepts `&str` (local path or `s3://`). Lance handles both.
 
@@ -17,7 +17,7 @@ Living document tracking the build of the Lance-native graph database.
 
 ## Current Status
 
-**216 tests passing.** Steps 0–8 complete.
+**262 tests passing.** Steps 0–8 + 7a complete.
 
 ```
 Step 0  ✅  Crate restructuring
@@ -30,7 +30,7 @@ Step 5a ✅  Snapshot refactor (read consistency)
 Step 6  ✅  Graph index + traversal + Lance-native optimizations
 Step 7  ✅  Mutations (insert/update/delete + edge cascade)
 Step 8  ✅  Search predicates (FTS inverted indices)
-Step 7a    Constraint system restructuring
+Step 7a ✅  Constraint system restructuring (interfaces, body constraints, cardinality, value constraints)
 Step 9     Branching
 Step 10    Change tracking + CLI
 ```
@@ -130,7 +130,7 @@ String IDs everywhere: node `id` Utf8, edge `id`/`src`/`dst` Utf8. `key_property
 
 ### Step 4: Data Loading ✅
 
-JSONL loader: per-type RecordBatch building, Overwrite/Append/Merge modes, `key()` → id or ULID, atomic manifest commit. Tests: 178.
+JSONL loader: per-type RecordBatch building, Overwrite/Append/Merge modes, `@key` → id or ULID, atomic manifest commit. Tests: 178.
 
 ### Step 5: Query Execution (Tabular) ✅
 
@@ -153,122 +153,29 @@ Lance Scanner with SQL filter pushdown, Arrow filter/project/sort, limit. Tests:
 Insert, update, delete nodes and edges with schema-driven edge cascade. **Complete.**
 
 - `Omnigraph::run_mutation()` in `exec/mod.rs` — parse, typecheck, lower, dispatch
-- Insert: single-row RecordBatch, upsert for `key()` types via `merge_insert`, append for keyless. Edge inserts invalidate graph index.
-- Update: scan with predicate filter → apply assignments → `merge_insert` keyed by `id`. Rejects `key()` property updates.
+- Insert: single-row RecordBatch, upsert for `@key` types via `merge_insert`, append for keyless. Edge inserts invalidate graph index.
+- Update: scan with predicate filter → apply assignments → `merge_insert` keyed by `id`. Rejects `@key` property updates.
 - Delete: node deletes cascade to all referencing edge types via `src IN (...) OR dst IN (...)` filters. Edge deletes have no cascade. Graph index invalidated.
 - 7 mutation tests + supporting tests in end_to_end.rs, consistency.rs, traversal.rs
 - Tests: +25. Running total: 209.
 
 ---
 
-### Step 7a: Constraint System Restructuring
+### Step 7a: Constraint System Restructuring ✅
 
-Restructure the schema language to separate structural constraints (`key`, `unique`, `index`, `range`, `check`) from metadata annotations (`@description`, `@instruction`, `@rename_from`). Add edge cardinality and value constraints. Replace `@embed` with derivation syntax. Remove unused inheritance syntax. See `omnigraph-specs.md` Schema Language section for the target design.
+Interfaces, body-level constraints, edge cardinality, value constraints. **Complete.**
 
-**Clean break**: Old annotation syntax (`@key`, `@unique`, `@index`, `@embed`) is removed entirely — no backward compatibility layer.
+**Grammar** (`schema.pest`): `interface_decl`, `implements_clause`, `body_constraint` (`@key(name)`, `@unique(a, b)`, `@index(a, b)`, `@range(prop, min..max)`, `@check(prop, "regex")`), `cardinality` (`@card(0..1)`). Negative lookahead on `annotation` rule to prevent constraint keywords from being consumed as annotations. Inheritance syntax replaced with `implements`.
 
-#### Step 7a.1: Grammar + AST (compiler crate only)
+**AST** (`ast.rs`): `InterfaceDecl`, `Constraint` enum (Key/Unique/Index/Range/Check), `ConstraintBound` (Integer/Float), `Cardinality`. `SchemaDecl::Interface` variant. `NodeDecl`: `implements`, `constraints`, `parent` removed. `EdgeDecl`: `constraints`, `cardinality`.
 
-**`crates/omnigraph-compiler/src/schema/schema.pest`** (~25 lines changed):
-- Add `constraint_decl` rule inside node/edge bodies: `key(ident+)`, `unique(ident+)`, `index(ident+)`, `range(ident, bound..bound)`, `check(ident, "regex")`
-- Add `derivation` rule as optional prop_decl suffix: `= embed(ident)`
-- Add `cardinality` rule on edge_decl: `@card(N..M?)`
-- Remove inheritance syntax (`(":" ~ type_name)?` from node_decl)
-- Remove `@key`/`@unique`/`@index`/`@embed` from valid annotations (clean break)
+**Parser** (`parser.rs`): `parse_interface_decl`, `parse_body_constraint`, `parse_cardinality`, `resolve_interfaces` (verify/inject interface properties, detect type conflicts), `desugar_property_constraints` (property-level `@key` → `Constraint::Key`), `validate_constraints` (typed constraint validation), `validate_property_annotations` (extracted, simplified). `@unique`/`@index` now allowed on edge properties.
 
-**`crates/omnigraph-compiler/src/schema/ast.rs`** (~50 lines added):
-```rust
-pub enum Constraint {
-    Key(Vec<String>),
-    Unique(Vec<String>),
-    Index(Vec<String>),
-    Range { property: String, min: Option<Literal>, max: Option<Literal> },
-    Check { property: String, pattern: String },
-}
+**Catalog** (`catalog/mod.rs`): `NodeType` — `key: Option<Vec<String>>`, `unique_constraints`, `indices: Vec<Vec<String>>`, `range_constraints`, `check_constraints`, `implements`. `key_property()` convenience method. `EdgeType` — `cardinality`, `unique_constraints`, `indices`. `Catalog` — `interfaces: HashMap<String, InterfaceType>`. Three-pass `build_catalog` (interfaces → nodes → edges). `@key` implies index.
 
-pub enum Derivation {
-    Embed { source_property: String },
-}
+**Runtime**: `validate_value_constraints()` in loader (range + check, strict errors). `validate_edge_cardinality()` after edge writes. `ensure_indices()` reads from `node_type.indices`. `key_property()` method calls in loader + executor.
 
-pub struct Cardinality {
-    pub min: u32,
-    pub max: Option<u32>,  // None = unbounded
-}
-// Default: 0..* (min: 0, max: None)
-```
-
-Changes to existing types:
-- `NodeDecl`: add `constraints: Vec<Constraint>`, remove `parent: Option<String>`
-- `EdgeDecl`: add `constraints: Vec<Constraint>`, add `cardinality: Cardinality`
-- `PropDecl`: add `derived_from: Option<Derivation>`
-
-**`crates/omnigraph-compiler/src/schema/parser.rs`** (~200 lines rewritten, net -50):
-- Add `parse_constraint()`, `parse_derivation()`, `parse_cardinality()`
-- `validate_schema_annotations()` shrinks from 220 → ~30 lines (only validates `@description`/`@instruction`/`@rename_from`)
-- New `validate_constraints()` ~80 lines: property refs exist, key at most 1 per type, range on numeric types, check on String, embed target is Vector + source is String, edge cardinality bounds valid
-
-**Test fixtures** — update to new syntax:
-- `crates/omnigraph/tests/fixtures/test.pg`: `name: String @key` → `key(name)` in body
-- `crates/omnigraph/tests/fixtures/signals.pg`: `slug: String @key` → `key(slug)` in body
-
-**Tests**: Rewrite 26+ parser tests, add ~15 new tests for constraint parsing, composite constraints, cardinality, derivation, rejection cases, inheritance removal.
-
-**Estimated: ~15 new tests. Running total: ~224.**
-
-#### Step 7a.2: Catalog Changes (compiler crate)
-
-**`crates/omnigraph-compiler/src/catalog/mod.rs`** (~50 lines changed):
-
-Change `NodeType`:
-```rust
-pub struct NodeType {
-    pub name: String,
-    pub properties: HashMap<String, PropType>,
-    pub key: Option<Vec<String>>,              // was: key_property: Option<String>
-    pub unique_constraints: Vec<Vec<String>>,   // NEW
-    pub indices: Vec<Vec<String>>,              // was: indexed_properties: HashSet<String>
-    pub range_constraints: Vec<RangeConstraint>,// NEW
-    pub check_constraints: Vec<CheckConstraint>,// NEW
-    pub embed_sources: HashMap<String, String>, // unchanged (populated from derivations)
-    pub arrow_schema: SchemaRef,
-}
-```
-
-Add `pub fn key_property(&self) -> Option<&str>` convenience method (returns first element of key vec) for runtime backward compat.
-
-Change `EdgeType`: add `cardinality: Cardinality`, `unique_constraints: Vec<Vec<String>>`, `indices: Vec<Vec<String>>`.
-
-Update `build_catalog()`: consume `Vec<Constraint>` from AST instead of scanning property annotations.
-
-**Estimated: ~5 new tests. Running total: ~229.**
-
-#### Step 7a.3: Runtime Adaptation (omnigraph crate)
-
-**`crates/omnigraph/src/loader/mod.rs`** (~80 lines added):
-- Change `node_type.key_property` → `node_type.key_property()` (method call)
-- Add `validate_value_constraints(batch, node_type)` (~40 lines): iterate `range_constraints` and `check_constraints`, validate each row. Hard error on violation.
-- Add edge cardinality validation after edge load (~30 lines): count edges per `(src, edge_type)` pair, check against `cardinality` bounds.
-
-**`crates/omnigraph/src/exec/mod.rs`** (~20 lines changed):
-- Change `node_type.key_property` → `node_type.key_property()` (3 locations)
-- Add value constraint validation in `execute_insert` before write
-- Add cardinality check in edge insert (max bound) and edge delete (min bound)
-
-**`crates/omnigraph/src/db/omnigraph.rs`** (~30 lines changed):
-- Update `ensure_indices()`: read from `node_type.indices` (`Vec<Vec<String>>`) instead of `indexed_properties` (`HashSet<String>`)
-- Inverted indices on String properties already work from Step 8; adapt to new field names
-- Add edge property indices: iterate `edge_type.indices`
-- Support composite indices
-
-**`crates/omnigraph/src/loader/constraints.rs`** — update to use new catalog types or inline into loader if mostly dead Nanograph code.
-
-**Estimated: ~5 new tests (value constraint violation, cardinality violation). Running total: ~234.**
-
-#### Step 7a.4: Cleanup
-
-- Remove any remaining old annotation handling code
-- Verify all ~234 tests pass
-- No new tests
+**Tests**: +32. Running total: 262.
 
 ---
 
@@ -446,16 +353,13 @@ CLI tests can be integration tests using `assert_cmd` crate, or just verify the 
 ## Dependency Graph
 
 ```
-Steps 0–8 ✅ (216 tests)
-     └→ Step 7a (constraint restructuring — grammar, AST, catalog, runtime)
-          ├→ Step 9 (branching — independent of constraints)
-          │    └→ Step 10 (CLI — needs branching)
-          └→ Step 10 (CLI core — needs 7a for describe)
+Steps 0–8 + 7a ✅ (262 tests)
+     ├→ Step 9 (branching)
+     │    └→ Step 10 (CLI — needs branching)
+     └→ Step 10 (CLI core wiring)
 ```
 
-Step 7a restructures the constraint and index model. Step 9 can proceed after 7a.
-
-**Critical path:** Step 7a → Step 9 → Step 10.
+**Critical path:** Step 9 → Step 10.
 
 ---
 
@@ -472,12 +376,12 @@ Step 7a restructures the constraint and index model. Step 9 can proceed after 7a
 | 5a | +1 (snapshot pinning) | 179 |
 | 6 | +5 (traversal + anti-join + optimizations) | 184 |
 | 7 | +25 (insert/update/delete/cascade/mutations) | 209 |
-| 8 | +7 (search/fuzzy/nearest/bm25/rrf) | 216 |
-| 7a | ~25 (grammar, catalog, constraints, cardinality) | ~241 |
-| 9 | ~8 (branch create/read/merge) | ~249 |
-| 10 | ~5 (CLI) | ~254 |
+| 8 | +21 (search/fuzzy/nearest/bm25/rrf/indices/blobs) | 230 |
+| 7a | +32 (interfaces, body constraints, cardinality, value constraints) | 262 |
+| 9 | ~8 (branch create/read/merge) | ~270 |
+| 10 | ~5 (CLI) | ~275 |
 
-**Current: 216 tests passing.** Target: ~254 at completion.
+**Current: 262 tests passing.** Target: ~275 at completion.
 
 ---
 
@@ -524,5 +428,6 @@ Step 7a restructures the constraint and index model. Step 9 can proceed after 7a
 9. **Binary ULIDs.** Switch `id` from Utf8 to `FixedSizeBinary(16)` for performance. See `omnigraph-specs.md` Identity Model section. Trigger: profile TypeIndex build in production-scale graphs.
 10. **Row-correlated bindings.** The executor uses flat per-variable RecordBatches. Multi-variable returns across traversal hops break when row counts differ. Needs tuple-based binding model for v0.2.0.
 11. **take_rows() hydration.** Use Lance stable row ID addresses for O(1) node hydration instead of `IN (...)` filter. Deferred — scalar indices already make the IN filter fast.
-12. **Composite key enforcement at Lance level.** Step 7a adds composite key syntax (`key(tenant, slug)`) to the schema language, but the runtime still uses a single `id` column. Full composite key support (multi-column unique constraint at the Lance level) is deferred.
+12. **Composite key enforcement at Lance level.** Step 7a adds composite key syntax (`@key(tenant, slug)`) to the schema language, but the runtime still uses a single `id` column. Full composite key support (multi-column unique constraint at the Lance level) is deferred.
 13. **Cross-branch cardinality validation.** Edge cardinality is validated per-branch. Cross-branch cardinality semantics after merge are deferred.
+14. **Polymorphic interface queries.** Phase 1 (Step 7a) treats interfaces as compile-time property verification. Phase 2 enables `$e: InterfaceName` in queries (multi-dataset scan + union) and interface types as edge targets. Requires executor and graph index changes.

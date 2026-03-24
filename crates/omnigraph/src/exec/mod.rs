@@ -1524,7 +1524,7 @@ impl Omnigraph {
             let node_type = &self.catalog().node_types[type_name];
             let schema = node_type.arrow_schema.clone();
             let blob_props = node_type.blob_properties.clone();
-            let id = if let Some(key_prop) = &node_type.key_property {
+            let id = if let Some(key_prop) = node_type.key_property() {
                 match resolved.get(key_prop) {
                     Some(Literal::String(s)) => s.clone(),
                     Some(other) => literal_to_sql(other).trim_matches('\'').to_string(),
@@ -1540,7 +1540,7 @@ impl Omnigraph {
             };
 
             let batch = build_insert_batch(&schema, &id, &resolved, &blob_props)?;
-            let has_key = node_type.key_property.is_some();
+            let has_key = node_type.key_property().is_some();
             let (new_version, row_count) = if has_key {
                 self.upsert_batch(type_name, true, schema, batch).await?
             } else {
@@ -1692,8 +1692,8 @@ impl Omnigraph {
         params: &ParamMap,
     ) -> Result<MutationResult> {
         // Reject updates to @key properties — identity is immutable
-        if let Some(key_prop) = &self.catalog().node_types[type_name].key_property {
-            if assignments.iter().any(|a| a.property == *key_prop) {
+        if let Some(key_prop) = self.catalog().node_types[type_name].key_property() {
+            if assignments.iter().any(|a| a.property == key_prop) {
                 return Err(OmniError::Manifest(format!(
                     "cannot update @key property '{}' — delete and re-insert instead",
                     key_prop
