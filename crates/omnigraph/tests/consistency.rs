@@ -1,11 +1,12 @@
 mod helpers;
 
-use arrow_array::{Array, Int32Array, StringArray};
+use arrow_array::{Array, Date32Array, Int32Array, StringArray};
 use futures::TryStreamExt;
 
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_compiler::ir::ParamMap;
+use omnigraph_compiler::query::ast::Literal;
 
 use helpers::*;
 
@@ -273,4 +274,132 @@ async fn traversal_works_after_node_then_edge_insert() {
         .downcast_ref::<StringArray>()
         .unwrap();
     assert_eq!(names.value(0), "Alice");
+}
+
+// ─── Edge property insert ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn insert_edge_with_property() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    // Knows has `since: Date?` property
+    let queries = r#"
+query add_friend_since($from: String, $to: String, $since: Date) {
+    insert Knows { from: $from, to: $to, since: $since }
+}
+"#;
+    let mut p = params(&[("$from", "Diana"), ("$to", "Bob")]);
+    p.insert("since".to_string(), Literal::Date("2024-06-15".to_string()));
+
+    let result = db.run_mutation(queries, "add_friend_since", &p).await.unwrap();
+    assert_eq!(result.affected_edges, 1);
+
+    // Verify the edge property was stored
+    let batches = read_table(&db, "edge:Knows").await;
+    let mut found = false;
+    for batch in &batches {
+        let srcs = batch.column_by_name("src").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+        let dsts = batch.column_by_name("dst").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+        let since = batch.column_by_name("since").unwrap().as_any().downcast_ref::<Date32Array>().unwrap();
+        for i in 0..batch.num_rows() {
+            if srcs.value(i) == "Diana" && dsts.value(i) == "Bob" {
+                assert!(!since.is_null(i), "since should not be null");
+                found = true;
+            }
+        }
+    }
+    assert!(found, "should find Diana→Bob edge");
+}
+
+// ─── Update / delete no-match ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn update_nonexistent_returns_zero_affected() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let result = db
+        .run_mutation(
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Nobody")], &[("$age", 99)]),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.affected_nodes, 0);
+}
+
+#[tokio::test]
+async fn delete_nonexistent_returns_zero_affected() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let result = db
+        .run_mutation(
+            MUTATION_QUERIES,
+            "remove_person",
+            &params(&[("$name", "Nobody")]),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.affected_nodes, 0);
+    assert_eq!(result.affected_edges, 0);
+
+    // All 4 persons still intact
+    assert_eq!(count_rows(&db, "node:Person").await, 4);
+}
+
+// ─── Large batch load ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn large_batch_load_and_query() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    let schema = r#"
+node Item {
+    name: String @key
+    value: I32
+}
+"#;
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+
+    // Generate 500 items
+    let mut lines = Vec::with_capacity(500);
+    for i in 0..500 {
+        lines.push(format!(
+            r#"{{"type": "Item", "data": {{"name": "item_{:04}", "value": {}}}}}"#,
+            i, i
+        ));
+    }
+    let data = lines.join("\n");
+    load_jsonl(&mut db, &data, LoadMode::Overwrite).await.unwrap();
+
+    assert_eq!(count_rows(&db, "node:Item").await, 500);
+
+    // Query with filter — value > 490
+    let queries = r#"
+query high_value() {
+    match {
+        $i: Item
+        $i.value > 490
+    }
+    return { $i.name, $i.value }
+    order { $i.value asc }
+}
+"#;
+    let result = db
+        .run_query(queries, "high_value", &ParamMap::new())
+        .await
+        .unwrap();
+
+    // Items 491..499 = 9 items
+    assert_eq!(result.num_rows(), 9);
+    let batch = &result.batches()[0];
+    let values = batch.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(values.value(0), 491);
+    assert_eq!(values.value(8), 499);
 }

@@ -244,6 +244,120 @@ async fn traversal_no_edges_returns_empty() {
     assert_eq!(names.len(), 2); // Alice and Bob
 }
 
+// ─── Filter comparison operators ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn filter_less_than() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let queries = r#"
+query young($age: I32) {
+    match {
+        $p: Person
+        $p.age < $age
+    }
+    return { $p.name, $p.age }
+    order { $p.age asc }
+}
+"#;
+    let result = db
+        .run_query(queries, "young", &int_params(&[("$age", 28)]))
+        .await
+        .unwrap();
+
+    // Only Bob (25) is < 28
+    assert_eq!(result.num_rows(), 1);
+    let batch = &result.batches()[0];
+    let names = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(names.value(0), "Bob");
+}
+
+#[tokio::test]
+async fn filter_greater_equal() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let queries = r#"
+query at_least_30() {
+    match {
+        $p: Person
+        $p.age >= 30
+    }
+    return { $p.name }
+    order { $p.age asc }
+}
+"#;
+    let result = db
+        .run_query(queries, "at_least_30", &ParamMap::new())
+        .await
+        .unwrap();
+
+    // Alice (30) and Charlie (35)
+    assert_eq!(result.num_rows(), 2);
+    let batch = &result.batches()[0];
+    let names = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(names.value(0), "Alice");
+    assert_eq!(names.value(1), "Charlie");
+}
+
+#[tokio::test]
+async fn filter_less_equal() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let queries = r#"
+query at_most_28() {
+    match {
+        $p: Person
+        $p.age <= 28
+    }
+    return { $p.name }
+    order { $p.age asc }
+}
+"#;
+    let result = db
+        .run_query(queries, "at_most_28", &ParamMap::new())
+        .await
+        .unwrap();
+
+    // Bob (25) and Diana (28)
+    assert_eq!(result.num_rows(), 2);
+    let batch = &result.batches()[0];
+    let names = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(names.value(0), "Bob");
+    assert_eq!(names.value(1), "Diana");
+}
+
+#[tokio::test]
+async fn filter_not_equal() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let queries = r#"
+query not_alice() {
+    match {
+        $p: Person
+        $p.name != "Alice"
+    }
+    return { $p.name }
+    order { $p.name asc }
+}
+"#;
+    let result = db
+        .run_query(queries, "not_alice", &ParamMap::new())
+        .await
+        .unwrap();
+
+    // Bob, Charlie, Diana
+    assert_eq!(result.num_rows(), 3);
+    let batch = &result.batches()[0];
+    let names = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    let mut name_vec: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
+    name_vec.sort();
+    assert_eq!(name_vec, vec!["Bob", "Charlie", "Diana"]);
+}
+
 // ─── Error paths ────────────────────────────────────────────────────────────
 
 #[tokio::test]
