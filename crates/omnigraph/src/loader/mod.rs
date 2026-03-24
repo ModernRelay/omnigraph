@@ -3,8 +3,8 @@ use std::io::{BufRead, BufReader, Cursor};
 use std::sync::Arc;
 
 use arrow_array::{
-    ArrayRef, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
-    RecordBatchIterator, StringArray, UInt32Array, UInt64Array,
+    ArrayRef, Date32Array, FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array,
+    RecordBatch, RecordBatchIterator, StringArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, SchemaRef};
 use lance::dataset::{WriteMode, WriteParams};
@@ -333,6 +333,35 @@ fn build_column_from_json(
                 })
                 .collect();
             Ok(Arc::new(Date32Array::from(values)))
+        }
+        DataType::FixedSizeList(child_field, dim) => {
+            // Vector type: parse JSON array of floats into FixedSizeList<Float32>
+            let dim = *dim;
+            let mut flat_values: Vec<f32> = Vec::with_capacity(rows.len() * dim as usize);
+            for row in rows {
+                if let Some(arr) = row.get(name).and_then(|v| v.as_array()) {
+                    if arr.len() != dim as usize {
+                        return Err(OmniError::Manifest(format!(
+                            "vector property '{}' expects {} dimensions, got {}",
+                            name, dim, arr.len()
+                        )));
+                    }
+                    for val in arr {
+                        flat_values.push(val.as_f64().unwrap_or(0.0) as f32);
+                    }
+                } else if nullable {
+                    flat_values.extend(std::iter::repeat(0.0f32).take(dim as usize));
+                } else {
+                    return Err(OmniError::Manifest(format!(
+                        "non-nullable vector property '{}' has null values",
+                        name
+                    )));
+                }
+            }
+            let values_array = Arc::new(Float32Array::from(flat_values));
+            let list_array = FixedSizeListArray::try_new(child_field.clone(), dim, values_array, None)
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            Ok(Arc::new(list_array))
         }
         _ => {
             // Unsupported type: fill with nulls

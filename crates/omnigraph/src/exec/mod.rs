@@ -55,6 +55,138 @@ impl Omnigraph {
     }
 }
 
+// ─── Search mode ─────────────────────────────────────────────────────────────
+
+/// Describes how the query's ordering changes the scan mode.
+#[derive(Debug, Default)]
+struct SearchMode {
+    /// Vector ANN search: (variable, property, query_vector, k).
+    nearest: Option<(String, String, Vec<f32>, usize)>,
+    /// BM25 full-text search: (variable, property, query_text).
+    bm25: Option<(String, String, String)>,
+    /// RRF fusion: (primary, secondary, k_constant, limit).
+    rrf: Option<RrfMode>,
+}
+
+#[derive(Debug)]
+struct RrfMode {
+    primary: Box<SearchMode>,
+    secondary: Box<SearchMode>,
+    k: u32,
+    limit: usize,
+}
+
+/// Extract search ordering mode from the IR.
+fn extract_search_mode(ir: &QueryIR, params: &ParamMap) -> Result<SearchMode> {
+    if ir.order_by.is_empty() {
+        return Ok(SearchMode::default());
+    }
+    let ordering = &ir.order_by[0];
+    match &ordering.expr {
+        IRExpr::Nearest { variable, property, query } => {
+            let vec = resolve_to_f32_vec(query, params)?;
+            let k = ir.limit.ok_or_else(|| {
+                OmniError::Manifest("nearest() ordering requires a limit clause".to_string())
+            })? as usize;
+            Ok(SearchMode {
+                nearest: Some((variable.clone(), property.clone(), vec, k)),
+                ..Default::default()
+            })
+        }
+        IRExpr::Bm25 { field, query } => {
+            let var = match field.as_ref() {
+                IRExpr::PropAccess { variable, .. } => variable.clone(),
+                _ => return Err(OmniError::Manifest("bm25 field must be a property access".to_string())),
+            };
+            let prop = extract_property(field).ok_or_else(|| {
+                OmniError::Manifest("bm25 field must be a property access".to_string())
+            })?;
+            let text = resolve_to_string(query, params).ok_or_else(|| {
+                OmniError::Manifest("bm25 query must resolve to a string".to_string())
+            })?;
+            Ok(SearchMode {
+                bm25: Some((var, prop, text)),
+                ..Default::default()
+            })
+        }
+        IRExpr::Rrf { primary, secondary, k } => {
+            let limit = ir.limit.ok_or_else(|| {
+                OmniError::Manifest("rrf() ordering requires a limit clause".to_string())
+            })? as usize;
+            let k_val = k.as_ref()
+                .and_then(|e| resolve_to_int(e, params))
+                .unwrap_or(60) as u32;
+
+            let primary_mode = extract_sub_search_mode(primary, params, ir.limit)?;
+            let secondary_mode = extract_sub_search_mode(secondary, params, ir.limit)?;
+
+            Ok(SearchMode {
+                rrf: Some(RrfMode {
+                    primary: Box::new(primary_mode),
+                    secondary: Box::new(secondary_mode),
+                    k: k_val,
+                    limit,
+                }),
+                ..Default::default()
+            })
+        }
+        _ => Ok(SearchMode::default()),
+    }
+}
+
+/// Extract a sub-search mode from a nested RRF expression (nearest or bm25).
+fn extract_sub_search_mode(expr: &IRExpr, params: &ParamMap, limit: Option<u64>) -> Result<SearchMode> {
+    match expr {
+        IRExpr::Nearest { variable, property, query } => {
+            let vec = resolve_to_f32_vec(query, params)?;
+            let k = limit.unwrap_or(100) as usize;
+            Ok(SearchMode {
+                nearest: Some((variable.clone(), property.clone(), vec, k)),
+                ..Default::default()
+            })
+        }
+        IRExpr::Bm25 { field, query } => {
+            let var = match field.as_ref() {
+                IRExpr::PropAccess { variable, .. } => variable.clone(),
+                _ => return Err(OmniError::Manifest("bm25 field must be a property access".to_string())),
+            };
+            let prop = extract_property(field).ok_or_else(|| {
+                OmniError::Manifest("bm25 field must be a property access".to_string())
+            })?;
+            let text = resolve_to_string(query, params).ok_or_else(|| {
+                OmniError::Manifest("bm25 query must resolve to a string".to_string())
+            })?;
+            Ok(SearchMode {
+                bm25: Some((var, prop, text)),
+                ..Default::default()
+            })
+        }
+        _ => Ok(SearchMode::default()),
+    }
+}
+
+/// Resolve an expression to a Vec<f32> (for vector search).
+fn resolve_to_f32_vec(expr: &IRExpr, params: &ParamMap) -> Result<Vec<f32>> {
+    let lit = match expr {
+        IRExpr::Literal(lit) => lit.clone(),
+        IRExpr::Param(name) => params.get(name).cloned().ok_or_else(|| {
+            OmniError::Manifest(format!("parameter '{}' not provided", name))
+        })?,
+        _ => return Err(OmniError::Manifest("nearest query must be a literal or parameter".to_string())),
+    };
+    match lit {
+        Literal::List(items) => items
+            .iter()
+            .map(|item| match item {
+                Literal::Float(f) => Ok(*f as f32),
+                Literal::Integer(n) => Ok(*n as f32),
+                _ => Err(OmniError::Manifest("vector elements must be numeric".to_string())),
+            })
+            .collect(),
+        _ => Err(OmniError::Manifest("nearest query must be a list of floats".to_string())),
+    }
+}
+
 /// Execute a lowered QueryIR. Pure function — no state, no caches.
 pub async fn execute_query(
     ir: &QueryIR,
@@ -63,15 +195,22 @@ pub async fn execute_query(
     graph_index: Option<&GraphIndex>,
     catalog: &Catalog,
 ) -> Result<QueryResult> {
+    let search_mode = extract_search_mode(ir, params)?;
+
+    // RRF requires forked execution
+    if let Some(ref rrf) = search_mode.rrf {
+        return execute_rrf_query(ir, params, snapshot, graph_index, catalog, rrf).await;
+    }
+
     let mut bindings: HashMap<String, RecordBatch> = HashMap::new();
 
-    execute_pipeline(&ir.pipeline, params, snapshot, graph_index, catalog, &mut bindings).await?;
+    execute_pipeline(&ir.pipeline, params, snapshot, graph_index, catalog, &mut bindings, &search_mode).await?;
 
     // Project return expressions
     let mut result_batch = project_return(&bindings, &ir.return_exprs, params)?;
 
-    // Apply ordering
-    if !ir.order_by.is_empty() {
+    // Apply ordering (skip if search mode already ordered the results)
+    if !ir.order_by.is_empty() && !is_search_ordered(&search_mode) {
         result_batch = apply_ordering(result_batch, &ir.order_by, &bindings, params)?;
     }
 
@@ -84,6 +223,158 @@ pub async fn execute_query(
     Ok(QueryResult::new(result_batch.schema(), vec![result_batch]))
 }
 
+/// Check if the search mode already returns results in the correct order.
+fn is_search_ordered(search_mode: &SearchMode) -> bool {
+    search_mode.nearest.is_some() || search_mode.bm25.is_some()
+}
+
+/// Execute a query with RRF (Reciprocal Rank Fusion) ordering.
+async fn execute_rrf_query(
+    ir: &QueryIR,
+    params: &ParamMap,
+    snapshot: &Snapshot,
+    graph_index: Option<&GraphIndex>,
+    catalog: &Catalog,
+    rrf: &RrfMode,
+) -> Result<QueryResult> {
+    // Execute primary search
+    let mut primary_bindings: HashMap<String, RecordBatch> = HashMap::new();
+    execute_pipeline(&ir.pipeline, params, snapshot, graph_index, catalog, &mut primary_bindings, &rrf.primary).await?;
+
+    // Execute secondary search
+    let mut secondary_bindings: HashMap<String, RecordBatch> = HashMap::new();
+    execute_pipeline(&ir.pipeline, params, snapshot, graph_index, catalog, &mut secondary_bindings, &rrf.secondary).await?;
+
+    // For RRF, we need to find the main binding variable
+    // (the one that both searches operate on)
+    let primary_var = rrf.primary.nearest.as_ref().map(|(v, ..)| v.as_str())
+        .or_else(|| rrf.primary.bm25.as_ref().map(|(v, ..)| v.as_str()))
+        .ok_or_else(|| OmniError::Manifest("rrf primary must be nearest or bm25".to_string()))?;
+
+    let primary_batch = primary_bindings.get(primary_var).ok_or_else(|| {
+        OmniError::Manifest(format!("rrf primary variable '{}' not in bindings", primary_var))
+    })?;
+    let secondary_batch = secondary_bindings.get(primary_var).ok_or_else(|| {
+        OmniError::Manifest(format!("rrf secondary variable '{}' not in bindings", primary_var))
+    })?;
+
+    // Build ID → rank maps
+    let primary_ids = extract_id_column(primary_batch)?;
+    let secondary_ids = extract_id_column(secondary_batch)?;
+
+    let mut primary_rank: HashMap<String, usize> = HashMap::new();
+    for (i, id) in primary_ids.iter().enumerate() {
+        primary_rank.entry(id.clone()).or_insert(i);
+    }
+    let mut secondary_rank: HashMap<String, usize> = HashMap::new();
+    for (i, id) in secondary_ids.iter().enumerate() {
+        secondary_rank.entry(id.clone()).or_insert(i);
+    }
+
+    // Collect all unique IDs
+    let mut all_ids: Vec<String> = primary_ids.clone();
+    for id in &secondary_ids {
+        if !primary_rank.contains_key(id) {
+            all_ids.push(id.clone());
+        }
+    }
+
+    // Compute RRF scores
+    let k = rrf.k as f64;
+    let mut scored: Vec<(String, f64)> = all_ids
+        .iter()
+        .map(|id| {
+            let p = primary_rank.get(id).map(|&r| 1.0 / (k + r as f64 + 1.0)).unwrap_or(0.0);
+            let s = secondary_rank.get(id).map(|&r| 1.0 / (k + r as f64 + 1.0)).unwrap_or(0.0);
+            (id.clone(), p + s)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(rrf.limit);
+
+    // Collect winning IDs in order — look up rows from primary or secondary batch
+    let winning_ids: Vec<String> = scored.iter().map(|(id, _)| id.clone()).collect();
+
+    // Build a combined row source: merge primary and secondary by id
+    let mut id_to_batch_row: HashMap<String, (&RecordBatch, usize)> = HashMap::new();
+    for (i, id) in primary_ids.iter().enumerate() {
+        id_to_batch_row.entry(id.clone()).or_insert((primary_batch, i));
+    }
+    for (i, id) in secondary_ids.iter().enumerate() {
+        id_to_batch_row.entry(id.clone()).or_insert((secondary_batch, i));
+    }
+
+    // Reconstruct a combined batch for the binding in winning order
+    let fused_batch = build_fused_batch(&winning_ids, &id_to_batch_row, primary_batch.schema())?;
+
+    // Replace the binding and project
+    let mut fused_bindings = primary_bindings;
+    fused_bindings.insert(primary_var.to_string(), fused_batch);
+
+    let result_batch = project_return(&fused_bindings, &ir.return_exprs, params)?;
+
+    // Already ordered by RRF score + already limited
+    Ok(QueryResult::new(result_batch.schema(), vec![result_batch]))
+}
+
+fn extract_id_column(batch: &RecordBatch) -> Result<Vec<String>> {
+    let col = batch.column_by_name("id").ok_or_else(|| {
+        OmniError::Manifest("batch missing 'id' column for RRF".to_string())
+    })?;
+    let ids = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+        OmniError::Manifest("'id' column is not Utf8".to_string())
+    })?;
+    Ok((0..ids.len()).map(|i| ids.value(i).to_string()).collect())
+}
+
+fn build_fused_batch(
+    ordered_ids: &[String],
+    id_to_batch_row: &HashMap<String, (&RecordBatch, usize)>,
+    schema: SchemaRef,
+) -> Result<RecordBatch> {
+    if ordered_ids.is_empty() {
+        return Ok(RecordBatch::new_empty(schema));
+    }
+
+    // Gather indices from source batches, collecting rows in the right order
+    let mut row_slices: Vec<RecordBatch> = Vec::with_capacity(ordered_ids.len());
+    for id in ordered_ids {
+        if let Some(&(batch, row_idx)) = id_to_batch_row.get(id) {
+            row_slices.push(batch.slice(row_idx, 1));
+        }
+    }
+
+    if row_slices.is_empty() {
+        return Ok(RecordBatch::new_empty(schema));
+    }
+
+    let schema = row_slices[0].schema();
+    arrow_select::concat::concat_batches(&schema, &row_slices)
+        .map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+/// Check if a filter is a text search filter that needs Lance SQL pushdown.
+fn is_search_filter(filter: &IRFilter) -> bool {
+    matches!(
+        &filter.left,
+        IRExpr::Search { .. } | IRExpr::Fuzzy { .. } | IRExpr::MatchText { .. }
+    )
+}
+
+/// Extract the variable name from a search filter's field expression.
+fn search_filter_variable(filter: &IRFilter) -> Option<&str> {
+    let field = match &filter.left {
+        IRExpr::Search { field, .. } => field,
+        IRExpr::Fuzzy { field, .. } => field,
+        IRExpr::MatchText { field, .. } => field,
+        _ => return None,
+    };
+    match field.as_ref() {
+        IRExpr::PropAccess { variable, .. } => Some(variable.as_str()),
+        _ => None,
+    }
+}
+
 /// Execute a pipeline of IR operations, populating variable bindings.
 fn execute_pipeline<'a>(
     pipeline: &'a [IROp],
@@ -92,17 +383,44 @@ fn execute_pipeline<'a>(
     graph_index: Option<&'a GraphIndex>,
     catalog: &'a Catalog,
     bindings: &'a mut HashMap<String, RecordBatch>,
+    search_mode: &'a SearchMode,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
-    for op in pipeline {
+    // Pre-pass: collect search filters that need to be hoisted to NodeScan
+    let mut hoisted_search_filters: HashMap<String, Vec<IRFilter>> = HashMap::new();
+    let mut hoisted_indices: HashSet<usize> = HashSet::new();
+    for (i, op) in pipeline.iter().enumerate() {
+        if let IROp::Filter(filter) = op {
+            if is_search_filter(filter) {
+                if let Some(var) = search_filter_variable(filter) {
+                    hoisted_search_filters
+                        .entry(var.to_string())
+                        .or_default()
+                        .push(filter.clone());
+                    hoisted_indices.insert(i);
+                }
+            }
+        }
+    }
+
+    for (i, op) in pipeline.iter().enumerate() {
+        // Skip hoisted search filters
+        if hoisted_indices.contains(&i) {
+            continue;
+        }
         match op {
             IROp::NodeScan {
                 variable,
                 type_name,
                 filters,
             } => {
+                // Merge inline filters with hoisted search filters
+                let mut all_filters: Vec<IRFilter> = filters.clone();
+                if let Some(extra) = hoisted_search_filters.get(variable) {
+                    all_filters.extend(extra.iter().cloned());
+                }
                 let batch =
-                    execute_node_scan(type_name, filters, params, snapshot, catalog).await?;
+                    execute_node_scan(type_name, variable, &all_filters, params, snapshot, catalog, search_mode).await?;
                 bindings.insert(variable.clone(), batch);
             }
             IROp::Filter(filter) => {
@@ -378,6 +696,7 @@ async fn execute_anti_join(
         let mut inner_bindings: HashMap<String, RecordBatch> = HashMap::new();
         inner_bindings.insert(outer_var.to_string(), single_row);
 
+        let no_search = SearchMode::default();
         execute_pipeline(
             inner_pipeline,
             params,
@@ -385,6 +704,7 @@ async fn execute_anti_join(
             graph_index,
             catalog,
             &mut inner_bindings,
+            &no_search,
         )
         .await?;
 
@@ -406,18 +726,20 @@ async fn execute_anti_join(
     Ok(())
 }
 
-/// Scan a node type's Lance dataset with optional filter pushdown.
+/// Scan a node type's Lance dataset with optional filter pushdown and search modes.
 async fn execute_node_scan(
     type_name: &str,
+    variable: &str,
     filters: &[IRFilter],
     params: &ParamMap,
     snapshot: &Snapshot,
     catalog: &Catalog,
+    search_mode: &SearchMode,
 ) -> Result<RecordBatch> {
     let table_key = format!("node:{}", type_name);
     let ds = snapshot.open(&table_key).await?;
 
-    // Build Lance SQL filter string from IR filters
+    // Build Lance SQL filter string from non-search IR filters
     let filter_sql = build_lance_filter(filters, params);
 
     let mut scanner = ds.scan();
@@ -425,6 +747,39 @@ async fn execute_node_scan(
         scanner
             .filter(sql.as_str())
             .map_err(|e| OmniError::Lance(format!("filter '{}': {}", sql, e)))?;
+    }
+
+    // Apply FTS queries from hoisted search filters (search/fuzzy/match_text in match clause)
+    for filter in filters {
+        if is_search_filter(filter) {
+            if let Some(fts_query) = build_fts_query(&filter.left, params) {
+                scanner
+                    .full_text_search(fts_query)
+                    .map_err(|e| OmniError::Lance(format!("full_text_search filter: {}", e)))?;
+            }
+        }
+    }
+
+    // Apply nearest vector search if this variable is the target
+    if let Some((ref var, ref prop, ref vec, k)) = search_mode.nearest {
+        if var == variable {
+            let query_arr = Float32Array::from(vec.clone());
+            scanner
+                .nearest(prop, &query_arr, k)
+                .map_err(|e| OmniError::Lance(format!("nearest: {}", e)))?;
+        }
+    }
+
+    // Apply BM25 full-text search if this variable is the target
+    if let Some((ref var, ref prop, ref text)) = search_mode.bm25 {
+        if var == variable {
+            let fts_query = lance_index::scalar::FullTextSearchQuery::new(text.clone())
+                .with_column(prop.clone())
+                .map_err(|e| OmniError::Lance(format!("fts with_column: {}", e)))?;
+            scanner
+                .full_text_search(fts_query)
+                .map_err(|e| OmniError::Lance(format!("full_text_search: {}", e)))?;
+        }
     }
 
     let batches: Vec<RecordBatch> = scanner
@@ -468,6 +823,12 @@ fn build_lance_filter(filters: &[IRFilter], params: &ParamMap) -> Option<String>
 }
 
 fn ir_filter_to_sql(filter: &IRFilter, params: &ParamMap) -> Option<String> {
+    // Search predicates (search/fuzzy/match_text = true) are NOT converted to SQL.
+    // They are handled via scanner.full_text_search() in execute_node_scan.
+    if is_search_filter(filter) {
+        return None;
+    }
+
     let left = ir_expr_to_sql(&filter.left, params)?;
     let right = ir_expr_to_sql(&filter.right, params)?;
     let op = match filter.op {
@@ -480,6 +841,74 @@ fn ir_filter_to_sql(filter: &IRFilter, params: &ParamMap) -> Option<String> {
         CompOp::Contains => return None, // Can't pushdown list contains
     };
     Some(format!("{} {} {}", left, op, right))
+}
+
+/// Build a FullTextSearchQuery from a search IR expression.
+fn build_fts_query(
+    expr: &IRExpr,
+    params: &ParamMap,
+) -> Option<lance_index::scalar::FullTextSearchQuery> {
+    match expr {
+        IRExpr::Search { field, query } => {
+            let prop = extract_property(field)?;
+            let q = resolve_to_string(query, params)?;
+            lance_index::scalar::FullTextSearchQuery::new(q)
+                .with_column(prop)
+                .ok()
+        }
+        IRExpr::Fuzzy { field, query, max_edits } => {
+            let prop = extract_property(field)?;
+            let q = resolve_to_string(query, params)?;
+            let edits = max_edits
+                .as_ref()
+                .and_then(|e| resolve_to_int(e, params))
+                .unwrap_or(2) as u32;
+            lance_index::scalar::FullTextSearchQuery::new_fuzzy(q, Some(edits))
+                .with_column(prop)
+                .ok()
+        }
+        IRExpr::MatchText { field, query } => {
+            // Use regular text search (phrase search not available in Lance 3.0 Rust API)
+            let prop = extract_property(field)?;
+            let q = resolve_to_string(query, params)?;
+            lance_index::scalar::FullTextSearchQuery::new(q)
+                .with_column(prop)
+                .ok()
+        }
+        _ => None,
+    }
+}
+
+/// Extract the property name from a PropAccess expression.
+fn extract_property(expr: &IRExpr) -> Option<String> {
+    match expr {
+        IRExpr::PropAccess { property, .. } => Some(property.clone()),
+        _ => None,
+    }
+}
+
+/// Resolve an expression to a string value (literal or param).
+fn resolve_to_string(expr: &IRExpr, params: &ParamMap) -> Option<String> {
+    match expr {
+        IRExpr::Literal(Literal::String(s)) => Some(s.clone()),
+        IRExpr::Param(name) => match params.get(name)? {
+            Literal::String(s) => Some(s.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Resolve an expression to an integer value (literal or param).
+fn resolve_to_int(expr: &IRExpr, params: &ParamMap) -> Option<i64> {
+    match expr {
+        IRExpr::Literal(Literal::Integer(n)) => Some(*n),
+        IRExpr::Param(name) => match params.get(name)? {
+            Literal::Integer(n) => Some(*n),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn ir_expr_to_sql(expr: &IRExpr, params: &ParamMap) -> Option<String> {

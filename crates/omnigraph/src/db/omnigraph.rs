@@ -8,6 +8,7 @@ use lance_index::{DatasetIndexExt, IndexType};
 use omnigraph_compiler::build_catalog;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::schema::parser::parse_schema;
+use omnigraph_compiler::types::ScalarType;
 
 use crate::error::{OmniError, Result};
 use crate::graph_index::GraphIndex;
@@ -149,6 +150,24 @@ impl Omnigraph {
                     .create_index_builder(&["id"], IndexType::BTree, &params)
                     .replace(true)
                     .await;
+
+                // Inverted (FTS) indices on @index String properties
+                if let Some(node_type) = self.catalog.node_types.get(type_name) {
+                    for prop_name in &node_type.indexed_properties {
+                        if let Some(prop_type) = node_type.properties.get(prop_name) {
+                            if matches!(prop_type.scalar, ScalarType::String) && !prop_type.list {
+                                let _ = ds
+                                    .create_index_builder(
+                                        &[prop_name.as_str()],
+                                        IndexType::Inverted,
+                                        &params,
+                                    )
+                                    .replace(true)
+                                    .await;
+                            }
+                        }
+                    }
+                }
             }
         }
 

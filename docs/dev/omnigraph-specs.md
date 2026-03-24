@@ -12,7 +12,7 @@ It is a new product with:
 
 - a **Lance-native storage model**: manifest as a Lance table, per-type Lance datasets, stable row IDs, shallow clone branching — no custom WAL, no custom JSON manifest, no custom CDC
 - a **git-style API**: branch, merge, tag, clone, push, pull
-- a **different identity model**: String IDs (`@key` values or ULIDs), no `u64` counters, no cross-branch ID coordination
+- a **different identity model**: String IDs (`key()` values or ULIDs), no `u64` counters, no cross-branch ID coordination
 - a **different runtime shape**: lazy topology indices, tiered hydration, on-demand property access, URI-based open for local and remote repos
 
 Nanograph remains the embedded local-first product with a single-database API.
@@ -41,7 +41,7 @@ What does **not** carry forward:
 1. **Git-style graph database**: branch, merge, tag, clone, push, pull for typed property graphs
 2. **Local-first, remote-native**: works on a laptop, works on S3 — same API, same URI
 3. **Fast traversal without full-row residency**: in-memory topology, on-demand property hydration
-4. **Typed columnar execution**: Lance Scanner with SQL filter pushdown over per-type Lance tables. BTree scalar indices on `id`, `src`, `dst`.
+4. **Typed columnar execution**: Lance Scanner with SQL filter pushdown over per-type Lance tables. BTree/Inverted/Vector indices from schema constraints.
 5. **Indexed search**: Lance FTS, n-gram, and vector indexes replace brute-force in-memory search
 6. **Schema-as-code**: `.pg` remains readable and versioned with data
 7. **Two products, shared compiler**: Nanograph and Omnigraph share the `omnigraph-compiler` crate but own different storage/execution layers
@@ -52,7 +52,9 @@ What does **not** carry forward:
 
 ### Shared: `omnigraph-compiler`
 
-- schema AST/parser (`.pg`)
+- schema AST/parser (`.pg`) with first-class constraint system (`key`, `unique`, `index`, `range`, `check`)
+- edge cardinality model (`@card(min..max)`)
+- property derivations (`= embed(source)`)
 - query AST/parser (`.gq`)
 - typechecker (read queries + mutations)
 - catalog builder
@@ -72,10 +74,116 @@ What does **not** carry forward:
 - `ManifestCoordinator` — Lance table for cross-dataset coordination
 - `GraphIndex` — lazy CSR/CSC with dense u32 indices
 - `execute_query()` — pure function executor
-- JSONL loader targeting per-type Lance tables
-- `ensure_indices()` — BTree scalar index creation
+- JSONL loader targeting per-type Lance tables with constraint validation
+- `ensure_indices()` — BTree, Inverted, Vector index creation from schema constraints
 - Lance-native branching, tagging, shallow clone (planned)
 - CLI (planned)
+
+---
+
+## Schema Language
+
+The `.pg` schema defines typed nodes, edges, constraints, and metadata. Constraints are first-class grammar elements — not annotations. Annotations are reserved for metadata only.
+
+### Type Declarations
+
+```
+node TypeName @description("...") {
+    prop: Type                               // required
+    prop: Type?                              // nullable
+
+    key(prop)                                // identity constraint
+    unique(p1, p2)                           // uniqueness (composite ok)
+    index(p1, p2)                            // index hint (composite ok)
+    range(prop, 0..100)                      // value bound
+    check(prop, "[A-Z]{3}-[0-9]+")           // regex pattern
+}
+
+edge TypeName: From -> To @card(0..1) {
+    prop: Type?
+
+    unique(src, dst)                         // prevent duplicate edges
+    index(prop)                              // edge property index
+}
+```
+
+### Constraints
+
+First-class grammar elements inside type bodies. NOT annotations.
+
+| Constraint | Syntax | Targets | Composites | Effect |
+|---|---|---|---|---|
+| `key` | `key(prop)` | nodes | no (single) | Value becomes `id` column, implies index, at most 1 per type |
+| `unique` | `unique(p1, ...)` | nodes, edges | yes | Enforce uniqueness on column tuple |
+| `index` | `index(p1, ...)` | nodes, edges | yes | BTree (scalar), Inverted (String), IVF-HNSW (Vector) |
+| `range` | `range(prop, min..max)` | nodes | no | Validate value within bounds at load/mutation |
+| `check` | `check(prop, "regex")` | nodes | no | Validate value matches pattern at load/mutation |
+
+Enforcement is strict: violations are hard errors at load and mutation time.
+
+### Edge Cardinality
+
+```
+edge WorksAt: Person -> Company @card(0..1)      // at most one employer
+edge Knows: Person -> Person                      // default: @card(0..)
+edge Authored: Person -> Paper @card(1..)         // at least one author required
+```
+
+Enforced at: loader (post-write validation), mutation insert (max bound check), mutation delete (min bound check).
+
+### Derivations
+
+Property derivation replaces the former `@embed` annotation:
+
+```
+node Document {
+    body: String
+    embedding: Vector(1536) = embed(body)
+}
+```
+
+The `= embed(source_property)` syntax makes the derivation relationship explicit. Derivations are validated at parse time: target must be `Vector`, source must be `String`, source property must exist.
+
+### Annotations (Metadata Only)
+
+After the constraint restructuring, annotations are exclusively for metadata that does not affect storage or runtime behavior:
+
+- `@description("...")` — human-readable documentation on types and properties
+- `@instruction("...")` — agent/LLM guidance on types
+- `@rename_from("...")` — schema evolution hint
+
+### Example Schema
+
+```
+node Person @description("A person in the graph") {
+    name: String
+    email: String
+    age: I32?
+    bio: String?
+    embedding: Vector(384) = embed(bio)
+
+    key(name)
+    unique(email)
+    index(name, age)
+    range(age, 0..200)
+}
+
+node Company @description("An organization") {
+    name: String
+
+    key(name)
+}
+
+edge WorksAt: Person -> Company @card(0..1) {
+    since: Date?
+
+    index(since)
+}
+
+edge Knows: Person -> Person {
+    unique(src, dst)
+}
+```
 
 ---
 
@@ -126,7 +234,7 @@ impl Omnigraph {
     pub async fn refresh(&mut self) -> Result<()>;           // re-read from storage
     pub async fn graph_index(&mut self) -> Result<Arc<GraphIndex>>;
     pub async fn run_query(&mut self, source: &str, name: &str, params: &ParamMap) -> Result<QueryResult>;
-    pub async fn ensure_indices(&self) -> Result<()>;        // BTree on id/src/dst
+    pub async fn ensure_indices(&self) -> Result<()>;        // BTree/Inverted/Vector from schema constraints
     pub fn catalog(&self) -> &Catalog;
     pub fn uri(&self) -> &str;
     pub fn version(&self) -> u64;
@@ -186,11 +294,11 @@ Every future optimization is additive — a new field on `Omnigraph` or a new pa
 
 ```
 crates/
-├── omnigraph-compiler/        # No Lance dependency. 149 tests.
+├── omnigraph-compiler/        # No Lance dependency. 149+ tests.
 │   └── src/
-│       ├── schema/            # .pg parser, AST, pest grammar
+│       ├── schema/            # .pg parser, AST, pest grammar, Constraint/Derivation/Cardinality types
 │       ├── query/             # .gq parser, AST, typechecker, pest grammar
-│       ├── catalog/           # Catalog, build_catalog
+│       ├── catalog/           # Catalog, build_catalog (key, unique, index, range, check, cardinality)
 │       ├── ir/                # QueryIR, MutationIR, lowering
 │       ├── types.rs           # ScalarType, PropType, Direction
 │       ├── error.rs           # NanoError, ParseDiagnostic
@@ -199,17 +307,17 @@ crates/
 │       ├── result.rs          # QueryResult, MutationResult, RunResult
 │       └── query_input.rs     # Named query lookup, param parsing, params! macro
 │
-├── omnigraph/                 # The database. Lance-dependent. 35 tests.
+├── omnigraph/                 # The database. Lance-dependent. 60+ tests.
 │   └── src/
 │       ├── db/
 │       │   ├── manifest.rs    # Snapshot, ManifestCoordinator (known_state, snapshot, refresh, commit)
-│       │   └── omnigraph.rs   # Omnigraph handle (init, open, run_query, graph_index, ensure_indices)
+│       │   └── omnigraph.rs   # Omnigraph handle (init, open, run_query, run_mutation, graph_index, ensure_indices)
 │       ├── exec/
-│       │   └── mod.rs         # execute_query, execute_pipeline, execute_expand, execute_anti_join, hydrate_nodes
+│       │   └── mod.rs         # execute_query, execute_mutation, execute_expand, execute_anti_join, hydrate_nodes
 │       ├── graph_index/
 │       │   └── mod.rs         # GraphIndex, TypeIndex (String↔u32), CsrIndex (CSR adjacency)
 │       └── loader/
-│           └── mod.rs         # load_jsonl, load_jsonl_file, build_node_batch, write_batch_to_dataset
+│           └── mod.rs         # load_jsonl, load_jsonl_file, build_node_batch, validate_constraints
 │
 └── omnigraph-cli/             # Binary (stubbed, wired in Step 10)
     └── src/
@@ -271,7 +379,7 @@ The manifest is a Lance table. One row per sub-table. A repo version is one mani
 
 | Column | Type | Notes |
 |---|---|---|
-| `id` | Utf8 | `@key` value or ULID. BTree index. |
+| `id` | Utf8 | `key()` value or ULID. BTree index. |
 | `{property}` | typed | One column per `.pg` property |
 
 **Edges** (from `Catalog::edge_types[name].arrow_schema`):
@@ -285,13 +393,22 @@ The manifest is a Lance table. One row per sub-table. A repo version is one mani
 
 All datasets created with `enable_stable_row_ids = true` and `LanceFileVersion::V2_2`.
 
-### Scalar Indices
+### Indices
 
-`Omnigraph::ensure_indices()` creates BTree indices after data load:
+`Omnigraph::ensure_indices()` creates indices after data load.
+
+**Always created (structural):**
 - Node tables: BTree on `id`
 - Edge tables: BTree on `src`, BTree on `dst`
 
-Uses `lance_index::DatasetIndexExt::create_index_builder` with `IndexType::BTree` and `ScalarIndexParams::default()`. Idempotent (`replace=true`).
+**From schema constraints (`index(...)`):**
+- Scalar properties → `IndexType::BTree`
+- String properties → `IndexType::Inverted` (for FTS)
+- Vector properties → `IndexType::IvfHnswPq` (for ANN)
+- Composite indices: `index(p1, p2)` → multi-column BTree
+- Edge property indices: `index(since)` inside edge body → BTree on edge property columns
+
+Uses `lance_index::DatasetIndexExt::create_index_builder`. Idempotent (`replace=true`).
 
 ### Why Per-Type Tables
 
@@ -309,7 +426,7 @@ Uses `lance_index::DatasetIndexExt::create_index_builder` with `IndexType::BTree
 ### Persisted Identity
 
 - every node/edge row has a String `id` column (Utf8)
-- `@key` types use the key property value as `id` (e.g., `name: String @key` → `id = "Alice"`)
+- `key()` types use the key property value as `id` (e.g., `key(name)` → `id = "Alice"`)
 - keyless types use generated ULIDs (`ulid::Ulid::new().to_string()`)
 - edge `src` / `dst` persist String IDs of referenced nodes
 - `id` has BTree scalar index for efficient lookups and `merge_insert`
@@ -324,7 +441,7 @@ Uses `lance_index::DatasetIndexExt::create_index_builder` with `IndexType::BTree
 
 ### Future: Binary ULIDs
 
-The current design stores all IDs as Utf8 strings — 26-byte Crockford Base32 for ULIDs, variable-length for `@key` values. This prioritizes simplicity and debuggability at v0.1.0 but has known performance costs at scale:
+The current design stores all IDs as Utf8 strings — 26-byte Crockford Base32 for ULIDs, variable-length for `key()` values. This prioritizes simplicity and debuggability at v0.1.0 but has known performance costs at scale:
 
 - **Space:** Each edge row carries 78+ bytes of string IDs (`id` + `src` + `dst`). Binary ULIDs (`FixedSizeBinary(16)`) would cut this to 48 bytes — a 38% reduction on the ID columns.
 - **Speed:** String hashing/comparison for `TypeIndex` build, `merge_insert` keyed by `id`, and edge-to-node joins is ~3-5x slower than fixed-width binary comparison.
@@ -332,11 +449,11 @@ The current design stores all IDs as Utf8 strings — 26-byte Crockford Base32 f
 
 **Recommended migration path** (not before Step 6 profiling justifies it):
 
-1. Separate external identity (`@key` — user-facing, indexed, human-readable) from internal identity (`id` — binary ULID, `FixedSizeBinary(16)`).
-2. Edge `src`/`dst` store binary ULIDs, not `@key` strings.
-3. `@key` becomes a unique indexed property column, not the `id` value.
+1. Separate external identity (`key()` — user-facing, indexed, human-readable) from internal identity (`id` — binary ULID, `FixedSizeBinary(16)`).
+2. Edge `src`/`dst` store binary ULIDs, not `key()` strings.
+3. `key()` property becomes a unique indexed column, not the `id` value.
 4. `TypeIndex` becomes `HashMap<u128, u32>` — faster build, less memory.
-5. Lookup by `@key` goes through a Lance scalar index on that column.
+5. Lookup by `key()` goes through a Lance scalar index on that column.
 
 **Trigger:** Profile the `TypeIndex` build in Step 6. If `HashMap<String, u32>` construction is measurable (>10ms for the target graph size), that's the signal to switch.
 
@@ -450,11 +567,11 @@ Sub-tables not written to on a branch are never branched. Storage overhead is pr
 
 ---
 
-## Mutation Model (Planned — Step 7)
+## Mutation Model
 
-### Compiler Support (Already Built)
+### Pipeline
 
-The compiler handles the full mutation pipeline — parsing, typechecking, IR lowering:
+`Omnigraph::run_mutation()` → parse → typecheck → lower → `execute_mutation()`.
 
 **Grammar**: `insert Type { prop: value }`, `update Type set { prop: value } where pred`, `delete Type where pred`
 
@@ -465,11 +582,11 @@ The compiler handles the full mutation pipeline — parsing, typechecking, IR lo
 - Update validates property types, rejects edge updates (T16)
 - Delete validates predicate for both nodes and edges
 
-### Runtime (To Build)
+### Runtime
 
-**Insert**: Build single-row RecordBatch → `Dataset::append()` → commit manifest.
+**Insert**: Build single-row RecordBatch → `key()` types use `merge_insert` (upsert), keyless use `append` → commit manifest. Edge inserts invalidate graph index.
 
-**Update**: Scan with predicate filter → apply assignments → `merge_insert` keyed by `id` → commit manifest.
+**Update**: Scan with predicate filter → apply assignments → `merge_insert` keyed by `id` → commit manifest. Rejects `key()` property changes.
 
 **Delete with edge cascade**:
 1. Scan for matching IDs
@@ -478,11 +595,18 @@ The compiler handles the full mutation pipeline — parsing, typechecking, IR lo
 4. Commit manifest for all changed sub-tables
 5. Invalidate graph index: `self.cached_graph_index = None`
 
-**Lance APIs**: `ds.append()`, `MergeInsertBuilder`, `ds.delete(predicate)` — all already used in the loader.
+### Constraint Enforcement
+
+Mutations enforce schema constraints at runtime:
+
+- **Value constraints**: `range()` and `check()` validated before write in `execute_insert` and `execute_update`. Violations are hard errors.
+- **Edge cardinality**: `@card(min..max)` validated in `execute_insert` (max bound check) and `execute_delete` (min bound check for min > 0). Violations are hard errors.
+- **Unique constraints**: enforced via `merge_insert` keyed by `id` for `key()`, post-write duplicate scan for `unique(...)`.
+- **Key immutability**: updates to `key()` properties are rejected by the typechecker (T16-style check).
 
 ---
 
-## Search Model (Planned — Step 8)
+## Search Model
 
 Lance-native indexed search replaces Nanograph's brute-force implementations:
 
@@ -495,9 +619,10 @@ Lance-native indexed search replaces Nanograph's brute-force implementations:
 | `nearest()` | Lance ANN | `IndexType::IvfHnswPq` |
 | `rrf()` | Application-level score fusion | N/A |
 
-Index creation extends `ensure_indices()`:
-- `@index` String properties → `IndexType::Inverted`
-- `Vector(N)` properties → `IndexType::IvfHnswPq`
+Index creation is driven by `index()` constraints in the schema:
+- `index(title)` on String properties → `IndexType::Inverted` (FTS)
+- `index(embedding)` on Vector properties → `IndexType::IvfHnswPq` (ANN)
+- `ensure_indices()` already creates Inverted indices on `index()` String properties
 
 The compiler IR already supports all search expressions (`IRExpr::Search/Fuzzy/MatchText/Bm25/Nearest/Rrf`). Only the runtime execution is missing.
 
@@ -605,7 +730,7 @@ Each sub-table dataset (the "base table" in MemWAL terms) can independently have
 
 - Each MemWAL region has exactly one active writer at a time, enforced by epoch-based fencing
 - **Correctness invariant:** rows with the same primary key must go to the same region — otherwise merge order between regions can corrupt "last write wins" semantics
-- Omnigraph's `id` column (String, `@key` value or ULID) serves as the unenforced primary key required by MemWAL
+- Omnigraph's `id` column (String, `key()` value or ULID) serves as the unenforced primary key required by MemWAL
 - Region assignment strategy: for node types, partition by `id`; for edge types, partition by `src` (ensures all edges from the same source node go to the same region, which aligns with CSR build patterns)
 - Region specs use Lance's `bucket(id, N)` transform to distribute rows across N regions
 - Multiple writers claim different regions → horizontal write scale-out on a single branch, no coordination between writers
@@ -638,7 +763,7 @@ The current model (Step 7) does one manifest commit per mutation. With streaming
 4. **Writer handle pool** — `Omnigraph` handle exposes region-aware write API. Each writer claims a region via epoch-based fencing. Multiple handles write concurrently to different regions on the same branch
 5. **Read path unchanged** — `Snapshot::open()` returns a `Dataset` that includes flushed MemTable data via Lance's LSM-tree merging read. Graph index builds from merged scan results
 
-**Trigger:** Profile write throughput on agent workloads. If per-mutation commit latency exceeds 10ms or throughput drops below 100 writes/sec, add manifest batching first, then MemWAL. **Prerequisite:** Step 7 (mutations) and Step 9 (branching).
+**Trigger:** Profile write throughput on agent workloads. If per-mutation commit latency exceeds 10ms or throughput drops below 100 writes/sec, add manifest batching first, then MemWAL. **Prerequisite:** Step 7 (complete) and Step 9 (branching).
 
 ---
 
@@ -647,11 +772,11 @@ The current model (Step 7) does one manifest commit per mutation. With streaming
 See `implementation-plan.md` for detailed step-by-step status, compiler types to reuse, runtime code to write, Lance APIs, and test cases for each remaining step.
 
 ```
-Steps 0–6 ✅ (184 tests)
-     ├→ Step 7: Mutations (insert/update/delete + edge cascade)
-     ├→ Step 8: Search predicates (Lance FTS/ANN)
-     └→ Step 9: Branching (Lance branches on manifest + sub-tables)
-          └→ Step 10: Change tracking + CLI
+Steps 0–8 ✅ (216 tests)
+     └→ Step 7a: Constraint system restructuring
+          ├→ Step 9: Branching (Lance branches on manifest + sub-tables)
+          │    └→ Step 10: Change tracking + CLI
+          └→ Step 10: CLI core wiring
 ```
 
 ---
@@ -679,8 +804,10 @@ Omnigraph is successful when:
 4. **Compaction.** Lance handles natively. Wire up as CLI command.
 5. **SDKs (TS, Swift, Python).** Thin wrappers after API stabilizes.
 6. **DuckDB fallback.** For graphs > ~5M edges. Defer until scale demands.
-7. **MemWAL — Streaming concurrent writes on a single branch.** Lance MemWAL is an LSM-tree architecture enabling high-throughput streaming writes. Each sub-table dataset gets its own MemWAL with regions (one active writer per region, epoch-fenced). The same `append`/`merge_insert`/`delete` API surface works transparently — MemWAL routes writes through a durable WAL internally. Omnigraph integration requires: (1) enable MemWAL on sub-table datasets, (2) region assignment by `id` column using `bucket(id, N)` transform, (3) manifest commit batching — replace per-mutation commit with periodic checkpoint, (4) writer handle pool with region-aware API. The read path is unchanged — `Snapshot::open()` returns a Dataset that includes flushed MemTable data via Lance's LSM-tree merging read. See Concurrency Model and Consistency Model sections for full architecture. **Trigger:** per-mutation commit latency >10ms or throughput <100 writes/sec. **Prerequisite:** Step 7 + Step 9.
+7. **MemWAL — Streaming concurrent writes on a single branch.** Lance MemWAL is an LSM-tree architecture enabling high-throughput streaming writes. Each sub-table dataset gets its own MemWAL with regions (one active writer per region, epoch-fenced). The same `append`/`merge_insert`/`delete` API surface works transparently — MemWAL routes writes through a durable WAL internally. Omnigraph integration requires: (1) enable MemWAL on sub-table datasets, (2) region assignment by `id` column using `bucket(id, N)` transform, (3) manifest commit batching — replace per-mutation commit with periodic checkpoint, (4) writer handle pool with region-aware API. The read path is unchanged — `Snapshot::open()` returns a Dataset that includes flushed MemTable data via Lance's LSM-tree merging read. See Concurrency Model and Consistency Model sections for full architecture. **Trigger:** per-mutation commit latency >10ms or throughput <100 writes/sec. **Prerequisite:** Step 7 (complete) + Step 9.
 8. **Service layer / HTTP API.** `Omnigraph` struct IS the cache — a service just keeps it alive.
 9. **Binary ULIDs.** Switch `id` from Utf8 to `FixedSizeBinary(16)` for performance. See Identity Model section.
 10. **Row-correlated bindings.** Tuple-based binding model for general N×M cross-variable returns. See Query Execution section.
 11. **take_rows() hydration.** Use Lance stable row ID addresses for O(1) node hydration. Scalar indices already cover the IN filter path.
+12. **Composite key enforcement at Lance level.** Step 7a adds composite key syntax (`key(tenant, slug)`) to the schema language, but the runtime still uses a single `id` column. Full composite key support (multi-column unique constraint at the Lance level) is deferred.
+13. **Cross-branch cardinality validation.** Edge cardinality is validated per-branch. Cross-branch cardinality semantics after merge are deferred.

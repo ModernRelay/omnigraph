@@ -112,3 +112,25 @@ pub fn mixed_params(str_pairs: &[(&str, &str)], int_pairs: &[(&str, i64)]) -> Pa
     }
     map
 }
+
+/// Build a ParamMap with a single vector parameter.
+pub fn vector_param(name: &str, values: &[f32]) -> ParamMap {
+    let key = name.strip_prefix('$').unwrap_or(name).to_string();
+    let lit = Literal::List(values.iter().map(|v| Literal::Float(*v as f64)).collect());
+    let mut map = ParamMap::new();
+    map.insert(key, lit);
+    map
+}
+
+/// Build a ParamMap with a vector param and a string param.
+pub fn vector_and_string_params(
+    vec_name: &str,
+    vec_values: &[f32],
+    str_name: &str,
+    str_value: &str,
+) -> ParamMap {
+    let mut map = vector_param(vec_name, vec_values);
+    let key = str_name.strip_prefix('$').unwrap_or(str_name).to_string();
+    map.insert(key, Literal::String(str_value.to_string()));
+    map
+}
