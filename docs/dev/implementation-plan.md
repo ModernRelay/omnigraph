@@ -17,7 +17,7 @@ Living document tracking the build of the Lance-native graph database.
 
 ## Current Status
 
-**297 registered tests passing.** Steps 0–9a complete. Step 10 is next.
+**311 registered tests passing.** Steps 0–10a complete. Step 10b is next.
 
 ```
 Step 0  ✅  Crate restructuring
@@ -35,8 +35,8 @@ Step 8a ✅  Runtime alignment before branching
 Step 8b ✅  Graph write correctness before branching
 Step 9  ✅  Branching
 Step 9a ✅  Merge engine hardening
-Step 9b    Surgical merge publish (preserve row identity across merges)
-Step 10a   Change detection module (net-current diff, two-path lineage-aware)
+Step 9b ✅  Surgical merge publish (preserve row identity across merges)
+Step 10a ✅ Change detection module (net-current diff, two-path lineage-aware)
 Step 10b   Point-in-time query support (historical snapshots)
 Step 10c   CLI wiring (all stubbed commands + changes/diff)
 Step 10d   Hook + query-result subscription extension points (design only)
@@ -566,6 +566,8 @@ Add BTree index on `id` for edge tables in `build_indices_on_dataset`. Currently
 // 5. Merge publish writes fewer rows than truncate+append (delta only)
 ```
 
+**Result:** Surgical merge publish is in the active runtime. `stage_streaming_table_merge` outputs dual result (full for validation, delta for publish). `publish_rewritten_merge_table` uses `merge_insert` + `delete`. `publish_adopted_source_state` applies delta onto target lineage for cases where target owns the sub-table. Edge tables have BTree on `id`. 3 new tests + all 18 existing branching tests pass.
+
 ---
 
 ### Step 10: Change Tracking + CLI
@@ -732,6 +734,10 @@ This correctly handles cross-branch diffs — each snapshot opens the manifest o
 // 10. diff after merge (with Step 9b) correctly reports only actual changes (not all rows as inserts)
 ```
 
+**Result:** Change detection module is in the active runtime. `diff_snapshots` implements three-level algorithm (manifest diff → lineage check → row-level diff). Fast path uses `_row_last_updated_at_version` + ID set membership (works around Lance `merge_insert` stamping `_row_created_at_version` at dataset creation version). Cross-branch path uses streaming ordered ID diff with row signatures. Public API: `diff()`, `changes_since()`, `diff_commits()`, `entity_at()`, `snapshot_at_version()`. 8 tests + 3 Lance investigation tests. Lance `merge_insert` version-column behavior documented in `lance_version_columns.rs` with strict assertions.
+
+**Running total: 311 registered tests (140 omnigraph + 171 compiler). Steps 0–10a complete.**
+
 ---
 
 #### Step 10b: Point-in-Time Query Support
@@ -860,16 +866,14 @@ fn extract_deps(ir: &QueryIR) -> QueryDeps {
 ## Dependency Graph
 
 ```
-Steps 0–9a ✅ (297 tests)
-     └→ Step 9b  (surgical merge publish — preserves row identity for change detection)
-         └→ Step 10a (change detection — two-path lineage-aware diff)
-             └→ Step 10b (point-in-time — historical snapshots)
-             └→ Step 10c (CLI — all commands + changes/diff)
-             └→ Step 10d (design only — validates hooks + query subscriptions)
-                 └→ Future Step 11: Hook system (entity-change + query-result triggers)
+Steps 0–10a ✅ (311 tests)
+     └→ Step 10b (point-in-time — historical snapshots)
+     └→ Step 10c (CLI — all commands + changes/diff)
+     └→ Step 10d (design only — validates hooks + query subscriptions)
+         └→ Future Step 11: Hook system (entity-change + query-result triggers)
 ```
 
-**Critical path:** Step 9b → 10a → 10b → 10c. Step 10d is design verification only.
+**Critical path:** Step 10b → 10c. Step 10d is design verification only.
 
 ---
 
@@ -897,7 +901,7 @@ Steps 0–9a ✅ (297 tests)
 | 10b | ~3 (point-in-time: historical query, traversal, error) | ~313-315 |
 | 10c | ~5 (CLI: init/load/run/branch/changes) | ~318-320 |
 
-**Current: 297 registered tests passing.** Milestone running totals are approximate and may drift as coverage is added to existing files. Target: ~320 tests at completion.
+**Current: 311 registered tests passing (140 omnigraph + 171 compiler).** Steps 9b (+3 branching tests) and 10a (+8 change detection tests + 3 Lance investigation tests) complete. Target: ~320 tests at completion.
 
 ---
 

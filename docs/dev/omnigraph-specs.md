@@ -77,7 +77,8 @@ What does **not** carry forward:
 - JSONL loader targeting per-type Lance tables with constraint validation
 - `ensure_indices()` — BTree, Inverted, and Vector ANN index creation from active schema constraints
 - Lance-native branching, tagging, merge with three-way diff (complete)
-- Change detection — net-current diff via Lance version columns + ID set-difference (Step 10a)
+- Surgical merge publish — `merge_insert` + `delete` preserves row version metadata (complete)
+- Change detection — two-path lineage-aware diff via Lance version columns + ID set-difference (complete)
 - Point-in-time queries — historical Snapshot + `run_query_at()` (Step 10b)
 - CLI (Step 10c)
 - Hook system — entity-change + query-result triggers (Step 11, planned)
@@ -517,7 +518,7 @@ crates/
 │       ├── result.rs          # QueryResult, MutationResult, RunResult
 │       └── query_input.rs     # Named query lookup, param parsing, params! macro
 │
-├── omnigraph/                 # The database. Lance-dependent. 85+ tests. Blob v2 via fixup_blob_schemas().
+├── omnigraph/                 # The database. Lance-dependent. 140 tests. Blob v2 via fixup_blob_schemas().
 │   └── src/
 │       ├── db/
 │       │   ├── manifest.rs    # Snapshot, ManifestCoordinator (known_state, snapshot, refresh, commit)
@@ -1236,12 +1237,10 @@ The current model (Step 7) does one manifest commit per mutation. With streaming
 See `implementation-plan.md` for detailed step-by-step status, compiler types to reuse, runtime code to write, Lance APIs, and test cases for each remaining step.
 
 ```
-Steps 0–9a ✅ (297 tests)
-     └→ Step 9b:  Surgical merge publish (preserve row identity for change detection)
-         ├→ Step 10a: Change detection (two-path lineage-aware diff)
-         ├→ Step 10b: Point-in-time query support (historical snapshots)
-         ├→ Step 10c: CLI wiring
-         └→ Step 10d: Hook + query-result subscription design validation
+Steps 0–10a ✅ (311 tests)
+     ├→ Step 10b: Point-in-time query support (historical snapshots)
+     ├→ Step 10c: CLI wiring
+     └→ Step 10d: Hook + query-result subscription design validation
 ```
 
 ---
