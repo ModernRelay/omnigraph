@@ -4,11 +4,31 @@ use std::fs;
 
 use arrow_array::{Array, Int32Array};
 
-use omnigraph::db::Omnigraph;
+use omnigraph::db::{MergeOutcome, Omnigraph};
 use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::error::{MergeConflictKind, OmniError};
+use omnigraph::loader::{LoadMode, load_jsonl};
 
 use helpers::*;
+
+const SEARCH_SCHEMA: &str = include_str!("fixtures/search.pg");
+const SEARCH_DATA: &str = include_str!("fixtures/search.jsonl");
+const SEARCH_QUERIES: &str = include_str!("fixtures/search.gq");
+const SEARCH_MUTATIONS: &str = r#"
+query set_doc_title($slug: String, $title: String) {
+    update Doc set { title: $title } where slug = $slug
+}
+"#;
+
+async fn init_search_db(dir: &tempfile::TempDir) -> Omnigraph {
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, SEARCH_SCHEMA).await.unwrap();
+    load_jsonl(&mut db, SEARCH_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    db.ensure_indices().await.unwrap();
+    db
+}
 
 #[tokio::test]
 async fn branch_create_open_list_and_lazy_branching_work() {
@@ -92,7 +112,8 @@ async fn branch_merge_updates_main_traversal() {
         .unwrap();
     assert_eq!(main_before.num_rows(), 2);
 
-    main.branch_merge("feature", "main").await.unwrap();
+    let outcome = main.branch_merge("feature", "main").await.unwrap();
+    assert_eq!(outcome, MergeOutcome::FastForward);
 
     let merged = main
         .run_query(TEST_QUERIES, "friends_of", &params(&[("$name", "Alice")]))
@@ -118,7 +139,8 @@ async fn branch_merge_applies_node_insert_to_main() {
         .await
         .unwrap();
 
-    feature.branch_merge("feature", "main").await.unwrap();
+    let outcome = feature.branch_merge("feature", "main").await.unwrap();
+    assert_eq!(outcome, MergeOutcome::FastForward);
 
     let mut reopened = Omnigraph::open(uri).await.unwrap();
     let qr = reopened
@@ -160,7 +182,8 @@ async fn branch_merge_records_single_latest_commit_with_two_parents() {
         .unwrap()
         .unwrap();
 
-    main.branch_merge("feature", "main").await.unwrap();
+    let outcome = main.branch_merge("feature", "main").await.unwrap();
+    assert_eq!(outcome, MergeOutcome::FastForward);
 
     let commit_graph = CommitGraph::open(uri).await.unwrap();
     let head = commit_graph.head_commit().await.unwrap().unwrap();
@@ -184,7 +207,7 @@ async fn branch_merge_records_single_latest_commit_with_two_parents() {
 }
 
 #[tokio::test]
-async fn no_op_branch_merge_moves_head_to_merge_commit_at_same_manifest_version() {
+async fn already_up_to_date_branch_merge_returns_without_new_commit() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut main = init_and_load(&dir).await;
@@ -209,21 +232,103 @@ async fn no_op_branch_merge_moves_head_to_merge_commit_at_same_manifest_version(
         target_head_before.manifest_version
     );
 
-    main.branch_merge("feature", "main").await.unwrap();
+    let outcome = main.branch_merge("feature", "main").await.unwrap();
+    assert_eq!(outcome, MergeOutcome::AlreadyUpToDate);
 
     let commit_graph = CommitGraph::open(uri).await.unwrap();
     let head = commit_graph.head_commit().await.unwrap().unwrap();
 
     assert_eq!(head.manifest_version, target_head_before.manifest_version);
-    assert_ne!(head.graph_commit_id, target_head_before.graph_commit_id);
+    assert_eq!(head.graph_commit_id, target_head_before.graph_commit_id);
     assert_eq!(
-        head.parent_commit_id.as_deref(),
-        Some(target_head_before.graph_commit_id.as_str())
+        head.graph_commit_id,
+        source_head_before.graph_commit_id
     );
-    assert_eq!(
-        head.merged_parent_commit_id.as_deref(),
-        Some(source_head_before.graph_commit_id.as_str())
-    );
+}
+
+#[tokio::test]
+async fn branch_merge_returns_merged_for_non_fast_forward_auto_merge() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = init_and_load(&dir).await;
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open_branch(uri, "feature").await.unwrap();
+
+    main.run_mutation(
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Bob")], &[("$age", 26)]),
+    )
+    .await
+    .unwrap();
+
+    feature
+        .run_mutation(
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        )
+        .await
+        .unwrap();
+
+    let outcome = main.branch_merge("feature", "main").await.unwrap();
+    assert_eq!(outcome, MergeOutcome::Merged);
+
+    let bob = main
+        .run_query(TEST_QUERIES, "get_person", &params(&[("$name", "Bob")]))
+        .await
+        .unwrap()
+        .concat_batches()
+        .unwrap();
+    let bob_ages = bob.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+    assert_eq!(bob_ages.value(0), 26);
+
+    let eve = main
+        .run_query(TEST_QUERIES, "get_person", &params(&[("$name", "Eve")]))
+        .await
+        .unwrap();
+    assert_eq!(eve.num_rows(), 1);
+}
+
+#[tokio::test]
+async fn merged_rewritten_indexed_table_is_searchable_immediately() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = init_search_db(&dir).await;
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open_branch(uri, "feature").await.unwrap();
+
+    main.run_mutation(
+        SEARCH_MUTATIONS,
+        "set_doc_title",
+        &params(&[("$slug", "ml-intro"), ("$title", "Orion ML Intro")]),
+    )
+    .await
+    .unwrap();
+
+    feature
+        .run_mutation(
+            SEARCH_MUTATIONS,
+            "set_doc_title",
+            &params(&[("$slug", "dl-basics"), ("$title", "Orion DL Basics")]),
+        )
+        .await
+        .unwrap();
+
+    let outcome = main.branch_merge("feature", "main").await.unwrap();
+    assert_eq!(outcome, MergeOutcome::Merged);
+
+    let result = main
+        .run_query(SEARCH_QUERIES, "text_search", &params(&[("$q", "Orion")]))
+        .await
+        .unwrap();
+    let batch = result.concat_batches().unwrap();
+    let slugs = batch.column(0).as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+    let values: Vec<&str> = (0..slugs.len()).map(|idx| slugs.value(idx)).collect();
+    assert!(values.contains(&"ml-intro"));
+    assert!(values.contains(&"dl-basics"));
 }
 
 #[tokio::test]
@@ -493,7 +598,8 @@ async fn branch_merge_into_non_main_target_works() {
         .await
         .unwrap();
 
-    main.branch_merge("feature", "experiment").await.unwrap();
+    let outcome = main.branch_merge("feature", "experiment").await.unwrap();
+    assert_eq!(outcome, MergeOutcome::FastForward);
 
     let mut experiment = Omnigraph::open_branch(uri, "experiment").await.unwrap();
     let bob = experiment
@@ -513,6 +619,15 @@ async fn branch_merge_into_non_main_target_works() {
         .await
         .unwrap();
     assert_eq!(eve.num_rows(), 1);
+    assert_eq!(
+        experiment
+            .snapshot()
+            .entry("node:Person")
+            .unwrap()
+            .table_branch
+            .as_deref(),
+        Some("experiment")
+    );
 
     let mut reopened_main = Omnigraph::open(uri).await.unwrap();
     let main_bob = reopened_main

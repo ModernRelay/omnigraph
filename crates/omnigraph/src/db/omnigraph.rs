@@ -25,6 +25,13 @@ use super::manifest::{ManifestCoordinator, Snapshot};
 
 const SCHEMA_FILENAME: &str = "_schema.pg";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeOutcome {
+    AlreadyUpToDate,
+    FastForward,
+    Merged,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GraphIndexCacheKey {
     active_branch: Option<String>,
@@ -234,7 +241,6 @@ impl Omnigraph {
     /// their index metadata is updated.
     pub async fn ensure_indices(&mut self) -> Result<()> {
         let snapshot = self.snapshot();
-        let params = ScalarIndexParams::default();
         let mut updates = Vec::new();
         let active_branch = self.active_branch.clone();
 
@@ -262,45 +268,7 @@ impl Omnigraph {
             };
             let row_count = ds.count_rows(None).await.unwrap_or(0);
             if row_count > 0 {
-                let _ = ds
-                    .create_index_builder(&["id"], IndexType::BTree, &params)
-                    .replace(true)
-                    .await;
-
-                // Indices from schema constraints
-                if let Some(node_type) = self.catalog.node_types.get(type_name) {
-                    for index_cols in &node_type.indices {
-                        if index_cols.len() == 1 {
-                            let prop_name = &index_cols[0];
-                            if let Some(prop_type) = node_type.properties.get(prop_name) {
-                                if matches!(prop_type.scalar, ScalarType::String) && !prop_type.list
-                                {
-                                    let _ = ds
-                                        .create_index_builder(
-                                            &[prop_name.as_str()],
-                                            IndexType::Inverted,
-                                            &params,
-                                        )
-                                        .replace(true)
-                                        .await;
-                                } else if matches!(prop_type.scalar, ScalarType::Vector(_))
-                                    && !prop_type.list
-                                {
-                                    let vector_params =
-                                        VectorIndexParams::ivf_flat(1, MetricType::L2);
-                                    let _ = ds
-                                        .create_index_builder(
-                                            &[prop_name.as_str()],
-                                            IndexType::Vector,
-                                            &vector_params,
-                                        )
-                                        .replace(true)
-                                        .await;
-                                }
-                            }
-                        }
-                    }
-                }
+                self.build_indices_on_dataset(&table_key, &mut ds).await?;
             }
 
             let final_version = ds.version().version;
@@ -340,14 +308,7 @@ impl Omnigraph {
             };
             let row_count = ds.count_rows(None).await.unwrap_or(0);
             if row_count > 0 {
-                let _ = ds
-                    .create_index_builder(&["src"], IndexType::BTree, &params)
-                    .replace(true)
-                    .await;
-                let _ = ds
-                    .create_index_builder(&["dst"], IndexType::BTree, &params)
-                    .replace(true)
-                    .await;
+                self.build_indices_on_dataset(&table_key, &mut ds).await?;
             }
 
             let final_version = ds.version().version;
@@ -521,7 +482,7 @@ impl Omnigraph {
     /// Open the dataset that should receive a branch-local metadata or data
     /// write, forking it from the manifest-pinned source state when the active
     /// branch does not yet own the subtable.
-    async fn open_owned_dataset_for_branch_write(
+    pub(crate) async fn open_owned_dataset_for_branch_write(
         &self,
         table_key: &str,
         full_path: &str,
@@ -552,7 +513,7 @@ impl Omnigraph {
         }
     }
 
-    async fn fork_dataset_from_entry_state(
+    pub(crate) async fn fork_dataset_from_entry_state(
         &self,
         table_key: &str,
         full_path: &str,
@@ -650,6 +611,72 @@ impl Omnigraph {
         ds.checkout_version(table_version)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))
+    }
+
+    pub(crate) async fn build_indices_on_dataset(
+        &self,
+        table_key: &str,
+        ds: &mut Dataset,
+    ) -> Result<()> {
+        let params = ScalarIndexParams::default();
+
+        if let Some(type_name) = table_key.strip_prefix("node:") {
+            let _ = ds
+                .create_index_builder(&["id"], IndexType::BTree, &params)
+                .replace(true)
+                .await;
+
+            if let Some(node_type) = self.catalog.node_types.get(type_name) {
+                for index_cols in &node_type.indices {
+                    if index_cols.len() != 1 {
+                        continue;
+                    }
+                    let prop_name = &index_cols[0];
+                    if let Some(prop_type) = node_type.properties.get(prop_name) {
+                        if matches!(prop_type.scalar, ScalarType::String) && !prop_type.list {
+                            let _ = ds
+                                .create_index_builder(
+                                    &[prop_name.as_str()],
+                                    IndexType::Inverted,
+                                    &params,
+                                )
+                                .replace(true)
+                                .await;
+                        } else if matches!(prop_type.scalar, ScalarType::Vector(_))
+                            && !prop_type.list
+                        {
+                            let vector_params = VectorIndexParams::ivf_flat(1, MetricType::L2);
+                            let _ = ds
+                                .create_index_builder(
+                                    &[prop_name.as_str()],
+                                    IndexType::Vector,
+                                    &vector_params,
+                                )
+                                .replace(true)
+                                .await;
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        if table_key.starts_with("edge:") {
+            let _ = ds
+                .create_index_builder(&["src"], IndexType::BTree, &params)
+                .replace(true)
+                .await;
+            let _ = ds
+                .create_index_builder(&["dst"], IndexType::BTree, &params)
+                .replace(true)
+                .await;
+            return Ok(());
+        }
+
+        Err(OmniError::Manifest(format!(
+            "invalid table key '{}'",
+            table_key
+        )))
     }
 
     pub(crate) async fn commit_updates(

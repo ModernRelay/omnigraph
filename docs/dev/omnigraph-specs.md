@@ -468,13 +468,13 @@ The executor `execute_query()` is a **public pure function** — no state, no ca
 
 ### Graph Index Invalidation
 
-The graph index is a single cache slot keyed by the current edge sub-table state. It is:
+The graph index is a handle-local cache keyed by active branch plus current edge sub-table state. It is:
 - **Built lazily** on first traversal query via `graph_index()`
 - **Shared** across queries via `Arc`
-- **Invalidated** by setting to `None` after edge mutations (insert edge, delete node with cascade, delete edge)
-- **Dropped on refresh** when the manifest shows different edge table versions than the cached key
+- **Invalidated** by setting to `None` after edge mutations and edge-affecting merges
+- **Dropped on refresh** when the manifest shows different edge table branch/version state than the cached key
 
-This keeps the current single-slot cache correct for main-only snapshot refresh. The next step is broadening that model to branch-aware / multi-target cache keys in Step 9.
+This keeps the single-slot cache semantically correct for the current one-handle / one-target runtime. A multi-target cache map remains a future optimization, not a correctness gap.
 
 ### Extension Points
 
@@ -783,13 +783,22 @@ Branches are Lance branches on the manifest table. Sub-tables are branched lazil
 
 **Merge:**
 1. Resolve `source_head`, `target_head`, and nearest common ancestor from `_graph_commits.lance`
-2. Open base/source/target manifest states
-3. For each sub-table:
-   - source-only change → take source
+2. Preflight outcome:
+   - `source_head == target_head` or `merge_base == source_head` → `MergeOutcome::AlreadyUpToDate`
+   - `merge_base == target_head` → `MergeOutcome::FastForward`
+   - otherwise → `MergeOutcome::Merged`
+3. Open base/source/target manifest states
+4. For each sub-table:
+   - source-only change → adopt source state into the target
    - target-only change → keep target
-   - both changed → row-level three-way merge keyed by persisted `id`
-4. Validate merged candidate graph
-5. Materialize validated candidate batches for changed target subtables, commit target manifest, append merge commit row
+   - both changed → ordered streaming three-way diff keyed by persisted `id`
+5. Validate the candidate merged graph
+6. Publish:
+   - named targets shallow-clone adopted branch-owned sub-tables into target-owned branch state
+   - `main` rewrites adopted branch-owned sub-table state into the main dataset head
+   - doubly changed tables stage merged rows in temp Lance datasets with bounded chunking, then rewrite only those target tables
+   - rewritten tables rebuild search/scalar indices before the manifest commit
+   - commit target manifest once, append one merge commit row
 
 **V1 conflict policy:**
 - same `id` changed differently on both sides → conflict
@@ -799,6 +808,8 @@ Branches are Lance branches on the manifest table. Sub-tables are branched lazil
 - post-merge `@unique(...)` / `@card(...)` violations → conflict
 
 This is intentionally conservative. The architecture supports finer-grained property-wise auto-merge later without changing the storage model.
+
+**Current implementation detail:** ordered merge scans use `ORDER BY id`. If a table’s `id` ordering is not index-backed at read time, Lance may pay a full scan + sort cost. This is a performance concern, not a semantic one.
 
 Sub-tables not written to on a branch are never branched. Storage overhead is proportional to what changed.
 

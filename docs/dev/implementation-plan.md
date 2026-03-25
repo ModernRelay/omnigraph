@@ -17,7 +17,7 @@ Living document tracking the build of the Lance-native graph database.
 
 ## Current Status
 
-**283 tests passing.** Steps 0–9 complete. Step 10 is next.
+**297 registered tests passing.** Steps 0–9a complete. Step 10 is next.
 
 ```
 Step 0  ✅  Crate restructuring
@@ -34,6 +34,7 @@ Step 7a ✅  Constraint system restructuring (interfaces, body constraints, card
 Step 8a ✅  Runtime alignment before branching
 Step 8b ✅  Graph write correctness before branching
 Step 9  ✅  Branching
+Step 9a ✅  Merge engine hardening
 Step 10    Change tracking + CLI
 ```
 
@@ -225,7 +226,7 @@ Lock down correctness and narrow the docs/runtime gap before Step 9 expands the 
   - mutation insert/update parity for `@range(...)`
   - mutation insert/update parity for `@check(...)`
 
-**Running total: 283 registered tests. Step 8b and Step 9 are complete; Step 10 is next.**
+**Running total: 297 registered tests. Step 8b, Step 9, and Step 9a are complete; Step 10 is next.**
 
 ---
 
@@ -343,18 +344,24 @@ This avoids relying on Lance branch creation metadata alone. Lance's `parent_ver
 
 **Merge** (`Omnigraph::branch_merge(source, target)`):
 1. Resolve `source_head`, `target_head`, and `merge_base` from `_graph_commits.lance`
-2. Open base/source/target manifest states
-3. For each sub-table:
+2. Preflight result:
+   - `source_head == target_head` or `merge_base == source_head` → `MergeOutcome::AlreadyUpToDate`, publish nothing
+   - `merge_base == target_head` → `MergeOutcome::FastForward`
+   - otherwise → `MergeOutcome::Merged`
+3. Open base/source/target manifest states
+4. For each sub-table:
    - unchanged on source and target → keep target
-   - changed on source only → take source change
+   - changed on source only → adopt source state into target
    - changed on target only → keep target change
-   - changed on both → run row-level merge keyed by persisted `id`
-4. Validate the merged candidate graph
-5. If there are no conflicts:
-   - materialize a full validated candidate batch for each changed sub-table
-   - rewrite only the changed target sub-tables from those candidate batches
-   - commit target manifest
-   - append a merge commit row to `_graph_commits.lance`
+   - changed on both → run streaming row-level three-way merge keyed by persisted `id`
+5. Validate the merged candidate graph
+6. If there are no conflicts:
+   - source-only tables adopt source state into the target
+   - doubly changed tables stream merged rows into temp Lance datasets in bounded chunks
+   - rewrite only the tables that actually need target-owned new data
+   - rebuild indices for rewritten tables before publish
+   - commit target manifest once
+   - append one merge commit row to `_graph_commits.lance`
 
 **Row merge model**
 
@@ -394,12 +401,11 @@ If validation fails, return structured merge conflicts instead of committing par
 The design above is the durable foundation. These are improvements, not architectural rewrites:
 
 - property-wise auto-merge for disjoint updates on the same `id`
-- fast-forward optimization when target is an ancestor of source
-- CDC-based / change-set-based diffing instead of full-table scan on doubly changed tables
+- incremental index merge / preservation for rewritten tables
 - incremental `@unique(...)` / `@card(...)` validation instead of rescanning affected tables
 - richer conflict reporting and agent-assisted resolution workflows
 - broader target selection (arbitrary branch-to-branch merge) if v1 starts with merge-into-current-branch only
-- merge-time performance optimizations for very large tables
+- ordered-scan and sort optimizations for very large tables
 
 #### Files to Modify
 
@@ -407,7 +413,8 @@ The design above is the durable foundation. These are improvements, not architec
 - `Omnigraph::branch_create(&mut self, name: &str) -> Result<()>`
 - `Omnigraph::open_branch(uri: &str, branch: &str) -> Result<Self>`
 - `Omnigraph::branch_list(&self) -> Result<Vec<String>>`
-- `Omnigraph::branch_merge(&mut self, source: &str, target: &str) -> Result<()>`
+- `Omnigraph::branch_merge(&mut self, source: &str, target: &str) -> Result<MergeOutcome>`
+- reusable per-dataset index builder for both `ensure_indices()` and merge publish
 
 **`crates/omnigraph/src/db/manifest.rs`**:
 - `ManifestCoordinator::create_branch(&mut self, name: &str) -> Result<()>`
@@ -426,7 +433,11 @@ The design above is the durable foundation. These are improvements, not architec
 
 **`crates/omnigraph/src/exec/mod.rs`**:
 - Append graph commit rows after mutation commits
-- Build validated candidate batches for changed tables, then publish them to the target branch
+- preflight merge outcomes (`AlreadyUpToDate`, `FastForward`, `Merged`)
+- ordered streaming three-way diff by `id`
+- temp-dataset staging for rewritten tables
+- source-state adoption into target-owned sub-table state
+- integrated validation + publish + rewritten-table index rebuild
 
 #### Test Cases
 
@@ -443,7 +454,8 @@ let mut branch_db = Omnigraph::open_branch(uri, "experiment").await?;
 // reopen main — verify the person is NOT there
 
 // 3. Merge branch back
-db.branch_merge("experiment", "main").await?;
+let outcome = db.branch_merge("experiment", "main").await?;
+assert!(matches!(outcome, MergeOutcome::FastForward | MergeOutcome::Merged));
 // verify the person is now visible on main
 
 // 4. Conservative conflict: both branches update same id differently
@@ -460,7 +472,20 @@ assert!(conflicts.to_string().contains("same id changed on both branches"));
 // open old repo -> commit graph is created with a genesis row
 ```
 
-**Result:** `_graph_commits.lance`, branch-aware `Snapshot::open()`, lazy sub-table branching with retry-on-existing-branch, explicit `branch_merge(source, target)`, and merge-conflict reporting are now in the runtime with integration coverage.
+**Result:** `_graph_commits.lance`, branch-aware `Snapshot::open()`, lazy sub-table branching with retry-on-existing-branch, explicit `branch_merge(source, target)`, merge outcomes, target-owned adopt-source publish, streaming three-way diff, and merge-time index rebuild are now in the runtime with integration coverage.
+
+### Step 9a: Merge Engine Hardening ✅
+
+Step 9 established graph-level branching and conservative merge semantics. Step 9a hardened the merge engine without changing the user model:
+
+- `branch_merge(source, target)` now returns `MergeOutcome::{AlreadyUpToDate, FastForward, Merged}`
+- merge preflight skips unnecessary work when the source is already contained in the target
+- source-only changes adopt source state into the target without forcing row-level merge
+- doubly changed tables use ordered streaming three-way diff by persisted `id` instead of materializing full base/source/target row maps
+- rewritten tables stage rows in temp Lance datasets with bounded chunking, validate against the candidate graph view, rebuild indices, then publish in one manifest commit
+- named targets never end a merge pointing at sibling/source branch-owned sub-table branches; adopted branch-owned state is either shallow-cloned into the target branch or rewritten into the target-owned dataset head
+
+This keeps the conservative conflict policy from Step 9 while removing the largest scalability and post-merge-search gaps from the initial implementation.
 
 ---
 

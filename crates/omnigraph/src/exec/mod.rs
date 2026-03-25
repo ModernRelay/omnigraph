@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::env;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow_array::{
@@ -8,7 +10,11 @@ use arrow_array::{
 use arrow_cast::display::array_value_to_string;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::TryStreamExt;
+use lance::Dataset;
 use lance::blob::BlobArrayBuilder;
+use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream};
+use lance::dataset::{WriteMode, WriteParams};
+use lance_file::version::LanceFileVersion;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::ir::{
     IRAssignment, IRExpr, IRFilter, IRMutationPredicate, IROp, IROrdering, IRProjection,
@@ -21,12 +27,13 @@ use omnigraph_compiler::query::typecheck::{CheckedQuery, typecheck_query, typech
 use omnigraph_compiler::result::{MutationResult, QueryResult};
 use omnigraph_compiler::types::Direction;
 
-use crate::db::Omnigraph;
+use crate::db::{MergeOutcome, Omnigraph};
 use crate::db::Snapshot;
 use crate::db::commit_graph::CommitGraph;
 use crate::db::manifest::ManifestCoordinator;
 use crate::error::{MergeConflict, MergeConflictKind, OmniError, Result};
 use crate::graph_index::GraphIndex;
+use tempfile::{Builder as TempDirBuilder, TempDir};
 
 impl Omnigraph {
     /// Run a named query from a .gq query source string.
@@ -66,81 +73,341 @@ impl Omnigraph {
     }
 }
 
+const MERGE_STAGE_BATCH_ROWS: usize = 8192;
+const MERGE_STAGE_DIR_ENV: &str = "OMNIGRAPH_MERGE_STAGING_DIR";
+
+#[derive(Debug)]
+enum CandidateTableState {
+    AdoptSourceState,
+    RewriteMerged(StagedTable),
+}
+
+#[derive(Debug)]
+struct StagedTable {
+    _dir: TempDir,
+    dataset: Dataset,
+}
+
 #[derive(Debug, Clone)]
-struct TableRowMeta {
-    index: usize,
+struct CursorRow {
+    id: String,
     signature: String,
-}
-
-#[derive(Debug, Clone)]
-struct TableRows {
     batch: RecordBatch,
-    rows: HashMap<String, TableRowMeta>,
+    row_index: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum CandidateRow {
-    Source(usize),
-    Target(usize),
+struct OrderedTableCursor {
+    stream: Option<std::pin::Pin<Box<DatasetRecordBatchStream>>>,
+    current_batch: Option<RecordBatch>,
+    current_row: usize,
+    peeked: Option<CursorRow>,
 }
 
-async fn load_table_rows(
-    snapshot: &Snapshot,
-    catalog: &Catalog,
-    table_key: &str,
-) -> Result<TableRows> {
-    let schema = schema_for_table_key(catalog, table_key)?;
-    let batch = if snapshot.entry(table_key).is_some() {
-        let ds = snapshot.open(table_key).await?;
-        let batches: Vec<RecordBatch> = ds
-            .scan()
-            .try_into_stream()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?
-            .try_collect()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        if batches.is_empty() {
-            RecordBatch::new_empty(schema.clone())
-        } else if batches.len() == 1 {
-            batches.into_iter().next().unwrap()
+impl OrderedTableCursor {
+    async fn from_snapshot(snapshot: &Snapshot, table_key: &str) -> Result<Self> {
+        let dataset = match snapshot.entry(table_key) {
+            Some(_) => Some(snapshot.open(table_key).await?),
+            None => None,
+        };
+        Self::from_dataset(dataset).await
+    }
+
+    async fn from_dataset(dataset: Option<Dataset>) -> Result<Self> {
+        let stream = if let Some(ds) = dataset {
+            let mut scanner = ds.scan();
+            scanner
+                .order_by(Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]))
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            Some(Box::pin(
+                scanner
+                    .try_into_stream()
+                    .await
+                    .map_err(|e| OmniError::Lance(e.to_string()))?,
+            ))
         } else {
-            arrow_select::concat::concat_batches(&schema, &batches)
-                .map_err(|e| OmniError::Lance(e.to_string()))?
+            None
+        };
+
+        Ok(Self {
+            stream,
+            current_batch: None,
+            current_row: 0,
+            peeked: None,
+        })
+    }
+
+    async fn peek_cloned(&mut self) -> Result<Option<CursorRow>> {
+        if self.peeked.is_none() {
+            self.peeked = self.next_row().await?;
         }
-    } else {
-        RecordBatch::new_empty(schema.clone())
+        Ok(self.peeked.clone())
+    }
+
+    async fn pop(&mut self) -> Result<Option<CursorRow>> {
+        if self.peeked.is_some() {
+            return Ok(self.peeked.take());
+        }
+        self.next_row().await
+    }
+
+    async fn next_row(&mut self) -> Result<Option<CursorRow>> {
+        loop {
+            if let Some(batch) = &self.current_batch {
+                if self.current_row < batch.num_rows() {
+                    let row_index = self.current_row;
+                    self.current_row += 1;
+                    return Ok(Some(CursorRow {
+                        id: row_id_at(batch, row_index)?,
+                        signature: row_signature(batch, row_index)?,
+                        batch: batch.clone(),
+                        row_index,
+                    }));
+                }
+            }
+
+            let Some(stream) = self.stream.as_mut() else {
+                return Ok(None);
+            };
+            match stream.try_next().await {
+                Ok(Some(batch)) => {
+                    self.current_batch = Some(batch);
+                    self.current_row = 0;
+                }
+                Ok(None) => {
+                    self.stream = None;
+                    self.current_batch = None;
+                    return Ok(None);
+                }
+                Err(err) => return Err(OmniError::Lance(err.to_string())),
+            }
+        }
+    }
+}
+
+struct StagedTableWriter {
+    schema: SchemaRef,
+    dataset_uri: String,
+    dir: TempDir,
+    dataset: Option<Dataset>,
+    buffered_rows: usize,
+    row_count: u64,
+    batches: Vec<RecordBatch>,
+}
+
+impl StagedTableWriter {
+    fn new(table_key: &str, schema: SchemaRef) -> Result<Self> {
+        let dir = merge_stage_tempdir(table_key)?;
+        let dataset_uri = dir.path().join("table.lance").to_string_lossy().to_string();
+        Ok(Self {
+            schema,
+            dataset_uri,
+            dir,
+            dataset: None,
+            buffered_rows: 0,
+            row_count: 0,
+            batches: Vec::new(),
+        })
+    }
+
+    async fn push_row(&mut self, row: &CursorRow) -> Result<()> {
+        self.row_count += 1;
+        self.buffered_rows += 1;
+        self.batches.push(row.batch.slice(row.row_index, 1));
+        if self.buffered_rows >= MERGE_STAGE_BATCH_ROWS {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+
+    async fn finish(mut self) -> Result<StagedTable> {
+        self.flush().await?;
+        if self.dataset.is_none() {
+            self.dataset = Some(create_staged_dataset(&self.dataset_uri, &self.schema).await?);
+        }
+        Ok(StagedTable {
+            _dir: self.dir,
+            dataset: self.dataset.unwrap(),
+        })
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        if self.batches.is_empty() {
+            return Ok(());
+        }
+
+        let batch = if self.batches.len() == 1 {
+            self.batches.pop().unwrap()
+        } else {
+            let batches = std::mem::take(&mut self.batches);
+            arrow_select::concat::concat_batches(&self.schema, &batches)
+                .map_err(|e| OmniError::Lance(e.to_string()))?
+        };
+        self.buffered_rows = 0;
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let params = WriteParams {
+            mode: WriteMode::Create,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        };
+
+        let ds = match self.dataset.take() {
+            Some(mut ds) => {
+                ds.append(reader, None)
+                    .await
+                    .map_err(|e| OmniError::Lance(e.to_string()))?;
+                ds
+            }
+            None => Dataset::write(reader, &self.dataset_uri as &str, Some(params))
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?,
+        };
+        self.dataset = Some(ds);
+        Ok(())
+    }
+}
+
+fn merge_stage_tempdir(table_key: &str) -> Result<TempDir> {
+    if let Ok(root) = env::var(MERGE_STAGE_DIR_ENV) {
+        return TempDirBuilder::new()
+            .prefix(&format!("omnigraph-merge-{}-", sanitize_table_key(table_key)))
+            .tempdir_in(PathBuf::from(root))
+            .map_err(OmniError::from);
+    }
+    TempDirBuilder::new()
+        .prefix(&format!("omnigraph-merge-{}-", sanitize_table_key(table_key)))
+        .tempdir()
+        .map_err(OmniError::from)
+}
+
+fn sanitize_table_key(table_key: &str) -> String {
+    table_key
+        .chars()
+        .map(|ch| match ch {
+            ':' | '/' | '\\' => '-',
+            other => other,
+        })
+        .collect()
+}
+
+async fn create_staged_dataset(dataset_uri: &str, schema: &SchemaRef) -> Result<Dataset> {
+    let batch = RecordBatch::new_empty(schema.clone());
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
     };
+    Dataset::write(reader, dataset_uri, Some(params))
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))
+}
 
-    let id_col = batch
-        .column_by_name("id")
-        .ok_or_else(|| OmniError::Manifest(format!("table {} missing id column", table_key)))?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| OmniError::Manifest(format!("table {} id column is not Utf8", table_key)))?;
+async fn scan_table_batches(ds: &Dataset) -> Result<DatasetRecordBatchStream> {
+    ds.scan()
+        .try_into_stream()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))
+}
 
-    let mut rows = HashMap::new();
-    for row in 0..batch.num_rows() {
-        let id = id_col.value(row).to_string();
-        let signature = row_signature(&batch, row)?;
-        if rows
-            .insert(
-                id.clone(),
-                TableRowMeta {
-                    index: row,
-                    signature,
-                },
-            )
-            .is_some()
-        {
-            return Err(OmniError::Manifest(format!(
-                "table {} contains duplicate id '{}'",
-                table_key, id
-            )));
+fn min_cursor_id(
+    base_row: &Option<CursorRow>,
+    source_row: &Option<CursorRow>,
+    target_row: &Option<CursorRow>,
+) -> Option<String> {
+    [base_row.as_ref(), source_row.as_ref(), target_row.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|row| row.id.clone())
+        .min()
+}
+
+async fn stage_streaming_table_merge(
+    table_key: &str,
+    catalog: &Catalog,
+    base_snapshot: &Snapshot,
+    source_snapshot: &Snapshot,
+    target_snapshot: &Snapshot,
+    conflicts: &mut Vec<MergeConflict>,
+) -> Result<Option<StagedTable>> {
+    let schema = schema_for_table_key(catalog, table_key)?;
+    let mut writer = StagedTableWriter::new(table_key, schema)?;
+    let mut base = OrderedTableCursor::from_snapshot(base_snapshot, table_key).await?;
+    let mut source = OrderedTableCursor::from_snapshot(source_snapshot, table_key).await?;
+    let mut target = OrderedTableCursor::from_snapshot(target_snapshot, table_key).await?;
+
+    let prior_conflict_count = conflicts.len();
+    let mut needs_update = false;
+
+    loop {
+        let base_row = base.peek_cloned().await?;
+        let source_row = source.peek_cloned().await?;
+        let target_row = target.peek_cloned().await?;
+        let Some(next_id) = min_cursor_id(&base_row, &source_row, &target_row) else {
+            break;
+        };
+
+        let base_row = if base_row.as_ref().map(|row| row.id.as_str()) == Some(next_id.as_str()) {
+            base.pop().await?
+        } else {
+            None
+        };
+        let source_row =
+            if source_row.as_ref().map(|row| row.id.as_str()) == Some(next_id.as_str()) {
+                source.pop().await?
+            } else {
+                None
+            };
+        let target_row =
+            if target_row.as_ref().map(|row| row.id.as_str()) == Some(next_id.as_str()) {
+                target.pop().await?
+            } else {
+                None
+            };
+
+        let base_sig = base_row.as_ref().map(|row| row.signature.as_str());
+        let source_sig = source_row.as_ref().map(|row| row.signature.as_str());
+        let target_sig = target_row.as_ref().map(|row| row.signature.as_str());
+
+        let source_changed = source_sig != base_sig;
+        let target_changed = target_sig != base_sig;
+
+        let selection = if !source_changed {
+            target_row.as_ref()
+        } else if !target_changed {
+            source_row.as_ref()
+        } else if source_sig == target_sig {
+            target_row.as_ref()
+        } else {
+            conflicts.push(classify_merge_conflict(
+                table_key, &next_id, base_sig, source_sig, target_sig,
+            ));
+            None
+        };
+
+        if conflicts.len() > prior_conflict_count {
+            continue;
+        }
+
+        if selection.map(|row| row.signature.as_str()) != target_sig {
+            needs_update = true;
+        }
+
+        if let Some(selection) = selection {
+            writer.push_row(selection).await?;
         }
     }
 
-    Ok(TableRows { batch, rows })
+    if conflicts.len() > prior_conflict_count {
+        return Ok(None);
+    }
+    if !needs_update {
+        return Ok(None);
+    }
+
+    Ok(Some(writer.finish().await?))
 }
 
 fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result<SchemaRef> {
@@ -175,101 +442,6 @@ fn same_manifest_state(
         (None, None) => true,
         _ => false,
     }
-}
-
-fn plan_table_merge(
-    table_key: &str,
-    base: &TableRows,
-    source: &TableRows,
-    target: &TableRows,
-    conflicts: &mut Vec<MergeConflict>,
-) -> Result<Option<RecordBatch>> {
-    let mut ids = HashSet::new();
-    ids.extend(base.rows.keys().cloned());
-    ids.extend(source.rows.keys().cloned());
-    ids.extend(target.rows.keys().cloned());
-
-    let mut ordered_ids: Vec<String> = ids.into_iter().collect();
-    ordered_ids.sort();
-
-    let mut selections = Vec::new();
-    let mut needs_update = false;
-
-    for id in &ordered_ids {
-        let base_row = base.rows.get(id);
-        let source_row = source.rows.get(id);
-        let target_row = target.rows.get(id);
-
-        let base_sig = base_row.map(|row| row.signature.as_str());
-        let source_sig = source_row.map(|row| row.signature.as_str());
-        let target_sig = target_row.map(|row| row.signature.as_str());
-
-        let source_changed = source_sig != base_sig;
-        let target_changed = target_sig != base_sig;
-
-        let selection = if !source_changed {
-            target_row.map(|row| CandidateRow::Target(row.index))
-        } else if !target_changed {
-            needs_update |= source_sig != target_sig;
-            source_row.map(|row| CandidateRow::Source(row.index))
-        } else if source_sig == target_sig {
-            target_row.map(|row| CandidateRow::Target(row.index))
-        } else {
-            conflicts.push(classify_merge_conflict(
-                table_key, id, base_sig, source_sig, target_sig,
-            ));
-            target_row.map(|row| CandidateRow::Target(row.index))
-        };
-
-        if selection.is_none() && target_row.is_some() && source_changed && !target_changed {
-            needs_update = true;
-        }
-
-        if let Some(selection) = selection {
-            selections.push(selection);
-        }
-    }
-
-    if !conflicts.is_empty() {
-        return Ok(None);
-    }
-    if !needs_update {
-        return Ok(None);
-    }
-
-    let schema = target.batch.schema();
-    let mut batches = Vec::new();
-    let target_indices: Vec<usize> = selections
-        .iter()
-        .filter_map(|selection| match selection {
-            CandidateRow::Target(index) => Some(*index),
-            CandidateRow::Source(_) => None,
-        })
-        .collect();
-    if !target_indices.is_empty() {
-        batches.push(take_rows(&target.batch, &target_indices)?);
-    }
-    let source_indices: Vec<usize> = selections
-        .iter()
-        .filter_map(|selection| match selection {
-            CandidateRow::Source(index) => Some(*index),
-            CandidateRow::Target(_) => None,
-        })
-        .collect();
-    if !source_indices.is_empty() {
-        batches.push(take_rows(&source.batch, &source_indices)?);
-    }
-
-    let merged = if batches.is_empty() {
-        RecordBatch::new_empty(schema.clone())
-    } else if batches.len() == 1 {
-        batches.into_iter().next().unwrap()
-    } else {
-        arrow_select::concat::concat_batches(&schema, &batches)
-            .map_err(|e| OmniError::Lance(e.to_string()))?
-    };
-
-    Ok(Some(sort_batch_by_id(merged)?))
 }
 
 fn classify_merge_conflict(
@@ -312,106 +484,95 @@ fn row_signature(batch: &RecordBatch, row: usize) -> Result<String> {
     Ok(values.join("\u{1f}"))
 }
 
-fn take_rows(batch: &RecordBatch, indices: &[usize]) -> Result<RecordBatch> {
-    let indices: Vec<u32> = indices.iter().map(|index| *index as u32).collect();
-    let indices = UInt32Array::from(indices);
-    let columns: Vec<ArrayRef> = batch
-        .columns()
-        .iter()
-        .map(|column| arrow_select::take::take(column.as_ref(), &indices, None))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
-    RecordBatch::try_new(batch.schema(), columns).map_err(|e| OmniError::Lance(e.to_string()))
-}
-
-fn sort_batch_by_id(batch: RecordBatch) -> Result<RecordBatch> {
-    if batch.num_rows() <= 1 {
-        return Ok(batch);
-    }
-    let id_column = batch
-        .column_by_name("id")
-        .ok_or_else(|| OmniError::Manifest("batch missing id column".to_string()))?
-        .clone();
-    let indices = arrow_ord::sort::lexsort_to_indices(
-        &[arrow_ord::sort::SortColumn {
-            values: id_column,
-            options: Some(arrow_schema::SortOptions {
-                descending: false,
-                nulls_first: false,
-            }),
-        }],
-        None,
-    )
-    .map_err(|e| OmniError::Lance(e.to_string()))?;
-    let columns: Vec<ArrayRef> = batch
-        .columns()
-        .iter()
-        .map(|column| arrow_select::take::take(column.as_ref(), &indices, None))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
-    RecordBatch::try_new(batch.schema(), columns).map_err(|e| OmniError::Lance(e.to_string()))
-}
-
 async fn validate_merge_candidates(
     db: &Omnigraph,
+    source_snapshot: &Snapshot,
     target_snapshot: &Snapshot,
-    candidates: &HashMap<String, RecordBatch>,
+    candidates: &HashMap<String, CandidateTableState>,
 ) -> Result<()> {
     let mut conflicts = Vec::new();
     let mut node_ids: HashMap<String, HashSet<String>> = HashMap::new();
 
     for (type_name, node_type) in &db.catalog().node_types {
         let table_key = format!("node:{}", type_name);
-        let batch = candidate_batch(db, target_snapshot, candidates, &table_key).await?;
-
-        if let Err(err) = crate::loader::validate_value_constraints(&batch, node_type) {
-            conflicts.push(MergeConflict {
-                table_key: table_key.clone(),
-                row_id: None,
-                kind: MergeConflictKind::ValueConstraintViolation,
-                message: err.to_string(),
-            });
-        }
-        conflicts.extend(validate_unique_constraints(
-            &table_key,
-            &batch,
-            &node_type.unique_constraints,
-        )?);
-
-        let ids = batch
-            .column_by_name("id")
-            .ok_or_else(|| OmniError::Manifest(format!("table {} missing id column", table_key)))?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| {
-                OmniError::Manifest(format!("table {} id column is not Utf8", table_key))
-            })?;
         let mut values = HashSet::new();
-        for row in 0..ids.len() {
-            values.insert(ids.value(row).to_string());
+        let mut unique_seen = vec![HashMap::new(); node_type.unique_constraints.len()];
+
+        if let Some(ds) = candidate_dataset(source_snapshot, target_snapshot, candidates, &table_key).await?
+        {
+            let mut stream = scan_table_batches(&ds).await?;
+            while let Some(batch) = stream
+                .try_next()
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?
+            {
+                if let Err(err) = crate::loader::validate_value_constraints(&batch, node_type) {
+                    conflicts.push(MergeConflict {
+                        table_key: table_key.clone(),
+                        row_id: None,
+                        kind: MergeConflictKind::ValueConstraintViolation,
+                        message: err.to_string(),
+                    });
+                }
+                update_unique_constraints(
+                    &table_key,
+                    &batch,
+                    &node_type.unique_constraints,
+                    &mut unique_seen,
+                    &mut conflicts,
+                )?;
+                let ids = batch
+                    .column_by_name("id")
+                    .ok_or_else(|| {
+                        OmniError::Manifest(format!("table {} missing id column", table_key))
+                    })?
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        OmniError::Manifest(format!("table {} id column is not Utf8", table_key))
+                    })?;
+                for row in 0..ids.len() {
+                    values.insert(ids.value(row).to_string());
+                }
+            }
         }
         node_ids.insert(type_name.clone(), values);
     }
 
     for (edge_name, edge_type) in &db.catalog().edge_types {
         let table_key = format!("edge:{}", edge_name);
-        let batch = candidate_batch(db, target_snapshot, candidates, &table_key).await?;
+        let mut unique_seen = vec![HashMap::new(); edge_type.unique_constraints.len()];
+        let mut src_counts = HashMap::new();
 
-        conflicts.extend(validate_unique_constraints(
-            &table_key,
-            &batch,
-            &edge_type.unique_constraints,
-        )?);
-        conflicts.extend(validate_edge_cardinality_batch(
+        if let Some(ds) = candidate_dataset(source_snapshot, target_snapshot, candidates, &table_key).await?
+        {
+            let mut stream = scan_table_batches(&ds).await?;
+            while let Some(batch) = stream
+                .try_next()
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?
+            {
+                update_unique_constraints(
+                    &table_key,
+                    &batch,
+                    &edge_type.unique_constraints,
+                    &mut unique_seen,
+                    &mut conflicts,
+                )?;
+                accumulate_edge_cardinality(&batch, &mut src_counts, &table_key)?;
+                conflicts.extend(validate_orphan_edges_batch(
+                    &table_key, edge_type, &batch, &node_ids,
+                )?);
+            }
+        }
+
+        conflicts.extend(finalize_edge_cardinality_conflicts(
             &table_key,
             edge_name,
             edge_type.cardinality.min,
             edge_type.cardinality.max,
-            &batch,
-        )?);
-        conflicts.extend(validate_orphan_edges(
-            &table_key, edge_type, &batch, &node_ids,
-        )?);
+            src_counts,
+        ));
     }
 
     if conflicts.is_empty() {
@@ -421,46 +582,36 @@ async fn validate_merge_candidates(
     }
 }
 
-async fn candidate_batch(
-    db: &Omnigraph,
+async fn candidate_dataset(
+    source_snapshot: &Snapshot,
     target_snapshot: &Snapshot,
-    candidates: &HashMap<String, RecordBatch>,
+    candidates: &HashMap<String, CandidateTableState>,
     table_key: &str,
-) -> Result<RecordBatch> {
-    if let Some(batch) = candidates.get(table_key) {
-        return Ok(batch.clone());
+) -> Result<Option<Dataset>> {
+    if let Some(candidate) = candidates.get(table_key) {
+        return match candidate {
+            CandidateTableState::AdoptSourceState => match source_snapshot.entry(table_key) {
+                Some(_) => Ok(Some(source_snapshot.open(table_key).await?)),
+                None => Ok(None),
+            },
+            CandidateTableState::RewriteMerged(staged) => Ok(Some(staged.dataset.clone())),
+        };
     }
-    let schema = schema_for_table_key(db.catalog(), table_key)?;
-    if target_snapshot.entry(table_key).is_none() {
-        return Ok(RecordBatch::new_empty(schema));
-    }
-    let ds = target_snapshot.open(table_key).await?;
-    let batches: Vec<RecordBatch> = ds
-        .scan()
-        .try_into_stream()
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?
-        .try_collect()
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
-    if batches.is_empty() {
-        Ok(RecordBatch::new_empty(schema))
-    } else if batches.len() == 1 {
-        Ok(batches.into_iter().next().unwrap())
-    } else {
-        arrow_select::concat::concat_batches(&schema, &batches)
-            .map_err(|e| OmniError::Lance(e.to_string()))
+    match target_snapshot.entry(table_key) {
+        Some(_) => Ok(Some(target_snapshot.open(table_key).await?)),
+        None => Ok(None),
     }
 }
 
-fn validate_unique_constraints(
+fn update_unique_constraints(
     table_key: &str,
     batch: &RecordBatch,
     constraints: &[Vec<String>],
-) -> Result<Vec<MergeConflict>> {
-    let mut conflicts = Vec::new();
-    for columns in constraints {
-        let mut seen: HashMap<String, String> = HashMap::new();
+    seen: &mut [HashMap<String, String>],
+    conflicts: &mut Vec<MergeConflict>,
+) -> Result<()> {
+    for (constraint_idx, columns) in constraints.iter().enumerate() {
+        let seen = &mut seen[constraint_idx];
         for row in 0..batch.num_rows() {
             let mut parts = Vec::with_capacity(columns.len());
             let mut any_null = false;
@@ -498,19 +649,14 @@ fn validate_unique_constraints(
             }
         }
     }
-    Ok(conflicts)
+    Ok(())
 }
 
-fn validate_edge_cardinality_batch(
-    table_key: &str,
-    edge_name: &str,
-    min: u32,
-    max: Option<u32>,
+fn accumulate_edge_cardinality(
     batch: &RecordBatch,
-) -> Result<Vec<MergeConflict>> {
-    if min == 0 && max.is_none() {
-        return Ok(Vec::new());
-    }
+    counts: &mut HashMap<String, u32>,
+    table_key: &str,
+) -> Result<()> {
     let srcs = batch
         .column_by_name("src")
         .ok_or_else(|| OmniError::Manifest(format!("table {} missing src column", table_key)))?
@@ -519,11 +665,19 @@ fn validate_edge_cardinality_batch(
         .ok_or_else(|| {
             OmniError::Manifest(format!("table {} src column is not Utf8", table_key))
         })?;
-    let mut counts = HashMap::new();
     for row in 0..srcs.len() {
         *counts.entry(srcs.value(row).to_string()).or_insert(0_u32) += 1;
     }
+    Ok(())
+}
 
+fn finalize_edge_cardinality_conflicts(
+    table_key: &str,
+    edge_name: &str,
+    min: u32,
+    max: Option<u32>,
+    counts: HashMap<String, u32>,
+) -> Vec<MergeConflict> {
     let mut conflicts = Vec::new();
     for (src, count) in counts {
         if let Some(max) = max {
@@ -551,10 +705,10 @@ fn validate_edge_cardinality_batch(
             });
         }
     }
-    Ok(conflicts)
+    conflicts
 }
 
-fn validate_orphan_edges(
+fn validate_orphan_edges_batch(
     table_key: &str,
     edge_type: &omnigraph_compiler::catalog::EdgeType,
     batch: &RecordBatch,
@@ -623,6 +777,109 @@ fn row_id_at(batch: &RecordBatch, row: usize) -> Result<String> {
         .downcast_ref::<StringArray>()
         .ok_or_else(|| OmniError::Manifest("id column is not Utf8".to_string()))?;
     Ok(ids.value(row).to_string())
+}
+
+async fn rewrite_target_table_from_dataset(
+    target_db: &Omnigraph,
+    table_key: &str,
+    source_ds: &Dataset,
+) -> Result<crate::db::SubTableUpdate> {
+    let (mut ds, _full_path, table_branch) = target_db.open_for_mutation(table_key).await?;
+    ds.truncate_table()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+    let mut stream = scan_table_batches(source_ds).await?;
+    while let Some(batch) = stream
+        .try_next()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?
+    {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        ds.append(reader, None)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+    }
+
+    let row_count = ds
+        .count_rows(None)
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
+    if row_count > 0 {
+        target_db.build_indices_on_dataset(table_key, &mut ds).await?;
+    }
+
+    Ok(crate::db::SubTableUpdate {
+        table_key: table_key.to_string(),
+        table_version: ds.version().version,
+        table_branch,
+        row_count,
+    })
+}
+
+async fn publish_adopted_source_state(
+    target_db: &Omnigraph,
+    source_snapshot: &Snapshot,
+    target_snapshot: &Snapshot,
+    table_key: &str,
+) -> Result<crate::db::SubTableUpdate> {
+    let source_entry = source_snapshot
+        .entry(table_key)
+        .ok_or_else(|| OmniError::Manifest(format!("missing source entry for {}", table_key)))?;
+    let target_entry = target_snapshot.entry(table_key);
+
+    match (target_db.active_branch(), source_entry.table_branch.as_deref()) {
+        (None, None) => Ok(crate::db::SubTableUpdate {
+            table_key: table_key.to_string(),
+            table_version: source_entry.table_version,
+            table_branch: None,
+            row_count: source_entry.row_count,
+        }),
+        (Some(_target_branch), None) => Ok(crate::db::SubTableUpdate {
+            table_key: table_key.to_string(),
+            table_version: source_entry.table_version,
+            table_branch: None,
+            row_count: source_entry.row_count,
+        }),
+        (None, Some(_source_branch)) => {
+            let source_ds = source_snapshot.open(table_key).await?;
+            rewrite_target_table_from_dataset(target_db, table_key, &source_ds).await
+        }
+        (Some(target_branch), Some(source_branch)) => {
+            if target_entry.and_then(|entry| entry.table_branch.as_deref()) == Some(target_branch) {
+                let source_ds = source_snapshot.open(table_key).await?;
+                rewrite_target_table_from_dataset(target_db, table_key, &source_ds).await
+            } else {
+                let full_path = format!("{}/{}", target_db.uri(), source_entry.table_path);
+                let ds = target_db
+                    .fork_dataset_from_entry_state(
+                        table_key,
+                        &full_path,
+                        Some(source_branch),
+                        source_entry.table_version,
+                        target_branch,
+                    )
+                    .await?;
+                Ok(crate::db::SubTableUpdate {
+                    table_key: table_key.to_string(),
+                    table_version: ds.version().version,
+                    table_branch: Some(target_branch.to_string()),
+                    row_count: source_entry.row_count,
+                })
+            }
+        }
+    }
+}
+
+async fn publish_rewritten_merge_table(
+    target_db: &Omnigraph,
+    table_key: &str,
+    staged: &StagedTable,
+) -> Result<crate::db::SubTableUpdate> {
+    rewrite_target_table_from_dataset(target_db, table_key, &staged.dataset).await
 }
 
 // ─── Search mode ─────────────────────────────────────────────────────────────
@@ -2259,7 +2516,7 @@ impl Omnigraph {
         }
     }
 
-    pub async fn branch_merge(&mut self, source: &str, target: &str) -> Result<()> {
+    pub async fn branch_merge(&mut self, source: &str, target: &str) -> Result<MergeOutcome> {
         let source_branch = Omnigraph::normalize_branch_name(source)?;
         let target_branch = Omnigraph::normalize_branch_name(target)?;
         if source_branch == target_branch {
@@ -2296,6 +2553,13 @@ impl Omnigraph {
         .await?
         .ok_or_else(|| OmniError::Manifest("branches have no common ancestor".to_string()))?;
 
+        if source_head_commit_id == target_head_commit_id
+            || base_commit.graph_commit_id == source_head_commit_id
+        {
+            return Ok(MergeOutcome::AlreadyUpToDate);
+        }
+        let is_fast_forward = base_commit.graph_commit_id == target_head_commit_id;
+
         let base_snapshot = ManifestCoordinator::snapshot_at(
             self.uri(),
             base_commit.manifest_branch.as_deref(),
@@ -2320,27 +2584,34 @@ impl Omnigraph {
         ordered_table_keys.sort();
 
         let mut conflicts = Vec::new();
-        let mut candidate_batches: HashMap<String, RecordBatch> = HashMap::new();
+        let mut candidates: HashMap<String, CandidateTableState> = HashMap::new();
 
         for table_key in &ordered_table_keys {
+            let base_entry = base_snapshot.entry(table_key);
             let source_entry = source_snapshot.entry(table_key);
             let target_entry = target_snapshot.entry(table_key);
             if same_manifest_state(source_entry, target_entry) {
                 continue;
             }
+            if same_manifest_state(base_entry, source_entry) {
+                continue;
+            }
+            if same_manifest_state(base_entry, target_entry) {
+                candidates.insert(table_key.clone(), CandidateTableState::AdoptSourceState);
+                continue;
+            }
 
-            let base_rows = load_table_rows(&base_snapshot, self.catalog(), table_key).await?;
-            let source_rows = load_table_rows(&source_snapshot, self.catalog(), table_key).await?;
-            let target_rows = load_table_rows(&target_snapshot, self.catalog(), table_key).await?;
-
-            if let Some(candidate) = plan_table_merge(
+            if let Some(staged) = stage_streaming_table_merge(
                 table_key,
-                &base_rows,
-                &source_rows,
-                &target_rows,
+                self.catalog(),
+                &base_snapshot,
+                &source_snapshot,
+                &target_snapshot,
                 &mut conflicts,
-            )? {
-                candidate_batches.insert(table_key.clone(), candidate);
+            )
+            .await?
+            {
+                candidates.insert(table_key.clone(), CandidateTableState::RewriteMerged(staged));
             }
         }
 
@@ -2348,38 +2619,33 @@ impl Omnigraph {
             return Err(OmniError::MergeConflicts(conflicts));
         }
 
-        validate_merge_candidates(&target_db, &target_snapshot, &candidate_batches).await?;
+        validate_merge_candidates(&target_db, &source_snapshot, &target_snapshot, &candidates)
+            .await?;
 
         let mut updates = Vec::new();
+        let mut changed_edge_tables = false;
         for table_key in &ordered_table_keys {
-            let Some(candidate_batch) = candidate_batches.get(table_key) else {
+            let Some(candidate_state) = candidates.get(table_key) else {
                 continue;
             };
-            let (mut ds, _full_path, table_branch) = target_db.open_for_mutation(table_key).await?;
-            ds.truncate_table()
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
-
-            if candidate_batch.num_rows() > 0 {
-                let reader = RecordBatchIterator::new(
-                    vec![Ok(candidate_batch.clone())],
-                    candidate_batch.schema(),
-                );
-                ds.append(reader, None)
-                    .await
-                    .map_err(|e| OmniError::Lance(e.to_string()))?;
+            let update = match candidate_state {
+                CandidateTableState::AdoptSourceState => {
+                    publish_adopted_source_state(
+                        &target_db,
+                        &source_snapshot,
+                        &target_snapshot,
+                        table_key,
+                    )
+                    .await?
+                }
+                CandidateTableState::RewriteMerged(staged) => {
+                    publish_rewritten_merge_table(&target_db, table_key, staged).await?
+                }
+            };
+            if table_key.starts_with("edge:") {
+                changed_edge_tables = true;
             }
-
-            let row_count = ds
-                .count_rows(None)
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
-            updates.push(crate::db::SubTableUpdate {
-                table_key: table_key.clone(),
-                table_version: ds.version().version,
-                table_branch,
-                row_count,
-            });
+            updates.push(update);
         }
 
         let manifest_version = if updates.is_empty() {
@@ -2395,11 +2661,7 @@ impl Omnigraph {
             )
             .await?;
 
-        if target_snapshot
-            .entries()
-            .any(|entry| entry.table_key.starts_with("edge:"))
-            && !updates.is_empty()
-        {
+        if changed_edge_tables {
             target_db.invalidate_graph_index();
         }
 
@@ -2408,7 +2670,11 @@ impl Omnigraph {
             self.refresh().await?;
         }
 
-        Ok(())
+        Ok(if is_fast_forward {
+            MergeOutcome::FastForward
+        } else {
+            MergeOutcome::Merged
+        })
     }
 
     async fn execute_insert(
