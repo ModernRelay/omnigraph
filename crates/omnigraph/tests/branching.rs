@@ -3,9 +3,10 @@ mod helpers;
 use std::fs;
 
 use arrow_array::{Array, Int32Array};
+use lance_index::{DatasetIndexExt, is_system_index};
 
-use omnigraph::db::{MergeOutcome, Omnigraph};
 use omnigraph::db::commit_graph::CommitGraph;
+use omnigraph::db::{MergeOutcome, Omnigraph};
 use omnigraph::error::{MergeConflictKind, OmniError};
 use omnigraph::loader::{LoadMode, load_jsonl};
 
@@ -240,10 +241,7 @@ async fn already_up_to_date_branch_merge_returns_without_new_commit() {
 
     assert_eq!(head.manifest_version, target_head_before.manifest_version);
     assert_eq!(head.graph_commit_id, target_head_before.graph_commit_id);
-    assert_eq!(
-        head.graph_commit_id,
-        source_head_before.graph_commit_id
-    );
+    assert_eq!(head.graph_commit_id, source_head_before.graph_commit_id);
 }
 
 #[tokio::test]
@@ -325,10 +323,23 @@ async fn merged_rewritten_indexed_table_is_searchable_immediately() {
         .await
         .unwrap();
     let batch = result.concat_batches().unwrap();
-    let slugs = batch.column(0).as_any().downcast_ref::<arrow_array::StringArray>().unwrap();
+    let slugs = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+        .unwrap();
     let values: Vec<&str> = (0..slugs.len()).map(|idx| slugs.value(idx)).collect();
     assert!(values.contains(&"ml-intro"));
     assert!(values.contains(&"dl-basics"));
+
+    let ds = main.snapshot().open("node:Doc").await.unwrap();
+    let indices = ds.load_indices().await.unwrap();
+    let user_indices: Vec<_> = indices.iter().filter(|idx| !is_system_index(idx)).collect();
+    assert_eq!(
+        user_indices.len(),
+        4,
+        "expected rebuilt id BTree plus key-property and title/body indices after rewritten merge"
+    );
 }
 
 #[tokio::test]

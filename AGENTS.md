@@ -151,6 +151,16 @@ Treat these as historical/stale unless you are explicitly reviving them:
 - Logging via `tracing`
 - Workspace dependencies centralized in root `Cargo.toml`
 
+## Bug Prevention
+
+- Do not silently ignore `Result` values on storage, indexing, validation, branch, or merge paths. If an operation is intentionally best-effort, log it with table/column context and make that policy explicit in code.
+- When mapping Omnigraph schema/runtime concepts onto Lance APIs, prefer a typed local wrapper over passing loosely coupled pairs like `(IndexType, IndexParams)` around. Invalid combinations should be hard to express.
+- Add tests at two levels for critical paths:
+  - behavior tests proving user-visible queries/mutations/merges work
+  - state tests proving the expected manifest rows, branch ownership, commit graph rows, and index metadata exist
+- When asserting on Lance index metadata, filter out Lance system indices and assert the Omnigraph contract, not raw engine internals.
+- Keep regression tests for every bug that reaches runtime behavior or persisted state. Add the regression in the same change that fixes the bug.
+
 ## CLI Usage
 
 Current CLI syntax shape:

@@ -1,7 +1,7 @@
 mod helpers;
 
 use arrow_array::{Array, StringArray};
-use lance_index::DatasetIndexExt;
+use lance_index::{DatasetIndexExt, is_system_index};
 
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::{LoadMode, load_jsonl};
@@ -260,9 +260,25 @@ node Doc {
 
     let ds = db.snapshot().open("node:Doc").await.unwrap();
     let indices = ds.load_indices().await.unwrap();
+    let user_indices: Vec<_> = indices.iter().filter(|idx| !is_system_index(idx)).collect();
     assert_eq!(
-        indices.len(),
-        2,
-        "expected id BTree index plus vector ANN index"
+        user_indices.len(),
+        3,
+        "expected id BTree index plus key-property and vector indices"
+    );
+}
+
+#[tokio::test]
+async fn ensure_indices_creates_inverted_indices_for_string_annotations() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_search_db(&dir).await;
+
+    let ds = db.snapshot().open("node:Doc").await.unwrap();
+    let indices = ds.load_indices().await.unwrap();
+    let user_indices: Vec<_> = indices.iter().filter(|idx| !is_system_index(idx)).collect();
+    assert_eq!(
+        user_indices.len(),
+        4,
+        "expected id BTree index plus key-property and title/body inverted indices"
     );
 }

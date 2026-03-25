@@ -27,10 +27,10 @@ use omnigraph_compiler::query::typecheck::{CheckedQuery, typecheck_query, typech
 use omnigraph_compiler::result::{MutationResult, QueryResult};
 use omnigraph_compiler::types::Direction;
 
-use crate::db::{MergeOutcome, Omnigraph};
 use crate::db::Snapshot;
 use crate::db::commit_graph::CommitGraph;
 use crate::db::manifest::ManifestCoordinator;
+use crate::db::{MergeOutcome, Omnigraph};
 use crate::error::{MergeConflict, MergeConflictKind, OmniError, Result};
 use crate::graph_index::GraphIndex;
 use tempfile::{Builder as TempDirBuilder, TempDir};
@@ -271,12 +271,18 @@ impl StagedTableWriter {
 fn merge_stage_tempdir(table_key: &str) -> Result<TempDir> {
     if let Ok(root) = env::var(MERGE_STAGE_DIR_ENV) {
         return TempDirBuilder::new()
-            .prefix(&format!("omnigraph-merge-{}-", sanitize_table_key(table_key)))
+            .prefix(&format!(
+                "omnigraph-merge-{}-",
+                sanitize_table_key(table_key)
+            ))
             .tempdir_in(PathBuf::from(root))
             .map_err(OmniError::from);
     }
     TempDirBuilder::new()
-        .prefix(&format!("omnigraph-merge-{}-", sanitize_table_key(table_key)))
+        .prefix(&format!(
+            "omnigraph-merge-{}-",
+            sanitize_table_key(table_key)
+        ))
         .tempdir()
         .map_err(OmniError::from)
 }
@@ -354,18 +360,18 @@ async fn stage_streaming_table_merge(
         } else {
             None
         };
-        let source_row =
-            if source_row.as_ref().map(|row| row.id.as_str()) == Some(next_id.as_str()) {
-                source.pop().await?
-            } else {
-                None
-            };
-        let target_row =
-            if target_row.as_ref().map(|row| row.id.as_str()) == Some(next_id.as_str()) {
-                target.pop().await?
-            } else {
-                None
-            };
+        let source_row = if source_row.as_ref().map(|row| row.id.as_str()) == Some(next_id.as_str())
+        {
+            source.pop().await?
+        } else {
+            None
+        };
+        let target_row = if target_row.as_ref().map(|row| row.id.as_str()) == Some(next_id.as_str())
+        {
+            target.pop().await?
+        } else {
+            None
+        };
 
         let base_sig = base_row.as_ref().map(|row| row.signature.as_str());
         let source_sig = source_row.as_ref().map(|row| row.signature.as_str());
@@ -498,7 +504,8 @@ async fn validate_merge_candidates(
         let mut values = HashSet::new();
         let mut unique_seen = vec![HashMap::new(); node_type.unique_constraints.len()];
 
-        if let Some(ds) = candidate_dataset(source_snapshot, target_snapshot, candidates, &table_key).await?
+        if let Some(ds) =
+            candidate_dataset(source_snapshot, target_snapshot, candidates, &table_key).await?
         {
             let mut stream = scan_table_batches(&ds).await?;
             while let Some(batch) = stream
@@ -544,7 +551,8 @@ async fn validate_merge_candidates(
         let mut unique_seen = vec![HashMap::new(); edge_type.unique_constraints.len()];
         let mut src_counts = HashMap::new();
 
-        if let Some(ds) = candidate_dataset(source_snapshot, target_snapshot, candidates, &table_key).await?
+        if let Some(ds) =
+            candidate_dataset(source_snapshot, target_snapshot, candidates, &table_key).await?
         {
             let mut stream = scan_table_batches(&ds).await?;
             while let Some(batch) = stream
@@ -809,7 +817,9 @@ async fn rewrite_target_table_from_dataset(
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
     if row_count > 0 {
-        target_db.build_indices_on_dataset(table_key, &mut ds).await?;
+        target_db
+            .build_indices_on_dataset(table_key, &mut ds)
+            .await?;
     }
 
     Ok(crate::db::SubTableUpdate {
@@ -831,7 +841,10 @@ async fn publish_adopted_source_state(
         .ok_or_else(|| OmniError::Manifest(format!("missing source entry for {}", table_key)))?;
     let target_entry = target_snapshot.entry(table_key);
 
-    match (target_db.active_branch(), source_entry.table_branch.as_deref()) {
+    match (
+        target_db.active_branch(),
+        source_entry.table_branch.as_deref(),
+    ) {
         (None, None) => Ok(crate::db::SubTableUpdate {
             table_key: table_key.to_string(),
             table_version: source_entry.table_version,
@@ -2611,7 +2624,10 @@ impl Omnigraph {
             )
             .await?
             {
-                candidates.insert(table_key.clone(), CandidateTableState::RewriteMerged(staged));
+                candidates.insert(
+                    table_key.clone(),
+                    CandidateTableState::RewriteMerged(staged),
+                );
             }
         }
 

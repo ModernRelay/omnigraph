@@ -9,7 +9,7 @@ use lance::Dataset;
 use lance::blob::blob_field;
 use lance::dataset::BlobFile;
 use lance::index::vector::VectorIndexParams;
-use lance_index::scalar::ScalarIndexParams;
+use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
 use lance_index::{DatasetIndexExt, IndexType};
 use lance_linalg::distance::MetricType;
 use omnigraph_compiler::build_catalog;
@@ -621,10 +621,12 @@ impl Omnigraph {
         let params = ScalarIndexParams::default();
 
         if let Some(type_name) = table_key.strip_prefix("node:") {
-            let _ = ds
-                .create_index_builder(&["id"], IndexType::BTree, &params)
+            ds.create_index_builder(&["id"], IndexType::BTree, &params)
                 .replace(true)
-                .await;
+                .await
+                .map_err(|e| {
+                    OmniError::Lance(format!("create BTree index on {}(id): {}", table_key, e))
+                })?;
 
             if let Some(node_type) = self.catalog.node_types.get(type_name) {
                 for index_cols in &node_type.indices {
@@ -634,26 +636,37 @@ impl Omnigraph {
                     let prop_name = &index_cols[0];
                     if let Some(prop_type) = node_type.properties.get(prop_name) {
                         if matches!(prop_type.scalar, ScalarType::String) && !prop_type.list {
-                            let _ = ds
-                                .create_index_builder(
-                                    &[prop_name.as_str()],
-                                    IndexType::Inverted,
-                                    &params,
-                                )
-                                .replace(true)
-                                .await;
+                            let inverted_params = InvertedIndexParams::default();
+                            ds.create_index_builder(
+                                &[prop_name.as_str()],
+                                IndexType::Inverted,
+                                &inverted_params,
+                            )
+                            .replace(true)
+                            .await
+                            .map_err(|e| {
+                                OmniError::Lance(format!(
+                                    "create Inverted index on {}({}): {}",
+                                    table_key, prop_name, e
+                                ))
+                            })?;
                         } else if matches!(prop_type.scalar, ScalarType::Vector(_))
                             && !prop_type.list
                         {
                             let vector_params = VectorIndexParams::ivf_flat(1, MetricType::L2);
-                            let _ = ds
-                                .create_index_builder(
-                                    &[prop_name.as_str()],
-                                    IndexType::Vector,
-                                    &vector_params,
-                                )
-                                .replace(true)
-                                .await;
+                            ds.create_index_builder(
+                                &[prop_name.as_str()],
+                                IndexType::Vector,
+                                &vector_params,
+                            )
+                            .replace(true)
+                            .await
+                            .map_err(|e| {
+                                OmniError::Lance(format!(
+                                    "create Vector index on {}({}): {}",
+                                    table_key, prop_name, e
+                                ))
+                            })?;
                         }
                     }
                 }
@@ -662,14 +675,18 @@ impl Omnigraph {
         }
 
         if table_key.starts_with("edge:") {
-            let _ = ds
-                .create_index_builder(&["src"], IndexType::BTree, &params)
+            ds.create_index_builder(&["src"], IndexType::BTree, &params)
                 .replace(true)
-                .await;
-            let _ = ds
-                .create_index_builder(&["dst"], IndexType::BTree, &params)
+                .await
+                .map_err(|e| {
+                    OmniError::Lance(format!("create BTree index on {}(src): {}", table_key, e))
+                })?;
+            ds.create_index_builder(&["dst"], IndexType::BTree, &params)
                 .replace(true)
-                .await;
+                .await
+                .map_err(|e| {
+                    OmniError::Lance(format!("create BTree index on {}(dst): {}", table_key, e))
+                })?;
             return Ok(());
         }
 
