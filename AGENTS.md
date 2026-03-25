@@ -210,7 +210,7 @@ poetry run lance-explore node ~/code/omnigraph-test cerebras
 
 ## Specs & Roadmap
 
-- Architecture specification: `docs/dev/omnigraph-specs.md`
+- Full architecture specification: `docs/dev/omnigraph-specs.md` (Log all features and architecture details)
 - Implementation tracker: `docs/dev/implementation-plan.md`
 - Migration/split strategy: `docs/dev/nano-omni.md`
 - Lance format spec: `docs/dev/lance-format-spec.md`

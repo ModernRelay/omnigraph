@@ -1,3 +1,4 @@
+pub mod changes;
 pub mod db;
 pub mod error;
 mod exec;

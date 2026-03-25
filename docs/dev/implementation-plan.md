@@ -35,7 +35,11 @@ Step 8a ✅  Runtime alignment before branching
 Step 8b ✅  Graph write correctness before branching
 Step 9  ✅  Branching
 Step 9a ✅  Merge engine hardening
-Step 10    Change tracking + CLI
+Step 9b    Surgical merge publish (preserve row identity across merges)
+Step 10a   Change detection module (net-current diff, two-path lineage-aware)
+Step 10b   Point-in-time query support (historical snapshots)
+Step 10c   CLI wiring (all stubbed commands + changes/diff)
+Step 10d   Hook + query-result subscription extension points (design only)
 ```
 
 ---
@@ -489,21 +493,281 @@ This keeps the conservative conflict policy from Step 9 while removing the large
 
 ---
 
+### Step 9b: Surgical Merge Publish
+
+The Step 9a merge engine publishes rewritten tables via `truncate_table()` + `append()` (`exec/mod.rs:790-831`). This destroys Lance's row version metadata (`_row_created_at_version`, `_row_last_updated_at_version`), making all surviving rows appear as fresh inserts. Step 10a's change detection depends on this metadata being correct.
+
+**Problem:** The three-way merge in `stage_streaming_table_merge` already computes per-row signatures and knows which rows changed, but writes ALL rows (including unchanged ones) to the staged table. The publish then truncates the target and appends everything, destroying version history for unchanged rows.
+
+**Fix:** Publish only the delta, using `merge_insert` + `delete` instead of `truncate + append`.
+
+#### Rewrite merge publish for `RewriteMerged` tables
+
+Change `stage_streaming_table_merge` to output only changed rows:
+
+1. When `selection.signature == target_sig` → skip (row is unchanged in target, don't touch it)
+2. When `selection` differs from target → write to staged delta table (for `merge_insert`)
+3. When a row exists in base/target but not in the merge result → collect ID for deletion
+
+Change `publish_rewritten_merge_table` to apply the delta:
+
+```rust
+// merge_insert changed/new rows — preserves _row_created_at_version for existing rows
+let job = MergeInsertBuilder::try_new(target_ds, vec!["id".to_string()])
+    .when_matched(WhenMatched::UpdateAll)
+    .when_not_matched(WhenNotMatched::InsertAll)
+    .try_build()?;
+job.execute(delta_stream).await?;
+
+// delete removed rows via deletion vectors
+if !deleted_ids.is_empty() {
+    let filter = format!("id IN ({})", escaped_ids(&deleted_ids));
+    target_ds.delete(&filter).await?;
+}
+```
+
+Lance `merge_insert` with stable row IDs guarantees:
+- Matched rows: `_rowid` preserved, `_row_created_at_version` preserved, `_row_last_updated_at_version` bumped to current version
+- Not-matched rows (inserts): new `_rowid`, `_row_created_at_version` = current version
+- Untouched rows (not in delta): all version metadata intact
+
+#### Rewrite merge publish for `AdoptSourceState` tables
+
+Currently `publish_adopted_source_state` can point the target manifest at a source-branch-owned sub-table, or rewrite via truncate+append. Both break version column semantics on the target lineage.
+
+Change to apply the source delta onto the target's own table:
+
+1. The source changed relative to the merge base; the target didn't. So `diff(base, source)` gives the delta.
+2. Apply via `merge_insert` (for source inserts/updates) + `delete` (for source deletes) on the target table.
+3. The target sub-table stays on its own branch lineage — no ownership switching.
+
+This is more expensive than pointer switching but keeps every sub-table on the target branch's lineage, which means version-column diff is always valid for same-branch operations (`diff()`, `changes_since()`).
+
+#### Add edge `id` BTree index
+
+Add BTree index on `id` for edge tables in `build_indices_on_dataset`. Currently only nodes get `id` BTree; edges get `src`/`dst` BTree. Step 10a's delete detection scans the `id` column at two versions — without an index, edge delete detection is a full table scan.
+
+#### Files to modify
+
+- **`crates/omnigraph/src/exec/mod.rs`** (~150 lines changed):
+  - `stage_streaming_table_merge` → output delta only (changed + deleted), not full snapshot
+  - `publish_rewritten_merge_table` → `merge_insert` + `delete` instead of `truncate + append`
+  - `publish_adopted_source_state` → apply delta onto target lineage instead of ownership switch
+  - New: `StagedDelta` struct with `changed_rows: StagedTable` + `deleted_ids: Vec<String>`
+- **`crates/omnigraph/src/db/omnigraph.rs`** (~5 lines): add edge `id` BTree in `build_indices_on_dataset`
+
+#### Tests (~5)
+
+```rust
+// 1. After merge of doubly-changed table, _row_created_at_version is preserved for unchanged rows
+// 2. After merge, changes_since(pre_merge_version) correctly reports only actual changes (not all rows as inserts)
+// 3. After adopted-source merge, target sub-table stays on target branch lineage (table_branch unchanged or target-owned)
+// 4. Edge tables have BTree index on id after ensure_indices
+// 5. Merge publish writes fewer rows than truncate+append (delta only)
+```
+
+---
+
 ### Step 10: Change Tracking + CLI
 
-#### Change Tracking
+Step 10 is split into four sub-steps. 10a and 10b are the foundation (change detection + point-in-time). 10c wires the CLI. 10d is a design-only step that ensures the architecture supports hooks and query-result subscriptions later.
 
-Lance stable row IDs enable `_rowid` tracking. Version metadata on fragments enables change detection:
+---
 
-**Changes since version N:**
-1. Compare manifest at version N vs current → find which sub-tables changed
-2. For each changed sub-table: scan with version-based filters
+#### Step 10a: Change Detection Module
 
-**Diff between versions:**
-1. Checkout manifest at V1 and V2
-2. For each sub-table that differs: scan both, compute row-level diff by `id`
+**New file: `crates/omnigraph/src/changes/mod.rs`**
 
-#### CLI Commands
+**Prerequisite: Step 9b** (surgical merge publish). Without 9b, merge rewrites destroy `_row_created_at_version` on surviving rows, making version-column diff over-report inserts after merges.
+
+Lance stable row IDs (enabled on all Omnigraph datasets) provide `_row_created_at_version` and `_row_last_updated_at_version` system columns on every row. Change detection uses these natively — no custom CDC, no write-path coupling, no additional storage.
+
+**Semantic model — net-current diff:**
+
+| Term | Meaning |
+|---|---|
+| **Insert** | Entity exists at `to` version but was created after `from` version |
+| **Update** | Entity exists at both versions but was modified after `from` version |
+| **Delete** | Entity existed at `from` version but doesn't exist at `to` version |
+
+This is the observable difference between two points in time. Intermediate states collapse: if an entity is inserted then deleted between `from` and `to`, neither appears in the diff. Falls out naturally from Lance's version columns.
+
+**Graph-level semantics:**
+
+- Edge changes always carry `src`/`dst` endpoints (topology context). For deletes, endpoints are read from the historical version.
+- Cascading edge deletes appear as individual entity changes. The consumer identifies cascades from schema knowledge (which edge types reference the deleted node type).
+- Merge commits appear as regular changes on the target branch (Step 9b ensures version metadata is correct after merge). The graph commit DAG records merge parentage for consumers that need it.
+- Edge `src`/`dst` are immutable — edge updates are always property-only, never topology changes.
+
+**Types:**
+
+```rust
+pub enum EntityKind { Node, Edge }
+pub enum ChangeOp { Insert, Update, Delete }
+
+pub struct Endpoints { pub src: String, pub dst: String }
+
+pub struct EntityChange {
+    pub table_key: String,              // "node:Person", "edge:Knows"
+    pub kind: EntityKind,
+    pub type_name: String,              // "Person", "Knows"
+    pub id: String,
+    pub op: ChangeOp,
+    pub manifest_version: u64,          // manifest version where this occurred
+    pub endpoints: Option<Endpoints>,   // always set for edges, None for nodes
+}
+
+pub struct ChangeFilter {
+    pub kinds: Option<Vec<EntityKind>>,
+    pub type_names: Option<Vec<String>>,
+    pub ops: Option<Vec<ChangeOp>>,
+}
+
+pub struct ChangeStats {
+    pub inserts: usize,
+    pub updates: usize,
+    pub deletes: usize,
+    pub types_affected: Vec<String>,
+}
+
+pub struct ChangeSet {
+    pub from_version: u64,
+    pub to_version: u64,
+    pub branch: Option<String>,
+    pub changes: Vec<EntityChange>,
+    pub stats: ChangeStats,
+}
+```
+
+**Three-level detection algorithm:**
+
+Level 1 — manifest diff (which sub-tables changed):
+1. Create snapshots at `from` and `to`
+2. For each sub-table entry in `to`: compare `(table_version, table_branch)` with `from`
+3. Skip unchanged tables entirely (O(num_types), no data I/O)
+
+Level 2 — lineage check (which diff strategy per sub-table):
+
+For each changed sub-table, check whether `from_entry.table_branch == to_entry.table_branch`:
+
+- **Same lineage** → fast path (version-column diff). Both endpoints are on the same dataset branch. Lance's `_row_created_at_version` and `_row_last_updated_at_version` are comparable because they're in the same version namespace.
+- **Different lineage** → cross-branch path (streaming ID-based diff). The endpoints are on different dataset branches. Version numbers are branch-scoped and not comparable — a row "created at v5" on main and a row "created at v5" on feature are unrelated events.
+
+The lineage check is deterministic (equality of `table_branch`), not a heuristic. With Step 9b's adopted-state-as-delta fix, all sub-tables on the target branch stay on the target lineage after merge, so `diff()` and `changes_since()` on the same branch always hit the fast path.
+
+Level 3 — row-level diff:
+
+**Fast path (same lineage)** — version-column queries on the `to` sub-table version:
+1. **Inserts**: `_row_created_at_version > Vf AND _row_created_at_version <= Vt`, project `id` (+ `src`, `dst` for edges)
+2. **Updates**: `_row_created_at_version <= Vf AND _row_last_updated_at_version > Vf AND _row_last_updated_at_version <= Vt`, project `id` (+ `src`, `dst` for edges)
+3. **Deletes**: scan `id` at `Vf`, scan `id` at `Vt`, set-difference. For deleted edges, read `src`/`dst` from `Vf`. The `id` column is BTree-indexed on all tables (nodes: existing; edges: added in Step 9b).
+
+**Cross-branch path (different lineage)** — streaming row-by-id diff:
+1. Scan `id` (+ `src`, `dst` for edges) at both `from` and `to` sub-table versions
+2. **Inserts**: IDs in `to` but not `from`
+3. **Deletes**: IDs in `from` but not `to`
+4. **Updates**: IDs in both — compare row signatures (same algorithm as `row_signature` in the merge engine) to detect actual data changes. Rows with identical signatures are unchanged and excluded.
+
+`ChangeFilter` pushes down before any scans: if filter excludes a table's type, skip entirely. If filter excludes an operation type, skip that scan.
+
+**Core primitive — `diff_snapshots`:**
+
+The real implementation is `diff_snapshots(from: &Snapshot, to: &Snapshot, filter)` — a pure function on two snapshots. The public API methods are convenience wrappers:
+
+```rust
+impl Omnigraph {
+    /// Diff two manifest versions on the current branch.
+    pub async fn diff(&self, from: u64, to: u64, filter: &ChangeFilter) -> Result<ChangeSet>;
+
+    /// Changes since a version on the current branch. Sugar for diff(from, current).
+    pub async fn changes_since(&self, from: u64, filter: &ChangeFilter) -> Result<ChangeSet>;
+
+    /// Diff two graph commits. Resolves each commit to (manifest_branch, manifest_version)
+    /// and creates branch-aware snapshots. Supports cross-branch comparison.
+    pub async fn diff_commits(&self, from_commit: &str, to_commit: &str, filter: &ChangeFilter) -> Result<ChangeSet>;
+
+    /// On-demand enrichment: read one entity at a specific sub-table version via time travel.
+    pub async fn entity_at(&self, table_key: &str, id: &str, version: u64) -> Result<Option<serde_json::Value>>;
+}
+```
+
+**Branch-aware `diff_commits`:**
+
+Each graph commit stores `manifest_branch` and `manifest_version`. `diff_commits` resolves each commit to its own `(branch, version)` pair and creates snapshots accordingly:
+
+```rust
+pub async fn diff_commits(&self, from: &str, to: &str, filter: &ChangeFilter) -> Result<ChangeSet> {
+    let from_commit = self.resolve_commit(from).await?;
+    let to_commit = self.resolve_commit(to).await?;
+    let from_snap = ManifestCoordinator::snapshot_at(
+        self.uri(), from_commit.manifest_branch.as_deref(), from_commit.manifest_version
+    ).await?;
+    let to_snap = ManifestCoordinator::snapshot_at(
+        self.uri(), to_commit.manifest_branch.as_deref(), to_commit.manifest_version
+    ).await?;
+    diff_snapshots(&from_snap, &to_snap, filter).await
+}
+```
+
+This correctly handles cross-branch diffs — each snapshot opens the manifest on its commit's own branch. The per-sub-table lineage check then determines which diff strategy to use for each sub-table independently.
+
+**Files to create/modify:**
+
+- **`crates/omnigraph/src/changes/mod.rs`** (new, ~350 lines): `ChangeSet`, `EntityChange`, `ChangeFilter`, `ChangeStats`, `diff_snapshots()` implementation, per-sub-table lineage check, version-column diff path, ID-based diff path
+- **`crates/omnigraph/src/db/omnigraph.rs`** (~50 lines): `diff()`, `changes_since()`, `diff_commits()`, `entity_at()` methods
+- **`crates/omnigraph/src/lib.rs`** (~2 lines): `pub mod changes;`
+
+**Tests (~10):**
+
+```rust
+// 1. diff returns empty ChangeSet when nothing changed
+// 2. diff detects node insert (load data, diff from previous version)
+// 3. diff detects node update (mutation, diff from pre-mutation version)
+// 4. diff detects node delete with edge cascade (delete node, verify both node + edge deletes appear)
+// 5. diff detects edge insert with endpoints (insert edge, verify src/dst in EntityChange)
+// 6. ChangeFilter by type_name skips non-matching tables entirely
+// 7. ChangeFilter by op skips insert/update/delete scans selectively
+// 8. diff_commits resolves graph commit IDs with branch-aware snapshots (same branch)
+// 9. diff_commits across branches uses cross-branch ID-based path for branched sub-tables
+// 10. diff after merge (with Step 9b) correctly reports only actual changes (not all rows as inserts)
+```
+
+---
+
+#### Step 10b: Point-in-Time Query Support
+
+Enable querying the graph as it existed at any prior manifest version. The executor is already a pure function of `(IR, Snapshot, GraphIndex, Catalog)` — point-in-time queries supply a historical Snapshot.
+
+**API:**
+
+```rust
+impl Omnigraph {
+    pub async fn snapshot_at_version(&self, version: u64) -> Result<Snapshot>;
+    pub async fn run_query_at(
+        &mut self, version: u64, source: &str, name: &str, params: &ParamMap,
+    ) -> Result<QueryResult>;
+}
+```
+
+`snapshot_at_version()` opens the manifest at the given version, reads sub-table entries, returns a Snapshot. Uses `ManifestCoordinator::snapshot_at()` which already exists.
+
+`run_query_at()` creates a historical snapshot, compiles the query normally, builds a temporary graph index if traversal is needed (not cached — historical traversals are rare), then calls the existing `execute_query()`.
+
+**Files to modify:**
+
+- **`crates/omnigraph/src/db/omnigraph.rs`** (~30 lines): `snapshot_at_version()`, `run_query_at()`
+
+**Tests (~3):**
+
+```rust
+// 1. run_query_at returns data as it existed at a prior version
+// 2. run_query_at with traversal builds temporary graph index from historical snapshot
+// 3. snapshot_at_version fails with error for non-existent version
+```
+
+---
+
+#### Step 10c: CLI Wiring
 
 **File: `crates/omnigraph-cli/src/main.rs`** — currently stubbed, all commands print "not yet implemented".
 
@@ -516,48 +780,96 @@ Wire each command to the `Omnigraph` API:
 | `omnigraph run --query <file> --name <name> [--param key=val] <uri>` | `db.run_query(source, name, &params)` → print JSON |
 | `omnigraph branch create <name> <uri>` | `db.branch_create(name)` |
 | `omnigraph branch list <uri>` | `db.branch_list()` → print |
+| `omnigraph branch merge <source> <target> <uri>` | `db.branch_merge(source, target)` → print outcome |
 | `omnigraph snapshot [--branch <b>] [--json] <uri>` | `db.snapshot()` → print entries |
 | `omnigraph describe <uri>` | Print schema + catalog + constraints + cardinality + manifest summary |
+| `omnigraph changes --since <version> [--type <t>] [--kind node\|edge] <uri>` | `db.changes_since(v, filter)` → print changes |
+| `omnigraph diff <from> <to> [--type <t>] <uri>` | `db.diff(from, to, filter)` → print changes |
 | `omnigraph compact <uri>` | `Dataset::compact_files()` on each sub-table |
 
 **Tokio runtime:** The CLI main function needs `#[tokio::main]` since all Omnigraph methods are async. Currently uses sync `fn main()`.
 
 **Param parsing for `run`:** Parse `--param name=value` pairs into `ParamMap`. Handle `$` prefix stripping (params stored without `$`). Detect type from value format (quoted → String, numeric → Integer, etc.) or accept `--param-json` for typed params.
 
-#### Files to Modify
+**Files to modify:**
 
-**`crates/omnigraph-cli/src/main.rs`** (~200 lines):
-- Add `#[tokio::main]` to main
-- Wire each subcommand to the Omnigraph API
-- Add `Run` subcommand with `--query`, `--name`, `--param` args
-- Add `Describe` subcommand
-- JSON output formatting for query results
+- **`crates/omnigraph-cli/src/main.rs`** (~300 lines): Add `#[tokio::main]`, wire all subcommands, add `Run`/`Describe`/`Changes`/`Diff`/`BranchMerge`/`BranchList` subcommands, JSON output formatting
+- **`crates/omnigraph/src/db/omnigraph.rs`** (~30 lines): `Omnigraph::describe(&self) -> String` — human-readable summary
 
-**`crates/omnigraph/src/db/omnigraph.rs`** (~30 lines):
-- `Omnigraph::describe(&self) -> String` — human-readable summary
-
-#### Test Cases
-
-CLI tests can be integration tests using `assert_cmd` crate, or just verify the API layer works:
+**Tests (~5):**
 
 ```rust
-// 1. Init via CLI args → open → verify
-// 2. Load via CLI → query → verify results
-// 3. Branch create via CLI → list → verify
+// 1. Init via CLI args → open → verify schema and manifest exist
+// 2. Load via CLI → run query → verify results match
+// 3. Branch create via CLI → list → verify branch appears
+// 4. Changes --since shows inserts after load
+// 5. Diff between two versions shows correct entity changes
 ```
 
-**Expected: ~230 lines in CLI, ~30 lines in omnigraph.rs. Total: ~254 tests.**
+---
+
+#### Step 10d: Hook + Query-Result Subscription Extension Points (Design Only)
+
+No code in Step 10. Ensures the Step 10a/10b architecture supports two future hook trigger types without modification.
+
+**Entity-change hooks (future Step 11):**
+
+The hook system is a consumer of `changes_since()` + `ChangeFilter`. Each hook maintains a cursor (last-seen version), queries changes matching its filter, dispatches to an executor (shell/webhook). The change detection layer requires zero modification — `ChangeFilter` already pushes type/op filtering to the scan level.
+
+```
+Hook Dispatch (config + cursors + executors)
+     ↓ consumes
+changes_since(cursor, filter) → ChangeSet
+     ↓ already built in 10a
+```
+
+**Query-result hooks (future Step 11+):**
+
+A hook fires when the result of a named query changes. Three-tier evaluation:
+
+1. **Dependency check (static, instant):** Extract from `QueryIR` which sub-tables and properties the query touches. Check if any `EntityChange` in the `ChangeSet` intersects those dependencies. If not → skip. This eliminates most hooks on most poll cycles.
+
+2. **Re-execute + diff (only when tier 1 says yes):** Call `run_query_at(cursor_version, ...)` and `run_query(...)`. Diff the two `RecordBatch` result sets by entity `id`. Produces entered/exited/modified rows.
+
+3. **Fire hook with result diff:** The hook receives which rows entered, exited, or changed in the query result — not raw entity changes.
+
+This works because:
+- `QueryIR` (from the compiler) already encodes type/property/traversal dependencies
+- `run_query_at()` (from 10b) enables point-in-time re-execution
+- `ChangeSet` (from 10a) provides the entity-level trigger
+- The executor is already a pure function of `(IR, Snapshot)` — running it at two versions is trivial
+
+**Query dependency extraction** (new code when hooks are implemented, not now):
+```rust
+fn extract_deps(ir: &QueryIR) -> QueryDeps {
+    // Walk ir.pipeline: NodeScan → table_keys + filter properties
+    //                   Expand → edge table_key + dst table_key
+    // Walk ir.return_exprs + ir.order_by → projected properties
+}
+```
+
+**What Step 10a/10b must provide for this to work later (verified by design):**
+- `ChangeFilter` as a first-class parameter on `diff()` / `changes_since()` ✅
+- `manifest_version` on every `EntityChange` (for per-version grouping) ✅
+- `entity_at()` for on-demand before/after enrichment ✅
+- `run_query_at()` for point-in-time re-execution ✅
+- No write-path coupling in change detection ✅
 
 ---
 
 ## Dependency Graph
 
 ```
-Steps 0–9 ✅ (283 tests)
-     └→ Step 10 (CLI — needs branching + change tracking)
+Steps 0–9a ✅ (297 tests)
+     └→ Step 9b  (surgical merge publish — preserves row identity for change detection)
+         └→ Step 10a (change detection — two-path lineage-aware diff)
+             └→ Step 10b (point-in-time — historical snapshots)
+             └→ Step 10c (CLI — all commands + changes/diff)
+             └→ Step 10d (design only — validates hooks + query subscriptions)
+                 └→ Future Step 11: Hook system (entity-change + query-result triggers)
 ```
 
-**Critical path:** Step 10.
+**Critical path:** Step 9b → 10a → 10b → 10c. Step 10d is design verification only.
 
 ---
 
@@ -579,9 +891,13 @@ Steps 0–9 ✅ (283 tests)
 | 8a | +7 (snapshot/cache/search/constraint parity) | 270 |
 | 8b | ~5-7 (endpoint validation, staged publish, visibility regressions) | ~275-277 |
 | 9 | ~8 (branch create/read/merge) | ~283-285 |
-| 10 | ~5 (CLI) | ~288-290 |
+| 9a | ~12 (merge hardening, streaming three-way diff) | ~295-297 |
+| 9b | ~5 (surgical merge publish, row identity, edge id BTree) | ~300-302 |
+| 10a | ~10 (change detection: two-path diff, cross-branch, filter) | ~310-312 |
+| 10b | ~3 (point-in-time: historical query, traversal, error) | ~313-315 |
+| 10c | ~5 (CLI: init/load/run/branch/changes) | ~318-320 |
 
-**Current: 283 registered tests passing.** Milestone running totals are approximate and may drift as coverage is added to existing files. Target: ~290 tests at completion.
+**Current: 297 registered tests passing.** Milestone running totals are approximate and may drift as coverage is added to existing files. Target: ~320 tests at completion.
 
 ---
 
@@ -619,7 +935,7 @@ Steps 0–9 ✅ (283 tests)
 
 1. **Remote sync (clone/push/pull).** URI-based open + `base_paths` make this architecturally possible. Deferred to after local branching works.
 2. **Schema evolution / migration.** Lance `add_columns`/`alter_columns`/`drop_columns` when needed.
-3. **Hook system.** Thin dispatch layer on Lance version tracking. Requires Step 10.
+3. **Hook system (Step 11).** Entity-change hooks consume `changes_since(cursor, filter)` with per-hook cursors. Query-result hooks use IR dependency extraction + `run_query_at()` for three-tier evaluation (dependency check → re-execute + diff → fire). Shell + webhook executors. Config in TOML, cursors in `.omnigraph_hooks.json`. Requires Step 10a + 10b. See Step 10d design for architecture validation.
 4. **Compaction.** Lance handles natively. Wire up as CLI command.
 5. **SDKs (TS, Swift, Python).** Thin wrappers after API stabilizes.
 6. **DuckDB fallback.** For graphs > ~5M edges. Defer until scale demands.

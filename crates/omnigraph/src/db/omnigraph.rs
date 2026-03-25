@@ -202,6 +202,141 @@ impl Omnigraph {
         Ok(())
     }
 
+    // ─── Change detection ────────────────────────────────────────────────
+
+    /// Diff two manifest versions on the current branch.
+    pub async fn diff(
+        &self,
+        from_version: u64,
+        to_version: u64,
+        filter: &crate::changes::ChangeFilter,
+    ) -> Result<crate::changes::ChangeSet> {
+        let from_snap = ManifestCoordinator::snapshot_at(
+            self.uri(),
+            self.active_branch.as_deref(),
+            from_version,
+        )
+        .await?;
+        let to_snap = ManifestCoordinator::snapshot_at(
+            self.uri(),
+            self.active_branch.as_deref(),
+            to_version,
+        )
+        .await?;
+        crate::changes::diff_snapshots(self.uri(), &from_snap, &to_snap, filter).await
+    }
+
+    /// Changes since a version on the current branch. Sugar for `diff(from, current)`.
+    pub async fn changes_since(
+        &self,
+        from_version: u64,
+        filter: &crate::changes::ChangeFilter,
+    ) -> Result<crate::changes::ChangeSet> {
+        let from_snap = ManifestCoordinator::snapshot_at(
+            self.uri(),
+            self.active_branch.as_deref(),
+            from_version,
+        )
+        .await?;
+        let to_snap = self.snapshot();
+        crate::changes::diff_snapshots(self.uri(), &from_snap, &to_snap, filter).await
+    }
+
+    /// Diff two graph commits. Resolves each commit to `(manifest_branch, manifest_version)`
+    /// and creates branch-aware snapshots. Supports cross-branch comparison.
+    pub async fn diff_commits(
+        &self,
+        from_commit_id: &str,
+        to_commit_id: &str,
+        filter: &crate::changes::ChangeFilter,
+    ) -> Result<crate::changes::ChangeSet> {
+        let from_commit = self.resolve_commit(from_commit_id).await?;
+        let to_commit = self.resolve_commit(to_commit_id).await?;
+        let from_snap = ManifestCoordinator::snapshot_at(
+            self.uri(),
+            from_commit.manifest_branch.as_deref(),
+            from_commit.manifest_version,
+        )
+        .await?;
+        let to_snap = ManifestCoordinator::snapshot_at(
+            self.uri(),
+            to_commit.manifest_branch.as_deref(),
+            to_commit.manifest_version,
+        )
+        .await?;
+        crate::changes::diff_snapshots(self.uri(), &from_snap, &to_snap, filter).await
+    }
+
+    /// Read one entity at a specific manifest version via time travel (on-demand enrichment).
+    pub async fn entity_at(
+        &self,
+        table_key: &str,
+        id: &str,
+        version: u64,
+    ) -> Result<Option<serde_json::Value>> {
+        let snap = ManifestCoordinator::snapshot_at(
+            self.uri(),
+            self.active_branch.as_deref(),
+            version,
+        )
+        .await?;
+        if snap.entry(table_key).is_none() {
+            return Ok(None);
+        }
+        let ds = snap.open(table_key).await?;
+        let filter_sql = format!("id = '{}'", id.replace('\'', "''"));
+        let mut scanner = ds.scan();
+        scanner
+            .filter(&filter_sql)
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let batches: Vec<arrow_array::RecordBatch> = scanner
+            .try_into_stream()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        if batches.is_empty() || batches[0].num_rows() == 0 {
+            return Ok(None);
+        }
+        let batch = &batches[0];
+        let mut obj = serde_json::Map::new();
+        for (i, field) in batch.schema().fields().iter().enumerate() {
+            let val = arrow_cast::display::array_value_to_string(batch.column(i).as_ref(), 0)
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            obj.insert(field.name().clone(), serde_json::Value::String(val));
+        }
+        Ok(Some(serde_json::Value::Object(obj)))
+    }
+
+    /// Create a Snapshot at any historical manifest version.
+    pub async fn snapshot_at_version(&self, version: u64) -> Result<Snapshot> {
+        ManifestCoordinator::snapshot_at(
+            self.uri(),
+            self.active_branch.as_deref(),
+            version,
+        )
+        .await
+    }
+
+    async fn resolve_commit(
+        &self,
+        commit_id: &str,
+    ) -> Result<crate::db::commit_graph::GraphCommit> {
+        let cg = self.commit_graph.as_ref().ok_or_else(|| {
+            OmniError::Manifest("diff_commits requires _graph_commits.lance".to_string())
+        })?;
+        let commits = cg.load_commits().await?;
+        commits
+            .into_iter()
+            .find(|c| c.graph_commit_id == commit_id)
+            .ok_or_else(|| {
+                OmniError::Manifest(format!("commit '{}' not found", commit_id))
+            })
+    }
+
+    // ─── Graph index ──────────────────────────────────────────────────────
+
     /// Get or build the graph index for the current snapshot.
     pub async fn graph_index(&mut self) -> Result<Arc<GraphIndex>> {
         let key = self.graph_index_cache_key();
@@ -675,6 +810,12 @@ impl Omnigraph {
         }
 
         if table_key.starts_with("edge:") {
+            ds.create_index_builder(&["id"], IndexType::BTree, &params)
+                .replace(true)
+                .await
+                .map_err(|e| {
+                    OmniError::Lance(format!("create BTree index on {}(id): {}", table_key, e))
+                })?;
             ds.create_index_builder(&["src"], IndexType::BTree, &params)
                 .replace(true)
                 .await

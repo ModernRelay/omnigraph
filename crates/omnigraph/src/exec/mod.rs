@@ -79,13 +79,20 @@ const MERGE_STAGE_DIR_ENV: &str = "OMNIGRAPH_MERGE_STAGING_DIR";
 #[derive(Debug)]
 enum CandidateTableState {
     AdoptSourceState,
-    RewriteMerged(StagedTable),
+    RewriteMerged(StagedMergeResult),
 }
 
 #[derive(Debug)]
 struct StagedTable {
     _dir: TempDir,
     dataset: Dataset,
+}
+
+#[derive(Debug)]
+struct StagedMergeResult {
+    full_staged: StagedTable,
+    delta_staged: Option<StagedTable>,
+    deleted_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -318,6 +325,94 @@ async fn scan_table_batches(ds: &Dataset) -> Result<DatasetRecordBatchStream> {
         .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
+/// Computes the delta between base and source for an adopted-source merge.
+/// Returns the changed/new rows (for merge_insert) and deleted IDs (for delete).
+async fn compute_source_delta(
+    table_key: &str,
+    catalog: &Catalog,
+    base_snapshot: &Snapshot,
+    source_snapshot: &Snapshot,
+) -> Result<Option<StagedMergeResult>> {
+    let schema = schema_for_table_key(catalog, table_key)?;
+    let mut full_writer =
+        StagedTableWriter::new(&format!("{}_adopt_full", table_key), schema.clone())?;
+    let mut delta_writer =
+        StagedTableWriter::new(&format!("{}_adopt_delta", table_key), schema)?;
+    let mut deleted_ids: Vec<String> = Vec::new();
+    let mut base = OrderedTableCursor::from_snapshot(base_snapshot, table_key).await?;
+    let mut source = OrderedTableCursor::from_snapshot(source_snapshot, table_key).await?;
+
+    let mut needs_update = false;
+
+    loop {
+        let base_row = base.peek_cloned().await?;
+        let source_row = source.peek_cloned().await?;
+
+        let next_id = [base_row.as_ref(), source_row.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|row| row.id.clone())
+            .min();
+        let Some(next_id) = next_id else { break };
+
+        let base_row = if base_row.as_ref().map(|r| r.id.as_str()) == Some(next_id.as_str()) {
+            base.pop().await?
+        } else {
+            None
+        };
+        let source_row =
+            if source_row.as_ref().map(|r| r.id.as_str()) == Some(next_id.as_str()) {
+                source.pop().await?
+            } else {
+                None
+            };
+
+        let base_sig = base_row.as_ref().map(|r| r.signature.as_str());
+        let source_sig = source_row.as_ref().map(|r| r.signature.as_str());
+
+        match (&base_row, &source_row) {
+            (Some(_), None) => {
+                // Deleted on source
+                deleted_ids.push(next_id);
+                needs_update = true;
+            }
+            (None, Some(src)) => {
+                // New on source
+                full_writer.push_row(src).await?;
+                delta_writer.push_row(src).await?;
+                needs_update = true;
+            }
+            (Some(_), Some(src)) if source_sig != base_sig => {
+                // Changed on source
+                full_writer.push_row(src).await?;
+                delta_writer.push_row(src).await?;
+                needs_update = true;
+            }
+            (Some(base), Some(_)) => {
+                // Unchanged — write to full (for validation), skip delta
+                full_writer.push_row(base).await?;
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+
+    if !needs_update {
+        return Ok(None);
+    }
+
+    let delta_staged = if delta_writer.row_count > 0 {
+        Some(delta_writer.finish().await?)
+    } else {
+        None
+    };
+
+    Ok(Some(StagedMergeResult {
+        full_staged: full_writer.finish().await?,
+        delta_staged,
+        deleted_ids,
+    }))
+}
+
 fn min_cursor_id(
     base_row: &Option<CursorRow>,
     source_row: &Option<CursorRow>,
@@ -337,9 +432,13 @@ async fn stage_streaming_table_merge(
     source_snapshot: &Snapshot,
     target_snapshot: &Snapshot,
     conflicts: &mut Vec<MergeConflict>,
-) -> Result<Option<StagedTable>> {
+) -> Result<Option<StagedMergeResult>> {
     let schema = schema_for_table_key(catalog, table_key)?;
-    let mut writer = StagedTableWriter::new(table_key, schema)?;
+    let mut full_writer =
+        StagedTableWriter::new(&format!("{}_full", table_key), schema.clone())?;
+    let mut delta_writer =
+        StagedTableWriter::new(&format!("{}_delta", table_key), schema)?;
+    let mut deleted_ids: Vec<String> = Vec::new();
     let mut base = OrderedTableCursor::from_snapshot(base_snapshot, table_key).await?;
     let mut source = OrderedTableCursor::from_snapshot(source_snapshot, table_key).await?;
     let mut target = OrderedTableCursor::from_snapshot(target_snapshot, table_key).await?;
@@ -397,12 +496,21 @@ async fn stage_streaming_table_merge(
             continue;
         }
 
-        if selection.map(|row| row.signature.as_str()) != target_sig {
+        // Row existed in target but not in merge result → delete
+        if selection.is_none() && target_row.is_some() {
+            deleted_ids.push(next_id.clone());
             needs_update = true;
+            continue;
         }
 
         if let Some(selection) = selection {
-            writer.push_row(selection).await?;
+            // Always write to full (for validation)
+            full_writer.push_row(selection).await?;
+            // Only write changed rows to delta (for publish)
+            if selection.signature.as_str() != target_sig.unwrap_or("") {
+                delta_writer.push_row(selection).await?;
+                needs_update = true;
+            }
         }
     }
 
@@ -413,7 +521,17 @@ async fn stage_streaming_table_merge(
         return Ok(None);
     }
 
-    Ok(Some(writer.finish().await?))
+    let delta_staged = if delta_writer.row_count > 0 {
+        Some(delta_writer.finish().await?)
+    } else {
+        None
+    };
+
+    Ok(Some(StagedMergeResult {
+        full_staged: full_writer.finish().await?,
+        delta_staged,
+        deleted_ids,
+    }))
 }
 
 fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result<SchemaRef> {
@@ -602,7 +720,9 @@ async fn candidate_dataset(
                 Some(_) => Ok(Some(source_snapshot.open(table_key).await?)),
                 None => Ok(None),
             },
-            CandidateTableState::RewriteMerged(staged) => Ok(Some(staged.dataset.clone())),
+            CandidateTableState::RewriteMerged(staged) => {
+                Ok(Some(staged.full_staged.dataset.clone()))
+            }
         };
     }
     match target_snapshot.entry(table_key) {
@@ -832,6 +952,8 @@ async fn rewrite_target_table_from_dataset(
 
 async fn publish_adopted_source_state(
     target_db: &Omnigraph,
+    catalog: &Catalog,
+    base_snapshot: &Snapshot,
     source_snapshot: &Snapshot,
     target_snapshot: &Snapshot,
     table_key: &str,
@@ -845,27 +967,62 @@ async fn publish_adopted_source_state(
         target_db.active_branch(),
         source_entry.table_branch.as_deref(),
     ) {
+        // Both on main — pointer switch is safe (same lineage, version columns valid)
         (None, None) => Ok(crate::db::SubTableUpdate {
             table_key: table_key.to_string(),
             table_version: source_entry.table_version,
             table_branch: None,
             row_count: source_entry.row_count,
         }),
+        // Source on main, target on branch — pointer switch to main version
+        // (target reads from main, same lineage)
         (Some(_target_branch), None) => Ok(crate::db::SubTableUpdate {
             table_key: table_key.to_string(),
             table_version: source_entry.table_version,
             table_branch: None,
             row_count: source_entry.row_count,
         }),
+        // Source on branch, target on main — apply delta to preserve version metadata
         (None, Some(_source_branch)) => {
-            let source_ds = source_snapshot.open(table_key).await?;
-            rewrite_target_table_from_dataset(target_db, table_key, &source_ds).await
+            let delta =
+                compute_source_delta(table_key, catalog, base_snapshot, source_snapshot).await?;
+            match delta {
+                Some(staged) => {
+                    publish_rewritten_merge_table(target_db, table_key, &staged).await
+                }
+                None => Ok(crate::db::SubTableUpdate {
+                    table_key: table_key.to_string(),
+                    table_version: target_entry
+                        .map(|e| e.table_version)
+                        .unwrap_or(source_entry.table_version),
+                    table_branch: None,
+                    row_count: source_entry.row_count,
+                }),
+            }
         }
+        // Both on branches
         (Some(target_branch), Some(source_branch)) => {
-            if target_entry.and_then(|entry| entry.table_branch.as_deref()) == Some(target_branch) {
-                let source_ds = source_snapshot.open(table_key).await?;
-                rewrite_target_table_from_dataset(target_db, table_key, &source_ds).await
+            if target_entry.and_then(|entry| entry.table_branch.as_deref())
+                == Some(target_branch)
+            {
+                // Target already owns this table — apply delta onto its lineage
+                let delta =
+                    compute_source_delta(table_key, catalog, base_snapshot, source_snapshot)
+                        .await?;
+                match delta {
+                    Some(staged) => {
+                        publish_rewritten_merge_table(target_db, table_key, &staged).await
+                    }
+                    None => Ok(crate::db::SubTableUpdate {
+                        table_key: table_key.to_string(),
+                        table_version: target_entry.unwrap().table_version,
+                        table_branch: Some(target_branch.to_string()),
+                        row_count: source_entry.row_count,
+                    }),
+                }
             } else {
+                // Target doesn't own this table yet — fork from source state.
+                // This creates the target branch on the sub-table dataset.
                 let full_path = format!("{}/{}", target_db.uri(), source_entry.table_path);
                 let ds = target_db
                     .fork_dataset_from_entry_state(
@@ -890,9 +1047,77 @@ async fn publish_adopted_source_state(
 async fn publish_rewritten_merge_table(
     target_db: &Omnigraph,
     table_key: &str,
-    staged: &StagedTable,
+    staged: &StagedMergeResult,
 ) -> Result<crate::db::SubTableUpdate> {
-    rewrite_target_table_from_dataset(target_db, table_key, &staged.dataset).await
+    let (ds, _full_path, table_branch) = target_db.open_for_mutation(table_key).await?;
+    let mut current_ds = ds;
+
+    // Phase 1: merge_insert changed/new rows (preserves _row_created_at_version for
+    // existing rows, bumps _row_last_updated_at_version only for actually-changed rows)
+    if let Some(delta) = &staged.delta_staged {
+        let mut batches = Vec::new();
+        let mut stream = scan_table_batches(&delta.dataset).await?;
+        while let Some(batch) = stream
+            .try_next()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+        {
+            if batch.num_rows() > 0 {
+                batches.push(Ok(batch));
+            }
+        }
+        if !batches.is_empty() {
+            let schema = batches[0].as_ref().unwrap().schema();
+            let reader = RecordBatchIterator::new(batches, schema);
+            let ds_arc = std::sync::Arc::new(current_ds);
+            let job = lance::dataset::MergeInsertBuilder::try_new(
+                ds_arc,
+                vec!["id".to_string()],
+            )
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+            .when_matched(lance::dataset::WhenMatched::UpdateAll)
+            .when_not_matched(lance::dataset::WhenNotMatched::InsertAll)
+            .try_build()
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            let (new_ds, _stats) = job
+                .execute(lance_datafusion::utils::reader_to_stream(Box::new(reader)))
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            current_ds = new_ds.as_ref().clone();
+        }
+    }
+
+    // Phase 2: delete removed rows via deletion vectors
+    if !staged.deleted_ids.is_empty() {
+        let escaped: Vec<String> = staged
+            .deleted_ids
+            .iter()
+            .map(|id| format!("'{}'", id.replace('\'', "''")))
+            .collect();
+        let filter = format!("id IN ({})", escaped.join(", "));
+        current_ds
+            .delete(&filter)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+    }
+
+    // Phase 3: rebuild indices
+    let row_count = current_ds
+        .count_rows(None)
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
+    if row_count > 0 {
+        target_db
+            .build_indices_on_dataset(table_key, &mut current_ds)
+            .await?;
+    }
+
+    Ok(crate::db::SubTableUpdate {
+        table_key: table_key.to_string(),
+        table_version: current_ds.version().version,
+        table_branch,
+        row_count,
+    })
 }
 
 // ─── Search mode ─────────────────────────────────────────────────────────────
@@ -2648,6 +2873,8 @@ impl Omnigraph {
                 CandidateTableState::AdoptSourceState => {
                     publish_adopted_source_state(
                         &target_db,
+                        self.catalog(),
+                        &base_snapshot,
                         &source_snapshot,
                         &target_snapshot,
                         table_key,

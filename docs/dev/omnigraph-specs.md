@@ -76,8 +76,11 @@ What does **not** carry forward:
 - `execute_query()` — pure function executor
 - JSONL loader targeting per-type Lance tables with constraint validation
 - `ensure_indices()` — BTree, Inverted, and Vector ANN index creation from active schema constraints
-- Lance-native branching, tagging, shallow clone (planned)
-- CLI (planned)
+- Lance-native branching, tagging, merge with three-way diff (complete)
+- Change detection — net-current diff via Lance version columns + ID set-difference (Step 10a)
+- Point-in-time queries — historical Snapshot + `run_query_at()` (Step 10b)
+- CLI (Step 10c)
+- Hook system — entity-change + query-result triggers (Step 11, planned)
 
 ---
 
@@ -426,6 +429,14 @@ impl Omnigraph {
     pub async fn run_mutation(&mut self, source: &str, name: &str, params: &ParamMap) -> Result<MutationResult>;
     pub async fn read_blob(&self, type_name: &str, id: &str, property: &str) -> Result<BlobFile>;
     pub async fn ensure_indices(&mut self) -> Result<()>;    // BTree + Inverted + Vector ANN; commits manifest updates
+    // Change tracking (Step 10a)
+    pub async fn diff(&self, from: u64, to: u64, filter: &ChangeFilter) -> Result<ChangeSet>;
+    pub async fn changes_since(&self, from: u64, filter: &ChangeFilter) -> Result<ChangeSet>;
+    pub async fn diff_commits(&self, from: &str, to: &str, filter: &ChangeFilter) -> Result<ChangeSet>;
+    pub async fn entity_at(&self, table_key: &str, id: &str, version: u64) -> Result<Option<serde_json::Value>>;
+    // Point-in-time (Step 10b)
+    pub async fn snapshot_at_version(&self, version: u64) -> Result<Snapshot>;
+    pub async fn run_query_at(&mut self, version: u64, source: &str, name: &str, params: &ParamMap) -> Result<QueryResult>;
     pub fn catalog(&self) -> &Catalog;
     pub fn uri(&self) -> &str;
     pub fn version(&self) -> u64;
@@ -484,6 +495,8 @@ Every future optimization is additive — a new field on `Omnigraph` or a new pa
 - Node cache → new field on Omnigraph, new parameter to executor
 - DuckDB fallback → new field, new parameter
 - Persistent index → serialize/deserialize `GraphIndex` (it's just data)
+- Hook system → consumes `changes_since()` + `run_query_at()` — no changes to change detection or executor
+- Query-result hooks → IR dependency extraction + point-in-time re-execution — additive on top of existing IR and executor
 
 ---
 
@@ -508,7 +521,10 @@ crates/
 │   └── src/
 │       ├── db/
 │       │   ├── manifest.rs    # Snapshot, ManifestCoordinator (known_state, snapshot, refresh, commit)
-│       │   └── omnigraph.rs   # Omnigraph handle (init, open, run_query, run_mutation, read_blob, graph_index, ensure_indices, fixup_blob_schemas)
+│       │   ├── omnigraph.rs   # Omnigraph handle (init, open, run_query, run_mutation, read_blob, graph_index, ensure_indices, diff, changes_since, run_query_at)
+│       │   └── commit_graph.rs # Graph commit DAG (merge-base lookup, commit append)
+│       ├── changes/
+│       │   └── mod.rs         # ChangeSet, EntityChange, ChangeFilter, diff implementation (Lance version columns + ID set-difference)
 │       ├── exec/
 │       │   └── mod.rs         # execute_query, execute_mutation, execute_expand, execute_anti_join, hydrate_nodes
 │       ├── graph_index/
@@ -809,6 +825,15 @@ Branches are Lance branches on the manifest table. Sub-tables are branched lazil
 
 This is intentionally conservative. The architecture supports finer-grained property-wise auto-merge later without changing the storage model.
 
+**Surgical merge publish (Step 9b):**
+
+The merge engine publishes results using `merge_insert` + `delete` instead of `truncate + append`. This preserves Lance’s row version metadata (`_row_created_at_version`, `_row_last_updated_at_version`) for rows that survive the merge unchanged:
+
+- **Rewritten merged tables:** The three-way merge already computes per-row signatures. Only rows that actually differ from the target are written via `merge_insert` (preserves `_row_created_at_version` for existing rows, bumps `_row_last_updated_at_version`). Deleted rows use Lance deletion vectors. Unchanged rows are never touched.
+- **Adopted source state:** Applied as a delta onto the target’s own table (not pointer switching). The source changes relative to the merge base are applied via `merge_insert` + `delete` on the target, keeping the target sub-table on its own branch lineage.
+
+This is required for change detection (Step 10a) to correctly report inserts/updates/deletes after merges using Lance version columns.
+
 **Current implementation detail:** ordered merge scans use `ORDER BY id`. If a table’s `id` ordering is not index-backed at read time, Lance may pay a full scan + sort cost. This is a performance concern, not a semantic one.
 
 Sub-tables not written to on a branch are never branched. Storage overhead is proportional to what changed.
@@ -969,6 +994,181 @@ When MemWAL is enabled on sub-table datasets, consistency operates at two levels
 
 ---
 
+## Change Tracking Model
+
+### Design Principle
+
+Change detection is read-time, not write-time. Lance's `_row_created_at_version` and `_row_last_updated_at_version` system columns (available because all Omnigraph datasets have `enable_stable_row_ids = true`) provide the raw signal. No custom CDC log, no write-path coupling, no additional storage. Changes can be queried retroactively between any two historical versions on any branch.
+
+**Prerequisite:** The merge engine must preserve row version metadata across publishes (Step 9b: surgical merge publish). Without this, merge rewrites via `truncate + append` destroy `_row_created_at_version` on surviving rows, making all rows appear as fresh inserts after a merge.
+
+### Net-Current Semantics
+
+A `ChangeSet` captures the **observable difference** between two manifest versions — not a replay of intermediate states.
+
+| Term | Meaning |
+|---|---|
+| Insert | Entity exists at `to` version but was created after `from` version |
+| Update | Entity exists at both versions but was modified after `from` version |
+| Delete | Entity existed at `from` version but doesn't exist at `to` version |
+
+Intermediate states collapse. If an entity is inserted at version 6 and deleted at version 9, `diff(5, 10)` shows nothing — the entity doesn't exist at either endpoint. This falls out naturally from Lance's version column queries (inserts/updates scan the `to` version, deletes are detected by ID set-difference).
+
+### Three-Level Detection
+
+**Level 1 — Manifest diff (which types changed):**
+
+Compare `(table_version, table_branch)` between snapshots at `from` and `to`. O(num_types), no data I/O. Unchanged sub-tables are skipped entirely.
+
+**Level 2 — Lineage check (which diff strategy per sub-table):**
+
+For each changed sub-table, check whether `from_entry.table_branch == to_entry.table_branch`:
+
+- **Same lineage** → fast path (version-column diff). Both endpoints are on the same dataset branch. Lance's version columns are comparable because they share the same version namespace.
+- **Different lineage** → cross-branch path (streaming ID-based diff). The endpoints are on different dataset branches. Lance versions are branch-scoped — `_row_created_at_version = 5` on main and `_row_created_at_version = 5` on feature are unrelated events. Deletion vectors are also branch-local — a row can be alive on one branch and deleted on another.
+
+The lineage check is deterministic (`table_branch` equality), not a heuristic. With Step 9b's adopted-state-as-delta fix, all sub-tables on the target branch stay on the target lineage after merge, so `diff()` and `changes_since()` on the same branch always hit the fast path. Only `diff_commits()` across different branches can hit the cross-branch path.
+
+**Level 3 — Row-level diff:**
+
+**Fast path (same lineage)** — version-column queries on the `to` sub-table:
+
+- **Inserts:** `_row_created_at_version > Vf AND _row_created_at_version <= Vt`
+- **Updates:** `_row_created_at_version <= Vf AND _row_last_updated_at_version > Vf AND _row_last_updated_at_version <= Vt`
+- **Deletes:** Scan `id` column at `Vf`, scan `id` column at `Vt`, set-difference. The `id` column is BTree-indexed on all tables (nodes: structural; edges: added in Step 9b).
+
+**Cross-branch path (different lineage)** — streaming row-by-id diff:
+
+1. Scan `id` (+ `src`, `dst` for edges) at both `from` and `to` sub-table versions
+2. **Inserts:** IDs in `to` but not `from`
+3. **Deletes:** IDs in `from` but not `to`
+4. **Updates:** IDs in both — compare row signatures to detect actual data changes. Rows with identical signatures are unchanged and excluded.
+
+### Graph-Level Semantics
+
+**Edge topology context:** Edge changes always include `src` and `dst` endpoint IDs. For inserts/updates, read from the `to` version alongside the detection scan. For deletes, read from the `from` version. This is essential — "edge X was deleted" is useless without knowing which nodes it connected.
+
+**Edge immutability invariant:** Edge `src`/`dst` columns are immutable (the runtime rejects updates to endpoint columns). Therefore:
+- Edge Insert = topology change (new relationship)
+- Edge Delete = topology change (removed relationship)
+- Edge Update = property-only change (metadata on existing relationship, connectivity unchanged)
+
+Consumers watching for topology changes need only Insert + Delete on edges.
+
+**Cascade deletes:** When a node delete cascades to edge deletes, each deleted edge appears as its own `EntityChange`. The consumer identifies cascades by correlation: if Person "Alice" was deleted in the same version as Knows edges with `src = "Alice"`, and the schema declares `Knows: Person -> Person`, those are cascades. The schema encodes this knowledge — the change event doesn't duplicate it.
+
+**Merge commits:** Appear as regular changes on the target branch. Step 9b ensures row version metadata is correct after merge (surgical publish preserves `_row_created_at_version` for unchanged rows). The graph commit DAG records merge parentage for consumers that need it.
+
+### Core Primitive — `diff_snapshots`
+
+The real implementation is `diff_snapshots(from: &Snapshot, to: &Snapshot, filter)` — a pure function on two snapshots. Each snapshot carries its own branch context. The per-sub-table lineage check determines which diff strategy to use independently for each sub-table.
+
+Public API methods are convenience wrappers:
+
+- `diff(from_version, to_version, filter)` — creates both snapshots on the handle's current branch. Always hits the fast path.
+- `changes_since(from_version, filter)` — sugar for `diff(from, current)`. Always hits the fast path.
+- `diff_commits(from_commit_id, to_commit_id, filter)` — resolves each commit to `(manifest_branch, manifest_version)` from `_graph_commits.lance`, creates branch-aware snapshots. Per-sub-table lineage check determines fast vs cross-branch path.
+
+### Filtering
+
+`ChangeFilter` pushes down before any scans:
+
+- `kinds: [Node]` → skip all edge sub-tables
+- `type_names: ["Drug"]` → skip all sub-tables except `node:Drug`
+- `ops: [Insert, Delete]` → skip the update scan (saves one query per sub-table)
+
+Cost is O(matching changes in matching sub-tables), not O(all changes).
+
+### Enrichment
+
+The base `EntityChange` is lightweight (ID + op + type + endpoints). Property values are not included. When a consumer needs before/after data:
+
+```rust
+let before = db.entity_at("node:Drug", "aspirin", from_version).await?;
+let after = db.entity_at("node:Drug", "aspirin", to_version).await?;
+// diff the two JSON objects for property-level changes
+```
+
+`entity_at()` reads one entity at a specific sub-table version via Lance time travel. Hooks and agents call this on demand, not on every change.
+
+### Point-in-Time Queries
+
+The executor is a pure function: `execute_query(ir, params, snapshot, graph_index, catalog)`. Point-in-time queries supply a historical `Snapshot` created by opening the manifest at a prior version:
+
+```rust
+let historical = db.snapshot_at_version(42).await?;
+// Then execute against this snapshot (same executor, different data view)
+```
+
+For traversal queries at historical versions, a temporary `GraphIndex` is built from the historical snapshot's edge sub-tables. This is expensive but correct, and historical traversals are rare.
+
+---
+
+## Hook System (Planned — Step 11)
+
+### Architecture
+
+The hook system sits on top of change detection and point-in-time queries. It does not modify the storage layer or query pipeline. Three layers, each consuming only the one below:
+
+```text
+Hook Dispatch (config + cursors + executors)
+     ↓ consumes
+Change Detection (ChangeSet via changes_since)
+     +
+Point-in-Time Queries (run_query_at for query-result hooks)
+     ↓ depends on
+Versioned Access (Snapshot at any version)
+```
+
+### Trigger Types
+
+**Entity-change trigger:** Fires when entities matching a filter change. Consumes `changes_since(cursor, filter)` directly. Each hook maintains a cursor (last-seen manifest version).
+
+**Query-result trigger:** Fires when the output of a named query changes. Three-tier evaluation:
+
+1. **Dependency check (instant):** Extract from `QueryIR` which sub-tables and properties the query reads. Check if any changes intersect those dependencies. If not → skip. This eliminates most hooks on most poll cycles.
+
+2. **Re-execute + diff (only when tier 1 says yes):** Call `run_query_at(cursor_version, ...)` and `run_query(...)`. Diff the two result sets by entity `id`. Produces entered/exited/modified rows.
+
+3. **Fire with result diff:** Hook receives which rows entered, exited, or changed in the query result — not raw entity changes.
+
+**Schedule trigger:** Fires on a cron expression. Receives current graph state.
+
+**Manual trigger:** Fires on `hook run <name>`. Receives current graph state.
+
+### Executors
+
+- **Shell:** runs a command with change context as JSON on stdin
+- **Webhook:** HTTP POST with JSON body
+
+Agent/LLM reasoning is a shell command that invokes an agent CLI. The hook system doesn't know it's talking to an LLM.
+
+### Cursor Persistence
+
+Per-hook cursors stored in `.omnigraph_hooks.json` (local file, not inside the database). Not versioned, not branched — local dispatch state only. Change-triggered hooks advance cursor after successful execution. Schedule and manual hooks don't use cursors.
+
+### Query Dependency Extraction
+
+```rust
+struct QueryDeps {
+    table_keys: HashSet<String>,                        // which sub-tables
+    properties: HashMap<String, HashSet<String>>,       // which properties per table
+}
+```
+
+Extracted by walking `QueryIR.pipeline`: `NodeScan` → table_keys + filter/projection properties. `Expand` → edge table_key + destination table_key. Cached per query definition (static analysis, doesn't change unless the query file changes).
+
+### Dispatch Model
+
+- `poll` — stateless command, processes all pending change-triggered hooks. Safe to run from cron, CI, or manually.
+- `watch --interval <duration>` — long-running loop for schedule triggers + continuous polling. Optional.
+- `hook run <name>` — manual trigger.
+- `auto_poll = true` in config — poll runs automatically during CLI operations (`load`, `run`).
+
+No daemon required for basic use. The hook system is a polling consumer, not a streaming subscriber.
+
+---
+
 ## Concurrency Model
 
 Branches are the primary concurrency primitive. Progression:
@@ -1036,8 +1236,12 @@ The current model (Step 7) does one manifest commit per mutation. With streaming
 See `implementation-plan.md` for detailed step-by-step status, compiler types to reuse, runtime code to write, Lance APIs, and test cases for each remaining step.
 
 ```
-Steps 0–9 ✅ (283 tests)
-     └→ Step 10: Change tracking + CLI
+Steps 0–9a ✅ (297 tests)
+     └→ Step 9b:  Surgical merge publish (preserve row identity for change detection)
+         ├→ Step 10a: Change detection (two-path lineage-aware diff)
+         ├→ Step 10b: Point-in-time query support (historical snapshots)
+         ├→ Step 10c: CLI wiring
+         └→ Step 10d: Hook + query-result subscription design validation
 ```
 
 ---
@@ -1051,6 +1255,11 @@ Omnigraph is successful when:
 - `omnigraph run` executes queries with filter pushdown, graph traversal (CSR/CSC), bulk anti-join, and indexed search
 - `omnigraph branch create` is O(1) regardless of data size (manifest branch only)
 - `omnigraph branch merge` applies net changes proportional to what changed
+- `omnigraph changes --since N` returns inserts/updates/deletes since version N using Lance version columns — no custom CDC
+- `omnigraph diff V1 V2` shows what changed between any two versions with type/kind filtering
+- point-in-time queries work via historical snapshots (`run_query_at`)
+- change detection cost is O(changed rows in matching sub-tables), not O(total graph)
+- the hook system (Step 11) requires zero modifications to change detection — it consumes `changes_since()` and `run_query_at()` directly
 - the same URI works for local and S3 repos
 - no custom WAL, no custom JSON manifest, no custom CDC — Lance-native throughout
 - the compiler crate has zero Lance dependency and can be shared with Nanograph
@@ -1061,7 +1270,7 @@ Omnigraph is successful when:
 
 1. **Remote sync (clone/push/pull).** URI-based open + `base_paths` make this architecturally possible. Deferred to after local branching works.
 2. **Schema evolution / migration.** Lance `add_columns`/`alter_columns`/`drop_columns` when needed.
-3. **Hook system.** Thin dispatch layer on Lance version tracking. Requires Step 10.
+3. **Hook system (Step 11).** Entity-change hooks consume `changes_since(cursor, filter)`. Query-result hooks use IR dependency extraction + `run_query_at()` for three-tier evaluation. Shell + webhook executors. Config in TOML, cursors in `.omnigraph_hooks.json`. Requires Step 10a + 10b. See Change Tracking Model and Hook System sections above.
 4. **Compaction.** Lance handles natively. Wire up as CLI command.
 5. **SDKs (TS, Swift, Python).** Thin wrappers after API stabilizes.
 6. **DuckDB fallback.** For graphs > ~5M edges. Defer until scale demands.

@@ -2,7 +2,8 @@ mod helpers;
 
 use std::fs;
 
-use arrow_array::{Array, Int32Array};
+use arrow_array::{Array, Int32Array, UInt64Array};
+use futures::TryStreamExt;
 use lance_index::{DatasetIndexExt, is_system_index};
 
 use omnigraph::db::commit_graph::CommitGraph;
@@ -797,4 +798,187 @@ async fn branch_api_rejects_reserved_main_and_same_source_target_merge() {
 
     let err = db.branch_merge("main", "main").await.unwrap_err();
     assert!(err.to_string().contains("distinct source and target"));
+}
+
+// ─── Step 9b: Surgical merge publish tests ──────────────────────────────────
+
+#[tokio::test]
+async fn merged_table_preserves_row_version_for_unchanged_rows() {
+    // After a non-FF merge, unchanged rows retain their original _row_created_at_version.
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = init_and_load(&dir).await;
+    main.ensure_indices().await.unwrap();
+    let pre_branch_version = main.version();
+
+    main.branch_create("feature").await.unwrap();
+    let mut feature = Omnigraph::open_branch(uri, "feature").await.unwrap();
+
+    // Main updates Bob's age → changes one row
+    main.run_mutation(
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Bob")], &[("$age", 26)]),
+    )
+    .await
+    .unwrap();
+
+    // Feature inserts Eve → adds one row
+    feature
+        .run_mutation(
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        )
+        .await
+        .unwrap();
+
+    let outcome = main.branch_merge("feature", "main").await.unwrap();
+    assert_eq!(outcome, MergeOutcome::Merged);
+
+    // After merge: scan node:Person with _row_created_at_version
+    let snap = main.snapshot();
+    let ds = snap.open("node:Person").await.unwrap();
+    let mut scanner = ds.scan();
+    scanner
+        .project(&["id", "_row_created_at_version"])
+        .unwrap();
+    let batches: Vec<_> = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+
+    // Collect _row_created_at_version for each person
+    let mut version_by_id: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        let versions = batch
+            .column_by_name("_row_created_at_version")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        for i in 0..ids.len() {
+            version_by_id.insert(ids.value(i).to_string(), versions.value(i));
+        }
+    }
+
+    // The key assertion: NOT all rows have the same _row_created_at_version.
+    // With truncate+append, all rows would be re-stamped to the merge version.
+    // With surgical merge_insert, unchanged rows keep their original version.
+    let unique_versions: std::collections::HashSet<u64> =
+        version_by_id.values().copied().collect();
+    assert!(
+        unique_versions.len() > 1,
+        "After surgical merge, rows should have different _row_created_at_version values \
+         (original rows keep old version, merged-in rows get new version). \
+         Got only {:?} for ids {:?}",
+        unique_versions,
+        version_by_id
+    );
+}
+
+#[tokio::test]
+async fn edge_tables_have_id_btree_after_ensure_indices() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    db.ensure_indices().await.unwrap();
+
+    let snap = db.snapshot();
+    let ds = snap.open("edge:Knows").await.unwrap();
+    let indices = ds.load_indices().await.unwrap();
+    let user_indices: Vec<_> = indices.iter().filter(|idx| !is_system_index(idx)).collect();
+
+    // Should have BTree on id, src, dst = 3 indices
+    let index_names: Vec<_> = user_indices
+        .iter()
+        .map(|idx| idx.fields.clone())
+        .collect();
+    assert!(
+        user_indices.len() >= 3,
+        "Edge table should have at least 3 indices (id, src, dst), got {:?}",
+        index_names
+    );
+}
+
+#[tokio::test]
+async fn merge_delta_only_bumps_changed_rows() {
+    // After a non-FF merge, unchanged rows should NOT have _row_last_updated_at_version
+    // bumped. Only rows that were actually modified should get new version stamps.
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = init_and_load(&dir).await;
+    main.ensure_indices().await.unwrap();
+
+    main.branch_create("feature").await.unwrap();
+    let mut feature = Omnigraph::open_branch(uri, "feature").await.unwrap();
+
+    // Main updates Bob's age → changes one Person row
+    main.run_mutation(
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Bob")], &[("$age", 26)]),
+    )
+    .await
+    .unwrap();
+
+    // Feature inserts Eve → adds one Person row (makes it non-FF)
+    feature
+        .run_mutation(
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        )
+        .await
+        .unwrap();
+
+    let outcome = main.branch_merge("feature", "main").await.unwrap();
+    assert_eq!(outcome, MergeOutcome::Merged);
+
+    // Scan all persons with _row_last_updated_at_version
+    let snap = main.snapshot();
+    let ds = snap.open("node:Person").await.unwrap();
+    let mut scanner = ds.scan();
+    scanner
+        .project(&["id", "_row_last_updated_at_version"])
+        .unwrap();
+    let batches: Vec<_> = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+
+    // Collect all _row_last_updated_at_version values
+    let mut versions: Vec<u64> = Vec::new();
+    for batch in &batches {
+        let v = batch
+            .column_by_name("_row_last_updated_at_version")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        for i in 0..v.len() {
+            versions.push(v.value(i));
+        }
+    }
+
+    // Not all rows should have the same version — unchanged rows keep old version
+    let unique_versions: std::collections::HashSet<u64> = versions.iter().copied().collect();
+    assert!(
+        unique_versions.len() > 1,
+        "After surgical merge, rows should have different _row_last_updated_at_version values. \
+         Unchanged rows should keep old version, changed rows get new version. \
+         Got only {:?}",
+        unique_versions
+    );
 }
