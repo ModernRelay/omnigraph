@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use arrow_array::{Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use lance::dataset::{WriteMode, WriteParams};
 use lance::Dataset;
+use lance::dataset::{WriteMode, WriteParams};
 use lance_file::version::LanceFileVersion;
 use omnigraph_compiler::catalog::Catalog;
 
@@ -24,13 +24,21 @@ pub struct Snapshot {
 impl Snapshot {
     /// Open a sub-table dataset at its pinned version.
     pub async fn open(&self, table_key: &str) -> Result<Dataset> {
-        let entry = self.entries.get(table_key).ok_or_else(|| {
-            OmniError::Manifest(format!("no manifest entry for {}", table_key))
-        })?;
+        let entry = self
+            .entries
+            .get(table_key)
+            .ok_or_else(|| OmniError::Manifest(format!("no manifest entry for {}", table_key)))?;
         let full_path = format!("{}/{}", self.root_uri, entry.table_path);
         let ds = Dataset::open(&full_path)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let ds = match &entry.table_branch {
+            Some(branch) => ds
+                .checkout_branch(branch)
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?,
+            None => ds,
+        };
         let ds = ds
             .checkout_version(entry.table_version)
             .await
@@ -46,6 +54,10 @@ impl Snapshot {
     /// Look up a sub-table entry by key.
     pub fn entry(&self, table_key: &str) -> Option<&SubTableEntry> {
         self.entries.get(table_key)
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = &SubTableEntry> {
+        self.entries.values()
     }
 }
 
@@ -95,19 +107,6 @@ struct ManifestState {
     pub entries: Vec<SubTableEntry>,
 }
 
-impl ManifestState {
-    pub fn entry(&self, table_key: &str) -> Option<&SubTableEntry> {
-        self.entries.iter().find(|e| e.table_key == table_key)
-    }
-
-    pub fn entries_map(&self) -> HashMap<String, &SubTableEntry> {
-        self.entries
-            .iter()
-            .map(|e| (e.table_key.clone(), e))
-            .collect()
-    }
-}
-
 /// Coordinates cross-dataset state through a Lance manifest table.
 ///
 /// The manifest table has one row per sub-table (one per node/edge type).
@@ -117,6 +116,7 @@ pub struct ManifestCoordinator {
     root_uri: String,
     dataset: Dataset,
     known_state: ManifestState,
+    active_branch: Option<String>,
 }
 
 impl ManifestCoordinator {
@@ -184,6 +184,7 @@ impl ManifestCoordinator {
             root_uri: root.to_string(),
             dataset,
             known_state,
+            active_branch: None,
         })
     }
 
@@ -199,6 +200,64 @@ impl ManifestCoordinator {
             root_uri: root.to_string(),
             dataset,
             known_state,
+            active_branch: None,
+        })
+    }
+
+    /// Open an existing repo's manifest at a specific branch.
+    pub async fn open_at_branch(root_uri: &str, branch: &str) -> Result<Self> {
+        if branch == "main" {
+            return Self::open(root_uri).await;
+        }
+
+        let root = root_uri.trim_end_matches('/');
+        let manifest_uri = format!("{}/_manifest.lance", root);
+        let dataset = Dataset::open(&manifest_uri)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let dataset = dataset
+            .checkout_branch(branch)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let known_state = read_manifest_state(&dataset).await?;
+        Ok(Self {
+            root_uri: root.to_string(),
+            dataset,
+            known_state,
+            active_branch: Some(branch.to_string()),
+        })
+    }
+
+    pub async fn snapshot_at(
+        root_uri: &str,
+        branch: Option<&str>,
+        version: u64,
+    ) -> Result<Snapshot> {
+        let root = root_uri.trim_end_matches('/');
+        let manifest_uri = format!("{}/_manifest.lance", root);
+        let dataset = Dataset::open(&manifest_uri)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let dataset = match branch {
+            Some(branch) if branch != "main" => dataset
+                .checkout_branch(branch)
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?,
+            _ => dataset,
+        };
+        let dataset = dataset
+            .checkout_version(version)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let state = read_manifest_state(&dataset).await?;
+        Ok(Snapshot {
+            root_uri: root.to_string(),
+            version: state.version,
+            entries: state
+                .entries
+                .into_iter()
+                .map(|entry| (entry.table_key.clone(), entry))
+                .collect(),
         })
     }
 
@@ -222,6 +281,13 @@ impl ManifestCoordinator {
         self.dataset = Dataset::open(&manifest_uri)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
+        if let Some(branch) = &self.active_branch {
+            self.dataset = self
+                .dataset
+                .checkout_branch(branch)
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
+        }
         self.known_state = read_manifest_state(&self.dataset).await?;
         Ok(())
     }
@@ -280,15 +346,12 @@ impl ManifestCoordinator {
         .map_err(|e| OmniError::Lance(e.to_string()))?;
 
         let ds = Arc::new(self.dataset.clone());
-        let job = lance::dataset::MergeInsertBuilder::try_new(
-            ds,
-            vec!["table_key".to_string()],
-        )
-        .map_err(|e| OmniError::Lance(e.to_string()))?
-        .when_matched(lance::dataset::WhenMatched::UpdateAll)
-        .when_not_matched(lance::dataset::WhenNotMatched::InsertAll)
-        .try_build()
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let job = lance::dataset::MergeInsertBuilder::try_new(ds, vec!["table_key".to_string()])
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+            .when_matched(lance::dataset::WhenMatched::UpdateAll)
+            .when_not_matched(lance::dataset::WhenNotMatched::InsertAll)
+            .try_build()
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
 
         let reader = RecordBatchIterator::new(vec![Ok(batch)], manifest_schema());
         let (new_ds, _stats) = job
@@ -304,6 +367,31 @@ impl ManifestCoordinator {
     /// Current manifest version.
     pub fn version(&self) -> u64 {
         self.dataset.version().version
+    }
+
+    pub fn active_branch(&self) -> Option<&str> {
+        self.active_branch.as_deref()
+    }
+
+    pub async fn create_branch(&mut self, name: &str) -> Result<()> {
+        let mut ds = self.dataset.clone();
+        ds.create_branch(name, self.version(), None)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn list_branches(&self) -> Result<Vec<String>> {
+        let branches = self
+            .dataset
+            .list_branches()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let mut names: Vec<String> = branches.into_keys().collect();
+        names.sort();
+        let mut all = vec!["main".to_string()];
+        all.extend(names);
+        Ok(all)
     }
 
     /// Root URI of the repo.
@@ -397,10 +485,7 @@ fn entries_to_batch(entries: &[SubTableEntry]) -> Result<RecordBatch> {
     let keys: Vec<&str> = entries.iter().map(|e| e.table_key.as_str()).collect();
     let paths: Vec<&str> = entries.iter().map(|e| e.table_path.as_str()).collect();
     let versions: Vec<u64> = entries.iter().map(|e| e.table_version).collect();
-    let branches: Vec<Option<&str>> = entries
-        .iter()
-        .map(|e| e.table_branch.as_deref())
-        .collect();
+    let branches: Vec<Option<&str>> = entries.iter().map(|e| e.table_branch.as_deref()).collect();
     let row_counts: Vec<u64> = entries.iter().map(|e| e.row_count).collect();
 
     RecordBatch::try_new(

@@ -3415,6 +3415,7 @@ dependencies = [
  "lance-datafusion",
  "lance-file",
  "lance-index",
+ "lance-linalg",
  "omnigraph-compiler",
  "regex",
  "serde",

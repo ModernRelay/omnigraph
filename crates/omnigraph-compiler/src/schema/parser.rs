@@ -257,17 +257,15 @@ fn parse_body_constraint(pair: pest::iterators::Pair<Rule>) -> Result<Constraint
             // @check(prop, "regex")
             if args.len() < 2 {
                 return Err(NanoError::Parse(
-                    "@check requires property name and pattern: @check(prop, \"regex\")".to_string(),
+                    "@check requires property name and pattern: @check(prop, \"regex\")"
+                        .to_string(),
                 ));
             }
             let property = extract_ident_from_constraint_arg(args[0].clone())?;
             let pattern = extract_string_from_constraint_arg(&args[1])?;
             Ok(Constraint::Check { property, pattern })
         }
-        other => Err(NanoError::Parse(format!(
-            "unknown constraint: @{}",
-            other
-        ))),
+        other => Err(NanoError::Parse(format!("unknown constraint: @{}", other))),
     }
 }
 
@@ -314,9 +312,8 @@ fn extract_string_from_constraint_arg(pair: &pest::iterators::Pair<Rule>) -> Res
         None
     }
 
-    find_string(pair).ok_or_else(|| {
-        NanoError::Parse("expected string argument in constraint".to_string())
-    })
+    find_string(pair)
+        .ok_or_else(|| NanoError::Parse("expected string argument in constraint".to_string()))
 }
 
 fn extract_range_bounds(
@@ -824,8 +821,7 @@ fn validate_property_annotations(
                             type_name, prop.name, source_prop
                         ))
                     })?;
-                if source_decl.prop_type.list
-                    || source_decl.prop_type.scalar != ScalarType::String
+                if source_decl.prop_type.list || source_decl.prop_type.scalar != ScalarType::String
                 {
                     return Err(NanoError::Parse(format!(
                         "@embed source property {}.{} must be String",
@@ -846,20 +842,10 @@ fn validate_constraints(schema: &SchemaFile) -> Result<()> {
         match decl {
             SchemaDecl::Interface(_) => {}
             SchemaDecl::Node(node) => {
-                validate_type_constraints(
-                    &node.constraints,
-                    &node.properties,
-                    &node.name,
-                    false,
-                )?;
+                validate_type_constraints(&node.constraints, &node.properties, &node.name, false)?;
             }
             SchemaDecl::Edge(edge) => {
-                validate_type_constraints(
-                    &edge.constraints,
-                    &edge.properties,
-                    &edge.name,
-                    true,
-                )?;
+                validate_type_constraints(&edge.constraints, &edge.properties, &edge.name, true)?;
             }
         }
     }
@@ -1115,7 +1101,11 @@ node Signal implements Slugged, Described {
                 // slug + title + description + strength
                 assert_eq!(n.properties.len(), 4);
                 // @key from Slugged should be desugared into constraints
-                assert!(n.constraints.iter().any(|c| matches!(c, Constraint::Key(v) if v == &["slug"])));
+                assert!(
+                    n.constraints
+                        .iter()
+                        .any(|c| matches!(c, Constraint::Key(v) if v == &["slug"]))
+                );
             }
             _ => panic!("expected Node"),
         }
@@ -1163,9 +1153,21 @@ node Person {
                 assert_eq!(n.properties[1].annotations[0].name, "key");
                 assert_eq!(n.properties[2].annotations[0].name, "index");
                 // Annotations are desugared into constraints
-                assert!(n.constraints.iter().any(|c| matches!(c, Constraint::Unique(_))));
-                assert!(n.constraints.iter().any(|c| matches!(c, Constraint::Key(_))));
-                assert!(n.constraints.iter().any(|c| matches!(c, Constraint::Index(_))));
+                assert!(
+                    n.constraints
+                        .iter()
+                        .any(|c| matches!(c, Constraint::Unique(_)))
+                );
+                assert!(
+                    n.constraints
+                        .iter()
+                        .any(|c| matches!(c, Constraint::Key(_)))
+                );
+                assert!(
+                    n.constraints
+                        .iter()
+                        .any(|c| matches!(c, Constraint::Index(_)))
+                );
             }
             _ => panic!("expected Node"),
         }
@@ -1181,7 +1183,11 @@ node Person {
         let schema = parse_schema(input).unwrap();
         match &schema.declarations[0] {
             SchemaDecl::Node(n) => {
-                assert!(n.constraints.iter().any(|c| matches!(c, Constraint::Key(v) if v == &["name"])));
+                assert!(
+                    n.constraints
+                        .iter()
+                        .any(|c| matches!(c, Constraint::Key(v) if v == &["name"]))
+                );
             }
             _ => panic!("expected Node"),
         }
@@ -1198,7 +1204,11 @@ node Person {
         let schema = parse_schema(input).unwrap();
         match &schema.declarations[0] {
             SchemaDecl::Node(n) => {
-                assert!(n.constraints.iter().any(|c| matches!(c, Constraint::Key(v) if v == &["name"])));
+                assert!(
+                    n.constraints
+                        .iter()
+                        .any(|c| matches!(c, Constraint::Key(v) if v == &["name"]))
+                );
             }
             _ => panic!("expected Node"),
         }
@@ -1216,7 +1226,11 @@ node Person {
         let schema = parse_schema(input).unwrap();
         match &schema.declarations[0] {
             SchemaDecl::Node(n) => {
-                assert!(n.constraints.iter().any(|c| matches!(c, Constraint::Unique(v) if v == &["first", "last"])));
+                assert!(
+                    n.constraints
+                        .iter()
+                        .any(|c| matches!(c, Constraint::Unique(v) if v == &["first", "last"]))
+                );
             }
             _ => panic!("expected Node"),
         }
@@ -1234,7 +1248,11 @@ node Event {
         let schema = parse_schema(input).unwrap();
         match &schema.declarations[0] {
             SchemaDecl::Node(n) => {
-                assert!(n.constraints.iter().any(|c| matches!(c, Constraint::Index(v) if v == &["category", "date"])));
+                assert!(
+                    n.constraints
+                        .iter()
+                        .any(|c| matches!(c, Constraint::Index(v) if v == &["category", "date"]))
+                );
             }
             _ => panic!("expected Node"),
         }
@@ -1251,7 +1269,11 @@ node Person {
         let schema = parse_schema(input).unwrap();
         match &schema.declarations[0] {
             SchemaDecl::Node(n) => {
-                assert!(n.constraints.iter().any(|c| matches!(c, Constraint::Range { property, .. } if property == "age")));
+                assert!(
+                    n.constraints.iter().any(
+                        |c| matches!(c, Constraint::Range { property, .. } if property == "age")
+                    )
+                );
             }
             _ => panic!("expected Node"),
         }
@@ -1358,7 +1380,11 @@ edge Knows: Person -> Person {
         let schema = parse_schema(input).unwrap();
         match &schema.declarations[1] {
             SchemaDecl::Edge(e) => {
-                assert!(e.constraints.iter().any(|c| matches!(c, Constraint::Unique(v) if v == &["src", "dst"])));
+                assert!(
+                    e.constraints
+                        .iter()
+                        .any(|c| matches!(c, Constraint::Unique(v) if v == &["src", "dst"]))
+                );
             }
             _ => panic!("expected Edge"),
         }
@@ -1377,7 +1403,11 @@ edge WorksAt: Person -> Company {
         match &schema.declarations[2] {
             SchemaDecl::Edge(e) => {
                 // @index on since is desugared to Constraint::Index
-                assert!(e.constraints.iter().any(|c| matches!(c, Constraint::Index(v) if v == &["since"])));
+                assert!(
+                    e.constraints
+                        .iter()
+                        .any(|c| matches!(c, Constraint::Index(v) if v == &["since"]))
+                );
             }
             _ => panic!("expected Edge"),
         }
@@ -1529,7 +1559,11 @@ edge Knows: Person -> Person {
         let schema = parse_schema(input).unwrap();
         match &schema.declarations[1] {
             SchemaDecl::Edge(e) => {
-                assert!(e.constraints.iter().any(|c| matches!(c, Constraint::Unique(v) if v == &["weight"])));
+                assert!(
+                    e.constraints
+                        .iter()
+                        .any(|c| matches!(c, Constraint::Unique(v) if v == &["weight"]))
+                );
             }
             _ => panic!("expected Edge"),
         }
@@ -1547,7 +1581,11 @@ edge Knows: Person -> Person {
         let schema = parse_schema(input).unwrap();
         match &schema.declarations[1] {
             SchemaDecl::Edge(e) => {
-                assert!(e.constraints.iter().any(|c| matches!(c, Constraint::Index(v) if v == &["weight"])));
+                assert!(
+                    e.constraints
+                        .iter()
+                        .any(|c| matches!(c, Constraint::Index(v) if v == &["weight"]))
+                );
             }
             _ => panic!("expected Edge"),
         }

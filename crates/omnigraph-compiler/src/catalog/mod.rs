@@ -392,20 +392,36 @@ edge Knows: Person -> Alien
         let catalog = build_catalog(&schema).unwrap();
         let person = &catalog.node_types["Person"];
         assert_eq!(
-            person.arrow_schema.field_with_name("id").unwrap().data_type(),
+            person
+                .arrow_schema
+                .field_with_name("id")
+                .unwrap()
+                .data_type(),
             &DataType::Utf8
         );
         let knows = &catalog.edge_types["Knows"];
         assert_eq!(
-            knows.arrow_schema.field_with_name("id").unwrap().data_type(),
+            knows
+                .arrow_schema
+                .field_with_name("id")
+                .unwrap()
+                .data_type(),
             &DataType::Utf8
         );
         assert_eq!(
-            knows.arrow_schema.field_with_name("src").unwrap().data_type(),
+            knows
+                .arrow_schema
+                .field_with_name("src")
+                .unwrap()
+                .data_type(),
             &DataType::Utf8
         );
         assert_eq!(
-            knows.arrow_schema.field_with_name("dst").unwrap().data_type(),
+            knows
+                .arrow_schema
+                .field_with_name("dst")
+                .unwrap()
+                .data_type(),
             &DataType::Utf8
         );
     }
@@ -424,10 +440,7 @@ edge Emits: Person -> Signal
 "#;
         let schema = parse_schema(input).unwrap();
         let catalog = build_catalog(&schema).unwrap();
-        assert_eq!(
-            catalog.node_types["Signal"].key_property(),
-            Some("slug")
-        );
+        assert_eq!(catalog.node_types["Signal"].key_property(), Some("slug"));
         assert_eq!(catalog.node_types["Person"].key_property(), None);
     }
 
@@ -473,7 +486,11 @@ node Person {
         let schema = parse_schema(input).unwrap();
         let catalog = build_catalog(&schema).unwrap();
         let person = &catalog.node_types["Person"];
-        assert!(person.unique_constraints.contains(&vec!["first".to_string(), "last".to_string()]));
+        assert!(
+            person
+                .unique_constraints
+                .contains(&vec!["first".to_string(), "last".to_string()])
+        );
     }
 
     #[test]
@@ -488,7 +505,11 @@ node Event {
         let schema = parse_schema(input).unwrap();
         let catalog = build_catalog(&schema).unwrap();
         let event = &catalog.node_types["Event"];
-        assert!(event.indices.contains(&vec!["category".to_string(), "date".to_string()]));
+        assert!(
+            event
+                .indices
+                .contains(&vec!["category".to_string(), "date".to_string()])
+        );
     }
 
     #[test]

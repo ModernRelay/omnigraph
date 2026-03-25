@@ -1,10 +1,10 @@
 mod helpers;
 
 use arrow_array::{Array, StringArray};
+use lance_index::DatasetIndexExt;
 
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph_compiler::ir::ParamMap;
 
 use helpers::*;
 
@@ -31,11 +31,18 @@ async fn text_search_filters_results() {
 
     // "Learning" appears in: ml-intro, dl-basics, rl-intro titles
     let result = db
-        .run_query(SEARCH_QUERIES, "text_search", &params(&[("$q", "Learning")]))
+        .run_query(
+            SEARCH_QUERIES,
+            "text_search",
+            &params(&[("$q", "Learning")]),
+        )
         .await
         .unwrap();
 
-    assert!(result.num_rows() > 0, "expected at least 1 result for 'Learning'");
+    assert!(
+        result.num_rows() > 0,
+        "expected at least 1 result for 'Learning'"
+    );
     let batch = result.concat_batches().unwrap();
     let slugs = batch
         .column(0)
@@ -108,7 +115,10 @@ async fn phrase_search_matches_exact_phrase() {
         .await
         .unwrap();
 
-    assert!(result.num_rows() > 0, "expected match for 'neural networks'");
+    assert!(
+        result.num_rows() > 0,
+        "expected match for 'neural networks'"
+    );
     let batch = result.concat_batches().unwrap();
     let slugs = batch
         .column(0)
@@ -119,6 +129,38 @@ async fn phrase_search_matches_exact_phrase() {
     assert!(
         slug_values.contains(&"dl-basics"),
         "expected dl-basics for 'neural networks', got {:?}",
+        slug_values
+    );
+}
+
+#[tokio::test]
+async fn phrase_search_is_documented_fts_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+
+    let result = db
+        .run_query(
+            SEARCH_QUERIES,
+            "phrase_search",
+            &params(&[("$q", "networks layers")]),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        result.num_rows() > 0,
+        "match_text fallback should still match FTS tokens"
+    );
+    let batch = result.concat_batches().unwrap();
+    let slugs = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let slug_values: Vec<&str> = (0..slugs.len()).map(|i| slugs.value(i)).collect();
+    assert!(
+        slug_values.contains(&"dl-basics"),
+        "expected FTS fallback to match dl-basics, got {:?}",
         slug_values
     );
 }
@@ -170,7 +212,10 @@ async fn bm25_returns_ranked_results() {
         .await
         .unwrap();
 
-    assert!(result.num_rows() > 0, "bm25 should return results for 'Learning'");
+    assert!(
+        result.num_rows() > 0,
+        "bm25 should return results for 'Learning'"
+    );
     assert!(result.num_rows() <= 3, "bm25 should respect limit 3");
 }
 
@@ -192,4 +237,32 @@ async fn rrf_fuses_vector_and_text() {
 
     assert!(result.num_rows() > 0, "rrf should return results");
     assert!(result.num_rows() <= 3, "rrf should respect limit 3");
+}
+
+#[tokio::test]
+async fn ensure_indices_creates_vector_index_for_vector_annotations() {
+    let schema = r#"
+node Doc {
+    slug: String @key
+    embedding: Vector(4) @index
+}
+"#;
+    let data = r#"{"type": "Doc", "data": {"slug": "a", "embedding": [0.1, 0.2, 0.3, 0.4]}}
+{"type": "Doc", "data": {"slug": "b", "embedding": [0.5, 0.6, 0.7, 0.8]}}"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    db.ensure_indices().await.unwrap();
+
+    let ds = db.snapshot().open("node:Doc").await.unwrap();
+    let indices = ds.load_indices().await.unwrap();
+    assert_eq!(
+        indices.len(),
+        2,
+        "expected id BTree index plus vector ANN index"
+    );
 }

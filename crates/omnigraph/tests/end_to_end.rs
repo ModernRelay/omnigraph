@@ -202,9 +202,7 @@ async fn append_adds_rows() {
     load_jsonl(&mut db, batch1, LoadMode::Overwrite)
         .await
         .unwrap();
-    load_jsonl(&mut db, batch2, LoadMode::Append)
-        .await
-        .unwrap();
+    load_jsonl(&mut db, batch2, LoadMode::Append).await.unwrap();
 
     let snap = db.snapshot();
     let ds = snap.open("node:Person").await.unwrap();
@@ -219,10 +217,7 @@ async fn load_from_file_works() {
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
-    let fixture_path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/test.jsonl"
-    );
+    let fixture_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.jsonl");
     load_jsonl_file(&mut db, fixture_path, LoadMode::Overwrite)
         .await
         .unwrap();
@@ -302,11 +297,7 @@ async fn query_get_person_not_found() {
     let mut db = init_and_load(&dir).await;
 
     let result = db
-        .run_query(
-            TEST_QUERIES,
-            "get_person",
-            &params(&[("$name", "Nobody")]),
-        )
+        .run_query(TEST_QUERIES, "get_person", &params(&[("$name", "Nobody")]))
         .await
         .unwrap();
 
@@ -486,7 +477,9 @@ query unemployed() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, schema).await.unwrap();
-    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
 
     let result = db
         .run_query(queries, "unemployed", &ParamMap::new())
@@ -621,7 +614,11 @@ async fn mutation_delete_node_cascades_edges() {
         .unwrap();
 
     assert_eq!(result.affected_nodes, 1);
-    assert!(result.affected_edges >= 3, "expected at least 3 cascaded edges, got {}", result.affected_edges);
+    assert!(
+        result.affected_edges >= 3,
+        "expected at least 3 cascaded edges, got {}",
+        result.affected_edges
+    );
 
     // Alice should be gone
     let qr = db
@@ -656,8 +653,18 @@ async fn mutation_delete_node_cascades_edges() {
                 .downcast_ref::<StringArray>()
                 .unwrap();
             for i in 0..batch.num_rows() {
-                assert_ne!(srcs.value(i), "Alice", "found edge src=Alice in {}", edge_key);
-                assert_ne!(dsts.value(i), "Alice", "found edge dst=Alice in {}", edge_key);
+                assert_ne!(
+                    srcs.value(i),
+                    "Alice",
+                    "found edge src=Alice in {}",
+                    edge_key
+                );
+                assert_ne!(
+                    dsts.value(i),
+                    "Alice",
+                    "found edge dst=Alice in {}",
+                    edge_key
+                );
             }
         }
     }
@@ -791,9 +798,11 @@ async fn blob_schema_parses_and_init_succeeds() {
     let uri = dir.path().to_str().unwrap();
     let db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
 
-    assert!(db.catalog().node_types["Document"]
-        .blob_properties
-        .contains("content"));
+    assert!(
+        db.catalog().node_types["Document"]
+            .blob_properties
+            .contains("content")
+    );
     assert_eq!(db.catalog().node_types["Document"].properties.len(), 2);
 }
 
@@ -807,7 +816,9 @@ async fn blob_load_base64_inline() {
     let data = r#"{"type": "Document", "data": {"title": "readme", "content": "base64:SGVsbG8gV29ybGQ="}}
 {"type": "Document", "data": {"title": "empty"}}
 "#;
-    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
 
     let snap = db.snapshot();
     let ds = snap.open("node:Document").await.unwrap();
@@ -821,7 +832,9 @@ async fn blob_query_returns_metadata() {
     let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
 
     let data = r#"{"type": "Document", "data": {"title": "readme", "content": "base64:SGVsbG8gV29ybGQ="}}"#;
-    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
 
     let result = db
         .run_query(BLOB_QUERIES, "get_doc", &params(&[("$title", "readme")]))
@@ -835,7 +848,10 @@ async fn blob_query_returns_metadata() {
     assert_eq!(row["d.title"], "readme");
     // Blob columns return null in query projections — data is accessed via take_blobs API.
     // (Lance bug: BlobsDescriptions + filter triggers assertion, so blobs are excluded from scan)
-    assert!(row["d.content"].is_null(), "blob column should return null in query projection");
+    assert!(
+        row["d.content"].is_null(),
+        "blob column should return null in query projection"
+    );
 }
 
 #[tokio::test]
@@ -845,7 +861,9 @@ async fn blob_null_returns_null_in_query() {
     let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
 
     let data = r#"{"type": "Document", "data": {"title": "empty"}}"#;
-    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
 
     let result = db
         .run_query(BLOB_QUERIES, "get_doc", &params(&[("$title", "empty")]))
@@ -857,7 +875,11 @@ async fn blob_null_returns_null_in_query() {
     let row = json.as_array().unwrap().first().unwrap();
     assert_eq!(row["d.title"], "empty");
     // Nullable blob with no value should return null
-    assert!(row["d.content"].is_null(), "null blob should return null, got: {}", row["d.content"]);
+    assert!(
+        row["d.content"].is_null(),
+        "null blob should return null, got: {}",
+        row["d.content"]
+    );
 }
 
 #[tokio::test]
@@ -887,7 +909,10 @@ async fn blob_insert_mutation() {
     let row = json.as_array().unwrap().first().unwrap();
     assert_eq!(row["d.title"], "new-doc");
     // Blob column present but null in query projection (data accessed via take_blobs)
-    assert!(row.get("d.content").is_some(), "content column should be present");
+    assert!(
+        row.get("d.content").is_some(),
+        "content column should be present"
+    );
 }
 
 #[tokio::test]
@@ -926,7 +951,10 @@ async fn blob_update_mutation() {
     let json = qr.to_sdk_json();
     let row = json.as_array().unwrap().first().unwrap();
     // Blob column present (data was actually updated via separate merge_insert)
-    assert!(row.get("d.content").is_some(), "content column should be present after update");
+    assert!(
+        row.get("d.content").is_some(),
+        "content column should be present after update"
+    );
 }
 
 // ─── Blob read API ───────────────────────────────────────────────────────
@@ -939,7 +967,9 @@ async fn blob_read_returns_bytes() {
 
     // "Hello World" = base64 "SGVsbG8gV29ybGQ="
     let data = r#"{"type": "Document", "data": {"title": "readme", "content": "base64:SGVsbG8gV29ybGQ="}}"#;
-    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
 
     let blob = db.read_blob("Document", "readme", "content").await.unwrap();
     assert_eq!(blob.size(), 11); // "Hello World" = 11 bytes
@@ -955,7 +985,9 @@ async fn blob_read_not_found_errors() {
     let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
 
     let data = r#"{"type": "Document", "data": {"title": "readme", "content": "base64:SGVsbG8="}}"#;
-    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
 
     // Non-existent ID
     let err = db.read_blob("Document", "nonexistent", "content").await;
@@ -981,7 +1013,10 @@ async fn blob_read_after_mutation_insert() {
     .await
     .unwrap();
 
-    let blob = db.read_blob("Document", "inserted", "content").await.unwrap();
+    let blob = db
+        .read_blob("Document", "inserted", "content")
+        .await
+        .unwrap();
     let bytes = blob.read().await.unwrap();
     assert_eq!(&bytes[..], &[1, 2, 3]);
 }
@@ -997,7 +1032,9 @@ async fn blob_scan_with_descriptions_on_nonempty_dataset() {
     let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
 
     let data = r#"{"type": "Document", "data": {"title": "readme", "content": "base64:SGVsbG8gV29ybGQ="}}"#;
-    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
 
     // Open the dataset directly and try BlobsDescriptions
     let snap = db.snapshot();
@@ -1058,7 +1095,9 @@ node Person {
     let mut db = Omnigraph::init(uri, schema).await.unwrap();
 
     let data = r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}"#;
-    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
 
     let snap = db.snapshot();
     let ds = snap.open("node:Person").await.unwrap();
@@ -1097,11 +1136,170 @@ node Order {
     let mut db = Omnigraph::init(uri, schema).await.unwrap();
 
     let data = r#"{"type": "Order", "data": {"code": "ABC-123"}}"#;
-    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
 
     let snap = db.snapshot();
     let ds = snap.open("node:Order").await.unwrap();
     assert_eq!(ds.count_rows(None).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn mutation_insert_rejects_range_violation() {
+    let schema = r#"
+node Person {
+    name: String @key
+    age: I32?
+    @range(age, 0..200)
+}
+"#;
+    let queries = r#"
+query insert_person($name: String, $age: I32) {
+    insert Person { name: $name, age: $age }
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+
+    let result = db
+        .run_mutation(queries, "insert_person", &{
+            let mut p = omnigraph_compiler::ir::ParamMap::new();
+            p.insert(
+                "name".to_string(),
+                omnigraph_compiler::query::ast::Literal::String("Old".to_string()),
+            );
+            p.insert(
+                "age".to_string(),
+                omnigraph_compiler::query::ast::Literal::Integer(300),
+            );
+            p
+        })
+        .await;
+    assert!(result.is_err(), "expected range violation");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("@range violation"), "error: {}", err);
+}
+
+#[tokio::test]
+async fn mutation_update_rejects_range_violation() {
+    let schema = r#"
+node Person {
+    name: String @key
+    age: I32?
+    @range(age, 0..200)
+}
+"#;
+    let queries = r#"
+query set_age($name: String, $age: I32) {
+    update Person set { age: $age } where name = $name
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    load_jsonl(
+        &mut db,
+        r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+
+    let result = db
+        .run_mutation(queries, "set_age", &{
+            let mut p = omnigraph_compiler::ir::ParamMap::new();
+            p.insert(
+                "name".to_string(),
+                omnigraph_compiler::query::ast::Literal::String("Alice".to_string()),
+            );
+            p.insert(
+                "age".to_string(),
+                omnigraph_compiler::query::ast::Literal::Integer(300),
+            );
+            p
+        })
+        .await;
+    assert!(result.is_err(), "expected range violation");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("@range violation"), "error: {}", err);
+}
+
+#[tokio::test]
+async fn mutation_insert_rejects_check_violation() {
+    let schema = r#"
+node Order {
+    code: String @key
+    @check(code, "^[A-Z]{3}-[0-9]+$")
+}
+"#;
+    let queries = r#"
+query insert_order($code: String) {
+    insert Order { code: $code }
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+
+    let result = db
+        .run_mutation(queries, "insert_order", &{
+            let mut p = omnigraph_compiler::ir::ParamMap::new();
+            p.insert(
+                "code".to_string(),
+                omnigraph_compiler::query::ast::Literal::String("invalid".to_string()),
+            );
+            p
+        })
+        .await;
+    assert!(result.is_err(), "expected check violation");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("@check violation"), "error: {}", err);
+}
+
+#[tokio::test]
+async fn mutation_update_rejects_check_violation() {
+    let schema = r#"
+node Order {
+    code: String @key
+    label: String?
+    @check(label, "^[A-Z]+$")
+}
+"#;
+    let queries = r#"
+query set_label($code: String, $label: String) {
+    update Order set { label: $label } where code = $code
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    load_jsonl(
+        &mut db,
+        r#"{"type": "Order", "data": {"code": "ABC-123", "label": "VALID"}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+
+    let result = db
+        .run_mutation(queries, "set_label", &{
+            let mut p = omnigraph_compiler::ir::ParamMap::new();
+            p.insert(
+                "code".to_string(),
+                omnigraph_compiler::query::ast::Literal::String("ABC-123".to_string()),
+            );
+            p.insert(
+                "label".to_string(),
+                omnigraph_compiler::query::ast::Literal::String("invalid".to_string()),
+            );
+            p
+        })
+        .await;
+    assert!(result.is_err(), "expected check violation");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("@check violation"), "error: {}", err);
 }
 
 #[tokio::test]
@@ -1143,9 +1341,234 @@ edge WorksAt: Person -> Company @card(0..1)
 {"type": "Company", "data": {"name": "Acme"}}
 {"edge": "WorksAt", "from": "Alice", "to": "Acme"}
 "#;
-    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
 
     let snap = db.snapshot();
     let ds = snap.open("edge:WorksAt").await.unwrap();
     assert_eq!(ds.count_rows(None).await.unwrap(), 1);
+}
+
+// ─── Regression: apply_assignments with blob mid-schema ──────────────────────
+
+#[tokio::test]
+async fn update_with_blob_mid_schema_does_not_panic() {
+    // Blob column in the MIDDLE of schema — not last. This previously caused
+    // a column-index mismatch in apply_assignments (batch.column(idx) used
+    // schema position but the batch had blob columns excluded from projection).
+    let schema = r#"
+node Article {
+    slug: String @key
+    attachment: Blob?
+    summary: String?
+    rating: I32?
+}
+"#;
+    let mutations = r#"
+query insert_article($slug: String, $summary: String, $rating: I32) {
+    insert Article { slug: $slug, summary: $summary, rating: $rating }
+}
+query update_summary($slug: String, $summary: String) {
+    update Article set { summary: $summary } where slug = $slug
+}
+query get_article($slug: String) {
+    match { $a: Article { slug: $slug } }
+    return { $a.slug, $a.summary, $a.rating }
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+
+    db.run_mutation(
+        mutations,
+        "insert_article",
+        &mixed_params(
+            &[("$slug", "a1"), ("$summary", "hello")],
+            &[("$rating", 42)],
+        ),
+    )
+    .await
+    .unwrap();
+
+    // This would panic with the old batch.column(idx) code
+    let result = db
+        .run_mutation(
+            mutations,
+            "update_summary",
+            &params(&[("$slug", "a1"), ("$summary", "updated")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.affected_nodes, 1);
+
+    // Verify the update applied correctly
+    let qr = db
+        .run_query(mutations, "get_article", &params(&[("$slug", "a1")]))
+        .await
+        .unwrap();
+    assert_eq!(qr.num_rows(), 1);
+}
+
+// ─── Regression: execute_update on edge type ─────────────────────────────────
+
+#[tokio::test]
+async fn update_edge_type_returns_error_not_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    // The typechecker should reject this, but even if bypassed,
+    // execute_update must not panic with HashMap key-not-found.
+    let mutations = r#"
+query update_edge($from: String) {
+    update Knows set { since: "2025-01-01" } where from = $from
+}
+"#;
+    let result = db
+        .run_mutation(mutations, "update_edge", &params(&[("$from", "Alice")]))
+        .await;
+    assert!(result.is_err(), "should return error, not panic");
+}
+
+// ─── Regression: Date/DateTime SQL literal escaping ──────────────────────────
+
+#[tokio::test]
+async fn date_literal_with_quote_is_escaped() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    // A date-like value with a single-quote must not cause SQL injection.
+    // This tests that literal_to_sql escapes Date/DateTime values.
+    let queries = r#"
+query filter_date($d: String) {
+    match { $p: Person { name: $d } }
+    return { $p.name }
+}
+"#;
+    // Pass a value with a single-quote — should not error or return all rows
+    let result = db
+        .run_query(
+            queries,
+            "filter_date",
+            &params(&[("$d", "2025-01-01' OR '1'='1")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 0);
+}
+
+// ─── Regression: manifest row_count tracks total, not batch size ─────────────
+
+#[tokio::test]
+async fn append_mode_manifest_row_count_is_total() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await; // Overwrite: 4 persons
+
+    let extra = r#"{"type": "Person", "data": {"name": "Eve", "age": 22}}"#;
+    load_jsonl(&mut db, extra, LoadMode::Append).await.unwrap();
+
+    let snap = db.snapshot();
+    let entry = snap.entry("node:Person").unwrap();
+    // Must be total rows (4 + 1 = 5), not just the appended batch size (1)
+    assert_eq!(entry.row_count, 5);
+
+    // Verify actual dataset count matches manifest
+    let ds = snap.open("node:Person").await.unwrap();
+    assert_eq!(ds.count_rows(None).await.unwrap() as u64, entry.row_count);
+}
+
+// ─── Regression: cardinality violation must not commit manifest ───────────────
+
+#[tokio::test]
+async fn cardinality_violation_does_not_commit_manifest() {
+    let schema = r#"
+node Person { name: String @key }
+node Company { name: String @key }
+edge WorksAt: Person -> Company @card(0..1)
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+
+    // Alice works at two companies — violates @card(0..1) (at most 1)
+    let data = r#"
+{"type": "Person", "data": {"name": "Alice"}}
+{"type": "Company", "data": {"name": "Acme"}}
+{"type": "Company", "data": {"name": "Beta"}}
+{"edge": "WorksAt", "from": "Alice", "to": "Acme"}
+{"edge": "WorksAt", "from": "Alice", "to": "Beta"}
+"#;
+
+    let v_before = db.version();
+    let result = load_jsonl(&mut db, data, LoadMode::Overwrite).await;
+    assert!(result.is_err(), "cardinality violation should be rejected");
+    assert!(
+        result.unwrap_err().to_string().contains("@card violation"),
+        "error should mention @card"
+    );
+
+    // Manifest must NOT have advanced — invalid data was not committed
+    assert_eq!(db.version(), v_before);
+}
+
+// ─── Regression: dangling edge references are rejected ───────────────────────
+
+#[tokio::test]
+async fn dangling_edge_dst_rejected_on_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+    let data = r#"
+{"type": "Person", "data": {"name": "Alice", "age": 30}}
+{"type": "Company", "data": {"name": "Acme"}}
+{"edge": "Knows", "from": "Alice", "to": "NonExistent"}
+"#;
+    let result = load_jsonl(&mut db, data, LoadMode::Overwrite).await;
+    assert!(result.is_err(), "dangling edge dst should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("not found"),
+        "error should mention 'not found': {}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn dangling_edge_src_rejected_on_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+    let data = r#"
+{"type": "Person", "data": {"name": "Alice", "age": 30}}
+{"type": "Company", "data": {"name": "Acme"}}
+{"edge": "WorksAt", "from": "Ghost", "to": "Acme"}
+"#;
+    let result = load_jsonl(&mut db, data, LoadMode::Overwrite).await;
+    assert!(result.is_err(), "dangling edge src should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("not found"),
+        "error should mention 'not found': {}",
+        err
+    );
+}
+
+// ─── Regression: ensure_indices is idempotent ────────────────────────────────
+
+#[tokio::test]
+async fn ensure_indices_does_not_error_on_repeated_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    // ensure_indices is called during load; calling it again should not error
+    db.ensure_indices().await.unwrap();
+    db.ensure_indices().await.unwrap();
+
+    // Data should still be queryable after index operations
+    let snap = db.snapshot();
+    let ds = snap.open("node:Person").await.unwrap();
+    assert_eq!(ds.count_rows(None).await.unwrap(), 4);
 }

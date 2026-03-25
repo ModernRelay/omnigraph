@@ -88,10 +88,7 @@ pub struct Cardinality {
 
 impl Default for Cardinality {
     fn default() -> Self {
-        Self {
-            min: 0,
-            max: None,
-        }
+        Self { min: 0, max: None }
     }
 }
 

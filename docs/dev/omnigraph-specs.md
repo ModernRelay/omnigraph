@@ -41,7 +41,7 @@ What does **not** carry forward:
 1. **Git-style graph database**: branch, merge, tag, clone, push, pull for typed property graphs
 2. **Local-first, remote-native**: works on a laptop, works on S3 — same API, same URI
 3. **Fast traversal without full-row residency**: in-memory topology, on-demand property hydration
-4. **Typed columnar execution**: Lance Scanner with SQL filter pushdown over per-type Lance tables. BTree/Inverted/Vector indices from schema constraints.
+4. **Typed columnar execution**: Lance Scanner with SQL filter pushdown over per-type Lance tables. BTree, Inverted, and schema-driven Vector ANN indices are active today.
 5. **Indexed search**: Lance FTS, n-gram, and vector indexes replace brute-force in-memory search
 6. **Schema-as-code**: `.pg` remains readable and versioned with data
 7. **Two products, shared compiler**: Nanograph and Omnigraph share the `omnigraph-compiler` crate but own different storage/execution layers
@@ -75,7 +75,7 @@ What does **not** carry forward:
 - `GraphIndex` — lazy CSR/CSC with dense u32 indices
 - `execute_query()` — pure function executor
 - JSONL loader targeting per-type Lance tables with constraint validation
-- `ensure_indices()` — BTree, Inverted, Vector index creation from schema constraints
+- `ensure_indices()` — BTree, Inverted, and Vector ANN index creation from active schema constraints
 - Lance-native branching, tagging, shallow clone (planned)
 - CLI (planned)
 
@@ -186,11 +186,11 @@ node Pattern implements Slugged, Described {
 
 **Enforcement:**
 - `@key`: validated at parse time (non-nullable, non-list, non-vector, non-blob, at most 1 per type). At runtime, `@key` value becomes the `id` column; `@key` types use `merge_insert` (upsert) on insert.
-- `@unique`: validated at parse time (properties exist). Composite uniqueness enforcement at runtime is deferred.
-- `@index`: validated at parse time (properties exist, not blob). `ensure_indices()` creates BTree/Inverted/IVF-HNSW indices after load.
-- `@range`: validated at parse time (numeric property). At load/mutation time, every row is checked — violations are hard errors.
-- `@check`: validated at parse time (String property, valid regex). At load/mutation time, every row is checked — violations are hard errors.
-- `@embed`: validated at parse time (target is Vector, source is String, source exists). Embedding generation at load time (when embedding client is configured).
+- `@unique`: validated at parse time (properties exist). `@key` uniqueness is enforced indirectly through the `id`-keyed write path; composite and non-key `@unique(...)` enforcement is not part of the active compiled runtime yet.
+- `@index`: validated at parse time (properties exist, not blob). `ensure_indices()` creates BTree, Inverted, and Vector ANN indices in the active runtime.
+- `@range`: validated at parse time (numeric property). In the active runtime, both the loader and mutation insert/update paths check every row.
+- `@check`: validated at parse time (String property, valid regex). In the active runtime, both the loader and mutation insert/update paths check every row.
+- `@embed`: validated at parse time (target is Vector, source is String, source exists). Automatic embedding materialization is not part of the active compiled loader path yet.
 
 ### Blob Type
 
@@ -390,7 +390,7 @@ Omnigraph (handle — one per connection, long-lived)
   ├── refresh()                    (async — re-reads manifest from storage)
   ├── graph_index()                (async — cache check, maybe rebuild)
   ├── run_query()                  (async — snapshot + compile + execute)
-  └── ensure_indices()             (async — create BTree indices)
+  └── ensure_indices()             (async — create schema-driven Lance indices + commit manifest updates)
 
 Snapshot (immutable read view, per-query, cheap)
   ├── version: u64
@@ -410,7 +410,7 @@ pub struct Omnigraph {
     manifest: ManifestCoordinator,
     catalog: Catalog,
     schema_source: String,
-    cached_graph_index: Option<Arc<GraphIndex>>,
+    cached_graph_index: Option<CachedGraphIndex>,
 }
 ```
 
@@ -425,13 +425,18 @@ impl Omnigraph {
     pub async fn run_query(&mut self, source: &str, name: &str, params: &ParamMap) -> Result<QueryResult>;
     pub async fn run_mutation(&mut self, source: &str, name: &str, params: &ParamMap) -> Result<MutationResult>;
     pub async fn read_blob(&self, type_name: &str, id: &str, property: &str) -> Result<BlobFile>;
-    pub async fn ensure_indices(&self) -> Result<()>;        // BTree/Inverted/Vector from schema constraints
+    pub async fn ensure_indices(&mut self) -> Result<()>;    // BTree + Inverted + Vector ANN; commits manifest updates
     pub fn catalog(&self) -> &Catalog;
     pub fn uri(&self) -> &str;
     pub fn version(&self) -> u64;
     pub fn manifest_mut(&mut self) -> &mut ManifestCoordinator;
 }
 ```
+
+**Current gaps / TODOs:**
+- The public API is still ambient-handle based. Explicit branch/snapshot targets are a later API step, not the current runtime shape.
+- `init(uri)` / `open(uri)` use URI-shaped signatures, but `_schema.pg` I/O is still local-path-only today.
+- `manifest_mut()` is a prototype escape hatch and not a stable long-term coordinator boundary.
 
 ### Query Path (Actual)
 
@@ -463,12 +468,13 @@ The executor `execute_query()` is a **public pure function** — no state, no ca
 
 ### Graph Index Invalidation
 
-The graph index is a single cache slot: `Option<Arc<GraphIndex>>`. It is:
+The graph index is a single cache slot keyed by the current edge sub-table state. It is:
 - **Built lazily** on first traversal query via `graph_index()`
 - **Shared** across queries via `Arc`
 - **Invalidated** by setting to `None` after edge mutations (insert edge, delete node with cascade, delete edge)
+- **Dropped on refresh** when the manifest shows different edge table versions than the cached key
 
-Phase 1 uses simple invalidation. Future: key by edge sub-table versions (`BTreeMap<String, u64>`) so node-only loads don't trigger rebuilds.
+This keeps the current single-slot cache correct for main-only snapshot refresh. The next step is broadening that model to branch-aware / multi-target cache keys in Step 9.
 
 ### Extension Points
 
@@ -530,6 +536,10 @@ graph-db/                               # repo root (local path or s3:// URI)
 │   ├── _versions/                      # MVCC — repo version = manifest version
 │   ├── _refs/branches/                 # Lance-native branch metadata
 │   └── data/
+├── _graph_commits.lance/               # Tiny graph commit DAG for merge-base resolution
+│   ├── _versions/
+│   ├── _refs/branches/
+│   └── data/
 ├── nodes/
 │   ├── {hash}/                         # Per-type dataset (FNV-1a hash of type name)
 │   │   ├── _versions/
@@ -565,6 +575,10 @@ The manifest is a Lance table. One row per sub-table. A repo version is one mani
 2. Build update batch
 3. `merge_insert` on `_manifest.lance` keyed by `table_key` (atomic commit point)
 4. Update `known_state` for read-your-own-writes
+
+**Target contract:** the manifest advance is the graph-level publish point. Sub-table writes and graph-level validation must complete before a new manifest version becomes visible.
+
+The active JSONL load path stages writes, validates edge endpoints and edge cardinality, and advances the manifest only after validation passes.
 
 ### Sub-Table Schemas
 
@@ -603,6 +617,13 @@ All datasets created with `enable_stable_row_ids = true`, `LanceFileVersion::V2_
 - Edge property indices: `since: Date? @index` inside edge body → BTree on edge property columns
 
 Uses `lance_index::DatasetIndexExt::create_index_builder`. Idempotent (`replace=true`).
+
+**Current gap / TODO:** the active runtime currently materializes:
+- structural BTree indices on `id`, `src`, and `dst`
+- single-column String `@index` as Inverted / FTS
+- single-column Vector `@index` as ANN
+
+Non-String scalar `@index`, composite `@index(p1, p2)`, and schema-driven edge-property `@index` materialization remain TODO.
 
 ### Why Per-Type Tables
 
@@ -726,36 +747,58 @@ Each variable binding is an independent `RecordBatch`. Multi-variable returns ac
 
 ---
 
-## Branching Model (Planned — Step 9)
+## Branching Model
 
 ### Lance-Native Branching
 
 Branches are Lance branches on the manifest table. Sub-tables are branched lazily.
 
-**Lance APIs available** (verified in lance 3.0):
-- `Dataset::create_branch(name)` — zero-copy branch
+**Lance APIs available** (verified in lance 3.0.1 Rust API):
+- `Dataset::create_branch(name, version, None)` — zero-copy branch
 - `Dataset::checkout_branch(name)` — open at branch
-- `Dataset::list_branches()` — enumerate branches
+- `Dataset::list_branches()` — enumerate branches as `HashMap<String, BranchContents>`
 - `Dataset::delete_branch(name)` — remove branch
 - `Dataset::shallow_clone(dest, base_paths)` — cross-location clone
 
+**Graph ancestry:**
+- Omnigraph keeps a tiny `_graph_commits.lance` dataset to track graph commit ancestry
+- This is separate from per-table Lance history and exists to answer one question correctly: "what is the merge base?"
+- Each row records `graph_commit_id`, `manifest_branch`, `manifest_version`, `parent_commit_id`, optional `merged_parent_commit_id`, and `created_at`
+- `_graph_commits.lance` is branched eagerly with `_manifest.lance` because it is small and is required for branch merge
+
 **Create branch:**
-1. `_manifest.lance` dataset: `ds.create_branch("experiment")` (zero-copy, inherits all rows)
-2. No sub-tables branched yet — `table_branch` remains null
+1. `_manifest.lance` dataset: `ds.create_branch("experiment", version, None)` (zero-copy, inherits all rows)
+2. `_graph_commits.lance` dataset: `ds.create_branch("experiment", version, None)`
+3. No sub-tables branched yet — `table_branch` remains null
 
 **First write on branch:**
 1. Sub-table has no branch → create Lance branch on the sub-table
 2. Write to the branched sub-table
 3. Update manifest row: set `table_branch`, commit manifest on the branch
+4. Append a graph commit row to `_graph_commits.lance`
 
 **Read from branch:**
 1. Open manifest at the branch: `ds.checkout_branch("experiment")`
 2. For each sub-table: if `table_branch` is null, open at `table_version` on main. If set, checkout that branch.
 
 **Merge:**
-1. Read source and target manifest states
-2. For each sub-table that differs: `merge_insert` keyed by `id` to apply changes
-3. Commit target manifest
+1. Resolve `source_head`, `target_head`, and nearest common ancestor from `_graph_commits.lance`
+2. Open base/source/target manifest states
+3. For each sub-table:
+   - source-only change → take source
+   - target-only change → keep target
+   - both changed → row-level three-way merge keyed by persisted `id`
+4. Validate merged candidate graph
+5. Materialize validated candidate batches for changed target subtables, commit target manifest, append merge commit row
+
+**V1 conflict policy:**
+- same `id` changed differently on both sides → conflict
+- delete vs update on the same `id` → conflict
+- same `id` inserted differently on both sides → conflict
+- orphan edge introduced by merge → conflict
+- post-merge `@unique(...)` / `@card(...)` violations → conflict
+
+This is intentionally conservative. The architecture supports finer-grained property-wise auto-merge later without changing the storage model.
 
 Sub-tables not written to on a branch are never branched. Storage overhead is proportional to what changed.
 
@@ -772,13 +815,19 @@ Sub-tables not written to on a branch are never branched. Storage overhead is pr
 **IR**: `MutationIR { name, params, op: MutationOpIR }` with `Insert/Update/Delete` variants. `IRAssignment { property, value: IRExpr }`, `IRMutationPredicate { property, op, value: IRExpr }`.
 
 **Typechecker**:
-- Insert validates all non-nullable properties provided, validates edge `from`/`to` endpoints
+- Insert validates all non-nullable properties provided
 - Update validates property types, rejects edge updates (T16)
 - Delete validates predicate for both nodes and edges
+
+**Target contract:** edge writes must validate `from` / `to` endpoint existence and schema-declared endpoint type before publish.
+
+The active runtime validates endpoint existence/type on JSONL edge loads and edge mutation inserts before publish.
 
 ### Runtime
 
 **Insert**: Build single-row RecordBatch → `@key` types use `merge_insert` (upsert), keyless use `append` → commit manifest. Edge inserts invalidate graph index. Blob properties use `BlobArrayBuilder` (accepting URI or base64 string values).
+
+Edge inserts and edge loads validate endpoint IDs before publish, and branch merge re-validates no-orphan-edge visibility against the merged candidate graph.
 
 **Update**: Two-phase for types with blob properties:
 1. Scan non-blob columns (blob columns excluded via `.project()`) → apply scalar assignments → `merge_insert` keyed by `id`
@@ -794,34 +843,36 @@ For types without blobs: single-phase scan → apply → merge_insert (unchanged
 
 ### Constraint Enforcement
 
-Mutations enforce schema constraints at runtime:
+Current runtime enforcement is split by path:
 
-- **Value constraints**: `range()` and `check()` validated before write in `execute_insert` and `execute_update`. Violations are hard errors.
-- **Edge cardinality**: `@card(min..max)` validated in `execute_insert` (max bound check) and `execute_delete` (min bound check for min > 0). Violations are hard errors.
-- **Unique constraints**: enforced via `merge_insert` keyed by `id` for `@key`, post-write duplicate scan for `@unique(...)`.
+- **Load path**: `@range` and `@check` are validated in the active JSONL loader, and edge cardinality is validated after edge writes. Violations are hard errors.
+- **Mutation path**: `@range` and `@check` are validated before write, `@key` immutability is enforced, edge-delete cascade is enforced, and `@key` node inserts/upserts use `merge_insert` keyed by `id`.
+- **Unique constraints**: the active compiled runtime does not yet perform the post-write duplicate scans described for `@unique(...)`; that remains deferred work beyond the Step 8a cleanup.
+- **Embedding materialization**: automatic `@embed` generation is not part of the active compiled loader path.
 - **Key immutability**: updates to `@key` properties are rejected by the typechecker (T16-style check).
 
 ---
 
 ## Search Model
 
-Lance-native indexed search replaces Nanograph's brute-force implementations:
+Steps 8, 8a, 8b, and 9 are complete. Search/runtime parity, publish-safe graph writes, and branch-aware runtime semantics are in the active implementation.
 
-| Predicate | Omnigraph (Lance-indexed) | Lance Index Type |
+| Predicate | Current runtime | Notes |
 |---|---|---|
-| `search()` | FTS `match_tokens` | `IndexType::Inverted` |
-| `fuzzy()` | N-gram FTS index | `IndexType::Inverted` (n-gram config) |
-| `match_text()` | FTS `match_phrase` | `IndexType::Inverted` |
-| `bm25()` | FTS `match` with BM25 scoring | `IndexType::Inverted` |
-| `nearest()` | Lance ANN | `IndexType::IvfHnswPq` |
-| `rrf()` | Application-level score fusion | N/A |
+| `search()` | FTS query via `FullTextSearchQuery` | Uses Inverted indices when available |
+| `fuzzy()` | Fuzzy FTS query via `FullTextSearchQuery::new_fuzzy` | Uses the same Lance FTS path |
+| `match_text()` | Currently the same FTS path as `search()` | True phrase semantics are deferred until the Lance Rust API exposes them cleanly |
+| `bm25()` | FTS with BM25 scoring | Uses Lance ranking support |
+| `nearest()` | `scanner.nearest(column, vector, k)` | Query-time ANN path works and `ensure_indices()` now builds ANN indices for `Vector @index` |
+| `rrf()` | Application-level score fusion | Fuses two ranked result sets in Omnigraph |
 
-Index creation is driven by `@index` constraints in the schema:
-- `title: String @index` → `IndexType::Inverted` (FTS)
-- `embedding: Vector(N) @index` → `IndexType::IvfHnswPq` (ANN)
-- `ensure_indices()` already creates Inverted indices on `@index` String properties
+Index creation in the active runtime matches the current schema contract for active index types:
+- `ensure_indices()` creates BTree indices on `id` / `src` / `dst`
+- `ensure_indices()` creates Inverted indices on single-column String `@index` properties
+- `ensure_indices()` creates Vector ANN indices on single-column `Vector @index` properties
+- Index creation commits the new sub-table versions back into the manifest so snapshot-pinned reads target the indexed version
 
-The compiler IR already supports all search expressions (`IRExpr::Search/Fuzzy/MatchText/Bm25/Nearest/Rrf`). Only the runtime execution is missing.
+The compiler IR and the runtime executor support `search` / `fuzzy` / `match_text` / `bm25` / `nearest` / `rrf`. `match_text()` remains a documented FTS fallback until Lance exposes a clean phrase-search API in Rust.
 
 ---
 
@@ -833,11 +884,13 @@ The compiler IR already supports all search expressions (`IRExpr::Search/Fuzzy/M
 
 ### Snapshot Isolation
 
-`Snapshot` is created from `ManifestCoordinator::known_state` — sync, no storage I/O. It holds `version: u64` + `entries: HashMap<String, SubTableEntry>`. It can open any sub-table on demand via `open(table_key)`, which resolves the path and checks out the pinned version.
+`Snapshot` is created from `ManifestCoordinator::known_state` — sync, no storage I/O. It holds `version: u64` + `entries: HashMap<String, SubTableEntry>`. `open(table_key)` resolves the path and checks out the pinned `(table_branch, table_version)` state for that sub-table.
 
 **Within a query:** The executor takes one Snapshot at query start. All `NodeScan`, `Expand`, and `AntiJoin` operations read through it. Concurrent writes are invisible.
 
 **Across queries:** Each query takes its own Snapshot from the handle's known version. Successive queries see the latest committed state (if the handle committed) or the last known state (if another writer committed and `refresh()` hasn't been called).
+
+**Current limitation:** the cached `GraphIndex` is still a single slot per handle. It is branch-aware through the cache key, but the runtime does not yet keep a multi-target cache pool.
 
 ### Multi-Reader
 
@@ -849,6 +902,7 @@ Multiple writers each open their own `Omnigraph::open(uri)` handle. When two wri
 
 - **Different sub-tables**: Lance merges manifest rows automatically (`merge_insert` by `table_key` is non-conflicting for different keys)
 - **Same sub-table**: Lance's optimistic concurrency handles it (Append+Append is rebasable, same-row Update is retryable)
+- **Branch merge conflicts**: handled at the Omnigraph layer by graph-level three-way merge keyed by persisted `id`
 - **No application-level locking required**
 
 ### Read-After-Write
@@ -919,6 +973,8 @@ Branches are the primary concurrency primitive. Progression:
 
 Lance MemWAL is a Lance-native LSM-tree architecture for high-throughput streaming writes. It enables multiple concurrent writers on a single branch without custom WAL or coordination logic in Omnigraph.
 
+**Scope note:** this is a later table/write-path optimization after branching. It does not change the Step 9 graph-coordination design.
+
 **Architecture:**
 
 Each sub-table dataset (the "base table" in MemWAL terms) can independently have MemWAL enabled. Writers write to an in-memory MemTable backed by a durable WAL per region. MemTables flush to storage periodically; flushed MemTables merge into the base table asynchronously via `merge_insert`. The same Lance API surface (`append`, `merge_insert`, `delete`) works transparently — MemWAL routes writes through the WAL internally. Omnigraph does not build a custom WAL.
@@ -969,10 +1025,8 @@ The current model (Step 7) does one manifest commit per mutation. With streaming
 See `implementation-plan.md` for detailed step-by-step status, compiler types to reuse, runtime code to write, Lance APIs, and test cases for each remaining step.
 
 ```
-Steps 0–8 + 7a ✅ (262 tests)
-     ├→ Step 9: Branching (Lance branches on manifest + sub-tables)
-     │    └→ Step 10: Change tracking + CLI
-     └→ Step 10: CLI core wiring
+Steps 0–9 ✅ (283 tests)
+     └→ Step 10: Change tracking + CLI
 ```
 
 ---

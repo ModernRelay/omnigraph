@@ -1,3 +1,4 @@
+pub mod commit_graph;
 pub mod manifest;
 mod omnigraph;
 

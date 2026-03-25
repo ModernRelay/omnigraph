@@ -159,6 +159,59 @@ async fn refresh_sees_other_writer_commits() {
     assert_eq!(qr.num_rows(), 1, "refreshed handle should see Eve");
 }
 
+#[tokio::test]
+async fn refresh_rebuilds_graph_index_after_external_edge_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let _db = init_and_load(&dir).await;
+    drop(_db);
+
+    let uri = dir.path().to_str().unwrap();
+    let mut db1 = Omnigraph::open(uri).await.unwrap();
+    let mut db2 = Omnigraph::open(uri).await.unwrap();
+
+    let warm = db2
+        .run_query(TEST_QUERIES, "friends_of", &params(&[("$name", "Alice")]))
+        .await
+        .unwrap();
+    assert_eq!(warm.num_rows(), 2);
+
+    db1.run_mutation(
+        MUTATION_QUERIES,
+        "add_friend",
+        &params(&[("$from", "Alice"), ("$to", "Diana")]),
+    )
+    .await
+    .unwrap();
+
+    let stale = db2
+        .run_query(TEST_QUERIES, "friends_of", &params(&[("$name", "Alice")]))
+        .await
+        .unwrap();
+    assert_eq!(stale.num_rows(), 2, "stale handle should keep old topology");
+
+    db2.refresh().await.unwrap();
+
+    let refreshed = db2
+        .run_query(TEST_QUERIES, "friends_of", &params(&[("$name", "Alice")]))
+        .await
+        .unwrap();
+    assert_eq!(
+        refreshed.num_rows(),
+        3,
+        "refreshed handle should rebuild topology after edge change"
+    );
+
+    let batch = refreshed.concat_batches().unwrap();
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let values: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
+    assert!(values.contains(&"Bob"));
+    assert!(values.contains(&"Diana"));
+}
+
 // ─── Null handling ──────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -292,16 +345,34 @@ query add_friend_since($from: String, $to: String, $since: Date) {
     let mut p = params(&[("$from", "Diana"), ("$to", "Bob")]);
     p.insert("since".to_string(), Literal::Date("2024-06-15".to_string()));
 
-    let result = db.run_mutation(queries, "add_friend_since", &p).await.unwrap();
+    let result = db
+        .run_mutation(queries, "add_friend_since", &p)
+        .await
+        .unwrap();
     assert_eq!(result.affected_edges, 1);
 
     // Verify the edge property was stored
     let batches = read_table(&db, "edge:Knows").await;
     let mut found = false;
     for batch in &batches {
-        let srcs = batch.column_by_name("src").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-        let dsts = batch.column_by_name("dst").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-        let since = batch.column_by_name("since").unwrap().as_any().downcast_ref::<Date32Array>().unwrap();
+        let srcs = batch
+            .column_by_name("src")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let dsts = batch
+            .column_by_name("dst")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let since = batch
+            .column_by_name("since")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
         for i in 0..batch.num_rows() {
             if srcs.value(i) == "Diana" && dsts.value(i) == "Bob" {
                 assert!(!since.is_null(i), "since should not be null");
@@ -376,7 +447,9 @@ node Item {
         ));
     }
     let data = lines.join("\n");
-    load_jsonl(&mut db, &data, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&mut db, &data, LoadMode::Overwrite)
+        .await
+        .unwrap();
 
     assert_eq!(count_rows(&db, "node:Item").await, 500);
 
@@ -399,7 +472,60 @@ query high_value() {
     // Items 491..499 = 9 items
     assert_eq!(result.num_rows(), 9);
     let batch = &result.batches()[0];
-    let values = batch.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+    let values = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
     assert_eq!(values.value(0), 491);
     assert_eq!(values.value(8), 499);
+}
+
+// ─── Regression: mutation on stale handle detects version drift ──────────────
+
+#[tokio::test]
+async fn stale_handle_mutation_detects_version_drift() {
+    let dir = tempfile::tempdir().unwrap();
+    let _db = init_and_load(&dir).await;
+    drop(_db);
+
+    let uri = dir.path().to_str().unwrap();
+    let mut db1 = Omnigraph::open(uri).await.unwrap();
+    let mut db2 = Omnigraph::open(uri).await.unwrap();
+
+    // Writer 1 inserts — advances the Person sub-table version
+    db1.run_mutation(
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+
+    // Writer 2 (stale) tries to mutate — should detect version drift
+    let result = db2
+        .run_mutation(
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
+        )
+        .await;
+    assert!(result.is_err(), "stale handle should detect version drift");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("version drift"),
+        "error should mention version drift: {}",
+        err
+    );
+
+    // After refresh, the mutation should succeed
+    db2.refresh().await.unwrap();
+    let result = db2
+        .run_mutation(
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
+        )
+        .await;
+    assert!(result.is_ok(), "refreshed handle should succeed");
 }

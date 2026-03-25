@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use std::io::{BufRead, BufReader, Cursor};
 use std::sync::Arc;
@@ -7,17 +7,13 @@ use arrow_array::{
     ArrayRef, Date32Array, FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array,
     RecordBatch, RecordBatchIterator, StringArray, UInt32Array, UInt64Array,
 };
-use arrow_schema::{DataType, SchemaRef};
+use arrow_schema::DataType;
 use base64::Engine;
-use lance::blob::BlobArrayBuilder;
-use lance::dataset::{WriteMode, WriteParams};
-use lance::Dataset;
-use lance_file::version::LanceFileVersion;
-use omnigraph_compiler::catalog::{Catalog, NodeType};
 use futures::TryStreamExt;
+use lance::blob::BlobArrayBuilder;
+use omnigraph_compiler::catalog::NodeType;
 use serde_json::Value as JsonValue;
 
-use crate::db::manifest::ManifestCoordinator;
 use crate::db::Omnigraph;
 use crate::error::{OmniError, Result};
 
@@ -46,13 +42,8 @@ pub async fn load_jsonl(db: &mut Omnigraph, data: &str, mode: LoadMode) -> Resul
 }
 
 /// Load JSONL data from a file path.
-pub async fn load_jsonl_file(
-    db: &mut Omnigraph,
-    path: &str,
-    mode: LoadMode,
-) -> Result<LoadResult> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| OmniError::Io(e))?;
+pub async fn load_jsonl_file(db: &mut Omnigraph, path: &str, mode: LoadMode) -> Result<LoadResult> {
+    let file = std::fs::File::open(path).map_err(|e| OmniError::Io(e))?;
     let reader = BufReader::new(file);
     load_jsonl_reader(db, reader, mode).await
 }
@@ -90,7 +81,10 @@ async fn load_jsonl_reader<R: BufRead>(
                 .get("data")
                 .cloned()
                 .unwrap_or(JsonValue::Object(serde_json::Map::new()));
-            node_rows.entry(type_name.to_string()).or_default().push(data);
+            node_rows
+                .entry(type_name.to_string())
+                .or_default()
+                .push(data);
         } else if let Some(edge_name) = value.get("edge").and_then(|v| v.as_str()) {
             if catalog.lookup_edge_by_name(edge_name).is_none() {
                 return Err(OmniError::Manifest(format!(
@@ -106,10 +100,13 @@ async fn load_jsonl_reader<R: BufRead>(
                     OmniError::Manifest(format!("line {}: edge missing 'from'", line_num + 1))
                 })?
                 .to_string();
-            let to = value.get("to").and_then(|v| v.as_str()).ok_or_else(|| {
-                OmniError::Manifest(format!("line {}: edge missing 'to'", line_num + 1))
-            })?
-            .to_string();
+            let to = value
+                .get("to")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    OmniError::Manifest(format!("line {}: edge missing 'to'", line_num + 1))
+                })?
+                .to_string();
             let data = value
                 .get("data")
                 .cloned()
@@ -141,59 +138,97 @@ async fn load_jsonl_reader<R: BufRead>(
         // Validate value constraints before writing
         validate_value_constraints(&batch, node_type)?;
 
-        let row_count = batch.num_rows();
+        let loaded_count = batch.num_rows();
 
         let table_key = format!("node:{}", type_name);
-        let entry = snapshot.entry(&table_key).ok_or_else(|| {
-            OmniError::Manifest(format!("no manifest entry for {}", table_key))
-        })?;
+        snapshot
+            .entry(&table_key)
+            .ok_or_else(|| OmniError::Manifest(format!("no manifest entry for {}", table_key)))?;
 
-        let full_path = format!("{}/{}", db.uri(), entry.table_path);
-        let new_version = write_batch_to_dataset(&full_path, batch, mode).await?;
+        let (new_version, total_rows, table_branch) =
+            write_batch_to_dataset(db, &table_key, batch, mode).await?;
 
         updates.push(crate::db::SubTableUpdate {
             table_key,
             table_version: new_version,
-            table_branch: None,
-            row_count: row_count as u64,
+            table_branch,
+            row_count: total_rows,
         });
-        result
-            .nodes_loaded
-            .insert(type_name.clone(), row_count);
+        result.nodes_loaded.insert(type_name.clone(), loaded_count);
+    }
+
+    // Phase 2b: Validate edge referential integrity — every src/dst must
+    // reference an existing node ID in the appropriate type.
+    for (edge_name, rows) in &edge_rows {
+        let edge_type = &catalog.edge_types[edge_name];
+        let from_ids =
+            collect_node_ids(db, &edge_type.from_type, &node_rows, &catalog, &updates).await?;
+        let to_ids =
+            collect_node_ids(db, &edge_type.to_type, &node_rows, &catalog, &updates).await?;
+
+        for (i, (src, dst, _)) in rows.iter().enumerate() {
+            if !from_ids.contains(src.as_str()) {
+                return Err(OmniError::Manifest(format!(
+                    "edge {} row {}: src '{}' not found in {}",
+                    edge_name,
+                    i + 1,
+                    src,
+                    edge_type.from_type
+                )));
+            }
+            if !to_ids.contains(dst.as_str()) {
+                return Err(OmniError::Manifest(format!(
+                    "edge {} row {}: dst '{}' not found in {}",
+                    edge_name,
+                    i + 1,
+                    dst,
+                    edge_type.to_type
+                )));
+            }
+        }
     }
 
     // Write edges
     for (edge_name, rows) in &edge_rows {
         let edge_type = &catalog.edge_types[edge_name];
         let batch = build_edge_batch(edge_type, rows)?;
-        let row_count = batch.num_rows();
+        let loaded_count = batch.num_rows();
 
         let table_key = format!("edge:{}", edge_name);
-        let entry = snapshot.entry(&table_key).ok_or_else(|| {
-            OmniError::Manifest(format!("no manifest entry for {}", table_key))
-        })?;
+        snapshot
+            .entry(&table_key)
+            .ok_or_else(|| OmniError::Manifest(format!("no manifest entry for {}", table_key)))?;
 
-        let full_path = format!("{}/{}", db.uri(), entry.table_path);
-        let new_version = write_batch_to_dataset(&full_path, batch, mode).await?;
+        let (new_version, total_rows, table_branch) =
+            write_batch_to_dataset(db, &table_key, batch, mode).await?;
 
         updates.push(crate::db::SubTableUpdate {
             table_key,
             table_version: new_version,
-            table_branch: None,
-            row_count: row_count as u64,
+            table_branch,
+            row_count: total_rows,
         });
-        result
-            .edges_loaded
-            .insert(edge_name.clone(), row_count);
+        result.edges_loaded.insert(edge_name.clone(), loaded_count);
     }
 
-    // Phase 3: Atomic manifest commit
-    db.manifest_mut().commit(&updates).await?;
-
-    // Phase 4: Validate edge cardinality constraints
-    for edge_name in edge_rows.keys() {
-        validate_edge_cardinality(db, edge_name).await?;
+    // Phase 3: Validate edge cardinality constraints (before commit — invalid
+    // data must not be committed). Opens edge sub-tables at their just-written
+    // versions, not through the snapshot (which still pins to pre-write state).
+    for (edge_name, _) in &edge_rows {
+        let table_key = format!("edge:{}", edge_name);
+        if let Some(update) = updates.iter().find(|u| u.table_key == table_key) {
+            validate_edge_cardinality(
+                db,
+                edge_name,
+                update.table_version,
+                update.table_branch.as_deref(),
+            )
+            .await?;
+        }
     }
+
+    // Phase 4: Atomic manifest commit
+    db.commit_updates(&updates).await?;
 
     // Phase 5: Ensure scalar indices on key columns
     db.ensure_indices().await?;
@@ -233,7 +268,8 @@ fn build_node_batch(node_type: &NodeType, rows: &[JsonValue]) -> Result<RecordBa
             let col = build_blob_column(field.name(), field.is_nullable(), rows)?;
             columns.push(col);
         } else {
-            let col = build_column_from_json(field.name(), field.data_type(), field.is_nullable(), rows)?;
+            let col =
+                build_column_from_json(field.name(), field.data_type(), field.is_nullable(), rows)?;
             columns.push(col);
         }
     }
@@ -294,11 +330,7 @@ pub(crate) fn append_blob_value(builder: &mut BlobArrayBuilder, value: &str) -> 
 }
 
 /// Build a blob column from JSON values using Lance BlobArrayBuilder.
-fn build_blob_column(
-    name: &str,
-    nullable: bool,
-    rows: &[JsonValue],
-) -> Result<ArrayRef> {
+fn build_blob_column(name: &str, nullable: bool, rows: &[JsonValue]) -> Result<ArrayRef> {
     let mut builder = BlobArrayBuilder::new(rows.len());
     for row in rows {
         match row.get(name) {
@@ -339,7 +371,11 @@ fn build_column_from_json(
         DataType::Utf8 => {
             let values: Vec<Option<String>> = rows
                 .iter()
-                .map(|row| row.get(name).and_then(|v| v.as_str()).map(|s| s.to_string()))
+                .map(|row| {
+                    row.get(name)
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
                 .collect();
             if !nullable && values.iter().any(|v| v.is_none()) {
                 return Err(OmniError::Manifest(format!(
@@ -419,7 +455,9 @@ fn build_column_from_json(
                     if arr.len() != dim as usize {
                         return Err(OmniError::Manifest(format!(
                             "vector property '{}' expects {} dimensions, got {}",
-                            name, dim, arr.len()
+                            name,
+                            dim,
+                            arr.len()
                         )));
                     }
                     for val in arr {
@@ -435,8 +473,9 @@ fn build_column_from_json(
                 }
             }
             let values_array = Arc::new(Float32Array::from(flat_values));
-            let list_array = FixedSizeListArray::try_new(child_field.clone(), dim, values_array, None)
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            let list_array =
+                FixedSizeListArray::try_new(child_field.clone(), dim, values_array, None)
+                    .map_err(|e| OmniError::Lance(e.to_string()))?;
             Ok(Arc::new(list_array))
         }
         _ => {
@@ -447,18 +486,20 @@ fn build_column_from_json(
     }
 }
 
-/// Write a batch to a Lance dataset, returning the new dataset version.
+/// Write a batch to a Lance dataset, returning (new_version, total_row_count).
 async fn write_batch_to_dataset(
-    uri: &str,
+    db: &Omnigraph,
+    table_key: &str,
     batch: RecordBatch,
     mode: LoadMode,
-) -> Result<u64> {
+) -> Result<(u64, u64, Option<String>)> {
+    let (mut ds, _full_path, table_branch) = db.open_for_mutation(table_key).await?;
     if batch.num_rows() == 0 {
-        // Nothing to write; open to get current version
-        let ds = Dataset::open(uri)
+        let row_count = ds
+            .count_rows(None)
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        return Ok(ds.version().version);
+            .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
+        return Ok((ds.version().version, row_count, table_branch));
     }
 
     let schema = batch.schema();
@@ -466,55 +507,48 @@ async fn write_batch_to_dataset(
 
     match mode {
         LoadMode::Overwrite => {
-            let params = WriteParams {
-                mode: WriteMode::Overwrite,
-                enable_stable_row_ids: true,
-                data_storage_version: Some(LanceFileVersion::V2_2),
-                allow_external_blob_outside_bases: true,
-                ..Default::default()
-            };
-            let ds = Dataset::write(reader, uri, Some(params))
+            ds.truncate_table()
                 .await
                 .map_err(|e| OmniError::Lance(e.to_string()))?;
-            Ok(ds.version().version)
-        }
-        LoadMode::Append => {
-            let ds = Dataset::open(uri)
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
-            let mut ds = ds;
             ds.append(reader, None)
                 .await
                 .map_err(|e| OmniError::Lance(e.to_string()))?;
-            // Re-open to get latest version
-            let ds = Dataset::open(uri)
+            let row_count = ds
+                .count_rows(None)
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
+            Ok((ds.version().version, row_count, table_branch))
+        }
+        LoadMode::Append => {
+            ds.append(reader, None)
                 .await
                 .map_err(|e| OmniError::Lance(e.to_string()))?;
-            Ok(ds.version().version)
+            // Use the mutated handle directly — no re-open needed
+            let row_count = ds
+                .count_rows(None)
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
+            Ok((ds.version().version, row_count, table_branch))
         }
         LoadMode::Merge => {
             // merge_insert keyed by "id"
-            let ds = Dataset::open(uri)
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
             let ds = Arc::new(ds);
-            let job = lance::dataset::MergeInsertBuilder::try_new(
-                ds,
-                vec!["id".to_string()],
-            )
-            .map_err(|e| OmniError::Lance(e.to_string()))?
-            .when_matched(lance::dataset::WhenMatched::UpdateAll)
-            .when_not_matched(lance::dataset::WhenNotMatched::InsertAll)
-            .try_build()
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            let job = lance::dataset::MergeInsertBuilder::try_new(ds, vec!["id".to_string()])
+                .map_err(|e| OmniError::Lance(e.to_string()))?
+                .when_matched(lance::dataset::WhenMatched::UpdateAll)
+                .when_not_matched(lance::dataset::WhenNotMatched::InsertAll)
+                .try_build()
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
 
             let (new_ds, _stats) = job
-                .execute(lance_datafusion::utils::reader_to_stream(
-                    Box::new(reader),
-                ))
+                .execute(lance_datafusion::utils::reader_to_stream(Box::new(reader)))
                 .await
                 .map_err(|e| OmniError::Lance(e.to_string()))?;
-            Ok(new_ds.version().version)
+            let row_count = new_ds
+                .count_rows(None)
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
+            Ok((new_ds.version().version, row_count, table_branch))
         }
     }
 }
@@ -551,7 +585,7 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> i32 {
 
 // ─── Value constraint validation ─────────────────────────────────────────────
 
-fn validate_value_constraints(
+pub(crate) fn validate_value_constraints(
     batch: &RecordBatch,
     node_type: &omnigraph_compiler::catalog::NodeType,
 ) -> Result<()> {
@@ -601,9 +635,7 @@ fn validate_value_constraints(
         let Some(col) = batch.column_by_name(&cc.property) else {
             continue;
         };
-        let str_col = col
-            .as_any()
-            .downcast_ref::<StringArray>();
+        let str_col = col.as_any().downcast_ref::<StringArray>();
         if let Some(str_col) = str_col {
             for row in 0..str_col.len() {
                 if str_col.is_null(row) {
@@ -624,7 +656,9 @@ fn validate_value_constraints(
 }
 
 fn extract_numeric_value(col: &ArrayRef, row: usize) -> Option<f64> {
-    use arrow_array::{Array, Int32Array, Int64Array, UInt32Array, UInt64Array, Float32Array, Float64Array};
+    use arrow_array::{
+        Array, Float32Array, Float64Array, Int32Array, Int64Array, UInt32Array, UInt64Array,
+    };
     if let Some(a) = col.as_any().downcast_ref::<Int32Array>() {
         return Some(a.value(row) as f64);
     }
@@ -659,6 +693,8 @@ fn literal_value_to_f64(v: &omnigraph_compiler::catalog::LiteralValue) -> f64 {
 async fn validate_edge_cardinality(
     db: &crate::db::Omnigraph,
     edge_name: &str,
+    written_version: u64,
+    written_branch: Option<&str>,
 ) -> Result<()> {
     use arrow_array::Array;
     let catalog = db.catalog();
@@ -667,9 +703,20 @@ async fn validate_edge_cardinality(
         return Ok(());
     }
 
+    // Open edge sub-table at the just-written version, not the snapshot's
+    // (the snapshot still pins to the pre-write version).
     let snapshot = db.snapshot();
     let table_key = format!("edge:{}", edge_name);
-    let ds = snapshot.open(&table_key).await?;
+    let entry = snapshot
+        .entry(&table_key)
+        .ok_or_else(|| OmniError::Manifest(format!("no manifest entry for {}", table_key)))?;
+    let ds = db
+        .open_dataset_at_state(
+            &entry.table_path,
+            written_branch.or(entry.table_branch.as_deref()),
+            written_version,
+        )
+        .await?;
 
     // Scan src column, count per source
     let batches: Vec<RecordBatch> = ds
@@ -717,12 +764,80 @@ async fn validate_edge_cardinality(
     Ok(())
 }
 
+/// Collect all valid node IDs for a given type. Union of:
+/// - IDs from the just-loaded batch (in memory, from node_rows)
+/// - IDs from the sub-table at the just-written version (if it was updated)
+/// - IDs from the sub-table at the snapshot-pinned version (if it was not updated)
+async fn collect_node_ids(
+    db: &Omnigraph,
+    type_name: &str,
+    node_rows: &HashMap<String, Vec<JsonValue>>,
+    catalog: &omnigraph_compiler::catalog::Catalog,
+    updates: &[crate::db::SubTableUpdate],
+) -> Result<HashSet<String>> {
+    let mut ids = HashSet::new();
+
+    // IDs from the in-memory batch (just loaded in this operation)
+    if let Some(rows) = node_rows.get(type_name) {
+        if let Some(node_type) = catalog.node_types.get(type_name) {
+            if let Some(key_prop) = node_type.key_property() {
+                for row in rows {
+                    if let Some(id) = row.get(key_prop).and_then(|v| v.as_str()) {
+                        ids.insert(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // IDs from the Lance sub-table
+    let table_key = format!("node:{}", type_name);
+    let snapshot = db.snapshot();
+    let Some(entry) = snapshot.entry(&table_key) else {
+        return Ok(ids);
+    };
+    // Use the just-written version if this type was updated, else snapshot version
+    let updated = updates
+        .iter()
+        .find(|u| u.table_key == table_key)
+        .map(|u| (u.table_version, u.table_branch.as_deref()));
+    let (version, branch) = updated.unwrap_or((entry.table_version, entry.table_branch.as_deref()));
+    let ds = db
+        .open_dataset_at_state(&entry.table_path, branch, version)
+        .await?;
+
+    let batches: Vec<RecordBatch> = ds
+        .scan()
+        .project(&["id"])
+        .map_err(|e| OmniError::Lance(e.to_string()))?
+        .try_into_stream()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?
+        .try_collect()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+    for batch in &batches {
+        let id_col = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            ids.insert(id_col.value(i).to_string());
+        }
+    }
+
+    Ok(ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Omnigraph;
     use arrow_array::Array;
     use futures::TryStreamExt;
-    use crate::db::Omnigraph;
 
     const TEST_SCHEMA: &str = r#"
 node Person {
@@ -864,9 +979,7 @@ edge WorksAt: Person -> Company
         load_jsonl(&mut db, batch1, LoadMode::Overwrite)
             .await
             .unwrap();
-        load_jsonl(&mut db, batch2, LoadMode::Append)
-            .await
-            .unwrap();
+        load_jsonl(&mut db, batch2, LoadMode::Append).await.unwrap();
 
         let snap = db.snapshot();
         let person_ds = snap.open("node:Person").await.unwrap();

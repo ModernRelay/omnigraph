@@ -269,7 +269,11 @@ query young($age: I32) {
     // Only Bob (25) is < 28
     assert_eq!(result.num_rows(), 1);
     let batch = &result.batches()[0];
-    let names = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
     assert_eq!(names.value(0), "Bob");
 }
 
@@ -296,7 +300,11 @@ query at_least_30() {
     // Alice (30) and Charlie (35)
     assert_eq!(result.num_rows(), 2);
     let batch = &result.batches()[0];
-    let names = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
     assert_eq!(names.value(0), "Alice");
     assert_eq!(names.value(1), "Charlie");
 }
@@ -324,7 +332,11 @@ query at_most_28() {
     // Bob (25) and Diana (28)
     assert_eq!(result.num_rows(), 2);
     let batch = &result.batches()[0];
-    let names = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
     assert_eq!(names.value(0), "Bob");
     assert_eq!(names.value(1), "Diana");
 }
@@ -352,7 +364,11 @@ query not_alice() {
     // Bob, Charlie, Diana
     assert_eq!(result.num_rows(), 3);
     let batch = &result.batches()[0];
-    let names = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
     let mut name_vec: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
     name_vec.sort();
     assert_eq!(name_vec, vec!["Bob", "Charlie", "Diana"]);

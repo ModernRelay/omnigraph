@@ -185,16 +185,10 @@ impl GraphIndex {
             let src_count = type_indices[from_type].len();
             let dst_count = type_indices[to_type].len();
 
-            csr.insert(
-                edge_name.clone(),
-                CsrIndex::build(src_count, edges),
-            );
+            csr.insert(edge_name.clone(), CsrIndex::build(src_count, edges));
 
             let reversed: Vec<(u32, u32)> = edges.iter().map(|&(s, d)| (d, s)).collect();
-            csc.insert(
-                edge_name.clone(),
-                CsrIndex::build(dst_count, &reversed),
-            );
+            csc.insert(edge_name.clone(), CsrIndex::build(dst_count, &reversed));
         }
 
         Ok(Self {

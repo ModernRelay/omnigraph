@@ -11,6 +11,7 @@ lance = { workspace = true }
 lance-datafusion = { workspace = true }
 lance-file = { workspace = true }
 lance-index = { workspace = true }
+lance-linalg = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-ord = { workspace = true }

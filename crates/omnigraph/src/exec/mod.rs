@@ -2,28 +2,30 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array,
-    Int64Array, RecordBatch, RecordBatchIterator, StringArray, UInt32Array, UInt64Array,
+    Array, ArrayRef, BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array,
+    RecordBatch, RecordBatchIterator, StringArray, UInt32Array, UInt64Array,
 };
+use arrow_cast::display::array_value_to_string;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::TryStreamExt;
-use lance::Dataset;
 use lance::blob::BlobArrayBuilder;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::ir::{
-    IRExpr, IRFilter, IROrdering, IRProjection, IROp, IRAssignment, IRMutationPredicate,
+    IRAssignment, IRExpr, IRFilter, IRMutationPredicate, IROp, IROrdering, IRProjection,
     MutationOpIR, ParamMap, QueryIR,
 };
-use omnigraph_compiler::lower_query;
 use omnigraph_compiler::lower_mutation_query;
+use omnigraph_compiler::lower_query;
 use omnigraph_compiler::query::ast::{CompOp, Literal};
-use omnigraph_compiler::query::typecheck::{typecheck_query, typecheck_query_decl, CheckedQuery};
+use omnigraph_compiler::query::typecheck::{CheckedQuery, typecheck_query, typecheck_query_decl};
 use omnigraph_compiler::result::{MutationResult, QueryResult};
 use omnigraph_compiler::types::Direction;
 
 use crate::db::Omnigraph;
 use crate::db::Snapshot;
-use crate::error::{OmniError, Result};
+use crate::db::commit_graph::CommitGraph;
+use crate::db::manifest::ManifestCoordinator;
+use crate::error::{MergeConflict, MergeConflictKind, OmniError, Result};
 use crate::graph_index::GraphIndex;
 
 impl Omnigraph {
@@ -43,17 +45,584 @@ impl Omnigraph {
         let ir = lower_query(self.catalog(), &query_decl, &type_ctx)?;
 
         // Build graph index if the query needs traversal
-        let needs_graph = ir.pipeline.iter().any(|op| {
-            matches!(op, IROp::Expand { .. } | IROp::AntiJoin { .. })
-        });
+        let needs_graph = ir
+            .pipeline
+            .iter()
+            .any(|op| matches!(op, IROp::Expand { .. } | IROp::AntiJoin { .. }));
         let graph_index = if needs_graph {
             Some(self.graph_index().await?)
         } else {
             None
         };
 
-        execute_query(&ir, params, &snapshot, graph_index.as_deref(), self.catalog()).await
+        execute_query(
+            &ir,
+            params,
+            &snapshot,
+            graph_index.as_deref(),
+            self.catalog(),
+        )
+        .await
     }
+}
+
+#[derive(Debug, Clone)]
+struct TableRowMeta {
+    index: usize,
+    signature: String,
+}
+
+#[derive(Debug, Clone)]
+struct TableRows {
+    batch: RecordBatch,
+    rows: HashMap<String, TableRowMeta>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CandidateRow {
+    Source(usize),
+    Target(usize),
+}
+
+async fn load_table_rows(
+    snapshot: &Snapshot,
+    catalog: &Catalog,
+    table_key: &str,
+) -> Result<TableRows> {
+    let schema = schema_for_table_key(catalog, table_key)?;
+    let batch = if snapshot.entry(table_key).is_some() {
+        let ds = snapshot.open(table_key).await?;
+        let batches: Vec<RecordBatch> = ds
+            .scan()
+            .try_into_stream()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        if batches.is_empty() {
+            RecordBatch::new_empty(schema.clone())
+        } else if batches.len() == 1 {
+            batches.into_iter().next().unwrap()
+        } else {
+            arrow_select::concat::concat_batches(&schema, &batches)
+                .map_err(|e| OmniError::Lance(e.to_string()))?
+        }
+    } else {
+        RecordBatch::new_empty(schema.clone())
+    };
+
+    let id_col = batch
+        .column_by_name("id")
+        .ok_or_else(|| OmniError::Manifest(format!("table {} missing id column", table_key)))?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| OmniError::Manifest(format!("table {} id column is not Utf8", table_key)))?;
+
+    let mut rows = HashMap::new();
+    for row in 0..batch.num_rows() {
+        let id = id_col.value(row).to_string();
+        let signature = row_signature(&batch, row)?;
+        if rows
+            .insert(
+                id.clone(),
+                TableRowMeta {
+                    index: row,
+                    signature,
+                },
+            )
+            .is_some()
+        {
+            return Err(OmniError::Manifest(format!(
+                "table {} contains duplicate id '{}'",
+                table_key, id
+            )));
+        }
+    }
+
+    Ok(TableRows { batch, rows })
+}
+
+fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result<SchemaRef> {
+    if let Some(name) = table_key.strip_prefix("node:") {
+        return catalog
+            .node_types
+            .get(name)
+            .map(|t| t.arrow_schema.clone())
+            .ok_or_else(|| OmniError::Manifest(format!("unknown node type '{}'", name)));
+    }
+    if let Some(name) = table_key.strip_prefix("edge:") {
+        return catalog
+            .edge_types
+            .get(name)
+            .map(|t| t.arrow_schema.clone())
+            .ok_or_else(|| OmniError::Manifest(format!("unknown edge type '{}'", name)));
+    }
+    Err(OmniError::Manifest(format!(
+        "invalid table key '{}'",
+        table_key
+    )))
+}
+
+fn same_manifest_state(
+    left: Option<&crate::db::SubTableEntry>,
+    right: Option<&crate::db::SubTableEntry>,
+) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            left.table_version == right.table_version && left.table_branch == right.table_branch
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn plan_table_merge(
+    table_key: &str,
+    base: &TableRows,
+    source: &TableRows,
+    target: &TableRows,
+    conflicts: &mut Vec<MergeConflict>,
+) -> Result<Option<RecordBatch>> {
+    let mut ids = HashSet::new();
+    ids.extend(base.rows.keys().cloned());
+    ids.extend(source.rows.keys().cloned());
+    ids.extend(target.rows.keys().cloned());
+
+    let mut ordered_ids: Vec<String> = ids.into_iter().collect();
+    ordered_ids.sort();
+
+    let mut selections = Vec::new();
+    let mut needs_update = false;
+
+    for id in &ordered_ids {
+        let base_row = base.rows.get(id);
+        let source_row = source.rows.get(id);
+        let target_row = target.rows.get(id);
+
+        let base_sig = base_row.map(|row| row.signature.as_str());
+        let source_sig = source_row.map(|row| row.signature.as_str());
+        let target_sig = target_row.map(|row| row.signature.as_str());
+
+        let source_changed = source_sig != base_sig;
+        let target_changed = target_sig != base_sig;
+
+        let selection = if !source_changed {
+            target_row.map(|row| CandidateRow::Target(row.index))
+        } else if !target_changed {
+            needs_update |= source_sig != target_sig;
+            source_row.map(|row| CandidateRow::Source(row.index))
+        } else if source_sig == target_sig {
+            target_row.map(|row| CandidateRow::Target(row.index))
+        } else {
+            conflicts.push(classify_merge_conflict(
+                table_key, id, base_sig, source_sig, target_sig,
+            ));
+            target_row.map(|row| CandidateRow::Target(row.index))
+        };
+
+        if selection.is_none() && target_row.is_some() && source_changed && !target_changed {
+            needs_update = true;
+        }
+
+        if let Some(selection) = selection {
+            selections.push(selection);
+        }
+    }
+
+    if !conflicts.is_empty() {
+        return Ok(None);
+    }
+    if !needs_update {
+        return Ok(None);
+    }
+
+    let schema = target.batch.schema();
+    let mut batches = Vec::new();
+    let target_indices: Vec<usize> = selections
+        .iter()
+        .filter_map(|selection| match selection {
+            CandidateRow::Target(index) => Some(*index),
+            CandidateRow::Source(_) => None,
+        })
+        .collect();
+    if !target_indices.is_empty() {
+        batches.push(take_rows(&target.batch, &target_indices)?);
+    }
+    let source_indices: Vec<usize> = selections
+        .iter()
+        .filter_map(|selection| match selection {
+            CandidateRow::Source(index) => Some(*index),
+            CandidateRow::Target(_) => None,
+        })
+        .collect();
+    if !source_indices.is_empty() {
+        batches.push(take_rows(&source.batch, &source_indices)?);
+    }
+
+    let merged = if batches.is_empty() {
+        RecordBatch::new_empty(schema.clone())
+    } else if batches.len() == 1 {
+        batches.into_iter().next().unwrap()
+    } else {
+        arrow_select::concat::concat_batches(&schema, &batches)
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+    };
+
+    Ok(Some(sort_batch_by_id(merged)?))
+}
+
+fn classify_merge_conflict(
+    table_key: &str,
+    row_id: &str,
+    base_sig: Option<&str>,
+    source_sig: Option<&str>,
+    target_sig: Option<&str>,
+) -> MergeConflict {
+    let (kind, message) = match (base_sig, source_sig, target_sig) {
+        (None, Some(_), Some(_)) => (
+            MergeConflictKind::DivergentInsert,
+            format!("divergent insert for id '{}'", row_id),
+        ),
+        (Some(_), None, Some(_)) | (Some(_), Some(_), None) => (
+            MergeConflictKind::DeleteVsUpdate,
+            format!("delete/update conflict for id '{}'", row_id),
+        ),
+        _ => (
+            MergeConflictKind::DivergentUpdate,
+            format!("divergent update for id '{}'", row_id),
+        ),
+    };
+    MergeConflict {
+        table_key: table_key.to_string(),
+        row_id: Some(row_id.to_string()),
+        kind,
+        message,
+    }
+}
+
+fn row_signature(batch: &RecordBatch, row: usize) -> Result<String> {
+    let mut values = Vec::with_capacity(batch.num_columns());
+    for column in batch.columns() {
+        values.push(
+            array_value_to_string(column.as_ref(), row)
+                .map_err(|e| OmniError::Lance(e.to_string()))?,
+        );
+    }
+    Ok(values.join("\u{1f}"))
+}
+
+fn take_rows(batch: &RecordBatch, indices: &[usize]) -> Result<RecordBatch> {
+    let indices: Vec<u32> = indices.iter().map(|index| *index as u32).collect();
+    let indices = UInt32Array::from(indices);
+    let columns: Vec<ArrayRef> = batch
+        .columns()
+        .iter()
+        .map(|column| arrow_select::take::take(column.as_ref(), &indices, None))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    RecordBatch::try_new(batch.schema(), columns).map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+fn sort_batch_by_id(batch: RecordBatch) -> Result<RecordBatch> {
+    if batch.num_rows() <= 1 {
+        return Ok(batch);
+    }
+    let id_column = batch
+        .column_by_name("id")
+        .ok_or_else(|| OmniError::Manifest("batch missing id column".to_string()))?
+        .clone();
+    let indices = arrow_ord::sort::lexsort_to_indices(
+        &[arrow_ord::sort::SortColumn {
+            values: id_column,
+            options: Some(arrow_schema::SortOptions {
+                descending: false,
+                nulls_first: false,
+            }),
+        }],
+        None,
+    )
+    .map_err(|e| OmniError::Lance(e.to_string()))?;
+    let columns: Vec<ArrayRef> = batch
+        .columns()
+        .iter()
+        .map(|column| arrow_select::take::take(column.as_ref(), &indices, None))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    RecordBatch::try_new(batch.schema(), columns).map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+async fn validate_merge_candidates(
+    db: &Omnigraph,
+    target_snapshot: &Snapshot,
+    candidates: &HashMap<String, RecordBatch>,
+) -> Result<()> {
+    let mut conflicts = Vec::new();
+    let mut node_ids: HashMap<String, HashSet<String>> = HashMap::new();
+
+    for (type_name, node_type) in &db.catalog().node_types {
+        let table_key = format!("node:{}", type_name);
+        let batch = candidate_batch(db, target_snapshot, candidates, &table_key).await?;
+
+        if let Err(err) = crate::loader::validate_value_constraints(&batch, node_type) {
+            conflicts.push(MergeConflict {
+                table_key: table_key.clone(),
+                row_id: None,
+                kind: MergeConflictKind::ValueConstraintViolation,
+                message: err.to_string(),
+            });
+        }
+        conflicts.extend(validate_unique_constraints(
+            &table_key,
+            &batch,
+            &node_type.unique_constraints,
+        )?);
+
+        let ids = batch
+            .column_by_name("id")
+            .ok_or_else(|| OmniError::Manifest(format!("table {} missing id column", table_key)))?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                OmniError::Manifest(format!("table {} id column is not Utf8", table_key))
+            })?;
+        let mut values = HashSet::new();
+        for row in 0..ids.len() {
+            values.insert(ids.value(row).to_string());
+        }
+        node_ids.insert(type_name.clone(), values);
+    }
+
+    for (edge_name, edge_type) in &db.catalog().edge_types {
+        let table_key = format!("edge:{}", edge_name);
+        let batch = candidate_batch(db, target_snapshot, candidates, &table_key).await?;
+
+        conflicts.extend(validate_unique_constraints(
+            &table_key,
+            &batch,
+            &edge_type.unique_constraints,
+        )?);
+        conflicts.extend(validate_edge_cardinality_batch(
+            &table_key,
+            edge_name,
+            edge_type.cardinality.min,
+            edge_type.cardinality.max,
+            &batch,
+        )?);
+        conflicts.extend(validate_orphan_edges(
+            &table_key, edge_type, &batch, &node_ids,
+        )?);
+    }
+
+    if conflicts.is_empty() {
+        Ok(())
+    } else {
+        Err(OmniError::MergeConflicts(conflicts))
+    }
+}
+
+async fn candidate_batch(
+    db: &Omnigraph,
+    target_snapshot: &Snapshot,
+    candidates: &HashMap<String, RecordBatch>,
+    table_key: &str,
+) -> Result<RecordBatch> {
+    if let Some(batch) = candidates.get(table_key) {
+        return Ok(batch.clone());
+    }
+    let schema = schema_for_table_key(db.catalog(), table_key)?;
+    if target_snapshot.entry(table_key).is_none() {
+        return Ok(RecordBatch::new_empty(schema));
+    }
+    let ds = target_snapshot.open(table_key).await?;
+    let batches: Vec<RecordBatch> = ds
+        .scan()
+        .try_into_stream()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?
+        .try_collect()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    if batches.is_empty() {
+        Ok(RecordBatch::new_empty(schema))
+    } else if batches.len() == 1 {
+        Ok(batches.into_iter().next().unwrap())
+    } else {
+        arrow_select::concat::concat_batches(&schema, &batches)
+            .map_err(|e| OmniError::Lance(e.to_string()))
+    }
+}
+
+fn validate_unique_constraints(
+    table_key: &str,
+    batch: &RecordBatch,
+    constraints: &[Vec<String>],
+) -> Result<Vec<MergeConflict>> {
+    let mut conflicts = Vec::new();
+    for columns in constraints {
+        let mut seen: HashMap<String, String> = HashMap::new();
+        for row in 0..batch.num_rows() {
+            let mut parts = Vec::with_capacity(columns.len());
+            let mut any_null = false;
+            for column_name in columns {
+                let column = batch.column_by_name(column_name).ok_or_else(|| {
+                    OmniError::Manifest(format!(
+                        "table {} missing unique column '{}'",
+                        table_key, column_name
+                    ))
+                })?;
+                if column.is_null(row) {
+                    any_null = true;
+                    break;
+                }
+                parts.push(
+                    array_value_to_string(column.as_ref(), row)
+                        .map_err(|e| OmniError::Lance(e.to_string()))?,
+                );
+            }
+            if any_null {
+                continue;
+            }
+            let value = parts.join("|");
+            let row_id = row_id_at(batch, row)?;
+            if let Some(first_row_id) = seen.insert(value.clone(), row_id.clone()) {
+                conflicts.push(MergeConflict {
+                    table_key: table_key.to_string(),
+                    row_id: Some(row_id.clone()),
+                    kind: MergeConflictKind::UniqueViolation,
+                    message: format!(
+                        "unique constraint {:?} violated by '{}' and '{}'",
+                        columns, first_row_id, row_id
+                    ),
+                });
+            }
+        }
+    }
+    Ok(conflicts)
+}
+
+fn validate_edge_cardinality_batch(
+    table_key: &str,
+    edge_name: &str,
+    min: u32,
+    max: Option<u32>,
+    batch: &RecordBatch,
+) -> Result<Vec<MergeConflict>> {
+    if min == 0 && max.is_none() {
+        return Ok(Vec::new());
+    }
+    let srcs = batch
+        .column_by_name("src")
+        .ok_or_else(|| OmniError::Manifest(format!("table {} missing src column", table_key)))?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            OmniError::Manifest(format!("table {} src column is not Utf8", table_key))
+        })?;
+    let mut counts = HashMap::new();
+    for row in 0..srcs.len() {
+        *counts.entry(srcs.value(row).to_string()).or_insert(0_u32) += 1;
+    }
+
+    let mut conflicts = Vec::new();
+    for (src, count) in counts {
+        if let Some(max) = max {
+            if count > max {
+                conflicts.push(MergeConflict {
+                    table_key: table_key.to_string(),
+                    row_id: None,
+                    kind: MergeConflictKind::CardinalityViolation,
+                    message: format!(
+                        "@card violation on edge {}: source '{}' has {} edges (max {})",
+                        edge_name, src, count, max
+                    ),
+                });
+            }
+        }
+        if count < min {
+            conflicts.push(MergeConflict {
+                table_key: table_key.to_string(),
+                row_id: None,
+                kind: MergeConflictKind::CardinalityViolation,
+                message: format!(
+                    "@card violation on edge {}: source '{}' has {} edges (min {})",
+                    edge_name, src, count, min
+                ),
+            });
+        }
+    }
+    Ok(conflicts)
+}
+
+fn validate_orphan_edges(
+    table_key: &str,
+    edge_type: &omnigraph_compiler::catalog::EdgeType,
+    batch: &RecordBatch,
+    node_ids: &HashMap<String, HashSet<String>>,
+) -> Result<Vec<MergeConflict>> {
+    let srcs = batch
+        .column_by_name("src")
+        .ok_or_else(|| OmniError::Manifest(format!("table {} missing src column", table_key)))?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            OmniError::Manifest(format!("table {} src column is not Utf8", table_key))
+        })?;
+    let dsts = batch
+        .column_by_name("dst")
+        .ok_or_else(|| OmniError::Manifest(format!("table {} missing dst column", table_key)))?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            OmniError::Manifest(format!("table {} dst column is not Utf8", table_key))
+        })?;
+
+    let from_ids = node_ids.get(&edge_type.from_type).ok_or_else(|| {
+        OmniError::Manifest(format!(
+            "missing candidate node ids for {}",
+            edge_type.from_type
+        ))
+    })?;
+    let to_ids = node_ids.get(&edge_type.to_type).ok_or_else(|| {
+        OmniError::Manifest(format!(
+            "missing candidate node ids for {}",
+            edge_type.to_type
+        ))
+    })?;
+
+    let mut conflicts = Vec::new();
+    for row in 0..batch.num_rows() {
+        let row_id = row_id_at(batch, row)?;
+        let src = srcs.value(row);
+        let dst = dsts.value(row);
+        if !from_ids.contains(src) {
+            conflicts.push(MergeConflict {
+                table_key: table_key.to_string(),
+                row_id: Some(row_id.clone()),
+                kind: MergeConflictKind::OrphanEdge,
+                message: format!("src '{}' not found in {}", src, edge_type.from_type),
+            });
+        }
+        if !to_ids.contains(dst) {
+            conflicts.push(MergeConflict {
+                table_key: table_key.to_string(),
+                row_id: Some(row_id),
+                kind: MergeConflictKind::OrphanEdge,
+                message: format!("dst '{}' not found in {}", dst, edge_type.to_type),
+            });
+        }
+    }
+    Ok(conflicts)
+}
+
+fn row_id_at(batch: &RecordBatch, row: usize) -> Result<String> {
+    let ids = batch
+        .column_by_name("id")
+        .ok_or_else(|| OmniError::Manifest("batch missing id column".to_string()))?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| OmniError::Manifest("id column is not Utf8".to_string()))?;
+    Ok(ids.value(row).to_string())
 }
 
 // ─── Search mode ─────────────────────────────────────────────────────────────
@@ -84,7 +653,11 @@ fn extract_search_mode(ir: &QueryIR, params: &ParamMap) -> Result<SearchMode> {
     }
     let ordering = &ir.order_by[0];
     match &ordering.expr {
-        IRExpr::Nearest { variable, property, query } => {
+        IRExpr::Nearest {
+            variable,
+            property,
+            query,
+        } => {
             let vec = resolve_to_f32_vec(query, params)?;
             let k = ir.limit.ok_or_else(|| {
                 OmniError::Manifest("nearest() ordering requires a limit clause".to_string())
@@ -97,7 +670,11 @@ fn extract_search_mode(ir: &QueryIR, params: &ParamMap) -> Result<SearchMode> {
         IRExpr::Bm25 { field, query } => {
             let var = match field.as_ref() {
                 IRExpr::PropAccess { variable, .. } => variable.clone(),
-                _ => return Err(OmniError::Manifest("bm25 field must be a property access".to_string())),
+                _ => {
+                    return Err(OmniError::Manifest(
+                        "bm25 field must be a property access".to_string(),
+                    ));
+                }
             };
             let prop = extract_property(field).ok_or_else(|| {
                 OmniError::Manifest("bm25 field must be a property access".to_string())
@@ -110,11 +687,16 @@ fn extract_search_mode(ir: &QueryIR, params: &ParamMap) -> Result<SearchMode> {
                 ..Default::default()
             })
         }
-        IRExpr::Rrf { primary, secondary, k } => {
+        IRExpr::Rrf {
+            primary,
+            secondary,
+            k,
+        } => {
             let limit = ir.limit.ok_or_else(|| {
                 OmniError::Manifest("rrf() ordering requires a limit clause".to_string())
             })? as usize;
-            let k_val = k.as_ref()
+            let k_val = k
+                .as_ref()
                 .and_then(|e| resolve_to_int(e, params))
                 .unwrap_or(60) as u32;
 
@@ -136,9 +718,17 @@ fn extract_search_mode(ir: &QueryIR, params: &ParamMap) -> Result<SearchMode> {
 }
 
 /// Extract a sub-search mode from a nested RRF expression (nearest or bm25).
-fn extract_sub_search_mode(expr: &IRExpr, params: &ParamMap, limit: Option<u64>) -> Result<SearchMode> {
+fn extract_sub_search_mode(
+    expr: &IRExpr,
+    params: &ParamMap,
+    limit: Option<u64>,
+) -> Result<SearchMode> {
     match expr {
-        IRExpr::Nearest { variable, property, query } => {
+        IRExpr::Nearest {
+            variable,
+            property,
+            query,
+        } => {
             let vec = resolve_to_f32_vec(query, params)?;
             let k = limit.unwrap_or(100) as usize;
             Ok(SearchMode {
@@ -149,7 +739,11 @@ fn extract_sub_search_mode(expr: &IRExpr, params: &ParamMap, limit: Option<u64>)
         IRExpr::Bm25 { field, query } => {
             let var = match field.as_ref() {
                 IRExpr::PropAccess { variable, .. } => variable.clone(),
-                _ => return Err(OmniError::Manifest("bm25 field must be a property access".to_string())),
+                _ => {
+                    return Err(OmniError::Manifest(
+                        "bm25 field must be a property access".to_string(),
+                    ));
+                }
             };
             let prop = extract_property(field).ok_or_else(|| {
                 OmniError::Manifest("bm25 field must be a property access".to_string())
@@ -170,10 +764,15 @@ fn extract_sub_search_mode(expr: &IRExpr, params: &ParamMap, limit: Option<u64>)
 fn resolve_to_f32_vec(expr: &IRExpr, params: &ParamMap) -> Result<Vec<f32>> {
     let lit = match expr {
         IRExpr::Literal(lit) => lit.clone(),
-        IRExpr::Param(name) => params.get(name).cloned().ok_or_else(|| {
-            OmniError::Manifest(format!("parameter '{}' not provided", name))
-        })?,
-        _ => return Err(OmniError::Manifest("nearest query must be a literal or parameter".to_string())),
+        IRExpr::Param(name) => params
+            .get(name)
+            .cloned()
+            .ok_or_else(|| OmniError::Manifest(format!("parameter '{}' not provided", name)))?,
+        _ => {
+            return Err(OmniError::Manifest(
+                "nearest query must be a literal or parameter".to_string(),
+            ));
+        }
     };
     match lit {
         Literal::List(items) => items
@@ -181,10 +780,14 @@ fn resolve_to_f32_vec(expr: &IRExpr, params: &ParamMap) -> Result<Vec<f32>> {
             .map(|item| match item {
                 Literal::Float(f) => Ok(*f as f32),
                 Literal::Integer(n) => Ok(*n as f32),
-                _ => Err(OmniError::Manifest("vector elements must be numeric".to_string())),
+                _ => Err(OmniError::Manifest(
+                    "vector elements must be numeric".to_string(),
+                )),
             })
             .collect(),
-        _ => Err(OmniError::Manifest("nearest query must be a list of floats".to_string())),
+        _ => Err(OmniError::Manifest(
+            "nearest query must be a list of floats".to_string(),
+        )),
     }
 }
 
@@ -205,7 +808,16 @@ pub async fn execute_query(
 
     let mut bindings: HashMap<String, RecordBatch> = HashMap::new();
 
-    execute_pipeline(&ir.pipeline, params, snapshot, graph_index, catalog, &mut bindings, &search_mode).await?;
+    execute_pipeline(
+        &ir.pipeline,
+        params,
+        snapshot,
+        graph_index,
+        catalog,
+        &mut bindings,
+        &search_mode,
+    )
+    .await?;
 
     // Project return expressions
     let mut result_batch = project_return(&bindings, &ir.return_exprs, params)?;
@@ -240,23 +852,51 @@ async fn execute_rrf_query(
 ) -> Result<QueryResult> {
     // Execute primary search
     let mut primary_bindings: HashMap<String, RecordBatch> = HashMap::new();
-    execute_pipeline(&ir.pipeline, params, snapshot, graph_index, catalog, &mut primary_bindings, &rrf.primary).await?;
+    execute_pipeline(
+        &ir.pipeline,
+        params,
+        snapshot,
+        graph_index,
+        catalog,
+        &mut primary_bindings,
+        &rrf.primary,
+    )
+    .await?;
 
     // Execute secondary search
     let mut secondary_bindings: HashMap<String, RecordBatch> = HashMap::new();
-    execute_pipeline(&ir.pipeline, params, snapshot, graph_index, catalog, &mut secondary_bindings, &rrf.secondary).await?;
+    execute_pipeline(
+        &ir.pipeline,
+        params,
+        snapshot,
+        graph_index,
+        catalog,
+        &mut secondary_bindings,
+        &rrf.secondary,
+    )
+    .await?;
 
     // For RRF, we need to find the main binding variable
     // (the one that both searches operate on)
-    let primary_var = rrf.primary.nearest.as_ref().map(|(v, ..)| v.as_str())
+    let primary_var = rrf
+        .primary
+        .nearest
+        .as_ref()
+        .map(|(v, ..)| v.as_str())
         .or_else(|| rrf.primary.bm25.as_ref().map(|(v, ..)| v.as_str()))
         .ok_or_else(|| OmniError::Manifest("rrf primary must be nearest or bm25".to_string()))?;
 
     let primary_batch = primary_bindings.get(primary_var).ok_or_else(|| {
-        OmniError::Manifest(format!("rrf primary variable '{}' not in bindings", primary_var))
+        OmniError::Manifest(format!(
+            "rrf primary variable '{}' not in bindings",
+            primary_var
+        ))
     })?;
     let secondary_batch = secondary_bindings.get(primary_var).ok_or_else(|| {
-        OmniError::Manifest(format!("rrf secondary variable '{}' not in bindings", primary_var))
+        OmniError::Manifest(format!(
+            "rrf secondary variable '{}' not in bindings",
+            primary_var
+        ))
     })?;
 
     // Build ID → rank maps
@@ -285,8 +925,14 @@ async fn execute_rrf_query(
     let mut scored: Vec<(String, f64)> = all_ids
         .iter()
         .map(|id| {
-            let p = primary_rank.get(id).map(|&r| 1.0 / (k + r as f64 + 1.0)).unwrap_or(0.0);
-            let s = secondary_rank.get(id).map(|&r| 1.0 / (k + r as f64 + 1.0)).unwrap_or(0.0);
+            let p = primary_rank
+                .get(id)
+                .map(|&r| 1.0 / (k + r as f64 + 1.0))
+                .unwrap_or(0.0);
+            let s = secondary_rank
+                .get(id)
+                .map(|&r| 1.0 / (k + r as f64 + 1.0))
+                .unwrap_or(0.0);
             (id.clone(), p + s)
         })
         .collect();
@@ -299,10 +945,14 @@ async fn execute_rrf_query(
     // Build a combined row source: merge primary and secondary by id
     let mut id_to_batch_row: HashMap<String, (&RecordBatch, usize)> = HashMap::new();
     for (i, id) in primary_ids.iter().enumerate() {
-        id_to_batch_row.entry(id.clone()).or_insert((primary_batch, i));
+        id_to_batch_row
+            .entry(id.clone())
+            .or_insert((primary_batch, i));
     }
     for (i, id) in secondary_ids.iter().enumerate() {
-        id_to_batch_row.entry(id.clone()).or_insert((secondary_batch, i));
+        id_to_batch_row
+            .entry(id.clone())
+            .or_insert((secondary_batch, i));
     }
 
     // Reconstruct a combined batch for the binding in winning order
@@ -319,12 +969,13 @@ async fn execute_rrf_query(
 }
 
 fn extract_id_column(batch: &RecordBatch) -> Result<Vec<String>> {
-    let col = batch.column_by_name("id").ok_or_else(|| {
-        OmniError::Manifest("batch missing 'id' column for RRF".to_string())
-    })?;
-    let ids = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-        OmniError::Manifest("'id' column is not Utf8".to_string())
-    })?;
+    let col = batch
+        .column_by_name("id")
+        .ok_or_else(|| OmniError::Manifest("batch missing 'id' column for RRF".to_string()))?;
+    let ids = col
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| OmniError::Manifest("'id' column is not Utf8".to_string()))?;
     Ok((0..ids.len()).map(|i| ids.value(i).to_string()).collect())
 }
 
@@ -387,75 +1038,81 @@ fn execute_pipeline<'a>(
     search_mode: &'a SearchMode,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
-    // Pre-pass: collect search filters that need to be hoisted to NodeScan
-    let mut hoisted_search_filters: HashMap<String, Vec<IRFilter>> = HashMap::new();
-    let mut hoisted_indices: HashSet<usize> = HashSet::new();
-    for (i, op) in pipeline.iter().enumerate() {
-        if let IROp::Filter(filter) = op {
-            if is_search_filter(filter) {
-                if let Some(var) = search_filter_variable(filter) {
-                    hoisted_search_filters
-                        .entry(var.to_string())
-                        .or_default()
-                        .push(filter.clone());
-                    hoisted_indices.insert(i);
+        // Pre-pass: collect search filters that need to be hoisted to NodeScan
+        let mut hoisted_search_filters: HashMap<String, Vec<IRFilter>> = HashMap::new();
+        let mut hoisted_indices: HashSet<usize> = HashSet::new();
+        for (i, op) in pipeline.iter().enumerate() {
+            if let IROp::Filter(filter) = op {
+                if is_search_filter(filter) {
+                    if let Some(var) = search_filter_variable(filter) {
+                        hoisted_search_filters
+                            .entry(var.to_string())
+                            .or_default()
+                            .push(filter.clone());
+                        hoisted_indices.insert(i);
+                    }
                 }
             }
         }
-    }
 
-    for (i, op) in pipeline.iter().enumerate() {
-        // Skip hoisted search filters
-        if hoisted_indices.contains(&i) {
-            continue;
-        }
-        match op {
-            IROp::NodeScan {
-                variable,
-                type_name,
-                filters,
-            } => {
-                // Merge inline filters with hoisted search filters
-                let mut all_filters: Vec<IRFilter> = filters.clone();
-                if let Some(extra) = hoisted_search_filters.get(variable) {
-                    all_filters.extend(extra.iter().cloned());
+        for (i, op) in pipeline.iter().enumerate() {
+            // Skip hoisted search filters
+            if hoisted_indices.contains(&i) {
+                continue;
+            }
+            match op {
+                IROp::NodeScan {
+                    variable,
+                    type_name,
+                    filters,
+                } => {
+                    // Merge inline filters with hoisted search filters
+                    let mut all_filters: Vec<IRFilter> = filters.clone();
+                    if let Some(extra) = hoisted_search_filters.get(variable) {
+                        all_filters.extend(extra.iter().cloned());
+                    }
+                    let batch = execute_node_scan(
+                        type_name,
+                        variable,
+                        &all_filters,
+                        params,
+                        snapshot,
+                        catalog,
+                        search_mode,
+                    )
+                    .await?;
+                    bindings.insert(variable.clone(), batch);
                 }
-                let batch =
-                    execute_node_scan(type_name, variable, &all_filters, params, snapshot, catalog, search_mode).await?;
-                bindings.insert(variable.clone(), batch);
-            }
-            IROp::Filter(filter) => {
-                apply_filter(bindings, filter, params)?;
-            }
-            IROp::Expand {
-                src_var,
-                dst_var,
-                edge_type,
-                direction,
-                dst_type,
-                min_hops,
-                max_hops,
-            } => {
-                let gi = graph_index.ok_or_else(|| {
-                    OmniError::Manifest("graph index required for traversal".to_string())
-                })?;
-                let batch = execute_expand(
-                    bindings, gi, snapshot, catalog, src_var, dst_var, edge_type,
-                    *direction, dst_type, *min_hops, *max_hops,
-                )
-                .await?;
-                bindings.insert(dst_var.clone(), batch);
-            }
-            IROp::AntiJoin { outer_var, inner } => {
-                let gi = graph_index;
-                execute_anti_join(
-                    bindings, inner, params, snapshot, gi, catalog, outer_var,
-                )
-                .await?;
+                IROp::Filter(filter) => {
+                    apply_filter(bindings, filter, params)?;
+                }
+                IROp::Expand {
+                    src_var,
+                    dst_var,
+                    edge_type,
+                    direction,
+                    dst_type,
+                    min_hops,
+                    max_hops,
+                } => {
+                    let gi = graph_index.ok_or_else(|| {
+                        OmniError::Manifest("graph index required for traversal".to_string())
+                    })?;
+                    let batch = execute_expand(
+                        bindings, gi, snapshot, catalog, src_var, dst_var, edge_type, *direction,
+                        dst_type, *min_hops, *max_hops,
+                    )
+                    .await?;
+                    bindings.insert(dst_var.clone(), batch);
+                }
+                IROp::AntiJoin { outer_var, inner } => {
+                    let gi = graph_index;
+                    execute_anti_join(bindings, inner, params, snapshot, gi, catalog, outer_var)
+                        .await?;
+                }
             }
         }
-    }
-    Ok(())
+        Ok(())
     })
 }
 
@@ -485,29 +1142,28 @@ async fn execute_expand(
         .ok_or_else(|| OmniError::Manifest("source 'id' column is not Utf8".to_string()))?;
 
     // Determine which type index to use for source and destination
-    let edge_def = catalog.edge_types.get(edge_type).ok_or_else(|| {
-        OmniError::Manifest(format!("unknown edge type '{}'", edge_type))
-    })?;
+    let edge_def = catalog
+        .edge_types
+        .get(edge_type)
+        .ok_or_else(|| OmniError::Manifest(format!("unknown edge type '{}'", edge_type)))?;
 
     let (src_type_name, dst_type_name) = match direction {
         Direction::Out => (&edge_def.from_type, &edge_def.to_type),
         Direction::In => (&edge_def.to_type, &edge_def.from_type),
     };
 
-    let src_type_idx = graph_index.type_index(src_type_name).ok_or_else(|| {
-        OmniError::Manifest(format!("no type index for '{}'", src_type_name))
-    })?;
-    let dst_type_idx = graph_index.type_index(dst_type_name).ok_or_else(|| {
-        OmniError::Manifest(format!("no type index for '{}'", dst_type_name))
-    })?;
+    let src_type_idx = graph_index
+        .type_index(src_type_name)
+        .ok_or_else(|| OmniError::Manifest(format!("no type index for '{}'", src_type_name)))?;
+    let dst_type_idx = graph_index
+        .type_index(dst_type_name)
+        .ok_or_else(|| OmniError::Manifest(format!("no type index for '{}'", dst_type_name)))?;
 
     let adj = match direction {
         Direction::Out => graph_index.csr(edge_type),
         Direction::In => graph_index.csc(edge_type),
     }
-    .ok_or_else(|| {
-        OmniError::Manifest(format!("no adjacency index for edge '{}'", edge_type))
-    })?;
+    .ok_or_else(|| OmniError::Manifest(format!("no adjacency index for edge '{}'", edge_type)))?;
 
     let max = max_hops.unwrap_or(min_hops.max(1));
 
@@ -563,9 +1219,10 @@ async fn hydrate_nodes(
     type_name: &str,
     ids: &[String],
 ) -> Result<RecordBatch> {
-    let node_type = catalog.node_types.get(type_name).ok_or_else(|| {
-        OmniError::Manifest(format!("unknown node type '{}'", type_name))
-    })?;
+    let node_type = catalog
+        .node_types
+        .get(type_name)
+        .ok_or_else(|| OmniError::Manifest(format!("unknown node type '{}'", type_name)))?;
 
     if ids.is_empty() {
         return Ok(RecordBatch::new_empty(node_type.arrow_schema.clone()));
@@ -575,7 +1232,10 @@ async fn hydrate_nodes(
     let ds = snapshot.open(&table_key).await?;
 
     // Build filter: id IN ('a', 'b', 'c')
-    let escaped: Vec<String> = ids.iter().map(|id| format!("'{}'", id.replace('\'', "''"))).collect();
+    let escaped: Vec<String> = ids
+        .iter()
+        .map(|id| format!("'{}'", id.replace('\'', "''")))
+        .collect();
     let filter_sql = format!("id IN ({})", escaped.join(", "));
 
     let mut scanner = ds.scan();
@@ -692,11 +1352,16 @@ async fn execute_anti_join(
     outer_var: &str,
 ) -> Result<()> {
     let outer_batch = bindings.get(outer_var).ok_or_else(|| {
-        OmniError::Manifest(format!("anti-join references unbound variable '{}'", outer_var))
+        OmniError::Manifest(format!(
+            "anti-join references unbound variable '{}'",
+            outer_var
+        ))
     })?;
 
     // Fast path: bulk CSR existence check (O(N), zero Lance I/O)
-    if let Some(result) = try_bulk_anti_join(outer_batch, inner_pipeline, graph_index, catalog, outer_var) {
+    if let Some(result) =
+        try_bulk_anti_join(outer_batch, inner_pipeline, graph_index, catalog, outer_var)
+    {
         bindings.insert(outer_var.to_string(), result?);
         return Ok(());
     }
@@ -832,9 +1497,13 @@ async fn execute_node_scan(
     let scan_result = if batches.is_empty() {
         RecordBatch::new_empty(batches.first().map(|b| b.schema()).unwrap_or_else(|| {
             // Build a non-blob schema for empty result
-            let fields: Vec<_> = node_type.arrow_schema.fields().iter()
+            let fields: Vec<_> = node_type
+                .arrow_schema
+                .fields()
+                .iter()
                 .filter(|f| !node_type.blob_properties.contains(f.name()))
-                .map(|f| f.as_ref().clone()).collect();
+                .map(|f| f.as_ref().clone())
+                .collect();
             Arc::new(Schema::new(fields))
         }))
     } else if batches.len() == 1 {
@@ -868,7 +1537,8 @@ fn add_null_blob_columns(
             columns.push(Arc::new(StringArray::from(vec![None::<&str>; num_rows])));
         } else if let Some(col) = batch.column_by_name(field.name()) {
             let batch_schema = batch.schema();
-            let batch_field = batch_schema.field_with_name(field.name())
+            let batch_field = batch_schema
+                .field_with_name(field.name())
                 .map_err(|e| OmniError::Lance(e.to_string()))?;
             fields.push(batch_field.clone());
             columns.push(col.clone());
@@ -931,7 +1601,11 @@ fn build_fts_query(
                 .with_column(prop)
                 .ok()
         }
-        IRExpr::Fuzzy { field, query, max_edits } => {
+        IRExpr::Fuzzy {
+            field,
+            query,
+            max_edits,
+        } => {
             let prop = extract_property(field)?;
             let q = resolve_to_string(query, params)?;
             let edits = max_edits
@@ -1001,8 +1675,8 @@ fn literal_to_sql(lit: &Literal) -> String {
         Literal::Integer(n) => n.to_string(),
         Literal::Float(f) => f.to_string(),
         Literal::Bool(b) => b.to_string(),
-        Literal::Date(s) => format!("'{}'", s),
-        Literal::DateTime(s) => format!("'{}'", s),
+        Literal::Date(s) => format!("'{}'", s.replace('\'', "''")),
+        Literal::DateTime(s) => format!("'{}'", s.replace('\'', "''")),
         Literal::List(_) => "NULL".to_string(), // Not supported in SQL pushdown
     }
 }
@@ -1068,25 +1742,18 @@ fn evaluate_filter(
 }
 
 /// Evaluate an IR expression against a batch, producing an array.
-fn evaluate_expr(
-    batch: &RecordBatch,
-    expr: &IRExpr,
-    params: &ParamMap,
-) -> Result<ArrayRef> {
+fn evaluate_expr(batch: &RecordBatch, expr: &IRExpr, params: &ParamMap) -> Result<ArrayRef> {
     match expr {
         IRExpr::PropAccess { property, .. } => {
-            batch
-                .column_by_name(property)
-                .cloned()
-                .ok_or_else(|| {
-                    OmniError::Manifest(format!("column '{}' not found in batch", property))
-                })
+            batch.column_by_name(property).cloned().ok_or_else(|| {
+                OmniError::Manifest(format!("column '{}' not found in batch", property))
+            })
         }
         IRExpr::Literal(lit) => literal_to_array(lit, batch.num_rows()),
         IRExpr::Param(name) => {
-            let lit = params.get(name).ok_or_else(|| {
-                OmniError::Manifest(format!("parameter '{}' not provided", name))
-            })?;
+            let lit = params
+                .get(name)
+                .ok_or_else(|| OmniError::Manifest(format!("parameter '{}' not provided", name)))?;
             literal_to_array(lit, batch.num_rows())
         }
         _ => Err(OmniError::Manifest(format!(
@@ -1099,19 +1766,13 @@ fn evaluate_expr(
 /// Create a constant array from a literal value.
 fn literal_to_array(lit: &Literal, num_rows: usize) -> Result<ArrayRef> {
     Ok(match lit {
-        Literal::String(s) => {
-            Arc::new(StringArray::from(vec![s.as_str(); num_rows])) as ArrayRef
-        }
+        Literal::String(s) => Arc::new(StringArray::from(vec![s.as_str(); num_rows])) as ArrayRef,
         Literal::Integer(n) => {
             // Try to match the most common integer types
             Arc::new(Int64Array::from(vec![*n; num_rows])) as ArrayRef
         }
-        Literal::Float(f) => {
-            Arc::new(Float64Array::from(vec![*f; num_rows])) as ArrayRef
-        }
-        Literal::Bool(b) => {
-            Arc::new(BooleanArray::from(vec![*b; num_rows])) as ArrayRef
-        }
+        Literal::Float(f) => Arc::new(Float64Array::from(vec![*f; num_rows])) as ArrayRef,
+        Literal::Bool(b) => Arc::new(BooleanArray::from(vec![*b; num_rows])) as ArrayRef,
         _ => {
             return Err(OmniError::Manifest(format!(
                 "unsupported literal type: {:?}",
@@ -1160,7 +1821,10 @@ fn evaluate_projection(
     match expr {
         IRExpr::PropAccess { variable, property } => {
             let batch = bindings.get(variable).ok_or_else(|| {
-                OmniError::Manifest(format!("projection references unbound variable '{}'", variable))
+                OmniError::Manifest(format!(
+                    "projection references unbound variable '{}'",
+                    variable
+                ))
             })?;
             let col = batch.column_by_name(property).ok_or_else(|| {
                 OmniError::Manifest(format!(
@@ -1177,9 +1841,9 @@ fn evaluate_projection(
             Ok(("literal".to_string(), arr))
         }
         IRExpr::Param(name) => {
-            let lit = params.get(name).ok_or_else(|| {
-                OmniError::Manifest(format!("parameter '{}' not provided", name))
-            })?;
+            let lit = params
+                .get(name)
+                .ok_or_else(|| OmniError::Manifest(format!("parameter '{}' not provided", name)))?;
             let num_rows = bindings.values().next().map(|b| b.num_rows()).unwrap_or(0);
             let arr = literal_to_array(lit, num_rows)?;
             Ok((name.clone(), arr))
@@ -1196,7 +1860,7 @@ fn apply_ordering(
     batch: RecordBatch,
     orderings: &[IROrdering],
     bindings: &HashMap<String, RecordBatch>,
-    params: &ParamMap,
+    _params: &ParamMap,
 ) -> Result<RecordBatch> {
     use arrow_ord::sort::{SortColumn, lexsort_to_indices};
 
@@ -1206,19 +1870,26 @@ fn apply_ordering(
         let col = match &ordering.expr {
             IRExpr::PropAccess { variable, property } => {
                 let binding = bindings.get(variable).ok_or_else(|| {
-                    OmniError::Manifest(format!("ordering references unbound variable '{}'", variable))
+                    OmniError::Manifest(format!(
+                        "ordering references unbound variable '{}'",
+                        variable
+                    ))
                 })?;
-                binding.column_by_name(property).ok_or_else(|| {
-                    OmniError::Manifest(format!("column '{}' not found for ordering", property))
-                })?
-                .clone()
+                binding
+                    .column_by_name(property)
+                    .ok_or_else(|| {
+                        OmniError::Manifest(format!("column '{}' not found for ordering", property))
+                    })?
+                    .clone()
             }
             IRExpr::AliasRef(alias) => {
                 // Look up in the projected batch by column name
-                batch.column_by_name(alias).ok_or_else(|| {
-                    OmniError::Manifest(format!("alias '{}' not found for ordering", alias))
-                })?
-                .clone()
+                batch
+                    .column_by_name(alias)
+                    .ok_or_else(|| {
+                        OmniError::Manifest(format!("alias '{}' not found for ordering", alias))
+                    })?
+                    .clone()
             }
             _ => {
                 return Err(OmniError::Manifest(
@@ -1236,8 +1907,8 @@ fn apply_ordering(
         });
     }
 
-    let indices = lexsort_to_indices(&sort_columns, None)
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    let indices =
+        lexsort_to_indices(&sort_columns, None).map_err(|e| OmniError::Lance(e.to_string()))?;
 
     let columns: Vec<ArrayRef> = batch
         .columns()
@@ -1255,9 +1926,10 @@ fn apply_ordering(
 fn resolve_expr_value(expr: &IRExpr, params: &ParamMap) -> Result<Literal> {
     match expr {
         IRExpr::Literal(lit) => Ok(lit.clone()),
-        IRExpr::Param(name) => params.get(name).cloned().ok_or_else(|| {
-            OmniError::Manifest(format!("parameter '{}' not provided", name))
-        }),
+        IRExpr::Param(name) => params
+            .get(name)
+            .cloned()
+            .ok_or_else(|| OmniError::Manifest(format!("parameter '{}' not provided", name))),
         other => Err(OmniError::Manifest(format!(
             "unsupported expression in mutation: {:?}",
             other
@@ -1266,7 +1938,11 @@ fn resolve_expr_value(expr: &IRExpr, params: &ParamMap) -> Result<Literal> {
 }
 
 /// Create a single-element or N-element array from a Literal, matching the target DataType.
-fn literal_to_typed_array(lit: &Literal, data_type: &DataType, num_rows: usize) -> Result<ArrayRef> {
+fn literal_to_typed_array(
+    lit: &Literal,
+    data_type: &DataType,
+    num_rows: usize,
+) -> Result<ArrayRef> {
     Ok(match (lit, data_type) {
         (Literal::String(s), DataType::Utf8) => {
             Arc::new(StringArray::from(vec![s.as_str(); num_rows])) as ArrayRef
@@ -1274,9 +1950,7 @@ fn literal_to_typed_array(lit: &Literal, data_type: &DataType, num_rows: usize) 
         (Literal::Integer(n), DataType::Int32) => {
             Arc::new(Int32Array::from(vec![*n as i32; num_rows]))
         }
-        (Literal::Integer(n), DataType::Int64) => {
-            Arc::new(Int64Array::from(vec![*n; num_rows]))
-        }
+        (Literal::Integer(n), DataType::Int64) => Arc::new(Int64Array::from(vec![*n; num_rows])),
         (Literal::Integer(n), DataType::UInt32) => {
             Arc::new(UInt32Array::from(vec![*n as u32; num_rows]))
         }
@@ -1286,16 +1960,11 @@ fn literal_to_typed_array(lit: &Literal, data_type: &DataType, num_rows: usize) 
         (Literal::Float(f), DataType::Float32) => {
             Arc::new(Float32Array::from(vec![*f as f32; num_rows]))
         }
-        (Literal::Float(f), DataType::Float64) => {
-            Arc::new(Float64Array::from(vec![*f; num_rows]))
-        }
-        (Literal::Bool(b), DataType::Boolean) => {
-            Arc::new(BooleanArray::from(vec![*b; num_rows]))
-        }
+        (Literal::Float(f), DataType::Float64) => Arc::new(Float64Array::from(vec![*f; num_rows])),
+        (Literal::Bool(b), DataType::Boolean) => Arc::new(BooleanArray::from(vec![*b; num_rows])),
         (Literal::Date(s), DataType::Date32) => {
-            let days = parse_date32(s).ok_or_else(|| {
-                OmniError::Manifest(format!("invalid date: {}", s))
-            })?;
+            let days = parse_date32(s)
+                .ok_or_else(|| OmniError::Manifest(format!("invalid date: {}", s)))?;
             Arc::new(Date32Array::from(vec![days; num_rows]))
         }
         _ => {
@@ -1389,8 +2058,80 @@ fn build_insert_batch(
         }
     }
 
-    RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| OmniError::Lance(e.to_string()))
+    RecordBatch::try_new(schema.clone(), columns).map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+async fn validate_edge_insert_endpoints(
+    db: &Omnigraph,
+    edge_name: &str,
+    assignments: &HashMap<String, Literal>,
+) -> Result<()> {
+    let edge_type = db
+        .catalog()
+        .edge_types
+        .get(edge_name)
+        .ok_or_else(|| OmniError::Manifest(format!("unknown edge type '{}'", edge_name)))?;
+    let from = match assignments.get("from") {
+        Some(Literal::String(value)) => value.as_str(),
+        Some(other) => {
+            return Err(OmniError::Manifest(format!(
+                "edge {} from endpoint must be a string id, got {}",
+                edge_name,
+                literal_to_sql(other)
+            )));
+        }
+        None => {
+            return Err(OmniError::Manifest(format!(
+                "edge {} missing 'from' endpoint",
+                edge_name
+            )));
+        }
+    };
+    let to = match assignments.get("to") {
+        Some(Literal::String(value)) => value.as_str(),
+        Some(other) => {
+            return Err(OmniError::Manifest(format!(
+                "edge {} to endpoint must be a string id, got {}",
+                edge_name,
+                literal_to_sql(other)
+            )));
+        }
+        None => {
+            return Err(OmniError::Manifest(format!(
+                "edge {} missing 'to' endpoint",
+                edge_name
+            )));
+        }
+    };
+
+    ensure_node_id_exists(db, &edge_type.from_type, from, "src").await?;
+    ensure_node_id_exists(db, &edge_type.to_type, to, "dst").await?;
+    Ok(())
+}
+
+async fn ensure_node_id_exists(
+    db: &Omnigraph,
+    node_type: &str,
+    id: &str,
+    label: &str,
+) -> Result<()> {
+    let snapshot = db.snapshot();
+    let table_key = format!("node:{}", node_type);
+    let ds = snapshot.open(&table_key).await?;
+    let filter = format!("id = '{}'", id.replace('\'', "''"));
+    let exists = ds
+        .count_rows(Some(filter))
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?
+        > 0;
+    if exists {
+        Ok(())
+    } else {
+        Err(OmniError::Manifest(format!(
+            "{} '{}' not found in {}",
+            label, id, node_type
+        )))
+    }
 }
 
 /// Convert an IRMutationPredicate to a Lance SQL filter string.
@@ -1440,19 +2181,31 @@ fn apply_assignments(
     let schema = batch.schema();
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
 
-    for (idx, field) in schema.fields().iter().enumerate() {
+    for field in schema.fields().iter() {
         if blob_properties.contains(field.name()) {
             // Blob columns aren't in the scan result — skip
             continue;
         } else if let Some(lit) = assignments.get(field.name()) {
-            columns.push(literal_to_typed_array(lit, field.data_type(), batch.num_rows())?);
+            columns.push(literal_to_typed_array(
+                lit,
+                field.data_type(),
+                batch.num_rows(),
+            )?);
         } else {
-            columns.push(batch.column(idx).clone());
+            let col = batch.column_by_name(field.name()).ok_or_else(|| {
+                OmniError::Lance(format!(
+                    "column '{}' not found in scan result",
+                    field.name()
+                ))
+            })?;
+            columns.push(col.clone());
         }
     }
 
     // Build schema without blob columns
-    let non_blob_fields: Vec<_> = schema.fields().iter()
+    let non_blob_fields: Vec<_> = schema
+        .fields()
+        .iter()
         .filter(|f| !blob_properties.contains(f.name()))
         .map(|f| f.as_ref().clone())
         .collect();
@@ -1506,6 +2259,158 @@ impl Omnigraph {
         }
     }
 
+    pub async fn branch_merge(&mut self, source: &str, target: &str) -> Result<()> {
+        let source_branch = Omnigraph::normalize_branch_name(source)?;
+        let target_branch = Omnigraph::normalize_branch_name(target)?;
+        if source_branch == target_branch {
+            return Err(OmniError::Manifest(
+                "branch_merge requires distinct source and target branches".to_string(),
+            ));
+        }
+
+        let mut source_db = match source_branch.as_deref() {
+            Some(branch) => Omnigraph::open_branch(self.uri(), branch).await?,
+            None => Omnigraph::open(self.uri()).await?,
+        };
+        let mut target_db = match target_branch.as_deref() {
+            Some(branch) => Omnigraph::open_branch(self.uri(), branch).await?,
+            None => Omnigraph::open(self.uri()).await?,
+        };
+
+        source_db.ensure_commit_graph_initialized().await?;
+        target_db.ensure_commit_graph_initialized().await?;
+
+        let source_head_commit_id = source_db
+            .head_commit_id()
+            .await?
+            .ok_or_else(|| OmniError::Manifest("source branch has no head commit".to_string()))?;
+        let target_head_commit_id = target_db
+            .head_commit_id()
+            .await?
+            .ok_or_else(|| OmniError::Manifest("target branch has no head commit".to_string()))?;
+        let base_commit = CommitGraph::merge_base(
+            self.uri(),
+            source_branch.as_deref(),
+            target_branch.as_deref(),
+        )
+        .await?
+        .ok_or_else(|| OmniError::Manifest("branches have no common ancestor".to_string()))?;
+
+        let base_snapshot = ManifestCoordinator::snapshot_at(
+            self.uri(),
+            base_commit.manifest_branch.as_deref(),
+            base_commit.manifest_version,
+        )
+        .await?;
+        let source_snapshot = source_db.snapshot();
+        let target_snapshot = target_db.snapshot();
+
+        let mut table_keys = HashSet::new();
+        for entry in base_snapshot.entries() {
+            table_keys.insert(entry.table_key.clone());
+        }
+        for entry in source_snapshot.entries() {
+            table_keys.insert(entry.table_key.clone());
+        }
+        for entry in target_snapshot.entries() {
+            table_keys.insert(entry.table_key.clone());
+        }
+
+        let mut ordered_table_keys: Vec<String> = table_keys.into_iter().collect();
+        ordered_table_keys.sort();
+
+        let mut conflicts = Vec::new();
+        let mut candidate_batches: HashMap<String, RecordBatch> = HashMap::new();
+
+        for table_key in &ordered_table_keys {
+            let source_entry = source_snapshot.entry(table_key);
+            let target_entry = target_snapshot.entry(table_key);
+            if same_manifest_state(source_entry, target_entry) {
+                continue;
+            }
+
+            let base_rows = load_table_rows(&base_snapshot, self.catalog(), table_key).await?;
+            let source_rows = load_table_rows(&source_snapshot, self.catalog(), table_key).await?;
+            let target_rows = load_table_rows(&target_snapshot, self.catalog(), table_key).await?;
+
+            if let Some(candidate) = plan_table_merge(
+                table_key,
+                &base_rows,
+                &source_rows,
+                &target_rows,
+                &mut conflicts,
+            )? {
+                candidate_batches.insert(table_key.clone(), candidate);
+            }
+        }
+
+        if !conflicts.is_empty() {
+            return Err(OmniError::MergeConflicts(conflicts));
+        }
+
+        validate_merge_candidates(&target_db, &target_snapshot, &candidate_batches).await?;
+
+        let mut updates = Vec::new();
+        for table_key in &ordered_table_keys {
+            let Some(candidate_batch) = candidate_batches.get(table_key) else {
+                continue;
+            };
+            let (mut ds, _full_path, table_branch) = target_db.open_for_mutation(table_key).await?;
+            ds.truncate_table()
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+            if candidate_batch.num_rows() > 0 {
+                let reader = RecordBatchIterator::new(
+                    vec![Ok(candidate_batch.clone())],
+                    candidate_batch.schema(),
+                );
+                ds.append(reader, None)
+                    .await
+                    .map_err(|e| OmniError::Lance(e.to_string()))?;
+            }
+
+            let row_count = ds
+                .count_rows(None)
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
+            updates.push(crate::db::SubTableUpdate {
+                table_key: table_key.clone(),
+                table_version: ds.version().version,
+                table_branch,
+                row_count,
+            });
+        }
+
+        let manifest_version = if updates.is_empty() {
+            target_db.version()
+        } else {
+            target_db.commit_manifest_updates(&updates).await?
+        };
+        target_db
+            .record_merge_commit(
+                manifest_version,
+                &target_head_commit_id,
+                &source_head_commit_id,
+            )
+            .await?;
+
+        if target_snapshot
+            .entries()
+            .any(|entry| entry.table_key.starts_with("edge:"))
+            && !updates.is_empty()
+        {
+            target_db.invalidate_graph_index();
+        }
+
+        let self_branch = self.active_branch().map(str::to_string);
+        if self_branch == target_branch {
+            self.refresh().await?;
+        }
+
+        Ok(())
+    }
+
     async fn execute_insert(
         &mut self,
         type_name: &str,
@@ -1540,22 +2445,22 @@ impl Omnigraph {
             };
 
             let batch = build_insert_batch(&schema, &id, &resolved, &blob_props)?;
+            crate::loader::validate_value_constraints(&batch, node_type)?;
             let has_key = node_type.key_property().is_some();
-            let (new_version, row_count) = if has_key {
+            let (new_version, row_count, table_branch) = if has_key {
                 self.upsert_batch(type_name, true, schema, batch).await?
             } else {
                 self.append_batch(type_name, true, schema, batch).await?
             };
 
             let table_key = format!("node:{}", type_name);
-            self.manifest_mut()
-                .commit(&[crate::db::SubTableUpdate {
-                    table_key,
-                    table_version: new_version,
-                    table_branch: None,
-                    row_count,
-                }])
-                .await?;
+            self.commit_updates(&[crate::db::SubTableUpdate {
+                table_key,
+                table_version: new_version,
+                table_branch,
+                row_count,
+            }])
+            .await?;
 
             Ok(MutationResult {
                 affected_nodes: 1,
@@ -1568,18 +2473,18 @@ impl Omnigraph {
             let id = ulid::Ulid::new().to_string();
 
             let batch = build_insert_batch(&schema, &id, &resolved, &blob_props)?;
-            let (new_version, row_count) =
+            validate_edge_insert_endpoints(self, type_name, &resolved).await?;
+            let (new_version, row_count, table_branch) =
                 self.append_batch(type_name, false, schema, batch).await?;
 
             let table_key = format!("edge:{}", type_name);
-            self.manifest_mut()
-                .commit(&[crate::db::SubTableUpdate {
-                    table_key,
-                    table_version: new_version,
-                    table_branch: None,
-                    row_count,
-                }])
-                .await?;
+            self.commit_updates(&[crate::db::SubTableUpdate {
+                table_key,
+                table_version: new_version,
+                table_branch,
+                row_count,
+            }])
+            .await?;
 
             self.invalidate_graph_index();
 
@@ -1588,10 +2493,7 @@ impl Omnigraph {
                 affected_edges: 1,
             })
         } else {
-            Err(OmniError::Manifest(format!(
-                "unknown type '{}'",
-                type_name
-            )))
+            Err(OmniError::Manifest(format!("unknown type '{}'", type_name)))
         }
     }
 
@@ -1602,36 +2504,26 @@ impl Omnigraph {
         is_node: bool,
         schema: SchemaRef,
         batch: RecordBatch,
-    ) -> Result<(u64, u64)> {
+    ) -> Result<(u64, u64, Option<String>)> {
         let table_key = if is_node {
             format!("node:{}", type_name)
         } else {
             format!("edge:{}", type_name)
         };
-        let snapshot = self.snapshot();
-        let entry = snapshot.entry(&table_key).ok_or_else(|| {
-            OmniError::Manifest(format!("no manifest entry for {}", table_key))
-        })?;
-        let full_path = format!("{}/{}", self.uri(), entry.table_path);
-
-        let mut ds = Dataset::open(&full_path)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let (mut ds, _full_path, table_branch) = self.open_for_mutation(&table_key).await?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
         ds.append(reader, None)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
 
-        let ds = Dataset::open(&full_path)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        // Use the mutated handle directly — no re-open needed (avoids TOCTOU race)
         let new_version = ds.version().version;
         let row_count = ds
             .count_rows(None)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
 
-        Ok((new_version, row_count))
+        Ok((new_version, row_count, table_branch))
     }
 
     /// Upsert a batch into a sub-table using merge_insert keyed by "id".
@@ -1642,32 +2534,21 @@ impl Omnigraph {
         is_node: bool,
         schema: SchemaRef,
         batch: RecordBatch,
-    ) -> Result<(u64, u64)> {
+    ) -> Result<(u64, u64, Option<String>)> {
         let table_key = if is_node {
             format!("node:{}", type_name)
         } else {
             format!("edge:{}", type_name)
         };
-        let snapshot = self.snapshot();
-        let entry = snapshot.entry(&table_key).ok_or_else(|| {
-            OmniError::Manifest(format!("no manifest entry for {}", table_key))
-        })?;
-        let full_path = format!("{}/{}", self.uri(), entry.table_path);
-
-        let ds = Dataset::open(&full_path)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let (ds, _full_path, table_branch) = self.open_for_mutation(&table_key).await?;
         let ds = Arc::new(ds);
 
-        let job = lance::dataset::MergeInsertBuilder::try_new(
-            ds,
-            vec!["id".to_string()],
-        )
-        .map_err(|e| OmniError::Lance(e.to_string()))?
-        .when_matched(lance::dataset::WhenMatched::UpdateAll)
-        .when_not_matched(lance::dataset::WhenNotMatched::InsertAll)
-        .try_build()
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let job = lance::dataset::MergeInsertBuilder::try_new(ds, vec!["id".to_string()])
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+            .when_matched(lance::dataset::WhenMatched::UpdateAll)
+            .when_not_matched(lance::dataset::WhenNotMatched::InsertAll)
+            .try_build()
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
 
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
         let (new_ds, _stats) = job
@@ -1681,7 +2562,7 @@ impl Omnigraph {
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
 
-        Ok((new_version, row_count))
+        Ok((new_version, row_count, table_branch))
     }
 
     async fn execute_update(
@@ -1691,6 +2572,14 @@ impl Omnigraph {
         predicate: &IRMutationPredicate,
         params: &ParamMap,
     ) -> Result<MutationResult> {
+        // Defense in depth: ensure this is a node type
+        if !self.catalog().node_types.contains_key(type_name) {
+            return Err(OmniError::Manifest(format!(
+                "update is only supported for node types, not '{}'",
+                type_name
+            )));
+        }
+
         // Reject updates to @key properties — identity is immutable
         if let Some(key_prop) = self.catalog().node_types[type_name].key_property() {
             if assignments.iter().any(|a| a.property == key_prop) {
@@ -1705,16 +2594,9 @@ impl Omnigraph {
         let schema = self.catalog().node_types[type_name].arrow_schema.clone();
         let blob_props = self.catalog().node_types[type_name].blob_properties.clone();
 
-        let snapshot = self.snapshot();
         let table_key = format!("node:{}", type_name);
-        let entry = snapshot.entry(&table_key).ok_or_else(|| {
-            OmniError::Manifest(format!("no manifest entry for {}", table_key))
-        })?;
-        let full_path = format!("{}/{}", self.uri(), entry.table_path);
-
-        let ds = Dataset::open(&full_path)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let (ds, full_path, table_branch) = self.open_for_mutation(&table_key).await?;
+        let initial_version = ds.version().version;
 
         let mut scanner = ds.scan();
         if !blob_props.is_empty() {
@@ -1762,21 +2644,26 @@ impl Omnigraph {
             resolved.insert(a.property.clone(), resolve_expr_value(&a.value, params)?);
         }
         let updated = apply_assignments(&matched, &resolved, &blob_props)?;
+        crate::loader::validate_value_constraints(&updated, &self.catalog().node_types[type_name])?;
 
-        let ds = Dataset::open(&full_path)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        // Re-open for merge_insert (scan consumed the dataset;
+        // version guard was already applied by open_for_mutation above)
+        let ds = self
+            .reopen_for_mutation(
+                &table_key,
+                &full_path,
+                table_branch.as_deref(),
+                initial_version,
+            )
+            .await?;
         let ds = Arc::new(ds);
 
-        let job = lance::dataset::MergeInsertBuilder::try_new(
-            ds,
-            vec!["id".to_string()],
-        )
-        .map_err(|e| OmniError::Lance(e.to_string()))?
-        .when_matched(lance::dataset::WhenMatched::UpdateAll)
-        .when_not_matched(lance::dataset::WhenNotMatched::DoNothing)
-        .try_build()
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let job = lance::dataset::MergeInsertBuilder::try_new(ds, vec!["id".to_string()])
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+            .when_matched(lance::dataset::WhenMatched::UpdateAll)
+            .when_not_matched(lance::dataset::WhenNotMatched::DoNothing)
+            .try_build()
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
 
         let update_schema = updated.schema();
         let reader = RecordBatchIterator::new(vec![Ok(updated)], update_schema);
@@ -1803,9 +2690,10 @@ impl Omnigraph {
             let id_col = matched.column_by_name("id").ok_or_else(|| {
                 OmniError::Manifest("matched batch missing 'id' column".to_string())
             })?;
-            let ids = id_col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                OmniError::Manifest("id column is not Utf8".to_string())
-            })?;
+            let ids = id_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| OmniError::Manifest("id column is not Utf8".to_string()))?;
 
             // Build batch: id + blob columns
             let mut blob_fields = vec![Field::new("id", DataType::Utf8, false)];
@@ -1820,7 +2708,9 @@ impl Omnigraph {
                     let blob_field = lance::blob::blob_field(blob_prop, true);
                     blob_fields.push(blob_field);
                     blob_columns.push(
-                        builder.finish().map_err(|e| OmniError::Lance(e.to_string()))?,
+                        builder
+                            .finish()
+                            .map_err(|e| OmniError::Lance(e.to_string()))?,
                     );
                 }
             }
@@ -1829,20 +2719,23 @@ impl Omnigraph {
             let blob_batch = RecordBatch::try_new(blob_schema.clone(), blob_columns)
                 .map_err(|e| OmniError::Lance(e.to_string()))?;
 
-            let ds = Dataset::open(&full_path)
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            // Re-open for blob merge_insert (version guard from open_for_mutation)
+            let ds = self
+                .reopen_for_mutation(
+                    &table_key,
+                    &full_path,
+                    table_branch.as_deref(),
+                    final_version,
+                )
+                .await?;
             let ds = Arc::new(ds);
 
-            let job = lance::dataset::MergeInsertBuilder::try_new(
-                ds,
-                vec!["id".to_string()],
-            )
-            .map_err(|e| OmniError::Lance(e.to_string()))?
-            .when_matched(lance::dataset::WhenMatched::UpdateAll)
-            .when_not_matched(lance::dataset::WhenNotMatched::DoNothing)
-            .try_build()
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            let job = lance::dataset::MergeInsertBuilder::try_new(ds, vec!["id".to_string()])
+                .map_err(|e| OmniError::Lance(e.to_string()))?
+                .when_matched(lance::dataset::WhenMatched::UpdateAll)
+                .when_not_matched(lance::dataset::WhenNotMatched::DoNothing)
+                .try_build()
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
 
             let reader = RecordBatchIterator::new(vec![Ok(blob_batch)], blob_schema);
             let (new_ds, _stats) = job
@@ -1857,14 +2750,13 @@ impl Omnigraph {
                 .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
         }
 
-        self.manifest_mut()
-            .commit(&[crate::db::SubTableUpdate {
-                table_key,
-                table_version: final_version,
-                table_branch: None,
-                row_count: final_row_count,
-            }])
-            .await?;
+        self.commit_updates(&[crate::db::SubTableUpdate {
+            table_key,
+            table_version: final_version,
+            table_branch,
+            row_count: final_row_count,
+        }])
+        .await?;
 
         Ok(MutationResult {
             affected_nodes: affected_count,
@@ -1894,17 +2786,11 @@ impl Omnigraph {
     ) -> Result<MutationResult> {
         let pred_sql = predicate_to_sql(predicate, params, false)?;
 
-        let snapshot = self.snapshot();
         let table_key = format!("node:{}", type_name);
-        let entry = snapshot.entry(&table_key).ok_or_else(|| {
-            OmniError::Manifest(format!("no manifest entry for {}", table_key))
-        })?;
-        let full_path = format!("{}/{}", self.uri(), entry.table_path);
+        let (ds, full_path, table_branch) = self.open_for_mutation(&table_key).await?;
+        let initial_version = ds.version().version;
 
         // Scan matching IDs for cascade
-        let ds = Dataset::open(&full_path)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
         let mut scanner = ds.scan();
         scanner
             .project(&["id"])
@@ -1944,10 +2830,16 @@ impl Omnigraph {
 
         let affected_nodes = deleted_ids.len();
 
-        // Delete nodes
-        let mut ds = Dataset::open(&full_path)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        // Delete nodes (re-open needed because the scan consumed the dataset;
+        // version guard was already applied by open_for_mutation above)
+        let mut ds = self
+            .reopen_for_mutation(
+                &table_key,
+                &full_path,
+                table_branch.as_deref(),
+                initial_version,
+            )
+            .await?;
         let delete_result = ds
             .delete(&pred_sql)
             .await
@@ -1963,11 +2855,10 @@ impl Omnigraph {
         let mut updates = vec![crate::db::SubTableUpdate {
             table_key,
             table_version: node_version,
-            table_branch: None,
+            table_branch: table_branch.clone(),
             row_count: node_row_count,
         }];
 
-        // Edge cascade
         let mut affected_edges = 0usize;
         let escaped: Vec<String> = deleted_ids
             .iter()
@@ -1995,15 +2886,9 @@ impl Omnigraph {
             }
 
             let edge_table_key = format!("edge:{}", edge_name);
-            let Some(edge_entry) = snapshot.entry(&edge_table_key) else {
-                continue;
-            };
-            let edge_full_path = format!("{}/{}", self.uri(), edge_entry.table_path);
-
             let cascade_filter = cascade_filters.join(" OR ");
-            let mut edge_ds = Dataset::open(&edge_full_path)
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            let (mut edge_ds, _edge_full_path, edge_table_branch) =
+                self.open_for_mutation(&edge_table_key).await?;
 
             let edge_delete = edge_ds
                 .delete(&cascade_filter)
@@ -2018,18 +2903,19 @@ impl Omnigraph {
                     .new_dataset
                     .count_rows(None)
                     .await
-                    .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
+                    .map_err(|e| OmniError::Lance(e.to_string()))?
+                    as u64;
 
                 updates.push(crate::db::SubTableUpdate {
                     table_key: edge_table_key,
                     table_version: edge_version,
-                    table_branch: None,
+                    table_branch: edge_table_branch,
                     row_count: edge_row_count,
                 });
             }
         }
 
-        self.manifest_mut().commit(&updates).await?;
+        self.commit_updates(&updates).await?;
 
         if affected_edges > 0 {
             self.invalidate_graph_index();
@@ -2049,16 +2935,8 @@ impl Omnigraph {
     ) -> Result<MutationResult> {
         let pred_sql = predicate_to_sql(predicate, params, true)?;
 
-        let snapshot = self.snapshot();
         let table_key = format!("edge:{}", type_name);
-        let entry = snapshot.entry(&table_key).ok_or_else(|| {
-            OmniError::Manifest(format!("no manifest entry for {}", table_key))
-        })?;
-        let full_path = format!("{}/{}", self.uri(), entry.table_path);
-
-        let mut ds = Dataset::open(&full_path)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let (mut ds, _full_path, table_branch) = self.open_for_mutation(&table_key).await?;
 
         let delete_result = ds
             .delete(&pred_sql)
@@ -2075,14 +2953,13 @@ impl Omnigraph {
                 .await
                 .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
 
-            self.manifest_mut()
-                .commit(&[crate::db::SubTableUpdate {
-                    table_key,
-                    table_version: new_version,
-                    table_branch: None,
-                    row_count,
-                }])
-                .await?;
+            self.commit_updates(&[crate::db::SubTableUpdate {
+                table_key,
+                table_version: new_version,
+                table_branch,
+                row_count,
+            }])
+            .await?;
 
             self.invalidate_graph_index();
         }
