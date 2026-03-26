@@ -1,14 +1,13 @@
 use std::collections::HashSet;
 
-use arrow_array::{Array, RecordBatch, StringArray};
+use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
 use arrow_cast::display::array_value_to_string;
-use futures::TryStreamExt;
-use lance::Dataset;
 use lance::dataset::scanner::ColumnOrdering;
 
 use crate::db::SubTableEntry;
 use crate::db::manifest::Snapshot;
-use crate::error::{OmniError, Result};
+use crate::error::Result;
+use crate::table_store::TableStore;
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -115,7 +114,9 @@ pub async fn diff_snapshots(
     from: &Snapshot,
     to: &Snapshot,
     filter: &ChangeFilter,
+    branch: Option<String>,
 ) -> Result<ChangeSet> {
+    let table_store = TableStore::new(root_uri);
     let mut all_keys: HashSet<String> = HashSet::new();
     for entry in from.entries() {
         all_keys.insert(entry.table_key.clone());
@@ -144,14 +145,14 @@ pub async fn diff_snapshots(
 
         let table_changes = if from_entry.is_none() {
             // Table added — all rows are inserts
-            diff_table_added(root_uri, to, table_key, is_edge, filter).await?
+            diff_table_added(&table_store, to, table_key, is_edge, filter).await?
         } else if to_entry.is_none() {
             // Table removed — all rows are deletes
-            diff_table_removed(root_uri, from, table_key, is_edge, filter).await?
+            diff_table_removed(&table_store, from, table_key, is_edge, filter).await?
         } else if same_lineage(from_entry, to_entry) {
             // Fast path: version-column diff
             diff_table_same_lineage(
-                root_uri,
+                &table_store,
                 from_entry.unwrap(),
                 to_entry.unwrap(),
                 is_edge,
@@ -160,14 +161,16 @@ pub async fn diff_snapshots(
             .await?
         } else {
             // Cross-branch path: streaming ID-based diff
-            diff_table_cross_branch(from, to, table_key, is_edge, filter).await?
+            diff_table_cross_branch(&table_store, from, to, table_key, is_edge, filter).await?
         };
 
         for mut c in table_changes {
             c.table_key = table_key.clone();
             c.kind = kind;
             c.type_name = type_name.to_string();
-            c.manifest_version = to.version();
+            if c.manifest_version == 0 {
+                c.manifest_version = to.version();
+            }
             changes.push(c);
         }
     }
@@ -176,7 +179,7 @@ pub async fn diff_snapshots(
     Ok(ChangeSet {
         from_version: from.version(),
         to_version: to.version(),
-        branch: None,
+        branch,
         changes,
         stats,
     })
@@ -218,7 +221,7 @@ fn compute_stats(changes: &[EntityChange]) -> ChangeStats {
 // ─── Fast path: version-column diff ─────────────────────────────────────────
 
 async fn diff_table_same_lineage(
-    root_uri: &str,
+    table_store: &TableStore,
     from_entry: &SubTableEntry,
     to_entry: &SubTableEntry,
     is_edge: bool,
@@ -226,12 +229,12 @@ async fn diff_table_same_lineage(
 ) -> Result<Vec<EntityChange>> {
     let vf = from_entry.table_version;
     let vt = to_entry.table_version;
-    let to_ds = open_at_entry(root_uri, to_entry).await?;
+    let to_ds = table_store.open_at_entry(to_entry).await?;
 
     let cols: Vec<&str> = if is_edge {
-        vec!["id", "src", "dst"]
+        vec!["id", "src", "dst", "_row_last_updated_at_version"]
     } else {
-        vec!["id"]
+        vec!["id", "_row_last_updated_at_version"]
     };
 
     let wants_inserts = filter.wants_op(ChangeOp::Insert);
@@ -254,12 +257,12 @@ async fn diff_table_same_lineage(
             "_row_last_updated_at_version > {} AND _row_last_updated_at_version <= {}",
             vf, vt
         );
-        let changed_rows = scan_with_filter(&to_ds, &cols, &filter_sql).await?;
+        let changed_rows = scan_with_filter(table_store, &to_ds, &cols, &filter_sql).await?;
 
         if !changed_rows.is_empty() {
             // Build the set of IDs that existed at the from version
-            let from_ds = open_at_entry(root_uri, from_entry).await?;
-            let from_ids: HashSet<String> = scan_id_set(&from_ds, &["id"])
+            let from_ds = table_store.open_at_entry(from_entry).await?;
+            let from_ids: HashSet<String> = scan_id_set(table_store, &from_ds, &["id"])
                 .await?
                 .into_iter()
                 .map(|r| r.id)
@@ -279,8 +282,8 @@ async fn diff_table_same_lineage(
 
     // Deletes: ID set-difference
     if wants_deletes {
-        let from_ds = open_at_entry(root_uri, from_entry).await?;
-        let deleted = deleted_ids_by_set_diff(&from_ds, &to_ds, is_edge).await?;
+        let from_ds = table_store.open_at_entry(from_entry).await?;
+        let deleted = deleted_ids_by_set_diff(table_store, &from_ds, &to_ds, is_edge).await?;
         changes.extend(deleted);
     }
 
@@ -290,17 +293,20 @@ async fn diff_table_same_lineage(
 // ─── Cross-branch path: streaming ID-based diff ────────────────────────────
 
 async fn diff_table_cross_branch(
+    table_store: &TableStore,
     from_snap: &Snapshot,
     to_snap: &Snapshot,
     table_key: &str,
     is_edge: bool,
     filter: &ChangeFilter,
 ) -> Result<Vec<EntityChange>> {
-    let from_ds = from_snap.open(table_key).await?;
-    let to_ds = to_snap.open(table_key).await?;
+    let from_ds = table_store
+        .open_snapshot_table(from_snap, table_key)
+        .await?;
+    let to_ds = table_store.open_snapshot_table(to_snap, table_key).await?;
 
-    let from_rows = scan_all_rows_ordered(&from_ds, is_edge).await?;
-    let to_rows = scan_all_rows_ordered(&to_ds, is_edge).await?;
+    let from_rows = scan_all_rows_ordered(table_store, &from_ds, is_edge).await?;
+    let to_rows = scan_all_rows_ordered(table_store, &to_ds, is_edge).await?;
 
     let mut changes = Vec::new();
     let mut fi = 0;
@@ -377,7 +383,7 @@ async fn diff_table_cross_branch(
 // ─── Table added/removed ────────────────────────────────────────────────────
 
 async fn diff_table_added(
-    _root_uri: &str,
+    table_store: &TableStore,
     to_snap: &Snapshot,
     table_key: &str,
     is_edge: bool,
@@ -386,8 +392,8 @@ async fn diff_table_added(
     if !filter.wants_op(ChangeOp::Insert) {
         return Ok(Vec::new());
     }
-    let ds = to_snap.open(table_key).await?;
-    let rows = scan_all_rows_ordered(&ds, is_edge).await?;
+    let ds = table_store.open_snapshot_table(to_snap, table_key).await?;
+    let rows = scan_all_rows_ordered(table_store, &ds, is_edge).await?;
     Ok(rows
         .into_iter()
         .map(|r| entity_change_from_row(&r, ChangeOp::Insert, is_edge))
@@ -395,7 +401,7 @@ async fn diff_table_added(
 }
 
 async fn diff_table_removed(
-    _root_uri: &str,
+    table_store: &TableStore,
     from_snap: &Snapshot,
     table_key: &str,
     is_edge: bool,
@@ -404,8 +410,10 @@ async fn diff_table_removed(
     if !filter.wants_op(ChangeOp::Delete) {
         return Ok(Vec::new());
     }
-    let ds = from_snap.open(table_key).await?;
-    let rows = scan_all_rows_ordered(&ds, is_edge).await?;
+    let ds = table_store
+        .open_snapshot_table(from_snap, table_key)
+        .await?;
+    let rows = scan_all_rows_ordered(table_store, &ds, is_edge).await?;
     Ok(rows
         .into_iter()
         .map(|r| entity_change_from_row(&r, ChangeOp::Delete, is_edge))
@@ -414,68 +422,41 @@ async fn diff_table_removed(
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-async fn open_at_entry(root_uri: &str, entry: &SubTableEntry) -> Result<Dataset> {
-    let full_path = format!("{}/{}", root_uri, entry.table_path);
-    let ds = Dataset::open(&full_path)
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
-    let ds = match &entry.table_branch {
-        Some(branch) => ds
-            .checkout_branch(branch)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?,
-        None => ds,
-    };
-    ds.checkout_version(entry.table_version)
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))
-}
-
 /// Scan with a SQL filter, projecting specific columns.
 async fn scan_with_filter(
-    ds: &Dataset,
+    table_store: &TableStore,
+    ds: &lance::Dataset,
     cols: &[&str],
     filter_sql: &str,
 ) -> Result<Vec<ScannedRow>> {
-    let mut scanner = ds.scan();
-    scanner
-        .project(cols)
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
-    scanner
-        .filter(filter_sql)
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
-    let stream = scanner
-        .try_into_stream()
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
-    let batches: Vec<RecordBatch> = stream
-        .try_collect()
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    let batches = table_store
+        .scan(ds, Some(cols), Some(filter_sql), None)
+        .await?;
     Ok(extract_rows(&batches))
 }
 
 /// Scan all rows ordered by id, projecting id (+ src/dst for edges) + all columns for signature.
-async fn scan_all_rows_ordered(ds: &Dataset, is_edge: bool) -> Result<Vec<ScannedRow>> {
-    let mut scanner = ds.scan();
-    scanner
-        .order_by(Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]))
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
-    let stream = scanner
-        .try_into_stream()
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
-    let batches: Vec<RecordBatch> = stream
-        .try_collect()
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+async fn scan_all_rows_ordered(
+    table_store: &TableStore,
+    ds: &lance::Dataset,
+    is_edge: bool,
+) -> Result<Vec<ScannedRow>> {
+    let batches = table_store
+        .scan(
+            ds,
+            None,
+            None,
+            Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]),
+        )
+        .await?;
     Ok(extract_rows_with_signature(&batches, is_edge))
 }
 
 /// Compute deleted IDs: scan id at from and to, set-difference.
 async fn deleted_ids_by_set_diff(
-    from_ds: &Dataset,
-    to_ds: &Dataset,
+    table_store: &TableStore,
+    from_ds: &lance::Dataset,
+    to_ds: &lance::Dataset,
     is_edge: bool,
 ) -> Result<Vec<EntityChange>> {
     let cols: Vec<&str> = if is_edge {
@@ -484,8 +465,8 @@ async fn deleted_ids_by_set_diff(
         vec!["id"]
     };
 
-    let from_rows = scan_id_set(from_ds, &cols).await?;
-    let to_ids: HashSet<String> = scan_id_set(to_ds, &["id"])
+    let from_rows = scan_id_set(table_store, from_ds, &cols).await?;
+    let to_ids: HashSet<String> = scan_id_set(table_store, to_ds, &["id"])
         .await?
         .into_iter()
         .map(|r| r.id)
@@ -498,19 +479,12 @@ async fn deleted_ids_by_set_diff(
         .collect())
 }
 
-async fn scan_id_set(ds: &Dataset, cols: &[&str]) -> Result<Vec<ScannedRow>> {
-    let mut scanner = ds.scan();
-    scanner
-        .project(cols)
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
-    let stream = scanner
-        .try_into_stream()
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
-    let batches: Vec<RecordBatch> = stream
-        .try_collect()
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+async fn scan_id_set(
+    table_store: &TableStore,
+    ds: &lance::Dataset,
+    cols: &[&str],
+) -> Result<Vec<ScannedRow>> {
+    let batches = table_store.scan(ds, Some(cols), None, None).await?;
     Ok(extract_rows(&batches))
 }
 
@@ -522,6 +496,7 @@ struct ScannedRow {
     src: Option<String>,
     dst: Option<String>,
     signature: String,
+    change_version: Option<u64>,
 }
 
 fn extract_rows(batches: &[RecordBatch]) -> Vec<ScannedRow> {
@@ -543,6 +518,10 @@ fn extract_rows(batches: &[RecordBatch]) -> Vec<ScannedRow> {
                 src: srcs.map(|a| a.value(i).to_string()),
                 dst: dsts.map(|a| a.value(i).to_string()),
                 signature: String::new(),
+                change_version: batch
+                    .column_by_name("_row_last_updated_at_version")
+                    .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+                    .map(|versions| versions.value(i)),
             });
         }
     }
@@ -582,6 +561,10 @@ fn extract_rows_with_signature(batches: &[RecordBatch], is_edge: bool) -> Vec<Sc
                 src: srcs.map(|a| a.value(i).to_string()),
                 dst: dsts.map(|a| a.value(i).to_string()),
                 signature: values.join("\x1f"),
+                change_version: batch
+                    .column_by_name("_row_last_updated_at_version")
+                    .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+                    .map(|versions| versions.value(i)),
             });
         }
     }
@@ -599,7 +582,7 @@ fn entity_change_from_row(row: &ScannedRow, op: ChangeOp, is_edge: bool) -> Enti
         type_name: String::new(),
         id: row.id.clone(),
         op,
-        manifest_version: 0,
+        manifest_version: row.change_version.unwrap_or(0),
         endpoints: if is_edge {
             Some(Endpoints {
                 src: row.src.clone().unwrap_or_default(),
@@ -610,4 +593,3 @@ fn entity_change_from_row(row: &ScannedRow, op: ChangeOp, is_edge: bool) -> Enti
         },
     }
 }
-

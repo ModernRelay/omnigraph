@@ -7,7 +7,7 @@ use futures::TryStreamExt;
 use lance_index::{DatasetIndexExt, is_system_index};
 
 use omnigraph::db::commit_graph::CommitGraph;
-use omnigraph::db::{MergeOutcome, Omnigraph};
+use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
 use omnigraph::error::{MergeConflictKind, OmniError};
 use omnigraph::loader::{LoadMode, load_jsonl};
 
@@ -82,6 +82,118 @@ async fn branch_create_open_list_and_lazy_branching_work() {
         .await
         .unwrap();
     assert_eq!(qr, 4);
+}
+
+#[tokio::test]
+async fn explicit_target_query_reads_multiple_branches_from_one_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    db.branch_create("feature").await.unwrap();
+    db.mutate(
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+
+    let main_qr = db
+        .query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "Eve")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(main_qr.num_rows(), 0);
+
+    let feature_qr = db
+        .query(
+            ReadTarget::branch("feature"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "Eve")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(feature_qr.num_rows(), 1);
+}
+
+#[tokio::test]
+async fn resolved_snapshot_stays_pinned_after_branch_advances() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let snapshot_id = db.resolve_snapshot("main").await.unwrap();
+    db.run_mutation(
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+
+    let pinned = db
+        .query(
+            ReadTarget::Snapshot(snapshot_id.clone()),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "Eve")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pinned.num_rows(), 0);
+
+    let head = db
+        .query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "Eve")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(head.num_rows(), 1);
+}
+
+#[tokio::test]
+async fn explicit_target_load_writes_to_named_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    db.branch_create("feature").await.unwrap();
+    db.load(
+        "feature",
+        r#"{"type":"Person","data":{"name":"Eve","age":22}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+
+    let main_qr = db
+        .query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "Eve")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(main_qr.num_rows(), 0);
+
+    let feature_qr = db
+        .query(
+            ReadTarget::branch("feature"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "Eve")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(feature_qr.num_rows(), 1);
 }
 
 #[tokio::test]

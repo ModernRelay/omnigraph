@@ -27,37 +27,39 @@ use omnigraph_compiler::query::typecheck::{CheckedQuery, typecheck_query, typech
 use omnigraph_compiler::result::{MutationResult, QueryResult};
 use omnigraph_compiler::types::Direction;
 
-use crate::db::Snapshot;
 use crate::db::commit_graph::CommitGraph;
 use crate::db::manifest::ManifestCoordinator;
 use crate::db::{MergeOutcome, Omnigraph};
+use crate::db::{ReadTarget, Snapshot};
 use crate::error::{MergeConflict, MergeConflictKind, OmniError, Result};
 use crate::graph_index::GraphIndex;
 use tempfile::{Builder as TempDirBuilder, TempDir};
 
 impl Omnigraph {
-    /// Run a named query from a .gq query source string.
-    pub async fn run_query(
+    /// Run a named query against an explicit branch or snapshot target.
+    pub async fn query(
         &mut self,
+        target: impl Into<ReadTarget>,
         query_source: &str,
         query_name: &str,
         params: &ParamMap,
     ) -> Result<QueryResult> {
-        let snapshot = self.snapshot();
+        let resolved = self.resolved_target(target).await?;
 
-        // Parse → typecheck → lower
         let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
             .map_err(|e| OmniError::Manifest(e.to_string()))?;
         let type_ctx = typecheck_query(self.catalog(), &query_decl)?;
         let ir = lower_query(self.catalog(), &query_decl, &type_ctx)?;
 
-        // Build graph index if the query needs traversal
         let needs_graph = ir
             .pipeline
             .iter()
             .any(|op| matches!(op, IROp::Expand { .. } | IROp::AntiJoin { .. }));
         let graph_index = if needs_graph {
-            Some(self.graph_index().await?)
+            Some(
+                self.graph_index_for_target(resolved.requested.clone())
+                    .await?,
+            )
         } else {
             None
         };
@@ -65,9 +67,25 @@ impl Omnigraph {
         execute_query(
             &ir,
             params,
-            &snapshot,
+            &resolved.snapshot,
             graph_index.as_deref(),
             self.catalog(),
+        )
+        .await
+    }
+
+    /// Run a named query from a .gq query source string.
+    pub async fn run_query(
+        &mut self,
+        query_source: &str,
+        query_name: &str,
+        params: &ParamMap,
+    ) -> Result<QueryResult> {
+        self.query(
+            ReadTarget::Branch(self.active_branch().unwrap_or("main").to_string()),
+            query_source,
+            query_name,
+            params,
         )
         .await
     }
@@ -2658,6 +2676,23 @@ fn apply_assignments(
 // ─── Mutation execution ──────────────────────────────────────────────────────
 
 impl Omnigraph {
+    pub async fn mutate(
+        &mut self,
+        branch: &str,
+        query_source: &str,
+        query_name: &str,
+        params: &ParamMap,
+    ) -> Result<MutationResult> {
+        let requested = Self::normalize_branch_name(branch)?;
+        let current = self.active_branch().map(str::to_string);
+        if requested == current {
+            return self.run_mutation(query_source, query_name, params).await;
+        }
+
+        let mut other = self.reopen_for_branch(requested.as_deref()).await?;
+        other.run_mutation(query_source, query_name, params).await
+    }
+
     /// Run a named mutation from a .gq query source string.
     pub async fn run_mutation(
         &mut self,
@@ -2709,14 +2744,8 @@ impl Omnigraph {
             ));
         }
 
-        let mut source_db = match source_branch.as_deref() {
-            Some(branch) => Omnigraph::open_branch(self.uri(), branch).await?,
-            None => Omnigraph::open(self.uri()).await?,
-        };
-        let mut target_db = match target_branch.as_deref() {
-            Some(branch) => Omnigraph::open_branch(self.uri(), branch).await?,
-            None => Omnigraph::open(self.uri()).await?,
-        };
+        let mut source_db = self.reopen_for_branch(source_branch.as_deref()).await?;
+        let mut target_db = self.reopen_for_branch(target_branch.as_deref()).await?;
 
         source_db.ensure_commit_graph_initialized().await?;
         target_db.ensure_commit_graph_initialized().await?;

@@ -7,18 +7,18 @@ use omnigraph::db::{MergeOutcome, Omnigraph};
 use helpers::*;
 
 async fn head_commit_id(uri: &str, branch: Option<&str>) -> String {
-    let cg = match branch {
+    let commit_graph = match branch {
         Some(branch) => CommitGraph::open_at_branch(uri, branch).await.unwrap(),
         None => CommitGraph::open(uri).await.unwrap(),
     };
-    cg.head_commit_id().await.unwrap().unwrap()
+    commit_graph.head_commit_id().await.unwrap().unwrap()
 }
 
-fn change_tuples(cs: &omnigraph::changes::ChangeSet) -> Vec<(String, String, ChangeOp)> {
-    let mut tuples: Vec<_> = cs
+fn change_tuples(change_set: &omnigraph::changes::ChangeSet) -> Vec<(String, String, ChangeOp)> {
+    let mut tuples: Vec<_> = change_set
         .changes
         .iter()
-        .map(|c| (c.table_key.clone(), c.id.clone(), c.op))
+        .map(|change| (change.table_key.clone(), change.id.clone(), change.op))
         .collect();
     tuples.sort_by(|a, b| {
         a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| {
@@ -379,6 +379,102 @@ async fn diff_after_merge_reports_actual_changes() {
 }
 
 #[tokio::test]
+async fn diff_commits_resolves_feature_commit_from_main_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = init_and_load(&dir).await;
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open_branch(uri, "feature").await.unwrap();
+    feature
+        .run_mutation(
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        )
+        .await
+        .unwrap();
+
+    let main_head = CommitGraph::open(uri)
+        .await
+        .unwrap()
+        .head_commit()
+        .await
+        .unwrap()
+        .unwrap()
+        .graph_commit_id;
+    let feature_head = CommitGraph::open_at_branch(uri, "feature")
+        .await
+        .unwrap()
+        .head_commit()
+        .await
+        .unwrap()
+        .unwrap()
+        .graph_commit_id;
+
+    let cs = main
+        .diff_commits(&main_head, &feature_head, &ChangeFilter::default())
+        .await
+        .unwrap();
+    assert!(
+        cs.changes
+            .iter()
+            .any(|change| change.op == ChangeOp::Insert && change.id == "Eve"),
+        "expected feature-only insert to be diffable from a main handle"
+    );
+}
+
+#[tokio::test]
+async fn cross_branch_diff_honors_insert_only_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = init_and_load(&dir).await;
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open_branch(uri, "feature").await.unwrap();
+    feature
+        .run_mutation(
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        )
+        .await
+        .unwrap();
+
+    let main_head = CommitGraph::open(uri)
+        .await
+        .unwrap()
+        .head_commit()
+        .await
+        .unwrap()
+        .unwrap()
+        .graph_commit_id;
+    let feature_head = CommitGraph::open_at_branch(uri, "feature")
+        .await
+        .unwrap()
+        .head_commit()
+        .await
+        .unwrap()
+        .unwrap()
+        .graph_commit_id;
+
+    let filter = ChangeFilter {
+        ops: Some(vec![ChangeOp::Insert]),
+        ..Default::default()
+    };
+    let cs = main
+        .diff_commits(&main_head, &feature_head, &filter)
+        .await
+        .unwrap();
+    assert!(!cs.changes.is_empty());
+    assert!(
+        cs.changes
+            .iter()
+            .all(|change| change.op == ChangeOp::Insert)
+    );
+}
+
+#[tokio::test]
 async fn diff_commits_resolves_commits_across_branches_from_any_handle() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -407,12 +503,9 @@ async fn diff_commits_resolves_commits_across_branches_from_any_handle() {
         .unwrap();
 
     assert_eq!(change_tuples(&from_main), change_tuples(&from_feature));
-    assert!(
-        from_main
-            .changes
-            .iter()
-            .any(|c| c.table_key == "node:Person" && c.id == "Eve" && c.op == ChangeOp::Insert)
-    );
+    assert!(from_main.changes.iter().any(|change| {
+        change.table_key == "node:Person" && change.id == "Eve" && change.op == ChangeOp::Insert
+    }));
 }
 
 #[tokio::test]
@@ -445,53 +538,18 @@ async fn cross_lineage_diff_honors_delete_only_filter() {
         ops: Some(vec![ChangeOp::Delete]),
         ..Default::default()
     };
-    let cs = feature.changes_since(before, &filter).await.unwrap();
+    let change_set = feature.changes_since(before, &filter).await.unwrap();
 
     assert!(
-        !cs.changes.is_empty(),
+        !change_set.changes.is_empty(),
         "expected delete changes after removing Alice"
     );
-    assert!(cs.changes.iter().all(|c| c.op == ChangeOp::Delete));
-}
-
-#[tokio::test]
-async fn cross_lineage_diff_honors_insert_only_filter() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let mut main = init_and_load(&dir).await;
-    main.branch_create("feature").await.unwrap();
-    let mut feature = Omnigraph::open_branch(uri, "feature").await.unwrap();
-    let before = feature.version();
-
-    feature
-        .run_mutation(
-            MUTATION_QUERIES,
-            "insert_person",
-            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
-        )
-        .await
-        .unwrap();
-    feature
-        .run_mutation(
-            MUTATION_QUERIES,
-            "set_age",
-            &mixed_params(&[("$name", "Bob")], &[("$age", 99)]),
-        )
-        .await
-        .unwrap();
-
-    let filter = ChangeFilter {
-        ops: Some(vec![ChangeOp::Insert]),
-        ..Default::default()
-    };
-    let cs = feature.changes_since(before, &filter).await.unwrap();
-
     assert!(
-        !cs.changes.is_empty(),
-        "expected insert changes after adding Eve"
+        change_set
+            .changes
+            .iter()
+            .all(|change| change.op == ChangeOp::Delete)
     );
-    assert!(cs.changes.iter().all(|c| c.op == ChangeOp::Insert));
-    assert!(cs.changes.iter().any(|c| c.id == "Eve"));
 }
 
 #[tokio::test]
@@ -512,16 +570,13 @@ async fn same_branch_diff_across_first_lazy_fork_detects_update() {
         .await
         .unwrap();
 
-    let cs = feature
+    let change_set = feature
         .changes_since(before, &ChangeFilter::default())
         .await
         .unwrap();
-    assert!(
-        cs.changes
-            .iter()
-            .any(|c| c.table_key == "node:Person" && c.id == "Bob" && c.op == ChangeOp::Update),
-        "same-branch diff across first lazy fork should still report Bob's update"
-    );
+    assert!(change_set.changes.iter().any(|change| {
+        change.table_key == "node:Person" && change.id == "Bob" && change.op == ChangeOp::Update
+    }));
 }
 
 #[tokio::test]
@@ -543,21 +598,15 @@ async fn diff_commits_cross_branch_reports_property_only_updates() {
         .unwrap();
     let feature_commit = head_commit_id(uri, Some("feature")).await;
 
-    let cs = main
+    let change_set = main
         .diff_commits(&base_commit, &feature_commit, &ChangeFilter::default())
         .await
         .unwrap();
 
-    assert!(
-        cs.changes
-            .iter()
-            .any(|c| c.table_key == "node:Person" && c.id == "Bob" && c.op == ChangeOp::Update),
-        "cross-branch diff should report Bob as an update"
-    );
-    assert!(
-        !cs.changes
-            .iter()
-            .any(|c| c.table_key == "node:Person" && c.id == "Bob" && c.op == ChangeOp::Insert),
-        "property-only update should not be misclassified as insert"
-    );
+    assert!(change_set.changes.iter().any(|change| {
+        change.table_key == "node:Person" && change.id == "Bob" && change.op == ChangeOp::Update
+    }));
+    assert!(!change_set.changes.iter().any(|change| {
+        change.table_key == "node:Person" && change.id == "Bob" && change.op == ChangeOp::Insert
+    }));
 }

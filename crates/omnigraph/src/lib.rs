@@ -5,3 +5,6 @@ mod exec;
 pub mod failpoints;
 pub mod graph_index;
 pub mod loader;
+pub mod runtime_cache;
+pub mod storage;
+pub mod table_store;

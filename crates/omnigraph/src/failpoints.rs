@@ -1,13 +1,11 @@
 use crate::error::Result;
-#[cfg(feature = "failpoints")]
-use crate::error::OmniError;
 
 pub(crate) fn maybe_fail(_name: &str) -> Result<()> {
     #[cfg(feature = "failpoints")]
     {
         let name = _name;
         fail::fail_point!(name, |_| {
-            return Err(OmniError::Manifest(format!(
+            return Err(crate::error::OmniError::Manifest(format!(
                 "injected failpoint triggered: {}",
                 name
             )));

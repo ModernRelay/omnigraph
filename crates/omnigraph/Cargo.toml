@@ -7,7 +7,7 @@ license = "MIT"
 
 [features]
 default = []
-failpoints = ["dep:fail"]
+failpoints = ["dep:fail", "fail/failpoints"]
 
 [dependencies]
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.1.0" }

@@ -48,6 +48,35 @@ pub async fn load_jsonl_file(db: &mut Omnigraph, path: &str, mode: LoadMode) -> 
     load_jsonl_reader(db, reader, mode).await
 }
 
+impl Omnigraph {
+    pub async fn load(&mut self, branch: &str, data: &str, mode: LoadMode) -> Result<LoadResult> {
+        let requested = Self::normalize_branch_name(branch)?;
+        let current = self.active_branch().map(str::to_string);
+        if requested == current {
+            return load_jsonl(self, data, mode).await;
+        }
+
+        let mut other = self.reopen_for_branch(requested.as_deref()).await?;
+        load_jsonl(&mut other, data, mode).await
+    }
+
+    pub async fn load_file(
+        &mut self,
+        branch: &str,
+        path: &str,
+        mode: LoadMode,
+    ) -> Result<LoadResult> {
+        let requested = Self::normalize_branch_name(branch)?;
+        let current = self.active_branch().map(str::to_string);
+        if requested == current {
+            return load_jsonl_file(self, path, mode).await;
+        }
+
+        let mut other = self.reopen_for_branch(requested.as_deref()).await?;
+        load_jsonl_file(&mut other, path, mode).await
+    }
+}
+
 async fn load_jsonl_reader<R: BufRead>(
     db: &mut Omnigraph,
     reader: R,

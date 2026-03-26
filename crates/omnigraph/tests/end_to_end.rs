@@ -3,7 +3,7 @@ mod helpers;
 use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
 
-use omnigraph::db::Omnigraph;
+use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::{LoadMode, load_jsonl, load_jsonl_file};
 use omnigraph_compiler::ir::ParamMap;
 
@@ -101,6 +101,34 @@ async fn node_properties_are_correct() {
     // Find Alice's row and check age
     let alice_idx = (0..ids.len()).find(|&i| ids.value(i) == "Alice").unwrap();
     assert_eq!(ages.value(alice_idx), 30);
+}
+
+#[tokio::test]
+async fn entity_at_returns_typed_json_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema = r#"
+node Flagged {
+    slug: String @key
+    active: Bool
+    rating: I32?
+}
+"#;
+    let data = r#"{"type":"Flagged","data":{"slug":"alpha","active":true,"rating":42}}"#;
+
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let entity = db
+        .entity_at_target(ReadTarget::branch("main"), "node:Flagged", "alpha")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(entity["id"], serde_json::json!("alpha"));
+    assert_eq!(entity["active"], serde_json::json!(true));
+    assert_eq!(entity["rating"], serde_json::json!(42));
 }
 
 #[tokio::test]

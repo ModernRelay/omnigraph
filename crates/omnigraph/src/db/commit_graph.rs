@@ -1,5 +1,4 @@
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -64,14 +63,6 @@ impl CommitGraph {
         })
     }
 
-    pub async fn open_if_exists(root_uri: &str) -> Result<Option<Self>> {
-        let root = root_uri.trim_end_matches('/');
-        if !Path::new(&graph_commits_uri(root)).exists() {
-            return Ok(None);
-        }
-        Ok(Some(Self::open(root).await?))
-    }
-
     pub async fn open(root_uri: &str) -> Result<Self> {
         let root = root_uri.trim_end_matches('/');
         let dataset = Dataset::open(&graph_commits_uri(root))
@@ -98,14 +89,6 @@ impl CommitGraph {
             dataset,
             active_branch: Some(branch.to_string()),
         })
-    }
-
-    pub async fn ensure_initialized(root_uri: &str, manifest_version: u64) -> Result<()> {
-        if Path::new(&graph_commits_uri(root_uri.trim_end_matches('/'))).exists() {
-            return Ok(());
-        }
-        let _ = Self::init(root_uri, manifest_version).await?;
-        Ok(())
     }
 
     pub async fn refresh(&mut self) -> Result<()> {
