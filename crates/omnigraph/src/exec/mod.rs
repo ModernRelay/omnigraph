@@ -336,8 +336,7 @@ async fn compute_source_delta(
     let schema = schema_for_table_key(catalog, table_key)?;
     let mut full_writer =
         StagedTableWriter::new(&format!("{}_adopt_full", table_key), schema.clone())?;
-    let mut delta_writer =
-        StagedTableWriter::new(&format!("{}_adopt_delta", table_key), schema)?;
+    let mut delta_writer = StagedTableWriter::new(&format!("{}_adopt_delta", table_key), schema)?;
     let mut deleted_ids: Vec<String> = Vec::new();
     let mut base = OrderedTableCursor::from_snapshot(base_snapshot, table_key).await?;
     let mut source = OrderedTableCursor::from_snapshot(source_snapshot, table_key).await?;
@@ -360,12 +359,11 @@ async fn compute_source_delta(
         } else {
             None
         };
-        let source_row =
-            if source_row.as_ref().map(|r| r.id.as_str()) == Some(next_id.as_str()) {
-                source.pop().await?
-            } else {
-                None
-            };
+        let source_row = if source_row.as_ref().map(|r| r.id.as_str()) == Some(next_id.as_str()) {
+            source.pop().await?
+        } else {
+            None
+        };
 
         let base_sig = base_row.as_ref().map(|r| r.signature.as_str());
         let source_sig = source_row.as_ref().map(|r| r.signature.as_str());
@@ -434,10 +432,8 @@ async fn stage_streaming_table_merge(
     conflicts: &mut Vec<MergeConflict>,
 ) -> Result<Option<StagedMergeResult>> {
     let schema = schema_for_table_key(catalog, table_key)?;
-    let mut full_writer =
-        StagedTableWriter::new(&format!("{}_full", table_key), schema.clone())?;
-    let mut delta_writer =
-        StagedTableWriter::new(&format!("{}_delta", table_key), schema)?;
+    let mut full_writer = StagedTableWriter::new(&format!("{}_full", table_key), schema.clone())?;
+    let mut delta_writer = StagedTableWriter::new(&format!("{}_delta", table_key), schema)?;
     let mut deleted_ids: Vec<String> = Vec::new();
     let mut base = OrderedTableCursor::from_snapshot(base_snapshot, table_key).await?;
     let mut source = OrderedTableCursor::from_snapshot(source_snapshot, table_key).await?;
@@ -907,49 +903,6 @@ fn row_id_at(batch: &RecordBatch, row: usize) -> Result<String> {
     Ok(ids.value(row).to_string())
 }
 
-async fn rewrite_target_table_from_dataset(
-    target_db: &Omnigraph,
-    table_key: &str,
-    source_ds: &Dataset,
-) -> Result<crate::db::SubTableUpdate> {
-    let (mut ds, _full_path, table_branch) = target_db.open_for_mutation(table_key).await?;
-    ds.truncate_table()
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
-
-    let mut stream = scan_table_batches(source_ds).await?;
-    while let Some(batch) = stream
-        .try_next()
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?
-    {
-        if batch.num_rows() == 0 {
-            continue;
-        }
-        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
-        ds.append(reader, None)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-    }
-
-    let row_count = ds
-        .count_rows(None)
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
-    if row_count > 0 {
-        target_db
-            .build_indices_on_dataset(table_key, &mut ds)
-            .await?;
-    }
-
-    Ok(crate::db::SubTableUpdate {
-        table_key: table_key.to_string(),
-        table_version: ds.version().version,
-        table_branch,
-        row_count,
-    })
-}
-
 async fn publish_adopted_source_state(
     target_db: &Omnigraph,
     catalog: &Catalog,
@@ -987,9 +940,7 @@ async fn publish_adopted_source_state(
             let delta =
                 compute_source_delta(table_key, catalog, base_snapshot, source_snapshot).await?;
             match delta {
-                Some(staged) => {
-                    publish_rewritten_merge_table(target_db, table_key, &staged).await
-                }
+                Some(staged) => publish_rewritten_merge_table(target_db, table_key, &staged).await,
                 None => Ok(crate::db::SubTableUpdate {
                     table_key: table_key.to_string(),
                     table_version: target_entry
@@ -1002,9 +953,7 @@ async fn publish_adopted_source_state(
         }
         // Both on branches
         (Some(target_branch), Some(source_branch)) => {
-            if target_entry.and_then(|entry| entry.table_branch.as_deref())
-                == Some(target_branch)
-            {
+            if target_entry.and_then(|entry| entry.table_branch.as_deref()) == Some(target_branch) {
                 // Target already owns this table — apply delta onto its lineage
                 let delta =
                     compute_source_delta(table_key, catalog, base_snapshot, source_snapshot)
@@ -1070,15 +1019,12 @@ async fn publish_rewritten_merge_table(
             let schema = batches[0].as_ref().unwrap().schema();
             let reader = RecordBatchIterator::new(batches, schema);
             let ds_arc = std::sync::Arc::new(current_ds);
-            let job = lance::dataset::MergeInsertBuilder::try_new(
-                ds_arc,
-                vec!["id".to_string()],
-            )
-            .map_err(|e| OmniError::Lance(e.to_string()))?
-            .when_matched(lance::dataset::WhenMatched::UpdateAll)
-            .when_not_matched(lance::dataset::WhenNotMatched::InsertAll)
-            .try_build()
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            let job = lance::dataset::MergeInsertBuilder::try_new(ds_arc, vec!["id".to_string()])
+                .map_err(|e| OmniError::Lance(e.to_string()))?
+                .when_matched(lance::dataset::WhenMatched::UpdateAll)
+                .when_not_matched(lance::dataset::WhenNotMatched::InsertAll)
+                .try_build()
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
             let (new_ds, _stats) = job
                 .execute(lance_datafusion::utils::reader_to_stream(Box::new(reader)))
                 .await

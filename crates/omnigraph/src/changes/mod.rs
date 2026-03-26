@@ -1,13 +1,13 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-use arrow_array::{Array, RecordBatch, StringArray, UInt64Array};
+use arrow_array::{Array, RecordBatch, StringArray};
 use arrow_cast::display::array_value_to_string;
 use futures::TryStreamExt;
-use lance::dataset::scanner::ColumnOrdering;
 use lance::Dataset;
+use lance::dataset::scanner::ColumnOrdering;
 
-use crate::db::manifest::Snapshot;
 use crate::db::SubTableEntry;
+use crate::db::manifest::Snapshot;
 use crate::error::{OmniError, Result};
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -151,12 +151,16 @@ pub async fn diff_snapshots(
         } else if same_lineage(from_entry, to_entry) {
             // Fast path: version-column diff
             diff_table_same_lineage(
-                root_uri, from_entry.unwrap(), to_entry.unwrap(), is_edge, filter,
+                root_uri,
+                from_entry.unwrap(),
+                to_entry.unwrap(),
+                is_edge,
+                filter,
             )
             .await?
         } else {
             // Cross-branch path: streaming ID-based diff
-            diff_table_cross_branch(root_uri, from, to, table_key, is_edge).await?
+            diff_table_cross_branch(from, to, table_key, is_edge, filter).await?
         };
 
         for mut c in table_changes {
@@ -286,11 +290,11 @@ async fn diff_table_same_lineage(
 // ─── Cross-branch path: streaming ID-based diff ────────────────────────────
 
 async fn diff_table_cross_branch(
-    root_uri: &str,
     from_snap: &Snapshot,
     to_snap: &Snapshot,
     table_key: &str,
     is_edge: bool,
+    filter: &ChangeFilter,
 ) -> Result<Vec<EntityChange>> {
     let from_ds = from_snap.open(table_key).await?;
     let to_ds = to_snap.open(table_key).await?;
@@ -309,26 +313,32 @@ async fn diff_table_cross_branch(
         match (from_id, to_id) {
             (Some(fid), Some(tid)) if fid < tid => {
                 // ID only in from → Delete
-                changes.push(entity_change_from_scanned_row(
-                    &from_rows[fi],
-                    ChangeOp::Delete,
-                    is_edge,
-                ));
+                if filter.wants_op(ChangeOp::Delete) {
+                    changes.push(entity_change_from_row(
+                        &from_rows[fi],
+                        ChangeOp::Delete,
+                        is_edge,
+                    ));
+                }
                 fi += 1;
             }
             (Some(fid), Some(tid)) if fid > tid => {
                 // ID only in to → Insert
-                changes.push(entity_change_from_scanned_row(
-                    &to_rows[ti],
-                    ChangeOp::Insert,
-                    is_edge,
-                ));
+                if filter.wants_op(ChangeOp::Insert) {
+                    changes.push(entity_change_from_row(
+                        &to_rows[ti],
+                        ChangeOp::Insert,
+                        is_edge,
+                    ));
+                }
                 ti += 1;
             }
             (Some(_), Some(_)) => {
                 // Same ID — check signature
-                if from_rows[fi].signature != to_rows[ti].signature {
-                    changes.push(entity_change_from_scanned_row(
+                if from_rows[fi].signature != to_rows[ti].signature
+                    && filter.wants_op(ChangeOp::Update)
+                {
+                    changes.push(entity_change_from_row(
                         &to_rows[ti],
                         ChangeOp::Update,
                         is_edge,
@@ -338,19 +348,23 @@ async fn diff_table_cross_branch(
                 ti += 1;
             }
             (Some(_), None) => {
-                changes.push(entity_change_from_scanned_row(
-                    &from_rows[fi],
-                    ChangeOp::Delete,
-                    is_edge,
-                ));
+                if filter.wants_op(ChangeOp::Delete) {
+                    changes.push(entity_change_from_row(
+                        &from_rows[fi],
+                        ChangeOp::Delete,
+                        is_edge,
+                    ));
+                }
                 fi += 1;
             }
             (None, Some(_)) => {
-                changes.push(entity_change_from_scanned_row(
-                    &to_rows[ti],
-                    ChangeOp::Insert,
-                    is_edge,
-                ));
+                if filter.wants_op(ChangeOp::Insert) {
+                    changes.push(entity_change_from_row(
+                        &to_rows[ti],
+                        ChangeOp::Insert,
+                        is_edge,
+                    ));
+                }
                 ti += 1;
             }
             (None, None) => break,
@@ -376,7 +390,7 @@ async fn diff_table_added(
     let rows = scan_all_rows_ordered(&ds, is_edge).await?;
     Ok(rows
         .into_iter()
-        .map(|r| entity_change_from_scanned_row(&r, ChangeOp::Insert, is_edge))
+        .map(|r| entity_change_from_row(&r, ChangeOp::Insert, is_edge))
         .collect())
 }
 
@@ -394,7 +408,7 @@ async fn diff_table_removed(
     let rows = scan_all_rows_ordered(&ds, is_edge).await?;
     Ok(rows
         .into_iter()
-        .map(|r| entity_change_from_scanned_row(&r, ChangeOp::Delete, is_edge))
+        .map(|r| entity_change_from_row(&r, ChangeOp::Delete, is_edge))
         .collect())
 }
 
@@ -445,9 +459,7 @@ async fn scan_with_filter(
 async fn scan_all_rows_ordered(ds: &Dataset, is_edge: bool) -> Result<Vec<ScannedRow>> {
     let mut scanner = ds.scan();
     scanner
-        .order_by(Some(vec![ColumnOrdering::asc_nulls_last(
-            "id".to_string(),
-        )]))
+        .order_by(Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]))
         .map_err(|e| OmniError::Lance(e.to_string()))?;
     let stream = scanner
         .try_into_stream()
@@ -482,7 +494,7 @@ async fn deleted_ids_by_set_diff(
     Ok(from_rows
         .into_iter()
         .filter(|r| !to_ids.contains(&r.id))
-        .map(|r| entity_change_from_scanned_row(&r, ChangeOp::Delete, is_edge))
+        .map(|r| entity_change_from_row(&r, ChangeOp::Delete, is_edge))
         .collect())
 }
 
@@ -579,7 +591,11 @@ fn extract_rows_with_signature(batches: &[RecordBatch], is_edge: bool) -> Vec<Sc
 fn entity_change_from_row(row: &ScannedRow, op: ChangeOp, is_edge: bool) -> EntityChange {
     EntityChange {
         table_key: String::new(),
-        kind: if is_edge { EntityKind::Edge } else { EntityKind::Node },
+        kind: if is_edge {
+            EntityKind::Edge
+        } else {
+            EntityKind::Node
+        },
         type_name: String::new(),
         id: row.id.clone(),
         op,
@@ -595,10 +611,3 @@ fn entity_change_from_row(row: &ScannedRow, op: ChangeOp, is_edge: bool) -> Enti
     }
 }
 
-fn entity_change_from_scanned_row(
-    row: &ScannedRow,
-    op: ChangeOp,
-    is_edge: bool,
-) -> EntityChange {
-    entity_change_from_row(row, op, is_edge)
-}

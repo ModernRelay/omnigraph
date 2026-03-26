@@ -104,10 +104,14 @@ Read queries go through:
 - Search execution for FTS, fuzzy, BM25, nearest, and RRF
 - Mutations: insert, update, delete, node delete cascade to edges
 - Blob schema fixup and blob read support
+- Lance-native branching, merge with three-way diff, merge-base resolution via graph commit DAG
+- Surgical merge publish via merge_insert + delete (preserves row version metadata)
+- Change detection: two-path lineage-aware diff (version columns for same-branch, ID-based for cross-branch)
+- Change detection API: diff(), changes_since(), diff_commits(), entity_at(), snapshot_at_version()
 
 ## Important Current Limits
 
-- Branching is planned in docs but not implemented in the runtime yet
+- Point-in-time query execution (`run_query_at`) is designed but not yet implemented
 - CLI subcommands are mostly stubs
 - `init`/`open` currently use local filesystem paths; `s3://` support is not wired up yet
 - There are stale files under `crates/omnigraph/src/loader/` from an older design; the live exported loader is `crates/omnigraph/src/loader/mod.rs`
@@ -139,7 +143,9 @@ Treat these as historical/stale unless you are explicitly reviving them:
 - `crates/omnigraph/src/exec/mod.rs` — query and mutation executor
 - `crates/omnigraph/src/graph_index/mod.rs` — dense ID map plus CSR/CSC traversal index
 - `crates/omnigraph/src/loader/mod.rs` — active JSONL loader
-- `crates/omnigraph-cli/src/main.rs` — current CLI surface
+- `crates/omnigraph/src/changes/mod.rs` — change detection (diff_snapshots, ChangeSet, two-path lineage-aware diff)
+- `crates/omnigraph/src/db/commit_graph.rs` — graph commit DAG for merge-base resolution
+- `crates/omnigraph-cli/src/main.rs` — current CLI surface (stubbed)
 
 ## Toolchain & Conventions
 

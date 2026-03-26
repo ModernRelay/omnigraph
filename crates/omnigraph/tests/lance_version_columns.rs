@@ -35,13 +35,21 @@ async fn create_test_dataset(uri: &str) -> Dataset {
     Dataset::write(reader, uri, Some(params)).await.unwrap()
 }
 
-fn read_version_columns(
-    batches: &[RecordBatch],
-) -> Vec<(String, i32, u64, u64)> {
+fn read_version_columns(batches: &[RecordBatch]) -> Vec<(String, i32, u64, u64)> {
     let mut rows = Vec::new();
     for batch in batches {
-        let ids = batch.column_by_name("id").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
-        let vals = batch.column_by_name("value").unwrap().as_any().downcast_ref::<Int32Array>().unwrap();
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let vals = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
         let created = batch
             .column_by_name("_row_created_at_version")
             .unwrap()
@@ -70,7 +78,12 @@ fn read_version_columns(
 async fn scan_with_versions(ds: &Dataset) -> Vec<(String, i32, u64, u64)> {
     let mut scanner = ds.scan();
     scanner
-        .project(&["id", "value", "_row_created_at_version", "_row_last_updated_at_version"])
+        .project(&[
+            "id",
+            "value",
+            "_row_created_at_version",
+            "_row_last_updated_at_version",
+        ])
         .unwrap();
     let batches: Vec<RecordBatch> = scanner
         .try_into_stream()
@@ -112,7 +125,10 @@ async fn lance_append_stamps_created_at_version_correctly() {
     let rows = scan_with_versions(&ds).await;
     eprintln!("After append (v1={}, v2={}):", v1, v2);
     for (id, val, created, updated) in &rows {
-        eprintln!("  id={:<10} val={:<4} created_v={:<4} updated_v={}", id, val, created, updated);
+        eprintln!(
+            "  id={:<10} val={:<4} created_v={:<4} updated_v={}",
+            id, val, created, updated
+        );
     }
 
     // Alice and Bob: created at v1
@@ -121,7 +137,10 @@ async fn lance_append_stamps_created_at_version_correctly() {
 
     // Charlie: created at v2 (the append version)
     let charlie = rows.iter().find(|r| r.0 == "charlie").unwrap();
-    assert_eq!(charlie.2, v2, "charlie created_at should be v2 (append version)");
+    assert_eq!(
+        charlie.2, v2,
+        "charlie created_at should be v2 (append version)"
+    );
 }
 
 #[tokio::test]
@@ -163,7 +182,10 @@ async fn lance_merge_insert_new_row_stamps_created_at_version() {
     let rows = scan_with_versions(&new_ds).await;
     eprintln!("After merge_insert NEW eve (v1={}, v2={}):", v1, v2);
     for (id, val, created, updated) in &rows {
-        eprintln!("  id={:<10} val={:<4} created_v={:<4} updated_v={}", id, val, created, updated);
+        eprintln!(
+            "  id={:<10} val={:<4} created_v={:<4} updated_v={}",
+            id, val, created, updated
+        );
     }
 
     let eve = rows.iter().find(|r| r.0 == "eve").unwrap();
@@ -223,7 +245,10 @@ async fn lance_merge_insert_update_preserves_created_at_version() {
     let rows = scan_with_versions(&new_ds).await;
     eprintln!("After merge_insert UPDATE bob (v1={}, v2={}):", v1, v2);
     for (id, val, created, updated) in &rows {
-        eprintln!("  id={:<10} val={:<4} created_v={:<4} updated_v={}", id, val, created, updated);
+        eprintln!(
+            "  id={:<10} val={:<4} created_v={:<4} updated_v={}",
+            id, val, created, updated
+        );
     }
 
     let alice = rows.iter().find(|r| r.0 == "alice").unwrap();
@@ -235,6 +260,9 @@ async fn lance_merge_insert_update_preserves_created_at_version() {
 
     // Bob: updated via merge_insert
     // created_at should be preserved (v1), updated_at should be bumped (v2)
-    eprintln!("Bob: created_at={}, updated_at={}, v1={}, v2={}", bob.2, bob.3, v1, v2);
+    eprintln!(
+        "Bob: created_at={}, updated_at={}, v1={}, v2={}",
+        bob.2, bob.3, v1, v2
+    );
     assert_eq!(bob.1, 99, "bob's value should be updated to 99");
 }

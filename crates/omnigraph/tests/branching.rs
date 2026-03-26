@@ -840,9 +840,7 @@ async fn merged_table_preserves_row_version_for_unchanged_rows() {
     let snap = main.snapshot();
     let ds = snap.open("node:Person").await.unwrap();
     let mut scanner = ds.scan();
-    scanner
-        .project(&["id", "_row_created_at_version"])
-        .unwrap();
+    scanner.project(&["id", "_row_created_at_version"]).unwrap();
     let batches: Vec<_> = scanner
         .try_into_stream()
         .await
@@ -852,7 +850,8 @@ async fn merged_table_preserves_row_version_for_unchanged_rows() {
         .unwrap();
 
     // Collect _row_created_at_version for each person
-    let mut version_by_id: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut version_by_id: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
     for batch in &batches {
         let ids = batch
             .column_by_name("id")
@@ -874,8 +873,7 @@ async fn merged_table_preserves_row_version_for_unchanged_rows() {
     // The key assertion: NOT all rows have the same _row_created_at_version.
     // With truncate+append, all rows would be re-stamped to the merge version.
     // With surgical merge_insert, unchanged rows keep their original version.
-    let unique_versions: std::collections::HashSet<u64> =
-        version_by_id.values().copied().collect();
+    let unique_versions: std::collections::HashSet<u64> = version_by_id.values().copied().collect();
     assert!(
         unique_versions.len() > 1,
         "After surgical merge, rows should have different _row_created_at_version values \
@@ -898,10 +896,7 @@ async fn edge_tables_have_id_btree_after_ensure_indices() {
     let user_indices: Vec<_> = indices.iter().filter(|idx| !is_system_index(idx)).collect();
 
     // Should have BTree on id, src, dst = 3 indices
-    let index_names: Vec<_> = user_indices
-        .iter()
-        .map(|idx| idx.fields.clone())
-        .collect();
+    let index_names: Vec<_> = user_indices.iter().map(|idx| idx.fields.clone()).collect();
     assert!(
         user_indices.len() >= 3,
         "Edge table should have at least 3 indices (id, src, dst), got {:?}",

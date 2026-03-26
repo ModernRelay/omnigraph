@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -18,6 +18,7 @@ use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::types::ScalarType;
 
 use crate::error::{OmniError, Result};
+use crate::failpoints;
 use crate::graph_index::GraphIndex;
 
 use super::commit_graph::CommitGraph;
@@ -217,12 +218,9 @@ impl Omnigraph {
             from_version,
         )
         .await?;
-        let to_snap = ManifestCoordinator::snapshot_at(
-            self.uri(),
-            self.active_branch.as_deref(),
-            to_version,
-        )
-        .await?;
+        let to_snap =
+            ManifestCoordinator::snapshot_at(self.uri(), self.active_branch.as_deref(), to_version)
+                .await?;
         crate::changes::diff_snapshots(self.uri(), &from_snap, &to_snap, filter).await
     }
 
@@ -274,12 +272,9 @@ impl Omnigraph {
         id: &str,
         version: u64,
     ) -> Result<Option<serde_json::Value>> {
-        let snap = ManifestCoordinator::snapshot_at(
-            self.uri(),
-            self.active_branch.as_deref(),
-            version,
-        )
-        .await?;
+        let snap =
+            ManifestCoordinator::snapshot_at(self.uri(), self.active_branch.as_deref(), version)
+                .await?;
         if snap.entry(table_key).is_none() {
             return Ok(None);
         }
@@ -311,12 +306,7 @@ impl Omnigraph {
 
     /// Create a Snapshot at any historical manifest version.
     pub async fn snapshot_at_version(&self, version: u64) -> Result<Snapshot> {
-        ManifestCoordinator::snapshot_at(
-            self.uri(),
-            self.active_branch.as_deref(),
-            version,
-        )
-        .await
+        ManifestCoordinator::snapshot_at(self.uri(), self.active_branch.as_deref(), version).await
     }
 
     async fn resolve_commit(
@@ -326,13 +316,43 @@ impl Omnigraph {
         let cg = self.commit_graph.as_ref().ok_or_else(|| {
             OmniError::Manifest("diff_commits requires _graph_commits.lance".to_string())
         })?;
-        let commits = cg.load_commits().await?;
-        commits
+        if let Some(commit) = cg
+            .load_commits()
+            .await?
             .into_iter()
             .find(|c| c.graph_commit_id == commit_id)
-            .ok_or_else(|| {
-                OmniError::Manifest(format!("commit '{}' not found", commit_id))
-            })
+        {
+            return Ok(commit);
+        }
+
+        let current_branch = self.active_branch.as_deref().unwrap_or("main");
+        let mut searched = HashSet::from([current_branch.to_string()]);
+
+        for branch in self.branch_list().await? {
+            if !searched.insert(branch.clone()) {
+                continue;
+            }
+
+            let branch_graph = if branch == "main" {
+                CommitGraph::open(self.uri()).await?
+            } else {
+                CommitGraph::open_at_branch(self.uri(), &branch).await?
+            };
+
+            if let Some(commit) = branch_graph
+                .load_commits()
+                .await?
+                .into_iter()
+                .find(|c| c.graph_commit_id == commit_id)
+            {
+                return Ok(commit);
+            }
+        }
+
+        Err(OmniError::Manifest(format!(
+            "commit '{}' not found",
+            commit_id
+        )))
     }
 
     // ─── Graph index ──────────────────────────────────────────────────────
@@ -569,6 +589,7 @@ impl Omnigraph {
             .ok_or_else(|| OmniError::Manifest("cannot create branch 'main'".to_string()))?;
         self.ensure_commit_graph_initialized().await?;
         self.manifest.create_branch(&branch).await?;
+        failpoints::maybe_fail("branch_create.after_manifest_branch_create")?;
         if let Some(commit_graph) = &mut self.commit_graph {
             commit_graph.create_branch(&branch).await?;
         }
@@ -850,11 +871,14 @@ impl Omnigraph {
         &mut self,
         updates: &[crate::db::SubTableUpdate],
     ) -> Result<u64> {
-        self.manifest.commit(updates).await
+        let version = self.manifest.commit(updates).await?;
+        failpoints::maybe_fail("graph_publish.after_manifest_commit")?;
+        Ok(version)
     }
 
     pub(crate) async fn record_graph_commit(&mut self, manifest_version: u64) -> Result<()> {
         if let Some(commit_graph) = &mut self.commit_graph {
+            failpoints::maybe_fail("graph_publish.before_commit_append")?;
             commit_graph
                 .append_commit(self.active_branch.as_deref(), manifest_version)
                 .await?;
@@ -871,6 +895,7 @@ impl Omnigraph {
         let commit_graph = self.commit_graph.as_mut().ok_or_else(|| {
             OmniError::Manifest("branch merge requires _graph_commits.lance".to_string())
         })?;
+        failpoints::maybe_fail("graph_publish.before_commit_append")?;
         commit_graph
             .append_merge_commit(
                 self.active_branch.as_deref(),

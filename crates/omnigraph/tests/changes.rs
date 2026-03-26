@@ -1,10 +1,42 @@
 mod helpers;
 
 use omnigraph::changes::{ChangeFilter, ChangeOp, EntityKind};
+use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{MergeOutcome, Omnigraph};
-use omnigraph::loader::{LoadMode, load_jsonl};
 
 use helpers::*;
+
+async fn head_commit_id(uri: &str, branch: Option<&str>) -> String {
+    let cg = match branch {
+        Some(branch) => CommitGraph::open_at_branch(uri, branch).await.unwrap(),
+        None => CommitGraph::open(uri).await.unwrap(),
+    };
+    cg.head_commit_id().await.unwrap().unwrap()
+}
+
+fn change_tuples(cs: &omnigraph::changes::ChangeSet) -> Vec<(String, String, ChangeOp)> {
+    let mut tuples: Vec<_> = cs
+        .changes
+        .iter()
+        .map(|c| (c.table_key.clone(), c.id.clone(), c.op))
+        .collect();
+    tuples.sort_by(|a, b| {
+        a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| {
+            let a_op = match a.2 {
+                ChangeOp::Insert => 0,
+                ChangeOp::Update => 1,
+                ChangeOp::Delete => 2,
+            };
+            let b_op = match b.2 {
+                ChangeOp::Insert => 0,
+                ChangeOp::Update => 1,
+                ChangeOp::Delete => 2,
+            };
+            a_op.cmp(&b_op)
+        })
+    });
+    tuples
+}
 
 // ─── Same-branch diff tests ────────────────────────────────────────────────
 
@@ -46,7 +78,10 @@ async fn diff_detects_node_insert() {
     assert!(
         !inserts.is_empty(),
         "Should detect the Person insert. Got changes: {:?}",
-        cs.changes.iter().map(|c| (&c.table_key, &c.id, c.op)).collect::<Vec<_>>()
+        cs.changes
+            .iter()
+            .map(|c| (&c.table_key, &c.id, c.op))
+            .collect::<Vec<_>>()
     );
     assert!(
         inserts.iter().any(|c| c.id == "Eve"),
@@ -83,7 +118,10 @@ async fn diff_detects_node_update() {
     assert!(
         !updates.is_empty(),
         "Should detect the Person update. Got changes: {:?}",
-        cs.changes.iter().map(|c| (&c.table_key, &c.id, c.op)).collect::<Vec<_>>()
+        cs.changes
+            .iter()
+            .map(|c| (&c.table_key, &c.id, c.op))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -115,7 +153,10 @@ async fn diff_detects_node_delete_with_cascade() {
     assert!(
         !person_deletes.is_empty(),
         "Should detect Person delete. Changes: {:?}",
-        cs.changes.iter().map(|c| (&c.table_key, &c.id, c.op)).collect::<Vec<_>>()
+        cs.changes
+            .iter()
+            .map(|c| (&c.table_key, &c.id, c.op))
+            .collect::<Vec<_>>()
     );
 
     // Should also have edge:Knows cascade deletes
@@ -127,7 +168,10 @@ async fn diff_detects_node_delete_with_cascade() {
     assert!(
         !edge_deletes.is_empty(),
         "Should detect cascaded Knows edge deletes. Changes: {:?}",
-        cs.changes.iter().map(|c| (&c.table_key, &c.id, c.op)).collect::<Vec<_>>()
+        cs.changes
+            .iter()
+            .map(|c| (&c.table_key, &c.id, c.op))
+            .collect::<Vec<_>>()
     );
 
     // Cascaded edge deletes should have endpoints
@@ -166,12 +210,18 @@ async fn diff_detects_edge_insert_with_endpoints() {
     assert!(
         !edge_inserts.is_empty(),
         "Should detect Knows edge insert. Changes: {:?}",
-        cs.changes.iter().map(|c| (&c.table_key, &c.id, c.op)).collect::<Vec<_>>()
+        cs.changes
+            .iter()
+            .map(|c| (&c.table_key, &c.id, c.op))
+            .collect::<Vec<_>>()
     );
 
     let e = &edge_inserts[0];
     assert_eq!(e.kind, EntityKind::Edge);
-    let ep = e.endpoints.as_ref().expect("Edge insert should have endpoints");
+    let ep = e
+        .endpoints
+        .as_ref()
+        .expect("Edge insert should have endpoints");
     assert!(!ep.src.is_empty(), "src should not be empty");
     assert!(!ep.dst.is_empty(), "dst should not be empty");
 }
@@ -202,7 +252,10 @@ async fn filter_by_type_name_skips_non_matching() {
     assert!(
         cs.changes.is_empty(),
         "Filter to Company should skip Person changes. Got: {:?}",
-        cs.changes.iter().map(|c| (&c.table_key, &c.id, c.op)).collect::<Vec<_>>()
+        cs.changes
+            .iter()
+            .map(|c| (&c.table_key, &c.id, c.op))
+            .collect::<Vec<_>>()
     );
 }
 
@@ -242,7 +295,9 @@ async fn filter_by_op_skips_unwanted_operations() {
             c.op,
             ChangeOp::Insert,
             "Filter for Insert-only should not include {:?} for {} ({})",
-            c.op, c.table_key, c.id
+            c.op,
+            c.table_key,
+            c.id
         );
     }
 }
@@ -320,5 +375,189 @@ async fn diff_after_merge_reports_actual_changes() {
     assert!(
         !person_updates.is_empty() || person_inserts.len() > 0,
         "Should detect Bob's age update or Eve's insert"
+    );
+}
+
+#[tokio::test]
+async fn diff_commits_resolves_commits_across_branches_from_any_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = init_and_load(&dir).await;
+    let base_commit = head_commit_id(uri, None).await;
+
+    main.branch_create("feature").await.unwrap();
+    let mut feature = Omnigraph::open_branch(uri, "feature").await.unwrap();
+    feature
+        .run_mutation(
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        )
+        .await
+        .unwrap();
+    let feature_commit = head_commit_id(uri, Some("feature")).await;
+
+    let from_main = main
+        .diff_commits(&base_commit, &feature_commit, &ChangeFilter::default())
+        .await
+        .unwrap();
+    let from_feature = feature
+        .diff_commits(&base_commit, &feature_commit, &ChangeFilter::default())
+        .await
+        .unwrap();
+
+    assert_eq!(change_tuples(&from_main), change_tuples(&from_feature));
+    assert!(
+        from_main
+            .changes
+            .iter()
+            .any(|c| c.table_key == "node:Person" && c.id == "Eve" && c.op == ChangeOp::Insert)
+    );
+}
+
+#[tokio::test]
+async fn cross_lineage_diff_honors_delete_only_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = init_and_load(&dir).await;
+    main.branch_create("feature").await.unwrap();
+    let mut feature = Omnigraph::open_branch(uri, "feature").await.unwrap();
+    let before = feature.version();
+
+    feature
+        .run_mutation(
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Bob")], &[("$age", 99)]),
+        )
+        .await
+        .unwrap();
+    feature
+        .run_mutation(
+            MUTATION_QUERIES,
+            "remove_person",
+            &params(&[("$name", "Alice")]),
+        )
+        .await
+        .unwrap();
+
+    let filter = ChangeFilter {
+        ops: Some(vec![ChangeOp::Delete]),
+        ..Default::default()
+    };
+    let cs = feature.changes_since(before, &filter).await.unwrap();
+
+    assert!(
+        !cs.changes.is_empty(),
+        "expected delete changes after removing Alice"
+    );
+    assert!(cs.changes.iter().all(|c| c.op == ChangeOp::Delete));
+}
+
+#[tokio::test]
+async fn cross_lineage_diff_honors_insert_only_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = init_and_load(&dir).await;
+    main.branch_create("feature").await.unwrap();
+    let mut feature = Omnigraph::open_branch(uri, "feature").await.unwrap();
+    let before = feature.version();
+
+    feature
+        .run_mutation(
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        )
+        .await
+        .unwrap();
+    feature
+        .run_mutation(
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Bob")], &[("$age", 99)]),
+        )
+        .await
+        .unwrap();
+
+    let filter = ChangeFilter {
+        ops: Some(vec![ChangeOp::Insert]),
+        ..Default::default()
+    };
+    let cs = feature.changes_since(before, &filter).await.unwrap();
+
+    assert!(
+        !cs.changes.is_empty(),
+        "expected insert changes after adding Eve"
+    );
+    assert!(cs.changes.iter().all(|c| c.op == ChangeOp::Insert));
+    assert!(cs.changes.iter().any(|c| c.id == "Eve"));
+}
+
+#[tokio::test]
+async fn same_branch_diff_across_first_lazy_fork_detects_update() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = init_and_load(&dir).await;
+    main.branch_create("feature").await.unwrap();
+    let mut feature = Omnigraph::open_branch(uri, "feature").await.unwrap();
+    let before = feature.version();
+
+    feature
+        .run_mutation(
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Bob")], &[("$age", 77)]),
+        )
+        .await
+        .unwrap();
+
+    let cs = feature
+        .changes_since(before, &ChangeFilter::default())
+        .await
+        .unwrap();
+    assert!(
+        cs.changes
+            .iter()
+            .any(|c| c.table_key == "node:Person" && c.id == "Bob" && c.op == ChangeOp::Update),
+        "same-branch diff across first lazy fork should still report Bob's update"
+    );
+}
+
+#[tokio::test]
+async fn diff_commits_cross_branch_reports_property_only_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = init_and_load(&dir).await;
+    let base_commit = head_commit_id(uri, None).await;
+
+    main.branch_create("feature").await.unwrap();
+    let mut feature = Omnigraph::open_branch(uri, "feature").await.unwrap();
+    feature
+        .run_mutation(
+            MUTATION_QUERIES,
+            "set_age",
+            &mixed_params(&[("$name", "Bob")], &[("$age", 55)]),
+        )
+        .await
+        .unwrap();
+    let feature_commit = head_commit_id(uri, Some("feature")).await;
+
+    let cs = main
+        .diff_commits(&base_commit, &feature_commit, &ChangeFilter::default())
+        .await
+        .unwrap();
+
+    assert!(
+        cs.changes
+            .iter()
+            .any(|c| c.table_key == "node:Person" && c.id == "Bob" && c.op == ChangeOp::Update),
+        "cross-branch diff should report Bob as an update"
+    );
+    assert!(
+        !cs.changes
+            .iter()
+            .any(|c| c.table_key == "node:Person" && c.id == "Bob" && c.op == ChangeOp::Insert),
+        "property-only update should not be misclassified as insert"
     );
 }
