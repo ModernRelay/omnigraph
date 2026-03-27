@@ -20,14 +20,16 @@ use omnigraph_compiler::ir::{
 };
 use omnigraph_compiler::lower_mutation_query;
 use omnigraph_compiler::lower_query;
-use omnigraph_compiler::query::ast::{CompOp, Literal};
+use omnigraph_compiler::query::ast::{CompOp, Literal, NOW_PARAM_NAME};
 use omnigraph_compiler::query::typecheck::{CheckedQuery, typecheck_query, typecheck_query_decl};
 use omnigraph_compiler::result::{MutationResult, QueryResult};
 use omnigraph_compiler::types::Direction;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use crate::db::commit_graph::CommitGraph;
 use crate::db::manifest::ManifestCoordinator;
-use crate::db::{MergeOutcome, Omnigraph};
+use crate::db::{MergeOutcome, Omnigraph, is_internal_run_branch};
 use crate::db::{ReadTarget, Snapshot};
 use crate::error::{MergeConflict, MergeConflictKind, OmniError, Result};
 use crate::graph_index::GraphIndex;
@@ -2623,6 +2625,91 @@ impl Omnigraph {
         params: &ParamMap,
     ) -> Result<MutationResult> {
         let requested = Self::normalize_branch_name(branch)?;
+        let resolved_params = enrich_mutation_params(params)?;
+        let operation = format!(
+            "mutation:{}:branch={}",
+            query_name,
+            requested.as_deref().unwrap_or("main")
+        );
+
+        if requested.as_deref().is_some_and(is_internal_run_branch) {
+            return self
+                .execute_named_mutation_on_branch(
+                    requested.as_deref(),
+                    query_source,
+                    query_name,
+                    &resolved_params,
+                )
+                .await;
+        }
+
+        let target_branch = requested.clone().unwrap_or_else(|| "main".to_string());
+        let target_head_before = self.resolve_snapshot(&target_branch).await?;
+        let run = self
+            .begin_run(&target_branch, Some(operation.as_str()))
+            .await?;
+
+        let staged_result = match self
+            .execute_named_mutation_on_branch(
+                Some(run.run_branch.as_str()),
+                query_source,
+                query_name,
+                &resolved_params,
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                let _ = self.fail_run(&run.run_id).await;
+                return Err(err);
+            }
+        };
+
+        let target_head_now = self.resolve_snapshot(&target_branch).await?;
+        if target_head_now.as_str() != target_head_before.as_str() {
+            let _ = self.fail_run(&run.run_id).await;
+            return Err(OmniError::Manifest(format!(
+                "target branch '{}' advanced during transactional mutation; retry",
+                target_branch
+            )));
+        }
+
+        if let Err(err) = self
+            .execute_named_mutation_on_branch(
+                requested.as_deref(),
+                query_source,
+                query_name,
+                &resolved_params,
+            )
+            .await
+        {
+            let _ = self.fail_run(&run.run_id).await;
+            return Err(err);
+        }
+
+        let current_branch = self.active_branch().map(str::to_string);
+        if current_branch == requested {
+            self.sync_branch(&target_branch).await?;
+        }
+
+        let published_snapshot_id = self.resolve_snapshot(&target_branch).await?;
+        self.mark_run_published(&run.run_id, &published_snapshot_id)
+            .await?;
+
+        Ok(staged_result)
+    }
+
+    async fn execute_named_mutation_on_branch(
+        &mut self,
+        branch: Option<&str>,
+        query_source: &str,
+        query_name: &str,
+        params: &ParamMap,
+    ) -> Result<MutationResult> {
+        let requested = match branch {
+            Some(branch) => Self::normalize_branch_name(branch)?,
+            None => None,
+        };
         let current = self.active_branch().map(str::to_string);
         if requested == current {
             return self
@@ -2682,6 +2769,31 @@ impl Omnigraph {
     }
 
     pub async fn branch_merge(&mut self, source: &str, target: &str) -> Result<MergeOutcome> {
+        self.branch_merge_impl(source, target, false).await
+    }
+
+    pub(crate) async fn branch_merge_internal(
+        &mut self,
+        source: &str,
+        target: &str,
+    ) -> Result<MergeOutcome> {
+        self.branch_merge_impl(source, target, true).await
+    }
+
+    async fn branch_merge_impl(
+        &mut self,
+        source: &str,
+        target: &str,
+        allow_internal_refs: bool,
+    ) -> Result<MergeOutcome> {
+        if !allow_internal_refs {
+            if is_internal_run_branch(source) || is_internal_run_branch(target) {
+                return Err(OmniError::Manifest(format!(
+                    "branch_merge does not allow internal run refs ('{}' -> '{}')",
+                    source, target
+                )));
+            }
+        }
         let source_branch = Omnigraph::normalize_branch_name(source)?;
         let target_branch = Omnigraph::normalize_branch_name(target)?;
         if source_branch == target_branch {
@@ -3337,4 +3449,15 @@ impl Omnigraph {
             affected_edges: affected,
         })
     }
+}
+
+fn enrich_mutation_params(params: &ParamMap) -> Result<ParamMap> {
+    let mut resolved = params.clone();
+    if !resolved.contains_key(NOW_PARAM_NAME) {
+        let now = OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .map_err(|e| OmniError::Manifest(format!("failed to format now(): {}", e)))?;
+        resolved.insert(NOW_PARAM_NAME.to_string(), Literal::DateTime(now));
+    }
+    Ok(resolved)
 }

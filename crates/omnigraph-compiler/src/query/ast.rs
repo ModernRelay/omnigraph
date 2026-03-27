@@ -1,4 +1,4 @@
-pub(crate) const NOW_PARAM_NAME: &str = "__nanograph_now";
+pub const NOW_PARAM_NAME: &str = "__nanograph_now";
 
 #[derive(Debug, Clone)]
 pub struct QueryFile {

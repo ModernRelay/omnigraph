@@ -1,0 +1,207 @@
+// ── Lookup ────────────────────────────────────────────
+
+// Find an actor by slug
+query get_actor($slug: String) {
+    match {
+        $a: Actor { slug: $slug }
+    }
+    return { $a.slug, $a.name, $a.email }
+}
+
+// Find a decision by slug
+query get_decision($slug: String) {
+    match {
+        $d: Decision { slug: $slug }
+    }
+    return { $d.slug, $d.title, $d.status, $d.urgency, $d.decided_at }
+}
+
+// Find a signal by slug
+query get_signal($slug: String) {
+    match {
+        $s: Signal { slug: $slug }
+    }
+    return { $s.slug, $s.title, $s.category, $s.strength, $s.observed_at }
+}
+
+// ── Listing ──────────────────────────────────────────
+
+// All proposed decisions, most urgent first
+query proposed_decisions() {
+    match {
+        $d: Decision { status: "proposed" }
+    }
+    return { $d.slug, $d.title, $d.urgency, $d.decided_at }
+}
+
+// All strong signals
+query strong_signals() {
+    match {
+        $s: Signal { strength: "strong" }
+    }
+    return { $s.slug, $s.title, $s.category, $s.observed_at }
+}
+
+// All competitor signals
+query competitor_signals() {
+    match {
+        $s: Signal { category: "competitor" }
+    }
+    return { $s.slug, $s.title, $s.strength, $s.observed_at }
+}
+
+// Recent traces
+query recent_traces() {
+    match {
+        $t: Trace
+    }
+    return { $t.slug, $t.title, $t.kind, $t.recorded_at }
+    order { $t.recorded_at desc }
+    limit 20
+}
+
+// ── Ownership / participation ────────────────────────
+
+// Who owns a decision
+query decision_owner($slug: String) {
+    match {
+        $d: Decision { slug: $slug }
+        $d ownedBy $a
+    }
+    return { $d.title, $a.name }
+}
+
+// All decisions owned by a person
+query decisions_by_actor($actor: String) {
+    match {
+        $a: Actor { slug: $actor }
+        $d ownedBy $a
+    }
+    return { $d.slug, $d.title, $d.status, $d.urgency }
+}
+
+// Who participated in a decision
+query decision_participants($slug: String) {
+    match {
+        $a: Actor
+        $d: Decision { slug: $slug }
+        $a participatedIn $d
+    }
+    return { $a.name }
+}
+
+// ── Evidence trail ───────────────────────────────────
+
+// Traces supporting a decision
+query supporting_traces($slug: String) {
+    match {
+        $d: Decision { slug: $slug }
+        $t supports $d
+    }
+    return { $t.slug, $t.title, $t.kind, $t.recorded_at }
+}
+
+// Who recorded a trace
+query trace_recorder($slug: String) {
+    match {
+        $t: Trace { slug: $slug }
+        $t recordedBy $a
+    }
+    return { $t.title, $a.name }
+}
+
+// Artifacts attached to a decision
+query decision_artifacts($slug: String) {
+    match {
+        $d: Decision { slug: $slug }
+        $art attached $d
+    }
+    return { $art.slug, $art.title, $art.kind, $art.url }
+}
+
+// ── Signal traversal ─────────────────────────────────
+
+// What signals triggered a decision
+query decision_triggers($slug: String) {
+    match {
+        $d: Decision { slug: $slug }
+        $s triggered $d
+    }
+    return { $s.slug, $s.title, $s.category, $s.strength }
+}
+
+// What decisions did a signal trigger
+query signal_impact($slug: String) {
+    match {
+        $s: Signal { slug: $slug }
+        $s triggered $d
+    }
+    return { $d.slug, $d.title, $d.status, $d.urgency }
+}
+
+// Correlated signals
+query correlated_signals($slug: String) {
+    match {
+        $s: Signal { slug: $slug }
+        $s correlates $other
+    }
+    return { $other.slug, $other.title, $other.category, $other.strength }
+}
+
+// ── Decision lineage ─────────────────────────────────
+
+// What does this decision supersede
+query superseded_by($slug: String) {
+    match {
+        $new: Decision { slug: $slug }
+        $new supersedes $old
+    }
+    return { $old.slug, $old.title, $old.status }
+}
+
+// ── Multi-hop ────────────────────────────────────────
+
+// Full audit trail: signal -> decision -> supporting traces
+query decision_audit($slug: String) {
+    match {
+        $d: Decision { slug: $slug }
+        $s triggered $d
+        $t supports $d
+    }
+    return { $s.title, $d.title, $t.title, $t.kind }
+}
+
+// Decisions with no supporting evidence
+query unsupported_decisions() {
+    match {
+        $d: Decision
+        not { $_ supports $d }
+    }
+    return { $d.slug, $d.title, $d.status }
+}
+
+// Signals that haven't triggered any decision yet
+query unacted_signals() {
+    match {
+        $s: Signal
+        not { $s triggered $_ }
+    }
+    return { $s.slug, $s.title, $s.category, $s.strength }
+}
+
+// Actor activity: everything an actor is connected to
+query actor_decisions($actor: String) {
+    match {
+        $a: Actor { slug: $actor }
+        $d ownedBy $a
+    }
+    return { $d.slug, $d.title, $d.status }
+}
+
+query actor_traces($actor: String) {
+    match {
+        $a: Actor { slug: $actor }
+        $t recordedBy $a
+    }
+    return { $t.slug, $t.title, $t.kind, $t.recorded_at }
+}

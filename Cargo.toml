@@ -52,6 +52,8 @@ ariadne = "0.4"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 fail = "0.5"
+time = { version = "0.3", features = ["formatting"] }
+axum = { version = "0.8", features = ["json", "macros"] }
 
 [profile.dev]
 debug = 0

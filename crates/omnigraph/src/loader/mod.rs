@@ -36,24 +36,68 @@ pub enum LoadMode {
 
 /// Load JSONL data into an Omnigraph database.
 pub async fn load_jsonl(db: &mut Omnigraph, data: &str, mode: LoadMode) -> Result<LoadResult> {
-    let reader = BufReader::new(Cursor::new(data.as_bytes()));
     let current_branch = db.active_branch().map(str::to_string);
-    load_jsonl_reader(db, current_branch.as_deref(), reader, mode).await
+    let branch = current_branch.as_deref().unwrap_or("main");
+    db.load(branch, data, mode).await
 }
 
 /// Load JSONL data from a file path.
 pub async fn load_jsonl_file(db: &mut Omnigraph, path: &str, mode: LoadMode) -> Result<LoadResult> {
-    let file = std::fs::File::open(path).map_err(|e| OmniError::Io(e))?;
-    let reader = BufReader::new(file);
     let current_branch = db.active_branch().map(str::to_string);
-    load_jsonl_reader(db, current_branch.as_deref(), reader, mode).await
+    let branch = current_branch.as_deref().unwrap_or("main");
+    db.load_file(branch, path, mode).await
 }
 
 impl Omnigraph {
     pub async fn load(&mut self, branch: &str, data: &str, mode: LoadMode) -> Result<LoadResult> {
-        let requested = Self::normalize_branch_name(branch)?;
-        let reader = BufReader::new(Cursor::new(data.as_bytes()));
-        load_jsonl_reader(self, requested.as_deref(), reader, mode).await
+        let requested = Self::normalize_branch_name(branch)?.unwrap_or_else(|| "main".to_string());
+        if crate::db::is_internal_run_branch(&requested) {
+            return self
+                .load_direct_on_branch(Some(requested.as_str()), data, mode)
+                .await;
+        }
+
+        let target_head_before = self.resolve_snapshot(&requested).await?;
+        let op = format!("load_jsonl:branch={}:mode={}", requested, mode.as_str());
+        let run = self.begin_run(&requested, Some(op.as_str())).await?;
+        let staged_result = match self
+            .load_direct_on_branch(Some(run.run_branch.as_str()), data, mode)
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                let _ = self.fail_run(&run.run_id).await;
+                return Err(err);
+            }
+        };
+
+        let target_head_now = self.resolve_snapshot(&requested).await?;
+        if target_head_now.as_str() != target_head_before.as_str() {
+            let _ = self.fail_run(&run.run_id).await;
+            return Err(OmniError::Manifest(format!(
+                "target branch '{}' advanced during transactional load; retry",
+                requested
+            )));
+        }
+
+        if let Err(err) = self
+            .load_direct_on_branch(Some(requested.as_str()), data, mode)
+            .await
+        {
+            let _ = self.fail_run(&run.run_id).await;
+            return Err(err);
+        }
+
+        let current_branch = self.active_branch().map(str::to_string);
+        if current_branch.as_deref() == Self::normalize_branch_name(&requested)?.as_deref() {
+            self.sync_branch(&requested).await?;
+        }
+
+        let published_snapshot_id = self.resolve_snapshot(&requested).await?;
+        self.mark_run_published(&run.run_id, &published_snapshot_id)
+            .await?;
+
+        Ok(staged_result)
     }
 
     pub async fn load_file(
@@ -62,10 +106,28 @@ impl Omnigraph {
         path: &str,
         mode: LoadMode,
     ) -> Result<LoadResult> {
-        let requested = Self::normalize_branch_name(branch)?;
-        let file = std::fs::File::open(path).map_err(|e| OmniError::Io(e))?;
-        let reader = BufReader::new(file);
-        load_jsonl_reader(self, requested.as_deref(), reader, mode).await
+        let data = std::fs::read_to_string(path).map_err(|e| OmniError::Io(e))?;
+        self.load(branch, &data, mode).await
+    }
+
+    async fn load_direct_on_branch(
+        &mut self,
+        branch: Option<&str>,
+        data: &str,
+        mode: LoadMode,
+    ) -> Result<LoadResult> {
+        let reader = BufReader::new(Cursor::new(data.as_bytes()));
+        load_jsonl_reader(self, branch, reader, mode).await
+    }
+}
+
+impl LoadMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LoadMode::Overwrite => "overwrite",
+            LoadMode::Append => "append",
+            LoadMode::Merge => "merge",
+        }
     }
 }
 

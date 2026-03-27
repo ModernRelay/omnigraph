@@ -9,6 +9,7 @@ use crate::storage::{StorageAdapter, join_uri, normalize_root_uri};
 
 use super::commit_graph::{CommitGraph, GraphCommit};
 use super::manifest::{ManifestCoordinator, Snapshot, SubTableUpdate};
+use super::run_registry::{RunId, RunRecord, RunRegistry, graph_runs_uri, is_internal_run_branch};
 
 const GRAPH_COMMITS_DIR: &str = "_graph_commits.lance";
 
@@ -91,6 +92,7 @@ pub struct GraphCoordinator {
     storage: Arc<dyn StorageAdapter>,
     manifest: ManifestCoordinator,
     commit_graph: Option<CommitGraph>,
+    run_registry: Option<RunRegistry>,
     bound_branch: Option<String>,
 }
 
@@ -108,6 +110,7 @@ impl GraphCoordinator {
             storage,
             manifest,
             commit_graph,
+            run_registry: None,
             bound_branch: None,
         })
     }
@@ -120,11 +123,17 @@ impl GraphCoordinator {
         } else {
             None
         };
+        let run_registry = if storage.exists(&graph_runs_uri(&root))? {
+            Some(RunRegistry::open(&root).await?)
+        } else {
+            None
+        };
         Ok(Self {
             root_uri: root,
             storage,
             manifest,
             commit_graph,
+            run_registry,
             bound_branch: None,
         })
     }
@@ -146,12 +155,18 @@ impl GraphCoordinator {
         } else {
             None
         };
+        let run_registry = if storage.exists(&graph_runs_uri(&root))? {
+            Some(RunRegistry::open(&root).await?)
+        } else {
+            None
+        };
 
         Ok(Self {
             root_uri: root,
             storage,
             manifest,
             commit_graph,
+            run_registry,
             bound_branch: Some(branch_name),
         })
     }
@@ -177,11 +192,20 @@ impl GraphCoordinator {
         if let Some(commit_graph) = &mut self.commit_graph {
             commit_graph.refresh().await?;
         }
+        if let Some(run_registry) = &mut self.run_registry {
+            let root_uri = self.root_uri.clone();
+            run_registry.refresh(&root_uri).await?;
+        }
         Ok(())
     }
 
     pub async fn branch_list(&self) -> Result<Vec<String>> {
-        self.manifest.list_branches().await
+        self.manifest.list_branches().await.map(|branches| {
+            branches
+                .into_iter()
+                .filter(|branch| !is_internal_run_branch(branch))
+                .collect()
+        })
     }
 
     pub async fn branch_create(&mut self, name: &str) -> Result<()> {
@@ -319,6 +343,17 @@ impl GraphCoordinator {
         Ok(())
     }
 
+    pub(crate) async fn ensure_run_registry_initialized(&mut self) -> Result<()> {
+        if self.run_registry.is_some() {
+            return Ok(());
+        }
+        if !self.storage.exists(&graph_runs_uri(self.root_uri()))? {
+            let _ = RunRegistry::init(self.root_uri()).await?;
+        }
+        self.run_registry = Some(RunRegistry::open(self.root_uri()).await?);
+        Ok(())
+    }
+
     pub(crate) async fn commit_updates(
         &mut self,
         updates: &[SubTableUpdate],
@@ -394,6 +429,35 @@ impl GraphCoordinator {
             None => CommitGraph::open(self.root_uri()).await?,
         };
         Ok(Some(graph))
+    }
+
+    pub(crate) async fn append_run_record(&mut self, record: &RunRecord) -> Result<()> {
+        self.ensure_run_registry_initialized().await?;
+        let Some(run_registry) = &mut self.run_registry else {
+            return Err(OmniError::Manifest(
+                "run registry not initialized".to_string(),
+            ));
+        };
+        run_registry.append_record(record).await
+    }
+
+    pub(crate) async fn get_run(&self, run_id: &RunId) -> Result<RunRecord> {
+        if !self.storage.exists(&graph_runs_uri(self.root_uri()))? {
+            return Err(OmniError::Manifest(format!("run '{}' not found", run_id)));
+        }
+        let run_registry = RunRegistry::open(self.root_uri()).await?;
+        run_registry
+            .get_run(run_id)
+            .await?
+            .ok_or_else(|| OmniError::Manifest(format!("run '{}' not found", run_id)))
+    }
+
+    pub(crate) async fn list_runs(&self) -> Result<Vec<RunRecord>> {
+        if !self.storage.exists(&graph_runs_uri(self.root_uri()))? {
+            return Ok(Vec::new());
+        }
+        let run_registry = RunRegistry::open(self.root_uri()).await?;
+        run_registry.list_runs().await
     }
 }
 

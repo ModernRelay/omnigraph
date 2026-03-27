@@ -32,6 +32,7 @@ thiserror = { workspace = true }
 regex = { workspace = true }
 tempfile = { workspace = true }
 fail = { workspace = true, optional = true }
+time = { workspace = true }
 
 [dev-dependencies]
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.1.0" }

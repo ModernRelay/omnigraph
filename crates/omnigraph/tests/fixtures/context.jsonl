@@ -1,0 +1,13 @@
+{"type": "Actor", "data": {"slug": "aaron", "name": "Aaron"}}
+{"type": "Actor", "data": {"slug": "bruno", "name": "Bruno"}}
+{"type": "Actor", "data": {"slug": "jorge", "name": "Jorge"}}
+{"type": "Actor", "data": {"slug": "muneeb", "name": "Muneeb"}}
+{"type": "Actor", "data": {"slug": "ragnor", "name": "Ragnor"}}
+{"type": "Actor", "data": {"slug": "andrew", "name": "Andrew"}}
+{"type": "Signal", "data": {"slug": "zylon-private-ai-platform", "title": "Zylon.ai positions as complete on-premise enterprise AI platform for regulated industries", "body": "Zylon.ai positions itself as a complete, fully private (100% on-premise) enterprise AI platform built explicitly for regulated industries, emphasizing air-gapped deployability, data sovereignty (no external cloud dependency), and predictable fixed-cost economics (no per-token pricing).", "category": "competitor", "strength": "strong", "observed_at": "2026-03-27", "source": "https://www.zylon.ai/"}}
+{"type": "Decision", "data": {"slug": "create-360-ai-infra", "title": "Create 360 AI Infra offering", "body": "Build a comprehensive 360-degree AI infrastructure offering in response to competitors like Zylon positioning complete on-premise AI platforms for regulated industries.", "status": "proposed", "urgency": "high", "decided_at": "2026-03-27"}}
+{"type": "Trace", "data": {"slug": "jorge-spots-zylon", "title": "Jorge spots Zylon.ai competitor signal", "body": "Jorge identified Zylon.ai as a new competitor positioning a fully private enterprise AI platform targeting regulated industries with air-gapped deployment and fixed-cost pricing.", "kind": "note", "recorded_at": "2026-03-27", "source": "https://www.zylon.ai/"}}
+{"edge": "OwnedBy", "from": "create-360-ai-infra", "to": "andrew"}
+{"edge": "RecordedBy", "from": "jorge-spots-zylon", "to": "jorge"}
+{"edge": "Triggered", "from": "zylon-private-ai-platform", "to": "create-360-ai-infra"}
+{"edge": "Supports", "from": "jorge-spots-zylon", "to": "create-360-ai-infra"}

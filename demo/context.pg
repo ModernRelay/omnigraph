@@ -1,0 +1,78 @@
+// Context graph: decisions, the people behind them,
+// the evidence trail, and market signals that inform them.
+
+// ── Nodes ────────────────────────────────────────────
+
+node Actor {
+    slug: String @key
+    name: String
+    email: String? @unique
+}
+
+node Decision {
+    slug: String @key
+    title: String @index
+    body: String?
+    status: enum(proposed, accepted, rejected, superseded)
+    urgency: enum(low, normal, high, critical)
+    decided_at: Date?
+}
+
+node Trace {
+    slug: String @key
+    title: String @index
+    body: String?
+    kind: enum(note, discussion, experiment, review, meeting, document)
+    recorded_at: Date
+    source: String?
+}
+
+node Signal {
+    slug: String @key
+    title: String @index
+    body: String?
+    category: enum(competitor, market, regulatory, technology, customer)
+    strength: enum(strong, moderate, weak)
+    observed_at: Date
+    source: String?
+}
+
+node Artifact {
+    slug: String @key
+    title: String @index
+    kind: enum(doc, presentation, proposal, spec, report, memo)
+    url: String?
+    created_at: Date
+}
+
+// ── Ownership / participation ────────────────────────
+
+edge OwnedBy: Decision -> Actor @card(1..1)
+
+edge ParticipatedIn: Actor -> Decision
+
+edge RecordedBy: Trace -> Actor @card(1..1)
+
+edge AuthoredBy: Artifact -> Actor @card(1..1)
+
+// ── Evidence trail ───────────────────────────────────
+
+edge Supports: Trace -> Decision
+
+edge Attached: Artifact -> Decision
+
+edge CitedIn: Artifact -> Trace
+
+// ── Signal linkage ───────────────────────────────────
+
+edge Triggered: Signal -> Decision
+
+edge Correlates: Signal -> Signal {
+    @unique(src, dst)
+}
+
+// ── Decision lineage ─────────────────────────────────
+
+edge Supersedes: Decision -> Decision {
+    @unique(src, dst)
+}
