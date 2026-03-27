@@ -1,10 +1,15 @@
+#![allow(dead_code)]
+
 use arrow_array::{Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
 
-use omnigraph::db::Omnigraph;
+use omnigraph::changes::{ChangeFilter, ChangeSet};
+use omnigraph::db::{Omnigraph, ReadTarget, Snapshot, SnapshotId};
+use omnigraph::error::Result;
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_compiler::ir::ParamMap;
 use omnigraph_compiler::query::ast::Literal;
+use omnigraph_compiler::result::{MutationResult, QueryResult};
 
 pub const TEST_SCHEMA: &str = include_str!("../fixtures/test.pg");
 pub const TEST_DATA: &str = include_str!("../fixtures/test.jsonl");
@@ -44,7 +49,20 @@ pub async fn init_and_load(dir: &tempfile::TempDir) -> Omnigraph {
 
 /// Read all rows from a sub-table by table_key.
 pub async fn read_table(db: &Omnigraph, table_key: &str) -> Vec<RecordBatch> {
-    let snap = db.snapshot();
+    let snap = snapshot_main(db).await.unwrap();
+    let ds = snap.open(table_key).await.unwrap();
+    ds.scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap()
+}
+
+/// Read all rows from a branch-local sub-table by table_key.
+pub async fn read_table_branch(db: &Omnigraph, branch: &str, table_key: &str) -> Vec<RecordBatch> {
+    let snap = snapshot_branch(db, branch).await.unwrap();
     let ds = snap.open(table_key).await.unwrap();
     ds.scan()
         .try_into_stream()
@@ -57,7 +75,14 @@ pub async fn read_table(db: &Omnigraph, table_key: &str) -> Vec<RecordBatch> {
 
 /// Count rows in a sub-table.
 pub async fn count_rows(db: &Omnigraph, table_key: &str) -> usize {
-    let snap = db.snapshot();
+    let snap = snapshot_main(db).await.unwrap();
+    let ds = snap.open(table_key).await.unwrap();
+    ds.count_rows(None).await.unwrap()
+}
+
+/// Count rows in a branch-local sub-table.
+pub async fn count_rows_branch(db: &Omnigraph, branch: &str, table_key: &str) -> usize {
+    let snap = snapshot_branch(db, branch).await.unwrap();
     let ds = snap.open(table_key).await.unwrap();
     ds.count_rows(None).await.unwrap()
 }
@@ -79,6 +104,88 @@ pub fn collect_column_strings(batches: &[RecordBatch], col: &str) -> Vec<String>
         }
     }
     out
+}
+
+pub async fn query_main(
+    db: &mut Omnigraph,
+    query_source: &str,
+    query_name: &str,
+    params: &ParamMap,
+) -> Result<QueryResult> {
+    db.query(ReadTarget::branch("main"), query_source, query_name, params)
+        .await
+}
+
+pub async fn query_branch(
+    db: &mut Omnigraph,
+    branch: &str,
+    query_source: &str,
+    query_name: &str,
+    params: &ParamMap,
+) -> Result<QueryResult> {
+    db.query(ReadTarget::branch(branch), query_source, query_name, params)
+        .await
+}
+
+pub async fn mutate_main(
+    db: &mut Omnigraph,
+    query_source: &str,
+    query_name: &str,
+    params: &ParamMap,
+) -> Result<MutationResult> {
+    db.mutate("main", query_source, query_name, params).await
+}
+
+pub async fn mutate_branch(
+    db: &mut Omnigraph,
+    branch: &str,
+    query_source: &str,
+    query_name: &str,
+    params: &ParamMap,
+) -> Result<MutationResult> {
+    db.mutate(branch, query_source, query_name, params).await
+}
+
+pub async fn snapshot_main(db: &Omnigraph) -> Result<Snapshot> {
+    db.snapshot_of(ReadTarget::branch("main")).await
+}
+
+pub async fn snapshot_branch(db: &Omnigraph, branch: &str) -> Result<Snapshot> {
+    db.snapshot_of(ReadTarget::branch(branch)).await
+}
+
+pub async fn version_main(db: &Omnigraph) -> Result<u64> {
+    db.version_of(ReadTarget::branch("main")).await
+}
+
+pub async fn version_branch(db: &Omnigraph, branch: &str) -> Result<u64> {
+    db.version_of(ReadTarget::branch(branch)).await
+}
+
+pub async fn sync_main(db: &mut Omnigraph) -> Result<()> {
+    db.sync_branch("main").await
+}
+
+pub async fn sync_named_branch(db: &mut Omnigraph, branch: &str) -> Result<()> {
+    db.sync_branch(branch).await
+}
+
+pub async fn snapshot_id(db: &Omnigraph, branch: &str) -> Result<SnapshotId> {
+    db.resolve_snapshot(branch).await
+}
+
+pub async fn diff_since_branch(
+    db: &Omnigraph,
+    branch: &str,
+    from_snapshot: SnapshotId,
+    filter: &ChangeFilter,
+) -> Result<ChangeSet> {
+    db.diff_between(
+        ReadTarget::Snapshot(from_snapshot),
+        ReadTarget::branch(branch),
+        filter,
+    )
+    .await
 }
 
 /// Build a ParamMap from string key-value pairs.

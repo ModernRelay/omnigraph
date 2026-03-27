@@ -30,7 +30,7 @@ async fn open_restores_full_state() {
     let uri = dir.path().to_str().unwrap();
 
     let original = init_and_load(&dir).await;
-    let v = original.version();
+    let v = version_main(&original).await.unwrap();
     drop(original);
 
     let reopened = Omnigraph::open(uri).await.unwrap();
@@ -38,15 +38,15 @@ async fn open_restores_full_state() {
     assert_eq!(reopened.catalog().edge_types.len(), 2);
     // Version should be what we left it at
     // (manifest was committed during load)
-    assert!(reopened.version() >= v);
+    assert!(version_main(&reopened).await.unwrap() >= v);
 }
 
 #[tokio::test]
 async fn load_populates_all_types() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
-    let snap = db.snapshot();
+    let snap = snapshot_main(&db).await.unwrap();
 
     // 4 persons
     let person_ds = snap.open("node:Person").await.unwrap();
@@ -70,7 +70,7 @@ async fn load_populates_all_types() {
 #[tokio::test]
 async fn node_ids_are_key_values() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let batches = read_table(&db, "node:Person").await;
     let mut ids = collect_column_strings(&batches, "id");
@@ -81,7 +81,7 @@ async fn node_ids_are_key_values() {
 #[tokio::test]
 async fn node_properties_are_correct() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let batches = read_table(&db, "node:Person").await;
     let batch = &batches[0];
@@ -134,7 +134,7 @@ node Flagged {
 #[tokio::test]
 async fn edge_src_dst_reference_node_ids() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let batches = read_table(&db, "edge:Knows").await;
     let batch = &batches[0];
@@ -166,7 +166,7 @@ async fn edge_src_dst_reference_node_ids() {
 #[tokio::test]
 async fn edge_ids_are_unique_strings() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     let batches = read_table(&db, "edge:Knows").await;
     let batch = &batches[0];
@@ -232,7 +232,7 @@ async fn append_adds_rows() {
         .unwrap();
     load_jsonl(&mut db, batch2, LoadMode::Append).await.unwrap();
 
-    let snap = db.snapshot();
+    let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Person").await.unwrap();
     assert_eq!(ds.count_rows(None).await.unwrap(), 2);
 }
@@ -250,7 +250,7 @@ async fn load_from_file_works() {
         .await
         .unwrap();
 
-    let snap = db.snapshot();
+    let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Person").await.unwrap();
     assert_eq!(ds.count_rows(None).await.unwrap(), 4);
 }
@@ -269,7 +269,7 @@ async fn signals_fixture_loads_correctly() {
         .await
         .unwrap();
 
-    let snap = db.snapshot();
+    let snap = snapshot_main(&db).await.unwrap();
 
     // Verify some types have data
     let company_ds = snap.open("node:Company").await.unwrap();
@@ -297,10 +297,14 @@ async fn query_get_person_by_name() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
 
-    let result = db
-        .run_query(TEST_QUERIES, "get_person", &params(&[("$name", "Alice")]))
-        .await
-        .unwrap();
+    let result = query_main(
+        &mut db,
+        TEST_QUERIES,
+        "get_person",
+        &params(&[("$name", "Alice")]),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(result.num_rows(), 1);
     let batch = &result.batches()[0];
@@ -324,10 +328,14 @@ async fn query_get_person_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
 
-    let result = db
-        .run_query(TEST_QUERIES, "get_person", &params(&[("$name", "Nobody")]))
-        .await
-        .unwrap();
+    let result = query_main(
+        &mut db,
+        TEST_QUERIES,
+        "get_person",
+        &params(&[("$name", "Nobody")]),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(result.num_rows(), 0);
 }
@@ -337,8 +345,7 @@ async fn query_adults_filtered_and_ordered() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
 
-    let result = db
-        .run_query(TEST_QUERIES, "adults", &ParamMap::new())
+    let result = query_main(&mut db, TEST_QUERIES, "adults", &ParamMap::new())
         .await
         .unwrap();
 
@@ -358,8 +365,7 @@ async fn query_top_by_age_with_limit() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
 
-    let result = db
-        .run_query(TEST_QUERIES, "top_by_age", &ParamMap::new())
+    let result = query_main(&mut db, TEST_QUERIES, "top_by_age", &ParamMap::new())
         .await
         .unwrap();
 
@@ -390,10 +396,14 @@ async fn query_friends_of() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
 
-    let result = db
-        .run_query(TEST_QUERIES, "friends_of", &params(&[("$name", "Alice")]))
-        .await
-        .unwrap();
+    let result = query_main(
+        &mut db,
+        TEST_QUERIES,
+        "friends_of",
+        &params(&[("$name", "Alice")]),
+    )
+    .await
+    .unwrap();
 
     // Alice knows Bob and Charlie
     let batch = result.concat_batches().unwrap();
@@ -412,14 +422,14 @@ async fn query_employees_of() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
 
-    let result = db
-        .run_query(
-            TEST_QUERIES,
-            "employees_of",
-            &params(&[("$company", "Acme")]),
-        )
-        .await
-        .unwrap();
+    let result = query_main(
+        &mut db,
+        TEST_QUERIES,
+        "employees_of",
+        &params(&[("$company", "Acme")]),
+    )
+    .await
+    .unwrap();
 
     // Alice works at Acme (reverse traversal)
     let batch = result.concat_batches().unwrap();
@@ -437,14 +447,14 @@ async fn query_friends_of_friends() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
 
-    let result = db
-        .run_query(
-            TEST_QUERIES,
-            "friends_of_friends",
-            &params(&[("$name", "Alice")]),
-        )
-        .await
-        .unwrap();
+    let result = query_main(
+        &mut db,
+        TEST_QUERIES,
+        "friends_of_friends",
+        &params(&[("$name", "Alice")]),
+    )
+    .await
+    .unwrap();
 
     // Alice→Bob→Diana (Alice→Charlie→nobody)
     let batch = result.concat_batches().unwrap();
@@ -463,8 +473,7 @@ async fn query_unemployed() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
 
-    let result = db
-        .run_query(TEST_QUERIES, "unemployed", &ParamMap::new())
+    let result = query_main(&mut db, TEST_QUERIES, "unemployed", &ParamMap::new())
         .await
         .unwrap();
 
@@ -509,8 +518,7 @@ query unemployed() {
         .await
         .unwrap();
 
-    let result = db
-        .run_query(queries, "unemployed", &ParamMap::new())
+    let result = query_main(&mut db, queries, "unemployed", &ParamMap::new())
         .await
         .unwrap();
 
@@ -525,23 +533,27 @@ async fn mutation_insert_node() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
 
-    let result = db
-        .run_mutation(
-            MUTATION_QUERIES,
-            "insert_person",
-            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
-        )
-        .await
-        .unwrap();
+    let result = mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(result.affected_nodes, 1);
     assert_eq!(result.affected_edges, 0);
 
     // Query it back
-    let qr = db
-        .run_query(TEST_QUERIES, "get_person", &params(&[("$name", "Eve")]))
-        .await
-        .unwrap();
+    let qr = query_main(
+        &mut db,
+        TEST_QUERIES,
+        "get_person",
+        &params(&[("$name", "Eve")]),
+    )
+    .await
+    .unwrap();
     assert_eq!(qr.num_rows(), 1);
     let batch = &qr.batches()[0];
     let names = batch
@@ -558,7 +570,8 @@ async fn mutation_insert_edge() {
     let mut db = init_and_load(&dir).await;
 
     // Insert Eve
-    db.run_mutation(
+    mutate_main(
+        &mut db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
@@ -567,23 +580,27 @@ async fn mutation_insert_edge() {
     .unwrap();
 
     // Add edge Eve → Alice
-    let result = db
-        .run_mutation(
-            MUTATION_QUERIES,
-            "add_friend",
-            &params(&[("$from", "Eve"), ("$to", "Alice")]),
-        )
-        .await
-        .unwrap();
+    let result = mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "add_friend",
+        &params(&[("$from", "Eve"), ("$to", "Alice")]),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(result.affected_nodes, 0);
     assert_eq!(result.affected_edges, 1);
 
     // Verify traversal
-    let qr = db
-        .run_query(TEST_QUERIES, "friends_of", &params(&[("$name", "Eve")]))
-        .await
-        .unwrap();
+    let qr = query_main(
+        &mut db,
+        TEST_QUERIES,
+        "friends_of",
+        &params(&[("$name", "Eve")]),
+    )
+    .await
+    .unwrap();
     assert_eq!(qr.num_rows(), 1);
     let batch = qr.concat_batches().unwrap();
     let names = batch
@@ -599,23 +616,27 @@ async fn mutation_update_node() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
 
-    let result = db
-        .run_mutation(
-            MUTATION_QUERIES,
-            "set_age",
-            &mixed_params(&[("$name", "Alice")], &[("$age", 31)]),
-        )
-        .await
-        .unwrap();
+    let result = mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 31)]),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(result.affected_nodes, 1);
     assert_eq!(result.affected_edges, 0);
 
     // Verify the update
-    let qr = db
-        .run_query(TEST_QUERIES, "get_person", &params(&[("$name", "Alice")]))
-        .await
-        .unwrap();
+    let qr = query_main(
+        &mut db,
+        TEST_QUERIES,
+        "get_person",
+        &params(&[("$name", "Alice")]),
+    )
+    .await
+    .unwrap();
     assert_eq!(qr.num_rows(), 1);
     let batch = &qr.batches()[0];
     let ages = batch
@@ -632,14 +653,14 @@ async fn mutation_delete_node_cascades_edges() {
     let mut db = init_and_load(&dir).await;
 
     // Alice has: 2 outgoing Knows (Alice→Bob, Alice→Charlie) + 1 WorksAt (Alice→Acme) = 3 edges
-    let result = db
-        .run_mutation(
-            MUTATION_QUERIES,
-            "remove_person",
-            &params(&[("$name", "Alice")]),
-        )
-        .await
-        .unwrap();
+    let result = mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "remove_person",
+        &params(&[("$name", "Alice")]),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(result.affected_nodes, 1);
     assert!(
@@ -649,14 +670,18 @@ async fn mutation_delete_node_cascades_edges() {
     );
 
     // Alice should be gone
-    let qr = db
-        .run_query(TEST_QUERIES, "get_person", &params(&[("$name", "Alice")]))
-        .await
-        .unwrap();
+    let qr = query_main(
+        &mut db,
+        TEST_QUERIES,
+        "get_person",
+        &params(&[("$name", "Alice")]),
+    )
+    .await
+    .unwrap();
     assert_eq!(qr.num_rows(), 0);
 
     // Verify no edges reference Alice
-    let snap = db.snapshot();
+    let snap = snapshot_main(&db).await.unwrap();
     for edge_key in &["edge:Knows", "edge:WorksAt"] {
         let ds = snap.open(edge_key).await.unwrap();
         let batches: Vec<arrow_array::RecordBatch> = ds
@@ -704,30 +729,38 @@ async fn mutation_delete_edge() {
     let mut db = init_and_load(&dir).await;
 
     // Delete all Knows edges from Alice (Alice→Bob, Alice→Charlie)
-    let result = db
-        .run_mutation(
-            MUTATION_QUERIES,
-            "remove_friendship",
-            &params(&[("$from", "Alice")]),
-        )
-        .await
-        .unwrap();
+    let result = mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "remove_friendship",
+        &params(&[("$from", "Alice")]),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(result.affected_nodes, 0);
     assert_eq!(result.affected_edges, 2);
 
     // Alice should still exist
-    let qr = db
-        .run_query(TEST_QUERIES, "get_person", &params(&[("$name", "Alice")]))
-        .await
-        .unwrap();
+    let qr = query_main(
+        &mut db,
+        TEST_QUERIES,
+        "get_person",
+        &params(&[("$name", "Alice")]),
+    )
+    .await
+    .unwrap();
     assert_eq!(qr.num_rows(), 1);
 
     // But has no friends
-    let qr = db
-        .run_query(TEST_QUERIES, "friends_of", &params(&[("$name", "Alice")]))
-        .await
-        .unwrap();
+    let qr = query_main(
+        &mut db,
+        TEST_QUERIES,
+        "friends_of",
+        &params(&[("$name", "Alice")]),
+    )
+    .await
+    .unwrap();
     assert_eq!(qr.num_rows(), 0);
 }
 
@@ -737,22 +770,26 @@ async fn mutation_insert_duplicate_key_upserts() {
     let mut db = init_and_load(&dir).await;
 
     // Alice already exists with age=30. Insert again with age=99.
-    let result = db
-        .run_mutation(
-            MUTATION_QUERIES,
-            "insert_person",
-            &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
-        )
-        .await
-        .unwrap();
+    let result = mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(result.affected_nodes, 1);
 
     // Should still be exactly 1 Alice (upsert, not duplicate)
-    let qr = db
-        .run_query(TEST_QUERIES, "get_person", &params(&[("$name", "Alice")]))
-        .await
-        .unwrap();
+    let qr = query_main(
+        &mut db,
+        TEST_QUERIES,
+        "get_person",
+        &params(&[("$name", "Alice")]),
+    )
+    .await
+    .unwrap();
     assert_eq!(qr.num_rows(), 1);
 
     // Age should be updated to 99
@@ -776,13 +813,13 @@ query rename_person($old_name: String, $new_name: String) {
 }
 "#;
 
-    let result = db
-        .run_mutation(
-            queries,
-            "rename_person",
-            &params(&[("$old_name", "Alice"), ("$new_name", "Bob")]),
-        )
-        .await;
+    let result = mutate_main(
+        &mut db,
+        queries,
+        "rename_person",
+        &params(&[("$old_name", "Alice"), ("$new_name", "Bob")]),
+    )
+    .await;
 
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
@@ -848,7 +885,7 @@ async fn blob_load_base64_inline() {
         .await
         .unwrap();
 
-    let snap = db.snapshot();
+    let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Document").await.unwrap();
     assert_eq!(ds.count_rows(None).await.unwrap(), 2);
 }
@@ -864,10 +901,14 @@ async fn blob_query_returns_metadata() {
         .await
         .unwrap();
 
-    let result = db
-        .run_query(BLOB_QUERIES, "get_doc", &params(&[("$title", "readme")]))
-        .await
-        .unwrap();
+    let result = query_main(
+        &mut db,
+        BLOB_QUERIES,
+        "get_doc",
+        &params(&[("$title", "readme")]),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(result.num_rows(), 1);
 
@@ -893,10 +934,14 @@ async fn blob_null_returns_null_in_query() {
         .await
         .unwrap();
 
-    let result = db
-        .run_query(BLOB_QUERIES, "get_doc", &params(&[("$title", "empty")]))
-        .await
-        .unwrap();
+    let result = query_main(
+        &mut db,
+        BLOB_QUERIES,
+        "get_doc",
+        &params(&[("$title", "empty")]),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(result.num_rows(), 1);
     let json = result.to_sdk_json();
@@ -916,22 +961,26 @@ async fn blob_insert_mutation() {
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
 
-    let result = db
-        .run_mutation(
-            BLOB_MUTATIONS,
-            "insert_doc",
-            &params(&[("$title", "new-doc"), ("$content", "base64:AQID")]),
-        )
-        .await
-        .unwrap();
+    let result = mutate_main(
+        &mut db,
+        BLOB_MUTATIONS,
+        "insert_doc",
+        &params(&[("$title", "new-doc"), ("$content", "base64:AQID")]),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(result.affected_nodes, 1);
 
     // Query it back
-    let qr = db
-        .run_query(BLOB_QUERIES, "get_doc", &params(&[("$title", "new-doc")]))
-        .await
-        .unwrap();
+    let qr = query_main(
+        &mut db,
+        BLOB_QUERIES,
+        "get_doc",
+        &params(&[("$title", "new-doc")]),
+    )
+    .await
+    .unwrap();
     assert_eq!(qr.num_rows(), 1);
     let json = qr.to_sdk_json();
     let row = json.as_array().unwrap().first().unwrap();
@@ -950,7 +999,8 @@ async fn blob_update_mutation() {
     let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
 
     // First insert a doc with blob
-    db.run_mutation(
+    mutate_main(
+        &mut db,
         BLOB_MUTATIONS,
         "insert_doc",
         &params(&[("$title", "updatable"), ("$content", "base64:AQID")]),
@@ -959,22 +1009,26 @@ async fn blob_update_mutation() {
     .unwrap();
 
     // Update the blob
-    let result = db
-        .run_mutation(
-            BLOB_MUTATIONS,
-            "update_doc_content",
-            &params(&[("$title", "updatable"), ("$content", "base64:BAUG")]),
-        )
-        .await
-        .unwrap();
+    let result = mutate_main(
+        &mut db,
+        BLOB_MUTATIONS,
+        "update_doc_content",
+        &params(&[("$title", "updatable"), ("$content", "base64:BAUG")]),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(result.affected_nodes, 1);
 
     // Query it back — blob metadata should still be present
-    let qr = db
-        .run_query(BLOB_QUERIES, "get_doc", &params(&[("$title", "updatable")]))
-        .await
-        .unwrap();
+    let qr = query_main(
+        &mut db,
+        BLOB_QUERIES,
+        "get_doc",
+        &params(&[("$title", "updatable")]),
+    )
+    .await
+    .unwrap();
     assert_eq!(qr.num_rows(), 1);
     let json = qr.to_sdk_json();
     let row = json.as_array().unwrap().first().unwrap();
@@ -1033,7 +1087,8 @@ async fn blob_read_after_mutation_insert() {
     let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
 
     // Insert via mutation (base64 for bytes [1, 2, 3])
-    db.run_mutation(
+    mutate_main(
+        &mut db,
         BLOB_MUTATIONS,
         "insert_doc",
         &params(&[("$title", "inserted"), ("$content", "base64:AQID")]),
@@ -1065,7 +1120,7 @@ async fn blob_scan_with_descriptions_on_nonempty_dataset() {
         .unwrap();
 
     // Open the dataset directly and try BlobsDescriptions
-    let snap = db.snapshot();
+    let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Document").await.unwrap();
     assert_eq!(ds.count_rows(None).await.unwrap(), 1);
 
@@ -1127,7 +1182,7 @@ node Person {
         .await
         .unwrap();
 
-    let snap = db.snapshot();
+    let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Person").await.unwrap();
     assert_eq!(ds.count_rows(None).await.unwrap(), 1);
 }
@@ -1168,7 +1223,7 @@ node Order {
         .await
         .unwrap();
 
-    let snap = db.snapshot();
+    let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Order").await.unwrap();
     assert_eq!(ds.count_rows(None).await.unwrap(), 1);
 }
@@ -1191,20 +1246,19 @@ query insert_person($name: String, $age: I32) {
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, schema).await.unwrap();
 
-    let result = db
-        .run_mutation(queries, "insert_person", &{
-            let mut p = omnigraph_compiler::ir::ParamMap::new();
-            p.insert(
-                "name".to_string(),
-                omnigraph_compiler::query::ast::Literal::String("Old".to_string()),
-            );
-            p.insert(
-                "age".to_string(),
-                omnigraph_compiler::query::ast::Literal::Integer(300),
-            );
-            p
-        })
-        .await;
+    let result = mutate_main(&mut db, queries, "insert_person", &{
+        let mut p = omnigraph_compiler::ir::ParamMap::new();
+        p.insert(
+            "name".to_string(),
+            omnigraph_compiler::query::ast::Literal::String("Old".to_string()),
+        );
+        p.insert(
+            "age".to_string(),
+            omnigraph_compiler::query::ast::Literal::Integer(300),
+        );
+        p
+    })
+    .await;
     assert!(result.is_err(), "expected range violation");
     let err = result.unwrap_err().to_string();
     assert!(err.contains("@range violation"), "error: {}", err);
@@ -1235,20 +1289,19 @@ query set_age($name: String, $age: I32) {
     .await
     .unwrap();
 
-    let result = db
-        .run_mutation(queries, "set_age", &{
-            let mut p = omnigraph_compiler::ir::ParamMap::new();
-            p.insert(
-                "name".to_string(),
-                omnigraph_compiler::query::ast::Literal::String("Alice".to_string()),
-            );
-            p.insert(
-                "age".to_string(),
-                omnigraph_compiler::query::ast::Literal::Integer(300),
-            );
-            p
-        })
-        .await;
+    let result = mutate_main(&mut db, queries, "set_age", &{
+        let mut p = omnigraph_compiler::ir::ParamMap::new();
+        p.insert(
+            "name".to_string(),
+            omnigraph_compiler::query::ast::Literal::String("Alice".to_string()),
+        );
+        p.insert(
+            "age".to_string(),
+            omnigraph_compiler::query::ast::Literal::Integer(300),
+        );
+        p
+    })
+    .await;
     assert!(result.is_err(), "expected range violation");
     let err = result.unwrap_err().to_string();
     assert!(err.contains("@range violation"), "error: {}", err);
@@ -1271,16 +1324,15 @@ query insert_order($code: String) {
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, schema).await.unwrap();
 
-    let result = db
-        .run_mutation(queries, "insert_order", &{
-            let mut p = omnigraph_compiler::ir::ParamMap::new();
-            p.insert(
-                "code".to_string(),
-                omnigraph_compiler::query::ast::Literal::String("invalid".to_string()),
-            );
-            p
-        })
-        .await;
+    let result = mutate_main(&mut db, queries, "insert_order", &{
+        let mut p = omnigraph_compiler::ir::ParamMap::new();
+        p.insert(
+            "code".to_string(),
+            omnigraph_compiler::query::ast::Literal::String("invalid".to_string()),
+        );
+        p
+    })
+    .await;
     assert!(result.is_err(), "expected check violation");
     let err = result.unwrap_err().to_string();
     assert!(err.contains("@check violation"), "error: {}", err);
@@ -1311,20 +1363,19 @@ query set_label($code: String, $label: String) {
     .await
     .unwrap();
 
-    let result = db
-        .run_mutation(queries, "set_label", &{
-            let mut p = omnigraph_compiler::ir::ParamMap::new();
-            p.insert(
-                "code".to_string(),
-                omnigraph_compiler::query::ast::Literal::String("ABC-123".to_string()),
-            );
-            p.insert(
-                "label".to_string(),
-                omnigraph_compiler::query::ast::Literal::String("invalid".to_string()),
-            );
-            p
-        })
-        .await;
+    let result = mutate_main(&mut db, queries, "set_label", &{
+        let mut p = omnigraph_compiler::ir::ParamMap::new();
+        p.insert(
+            "code".to_string(),
+            omnigraph_compiler::query::ast::Literal::String("ABC-123".to_string()),
+        );
+        p.insert(
+            "label".to_string(),
+            omnigraph_compiler::query::ast::Literal::String("invalid".to_string()),
+        );
+        p
+    })
+    .await;
     assert!(result.is_err(), "expected check violation");
     let err = result.unwrap_err().to_string();
     assert!(err.contains("@check violation"), "error: {}", err);
@@ -1373,7 +1424,7 @@ edge WorksAt: Person -> Company @card(0..1)
         .await
         .unwrap();
 
-    let snap = db.snapshot();
+    let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("edge:WorksAt").await.unwrap();
     assert_eq!(ds.count_rows(None).await.unwrap(), 1);
 }
@@ -1409,7 +1460,8 @@ query get_article($slug: String) {
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, schema).await.unwrap();
 
-    db.run_mutation(
+    mutate_main(
+        &mut db,
         mutations,
         "insert_article",
         &mixed_params(
@@ -1421,21 +1473,25 @@ query get_article($slug: String) {
     .unwrap();
 
     // This would panic with the old batch.column(idx) code
-    let result = db
-        .run_mutation(
-            mutations,
-            "update_summary",
-            &params(&[("$slug", "a1"), ("$summary", "updated")]),
-        )
-        .await
-        .unwrap();
+    let result = mutate_main(
+        &mut db,
+        mutations,
+        "update_summary",
+        &params(&[("$slug", "a1"), ("$summary", "updated")]),
+    )
+    .await
+    .unwrap();
     assert_eq!(result.affected_nodes, 1);
 
     // Verify the update applied correctly
-    let qr = db
-        .run_query(mutations, "get_article", &params(&[("$slug", "a1")]))
-        .await
-        .unwrap();
+    let qr = query_main(
+        &mut db,
+        mutations,
+        "get_article",
+        &params(&[("$slug", "a1")]),
+    )
+    .await
+    .unwrap();
     assert_eq!(qr.num_rows(), 1);
 }
 
@@ -1453,9 +1509,13 @@ query update_edge($from: String) {
     update Knows set { since: "2025-01-01" } where from = $from
 }
 "#;
-    let result = db
-        .run_mutation(mutations, "update_edge", &params(&[("$from", "Alice")]))
-        .await;
+    let result = mutate_main(
+        &mut db,
+        mutations,
+        "update_edge",
+        &params(&[("$from", "Alice")]),
+    )
+    .await;
     assert!(result.is_err(), "should return error, not panic");
 }
 
@@ -1475,14 +1535,14 @@ query filter_date($d: String) {
 }
 "#;
     // Pass a value with a single-quote — should not error or return all rows
-    let result = db
-        .run_query(
-            queries,
-            "filter_date",
-            &params(&[("$d", "2025-01-01' OR '1'='1")]),
-        )
-        .await
-        .unwrap();
+    let result = query_main(
+        &mut db,
+        queries,
+        "filter_date",
+        &params(&[("$d", "2025-01-01' OR '1'='1")]),
+    )
+    .await
+    .unwrap();
     assert_eq!(result.num_rows(), 0);
 }
 
@@ -1496,7 +1556,7 @@ async fn append_mode_manifest_row_count_is_total() {
     let extra = r#"{"type": "Person", "data": {"name": "Eve", "age": 22}}"#;
     load_jsonl(&mut db, extra, LoadMode::Append).await.unwrap();
 
-    let snap = db.snapshot();
+    let snap = snapshot_main(&db).await.unwrap();
     let entry = snap.entry("node:Person").unwrap();
     // Must be total rows (4 + 1 = 5), not just the appended batch size (1)
     assert_eq!(entry.row_count, 5);
@@ -1528,7 +1588,7 @@ edge WorksAt: Person -> Company @card(0..1)
 {"edge": "WorksAt", "from": "Alice", "to": "Beta"}
 "#;
 
-    let v_before = db.version();
+    let v_before = version_main(&db).await.unwrap();
     let result = load_jsonl(&mut db, data, LoadMode::Overwrite).await;
     assert!(result.is_err(), "cardinality violation should be rejected");
     assert!(
@@ -1537,7 +1597,7 @@ edge WorksAt: Person -> Company @card(0..1)
     );
 
     // Manifest must NOT have advanced — invalid data was not committed
-    assert_eq!(db.version(), v_before);
+    assert_eq!(version_main(&db).await.unwrap(), v_before);
 }
 
 // ─── Regression: dangling edge references are rejected ───────────────────────
@@ -1596,7 +1656,7 @@ async fn ensure_indices_does_not_error_on_repeated_call() {
     db.ensure_indices().await.unwrap();
 
     // Data should still be queryable after index operations
-    let snap = db.snapshot();
+    let snap = snapshot_main(&db).await.unwrap();
     let ds = snap.open("node:Person").await.unwrap();
     assert_eq!(ds.count_rows(None).await.unwrap(), 4);
 }

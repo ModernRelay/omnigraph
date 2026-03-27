@@ -30,14 +30,14 @@ async fn text_search_filters_results() {
     let mut db = init_search_db(&dir).await;
 
     // "Learning" appears in: ml-intro, dl-basics, rl-intro titles
-    let result = db
-        .run_query(
-            SEARCH_QUERIES,
-            "text_search",
-            &params(&[("$q", "Learning")]),
-        )
-        .await
-        .unwrap();
+    let result = query_main(
+        &mut db,
+        SEARCH_QUERIES,
+        "text_search",
+        &params(&[("$q", "Learning")]),
+    )
+    .await
+    .unwrap();
 
     assert!(
         result.num_rows() > 0,
@@ -63,14 +63,14 @@ async fn text_search_no_results() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_search_db(&dir).await;
 
-    let result = db
-        .run_query(
-            SEARCH_QUERIES,
-            "text_search",
-            &params(&[("$q", "xyznonexistent")]),
-        )
-        .await
-        .unwrap();
+    let result = query_main(
+        &mut db,
+        SEARCH_QUERIES,
+        "text_search",
+        &params(&[("$q", "xyznonexistent")]),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(result.num_rows(), 0);
 }
@@ -83,14 +83,14 @@ async fn fuzzy_search_tolerates_typos() {
     let mut db = init_search_db(&dir).await;
 
     // "Introductio" (missing 'n') should fuzzy-match "Introduction" with max_edits=2
-    let result = db
-        .run_query(
-            SEARCH_QUERIES,
-            "fuzzy_search",
-            &params(&[("$q", "Introductio")]),
-        )
-        .await
-        .unwrap();
+    let result = query_main(
+        &mut db,
+        SEARCH_QUERIES,
+        "fuzzy_search",
+        &params(&[("$q", "Introductio")]),
+    )
+    .await
+    .unwrap();
 
     // Fuzzy matching may not work with the default tokenizer on all terms;
     // at minimum verify it doesn't error
@@ -106,14 +106,14 @@ async fn phrase_search_matches_exact_phrase() {
     let mut db = init_search_db(&dir).await;
 
     // "neural networks" appears in dl-basics body
-    let result = db
-        .run_query(
-            SEARCH_QUERIES,
-            "phrase_search",
-            &params(&[("$q", "neural networks")]),
-        )
-        .await
-        .unwrap();
+    let result = query_main(
+        &mut db,
+        SEARCH_QUERIES,
+        "phrase_search",
+        &params(&[("$q", "neural networks")]),
+    )
+    .await
+    .unwrap();
 
     assert!(
         result.num_rows() > 0,
@@ -138,14 +138,14 @@ async fn phrase_search_is_documented_fts_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_search_db(&dir).await;
 
-    let result = db
-        .run_query(
-            SEARCH_QUERIES,
-            "phrase_search",
-            &params(&[("$q", "networks layers")]),
-        )
-        .await
-        .unwrap();
+    let result = query_main(
+        &mut db,
+        SEARCH_QUERIES,
+        "phrase_search",
+        &params(&[("$q", "networks layers")]),
+    )
+    .await
+    .unwrap();
 
     assert!(
         result.num_rows() > 0,
@@ -173,14 +173,14 @@ async fn nearest_returns_k_closest() {
     let mut db = init_search_db(&dir).await;
 
     // Query vector [0.1, 0.2, 0.3, 0.4] is identical to ml-intro's embedding
-    let result = db
-        .run_query(
-            SEARCH_QUERIES,
-            "vector_search",
-            &vector_param("$q", &[0.1, 0.2, 0.3, 0.4]),
-        )
-        .await
-        .unwrap();
+    let result = query_main(
+        &mut db,
+        SEARCH_QUERIES,
+        "vector_search",
+        &vector_param("$q", &[0.1, 0.2, 0.3, 0.4]),
+    )
+    .await
+    .unwrap();
 
     // limit 3 → should return exactly 3
     assert_eq!(result.num_rows(), 3);
@@ -203,14 +203,14 @@ async fn bm25_returns_ranked_results() {
     let mut db = init_search_db(&dir).await;
 
     // "Learning" appears in multiple titles
-    let result = db
-        .run_query(
-            SEARCH_QUERIES,
-            "bm25_search",
-            &params(&[("$q", "Learning")]),
-        )
-        .await
-        .unwrap();
+    let result = query_main(
+        &mut db,
+        SEARCH_QUERIES,
+        "bm25_search",
+        &params(&[("$q", "Learning")]),
+    )
+    .await
+    .unwrap();
 
     assert!(
         result.num_rows() > 0,
@@ -226,14 +226,14 @@ async fn rrf_fuses_vector_and_text() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_search_db(&dir).await;
 
-    let result = db
-        .run_query(
-            SEARCH_QUERIES,
-            "hybrid_search",
-            &vector_and_string_params("$vq", &[0.1, 0.2, 0.3, 0.4], "$tq", "Learning"),
-        )
-        .await
-        .unwrap();
+    let result = query_main(
+        &mut db,
+        SEARCH_QUERIES,
+        "hybrid_search",
+        &vector_and_string_params("$vq", &[0.1, 0.2, 0.3, 0.4], "$tq", "Learning"),
+    )
+    .await
+    .unwrap();
 
     assert!(result.num_rows() > 0, "rrf should return results");
     assert!(result.num_rows() <= 3, "rrf should respect limit 3");
@@ -258,7 +258,12 @@ node Doc {
         .unwrap();
     db.ensure_indices().await.unwrap();
 
-    let ds = db.snapshot().open("node:Doc").await.unwrap();
+    let ds = snapshot_main(&db)
+        .await
+        .unwrap()
+        .open("node:Doc")
+        .await
+        .unwrap();
     let indices = ds.load_indices().await.unwrap();
     let user_indices: Vec<_> = indices.iter().filter(|idx| !is_system_index(idx)).collect();
     assert_eq!(
@@ -273,7 +278,12 @@ async fn ensure_indices_creates_inverted_indices_for_string_annotations() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_search_db(&dir).await;
 
-    let ds = db.snapshot().open("node:Doc").await.unwrap();
+    let ds = snapshot_main(&db)
+        .await
+        .unwrap()
+        .open("node:Doc")
+        .await
+        .unwrap();
     let indices = ds.load_indices().await.unwrap();
     let user_indices: Vec<_> = indices.iter().filter(|idx| !is_system_index(idx)).collect();
     assert_eq!(

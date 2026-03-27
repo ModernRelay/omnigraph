@@ -32,14 +32,14 @@ async fn graph_publish_failpoint_triggers_before_commit_append() {
         .unwrap();
     let _failpoint = ScopedFailPoint::new("graph_publish.before_commit_append", "return");
 
-    let err = db
-        .run_mutation(
-            MUTATION_QUERIES,
-            "insert_person",
-            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
-        )
-        .await
-        .unwrap_err();
+    let err = mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap_err();
     assert!(
         err.to_string()
             .contains("injected failpoint triggered: graph_publish.before_commit_append")

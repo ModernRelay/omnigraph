@@ -24,7 +24,7 @@ impl SnapshotId {
         &self.0
     }
 
-    fn synthetic(branch: Option<&str>, version: u64) -> Self {
+    pub(crate) fn synthetic(branch: Option<&str>, version: u64) -> Self {
         match branch {
             Some(branch) => Self(format!("manifest:{}:v{}", branch, version)),
             None => Self(format!("manifest:main:v{}", version)),
@@ -202,13 +202,6 @@ impl GraphCoordinator {
 
     pub async fn resolve_snapshot_id(&self, branch: &str) -> Result<SnapshotId> {
         let normalized = normalize_branch_name(branch)?;
-        if normalized.as_deref() == self.current_branch() {
-            return Ok(self
-                .head_commit_id()
-                .await?
-                .unwrap_or_else(|| SnapshotId::synthetic(self.current_branch(), self.version())));
-        }
-
         let other = match normalized.as_deref() {
             Some(branch) => {
                 GraphCoordinator::open_branch(self.root_uri(), branch, Arc::clone(&self.storage))
@@ -227,18 +220,6 @@ impl GraphCoordinator {
         match target {
             ReadTarget::Branch(branch) => {
                 let normalized = normalize_branch_name(branch)?;
-                if normalized.as_deref() == self.current_branch() {
-                    let snapshot_id = self.head_commit_id().await?.unwrap_or_else(|| {
-                        SnapshotId::synthetic(self.current_branch(), self.version())
-                    });
-                    return Ok(ResolvedTarget {
-                        requested: target.clone(),
-                        branch: self.bound_branch.clone(),
-                        snapshot_id,
-                        snapshot: self.snapshot(),
-                    });
-                }
-
                 let other = match normalized.as_deref() {
                     Some(branch) => {
                         GraphCoordinator::open_branch(

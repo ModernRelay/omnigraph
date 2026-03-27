@@ -2,7 +2,7 @@ mod helpers;
 
 use omnigraph::changes::{ChangeFilter, ChangeOp, EntityKind};
 use omnigraph::db::commit_graph::CommitGraph;
-use omnigraph::db::{MergeOutcome, Omnigraph};
+use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget};
 
 use helpers::*;
 
@@ -43,9 +43,16 @@ fn change_tuples(change_set: &omnigraph::changes::ChangeSet) -> Vec<(String, Str
 #[tokio::test]
 async fn diff_empty_when_nothing_changed() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
-    let v = db.version();
-    let cs = db.diff(v, v, &ChangeFilter::default()).await.unwrap();
+    let db = init_and_load(&dir).await;
+    let v = snapshot_id(&db, "main").await.unwrap();
+    let cs = db
+        .diff_between(
+            ReadTarget::Snapshot(v.clone()),
+            ReadTarget::Snapshot(v),
+            &ChangeFilter::default(),
+        )
+        .await
+        .unwrap();
     assert!(cs.changes.is_empty());
     assert_eq!(cs.stats.inserts, 0);
     assert_eq!(cs.stats.updates, 0);
@@ -56,9 +63,10 @@ async fn diff_empty_when_nothing_changed() {
 async fn diff_detects_node_insert() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
-    let v_before = db.version();
+    let v_before = snapshot_id(&db, "main").await.unwrap();
 
-    db.run_mutation(
+    mutate_main(
+        &mut db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
@@ -66,8 +74,7 @@ async fn diff_detects_node_insert() {
     .await
     .unwrap();
 
-    let cs = db
-        .changes_since(v_before, &ChangeFilter::default())
+    let cs = diff_since_branch(&db, "main", v_before, &ChangeFilter::default())
         .await
         .unwrap();
     let inserts: Vec<_> = cs
@@ -96,9 +103,10 @@ async fn diff_detects_node_insert() {
 async fn diff_detects_node_update() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
-    let v_before = db.version();
+    let v_before = snapshot_id(&db, "main").await.unwrap();
 
-    db.run_mutation(
+    mutate_main(
+        &mut db,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "Bob")], &[("$age", 99)]),
@@ -106,8 +114,7 @@ async fn diff_detects_node_update() {
     .await
     .unwrap();
 
-    let cs = db
-        .changes_since(v_before, &ChangeFilter::default())
+    let cs = diff_since_branch(&db, "main", v_before, &ChangeFilter::default())
         .await
         .unwrap();
     let updates: Vec<_> = cs
@@ -129,9 +136,10 @@ async fn diff_detects_node_update() {
 async fn diff_detects_node_delete_with_cascade() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
-    let v_before = db.version();
+    let v_before = snapshot_id(&db, "main").await.unwrap();
 
-    db.run_mutation(
+    mutate_main(
+        &mut db,
         MUTATION_QUERIES,
         "remove_person",
         &params(&[("$name", "Alice")]),
@@ -139,8 +147,7 @@ async fn diff_detects_node_delete_with_cascade() {
     .await
     .unwrap();
 
-    let cs = db
-        .changes_since(v_before, &ChangeFilter::default())
+    let cs = diff_since_branch(&db, "main", v_before, &ChangeFilter::default())
         .await
         .unwrap();
 
@@ -187,9 +194,10 @@ async fn diff_detects_node_delete_with_cascade() {
 async fn diff_detects_edge_insert_with_endpoints() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
-    let v_before = db.version();
+    let v_before = snapshot_id(&db, "main").await.unwrap();
 
-    db.run_mutation(
+    mutate_main(
+        &mut db,
         MUTATION_QUERIES,
         "add_friend",
         &params(&[("$from", "Bob"), ("$to", "Charlie")]),
@@ -197,8 +205,7 @@ async fn diff_detects_edge_insert_with_endpoints() {
     .await
     .unwrap();
 
-    let cs = db
-        .changes_since(v_before, &ChangeFilter::default())
+    let cs = diff_since_branch(&db, "main", v_before, &ChangeFilter::default())
         .await
         .unwrap();
 
@@ -232,10 +239,11 @@ async fn diff_detects_edge_insert_with_endpoints() {
 async fn filter_by_type_name_skips_non_matching() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
-    let v_before = db.version();
+    let v_before = snapshot_id(&db, "main").await.unwrap();
 
     // Insert a person (node:Person) and add a friend (edge:Knows)
-    db.run_mutation(
+    mutate_main(
+        &mut db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "FilterTest")], &[("$age", 30)]),
@@ -248,7 +256,9 @@ async fn filter_by_type_name_skips_non_matching() {
         type_names: Some(vec!["Company".to_string()]),
         ..Default::default()
     };
-    let cs = db.changes_since(v_before, &filter).await.unwrap();
+    let cs = diff_since_branch(&db, "main", v_before, &filter)
+        .await
+        .unwrap();
     assert!(
         cs.changes.is_empty(),
         "Filter to Company should skip Person changes. Got: {:?}",
@@ -263,10 +273,11 @@ async fn filter_by_type_name_skips_non_matching() {
 async fn filter_by_op_skips_unwanted_operations() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
-    let v_before = db.version();
+    let v_before = snapshot_id(&db, "main").await.unwrap();
 
     // Insert Eve, update Bob, delete Alice
-    db.run_mutation(
+    mutate_main(
+        &mut db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
@@ -274,7 +285,8 @@ async fn filter_by_op_skips_unwanted_operations() {
     .await
     .unwrap();
 
-    db.run_mutation(
+    mutate_main(
+        &mut db,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "Bob")], &[("$age", 99)]),
@@ -287,7 +299,9 @@ async fn filter_by_op_skips_unwanted_operations() {
         ops: Some(vec![ChangeOp::Insert]),
         ..Default::default()
     };
-    let cs = db.changes_since(v_before, &filter).await.unwrap();
+    let cs = diff_since_branch(&db, "main", v_before, &filter)
+        .await
+        .unwrap();
 
     // Should only have inserts, no updates or deletes
     for c in &cs.changes {
@@ -310,13 +324,14 @@ async fn diff_after_merge_reports_actual_changes() {
     let uri = dir.path().to_str().unwrap();
     let mut main = init_and_load(&dir).await;
     main.ensure_indices().await.unwrap();
-    let v_before_branch = main.version();
+    let v_before_branch = snapshot_id(&main, "main").await.unwrap();
 
     main.branch_create("feature").await.unwrap();
-    let mut feature = Omnigraph::open_branch(uri, "feature").await.unwrap();
+    let mut feature = Omnigraph::open(uri).await.unwrap();
 
     // Main updates Bob
-    main.run_mutation(
+    mutate_main(
+        &mut main,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "Bob")], &[("$age", 26)]),
@@ -325,21 +340,21 @@ async fn diff_after_merge_reports_actual_changes() {
     .unwrap();
 
     // Feature inserts Eve
-    feature
-        .run_mutation(
-            MUTATION_QUERIES,
-            "insert_person",
-            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
-        )
-        .await
-        .unwrap();
+    mutate_branch(
+        &mut feature,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
 
     let outcome = main.branch_merge("feature", "main").await.unwrap();
     assert_eq!(outcome, MergeOutcome::Merged);
 
     // Diff from pre-branch to post-merge on main
-    let cs = main
-        .changes_since(v_before_branch, &ChangeFilter::default())
+    let cs = diff_since_branch(&main, "main", v_before_branch, &ChangeFilter::default())
         .await
         .unwrap();
 
@@ -385,15 +400,16 @@ async fn diff_commits_resolves_feature_commit_from_main_handle() {
     let mut main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open_branch(uri, "feature").await.unwrap();
-    feature
-        .run_mutation(
-            MUTATION_QUERIES,
-            "insert_person",
-            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
-        )
-        .await
-        .unwrap();
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+    mutate_branch(
+        &mut feature,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
 
     let main_head = CommitGraph::open(uri)
         .await
@@ -431,15 +447,16 @@ async fn cross_branch_diff_honors_insert_only_filter() {
     let mut main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open_branch(uri, "feature").await.unwrap();
-    feature
-        .run_mutation(
-            MUTATION_QUERIES,
-            "insert_person",
-            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
-        )
-        .await
-        .unwrap();
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+    mutate_branch(
+        &mut feature,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
 
     let main_head = CommitGraph::open(uri)
         .await
@@ -482,15 +499,16 @@ async fn diff_commits_resolves_commits_across_branches_from_any_handle() {
     let base_commit = head_commit_id(uri, None).await;
 
     main.branch_create("feature").await.unwrap();
-    let mut feature = Omnigraph::open_branch(uri, "feature").await.unwrap();
-    feature
-        .run_mutation(
-            MUTATION_QUERIES,
-            "insert_person",
-            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
-        )
-        .await
-        .unwrap();
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+    mutate_branch(
+        &mut feature,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
     let feature_commit = head_commit_id(uri, Some("feature")).await;
 
     let from_main = main
@@ -514,31 +532,35 @@ async fn cross_lineage_diff_honors_delete_only_filter() {
     let uri = dir.path().to_str().unwrap();
     let mut main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
-    let mut feature = Omnigraph::open_branch(uri, "feature").await.unwrap();
-    let before = feature.version();
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let before = snapshot_id(&feature, "feature").await.unwrap();
 
-    feature
-        .run_mutation(
-            MUTATION_QUERIES,
-            "set_age",
-            &mixed_params(&[("$name", "Bob")], &[("$age", 99)]),
-        )
-        .await
-        .unwrap();
-    feature
-        .run_mutation(
-            MUTATION_QUERIES,
-            "remove_person",
-            &params(&[("$name", "Alice")]),
-        )
-        .await
-        .unwrap();
+    mutate_branch(
+        &mut feature,
+        "feature",
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Bob")], &[("$age", 99)]),
+    )
+    .await
+    .unwrap();
+    mutate_branch(
+        &mut feature,
+        "feature",
+        MUTATION_QUERIES,
+        "remove_person",
+        &params(&[("$name", "Alice")]),
+    )
+    .await
+    .unwrap();
 
     let filter = ChangeFilter {
         ops: Some(vec![ChangeOp::Delete]),
         ..Default::default()
     };
-    let change_set = feature.changes_since(before, &filter).await.unwrap();
+    let change_set = diff_since_branch(&feature, "feature", before, &filter)
+        .await
+        .unwrap();
 
     assert!(
         !change_set.changes.is_empty(),
@@ -558,20 +580,20 @@ async fn same_branch_diff_across_first_lazy_fork_detects_update() {
     let uri = dir.path().to_str().unwrap();
     let mut main = init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
-    let mut feature = Omnigraph::open_branch(uri, "feature").await.unwrap();
-    let before = feature.version();
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+    let before = snapshot_id(&feature, "feature").await.unwrap();
 
-    feature
-        .run_mutation(
-            MUTATION_QUERIES,
-            "set_age",
-            &mixed_params(&[("$name", "Bob")], &[("$age", 77)]),
-        )
-        .await
-        .unwrap();
+    mutate_branch(
+        &mut feature,
+        "feature",
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Bob")], &[("$age", 77)]),
+    )
+    .await
+    .unwrap();
 
-    let change_set = feature
-        .changes_since(before, &ChangeFilter::default())
+    let change_set = diff_since_branch(&feature, "feature", before, &ChangeFilter::default())
         .await
         .unwrap();
     assert!(change_set.changes.iter().any(|change| {
@@ -587,15 +609,16 @@ async fn diff_commits_cross_branch_reports_property_only_updates() {
     let base_commit = head_commit_id(uri, None).await;
 
     main.branch_create("feature").await.unwrap();
-    let mut feature = Omnigraph::open_branch(uri, "feature").await.unwrap();
-    feature
-        .run_mutation(
-            MUTATION_QUERIES,
-            "set_age",
-            &mixed_params(&[("$name", "Bob")], &[("$age", 55)]),
-        )
-        .await
-        .unwrap();
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+    mutate_branch(
+        &mut feature,
+        "feature",
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Bob")], &[("$age", 55)]),
+    )
+    .await
+    .unwrap();
     let feature_commit = head_commit_id(uri, Some("feature")).await;
 
     let change_set = main

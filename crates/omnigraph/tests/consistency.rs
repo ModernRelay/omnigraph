@@ -18,10 +18,11 @@ async fn snapshot_returns_stale_data_after_write() {
     let mut db = init_and_load(&dir).await;
 
     // Snapshot BEFORE mutation
-    let snap_before = db.snapshot();
+    let snap_before = snapshot_main(&db).await.unwrap();
 
     // Insert a new person
-    db.run_mutation(
+    mutate_main(
+        &mut db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
@@ -30,7 +31,7 @@ async fn snapshot_returns_stale_data_after_write() {
     .unwrap();
 
     // Snapshot AFTER mutation
-    let snap_after = db.snapshot();
+    let snap_after = snapshot_main(&db).await.unwrap();
 
     // Old snapshot should still see 4 persons
     let ds_before = snap_before.open("node:Person").await.unwrap();
@@ -121,7 +122,7 @@ async fn load_merge_upserts_existing_and_inserts_new() {
 // ─── Multi-writer refresh ───────────────────────────────────────────────────
 
 #[tokio::test]
-async fn refresh_sees_other_writer_commits() {
+async fn explicit_target_query_sees_other_writer_commits_without_refresh() {
     let dir = tempfile::tempdir().unwrap();
     let _db = init_and_load(&dir).await;
     drop(_db);
@@ -133,7 +134,8 @@ async fn refresh_sees_other_writer_commits() {
     let mut db2 = Omnigraph::open(uri).await.unwrap();
 
     // Writer 1 inserts Eve
-    db1.run_mutation(
+    mutate_main(
+        &mut db1,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
@@ -141,26 +143,20 @@ async fn refresh_sees_other_writer_commits() {
     .await
     .unwrap();
 
-    // Writer 2 hasn't refreshed — should NOT see Eve
-    let qr = db2
-        .run_query(TEST_QUERIES, "get_person", &params(&[("$name", "Eve")]))
-        .await
-        .unwrap();
-    assert_eq!(qr.num_rows(), 0, "stale handle should not see Eve");
-
-    // Refresh writer 2
-    db2.refresh().await.unwrap();
-
-    // Now writer 2 should see Eve
-    let qr = db2
-        .run_query(TEST_QUERIES, "get_person", &params(&[("$name", "Eve")]))
-        .await
-        .unwrap();
-    assert_eq!(qr.num_rows(), 1, "refreshed handle should see Eve");
+    // Explicit-target reads resolve the latest branch head and should see Eve
+    let qr = query_main(
+        &mut db2,
+        TEST_QUERIES,
+        "get_person",
+        &params(&[("$name", "Eve")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(qr.num_rows(), 1, "explicit target reads should see Eve");
 }
 
 #[tokio::test]
-async fn refresh_rebuilds_graph_index_after_external_edge_write() {
+async fn explicit_target_query_rebuilds_graph_index_after_external_edge_write() {
     let dir = tempfile::tempdir().unwrap();
     let _db = init_and_load(&dir).await;
     drop(_db);
@@ -169,13 +165,18 @@ async fn refresh_rebuilds_graph_index_after_external_edge_write() {
     let mut db1 = Omnigraph::open(uri).await.unwrap();
     let mut db2 = Omnigraph::open(uri).await.unwrap();
 
-    let warm = db2
-        .run_query(TEST_QUERIES, "friends_of", &params(&[("$name", "Alice")]))
-        .await
-        .unwrap();
+    let warm = query_main(
+        &mut db2,
+        TEST_QUERIES,
+        "friends_of",
+        &params(&[("$name", "Alice")]),
+    )
+    .await
+    .unwrap();
     assert_eq!(warm.num_rows(), 2);
 
-    db1.run_mutation(
+    mutate_main(
+        &mut db1,
         MUTATION_QUERIES,
         "add_friend",
         &params(&[("$from", "Alice"), ("$to", "Diana")]),
@@ -183,22 +184,18 @@ async fn refresh_rebuilds_graph_index_after_external_edge_write() {
     .await
     .unwrap();
 
-    let stale = db2
-        .run_query(TEST_QUERIES, "friends_of", &params(&[("$name", "Alice")]))
-        .await
-        .unwrap();
-    assert_eq!(stale.num_rows(), 2, "stale handle should keep old topology");
-
-    db2.refresh().await.unwrap();
-
-    let refreshed = db2
-        .run_query(TEST_QUERIES, "friends_of", &params(&[("$name", "Alice")]))
-        .await
-        .unwrap();
+    let refreshed = query_main(
+        &mut db2,
+        TEST_QUERIES,
+        "friends_of",
+        &params(&[("$name", "Alice")]),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         refreshed.num_rows(),
         3,
-        "refreshed handle should rebuild topology after edge change"
+        "explicit target reads should rebuild topology after edge change"
     );
 
     let batch = refreshed.concat_batches().unwrap();
@@ -246,8 +243,7 @@ query all_persons() {
 }
 "#;
 
-    let result = db
-        .run_query(queries, "older_than_30", &ParamMap::new())
+    let result = query_main(&mut db, queries, "older_than_30", &ParamMap::new())
         .await
         .unwrap();
     assert_eq!(result.num_rows(), 1);
@@ -260,8 +256,7 @@ query all_persons() {
     assert_eq!(names.value(0), "Charlie");
 
     // Projection: Bob's age should be null
-    let all = db
-        .run_query(queries, "all_persons", &ParamMap::new())
+    let all = query_main(&mut db, queries, "all_persons", &ParamMap::new())
         .await
         .unwrap();
     let batch = &all.batches()[0];
@@ -291,13 +286,18 @@ async fn traversal_works_after_node_then_edge_insert() {
     let mut db = init_and_load(&dir).await;
 
     // Warm up the graph index cache by running a traversal
-    let _ = db
-        .run_query(TEST_QUERIES, "friends_of", &params(&[("$name", "Alice")]))
-        .await
-        .unwrap();
+    let _ = query_main(
+        &mut db,
+        TEST_QUERIES,
+        "friends_of",
+        &params(&[("$name", "Alice")]),
+    )
+    .await
+    .unwrap();
 
     // Insert a new node (does NOT invalidate graph index)
-    db.run_mutation(
+    mutate_main(
+        &mut db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Frank")], &[("$age", 40)]),
@@ -306,7 +306,8 @@ async fn traversal_works_after_node_then_edge_insert() {
     .unwrap();
 
     // Insert an edge from Frank → Alice (DOES invalidate graph index)
-    db.run_mutation(
+    mutate_main(
+        &mut db,
         MUTATION_QUERIES,
         "add_friend",
         &params(&[("$from", "Frank"), ("$to", "Alice")]),
@@ -315,10 +316,14 @@ async fn traversal_works_after_node_then_edge_insert() {
     .unwrap();
 
     // Traversal should work: Frank → Alice
-    let result = db
-        .run_query(TEST_QUERIES, "friends_of", &params(&[("$name", "Frank")]))
-        .await
-        .unwrap();
+    let result = query_main(
+        &mut db,
+        TEST_QUERIES,
+        "friends_of",
+        &params(&[("$name", "Frank")]),
+    )
+    .await
+    .unwrap();
     assert_eq!(result.num_rows(), 1);
     let batch = result.concat_batches().unwrap();
     let names = batch
@@ -345,8 +350,7 @@ query add_friend_since($from: String, $to: String, $since: Date) {
     let mut p = params(&[("$from", "Diana"), ("$to", "Bob")]);
     p.insert("since".to_string(), Literal::Date("2024-06-15".to_string()));
 
-    let result = db
-        .run_mutation(queries, "add_friend_since", &p)
+    let result = mutate_main(&mut db, queries, "add_friend_since", &p)
         .await
         .unwrap();
     assert_eq!(result.affected_edges, 1);
@@ -390,14 +394,14 @@ async fn update_nonexistent_returns_zero_affected() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
 
-    let result = db
-        .run_mutation(
-            MUTATION_QUERIES,
-            "set_age",
-            &mixed_params(&[("$name", "Nobody")], &[("$age", 99)]),
-        )
-        .await
-        .unwrap();
+    let result = mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Nobody")], &[("$age", 99)]),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(result.affected_nodes, 0);
 }
@@ -407,14 +411,14 @@ async fn delete_nonexistent_returns_zero_affected() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
 
-    let result = db
-        .run_mutation(
-            MUTATION_QUERIES,
-            "remove_person",
-            &params(&[("$name", "Nobody")]),
-        )
-        .await
-        .unwrap();
+    let result = mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "remove_person",
+        &params(&[("$name", "Nobody")]),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(result.affected_nodes, 0);
     assert_eq!(result.affected_edges, 0);
@@ -464,8 +468,7 @@ query high_value() {
     order { $i.value asc }
 }
 "#;
-    let result = db
-        .run_query(queries, "high_value", &ParamMap::new())
+    let result = query_main(&mut db, queries, "high_value", &ParamMap::new())
         .await
         .unwrap();
 
@@ -494,7 +497,8 @@ async fn stale_handle_mutation_detects_version_drift() {
     let mut db2 = Omnigraph::open(uri).await.unwrap();
 
     // Writer 1 inserts — advances the Person sub-table version
-    db1.run_mutation(
+    mutate_main(
+        &mut db1,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
@@ -503,13 +507,13 @@ async fn stale_handle_mutation_detects_version_drift() {
     .unwrap();
 
     // Writer 2 (stale) tries to mutate — should detect version drift
-    let result = db2
-        .run_mutation(
-            MUTATION_QUERIES,
-            "set_age",
-            &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
-        )
-        .await;
+    let result = mutate_main(
+        &mut db2,
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
+    )
+    .await;
     assert!(result.is_err(), "stale handle should detect version drift");
     let err = result.unwrap_err().to_string();
     assert!(
@@ -519,13 +523,13 @@ async fn stale_handle_mutation_detects_version_drift() {
     );
 
     // After refresh, the mutation should succeed
-    db2.refresh().await.unwrap();
-    let result = db2
-        .run_mutation(
-            MUTATION_QUERIES,
-            "set_age",
-            &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
-        )
-        .await;
+    sync_main(&mut db2).await.unwrap();
+    let result = mutate_main(
+        &mut db2,
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
+    )
+    .await;
     assert!(result.is_ok(), "refreshed handle should succeed");
 }

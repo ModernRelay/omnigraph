@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, RecordBatchIterator, StringArray, UInt32Array, UInt64Array,
+    RecordBatch, StringArray, UInt32Array, UInt64Array,
 };
 use arrow_cast::display::array_value_to_string;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -13,8 +13,6 @@ use futures::TryStreamExt;
 use lance::Dataset;
 use lance::blob::BlobArrayBuilder;
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream};
-use lance::dataset::{WriteMode, WriteParams};
-use lance_file::version::LanceFileVersion;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::ir::{
     IRAssignment, IRExpr, IRFilter, IRMutationPredicate, IROp, IROrdering, IRProjection,
@@ -56,10 +54,7 @@ impl Omnigraph {
             .iter()
             .any(|op| matches!(op, IROp::Expand { .. } | IROp::AntiJoin { .. }));
         let graph_index = if needs_graph {
-            Some(
-                self.graph_index_for_target(resolved.requested.clone())
-                    .await?,
-            )
+            Some(self.graph_index_for_resolved(&resolved).await?)
         } else {
             None
         };
@@ -70,22 +65,6 @@ impl Omnigraph {
             &resolved.snapshot,
             graph_index.as_deref(),
             self.catalog(),
-        )
-        .await
-    }
-
-    /// Run a named query from a .gq query source string.
-    pub async fn run_query(
-        &mut self,
-        query_source: &str,
-        query_name: &str,
-        params: &ParamMap,
-    ) -> Result<QueryResult> {
-        self.query(
-            ReadTarget::Branch(self.active_branch().unwrap_or("main").to_string()),
-            query_source,
-            query_name,
-            params,
         )
         .await
     }
@@ -139,15 +118,15 @@ impl OrderedTableCursor {
 
     async fn from_dataset(dataset: Option<Dataset>) -> Result<Self> {
         let stream = if let Some(ds) = dataset {
-            let mut scanner = ds.scan();
-            scanner
-                .order_by(Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]))
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
             Some(Box::pin(
-                scanner
-                    .try_into_stream()
-                    .await
-                    .map_err(|e| OmniError::Lance(e.to_string()))?,
+                crate::table_store::TableStore::scan_stream(
+                    &ds,
+                    None,
+                    None,
+                    Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]),
+                    false,
+                )
+                .await?,
             ))
         } else {
             None
@@ -247,7 +226,13 @@ impl StagedTableWriter {
     async fn finish(mut self) -> Result<StagedTable> {
         self.flush().await?;
         if self.dataset.is_none() {
-            self.dataset = Some(create_staged_dataset(&self.dataset_uri, &self.schema).await?);
+            self.dataset = Some(
+                crate::table_store::TableStore::create_empty_dataset(
+                    &self.dataset_uri,
+                    &self.schema,
+                )
+                .await?,
+            );
         }
         Ok(StagedTable {
             _dir: self.dir,
@@ -269,25 +254,12 @@ impl StagedTableWriter {
         };
         self.buffered_rows = 0;
 
-        let reader = RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
-        let params = WriteParams {
-            mode: WriteMode::Create,
-            enable_stable_row_ids: true,
-            data_storage_version: Some(LanceFileVersion::V2_2),
-            ..Default::default()
-        };
-
-        let ds = match self.dataset.take() {
-            Some(mut ds) => {
-                ds.append(reader, None)
-                    .await
-                    .map_err(|e| OmniError::Lance(e.to_string()))?;
-                ds
-            }
-            None => Dataset::write(reader, &self.dataset_uri as &str, Some(params))
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?,
-        };
+        let ds = crate::table_store::TableStore::append_or_create_batch(
+            &self.dataset_uri,
+            self.dataset.take(),
+            batch,
+        )
+        .await?;
         self.dataset = Some(ds);
         Ok(())
     }
@@ -320,27 +292,6 @@ fn sanitize_table_key(table_key: &str) -> String {
             other => other,
         })
         .collect()
-}
-
-async fn create_staged_dataset(dataset_uri: &str, schema: &SchemaRef) -> Result<Dataset> {
-    let batch = RecordBatch::new_empty(schema.clone());
-    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
-    let params = WriteParams {
-        mode: WriteMode::Create,
-        enable_stable_row_ids: true,
-        data_storage_version: Some(LanceFileVersion::V2_2),
-        ..Default::default()
-    };
-    Dataset::write(reader, dataset_uri, Some(params))
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))
-}
-
-async fn scan_table_batches(ds: &Dataset) -> Result<DatasetRecordBatchStream> {
-    ds.scan()
-        .try_into_stream()
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
 /// Computes the delta between base and source for an adopted-source merge.
@@ -639,7 +590,8 @@ async fn validate_merge_candidates(
         if let Some(ds) =
             candidate_dataset(source_snapshot, target_snapshot, candidates, &table_key).await?
         {
-            let mut stream = scan_table_batches(&ds).await?;
+            let mut stream =
+                crate::table_store::TableStore::scan_stream(&ds, None, None, None, false).await?;
             while let Some(batch) = stream
                 .try_next()
                 .await
@@ -686,7 +638,8 @@ async fn validate_merge_candidates(
         if let Some(ds) =
             candidate_dataset(source_snapshot, target_snapshot, candidates, &table_key).await?
         {
-            let mut stream = scan_table_batches(&ds).await?;
+            let mut stream =
+                crate::table_store::TableStore::scan_stream(&ds, None, None, None, false).await?;
             while let Some(batch) = stream
                 .try_next()
                 .await
@@ -1016,38 +969,38 @@ async fn publish_rewritten_merge_table(
     table_key: &str,
     staged: &StagedMergeResult,
 ) -> Result<crate::db::SubTableUpdate> {
-    let (ds, _full_path, table_branch) = target_db.open_for_mutation(table_key).await?;
+    let (ds, full_path, table_branch) = target_db.open_for_mutation(table_key).await?;
     let mut current_ds = ds;
 
     // Phase 1: merge_insert changed/new rows (preserves _row_created_at_version for
     // existing rows, bumps _row_last_updated_at_version only for actually-changed rows)
     if let Some(delta) = &staged.delta_staged {
-        let mut batches = Vec::new();
-        let mut stream = scan_table_batches(&delta.dataset).await?;
-        while let Some(batch) = stream
-            .try_next()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?
-        {
-            if batch.num_rows() > 0 {
-                batches.push(Ok(batch));
-            }
-        }
+        let batches: Vec<RecordBatch> = target_db
+            .table_store()
+            .scan_batches(&delta.dataset)
+            .await?
+            .into_iter()
+            .filter(|batch| batch.num_rows() > 0)
+            .collect();
         if !batches.is_empty() {
-            let schema = batches[0].as_ref().unwrap().schema();
-            let reader = RecordBatchIterator::new(batches, schema);
-            let ds_arc = std::sync::Arc::new(current_ds);
-            let job = lance::dataset::MergeInsertBuilder::try_new(ds_arc, vec!["id".to_string()])
-                .map_err(|e| OmniError::Lance(e.to_string()))?
-                .when_matched(lance::dataset::WhenMatched::UpdateAll)
-                .when_not_matched(lance::dataset::WhenNotMatched::InsertAll)
-                .try_build()
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
-            let (new_ds, _stats) = job
-                .execute(lance_datafusion::utils::reader_to_stream(Box::new(reader)))
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
-            current_ds = new_ds.as_ref().clone();
+            let state = target_db
+                .table_store()
+                .merge_insert_batches(
+                    current_ds,
+                    batches,
+                    vec!["id".to_string()],
+                    lance::dataset::WhenMatched::UpdateAll,
+                    lance::dataset::WhenNotMatched::InsertAll,
+                )
+                .await?;
+            current_ds = target_db
+                .reopen_for_mutation(
+                    table_key,
+                    &full_path,
+                    table_branch.as_deref(),
+                    state.version,
+                )
+                .await?;
         }
     }
 
@@ -1059,17 +1012,18 @@ async fn publish_rewritten_merge_table(
             .map(|id| format!("'{}'", id.replace('\'', "''")))
             .collect();
         let filter = format!("id IN ({})", escaped.join(", "));
-        current_ds
-            .delete(&filter)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        target_db
+            .table_store()
+            .delete_where(&mut current_ds, &filter)
+            .await?;
     }
 
     // Phase 3: rebuild indices
-    let row_count = current_ds
-        .count_rows(None)
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
+    let row_count = target_db
+        .table_store()
+        .table_state(&current_ds)
+        .await?
+        .row_count;
     if row_count > 0 {
         target_db
             .build_indices_on_dataset(table_key, &mut current_ds)
@@ -1696,34 +1650,26 @@ async fn hydrate_nodes(
         .map(|id| format!("'{}'", id.replace('\'', "''")))
         .collect();
     let filter_sql = format!("id IN ({})", escaped.join(", "));
-
-    let mut scanner = ds.scan();
     let has_blobs = !node_type.blob_properties.is_empty();
-
-    if has_blobs {
-        let non_blob_cols: Vec<&str> = node_type
-            .arrow_schema
-            .fields()
-            .iter()
-            .filter(|f| !node_type.blob_properties.contains(f.name()))
-            .map(|f| f.name().as_str())
-            .collect();
-        scanner
-            .project(&non_blob_cols)
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-    }
-
-    scanner
-        .filter(&filter_sql)
-        .map_err(|e| OmniError::Lance(format!("hydrate filter: {}", e)))?;
-
-    let batches: Vec<RecordBatch> = scanner
-        .try_into_stream()
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?
-        .try_collect()
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    let non_blob_cols: Vec<&str> = node_type
+        .arrow_schema
+        .fields()
+        .iter()
+        .filter(|f| !node_type.blob_properties.contains(f.name()))
+        .map(|f| f.name().as_str())
+        .collect();
+    let projection = has_blobs.then_some(non_blob_cols.as_slice());
+    let batches = crate::table_store::TableStore::scan_stream(
+        &ds,
+        projection,
+        Some(&filter_sql),
+        None,
+        false,
+    )
+    .await?
+    .try_collect::<Vec<RecordBatch>>()
+    .await
+    .map_err(|e| OmniError::Lance(e.to_string()))?;
 
     let scan_result = if batches.is_empty() {
         return Ok(RecordBatch::new_empty(node_type.arrow_schema.clone()));
@@ -1886,72 +1832,65 @@ async fn execute_node_scan(
     // Build Lance SQL filter string from non-search IR filters
     let filter_sql = build_lance_filter(filters, params);
 
-    let mut scanner = ds.scan();
-
     // Blob columns must be excluded from scan when a filter is present
     // (Lance bug: BlobsDescriptions + filter triggers a projection assertion).
     // We exclude blob columns and add metadata post-scan via take_blobs_by_indices.
     let node_type = &catalog.node_types[type_name];
     let has_blobs = !node_type.blob_properties.is_empty();
-    if has_blobs {
-        let non_blob_cols: Vec<&str> = node_type
-            .arrow_schema
-            .fields()
-            .iter()
-            .filter(|f| !node_type.blob_properties.contains(f.name()))
-            .map(|f| f.name().as_str())
-            .collect();
-        scanner
-            .project(&non_blob_cols)
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-    }
-
-    if let Some(sql) = &filter_sql {
-        scanner
-            .filter(sql.as_str())
-            .map_err(|e| OmniError::Lance(format!("filter '{}': {}", sql, e)))?;
-    }
-
-    // Apply FTS queries from hoisted search filters (search/fuzzy/match_text in match clause)
-    for filter in filters {
-        if is_search_filter(filter) {
-            if let Some(fts_query) = build_fts_query(&filter.left, params) {
-                scanner
-                    .full_text_search(fts_query)
-                    .map_err(|e| OmniError::Lance(format!("full_text_search filter: {}", e)))?;
+    let non_blob_cols: Vec<&str> = node_type
+        .arrow_schema
+        .fields()
+        .iter()
+        .filter(|f| !node_type.blob_properties.contains(f.name()))
+        .map(|f| f.name().as_str())
+        .collect();
+    let projection = has_blobs.then_some(non_blob_cols.as_slice());
+    let batches = crate::table_store::TableStore::scan_stream_with(
+        &ds,
+        projection,
+        filter_sql.as_deref(),
+        None,
+        false,
+        |scanner| {
+            // Apply FTS queries from hoisted search filters (search/fuzzy/match_text in match clause)
+            for filter in filters {
+                if is_search_filter(filter) {
+                    if let Some(fts_query) = build_fts_query(&filter.left, params) {
+                        scanner.full_text_search(fts_query).map_err(|e| {
+                            OmniError::Lance(format!("full_text_search filter: {}", e))
+                        })?;
+                    }
+                }
             }
-        }
-    }
 
-    // Apply nearest vector search if this variable is the target
-    if let Some((ref var, ref prop, ref vec, k)) = search_mode.nearest {
-        if var == variable {
-            let query_arr = Float32Array::from(vec.clone());
-            scanner
-                .nearest(prop, &query_arr, k)
-                .map_err(|e| OmniError::Lance(format!("nearest: {}", e)))?;
-        }
-    }
+            // Apply nearest vector search if this variable is the target
+            if let Some((ref var, ref prop, ref vec, k)) = search_mode.nearest {
+                if var == variable {
+                    let query_arr = Float32Array::from(vec.clone());
+                    scanner
+                        .nearest(prop, &query_arr, k)
+                        .map_err(|e| OmniError::Lance(format!("nearest: {}", e)))?;
+                }
+            }
 
-    // Apply BM25 full-text search if this variable is the target
-    if let Some((ref var, ref prop, ref text)) = search_mode.bm25 {
-        if var == variable {
-            let fts_query = lance_index::scalar::FullTextSearchQuery::new(text.clone())
-                .with_column(prop.clone())
-                .map_err(|e| OmniError::Lance(format!("fts with_column: {}", e)))?;
-            scanner
-                .full_text_search(fts_query)
-                .map_err(|e| OmniError::Lance(format!("full_text_search: {}", e)))?;
-        }
-    }
-
-    let batches: Vec<RecordBatch> = scanner
-        .try_into_stream()
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?
-        .try_collect()
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+            // Apply BM25 full-text search if this variable is the target
+            if let Some((ref var, ref prop, ref text)) = search_mode.bm25 {
+                if var == variable {
+                    let fts_query = lance_index::scalar::FullTextSearchQuery::new(text.clone())
+                        .with_column(prop.clone())
+                        .map_err(|e| OmniError::Lance(format!("fts with_column: {}", e)))?;
+                    scanner
+                        .full_text_search(fts_query)
+                        .map_err(|e| OmniError::Lance(format!("full_text_search: {}", e)))?;
+                }
+            }
+            Ok(())
+        },
+    )
+    .await?
+    .try_collect::<Vec<RecordBatch>>()
+    .await
+    .map_err(|e| OmniError::Lance(e.to_string()))?;
 
     let scan_result = if batches.is_empty() {
         RecordBatch::new_empty(batches.first().map(|b| b.schema()).unwrap_or_else(|| {
@@ -2686,15 +2625,22 @@ impl Omnigraph {
         let requested = Self::normalize_branch_name(branch)?;
         let current = self.active_branch().map(str::to_string);
         if requested == current {
-            return self.run_mutation(query_source, query_name, params).await;
+            return self
+                .execute_named_mutation(query_source, query_name, params)
+                .await;
         }
 
-        let mut other = self.reopen_for_branch(requested.as_deref()).await?;
-        other.run_mutation(query_source, query_name, params).await
+        let previous = self
+            .swap_coordinator_for_branch(requested.as_deref())
+            .await?;
+        let result = self
+            .execute_named_mutation(query_source, query_name, params)
+            .await;
+        self.restore_coordinator(previous);
+        result
     }
 
-    /// Run a named mutation from a .gq query source string.
-    pub async fn run_mutation(
+    async fn execute_named_mutation(
         &mut self,
         query_source: &str,
         query_name: &str,
@@ -2708,7 +2654,7 @@ impl Omnigraph {
             CheckedQuery::Mutation(_) => {}
             CheckedQuery::Read(_) => {
                 return Err(OmniError::Manifest(
-                    "run_mutation called on a read query; use run_query instead".to_string(),
+                    "mutation execution called on a read query; use query instead".to_string(),
                 ));
             }
         }
@@ -2744,18 +2690,12 @@ impl Omnigraph {
             ));
         }
 
-        let mut source_db = self.reopen_for_branch(source_branch.as_deref()).await?;
-        let mut target_db = self.reopen_for_branch(target_branch.as_deref()).await?;
-
-        source_db.ensure_commit_graph_initialized().await?;
-        target_db.ensure_commit_graph_initialized().await?;
-
-        let source_head_commit_id = source_db
-            .head_commit_id()
+        let source_head_commit_id = self
+            .head_commit_id_for_branch(source_branch.as_deref())
             .await?
             .ok_or_else(|| OmniError::Manifest("source branch has no head commit".to_string()))?;
-        let target_head_commit_id = target_db
-            .head_commit_id()
+        let target_head_commit_id = self
+            .head_commit_id_for_branch(target_branch.as_deref())
             .await?
             .ok_or_else(|| OmniError::Manifest("target branch has no head commit".to_string()))?;
         let base_commit = CommitGraph::merge_base(
@@ -2779,8 +2719,44 @@ impl Omnigraph {
             base_commit.manifest_version,
         )
         .await?;
-        let source_snapshot = source_db.snapshot();
-        let target_snapshot = target_db.snapshot();
+        let source_snapshot = self
+            .resolved_target(ReadTarget::Branch(
+                source_branch.clone().unwrap_or_else(|| "main".to_string()),
+            ))
+            .await?
+            .snapshot;
+        let previous_branch = self.active_branch().map(str::to_string);
+        let previous = self
+            .swap_coordinator_for_branch(target_branch.as_deref())
+            .await?;
+        let merge_result = self
+            .branch_merge_on_current_target(
+                &base_snapshot,
+                &source_snapshot,
+                &target_head_commit_id,
+                &source_head_commit_id,
+                is_fast_forward,
+            )
+            .await;
+        self.restore_coordinator(previous);
+
+        if merge_result.is_ok() && previous_branch == target_branch {
+            self.refresh().await?;
+        }
+
+        merge_result
+    }
+
+    async fn branch_merge_on_current_target(
+        &mut self,
+        base_snapshot: &Snapshot,
+        source_snapshot: &Snapshot,
+        target_head_commit_id: &str,
+        source_head_commit_id: &str,
+        is_fast_forward: bool,
+    ) -> Result<MergeOutcome> {
+        self.ensure_commit_graph_initialized().await?;
+        let target_snapshot = self.snapshot();
 
         let mut table_keys = HashSet::new();
         for entry in base_snapshot.entries() {
@@ -2817,8 +2793,8 @@ impl Omnigraph {
             if let Some(staged) = stage_streaming_table_merge(
                 table_key,
                 self.catalog(),
-                &base_snapshot,
-                &source_snapshot,
+                base_snapshot,
+                source_snapshot,
                 &target_snapshot,
                 &mut conflicts,
             )
@@ -2835,8 +2811,7 @@ impl Omnigraph {
             return Err(OmniError::MergeConflicts(conflicts));
         }
 
-        validate_merge_candidates(&target_db, &source_snapshot, &target_snapshot, &candidates)
-            .await?;
+        validate_merge_candidates(self, source_snapshot, &target_snapshot, &candidates).await?;
 
         let mut updates = Vec::new();
         let mut changed_edge_tables = false;
@@ -2847,17 +2822,17 @@ impl Omnigraph {
             let update = match candidate_state {
                 CandidateTableState::AdoptSourceState => {
                     publish_adopted_source_state(
-                        &target_db,
+                        self,
                         self.catalog(),
-                        &base_snapshot,
-                        &source_snapshot,
+                        base_snapshot,
+                        source_snapshot,
                         &target_snapshot,
                         table_key,
                     )
                     .await?
                 }
                 CandidateTableState::RewriteMerged(staged) => {
-                    publish_rewritten_merge_table(&target_db, table_key, staged).await?
+                    publish_rewritten_merge_table(self, table_key, staged).await?
                 }
             };
             if table_key.starts_with("edge:") {
@@ -2867,25 +2842,19 @@ impl Omnigraph {
         }
 
         let manifest_version = if updates.is_empty() {
-            target_db.version()
+            self.version()
         } else {
-            target_db.commit_manifest_updates(&updates).await?
+            self.commit_manifest_updates(&updates).await?
         };
-        target_db
-            .record_merge_commit(
-                manifest_version,
-                &target_head_commit_id,
-                &source_head_commit_id,
-            )
-            .await?;
+        self.record_merge_commit(
+            manifest_version,
+            target_head_commit_id,
+            source_head_commit_id,
+        )
+        .await?;
 
         if changed_edge_tables {
-            target_db.invalidate_graph_index();
-        }
-
-        let self_branch = self.active_branch().map(str::to_string);
-        if self_branch == target_branch {
-            self.refresh().await?;
+            self.invalidate_graph_index();
         }
 
         Ok(if is_fast_forward {
@@ -2986,7 +2955,7 @@ impl Omnigraph {
         &self,
         type_name: &str,
         is_node: bool,
-        schema: SchemaRef,
+        _schema: SchemaRef,
         batch: RecordBatch,
     ) -> Result<(u64, u64, Option<String>)> {
         let table_key = if is_node {
@@ -2995,19 +2964,8 @@ impl Omnigraph {
             format!("edge:{}", type_name)
         };
         let (mut ds, _full_path, table_branch) = self.open_for_mutation(&table_key).await?;
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        ds.append(reader, None)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-
-        // Use the mutated handle directly — no re-open needed (avoids TOCTOU race)
-        let new_version = ds.version().version;
-        let row_count = ds
-            .count_rows(None)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
-
-        Ok((new_version, row_count, table_branch))
+        let state = self.table_store().append_batch(&mut ds, batch).await?;
+        Ok((state.version, state.row_count, table_branch))
     }
 
     /// Upsert a batch into a sub-table using merge_insert keyed by "id".
@@ -3016,7 +2974,7 @@ impl Omnigraph {
         &self,
         type_name: &str,
         is_node: bool,
-        schema: SchemaRef,
+        _schema: SchemaRef,
         batch: RecordBatch,
     ) -> Result<(u64, u64, Option<String>)> {
         let table_key = if is_node {
@@ -3025,28 +2983,17 @@ impl Omnigraph {
             format!("edge:{}", type_name)
         };
         let (ds, _full_path, table_branch) = self.open_for_mutation(&table_key).await?;
-        let ds = Arc::new(ds);
-
-        let job = lance::dataset::MergeInsertBuilder::try_new(ds, vec!["id".to_string()])
-            .map_err(|e| OmniError::Lance(e.to_string()))?
-            .when_matched(lance::dataset::WhenMatched::UpdateAll)
-            .when_not_matched(lance::dataset::WhenNotMatched::InsertAll)
-            .try_build()
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        let (new_ds, _stats) = job
-            .execute(lance_datafusion::utils::reader_to_stream(Box::new(reader)))
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-
-        let new_version = new_ds.version().version;
-        let row_count = new_ds
-            .count_rows(None)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
-
-        Ok((new_version, row_count, table_branch))
+        let state = self
+            .table_store()
+            .merge_insert_batch(
+                ds,
+                batch,
+                vec!["id".to_string()],
+                lance::dataset::WhenMatched::UpdateAll,
+                lance::dataset::WhenNotMatched::InsertAll,
+            )
+            .await?;
+        Ok((state.version, state.row_count, table_branch))
     }
 
     async fn execute_update(
@@ -3082,29 +3029,21 @@ impl Omnigraph {
         let (ds, full_path, table_branch) = self.open_for_mutation(&table_key).await?;
         let initial_version = ds.version().version;
 
-        let mut scanner = ds.scan();
-        if !blob_props.is_empty() {
-            let non_blob_cols: Vec<&str> = schema
-                .fields()
-                .iter()
-                .filter(|f| !blob_props.contains(f.name()))
-                .map(|f| f.name().as_str())
-                .collect();
-            scanner
-                .project(&non_blob_cols)
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
-        }
-        scanner
-            .filter(&pred_sql)
-            .map_err(|e| OmniError::Lance(format!("update filter: {}", e)))?;
-
-        let batches: Vec<RecordBatch> = scanner
-            .try_into_stream()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?
-            .try_collect()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let non_blob_cols: Vec<&str> = schema
+            .fields()
+            .iter()
+            .filter(|f| !blob_props.contains(f.name()))
+            .map(|f| f.name().as_str())
+            .collect();
+        let batches = self
+            .table_store()
+            .scan(
+                &ds,
+                (!blob_props.is_empty()).then_some(non_blob_cols.as_slice()),
+                Some(&pred_sql),
+                None,
+            )
+            .await?;
 
         if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
             return Ok(MutationResult {
@@ -3140,27 +3079,19 @@ impl Omnigraph {
                 initial_version,
             )
             .await?;
-        let ds = Arc::new(ds);
+        let update_state = self
+            .table_store()
+            .merge_insert_batch(
+                ds,
+                updated,
+                vec!["id".to_string()],
+                lance::dataset::WhenMatched::UpdateAll,
+                lance::dataset::WhenNotMatched::DoNothing,
+            )
+            .await?;
 
-        let job = lance::dataset::MergeInsertBuilder::try_new(ds, vec!["id".to_string()])
-            .map_err(|e| OmniError::Lance(e.to_string()))?
-            .when_matched(lance::dataset::WhenMatched::UpdateAll)
-            .when_not_matched(lance::dataset::WhenNotMatched::DoNothing)
-            .try_build()
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-
-        let update_schema = updated.schema();
-        let reader = RecordBatchIterator::new(vec![Ok(updated)], update_schema);
-        let (new_ds, _stats) = job
-            .execute(lance_datafusion::utils::reader_to_stream(Box::new(reader)))
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-
-        let mut final_version = new_ds.version().version;
-        let mut final_row_count = new_ds
-            .count_rows(None)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
+        let mut final_version = update_state.version;
+        let mut final_row_count = update_state.row_count;
 
         // Phase 2: If there are blob assignments, apply them separately
         let blob_assignments: HashMap<&str, &Literal> = resolved
@@ -3212,26 +3143,19 @@ impl Omnigraph {
                     final_version,
                 )
                 .await?;
-            let ds = Arc::new(ds);
+            let blob_state = self
+                .table_store()
+                .merge_insert_batch(
+                    ds,
+                    blob_batch,
+                    vec!["id".to_string()],
+                    lance::dataset::WhenMatched::UpdateAll,
+                    lance::dataset::WhenNotMatched::DoNothing,
+                )
+                .await?;
 
-            let job = lance::dataset::MergeInsertBuilder::try_new(ds, vec!["id".to_string()])
-                .map_err(|e| OmniError::Lance(e.to_string()))?
-                .when_matched(lance::dataset::WhenMatched::UpdateAll)
-                .when_not_matched(lance::dataset::WhenNotMatched::DoNothing)
-                .try_build()
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
-
-            let reader = RecordBatchIterator::new(vec![Ok(blob_batch)], blob_schema);
-            let (new_ds, _stats) = job
-                .execute(lance_datafusion::utils::reader_to_stream(Box::new(reader)))
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
-
-            final_version = new_ds.version().version;
-            final_row_count = new_ds
-                .count_rows(None)
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
+            final_version = blob_state.version;
+            final_row_count = blob_state.row_count;
         }
 
         self.commit_updates(&[crate::db::SubTableUpdate {
@@ -3275,21 +3199,10 @@ impl Omnigraph {
         let initial_version = ds.version().version;
 
         // Scan matching IDs for cascade
-        let mut scanner = ds.scan();
-        scanner
-            .project(&["id"])
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        scanner
-            .filter(&pred_sql)
-            .map_err(|e| OmniError::Lance(format!("delete filter: {}", e)))?;
-
-        let batches: Vec<RecordBatch> = scanner
-            .try_into_stream()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?
-            .try_collect()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let batches = self
+            .table_store()
+            .scan(&ds, Some(&["id"]), Some(&pred_sql), None)
+            .await?;
 
         let deleted_ids: Vec<String> = batches
             .iter()
@@ -3324,23 +3237,13 @@ impl Omnigraph {
                 initial_version,
             )
             .await?;
-        let delete_result = ds
-            .delete(&pred_sql)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-
-        let node_version = delete_result.new_dataset.version().version;
-        let node_row_count = delete_result
-            .new_dataset
-            .count_rows(None)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
+        let delete_state = self.table_store().delete_where(&mut ds, &pred_sql).await?;
 
         let mut updates = vec![crate::db::SubTableUpdate {
             table_key,
-            table_version: node_version,
+            table_version: delete_state.version,
             table_branch: table_branch.clone(),
-            row_count: node_row_count,
+            row_count: delete_state.row_count,
         }];
 
         let mut affected_edges = 0usize;
@@ -3374,27 +3277,19 @@ impl Omnigraph {
             let (mut edge_ds, _edge_full_path, edge_table_branch) =
                 self.open_for_mutation(&edge_table_key).await?;
 
-            let edge_delete = edge_ds
-                .delete(&cascade_filter)
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            let edge_delete = self
+                .table_store()
+                .delete_where(&mut edge_ds, &cascade_filter)
+                .await?;
 
-            affected_edges += edge_delete.num_deleted_rows as usize;
+            affected_edges += edge_delete.deleted_rows;
 
-            if edge_delete.num_deleted_rows > 0 {
-                let edge_version = edge_delete.new_dataset.version().version;
-                let edge_row_count = edge_delete
-                    .new_dataset
-                    .count_rows(None)
-                    .await
-                    .map_err(|e| OmniError::Lance(e.to_string()))?
-                    as u64;
-
+            if edge_delete.deleted_rows > 0 {
                 updates.push(crate::db::SubTableUpdate {
                     table_key: edge_table_key,
-                    table_version: edge_version,
+                    table_version: edge_delete.version,
                     table_branch: edge_table_branch,
-                    row_count: edge_row_count,
+                    row_count: edge_delete.row_count,
                 });
             }
         }
@@ -3422,26 +3317,15 @@ impl Omnigraph {
         let table_key = format!("edge:{}", type_name);
         let (mut ds, _full_path, table_branch) = self.open_for_mutation(&table_key).await?;
 
-        let delete_result = ds
-            .delete(&pred_sql)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-
-        let affected = delete_result.num_deleted_rows as usize;
+        let delete_state = self.table_store().delete_where(&mut ds, &pred_sql).await?;
+        let affected = delete_state.deleted_rows;
 
         if affected > 0 {
-            let new_version = delete_result.new_dataset.version().version;
-            let row_count = delete_result
-                .new_dataset
-                .count_rows(None)
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
-
             self.commit_updates(&[crate::db::SubTableUpdate {
                 table_key,
-                table_version: new_version,
+                table_version: delete_state.version,
                 table_branch,
-                row_count,
+                row_count: delete_state.row_count,
             }])
             .await?;
 

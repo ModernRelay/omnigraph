@@ -6,14 +6,9 @@ use arrow_array::{
     RecordBatch, StringArray, StructArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
-use futures::TryStreamExt;
 use lance::Dataset;
 use lance::blob::blob_field;
 use lance::dataset::BlobFile;
-use lance::index::vector::VectorIndexParams;
-use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
-use lance_index::{DatasetIndexExt, IndexType};
-use lance_linalg::distance::MetricType;
 use omnigraph_compiler::build_catalog;
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::schema::parser::parse_schema;
@@ -123,37 +118,6 @@ impl Omnigraph {
         })
     }
 
-    pub async fn open_branch(uri: &str, branch: &str) -> Result<Self> {
-        Self::open_branch_with_storage(uri, branch, default_storage()).await
-    }
-
-    pub(crate) async fn open_branch_with_storage(
-        uri: &str,
-        branch: &str,
-        storage: Arc<dyn StorageAdapter>,
-    ) -> Result<Self> {
-        let root = normalize_root_uri(uri);
-        let schema_path = join_uri(&root, SCHEMA_FILENAME);
-        let schema_source = storage.read_text(&schema_path)?;
-
-        let schema_ast = parse_schema(&schema_source)?;
-        let mut catalog = build_catalog(&schema_ast)?;
-        fixup_blob_schemas(&mut catalog);
-
-        let coordinator =
-            GraphCoordinator::open_branch(&root, branch, Arc::clone(&storage)).await?;
-
-        Ok(Self {
-            root_uri: root.clone(),
-            storage,
-            coordinator,
-            table_store: TableStore::new(&root),
-            runtime_cache: RuntimeCache::default(),
-            catalog,
-            schema_source,
-        })
-    }
-
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
     }
@@ -166,27 +130,94 @@ impl Omnigraph {
         &self.root_uri
     }
 
-    pub(crate) async fn reopen_for_branch(&self, branch: Option<&str>) -> Result<Self> {
+    pub(crate) fn table_store(&self) -> &TableStore {
+        &self.table_store
+    }
+
+    pub(crate) async fn open_coordinator_for_branch(
+        &self,
+        branch: Option<&str>,
+    ) -> Result<GraphCoordinator> {
         match branch {
             Some(branch) => {
-                Omnigraph::open_branch_with_storage(self.uri(), branch, Arc::clone(&self.storage))
-                    .await
+                GraphCoordinator::open_branch(self.uri(), branch, Arc::clone(&self.storage)).await
             }
-            None => Omnigraph::open_with_storage(self.uri(), Arc::clone(&self.storage)).await,
+            None => GraphCoordinator::open(self.uri(), Arc::clone(&self.storage)).await,
         }
     }
 
-    pub fn version(&self) -> u64 {
+    pub(crate) async fn swap_coordinator_for_branch(
+        &mut self,
+        branch: Option<&str>,
+    ) -> Result<GraphCoordinator> {
+        let next = self.open_coordinator_for_branch(branch).await?;
+        Ok(std::mem::replace(&mut self.coordinator, next))
+    }
+
+    pub(crate) fn restore_coordinator(&mut self, coordinator: GraphCoordinator) {
+        self.coordinator = coordinator;
+    }
+
+    pub(crate) async fn resolved_branch_target(
+        &self,
+        branch: Option<&str>,
+    ) -> Result<ResolvedTarget> {
+        let requested = ReadTarget::Branch(branch.unwrap_or("main").to_string());
+        let normalized = normalize_branch_name(branch.unwrap_or("main"))?;
+        if normalized.as_deref() == self.coordinator.current_branch() {
+            let snapshot_id = self.coordinator.head_commit_id().await?.unwrap_or_else(|| {
+                SnapshotId::synthetic(
+                    self.coordinator.current_branch(),
+                    self.coordinator.version(),
+                )
+            });
+            return Ok(ResolvedTarget {
+                requested,
+                branch: self.coordinator.current_branch().map(str::to_string),
+                snapshot_id,
+                snapshot: self.coordinator.snapshot(),
+            });
+        }
+        self.coordinator.resolve_target(&requested).await
+    }
+
+    pub(crate) async fn snapshot_for_branch(&self, branch: Option<&str>) -> Result<Snapshot> {
+        self.resolved_branch_target(branch)
+            .await
+            .map(|resolved| resolved.snapshot)
+    }
+
+    pub(crate) fn version(&self) -> u64 {
         self.coordinator.version()
     }
 
     /// Return an immutable Snapshot from the known manifest state. No storage I/O.
-    pub fn snapshot(&self) -> Snapshot {
+    pub(crate) fn snapshot(&self) -> Snapshot {
         self.coordinator.snapshot()
     }
 
-    /// Re-read manifest from storage to see other writers' commits.
-    pub async fn refresh(&mut self) -> Result<()> {
+    pub async fn snapshot_of(&self, target: impl Into<ReadTarget>) -> Result<Snapshot> {
+        self.resolved_target(target)
+            .await
+            .map(|resolved| resolved.snapshot)
+    }
+
+    pub async fn version_of(&self, target: impl Into<ReadTarget>) -> Result<u64> {
+        self.snapshot_of(target)
+            .await
+            .map(|snapshot| snapshot.version())
+    }
+
+    /// Synchronize this handle's write base to the latest head of the named branch.
+    pub async fn sync_branch(&mut self, branch: &str) -> Result<()> {
+        let branch = normalize_branch_name(branch)?;
+        self.coordinator = self.open_coordinator_for_branch(branch.as_deref()).await?;
+        self.runtime_cache.invalidate_all();
+        Ok(())
+    }
+
+    /// Re-read the handle-local coordinator state from storage.
+    pub(crate) async fn refresh(&mut self) -> Result<()> {
         self.coordinator.refresh().await?;
         self.runtime_cache.invalidate_all();
         Ok(())
@@ -196,48 +227,14 @@ impl Omnigraph {
         self.coordinator.resolve_snapshot_id(branch).await
     }
 
-    pub async fn resolved_target(&self, target: impl Into<ReadTarget>) -> Result<ResolvedTarget> {
+    pub(crate) async fn resolved_target(
+        &self,
+        target: impl Into<ReadTarget>,
+    ) -> Result<ResolvedTarget> {
         self.coordinator.resolve_target(&target.into()).await
     }
 
     // ─── Change detection ────────────────────────────────────────────────
-
-    /// Diff two manifest versions on the current branch.
-    pub async fn diff(
-        &self,
-        from_version: u64,
-        to_version: u64,
-        filter: &crate::changes::ChangeFilter,
-    ) -> Result<crate::changes::ChangeSet> {
-        let from_snap = self.coordinator.snapshot_at_version(from_version).await?;
-        let to_snap = self.coordinator.snapshot_at_version(to_version).await?;
-        crate::changes::diff_snapshots(
-            self.uri(),
-            &from_snap,
-            &to_snap,
-            filter,
-            self.coordinator.current_branch().map(str::to_string),
-        )
-        .await
-    }
-
-    /// Changes since a version on the current branch. Sugar for `diff(from, current)`.
-    pub async fn changes_since(
-        &self,
-        from_version: u64,
-        filter: &crate::changes::ChangeFilter,
-    ) -> Result<crate::changes::ChangeSet> {
-        let from_snap = self.coordinator.snapshot_at_version(from_version).await?;
-        let to_snap = self.snapshot();
-        crate::changes::diff_snapshots(
-            self.uri(),
-            &from_snap,
-            &to_snap,
-            filter,
-            self.coordinator.current_branch().map(str::to_string),
-        )
-        .await
-    }
 
     pub async fn diff_between(
         &self,
@@ -337,17 +334,10 @@ impl Omnigraph {
             .open_snapshot_table(snapshot, table_key)
             .await?;
         let filter_sql = format!("id = '{}'", id.replace('\'', "''"));
-        let mut scanner = ds.scan();
-        scanner
-            .filter(&filter_sql)
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        let batches: Vec<RecordBatch> = scanner
-            .try_into_stream()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?
-            .try_collect()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let batches = self
+            .table_store
+            .scan(&ds, None, Some(&filter_sql), None)
+            .await?;
         let Some(batch) = batches.iter().find(|batch| batch.num_rows() > 0) else {
             return Ok(None);
         };
@@ -372,13 +362,12 @@ impl Omnigraph {
             .await
     }
 
-    pub(crate) async fn graph_index_for_target(
+    pub(crate) async fn graph_index_for_resolved(
         &mut self,
-        target: impl Into<ReadTarget>,
+        resolved: &ResolvedTarget,
     ) -> Result<Arc<crate::graph_index::GraphIndex>> {
-        let resolved = self.resolved_target(target).await?;
         self.runtime_cache
-            .graph_index(&resolved, &self.catalog)
+            .graph_index(resolved, &self.catalog)
             .await
     }
 
@@ -395,9 +384,21 @@ impl Omnigraph {
     /// from an ancestor branch are first forked into the active branch before
     /// their index metadata is updated.
     pub async fn ensure_indices(&mut self) -> Result<()> {
-        let snapshot = self.snapshot();
+        let current_branch = self.coordinator.current_branch().map(str::to_string);
+        self.ensure_indices_for_branch(current_branch.as_deref())
+            .await
+    }
+
+    pub async fn ensure_indices_on(&mut self, branch: &str) -> Result<()> {
+        let branch = normalize_branch_name(branch)?;
+        self.ensure_indices_for_branch(branch.as_deref()).await
+    }
+
+    pub(crate) async fn ensure_indices_for_branch(&mut self, branch: Option<&str>) -> Result<()> {
+        let resolved = self.resolved_branch_target(branch).await?;
+        let snapshot = resolved.snapshot;
         let mut updates = Vec::new();
-        let active_branch = self.coordinator.current_branch().map(str::to_string);
+        let active_branch = resolved.branch;
 
         for type_name in self.catalog.node_types.keys() {
             let table_key = format!("node:{}", type_name);
@@ -421,12 +422,12 @@ impl Omnigraph {
                 },
                 None => (self.open_dataset_head(&full_path, None).await?, None),
             };
-            let row_count = ds.count_rows(None).await.unwrap_or(0);
+            let row_count = self.table_store.count_rows(&ds, None).await.unwrap_or(0);
             if row_count > 0 {
                 self.build_indices_on_dataset(&table_key, &mut ds).await?;
             }
 
-            let final_version = ds.version().version;
+            let final_version = self.table_store.dataset_version(&ds);
             if final_version != entry.table_version
                 || resolved_branch.as_deref() != entry.table_branch.as_deref()
             {
@@ -461,12 +462,12 @@ impl Omnigraph {
                 },
                 None => (self.open_dataset_head(&full_path, None).await?, None),
             };
-            let row_count = ds.count_rows(None).await.unwrap_or(0);
+            let row_count = self.table_store.count_rows(&ds, None).await.unwrap_or(0);
             if row_count > 0 {
                 self.build_indices_on_dataset(&table_key, &mut ds).await?;
             }
 
-            let final_version = ds.version().version;
+            let final_version = self.table_store.dataset_version(&ds);
             if final_version != entry.table_version
                 || resolved_branch.as_deref() != entry.table_branch.as_deref()
             {
@@ -480,7 +481,7 @@ impl Omnigraph {
         }
 
         if !updates.is_empty() {
-            self.commit_updates(&updates).await?;
+            self.commit_updates_on_branch(branch, &updates).await?;
         }
 
         Ok(())
@@ -512,40 +513,11 @@ impl Omnigraph {
         let table_key = format!("node:{}", type_name);
         let ds = snapshot.open(&table_key).await?;
 
-        // Scan for the row with matching id, requesting _rowid
         let filter_sql = format!("id = '{}'", id.replace('\'', "''"));
-        let mut scanner = ds.scan();
-        scanner.with_row_id();
-        scanner
-            .project(&["id"])
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        scanner
-            .filter(&filter_sql)
-            .map_err(|e| OmniError::Lance(format!("blob filter: {}", e)))?;
-
-        let batches: Vec<arrow_array::RecordBatch> = scanner
-            .try_into_stream()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?
-            .try_collect()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-
-        // Extract the row ID
-        let row_id = batches
-            .iter()
-            .find_map(|batch| {
-                batch
-                    .column_by_name("_rowid")
-                    .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
-                    .and_then(|arr| {
-                        if arr.len() > 0 {
-                            Some(arr.value(0))
-                        } else {
-                            None
-                        }
-                    })
-            })
+        let row_id = self
+            .table_store
+            .first_row_id_for_filter(&ds, &filter_sql)
+            .await?
             .ok_or_else(|| {
                 OmniError::Manifest(format!("no {} with id '{}' found", type_name, id))
             })?;
@@ -565,7 +537,7 @@ impl Omnigraph {
         })
     }
 
-    pub fn active_branch(&self) -> Option<&str> {
+    pub(crate) fn active_branch(&self) -> Option<&str> {
         self.coordinator.current_branch()
     }
 
@@ -573,8 +545,13 @@ impl Omnigraph {
         normalize_branch_name(branch)
     }
 
-    pub(crate) async fn head_commit_id(&self) -> Result<Option<String>> {
-        self.coordinator
+    pub(crate) async fn head_commit_id_for_branch(
+        &self,
+        branch: Option<&str>,
+    ) -> Result<Option<String>> {
+        let mut coordinator = self.open_coordinator_for_branch(branch).await?;
+        coordinator.ensure_commit_graph_initialized().await?;
+        coordinator
             .head_commit_id()
             .await
             .map(|id| id.map(|snapshot_id| snapshot_id.as_str().to_string()))
@@ -582,6 +559,24 @@ impl Omnigraph {
 
     pub async fn branch_create(&mut self, name: &str) -> Result<()> {
         self.coordinator.branch_create(name).await
+    }
+
+    pub async fn branch_create_from(
+        &mut self,
+        from: impl Into<ReadTarget>,
+        name: &str,
+    ) -> Result<()> {
+        let target = from.into();
+        let ReadTarget::Branch(branch_name) = target else {
+            return Err(OmniError::Manifest(
+                "branch creation from pinned snapshots is not supported yet".to_string(),
+            ));
+        };
+        let branch = normalize_branch_name(&branch_name)?;
+        let previous = self.swap_coordinator_for_branch(branch.as_deref()).await?;
+        let result = self.coordinator.branch_create(name).await;
+        self.restore_coordinator(previous);
+        result
     }
 
     pub async fn branch_list(&self) -> Result<Vec<String>> {
@@ -597,15 +592,27 @@ impl Omnigraph {
         &self,
         table_key: &str,
     ) -> Result<(Dataset, String, Option<String>)> {
-        let snapshot = self.snapshot();
-        let entry = snapshot
+        let current_branch = self.coordinator.current_branch().map(str::to_string);
+        self.open_for_mutation_on_branch(current_branch.as_deref(), table_key)
+            .await
+    }
+
+    pub(crate) async fn open_for_mutation_on_branch(
+        &self,
+        branch: Option<&str>,
+        table_key: &str,
+    ) -> Result<(Dataset, String, Option<String>)> {
+        let resolved = self.resolved_branch_target(branch).await?;
+        let entry = resolved
+            .snapshot
             .entry(table_key)
             .ok_or_else(|| OmniError::Manifest(format!("no manifest entry for {}", table_key)))?;
         let full_path = format!("{}/{}", self.root_uri, entry.table_path);
-        match self.coordinator.current_branch() {
+        match resolved.branch.as_deref() {
             None => {
                 let ds = self.open_dataset_head(&full_path, None).await?;
-                ensure_expected_version(&ds, table_key, entry.table_version)?;
+                self.table_store
+                    .ensure_expected_version(&ds, table_key, entry.table_version)?;
                 Ok((ds, full_path, None))
             }
             Some(active_branch) => {
@@ -639,7 +646,8 @@ impl Omnigraph {
                 let ds = self
                     .open_dataset_head(full_path, Some(active_branch))
                     .await?;
-                ensure_expected_version(&ds, table_key, entry_version)?;
+                self.table_store
+                    .ensure_expected_version(&ds, table_key, entry_version)?;
                 Ok((ds, Some(active_branch.to_string())))
             }
             source_branch => {
@@ -665,54 +673,17 @@ impl Omnigraph {
         source_version: u64,
         active_branch: &str,
     ) -> Result<Dataset> {
-        let mut source_ds = self
-            .open_dataset_head(full_path, source_branch)
-            .await?
-            .checkout_version(source_version)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        ensure_expected_version(&source_ds, table_key, source_version)?;
-
-        match source_ds
-            .create_branch(active_branch, source_version, None)
-            .await
-        {
-            Ok(_) => {}
-            Err(create_err) => {
-                return self
-                    .open_existing_branch_after_create_race(
-                        table_key,
-                        full_path,
-                        active_branch,
-                        source_version,
-                        create_err.to_string(),
-                    )
-                    .await;
-            }
-        }
-
         let ds = self
-            .open_dataset_head(full_path, Some(active_branch))
+            .table_store
+            .fork_branch_from_state(
+                full_path,
+                source_branch,
+                table_key,
+                source_version,
+                active_branch,
+            )
             .await?;
-        ensure_expected_version(&ds, table_key, source_version)?;
         Ok(ds)
-    }
-
-    async fn open_existing_branch_after_create_race(
-        &self,
-        table_key: &str,
-        full_path: &str,
-        active_branch: &str,
-        expected_version: u64,
-        create_err: String,
-    ) -> Result<Dataset> {
-        match self.open_dataset_head(full_path, Some(active_branch)).await {
-            Ok(ds) => {
-                ensure_expected_version(&ds, table_key, expected_version)?;
-                Ok(ds)
-            }
-            Err(_) => Err(OmniError::Lance(create_err)),
-        }
     }
 
     pub(crate) async fn reopen_for_mutation(
@@ -722,9 +693,9 @@ impl Omnigraph {
         table_branch: Option<&str>,
         expected_version: u64,
     ) -> Result<Dataset> {
-        let ds = self.open_dataset_head(full_path, table_branch).await?;
-        ensure_expected_version(&ds, table_key, expected_version)?;
-        Ok(ds)
+        self.table_store
+            .reopen_for_mutation(full_path, table_branch, table_key, expected_version)
+            .await
     }
 
     pub(crate) async fn open_dataset_head(
@@ -751,11 +722,9 @@ impl Omnigraph {
         table_key: &str,
         ds: &mut Dataset,
     ) -> Result<()> {
-        let params = ScalarIndexParams::default();
-
         if let Some(type_name) = table_key.strip_prefix("node:") {
-            ds.create_index_builder(&["id"], IndexType::BTree, &params)
-                .replace(true)
+            self.table_store
+                .create_btree_index(ds, &["id"])
                 .await
                 .map_err(|e| {
                     OmniError::Lance(format!("create BTree index on {}(id): {}", table_key, e))
@@ -769,37 +738,27 @@ impl Omnigraph {
                     let prop_name = &index_cols[0];
                     if let Some(prop_type) = node_type.properties.get(prop_name) {
                         if matches!(prop_type.scalar, ScalarType::String) && !prop_type.list {
-                            let inverted_params = InvertedIndexParams::default();
-                            ds.create_index_builder(
-                                &[prop_name.as_str()],
-                                IndexType::Inverted,
-                                &inverted_params,
-                            )
-                            .replace(true)
-                            .await
-                            .map_err(|e| {
-                                OmniError::Lance(format!(
-                                    "create Inverted index on {}({}): {}",
-                                    table_key, prop_name, e
-                                ))
-                            })?;
+                            self.table_store
+                                .create_inverted_index(ds, prop_name.as_str())
+                                .await
+                                .map_err(|e| {
+                                    OmniError::Lance(format!(
+                                        "create Inverted index on {}({}): {}",
+                                        table_key, prop_name, e
+                                    ))
+                                })?;
                         } else if matches!(prop_type.scalar, ScalarType::Vector(_))
                             && !prop_type.list
                         {
-                            let vector_params = VectorIndexParams::ivf_flat(1, MetricType::L2);
-                            ds.create_index_builder(
-                                &[prop_name.as_str()],
-                                IndexType::Vector,
-                                &vector_params,
-                            )
-                            .replace(true)
-                            .await
-                            .map_err(|e| {
-                                OmniError::Lance(format!(
-                                    "create Vector index on {}({}): {}",
-                                    table_key, prop_name, e
-                                ))
-                            })?;
+                            self.table_store
+                                .create_vector_index(ds, prop_name.as_str())
+                                .await
+                                .map_err(|e| {
+                                    OmniError::Lance(format!(
+                                        "create Vector index on {}({}): {}",
+                                        table_key, prop_name, e
+                                    ))
+                                })?;
                         }
                     }
                 }
@@ -808,20 +767,20 @@ impl Omnigraph {
         }
 
         if table_key.starts_with("edge:") {
-            ds.create_index_builder(&["id"], IndexType::BTree, &params)
-                .replace(true)
+            self.table_store
+                .create_btree_index(ds, &["id"])
                 .await
                 .map_err(|e| {
                     OmniError::Lance(format!("create BTree index on {}(id): {}", table_key, e))
                 })?;
-            ds.create_index_builder(&["src"], IndexType::BTree, &params)
-                .replace(true)
+            self.table_store
+                .create_btree_index(ds, &["src"])
                 .await
                 .map_err(|e| {
                     OmniError::Lance(format!("create BTree index on {}(src): {}", table_key, e))
                 })?;
-            ds.create_index_builder(&["dst"], IndexType::BTree, &params)
-                .replace(true)
+            self.table_store
+                .create_btree_index(ds, &["dst"])
                 .await
                 .map_err(|e| {
                     OmniError::Lance(format!("create BTree index on {}(dst): {}", table_key, e))
@@ -865,6 +824,30 @@ impl Omnigraph {
             .map(|snapshot_id| snapshot_id.as_str().to_string())
     }
 
+    pub(crate) async fn commit_updates_on_branch(
+        &mut self,
+        branch: Option<&str>,
+        updates: &[crate::db::SubTableUpdate],
+    ) -> Result<u64> {
+        let current_branch = self.coordinator.current_branch().map(str::to_string);
+        let requested_branch = branch.map(|branch| branch.to_string());
+        if requested_branch == current_branch {
+            return self.commit_updates(updates).await;
+        }
+
+        let mut coordinator = match requested_branch.as_deref() {
+            Some(branch) => {
+                GraphCoordinator::open_branch(self.uri(), branch, Arc::clone(&self.storage)).await?
+            }
+            None => GraphCoordinator::open(self.uri(), Arc::clone(&self.storage)).await?,
+        };
+        let PublishedSnapshot {
+            manifest_version,
+            _snapshot_id: _,
+        } = coordinator.commit_updates(updates).await?;
+        Ok(manifest_version)
+    }
+
     pub(crate) async fn ensure_commit_graph_initialized(&mut self) -> Result<()> {
         self.coordinator.ensure_commit_graph_initialized().await
     }
@@ -886,18 +869,6 @@ pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
         return Ok(None);
     }
     Ok(Some(branch.to_string()))
-}
-
-fn ensure_expected_version(ds: &Dataset, table_key: &str, expected_version: u64) -> Result<()> {
-    if ds.version().version != expected_version {
-        return Err(OmniError::Manifest(format!(
-            "version drift on {}: snapshot pinned v{} but dataset is at v{} — call refresh() and retry",
-            table_key,
-            expected_version,
-            ds.version().version
-        )));
-    }
-    Ok(())
 }
 
 /// Replace placeholder `LargeBinary` fields with Lance blob v2 fields.

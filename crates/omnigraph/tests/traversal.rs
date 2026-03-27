@@ -31,8 +31,7 @@ query not_at_acme() {
 "#;
     // Test data: Alice→Acme, Bob→Globex. Charlie and Diana have no WorksAt.
     // Expected: everyone except Alice = {Bob, Charlie, Diana}
-    let result = db
-        .run_query(queries, "not_at_acme", &ParamMap::new())
+    let result = query_main(&mut db, queries, "not_at_acme", &ParamMap::new())
         .await
         .unwrap();
 
@@ -86,8 +85,7 @@ query reachable($name: String) {
     return { $f.name }
 }
 "#;
-    let result = db
-        .run_query(queries, "reachable", &params(&[("$name", "A")]))
+    let result = query_main(&mut db, queries, "reachable", &params(&[("$name", "A")]))
         .await
         .unwrap();
 
@@ -117,10 +115,14 @@ query far_reachable($name: String) {
     return { $f.name }
 }
 "#;
-    let result = db
-        .run_query(queries, "far_reachable", &params(&[("$name", "A")]))
-        .await
-        .unwrap();
+    let result = query_main(
+        &mut db,
+        queries,
+        "far_reachable",
+        &params(&[("$name", "A")]),
+    )
+    .await
+    .unwrap();
 
     let batch = result.concat_batches().unwrap();
     let names = batch
@@ -148,8 +150,7 @@ query exactly_2($name: String) {
     return { $f.name }
 }
 "#;
-    let result = db
-        .run_query(queries, "exactly_2", &params(&[("$name", "A")]))
+    let result = query_main(&mut db, queries, "exactly_2", &params(&[("$name", "A")]))
         .await
         .unwrap();
 
@@ -179,8 +180,7 @@ query by_age_asc() {
     order { $p.age asc }
 }
 "#;
-    let result = db
-        .run_query(queries, "by_age_asc", &ParamMap::new())
+    let result = query_main(&mut db, queries, "by_age_asc", &ParamMap::new())
         .await
         .unwrap();
 
@@ -224,15 +224,18 @@ async fn traversal_no_edges_returns_empty() {
         .unwrap();
 
     // Traversal should return empty, not crash
-    let result = db
-        .run_query(TEST_QUERIES, "friends_of", &params(&[("$name", "Alice")]))
-        .await
-        .unwrap();
+    let result = query_main(
+        &mut db,
+        TEST_QUERIES,
+        "friends_of",
+        &params(&[("$name", "Alice")]),
+    )
+    .await
+    .unwrap();
     assert_eq!(result.num_rows(), 0);
 
     // Anti-join: everyone is "unemployed" since no WorksAt edges exist
-    let result = db
-        .run_query(TEST_QUERIES, "unemployed", &ParamMap::new())
+    let result = query_main(&mut db, TEST_QUERIES, "unemployed", &ParamMap::new())
         .await
         .unwrap();
     let batch = result.concat_batches().unwrap();
@@ -261,8 +264,7 @@ query young($age: I32) {
     order { $p.age asc }
 }
 "#;
-    let result = db
-        .run_query(queries, "young", &int_params(&[("$age", 28)]))
+    let result = query_main(&mut db, queries, "young", &int_params(&[("$age", 28)]))
         .await
         .unwrap();
 
@@ -292,8 +294,7 @@ query at_least_30() {
     order { $p.age asc }
 }
 "#;
-    let result = db
-        .run_query(queries, "at_least_30", &ParamMap::new())
+    let result = query_main(&mut db, queries, "at_least_30", &ParamMap::new())
         .await
         .unwrap();
 
@@ -324,8 +325,7 @@ query at_most_28() {
     order { $p.age asc }
 }
 "#;
-    let result = db
-        .run_query(queries, "at_most_28", &ParamMap::new())
+    let result = query_main(&mut db, queries, "at_most_28", &ParamMap::new())
         .await
         .unwrap();
 
@@ -356,8 +356,7 @@ query not_alice() {
     order { $p.name asc }
 }
 "#;
-    let result = db
-        .run_query(queries, "not_alice", &ParamMap::new())
+    let result = query_main(&mut db, queries, "not_alice", &ParamMap::new())
         .await
         .unwrap();
 
@@ -387,9 +386,13 @@ query insert_no_name($age: I32) {
     insert Person { age: $age }
 }
 "#;
-    let result = db
-        .run_mutation(queries, "insert_no_name", &int_params(&[("$age", 25)]))
-        .await;
+    let result = mutate_main(
+        &mut db,
+        queries,
+        "insert_no_name",
+        &int_params(&[("$age", 25)]),
+    )
+    .await;
 
     assert!(result.is_err(), "insert without @key property should fail");
 }
