@@ -17,7 +17,7 @@ Living document tracking the build of the Lance-native graph database.
 
 ## Current Status
 
-**311 registered tests passing.** Steps 0–10a complete. Step 10b is next.
+**324 registered tests passing.** Steps 0–10b complete. Step 10c is next.
 
 ```
 Step 0  ✅  Crate restructuring
@@ -37,9 +37,10 @@ Step 9  ✅  Branching
 Step 9a ✅  Merge engine hardening
 Step 9b ✅  Surgical merge publish (preserve row identity across merges)
 Step 10a ✅ Change detection module (net-current diff, two-path lineage-aware)
-Step 10b   Point-in-time query support (historical snapshots)
+Step 10b ✅ Point-in-time query support (historical snapshots)
 Step 10c   CLI wiring (all stubbed commands + changes/diff)
-Step 10d   Hook + query-result subscription extension points (design only)
+Step 10d ✅ Hook + query-result subscription extension points (design validated)
+Step 11    Hook system (entity-change + query-result triggers)
 ```
 
 ---
@@ -771,6 +772,33 @@ impl Omnigraph {
 // 3. snapshot_at_version fails with error for non-existent version
 ```
 
+**Result:** `run_query_at()` added to `exec/mod.rs` (46 lines). Reuses the compile → IR → execute pipeline with a historical `Snapshot` and a temporary (non-cached) `GraphIndex` for traversal. `snapshot_at_version()` already existed on `Omnigraph` via `GraphCoordinator`. 13 tests covering morphological matrix of query types (tabular, traversal, multi-hop, negation/anti-join, filtered) × mutation types (insert, update, delete node with cascade, delete edge) × branch isolation × multi-version chains.
+
+**Running total: 324 registered tests (153 omnigraph + 171 compiler). Steps 0–10b complete.**
+
+---
+
+#### Step 10d: Hook + Query-Result Subscription Design Validation ✅
+
+Design-only step. All five checkpoints verified against the 10a/10b implementation:
+
+- `ChangeFilter` as a first-class parameter on `diff()` / `changes_since()` ✅ (10a)
+- `manifest_version` on every `EntityChange` (for per-version grouping) �� (10a)
+- `entity_at()` for on-demand before/after enrichment ��� (10a)
+- `run_query_at()` for point-in-time re-execution ✅ (10b)
+- No write-path coupling in change detection ✅ (by design)
+
+Design improvements identified during validation and incorporated into the Step 11 spec:
+
+1. **Cursor persistence in `_hooks.lance`** instead of `.omnigraph_hooks.json` — gets MVCC, crash safety, branch isolation
+2. **Batch polling** — one `ChangeSet` scan shared across all hooks, not one per hook
+3. **Manifest-level short-circuit** — `changed_tables()` skips unchanged sub-tables before any row scan
+4. **Idempotent dispatch** — deterministic dispatch IDs for executor deduplication
+5. **`run_query_on_snapshot`** — internal variant that accepts pre-built `Snapshot` to avoid redundant manifest I/O
+6. **`QueryDeps.equality_filters`** — constant predicates from IR reduce false tier-2 invocations
+7. **Executor retry semantics** — configurable `max_attempts`, `backoff`, `on_failure` policy
+8. **Version retention awareness** — `poll` warns when cursors approach retention boundary
+
 ---
 
 #### Step 10c: CLI Wiring
@@ -863,17 +891,247 @@ fn extract_deps(ir: &QueryIR) -> QueryDeps {
 
 ---
 
+### Step 11: Hook System
+
+The hook system is a read-only consumer of change detection (10a) and point-in-time queries (10b). Split into five sub-steps, each independently testable.
+
+---
+
+#### Step 11a: Hook Config + Cursor Table
+
+**New file: `crates/omnigraph/src/hooks/config.rs`** (~150 lines)
+
+Hook configuration parsed from TOML (or YAML). Each hook declaration specifies trigger type, filter, executor, and retry policy:
+
+```toml
+[hooks.sync_drugs]
+trigger = "entity-change"
+filter = { types = ["Drug", "Indication"] }
+executor = "shell"
+command = "python sync.py"
+
+[hooks.alert_on_friends]
+trigger = "query-result"
+query_file = "alerts.gq"
+query_name = "high_risk_friends"
+executor = "webhook"
+url = "https://api.example.com/alert"
+retry = { max_attempts = 3, backoff = "exponential" }
+on_failure = "stall"
+```
+
+**New file: `crates/omnigraph/src/hooks/cursor.rs`** (~100 lines)
+
+Cursor table at `_hooks.lance`:
+
+| Column | Type | Description |
+|---|---|---|
+| `hook_name` | String (PK) | Hook identifier |
+| `cursor_version` | UInt64 | Last successfully processed manifest version |
+| `last_poll_at` | Timestamp | When the hook last ran |
+| `status` | String | `ok`, `failed`, `stalled` |
+
+Operations:
+- `HookCursorTable::init(root_uri)` — create `_hooks.lance` if not exists
+- `HookCursorTable::read_cursors()` → `HashMap<String, HookCursor>`
+- `HookCursorTable::advance_cursor(hook_name, version)` — atomic `merge_insert`
+- `HookCursorTable::set_status(hook_name, status)` — mark stalled/failed
+
+**Files to create:**
+
+- `crates/omnigraph/src/hooks/mod.rs` (~10 lines): module declaration
+- `crates/omnigraph/src/hooks/config.rs` (~150 lines): TOML parsing, `HookConfig` struct
+- `crates/omnigraph/src/hooks/cursor.rs` (~100 lines): `_hooks.lance` CRUD
+- `crates/omnigraph/src/lib.rs` (~1 line): `pub mod hooks;`
+
+**Tests (~4):**
+
+```rust
+// 1. Cursor table init creates _hooks.lance with correct schema
+// 2. advance_cursor atomically updates version and last_poll_at
+// 3. set_status marks hook as stalled, read_cursors reflects it
+// 4. Hook config parsing: entity-change + query-result + retry policy
+```
+
+---
+
+#### Step 11b: Entity-Change Hooks + Batch Polling
+
+**New file: `crates/omnigraph/src/hooks/dispatch.rs`** (~200 lines)
+
+The core polling loop. One poll cycle:
+
+1. Load hook configs + read all cursors from `_hooks.lance`
+2. Find minimum cursor across all active (non-stalled) hooks
+3. Compute `changed_tables(min_cursor_snapshot, current_snapshot)` — manifest-level, O(num_types)
+4. If no tables changed → advance all cursors, done
+5. Compute one shared `ChangeSet` from min cursor to current
+6. For each entity-change hook:
+   a. Skip if hook's filtered types don't intersect `changed_tables`
+   b. Apply `ChangeFilter` in-memory against shared `ChangeSet`
+   c. If changes match → dispatch to executor with dispatch ID `{hook_name}:{from}:{to}`
+   d. On success → advance cursor
+   e. On failure → apply retry policy (`retry_next_poll`, `stall`, `skip`)
+
+**New: `changed_tables` utility** (`crates/omnigraph/src/changes/mod.rs`, ~15 lines):
+
+```rust
+pub fn changed_tables(from: &Snapshot, to: &Snapshot) -> HashSet<String> {
+    // Compare SubTableEntry (table_version, table_branch) between snapshots
+    // Return table_keys that differ
+}
+```
+
+This is the manifest-level pre-filter. O(num_types), no Lance scans.
+
+**New file: `crates/omnigraph/src/hooks/executor.rs`** (~100 lines)
+
+- `ShellExecutor::dispatch(context: &DispatchContext)` — spawn child process, pipe JSON to stdin, check exit code
+- `DispatchContext` includes: `dispatch_id`, `hook_name`, `changes` (filtered), `from_version`, `to_version`
+
+**Files to create/modify:**
+
+- `crates/omnigraph/src/hooks/dispatch.rs` (~200 lines): `poll_hooks()`, batch polling logic
+- `crates/omnigraph/src/hooks/executor.rs` (~100 lines): shell executor
+- `crates/omnigraph/src/changes/mod.rs` (~15 lines): `changed_tables()`
+- `crates/omnigraph/src/db/omnigraph.rs` (~10 lines): `Omnigraph::poll_hooks()` delegation
+
+**Tests (~6):**
+
+```rust
+// 1. poll_hooks with no changes advances all cursors (no dispatch)
+// 2. poll_hooks dispatches entity-change hook when matching type changes
+// 3. poll_hooks skips entity-change hook when only non-matching types change (manifest short-circuit)
+// 4. poll_hooks processes multiple hooks with different filters against shared ChangeSet
+// 5. Shell executor receives correct JSON on stdin with dispatch_id
+// 6. Failed executor does not advance cursor; stall policy marks hook as stalled
+```
+
+---
+
+#### Step 11c: Query-Result Hooks (Three-Tier Evaluation)
+
+**New file: `crates/omnigraph/src/hooks/query_deps.rs`** (~80 lines)
+
+Query dependency extraction from `QueryIR`:
+
+```rust
+pub struct QueryDeps {
+    pub table_keys: HashSet<String>,
+    pub properties: HashMap<String, HashSet<String>>,
+    pub equality_filters: HashMap<String, Vec<(String, Literal)>>,
+}
+
+pub fn extract_deps(ir: &QueryIR) -> QueryDeps {
+    // Walk ir.pipeline: NodeScan → table_keys + filter properties + constant predicates
+    //                   Expand → edge table_key + dst table_key
+    // Walk ir.return_exprs + ir.order_by → projected properties
+}
+```
+
+Cached per query definition (static analysis).
+
+**New: `run_query_on_snapshot` internal variant** (`crates/omnigraph/src/exec/mod.rs`, ~30 lines):
+
+```rust
+pub(crate) async fn run_query_on_snapshot(
+    &mut self,
+    snapshot: &Snapshot,
+    query_source: &str,
+    query_name: &str,
+    params: &ParamMap,
+) -> Result<QueryResult>
+```
+
+Same as `run_query_at` but accepts a pre-built `Snapshot`, avoiding redundant manifest I/O. `run_query_at` delegates to this.
+
+**Tier-2 result diffing** (`crates/omnigraph/src/hooks/dispatch.rs`, ~50 lines):
+
+Diff two `QueryResult` batches by `id` column → `ResultDiff { entered, exited, modified }`.
+
+**Integration into `poll_hooks`:**
+
+After entity-change hooks, process query-result hooks:
+1. Compile query → cache `QueryDeps`
+2. Tier 1: check `QueryDeps.table_keys ∩ changed_tables`. If empty → skip. Check `equality_filters` against `ChangeSet` for further pruning.
+3. Tier 2: `run_query_on_snapshot(cursor_snapshot, ...)` and `run_query_on_snapshot(current_snapshot, ...)`. Diff results.
+4. Tier 3: if diff is non-empty → dispatch to executor with result diff payload.
+
+**Files to create/modify:**
+
+- `crates/omnigraph/src/hooks/query_deps.rs` (~80 lines): `QueryDeps`, `extract_deps()`
+- `crates/omnigraph/src/exec/mod.rs` (~30 lines): `run_query_on_snapshot()`, refactor `run_query_at` to delegate
+- `crates/omnigraph/src/hooks/dispatch.rs` (~80 lines): tier-1/2/3 logic, result diffing
+
+**Tests (~5):**
+
+```rust
+// 1. extract_deps captures table_keys and properties from NodeScan + Expand
+// 2. extract_deps captures equality_filters from constant predicates
+// 3. Tier 1 skips query-result hook when changed_tables doesn't intersect deps
+// 4. Tier 2 detects entered/exited rows after insert + query re-execution
+// 5. Tier 2 detects no change when mutation doesn't affect query result (false positive from tier 1)
+```
+
+---
+
+#### Step 11d: Webhook Executor
+
+**Extend `crates/omnigraph/src/hooks/executor.rs`** (~60 lines):
+
+- `WebhookExecutor::dispatch(url, context, retry_policy)` — HTTP POST with JSON body
+- `X-Omnigraph-Dispatch-Id` header for idempotency
+- Retry with configurable backoff on 5xx / timeout / network error
+- No retry on 4xx (client error = permanent failure)
+
+**Tests (~3):**
+
+```rust
+// 1. Webhook executor sends POST with correct headers and body
+// 2. Webhook executor retries on 503 with exponential backoff
+// 3. Webhook executor does not retry on 400
+```
+
+---
+
+#### Step 11e: CLI + Auto-Poll
+
+**Wire into `crates/omnigraph-cli/src/main.rs`:**
+
+| Command | Implementation |
+|---|---|
+| `omnigraph hook poll <uri>` | `db.poll_hooks()` |
+| `omnigraph hook run <name> <uri>` | manual trigger for one hook |
+| `omnigraph hook list <uri>` | list hook configs + cursor state |
+| `omnigraph hook reset <name> <uri>` | reset cursor to current version |
+
+**Auto-poll:** When `auto_poll = true` in config, `load` and `run` commands call `poll_hooks()` after their primary operation completes.
+
+**Tests (~3):**
+
+```rust
+// 1. hook poll processes pending changes and advances cursors
+// 2. hook list shows hook names, cursor versions, and status
+// 3. hook reset sets cursor to current version and clears stalled status
+```
+
+---
+
 ## Dependency Graph
 
 ```
-Steps 0–10a ✅ (311 tests)
-     └→ Step 10b (point-in-time — historical snapshots)
-     └→ Step 10c (CLI — all commands + changes/diff)
-     └→ Step 10d (design only — validates hooks + query subscriptions)
-         └→ Future Step 11: Hook system (entity-change + query-result triggers)
+Steps 0–10b ✅ (324 tests)
+     ├→ Step 10c (CLI — all commands + changes/diff)
+     ├→ Step 10d ✅ (design validated — all 5 checkpoints satisfied)
+     └→ Step 11: Hook system
+          ├→ 11a: Config + cursor table
+          ├→ 11b: Entity-change hooks + batch polling (requires 11a)
+          ├→ 11c: Query-result hooks + three-tier evaluation (requires 11b)
+          ├→ 11d: Webhook executor (requires 11b)
+          └→ 11e: CLI + auto-poll (requires 11b)
 ```
 
-**Critical path:** Step 10b → 10c. Step 10d is design verification only.
+**Critical path for hooks:** 11a → 11b → 11c. Steps 11d and 11e can be done in parallel with 11c.
 
 ---
 
@@ -898,10 +1156,15 @@ Steps 0–10a ✅ (311 tests)
 | 9a | ~12 (merge hardening, streaming three-way diff) | ~295-297 |
 | 9b | ~5 (surgical merge publish, row identity, edge id BTree) | ~300-302 |
 | 10a | ~10 (change detection: two-path diff, cross-branch, filter) | ~310-312 |
-| 10b | ~3 (point-in-time: historical query, traversal, error) | ~313-315 |
-| 10c | ~5 (CLI: init/load/run/branch/changes) | ~318-320 |
+| 10b | +13 (point-in-time: morphological matrix of query×mutation×branch) | 324 |
+| 10c | ~5 (CLI: init/load/run/branch/changes) | ~329 |
+| 11a | ~4 (cursor table CRUD, config parsing) | ~333 |
+| 11b | ~6 (entity-change hooks, batch polling, manifest short-circuit) | ~339 |
+| 11c | ~5 (query-result hooks, dependency extraction, tier-1/2/3) | ~344 |
+| 11d | ~3 (webhook executor, retry) | ~347 |
+| 11e | ~3 (CLI hook commands, auto-poll) | ~350 |
 
-**Current: 311 registered tests passing (140 omnigraph + 171 compiler).** Steps 9b (+3 branching tests) and 10a (+8 change detection tests + 3 Lance investigation tests) complete. Target: ~320 tests at completion.
+**Current: 324 registered tests passing (153 omnigraph + 171 compiler).** Steps 0–10b complete. Target: ~350 tests after Step 11.
 
 ---
 
@@ -939,7 +1202,7 @@ Steps 0–10a ✅ (311 tests)
 
 1. **Remote sync (clone/push/pull).** URI-based open + `base_paths` make this architecturally possible. Deferred to after local branching works.
 2. **Schema evolution / migration.** Lance `add_columns`/`alter_columns`/`drop_columns` when needed.
-3. **Hook system (Step 11).** Entity-change hooks consume `changes_since(cursor, filter)` with per-hook cursors. Query-result hooks use IR dependency extraction + `run_query_at()` for three-tier evaluation (dependency check → re-execute + diff → fire). Shell + webhook executors. Config in TOML, cursors in `.omnigraph_hooks.json`. Requires Step 10a + 10b. See Step 10d design for architecture validation.
+3. **Hook system (Step 11).** Now a concrete implementation plan with five sub-steps (11a–11e). Entity-change hooks + query-result hooks with batch polling, manifest-level short-circuit, cursor table in `_hooks.lance`, idempotent dispatch, executor retry, and webhook support. See Step 11 section above.
 4. **Compaction.** Lance handles natively. Wire up as CLI command.
 5. **SDKs (TS, Swift, Python).** Thin wrappers after API stabilizes.
 6. **DuckDB fallback.** For graphs > ~5M edges. Defer until scale demands.

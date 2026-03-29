@@ -81,6 +81,7 @@ What does **not** carry forward:
 - Change detection — two-path lineage-aware diff via Lance version columns + ID set-difference (complete)
 - Point-in-time queries — historical Snapshot + `run_query_at()` (Step 10b)
 - CLI (Step 10c)
+- Point-in-time queries — historical Snapshot + `run_query_at()` (Step 10b, complete)
 - Hook system — entity-change + query-result triggers (Step 11, planned)
 
 ---
@@ -1109,17 +1110,25 @@ For traversal queries at historical versions, a temporary `GraphIndex` is built 
 
 ### Architecture
 
-The hook system sits on top of change detection and point-in-time queries. It does not modify the storage layer or query pipeline. Three layers, each consuming only the one below:
+The hook system sits on top of change detection and point-in-time queries. It does not modify the storage layer or query pipeline. Four layers, each consuming only the one below:
 
 ```text
-Hook Dispatch (config + cursors + executors)
+Hook Dispatch (config + cursors + executors + retry)
      ↓ consumes
 Change Detection (ChangeSet via changes_since)
      +
-Point-in-Time Queries (run_query_at for query-result hooks)
+Point-in-Time Queries (run_query_on_snapshot for query-result hooks)
      ↓ depends on
 Versioned Access (Snapshot at any version)
 ```
+
+### Design Principles
+
+1. **Zero write-path coupling.** Hooks are read-only consumers. Writers never block on hooks, never emit events, never coordinate with the hook system. All change detection uses Lance's native version columns — no custom CDC log, no event bus, no write amplification.
+2. **Pull over push.** Hooks poll at their own pace. No daemon required for basic use. A crashed hook loses nothing — the cursor stays at the last successfully processed version.
+3. **Batch-first polling.** One poll cycle computes one `ChangeSet` shared across all hooks, not one scan per hook.
+4. **Manifest-level short-circuit.** Before scanning any rows, compare manifest entries to skip unchanged sub-tables. Entity-change hooks filtered to `type_names: ["Drug"]` are skipped instantly if `node:Drug` didn't change.
+5. **Idempotent dispatch.** Every executor invocation includes a deterministic dispatch ID (`{hook_name}:{from_version}:{to_version}`) for downstream deduplication.
 
 ### Trigger Types
 
@@ -1127,9 +1136,9 @@ Versioned Access (Snapshot at any version)
 
 **Query-result trigger:** Fires when the output of a named query changes. Three-tier evaluation:
 
-1. **Dependency check (instant):** Extract from `QueryIR` which sub-tables and properties the query reads. Check if any changes intersect those dependencies. If not → skip. This eliminates most hooks on most poll cycles.
+1. **Dependency check (instant):** Extract from `QueryIR` which sub-tables, properties, and constant equality predicates the query touches. Compare against `changed_tables()` (manifest-level) first, then against `ChangeSet` entity types. If no intersection → skip. This eliminates most hooks on most poll cycles.
 
-2. **Re-execute + diff (only when tier 1 says yes):** Call `run_query_at(cursor_version, ...)` and `run_query(...)`. Diff the two result sets by entity `id`. Produces entered/exited/modified rows.
+2. **Re-execute + diff (only when tier 1 says yes):** Call `run_query_on_snapshot(cursor_snapshot, ...)` and `run_query_on_snapshot(current_snapshot, ...)`. Diff the two result sets by entity `id`. Produces entered/exited/modified rows.
 
 3. **Fire with result diff:** Hook receives which rows entered, exited, or changed in the query result — not raw entity changes.
 
@@ -1140,13 +1149,34 @@ Versioned Access (Snapshot at any version)
 ### Executors
 
 - **Shell:** runs a command with change context as JSON on stdin
-- **Webhook:** HTTP POST with JSON body
+- **Webhook:** HTTP POST with JSON body, with configurable retry
 
 Agent/LLM reasoning is a shell command that invokes an agent CLI. The hook system doesn't know it's talking to an LLM.
 
+### Executor Retry
+
+Each hook may configure retry semantics:
+
+- `max_attempts` — default 1 (no retry)
+- `backoff` — `none`, `linear`, `exponential` (default `none`)
+- `on_failure` — `stall` (stop polling this hook until manually resolved), `skip` (advance cursor, at-most-once), `retry_next_poll` (leave cursor, retry with accumulated changes on next poll cycle; default)
+
+A stalled hook is visible in the cursor table's `status` column. The `poll` command reports stalled hooks but continues processing other hooks.
+
 ### Cursor Persistence
 
-Per-hook cursors stored in `.omnigraph_hooks.json` (local file, not inside the database). Not versioned, not branched — local dispatch state only. Change-triggered hooks advance cursor after successful execution. Schedule and manual hooks don't use cursors.
+Per-hook cursors stored in `_hooks.lance` — a small Lance table inside the repo, coordinated through the same MVCC as other system tables. Schema:
+
+| Column | Type | Description |
+|---|---|---|
+| `hook_name` | String (PK) | Hook identifier |
+| `cursor_version` | UInt64 | Last successfully processed manifest version |
+| `last_poll_at` | Timestamp | When the hook last ran |
+| `status` | String | `ok`, `failed`, `stalled` |
+
+Cursor advancement is atomic (Lance `merge_insert` on `hook_name`). Crash mid-dispatch leaves cursor unchanged — the hook retries on next poll. Schedule and manual hooks don't use cursors.
+
+**Why Lance, not a JSON file:** A local JSON file has no atomicity (crash mid-write = corrupted cursor), no MVCC, and is invisible to the graph's version history. The Lance table gets crash safety, branch isolation (branched hooks have their own cursors), and observability for free (query the table to see all hook state).
 
 ### Query Dependency Extraction
 
@@ -1154,12 +1184,29 @@ Per-hook cursors stored in `.omnigraph_hooks.json` (local file, not inside the d
 struct QueryDeps {
     table_keys: HashSet<String>,                        // which sub-tables
     properties: HashMap<String, HashSet<String>>,       // which properties per table
+    equality_filters: HashMap<String, Vec<(String, Literal)>>,  // constant predicates
 }
 ```
 
-Extracted by walking `QueryIR.pipeline`: `NodeScan` → table_keys + filter/projection properties. `Expand` → edge table_key + destination table_key. Cached per query definition (static analysis, doesn't change unless the query file changes).
+Extracted by walking `QueryIR.pipeline`: `NodeScan` → table_keys + filter/projection properties + constant equality predicates. `Expand` → edge table_key + destination table_key. Cached per query definition (static analysis, doesn't change unless the query file changes).
+
+The `equality_filters` field captures constant predicates from the IR (e.g., `$c.name = "Acme"` → `{"Company": [("name", String("Acme"))]}`). During tier-1 evaluation, if the only changes to a dependency table don't match any equality filter, the hook is skipped without tier-2 re-execution. This is a refinement that reduces false tier-2 invocations for queries with selective filters.
 
 ### Dispatch Model
+
+**Batch polling:** The `poll` command processes all hooks in one pass:
+
+1. Find the minimum cursor across all active hooks
+2. Compute `changed_tables(min_cursor_snapshot, current_snapshot)` — manifest-level, O(num_types)
+3. Compute one shared `ChangeSet` from min cursor to current (with union of all hook filters)
+4. For each entity-change hook: apply its `ChangeFilter` in-memory against the shared `ChangeSet`
+5. For each query-result hook: run tier-1 dependency check against `changed_tables` + `ChangeSet`
+6. Dispatch matching hooks to their executors with deterministic dispatch IDs
+7. Advance cursors for successful hooks
+
+This turns N scans into 1 scan + N in-memory filters.
+
+**Commands:**
 
 - `poll` — stateless command, processes all pending change-triggered hooks. Safe to run from cron, CI, or manually.
 - `watch --interval <duration>` — long-running loop for schedule triggers + continuous polling. Optional.
@@ -1167,6 +1214,33 @@ Extracted by walking `QueryIR.pipeline`: `NodeScan` → table_keys + filter/proj
 - `auto_poll = true` in config — poll runs automatically during CLI operations (`load`, `run`).
 
 No daemon required for basic use. The hook system is a polling consumer, not a streaming subscriber.
+
+### Idempotency
+
+Every hook dispatch includes a deterministic dispatch ID in the payload:
+
+```
+dispatch_id = "{hook_name}:{from_version}:{to_version}"
+```
+
+For shell executors, this appears in the JSON payload on stdin. For webhook executors, it's sent as the `X-Omnigraph-Dispatch-Id` HTTP header. Executors can use this to deduplicate retried dispatches.
+
+### Version Retention
+
+Hook cursors reference manifest versions. If `compact` + `cleanup_old_versions` removes a version that a hook's cursor points to, `snapshot_at_version()` will fail. Mitigations:
+
+- Process hooks frequently enough to stay within the retention window (default: 100 versions)
+- The `poll` command warns when any hook cursor is within 10% of the retention boundary
+- A hook that falls behind the retention window enters `stalled` status and requires manual re-baseline
+
+### Efficiency
+
+**`run_query_on_snapshot` avoids redundant I/O.** The hook dispatch path already has both snapshots (from the `ChangeSet`'s `from_version` and `to_version`). The internal `run_query_on_snapshot(snapshot, ...)` variant accepts a pre-built `Snapshot` directly, avoiding the redundant `Dataset::open` + `checkout_version` + `read_manifest_state` that `run_query_at(version)` would perform.
+
+**Historical graph indices.** For query-result hooks that require traversal, the graph index at the historical snapshot is built fresh (not cached). This is acceptable because:
+- Tier-1 dependency check eliminates most hooks before tier-2 fires
+- Historical traversals are rare in practice
+- If profiling shows this is a bottleneck, an LRU cache keyed on `(version, edge_table_versions)` can be added without API changes
 
 ---
 
@@ -1237,10 +1311,10 @@ The current model (Step 7) does one manifest commit per mutation. With streaming
 See `implementation-plan.md` for detailed step-by-step status, compiler types to reuse, runtime code to write, Lance APIs, and test cases for each remaining step.
 
 ```
-Steps 0–10a ✅ (311 tests)
-     ├→ Step 10b: Point-in-time query support (historical snapshots)
+Steps 0–10b ✅ (324 tests)
      ├→ Step 10c: CLI wiring
-     └→ Step 10d: Hook + query-result subscription design validation
+     ├→ Step 10d: Hook + query-result subscription design validation ✅ (all 5 checkpoints satisfied)
+     └→ Step 11: Hook system (entity-change + query-result triggers, batch polling, cursor table)
 ```
 
 ---
@@ -1258,7 +1332,7 @@ Omnigraph is successful when:
 - `omnigraph diff V1 V2` shows what changed between any two versions with type/kind filtering
 - point-in-time queries work via historical snapshots (`run_query_at`)
 - change detection cost is O(changed rows in matching sub-tables), not O(total graph)
-- the hook system (Step 11) requires zero modifications to change detection — it consumes `changes_since()` and `run_query_at()` directly
+- the hook system (Step 11) requires zero modifications to change detection ��� it consumes `changes_since()` and `run_query_on_snapshot()` directly, with batch polling and manifest-level short-circuit
 - the same URI works for local and S3 repos
 - no custom WAL, no custom JSON manifest, no custom CDC — Lance-native throughout
 - the compiler crate has zero Lance dependency and can be shared with Nanograph
@@ -1269,7 +1343,7 @@ Omnigraph is successful when:
 
 1. **Remote sync (clone/push/pull).** URI-based open + `base_paths` make this architecturally possible. Deferred to after local branching works.
 2. **Schema evolution / migration.** Lance `add_columns`/`alter_columns`/`drop_columns` when needed.
-3. **Hook system (Step 11).** Entity-change hooks consume `changes_since(cursor, filter)`. Query-result hooks use IR dependency extraction + `run_query_at()` for three-tier evaluation. Shell + webhook executors. Config in TOML, cursors in `.omnigraph_hooks.json`. Requires Step 10a + 10b. See Change Tracking Model and Hook System sections above.
+3. **Hook system (Step 11).** Entity-change hooks consume `changes_since(cursor, filter)`. Query-result hooks use IR dependency extraction + `run_query_on_snapshot()` for three-tier evaluation. Shell + webhook executors with retry. Cursors in `_hooks.lance` (MVCC, branch-aware). Batch polling with manifest-level short-circuit and idempotent dispatch. Requires Step 10a + 10b. See Hook System section above.
 4. **Compaction.** Lance handles natively. Wire up as CLI command.
 5. **SDKs (TS, Swift, Python).** Thin wrappers after API stabilizes.
 6. **DuckDB fallback.** For graphs > ~5M edges. Defer until scale demands.
