@@ -70,6 +70,52 @@ impl Omnigraph {
         )
         .await
     }
+
+    /// Run a named query against the graph as it existed at a prior manifest version.
+    ///
+    /// Compiles the query normally, builds a temporary (non-cached) graph index
+    /// if traversal is needed, and executes against the historical snapshot.
+    pub async fn run_query_at(
+        &mut self,
+        version: u64,
+        query_source: &str,
+        query_name: &str,
+        params: &ParamMap,
+    ) -> Result<QueryResult> {
+        let snapshot = self.snapshot_at_version(version).await?;
+
+        let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
+            .map_err(|e| OmniError::Manifest(e.to_string()))?;
+        let type_ctx = typecheck_query(self.catalog(), &query_decl)?;
+        let ir = lower_query(self.catalog(), &query_decl, &type_ctx)?;
+
+        let needs_graph = ir
+            .pipeline
+            .iter()
+            .any(|op| matches!(op, IROp::Expand { .. } | IROp::AntiJoin { .. }));
+        let graph_index = if needs_graph {
+            let edge_types = self
+                .catalog()
+                .edge_types
+                .iter()
+                .map(|(name, et)| (name.clone(), (et.from_type.clone(), et.to_type.clone())))
+                .collect();
+            Some(Arc::new(
+                GraphIndex::build(&snapshot, &edge_types).await?,
+            ))
+        } else {
+            None
+        };
+
+        execute_query(
+            &ir,
+            params,
+            &snapshot,
+            graph_index.as_deref(),
+            self.catalog(),
+        )
+        .await
+    }
 }
 
 const MERGE_STAGE_BATCH_ROWS: usize = 8192;
