@@ -1,27 +1,28 @@
 [package]
-name = "omnigraph-cli"
+name = "omnigraph-server"
 version = "0.1.0"
 edition = "2024"
-description = "CLI for the Omnigraph graph database."
+description = "HTTP server for the Omnigraph graph database."
 license = "MIT"
 
 [[bin]]
-name = "omnigraph"
+name = "omnigraph-server"
 path = "src/main.rs"
 
 [dependencies]
 omnigraph = { path = "../omnigraph", version = "0.1.0" }
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.1.0" }
-omnigraph-server = { path = "../omnigraph-server", version = "0.1.0" }
+axum = { workspace = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
-reqwest = { workspace = true, features = ["blocking"] }
+serde_yaml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tower-http = { workspace = true }
 
 [dev-dependencies]
-assert_cmd = "2"
-predicates = "3"
-serde_json = { workspace = true }
 tempfile = { workspace = true }
+tower = { workspace = true }

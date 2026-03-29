@@ -1,143 +1,10 @@
-use std::fs;
-use std::net::TcpListener;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command as StdCommand, Stdio};
-use std::process::Output;
-use std::thread::sleep;
-use std::time::Duration;
-
-use assert_cmd::Command;
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::loader::LoadMode;
-use reqwest::blocking::Client;
 use serde_json::Value;
 use tempfile::tempdir;
 
-fn cli() -> Command {
-    Command::cargo_bin("omnigraph").unwrap()
-}
+mod support;
 
-fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../omnigraph/tests/fixtures")
-        .join(name)
-}
-
-fn repo_path(root: &Path) -> PathBuf {
-    root.join("demo.omni")
-}
-
-fn output_success(cmd: &mut Command) -> Output {
-    let output = cmd.output().unwrap();
-    assert!(
-        output.status.success(),
-        "command failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output
-}
-
-fn output_failure(cmd: &mut Command) -> Output {
-    let output = cmd.output().unwrap();
-    assert!(
-        !output.status.success(),
-        "command unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output
-}
-
-fn stdout_string(output: &Output) -> String {
-    String::from_utf8(output.stdout.clone()).unwrap()
-}
-
-fn init_repo(repo: &Path) {
-    let schema = fixture("test.pg");
-    output_success(cli().arg("init").arg("--schema").arg(&schema).arg(repo));
-}
-
-fn load_fixture(repo: &Path) {
-    let data = fixture("test.jsonl");
-    output_success(cli().arg("load").arg("--data").arg(&data).arg(repo));
-}
-
-fn write_jsonl(path: &Path, rows: &str) {
-    fs::write(path, rows).unwrap();
-}
-
-fn write_query_file(path: &Path, source: &str) {
-    fs::write(path, source).unwrap();
-}
-
-fn write_config(path: &Path, source: &str) {
-    fs::write(path, source).unwrap();
-}
-
-struct TestServer {
-    child: Child,
-    base_url: String,
-}
-
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-    port
-}
-
-fn spawn_server(repo: &Path) -> TestServer {
-    let port = free_port();
-    let bind = format!("127.0.0.1:{}", port);
-    let bin = assert_cmd::cargo::cargo_bin("omnigraph");
-    let child = StdCommand::new(bin)
-        .arg("server")
-        .arg(repo)
-        .arg("--bind")
-        .arg(&bind)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let base_url = format!("http://{}", bind);
-    let client = Client::new();
-    for _ in 0..50 {
-        if client
-            .get(format!("{}/healthz", base_url))
-            .send()
-            .map(|response| response.status().is_success())
-            .unwrap_or(false)
-        {
-            return TestServer { child, base_url };
-        }
-        sleep(Duration::from_millis(100));
-    }
-    panic!("server did not become healthy");
-}
-
-async fn begin_manual_run(repo: &Path, target_branch: &str) -> String {
-    let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
-    let run = db
-        .begin_run(target_branch, Some("cli-test-run"))
-        .await
-        .unwrap();
-    db.load(
-        &run.run_branch,
-        r#"{"type":"Person","data":{"name":"Eve","age":29}}"#,
-        LoadMode::Append,
-    )
-    .await
-    .unwrap();
-    run.run_id.as_str().to_string()
-}
+use support::*;
 
 #[test]
 fn init_creates_repo_successfully_on_missing_local_directory() {
@@ -151,6 +18,7 @@ fn init_creates_repo_successfully_on_missing_local_directory() {
     assert!(stdout.contains("initialized"));
     assert!(repo.join("_schema.pg").exists());
     assert!(repo.join("_manifest.lance").exists());
+    assert!(temp.path().join("omnigraph.yaml").exists());
 }
 
 #[test]
@@ -187,6 +55,7 @@ fn load_into_feature_branch_with_merge_mode_succeeds() {
         cli()
             .arg("branch")
             .arg("create")
+            .arg("--uri")
             .arg(&repo)
             .arg("--from")
             .arg("main")
@@ -249,16 +118,10 @@ fn read_json_outputs_rows_for_named_query() {
 fn read_can_resolve_uri_from_config() {
     let temp = tempdir().unwrap();
     let repo = repo_path(temp.path());
-    let config = temp.path().join("client.toml");
+    let config = temp.path().join("omnigraph.yaml");
     init_repo(&repo);
     load_fixture(&repo);
-    write_config(
-        &config,
-        &format!(
-            "uri = {:?}\nbranch = \"main\"\n",
-            repo.to_string_lossy().to_string()
-        ),
-    );
+    write_config(&config, &local_yaml_config(&repo));
 
     let output = output_success(
         cli()
@@ -275,6 +138,147 @@ fn read_can_resolve_uri_from_config() {
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["row_count"], 1);
+}
+
+#[test]
+fn read_alias_from_yaml_config_runs_with_kv_output() {
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    let config = temp.path().join("omnigraph.yaml");
+    let query = temp.path().join("aliases.gq");
+    init_repo(&repo);
+    load_fixture(&repo);
+    write_query_file(
+        &query,
+        &std::fs::read_to_string(fixture("test.gq")).unwrap(),
+    );
+    write_config(
+        &config,
+        &format!(
+            "{}aliases:\n  owner:\n    command: read\n    query: aliases.gq\n    name: get_person\n    args: [name]\n    format: kv\n",
+            local_yaml_config(&repo)
+        ),
+    );
+
+    let output = output_success(
+        cli()
+            .arg("read")
+            .arg("--config")
+            .arg(&config)
+            .arg("--alias")
+            .arg("owner")
+            .arg("Alice"),
+    );
+    let stdout = stdout_string(&output);
+
+    assert!(stdout.contains("row 1"));
+    assert!(stdout.contains("p.name: Alice"));
+}
+
+#[test]
+fn change_alias_from_yaml_config_persists_changes() {
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    let config = temp.path().join("omnigraph.yaml");
+    let query = temp.path().join("mutations.gq");
+    init_repo(&repo);
+    load_fixture(&repo);
+    write_query_file(
+        &query,
+        r#"
+query insert_person($name: String, $age: I32) {
+    insert Person { name: $name, age: $age }
+}
+"#,
+    );
+    write_config(
+        &config,
+        &format!(
+            "{}aliases:\n  add_person:\n    command: change\n    query: mutations.gq\n    name: insert_person\n    args: [name, age]\n",
+            local_yaml_config(&repo)
+        ),
+    );
+
+    let output = output_success(
+        cli()
+            .arg("change")
+            .arg("--config")
+            .arg(&config)
+            .arg("--alias")
+            .arg("add_person")
+            .arg("Eve")
+            .arg("29")
+            .arg("--json"),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["affected_nodes"], 1);
+
+    let verify = output_success(
+        cli()
+            .arg("read")
+            .arg(&repo)
+            .arg("--query")
+            .arg(fixture("test.gq"))
+            .arg("--name")
+            .arg("get_person")
+            .arg("--params")
+            .arg(r#"{"name":"Eve"}"#)
+            .arg("--json"),
+    );
+    let verify_payload: Value = serde_json::from_slice(&verify.stdout).unwrap();
+    assert_eq!(verify_payload["row_count"], 1);
+}
+
+#[test]
+fn read_csv_format_outputs_header_and_row_values() {
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    init_repo(&repo);
+    load_fixture(&repo);
+
+    let output = output_success(
+        cli()
+            .arg("read")
+            .arg(&repo)
+            .arg("--query")
+            .arg(fixture("test.gq"))
+            .arg("--name")
+            .arg("get_person")
+            .arg("--params")
+            .arg(r#"{"name":"Alice"}"#)
+            .arg("--format")
+            .arg("csv"),
+    );
+    let stdout = stdout_string(&output);
+
+    assert!(stdout.lines().next().unwrap().contains("p.name"));
+    assert!(stdout.contains("Alice"));
+}
+
+#[test]
+fn read_jsonl_format_outputs_metadata_header_first() {
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    init_repo(&repo);
+    load_fixture(&repo);
+
+    let output = output_success(
+        cli()
+            .arg("read")
+            .arg(&repo)
+            .arg("--query")
+            .arg(fixture("test.gq"))
+            .arg("--name")
+            .arg("get_person")
+            .arg("--params")
+            .arg(r#"{"name":"Alice"}"#)
+            .arg("--format")
+            .arg("jsonl"),
+    );
+    let stdout = stdout_string(&output);
+    let mut lines = stdout.lines();
+    assert!(lines.next().unwrap().contains("\"kind\":\"metadata\""));
+    assert!(lines.next().unwrap().contains("\"p.name\":\"Alice\""));
 }
 
 #[test]
@@ -330,16 +334,10 @@ query insert_person($name: String, $age: I32) {
 fn change_can_resolve_uri_and_branch_from_config() {
     let temp = tempdir().unwrap();
     let repo = repo_path(temp.path());
-    let config = temp.path().join("client.toml");
+    let config = temp.path().join("omnigraph.yaml");
     init_repo(&repo);
     load_fixture(&repo);
-    write_config(
-        &config,
-        &format!(
-            "uri = {:?}\nbranch = \"main\"\n",
-            repo.to_string_lossy().to_string()
-        ),
-    );
+    write_config(&config, &local_yaml_config(&repo));
     let mutation_file = temp.path().join("config-mutations.gq");
     write_query_file(
         &mutation_file,
@@ -394,6 +392,7 @@ fn branch_create_json_outputs_source_and_name() {
         cli()
             .arg("branch")
             .arg("create")
+            .arg("--uri")
             .arg(&repo)
             .arg("--from")
             .arg("main")
@@ -417,6 +416,7 @@ fn branch_list_outputs_sorted_branches() {
         cli()
             .arg("branch")
             .arg("create")
+            .arg("--uri")
             .arg(&repo)
             .arg("--from")
             .arg("main")
@@ -426,13 +426,14 @@ fn branch_list_outputs_sorted_branches() {
         cli()
             .arg("branch")
             .arg("create")
+            .arg("--uri")
             .arg(&repo)
             .arg("--from")
             .arg("main")
             .arg("alpha"),
     );
 
-    let output = output_success(cli().arg("branch").arg("list").arg(&repo));
+    let output = output_success(cli().arg("branch").arg("list").arg("--uri").arg(&repo));
     let stdout = stdout_string(&output);
     let lines = stdout
         .lines()
@@ -454,6 +455,7 @@ fn branch_merge_defaults_target_to_main() {
         cli()
             .arg("branch")
             .arg("create")
+            .arg("--uri")
             .arg(&repo)
             .arg("--from")
             .arg("main")
@@ -481,6 +483,7 @@ fn branch_merge_defaults_target_to_main() {
         cli()
             .arg("branch")
             .arg("merge")
+            .arg("--uri")
             .arg(&repo)
             .arg("feature")
             .arg("--json"),
@@ -521,6 +524,7 @@ fn branch_merge_supports_explicit_target() {
         cli()
             .arg("branch")
             .arg("create")
+            .arg("--uri")
             .arg(&repo)
             .arg("--from")
             .arg("main")
@@ -530,6 +534,7 @@ fn branch_merge_supports_explicit_target() {
         cli()
             .arg("branch")
             .arg("create")
+            .arg("--uri")
             .arg(&repo)
             .arg("--from")
             .arg("main")
@@ -557,9 +562,10 @@ fn branch_merge_supports_explicit_target() {
         cli()
             .arg("branch")
             .arg("merge")
+            .arg("--uri")
             .arg(&repo)
             .arg("feature")
-            .arg("--target")
+            .arg("--into")
             .arg("experiment")
             .arg("--json"),
     );
@@ -587,16 +593,10 @@ fn snapshot_json_returns_manifest_version_and_tables() {
 fn snapshot_can_resolve_uri_from_config() {
     let temp = tempdir().unwrap();
     let repo = repo_path(temp.path());
-    let config = temp.path().join("client.toml");
+    let config = temp.path().join("omnigraph.yaml");
     init_repo(&repo);
     load_fixture(&repo);
-    write_config(
-        &config,
-        &format!(
-            "uri = {:?}\nbranch = \"main\"\n",
-            repo.to_string_lossy().to_string()
-        ),
-    );
+    write_config(&config, &local_yaml_config(&repo));
 
     let output = output_success(
         cli()
@@ -681,7 +681,14 @@ fn cli_fails_for_invalid_merge_requests() {
     init_repo(&repo);
     load_fixture(&repo);
 
-    let missing_branch = output_failure(cli().arg("branch").arg("merge").arg(&repo).arg("missing"));
+    let missing_branch = output_failure(
+        cli()
+            .arg("branch")
+            .arg("merge")
+            .arg("--uri")
+            .arg(&repo)
+            .arg("missing"),
+    );
     let missing_branch_stderr = String::from_utf8(missing_branch.stderr).unwrap();
     assert!(
         missing_branch_stderr.contains("missing")
@@ -693,9 +700,10 @@ fn cli_fails_for_invalid_merge_requests() {
         cli()
             .arg("branch")
             .arg("merge")
+            .arg("--uri")
             .arg(&repo)
             .arg("main")
-            .arg("--target")
+            .arg("--into")
             .arg("main"),
     );
     assert!(
@@ -738,13 +746,10 @@ fn run_list_and_show_report_published_runs() {
 fn run_list_can_resolve_uri_from_config() {
     let temp = tempdir().unwrap();
     let repo = repo_path(temp.path());
-    let config = temp.path().join("client.toml");
+    let config = temp.path().join("omnigraph.yaml");
     init_repo(&repo);
     load_fixture(&repo);
-    write_config(
-        &config,
-        &format!("uri = {:?}\n", repo.to_string_lossy().to_string()),
-    );
+    write_config(&config, &local_yaml_config(&repo));
 
     let output = output_success(
         cli()
@@ -823,86 +828,4 @@ fn run_abort_marks_manual_running_run_aborted() {
     let payload: Value = serde_json::from_slice(&abort_output.stdout).unwrap();
     assert_eq!(payload["run_id"], run_id);
     assert_eq!(payload["status"], "aborted");
-}
-
-#[test]
-#[ignore = "requires local TCP listener"]
-fn remote_cli_dispatches_to_running_server() {
-    let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
-    let server = spawn_server(&repo);
-
-    let snapshot_output = output_success(
-        cli()
-            .arg("snapshot")
-            .arg(&server.base_url)
-            .arg("--json"),
-    );
-    let snapshot_payload: Value = serde_json::from_slice(&snapshot_output.stdout).unwrap();
-    assert_eq!(snapshot_payload["branch"], "main");
-
-    let read_output = output_success(
-        cli()
-            .arg("read")
-            .arg(&server.base_url)
-            .arg("--query")
-            .arg(fixture("test.gq"))
-            .arg("--name")
-            .arg("get_person")
-            .arg("--params")
-            .arg(r#"{"name":"Alice"}"#)
-            .arg("--json"),
-    );
-    let read_payload: Value = serde_json::from_slice(&read_output.stdout).unwrap();
-    assert_eq!(read_payload["row_count"], 1);
-    assert_eq!(read_payload["rows"][0]["p.name"], "Alice");
-
-    let mutation_file = temp.path().join("remote-mutations.gq");
-    write_query_file(
-        &mutation_file,
-        r#"
-query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
-}
-"#,
-    );
-    let change_output = output_success(
-        cli()
-            .arg("change")
-            .arg(&server.base_url)
-            .arg("--query")
-            .arg(&mutation_file)
-            .arg("--params")
-            .arg(r#"{"name":"Zoe","age":33}"#)
-            .arg("--json"),
-    );
-    let change_payload: Value = serde_json::from_slice(&change_output.stdout).unwrap();
-    assert_eq!(change_payload["affected_nodes"], 1);
-
-    let verify_output = output_success(
-        cli()
-            .arg("read")
-            .arg(&server.base_url)
-            .arg("--query")
-            .arg(fixture("test.gq"))
-            .arg("--name")
-            .arg("get_person")
-            .arg("--params")
-            .arg(r#"{"name":"Zoe"}"#)
-            .arg("--json"),
-    );
-    let verify_payload: Value = serde_json::from_slice(&verify_output.stdout).unwrap();
-    assert_eq!(verify_payload["row_count"], 1);
-
-    let runs_output = output_success(
-        cli()
-            .arg("run")
-            .arg("list")
-            .arg(&server.base_url)
-            .arg("--json"),
-    );
-    let runs_payload: Value = serde_json::from_slice(&runs_output.stdout).unwrap();
-    assert!(runs_payload["runs"].as_array().unwrap().len() >= 2);
 }

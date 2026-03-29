@@ -373,3 +373,57 @@ async fn failed_public_mutation_marks_run_failed_and_leaves_target_unchanged() {
         .unwrap();
     assert_eq!(qr.num_rows(), 2);
 }
+
+#[tokio::test]
+async fn concurrent_conflicting_run_publish_fails_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let run_a = db.begin_run("main", Some("conflict-a")).await.unwrap();
+    let run_b = db.begin_run("main", Some("conflict-b")).await.unwrap();
+
+    db.mutate(
+        run_a.run_branch.as_str(),
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 31)]),
+    )
+    .await
+    .unwrap();
+    db.mutate(
+        run_b.run_branch.as_str(),
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 32)]),
+    )
+    .await
+    .unwrap();
+
+    db.publish_run(&run_a.run_id).await.unwrap();
+    let publish_b = db.publish_run(&run_b.run_id).await;
+    assert!(publish_b.is_err(), "second conflicting publish should fail");
+    let err = publish_b.unwrap_err().to_string();
+    assert!(
+        err.contains("conflict") || err.contains("divergent") || err.contains("Alice"),
+        "unexpected conflict error: {}",
+        err
+    );
+
+    let alice = db
+        .query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "Alice")]),
+        )
+        .await
+        .unwrap();
+    let rows = alice.to_rust_json();
+    assert_eq!(alice.num_rows(), 1);
+    assert_eq!(rows[0]["p.age"], serde_json::json!(31));
+
+    let run_a_record = db.get_run(&run_a.run_id).await.unwrap();
+    assert_eq!(run_a_record.status, RunStatus::Published);
+    let run_b_record = db.get_run(&run_b.run_id).await.unwrap();
+    assert_eq!(run_b_record.status, RunStatus::Running);
+}

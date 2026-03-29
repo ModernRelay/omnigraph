@@ -4,10 +4,12 @@ members = [
     "crates/omnigraph-compiler",
     "crates/omnigraph",
     "crates/omnigraph-cli",
+    "crates/omnigraph-server",
 ]
 default-members = [
     "crates/omnigraph",
     "crates/omnigraph-cli",
+    "crates/omnigraph-server",
 ]
 
 [workspace.dependencies]
@@ -37,13 +39,15 @@ async-trait = "0.1"
 pest = "2"
 pest_derive = "2"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.9"
+serde_yaml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
 color-eyre = "0.6"
 tempfile = "3"
 ahash = "0.8"

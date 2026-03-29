@@ -1,24 +1,27 @@
 use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{Result, bail};
-use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget, RunId, RunRecord, SnapshotId};
+use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget, RunId, SnapshotId};
 use omnigraph::loader::LoadMode;
 use omnigraph_compiler::json_params_to_param_map;
 use omnigraph_compiler::query::parser::parse_query;
-use omnigraph_compiler::result::QueryResult;
 use omnigraph_compiler::{JsonParamMode, ParamMap};
+use omnigraph_server::api::{
+    ChangeOutput, ChangeRequest, ErrorOutput, ReadOutput, ReadRequest, RunListOutput, RunOutput,
+    SnapshotOutput, SnapshotTableOutput, read_output, run_output, snapshot_payload,
+};
+use omnigraph_server::{AliasCommand, OmnigraphConfig, ReadOutputFormat, load_config};
 use reqwest::Method;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::net::TcpListener;
+
+mod read_format;
+
+use read_format::{ReadRenderOptions, render_read};
 
 #[derive(Debug, Parser)]
 #[command(name = "omnigraph")]
@@ -39,16 +42,20 @@ enum Command {
     },
     /// Load data into a repo
     Load {
+        /// Repo URI
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
         #[arg(long)]
         data: PathBuf,
-        #[arg(long, default_value = "main")]
-        branch: String,
+        #[arg(long)]
+        branch: Option<String>,
         #[arg(long, default_value = "overwrite")]
         mode: CliLoadMode,
         #[arg(long)]
         json: bool,
-        /// Repo URI
-        uri: String,
     },
     /// Branch operations
     Branch {
@@ -59,6 +66,8 @@ enum Command {
     Snapshot {
         /// Repo URI
         uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long)]
@@ -76,9 +85,13 @@ enum Command {
         /// Repo URI
         uri: Option<String>,
         #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long)]
-        query: PathBuf,
+        alias: Option<String>,
+        #[arg(long)]
+        query: Option<PathBuf>,
         #[arg(long)]
         name: Option<String>,
         #[command(flatten)]
@@ -87,17 +100,25 @@ enum Command {
         branch: Option<String>,
         #[arg(long, conflicts_with = "branch")]
         snapshot: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "json")]
+        format: Option<ReadOutputFormat>,
+        #[arg(long, conflicts_with = "format")]
         json: bool,
+        #[arg()]
+        alias_args: Vec<String>,
     },
     /// Execute a graph change query against a branch
     Change {
         /// Repo URI
         uri: Option<String>,
         #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long)]
-        query: PathBuf,
+        alias: Option<String>,
+        #[arg(long)]
+        query: Option<PathBuf>,
         #[arg(long)]
         name: Option<String>,
         #[command(flatten)]
@@ -106,15 +127,8 @@ enum Command {
         branch: Option<String>,
         #[arg(long)]
         json: bool,
-    },
-    /// Run Omnigraph as an HTTP server
-    Server {
-        /// Repo URI
-        uri: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
-        bind: Option<String>,
+        #[arg()]
+        alias_args: Vec<String>,
     },
 }
 
@@ -123,9 +137,14 @@ enum BranchCommand {
     /// Create a new branch
     Create {
         /// Repo URI
-        uri: String,
-        #[arg(long, default_value = "main")]
-        from: String,
+        #[arg(long)]
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        from: Option<String>,
         name: String,
         #[arg(long)]
         json: bool,
@@ -133,17 +152,27 @@ enum BranchCommand {
     /// List branches
     List {
         /// Repo URI
-        uri: String,
+        #[arg(long)]
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
     /// Merge a source branch into a target branch
     Merge {
         /// Repo URI
-        uri: String,
+        #[arg(long)]
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
         source: String,
-        #[arg(long, default_value = "main")]
-        target: String,
+        #[arg(long)]
+        into: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -156,6 +185,8 @@ enum RunCommand {
         /// Repo URI
         uri: Option<String>,
         #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long)]
         json: bool,
@@ -165,6 +196,8 @@ enum RunCommand {
         /// Repo URI
         #[arg(long)]
         uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
         run_id: String,
@@ -177,6 +210,8 @@ enum RunCommand {
         #[arg(long)]
         uri: Option<String>,
         #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
         config: Option<PathBuf>,
         run_id: String,
         #[arg(long)]
@@ -187,6 +222,8 @@ enum RunCommand {
         /// Repo URI
         #[arg(long)]
         uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
         run_id: String,
@@ -201,20 +238,6 @@ struct ParamsArgs {
     params: Option<String>,
     #[arg(long, conflicts_with = "params")]
     params_file: Option<PathBuf>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CliConfigFile {
-    uri: Option<String>,
-    bind: Option<String>,
-    branch: Option<String>,
-    snapshot: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct ServerSettings {
-    uri: String,
-    bind: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, ValueEnum)]
@@ -301,134 +324,6 @@ struct BranchMergeOutput<'a> {
     outcome: CliMergeOutcome,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct SnapshotTableOutput {
-    table_key: String,
-    table_path: String,
-    table_version: u64,
-    table_branch: Option<String>,
-    row_count: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct SnapshotOutput {
-    branch: String,
-    manifest_version: u64,
-    tables: Vec<SnapshotTableOutput>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RunOutput {
-    run_id: String,
-    target_branch: String,
-    run_branch: String,
-    base_snapshot_id: String,
-    base_manifest_version: u64,
-    operation_hash: Option<String>,
-    status: String,
-    published_snapshot_id: Option<String>,
-    created_at: i64,
-    updated_at: i64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct RunListOutput {
-    runs: Vec<RunOutput>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ReadTargetOutput {
-    branch: Option<String>,
-    snapshot: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ReadOutput {
-    query_name: String,
-    target: ReadTargetOutput,
-    row_count: usize,
-    rows: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ChangeOutput {
-    branch: String,
-    query_name: String,
-    affected_nodes: usize,
-    affected_edges: usize,
-}
-
-#[derive(Debug, Clone)]
-struct ServerState {
-    uri: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ReadRequest {
-    query_source: String,
-    query_name: Option<String>,
-    params: Option<Value>,
-    branch: Option<String>,
-    snapshot: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ChangeRequest {
-    query_source: String,
-    query_name: Option<String>,
-    params: Option<Value>,
-    branch: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SnapshotQuery {
-    branch: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct HealthOutput<'a> {
-    status: &'a str,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ErrorOutput {
-    error: String,
-}
-
-#[derive(Debug)]
-struct ApiError {
-    status: StatusCode,
-    message: String,
-}
-
-impl ApiError {
-    fn bad_request(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message: message.into(),
-        }
-    }
-
-    fn internal(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: message.into(),
-        }
-    }
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(ErrorOutput {
-                error: self.message,
-            }),
-        )
-            .into_response()
-    }
-}
-
 fn ensure_local_repo_parent(uri: &str) -> Result<()> {
     if !uri.contains("://") {
         fs::create_dir_all(uri)?;
@@ -439,20 +334,6 @@ fn ensure_local_repo_parent(uri: &str) -> Result<()> {
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
-}
-
-fn load_cli_config(config_path: Option<&PathBuf>) -> Result<CliConfigFile> {
-    if let Some(path) = config_path {
-        let contents = fs::read_to_string(path)?;
-        Ok(toml::from_str::<CliConfigFile>(&contents)?)
-    } else {
-        Ok(CliConfigFile {
-            uri: None,
-            bind: None,
-            branch: None,
-            snapshot: None,
-        })
-    }
 }
 
 fn is_remote_uri(uri: &str) -> bool {
@@ -487,53 +368,113 @@ async fn remote_json<T: DeserializeOwned>(
     Ok(serde_json::from_str(&text)?)
 }
 
-fn load_server_settings(
-    config_path: Option<&PathBuf>,
+fn resolve_uri(
+    config: &OmnigraphConfig,
     cli_uri: Option<String>,
-    cli_bind: Option<String>,
-) -> Result<ServerSettings> {
-    let file_config = load_cli_config(config_path)?;
-
-    let uri = cli_uri
-        .or(file_config.uri)
-        .ok_or_else(|| color_eyre::eyre::eyre!("server URI must be provided via <URI> or --config"))?;
-    let bind = cli_bind
-        .or(file_config.bind)
-        .unwrap_or_else(|| "127.0.0.1:8080".to_string());
-
-    Ok(ServerSettings { uri, bind })
+    cli_target: Option<&str>,
+) -> Result<String> {
+    config.resolve_target_uri(cli_uri, cli_target, config.cli_target_name())
 }
 
-fn resolve_uri(config_path: Option<&PathBuf>, cli_uri: Option<String>) -> Result<String> {
-    let file_config = load_cli_config(config_path)?;
-    cli_uri
-        .or(file_config.uri)
-        .ok_or_else(|| color_eyre::eyre::eyre!("URI must be provided via <URI> or --config"))
+fn resolve_local_uri(
+    config: &OmnigraphConfig,
+    cli_uri: Option<String>,
+    cli_target: Option<&str>,
+    operation: &str,
+) -> Result<String> {
+    let uri = resolve_uri(config, cli_uri, cli_target)?;
+    if is_remote_uri(&uri) {
+        bail!(
+            "{} is only supported against local repo URIs in this milestone",
+            operation
+        );
+    }
+    Ok(uri)
 }
 
 fn resolve_branch(
-    config_path: Option<&PathBuf>,
+    config: &OmnigraphConfig,
     cli_branch: Option<String>,
+    alias_branch: Option<String>,
     default_branch: &str,
-) -> Result<String> {
-    let file_config = load_cli_config(config_path)?;
-    Ok(cli_branch
-        .or(file_config.branch)
-        .unwrap_or_else(|| default_branch.to_string()))
+) -> String {
+    cli_branch
+        .or(alias_branch)
+        .or_else(|| config.cli.branch.clone())
+        .unwrap_or_else(|| default_branch.to_string())
 }
 
 fn resolve_read_target(
-    config_path: Option<&PathBuf>,
+    config: &OmnigraphConfig,
     cli_branch: Option<String>,
     cli_snapshot: Option<String>,
+    alias_branch: Option<String>,
 ) -> Result<ReadTarget> {
-    let file_config = load_cli_config(config_path)?;
-    let branch = cli_branch.or(file_config.branch);
-    let snapshot = cli_snapshot.or(file_config.snapshot);
-    if branch.is_some() && snapshot.is_some() {
+    if cli_branch.is_some() && cli_snapshot.is_some() {
         bail!("read target may specify branch or snapshot, not both");
     }
-    Ok(read_target_from_cli(branch, snapshot))
+    Ok(read_target_from_cli(
+        cli_branch
+            .or(alias_branch)
+            .or_else(|| config.cli.branch.clone()),
+        cli_snapshot,
+    ))
+}
+
+fn resolve_query_source(
+    config: &OmnigraphConfig,
+    explicit_query: Option<&PathBuf>,
+    alias_query: Option<&str>,
+) -> Result<String> {
+    let query_path = explicit_query
+        .map(PathBuf::from)
+        .or_else(|| alias_query.map(PathBuf::from))
+        .ok_or_else(|| {
+            color_eyre::eyre::eyre!("exactly one of --query or --alias must be provided")
+        })?;
+    Ok(fs::read_to_string(config.resolve_query_path(&query_path)?)?)
+}
+
+fn parse_alias_value(value: &str) -> Value {
+    serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()))
+}
+
+fn merged_params_json(
+    alias_name: Option<&str>,
+    alias_arg_names: &[String],
+    alias_arg_values: &[String],
+    explicit: Option<Value>,
+) -> Result<Option<Value>> {
+    if alias_arg_values.len() > alias_arg_names.len() {
+        let alias = alias_name.unwrap_or("<alias>");
+        bail!(
+            "alias '{}' expects at most {} args but got {}",
+            alias,
+            alias_arg_names.len(),
+            alias_arg_values.len()
+        );
+    }
+
+    let mut merged = serde_json::Map::new();
+    for (arg_name, arg_value) in alias_arg_names.iter().zip(alias_arg_values.iter()) {
+        merged.insert(arg_name.clone(), parse_alias_value(arg_value));
+    }
+
+    match explicit {
+        Some(Value::Object(object)) => {
+            for (key, value) in object {
+                merged.insert(key, value);
+            }
+        }
+        Some(_) => bail!("params JSON must be an object"),
+        None => {}
+    }
+
+    if merged.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(Value::Object(merged)))
+    }
 }
 
 fn print_load_human(
@@ -567,25 +508,22 @@ fn print_snapshot_human(branch: &str, manifest_version: u64, entries: &[Snapshot
     }
 }
 
-fn print_read_human(output: &ReadOutput) -> Result<()> {
+fn print_read_output(
+    output: &ReadOutput,
+    format: ReadOutputFormat,
+    config: &OmnigraphConfig,
+) -> Result<()> {
     println!(
-        "{} rows from {}",
-        output.row_count,
-        output
-            .target
-            .snapshot
-            .as_deref()
-            .map(|id| format!("snapshot {}", id))
-            .or_else(|| {
-                output
-                    .target
-                    .branch
-                    .as_deref()
-                    .map(|branch| format!("branch {}", branch))
-            })
-            .unwrap_or_else(|| "target".to_string())
+        "{}",
+        render_read(
+            output,
+            format,
+            &ReadRenderOptions {
+                max_column_width: config.table_max_column_width(),
+                cell_layout: config.table_cell_layout(),
+            },
+        )?
     );
-    println!("{}", serde_json::to_string_pretty(&output.rows)?);
     Ok(())
 }
 
@@ -594,21 +532,6 @@ fn print_change_human(output: &ChangeOutput) {
         "changed {} via {}: {} nodes, {} edges",
         output.branch, output.query_name, output.affected_nodes, output.affected_edges
     );
-}
-
-fn run_output(run: &RunRecord) -> RunOutput {
-    RunOutput {
-        run_id: run.run_id.as_str().to_string(),
-        target_branch: run.target_branch.clone(),
-        run_branch: run.run_branch.clone(),
-        base_snapshot_id: run.base_snapshot_id.as_str().to_string(),
-        base_manifest_version: run.base_manifest_version,
-        operation_hash: run.operation_hash.clone(),
-        status: run.status.as_str().to_string(),
-        published_snapshot_id: run.published_snapshot_id.clone(),
-        created_at: run.created_at,
-        updated_at: run.updated_at,
-    }
 }
 
 fn print_run_list_human(runs: &[RunOutput]) {
@@ -637,24 +560,149 @@ fn print_run_human(run: &RunOutput) {
     println!("updated_at: {}", run.updated_at);
 }
 
+fn resolve_read_format(
+    config: &OmnigraphConfig,
+    cli_format: Option<ReadOutputFormat>,
+    json: bool,
+    alias_format: Option<ReadOutputFormat>,
+) -> ReadOutputFormat {
+    if json {
+        ReadOutputFormat::Json
+    } else {
+        cli_format
+            .or(alias_format)
+            .unwrap_or_else(|| config.cli_output_format())
+    }
+}
+
+fn resolve_alias<'a>(
+    config: &'a OmnigraphConfig,
+    alias_name: Option<&'a str>,
+    expected: AliasCommand,
+) -> Result<Option<(&'a str, &'a omnigraph_server::AliasConfig)>> {
+    let Some(alias_name) = alias_name else {
+        return Ok(None);
+    };
+    let alias = config.alias(alias_name)?;
+    if alias.command != expected {
+        bail!(
+            "alias '{}' is a {:?} alias, not a {:?} alias",
+            alias_name,
+            alias.command,
+            expected
+        );
+    }
+    Ok(Some((alias_name, alias)))
+}
+
+fn normalize_alias_args(
+    uri: Option<String>,
+    target: Option<&str>,
+    default_target_present: bool,
+    alias_name: Option<&str>,
+    mut alias_args: Vec<String>,
+) -> (Option<String>, Vec<String>) {
+    let Some(candidate) = uri else {
+        return (None, alias_args);
+    };
+
+    if alias_name.is_some()
+        && (target.is_some() || default_target_present)
+        && !is_remote_uri(&candidate)
+        && !candidate.contains(std::path::MAIN_SEPARATOR)
+        && !Path::new(&candidate).exists()
+    {
+        alias_args.insert(0, candidate);
+        return (None, alias_args);
+    }
+
+    (Some(candidate), alias_args)
+}
+
+fn scaffold_config_if_missing(uri: &str) -> Result<()> {
+    let path = inferred_config_path(uri)?;
+    if path.exists() {
+        return Ok(());
+    }
+
+    fs::write(
+        path,
+        format!(
+            "\
+project:
+  name: Omnigraph Project
+
+targets:
+  local:
+    uri: {}
+
+server:
+  target: local
+  bind: 127.0.0.1:8080
+
+cli:
+  target: local
+  branch: main
+  output_format: table
+  table_max_column_width: 80
+  table_cell_layout: truncate
+
+query:
+  roots:
+    - queries
+    - .
+
+aliases:
+  # owner:
+  #   command: read
+  #   query: context.gq
+  #   name: decision_owner
+  #   args: [slug]
+  #   target: local
+  #   branch: main
+  #   format: kv
+  #
+  # attach_trace:
+  #   command: change
+  #   query: mutations.gq
+  #   name: attach_trace
+  #   args: [decision_slug, trace_slug]
+  #   target: local
+  #   branch: main
+
+policy: {{}}
+",
+            yaml_string(uri),
+        ),
+    )?;
+    Ok(())
+}
+
+fn yaml_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn inferred_config_path(uri: &str) -> Result<PathBuf> {
+    if uri.contains("://") {
+        return Ok(omnigraph_server::config::default_config_path());
+    }
+
+    let path = Path::new(uri);
+    let base = if path.is_absolute() {
+        path.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or(std::env::current_dir()?)
+    } else {
+        std::env::current_dir()?.join(path.parent().unwrap_or_else(|| Path::new(".")))
+    };
+    Ok(base.join(omnigraph_server::config::DEFAULT_CONFIG_FILE))
+}
+
 fn read_target_from_cli(branch: Option<String>, snapshot: Option<String>) -> ReadTarget {
     if let Some(snapshot) = snapshot {
         ReadTarget::snapshot(SnapshotId::new(snapshot))
     } else {
         ReadTarget::branch(branch.unwrap_or_else(|| "main".to_string()))
-    }
-}
-
-fn read_target_output(target: &ReadTarget) -> ReadTargetOutput {
-    match target {
-        ReadTarget::Branch(branch) => ReadTargetOutput {
-            branch: Some(branch.clone()),
-            snapshot: None,
-        },
-        ReadTarget::Snapshot(snapshot) => ReadTargetOutput {
-            branch: None,
-            snapshot: Some(snapshot.as_str().to_string()),
-        },
     }
 }
 
@@ -693,15 +741,6 @@ fn query_params_from_json(
 ) -> Result<ParamMap> {
     json_params_to_param_map(params_json, query_params, JsonParamMode::Standard)
         .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))
-}
-
-fn read_output(query_name: String, target: &ReadTarget, result: QueryResult) -> ReadOutput {
-    ReadOutput {
-        query_name,
-        target: read_target_output(target),
-        row_count: result.num_rows(),
-        rows: result.to_rust_json(),
-    }
 }
 
 async fn execute_read(
@@ -786,246 +825,6 @@ async fn execute_change_remote(
     .await
 }
 
-fn snapshot_payload(branch: &str, snapshot: &omnigraph::db::Snapshot) -> SnapshotOutput {
-    let mut entries: Vec<_> = snapshot.entries().cloned().collect();
-    entries.sort_by(|a, b| a.table_key.cmp(&b.table_key));
-    let tables = entries
-        .iter()
-        .map(|entry| SnapshotTableOutput {
-            table_key: entry.table_key.clone(),
-            table_path: entry.table_path.clone(),
-            table_version: entry.table_version,
-            table_branch: entry.table_branch.clone(),
-            row_count: entry.row_count,
-        })
-        .collect::<Vec<_>>();
-    SnapshotOutput {
-        branch: branch.to_string(),
-        manifest_version: snapshot.version(),
-        tables,
-    }
-}
-
-async fn server_health() -> Json<HealthOutput<'static>> {
-    Json(HealthOutput { status: "ok" })
-}
-
-async fn run_request_task<F, Fut, T>(task: F) -> std::result::Result<T, ApiError>
-where
-    F: FnOnce() -> Fut + Send + 'static,
-    Fut: Future<Output = std::result::Result<T, ApiError>> + 'static,
-    T: Send + 'static,
-{
-    tokio::task::spawn_blocking(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|err| ApiError::internal(err.to_string()))?;
-        runtime.block_on(task())
-    })
-    .await
-    .map_err(|err| ApiError::internal(err.to_string()))?
-}
-
-#[axum::debug_handler]
-async fn server_snapshot(
-    State(state): State<ServerState>,
-    Query(query): Query<SnapshotQuery>,
-) -> std::result::Result<Json<serde_json::Value>, ApiError> {
-    let branch = query.branch.unwrap_or_else(|| "main".to_string());
-    let uri = state.uri;
-    let payload = run_request_task(move || async move {
-        let db = Omnigraph::open(&uri)
-            .await
-            .map_err(|err| ApiError::bad_request(err.to_string()))?;
-        let snapshot = db
-            .snapshot_of(ReadTarget::branch(branch.as_str()))
-            .await
-            .map_err(|err| ApiError::bad_request(err.to_string()))?;
-        Ok(snapshot_payload(&branch, &snapshot))
-    })
-    .await?;
-    Ok(Json(
-        serde_json::to_value(payload).map_err(|err| ApiError::internal(err.to_string()))?,
-    ))
-}
-
-#[axum::debug_handler]
-async fn server_read(
-    State(state): State<ServerState>,
-    Json(request): Json<ReadRequest>,
-) -> std::result::Result<Json<ReadOutput>, ApiError> {
-    if request.branch.is_some() && request.snapshot.is_some() {
-        return Err(ApiError::bad_request(
-            "read request may specify branch or snapshot, not both",
-        ));
-    }
-    let uri = state.uri;
-    let target = read_target_from_cli(request.branch, request.snapshot);
-    let query_source = request.query_source;
-    let query_name = request.query_name;
-    let params_json = request.params;
-    let output = run_request_task(move || async move {
-        let (selected_name, query_params) =
-            select_named_query(&query_source, query_name.as_deref())
-                .map_err(|err| ApiError::bad_request(err.to_string()))?;
-        let params = query_params_from_json(&query_params, params_json.as_ref())
-            .map_err(|err| ApiError::bad_request(err.to_string()))?;
-        let mut db = Omnigraph::open(&uri)
-            .await
-            .map_err(|err| ApiError::bad_request(err.to_string()))?;
-        let result = db
-            .query(target.clone(), &query_source, &selected_name, &params)
-            .await
-            .map_err(|err| ApiError::bad_request(err.to_string()))?;
-        Ok(read_output(selected_name, &target, result))
-    })
-    .await?;
-    Ok(Json(output))
-}
-
-#[axum::debug_handler]
-async fn server_change(
-    State(state): State<ServerState>,
-    Json(request): Json<ChangeRequest>,
-) -> std::result::Result<Json<serde_json::Value>, ApiError> {
-    let branch = request.branch.unwrap_or_else(|| "main".to_string());
-    let uri = state.uri;
-    let query_source = request.query_source;
-    let query_name = request.query_name;
-    let params_json = request.params;
-    let output = run_request_task(move || async move {
-        let (selected_name, query_params) =
-            select_named_query(&query_source, query_name.as_deref())
-                .map_err(|err| ApiError::bad_request(err.to_string()))?;
-        let params = query_params_from_json(&query_params, params_json.as_ref())
-            .map_err(|err| ApiError::bad_request(err.to_string()))?;
-        let mut db = Omnigraph::open(&uri)
-            .await
-            .map_err(|err| ApiError::bad_request(err.to_string()))?;
-        let result = db
-            .mutate(&branch, &query_source, &selected_name, &params)
-            .await
-            .map_err(|err| ApiError::bad_request(err.to_string()))?;
-        Ok(ChangeOutput {
-            branch,
-            query_name: selected_name,
-            affected_nodes: result.affected_nodes,
-            affected_edges: result.affected_edges,
-        })
-    })
-    .await?;
-    Ok(Json(
-        serde_json::to_value(output).map_err(|err| ApiError::internal(err.to_string()))?,
-    ))
-}
-
-#[axum::debug_handler]
-async fn server_run_list(
-    State(state): State<ServerState>,
-) -> std::result::Result<Json<serde_json::Value>, ApiError> {
-    let uri = state.uri;
-    let runs = run_request_task(move || async move {
-        let db = Omnigraph::open(&uri)
-            .await
-            .map_err(|err| ApiError::bad_request(err.to_string()))?;
-        db.list_runs()
-            .await
-            .map_err(|err| ApiError::bad_request(err.to_string()))
-    })
-    .await?;
-    Ok(Json(
-        serde_json::to_value(RunListOutput {
-            runs: runs.iter().map(run_output).collect(),
-        })
-        .map_err(|err| ApiError::internal(err.to_string()))?,
-    ))
-}
-
-#[axum::debug_handler]
-async fn server_run_show(
-    State(state): State<ServerState>,
-    Path(run_id): Path<String>,
-) -> std::result::Result<Json<serde_json::Value>, ApiError> {
-    let uri = state.uri;
-    let run = run_request_task(move || async move {
-        let db = Omnigraph::open(&uri)
-            .await
-            .map_err(|err| ApiError::bad_request(err.to_string()))?;
-        db.get_run(&RunId::new(run_id))
-            .await
-            .map_err(|err| ApiError::bad_request(err.to_string()))
-    })
-    .await?;
-    Ok(Json(
-        serde_json::to_value(run_output(&run)).map_err(|err| ApiError::internal(err.to_string()))?,
-    ))
-}
-
-#[axum::debug_handler]
-async fn server_run_publish(
-    State(state): State<ServerState>,
-    Path(run_id): Path<String>,
-) -> std::result::Result<Json<serde_json::Value>, ApiError> {
-    let uri = state.uri;
-    let run = run_request_task(move || async move {
-        let mut db = Omnigraph::open(&uri)
-            .await
-            .map_err(|err| ApiError::bad_request(err.to_string()))?;
-        db.publish_run(&RunId::new(run_id.clone()))
-            .await
-            .map_err(|err| ApiError::bad_request(err.to_string()))?;
-        db.get_run(&RunId::new(run_id))
-            .await
-            .map_err(|err| ApiError::bad_request(err.to_string()))
-    })
-    .await?;
-    Ok(Json(
-        serde_json::to_value(run_output(&run)).map_err(|err| ApiError::internal(err.to_string()))?,
-    ))
-}
-
-#[axum::debug_handler]
-async fn server_run_abort(
-    State(state): State<ServerState>,
-    Path(run_id): Path<String>,
-) -> std::result::Result<Json<serde_json::Value>, ApiError> {
-    let uri = state.uri;
-    let run = run_request_task(move || async move {
-        let mut db = Omnigraph::open(&uri)
-            .await
-            .map_err(|err| ApiError::bad_request(err.to_string()))?;
-        db.abort_run(&RunId::new(run_id))
-            .await
-            .map_err(|err| ApiError::bad_request(err.to_string()))
-    })
-    .await?;
-    Ok(Json(
-        serde_json::to_value(run_output(&run)).map_err(|err| ApiError::internal(err.to_string()))?,
-    ))
-}
-
-fn build_server_app(uri: String) -> Router {
-    let state = ServerState { uri };
-    Router::new()
-        .route("/healthz", get(server_health))
-        .route("/snapshot", get(server_snapshot))
-        .route("/read", post(server_read))
-        .route("/change", post(server_change))
-        .route("/runs", get(server_run_list))
-        .route("/runs/{run_id}", get(server_run_show))
-        .route("/runs/{run_id}/publish", post(server_run_publish))
-        .route("/runs/{run_id}/abort", post(server_run_abort))
-        .with_state(state)
-}
-
-async fn run_server(bind: &str, uri: &str) -> Result<()> {
-    let listener = TcpListener::bind(bind).await?;
-    println!("serving {} on http://{}", uri, bind);
-    axum::serve(listener, build_server_app(uri.to_string())).await?;
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
@@ -1035,15 +834,21 @@ async fn main() -> Result<()> {
             let schema_source = fs::read_to_string(&schema)?;
             ensure_local_repo_parent(&uri)?;
             Omnigraph::init(&uri, &schema_source).await?;
+            scaffold_config_if_missing(&uri)?;
             println!("initialized {}", uri);
         }
         Command::Load {
+            uri,
+            target,
+            config,
             data,
             branch,
             mode,
             json,
-            uri,
         } => {
+            let config = load_config(config.as_ref())?;
+            let uri = resolve_local_uri(&config, uri, target.as_deref(), "load")?;
+            let branch = resolve_branch(&config, branch, None, "main");
             let mut db = Omnigraph::open(&uri).await?;
             let result = db
                 .load_file(&branch, &data.to_string_lossy(), mode.into())
@@ -1070,10 +875,15 @@ async fn main() -> Result<()> {
         Command::Branch { command } => match command {
             BranchCommand::Create {
                 uri,
+                target,
+                config,
                 from,
                 name,
                 json,
             } => {
+                let config = load_config(config.as_ref())?;
+                let uri = resolve_local_uri(&config, uri, target.as_deref(), "branch create")?;
+                let from = resolve_branch(&config, from, None, "main");
                 let mut db = Omnigraph::open(&uri).await?;
                 db.branch_create_from(ReadTarget::branch(&from), &name)
                     .await?;
@@ -1087,7 +897,14 @@ async fn main() -> Result<()> {
                     println!("created branch {} from {}", name, from);
                 }
             }
-            BranchCommand::List { uri, json } => {
+            BranchCommand::List {
+                uri,
+                target,
+                config,
+                json,
+            } => {
+                let config = load_config(config.as_ref())?;
+                let uri = resolve_local_uri(&config, uri, target.as_deref(), "branch list")?;
                 let db = Omnigraph::open(&uri).await?;
                 let mut branches = db.branch_list().await?;
                 branches.sort();
@@ -1101,39 +918,42 @@ async fn main() -> Result<()> {
             }
             BranchCommand::Merge {
                 uri,
-                source,
                 target,
+                config,
+                source,
+                into,
                 json,
             } => {
+                let config = load_config(config.as_ref())?;
+                let uri = resolve_local_uri(&config, uri, target.as_deref(), "branch merge")?;
+                let into = resolve_branch(&config, into, None, "main");
                 let mut db = Omnigraph::open(&uri).await?;
-                let outcome: CliMergeOutcome = db.branch_merge(&source, &target).await?.into();
+                let outcome: CliMergeOutcome = db.branch_merge(&source, &into).await?.into();
                 if json {
                     print_json(&BranchMergeOutput {
                         source: &source,
-                        target: &target,
+                        target: &into,
                         outcome,
                     })?;
                 } else {
-                    println!("merged {} into {}: {}", source, target, outcome.as_str());
+                    println!("merged {} into {}: {}", source, into, outcome.as_str());
                 }
             }
         },
         Command::Snapshot {
             uri,
+            target,
             config,
             branch,
             json,
         } => {
-            let uri = resolve_uri(config.as_ref(), uri)?;
-            let branch = resolve_branch(config.as_ref(), branch, "main")?;
+            let config = load_config(config.as_ref())?;
+            let uri = resolve_uri(&config, uri, target.as_deref())?;
+            let branch = resolve_branch(&config, branch, None, "main");
             let payload = if is_remote_uri(&uri) {
                 remote_json::<SnapshotOutput>(
                     Method::GET,
-                    format!(
-                        "{}?branch={}",
-                        remote_url(&uri, "/snapshot"),
-                        branch
-                    ),
+                    format!("{}?branch={}", remote_url(&uri, "/snapshot"), branch),
                     None,
                 )
                 .await?
@@ -1150,8 +970,14 @@ async fn main() -> Result<()> {
             }
         }
         Command::Run { command } => match command {
-            RunCommand::List { uri, config, json } => {
-                let uri = resolve_uri(config.as_ref(), uri)?;
+            RunCommand::List {
+                uri,
+                target,
+                config,
+                json,
+            } => {
+                let config = load_config(config.as_ref())?;
+                let uri = resolve_uri(&config, uri, target.as_deref())?;
                 let runs = if is_remote_uri(&uri) {
                     remote_json::<RunListOutput>(Method::GET, remote_url(&uri, "/runs"), None)
                         .await?
@@ -1172,11 +998,13 @@ async fn main() -> Result<()> {
             }
             RunCommand::Show {
                 uri,
+                target,
                 config,
                 run_id,
                 json,
             } => {
-                let uri = resolve_uri(config.as_ref(), uri)?;
+                let config = load_config(config.as_ref())?;
+                let uri = resolve_uri(&config, uri, target.as_deref())?;
                 let run = if is_remote_uri(&uri) {
                     remote_json::<RunOutput>(
                         Method::GET,
@@ -1196,11 +1024,13 @@ async fn main() -> Result<()> {
             }
             RunCommand::Publish {
                 uri,
+                target,
                 config,
                 run_id,
                 json,
             } => {
-                let uri = resolve_uri(config.as_ref(), uri)?;
+                let config = load_config(config.as_ref())?;
+                let uri = resolve_uri(&config, uri, target.as_deref())?;
                 let run = if is_remote_uri(&uri) {
                     remote_json::<RunOutput>(
                         Method::POST,
@@ -1221,11 +1051,13 @@ async fn main() -> Result<()> {
             }
             RunCommand::Abort {
                 uri,
+                target,
                 config,
                 run_id,
                 json,
             } => {
-                let uri = resolve_uri(config.as_ref(), uri)?;
+                let config = load_config(config.as_ref())?;
+                let uri = resolve_uri(&config, uri, target.as_deref())?;
                 let run = if is_remote_uri(&uri) {
                     remote_json::<RunOutput>(
                         Method::POST,
@@ -1246,23 +1078,65 @@ async fn main() -> Result<()> {
         },
         Command::Read {
             uri,
+            target,
             config,
+            alias,
             query,
             name,
             params,
             branch,
             snapshot,
+            format,
             json,
+            alias_args,
         } => {
-            let uri = resolve_uri(config.as_ref(), uri)?;
-            let query_source = fs::read_to_string(&query)?;
-            let params_json = load_params_json(&params)?;
-            let target = resolve_read_target(config.as_ref(), branch, snapshot)?;
+            if alias.is_some() == query.is_some() {
+                bail!("exactly one of --alias or --query must be provided");
+            }
+
+            let config = load_config(config.as_ref())?;
+            let alias = resolve_alias(&config, alias.as_deref(), AliasCommand::Read)?;
+            let alias_name = alias.as_ref().map(|(name, _)| *name);
+            let alias_config = alias.as_ref().map(|(_, alias)| *alias);
+            let (uri, alias_args) = normalize_alias_args(
+                uri,
+                target.as_deref(),
+                config.cli_target_name().is_some(),
+                alias_name,
+                alias_args,
+            );
+            let uri = resolve_uri(
+                &config,
+                uri,
+                target
+                    .as_deref()
+                    .or_else(|| alias_config.and_then(|alias| alias.target.as_deref())),
+            )?;
+            let query_source = resolve_query_source(
+                &config,
+                query.as_ref(),
+                alias_config.map(|a| a.query.as_str()),
+            )?;
+            let params_json = merged_params_json(
+                alias_name,
+                alias_config
+                    .map(|alias| alias.args.as_slice())
+                    .unwrap_or(&[]),
+                &alias_args,
+                load_params_json(&params)?,
+            )?;
+            let target = resolve_read_target(
+                &config,
+                branch,
+                snapshot,
+                alias_config.and_then(|alias| alias.branch.clone()),
+            )?;
+            let query_name = name.or_else(|| alias_config.and_then(|alias| alias.name.clone()));
             let output = if is_remote_uri(&uri) {
                 execute_read_remote(
                     &uri,
                     &query_source,
-                    name.as_deref(),
+                    query_name.as_deref(),
                     target,
                     params_json.as_ref(),
                 )
@@ -1271,36 +1145,79 @@ async fn main() -> Result<()> {
                 execute_read(
                     &uri,
                     &query_source,
-                    name.as_deref(),
+                    query_name.as_deref(),
                     target,
                     params_json.as_ref(),
                 )
                 .await?
             };
-            if json {
-                print_json(&output)?;
-            } else {
-                print_read_human(&output)?;
-            }
+            let format = resolve_read_format(
+                &config,
+                format,
+                json,
+                alias_config.and_then(|alias| alias.format),
+            );
+            print_read_output(&output, format, &config)?;
         }
         Command::Change {
             uri,
+            target,
             config,
+            alias,
             query,
             name,
             params,
             branch,
             json,
+            alias_args,
         } => {
-            let uri = resolve_uri(config.as_ref(), uri)?;
-            let query_source = fs::read_to_string(&query)?;
-            let params_json = load_params_json(&params)?;
-            let branch = resolve_branch(config.as_ref(), branch, "main")?;
+            if alias.is_some() == query.is_some() {
+                bail!("exactly one of --alias or --query must be provided");
+            }
+
+            let config = load_config(config.as_ref())?;
+            let alias = resolve_alias(&config, alias.as_deref(), AliasCommand::Change)?;
+            let alias_name = alias.as_ref().map(|(name, _)| *name);
+            let alias_config = alias.as_ref().map(|(_, alias)| *alias);
+            let (uri, alias_args) = normalize_alias_args(
+                uri,
+                target.as_deref(),
+                config.cli_target_name().is_some(),
+                alias_name,
+                alias_args,
+            );
+            let uri = resolve_uri(
+                &config,
+                uri,
+                target
+                    .as_deref()
+                    .or_else(|| alias_config.and_then(|alias| alias.target.as_deref())),
+            )?;
+            let query_source = resolve_query_source(
+                &config,
+                query.as_ref(),
+                alias_config.map(|a| a.query.as_str()),
+            )?;
+            let params_json = merged_params_json(
+                alias_name,
+                alias_config
+                    .map(|alias| alias.args.as_slice())
+                    .unwrap_or(&[]),
+                &alias_args,
+                load_params_json(&params)?,
+            )?;
+            let branch = resolve_branch(
+                &config,
+                branch,
+                alias_config.and_then(|alias| alias.branch.clone()),
+                "main",
+            );
+            let query_name = name.or_else(|| alias_config.and_then(|alias| alias.name.clone()));
             let output = if is_remote_uri(&uri) {
                 execute_change_remote(
                     &uri,
                     &query_source,
-                    name.as_deref(),
+                    query_name.as_deref(),
                     &branch,
                     params_json.as_ref(),
                 )
@@ -1309,7 +1226,7 @@ async fn main() -> Result<()> {
                 execute_change(
                     &uri,
                     &query_source,
-                    name.as_deref(),
+                    query_name.as_deref(),
                     &branch,
                     params_json.as_ref(),
                 )
@@ -1321,64 +1238,6 @@ async fn main() -> Result<()> {
                 print_change_human(&output);
             }
         }
-        Command::Server { uri, config, bind } => {
-            let settings = load_server_settings(config.as_ref(), uri, bind)?;
-            run_server(&settings.bind, &settings.uri).await?;
-        }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::load_server_settings;
-    use std::fs;
-    use tempfile::tempdir;
-
-    #[test]
-    fn server_settings_load_from_toml_config() {
-        let temp = tempdir().unwrap();
-        let config = temp.path().join("server.toml");
-        fs::write(
-            &config,
-            r#"
-uri = "/tmp/demo.omni"
-bind = "0.0.0.0:9090"
-"#,
-        )
-        .unwrap();
-
-        let settings = load_server_settings(Some(&config), None, None).unwrap();
-        assert_eq!(settings.uri, "/tmp/demo.omni");
-        assert_eq!(settings.bind, "0.0.0.0:9090");
-    }
-
-    #[test]
-    fn server_settings_cli_flags_override_toml_config() {
-        let temp = tempdir().unwrap();
-        let config = temp.path().join("server.toml");
-        fs::write(
-            &config,
-            r#"
-uri = "/tmp/demo.omni"
-bind = "127.0.0.1:8080"
-"#,
-        )
-        .unwrap();
-
-        let settings = load_server_settings(
-            Some(&config),
-            Some("/tmp/override.omni".to_string()),
-            Some("0.0.0.0:9999".to_string()),
-        )
-        .unwrap();
-        assert_eq!(settings.uri, "/tmp/override.omni");
-        assert_eq!(settings.bind, "0.0.0.0:9999");
-    }
-
-    #[test]
-    fn server_settings_require_uri_from_cli_or_config() {
-        let error = load_server_settings(None, None, None).unwrap_err();
-        assert!(error.to_string().contains("server URI must be provided"));
-    }
 }

@@ -1,0 +1,35 @@
+project:
+  name: Context Demo
+
+targets:
+  local:
+    uri: ./context.omni
+  dev:
+    uri: http://127.0.0.1:8080
+
+server:
+  target: local
+  bind: 127.0.0.1:8080
+
+cli:
+  target: dev
+  branch: main
+  output_format: table
+  table_max_column_width: 80
+  table_cell_layout: truncate
+
+query:
+  roots:
+    - .
+
+aliases:
+  get_actor:
+    command: read
+    query: context.gq
+    name: get_actor
+    args: [slug]
+    target: dev
+    branch: main
+    format: kv
+
+policy: {}

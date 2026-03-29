@@ -105,16 +105,16 @@ og change ./demo/context.omni --query mutations.gq --name insert_signal --json \
 
 ```bash
 # Create a branch from main
-og branch create ./demo/context.omni --from main feature-x
+og branch create --uri ./demo/context.omni --from main feature-x
 
 # Create from another branch
-og branch create ./demo/context.omni --from feature-x feature-x-2
+og branch create --uri ./demo/context.omni --from feature-x feature-x-2
 
 # List branches
-og branch list ./demo/context.omni
+og branch list --uri ./demo/context.omni
 
 # Merge branch into main
-og branch merge ./demo/context.omni feature-x --target main
+og branch merge --uri ./demo/context.omni feature-x --into main
 ```
 
 ## Transactional Runs
@@ -136,14 +136,11 @@ og run abort --uri ./demo/context.omni <run-id>
 ## Server Mode
 
 ```bash
-# Start server (default 127.0.0.1:8080)
-og server ./demo/context.omni
+# Start server from project config
+omnigraph-server --config demo/omnigraph.yaml
 
-# Custom bind address
-og server ./demo/context.omni --bind 0.0.0.0:9090
-
-# From config file
-og server --config demo/server.toml
+# Override the bind address
+omnigraph-server --config demo/omnigraph.yaml --bind 0.0.0.0:9090
 ```
 
 ### Server API endpoints
@@ -162,18 +159,17 @@ POST /runs/{run_id}/abort     Abort run
 ### Remote CLI (point og at a server)
 
 ```bash
-# Remote client defaults
-cat demo/client.toml
+# Project defaults
+cat demo/omnigraph.yaml
 
-# Read via config
-og read --config demo/client.toml --query demo/context.gq --name get_actor \
-  --params '{"slug": "andrew"}'
+# Read via alias + config
+og read --config demo/omnigraph.yaml --alias get_actor andrew
 
-og snapshot --config demo/client.toml
+og snapshot --config demo/omnigraph.yaml
 
-og run list --config demo/client.toml
+og run list --config demo/omnigraph.yaml
 ```
 
 ## Output Modes
 
-All commands that produce output support `--json` for machine-readable JSON output. Without `--json`, output is human-readable text.
+`read` supports `--format table|kv|csv|jsonl|json`. Other commands still use human output by default plus `--json` for machine-readable output.

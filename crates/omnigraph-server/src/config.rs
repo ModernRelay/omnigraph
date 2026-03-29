@@ -1,0 +1,347 @@
+use std::collections::BTreeMap;
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use clap::ValueEnum;
+use color_eyre::eyre::{Result, bail};
+use serde::{Deserialize, Serialize};
+use serde_yaml::Mapping;
+
+pub const DEFAULT_CONFIG_FILE: &str = "omnigraph.yaml";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectConfig {
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetConfig {
+    pub uri: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadOutputFormat {
+    #[default]
+    Table,
+    Kv,
+    Csv,
+    Jsonl,
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum TableCellLayout {
+    #[default]
+    Truncate,
+    Wrap,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CliDefaults {
+    pub target: Option<String>,
+    pub branch: Option<String>,
+    pub output_format: Option<ReadOutputFormat>,
+    pub table_max_column_width: Option<usize>,
+    pub table_cell_layout: Option<TableCellLayout>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServerDefaults {
+    pub target: Option<String>,
+    pub bind: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QueryDefaults {
+    #[serde(default)]
+    pub roots: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AliasCommand {
+    Read,
+    Change,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AliasConfig {
+    pub command: AliasCommand,
+    pub query: String,
+    pub name: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub target: Option<String>,
+    pub branch: Option<String>,
+    pub format: Option<ReadOutputFormat>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OmnigraphConfig {
+    #[serde(default)]
+    pub project: ProjectConfig,
+    #[serde(default)]
+    pub targets: BTreeMap<String, TargetConfig>,
+    #[serde(default)]
+    pub server: ServerDefaults,
+    #[serde(default)]
+    pub cli: CliDefaults,
+    #[serde(default)]
+    pub query: QueryDefaults,
+    #[serde(default)]
+    pub aliases: BTreeMap<String, AliasConfig>,
+    #[serde(default)]
+    pub policy: Mapping,
+    #[serde(skip)]
+    base_dir: PathBuf,
+}
+
+impl Default for OmnigraphConfig {
+    fn default() -> Self {
+        Self {
+            project: ProjectConfig::default(),
+            targets: BTreeMap::new(),
+            server: ServerDefaults::default(),
+            cli: CliDefaults::default(),
+            query: QueryDefaults::default(),
+            aliases: BTreeMap::new(),
+            policy: Mapping::new(),
+            base_dir: PathBuf::new(),
+        }
+    }
+}
+
+impl OmnigraphConfig {
+    pub fn base_dir(&self) -> &Path {
+        &self.base_dir
+    }
+
+    pub fn cli_branch(&self) -> &str {
+        self.cli.branch.as_deref().unwrap_or("main")
+    }
+
+    pub fn cli_output_format(&self) -> ReadOutputFormat {
+        self.cli.output_format.unwrap_or_default()
+    }
+
+    pub fn table_max_column_width(&self) -> usize {
+        self.cli.table_max_column_width.unwrap_or(80)
+    }
+
+    pub fn table_cell_layout(&self) -> TableCellLayout {
+        self.cli.table_cell_layout.unwrap_or_default()
+    }
+
+    pub fn cli_target_name(&self) -> Option<&str> {
+        self.cli.target.as_deref()
+    }
+
+    pub fn server_target_name(&self) -> Option<&str> {
+        self.server.target.as_deref()
+    }
+
+    pub fn server_bind(&self) -> &str {
+        self.server.bind.as_deref().unwrap_or("127.0.0.1:8080")
+    }
+
+    pub fn alias(&self, name: &str) -> Result<&AliasConfig> {
+        self.aliases
+            .get(name)
+            .ok_or_else(|| color_eyre::eyre::eyre!("alias '{}' not found", name))
+    }
+
+    pub fn resolve_target_uri(
+        &self,
+        explicit_uri: Option<String>,
+        explicit_target: Option<&str>,
+        default_target: Option<&str>,
+    ) -> Result<String> {
+        if let Some(uri) = explicit_uri {
+            return Ok(uri);
+        }
+
+        let target_name = explicit_target.or(default_target).ok_or_else(|| {
+            color_eyre::eyre::eyre!("URI must be provided via <URI>, --target, or config")
+        })?;
+        let target = self.targets.get(target_name).ok_or_else(|| {
+            color_eyre::eyre::eyre!(
+                "target '{}' not found in {}",
+                target_name,
+                DEFAULT_CONFIG_FILE
+            )
+        })?;
+        Ok(self.resolve_config_uri(&target.uri))
+    }
+
+    pub fn resolve_query_path(&self, query: &Path) -> Result<PathBuf> {
+        if query.is_absolute() || query.exists() {
+            return Ok(query.to_path_buf());
+        }
+
+        let direct = self.base_dir.join(query);
+        if direct.exists() {
+            return Ok(direct);
+        }
+
+        for root in &self.query.roots {
+            let candidate = self.base_dir.join(root).join(query);
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+
+        bail!("query file '{}' not found", query.display());
+    }
+
+    fn resolve_config_uri(&self, value: &str) -> String {
+        if value.contains("://") {
+            return value.to_string();
+        }
+
+        let path = Path::new(value);
+        if path.is_absolute() {
+            value.to_string()
+        } else {
+            self.base_dir.join(path).to_string_lossy().to_string()
+        }
+    }
+}
+
+pub fn default_config_path() -> PathBuf {
+    PathBuf::from(DEFAULT_CONFIG_FILE)
+}
+
+pub fn load_config(config_path: Option<&PathBuf>) -> Result<OmnigraphConfig> {
+    load_config_in(&env::current_dir()?, config_path)
+}
+
+fn load_config_in(cwd: &Path, config_path: Option<&PathBuf>) -> Result<OmnigraphConfig> {
+    let explicit_path = config_path.cloned();
+    let config_path = explicit_path.or_else(|| {
+        let default_path = cwd.join(DEFAULT_CONFIG_FILE);
+        default_path.exists().then_some(default_path)
+    });
+
+    let mut config = if let Some(path) = &config_path {
+        serde_yaml::from_str::<OmnigraphConfig>(&fs::read_to_string(path)?)?
+    } else {
+        OmnigraphConfig::default()
+    };
+
+    config.base_dir = if let Some(path) = config_path {
+        absolute_base_dir(cwd, &path)?
+    } else {
+        cwd.to_path_buf()
+    };
+
+    Ok(config)
+}
+
+fn absolute_base_dir(cwd: &Path, path: &Path) -> Result<PathBuf> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    Ok(path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| cwd.to_path_buf()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use tempfile::tempdir;
+
+    use super::{ReadOutputFormat, TableCellLayout, load_config_in};
+
+    #[test]
+    fn load_config_reads_yaml_defaults_from_current_dir() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("omnigraph.yaml"),
+            r#"
+targets:
+  local:
+    uri: ./demo.omni
+cli:
+  target: local
+  branch: main
+  output_format: kv
+  table_max_column_width: 40
+  table_cell_layout: wrap
+policy: {}
+"#,
+        )
+        .unwrap();
+
+        let config = load_config_in(temp.path(), None).unwrap();
+        assert_eq!(config.cli_target_name(), Some("local"));
+        assert_eq!(config.cli_branch(), "main");
+        assert_eq!(config.cli_output_format(), ReadOutputFormat::Kv);
+        assert_eq!(config.table_max_column_width(), 40);
+        assert_eq!(config.table_cell_layout(), TableCellLayout::Wrap);
+        assert_eq!(
+            PathBuf::from(
+                config
+                    .resolve_target_uri(None, None, config.cli_target_name())
+                    .unwrap()
+            ),
+            temp.path().join("./demo.omni")
+        );
+    }
+
+    #[test]
+    fn load_config_does_not_walk_parent_directories() {
+        let temp = tempdir().unwrap();
+        let child = temp.path().join("child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(
+            temp.path().join("omnigraph.yaml"),
+            "targets:\n  local:\n    uri: ./demo.omni\n",
+        )
+        .unwrap();
+
+        let config = load_config_in(&child, None).unwrap();
+        assert!(config.targets.is_empty());
+    }
+
+    #[test]
+    fn resolve_query_path_searches_config_roots() {
+        let temp = tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("queries")).unwrap();
+        fs::write(
+            temp.path().join("omnigraph.yaml"),
+            "query:\n  roots:\n    - queries\npolicy: {}\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("queries").join("test.gq"),
+            "query q { return {} }",
+        )
+        .unwrap();
+
+        let config = load_config_in(temp.path(), None).unwrap();
+        let resolved = config.resolve_query_path(Path::new("test.gq")).unwrap();
+        assert_eq!(resolved, temp.path().join("queries").join("test.gq"));
+    }
+
+    #[test]
+    fn policy_block_accepts_non_empty_mapping() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("omnigraph.yaml"),
+            "policy:\n  admission:\n    require_branch: main\n",
+        )
+        .unwrap();
+
+        let config = load_config_in(temp.path(), None).unwrap();
+        assert!(!config.policy.is_empty());
+    }
+}
