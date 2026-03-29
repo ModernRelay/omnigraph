@@ -111,7 +111,7 @@ Read queries go through:
 
 ## Important Current Limits
 
-- Point-in-time query execution (`run_query_at`) is designed but not yet implemented
+- Point-in-time query execution (`run_query_at`) is implemented (Step 10b)
 - CLI subcommands are mostly stubs
 - `init`/`open` currently use local filesystem paths; `s3://` support is not wired up yet
 - There are stale files under `crates/omnigraph/src/loader/` from an older design; the live exported loader is `crates/omnigraph/src/loader/mod.rs`
