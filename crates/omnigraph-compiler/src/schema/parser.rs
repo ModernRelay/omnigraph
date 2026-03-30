@@ -4,7 +4,7 @@ use pest::Parser;
 use pest::error::InputLocation;
 use pest_derive::Parser;
 
-use crate::error::{NanoError, ParseDiagnostic, Result, SourceSpan};
+use crate::error::{NanoError, ParseDiagnostic, Result, SourceSpan, decode_string_literal, render_span};
 use crate::types::{PropType, ScalarType};
 
 use super::ast::*;
@@ -56,8 +56,8 @@ pub fn parse_schema_diagnostic(input: &str) -> std::result::Result<SchemaFile, P
 
 fn pest_error_to_diagnostic(err: pest::error::Error<Rule>) -> ParseDiagnostic {
     let span = match err.location {
-        InputLocation::Pos(pos) => Some(SourceSpan::new(pos, pos)),
-        InputLocation::Span((start, end)) => Some(SourceSpan::new(start, end)),
+        InputLocation::Pos(pos) => Some(render_span(SourceSpan::new(pos, pos))),
+        InputLocation::Span((start, end)) => Some(render_span(SourceSpan::new(start, end))),
     };
     ParseDiagnostic::new(err.to_string(), span)
 }
@@ -294,25 +294,19 @@ fn extract_ident_list_from_args(args: Vec<pest::iterators::Pair<Rule>>) -> Resul
 
 fn extract_string_from_constraint_arg(pair: &pest::iterators::Pair<Rule>) -> Result<String> {
     // Navigate into constraint_arg -> literal -> string_lit
-    fn find_string(pair: &pest::iterators::Pair<Rule>) -> Option<String> {
+    fn find_string(pair: &pest::iterators::Pair<Rule>) -> Result<Option<String>> {
         if pair.as_rule() == Rule::string_lit {
-            let s = pair.as_str();
-            return Some(
-                s.strip_prefix('"')
-                    .and_then(|inner| inner.strip_suffix('"'))
-                    .unwrap_or(s)
-                    .to_string(),
-            );
+            return decode_string_literal(pair.as_str()).map(Some);
         }
         for inner in pair.clone().into_inner() {
-            if let Some(s) = find_string(&inner) {
-                return Some(s);
+            if let Some(s) = find_string(&inner)? {
+                return Ok(Some(s));
             }
         }
-        None
+        Ok(None)
     }
 
-    find_string(pair)
+    find_string(pair)?
         .ok_or_else(|| NanoError::Parse("expected string argument in constraint".to_string()))
 }
 
@@ -558,13 +552,10 @@ fn parse_type_ref(pair: pest::iterators::Pair<Rule>) -> Result<PropType> {
 fn parse_annotation(pair: pest::iterators::Pair<Rule>) -> Result<Annotation> {
     let mut inner = pair.into_inner();
     let name = inner.next().unwrap().as_str().to_string();
-    let value = inner.next().map(|p| {
-        let s = p.as_str();
-        s.strip_prefix('"')
-            .and_then(|inner| inner.strip_suffix('"'))
-            .unwrap_or(s)
-            .to_string()
-    });
+    let value = inner
+        .next()
+        .map(|p| decode_string_literal(p.as_str()))
+        .transpose()?;
 
     Ok(Annotation { name, value })
 }
@@ -1754,6 +1745,40 @@ edge DependsOn: Task -> Task @description("Hard dependency") @instruction("Use o
             }
             _ => panic!("expected edge"),
         }
+    }
+
+    #[test]
+    fn test_parse_annotation_decodes_escapes() {
+        let input = r#"
+node Task @description("Tracked\n\"work\"\\item") {
+    slug: String @key @description("Stable\tidentifier")
+}
+"#;
+        let schema = parse_schema(input).unwrap();
+        match &schema.declarations[0] {
+            SchemaDecl::Node(node) => {
+                assert_eq!(
+                    node.annotations[0].value.as_deref(),
+                    Some("Tracked\n\"work\"\\item")
+                );
+                assert_eq!(
+                    node.properties[0].annotations[1].value.as_deref(),
+                    Some("Stable\tidentifier")
+                );
+            }
+            _ => panic!("expected node"),
+        }
+    }
+
+    #[test]
+    fn test_parse_annotation_rejects_unknown_escape() {
+        let input = r#"
+node Task @description("Tracked\q") {
+    slug: String @key
+}
+"#;
+        let err = parse_schema(input).unwrap_err();
+        assert!(err.to_string().contains("unsupported escape sequence"));
     }
 
     #[test]

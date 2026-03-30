@@ -132,6 +132,39 @@ node Flagged {
 }
 
 #[tokio::test]
+async fn nullable_vectors_round_trip_as_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema = r#"
+node Doc {
+    slug: String @key
+    embedding: Vector(2)?
+}
+"#;
+    let data = r#"{"type":"Doc","data":{"slug":"a"}}
+{"type":"Doc","data":{"slug":"b","embedding":[1.0,2.0]}}"#;
+
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let missing = db
+        .entity_at_target(ReadTarget::branch("main"), "node:Doc", "a")
+        .await
+        .unwrap()
+        .unwrap();
+    let present = db
+        .entity_at_target(ReadTarget::branch("main"), "node:Doc", "b")
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(missing["embedding"].is_null());
+    assert_eq!(present["embedding"], serde_json::json!([1.0, 2.0]));
+}
+
+#[tokio::test]
 async fn edge_src_dst_reference_node_ids() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_and_load(&dir).await;

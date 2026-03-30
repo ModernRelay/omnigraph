@@ -27,7 +27,7 @@ impl Snapshot {
         let entry = self
             .entries
             .get(table_key)
-            .ok_or_else(|| OmniError::Manifest(format!("no manifest entry for {}", table_key)))?;
+            .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
         let full_path = format!("{}/{}", self.root_uri, entry.table_path);
         let ds = Dataset::open(&full_path)
             .await
@@ -323,7 +323,7 @@ impl ManifestCoordinator {
 
         for u in updates {
             let table_path = path_map.get(&u.table_key).ok_or_else(|| {
-                OmniError::Manifest(format!("unknown table_key in commit: {}", u.table_key))
+                OmniError::manifest(format!("unknown table_key in commit: {}", u.table_key))
             })?;
             keys.push(u.table_key.as_str());
             paths.push(table_path.as_str());
@@ -387,7 +387,10 @@ impl ManifestCoordinator {
             .list_branches()
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
-        let mut names: Vec<String> = branches.into_keys().collect();
+        let mut names: Vec<String> = branches
+            .into_keys()
+            .filter(|name| name != "main")
+            .collect();
         names.sort();
         let mut all = vec!["main".to_string()];
         all.extend(names);
@@ -414,36 +417,11 @@ async fn read_manifest_state(dataset: &Dataset) -> Result<ManifestState> {
 
     let mut entries = Vec::new();
     for batch in &batches {
-        let keys = batch
-            .column_by_name("table_key")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let paths = batch
-            .column_by_name("table_path")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let versions = batch
-            .column_by_name("table_version")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
-        let branches = batch
-            .column_by_name("table_branch")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let row_counts = batch
-            .column_by_name("row_count")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
+        let keys = string_column(batch, "table_key")?;
+        let paths = string_column(batch, "table_path")?;
+        let versions = u64_column(batch, "table_version")?;
+        let branches = string_column(batch, "table_branch")?;
+        let row_counts = u64_column(batch, "row_count")?;
 
         for i in 0..batch.num_rows() {
             entries.push(SubTableEntry {
@@ -461,6 +439,24 @@ async fn read_manifest_state(dataset: &Dataset) -> Result<ManifestState> {
     }
 
     Ok(ManifestState { version, entries })
+}
+
+fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| OmniError::manifest_internal(format!("manifest batch missing '{name}' column")))?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| OmniError::manifest_internal(format!("manifest column '{name}' is not Utf8")))
+}
+
+fn u64_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt64Array> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| OmniError::manifest_internal(format!("manifest batch missing '{name}' column")))?
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| OmniError::manifest_internal(format!("manifest column '{name}' is not UInt64")))
 }
 
 /// Create an empty Lance dataset with the given schema.
@@ -505,6 +501,10 @@ use futures::TryStreamExt;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arrow_schema::{DataType, Field, Schema};
+
     use super::*;
     use omnigraph_compiler::catalog::build_catalog;
     use omnigraph_compiler::schema::parser::parse_schema;
@@ -626,5 +626,35 @@ edge WorksAt: Person -> Company {
         let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
         let snap = mc.snapshot();
         assert_eq!(mc.version(), snap.version());
+    }
+
+    #[tokio::test]
+    async fn test_list_branches_only_returns_main_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let catalog = build_test_catalog();
+
+        let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+        let branches = mc.list_branches().await.unwrap();
+        assert_eq!(
+            branches.iter().filter(|branch| branch.as_str() == "main").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn manifest_column_helpers_return_error_for_bad_schema() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "table_key",
+                DataType::UInt64,
+                false,
+            )])),
+            vec![Arc::new(UInt64Array::from(vec![1_u64]))],
+        )
+        .unwrap();
+
+        let err = string_column(&batch, "table_key").unwrap_err();
+        assert!(err.to_string().contains("table_key"));
     }
 }

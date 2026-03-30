@@ -18,6 +18,10 @@ pub fn cli() -> Command {
     Command::cargo_bin("omnigraph").unwrap()
 }
 
+pub fn cli_process() -> StdCommand {
+    StdCommand::new(assert_cmd::cargo::cargo_bin("omnigraph"))
+}
+
 fn server_process() -> StdCommand {
     if let Some(path) = std::env::var_os("CARGO_BIN_EXE_omnigraph-server") {
         StdCommand::new(path)

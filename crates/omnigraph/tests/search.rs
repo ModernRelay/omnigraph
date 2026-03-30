@@ -2,6 +2,7 @@ mod helpers;
 
 use arrow_array::{Array, StringArray};
 use lance_index::{DatasetIndexExt, is_system_index};
+use serial_test::serial;
 
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::{LoadMode, load_jsonl};
@@ -25,6 +26,7 @@ async fn init_search_db(dir: &tempfile::TempDir) -> Omnigraph {
 // ─── Text search (match_tokens) ─────────────────────────────────────────────
 
 #[tokio::test]
+#[serial]
 async fn text_search_filters_results() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_search_db(&dir).await;
@@ -59,6 +61,7 @@ async fn text_search_filters_results() {
 }
 
 #[tokio::test]
+#[serial]
 async fn text_search_no_results() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_search_db(&dir).await;
@@ -78,6 +81,7 @@ async fn text_search_no_results() {
 // ─── Fuzzy search (match_tokens with fuzzy_max_edits) ───────────────────────
 
 #[tokio::test]
+#[serial]
 async fn fuzzy_search_tolerates_typos() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_search_db(&dir).await;
@@ -101,6 +105,7 @@ async fn fuzzy_search_tolerates_typos() {
 // ─── Phrase search (match_phrase) ───────────────────────────────────────────
 
 #[tokio::test]
+#[serial]
 async fn phrase_search_matches_exact_phrase() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_search_db(&dir).await;
@@ -134,6 +139,7 @@ async fn phrase_search_matches_exact_phrase() {
 }
 
 #[tokio::test]
+#[serial]
 async fn phrase_search_is_documented_fts_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_search_db(&dir).await;
@@ -168,6 +174,7 @@ async fn phrase_search_is_documented_fts_fallback() {
 // ─── Vector search (nearest) ────────────────────────────────────────────────
 
 #[tokio::test]
+#[serial]
 async fn nearest_returns_k_closest() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_search_db(&dir).await;
@@ -198,6 +205,7 @@ async fn nearest_returns_k_closest() {
 // ─── BM25 search ────────────────────────────────────────────────────────────
 
 #[tokio::test]
+#[serial]
 async fn bm25_returns_ranked_results() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_search_db(&dir).await;
@@ -222,6 +230,7 @@ async fn bm25_returns_ranked_results() {
 // ─── RRF hybrid search ─────────────────────────────────────────────────────
 
 #[tokio::test]
+#[serial]
 async fn rrf_fuses_vector_and_text() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_search_db(&dir).await;
@@ -240,6 +249,7 @@ async fn rrf_fuses_vector_and_text() {
 }
 
 #[tokio::test]
+#[serial]
 async fn ensure_indices_creates_vector_index_for_vector_annotations() {
     let schema = r#"
 node Doc {
@@ -274,6 +284,7 @@ node Doc {
 }
 
 #[tokio::test]
+#[serial]
 async fn ensure_indices_creates_inverted_indices_for_string_annotations() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_search_db(&dir).await;

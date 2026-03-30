@@ -15,6 +15,7 @@ use omnigraph_server::api::{
 };
 use omnigraph_server::{AliasCommand, OmnigraphConfig, ReadOutputFormat, load_config};
 use reqwest::Method;
+use reqwest::header::AUTHORIZATION;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -344,13 +345,39 @@ fn remote_url(base: &str, path: &str) -> String {
     format!("{}{}", base.trim_end_matches('/'), path)
 }
 
+fn normalize_bearer_token(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn cli_bearer_token_from_env() -> Option<String> {
+    normalize_bearer_token(std::env::var("OMNIGRAPH_BEARER_TOKEN").ok())
+}
+
+fn build_http_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::new())
+}
+
+fn apply_bearer_token(
+    request: reqwest::RequestBuilder,
+    token: Option<&str>,
+) -> reqwest::RequestBuilder {
+    if let Some(token) = token {
+        request.header(AUTHORIZATION, format!("Bearer {}", token))
+    } else {
+        request
+    }
+}
+
 async fn remote_json<T: DeserializeOwned>(
+    client: &reqwest::Client,
     method: Method,
     url: String,
     body: Option<Value>,
 ) -> Result<T> {
-    let client = reqwest::Client::new();
-    let request = client.request(method, url);
+    let token = cli_bearer_token_from_env();
+    let request = apply_bearer_token(client.request(method, url), token.as_deref());
     let request = if let Some(body) = body {
         request.json(&body)
     } else {
@@ -752,7 +779,7 @@ async fn execute_read(
 ) -> Result<ReadOutput> {
     let (selected_name, query_params) = select_named_query(query_source, query_name)?;
     let params = query_params_from_json(&query_params, params_json)?;
-    let mut db = Omnigraph::open(uri).await?;
+    let db = Omnigraph::open(uri).await?;
     let result = db
         .query(target.clone(), query_source, &selected_name, &params)
         .await?;
@@ -760,6 +787,7 @@ async fn execute_read(
 }
 
 async fn execute_read_remote(
+    client: &reqwest::Client,
     uri: &str,
     query_source: &str,
     query_name: Option<&str>,
@@ -771,6 +799,7 @@ async fn execute_read_remote(
         ReadTarget::Snapshot(snapshot) => (None, Some(snapshot.as_str().to_string())),
     };
     remote_json(
+        client,
         Method::POST,
         remote_url(uri, "/read"),
         Some(serde_json::to_value(ReadRequest {
@@ -806,6 +835,7 @@ async fn execute_change(
 }
 
 async fn execute_change_remote(
+    client: &reqwest::Client,
     uri: &str,
     query_source: &str,
     query_name: Option<&str>,
@@ -813,6 +843,7 @@ async fn execute_change_remote(
     params_json: Option<&Value>,
 ) -> Result<ChangeOutput> {
     remote_json(
+        client,
         Method::POST,
         remote_url(uri, "/change"),
         Some(serde_json::to_value(ChangeRequest {
@@ -829,6 +860,7 @@ async fn execute_change_remote(
 async fn main() -> Result<()> {
     color_eyre::install()?;
     let cli = Cli::parse();
+    let http_client = build_http_client()?;
     match cli.command {
         Command::Init { schema, uri } => {
             let schema_source = fs::read_to_string(&schema)?;
@@ -952,6 +984,7 @@ async fn main() -> Result<()> {
             let branch = resolve_branch(&config, branch, None, "main");
             let payload = if is_remote_uri(&uri) {
                 remote_json::<SnapshotOutput>(
+                    &http_client,
                     Method::GET,
                     format!("{}?branch={}", remote_url(&uri, "/snapshot"), branch),
                     None,
@@ -979,9 +1012,14 @@ async fn main() -> Result<()> {
                 let config = load_config(config.as_ref())?;
                 let uri = resolve_uri(&config, uri, target.as_deref())?;
                 let runs = if is_remote_uri(&uri) {
-                    remote_json::<RunListOutput>(Method::GET, remote_url(&uri, "/runs"), None)
-                        .await?
-                        .runs
+                    remote_json::<RunListOutput>(
+                        &http_client,
+                        Method::GET,
+                        remote_url(&uri, "/runs"),
+                        None,
+                    )
+                    .await?
+                    .runs
                 } else {
                     let db = Omnigraph::open(&uri).await?;
                     db.list_runs()
@@ -1007,6 +1045,7 @@ async fn main() -> Result<()> {
                 let uri = resolve_uri(&config, uri, target.as_deref())?;
                 let run = if is_remote_uri(&uri) {
                     remote_json::<RunOutput>(
+                        &http_client,
                         Method::GET,
                         remote_url(&uri, &format!("/runs/{}", run_id)),
                         None,
@@ -1033,6 +1072,7 @@ async fn main() -> Result<()> {
                 let uri = resolve_uri(&config, uri, target.as_deref())?;
                 let run = if is_remote_uri(&uri) {
                     remote_json::<RunOutput>(
+                        &http_client,
                         Method::POST,
                         remote_url(&uri, &format!("/runs/{}/publish", run_id)),
                         Some(serde_json::json!({})),
@@ -1060,6 +1100,7 @@ async fn main() -> Result<()> {
                 let uri = resolve_uri(&config, uri, target.as_deref())?;
                 let run = if is_remote_uri(&uri) {
                     remote_json::<RunOutput>(
+                        &http_client,
                         Method::POST,
                         remote_url(&uri, &format!("/runs/{}/abort", run_id)),
                         Some(serde_json::json!({})),
@@ -1134,6 +1175,7 @@ async fn main() -> Result<()> {
             let query_name = name.or_else(|| alias_config.and_then(|alias| alias.name.clone()));
             let output = if is_remote_uri(&uri) {
                 execute_read_remote(
+                    &http_client,
                     &uri,
                     &query_source,
                     query_name.as_deref(),
@@ -1215,6 +1257,7 @@ async fn main() -> Result<()> {
             let query_name = name.or_else(|| alias_config.and_then(|alias| alias.name.clone()));
             let output = if is_remote_uri(&uri) {
                 execute_change_remote(
+                    &http_client,
                     &uri,
                     &query_source,
                     query_name.as_deref(),
@@ -1240,4 +1283,44 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_bearer_token, normalize_bearer_token};
+    use reqwest::header::AUTHORIZATION;
+
+    #[test]
+    fn apply_bearer_token_adds_header_when_configured() {
+        let client = reqwest::Client::new();
+        let request = apply_bearer_token(client.get("http://example.com"), Some("demo-token"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            request
+                .headers()
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer demo-token")
+        );
+    }
+
+    #[test]
+    fn apply_bearer_token_leaves_request_unchanged_when_not_configured() {
+        let client = reqwest::Client::new();
+        let request = apply_bearer_token(client.get("http://example.com"), None)
+            .build()
+            .unwrap();
+        assert!(request.headers().get(AUTHORIZATION).is_none());
+    }
+
+    #[test]
+    fn normalize_bearer_token_trims_and_filters_blank_values() {
+        assert_eq!(normalize_bearer_token(None), None);
+        assert_eq!(normalize_bearer_token(Some("   ".to_string())), None);
+        assert_eq!(
+            normalize_bearer_token(Some(" demo-token ".to_string())).as_deref(),
+            Some("demo-token")
+        );
+    }
 }

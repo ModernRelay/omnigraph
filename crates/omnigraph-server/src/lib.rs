@@ -8,8 +8,11 @@ use api::{
     ChangeOutput, ChangeRequest, ErrorCode, ErrorOutput, HealthOutput, ReadOutput, ReadRequest,
     RunListOutput, SnapshotQuery, snapshot_payload,
 };
-use axum::extract::{Path, Query, State};
+use axum::extract::DefaultBodyLimit;
+use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
+use axum::http::header::AUTHORIZATION;
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -19,13 +22,13 @@ pub use config::{
     QueryDefaults, ReadOutputFormat, ServerDefaults, TableCellLayout, TargetConfig, load_config,
 };
 use omnigraph::db::{Omnigraph, ReadTarget, RunId};
-use omnigraph::error::OmniError;
+use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph_compiler::json_params_to_param_map;
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::{JsonParamMode, ParamMap};
 use serde_json::Value;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -39,7 +42,8 @@ pub struct ServerConfig {
 #[derive(Clone)]
 pub struct AppState {
     uri: String,
-    db: Arc<Mutex<Omnigraph>>,
+    db: Arc<RwLock<Omnigraph>>,
+    bearer_token: Option<Arc<str>>,
 }
 
 #[derive(Debug)]
@@ -51,24 +55,52 @@ pub struct ApiError {
 
 impl AppState {
     pub fn new(uri: String, db: Omnigraph) -> Self {
+        Self::new_with_bearer_token(uri, db, None)
+    }
+
+    pub fn new_with_bearer_token(
+        uri: String,
+        db: Omnigraph,
+        bearer_token: Option<String>,
+    ) -> Self {
         Self {
             uri,
-            db: Arc::new(Mutex::new(db)),
+            db: Arc::new(RwLock::new(db)),
+            bearer_token: bearer_token.map(Arc::<str>::from),
         }
     }
 
     pub async fn open(uri: impl Into<String>) -> Result<Self> {
+        Self::open_with_bearer_token(uri, None).await
+    }
+
+    pub async fn open_with_bearer_token(
+        uri: impl Into<String>,
+        bearer_token: Option<String>,
+    ) -> Result<Self> {
         let uri = uri.into();
         let db = Omnigraph::open(&uri).await?;
-        Ok(Self::new(uri, db))
+        Ok(Self::new_with_bearer_token(uri, db, bearer_token))
     }
 
     pub fn uri(&self) -> &str {
         &self.uri
     }
+
+    fn bearer_token(&self) -> Option<&str> {
+        self.bearer_token.as_deref()
+    }
 }
 
 impl ApiError {
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            code: ErrorCode::Unauthorized,
+            message: message.into(),
+        }
+    }
+
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -105,7 +137,12 @@ impl ApiError {
         match err {
             OmniError::Compiler(err) => Self::bad_request(err.to_string()),
             OmniError::DataFusion(message) => Self::bad_request(format!("query: {message}")),
-            OmniError::Manifest(message) => classify_manifest_error(message),
+            OmniError::Manifest(err) => match err.kind {
+                ManifestErrorKind::BadRequest => Self::bad_request(err.message),
+                ManifestErrorKind::NotFound => Self::not_found(err.message),
+                ManifestErrorKind::Conflict => Self::conflict(err.message),
+                ManifestErrorKind::Internal => Self::internal(err.message),
+            },
             OmniError::MergeConflicts(conflicts) => {
                 Self::conflict(format!("merge conflicts: {:?}", conflicts))
             }
@@ -128,21 +165,6 @@ impl IntoResponse for ApiError {
     }
 }
 
-fn classify_manifest_error(message: String) -> ApiError {
-    if message.starts_with("run '") && message.contains("not found") {
-        return ApiError::not_found(message);
-    }
-
-    if message.contains("advanced during transactional")
-        || message.contains("version drift")
-        || message.contains("retry")
-    {
-        return ApiError::conflict(message);
-    }
-
-    ApiError::bad_request(message)
-}
-
 pub fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
@@ -163,8 +185,7 @@ pub fn load_server_settings(
 }
 
 pub fn build_app(state: AppState) -> Router {
-    Router::new()
-        .route("/healthz", get(server_health))
+    let protected = Router::new()
         .route("/snapshot", get(server_snapshot))
         .route("/read", post(server_read))
         .route("/change", post(server_change))
@@ -172,12 +193,25 @@ pub fn build_app(state: AppState) -> Router {
         .route("/runs/{run_id}", get(server_run_show))
         .route("/runs/{run_id}/publish", post(server_run_publish))
         .route("/runs/{run_id}/abort", post(server_run_abort))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer_auth,
+        ));
+
+    Router::new()
+        .route("/healthz", get(server_health))
+        .merge(protected)
+        .layer(DefaultBodyLimit::max(1_048_576))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
 pub async fn serve(config: ServerConfig) -> Result<()> {
-    let state = AppState::open(config.uri.clone()).await?;
+    let state = AppState::open_with_bearer_token(
+        config.uri.clone(),
+        server_bearer_token_from_env(),
+    )
+    .await?;
     let listener = TcpListener::bind(&config.bind).await?;
     info!(uri = %config.uri, bind = %config.bind, "serving omnigraph");
     axum::serve(listener, build_app(state))
@@ -200,20 +234,44 @@ async fn server_health() -> Json<HealthOutput> {
     })
 }
 
+async fn require_bearer_auth(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> std::result::Result<Response, ApiError> {
+    let Some(expected_token) = state.bearer_token() else {
+        return Ok(next.run(request).await);
+    };
+
+    let Some(header) = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Err(ApiError::unauthorized("missing bearer token"));
+    };
+
+    let Some(provided_token) = header.strip_prefix("Bearer ") else {
+        return Err(ApiError::unauthorized("missing bearer token"));
+    };
+
+    if provided_token != expected_token {
+        return Err(ApiError::unauthorized("invalid bearer token"));
+    }
+
+    Ok(next.run(request).await)
+}
+
 async fn server_snapshot(
     State(state): State<AppState>,
     Query(query): Query<SnapshotQuery>,
 ) -> std::result::Result<Json<api::SnapshotOutput>, ApiError> {
     let branch = query.branch.unwrap_or_else(|| "main".to_string());
     let snapshot = {
-        let db = state.db.lock().await;
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                db.snapshot_of(ReadTarget::branch(branch.as_str()))
-                    .await
-                    .map_err(ApiError::from_omni)
-            })
-        })?
+        let db = Arc::clone(&state.db).read_owned().await;
+        db.snapshot_of(ReadTarget::branch(branch.as_str()))
+            .await
+            .map_err(ApiError::from_omni)?
     };
     Ok(Json(snapshot_payload(&branch, &snapshot)))
 }
@@ -236,19 +294,15 @@ async fn server_read(
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
     let result = {
-        let mut db = state.db.lock().await;
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                db.query(
-                    target.clone(),
-                    &request.query_source,
-                    &selected_name,
-                    &params,
-                )
-                .await
-                .map_err(ApiError::from_omni)
-            })
-        })?
+        let db = Arc::clone(&state.db).read_owned().await;
+        db.query(
+            target.clone(),
+            &request.query_source,
+            &selected_name,
+            &params,
+        )
+        .await
+        .map_err(ApiError::from_omni)?
     };
     Ok(Json(api::read_output(selected_name, &target, result)))
 }
@@ -265,14 +319,10 @@ async fn server_change(
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
     let result = {
-        let mut db = state.db.lock().await;
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                db.mutate(&branch, &request.query_source, &selected_name, &params)
-                    .await
-                    .map_err(ApiError::from_omni)
-            })
-        })?
+        let mut db = Arc::clone(&state.db).write_owned().await;
+        db.mutate(&branch, &request.query_source, &selected_name, &params)
+            .await
+            .map_err(ApiError::from_omni)?
     };
     Ok(Json(ChangeOutput {
         branch,
@@ -286,11 +336,8 @@ async fn server_run_list(
     State(state): State<AppState>,
 ) -> std::result::Result<Json<RunListOutput>, ApiError> {
     let runs = {
-        let db = state.db.lock().await;
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { db.list_runs().await.map_err(ApiError::from_omni) })
-        })?
+        let db = Arc::clone(&state.db).read_owned().await;
+        db.list_runs().await.map_err(ApiError::from_omni)?
     };
     Ok(Json(RunListOutput {
         runs: runs.iter().map(api::run_output).collect(),
@@ -302,14 +349,10 @@ async fn server_run_show(
     Path(run_id): Path<String>,
 ) -> std::result::Result<Json<api::RunOutput>, ApiError> {
     let run = {
-        let db = state.db.lock().await;
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                db.get_run(&RunId::new(run_id))
-                    .await
-                    .map_err(ApiError::from_omni)
-            })
-        })?
+        let db = Arc::clone(&state.db).read_owned().await;
+        db.get_run(&RunId::new(run_id))
+            .await
+            .map_err(ApiError::from_omni)?
     };
     Ok(Json(api::run_output(&run)))
 }
@@ -320,13 +363,9 @@ async fn server_run_publish(
 ) -> std::result::Result<Json<api::RunOutput>, ApiError> {
     let run_id = RunId::new(run_id);
     let run = {
-        let mut db = state.db.lock().await;
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                db.publish_run(&run_id).await.map_err(ApiError::from_omni)?;
-                db.get_run(&run_id).await.map_err(ApiError::from_omni)
-            })
-        })?
+        let mut db = Arc::clone(&state.db).write_owned().await;
+        db.publish_run(&run_id).await.map_err(ApiError::from_omni)?;
+        db.get_run(&run_id).await.map_err(ApiError::from_omni)?
     };
     Ok(Json(api::run_output(&run)))
 }
@@ -336,14 +375,10 @@ async fn server_run_abort(
     Path(run_id): Path<String>,
 ) -> std::result::Result<Json<api::RunOutput>, ApiError> {
     let run = {
-        let mut db = state.db.lock().await;
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                db.abort_run(&RunId::new(run_id))
-                    .await
-                    .map_err(ApiError::from_omni)
-            })
-        })?
+        let mut db = Arc::clone(&state.db).write_owned().await;
+        db.abort_run(&RunId::new(run_id))
+            .await
+            .map_err(ApiError::from_omni)?
     };
     Ok(Json(api::run_output(&run)))
 }
@@ -384,9 +419,19 @@ fn query_params_from_json(
         .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))
 }
 
+fn normalize_bearer_token(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn server_bearer_token_from_env() -> Option<String> {
+    normalize_bearer_token(std::env::var("OMNIGRAPH_SERVER_BEARER_TOKEN").ok())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::load_server_settings;
+    use super::{load_server_settings, normalize_bearer_token};
     use std::fs;
     use tempfile::tempdir;
 
@@ -468,5 +513,15 @@ server:
     fn server_settings_require_uri_from_cli_or_config() {
         let error = load_server_settings(None, None, None, None).unwrap_err();
         assert!(error.to_string().contains("URI must be provided"));
+    }
+
+    #[test]
+    fn normalize_bearer_token_trims_and_filters_blank_values() {
+        assert_eq!(normalize_bearer_token(None), None);
+        assert_eq!(normalize_bearer_token(Some("   ".to_string())), None);
+        assert_eq!(
+            normalize_bearer_token(Some(" demo-token ".to_string())).as_deref(),
+            Some("demo-token")
+        );
     }
 }

@@ -38,7 +38,7 @@ use tempfile::{Builder as TempDirBuilder, TempDir};
 impl Omnigraph {
     /// Run a named query against an explicit branch or snapshot target.
     pub async fn query(
-        &mut self,
+        &self,
         target: impl Into<ReadTarget>,
         query_source: &str,
         query_name: &str,
@@ -47,7 +47,7 @@ impl Omnigraph {
         let resolved = self.resolved_target(target).await?;
 
         let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
-            .map_err(|e| OmniError::Manifest(e.to_string()))?;
+            .map_err(|e| OmniError::manifest(e.to_string()))?;
         let type_ctx = typecheck_query(self.catalog(), &query_decl)?;
         let ir = lower_query(self.catalog(), &query_decl, &type_ctx)?;
 
@@ -76,7 +76,7 @@ impl Omnigraph {
     /// Compiles the query normally, builds a temporary (non-cached) graph index
     /// if traversal is needed, and executes against the historical snapshot.
     pub async fn run_query_at(
-        &mut self,
+        &self,
         version: u64,
         query_source: &str,
         query_name: &str,
@@ -85,7 +85,7 @@ impl Omnigraph {
         let snapshot = self.snapshot_at_version(version).await?;
 
         let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
-            .map_err(|e| OmniError::Manifest(e.to_string()))?;
+            .map_err(|e| OmniError::manifest(e.to_string()))?;
         let type_ctx = typecheck_query(self.catalog(), &query_decl)?;
         let ir = lower_query(self.catalog(), &query_decl, &type_ctx)?;
 
@@ -553,16 +553,16 @@ fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result<SchemaRef>
             .node_types
             .get(name)
             .map(|t| t.arrow_schema.clone())
-            .ok_or_else(|| OmniError::Manifest(format!("unknown node type '{}'", name)));
+            .ok_or_else(|| OmniError::manifest(format!("unknown node type '{}'", name)));
     }
     if let Some(name) = table_key.strip_prefix("edge:") {
         return catalog
             .edge_types
             .get(name)
             .map(|t| t.arrow_schema.clone())
-            .ok_or_else(|| OmniError::Manifest(format!("unknown edge type '{}'", name)));
+            .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{}'", name)));
     }
-    Err(OmniError::Manifest(format!(
+    Err(OmniError::manifest(format!(
         "invalid table key '{}'",
         table_key
     )))
@@ -663,12 +663,12 @@ async fn validate_merge_candidates(
                 let ids = batch
                     .column_by_name("id")
                     .ok_or_else(|| {
-                        OmniError::Manifest(format!("table {} missing id column", table_key))
+                        OmniError::manifest(format!("table {} missing id column", table_key))
                     })?
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .ok_or_else(|| {
-                        OmniError::Manifest(format!("table {} id column is not Utf8", table_key))
+                        OmniError::manifest(format!("table {} id column is not Utf8", table_key))
                     })?;
                 for row in 0..ids.len() {
                     values.insert(ids.value(row).to_string());
@@ -760,7 +760,7 @@ fn update_unique_constraints(
             let mut any_null = false;
             for column_name in columns {
                 let column = batch.column_by_name(column_name).ok_or_else(|| {
-                    OmniError::Manifest(format!(
+                    OmniError::manifest(format!(
                         "table {} missing unique column '{}'",
                         table_key, column_name
                     ))
@@ -802,11 +802,11 @@ fn accumulate_edge_cardinality(
 ) -> Result<()> {
     let srcs = batch
         .column_by_name("src")
-        .ok_or_else(|| OmniError::Manifest(format!("table {} missing src column", table_key)))?
+        .ok_or_else(|| OmniError::manifest(format!("table {} missing src column", table_key)))?
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| {
-            OmniError::Manifest(format!("table {} src column is not Utf8", table_key))
+            OmniError::manifest(format!("table {} src column is not Utf8", table_key))
         })?;
     for row in 0..srcs.len() {
         *counts.entry(srcs.value(row).to_string()).or_insert(0_u32) += 1;
@@ -859,29 +859,29 @@ fn validate_orphan_edges_batch(
 ) -> Result<Vec<MergeConflict>> {
     let srcs = batch
         .column_by_name("src")
-        .ok_or_else(|| OmniError::Manifest(format!("table {} missing src column", table_key)))?
+        .ok_or_else(|| OmniError::manifest(format!("table {} missing src column", table_key)))?
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| {
-            OmniError::Manifest(format!("table {} src column is not Utf8", table_key))
+            OmniError::manifest(format!("table {} src column is not Utf8", table_key))
         })?;
     let dsts = batch
         .column_by_name("dst")
-        .ok_or_else(|| OmniError::Manifest(format!("table {} missing dst column", table_key)))?
+        .ok_or_else(|| OmniError::manifest(format!("table {} missing dst column", table_key)))?
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| {
-            OmniError::Manifest(format!("table {} dst column is not Utf8", table_key))
+            OmniError::manifest(format!("table {} dst column is not Utf8", table_key))
         })?;
 
     let from_ids = node_ids.get(&edge_type.from_type).ok_or_else(|| {
-        OmniError::Manifest(format!(
+        OmniError::manifest(format!(
             "missing candidate node ids for {}",
             edge_type.from_type
         ))
     })?;
     let to_ids = node_ids.get(&edge_type.to_type).ok_or_else(|| {
-        OmniError::Manifest(format!(
+        OmniError::manifest(format!(
             "missing candidate node ids for {}",
             edge_type.to_type
         ))
@@ -915,10 +915,10 @@ fn validate_orphan_edges_batch(
 fn row_id_at(batch: &RecordBatch, row: usize) -> Result<String> {
     let ids = batch
         .column_by_name("id")
-        .ok_or_else(|| OmniError::Manifest("batch missing id column".to_string()))?
+        .ok_or_else(|| OmniError::manifest("batch missing id column".to_string()))?
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| OmniError::Manifest("id column is not Utf8".to_string()))?;
+        .ok_or_else(|| OmniError::manifest("id column is not Utf8".to_string()))?;
     Ok(ids.value(row).to_string())
 }
 
@@ -932,7 +932,7 @@ async fn publish_adopted_source_state(
 ) -> Result<crate::db::SubTableUpdate> {
     let source_entry = source_snapshot
         .entry(table_key)
-        .ok_or_else(|| OmniError::Manifest(format!("missing source entry for {}", table_key)))?;
+        .ok_or_else(|| OmniError::manifest(format!("missing source entry for {}", table_key)))?;
     let target_entry = target_snapshot.entry(table_key);
 
     match (
@@ -1121,7 +1121,7 @@ fn extract_search_mode(ir: &QueryIR, params: &ParamMap) -> Result<SearchMode> {
         } => {
             let vec = resolve_to_f32_vec(query, params)?;
             let k = ir.limit.ok_or_else(|| {
-                OmniError::Manifest("nearest() ordering requires a limit clause".to_string())
+                OmniError::manifest("nearest() ordering requires a limit clause".to_string())
             })? as usize;
             Ok(SearchMode {
                 nearest: Some((variable.clone(), property.clone(), vec, k)),
@@ -1132,16 +1132,16 @@ fn extract_search_mode(ir: &QueryIR, params: &ParamMap) -> Result<SearchMode> {
             let var = match field.as_ref() {
                 IRExpr::PropAccess { variable, .. } => variable.clone(),
                 _ => {
-                    return Err(OmniError::Manifest(
+                    return Err(OmniError::manifest(
                         "bm25 field must be a property access".to_string(),
                     ));
                 }
             };
             let prop = extract_property(field).ok_or_else(|| {
-                OmniError::Manifest("bm25 field must be a property access".to_string())
+                OmniError::manifest("bm25 field must be a property access".to_string())
             })?;
             let text = resolve_to_string(query, params).ok_or_else(|| {
-                OmniError::Manifest("bm25 query must resolve to a string".to_string())
+                OmniError::manifest("bm25 query must resolve to a string".to_string())
             })?;
             Ok(SearchMode {
                 bm25: Some((var, prop, text)),
@@ -1154,7 +1154,7 @@ fn extract_search_mode(ir: &QueryIR, params: &ParamMap) -> Result<SearchMode> {
             k,
         } => {
             let limit = ir.limit.ok_or_else(|| {
-                OmniError::Manifest("rrf() ordering requires a limit clause".to_string())
+                OmniError::manifest("rrf() ordering requires a limit clause".to_string())
             })? as usize;
             let k_val = k
                 .as_ref()
@@ -1201,16 +1201,16 @@ fn extract_sub_search_mode(
             let var = match field.as_ref() {
                 IRExpr::PropAccess { variable, .. } => variable.clone(),
                 _ => {
-                    return Err(OmniError::Manifest(
+                    return Err(OmniError::manifest(
                         "bm25 field must be a property access".to_string(),
                     ));
                 }
             };
             let prop = extract_property(field).ok_or_else(|| {
-                OmniError::Manifest("bm25 field must be a property access".to_string())
+                OmniError::manifest("bm25 field must be a property access".to_string())
             })?;
             let text = resolve_to_string(query, params).ok_or_else(|| {
-                OmniError::Manifest("bm25 query must resolve to a string".to_string())
+                OmniError::manifest("bm25 query must resolve to a string".to_string())
             })?;
             Ok(SearchMode {
                 bm25: Some((var, prop, text)),
@@ -1228,9 +1228,9 @@ fn resolve_to_f32_vec(expr: &IRExpr, params: &ParamMap) -> Result<Vec<f32>> {
         IRExpr::Param(name) => params
             .get(name)
             .cloned()
-            .ok_or_else(|| OmniError::Manifest(format!("parameter '{}' not provided", name)))?,
+            .ok_or_else(|| OmniError::manifest(format!("parameter '{}' not provided", name)))?,
         _ => {
-            return Err(OmniError::Manifest(
+            return Err(OmniError::manifest(
                 "nearest query must be a literal or parameter".to_string(),
             ));
         }
@@ -1241,12 +1241,12 @@ fn resolve_to_f32_vec(expr: &IRExpr, params: &ParamMap) -> Result<Vec<f32>> {
             .map(|item| match item {
                 Literal::Float(f) => Ok(*f as f32),
                 Literal::Integer(n) => Ok(*n as f32),
-                _ => Err(OmniError::Manifest(
+                _ => Err(OmniError::manifest(
                     "vector elements must be numeric".to_string(),
                 )),
             })
             .collect(),
-        _ => Err(OmniError::Manifest(
+        _ => Err(OmniError::manifest(
             "nearest query must be a list of floats".to_string(),
         )),
     }
@@ -1345,16 +1345,16 @@ async fn execute_rrf_query(
         .as_ref()
         .map(|(v, ..)| v.as_str())
         .or_else(|| rrf.primary.bm25.as_ref().map(|(v, ..)| v.as_str()))
-        .ok_or_else(|| OmniError::Manifest("rrf primary must be nearest or bm25".to_string()))?;
+        .ok_or_else(|| OmniError::manifest("rrf primary must be nearest or bm25".to_string()))?;
 
     let primary_batch = primary_bindings.get(primary_var).ok_or_else(|| {
-        OmniError::Manifest(format!(
+        OmniError::manifest(format!(
             "rrf primary variable '{}' not in bindings",
             primary_var
         ))
     })?;
     let secondary_batch = secondary_bindings.get(primary_var).ok_or_else(|| {
-        OmniError::Manifest(format!(
+        OmniError::manifest(format!(
             "rrf secondary variable '{}' not in bindings",
             primary_var
         ))
@@ -1432,11 +1432,11 @@ async fn execute_rrf_query(
 fn extract_id_column(batch: &RecordBatch) -> Result<Vec<String>> {
     let col = batch
         .column_by_name("id")
-        .ok_or_else(|| OmniError::Manifest("batch missing 'id' column for RRF".to_string()))?;
+        .ok_or_else(|| OmniError::manifest("batch missing 'id' column for RRF".to_string()))?;
     let ids = col
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| OmniError::Manifest("'id' column is not Utf8".to_string()))?;
+        .ok_or_else(|| OmniError::manifest("'id' column is not Utf8".to_string()))?;
     Ok((0..ids.len()).map(|i| ids.value(i).to_string()).collect())
 }
 
@@ -1488,7 +1488,6 @@ fn search_filter_variable(filter: &IRFilter) -> Option<&str> {
     }
 }
 
-/// Execute a pipeline of IR operations, populating variable bindings.
 fn execute_pipeline<'a>(
     pipeline: &'a [IROp],
     params: &'a ParamMap,
@@ -1497,7 +1496,7 @@ fn execute_pipeline<'a>(
     catalog: &'a Catalog,
     bindings: &'a mut HashMap<String, RecordBatch>,
     search_mode: &'a SearchMode,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         // Pre-pass: collect search filters that need to be hoisted to NodeScan
         let mut hoisted_search_filters: HashMap<String, Vec<IRFilter>> = HashMap::new();
@@ -1557,7 +1556,7 @@ fn execute_pipeline<'a>(
                     max_hops,
                 } => {
                     let gi = graph_index.ok_or_else(|| {
-                        OmniError::Manifest("graph index required for traversal".to_string())
+                        OmniError::manifest("graph index required for traversal".to_string())
                     })?;
                     let batch = execute_expand(
                         bindings, gi, snapshot, catalog, src_var, dst_var, edge_type, *direction,
@@ -1592,21 +1591,21 @@ async fn execute_expand(
     max_hops: Option<u32>,
 ) -> Result<RecordBatch> {
     let src_batch = bindings.get(src_var).ok_or_else(|| {
-        OmniError::Manifest(format!("expand references unbound variable '{}'", src_var))
+        OmniError::manifest(format!("expand references unbound variable '{}'", src_var))
     })?;
 
     let src_ids = src_batch
         .column_by_name("id")
-        .ok_or_else(|| OmniError::Manifest("source batch missing 'id' column".to_string()))?
+        .ok_or_else(|| OmniError::manifest("source batch missing 'id' column".to_string()))?
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| OmniError::Manifest("source 'id' column is not Utf8".to_string()))?;
+        .ok_or_else(|| OmniError::manifest("source 'id' column is not Utf8".to_string()))?;
 
     // Determine which type index to use for source and destination
     let edge_def = catalog
         .edge_types
         .get(edge_type)
-        .ok_or_else(|| OmniError::Manifest(format!("unknown edge type '{}'", edge_type)))?;
+        .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{}'", edge_type)))?;
 
     let (src_type_name, dst_type_name) = match direction {
         Direction::Out => (&edge_def.from_type, &edge_def.to_type),
@@ -1615,16 +1614,16 @@ async fn execute_expand(
 
     let src_type_idx = graph_index
         .type_index(src_type_name)
-        .ok_or_else(|| OmniError::Manifest(format!("no type index for '{}'", src_type_name)))?;
+        .ok_or_else(|| OmniError::manifest(format!("no type index for '{}'", src_type_name)))?;
     let dst_type_idx = graph_index
         .type_index(dst_type_name)
-        .ok_or_else(|| OmniError::Manifest(format!("no type index for '{}'", dst_type_name)))?;
+        .ok_or_else(|| OmniError::manifest(format!("no type index for '{}'", dst_type_name)))?;
 
     let adj = match direction {
         Direction::Out => graph_index.csr(edge_type),
         Direction::In => graph_index.csc(edge_type),
     }
-    .ok_or_else(|| OmniError::Manifest(format!("no adjacency index for edge '{}'", edge_type)))?;
+    .ok_or_else(|| OmniError::manifest(format!("no adjacency index for edge '{}'", edge_type)))?;
 
     let max = max_hops.unwrap_or(min_hops.max(1));
 
@@ -1641,6 +1640,7 @@ async fn execute_expand(
         // BFS with hop tracking
         let mut frontier: Vec<u32> = vec![src_dense];
         let mut visited: HashSet<u32> = HashSet::new();
+        let mut seen_dst_ids: HashSet<String> = HashSet::new();
         // Only track visited in the destination namespace for same-type edges
         // (to avoid revisiting the source). For cross-type edges, dense indices
         // are in different namespaces so collision is impossible.
@@ -1656,7 +1656,10 @@ async fn execute_expand(
                         next_frontier.push(neighbor);
                         if hop >= min_hops {
                             if let Some(dst_id) = dst_type_idx.to_id(neighbor) {
-                                result_dst_ids.push(dst_id.to_string());
+                                let dst_id = dst_id.to_string();
+                                if seen_dst_ids.insert(dst_id.clone()) {
+                                    result_dst_ids.push(dst_id);
+                                }
                             }
                         }
                     }
@@ -1683,7 +1686,7 @@ async fn hydrate_nodes(
     let node_type = catalog
         .node_types
         .get(type_name)
-        .ok_or_else(|| OmniError::Manifest(format!("unknown node type '{}'", type_name)))?;
+        .ok_or_else(|| OmniError::manifest(format!("unknown node type '{}'", type_name)))?;
 
     if ids.is_empty() {
         return Ok(RecordBatch::new_empty(node_type.arrow_schema.clone()));
@@ -1805,7 +1808,7 @@ async fn execute_anti_join(
     outer_var: &str,
 ) -> Result<()> {
     let outer_batch = bindings.get(outer_var).ok_or_else(|| {
-        OmniError::Manifest(format!(
+        OmniError::manifest(format!(
             "anti-join references unbound variable '{}'",
             outer_var
         ))
@@ -1822,10 +1825,10 @@ async fn execute_anti_join(
     // Slow path: per-row inner pipeline execution
     let outer_ids = outer_batch
         .column_by_name("id")
-        .ok_or_else(|| OmniError::Manifest("outer batch missing 'id' column".to_string()))?
+        .ok_or_else(|| OmniError::manifest("outer batch missing 'id' column".to_string()))?
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| OmniError::Manifest("outer 'id' column is not Utf8".to_string()))?;
+        .ok_or_else(|| OmniError::manifest("outer 'id' column is not Utf8".to_string()))?;
 
     let mut keep_mask = vec![true; outer_batch.num_rows()];
 
@@ -2140,7 +2143,7 @@ fn apply_filter(
     };
 
     let batch = bindings.get(&var_name).ok_or_else(|| {
-        OmniError::Manifest(format!("filter references unbound variable '{}'", var_name))
+        OmniError::manifest(format!("filter references unbound variable '{}'", var_name))
     })?;
 
     let mask = evaluate_filter(batch, filter, params)?;
@@ -2177,7 +2180,7 @@ fn evaluate_filter(
         CompOp::Ge => cmp::gt_eq(&left, &right),
         CompOp::Le => cmp::lt_eq(&left, &right),
         CompOp::Contains => {
-            return Err(OmniError::Manifest(
+            return Err(OmniError::manifest(
                 "list contains not yet implemented".to_string(),
             ));
         }
@@ -2192,17 +2195,17 @@ fn evaluate_expr(batch: &RecordBatch, expr: &IRExpr, params: &ParamMap) -> Resul
     match expr {
         IRExpr::PropAccess { property, .. } => {
             batch.column_by_name(property).cloned().ok_or_else(|| {
-                OmniError::Manifest(format!("column '{}' not found in batch", property))
+                OmniError::manifest(format!("column '{}' not found in batch", property))
             })
         }
         IRExpr::Literal(lit) => literal_to_array(lit, batch.num_rows()),
         IRExpr::Param(name) => {
             let lit = params
                 .get(name)
-                .ok_or_else(|| OmniError::Manifest(format!("parameter '{}' not provided", name)))?;
+                .ok_or_else(|| OmniError::manifest(format!("parameter '{}' not provided", name)))?;
             literal_to_array(lit, batch.num_rows())
         }
-        _ => Err(OmniError::Manifest(format!(
+        _ => Err(OmniError::manifest(format!(
             "unsupported expression in filter: {:?}",
             expr
         ))),
@@ -2220,7 +2223,7 @@ fn literal_to_array(lit: &Literal, num_rows: usize) -> Result<ArrayRef> {
         Literal::Float(f) => Arc::new(Float64Array::from(vec![*f; num_rows])) as ArrayRef,
         Literal::Bool(b) => Arc::new(BooleanArray::from(vec![*b; num_rows])) as ArrayRef,
         _ => {
-            return Err(OmniError::Manifest(format!(
+            return Err(OmniError::manifest(format!(
                 "unsupported literal type: {:?}",
                 lit
             )));
@@ -2235,7 +2238,7 @@ fn project_return(
     params: &ParamMap,
 ) -> Result<RecordBatch> {
     if projections.is_empty() {
-        return Err(OmniError::Manifest(
+        return Err(OmniError::manifest(
             "query has no return projections".to_string(),
         ));
     }
@@ -2267,13 +2270,13 @@ fn evaluate_projection(
     match expr {
         IRExpr::PropAccess { variable, property } => {
             let batch = bindings.get(variable).ok_or_else(|| {
-                OmniError::Manifest(format!(
+                OmniError::manifest(format!(
                     "projection references unbound variable '{}'",
                     variable
                 ))
             })?;
             let col = batch.column_by_name(property).ok_or_else(|| {
-                OmniError::Manifest(format!(
+                OmniError::manifest(format!(
                     "column '{}' not found in binding '{}'",
                     property, variable
                 ))
@@ -2289,12 +2292,12 @@ fn evaluate_projection(
         IRExpr::Param(name) => {
             let lit = params
                 .get(name)
-                .ok_or_else(|| OmniError::Manifest(format!("parameter '{}' not provided", name)))?;
+                .ok_or_else(|| OmniError::manifest(format!("parameter '{}' not provided", name)))?;
             let num_rows = bindings.values().next().map(|b| b.num_rows()).unwrap_or(0);
             let arr = literal_to_array(lit, num_rows)?;
             Ok((name.clone(), arr))
         }
-        _ => Err(OmniError::Manifest(format!(
+        _ => Err(OmniError::manifest(format!(
             "unsupported projection expression: {:?}",
             expr
         ))),
@@ -2316,7 +2319,7 @@ fn apply_ordering(
         let col = match &ordering.expr {
             IRExpr::PropAccess { variable, property } => {
                 let binding = bindings.get(variable).ok_or_else(|| {
-                    OmniError::Manifest(format!(
+                    OmniError::manifest(format!(
                         "ordering references unbound variable '{}'",
                         variable
                     ))
@@ -2324,7 +2327,7 @@ fn apply_ordering(
                 binding
                     .column_by_name(property)
                     .ok_or_else(|| {
-                        OmniError::Manifest(format!("column '{}' not found for ordering", property))
+                        OmniError::manifest(format!("column '{}' not found for ordering", property))
                     })?
                     .clone()
             }
@@ -2333,12 +2336,12 @@ fn apply_ordering(
                 batch
                     .column_by_name(alias)
                     .ok_or_else(|| {
-                        OmniError::Manifest(format!("alias '{}' not found for ordering", alias))
+                        OmniError::manifest(format!("alias '{}' not found for ordering", alias))
                     })?
                     .clone()
             }
             _ => {
-                return Err(OmniError::Manifest(
+                return Err(OmniError::manifest(
                     "unsupported ordering expression".to_string(),
                 ));
             }
@@ -2375,8 +2378,8 @@ fn resolve_expr_value(expr: &IRExpr, params: &ParamMap) -> Result<Literal> {
         IRExpr::Param(name) => params
             .get(name)
             .cloned()
-            .ok_or_else(|| OmniError::Manifest(format!("parameter '{}' not provided", name))),
-        other => Err(OmniError::Manifest(format!(
+            .ok_or_else(|| OmniError::manifest(format!("parameter '{}' not provided", name))),
+        other => Err(OmniError::manifest(format!(
             "unsupported expression in mutation: {:?}",
             other
         ))),
@@ -2410,11 +2413,11 @@ fn literal_to_typed_array(
         (Literal::Bool(b), DataType::Boolean) => Arc::new(BooleanArray::from(vec![*b; num_rows])),
         (Literal::Date(s), DataType::Date32) => {
             let days = parse_date32(s)
-                .ok_or_else(|| OmniError::Manifest(format!("invalid date: {}", s)))?;
+                .ok_or_else(|| OmniError::manifest(format!("invalid date: {}", s)))?;
             Arc::new(Date32Array::from(vec![days; num_rows]))
         }
         _ => {
-            return Err(OmniError::Manifest(format!(
+            return Err(OmniError::manifest(format!(
                 "cannot convert {:?} to {:?}",
                 lit, data_type
             )));
@@ -2477,19 +2480,19 @@ fn build_insert_batch(
             } else if field.is_nullable() {
                 columns.push(build_null_blob_array()?);
             } else {
-                return Err(OmniError::Manifest(format!(
+                return Err(OmniError::manifest(format!(
                     "missing required blob property '{}'",
                     field.name()
                 )));
             }
         } else if field.name() == "src" {
             let lit = assignments.get("from").ok_or_else(|| {
-                OmniError::Manifest("missing required edge endpoint 'from'".to_string())
+                OmniError::manifest("missing required edge endpoint 'from'".to_string())
             })?;
             columns.push(literal_to_typed_array(lit, field.data_type(), 1)?);
         } else if field.name() == "dst" {
             let lit = assignments.get("to").ok_or_else(|| {
-                OmniError::Manifest("missing required edge endpoint 'to'".to_string())
+                OmniError::manifest("missing required edge endpoint 'to'".to_string())
             })?;
             columns.push(literal_to_typed_array(lit, field.data_type(), 1)?);
         } else if let Some(lit) = assignments.get(field.name()) {
@@ -2497,7 +2500,7 @@ fn build_insert_batch(
         } else if field.is_nullable() {
             columns.push(arrow_array::new_null_array(field.data_type(), 1));
         } else {
-            return Err(OmniError::Manifest(format!(
+            return Err(OmniError::manifest(format!(
                 "missing required property '{}'",
                 field.name()
             )));
@@ -2516,18 +2519,18 @@ async fn validate_edge_insert_endpoints(
         .catalog()
         .edge_types
         .get(edge_name)
-        .ok_or_else(|| OmniError::Manifest(format!("unknown edge type '{}'", edge_name)))?;
+        .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{}'", edge_name)))?;
     let from = match assignments.get("from") {
         Some(Literal::String(value)) => value.as_str(),
         Some(other) => {
-            return Err(OmniError::Manifest(format!(
+            return Err(OmniError::manifest(format!(
                 "edge {} from endpoint must be a string id, got {}",
                 edge_name,
                 literal_to_sql(other)
             )));
         }
         None => {
-            return Err(OmniError::Manifest(format!(
+            return Err(OmniError::manifest(format!(
                 "edge {} missing 'from' endpoint",
                 edge_name
             )));
@@ -2536,14 +2539,14 @@ async fn validate_edge_insert_endpoints(
     let to = match assignments.get("to") {
         Some(Literal::String(value)) => value.as_str(),
         Some(other) => {
-            return Err(OmniError::Manifest(format!(
+            return Err(OmniError::manifest(format!(
                 "edge {} to endpoint must be a string id, got {}",
                 edge_name,
                 literal_to_sql(other)
             )));
         }
         None => {
-            return Err(OmniError::Manifest(format!(
+            return Err(OmniError::manifest(format!(
                 "edge {} missing 'to' endpoint",
                 edge_name
             )));
@@ -2573,7 +2576,7 @@ async fn ensure_node_id_exists(
     if exists {
         Ok(())
     } else {
-        Err(OmniError::Manifest(format!(
+        Err(OmniError::manifest(format!(
             "{} '{}' not found in {}",
             label, id, node_type
         )))
@@ -2607,7 +2610,7 @@ fn predicate_to_sql(
         CompOp::Ge => ">=",
         CompOp::Le => "<=",
         CompOp::Contains => {
-            return Err(OmniError::Manifest(
+            return Err(OmniError::manifest(
                 "contains predicate not supported in mutations".to_string(),
             ));
         }
@@ -2690,7 +2693,7 @@ impl Omnigraph {
         }
 
         let target_branch = requested.clone().unwrap_or_else(|| "main".to_string());
-        let target_head_before = self.resolve_snapshot(&target_branch).await?;
+        let target_head_before = self.latest_branch_snapshot_id(&target_branch).await?;
         let run = self
             .begin_run(&target_branch, Some(operation.as_str()))
             .await?;
@@ -2711,36 +2714,19 @@ impl Omnigraph {
             }
         };
 
-        let target_head_now = self.resolve_snapshot(&target_branch).await?;
+        let target_head_now = self.latest_branch_snapshot_id(&target_branch).await?;
         if target_head_now.as_str() != target_head_before.as_str() {
             let _ = self.fail_run(&run.run_id).await;
-            return Err(OmniError::Manifest(format!(
+            return Err(OmniError::manifest_conflict(format!(
                 "target branch '{}' advanced during transactional mutation; retry",
                 target_branch
             )));
         }
 
-        if let Err(err) = self
-            .execute_named_mutation_on_branch(
-                requested.as_deref(),
-                query_source,
-                query_name,
-                &resolved_params,
-            )
-            .await
-        {
+        if let Err(err) = self.publish_run(&run.run_id).await {
             let _ = self.fail_run(&run.run_id).await;
             return Err(err);
         }
-
-        let current_branch = self.active_branch().map(str::to_string);
-        if current_branch == requested {
-            self.sync_branch(&target_branch).await?;
-        }
-
-        let published_snapshot_id = self.resolve_snapshot(&target_branch).await?;
-        self.mark_run_published(&run.run_id, &published_snapshot_id)
-            .await?;
 
         Ok(staged_result)
     }
@@ -2780,13 +2766,13 @@ impl Omnigraph {
         params: &ParamMap,
     ) -> Result<MutationResult> {
         let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
-            .map_err(|e| OmniError::Manifest(e.to_string()))?;
+            .map_err(|e| OmniError::manifest(e.to_string()))?;
 
         let checked = typecheck_query_decl(self.catalog(), &query_decl)?;
         match checked {
             CheckedQuery::Mutation(_) => {}
             CheckedQuery::Read(_) => {
-                return Err(OmniError::Manifest(
+                return Err(OmniError::manifest(
                     "mutation execution called on a read query; use query instead".to_string(),
                 ));
             }
@@ -2834,7 +2820,7 @@ impl Omnigraph {
     ) -> Result<MergeOutcome> {
         if !allow_internal_refs {
             if is_internal_run_branch(source) || is_internal_run_branch(target) {
-                return Err(OmniError::Manifest(format!(
+                return Err(OmniError::manifest(format!(
                     "branch_merge does not allow internal run refs ('{}' -> '{}')",
                     source, target
                 )));
@@ -2843,7 +2829,7 @@ impl Omnigraph {
         let source_branch = Omnigraph::normalize_branch_name(source)?;
         let target_branch = Omnigraph::normalize_branch_name(target)?;
         if source_branch == target_branch {
-            return Err(OmniError::Manifest(
+            return Err(OmniError::manifest(
                 "branch_merge requires distinct source and target branches".to_string(),
             ));
         }
@@ -2851,18 +2837,18 @@ impl Omnigraph {
         let source_head_commit_id = self
             .head_commit_id_for_branch(source_branch.as_deref())
             .await?
-            .ok_or_else(|| OmniError::Manifest("source branch has no head commit".to_string()))?;
+            .ok_or_else(|| OmniError::manifest("source branch has no head commit".to_string()))?;
         let target_head_commit_id = self
             .head_commit_id_for_branch(target_branch.as_deref())
             .await?
-            .ok_or_else(|| OmniError::Manifest("target branch has no head commit".to_string()))?;
+            .ok_or_else(|| OmniError::manifest("target branch has no head commit".to_string()))?;
         let base_commit = CommitGraph::merge_base(
             self.uri(),
             source_branch.as_deref(),
             target_branch.as_deref(),
         )
         .await?
-        .ok_or_else(|| OmniError::Manifest("branches have no common ancestor".to_string()))?;
+        .ok_or_else(|| OmniError::manifest("branches have no common ancestor".to_string()))?;
 
         if source_head_commit_id == target_head_commit_id
             || base_commit.graph_commit_id == source_head_commit_id
@@ -3012,7 +2998,7 @@ impl Omnigraph {
         .await?;
 
         if changed_edge_tables {
-            self.invalidate_graph_index();
+            self.invalidate_graph_index().await;
         }
 
         Ok(if is_fast_forward {
@@ -3045,7 +3031,7 @@ impl Omnigraph {
                     Some(Literal::String(s)) => s.clone(),
                     Some(other) => literal_to_sql(other).trim_matches('\'').to_string(),
                     None => {
-                        return Err(OmniError::Manifest(format!(
+                        return Err(OmniError::manifest(format!(
                             "insert missing @key property '{}'",
                             key_prop
                         )));
@@ -3097,14 +3083,14 @@ impl Omnigraph {
             }])
             .await?;
 
-            self.invalidate_graph_index();
+            self.invalidate_graph_index().await;
 
             Ok(MutationResult {
                 affected_nodes: 0,
                 affected_edges: 1,
             })
         } else {
-            Err(OmniError::Manifest(format!("unknown type '{}'", type_name)))
+            Err(OmniError::manifest(format!("unknown type '{}'", type_name)))
         }
     }
 
@@ -3163,7 +3149,7 @@ impl Omnigraph {
     ) -> Result<MutationResult> {
         // Defense in depth: ensure this is a node type
         if !self.catalog().node_types.contains_key(type_name) {
-            return Err(OmniError::Manifest(format!(
+            return Err(OmniError::manifest(format!(
                 "update is only supported for node types, not '{}'",
                 type_name
             )));
@@ -3172,7 +3158,7 @@ impl Omnigraph {
         // Reject updates to @key properties — identity is immutable
         if let Some(key_prop) = self.catalog().node_types[type_name].key_property() {
             if assignments.iter().any(|a| a.property == key_prop) {
-                return Err(OmniError::Manifest(format!(
+                return Err(OmniError::manifest(format!(
                     "cannot update @key property '{}' — delete and re-insert instead",
                     key_prop
                 )));
@@ -3261,12 +3247,12 @@ impl Omnigraph {
         if !blob_assignments.is_empty() {
             // Extract matched IDs from the scan result
             let id_col = matched.column_by_name("id").ok_or_else(|| {
-                OmniError::Manifest("matched batch missing 'id' column".to_string())
+                OmniError::manifest("matched batch missing 'id' column".to_string())
             })?;
             let ids = id_col
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| OmniError::Manifest("id column is not Utf8".to_string()))?;
+                .ok_or_else(|| OmniError::manifest("id column is not Utf8".to_string()))?;
 
             // Build batch: id + blob columns
             let mut blob_fields = vec![Field::new("id", DataType::Utf8, false)];
@@ -3455,7 +3441,7 @@ impl Omnigraph {
         self.commit_updates(&updates).await?;
 
         if affected_edges > 0 {
-            self.invalidate_graph_index();
+            self.invalidate_graph_index().await;
         }
 
         Ok(MutationResult {
@@ -3487,7 +3473,7 @@ impl Omnigraph {
             }])
             .await?;
 
-            self.invalidate_graph_index();
+            self.invalidate_graph_index().await;
         }
 
         Ok(MutationResult {
@@ -3502,7 +3488,7 @@ fn enrich_mutation_params(params: &ParamMap) -> Result<ParamMap> {
     if !resolved.contains_key(NOW_PARAM_NAME) {
         let now = OffsetDateTime::now_utc()
             .format(&Rfc3339)
-            .map_err(|e| OmniError::Manifest(format!("failed to format now(): {}", e)))?;
+            .map_err(|e| OmniError::manifest(format!("failed to format now(): {}", e)))?;
         resolved.insert(NOW_PARAM_NAME.to_string(), Literal::DateTime(now));
     }
     Ok(resolved)

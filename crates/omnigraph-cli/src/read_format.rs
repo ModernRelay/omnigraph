@@ -39,7 +39,7 @@ fn render_jsonl(output: &ReadOutput) -> Result<String> {
 
 fn render_csv(output: &ReadOutput) -> Result<String> {
     let rows = rows(output);
-    let columns = columns(&rows);
+    let columns = columns(output, &rows);
     let mut lines = Vec::new();
     lines.push(
         columns
@@ -73,7 +73,7 @@ fn render_kv(output: &ReadOutput) -> String {
             lines.push(String::new());
         }
         lines.push(format!("row {}", idx + 1));
-        for column in columns(&rows) {
+        for column in columns(output, &rows) {
             lines.push(format!(
                 "{}: {}",
                 column,
@@ -87,7 +87,7 @@ fn render_kv(output: &ReadOutput) -> String {
 fn render_table(output: &ReadOutput, options: &ReadRenderOptions) -> String {
     let mut lines = vec![header_line(output)];
     let rows = rows(output);
-    let columns = columns(&rows);
+    let columns = columns(output, &rows);
 
     if columns.is_empty() {
         lines.push("(no rows)".to_string());
@@ -197,7 +197,11 @@ fn rows(output: &ReadOutput) -> Vec<Map<String, Value>> {
         .collect()
 }
 
-fn columns(rows: &[Map<String, Value>]) -> Vec<String> {
+fn columns(output: &ReadOutput, rows: &[Map<String, Value>]) -> Vec<String> {
+    if !output.columns.is_empty() {
+        return output.columns.clone();
+    }
+
     let mut columns = rows
         .iter()
         .flat_map(|row| row.keys().cloned())
@@ -262,7 +266,7 @@ fn pad_to_width(value: &str, width: usize) -> String {
 }
 
 fn csv_escape(value: &str) -> String {
-    if value.contains(',') || value.contains('"') || value.contains('\n') {
+    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
         value.to_string()
@@ -283,6 +287,7 @@ mod tests {
                 snapshot: None,
             },
             row_count: 1,
+            columns: vec!["name".to_string(), "age".to_string()],
             rows: serde_json::json!([{ "name": "Alice", "age": 30 }]),
         }
     }
@@ -299,8 +304,8 @@ mod tests {
         )
         .unwrap();
 
-        assert!(rendered.lines().next().unwrap().contains("age,name"));
-        assert!(rendered.contains("30,Alice"));
+        assert!(rendered.lines().next().unwrap().contains("name,age"));
+        assert!(rendered.contains("Alice,30"));
     }
 
     #[test]
@@ -324,5 +329,28 @@ mod tests {
                 .unwrap()
                 .contains("\"name\":\"Alice\"")
         );
+    }
+
+    #[test]
+    fn render_falls_back_to_discovered_columns_for_legacy_payloads() {
+        let mut output = sample_output();
+        output.columns.clear();
+
+        let rendered = render_read(
+            &output,
+            ReadOutputFormat::Csv,
+            &ReadRenderOptions {
+                max_column_width: 80,
+                cell_layout: TableCellLayout::Truncate,
+            },
+        )
+        .unwrap();
+
+        assert!(rendered.lines().next().unwrap().contains("age,name"));
+    }
+
+    #[test]
+    fn csv_quotes_carriage_returns() {
+        assert_eq!(csv_escape("hello\rworld"), "\"hello\rworld\"");
     }
 }

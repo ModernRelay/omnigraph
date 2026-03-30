@@ -633,3 +633,45 @@ async fn diff_commits_cross_branch_reports_property_only_updates() {
         change.table_key == "node:Person" && change.id == "Bob" && change.op == ChangeOp::Insert
     }));
 }
+
+#[tokio::test]
+async fn diff_commits_ignores_row_version_only_differences() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = init_and_load(&dir).await;
+
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+    mutate_branch(
+        &mut feature,
+        "feature",
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Bob")], &[("$age", 55)]),
+    )
+    .await
+    .unwrap();
+    let feature_commit = head_commit_id(uri, Some("feature")).await;
+
+    mutate_main(
+        &mut main,
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Bob")], &[("$age", 55)]),
+    )
+    .await
+    .unwrap();
+    let main_commit = head_commit_id(uri, None).await;
+
+    let change_set = main
+        .diff_commits(&main_commit, &feature_commit, &ChangeFilter::default())
+        .await
+        .unwrap();
+
+    assert!(
+        change_set.changes.is_empty(),
+        "identical user-visible state should not produce diff entries: {:?}",
+        change_set.changes
+    );
+}

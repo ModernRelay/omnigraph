@@ -2,7 +2,7 @@ use pest::Parser;
 use pest::error::InputLocation;
 use pest_derive::Parser;
 
-use crate::error::{NanoError, ParseDiagnostic, Result, SourceSpan};
+use crate::error::{NanoError, ParseDiagnostic, Result, SourceSpan, decode_string_literal, render_span};
 
 use super::ast::*;
 
@@ -32,8 +32,8 @@ pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, Par
 
 fn pest_error_to_diagnostic(err: pest::error::Error<Rule>) -> ParseDiagnostic {
     let span = match err.location {
-        InputLocation::Pos(pos) => Some(SourceSpan::new(pos, pos)),
-        InputLocation::Span((start, end)) => Some(SourceSpan::new(start, end)),
+        InputLocation::Pos(pos) => Some(render_span(SourceSpan::new(pos, pos))),
+        InputLocation::Span((start, end)) => Some(render_span(SourceSpan::new(start, end))),
     };
     ParseDiagnostic::new(err.to_string(), span)
 }
@@ -171,7 +171,7 @@ fn parse_query_annotation(pair: pest::iterators::Pair<Rule>) -> Result<(&'static
                 .ok_or_else(|| {
                     NanoError::Parse("@description requires a string literal".to_string())
                 })
-                .map(|value| parse_string_lit(value.as_str()))?;
+                .map(|value| parse_string_lit(value.as_str()))??;
             Ok(("description", value))
         }
         Rule::instruction_annotation => {
@@ -181,7 +181,7 @@ fn parse_query_annotation(pair: pest::iterators::Pair<Rule>) -> Result<(&'static
                 .ok_or_else(|| {
                     NanoError::Parse("@instruction requires a string literal".to_string())
                 })
-                .map(|value| parse_string_lit(value.as_str()))?;
+                .map(|value| parse_string_lit(value.as_str()))??;
             Ok(("instruction", value))
         }
         other => Err(NanoError::Parse(format!(
@@ -653,7 +653,7 @@ fn parse_filter_op(pair: pest::iterators::Pair<Rule>) -> Result<CompOp> {
 fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Literal> {
     let inner = pair.into_inner().next().unwrap();
     match inner.as_rule() {
-        Rule::string_lit => Ok(Literal::String(parse_string_lit(inner.as_str()))),
+        Rule::string_lit => Ok(Literal::String(parse_string_lit(inner.as_str())?)),
         Rule::integer => {
             let n: i64 = inner
                 .as_str()
@@ -669,7 +669,16 @@ fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Literal> {
             Ok(Literal::Float(f))
         }
         Rule::bool_lit => {
-            let b = inner.as_str() == "true";
+            let b = match inner.as_str() {
+                "true" => true,
+                "false" => false,
+                other => {
+                    return Err(NanoError::Parse(format!(
+                        "invalid boolean literal: {}",
+                        other
+                    )))
+                }
+            };
             Ok(Literal::Bool(b))
         }
         Rule::date_lit => {
@@ -678,7 +687,7 @@ fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Literal> {
                 .next()
                 .map(|s| parse_string_lit(s.as_str()))
                 .ok_or_else(|| NanoError::Parse("date literal requires a string".to_string()))?;
-            Ok(Literal::Date(date_str))
+            Ok(Literal::Date(date_str?))
         }
         Rule::datetime_lit => {
             let dt_str = inner
@@ -688,7 +697,7 @@ fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Literal> {
                 .ok_or_else(|| {
                     NanoError::Parse("datetime literal requires a string".to_string())
                 })?;
-            Ok(Literal::DateTime(dt_str))
+            Ok(Literal::DateTime(dt_str?))
         }
         Rule::list_lit => {
             let mut items = Vec::new();
@@ -706,11 +715,8 @@ fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Literal> {
     }
 }
 
-fn parse_string_lit(raw: &str) -> String {
-    raw.strip_prefix('"')
-        .and_then(|inner| inner.strip_suffix('"'))
-        .unwrap_or(raw)
-        .to_string()
+fn parse_string_lit(raw: &str) -> Result<String> {
+    decode_string_literal(raw)
 }
 
 fn parse_projection(pair: pest::iterators::Pair<Rule>) -> Result<Projection> {
@@ -1090,6 +1096,75 @@ query test() {
             Clause::Filter(f) => {
                 assert_eq!(f.op, CompOp::Ne);
             }
+            _ => panic!("expected Filter"),
+        }
+    }
+
+    #[test]
+    fn test_parse_filter_string_decodes_escapes() {
+        let input = r#"
+query test() {
+    match {
+        $p: Person
+        $p.name = "Bob\n\"Builder\"\t\\"
+    }
+    return { $p.name }
+}
+"#;
+        let qf = parse_query(input).unwrap();
+        let q = &qf.queries[0];
+        match &q.match_clause[1] {
+            Clause::Filter(f) => match &f.right {
+                Expr::Literal(Literal::String(value)) => {
+                    assert_eq!(value, "Bob\n\"Builder\"\t\\");
+                }
+                other => panic!("expected string literal, got {:?}", other),
+            },
+            _ => panic!("expected Filter"),
+        }
+    }
+
+    #[test]
+    fn test_parse_string_literal_rejects_unknown_escape() {
+        let input = r#"
+query test() {
+    match {
+        $p: Person
+        $p.name = "Bob\q"
+    }
+    return { $p.name }
+}
+"#;
+        let err = parse_query(input).unwrap_err();
+        assert!(err.to_string().contains("unsupported escape sequence"));
+    }
+
+    #[test]
+    fn test_parse_bool_literals() {
+        let input = r#"
+query flags() {
+    match {
+        $p: Person
+        $p.active = true
+        $p.active != false
+    }
+    return { $p.name }
+}
+"#;
+        let qf = parse_query(input).unwrap();
+        let q = &qf.queries[0];
+        match &q.match_clause[1] {
+            Clause::Filter(f) => match &f.right {
+                Expr::Literal(Literal::Bool(value)) => assert!(*value),
+                other => panic!("expected bool literal, got {:?}", other),
+            },
+            _ => panic!("expected Filter"),
+        }
+        match &q.match_clause[2] {
+            Clause::Filter(f) => match &f.right {
+                Expr::Literal(Literal::Bool(value)) => assert!(!*value),
+                other => panic!("expected bool literal, got {:?}", other),
+            },
             _ => panic!("expected Filter"),
         }
     }

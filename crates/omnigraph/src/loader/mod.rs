@@ -4,7 +4,8 @@ use std::io::{BufRead, BufReader, Cursor};
 use std::sync::Arc;
 
 use arrow_array::{
-    ArrayRef, Date32Array, FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array,
+    builder::{FixedSizeListBuilder, Float32Builder},
+    ArrayRef, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array,
     RecordBatch, StringArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::DataType;
@@ -57,7 +58,7 @@ impl Omnigraph {
                 .await;
         }
 
-        let target_head_before = self.resolve_snapshot(&requested).await?;
+        let target_head_before = self.latest_branch_snapshot_id(&requested).await?;
         let op = format!("load_jsonl:branch={}:mode={}", requested, mode.as_str());
         let run = self.begin_run(&requested, Some(op.as_str())).await?;
         let staged_result = match self
@@ -71,31 +72,19 @@ impl Omnigraph {
             }
         };
 
-        let target_head_now = self.resolve_snapshot(&requested).await?;
+        let target_head_now = self.latest_branch_snapshot_id(&requested).await?;
         if target_head_now.as_str() != target_head_before.as_str() {
             let _ = self.fail_run(&run.run_id).await;
-            return Err(OmniError::Manifest(format!(
+            return Err(OmniError::manifest_conflict(format!(
                 "target branch '{}' advanced during transactional load; retry",
                 requested
             )));
         }
 
-        if let Err(err) = self
-            .load_direct_on_branch(Some(requested.as_str()), data, mode)
-            .await
-        {
+        if let Err(err) = self.publish_run(&run.run_id).await {
             let _ = self.fail_run(&run.run_id).await;
             return Err(err);
         }
-
-        let current_branch = self.active_branch().map(str::to_string);
-        if current_branch.as_deref() == Self::normalize_branch_name(&requested)?.as_deref() {
-            self.sync_branch(&requested).await?;
-        }
-
-        let published_snapshot_id = self.resolve_snapshot(&requested).await?;
-        self.mark_run_published(&run.run_id, &published_snapshot_id)
-            .await?;
 
         Ok(staged_result)
     }
@@ -150,12 +139,12 @@ async fn load_jsonl_reader<R: BufRead>(
             continue;
         }
         let value: JsonValue = serde_json::from_str(line).map_err(|e| {
-            OmniError::Manifest(format!("invalid JSON on line {}: {}", line_num + 1, e))
+            OmniError::manifest(format!("invalid JSON on line {}: {}", line_num + 1, e))
         })?;
 
         if let Some(type_name) = value.get("type").and_then(|v| v.as_str()) {
             if !catalog.node_types.contains_key(type_name) {
-                return Err(OmniError::Manifest(format!(
+                return Err(OmniError::manifest(format!(
                     "line {}: unknown node type '{}'",
                     line_num + 1,
                     type_name
@@ -171,7 +160,7 @@ async fn load_jsonl_reader<R: BufRead>(
                 .push(data);
         } else if let Some(edge_name) = value.get("edge").and_then(|v| v.as_str()) {
             if catalog.lookup_edge_by_name(edge_name).is_none() {
-                return Err(OmniError::Manifest(format!(
+                return Err(OmniError::manifest(format!(
                     "line {}: unknown edge type '{}'",
                     line_num + 1,
                     edge_name
@@ -181,14 +170,14 @@ async fn load_jsonl_reader<R: BufRead>(
                 .get("from")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    OmniError::Manifest(format!("line {}: edge missing 'from'", line_num + 1))
+                    OmniError::manifest(format!("line {}: edge missing 'from'", line_num + 1))
                 })?
                 .to_string();
             let to = value
                 .get("to")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    OmniError::Manifest(format!("line {}: edge missing 'to'", line_num + 1))
+                    OmniError::manifest(format!("line {}: edge missing 'to'", line_num + 1))
                 })?
                 .to_string();
             let data = value
@@ -201,7 +190,7 @@ async fn load_jsonl_reader<R: BufRead>(
                 .or_default()
                 .push((from, to, data));
         } else {
-            return Err(OmniError::Manifest(format!(
+            return Err(OmniError::manifest(format!(
                 "line {}: expected 'type' or 'edge' field",
                 line_num + 1
             )));
@@ -227,7 +216,7 @@ async fn load_jsonl_reader<R: BufRead>(
         let table_key = format!("node:{}", type_name);
         snapshot
             .entry(&table_key)
-            .ok_or_else(|| OmniError::Manifest(format!("no manifest entry for {}", table_key)))?;
+            .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
 
         let (new_version, total_rows, table_branch) =
             write_batch_to_dataset(db, branch, &table_key, batch, mode).await?;
@@ -266,7 +255,7 @@ async fn load_jsonl_reader<R: BufRead>(
 
         for (i, (src, dst, _)) in rows.iter().enumerate() {
             if !from_ids.contains(src.as_str()) {
-                return Err(OmniError::Manifest(format!(
+                return Err(OmniError::manifest(format!(
                     "edge {} row {}: src '{}' not found in {}",
                     edge_name,
                     i + 1,
@@ -275,7 +264,7 @@ async fn load_jsonl_reader<R: BufRead>(
                 )));
             }
             if !to_ids.contains(dst.as_str()) {
-                return Err(OmniError::Manifest(format!(
+                return Err(OmniError::manifest(format!(
                     "edge {} row {}: dst '{}' not found in {}",
                     edge_name,
                     i + 1,
@@ -295,7 +284,7 @@ async fn load_jsonl_reader<R: BufRead>(
         let table_key = format!("edge:{}", edge_name);
         snapshot
             .entry(&table_key)
-            .ok_or_else(|| OmniError::Manifest(format!("no manifest entry for {}", table_key)))?;
+            .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
 
         let (new_version, total_rows, table_branch) =
             write_batch_to_dataset(db, branch, &table_key, batch, mode).await?;
@@ -344,7 +333,7 @@ fn build_node_batch(node_type: &NodeType, rows: &[JsonValue]) -> Result<RecordBa
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .ok_or_else(|| {
-                        OmniError::Manifest(format!(
+                        OmniError::manifest(format!(
                             "node {} missing @key property '{}'",
                             node_type.name, key_prop
                         ))
@@ -413,7 +402,7 @@ pub(crate) fn append_blob_value(builder: &mut BlobArrayBuilder, value: &str) -> 
     if let Some(encoded) = value.strip_prefix("base64:") {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(encoded)
-            .map_err(|e| OmniError::Manifest(format!("invalid base64 blob data: {}", e)))?;
+            .map_err(|e| OmniError::manifest(format!("invalid base64 blob data: {}", e)))?;
         builder
             .push_bytes(bytes)
             .map_err(|e| OmniError::Lance(e.to_string()))
@@ -439,13 +428,13 @@ fn build_blob_column(name: &str, nullable: bool, rows: &[JsonValue]) -> Result<A
                     .map_err(|e| OmniError::Lance(e.to_string()))?;
             }
             Some(JsonValue::Null) | None => {
-                return Err(OmniError::Manifest(format!(
+                return Err(OmniError::manifest(format!(
                     "non-nullable blob property '{}' has null values",
                     name
                 )));
             }
             _ => {
-                return Err(OmniError::Manifest(format!(
+                return Err(OmniError::manifest(format!(
                     "blob property '{}' must be a URI string or base64: prefixed data",
                     name
                 )));
@@ -474,7 +463,7 @@ fn build_column_from_json(
                 })
                 .collect();
             if !nullable && values.iter().any(|v| v.is_none()) {
-                return Err(OmniError::Manifest(format!(
+                return Err(OmniError::manifest(format!(
                     "non-nullable property '{}' has null values",
                     name
                 )));
@@ -545,11 +534,16 @@ fn build_column_from_json(
         DataType::FixedSizeList(child_field, dim) => {
             // Vector type: parse JSON array of floats into FixedSizeList<Float32>
             let dim = *dim;
-            let mut flat_values: Vec<f32> = Vec::with_capacity(rows.len() * dim as usize);
+            let mut builder = FixedSizeListBuilder::with_capacity(
+                Float32Builder::with_capacity(rows.len() * dim as usize),
+                dim,
+                rows.len(),
+            )
+            .with_field(child_field.clone());
             for row in rows {
                 if let Some(arr) = row.get(name).and_then(|v| v.as_array()) {
                     if arr.len() != dim as usize {
-                        return Err(OmniError::Manifest(format!(
+                        return Err(OmniError::manifest(format!(
                             "vector property '{}' expects {} dimensions, got {}",
                             name,
                             dim,
@@ -557,22 +551,22 @@ fn build_column_from_json(
                         )));
                     }
                     for val in arr {
-                        flat_values.push(val.as_f64().unwrap_or(0.0) as f32);
+                        builder.values().append_value(val.as_f64().unwrap_or(0.0) as f32);
                     }
+                    builder.append(true);
                 } else if nullable {
-                    flat_values.extend(std::iter::repeat(0.0f32).take(dim as usize));
+                    for _ in 0..dim as usize {
+                        builder.values().append_null();
+                    }
+                    builder.append(false);
                 } else {
-                    return Err(OmniError::Manifest(format!(
+                    return Err(OmniError::manifest(format!(
                         "non-nullable vector property '{}' has null values",
                         name
                     )));
                 }
             }
-            let values_array = Arc::new(Float32Array::from(flat_values));
-            let list_array =
-                FixedSizeListArray::try_new(child_field.clone(), dim, values_array, None)
-                    .map_err(|e| OmniError::Lance(e.to_string()))?;
-            Ok(Arc::new(list_array))
+            Ok(Arc::new(builder.finish()))
         }
         _ => {
             // Unsupported type: fill with nulls
@@ -670,7 +664,7 @@ pub(crate) fn validate_value_constraints(
                 if let Some(ref min) = rc.min {
                     let min_f = literal_value_to_f64(min);
                     if val < min_f {
-                        return Err(OmniError::Manifest(format!(
+                        return Err(OmniError::manifest(format!(
                             "@range violation on {}.{}: value {} < min {}",
                             node_type.name, rc.property, val, min_f
                         )));
@@ -679,7 +673,7 @@ pub(crate) fn validate_value_constraints(
                 if let Some(ref max) = rc.max {
                     let max_f = literal_value_to_f64(max);
                     if val > max_f {
-                        return Err(OmniError::Manifest(format!(
+                        return Err(OmniError::manifest(format!(
                             "@range violation on {}.{}: value {} > max {}",
                             node_type.name, rc.property, val, max_f
                         )));
@@ -692,7 +686,7 @@ pub(crate) fn validate_value_constraints(
     // Check constraints (regex)
     for cc in &node_type.check_constraints {
         let re = regex::Regex::new(&cc.pattern).map_err(|e| {
-            OmniError::Manifest(format!(
+            OmniError::manifest(format!(
                 "@check on {}.{} has invalid regex '{}': {}",
                 node_type.name, cc.property, cc.pattern, e
             ))
@@ -708,7 +702,7 @@ pub(crate) fn validate_value_constraints(
                 }
                 let val = str_col.value(row);
                 if !re.is_match(val) {
-                    return Err(OmniError::Manifest(format!(
+                    return Err(OmniError::manifest(format!(
                         "@check violation on {}.{}: value '{}' does not match pattern '{}'",
                         node_type.name, cc.property, val, cc.pattern
                     )));
@@ -775,7 +769,7 @@ async fn validate_edge_cardinality(
     let table_key = format!("edge:{}", edge_name);
     let entry = snapshot
         .entry(&table_key)
-        .ok_or_else(|| OmniError::Manifest(format!("no manifest entry for {}", table_key)))?;
+        .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
     let ds = db
         .open_dataset_at_state(
             &entry.table_path,
@@ -807,14 +801,14 @@ async fn validate_edge_cardinality(
     for (src, count) in &counts {
         if let Some(max) = card.max {
             if *count > max {
-                return Err(OmniError::Manifest(format!(
+                return Err(OmniError::manifest(format!(
                     "@card violation on edge {}: source '{}' has {} edges (max {})",
                     edge_name, src, count, max
                 )));
             }
         }
         if *count < card.min {
-            return Err(OmniError::Manifest(format!(
+            return Err(OmniError::manifest(format!(
                 "@card violation on edge {}: source '{}' has {} edges (min {})",
                 edge_name, src, count, card.min
             )));

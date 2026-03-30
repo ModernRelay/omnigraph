@@ -551,7 +551,10 @@ fn extract_rows_with_signature(batches: &[RecordBatch], is_edge: bool) -> Vec<Sc
         };
         for i in 0..ids.len() {
             let mut values = Vec::with_capacity(batch.num_columns());
-            for col in batch.columns() {
+            for (field, col) in batch.schema().fields().iter().zip(batch.columns()) {
+                if field.name().starts_with("_row_") {
+                    continue;
+                }
                 if let Ok(v) = array_value_to_string(col.as_ref(), i) {
                     values.push(v);
                 }

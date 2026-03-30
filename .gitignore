@@ -5,3 +5,10 @@
 *.nanograph
 .DS_Store
 .env
+.env.*
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+*.tfvars
+!*.tfvars.example

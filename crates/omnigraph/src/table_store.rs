@@ -3,6 +3,7 @@ use arrow_schema::SchemaRef;
 use arrow_select::concat::concat_batches;
 use futures::TryStreamExt;
 use lance::Dataset;
+use lance::datatypes::BlobHandling;
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream, Scanner};
 use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
 use lance_file::version::LanceFileVersion;
@@ -102,7 +103,7 @@ impl TableStore {
         expected_version: u64,
     ) -> Result<()> {
         if ds.version().version != expected_version {
-            return Err(OmniError::Manifest(format!(
+            return Err(OmniError::manifest_conflict(format!(
                 "version drift on {}: snapshot pinned v{} but dataset is at v{} — call sync_branch() and retry",
                 table_key,
                 expected_version,
@@ -166,6 +167,23 @@ impl TableStore {
 
     pub async fn scan_batches(&self, ds: &Dataset) -> Result<Vec<RecordBatch>> {
         self.scan(ds, None, None, None).await
+    }
+
+    pub async fn scan_batches_for_rewrite(&self, ds: &Dataset) -> Result<Vec<RecordBatch>> {
+        let has_blob_columns = ds.schema().fields_pre_order().any(|field| field.is_blob());
+        if !has_blob_columns {
+            return self.scan_batches(ds).await;
+        }
+
+        let mut scanner = ds.scan();
+        scanner.blob_handling(BlobHandling::AllBinary);
+        scanner
+            .try_into_stream()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+            .try_collect()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))
     }
 
     pub async fn scan_stream(

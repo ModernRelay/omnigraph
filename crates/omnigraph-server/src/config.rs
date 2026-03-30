@@ -177,7 +177,7 @@ impl OmnigraphConfig {
     }
 
     pub fn resolve_query_path(&self, query: &Path) -> Result<PathBuf> {
-        if query.is_absolute() || query.exists() {
+        if query.is_absolute() {
             return Ok(query.to_path_buf());
         }
 
@@ -330,6 +330,23 @@ policy: {}
         let config = load_config_in(temp.path(), None).unwrap();
         let resolved = config.resolve_query_path(Path::new("test.gq")).unwrap();
         assert_eq!(resolved, temp.path().join("queries").join("test.gq"));
+    }
+
+    #[test]
+    fn resolve_query_path_prefers_config_base_dir_over_ambient_cwd() {
+        let workspace = tempdir().unwrap();
+        let config_dir = workspace.path().join("config");
+        let ambient_dir = workspace.path().join("ambient");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(&ambient_dir).unwrap();
+        fs::write(config_dir.join("omnigraph.yaml"), "policy: {}\n").unwrap();
+        fs::write(config_dir.join("local.gq"), "query local { return {} }").unwrap();
+        fs::write(ambient_dir.join("local.gq"), "query ambient { return {} }").unwrap();
+
+        let config = load_config_in(&ambient_dir, Some(&config_dir.join("omnigraph.yaml"))).unwrap();
+        let resolved = config.resolve_query_path(Path::new("local.gq")).unwrap();
+
+        assert_eq!(resolved, config_dir.join("local.gq"));
     }
 
     #[test]

@@ -7,7 +7,8 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
-use lance::blob::blob_field;
+use lance::blob::{BlobArrayBuilder, blob_field};
+use lance::datatypes::BlobKind;
 use lance::dataset::BlobFile;
 use omnigraph_compiler::build_catalog;
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
@@ -69,7 +70,7 @@ impl Omnigraph {
 
         // Write _schema.pg
         let schema_path = join_uri(&root, SCHEMA_FILENAME);
-        storage.write_text(&schema_path, schema_source)?;
+        storage.write_text(&schema_path, schema_source).await?;
 
         // Create manifest + per-type datasets
         let coordinator = GraphCoordinator::init(&root, &catalog, Arc::clone(&storage)).await?;
@@ -99,7 +100,7 @@ impl Omnigraph {
         let root = normalize_root_uri(uri);
         // Read _schema.pg
         let schema_path = join_uri(&root, SCHEMA_FILENAME);
-        let schema_source = storage.read_text(&schema_path)?;
+        let schema_source = storage.read_text(&schema_path).await?;
 
         // Parse and validate schema
         let schema_ast = parse_schema(&schema_source)?;
@@ -213,14 +214,14 @@ impl Omnigraph {
     pub async fn sync_branch(&mut self, branch: &str) -> Result<()> {
         let branch = normalize_branch_name(branch)?;
         self.coordinator = self.open_coordinator_for_branch(branch.as_deref()).await?;
-        self.runtime_cache.invalidate_all();
+        self.runtime_cache.invalidate_all().await;
         Ok(())
     }
 
     /// Re-read the handle-local coordinator state from storage.
     pub(crate) async fn refresh(&mut self) -> Result<()> {
         self.coordinator.refresh().await?;
-        self.runtime_cache.invalidate_all();
+        self.runtime_cache.invalidate_all().await;
         Ok(())
     }
 
@@ -348,7 +349,7 @@ impl Omnigraph {
     // ─── Graph index ──────────────────────────────────────────────────────
 
     /// Get or build the graph index for the current snapshot.
-    pub async fn graph_index(&mut self) -> Result<Arc<crate::graph_index::GraphIndex>> {
+    pub async fn graph_index(&self) -> Result<Arc<crate::graph_index::GraphIndex>> {
         let resolved = self
             .coordinator
             .resolve_target(&ReadTarget::Branch(
@@ -364,7 +365,7 @@ impl Omnigraph {
     }
 
     pub(crate) async fn graph_index_for_resolved(
-        &mut self,
+        &self,
         resolved: &ResolvedTarget,
     ) -> Result<Arc<crate::graph_index::GraphIndex>> {
         self.runtime_cache
@@ -502,9 +503,9 @@ impl Omnigraph {
             .catalog
             .node_types
             .get(type_name)
-            .ok_or_else(|| OmniError::Manifest(format!("unknown node type '{}'", type_name)))?;
+            .ok_or_else(|| OmniError::manifest(format!("unknown node type '{}'", type_name)))?;
         if !node_type.blob_properties.contains(property) {
-            return Err(OmniError::Manifest(format!(
+            return Err(OmniError::manifest(format!(
                 "property '{}' on type '{}' is not a Blob",
                 property, type_name
             )));
@@ -520,7 +521,7 @@ impl Omnigraph {
             .first_row_id_for_filter(&ds, &filter_sql)
             .await?
             .ok_or_else(|| {
-                OmniError::Manifest(format!("no {} with id '{}' found", type_name, id))
+                OmniError::manifest(format!("no {} with id '{}' found", type_name, id))
             })?;
 
         // Use take_blobs to get the BlobFile handle
@@ -531,7 +532,7 @@ impl Omnigraph {
             .map_err(|e| OmniError::Lance(e.to_string()))?;
 
         blobs.pop().ok_or_else(|| {
-            OmniError::Manifest(format!(
+            OmniError::manifest(format!(
                 "blob '{}' on {} '{}' returned no data",
                 property, type_name, id
             ))
@@ -579,7 +580,7 @@ impl Omnigraph {
     ) -> Result<()> {
         let target = from.into();
         let ReadTarget::Branch(branch_name) = target else {
-            return Err(OmniError::Manifest(
+            return Err(OmniError::manifest(
                 "branch creation from pinned snapshots is not supported yet".to_string(),
             ));
         };
@@ -598,6 +599,12 @@ impl Omnigraph {
         self.coordinator.branch_list().await
     }
 
+    pub(crate) async fn latest_branch_snapshot_id(&self, branch: &str) -> Result<SnapshotId> {
+        let normalized = normalize_branch_name(branch)?;
+        let fresh = self.open_coordinator_for_branch(normalized.as_deref()).await?;
+        fresh.resolve_snapshot_id(branch).await
+    }
+
     pub async fn begin_run(
         &mut self,
         target_branch: &str,
@@ -606,8 +613,11 @@ impl Omnigraph {
         ensure_public_branch_ref(target_branch, "begin_run")?;
         let target_branch =
             normalize_branch_name(target_branch)?.unwrap_or_else(|| "main".to_string());
-        let base_snapshot_id = self.resolve_snapshot(&target_branch).await?;
-        let base_manifest_version = self.version_of(ReadTarget::branch(&target_branch)).await?;
+        let fresh = self
+            .open_coordinator_for_branch(Self::normalize_branch_name(&target_branch)?.as_deref())
+            .await?;
+        let base_snapshot_id = fresh.resolve_snapshot_id(&target_branch).await?;
+        let base_manifest_version = fresh.version();
         let record = RunRecord::new(
             target_branch.clone(),
             base_snapshot_id.as_str(),
@@ -641,11 +651,11 @@ impl Omnigraph {
                 self.coordinator.append_run_record(&updated).await?;
                 Ok(updated)
             }
-            RunStatus::Published => Err(OmniError::Manifest(format!(
+            RunStatus::Published => Err(OmniError::manifest_conflict(format!(
                 "run '{}' is already published",
                 run_id
             ))),
-            RunStatus::Aborted => Err(OmniError::Manifest(format!(
+            RunStatus::Aborted => Err(OmniError::manifest_conflict(format!(
                 "run '{}' is already aborted",
                 run_id
             ))),
@@ -661,37 +671,12 @@ impl Omnigraph {
                 Ok(updated)
             }
             RunStatus::Failed => Ok(run),
-            RunStatus::Published => Err(OmniError::Manifest(format!(
+            RunStatus::Published => Err(OmniError::manifest_conflict(format!(
                 "run '{}' is already published",
                 run_id
             ))),
-            RunStatus::Aborted => Err(OmniError::Manifest(format!(
+            RunStatus::Aborted => Err(OmniError::manifest_conflict(format!(
                 "run '{}' is already aborted",
-                run_id
-            ))),
-        }
-    }
-
-    pub(crate) async fn mark_run_published(
-        &mut self,
-        run_id: &RunId,
-        snapshot_id: &SnapshotId,
-    ) -> Result<RunRecord> {
-        let run = self.get_run(run_id).await?;
-        match run.status {
-            RunStatus::Running => {
-                let updated =
-                    run.with_status(RunStatus::Published, Some(snapshot_id.as_str().to_string()))?;
-                self.coordinator.append_run_record(&updated).await?;
-                Ok(updated)
-            }
-            RunStatus::Published => Ok(run),
-            RunStatus::Failed => Err(OmniError::Manifest(format!(
-                "run '{}' is failed and cannot be published",
-                run_id
-            ))),
-            RunStatus::Aborted => Err(OmniError::Manifest(format!(
-                "run '{}' is aborted and cannot be published",
                 run_id
             ))),
         }
@@ -707,14 +692,14 @@ impl Omnigraph {
                     .clone()
                     .map(SnapshotId::new)
                     .ok_or_else(|| {
-                        OmniError::Manifest(format!(
+                        OmniError::manifest(format!(
                             "run '{}' is published but missing published snapshot id",
                             run_id
                         ))
                     });
             }
             RunStatus::Failed | RunStatus::Aborted => {
-                return Err(OmniError::Manifest(format!(
+                return Err(OmniError::manifest_conflict(format!(
                     "run '{}' is not publishable from status '{}'",
                     run_id,
                     run.status.as_str()
@@ -767,23 +752,14 @@ impl Omnigraph {
                 continue;
             }
             let Some(_run_entry) = run_entry else {
-                return Err(OmniError::Manifest(format!(
+                return Err(OmniError::manifest(format!(
                     "run '{}' removed table '{}' which publish_run does not support",
                     run.run_id, table_key
                 )));
             };
 
             let source_ds = run_snapshot.open(&table_key).await?;
-            let batches = self.table_store().scan_batches(&source_ds).await?;
-            let batch = if batches.is_empty() {
-                RecordBatch::new_empty(schema_for_table_key(self.catalog(), &table_key)?)
-            } else if batches.len() == 1 {
-                batches.into_iter().next().unwrap()
-            } else {
-                let schema = batches[0].schema();
-                arrow_select::concat::concat_batches(&schema, &batches)
-                    .map_err(|e| OmniError::Lance(e.to_string()))?
-            };
+            let batch = self.batch_for_table_rewrite(&source_ds, &table_key).await?;
 
             let (mut target_ds, _full_path, table_branch) = self
                 .open_for_mutation_on_branch(target_branch.as_deref(), &table_key)
@@ -807,7 +783,7 @@ impl Omnigraph {
             self.commit_updates_on_branch(target_branch.as_deref(), &updates)
                 .await?;
             if changed_edge_tables {
-                self.invalidate_graph_index();
+                self.invalidate_graph_index().await;
             }
         }
 
@@ -830,16 +806,9 @@ impl Omnigraph {
             }
 
             let source_ds = target_snapshot.open(&entry.table_key).await?;
-            let batches = self.table_store().scan_batches(&source_ds).await?;
-            let batch = if batches.is_empty() {
-                RecordBatch::new_empty(schema_for_table_key(self.catalog(), &entry.table_key)?)
-            } else if batches.len() == 1 {
-                batches.into_iter().next().unwrap()
-            } else {
-                let schema = batches[0].schema();
-                arrow_select::concat::concat_batches(&schema, &batches)
-                    .map_err(|e| OmniError::Lance(e.to_string()))?
-            };
+            let batch = self
+                .batch_for_table_rewrite(&source_ds, &entry.table_key)
+                .await?;
 
             let (mut target_ds, _full_path, table_branch) = self
                 .open_for_mutation_on_branch(target_branch.as_deref(), &entry.table_key)
@@ -863,7 +832,7 @@ impl Omnigraph {
             self.commit_updates_on_branch(target_branch.as_deref(), &updates)
                 .await?;
             if changed_edge_tables {
-                self.invalidate_graph_index();
+                self.invalidate_graph_index().await;
             }
         }
 
@@ -893,7 +862,7 @@ impl Omnigraph {
         let entry = resolved
             .snapshot
             .entry(table_key)
-            .ok_or_else(|| OmniError::Manifest(format!("no manifest entry for {}", table_key)))?;
+            .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
         let full_path = format!("{}/{}", self.root_uri, entry.table_path);
         match resolved.branch.as_deref() {
             None => {
@@ -1075,7 +1044,7 @@ impl Omnigraph {
             return Ok(());
         }
 
-        Err(OmniError::Manifest(format!(
+        Err(OmniError::manifest(format!(
             "invalid table key '{}'",
             table_key
         )))
@@ -1140,15 +1109,142 @@ impl Omnigraph {
     }
 
     /// Invalidate the cached graph index. Called after edge mutations.
-    pub(crate) fn invalidate_graph_index(&mut self) {
-        self.runtime_cache.invalidate_all();
+    pub(crate) async fn invalidate_graph_index(&self) {
+        self.runtime_cache.invalidate_all().await;
+    }
+
+    async fn batch_for_table_rewrite(&self, source_ds: &Dataset, table_key: &str) -> Result<RecordBatch> {
+        let target_schema = schema_for_table_key(self.catalog(), table_key)?;
+        let blob_properties = blob_properties_for_table_key(self.catalog(), table_key)?;
+        if blob_properties.is_empty() {
+            let batches = self.table_store().scan_batches(source_ds).await?;
+            return concat_or_empty_batches(target_schema, batches);
+        }
+
+        let batches = self
+            .table_store()
+            .scan_with(source_ds, None, None, None, true, |_| Ok(()))
+            .await?;
+        let batch = concat_or_empty_batches(target_schema.clone(), batches)?;
+        if batch.num_rows() == 0 {
+            return Ok(batch);
+        }
+
+        let row_ids = batch
+            .column_by_name("_rowid")
+            .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| {
+                OmniError::Lance(format!(
+                    "expected _rowid column when rewriting '{}'",
+                    table_key
+                ))
+            })?;
+        let row_ids: Vec<u64> = row_ids.values().iter().copied().collect();
+
+        let mut columns = Vec::with_capacity(target_schema.fields().len());
+        for field in target_schema.fields() {
+            if blob_properties.contains(field.name()) {
+                let descriptions = batch
+                    .column_by_name(field.name())
+                    .and_then(|col| col.as_any().downcast_ref::<StructArray>())
+                    .ok_or_else(|| {
+                        OmniError::Lance(format!(
+                            "expected blob descriptions for '{}.{}'",
+                            table_key,
+                            field.name()
+                        ))
+                    })?;
+                columns.push(
+                    self.rebuild_blob_column(source_ds, field.name(), descriptions, &row_ids)
+                        .await?,
+                );
+            } else {
+                columns.push(
+                    batch.column_by_name(field.name())
+                        .cloned()
+                        .ok_or_else(|| {
+                            OmniError::Lance(format!(
+                                "missing column '{}.{}' in rewrite batch",
+                                table_key,
+                                field.name()
+                            ))
+                        })?,
+                );
+            }
+        }
+
+        RecordBatch::try_new(target_schema, columns).map_err(|e| OmniError::Lance(e.to_string()))
+    }
+
+    async fn rebuild_blob_column(
+        &self,
+        source_ds: &Dataset,
+        column_name: &str,
+        descriptions: &StructArray,
+        row_ids: &[u64],
+    ) -> Result<Arc<dyn Array>> {
+        let mut builder = BlobArrayBuilder::new(row_ids.len());
+        let mut non_null_row_ids = Vec::new();
+        let mut row_has_blob = Vec::with_capacity(row_ids.len());
+
+        for row in 0..row_ids.len() {
+            let is_null = blob_description_is_null(descriptions, row)?;
+            row_has_blob.push(!is_null);
+            if !is_null {
+                non_null_row_ids.push(row_ids[row]);
+            }
+        }
+
+        let blob_files = if non_null_row_ids.is_empty() {
+            Vec::new()
+        } else {
+            Arc::new(source_ds.clone())
+                .take_blobs(&non_null_row_ids, column_name)
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?
+        };
+
+        let mut files = blob_files.into_iter();
+        for has_blob in row_has_blob {
+            if !has_blob {
+                builder
+                    .push_null()
+                    .map_err(|e| OmniError::Lance(e.to_string()))?;
+                continue;
+            }
+
+            let blob = files.next().ok_or_else(|| {
+                OmniError::Lance(format!(
+                    "blob rewrite for '{}' lost alignment with source rows",
+                    column_name
+                ))
+            })?;
+            if let Some(uri) = blob.uri() {
+                builder
+                    .push_uri(uri)
+                    .map_err(|e| OmniError::Lance(e.to_string()))?;
+            } else {
+                builder
+                    .push_bytes(blob.read().await.map_err(|e| OmniError::Lance(e.to_string()))?)
+                    .map_err(|e| OmniError::Lance(e.to_string()))?;
+            }
+        }
+
+        if files.next().is_some() {
+            return Err(OmniError::Lance(format!(
+                "blob rewrite for '{}' produced extra source blobs",
+                column_name
+            )));
+        }
+
+        builder.finish().map_err(|e| OmniError::Lance(e.to_string()))
     }
 }
 
 pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
     let branch = branch.trim();
     if branch.is_empty() {
-        return Err(OmniError::Manifest(
+        return Err(OmniError::manifest(
             "branch name cannot be empty".to_string(),
         ));
     }
@@ -1160,7 +1256,7 @@ pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
 
 fn ensure_public_branch_ref(branch: &str, operation: &str) -> Result<()> {
     if is_internal_run_branch(branch) {
-        return Err(OmniError::Manifest(format!(
+        return Err(OmniError::manifest(format!(
             "{} does not allow internal run ref '{}'",
             operation, branch
         )));
@@ -1182,6 +1278,84 @@ fn same_manifest_state(
         }
         _ => false,
     }
+}
+
+fn concat_or_empty_batches(
+    schema: Arc<Schema>,
+    batches: Vec<RecordBatch>,
+) -> Result<RecordBatch> {
+    if batches.is_empty() {
+        return Ok(RecordBatch::new_empty(schema));
+    }
+    if batches.len() == 1 {
+        return Ok(batches.into_iter().next().unwrap());
+    }
+    let batch_schema = batches[0].schema();
+    arrow_select::concat::concat_batches(&batch_schema, &batches)
+        .map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+fn blob_properties_for_table_key<'a>(
+    catalog: &'a Catalog,
+    table_key: &str,
+) -> Result<&'a std::collections::HashSet<String>> {
+    if let Some(type_name) = table_key.strip_prefix("node:") {
+        return catalog
+            .node_types
+            .get(type_name)
+            .map(|node_type| &node_type.blob_properties)
+            .ok_or_else(|| OmniError::manifest(format!("unknown node type '{}'", type_name)));
+    }
+    if let Some(type_name) = table_key.strip_prefix("edge:") {
+        return catalog
+            .edge_types
+            .get(type_name)
+            .map(|edge_type| &edge_type.blob_properties)
+            .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{}'", type_name)));
+    }
+    Err(OmniError::manifest(format!(
+        "invalid table key '{}'",
+        table_key
+    )))
+}
+
+fn blob_description_is_null(descriptions: &StructArray, row: usize) -> Result<bool> {
+    if descriptions.is_null(row) {
+        return Ok(true);
+    }
+
+    let kind = descriptions
+        .column_by_name("kind")
+        .and_then(|col| col.as_any().downcast_ref::<UInt32Array>())
+        .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row) as u8))
+        .or_else(|| {
+            descriptions
+                .column_by_name("kind")
+                .and_then(|col| col.as_any().downcast_ref::<arrow_array::UInt8Array>())
+                .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)))
+        });
+    let position = descriptions
+        .column_by_name("position")
+        .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+        .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)));
+    let size = descriptions
+        .column_by_name("size")
+        .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+        .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)));
+    let blob_uri = descriptions
+        .column_by_name("blob_uri")
+        .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+        .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)));
+
+    let Some(kind) = kind else {
+        return Ok(true);
+    };
+    let kind = BlobKind::try_from(kind).map_err(|e| OmniError::Lance(e.to_string()))?;
+    if kind != BlobKind::Inline {
+        return Ok(false);
+    }
+
+    Ok(position.unwrap_or(0) == 0 && size.unwrap_or(0) == 0 && blob_uri.unwrap_or("").is_empty())
 }
 
 /// Replace placeholder `LargeBinary` fields with Lance blob v2 fields.
@@ -1233,17 +1407,17 @@ fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result<Arc<Schema
         let node_type: &NodeType = catalog
             .node_types
             .get(type_name)
-            .ok_or_else(|| OmniError::Manifest(format!("unknown node type '{}'", type_name)))?;
+            .ok_or_else(|| OmniError::manifest(format!("unknown node type '{}'", type_name)))?;
         return Ok(node_type.arrow_schema.clone());
     }
     if let Some(type_name) = table_key.strip_prefix("edge:") {
         let edge_type: &EdgeType = catalog
             .edge_types
             .get(type_name)
-            .ok_or_else(|| OmniError::Manifest(format!("unknown edge type '{}'", type_name)))?;
+            .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{}'", type_name)))?;
         return Ok(edge_type.arrow_schema.clone());
     }
-    Err(OmniError::Manifest(format!(
+    Err(OmniError::manifest(format!(
         "invalid table key '{}'",
         table_key
     )))
@@ -1425,6 +1599,7 @@ fn json_value_from_array(array: &dyn Array, row: usize) -> Result<serde_json::Va
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use std::sync::Mutex;
 
     use crate::storage::{LocalStorageAdapter, StorageAdapter, join_uri};
@@ -1465,20 +1640,21 @@ edge WorksAt: Person -> Company
         }
     }
 
+    #[async_trait]
     impl StorageAdapter for RecordingStorageAdapter {
-        fn read_text(&self, uri: &str) -> Result<String> {
+        async fn read_text(&self, uri: &str) -> Result<String> {
             self.reads.lock().unwrap().push(uri.to_string());
-            self.inner.read_text(uri)
+            self.inner.read_text(uri).await
         }
 
-        fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
+        async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
             self.writes.lock().unwrap().push(uri.to_string());
-            self.inner.write_text(uri, contents)
+            self.inner.write_text(uri, contents).await
         }
 
-        fn exists(&self, uri: &str) -> Result<bool> {
+        async fn exists(&self, uri: &str) -> Result<bool> {
             self.exists_checks.lock().unwrap().push(uri.to_string());
-            self.inner.exists(uri)
+            self.inner.exists(uri).await
         }
     }
 

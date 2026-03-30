@@ -146,3 +146,61 @@ query insert_person($name: String, $age: I32) {
     ));
     assert!(runs_payload["runs"].as_array().unwrap().len() >= 2);
 }
+
+#[test]
+#[ignore = "requires loopback socket permissions in sandboxed runners"]
+fn remote_read_preserves_projection_order_in_json_and_csv() {
+    let repo = SystemRepo::loaded();
+    let server = repo.spawn_server();
+    let config = repo.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
+    let ordered_query = repo.write_query(
+        "ordered-remote.gq",
+        r#"
+query ordered_person($name: String) {
+    match {
+        $p: Person { name: $name }
+    }
+    return { $p.age, $p.name }
+}
+"#,
+    );
+
+    let json_payload = parse_stdout_json(&output_success(
+        cli()
+            .arg("read")
+            .arg("--config")
+            .arg(&config)
+            .arg("--query")
+            .arg(&ordered_query)
+            .arg("--name")
+            .arg("ordered_person")
+            .arg("--params")
+            .arg(r#"{"name":"Alice"}"#)
+            .arg("--json"),
+    ));
+    let columns = json_payload["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(columns, vec!["p.age", "p.name"]);
+
+    let csv = stdout_string(&output_success(
+        cli()
+            .arg("read")
+            .arg("--config")
+            .arg(&config)
+            .arg("--query")
+            .arg(&ordered_query)
+            .arg("--name")
+            .arg("ordered_person")
+            .arg("--params")
+            .arg(r#"{"name":"Alice"}"#)
+            .arg("--format")
+            .arg("csv"),
+    ));
+    let mut lines = csv.lines();
+    assert_eq!(lines.next().unwrap(), "p.age,p.name");
+    assert_eq!(lines.next().unwrap(), "30,Alice");
+}

@@ -119,6 +119,38 @@ async fn load_merge_upserts_existing_and_inserts_new() {
     }
 }
 
+#[tokio::test]
+async fn cross_type_traversal_deduplicates_duplicate_edges() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema = r#"
+node Person { name: String @key }
+node Company { name: String @key }
+edge WorksAt: Person -> Company
+"#;
+    let data = r#"{"type":"Person","data":{"name":"Alice"}}
+{"type":"Company","data":{"name":"Acme"}}
+{"edge":"WorksAt","from":"Alice","to":"Acme"}
+{"edge":"WorksAt","from":"Alice","to":"Acme"}"#;
+    let query = r#"
+query company($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p worksAt $c
+    }
+    return { $c.name }
+}
+"#;
+
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+
+    let result = query_main(&mut db, query, "company", &params(&[("$name", "Alice")]))
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 1);
+}
+
 // ─── Multi-writer refresh ───────────────────────────────────────────────────
 
 #[tokio::test]
@@ -484,10 +516,10 @@ query high_value() {
     assert_eq!(values.value(8), 499);
 }
 
-// ─── Regression: mutation on stale handle detects version drift ──────────────
+// ─── Regression: public mutation on stale handle still applies to latest head ──────────────
 
 #[tokio::test]
-async fn stale_handle_mutation_detects_version_drift() {
+async fn stale_handle_public_mutation_uses_latest_target_head() {
     let dir = tempfile::tempdir().unwrap();
     let _db = init_and_load(&dir).await;
     drop(_db);
@@ -506,30 +538,25 @@ async fn stale_handle_mutation_detects_version_drift() {
     .await
     .unwrap();
 
-    // Writer 2 (stale) tries to mutate — should detect version drift
-    let result = mutate_main(
+    // Writer 2 (stale) mutates through the public transactional path.
+    // It should stage from the latest target head rather than replaying a stale write.
+    mutate_main(
         &mut db2,
         MUTATION_QUERIES,
         "set_age",
         &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
     )
-    .await;
-    assert!(result.is_err(), "stale handle should detect version drift");
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("version drift"),
-        "error should mention version drift: {}",
-        err
-    );
+    .await
+    .unwrap();
 
-    // After refresh, the mutation should succeed
-    sync_main(&mut db2).await.unwrap();
-    let result = mutate_main(
-        &mut db2,
-        MUTATION_QUERIES,
-        "set_age",
-        &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
-    )
-    .await;
-    assert!(result.is_ok(), "refreshed handle should succeed");
+    let result = query_main(&mut db2, TEST_QUERIES, "get_person", &params(&[("$name", "Alice")]))
+        .await
+        .unwrap();
+    assert_eq!(result.num_rows(), 1);
+    assert_eq!(result.to_rust_json()[0]["p.age"], serde_json::json!(99));
+
+    let eve = query_main(&mut db2, TEST_QUERIES, "get_person", &params(&[("$name", "Eve")]))
+        .await
+        .unwrap();
+    assert_eq!(eve.num_rows(), 1, "concurrent insert should be preserved");
 }

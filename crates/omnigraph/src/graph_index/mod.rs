@@ -148,18 +148,8 @@ impl GraphIndex {
 
             let mut edges: Vec<(u32, u32)> = Vec::new();
             for batch in &batches {
-                let srcs = batch
-                    .column_by_name("src")
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap();
-                let dsts = batch
-                    .column_by_name("dst")
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap();
+                let srcs = string_column(batch, "src")?;
+                let dsts = string_column(batch, "dst")?;
 
                 for i in 0..batch.num_rows() {
                     let src_dense = type_indices
@@ -209,10 +199,33 @@ impl GraphIndex {
     pub fn csc(&self, edge_type: &str) -> Option<&CsrIndex> {
         self.csc.get(edge_type)
     }
+
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            type_indices: HashMap::new(),
+            csr: HashMap::new(),
+            csc: HashMap::new(),
+        }
+    }
+}
+
+fn string_column<'a>(batch: &'a arrow_array::RecordBatch, name: &str) -> Result<&'a StringArray> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| OmniError::manifest_internal(format!("graph index batch missing '{name}' column")))?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| OmniError::manifest_internal(format!("graph index column '{name}' is not Utf8")))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::UInt64Array;
+    use arrow_schema::{DataType, Field, Schema};
+
     use super::*;
 
     #[test]
@@ -278,5 +291,17 @@ mod tests {
         assert!(csr.has_neighbors(0));
         assert!(csr.has_neighbors(1));
         assert!(!csr.has_neighbors(2));
+    }
+
+    #[test]
+    fn string_column_returns_error_for_bad_schema() {
+        let batch = arrow_array::RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("src", DataType::UInt64, false)])),
+            vec![Arc::new(UInt64Array::from(vec![1_u64]))],
+        )
+        .unwrap();
+
+        let err = string_column(&batch, "src").unwrap_err();
+        assert!(err.to_string().contains("src"));
     }
 }

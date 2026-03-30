@@ -119,14 +119,12 @@ fn array_value_to_json_with_mode(
         DataType::Float32 => array
             .as_any()
             .downcast_ref::<Float32Array>()
-            .and_then(|a| {
-                serde_json::Number::from_f64(a.value(row) as f64).map(serde_json::Value::Number)
-            })
+            .map(|a| json_float_value(a.value(row) as f64))
             .unwrap_or(serde_json::Value::Null),
         DataType::Float64 => array
             .as_any()
             .downcast_ref::<Float64Array>()
-            .and_then(|a| serde_json::Number::from_f64(a.value(row)).map(serde_json::Value::Number))
+            .map(|a| json_float_value(a.value(row)))
             .unwrap_or(serde_json::Value::Null),
         DataType::Date32 => array
             .as_any()
@@ -190,6 +188,22 @@ fn array_value_to_json_with_mode(
     }
 }
 
+fn json_float_value(value: f64) -> serde_json::Value {
+    if value.is_nan() {
+        return serde_json::Value::String("NaN".to_string());
+    }
+    if value == f64::INFINITY {
+        return serde_json::Value::String("Infinity".to_string());
+    }
+    if value == f64::NEG_INFINITY {
+        return serde_json::Value::String("-Infinity".to_string());
+    }
+
+    serde_json::Number::from_f64(value)
+        .map(serde_json::Value::Number)
+        .unwrap_or(serde_json::Value::Null)
+}
+
 fn fixed_size_list_value_to_json(
     array: &FixedSizeListArray,
     row: usize,
@@ -234,7 +248,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
-    use arrow_array::{ArrayRef, Int64Array, RecordBatch, UInt64Array};
+    use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
 
     #[test]
@@ -316,5 +330,17 @@ mod tests {
             array_value_to_json(&values, 2),
             serde_json::json!([1.0, 2.0, 3.0])
         );
+    }
+
+    #[test]
+    fn non_finite_floats_are_stringified() {
+        let values: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+        ]));
+        assert_eq!(array_value_to_json(&values, 0), serde_json::json!("NaN"));
+        assert_eq!(array_value_to_json(&values, 1), serde_json::json!("Infinity"));
+        assert_eq!(array_value_to_json(&values, 2), serde_json::json!("-Infinity"));
     }
 }

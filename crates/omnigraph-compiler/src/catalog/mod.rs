@@ -11,7 +11,7 @@ use crate::types::{PropType, ScalarType};
 pub struct Catalog {
     pub node_types: HashMap<String, NodeType>,
     pub edge_types: HashMap<String, EdgeType>,
-    /// Maps lowercase edge name -> EdgeType key (e.g. "knows" -> "Knows")
+    /// Maps normalized lowercase edge name -> EdgeType key (e.g. "knows" -> "Knows")
     pub edge_name_index: HashMap<String, String>,
     /// Interface declarations (for Phase 2 polymorphic queries)
     pub interfaces: HashMap<String, InterfaceType>,
@@ -94,19 +94,15 @@ impl Catalog {
         if let Some(et) = self.edge_types.get(name) {
             return Some(et);
         }
-        if let Some(key) = self.edge_name_index.get(name) {
+        if let Some(key) = self.edge_name_index.get(&normalize_edge_name(name)) {
             return self.edge_types.get(key);
         }
         None
     }
 }
 
-fn lowercase_first_char(name: &str) -> String {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return String::new();
-    };
-    first.to_lowercase().chain(chars).collect()
+fn normalize_edge_name(name: &str) -> String {
+    name.to_lowercase()
 }
 
 fn bound_to_literal(b: &ConstraintBound) -> LiteralValue {
@@ -286,8 +282,16 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                 }
             }
 
-            let lowercase_name = lowercase_first_char(&edge.name);
-            edge_name_index.insert(lowercase_name, edge.name.clone());
+            let normalized_name = normalize_edge_name(&edge.name);
+            if let Some(existing) = edge_name_index.get(&normalized_name)
+                && existing != &edge.name
+            {
+                return Err(NanoError::Catalog(format!(
+                    "edge name collision after case folding: '{}' conflicts with '{}'",
+                    edge.name, existing
+                )));
+            }
+            edge_name_index.insert(normalized_name, edge.name.clone());
 
             edge_types.insert(
                 edge.name.clone(),
@@ -356,6 +360,8 @@ edge WorksAt: Person -> Company {
         let edge = catalog.lookup_edge_by_name("knows").unwrap();
         assert_eq!(edge.from_type, "Person");
         assert_eq!(edge.to_type, "Person");
+        let upper = catalog.lookup_edge_by_name("KNOWS").unwrap();
+        assert_eq!(upper.name, "Knows");
     }
 
     #[test]
@@ -472,6 +478,18 @@ edge Emits: Person -> Signal
         };
         let catalog = build_catalog(&schema).unwrap();
         assert!(catalog.lookup_edge_by_name("édges").is_some());
+    }
+
+    #[test]
+    fn test_edge_lookup_rejects_case_fold_collisions() {
+        let input = r#"
+node Person { name: String }
+edge Knows: Person -> Person
+edge KNOWS: Person -> Person
+"#;
+        let schema = parse_schema(input).unwrap();
+        let err = build_catalog(&schema).unwrap_err();
+        assert!(err.to_string().contains("case folding"));
     }
 
     #[test]

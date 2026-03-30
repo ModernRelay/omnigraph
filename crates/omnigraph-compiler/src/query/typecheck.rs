@@ -46,6 +46,16 @@ pub enum ResolvedType {
     Aggregate,
 }
 
+impl ResolvedType {
+    fn display_name(&self) -> String {
+        match self {
+            Self::Scalar(prop) => prop.display_name(),
+            Self::Node(type_name) => format!("node `{}`", type_name),
+            Self::Aggregate => "aggregate".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MutationTypeContext {
     pub target_type: String,
@@ -877,6 +887,12 @@ fn typecheck_filter(
                 r.display_name()
             )));
         }
+    } else {
+        return Err(NanoError::Type(format!(
+            "T7: filter comparisons require scalar operands, got {} and {}",
+            left_type.display_name(),
+            right_type.display_name()
+        )));
     }
 
     Ok(())
@@ -1955,6 +1971,25 @@ query q() {
         .unwrap();
         let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
         assert!(err.to_string().contains("T7"));
+    }
+
+    #[test]
+    fn test_t7_rejects_non_scalar_comparison() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $p: Person
+        $p != 5
+    }
+    return { $p.name }
+}
+"#,
+        )
+        .unwrap();
+        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        assert!(err.to_string().contains("scalar operands"));
     }
 
     #[test]

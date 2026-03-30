@@ -1,6 +1,6 @@
 mod helpers;
 
-use arrow_array::{Array, Int32Array, StringArray};
+use arrow_array::{Array, Int32Array};
 use helpers::*;
 use omnigraph::db::Omnigraph;
 use omnigraph_compiler::ir::ParamMap;

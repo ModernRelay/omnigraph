@@ -2,28 +2,32 @@ use std::fmt::Debug;
 use std::path::Path;
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
 use crate::error::Result;
 
+#[async_trait]
 pub trait StorageAdapter: Debug + Send + Sync {
-    fn read_text(&self, uri: &str) -> Result<String>;
-    fn write_text(&self, uri: &str, contents: &str) -> Result<()>;
-    fn exists(&self, uri: &str) -> Result<bool>;
+    async fn read_text(&self, uri: &str) -> Result<String>;
+    async fn write_text(&self, uri: &str, contents: &str) -> Result<()>;
+    async fn exists(&self, uri: &str) -> Result<bool>;
 }
 
 #[derive(Debug, Default)]
 pub struct LocalStorageAdapter;
 
+#[async_trait]
 impl StorageAdapter for LocalStorageAdapter {
-    fn read_text(&self, uri: &str) -> Result<String> {
-        Ok(std::fs::read_to_string(uri)?)
+    async fn read_text(&self, uri: &str) -> Result<String> {
+        Ok(tokio::fs::read_to_string(uri).await?)
     }
 
-    fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
-        std::fs::write(uri, contents)?;
+    async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
+        tokio::fs::write(uri, contents).await?;
         Ok(())
     }
 
-    fn exists(&self, uri: &str) -> Result<bool> {
+    async fn exists(&self, uri: &str) -> Result<bool> {
         Ok(Path::new(uri).exists())
     }
 }

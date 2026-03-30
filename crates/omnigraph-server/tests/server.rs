@@ -56,6 +56,18 @@ async fn app_for_loaded_repo() -> (tempfile::TempDir, Router) {
     (temp, build_app(state))
 }
 
+async fn app_for_loaded_repo_with_auth(token: &str) -> (tempfile::TempDir, Router) {
+    let temp = init_loaded_repo().await;
+    let repo = repo_path(temp.path());
+    let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let state = AppState::new_with_bearer_token(
+        repo.to_string_lossy().to_string(),
+        db,
+        Some(token.to_string()),
+    );
+    (temp, build_app(state))
+}
+
 async fn json_response(app: &Router, request: Request<Body>) -> (StatusCode, Value) {
     let response = app.clone().oneshot(request).await.unwrap();
     let status = response.status();
@@ -79,6 +91,59 @@ async fn healthz_succeeds_after_startup() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ok");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn protected_routes_require_bearer_token() {
+    let (_temp, app) = app_for_loaded_repo_with_auth("demo-token").await;
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/runs")
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    let error: ErrorOutput = serde_json::from_value(body).unwrap();
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        error.code,
+        Some(omnigraph_server::api::ErrorCode::Unauthorized)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn protected_routes_accept_valid_bearer_token_while_healthz_stays_open() {
+    let (_temp, app) = app_for_loaded_repo_with_auth("demo-token").await;
+
+    let health = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .method(Method::GET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/runs")
+            .method(Method::GET)
+            .header("authorization", "Bearer demo-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["runs"].is_array());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -210,4 +275,24 @@ async fn publish_conflict_returns_conflict_status() {
     let error: ErrorOutput = serde_json::from_value(body).unwrap();
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(error.code, Some(omnigraph_server::api::ErrorCode::Conflict));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_request_body_returns_payload_too_large() {
+    let (_temp, app) = app_for_loaded_repo().await;
+    let oversized = "x".repeat(1_100_000);
+    let response = app
+        .clone()
+        .oneshot(
+        Request::builder()
+            .uri("/read")
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(oversized))
+            .unwrap(),
+    )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }

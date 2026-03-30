@@ -216,13 +216,13 @@ async fn public_branch_apis_reject_internal_run_refs() {
 
     let merge_err = db.branch_merge(&run.run_branch, "main").await.unwrap_err();
     match merge_err {
-        OmniError::Manifest(message) => assert!(message.contains("internal run refs")),
+        OmniError::Manifest(message) => assert!(message.message.contains("internal run refs")),
         other => panic!("unexpected error: {}", other),
     }
 
     let create_err = db.branch_create(&run.run_branch).await.unwrap_err();
     match create_err {
-        OmniError::Manifest(message) => assert!(message.contains("internal run ref")),
+        OmniError::Manifest(message) => assert!(message.message.contains("internal run ref")),
         other => panic!("unexpected error: {}", other),
     }
 
@@ -231,7 +231,7 @@ async fn public_branch_apis_reject_internal_run_refs() {
         .await
         .unwrap_err();
     match fork_err {
-        OmniError::Manifest(message) => assert!(message.contains("internal run ref")),
+        OmniError::Manifest(message) => assert!(message.message.contains("internal run ref")),
         other => panic!("unexpected error: {}", other),
     }
 }
@@ -268,6 +268,29 @@ async fn public_load_uses_hidden_transactional_run_and_publishes_it() {
 }
 
 #[tokio::test]
+async fn public_load_preserves_staged_edge_ids_on_publish() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let runs = latest_runs(uri).await;
+    let run_branch = runs[0].run_branch.clone();
+
+    let mut main_ids = collect_column_strings(&read_table(&db, "edge:Knows").await, "id");
+    let mut run_ids = collect_column_strings(
+        &read_table_branch(&db, run_branch.as_str(), "edge:Knows").await,
+        "id",
+    );
+    main_ids.sort();
+    run_ids.sort();
+    assert_eq!(main_ids, run_ids);
+}
+
+#[tokio::test]
 async fn failed_public_load_marks_run_failed_and_leaves_target_unchanged() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -279,7 +302,7 @@ async fn failed_public_load_marks_run_failed_and_leaves_target_unchanged() {
         .await
         .unwrap_err();
     match err {
-        OmniError::Manifest(message) => assert!(message.contains("not found in Person")),
+        OmniError::Manifest(message) => assert!(message.message.contains("not found in Person")),
         other => panic!("unexpected error: {}", other),
     }
 
@@ -337,6 +360,34 @@ async fn public_mutation_uses_hidden_transactional_run_and_publishes_it() {
 }
 
 #[tokio::test]
+async fn public_mutation_preserves_staged_edge_ids_on_publish() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    db.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "add_friend",
+        &params(&[("$from", "Alice"), ("$to", "Diana")]),
+    )
+    .await
+    .unwrap();
+
+    let runs = latest_runs(uri).await;
+    let latest = runs.last().unwrap();
+
+    let mut main_ids = collect_column_strings(&read_table(&db, "edge:Knows").await, "id");
+    let mut run_ids = collect_column_strings(
+        &read_table_branch(&db, latest.run_branch.as_str(), "edge:Knows").await,
+        "id",
+    );
+    main_ids.sort();
+    run_ids.sort();
+    assert_eq!(main_ids, run_ids);
+}
+
+#[tokio::test]
 async fn failed_public_mutation_marks_run_failed_and_leaves_target_unchanged() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -352,7 +403,7 @@ async fn failed_public_mutation_marks_run_failed_and_leaves_target_unchanged() {
         .await
         .unwrap_err();
     match err {
-        OmniError::Manifest(message) => assert!(message.contains("not found")),
+        OmniError::Manifest(message) => assert!(message.message.contains("not found")),
         other => panic!("unexpected error: {}", other),
     }
 

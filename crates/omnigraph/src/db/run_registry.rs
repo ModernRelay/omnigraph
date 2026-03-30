@@ -60,7 +60,7 @@ impl RunStatus {
             "published" => Ok(Self::Published),
             "failed" => Ok(Self::Failed),
             "aborted" => Ok(Self::Aborted),
-            other => Err(OmniError::Manifest(format!(
+            other => Err(OmniError::manifest(format!(
                 "invalid run status '{}'",
                 other
             ))),
@@ -127,6 +127,7 @@ impl RunRecord {
 
 pub struct RunRegistry {
     dataset: Dataset,
+    latest_by_id: HashMap<String, RunRecord>,
 }
 
 impl RunRegistry {
@@ -143,20 +144,28 @@ impl RunRegistry {
         let dataset = Dataset::write(reader, &uri as &str, Some(params))
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
-        Ok(Self { dataset })
+        Ok(Self {
+            dataset,
+            latest_by_id: HashMap::new(),
+        })
     }
 
     pub async fn open(root_uri: &str) -> Result<Self> {
         let dataset = Dataset::open(&graph_runs_uri(root_uri))
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
-        Ok(Self { dataset })
+        let latest_by_id = load_run_cache(&dataset).await?;
+        Ok(Self {
+            dataset,
+            latest_by_id,
+        })
     }
 
     pub async fn refresh(&mut self, root_uri: &str) -> Result<()> {
         self.dataset = Dataset::open(&graph_runs_uri(root_uri))
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
+        self.latest_by_id = load_run_cache(&self.dataset).await?;
         Ok(())
     }
 
@@ -168,15 +177,12 @@ impl RunRegistry {
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         self.dataset = ds;
+        merge_latest_run(&mut self.latest_by_id, record.clone());
         Ok(())
     }
 
     pub async fn get_run(&self, run_id: &RunId) -> Result<Option<RunRecord>> {
-        Ok(self
-            .load_runs()
-            .await?
-            .into_iter()
-            .find(|record| record.run_id == *run_id))
+        Ok(self.latest_by_id.get(run_id.as_str()).cloned())
     }
 
     pub async fn list_runs(&self) -> Result<Vec<RunRecord>> {
@@ -184,114 +190,7 @@ impl RunRegistry {
     }
 
     pub async fn load_runs(&self) -> Result<Vec<RunRecord>> {
-        let batches: Vec<RecordBatch> = self
-            .dataset
-            .scan()
-            .try_into_stream()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?
-            .try_collect()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-
-        let mut latest_by_id: HashMap<String, RunRecord> = HashMap::new();
-        for batch in &batches {
-            let run_ids = batch
-                .column_by_name("run_id")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let target_branches = batch
-                .column_by_name("target_branch")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let run_branches = batch
-                .column_by_name("run_branch")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let base_snapshot_ids = batch
-                .column_by_name("base_snapshot_id")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let base_manifest_versions = batch
-                .column_by_name("base_manifest_version")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .unwrap();
-            let operation_hashes = batch
-                .column_by_name("operation_hash")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let statuses = batch
-                .column_by_name("status")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let published_snapshot_ids = batch
-                .column_by_name("published_snapshot_id")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap();
-            let created_ats = batch
-                .column_by_name("created_at")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .unwrap();
-            let updated_ats = batch
-                .column_by_name("updated_at")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .unwrap();
-
-            for row in 0..batch.num_rows() {
-                let record = RunRecord {
-                    run_id: RunId::new(run_ids.value(row)),
-                    target_branch: target_branches.value(row).to_string(),
-                    run_branch: run_branches.value(row).to_string(),
-                    base_snapshot_id: base_snapshot_ids.value(row).to_string(),
-                    base_manifest_version: base_manifest_versions.value(row),
-                    operation_hash: if operation_hashes.is_null(row) {
-                        None
-                    } else {
-                        Some(operation_hashes.value(row).to_string())
-                    },
-                    status: RunStatus::parse(statuses.value(row))?,
-                    published_snapshot_id: if published_snapshot_ids.is_null(row) {
-                        None
-                    } else {
-                        Some(published_snapshot_ids.value(row).to_string())
-                    },
-                    created_at: created_ats.value(row),
-                    updated_at: updated_ats.value(row),
-                };
-
-                match latest_by_id.get(record.run_id.as_str()) {
-                    Some(existing)
-                        if existing.updated_at > record.updated_at
-                            || (existing.updated_at == record.updated_at
-                                && existing.created_at >= record.created_at) => {}
-                    _ => {
-                        latest_by_id.insert(record.run_id.as_str().to_string(), record);
-                    }
-                }
-            }
-        }
-
-        let mut runs = latest_by_id.into_values().collect::<Vec<_>>();
+        let mut runs = self.latest_by_id.values().cloned().collect::<Vec<_>>();
         runs.sort_by(|a, b| {
             a.created_at
                 .cmp(&b.created_at)
@@ -335,6 +234,110 @@ fn run_registry_schema() -> SchemaRef {
             false,
         ),
     ]))
+}
+
+async fn load_run_cache(dataset: &Dataset) -> Result<HashMap<String, RunRecord>> {
+    let batches: Vec<RecordBatch> = dataset
+        .scan()
+        .try_into_stream()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?
+        .try_collect()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+    let mut latest_by_id = HashMap::new();
+    for record in load_runs_from_batches(&batches)? {
+        merge_latest_run(&mut latest_by_id, record);
+    }
+    Ok(latest_by_id)
+}
+
+fn load_runs_from_batches(batches: &[RecordBatch]) -> Result<Vec<RunRecord>> {
+    let mut runs = Vec::new();
+    for batch in batches {
+        let run_ids = string_column(batch, "run_id", "run registry")?;
+        let target_branches = string_column(batch, "target_branch", "run registry")?;
+        let run_branches = string_column(batch, "run_branch", "run registry")?;
+        let base_snapshot_ids = string_column(batch, "base_snapshot_id", "run registry")?;
+        let base_manifest_versions = u64_column(batch, "base_manifest_version", "run registry")?;
+        let operation_hashes = string_column(batch, "operation_hash", "run registry")?;
+        let statuses = string_column(batch, "status", "run registry")?;
+        let published_snapshot_ids = string_column(batch, "published_snapshot_id", "run registry")?;
+        let created_ats = timestamp_micros_column(batch, "created_at", "run registry")?;
+        let updated_ats = timestamp_micros_column(batch, "updated_at", "run registry")?;
+
+        for row in 0..batch.num_rows() {
+            runs.push(RunRecord {
+                run_id: RunId::new(run_ids.value(row)),
+                target_branch: target_branches.value(row).to_string(),
+                run_branch: run_branches.value(row).to_string(),
+                base_snapshot_id: base_snapshot_ids.value(row).to_string(),
+                base_manifest_version: base_manifest_versions.value(row),
+                operation_hash: if operation_hashes.is_null(row) {
+                    None
+                } else {
+                    Some(operation_hashes.value(row).to_string())
+                },
+                status: RunStatus::parse(statuses.value(row))?,
+                published_snapshot_id: if published_snapshot_ids.is_null(row) {
+                    None
+                } else {
+                    Some(published_snapshot_ids.value(row).to_string())
+                },
+                created_at: created_ats.value(row),
+                updated_at: updated_ats.value(row),
+            });
+        }
+    }
+    Ok(runs)
+}
+
+fn merge_latest_run(latest_by_id: &mut HashMap<String, RunRecord>, record: RunRecord) {
+    match latest_by_id.get(record.run_id.as_str()) {
+        Some(existing)
+            if existing.updated_at > record.updated_at
+                || (existing.updated_at == record.updated_at
+                    && existing.created_at >= record.created_at) => {}
+        _ => {
+            latest_by_id.insert(record.run_id.as_str().to_string(), record);
+        }
+    }
+}
+
+fn string_column<'a>(batch: &'a RecordBatch, name: &str, context: &str) -> Result<&'a StringArray> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| OmniError::manifest_internal(format!("{context} batch missing '{name}' column")))?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| OmniError::manifest_internal(format!("{context} column '{name}' is not Utf8")))
+}
+
+fn u64_column<'a>(batch: &'a RecordBatch, name: &str, context: &str) -> Result<&'a UInt64Array> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| OmniError::manifest_internal(format!("{context} batch missing '{name}' column")))?
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| OmniError::manifest_internal(format!("{context} column '{name}' is not UInt64")))
+}
+
+fn timestamp_micros_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+    context: &str,
+) -> Result<&'a TimestampMicrosecondArray> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| OmniError::manifest_internal(format!("{context} batch missing '{name}' column")))?
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "{context} column '{name}' is not Timestamp(Microsecond)"
+            ))
+        })
 }
 
 fn runs_to_batch(records: &[RunRecord]) -> Result<RecordBatch> {
@@ -394,6 +397,57 @@ fn runs_to_batch(records: &[RunRecord]) -> Result<RecordBatch> {
 fn now_micros() -> Result<i64> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| OmniError::Manifest(format!("system clock error: {}", e)))?;
+        .map_err(|e| OmniError::manifest(format!("system clock error: {}", e)))?;
     Ok(duration.as_micros() as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_schema::{DataType, Field, Schema};
+
+    use super::*;
+
+    #[test]
+    fn load_runs_from_batches_returns_error_for_bad_schema() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("run_id", DataType::UInt64, false),
+                Field::new("target_branch", DataType::Utf8, false),
+                Field::new("run_branch", DataType::Utf8, false),
+                Field::new("base_snapshot_id", DataType::Utf8, false),
+                Field::new("base_manifest_version", DataType::UInt64, false),
+                Field::new("operation_hash", DataType::Utf8, true),
+                Field::new("status", DataType::Utf8, false),
+                Field::new("published_snapshot_id", DataType::Utf8, true),
+                Field::new(
+                    "created_at",
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    false,
+                ),
+                Field::new(
+                    "updated_at",
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    false,
+                ),
+            ])),
+            vec![
+                Arc::new(UInt64Array::from(vec![1_u64])),
+                Arc::new(StringArray::from(vec!["main"])),
+                Arc::new(StringArray::from(vec!["__run__1"])),
+                Arc::new(StringArray::from(vec!["snap-1"])),
+                Arc::new(UInt64Array::from(vec![1_u64])),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(StringArray::from(vec!["running"])),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(TimestampMicrosecondArray::from(vec![1_i64])),
+                Arc::new(TimestampMicrosecondArray::from(vec![1_i64])),
+            ],
+        )
+        .unwrap();
+
+        let err = load_runs_from_batches(&[batch]).unwrap_err();
+        assert!(err.to_string().contains("run_id"));
+    }
 }

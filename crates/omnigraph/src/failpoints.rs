@@ -5,7 +5,7 @@ pub(crate) fn maybe_fail(_name: &str) -> Result<()> {
     {
         let name = _name;
         fail::fail_point!(name, |_| {
-            return Err(crate::error::OmniError::Manifest(format!(
+            return Err(crate::error::OmniError::manifest(format!(
                 "injected failpoint triggered: {}",
                 name
             )));

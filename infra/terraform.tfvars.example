@@ -1,0 +1,17 @@
+aws_region    = "us-east-1"
+instance_type = "t3.large"
+bearer_token  = "CHANGE_ME"
+repo_name     = "context.omni"
+
+# Optional: shared secret to lock ALB to CloudFront-only access
+# cloudfront_origin_secret = "some-random-secret"
+
+# Optional: ACM cert (must be in us-east-1 for CloudFront)
+# acm_certificate_arn = "arn:aws:acm:us-east-1:123456789:certificate/abc-123"
+
+# Optional: custom DNS
+# domain_name = "example.com"
+# hostname    = "omnigraph"
+
+# Optional: restrict ALB access by CIDR
+# allowed_ingress_cidrs = ["203.0.113.0/24"]

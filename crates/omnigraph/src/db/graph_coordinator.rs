@@ -118,12 +118,12 @@ impl GraphCoordinator {
     pub async fn open(root_uri: &str, storage: Arc<dyn StorageAdapter>) -> Result<Self> {
         let root = normalize_root_uri(root_uri);
         let manifest = ManifestCoordinator::open(&root).await?;
-        let commit_graph = if storage.exists(&graph_commits_uri(&root))? {
+        let commit_graph = if storage.exists(&graph_commits_uri(&root)).await? {
             Some(CommitGraph::open(&root).await?)
         } else {
             None
         };
-        let run_registry = if storage.exists(&graph_runs_uri(&root))? {
+        let run_registry = if storage.exists(&graph_runs_uri(&root)).await? {
             Some(RunRegistry::open(&root).await?)
         } else {
             None
@@ -150,12 +150,12 @@ impl GraphCoordinator {
 
         let root = normalize_root_uri(root_uri);
         let manifest = ManifestCoordinator::open_at_branch(&root, &branch_name).await?;
-        let commit_graph = if storage.exists(&graph_commits_uri(&root))? {
+        let commit_graph = if storage.exists(&graph_commits_uri(&root)).await? {
             Some(CommitGraph::open_at_branch(&root, &branch_name).await?)
         } else {
             None
         };
-        let run_registry = if storage.exists(&graph_runs_uri(&root))? {
+        let run_registry = if storage.exists(&graph_runs_uri(&root)).await? {
             Some(RunRegistry::open(&root).await?)
         } else {
             None
@@ -210,7 +210,7 @@ impl GraphCoordinator {
 
     pub async fn branch_create(&mut self, name: &str) -> Result<()> {
         let branch = normalize_branch_name(name)?
-            .ok_or_else(|| OmniError::Manifest("cannot create branch 'main'".to_string()))?;
+            .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
         self.ensure_commit_graph_initialized().await?;
         self.manifest.create_branch(&branch).await?;
         failpoints::maybe_fail("branch_create.after_manifest_branch_create")?;
@@ -287,11 +287,7 @@ impl GraphCoordinator {
 
     pub async fn resolve_commit(&self, snapshot_id: &SnapshotId) -> Result<GraphCommit> {
         if let Some(commit_graph) = &self.commit_graph {
-            let commits = commit_graph.load_commits().await?;
-            if let Some(commit) = commits
-                .into_iter()
-                .find(|commit| commit.graph_commit_id == snapshot_id.as_str())
-            {
+            if let Some(commit) = commit_graph.get_commit(snapshot_id.as_str()) {
                 return Ok(commit);
             }
         }
@@ -304,16 +300,12 @@ impl GraphCoordinator {
             else {
                 break;
             };
-            let commits = commit_graph.load_commits().await?;
-            if let Some(commit) = commits
-                .into_iter()
-                .find(|commit| commit.graph_commit_id == snapshot_id.as_str())
-            {
+            if let Some(commit) = commit_graph.get_commit(snapshot_id.as_str()) {
                 return Ok(commit);
             }
         }
 
-        Err(OmniError::Manifest(format!(
+        Err(OmniError::manifest_not_found(format!(
             "commit '{}' not found",
             snapshot_id
         )))
@@ -333,7 +325,7 @@ impl GraphCoordinator {
         if self.commit_graph.is_some() {
             return Ok(());
         }
-        if !self.storage.exists(&graph_commits_uri(self.root_uri()))? {
+        if !self.storage.exists(&graph_commits_uri(self.root_uri())).await? {
             let _ = CommitGraph::init(self.root_uri(), self.manifest.version()).await?;
         }
         self.commit_graph = match self.current_branch() {
@@ -347,7 +339,7 @@ impl GraphCoordinator {
         if self.run_registry.is_some() {
             return Ok(());
         }
-        if !self.storage.exists(&graph_runs_uri(self.root_uri()))? {
+        if !self.storage.exists(&graph_runs_uri(self.root_uri())).await? {
             let _ = RunRegistry::init(self.root_uri()).await?;
         }
         self.run_registry = Some(RunRegistry::open(self.root_uri()).await?);
@@ -403,7 +395,7 @@ impl GraphCoordinator {
         self.ensure_commit_graph_initialized().await?;
         let current_branch = self.current_branch().map(str::to_string);
         let commit_graph = self.commit_graph.as_mut().ok_or_else(|| {
-            OmniError::Manifest("branch merge requires _graph_commits.lance".to_string())
+            OmniError::manifest("branch merge requires _graph_commits.lance".to_string())
         })?;
         failpoints::maybe_fail("graph_publish.before_commit_append")?;
         let graph_commit_id = commit_graph
@@ -421,7 +413,7 @@ impl GraphCoordinator {
         &self,
         branch: Option<&str>,
     ) -> Result<Option<CommitGraph>> {
-        if !self.storage.exists(&graph_commits_uri(self.root_uri()))? {
+        if !self.storage.exists(&graph_commits_uri(self.root_uri())).await? {
             return Ok(None);
         }
         let graph = match branch {
@@ -434,7 +426,7 @@ impl GraphCoordinator {
     pub(crate) async fn append_run_record(&mut self, record: &RunRecord) -> Result<()> {
         self.ensure_run_registry_initialized().await?;
         let Some(run_registry) = &mut self.run_registry else {
-            return Err(OmniError::Manifest(
+            return Err(OmniError::manifest(
                 "run registry not initialized".to_string(),
             ));
         };
@@ -442,18 +434,29 @@ impl GraphCoordinator {
     }
 
     pub(crate) async fn get_run(&self, run_id: &RunId) -> Result<RunRecord> {
-        if !self.storage.exists(&graph_runs_uri(self.root_uri()))? {
-            return Err(OmniError::Manifest(format!("run '{}' not found", run_id)));
+        if let Some(run_registry) = &self.run_registry {
+            if let Some(run) = run_registry.get_run(run_id).await? {
+                return Ok(run);
+            }
+        }
+        if !self.storage.exists(&graph_runs_uri(self.root_uri())).await? {
+            return Err(OmniError::manifest_not_found(format!(
+                "run '{}' not found",
+                run_id
+            )));
         }
         let run_registry = RunRegistry::open(self.root_uri()).await?;
         run_registry
             .get_run(run_id)
             .await?
-            .ok_or_else(|| OmniError::Manifest(format!("run '{}' not found", run_id)))
+            .ok_or_else(|| OmniError::manifest_not_found(format!("run '{}' not found", run_id)))
     }
 
     pub(crate) async fn list_runs(&self) -> Result<Vec<RunRecord>> {
-        if !self.storage.exists(&graph_runs_uri(self.root_uri()))? {
+        if let Some(run_registry) = &self.run_registry {
+            return run_registry.list_runs().await;
+        }
+        if !self.storage.exists(&graph_runs_uri(self.root_uri())).await? {
             return Ok(Vec::new());
         }
         let run_registry = RunRegistry::open(self.root_uri()).await?;
@@ -468,7 +471,7 @@ fn graph_commits_uri(root_uri: &str) -> String {
 fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
     let branch = branch.trim();
     if branch.is_empty() {
-        return Err(OmniError::Manifest(
+        return Err(OmniError::manifest(
             "branch name cannot be empty".to_string(),
         ));
     }

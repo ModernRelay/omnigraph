@@ -49,6 +49,8 @@ pub struct ReadOutput {
     pub query_name: String,
     pub target: ReadTargetOutput,
     pub row_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<String>,
     pub rows: Value,
 }
 
@@ -90,6 +92,7 @@ pub struct HealthOutput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
+    Unauthorized,
     BadRequest,
     NotFound,
     Conflict,
@@ -139,10 +142,17 @@ pub fn run_output(run: &RunRecord) -> RunOutput {
 }
 
 pub fn read_output(query_name: String, target: &ReadTarget, result: QueryResult) -> ReadOutput {
+    let columns = result
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect();
     ReadOutput {
         query_name,
         target: read_target_output(target),
         row_count: result.num_rows(),
+        columns,
         rows: result.to_rust_json(),
     }
 }

@@ -789,7 +789,7 @@ fn run_publish_promotes_manual_running_run() {
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
-        let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+        let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
         let result = db
             .query(
                 ReadTarget::branch("main"),
