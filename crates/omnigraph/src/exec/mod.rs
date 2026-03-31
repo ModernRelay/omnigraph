@@ -4,8 +4,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray, UInt32Array, UInt64Array,
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
+    Int32Array, Int64Array, ListArray, RecordBatch, StringArray, UInt32Array, UInt64Array,
+    builder::{
+        BooleanBuilder, Date32Builder, Date64Builder, FixedSizeListBuilder, Float32Builder,
+        Float64Builder, Int32Builder, Int64Builder, ListBuilder, StringBuilder, UInt32Builder,
+        UInt64Builder,
+    },
 };
 use arrow_cast::display::array_value_to_string;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -23,10 +28,12 @@ use omnigraph_compiler::lower_query;
 use omnigraph_compiler::query::ast::{CompOp, Literal, NOW_PARAM_NAME};
 use omnigraph_compiler::query::typecheck::{CheckedQuery, typecheck_query, typecheck_query_decl};
 use omnigraph_compiler::result::{MutationResult, QueryResult};
+use omnigraph_compiler::types::ScalarType;
 use omnigraph_compiler::types::Direction;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use crate::embedding::EmbeddingClient;
 use crate::db::commit_graph::CommitGraph;
 use crate::db::manifest::ManifestCoordinator;
 use crate::db::{MergeOutcome, Omnigraph, is_internal_run_branch};
@@ -1108,7 +1115,11 @@ struct RrfMode {
 }
 
 /// Extract search ordering mode from the IR.
-fn extract_search_mode(ir: &QueryIR, params: &ParamMap) -> Result<SearchMode> {
+async fn extract_search_mode(
+    ir: &QueryIR,
+    params: &ParamMap,
+    catalog: &Catalog,
+) -> Result<SearchMode> {
     if ir.order_by.is_empty() {
         return Ok(SearchMode::default());
     }
@@ -1119,7 +1130,8 @@ fn extract_search_mode(ir: &QueryIR, params: &ParamMap) -> Result<SearchMode> {
             property,
             query,
         } => {
-            let vec = resolve_to_f32_vec(query, params)?;
+            let vec =
+                resolve_nearest_query_vec(ir, catalog, variable, property, query, params).await?;
             let k = ir.limit.ok_or_else(|| {
                 OmniError::manifest("nearest() ordering requires a limit clause".to_string())
             })? as usize;
@@ -1161,8 +1173,10 @@ fn extract_search_mode(ir: &QueryIR, params: &ParamMap) -> Result<SearchMode> {
                 .and_then(|e| resolve_to_int(e, params))
                 .unwrap_or(60) as u32;
 
-            let primary_mode = extract_sub_search_mode(primary, params, ir.limit)?;
-            let secondary_mode = extract_sub_search_mode(secondary, params, ir.limit)?;
+            let primary_mode =
+                extract_sub_search_mode(ir, primary, params, catalog, ir.limit).await?;
+            let secondary_mode =
+                extract_sub_search_mode(ir, secondary, params, catalog, ir.limit).await?;
 
             Ok(SearchMode {
                 rrf: Some(RrfMode {
@@ -1179,9 +1193,11 @@ fn extract_search_mode(ir: &QueryIR, params: &ParamMap) -> Result<SearchMode> {
 }
 
 /// Extract a sub-search mode from a nested RRF expression (nearest or bm25).
-fn extract_sub_search_mode(
+async fn extract_sub_search_mode(
+    ir: &QueryIR,
     expr: &IRExpr,
     params: &ParamMap,
+    catalog: &Catalog,
     limit: Option<u64>,
 ) -> Result<SearchMode> {
     match expr {
@@ -1190,7 +1206,8 @@ fn extract_sub_search_mode(
             property,
             query,
         } => {
-            let vec = resolve_to_f32_vec(query, params)?;
+            let vec =
+                resolve_nearest_query_vec(ir, catalog, variable, property, query, params).await?;
             let k = limit.unwrap_or(100) as usize;
             Ok(SearchMode {
                 nearest: Some((variable.clone(), property.clone(), vec, k)),
@@ -1221,9 +1238,33 @@ fn extract_sub_search_mode(
     }
 }
 
-/// Resolve an expression to a Vec<f32> (for vector search).
-fn resolve_to_f32_vec(expr: &IRExpr, params: &ParamMap) -> Result<Vec<f32>> {
-    let lit = match expr {
+/// Resolve an expression to a nearest() query vector.
+async fn resolve_nearest_query_vec(
+    ir: &QueryIR,
+    catalog: &Catalog,
+    variable: &str,
+    property: &str,
+    expr: &IRExpr,
+    params: &ParamMap,
+) -> Result<Vec<f32>> {
+    let lit = resolve_literal_or_param(expr, params)?;
+    match lit {
+        Literal::List(_) => literal_to_f32_vec(&lit),
+        Literal::String(text) => {
+            let expected_dim =
+                nearest_property_dimension(ir, catalog, variable, property)?;
+            EmbeddingClient::from_env()?
+                .embed_query_text(&text, expected_dim)
+                .await
+        }
+        _ => Err(OmniError::manifest(
+            "nearest query must be a string or list of floats".to_string(),
+        )),
+    }
+}
+
+fn resolve_literal_or_param(expr: &IRExpr, params: &ParamMap) -> Result<Literal> {
+    Ok(match expr {
         IRExpr::Literal(lit) => lit.clone(),
         IRExpr::Param(name) => params
             .get(name)
@@ -1234,7 +1275,11 @@ fn resolve_to_f32_vec(expr: &IRExpr, params: &ParamMap) -> Result<Vec<f32>> {
                 "nearest query must be a literal or parameter".to_string(),
             ));
         }
-    };
+    })
+}
+
+/// Resolve a literal vector expression to a Vec<f32>.
+fn literal_to_f32_vec(lit: &Literal) -> Result<Vec<f32>> {
     match lit {
         Literal::List(items) => items
             .iter()
@@ -1252,6 +1297,61 @@ fn resolve_to_f32_vec(expr: &IRExpr, params: &ParamMap) -> Result<Vec<f32>> {
     }
 }
 
+fn nearest_property_dimension(
+    ir: &QueryIR,
+    catalog: &Catalog,
+    variable: &str,
+    property: &str,
+) -> Result<usize> {
+    let type_name = resolve_binding_type_name(&ir.pipeline, variable).ok_or_else(|| {
+        OmniError::manifest_internal(format!(
+            "nearest() variable '${}' is not bound to a node type in the lowered pipeline",
+            variable
+        ))
+    })?;
+    let node_type = catalog.node_types.get(type_name).ok_or_else(|| {
+        OmniError::manifest_internal(format!(
+            "nearest() binding '${}' resolved unknown node type '{}'",
+            variable, type_name
+        ))
+    })?;
+    let prop = node_type.properties.get(property).ok_or_else(|| {
+        OmniError::manifest_internal(format!(
+            "nearest() property '{}.{}' is missing from the catalog",
+            type_name, property
+        ))
+    })?;
+    match prop.scalar {
+        ScalarType::Vector(dim) if !prop.list => Ok(dim as usize),
+        _ => Err(OmniError::manifest_internal(format!(
+            "nearest() property '{}.{}' is not a scalar vector",
+            type_name, property
+        ))),
+    }
+}
+
+fn resolve_binding_type_name<'a>(pipeline: &'a [IROp], variable: &str) -> Option<&'a str> {
+    for op in pipeline {
+        match op {
+            IROp::NodeScan {
+                variable: bound_var,
+                type_name,
+                ..
+            } if bound_var == variable => return Some(type_name.as_str()),
+            IROp::Expand {
+                dst_var, dst_type, ..
+            } if dst_var == variable => return Some(dst_type.as_str()),
+            IROp::AntiJoin { inner, .. } => {
+                if let Some(type_name) = resolve_binding_type_name(inner, variable) {
+                    return Some(type_name);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Execute a lowered QueryIR. Pure function — no state, no caches.
 pub async fn execute_query(
     ir: &QueryIR,
@@ -1260,7 +1360,7 @@ pub async fn execute_query(
     graph_index: Option<&GraphIndex>,
     catalog: &Catalog,
 ) -> Result<QueryResult> {
-    let search_mode = extract_search_mode(ir, params)?;
+    let search_mode = extract_search_mode(ir, params, catalog).await?;
 
     // RRF requires forked execution
     if let Some(ref rrf) = search_mode.rrf {
@@ -2163,6 +2263,10 @@ fn evaluate_filter(
     let left = evaluate_expr(batch, &filter.left, params)?;
     let right = evaluate_expr(batch, &filter.right, params)?;
 
+    if filter.op == CompOp::Contains {
+        return evaluate_contains_filter(&left, &right);
+    }
+
     // Cast right to match left's type if needed (e.g. Int64 literal vs Int32 column)
     let right = if left.data_type() != right.data_type() {
         arrow_cast::cast::cast(&right, left.data_type())
@@ -2179,11 +2283,7 @@ fn evaluate_filter(
         CompOp::Lt => cmp::lt(&left, &right),
         CompOp::Ge => cmp::gt_eq(&left, &right),
         CompOp::Le => cmp::lt_eq(&left, &right),
-        CompOp::Contains => {
-            return Err(OmniError::manifest(
-                "list contains not yet implemented".to_string(),
-            ));
-        }
+        CompOp::Contains => unreachable!("handled above"),
     }
     .map_err(|e| OmniError::Lance(e.to_string()))?;
 
@@ -2222,13 +2322,222 @@ fn literal_to_array(lit: &Literal, num_rows: usize) -> Result<ArrayRef> {
         }
         Literal::Float(f) => Arc::new(Float64Array::from(vec![*f; num_rows])) as ArrayRef,
         Literal::Bool(b) => Arc::new(BooleanArray::from(vec![*b; num_rows])) as ArrayRef,
-        _ => {
-            return Err(OmniError::manifest(format!(
-                "unsupported literal type: {:?}",
-                lit
-            )));
+        Literal::Date(s) => {
+            let days = crate::loader::parse_date32_literal(s)?;
+            Arc::new(Date32Array::from(vec![days; num_rows])) as ArrayRef
         }
+        Literal::DateTime(s) => {
+            let ms = crate::loader::parse_date64_literal(s)?;
+            Arc::new(Date64Array::from(vec![ms; num_rows])) as ArrayRef
+        }
+        Literal::List(items) => literal_list_to_array(items, num_rows)?,
     })
+}
+
+fn evaluate_contains_filter(left: &ArrayRef, right: &ArrayRef) -> Result<BooleanArray> {
+    let DataType::List(field) = left.data_type() else {
+        return Err(OmniError::manifest(
+            "contains requires a list property on the left".to_string(),
+        ));
+    };
+    let right = if right.data_type() != field.data_type() {
+        arrow_cast::cast::cast(right, field.data_type())
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+    } else {
+        Arc::clone(right)
+    };
+    let list = left
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| OmniError::manifest("contains requires an Arrow ListArray"))?;
+
+    let mut values = Vec::with_capacity(list.len());
+    for row in 0..list.len() {
+        if list.is_null(row) || right.is_null(row) {
+            values.push(Some(false));
+            continue;
+        }
+        let items = list.value(row);
+        let mut found = false;
+        for idx in 0..items.len() {
+            if array_value_eq(items.as_ref(), idx, right.as_ref(), row)? {
+                found = true;
+                break;
+            }
+        }
+        values.push(Some(found));
+    }
+    Ok(BooleanArray::from(values))
+}
+
+fn array_value_eq(
+    left: &dyn Array,
+    left_index: usize,
+    right: &dyn Array,
+    right_index: usize,
+) -> Result<bool> {
+    if left.is_null(left_index) || right.is_null(right_index) {
+        return Ok(false);
+    }
+    let left_value =
+        array_value_to_string(left, left_index).map_err(|e| OmniError::Lance(e.to_string()))?;
+    let right_value =
+        array_value_to_string(right, right_index).map_err(|e| OmniError::Lance(e.to_string()))?;
+    Ok(left_value == right_value)
+}
+
+fn literal_list_to_array(items: &[Literal], num_rows: usize) -> Result<ArrayRef> {
+    if items.is_empty() {
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        for _ in 0..num_rows {
+            builder.append(true);
+        }
+        return Ok(Arc::new(builder.finish()));
+    }
+
+    let scalar_type = list_scalar_type(items)?;
+    match scalar_type {
+        ScalarType::String => {
+            let mut builder =
+                ListBuilder::with_capacity(StringBuilder::new(), num_rows).with_field(Arc::new(
+                    Field::new("item", DataType::Utf8, true),
+                ));
+            for _ in 0..num_rows {
+                for item in items {
+                    match item {
+                        Literal::String(value) => builder.values().append_value(value),
+                        _ => builder.values().append_null(),
+                    }
+                }
+                builder.append(true);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        ScalarType::Bool => {
+            let mut builder = ListBuilder::with_capacity(BooleanBuilder::new(), num_rows)
+                .with_field(Arc::new(Field::new("item", DataType::Boolean, true)));
+            for _ in 0..num_rows {
+                for item in items {
+                    match item {
+                        Literal::Bool(value) => builder.values().append_value(*value),
+                        _ => builder.values().append_null(),
+                    }
+                }
+                builder.append(true);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        ScalarType::I32 => {
+            let mut builder = ListBuilder::with_capacity(Int32Builder::new(), num_rows)
+                .with_field(Arc::new(Field::new("item", DataType::Int32, true)));
+            for _ in 0..num_rows {
+                for item in items {
+                    match item {
+                        Literal::Integer(value) => builder.values().append_value(*value as i32),
+                        _ => builder.values().append_null(),
+                    }
+                }
+                builder.append(true);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        ScalarType::I64 | ScalarType::U32 | ScalarType::U64 => {
+            let mut builder = ListBuilder::with_capacity(Int64Builder::new(), num_rows)
+                .with_field(Arc::new(Field::new("item", DataType::Int64, true)));
+            for _ in 0..num_rows {
+                for item in items {
+                    match item {
+                        Literal::Integer(value) => builder.values().append_value(*value),
+                        _ => builder.values().append_null(),
+                    }
+                }
+                builder.append(true);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        ScalarType::F32 | ScalarType::F64 => {
+            let mut builder = ListBuilder::with_capacity(Float64Builder::new(), num_rows)
+                .with_field(Arc::new(Field::new("item", DataType::Float64, true)));
+            for _ in 0..num_rows {
+                for item in items {
+                    match item {
+                        Literal::Integer(value) => builder.values().append_value(*value as f64),
+                        Literal::Float(value) => builder.values().append_value(*value),
+                        _ => builder.values().append_null(),
+                    }
+                }
+                builder.append(true);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        ScalarType::Date => {
+            let mut builder = ListBuilder::with_capacity(Date32Builder::new(), num_rows)
+                .with_field(Arc::new(Field::new("item", DataType::Date32, true)));
+            for _ in 0..num_rows {
+                for item in items {
+                    match item {
+                        Literal::Date(value) => {
+                            builder
+                                .values()
+                                .append_value(crate::loader::parse_date32_literal(value)?)
+                        }
+                        _ => builder.values().append_null(),
+                    }
+                }
+                builder.append(true);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        ScalarType::DateTime => {
+            let mut builder = ListBuilder::with_capacity(Date64Builder::new(), num_rows)
+                .with_field(Arc::new(Field::new("item", DataType::Date64, true)));
+            for _ in 0..num_rows {
+                for item in items {
+                    match item {
+                        Literal::DateTime(value) => {
+                            builder
+                                .values()
+                                .append_value(crate::loader::parse_date64_literal(value)?)
+                        }
+                        _ => builder.values().append_null(),
+                    }
+                }
+                builder.append(true);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        ScalarType::Vector(_) | ScalarType::Blob => Err(OmniError::manifest(
+            "unsupported list literal element type".to_string(),
+        )),
+    }
+}
+
+fn list_scalar_type(items: &[Literal]) -> Result<ScalarType> {
+    let first = items.first().ok_or_else(|| OmniError::manifest("empty list literal"))?;
+    let expected = literal_scalar_type(first)?;
+    for item in items.iter().skip(1) {
+        let item_type = literal_scalar_type(item)?;
+        if item_type != expected {
+            return Err(OmniError::manifest(
+                "list literal elements must share a compatible scalar type".to_string(),
+            ));
+        }
+    }
+    Ok(expected)
+}
+
+fn literal_scalar_type(lit: &Literal) -> Result<ScalarType> {
+    match lit {
+        Literal::String(_) => Ok(ScalarType::String),
+        Literal::Integer(_) => Ok(ScalarType::I64),
+        Literal::Float(_) => Ok(ScalarType::F64),
+        Literal::Bool(_) => Ok(ScalarType::Bool),
+        Literal::Date(_) => Ok(ScalarType::Date),
+        Literal::DateTime(_) => Ok(ScalarType::DateTime),
+        Literal::List(_) => Err(OmniError::manifest(
+            "nested list literals are not supported".to_string(),
+        )),
+    }
 }
 
 /// Project return expressions into a result batch.
@@ -2412,9 +2721,47 @@ fn literal_to_typed_array(
         (Literal::Float(f), DataType::Float64) => Arc::new(Float64Array::from(vec![*f; num_rows])),
         (Literal::Bool(b), DataType::Boolean) => Arc::new(BooleanArray::from(vec![*b; num_rows])),
         (Literal::Date(s), DataType::Date32) => {
-            let days = parse_date32(s)
-                .ok_or_else(|| OmniError::manifest(format!("invalid date: {}", s)))?;
+            let days = crate::loader::parse_date32_literal(s)?;
             Arc::new(Date32Array::from(vec![days; num_rows]))
+        }
+        (Literal::DateTime(s), DataType::Date64) => Arc::new(Date64Array::from(vec![
+            crate::loader::parse_date64_literal(s)?;
+            num_rows
+        ])),
+        (Literal::List(items), DataType::List(field)) => {
+            typed_list_literal_to_array(items, field.data_type(), num_rows)?
+        }
+        (Literal::List(items), DataType::FixedSizeList(field, dim))
+            if field.data_type() == &DataType::Float32 =>
+        {
+            if items.len() != *dim as usize {
+                return Err(OmniError::manifest(format!(
+                    "vector property expects {} dimensions, got {}",
+                    dim,
+                    items.len()
+                )));
+            }
+            let mut builder = FixedSizeListBuilder::with_capacity(
+                Float32Builder::with_capacity(num_rows * (*dim as usize)),
+                *dim,
+                num_rows,
+            )
+            .with_field(field.clone());
+            for _ in 0..num_rows {
+                for item in items {
+                    match item {
+                        Literal::Integer(value) => builder.values().append_value(*value as f32),
+                        Literal::Float(value) => builder.values().append_value(*value as f32),
+                        _ => {
+                            return Err(OmniError::manifest(
+                                "vector elements must be numeric".to_string(),
+                            ));
+                        }
+                    }
+                }
+                builder.append(true);
+            }
+            Arc::new(builder.finish())
         }
         _ => {
             return Err(OmniError::manifest(format!(
@@ -2425,21 +2772,172 @@ fn literal_to_typed_array(
     })
 }
 
-/// Parse "YYYY-MM-DD" to days since epoch (same algorithm as loader/mod.rs).
-fn parse_date32(s: &str) -> Option<i32> {
-    let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 3 {
-        return None;
+fn typed_list_literal_to_array(
+    items: &[Literal],
+    item_type: &DataType,
+    num_rows: usize,
+) -> Result<ArrayRef> {
+    match item_type {
+        DataType::Utf8 => {
+            let mut builder = ListBuilder::new(StringBuilder::new());
+            for _ in 0..num_rows {
+                for item in items {
+                    match item {
+                        Literal::String(value) => builder.values().append_value(value),
+                        _ => builder.values().append_null(),
+                    }
+                }
+                builder.append(true);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Boolean => {
+            let mut builder = ListBuilder::new(BooleanBuilder::new());
+            for _ in 0..num_rows {
+                for item in items {
+                    match item {
+                        Literal::Bool(value) => builder.values().append_value(*value),
+                        _ => builder.values().append_null(),
+                    }
+                }
+                builder.append(true);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Int32 => {
+            let mut builder = ListBuilder::new(Int32Builder::new());
+            for _ in 0..num_rows {
+                for item in items {
+                    match item {
+                        Literal::Integer(value) => {
+                            let value = i32::try_from(*value).map_err(|_| {
+                                OmniError::manifest(format!("list value {} exceeds Int32 range", value))
+                            })?;
+                            builder.values().append_value(value);
+                        }
+                        _ => builder.values().append_null(),
+                    }
+                }
+                builder.append(true);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Int64 => {
+            let mut builder = ListBuilder::new(Int64Builder::new());
+            for _ in 0..num_rows {
+                for item in items {
+                    match item {
+                        Literal::Integer(value) => builder.values().append_value(*value),
+                        _ => builder.values().append_null(),
+                    }
+                }
+                builder.append(true);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::UInt32 => {
+            let mut builder = ListBuilder::new(UInt32Builder::new());
+            for _ in 0..num_rows {
+                for item in items {
+                    match item {
+                        Literal::Integer(value) => {
+                            let value = u32::try_from(*value).map_err(|_| {
+                                OmniError::manifest(format!("list value {} exceeds UInt32 range", value))
+                            })?;
+                            builder.values().append_value(value);
+                        }
+                        _ => builder.values().append_null(),
+                    }
+                }
+                builder.append(true);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::UInt64 => {
+            let mut builder = ListBuilder::new(UInt64Builder::new());
+            for _ in 0..num_rows {
+                for item in items {
+                    match item {
+                        Literal::Integer(value) => {
+                            let value = u64::try_from(*value).map_err(|_| {
+                                OmniError::manifest(format!("list value {} exceeds UInt64 range", value))
+                            })?;
+                            builder.values().append_value(value);
+                        }
+                        _ => builder.values().append_null(),
+                    }
+                }
+                builder.append(true);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Float32 => {
+            let mut builder = ListBuilder::new(Float32Builder::new());
+            for _ in 0..num_rows {
+                for item in items {
+                    match item {
+                        Literal::Integer(value) => builder.values().append_value(*value as f32),
+                        Literal::Float(value) => builder.values().append_value(*value as f32),
+                        _ => builder.values().append_null(),
+                    }
+                }
+                builder.append(true);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Float64 => {
+            let mut builder = ListBuilder::new(Float64Builder::new());
+            for _ in 0..num_rows {
+                for item in items {
+                    match item {
+                        Literal::Integer(value) => builder.values().append_value(*value as f64),
+                        Literal::Float(value) => builder.values().append_value(*value),
+                        _ => builder.values().append_null(),
+                    }
+                }
+                builder.append(true);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Date32 => {
+            let mut builder = ListBuilder::new(Date32Builder::new());
+            for _ in 0..num_rows {
+                for item in items {
+                    match item {
+                        Literal::Date(value) => {
+                            builder
+                                .values()
+                                .append_value(crate::loader::parse_date32_literal(value)?)
+                        }
+                        _ => builder.values().append_null(),
+                    }
+                }
+                builder.append(true);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        DataType::Date64 => {
+            let mut builder = ListBuilder::new(Date64Builder::new());
+            for _ in 0..num_rows {
+                for item in items {
+                    match item {
+                        Literal::DateTime(value) => {
+                            builder
+                                .values()
+                                .append_value(crate::loader::parse_date64_literal(value)?)
+                        }
+                        _ => builder.values().append_null(),
+                    }
+                }
+                builder.append(true);
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        other => Err(OmniError::manifest(format!(
+            "cannot convert list literal to {:?}",
+            other
+        ))),
     }
-    let y: i32 = parts[0].parse().ok()?;
-    let m: u32 = parts[1].parse().ok()?;
-    let d: u32 = parts[2].parse().ok()?;
-    let y2 = if m <= 2 { y - 1 } else { y };
-    let era = if y2 >= 0 { y2 } else { y2 - 399 } / 400;
-    let yoe = (y2 - era * 400) as u32;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Some((era * 146097 + doe as i32 - 719468) as i32)
 }
 
 /// Build a single-element blob array from a URI or base64 value string.

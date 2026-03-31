@@ -427,6 +427,25 @@ fn json_value_to_literal_typed(
                 json_type_name(other)
             ))),
         },
+        other if parse_list_item_type(other).is_some() => {
+            let item_type = parse_list_item_type(other).unwrap();
+            let items = value.as_array().ok_or_else(|| match mode {
+                JsonParamMode::Standard => {
+                    RunInputError::message(format!("param '{}': expected array for {}", key, other))
+                }
+                JsonParamMode::JavaScript => RunInputError::message(format!(
+                    "param '{}': expected array for {}, got {}",
+                    key,
+                    other,
+                    json_type_name(value)
+                )),
+            })?;
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(json_value_to_literal_typed(key, item, item_type, mode)?);
+            }
+            Ok(Literal::List(out))
+        }
         other if other.starts_with("Vector(") => {
             let expected_dim = parse_vector_dim(other).ok_or_else(|| match mode {
                 JsonParamMode::Standard => RunInputError::message(format!(
@@ -707,6 +726,10 @@ fn parse_vector_dim(type_name: &str) -> Option<usize> {
     if dim == 0 { None } else { Some(dim) }
 }
 
+fn parse_list_item_type(type_name: &str) -> Option<&str> {
+    Some(type_name.strip_prefix('[')?.strip_suffix(']')?.trim())
+}
+
 fn json_type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
@@ -813,5 +836,49 @@ mod tests {
             params.get("published_at"),
             Some(Literal::DateTime(value)) if value == "2026-03-06T12:00:00Z"
         ));
+    }
+
+    #[test]
+    fn typed_json_params_support_list_and_datetime_types() {
+        let query = find_named_query(
+            r#"
+query q($tags: [String], $days: [Date]?, $due_at: DateTime) {
+    match { $t: Task }
+    return { $t.slug }
+}
+"#,
+            "q",
+        )
+        .expect("query");
+
+        let params = json_params_to_param_map(
+            Some(&json!({
+                "tags": ["launch", "priority"],
+                "days": ["2026-04-01", "2026-04-02"],
+                "due_at": "2026-04-03T10:15:00Z"
+            })),
+            &query.params,
+            JsonParamMode::Standard,
+        )
+        .expect("typed params");
+
+        assert!(matches!(
+            params.get("due_at"),
+            Some(Literal::DateTime(value)) if value == "2026-04-03T10:15:00Z"
+        ));
+        match params.get("tags") {
+            Some(Literal::List(values)) => {
+                assert!(matches!(values.first(), Some(Literal::String(value)) if value == "launch"));
+                assert!(matches!(values.get(1), Some(Literal::String(value)) if value == "priority"));
+            }
+            other => panic!("expected string list param, got {:?}", other),
+        }
+        match params.get("days") {
+            Some(Literal::List(values)) => {
+                assert!(matches!(values.first(), Some(Literal::Date(value)) if value == "2026-04-01"));
+                assert!(matches!(values.get(1), Some(Literal::Date(value)) if value == "2026-04-02"));
+            }
+            other => panic!("expected date list param, got {:?}", other),
+        }
     }
 }

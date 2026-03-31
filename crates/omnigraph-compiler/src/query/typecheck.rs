@@ -116,13 +116,13 @@ fn parse_declared_param_types(params: &[Param]) -> Result<HashMap<String, PropTy
                 NOW_PARAM_NAME
             )));
         }
-        let scalar = ScalarType::from_str_name(&p.type_name).ok_or_else(|| {
+        let prop_type = PropType::from_param_type_name(&p.type_name, p.nullable).ok_or_else(|| {
             NanoError::Type(format!(
                 "unknown parameter type `{}` for `${}`",
                 p.type_name, p.name
             ))
         })?;
-        out.insert(p.name.clone(), PropType::scalar(scalar, p.nullable));
+        out.insert(p.name.clone(), prop_type);
     }
     Ok(out)
 }
@@ -998,7 +998,7 @@ fn resolve_expr_type(
                     }
                 }
                 ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {
-                    // query-time string embedding is supported in phase 3
+                    // query-time string embedding is supported by the runtime executor
                 }
                 ResolvedType::Scalar(s) => {
                     return Err(NanoError::Type(format!(
@@ -1854,6 +1854,24 @@ query q($tag: String) {
     }
 
     #[test]
+    fn test_declared_list_params_typecheck() {
+        let catalog = setup_list();
+        let qf = parse_query(
+            r#"
+query q($tags: [String], $days: [Date]?) {
+    match {
+        $p: Person
+        $p.tags contains "friend"
+    }
+    return { $p.tags, $tags, $days }
+}
+"#,
+        )
+        .unwrap();
+        assert!(typecheck_query(&catalog, &qf.queries[0]).is_ok());
+    }
+
+    #[test]
     fn test_contains_filter_requires_list_left_operand() {
         let catalog = setup();
         let qf = parse_query(
@@ -2195,6 +2213,24 @@ query q($vq: Vector(3), $tq: String) {
         let qf = parse_query(
             r#"
 query q($vq: Vector(3), $tq: String) {
+    match { $d: Doc }
+    return { $d.id_str }
+    order { rrf(nearest($d.embedding, $vq), bm25($d.id_str, $tq), 60) desc }
+    limit 5
+}
+"#,
+        )
+        .unwrap();
+        let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        assert!(ctx.bindings.contains_key("d"));
+    }
+
+    #[test]
+    fn test_rrf_ordering_ok_with_string_nearest_limit() {
+        let catalog = setup_vector();
+        let qf = parse_query(
+            r#"
+query q($vq: String, $tq: String) {
     match { $d: Doc }
     return { $d.id_str }
     order { rrf(nearest($d.embedding, $vq), bm25($d.id_str, $tq), 60) desc }

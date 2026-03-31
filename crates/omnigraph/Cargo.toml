@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Lance-native graph database with git-style branching."
 license = "MIT"
@@ -10,7 +10,7 @@ default = []
 failpoints = ["dep:fail", "fail/failpoints"]
 
 [dependencies]
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.1.0" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.2.0" }
 lance = { workspace = true }
 lance-datafusion = { workspace = true }
 lance-file = { workspace = true }
@@ -24,6 +24,7 @@ arrow-cast = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+reqwest = { workspace = true }
 ulid = { workspace = true }
 base64 = { workspace = true }
 futures = { workspace = true }
@@ -36,6 +37,6 @@ time = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.1.0" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.2.0" }
 tokio = { workspace = true }
 serial_test = "3"

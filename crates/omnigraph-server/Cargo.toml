@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-server"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "HTTP server for the Omnigraph graph database."
 license = "MIT"
@@ -10,8 +10,8 @@ name = "omnigraph-server"
 path = "src/main.rs"
 
 [dependencies]
-omnigraph = { path = "../omnigraph", version = "0.1.0" }
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.1.0" }
+omnigraph = { path = "../omnigraph", version = "0.2.0" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.2.0" }
 axum = { workspace = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }
@@ -26,3 +26,4 @@ tower-http = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tower = { workspace = true }
+serial_test = "3"

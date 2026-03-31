@@ -1,3 +1,4 @@
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -5,9 +6,10 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use omnigraph::db::Omnigraph;
-use omnigraph::loader::LoadMode;
+use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_server::api::{ChangeRequest, ErrorOutput, ReadRequest};
 use omnigraph_server::{AppState, build_app};
+use serial_test::serial;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -28,16 +30,20 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 async fn init_loaded_repo() -> tempfile::TempDir {
+    init_repo_with_schema_and_data(
+        &fs::read_to_string(fixture("test.pg")).unwrap(),
+        &fs::read_to_string(fixture("test.jsonl")).unwrap(),
+    )
+    .await
+}
+
+async fn init_repo_with_schema_and_data(schema: &str, data: &str) -> tempfile::TempDir {
     let temp = tempfile::tempdir().unwrap();
     let repo = repo_path(temp.path());
-    let schema = fs::read_to_string(fixture("test.pg")).unwrap();
-    let data = fixture("test.jsonl");
     fs::create_dir_all(&repo).unwrap();
-    Omnigraph::init(repo.to_str().unwrap(), &schema)
-        .await
-        .unwrap();
+    Omnigraph::init(repo.to_str().unwrap(), schema).await.unwrap();
     let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
-    db.load_file("main", &data.to_string_lossy(), LoadMode::Overwrite)
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
         .await
         .unwrap();
     temp
@@ -74,6 +80,90 @@ async fn json_response(app: &Router, request: Request<Body>) -> (StatusCode, Val
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let value = serde_json::from_slice(&body).unwrap();
     (status, value)
+}
+
+struct EnvGuard {
+    saved: Vec<(&'static str, Option<String>)>,
+}
+
+impl EnvGuard {
+    fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
+        let saved = vars
+            .iter()
+            .map(|(name, _)| (*name, env::var(name).ok()))
+            .collect::<Vec<_>>();
+        for (name, value) in vars {
+            unsafe {
+                match value {
+                    Some(value) => env::set_var(name, value),
+                    None => env::remove_var(name),
+                }
+            }
+        }
+        Self { saved }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (name, value) in self.saved.drain(..) {
+            unsafe {
+                match value {
+                    Some(value) => env::set_var(name, value),
+                    None => env::remove_var(name),
+                }
+            }
+        }
+    }
+}
+
+fn format_vector(values: &[f32]) -> String {
+    values
+        .iter()
+        .map(|value| format!("{:.8}", value))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn normalize_vector(mut values: Vec<f32>) -> Vec<f32> {
+    let norm = values
+        .iter()
+        .map(|value| (*value as f64) * (*value as f64))
+        .sum::<f64>()
+        .sqrt() as f32;
+    if norm > f32::EPSILON {
+        for value in &mut values {
+            *value /= norm;
+        }
+    }
+    values
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 14695981039346656037u64;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(1099511628211u64);
+    }
+    hash
+}
+
+fn xorshift64(mut x: u64) -> u64 {
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    x
+}
+
+fn mock_embedding(input: &str, dim: usize) -> Vec<f32> {
+    let mut seed = fnv1a64(input.as_bytes());
+    let mut out = Vec::with_capacity(dim);
+    for _ in 0..dim {
+        seed = xorshift64(seed);
+        let ratio = (seed as f64 / u64::MAX as f64) as f32;
+        out.push((ratio * 2.0) - 1.0);
+    }
+    normalize_vector(out)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -189,6 +279,75 @@ async fn repeated_read_after_change_sees_updated_state_from_same_app() {
     assert_eq!(read_status, StatusCode::OK);
     assert_eq!(read_body["row_count"], 1);
     assert_eq!(read_body["rows"][0]["p.name"], "Mina");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn remote_read_embeds_string_nearest_queries_with_mock_runtime() {
+    const EMBED_SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    title: String @index
+    embedding: Vector(4) @index
+}
+"#;
+    const EMBED_QUERY: &str = r#"
+query vector_search_string($q: String) {
+    match { $d: Doc }
+    return { $d.slug, $d.title }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+"#;
+
+    let alpha = mock_embedding("alpha", 4);
+    let beta = mock_embedding("beta", 4);
+    let gamma = mock_embedding("gamma", 4);
+    let data = format!(
+        concat!(
+            r#"{{"type":"Doc","data":{{"slug":"alpha-doc","title":"alpha guide","embedding":[{}]}}}}"#,
+            "\n",
+            r#"{{"type":"Doc","data":{{"slug":"beta-doc","title":"beta guide","embedding":[{}]}}}}"#,
+            "\n",
+            r#"{{"type":"Doc","data":{{"slug":"gamma-doc","title":"gamma handbook","embedding":[{}]}}}}"#
+        ),
+        format_vector(&alpha),
+        format_vector(&beta),
+        format_vector(&gamma),
+    );
+
+    let _guard = EnvGuard::set(&[
+        ("OMNIGRAPH_EMBEDDINGS_MOCK", Some("1")),
+        ("GEMINI_API_KEY", None),
+    ]);
+    let temp = init_repo_with_schema_and_data(EMBED_SCHEMA, &data).await;
+    let repo = repo_path(temp.path());
+    let state = AppState::open(repo.to_string_lossy().to_string())
+        .await
+        .unwrap();
+    let app = build_app(state);
+
+    let read = ReadRequest {
+        query_source: EMBED_QUERY.to_string(),
+        query_name: Some("vector_search_string".to_string()),
+        params: Some(json!({ "q": "alpha" })),
+        branch: Some("main".to_string()),
+        snapshot: None,
+    };
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/read")
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&read).unwrap()))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["row_count"], 3);
+    assert_eq!(body["rows"][0]["d.slug"], "alpha-doc");
 }
 
 #[tokio::test(flavor = "multi_thread")]
