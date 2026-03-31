@@ -18,6 +18,7 @@ pub struct ProjectConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TargetConfig {
     pub uri: String,
+    pub bearer_token_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
@@ -55,6 +56,11 @@ pub struct ServerDefaults {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AuthDefaults {
+    pub env_file: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QueryDefaults {
     #[serde(default)]
     pub roots: Vec<String>,
@@ -88,6 +94,8 @@ pub struct OmnigraphConfig {
     #[serde(default)]
     pub server: ServerDefaults,
     #[serde(default)]
+    pub auth: AuthDefaults,
+    #[serde(default)]
     pub cli: CliDefaults,
     #[serde(default)]
     pub query: QueryDefaults,
@@ -105,6 +113,7 @@ impl Default for OmnigraphConfig {
             project: ProjectConfig::default(),
             targets: BTreeMap::new(),
             server: ServerDefaults::default(),
+            auth: AuthDefaults::default(),
             cli: CliDefaults::default(),
             query: QueryDefaults::default(),
             aliases: BTreeMap::new(),
@@ -145,6 +154,43 @@ impl OmnigraphConfig {
 
     pub fn server_bind(&self) -> &str {
         self.server.bind.as_deref().unwrap_or("127.0.0.1:8080")
+    }
+
+    pub fn resolve_target_name<'a>(
+        &self,
+        explicit_uri: Option<&str>,
+        explicit_target: Option<&'a str>,
+        default_target: Option<&'a str>,
+    ) -> Option<&'a str> {
+        explicit_target.or_else(|| {
+            if explicit_uri.is_some() {
+                None
+            } else {
+                default_target
+            }
+        })
+    }
+
+    pub fn target_bearer_token_env(
+        &self,
+        explicit_uri: Option<&str>,
+        explicit_target: Option<&str>,
+        default_target: Option<&str>,
+    ) -> Option<&str> {
+        let target_name = self.resolve_target_name(explicit_uri, explicit_target, default_target)?;
+        self.targets
+            .get(target_name)
+            .and_then(|target| target.bearer_token_env.as_deref())
+    }
+
+    pub fn resolve_auth_env_file(&self) -> Option<PathBuf> {
+        let path = self.auth.env_file.as_deref()?;
+        let path = Path::new(path);
+        Some(if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.base_dir.join(path)
+        })
     }
 
     pub fn alias(&self, name: &str) -> Result<&AliasConfig> {
@@ -270,6 +316,9 @@ mod tests {
 targets:
   local:
     uri: ./demo.omni
+    bearer_token_env: DEMO_TOKEN
+auth:
+  env_file: .env.omni
 cli:
   target: local
   branch: main
@@ -287,6 +336,14 @@ policy: {}
         assert_eq!(config.cli_output_format(), ReadOutputFormat::Kv);
         assert_eq!(config.table_max_column_width(), 40);
         assert_eq!(config.table_cell_layout(), TableCellLayout::Wrap);
+        assert_eq!(
+            config.target_bearer_token_env(None, None, config.cli_target_name()),
+            Some("DEMO_TOKEN")
+        );
+        assert_eq!(
+            config.resolve_auth_env_file().unwrap(),
+            temp.path().join(".env.omni")
+        );
         assert_eq!(
             PathBuf::from(
                 config
@@ -360,5 +417,40 @@ policy: {}
 
         let config = load_config_in(temp.path(), None).unwrap();
         assert!(!config.policy.is_empty());
+    }
+
+    #[test]
+    fn scoped_auth_env_ignores_default_target_when_uri_is_explicit() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("omnigraph.yaml"),
+            r#"
+targets:
+  demo:
+    uri: https://example.com
+    bearer_token_env: DEMO_TOKEN
+cli:
+  target: demo
+"#,
+        )
+        .unwrap();
+
+        let config = load_config_in(temp.path(), None).unwrap();
+        assert_eq!(
+            config.target_bearer_token_env(
+                Some("https://override.example.com"),
+                None,
+                config.cli_target_name()
+            ),
+            None
+        );
+        assert_eq!(
+            config.target_bearer_token_env(
+                Some("https://override.example.com"),
+                Some("demo"),
+                config.cli_target_name()
+            ),
+            Some("DEMO_TOKEN")
+        );
     }
 }

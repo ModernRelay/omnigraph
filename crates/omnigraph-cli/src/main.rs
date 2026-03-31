@@ -24,6 +24,8 @@ mod read_format;
 
 use read_format::{ReadRenderOptions, render_read};
 
+const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
+
 #[derive(Debug, Parser)]
 #[command(name = "omnigraph")]
 #[command(about = "Omnigraph graph database CLI")]
@@ -351,8 +353,81 @@ fn normalize_bearer_token(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn cli_bearer_token_from_env() -> Option<String> {
-    normalize_bearer_token(std::env::var("OMNIGRAPH_BEARER_TOKEN").ok())
+fn bearer_token_from_env(var_name: &str) -> Option<String> {
+    normalize_bearer_token(std::env::var(var_name).ok())
+}
+
+fn parse_env_assignment(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+
+    let line = line.strip_prefix("export ").unwrap_or(line).trim();
+    let (name, value) = line.split_once('=')?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    let value = value.trim();
+    let value = if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+    {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    };
+
+    Some((name.to_string(), value.to_string()))
+}
+
+fn bearer_token_from_env_file(path: &Path, var_name: &str) -> Result<Option<String>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    for line in fs::read_to_string(path)?.lines() {
+        let Some((name, value)) = parse_env_assignment(line) else {
+            continue;
+        };
+        if name == var_name {
+            return Ok(normalize_bearer_token(Some(value)));
+        }
+    }
+
+    Ok(None)
+}
+
+fn resolve_remote_bearer_token(
+    config: &OmnigraphConfig,
+    explicit_uri: Option<&str>,
+    explicit_target: Option<&str>,
+) -> Result<Option<String>> {
+    let scoped_env =
+        config.target_bearer_token_env(explicit_uri, explicit_target, config.cli_target_name());
+    let mut env_names = Vec::new();
+    if let Some(name) = scoped_env {
+        env_names.push(name.to_string());
+    }
+    if env_names.iter().all(|name| name != DEFAULT_BEARER_TOKEN_ENV) {
+        env_names.push(DEFAULT_BEARER_TOKEN_ENV.to_string());
+    }
+
+    let env_file = config.resolve_auth_env_file();
+    for env_name in env_names {
+        if let Some(token) = bearer_token_from_env(&env_name) {
+            return Ok(Some(token));
+        }
+        if let Some(path) = env_file.as_ref() {
+            if let Some(token) = bearer_token_from_env_file(path, &env_name)? {
+                return Ok(Some(token));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 fn build_http_client() -> Result<reqwest::Client> {
@@ -375,9 +450,9 @@ async fn remote_json<T: DeserializeOwned>(
     method: Method,
     url: String,
     body: Option<Value>,
+    bearer_token: Option<&str>,
 ) -> Result<T> {
-    let token = cli_bearer_token_from_env();
-    let request = apply_bearer_token(client.request(method, url), token.as_deref());
+    let request = apply_bearer_token(client.request(method, url), bearer_token);
     let request = if let Some(body) = body {
         request.json(&body)
     } else {
@@ -662,6 +737,7 @@ project:
 targets:
   local:
     uri: {}
+    # bearer_token_env: OMNIGRAPH_BEARER_TOKEN
 
 server:
   target: local
@@ -696,6 +772,9 @@ aliases:
   #   args: [decision_slug, trace_slug]
   #   target: local
   #   branch: main
+
+# auth:
+#   env_file: ./.env.omni
 
 policy: {{}}
 ",
@@ -793,6 +872,7 @@ async fn execute_read_remote(
     query_name: Option<&str>,
     target: ReadTarget,
     params_json: Option<&Value>,
+    bearer_token: Option<&str>,
 ) -> Result<ReadOutput> {
     let (branch, snapshot) = match &target {
         ReadTarget::Branch(branch) => (Some(branch.clone()), None),
@@ -809,6 +889,7 @@ async fn execute_read_remote(
             branch,
             snapshot,
         })?),
+        bearer_token,
     )
     .await
 }
@@ -841,6 +922,7 @@ async fn execute_change_remote(
     query_name: Option<&str>,
     branch: &str,
     params_json: Option<&Value>,
+    bearer_token: Option<&str>,
 ) -> Result<ChangeOutput> {
     remote_json(
         client,
@@ -852,6 +934,7 @@ async fn execute_change_remote(
             params: params_json.cloned(),
             branch: Some(branch.to_string()),
         })?),
+        bearer_token,
     )
     .await
 }
@@ -980,6 +1063,8 @@ async fn main() -> Result<()> {
             json,
         } => {
             let config = load_config(config.as_ref())?;
+            let bearer_token =
+                resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
             let uri = resolve_uri(&config, uri, target.as_deref())?;
             let branch = resolve_branch(&config, branch, None, "main");
             let payload = if is_remote_uri(&uri) {
@@ -988,6 +1073,7 @@ async fn main() -> Result<()> {
                     Method::GET,
                     format!("{}?branch={}", remote_url(&uri, "/snapshot"), branch),
                     None,
+                    bearer_token.as_deref(),
                 )
                 .await?
             } else {
@@ -1010,6 +1096,8 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_config(config.as_ref())?;
+                let bearer_token =
+                    resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let uri = resolve_uri(&config, uri, target.as_deref())?;
                 let runs = if is_remote_uri(&uri) {
                     remote_json::<RunListOutput>(
@@ -1017,6 +1105,7 @@ async fn main() -> Result<()> {
                         Method::GET,
                         remote_url(&uri, "/runs"),
                         None,
+                        bearer_token.as_deref(),
                     )
                     .await?
                     .runs
@@ -1042,6 +1131,8 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_config(config.as_ref())?;
+                let bearer_token =
+                    resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let uri = resolve_uri(&config, uri, target.as_deref())?;
                 let run = if is_remote_uri(&uri) {
                     remote_json::<RunOutput>(
@@ -1049,6 +1140,7 @@ async fn main() -> Result<()> {
                         Method::GET,
                         remote_url(&uri, &format!("/runs/{}", run_id)),
                         None,
+                        bearer_token.as_deref(),
                     )
                     .await?
                 } else {
@@ -1069,6 +1161,8 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_config(config.as_ref())?;
+                let bearer_token =
+                    resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let uri = resolve_uri(&config, uri, target.as_deref())?;
                 let run = if is_remote_uri(&uri) {
                     remote_json::<RunOutput>(
@@ -1076,6 +1170,7 @@ async fn main() -> Result<()> {
                         Method::POST,
                         remote_url(&uri, &format!("/runs/{}/publish", run_id)),
                         Some(serde_json::json!({})),
+                        bearer_token.as_deref(),
                     )
                     .await?
                 } else {
@@ -1097,6 +1192,8 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_config(config.as_ref())?;
+                let bearer_token =
+                    resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let uri = resolve_uri(&config, uri, target.as_deref())?;
                 let run = if is_remote_uri(&uri) {
                     remote_json::<RunOutput>(
@@ -1104,6 +1201,7 @@ async fn main() -> Result<()> {
                         Method::POST,
                         remote_url(&uri, &format!("/runs/{}/abort", run_id)),
                         Some(serde_json::json!({})),
+                        bearer_token.as_deref(),
                     )
                     .await?
                 } else {
@@ -1146,12 +1244,15 @@ async fn main() -> Result<()> {
                 alias_name,
                 alias_args,
             );
+            let target_name = target
+                .as_deref()
+                .or_else(|| alias_config.and_then(|alias| alias.target.as_deref()));
+            let bearer_token =
+                resolve_remote_bearer_token(&config, uri.as_deref(), target_name)?;
             let uri = resolve_uri(
                 &config,
                 uri,
-                target
-                    .as_deref()
-                    .or_else(|| alias_config.and_then(|alias| alias.target.as_deref())),
+                target_name,
             )?;
             let query_source = resolve_query_source(
                 &config,
@@ -1181,6 +1282,7 @@ async fn main() -> Result<()> {
                     query_name.as_deref(),
                     target,
                     params_json.as_ref(),
+                    bearer_token.as_deref(),
                 )
                 .await?
             } else {
@@ -1228,12 +1330,15 @@ async fn main() -> Result<()> {
                 alias_name,
                 alias_args,
             );
+            let target_name = target
+                .as_deref()
+                .or_else(|| alias_config.and_then(|alias| alias.target.as_deref()));
+            let bearer_token =
+                resolve_remote_bearer_token(&config, uri.as_deref(), target_name)?;
             let uri = resolve_uri(
                 &config,
                 uri,
-                target
-                    .as_deref()
-                    .or_else(|| alias_config.and_then(|alias| alias.target.as_deref())),
+                target_name,
             )?;
             let query_source = resolve_query_source(
                 &config,
@@ -1263,6 +1368,7 @@ async fn main() -> Result<()> {
                     query_name.as_deref(),
                     &branch,
                     params_json.as_ref(),
+                    bearer_token.as_deref(),
                 )
                 .await?
             } else {
@@ -1287,8 +1393,15 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_bearer_token, normalize_bearer_token};
+    use std::fs;
+
+    use super::{
+        DEFAULT_BEARER_TOKEN_ENV, apply_bearer_token, bearer_token_from_env_file,
+        normalize_bearer_token, parse_env_assignment, resolve_remote_bearer_token,
+    };
+    use omnigraph_server::load_config;
     use reqwest::header::AUTHORIZATION;
+    use tempfile::tempdir;
 
     #[test]
     fn apply_bearer_token_adds_header_when_configured() {
@@ -1322,5 +1435,94 @@ mod tests {
             normalize_bearer_token(Some(" demo-token ".to_string())).as_deref(),
             Some("demo-token")
         );
+    }
+
+    #[test]
+    fn parse_env_assignment_supports_plain_and_exported_values() {
+        assert_eq!(
+            parse_env_assignment("DEMO_TOKEN=demo-token"),
+            Some(("DEMO_TOKEN".to_string(), "demo-token".to_string()))
+        );
+        assert_eq!(
+            parse_env_assignment("export DEMO_TOKEN=\"quoted-token\""),
+            Some(("DEMO_TOKEN".to_string(), "quoted-token".to_string()))
+        );
+        assert_eq!(parse_env_assignment("# comment"), None);
+        assert_eq!(parse_env_assignment("   "), None);
+    }
+
+    #[test]
+    fn bearer_token_from_env_file_reads_named_value() {
+        let temp = tempdir().unwrap();
+        let env_file = temp.path().join(".env.omni");
+        fs::write(
+            &env_file,
+            "FIRST=ignore\nexport DEMO_TOKEN=\" demo-token \"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            bearer_token_from_env_file(&env_file, "DEMO_TOKEN")
+                .unwrap()
+                .as_deref(),
+            Some("demo-token")
+        );
+        assert_eq!(
+            bearer_token_from_env_file(&env_file, "MISSING").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_remote_bearer_token_uses_scoped_env_file_with_global_fallback() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("omnigraph.yaml"),
+            r#"
+targets:
+  demo:
+    uri: https://example.com
+    bearer_token_env: DEMO_TOKEN
+auth:
+  env_file: .env.omni
+cli:
+  target: demo
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join(".env.omni"),
+            "DEMO_TOKEN=scoped-token\nOMNIGRAPH_BEARER_TOKEN=global-token\n",
+        )
+        .unwrap();
+
+        let previous = std::env::var_os(DEFAULT_BEARER_TOKEN_ENV);
+        unsafe {
+            std::env::remove_var(DEFAULT_BEARER_TOKEN_ENV);
+        }
+
+        let config_path = temp.path().join("omnigraph.yaml");
+        let config = load_config(Some(&config_path)).unwrap();
+
+        assert_eq!(
+            resolve_remote_bearer_token(&config, None, Some("demo"))
+                .unwrap()
+                .as_deref(),
+            Some("scoped-token")
+        );
+        assert_eq!(
+            resolve_remote_bearer_token(&config, Some("https://override.example.com"), None)
+                .unwrap()
+                .as_deref(),
+            Some("global-token")
+        );
+
+        unsafe {
+            if let Some(value) = previous {
+                std::env::set_var(DEFAULT_BEARER_TOKEN_ENV, value);
+            } else {
+                std::env::remove_var(DEFAULT_BEARER_TOKEN_ENV);
+            }
+        }
     }
 }
