@@ -70,17 +70,20 @@ resource "aws_iam_role_policy_attachment" "ssm_core" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
-data "aws_iam_policy_document" "read_bearer_token" {
+data "aws_iam_policy_document" "read_ssm_secrets" {
   statement {
-    actions   = ["ssm:GetParameter"]
-    resources = [aws_ssm_parameter.bearer_token.arn]
+    actions = ["ssm:GetParameter"]
+    resources = [
+      aws_ssm_parameter.bearer_token.arn,
+      aws_ssm_parameter.gemini_api_key.arn,
+    ]
   }
 }
 
-resource "aws_iam_role_policy" "read_bearer_token" {
-  name   = "read-bearer-token"
+resource "aws_iam_role_policy" "read_ssm_secrets" {
+  name   = "read-ssm-secrets"
   role   = aws_iam_role.ec2.id
-  policy = data.aws_iam_policy_document.read_bearer_token.json
+  policy = data.aws_iam_policy_document.read_ssm_secrets.json
 }
 
 resource "aws_iam_instance_profile" "ec2" {
@@ -105,8 +108,9 @@ resource "aws_instance" "omnigraph" {
 
   user_data = base64encode(templatefile("${path.module}/templates/user_data.sh", {
     aws_region     = var.aws_region
-    ssm_token_name = aws_ssm_parameter.bearer_token.name
-    ebs_device     = "/dev/xvdf"
+    ssm_token_name      = aws_ssm_parameter.bearer_token.name
+    ssm_gemini_key_name = aws_ssm_parameter.gemini_api_key.name
+    ebs_device          = "/dev/xvdf"
     data_dir       = "/var/lib/omnigraph"
     repo_name      = var.repo_name
     config_dir     = "/etc/omnigraph"

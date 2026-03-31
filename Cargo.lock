@@ -3537,7 +3537,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -3555,6 +3555,7 @@ dependencies = [
  "lance-linalg",
  "omnigraph-compiler",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "serial_test",
@@ -3568,7 +3569,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -3586,7 +3587,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-compiler"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -3606,7 +3607,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "clap",
@@ -3616,6 +3617,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "serial_test",
  "tempfile",
  "tokio",
  "tower",

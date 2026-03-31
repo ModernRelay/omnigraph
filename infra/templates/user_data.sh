@@ -46,8 +46,16 @@ TOKEN=$(aws ssm get-parameter \
   --query 'Parameter.Value' \
   --output text)
 
+GEMINI_KEY=$(aws ssm get-parameter \
+  --name "${ssm_gemini_key_name}" \
+  --with-decryption \
+  --region ${aws_region} \
+  --query 'Parameter.Value' \
+  --output text)
+
 cat > ${config_dir}/server.env <<ENVEOF
 OMNIGRAPH_SERVER_BEARER_TOKEN=$TOKEN
+GEMINI_API_KEY=$GEMINI_KEY
 ENVEOF
 
 chmod 600 ${config_dir}/server.env

@@ -1,5 +1,6 @@
 mod support;
 
+use std::env;
 use std::fs;
 use std::process::Stdio;
 use std::thread::sleep;
@@ -7,6 +8,8 @@ use std::time::Duration;
 
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::LoadMode;
+use reqwest::blocking::Client;
+use serde_json::Value;
 
 use support::*;
 
@@ -47,18 +50,20 @@ fn snapshot_table_row_count(repo: &SystemRepo, table_key: &str) -> u64 {
 }
 
 fn wait_for_running_run(repo: &SystemRepo) -> String {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
     for _ in 0..200 {
-        let payload = parse_stdout_json(&output_success(
-            cli().arg("run").arg("list").arg(repo.path()).arg("--json"),
-        ));
-        if let Some(run_id) = payload["runs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|run| run["target_branch"] == "main" && run["status"] == "running")
-            .and_then(|run| run["run_id"].as_str())
+        let running = runtime.block_on(async {
+            let db = Omnigraph::open(repo.path().to_str().unwrap()).await.unwrap();
+            db.list_runs()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|run| run.target_branch == "main" && run.status.as_str() == "running")
+                .map(|run| run.run_id.to_string())
+        });
+        if let Some(run_id) = running
         {
-            return run_id.to_string();
+            return run_id;
         }
         sleep(Duration::from_millis(50));
     }
@@ -77,6 +82,57 @@ fn bulk_people_jsonl(count: usize) -> String {
         rows.push('\n');
     }
     rows
+}
+
+fn gemini_base_url() -> String {
+    env::var("OMNIGRAPH_GEMINI_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta".to_string())
+}
+
+fn embed_text_with_gemini(text: &str, dim: usize) -> Vec<f32> {
+    let api_key = env::var("GEMINI_API_KEY").expect("GEMINI_API_KEY must be set");
+    let client = Client::new();
+    let response = client
+        .post(format!(
+            "{}/models/gemini-embedding-2-preview:embedContent",
+            gemini_base_url().trim_end_matches('/')
+        ))
+        .header("x-goog-api-key", api_key)
+        .json(&serde_json::json!({
+            "model": "models/gemini-embedding-2-preview",
+            "content": {
+                "parts": [
+                    {
+                        "text": text
+                    }
+                ]
+            },
+            "taskType": "RETRIEVAL_QUERY",
+            "outputDimensionality": dim,
+        }))
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Value>()
+        .unwrap();
+
+    response["embedding"]["values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_f64().unwrap() as f32)
+        .collect()
+}
+
+fn format_vector(values: &[f32]) -> String {
+    values
+        .iter()
+        .map(|value| format!("{:.8}", value))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[test]
@@ -385,9 +441,251 @@ query get_person($name: String) {
 }
 
 #[test]
+fn local_cli_datetime_and_list_types_round_trip_through_load_read_and_change() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    let schema = temp.path().join("datatypes.pg");
+    let data = temp.path().join("datatypes.jsonl");
+    let queries = temp.path().join("datatypes.gq");
+
+    write_query_file(
+        &schema,
+        r#"
+node Task {
+    slug: String @key
+    title: String
+    due_at: DateTime
+    tags: [String]
+    scores: [I32]?
+    active_days: [Date]?
+}
+"#,
+    );
+    write_jsonl(
+        &data,
+        r#"{"type":"Task","data":{"slug":"alpha","title":"Launch prep","due_at":"2026-04-01T08:30:00Z","tags":["launch","priority"],"scores":[1,2],"active_days":["2026-03-30","2026-03-31"]}}
+{"type":"Task","data":{"slug":"beta","title":"Archive","due_at":"2026-05-01T12:00:00Z","tags":["backlog"],"scores":[5],"active_days":["2026-04-01"]}}"#,
+    );
+    write_query_file(
+        &queries,
+        r#"
+query due_with_tag($deadline: DateTime, $tag: String) {
+    match {
+        $t: Task
+        $t.due_at <= $deadline
+        $t.tags contains $tag
+    }
+    return { $t.slug, $t.due_at, $t.tags, $t.scores, $t.active_days }
+}
+
+query insert_task(
+    $slug: String,
+    $title: String,
+    $due_at: DateTime,
+    $tags: [String],
+    $scores: [I32],
+    $active_days: [Date]
+) {
+    insert Task {
+        slug: $slug,
+        title: $title,
+        due_at: $due_at,
+        tags: $tags,
+        scores: $scores,
+        active_days: $active_days
+    }
+}
+
+query update_task(
+    $slug: String,
+    $due_at: DateTime,
+    $tags: [String],
+    $scores: [I32],
+    $active_days: [Date]
+) {
+    update Task set {
+        due_at: $due_at,
+        tags: $tags,
+        scores: $scores,
+        active_days: $active_days
+    } where slug = $slug
+}
+
+query get_task($slug: String) {
+    match { $t: Task { slug: $slug } }
+    return { $t.slug, $t.due_at, $t.tags, $t.scores, $t.active_days }
+}
+"#,
+    );
+
+    output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&repo));
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--data")
+            .arg(&data)
+            .arg(&repo),
+    );
+
+    let filtered = parse_stdout_json(&output_success(
+        cli()
+            .arg("read")
+            .arg(&repo)
+            .arg("--query")
+            .arg(&queries)
+            .arg("--name")
+            .arg("due_with_tag")
+            .arg("--params")
+            .arg(
+                r#"{"deadline":"2026-04-02T00:00:00Z","tag":"launch"}"#,
+            )
+            .arg("--json"),
+    ));
+    assert_eq!(filtered["row_count"], 1);
+    assert_eq!(filtered["rows"][0]["t.slug"], "alpha");
+    assert_eq!(filtered["rows"][0]["t.due_at"], "2026-04-01T08:30:00.000Z");
+    assert_eq!(
+        filtered["rows"][0]["t.tags"],
+        serde_json::json!(["launch", "priority"])
+    );
+    assert_eq!(filtered["rows"][0]["t.scores"], serde_json::json!([1, 2]));
+    assert_eq!(
+        filtered["rows"][0]["t.active_days"],
+        serde_json::json!(["2026-03-30", "2026-03-31"])
+    );
+
+    let insert_payload = parse_stdout_json(&output_success(
+        cli()
+            .arg("change")
+            .arg(&repo)
+            .arg("--query")
+            .arg(&queries)
+            .arg("--name")
+            .arg("insert_task")
+            .arg("--params")
+            .arg(
+                r#"{"slug":"gamma","title":"Embed prep","due_at":"2026-04-03T09:15:00Z","tags":["embed","launch"],"scores":[3,8],"active_days":["2026-04-02","2026-04-03"]}"#,
+            )
+            .arg("--json"),
+    ));
+    assert_eq!(insert_payload["affected_nodes"], 1);
+
+    let update_payload = parse_stdout_json(&output_success(
+        cli()
+            .arg("change")
+            .arg(&repo)
+            .arg("--query")
+            .arg(&queries)
+            .arg("--name")
+            .arg("update_task")
+            .arg("--params")
+            .arg(r#"{"slug":"gamma","due_at":"2026-04-04T10:45:00Z","tags":["embed","released"],"scores":[13,21],"active_days":["2026-04-04","2026-04-05"]}"#)
+            .arg("--json"),
+    ));
+    assert_eq!(update_payload["affected_nodes"], 1);
+
+    let gamma = parse_stdout_json(&output_success(
+        cli()
+            .arg("read")
+            .arg(&repo)
+            .arg("--query")
+            .arg(&queries)
+            .arg("--name")
+            .arg("get_task")
+            .arg("--params")
+            .arg(r#"{"slug":"gamma"}"#)
+            .arg("--json"),
+    ));
+    assert_eq!(gamma["row_count"], 1);
+    assert_eq!(gamma["rows"][0]["t.slug"], "gamma");
+    assert_eq!(gamma["rows"][0]["t.due_at"], "2026-04-04T10:45:00.000Z");
+    assert_eq!(
+        gamma["rows"][0]["t.tags"],
+        serde_json::json!(["embed", "released"])
+    );
+    assert_eq!(gamma["rows"][0]["t.scores"], serde_json::json!([13, 21]));
+    assert_eq!(
+        gamma["rows"][0]["t.active_days"],
+        serde_json::json!(["2026-04-04", "2026-04-05"])
+    );
+}
+
+#[test]
+#[ignore = "requires GEMINI_API_KEY and network access"]
+fn local_cli_real_gemini_string_nearest_query_returns_expected_match() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    let schema = temp.path().join("gemini.pg");
+    let data = temp.path().join("gemini.jsonl");
+    let queries = temp.path().join("gemini.gq");
+
+    write_query_file(
+        &schema,
+        r#"
+node Doc {
+    slug: String @key
+    title: String
+    embedding: Vector(4) @index
+}
+"#,
+    );
+
+    let alpha = embed_text_with_gemini("alpha", 4);
+    let beta = embed_text_with_gemini("beta", 4);
+    let gamma = embed_text_with_gemini("gamma", 4);
+    write_jsonl(
+        &data,
+        &format!(
+            r#"{{"type":"Doc","data":{{"slug":"alpha-doc","title":"alpha","embedding":[{}]}}}}
+{{"type":"Doc","data":{{"slug":"beta-doc","title":"beta","embedding":[{}]}}}}
+{{"type":"Doc","data":{{"slug":"gamma-doc","title":"gamma","embedding":[{}]}}}}"#,
+            format_vector(&alpha),
+            format_vector(&beta),
+            format_vector(&gamma),
+        ),
+    );
+    write_query_file(
+        &queries,
+        r#"
+query vector_search($q: String) {
+    match { $d: Doc }
+    return { $d.slug, $d.title }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+"#,
+    );
+
+    output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&repo));
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--data")
+            .arg(&data)
+            .arg(&repo),
+    );
+
+    let result = parse_stdout_json(&output_success(
+        cli()
+            .arg("read")
+            .arg(&repo)
+            .arg("--query")
+            .arg(&queries)
+            .arg("--name")
+            .arg("vector_search")
+            .arg("--params")
+            .arg(r#"{"q":"alpha"}"#)
+            .arg("--json"),
+    ));
+
+    assert_eq!(result["row_count"], 3);
+    assert_eq!(result["rows"][0]["d.slug"], "alpha-doc");
+}
+
+#[test]
 fn local_cli_transactional_load_drift_fails_without_partial_publish() {
     let repo = SystemRepo::loaded();
-    let large_data = repo.write_jsonl("system-large-load.jsonl", &bulk_people_jsonl(80_000));
+    let large_data = repo.write_jsonl("system-large-load.jsonl", &bulk_people_jsonl(250_000));
     let person_rows_before = snapshot_table_row_count(&repo, "node:Person");
 
     let mut load = cli_process();
@@ -405,13 +703,15 @@ fn local_cli_transactional_load_drift_fails_without_partial_publish() {
 
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let mut db = Omnigraph::open(repo.path().to_str().unwrap()).await.unwrap();
+        let interloper = db.begin_run("main", Some("system-test-interloper")).await.unwrap();
         db.load(
-            "main",
+            interloper.run_branch.as_str(),
             r#"{"type":"Person","data":{"name":"Interloper","age":41}}"#,
             LoadMode::Append,
         )
         .await
         .unwrap();
+        db.publish_run(&interloper.run_id).await.unwrap();
     });
 
     let output = child.wait_with_output().unwrap();

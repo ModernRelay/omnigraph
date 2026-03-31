@@ -34,7 +34,8 @@ mutation_predicate = { ident ~ comp_op ~ match_value }
 param_list = { param ~ ("," ~ param)* }
 param = { variable ~ ":" ~ type_ref }
 
-type_ref = { (base_type | vector_type) ~ "?"? }
+type_ref = { (list_type | base_type | vector_type) ~ "?"? }
+list_type = { "[" ~ base_type ~ "]" }
 vector_type = { "Vector" ~ "(" ~ integer ~ ")" }
 base_type = { "String" | "Blob" | "Bool" | "I32" | "I64" | "U32" | "U64" | "F32" | "F64" | "DateTime" | "Date" }
 

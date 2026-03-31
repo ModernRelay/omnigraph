@@ -1,5 +1,6 @@
 pub mod changes;
 pub mod db;
+mod embedding;
 pub mod error;
 mod exec;
 pub mod failpoints;

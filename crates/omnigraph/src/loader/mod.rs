@@ -4,9 +4,13 @@ use std::io::{BufRead, BufReader, Cursor};
 use std::sync::Arc;
 
 use arrow_array::{
-    builder::{FixedSizeListBuilder, Float32Builder},
-    ArrayRef, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray, UInt32Array, UInt64Array,
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array,
+    Float64Array, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
+    builder::{
+        ArrayBuilder, BooleanBuilder, Date32Builder, Date64Builder, FixedSizeListBuilder,
+        Float32Builder, Float64Builder, Int32Builder, Int64Builder, ListBuilder, StringBuilder,
+        UInt32Builder, UInt64Builder,
+    },
 };
 use arrow_schema::DataType;
 use base64::Engine;
@@ -452,7 +456,7 @@ fn build_column_from_json(
     nullable: bool,
     rows: &[JsonValue],
 ) -> Result<ArrayRef> {
-    match data_type {
+    let array: ArrayRef = match data_type {
         DataType::Utf8 => {
             let values: Vec<Option<String>> = rows
                 .iter()
@@ -462,74 +466,95 @@ fn build_column_from_json(
                         .map(|s| s.to_string())
                 })
                 .collect();
-            if !nullable && values.iter().any(|v| v.is_none()) {
-                return Err(OmniError::manifest(format!(
-                    "non-nullable property '{}' has null values",
-                    name
-                )));
-            }
-            Ok(Arc::new(StringArray::from(values)))
+            Arc::new(StringArray::from(values))
         }
         DataType::Int32 => {
             let values: Vec<Option<i32>> = rows
                 .iter()
                 .map(|row| row.get(name).and_then(|v| v.as_i64()).map(|v| v as i32))
                 .collect();
-            Ok(Arc::new(Int32Array::from(values)))
+            Arc::new(Int32Array::from(values))
         }
         DataType::Int64 => {
             let values: Vec<Option<i64>> = rows
                 .iter()
                 .map(|row| row.get(name).and_then(|v| v.as_i64()))
                 .collect();
-            Ok(Arc::new(Int64Array::from(values)))
+            Arc::new(Int64Array::from(values))
         }
         DataType::UInt32 => {
             let values: Vec<Option<u32>> = rows
                 .iter()
                 .map(|row| row.get(name).and_then(|v| v.as_u64()).map(|v| v as u32))
                 .collect();
-            Ok(Arc::new(UInt32Array::from(values)))
+            Arc::new(UInt32Array::from(values))
         }
         DataType::UInt64 => {
             let values: Vec<Option<u64>> = rows
                 .iter()
                 .map(|row| row.get(name).and_then(|v| v.as_u64()))
                 .collect();
-            Ok(Arc::new(UInt64Array::from(values)))
+            Arc::new(UInt64Array::from(values))
         }
         DataType::Float32 => {
             let values: Vec<Option<f32>> = rows
                 .iter()
                 .map(|row| row.get(name).and_then(|v| v.as_f64()).map(|v| v as f32))
                 .collect();
-            Ok(Arc::new(Float32Array::from(values)))
+            Arc::new(Float32Array::from(values))
         }
         DataType::Float64 => {
             let values: Vec<Option<f64>> = rows
                 .iter()
                 .map(|row| row.get(name).and_then(|v| v.as_f64()))
                 .collect();
-            Ok(Arc::new(Float64Array::from(values)))
+            Arc::new(Float64Array::from(values))
         }
         DataType::Boolean => {
             let values: Vec<Option<bool>> = rows
                 .iter()
                 .map(|row| row.get(name).and_then(|v| v.as_bool()))
                 .collect();
-            Ok(Arc::new(arrow_array::BooleanArray::from(values)))
+            Arc::new(BooleanArray::from(values))
         }
         DataType::Date32 => {
-            // Expect ISO date strings like "2024-01-15"
-            let values: Vec<Option<i32>> = rows
-                .iter()
-                .map(|row| {
-                    row.get(name)
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| parse_date32(s))
-                })
-                .collect();
-            Ok(Arc::new(Date32Array::from(values)))
+            let mut values = Vec::with_capacity(rows.len());
+            for row in rows {
+                values.push(parse_date32_json_value(row.get(name).unwrap_or(&JsonValue::Null))?);
+            }
+            Arc::new(Date32Array::from(values))
+        }
+        DataType::Date64 => {
+            let mut values = Vec::with_capacity(rows.len());
+            for row in rows {
+                values.push(parse_date64_json_value(row.get(name).unwrap_or(&JsonValue::Null))?);
+            }
+            Arc::new(Date64Array::from(values))
+        }
+        DataType::List(field) => {
+            let mut builder = ListBuilder::with_capacity(
+                make_list_value_builder(field.data_type(), rows.len())?,
+                rows.len(),
+            )
+            .with_field(field.clone());
+            for row in rows {
+                let value = row.get(name).unwrap_or(&JsonValue::Null);
+                if value.is_null() {
+                    builder.append(false);
+                    continue;
+                }
+                let items = value.as_array().ok_or_else(|| {
+                    OmniError::manifest(format!(
+                        "list property '{}' expects a JSON array, got {}",
+                        name, value
+                    ))
+                })?;
+                for item in items {
+                    append_json_list_item(builder.values(), field.data_type(), item)?;
+                }
+                builder.append(true);
+            }
+            Arc::new(builder.finish())
         }
         DataType::FixedSizeList(child_field, dim) => {
             // Vector type: parse JSON array of floats into FixedSizeList<Float32>
@@ -566,14 +591,218 @@ fn build_column_from_json(
                     )));
                 }
             }
-            Ok(Arc::new(builder.finish()))
+            Arc::new(builder.finish())
         }
         _ => {
             // Unsupported type: fill with nulls
             let values: Vec<Option<&str>> = vec![None; rows.len()];
-            Ok(Arc::new(StringArray::from(values)))
+            Arc::new(StringArray::from(values))
+        }
+    };
+
+    if !nullable && array.null_count() > 0 {
+        return Err(OmniError::manifest(format!(
+            "non-nullable property '{}' has null or invalid values",
+            name
+        )));
+    }
+
+    Ok(array)
+}
+
+fn make_list_value_builder(
+    data_type: &DataType,
+    capacity: usize,
+) -> Result<Box<dyn ArrayBuilder>> {
+    Ok(match data_type {
+        DataType::Utf8 => Box::new(StringBuilder::with_capacity(capacity, capacity * 8)),
+        DataType::Boolean => Box::new(BooleanBuilder::with_capacity(capacity)),
+        DataType::Int32 => Box::new(Int32Builder::with_capacity(capacity)),
+        DataType::Int64 => Box::new(Int64Builder::with_capacity(capacity)),
+        DataType::UInt32 => Box::new(UInt32Builder::with_capacity(capacity)),
+        DataType::UInt64 => Box::new(UInt64Builder::with_capacity(capacity)),
+        DataType::Float32 => Box::new(Float32Builder::with_capacity(capacity)),
+        DataType::Float64 => Box::new(Float64Builder::with_capacity(capacity)),
+        DataType::Date32 => Box::new(Date32Builder::with_capacity(capacity)),
+        DataType::Date64 => Box::new(Date64Builder::with_capacity(capacity)),
+        other => {
+            return Err(OmniError::manifest(format!(
+                "unsupported list element data type {:?}",
+                other
+            )));
+        }
+    })
+}
+
+fn append_json_list_item(
+    builder: &mut Box<dyn ArrayBuilder>,
+    data_type: &DataType,
+    value: &JsonValue,
+) -> Result<()> {
+    match data_type {
+        DataType::Utf8 => {
+            let builder = builder
+                .as_any_mut()
+                .downcast_mut::<StringBuilder>()
+                .ok_or_else(|| OmniError::manifest("list Utf8 builder downcast failed"))?;
+            if let Some(value) = value.as_str() {
+                builder.append_value(value);
+            } else {
+                builder.append_null();
+            }
+        }
+        DataType::Boolean => {
+            let builder = builder
+                .as_any_mut()
+                .downcast_mut::<BooleanBuilder>()
+                .ok_or_else(|| OmniError::manifest("list Boolean builder downcast failed"))?;
+            if let Some(value) = value.as_bool() {
+                builder.append_value(value);
+            } else {
+                builder.append_null();
+            }
+        }
+        DataType::Int32 => {
+            let builder = builder
+                .as_any_mut()
+                .downcast_mut::<Int32Builder>()
+                .ok_or_else(|| OmniError::manifest("list Int32 builder downcast failed"))?;
+            if let Some(value) = value.as_i64() {
+                let value = i32::try_from(value).map_err(|_| {
+                    OmniError::manifest(format!("list value {} exceeds Int32 range", value))
+                })?;
+                builder.append_value(value);
+            } else {
+                builder.append_null();
+            }
+        }
+        DataType::Int64 => {
+            let builder = builder
+                .as_any_mut()
+                .downcast_mut::<Int64Builder>()
+                .ok_or_else(|| OmniError::manifest("list Int64 builder downcast failed"))?;
+            if let Some(value) = value.as_i64() {
+                builder.append_value(value);
+            } else {
+                builder.append_null();
+            }
+        }
+        DataType::UInt32 => {
+            let builder = builder
+                .as_any_mut()
+                .downcast_mut::<UInt32Builder>()
+                .ok_or_else(|| OmniError::manifest("list UInt32 builder downcast failed"))?;
+            if let Some(value) = value.as_u64() {
+                let value = u32::try_from(value).map_err(|_| {
+                    OmniError::manifest(format!("list value {} exceeds UInt32 range", value))
+                })?;
+                builder.append_value(value);
+            } else {
+                builder.append_null();
+            }
+        }
+        DataType::UInt64 => {
+            let builder = builder
+                .as_any_mut()
+                .downcast_mut::<UInt64Builder>()
+                .ok_or_else(|| OmniError::manifest("list UInt64 builder downcast failed"))?;
+            if let Some(value) = value.as_u64() {
+                builder.append_value(value);
+            } else {
+                builder.append_null();
+            }
+        }
+        DataType::Float32 => {
+            let builder = builder
+                .as_any_mut()
+                .downcast_mut::<Float32Builder>()
+                .ok_or_else(|| OmniError::manifest("list Float32 builder downcast failed"))?;
+            if let Some(value) = value.as_f64() {
+                builder.append_value(value as f32);
+            } else {
+                builder.append_null();
+            }
+        }
+        DataType::Float64 => {
+            let builder = builder
+                .as_any_mut()
+                .downcast_mut::<Float64Builder>()
+                .ok_or_else(|| OmniError::manifest("list Float64 builder downcast failed"))?;
+            if let Some(value) = value.as_f64() {
+                builder.append_value(value);
+            } else {
+                builder.append_null();
+            }
+        }
+        DataType::Date32 => {
+            let builder = builder
+                .as_any_mut()
+                .downcast_mut::<Date32Builder>()
+                .ok_or_else(|| OmniError::manifest("list Date32 builder downcast failed"))?;
+            if let Some(value) = parse_date32_json_value(value)? {
+                builder.append_value(value);
+            } else {
+                builder.append_null();
+            }
+        }
+        DataType::Date64 => {
+            let builder = builder
+                .as_any_mut()
+                .downcast_mut::<Date64Builder>()
+                .ok_or_else(|| OmniError::manifest("list Date64 builder downcast failed"))?;
+            if let Some(value) = parse_date64_json_value(value)? {
+                builder.append_value(value);
+            } else {
+                builder.append_null();
+            }
+        }
+        other => {
+            return Err(OmniError::manifest(format!(
+                "unsupported list element data type {:?}",
+                other
+            )));
         }
     }
+
+    Ok(())
+}
+
+fn parse_date32_json_value(value: &JsonValue) -> Result<Option<i32>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    if let Some(days) = value.as_i64() {
+        let days = i32::try_from(days)
+            .map_err(|_| OmniError::manifest(format!("Date value out of range: {}", days)))?;
+        return Ok(Some(days));
+    }
+    if let Some(days) = value.as_u64() {
+        let days = i32::try_from(days)
+            .map_err(|_| OmniError::manifest(format!("Date value out of range: {}", days)))?;
+        return Ok(Some(days));
+    }
+    if let Some(value) = value.as_str() {
+        return Ok(Some(parse_date32_literal(value)?));
+    }
+    Ok(None)
+}
+
+fn parse_date64_json_value(value: &JsonValue) -> Result<Option<i64>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    if let Some(ms) = value.as_i64() {
+        return Ok(Some(ms));
+    }
+    if let Some(ms) = value.as_u64() {
+        let ms = i64::try_from(ms)
+            .map_err(|_| OmniError::manifest(format!("DateTime value out of range: {}", ms)))?;
+        return Ok(Some(ms));
+    }
+    if let Some(value) = value.as_str() {
+        return Ok(Some(parse_date64_literal(value)?));
+    }
+    Ok(None)
 }
 
 /// Write a batch to a Lance dataset, returning (new_version, total_row_count).
@@ -616,30 +845,39 @@ fn generate_id() -> String {
     ulid::Ulid::new().to_string()
 }
 
-fn parse_date32(s: &str) -> Option<i32> {
-    // Parse "YYYY-MM-DD" → days since epoch
-    let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 3 {
-        return None;
+pub(crate) fn parse_date32_literal(value: &str) -> Result<i32> {
+    let raw: Arc<dyn Array> = Arc::new(StringArray::from(vec![Some(value)]));
+    let casted = arrow_cast::cast::cast(raw.as_ref(), &DataType::Date32)
+        .map_err(|e| OmniError::manifest(format!("invalid Date literal '{}': {}", value, e)))?;
+    let out = casted
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .ok_or_else(|| OmniError::manifest("Date32 cast produced unexpected array"))?;
+    if out.is_null(0) {
+        return Err(OmniError::manifest(format!(
+            "invalid Date literal '{}'",
+            value
+        )));
     }
-    let y: i32 = parts[0].parse().ok()?;
-    let m: u32 = parts[1].parse().ok()?;
-    let d: u32 = parts[2].parse().ok()?;
-
-    // Days from 1970-01-01 using a simple calculation
-    // (accurate enough for testing; production would use chrono)
-    let days = days_from_civil(y, m, d);
-    Some(days)
+    Ok(out.value(0))
 }
 
-fn days_from_civil(y: i32, m: u32, d: u32) -> i32 {
-    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u32;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    (era * 146097 + doe as i32 - 719468) as i32
+pub(crate) fn parse_date64_literal(value: &str) -> Result<i64> {
+    let raw: Arc<dyn Array> = Arc::new(StringArray::from(vec![Some(value)]));
+    let casted = arrow_cast::cast::cast(raw.as_ref(), &DataType::Date64).map_err(|e| {
+        OmniError::manifest(format!("invalid DateTime literal '{}': {}", value, e))
+    })?;
+    let out = casted
+        .as_any()
+        .downcast_ref::<Date64Array>()
+        .ok_or_else(|| OmniError::manifest("Date64 cast produced unexpected array"))?;
+    if out.is_null(0) {
+        return Err(OmniError::manifest(format!(
+            "invalid DateTime literal '{}'",
+            value
+        )));
+    }
+    Ok(out.value(0))
 }
 
 // ─── Value constraint validation ─────────────────────────────────────────────

@@ -203,6 +203,13 @@ fn parse_param(pair: pest::iterators::Pair<Rule>) -> Result<Param> {
         .ok_or_else(|| NanoError::Parse("parameter type is missing".to_string()))?;
     let base = match core.as_rule() {
         Rule::base_type => core.as_str().to_string(),
+        Rule::list_type => {
+            let inner = core
+                .into_inner()
+                .next()
+                .ok_or_else(|| NanoError::Parse("list type missing item type".to_string()))?;
+            format!("[{}]", inner.as_str().trim())
+        }
         Rule::vector_type => {
             let vector = core
                 .into_inner()
@@ -1436,6 +1443,23 @@ query similar($q: Vector( 3 ) ?) {
         let q = &qf.queries[0];
         assert_eq!(q.params[0].type_name, "Vector(3)");
         assert!(q.params[0].nullable);
+    }
+
+    #[test]
+    fn test_parse_list_and_datetime_param_types() {
+        let input = r#"
+query tasks($tags: [String], $days: [Date]?, $due_at: DateTime) {
+    match { $t: Task }
+    return { $t.slug }
+}
+"#;
+        let qf = parse_query(input).unwrap();
+        let q = &qf.queries[0];
+        assert_eq!(q.params[0].type_name, "[String]");
+        assert!(!q.params[0].nullable);
+        assert_eq!(q.params[1].type_name, "[Date]");
+        assert!(q.params[1].nullable);
+        assert_eq!(q.params[2].type_name, "DateTime");
     }
 
     #[test]

@@ -105,6 +105,16 @@ pub struct PropType {
 }
 
 impl PropType {
+    pub fn from_param_type_name(s: &str, nullable: bool) -> Option<Self> {
+        if let Some(inner) = s.strip_prefix('[').and_then(|value| value.strip_suffix(']')) {
+            let scalar = ScalarType::from_str_name(inner)?;
+            return Some(Self::list_of(scalar, nullable));
+        }
+
+        let scalar = ScalarType::from_str_name(s)?;
+        Some(Self::scalar(scalar, nullable))
+    }
+
     pub fn scalar(scalar: ScalarType, nullable: bool) -> Self {
         Self {
             scalar,
@@ -196,6 +206,18 @@ mod tests {
         assert_eq!(
             ScalarType::from_str_name("Vector(2147483647)"),
             Some(ScalarType::Vector(2147483647))
+        );
+    }
+
+    #[test]
+    fn prop_type_from_param_type_name_supports_lists_and_nullable_scalars() {
+        assert_eq!(
+            PropType::from_param_type_name("[DateTime]", false),
+            Some(PropType::list_of(ScalarType::DateTime, false))
+        );
+        assert_eq!(
+            PropType::from_param_type_name("DateTime", true),
+            Some(PropType::scalar(ScalarType::DateTime, true))
         );
     }
 }

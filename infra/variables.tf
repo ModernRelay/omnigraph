@@ -73,6 +73,12 @@ variable "bearer_token" {
   sensitive   = true
 }
 
+variable "gemini_api_key" {
+  description = "Gemini API key. Stored in SSM Parameter Store."
+  type        = string
+  sensitive   = true
+}
+
 # --- DNS / CloudFront ---
 
 variable "domain_name" {
