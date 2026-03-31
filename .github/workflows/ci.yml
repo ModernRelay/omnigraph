@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test Workspace
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - name: Install Rust 1.91.0
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.0
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+
+  release_artifacts:
+    name: Build Linux Artifacts
+    needs: test
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - name: Install Rust 1.91.0
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.0
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Build release binaries
+        run: cargo build --release --locked -p omnigraph-server -p omnigraph-cli
+
+      - name: Package binaries
+        run: |
+          mkdir -p dist
+          install -m 0755 target/release/omnigraph-server dist/omnigraph-server
+          install -m 0755 target/release/omnigraph dist/omnigraph
+          tar -C dist -czf dist/omnigraph-linux-x86_64.tar.gz omnigraph-server omnigraph
+
+      - name: Build Linux demo repo
+        run: |
+          repo_root="$RUNNER_TEMP/context.omni"
+          rm -rf "$repo_root"
+          ./target/release/omnigraph init --schema demo/context.pg "$repo_root"
+          ./target/release/omnigraph load --data demo/context.jsonl "$repo_root"
+          tar -C "$RUNNER_TEMP" -czf dist/context.omni-linux-x86_64.tar.gz context.omni
+
+      - name: Write checksums
+        run: |
+          (
+            cd dist
+            sha256sum \
+              omnigraph-linux-x86_64.tar.gz \
+              context.omni-linux-x86_64.tar.gz \
+              > SHA256SUMS
+          )
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: omnigraph-linux-x86_64-${{ github.sha }}
+          retention-days: 14
+          path: |
+            dist/omnigraph-linux-x86_64.tar.gz
+            dist/context.omni-linux-x86_64.tar.gz
+            dist/SHA256SUMS

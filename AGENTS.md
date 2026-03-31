@@ -1,4 +1,6 @@
-# AGENTS.md
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project
 
@@ -9,6 +11,7 @@ The current codebase is not the older `omnigraph-engine` / `omnigraph-repo` spli
 - `omnigraph-compiler`
 - `omnigraph`
 - `omnigraph-cli`
+- `omnigraph-server`
 
 ## Build & Test Commands
 
@@ -43,25 +46,33 @@ cargo run -p omnigraph-cli -- <subcommand>
 
 ## Workspace Structure
 
-Cargo workspace with three crates:
+Cargo workspace with four crates:
 
 - **`omnigraph-compiler`** — Shared frontend/compiler crate. Owns `.pg` schema parsing, `.gq` query parsing, typechecking, catalog construction, IR lowering, result formatting, JSON param parsing, and embedding client code. This crate has no Lance dependency.
-- **`omnigraph`** — Lance-backed database runtime. Owns `Omnigraph`, `Snapshot`, `ManifestCoordinator`, JSONL loading, graph index building, query execution, traversal, search execution, blob handling, and mutations.
+- **`omnigraph`** — Lance-backed database runtime. Owns `Omnigraph`, `GraphCoordinator`, `Snapshot`, JSONL loading, graph index building, query execution, traversal, search execution, blob handling, mutations, runs (transactional branches), and change detection.
+- **`omnigraph-server`** — Axum HTTP server exposing Omnigraph over a REST API. Routes: `/healthz`, `/snapshot`, `/read`, `/change`, `/runs`, `/runs/{run_id}`, `/runs/{run_id}/publish`, `/runs/{run_id}/abort`. Configured via `omnigraph.yaml` or CLI flags. Bearer token auth via `OMNIGRAPH_SERVER_BEARER_TOKEN` env var.
 - **`omnigraph-cli`** — Binary crate for `omnigraph`. The command surface is defined, but most subcommands are still stubbed and print `not yet implemented`.
 
 Default members are:
 
 - `crates/omnigraph`
 - `crates/omnigraph-cli`
+- `crates/omnigraph-server`
 
 ## Architecture
 
 **Current top-level runtime objects:**
 
 ```text
-Omnigraph -> ManifestCoordinator -> Snapshot -> Lance sub-tables
-                          \
-                           -> cached GraphIndex
+Omnigraph
+  ├── GraphCoordinator (manifest + commit graph + run registry)
+  │     ├── Manifest → Snapshot → Lance sub-tables (pinned versions)
+  │     ├── CommitGraph → merge-base resolution
+  │     └── RunRegistry → transactional branch lifecycle
+  ├── TableStore (opens/creates Lance datasets by URI)
+  ├── StorageAdapter (filesystem abstraction for schema/blob I/O)
+  ├── RuntimeCache (cached GraphIndex, Catalog)
+  └── Catalog (compiled schema types)
 ```
 
 **Actual query pipeline:**
@@ -108,6 +119,8 @@ Read queries go through:
 - Surgical merge publish via merge_insert + delete (preserves row version metadata)
 - Change detection: two-path lineage-aware diff (version columns for same-branch, ID-based for cross-branch)
 - Change detection API: diff(), changes_since(), diff_commits(), entity_at(), snapshot_at_version()
+- Runs (transactional branches): create, load into, publish, abort — run registry tracks lifecycle and status
+- HTTP server (Axum): read queries, mutations, snapshot inspection, run management
 
 ## Important Current Limits
 
@@ -139,12 +152,19 @@ Treat these as historical/stale unless you are explicitly reviving them:
 - `crates/omnigraph-compiler/src/catalog/mod.rs` — catalog construction
 - `crates/omnigraph-compiler/src/ir/lower.rs` — AST to IR lowering
 - `crates/omnigraph/src/db/omnigraph.rs` — top-level DB handle
+- `crates/omnigraph/src/db/graph_coordinator.rs` — coordinates manifest, commit graph, and run registry
 - `crates/omnigraph/src/db/manifest.rs` — manifest and snapshot coordination
+- `crates/omnigraph/src/db/run_registry.rs` — transactional branch (run) lifecycle management
+- `crates/omnigraph/src/db/commit_graph.rs` — graph commit DAG for merge-base resolution
 - `crates/omnigraph/src/exec/mod.rs` — query and mutation executor
 - `crates/omnigraph/src/graph_index/mod.rs` — dense ID map plus CSR/CSC traversal index
 - `crates/omnigraph/src/loader/mod.rs` — active JSONL loader
 - `crates/omnigraph/src/changes/mod.rs` — change detection (diff_snapshots, ChangeSet, two-path lineage-aware diff)
-- `crates/omnigraph/src/db/commit_graph.rs` — graph commit DAG for merge-base resolution
+- `crates/omnigraph/src/table_store.rs` — opens/creates Lance datasets by URI
+- `crates/omnigraph/src/storage.rs` — filesystem abstraction (local; S3 not yet wired)
+- `crates/omnigraph-server/src/lib.rs` — HTTP server: routing, auth middleware, request handlers
+- `crates/omnigraph-server/src/api.rs` — request/response types for the REST API
+- `crates/omnigraph-server/src/config.rs` — YAML config loading (`omnigraph.yaml`) and CLI flag resolution
 - `crates/omnigraph-cli/src/main.rs` — current CLI surface (stubbed)
 
 ## Toolchain & Conventions
@@ -194,13 +214,22 @@ Fixtures live under `crates/omnigraph/tests/fixtures/`:
 - `test.pg` / `test.jsonl` / `test.gq` — basic Person/Company graph with reads, traversal, negation
 - `signals.pg` / `signals.jsonl` — larger keyed graph fixture
 - `search.pg` / `search.jsonl` / `search.gq` — text/vector/BM25/RRF search fixture
+- `context.pg` / `context.jsonl` — context fixture
 
 Integration tests live under `crates/omnigraph/tests/`:
 
-- `end_to_end.rs`
-- `traversal.rs`
-- `search.rs`
-- `consistency.rs`
+- `end_to_end.rs` — core query/mutation round-trips
+- `traversal.rs` — graph traversal paths
+- `search.rs` — FTS, BM25, vector, RRF search
+- `consistency.rs` — snapshot consistency invariants
+- `branching.rs` — branch create/merge/conflict workflows
+- `changes.rs` — change detection and diff APIs
+- `point_in_time.rs` — historical snapshot queries
+- `runs.rs` — transactional branch (run) lifecycle
+- `failpoints.rs` — fault injection tests via `fail` crate
+- `lance_version_columns.rs` — Lance version column behavior
+
+Server tests: `crates/omnigraph-server/tests/server.rs`
 
 ## Companion: lance-explore
 
@@ -221,3 +250,7 @@ poetry run lance-explore node ~/code/omnigraph-test cerebras
 - Migration/split strategy: `docs/dev/nano-omni.md`
 - Lance format spec: `docs/dev/lance-format-spec.md`
 - Lance guide: `docs/dev/lance-guide.md`
+- Architecture review: `docs/dev/architecture-review.md`
+- Public model design: `docs/dev/public-model.md`
+- Runs and transactional branches design: `docs/dev/runs-and-transactional-branches.md`
+- Lance alignment: `docs/dev/lance-alignment.md`

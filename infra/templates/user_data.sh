@@ -22,6 +22,14 @@ fi
 
 mkdir -p ${data_dir}/data
 
+# --- Ensure SSM agent is installed and running ---
+dnf install -y amazon-ssm-agent
+systemctl enable amazon-ssm-agent
+systemctl start amazon-ssm-agent
+
+# --- Ensure EC2 Instance Connect is installed ---
+dnf install -y ec2-instance-connect
+
 # --- Create omnigraph system user ---
 useradd --system --no-create-home --shell /sbin/nologin omnigraph || true
 chown -R omnigraph:omnigraph ${data_dir}

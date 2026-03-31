@@ -7,13 +7,13 @@
 | Endpoint | `https://d1lk4b7ad2a56j.cloudfront.net` |
 | CloudFront | `d1lk4b7ad2a56j.cloudfront.net` |
 | ALB (origin) | `omnigraph-885988689.us-east-1.elb.amazonaws.com` |
-| Instance | `i-04ed54b3cd720fc21` |
+| Instance | `i-091e0fb8e7c0ffb4b` |
 | Region | `us-east-1` |
 
 ## Access
 
 ```bash
-aws ssm start-session --target i-04ed54b3cd720fc21 --region us-east-1
+aws ssm start-session --target i-091e0fb8e7c0ffb4b --region us-east-1
 ```
 
 ## Terraform
