@@ -868,15 +868,23 @@ query q($tags: [String], $days: [Date]?, $due_at: DateTime) {
         ));
         match params.get("tags") {
             Some(Literal::List(values)) => {
-                assert!(matches!(values.first(), Some(Literal::String(value)) if value == "launch"));
-                assert!(matches!(values.get(1), Some(Literal::String(value)) if value == "priority"));
+                assert!(
+                    matches!(values.first(), Some(Literal::String(value)) if value == "launch")
+                );
+                assert!(
+                    matches!(values.get(1), Some(Literal::String(value)) if value == "priority")
+                );
             }
             other => panic!("expected string list param, got {:?}", other),
         }
         match params.get("days") {
             Some(Literal::List(values)) => {
-                assert!(matches!(values.first(), Some(Literal::Date(value)) if value == "2026-04-01"));
-                assert!(matches!(values.get(1), Some(Literal::Date(value)) if value == "2026-04-02"));
+                assert!(
+                    matches!(values.first(), Some(Literal::Date(value)) if value == "2026-04-01")
+                );
+                assert!(
+                    matches!(values.get(1), Some(Literal::Date(value)) if value == "2026-04-02")
+                );
             }
             other => panic!("expected date list param, got {:?}", other),
         }

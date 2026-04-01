@@ -202,12 +202,14 @@ fn lower_clauses(
     // Lower traversals into Expand ops
     // Handle "cycle closing" — if both src and dst are already bound, use a filter
     for traversal in &traversals {
-        let edge = catalog.lookup_edge_by_name(&traversal.edge_name).ok_or_else(|| {
-            crate::error::NanoError::Plan(format!(
-                "lowering traversal referenced missing edge '{}' after typecheck",
-                traversal.edge_name
-            ))
-        })?;
+        let edge = catalog
+            .lookup_edge_by_name(&traversal.edge_name)
+            .ok_or_else(|| {
+                crate::error::NanoError::Plan(format!(
+                    "lowering traversal referenced missing edge '{}' after typecheck",
+                    traversal.edge_name
+                ))
+            })?;
 
         // Determine direction from type context
         let direction = type_ctx

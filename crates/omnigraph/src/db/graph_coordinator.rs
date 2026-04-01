@@ -102,7 +102,7 @@ impl GraphCoordinator {
         catalog: &Catalog,
         storage: Arc<dyn StorageAdapter>,
     ) -> Result<Self> {
-        let root = normalize_root_uri(root_uri);
+        let root = normalize_root_uri(root_uri)?;
         let manifest = ManifestCoordinator::init(&root, catalog).await?;
         let commit_graph = Some(CommitGraph::init(&root, manifest.version()).await?);
         Ok(Self {
@@ -116,7 +116,7 @@ impl GraphCoordinator {
     }
 
     pub async fn open(root_uri: &str, storage: Arc<dyn StorageAdapter>) -> Result<Self> {
-        let root = normalize_root_uri(root_uri);
+        let root = normalize_root_uri(root_uri)?;
         let manifest = ManifestCoordinator::open(&root).await?;
         let commit_graph = if storage.exists(&graph_commits_uri(&root)).await? {
             Some(CommitGraph::open(&root).await?)
@@ -148,7 +148,7 @@ impl GraphCoordinator {
             return Self::open(root_uri, storage).await;
         };
 
-        let root = normalize_root_uri(root_uri);
+        let root = normalize_root_uri(root_uri)?;
         let manifest = ManifestCoordinator::open_at_branch(&root, &branch_name).await?;
         let commit_graph = if storage.exists(&graph_commits_uri(&root)).await? {
             Some(CommitGraph::open_at_branch(&root, &branch_name).await?)
@@ -325,7 +325,11 @@ impl GraphCoordinator {
         if self.commit_graph.is_some() {
             return Ok(());
         }
-        if !self.storage.exists(&graph_commits_uri(self.root_uri())).await? {
+        if !self
+            .storage
+            .exists(&graph_commits_uri(self.root_uri()))
+            .await?
+        {
             let _ = CommitGraph::init(self.root_uri(), self.manifest.version()).await?;
         }
         self.commit_graph = match self.current_branch() {
@@ -339,7 +343,11 @@ impl GraphCoordinator {
         if self.run_registry.is_some() {
             return Ok(());
         }
-        if !self.storage.exists(&graph_runs_uri(self.root_uri())).await? {
+        if !self
+            .storage
+            .exists(&graph_runs_uri(self.root_uri()))
+            .await?
+        {
             let _ = RunRegistry::init(self.root_uri()).await?;
         }
         self.run_registry = Some(RunRegistry::open(self.root_uri()).await?);
@@ -413,7 +421,11 @@ impl GraphCoordinator {
         &self,
         branch: Option<&str>,
     ) -> Result<Option<CommitGraph>> {
-        if !self.storage.exists(&graph_commits_uri(self.root_uri())).await? {
+        if !self
+            .storage
+            .exists(&graph_commits_uri(self.root_uri()))
+            .await?
+        {
             return Ok(None);
         }
         let graph = match branch {
@@ -439,7 +451,11 @@ impl GraphCoordinator {
                 return Ok(run);
             }
         }
-        if !self.storage.exists(&graph_runs_uri(self.root_uri())).await? {
+        if !self
+            .storage
+            .exists(&graph_runs_uri(self.root_uri()))
+            .await?
+        {
             return Err(OmniError::manifest_not_found(format!(
                 "run '{}' not found",
                 run_id
@@ -456,7 +472,11 @@ impl GraphCoordinator {
         if let Some(run_registry) = &self.run_registry {
             return run_registry.list_runs().await;
         }
-        if !self.storage.exists(&graph_runs_uri(self.root_uri())).await? {
+        if !self
+            .storage
+            .exists(&graph_runs_uri(self.root_uri()))
+            .await?
+        {
             return Ok(Vec::new());
         }
         let run_registry = RunRegistry::open(self.root_uri()).await?;

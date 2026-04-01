@@ -387,10 +387,7 @@ impl ManifestCoordinator {
             .list_branches()
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
-        let mut names: Vec<String> = branches
-            .into_keys()
-            .filter(|name| name != "main")
-            .collect();
+        let mut names: Vec<String> = branches.into_keys().filter(|name| name != "main").collect();
         names.sort();
         let mut all = vec!["main".to_string()];
         all.extend(names);
@@ -444,19 +441,27 @@ async fn read_manifest_state(dataset: &Dataset) -> Result<ManifestState> {
 fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
     batch
         .column_by_name(name)
-        .ok_or_else(|| OmniError::manifest_internal(format!("manifest batch missing '{name}' column")))?
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!("manifest batch missing '{name}' column"))
+        })?
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| OmniError::manifest_internal(format!("manifest column '{name}' is not Utf8")))
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!("manifest column '{name}' is not Utf8"))
+        })
 }
 
 fn u64_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt64Array> {
     batch
         .column_by_name(name)
-        .ok_or_else(|| OmniError::manifest_internal(format!("manifest batch missing '{name}' column")))?
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!("manifest batch missing '{name}' column"))
+        })?
         .as_any()
         .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| OmniError::manifest_internal(format!("manifest column '{name}' is not UInt64")))
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!("manifest column '{name}' is not UInt64"))
+        })
 }
 
 /// Create an empty Lance dataset with the given schema.
@@ -637,7 +642,10 @@ edge WorksAt: Person -> Company {
         let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
         let branches = mc.list_branches().await.unwrap();
         assert_eq!(
-            branches.iter().filter(|branch| branch.as_str() == "main").count(),
+            branches
+                .iter()
+                .filter(|branch| branch.as_str() == "main")
+                .count(),
             1
         );
     }

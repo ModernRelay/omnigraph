@@ -4,8 +4,8 @@ use std::io::{BufRead, BufReader, Cursor};
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array,
-    Float64Array, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
+    Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
     builder::{
         ArrayBuilder, BooleanBuilder, Date32Builder, Date64Builder, FixedSizeListBuilder,
         Float32Builder, Float64Builder, Int32Builder, Int64Builder, ListBuilder, StringBuilder,
@@ -520,14 +520,18 @@ fn build_column_from_json(
         DataType::Date32 => {
             let mut values = Vec::with_capacity(rows.len());
             for row in rows {
-                values.push(parse_date32_json_value(row.get(name).unwrap_or(&JsonValue::Null))?);
+                values.push(parse_date32_json_value(
+                    row.get(name).unwrap_or(&JsonValue::Null),
+                )?);
             }
             Arc::new(Date32Array::from(values))
         }
         DataType::Date64 => {
             let mut values = Vec::with_capacity(rows.len());
             for row in rows {
-                values.push(parse_date64_json_value(row.get(name).unwrap_or(&JsonValue::Null))?);
+                values.push(parse_date64_json_value(
+                    row.get(name).unwrap_or(&JsonValue::Null),
+                )?);
             }
             Arc::new(Date64Array::from(values))
         }
@@ -576,7 +580,9 @@ fn build_column_from_json(
                         )));
                     }
                     for val in arr {
-                        builder.values().append_value(val.as_f64().unwrap_or(0.0) as f32);
+                        builder
+                            .values()
+                            .append_value(val.as_f64().unwrap_or(0.0) as f32);
                     }
                     builder.append(true);
                 } else if nullable {
@@ -610,10 +616,7 @@ fn build_column_from_json(
     Ok(array)
 }
 
-fn make_list_value_builder(
-    data_type: &DataType,
-    capacity: usize,
-) -> Result<Box<dyn ArrayBuilder>> {
+fn make_list_value_builder(data_type: &DataType, capacity: usize) -> Result<Box<dyn ArrayBuilder>> {
     Ok(match data_type {
         DataType::Utf8 => Box::new(StringBuilder::with_capacity(capacity, capacity * 8)),
         DataType::Boolean => Box::new(BooleanBuilder::with_capacity(capacity)),
@@ -864,9 +867,8 @@ pub(crate) fn parse_date32_literal(value: &str) -> Result<i32> {
 
 pub(crate) fn parse_date64_literal(value: &str) -> Result<i64> {
     let raw: Arc<dyn Array> = Arc::new(StringArray::from(vec![Some(value)]));
-    let casted = arrow_cast::cast::cast(raw.as_ref(), &DataType::Date64).map_err(|e| {
-        OmniError::manifest(format!("invalid DateTime literal '{}': {}", value, e))
-    })?;
+    let casted = arrow_cast::cast::cast(raw.as_ref(), &DataType::Date64)
+        .map_err(|e| OmniError::manifest(format!("invalid DateTime literal '{}': {}", value, e)))?;
     let out = casted
         .as_any()
         .downcast_ref::<Date64Array>()

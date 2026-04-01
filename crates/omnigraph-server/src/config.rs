@@ -177,7 +177,8 @@ impl OmnigraphConfig {
         explicit_target: Option<&str>,
         default_target: Option<&str>,
     ) -> Option<&str> {
-        let target_name = self.resolve_target_name(explicit_uri, explicit_target, default_target)?;
+        let target_name =
+            self.resolve_target_name(explicit_uri, explicit_target, default_target)?;
         self.targets
             .get(target_name)
             .and_then(|target| target.bearer_token_env.as_deref())
@@ -400,7 +401,8 @@ policy: {}
         fs::write(config_dir.join("local.gq"), "query local { return {} }").unwrap();
         fs::write(ambient_dir.join("local.gq"), "query ambient { return {} }").unwrap();
 
-        let config = load_config_in(&ambient_dir, Some(&config_dir.join("omnigraph.yaml"))).unwrap();
+        let config =
+            load_config_in(&ambient_dir, Some(&config_dir.join("omnigraph.yaml"))).unwrap();
         let resolved = config.resolve_query_path(Path::new("local.gq")).unwrap();
 
         assert_eq!(resolved, config_dir.join("local.gq"));

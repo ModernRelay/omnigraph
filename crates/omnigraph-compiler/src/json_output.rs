@@ -340,7 +340,13 @@ mod tests {
             Some(f64::NEG_INFINITY),
         ]));
         assert_eq!(array_value_to_json(&values, 0), serde_json::json!("NaN"));
-        assert_eq!(array_value_to_json(&values, 1), serde_json::json!("Infinity"));
-        assert_eq!(array_value_to_json(&values, 2), serde_json::json!("-Infinity"));
+        assert_eq!(
+            array_value_to_json(&values, 1),
+            serde_json::json!("Infinity")
+        );
+        assert_eq!(
+            array_value_to_json(&values, 2),
+            serde_json::json!("-Infinity")
+        );
     }
 }

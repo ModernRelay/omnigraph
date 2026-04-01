@@ -1,0 +1,83 @@
+name: Package
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Git ref to package in CodeBuild
+        required: false
+        default: main
+
+concurrency:
+  group: package-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  codebuild_package:
+    name: Package via CodeBuild (AL2023)
+    if: ${{ vars.AWS_CODEBUILD_PACKAGE_PROJECT != '' && vars.AWS_ROLE_TO_ASSUME != '' && vars.AWS_REGION != '' }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_CODEBUILD_PACKAGE_PROJECT: ${{ vars.AWS_CODEBUILD_PACKAGE_PROJECT }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve source ref
+        id: source_ref
+        env:
+          WORKFLOW_SOURCE_REF: ${{ github.event.inputs.source_ref }}
+        run: |
+          source_ref="${GITHUB_SHA}"
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && -n "${WORKFLOW_SOURCE_REF}" ]]; then
+            source_ref="${WORKFLOW_SOURCE_REF}"
+          fi
+          echo "value=${source_ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Start CodeBuild package job
+        id: start
+        run: |
+          build_id="$(aws codebuild start-build \
+            --project-name "${AWS_CODEBUILD_PACKAGE_PROJECT}" \
+            --source-version "${{ steps.source_ref.outputs.value }}" \
+            --query 'build.id' \
+            --output text)"
+          echo "build_id=${build_id}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for CodeBuild completion
+        run: |
+          build_id="${{ steps.start.outputs.build_id }}"
+          while true; do
+            status="$(aws codebuild batch-get-builds --ids "${build_id}" --query 'builds[0].buildStatus' --output text)"
+            echo "CodeBuild status: ${status}"
+            case "${status}" in
+              SUCCEEDED)
+                exit 0
+                ;;
+              FAILED|FAULT|STOPPED|TIMED_OUT)
+                aws codebuild batch-get-builds --ids "${build_id}" --query 'builds[0].logs.deepLink' --output text
+                exit 1
+                ;;
+            esac
+            sleep 15
+          done
+
+      - name: Print CodeBuild logs link
+        if: always()
+        run: |
+          aws codebuild batch-get-builds \
+            --ids "${{ steps.start.outputs.build_id }}" \
+            --query 'builds[0].logs.deepLink' \
+            --output text

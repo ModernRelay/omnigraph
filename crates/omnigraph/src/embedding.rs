@@ -89,7 +89,9 @@ impl EmbeddingClient {
         let http = Client::builder()
             .timeout(Duration::from_millis(timeout_ms))
             .build()
-            .map_err(|e| OmniError::manifest_internal(format!("failed to initialize HTTP client: {}", e)))?;
+            .map_err(|e| {
+                OmniError::manifest_internal(format!("failed to initialize HTTP client: {}", e))
+            })?;
 
         Ok(Self {
             retry_attempts,
@@ -111,7 +113,11 @@ impl EmbeddingClient {
         }
     }
 
-    pub(crate) async fn embed_query_text(&self, input: &str, expected_dim: usize) -> Result<Vec<f32>> {
+    pub(crate) async fn embed_query_text(
+        &self,
+        input: &str,
+        expected_dim: usize,
+    ) -> Result<Vec<f32>> {
         if expected_dim == 0 {
             return Err(OmniError::manifest_internal(
                 "embedding dimension must be greater than zero",
@@ -206,10 +212,11 @@ impl EmbeddingClient {
             });
         }
 
-        let parsed: GeminiEmbedResponse = serde_json::from_str(&body).map_err(|err| EmbedCallError {
-            message: format!("embedding response decode failed: {}", err),
-            retryable: false,
-        })?;
+        let parsed: GeminiEmbedResponse =
+            serde_json::from_str(&body).map_err(|err| EmbedCallError {
+                message: format!("embedding response decode failed: {}", err),
+                retryable: false,
+            })?;
 
         validate_and_normalize_embedding(parsed.embedding.values, expected_dim).map_err(|message| {
             EmbedCallError {
@@ -243,7 +250,10 @@ fn build_gemini_request(input: &str, expected_dim: usize) -> Value {
     })
 }
 
-fn validate_and_normalize_embedding(values: Vec<f32>, expected_dim: usize) -> std::result::Result<Vec<f32>, String> {
+fn validate_and_normalize_embedding(
+    values: Vec<f32>,
+    expected_dim: usize,
+) -> std::result::Result<Vec<f32>, String> {
     if values.len() != expected_dim {
         return Err(format!(
             "embedding dimension mismatch: expected {}, got {}",
@@ -330,8 +340,8 @@ fn xorshift64(mut x: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use serial_test::serial;
 

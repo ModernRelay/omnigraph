@@ -28,16 +28,16 @@ use omnigraph_compiler::lower_query;
 use omnigraph_compiler::query::ast::{CompOp, Literal, NOW_PARAM_NAME};
 use omnigraph_compiler::query::typecheck::{CheckedQuery, typecheck_query, typecheck_query_decl};
 use omnigraph_compiler::result::{MutationResult, QueryResult};
-use omnigraph_compiler::types::ScalarType;
 use omnigraph_compiler::types::Direction;
+use omnigraph_compiler::types::ScalarType;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use crate::embedding::EmbeddingClient;
 use crate::db::commit_graph::CommitGraph;
 use crate::db::manifest::ManifestCoordinator;
 use crate::db::{MergeOutcome, Omnigraph, is_internal_run_branch};
 use crate::db::{ReadTarget, Snapshot};
+use crate::embedding::EmbeddingClient;
 use crate::error::{MergeConflict, MergeConflictKind, OmniError, Result};
 use crate::graph_index::GraphIndex;
 use tempfile::{Builder as TempDirBuilder, TempDir};
@@ -107,9 +107,7 @@ impl Omnigraph {
                 .iter()
                 .map(|(name, et)| (name.clone(), (et.from_type.clone(), et.to_type.clone())))
                 .collect();
-            Some(Arc::new(
-                GraphIndex::build(&snapshot, &edge_types).await?,
-            ))
+            Some(Arc::new(GraphIndex::build(&snapshot, &edge_types).await?))
         } else {
             None
         };
@@ -1251,8 +1249,7 @@ async fn resolve_nearest_query_vec(
     match lit {
         Literal::List(_) => literal_to_f32_vec(&lit),
         Literal::String(text) => {
-            let expected_dim =
-                nearest_property_dimension(ir, catalog, variable, property)?;
+            let expected_dim = nearest_property_dimension(ir, catalog, variable, property)?;
             EmbeddingClient::from_env()?
                 .embed_query_text(&text, expected_dim)
                 .await
@@ -2398,10 +2395,8 @@ fn literal_list_to_array(items: &[Literal], num_rows: usize) -> Result<ArrayRef>
     let scalar_type = list_scalar_type(items)?;
     match scalar_type {
         ScalarType::String => {
-            let mut builder =
-                ListBuilder::with_capacity(StringBuilder::new(), num_rows).with_field(Arc::new(
-                    Field::new("item", DataType::Utf8, true),
-                ));
+            let mut builder = ListBuilder::with_capacity(StringBuilder::new(), num_rows)
+                .with_field(Arc::new(Field::new("item", DataType::Utf8, true)));
             for _ in 0..num_rows {
                 for item in items {
                     match item {
@@ -2476,11 +2471,9 @@ fn literal_list_to_array(items: &[Literal], num_rows: usize) -> Result<ArrayRef>
             for _ in 0..num_rows {
                 for item in items {
                     match item {
-                        Literal::Date(value) => {
-                            builder
-                                .values()
-                                .append_value(crate::loader::parse_date32_literal(value)?)
-                        }
+                        Literal::Date(value) => builder
+                            .values()
+                            .append_value(crate::loader::parse_date32_literal(value)?),
                         _ => builder.values().append_null(),
                     }
                 }
@@ -2494,11 +2487,9 @@ fn literal_list_to_array(items: &[Literal], num_rows: usize) -> Result<ArrayRef>
             for _ in 0..num_rows {
                 for item in items {
                     match item {
-                        Literal::DateTime(value) => {
-                            builder
-                                .values()
-                                .append_value(crate::loader::parse_date64_literal(value)?)
-                        }
+                        Literal::DateTime(value) => builder
+                            .values()
+                            .append_value(crate::loader::parse_date64_literal(value)?),
                         _ => builder.values().append_null(),
                     }
                 }
@@ -2513,7 +2504,9 @@ fn literal_list_to_array(items: &[Literal], num_rows: usize) -> Result<ArrayRef>
 }
 
 fn list_scalar_type(items: &[Literal]) -> Result<ScalarType> {
-    let first = items.first().ok_or_else(|| OmniError::manifest("empty list literal"))?;
+    let first = items
+        .first()
+        .ok_or_else(|| OmniError::manifest("empty list literal"))?;
     let expected = literal_scalar_type(first)?;
     for item in items.iter().skip(1) {
         let item_type = literal_scalar_type(item)?;
@@ -2811,7 +2804,10 @@ fn typed_list_literal_to_array(
                     match item {
                         Literal::Integer(value) => {
                             let value = i32::try_from(*value).map_err(|_| {
-                                OmniError::manifest(format!("list value {} exceeds Int32 range", value))
+                                OmniError::manifest(format!(
+                                    "list value {} exceeds Int32 range",
+                                    value
+                                ))
                             })?;
                             builder.values().append_value(value);
                         }
@@ -2842,7 +2838,10 @@ fn typed_list_literal_to_array(
                     match item {
                         Literal::Integer(value) => {
                             let value = u32::try_from(*value).map_err(|_| {
-                                OmniError::manifest(format!("list value {} exceeds UInt32 range", value))
+                                OmniError::manifest(format!(
+                                    "list value {} exceeds UInt32 range",
+                                    value
+                                ))
                             })?;
                             builder.values().append_value(value);
                         }
@@ -2860,7 +2859,10 @@ fn typed_list_literal_to_array(
                     match item {
                         Literal::Integer(value) => {
                             let value = u64::try_from(*value).map_err(|_| {
-                                OmniError::manifest(format!("list value {} exceeds UInt64 range", value))
+                                OmniError::manifest(format!(
+                                    "list value {} exceeds UInt64 range",
+                                    value
+                                ))
                             })?;
                             builder.values().append_value(value);
                         }
@@ -2904,11 +2906,9 @@ fn typed_list_literal_to_array(
             for _ in 0..num_rows {
                 for item in items {
                     match item {
-                        Literal::Date(value) => {
-                            builder
-                                .values()
-                                .append_value(crate::loader::parse_date32_literal(value)?)
-                        }
+                        Literal::Date(value) => builder
+                            .values()
+                            .append_value(crate::loader::parse_date32_literal(value)?),
                         _ => builder.values().append_null(),
                     }
                 }
@@ -2921,11 +2921,9 @@ fn typed_list_literal_to_array(
             for _ in 0..num_rows {
                 for item in items {
                     match item {
-                        Literal::DateTime(value) => {
-                            builder
-                                .values()
-                                .append_value(crate::loader::parse_date64_literal(value)?)
-                        }
+                        Literal::DateTime(value) => builder
+                            .values()
+                            .append_value(crate::loader::parse_date64_literal(value)?),
                         _ => builder.values().append_null(),
                     }
                 }

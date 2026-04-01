@@ -7,6 +7,39 @@ mod support;
 use support::*;
 
 #[test]
+fn version_command_prints_current_cli_version() {
+    let output = output_success(cli().arg("version"));
+    let stdout = stdout_string(&output);
+
+    assert_eq!(
+        stdout.trim(),
+        format!("omnigraph {}", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn short_version_flag_prints_current_cli_version() {
+    let output = output_success(cli().arg("-v"));
+    let stdout = stdout_string(&output);
+
+    assert_eq!(
+        stdout.trim(),
+        format!("omnigraph {}", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn long_version_flag_prints_current_cli_version() {
+    let output = output_success(cli().arg("--version"));
+    let stdout = stdout_string(&output);
+
+    assert_eq!(
+        stdout.trim(),
+        format!("omnigraph {}", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
 fn init_creates_repo_successfully_on_missing_local_directory() {
     let temp = tempdir().unwrap();
     let repo = repo_path(temp.path());

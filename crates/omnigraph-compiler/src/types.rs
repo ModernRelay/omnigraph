@@ -106,7 +106,10 @@ pub struct PropType {
 
 impl PropType {
     pub fn from_param_type_name(s: &str, nullable: bool) -> Option<Self> {
-        if let Some(inner) = s.strip_prefix('[').and_then(|value| value.strip_suffix(']')) {
+        if let Some(inner) = s
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+        {
             let scalar = ScalarType::from_str_name(inner)?;
             return Some(Self::list_of(scalar, nullable));
         }

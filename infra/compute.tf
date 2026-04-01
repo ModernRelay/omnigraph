@@ -76,6 +76,7 @@ data "aws_iam_policy_document" "read_ssm_secrets" {
     resources = [
       aws_ssm_parameter.bearer_token.arn,
       aws_ssm_parameter.gemini_api_key.arn,
+      aws_ssm_parameter.repo_target_uri.arn,
     ]
   }
 }
@@ -84,6 +85,30 @@ resource "aws_iam_role_policy" "read_ssm_secrets" {
   name   = "read-ssm-secrets"
   role   = aws_iam_role.ec2.id
   policy = data.aws_iam_policy_document.read_ssm_secrets.json
+}
+
+# --- S3 Repo Access ---
+
+data "aws_iam_policy_document" "s3_repo_access" {
+  statement {
+    actions = [
+      "s3:GetObject",
+      "s3:PutObject",
+      "s3:DeleteObject",
+      "s3:ListBucket",
+      "s3:GetBucketLocation",
+    ]
+    resources = [
+      aws_s3_bucket.omnigraph_repo.arn,
+      "${aws_s3_bucket.omnigraph_repo.arn}/*",
+    ]
+  }
+}
+
+resource "aws_iam_role_policy" "s3_repo_access" {
+  name   = "s3-repo-access"
+  role   = aws_iam_role.ec2.id
+  policy = data.aws_iam_policy_document.s3_repo_access.json
 }
 
 resource "aws_iam_instance_profile" "ec2" {
@@ -107,14 +132,15 @@ resource "aws_instance" "omnigraph" {
   }
 
   user_data = base64encode(templatefile("${path.module}/templates/user_data.sh", {
-    aws_region     = var.aws_region
+    aws_region          = var.aws_region
     ssm_token_name      = aws_ssm_parameter.bearer_token.name
     ssm_gemini_key_name = aws_ssm_parameter.gemini_api_key.name
+    ssm_target_uri_name = aws_ssm_parameter.repo_target_uri.name
     ebs_device          = "/dev/xvdf"
-    data_dir       = "/var/lib/omnigraph"
-    repo_name      = var.repo_name
-    config_dir     = "/etc/omnigraph"
-    bin_dir        = "/opt/omnigraph/bin"
+    data_dir            = "/var/lib/omnigraph"
+    repo_name           = var.repo_name
+    config_dir          = "/etc/omnigraph"
+    bin_dir             = "/opt/omnigraph/bin"
   }))
 
   tags = { Name = var.project_name }

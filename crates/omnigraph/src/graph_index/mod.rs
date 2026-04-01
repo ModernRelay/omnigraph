@@ -213,10 +213,14 @@ impl GraphIndex {
 fn string_column<'a>(batch: &'a arrow_array::RecordBatch, name: &str) -> Result<&'a StringArray> {
     batch
         .column_by_name(name)
-        .ok_or_else(|| OmniError::manifest_internal(format!("graph index batch missing '{name}' column")))?
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!("graph index batch missing '{name}' column"))
+        })?
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| OmniError::manifest_internal(format!("graph index column '{name}' is not Utf8")))
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!("graph index column '{name}' is not Utf8"))
+        })
 }
 
 #[cfg(test)]
@@ -296,7 +300,11 @@ mod tests {
     #[test]
     fn string_column_returns_error_for_bad_schema() {
         let batch = arrow_array::RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new("src", DataType::UInt64, false)])),
+            Arc::new(Schema::new(vec![Field::new(
+                "src",
+                DataType::UInt64,
+                false,
+            )])),
             vec![Arc::new(UInt64Array::from(vec![1_u64]))],
         )
         .unwrap();

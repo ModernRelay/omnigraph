@@ -79,6 +79,67 @@ variable "gemini_api_key" {
   sensitive   = true
 }
 
+# --- S3 Storage ---
+
+variable "repo_bucket_name" {
+  description = "Override repo bucket name. Defaults to omnigraph-repo-<account>-<region>."
+  type        = string
+  default     = ""
+}
+
+variable "artifact_bucket_name" {
+  description = "Override artifact bucket name. Defaults to omnigraph-artifacts-<account>-<region>."
+  type        = string
+  default     = ""
+}
+
+variable "logs_bucket_name" {
+  description = "Override logs bucket name. Defaults to omnigraph-s3-logs-<account>-<region>."
+  type        = string
+  default     = ""
+}
+
+variable "repo_graph_name" {
+  description = "Name of the graph inside the repo bucket."
+  type        = string
+  default     = "context"
+}
+
+variable "initial_repo_target_uri" {
+  description = "Initial S3 URI for the live graph repo. Leave empty for local-disk fallback."
+  type        = string
+  default     = ""
+}
+
+# --- Build ---
+
+variable "codebuild_compute_type" {
+  description = "CodeBuild compute type."
+  type        = string
+  default     = "BUILD_GENERAL1_MEDIUM"
+}
+
+variable "codebuild_image" {
+  description = "CodeBuild image. Must be AL2023-compatible."
+  type        = string
+  default     = "aws/codebuild/amazonlinux-aarch64-standard:3.0"
+}
+
+variable "github_repository" {
+  description = "GitHub repository in owner/repo format."
+  type        = string
+  default     = "ModernRelay/omnigraph"
+}
+
+variable "github_oidc_subjects" {
+  description = "Allowed OIDC sub claims for GitHub Actions."
+  type        = list(string)
+  default = [
+    "repo:ModernRelay/omnigraph:ref:refs/heads/main",
+    "repo:ModernRelay/omnigraph:ref:refs/tags/*",
+  ]
+}
+
 # --- DNS / CloudFront ---
 
 variable "domain_name" {

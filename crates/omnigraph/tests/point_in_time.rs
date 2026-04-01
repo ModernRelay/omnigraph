@@ -307,7 +307,11 @@ async fn traversal_delete_edge_invisible_at_historical_version() {
     )
     .await
     .unwrap();
-    assert_eq!(current.num_rows(), 0, "Alice should have no friends after edge deletion");
+    assert_eq!(
+        current.num_rows(),
+        0,
+        "Alice should have no friends after edge deletion"
+    );
 }
 
 // ─── Negation (AntiJoin) × Insert ──────────────────────────────────────────
@@ -496,14 +500,9 @@ query fof($name: String) {
     assert_eq!(hist_names, vec!["Diana"]);
 
     // Current: friends-of-friends of Alice = Diana + Eve
-    let current = query_main(
-        &mut db,
-        fof_query,
-        "fof",
-        &params(&[("$name", "Alice")]),
-    )
-    .await
-    .unwrap();
+    let current = query_main(&mut db, fof_query, "fof", &params(&[("$name", "Alice")]))
+        .await
+        .unwrap();
     assert_eq!(current.num_rows(), 2);
     let cur_names = collect_column_strings(current.batches(), "f.name");
     assert!(cur_names.contains(&"Diana".to_string()));
@@ -607,9 +606,14 @@ async fn branch_point_in_time_isolated_from_main() {
     assert!(!hist_names.contains(&"Frank".to_string()));
 
     // Current main: 5 persons (Eve present, Frank not visible on main)
-    let cur_main = query_main(&mut main, ALL_PERSONS_QUERY, "all_persons", &ParamMap::new())
-        .await
-        .unwrap();
+    let cur_main = query_main(
+        &mut main,
+        ALL_PERSONS_QUERY,
+        "all_persons",
+        &ParamMap::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(cur_main.num_rows(), 5);
     let cur_names = collect_column_strings(cur_main.batches(), "p.name");
     assert!(cur_names.contains(&"Eve".to_string()));
@@ -684,7 +688,12 @@ async fn four_version_chain_insert_update_delete() {
 
     // v2: Eve exists with age 22, 5 persons
     let at_v2 = db
-        .run_query_at(v2, GET_PERSON_QUERY, "get_person", &params(&[("$name", "Eve")]))
+        .run_query_at(
+            v2,
+            GET_PERSON_QUERY,
+            "get_person",
+            &params(&[("$name", "Eve")]),
+        )
         .await
         .unwrap();
     assert_eq!(at_v2.num_rows(), 1);
@@ -699,7 +708,12 @@ async fn four_version_chain_insert_update_delete() {
 
     // v3: Eve exists with age 50
     let at_v3 = db
-        .run_query_at(v3, GET_PERSON_QUERY, "get_person", &params(&[("$name", "Eve")]))
+        .run_query_at(
+            v3,
+            GET_PERSON_QUERY,
+            "get_person",
+            &params(&[("$name", "Eve")]),
+        )
         .await
         .unwrap();
     assert_eq!(at_v3.num_rows(), 1);

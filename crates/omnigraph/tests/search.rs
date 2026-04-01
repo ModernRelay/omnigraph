@@ -416,9 +416,14 @@ async fn nearest_string_literal_works_under_mock_embeddings() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_mock_embedding_search_db(&dir).await;
 
-    let result = query_main(&mut db, MOCK_SEARCH_QUERIES, "vector_search_literal", &params(&[]))
-        .await
-        .unwrap();
+    let result = query_main(
+        &mut db,
+        MOCK_SEARCH_QUERIES,
+        "vector_search_literal",
+        &params(&[]),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(result_slugs(&result)[0], "alpha-doc");
 }

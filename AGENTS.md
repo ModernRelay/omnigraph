@@ -51,13 +51,9 @@ Cargo workspace with four crates:
 - **`omnigraph-compiler`** — Shared frontend/compiler crate. Owns `.pg` schema parsing, `.gq` query parsing, typechecking, catalog construction, IR lowering, result formatting, JSON param parsing, and embedding client code. This crate has no Lance dependency.
 - **`omnigraph`** — Lance-backed database runtime. Owns `Omnigraph`, `GraphCoordinator`, `Snapshot`, JSONL loading, graph index building, query execution, traversal, search execution, blob handling, mutations, runs (transactional branches), and change detection.
 - **`omnigraph-server`** — Axum HTTP server exposing Omnigraph over a REST API. Routes: `/healthz`, `/snapshot`, `/read`, `/change`, `/runs`, `/runs/{run_id}`, `/runs/{run_id}/publish`, `/runs/{run_id}/abort`. Configured via `omnigraph.yaml` or CLI flags. Bearer token auth via `OMNIGRAPH_SERVER_BEARER_TOKEN` env var.
-- **`omnigraph-cli`** — Binary crate for `omnigraph`. The command surface is defined, but most subcommands are still stubbed and print `not yet implemented`.
+- **`omnigraph-cli`** — Binary crate for `omnigraph`. Implements `init`, `load`, `branch` (create/list/merge), `snapshot`, `read`, `change`, and `run` subcommands. Supports both local repo mode and remote server mode (via `--target` or `omnigraph.yaml` config).
 
-Default members are:
-
-- `crates/omnigraph`
-- `crates/omnigraph-cli`
-- `crates/omnigraph-server`
+Default members are `omnigraph`, `omnigraph-cli`, and `omnigraph-server`. Note that `omnigraph-compiler` is **not** a default member — use `cargo build --workspace` or `-p omnigraph-compiler` to build it.
 
 ## Architecture
 
@@ -125,7 +121,6 @@ Read queries go through:
 ## Important Current Limits
 
 - Point-in-time query execution (`run_query_at`) is implemented (Step 10b)
-- CLI subcommands are mostly stubs
 - `init`/`open` currently use local filesystem paths; `s3://` support is not wired up yet
 - There are stale files under `crates/omnigraph/src/loader/` from an older design; the live exported loader is `crates/omnigraph/src/loader/mod.rs`
 - Aggregates typecheck in the compiler, but runtime projection/execution is still partial
@@ -169,7 +164,8 @@ Treat these as historical/stale unless you are explicitly reviving them:
 
 ## Toolchain & Conventions
 
-- Rust 1.91.0, edition 2024
+- Rust 1.91.0, edition 2024 (pinned in `rust-toolchain.toml`)
+- CI runs `cargo test --workspace --locked` and requires `protobuf-compiler` system dep
 - Tokio async runtime
 - Errors via `thiserror`
 - Parse diagnostics via `ariadne`
@@ -189,8 +185,6 @@ Treat these as historical/stale unless you are explicitly reviving them:
 
 ## CLI Usage
 
-Current CLI syntax shape:
-
 ```bash
 # Initialize a repo from a schema
 omnigraph init --schema ./schema.pg ./my-repo
@@ -198,14 +192,30 @@ omnigraph init --schema ./schema.pg ./my-repo
 # Load JSONL data into a repo
 omnigraph load --data ./data.jsonl ./my-repo
 
+# Load with explicit mode (overwrite | merge | append)
+omnigraph load --mode merge --data ./data.jsonl ./my-repo
+
 # Create a branch
-omnigraph branch create ./my-repo --from main feature-x
+omnigraph branch create --uri ./my-repo --from main feature-x
+
+# List branches
+omnigraph branch list --uri ./my-repo
+
+# Merge a branch into main
+omnigraph branch merge --uri ./my-repo feature-x
 
 # Show branch snapshot
-omnigraph snapshot ./my-repo --branch feature-x --json
-```
+omnigraph snapshot --uri ./my-repo --branch feature-x --json
 
-These commands are not fully implemented yet in `omnigraph-cli`.
+# Execute a read query
+omnigraph read --uri ./my-repo --query ./queries.gq --name my_query --json
+
+# Execute a mutation
+omnigraph change --uri ./my-repo --query ./queries.gq --name my_mutation --json
+
+# Remote mode (via config or --target)
+omnigraph read --target http://localhost:3000 --query ./queries.gq --name my_query
+```
 
 ## Test Fixtures
 
@@ -254,3 +264,7 @@ poetry run lance-explore node ~/code/omnigraph-test cerebras
 - Public model design: `docs/dev/public-model.md`
 - Runs and transactional branches design: `docs/dev/runs-and-transactional-branches.md`
 - Lance alignment: `docs/dev/lance-alignment.md`
+- Embeddings development: `docs/dev/embeddings-dev.md`
+- Canonicalization: `docs/dev/omnigraph-canon.md`
+- Lance v4: `docs/dev/omnigraph-lance4.md`
+- Seed data: `docs/dev/omnigraph-seed.md`

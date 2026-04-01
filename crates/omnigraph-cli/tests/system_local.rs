@@ -53,7 +53,9 @@ fn wait_for_running_run(repo: &SystemRepo) -> String {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     for _ in 0..200 {
         let running = runtime.block_on(async {
-            let db = Omnigraph::open(repo.path().to_str().unwrap()).await.unwrap();
+            let db = Omnigraph::open(repo.path().to_str().unwrap())
+                .await
+                .unwrap();
             db.list_runs()
                 .await
                 .unwrap()
@@ -61,8 +63,7 @@ fn wait_for_running_run(repo: &SystemRepo) -> String {
                 .find(|run| run.target_branch == "main" && run.status.as_str() == "running")
                 .map(|run| run.run_id.to_string())
         });
-        if let Some(run_id) = running
-        {
+        if let Some(run_id) = running {
             return run_id;
         }
         sleep(Duration::from_millis(50));
@@ -133,6 +134,19 @@ fn format_vector(values: &[f32]) -> String {
         .map(|value| format!("{:.8}", value))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn s3_test_repo_uri(suite: &str) -> Option<String> {
+    let bucket = env::var("OMNIGRAPH_S3_TEST_BUCKET").ok()?;
+    let prefix = env::var("OMNIGRAPH_S3_TEST_PREFIX")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "omnigraph-itests".to_string());
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(format!("s3://{}/{}/{}/{}", bucket, prefix, suite, unique))
 }
 
 #[test]
@@ -275,6 +289,80 @@ fn local_cli_end_to_end_branch_change_merge_flow() {
         runs.iter()
             .any(|run| run["target_branch"] == "feature" && run["status"] == "published")
     );
+}
+
+#[test]
+fn local_cli_s3_end_to_end_init_load_read_flow() {
+    let Some(repo_uri) = s3_test_repo_uri("cli-local") else {
+        eprintln!("skipping s3 cli test: OMNIGRAPH_S3_TEST_BUCKET is not set");
+        return;
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let query_root = temp.path();
+    let config = query_root.join("omnigraph.yaml");
+    let query = query_root.join("test.gq");
+    fs::copy(fixture("test.gq"), &query).unwrap();
+    write_config(
+        &config,
+        &format!(
+            "\
+targets:
+  rustfs:
+    uri: '{}'
+cli:
+  target: rustfs
+  branch: main
+query:
+  roots:
+    - .
+policy: {{}}
+",
+            repo_uri
+        ),
+    );
+
+    output_success(
+        cli()
+            .arg("init")
+            .arg("--schema")
+            .arg(fixture("test.pg"))
+            .arg(&repo_uri),
+    );
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--data")
+            .arg(fixture("test.jsonl"))
+            .arg(&repo_uri),
+    );
+
+    let read = parse_stdout_json(&output_success(
+        cli()
+            .current_dir(query_root)
+            .arg("read")
+            .arg("--config")
+            .arg(&config)
+            .arg("--query")
+            .arg("test.gq")
+            .arg("--name")
+            .arg("get_person")
+            .arg("--params")
+            .arg(r#"{"name":"Alice"}"#)
+            .arg("--json"),
+    ));
+    assert_eq!(read["row_count"], 1);
+    assert_eq!(read["rows"][0]["p.name"], "Alice");
+
+    let snapshot = parse_stdout_json(&output_success(
+        cli()
+            .current_dir(query_root)
+            .arg("snapshot")
+            .arg("--config")
+            .arg(&config)
+            .arg("--json"),
+    ));
+    assert!(snapshot["tables"].is_array());
 }
 
 #[test]
@@ -519,13 +607,7 @@ query get_task($slug: String) {
     );
 
     output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&repo));
-    output_success(
-        cli()
-            .arg("load")
-            .arg("--data")
-            .arg(&data)
-            .arg(&repo),
-    );
+    output_success(cli().arg("load").arg("--data").arg(&data).arg(&repo));
 
     let filtered = parse_stdout_json(&output_success(
         cli()
@@ -536,9 +618,7 @@ query get_task($slug: String) {
             .arg("--name")
             .arg("due_with_tag")
             .arg("--params")
-            .arg(
-                r#"{"deadline":"2026-04-02T00:00:00Z","tag":"launch"}"#,
-            )
+            .arg(r#"{"deadline":"2026-04-02T00:00:00Z","tag":"launch"}"#)
             .arg("--json"),
     ));
     assert_eq!(filtered["row_count"], 1);
@@ -657,13 +737,7 @@ query vector_search($q: String) {
     );
 
     output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&repo));
-    output_success(
-        cli()
-            .arg("load")
-            .arg("--data")
-            .arg(&data)
-            .arg(&repo),
-    );
+    output_success(cli().arg("load").arg("--data").arg(&data).arg(&repo));
 
     let result = parse_stdout_json(&output_success(
         cli()
@@ -702,8 +776,13 @@ fn local_cli_transactional_load_drift_fails_without_partial_publish() {
     let run_id = wait_for_running_run(&repo);
 
     tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let mut db = Omnigraph::open(repo.path().to_str().unwrap()).await.unwrap();
-        let interloper = db.begin_run("main", Some("system-test-interloper")).await.unwrap();
+        let mut db = Omnigraph::open(repo.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let interloper = db
+            .begin_run("main", Some("system-test-interloper"))
+            .await
+            .unwrap();
         db.load(
             interloper.run_branch.as_str(),
             r#"{"type":"Person","data":{"name":"Interloper","age":41}}"#,

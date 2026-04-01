@@ -58,11 +58,7 @@ impl AppState {
         Self::new_with_bearer_token(uri, db, None)
     }
 
-    pub fn new_with_bearer_token(
-        uri: String,
-        db: Omnigraph,
-        bearer_token: Option<String>,
-    ) -> Self {
+    pub fn new_with_bearer_token(uri: String, db: Omnigraph, bearer_token: Option<String>) -> Self {
         Self {
             uri,
             db: Arc::new(RwLock::new(db)),
@@ -207,11 +203,9 @@ pub fn build_app(state: AppState) -> Router {
 }
 
 pub async fn serve(config: ServerConfig) -> Result<()> {
-    let state = AppState::open_with_bearer_token(
-        config.uri.clone(),
-        server_bearer_token_from_env(),
-    )
-    .await?;
+    let state =
+        AppState::open_with_bearer_token(config.uri.clone(), server_bearer_token_from_env())
+            .await?;
     let listener = TcpListener::bind(&config.bind).await?;
     info!(uri = %config.uri, bind = %config.bind, "serving omnigraph");
     axum::serve(listener, build_app(state))

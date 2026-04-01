@@ -8,8 +8,8 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance::blob::{BlobArrayBuilder, blob_field};
-use lance::datatypes::BlobKind;
 use lance::dataset::BlobFile;
+use lance::datatypes::BlobKind;
 use omnigraph_compiler::build_catalog;
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
 use omnigraph_compiler::schema::parser::parse_schema;
@@ -19,7 +19,7 @@ use crate::db::graph_coordinator::{GraphCoordinator, PublishedSnapshot};
 use crate::db::run_registry::{RunRecord, RunStatus, is_internal_run_branch};
 use crate::error::{OmniError, Result};
 use crate::runtime_cache::RuntimeCache;
-use crate::storage::{StorageAdapter, default_storage, join_uri, normalize_root_uri};
+use crate::storage::{StorageAdapter, join_uri, normalize_root_uri, storage_for_uri};
 use crate::table_store::TableStore;
 
 use super::manifest::Snapshot;
@@ -54,7 +54,7 @@ impl Omnigraph {
     ///
     /// Creates `_schema.pg`, per-type Lance datasets, and `_manifest.lance`.
     pub async fn init(uri: &str, schema_source: &str) -> Result<Self> {
-        Self::init_with_storage(uri, schema_source, default_storage()).await
+        Self::init_with_storage(uri, schema_source, storage_for_uri(uri)?).await
     }
 
     pub(crate) async fn init_with_storage(
@@ -62,7 +62,7 @@ impl Omnigraph {
         schema_source: &str,
         storage: Arc<dyn StorageAdapter>,
     ) -> Result<Self> {
-        let root = normalize_root_uri(uri);
+        let root = normalize_root_uri(uri)?;
         // Parse and validate schema
         let schema_ast = parse_schema(schema_source)?;
         let mut catalog = build_catalog(&schema_ast)?;
@@ -90,14 +90,14 @@ impl Omnigraph {
     ///
     /// Reads `_schema.pg`, parses it, builds the catalog, and opens the manifest.
     pub async fn open(uri: &str) -> Result<Self> {
-        Self::open_with_storage(uri, default_storage()).await
+        Self::open_with_storage(uri, storage_for_uri(uri)?).await
     }
 
     pub(crate) async fn open_with_storage(
         uri: &str,
         storage: Arc<dyn StorageAdapter>,
     ) -> Result<Self> {
-        let root = normalize_root_uri(uri);
+        let root = normalize_root_uri(uri)?;
         // Read _schema.pg
         let schema_path = join_uri(&root, SCHEMA_FILENAME);
         let schema_source = storage.read_text(&schema_path).await?;
@@ -601,7 +601,9 @@ impl Omnigraph {
 
     pub(crate) async fn latest_branch_snapshot_id(&self, branch: &str) -> Result<SnapshotId> {
         let normalized = normalize_branch_name(branch)?;
-        let fresh = self.open_coordinator_for_branch(normalized.as_deref()).await?;
+        let fresh = self
+            .open_coordinator_for_branch(normalized.as_deref())
+            .await?;
         fresh.resolve_snapshot_id(branch).await
     }
 
@@ -1113,7 +1115,11 @@ impl Omnigraph {
         self.runtime_cache.invalidate_all().await;
     }
 
-    async fn batch_for_table_rewrite(&self, source_ds: &Dataset, table_key: &str) -> Result<RecordBatch> {
+    async fn batch_for_table_rewrite(
+        &self,
+        source_ds: &Dataset,
+        table_key: &str,
+    ) -> Result<RecordBatch> {
         let target_schema = schema_for_table_key(self.catalog(), table_key)?;
         let blob_properties = blob_properties_for_table_key(self.catalog(), table_key)?;
         if blob_properties.is_empty() {
@@ -1159,17 +1165,13 @@ impl Omnigraph {
                         .await?,
                 );
             } else {
-                columns.push(
-                    batch.column_by_name(field.name())
-                        .cloned()
-                        .ok_or_else(|| {
-                            OmniError::Lance(format!(
-                                "missing column '{}.{}' in rewrite batch",
-                                table_key,
-                                field.name()
-                            ))
-                        })?,
-                );
+                columns.push(batch.column_by_name(field.name()).cloned().ok_or_else(|| {
+                    OmniError::Lance(format!(
+                        "missing column '{}.{}' in rewrite batch",
+                        table_key,
+                        field.name()
+                    ))
+                })?);
             }
         }
 
@@ -1225,7 +1227,11 @@ impl Omnigraph {
                     .map_err(|e| OmniError::Lance(e.to_string()))?;
             } else {
                 builder
-                    .push_bytes(blob.read().await.map_err(|e| OmniError::Lance(e.to_string()))?)
+                    .push_bytes(
+                        blob.read()
+                            .await
+                            .map_err(|e| OmniError::Lance(e.to_string()))?,
+                    )
                     .map_err(|e| OmniError::Lance(e.to_string()))?;
             }
         }
@@ -1237,7 +1243,9 @@ impl Omnigraph {
             )));
         }
 
-        builder.finish().map_err(|e| OmniError::Lance(e.to_string()))
+        builder
+            .finish()
+            .map_err(|e| OmniError::Lance(e.to_string()))
     }
 }
 
@@ -1280,10 +1288,7 @@ fn same_manifest_state(
     }
 }
 
-fn concat_or_empty_batches(
-    schema: Arc<Schema>,
-    batches: Vec<RecordBatch>,
-) -> Result<RecordBatch> {
+fn concat_or_empty_batches(schema: Arc<Schema>, batches: Vec<RecordBatch>) -> Result<RecordBatch> {
     if batches.is_empty() {
         return Ok(RecordBatch::new_empty(schema));
     }

@@ -53,22 +53,33 @@ GEMINI_KEY=$(aws ssm get-parameter \
   --query 'Parameter.Value' \
   --output text)
 
+TARGET_URI=$(aws ssm get-parameter \
+  --name "${ssm_target_uri_name}" \
+  --region ${aws_region} \
+  --query 'Parameter.Value' \
+  --output text)
+
 cat > ${config_dir}/server.env <<ENVEOF
 OMNIGRAPH_SERVER_BEARER_TOKEN=$TOKEN
 GEMINI_API_KEY=$GEMINI_KEY
+OMNIGRAPH_TARGET_URI=$TARGET_URI
+AWS_REGION=${aws_region}
 ENVEOF
 
 chmod 600 ${config_dir}/server.env
 chown omnigraph:omnigraph ${config_dir}/server.env
 
 # --- Write omnigraph.yaml ---
+# If OMNIGRAPH_TARGET_URI is set, use it; otherwise fall back to local disk
 cat > ${config_dir}/omnigraph.yaml <<YAMLEOF
 targets:
+  active:
+    uri: $TARGET_URI
   local:
     uri: ${data_dir}/data/${repo_name}
 
 server:
-  target: local
+  target: active
   bind: 0.0.0.0:8080
 
 policy: {}
@@ -82,7 +93,6 @@ cat > /etc/systemd/system/omnigraph-server.service <<UNITEOF
 Description=Omnigraph Server
 After=network-online.target local-fs.target
 Wants=network-online.target
-ConditionPathExists=${data_dir}/data/${repo_name}
 
 [Service]
 Type=simple

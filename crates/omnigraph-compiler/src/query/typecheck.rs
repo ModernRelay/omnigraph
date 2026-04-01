@@ -116,12 +116,13 @@ fn parse_declared_param_types(params: &[Param]) -> Result<HashMap<String, PropTy
                 NOW_PARAM_NAME
             )));
         }
-        let prop_type = PropType::from_param_type_name(&p.type_name, p.nullable).ok_or_else(|| {
-            NanoError::Type(format!(
-                "unknown parameter type `{}` for `${}`",
-                p.type_name, p.name
-            ))
-        })?;
+        let prop_type =
+            PropType::from_param_type_name(&p.type_name, p.nullable).ok_or_else(|| {
+                NanoError::Type(format!(
+                    "unknown parameter type `{}` for `${}`",
+                    p.type_name, p.name
+                ))
+            })?;
         out.insert(p.name.clone(), prop_type);
     }
     Ok(out)

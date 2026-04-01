@@ -318,7 +318,9 @@ fn commits_to_batch(commits: &[GraphCommit]) -> Result<RecordBatch> {
     .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
-async fn load_commit_cache(dataset: &Dataset) -> Result<(HashMap<String, GraphCommit>, Option<GraphCommit>)> {
+async fn load_commit_cache(
+    dataset: &Dataset,
+) -> Result<(HashMap<String, GraphCommit>, Option<GraphCommit>)> {
     let batches: Vec<RecordBatch> = dataset
         .scan()
         .try_into_stream()
@@ -390,19 +392,27 @@ fn should_replace_head(current: Option<&GraphCommit>, candidate: &GraphCommit) -
 fn string_column<'a>(batch: &'a RecordBatch, name: &str, context: &str) -> Result<&'a StringArray> {
     batch
         .column_by_name(name)
-        .ok_or_else(|| OmniError::manifest_internal(format!("{context} batch missing '{name}' column")))?
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!("{context} batch missing '{name}' column"))
+        })?
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| OmniError::manifest_internal(format!("{context} column '{name}' is not Utf8")))
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!("{context} column '{name}' is not Utf8"))
+        })
 }
 
 fn u64_column<'a>(batch: &'a RecordBatch, name: &str, context: &str) -> Result<&'a UInt64Array> {
     batch
         .column_by_name(name)
-        .ok_or_else(|| OmniError::manifest_internal(format!("{context} batch missing '{name}' column")))?
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!("{context} batch missing '{name}' column"))
+        })?
         .as_any()
         .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| OmniError::manifest_internal(format!("{context} column '{name}' is not UInt64")))
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!("{context} column '{name}' is not UInt64"))
+        })
 }
 
 fn timestamp_micros_column<'a>(
@@ -412,7 +422,9 @@ fn timestamp_micros_column<'a>(
 ) -> Result<&'a TimestampMicrosecondArray> {
     batch
         .column_by_name(name)
-        .ok_or_else(|| OmniError::manifest_internal(format!("{context} batch missing '{name}' column")))?
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!("{context} batch missing '{name}' column"))
+        })?
         .as_any()
         .downcast_ref::<TimestampMicrosecondArray>()
         .ok_or_else(|| {

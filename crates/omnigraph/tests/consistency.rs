@@ -143,7 +143,9 @@ query company($name: String) {
 "#;
 
     let mut db = Omnigraph::init(uri, schema).await.unwrap();
-    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
 
     let result = query_main(&mut db, query, "company", &params(&[("$name", "Alice")]))
         .await
@@ -549,14 +551,24 @@ async fn stale_handle_public_mutation_uses_latest_target_head() {
     .await
     .unwrap();
 
-    let result = query_main(&mut db2, TEST_QUERIES, "get_person", &params(&[("$name", "Alice")]))
-        .await
-        .unwrap();
+    let result = query_main(
+        &mut db2,
+        TEST_QUERIES,
+        "get_person",
+        &params(&[("$name", "Alice")]),
+    )
+    .await
+    .unwrap();
     assert_eq!(result.num_rows(), 1);
     assert_eq!(result.to_rust_json()[0]["p.age"], serde_json::json!(99));
 
-    let eve = query_main(&mut db2, TEST_QUERIES, "get_person", &params(&[("$name", "Eve")]))
-        .await
-        .unwrap();
+    let eve = query_main(
+        &mut db2,
+        TEST_QUERIES,
+        "get_person",
+        &params(&[("$name", "Eve")]),
+    )
+    .await
+    .unwrap();
     assert_eq!(eve.num_rows(), 1, "concurrent insert should be preserved");
 }

@@ -241,3 +241,16 @@ pub fn vector_and_string_params(
     map.insert(key, Literal::String(str_value.to_string()));
     map
 }
+
+pub fn s3_test_repo_uri(suite: &str) -> Option<String> {
+    let bucket = std::env::var("OMNIGRAPH_S3_TEST_BUCKET").ok()?;
+    let prefix = std::env::var("OMNIGRAPH_S3_TEST_PREFIX")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "omnigraph-itests".to_string());
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(format!("s3://{}/{}/{}/{}", bucket, prefix, suite, unique))
+}

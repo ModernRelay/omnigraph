@@ -22,3 +22,46 @@ output "ssm_connect_command" {
   description = "Command to connect via SSM"
   value       = "aws ssm start-session --target ${aws_instance.omnigraph.id} --region ${var.aws_region}"
 }
+
+# --- S3 ---
+
+output "repo_bucket_name" {
+  description = "S3 bucket for Omnigraph repos"
+  value       = aws_s3_bucket.omnigraph_repo.id
+}
+
+output "artifact_bucket_name" {
+  description = "S3 bucket for build artifacts"
+  value       = aws_s3_bucket.omnigraph_artifacts.id
+}
+
+output "logs_bucket_name" {
+  description = "S3 bucket for access logs"
+  value       = aws_s3_bucket.s3_logs.id
+}
+
+# --- Build ---
+
+output "codebuild_project_name" {
+  description = "CodeBuild project name"
+  value       = aws_codebuild_project.package.name
+}
+
+output "ecr_repository_url" {
+  description = "ECR repository URL"
+  value       = aws_ecr_repository.omnigraph_server.repository_url
+}
+
+# --- OIDC ---
+
+output "github_actions_role_arn" {
+  description = "GitHub Actions OIDC role ARN"
+  value       = aws_iam_role.github_actions.arn
+}
+
+# --- Runtime ---
+
+output "repo_target_uri_param" {
+  description = "SSM parameter name for active repo target URI"
+  value       = aws_ssm_parameter.repo_target_uri.name
+}

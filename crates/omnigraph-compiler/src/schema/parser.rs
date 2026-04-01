@@ -4,7 +4,9 @@ use pest::Parser;
 use pest::error::InputLocation;
 use pest_derive::Parser;
 
-use crate::error::{NanoError, ParseDiagnostic, Result, SourceSpan, decode_string_literal, render_span};
+use crate::error::{
+    NanoError, ParseDiagnostic, Result, SourceSpan, decode_string_literal, render_span,
+};
 use crate::types::{PropType, ScalarType};
 
 use super::ast::*;

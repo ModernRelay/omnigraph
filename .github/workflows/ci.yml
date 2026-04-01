@@ -46,14 +46,21 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace --locked
 
-  release_artifacts:
-    name: Build Linux Artifacts
+  rustfs_integration:
+    name: RustFS S3 Integration
     needs: test
-    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
-    runs-on: blacksmith-8vcpu-ubuntu-2404
-    timeout-minutes: 60
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 45
     permissions:
       contents: read
+    env:
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
+      AWS_REGION: us-east-1
+      AWS_ENDPOINT_URL_S3: http://127.0.0.1:9000
+      AWS_S3_FORCE_PATH_STYLE: "true"
+      OMNIGRAPH_S3_TEST_BUCKET: omnigraph-ci
+      OMNIGRAPH_S3_TEST_PREFIX: github-actions
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -61,7 +68,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev python3-pip
 
       - name: Install Rust 1.91.0
         uses: dtolnay/rust-toolchain@stable
@@ -74,40 +81,41 @@ jobs:
           workspaces: |
             . -> target
 
-      - name: Build release binaries
-        run: cargo build --release --locked -p omnigraph-server -p omnigraph-cli
-
-      - name: Package binaries
+      - name: Start RustFS
         run: |
-          mkdir -p dist
-          install -m 0755 target/release/omnigraph-server dist/omnigraph-server
-          install -m 0755 target/release/omnigraph dist/omnigraph
-          tar -C dist -czf dist/omnigraph-linux-x86_64.tar.gz omnigraph-server omnigraph
+          docker rm -f rustfs >/dev/null 2>&1 || true
+          docker run -d \
+            --name rustfs \
+            -p 9000:9000 \
+            -p 9001:9001 \
+            -e RUSTFS_ACCESS_KEY="${AWS_ACCESS_KEY_ID}" \
+            -e RUSTFS_SECRET_KEY="${AWS_SECRET_ACCESS_KEY}" \
+            rustfs/rustfs:latest \
+            /data
 
-      - name: Build Linux demo repo
+      - name: Install AWS CLI
         run: |
-          repo_root="$RUNNER_TEMP/context.omni"
-          rm -rf "$repo_root"
-          ./target/release/omnigraph init --schema demo/context.pg "$repo_root"
-          ./target/release/omnigraph load --data demo/context.jsonl "$repo_root"
-          tar -C "$RUNNER_TEMP" -czf dist/context.omni-linux-x86_64.tar.gz context.omni
+          python3 -m pip install --user awscli
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Write checksums
+      - name: Create RustFS test bucket
         run: |
-          (
-            cd dist
-            sha256sum \
-              omnigraph-linux-x86_64.tar.gz \
-              context.omni-linux-x86_64.tar.gz \
-              > SHA256SUMS
-          )
+          for _ in $(seq 1 30); do
+            if aws --endpoint-url "${AWS_ENDPOINT_URL_S3}" s3api list-buckets >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          aws --endpoint-url "${AWS_ENDPOINT_URL_S3}" \
+            s3api create-bucket \
+            --bucket "${OMNIGRAPH_S3_TEST_BUCKET}" >/dev/null 2>&1 || true
 
-      - name: Upload release artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: omnigraph-linux-x86_64-${{ github.sha }}
-          retention-days: 14
-          path: |
-            dist/omnigraph-linux-x86_64.tar.gz
-            dist/context.omni-linux-x86_64.tar.gz
-            dist/SHA256SUMS
+      - name: Run RustFS-backed repo tests
+        run: |
+          cargo test --locked -p omnigraph --test s3_storage -- --nocapture
+          cargo test --locked -p omnigraph-server --test server server_opens_s3_repo_directly_and_serves_snapshot_and_read -- --nocapture
+          cargo test --locked -p omnigraph-cli --test system_local local_cli_s3_end_to_end_init_load_read_flow -- --nocapture
+
+      - name: Dump RustFS logs on failure
+        if: failure()
+        run: docker logs rustfs

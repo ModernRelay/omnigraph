@@ -2,7 +2,9 @@ use pest::Parser;
 use pest::error::InputLocation;
 use pest_derive::Parser;
 
-use crate::error::{NanoError, ParseDiagnostic, Result, SourceSpan, decode_string_literal, render_span};
+use crate::error::{
+    NanoError, ParseDiagnostic, Result, SourceSpan, decode_string_literal, render_span,
+};
 
 use super::ast::*;
 
@@ -683,7 +685,7 @@ fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Literal> {
                     return Err(NanoError::Parse(format!(
                         "invalid boolean literal: {}",
                         other
-                    )))
+                    )));
                 }
             };
             Ok(Literal::Bool(b))

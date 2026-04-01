@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Arg, ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{Result, bail};
 use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget, RunId, SnapshotId};
 use omnigraph::loader::LoadMode;
@@ -29,6 +29,7 @@ const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
 #[derive(Debug, Parser)]
 #[command(name = "omnigraph")]
 #[command(about = "Omnigraph graph database CLI")]
+#[command(version = env!("CARGO_PKG_VERSION"), disable_version_flag = true)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -36,6 +37,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Print the CLI version
+    Version,
     /// Initialize a new repo from a schema
     Init {
         #[arg(long)]
@@ -400,6 +403,33 @@ fn bearer_token_from_env_file(path: &Path, var_name: &str) -> Result<Option<Stri
     Ok(None)
 }
 
+fn load_env_file_into_process(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    for line in fs::read_to_string(path)?.lines() {
+        let Some((name, value)) = parse_env_assignment(line) else {
+            continue;
+        };
+        if std::env::var_os(&name).is_none() {
+            unsafe {
+                std::env::set_var(name, value);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn load_cli_config(config_path: Option<&PathBuf>) -> Result<OmnigraphConfig> {
+    let config = load_config(config_path)?;
+    if let Some(path) = config.resolve_auth_env_file() {
+        load_env_file_into_process(&path)?;
+    }
+    Ok(config)
+}
+
 fn resolve_remote_bearer_token(
     config: &OmnigraphConfig,
     explicit_uri: Option<&str>,
@@ -411,7 +441,10 @@ fn resolve_remote_bearer_token(
     if let Some(name) = scoped_env {
         env_names.push(name.to_string());
     }
-    if env_names.iter().all(|name| name != DEFAULT_BEARER_TOKEN_ENV) {
+    if env_names
+        .iter()
+        .all(|name| name != DEFAULT_BEARER_TOKEN_ENV)
+    {
         env_names.push(DEFAULT_BEARER_TOKEN_ENV.to_string());
     }
 
@@ -942,9 +975,23 @@ async fn execute_change_remote(
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
-    let cli = Cli::parse();
+    let cli = {
+        let matches = Cli::command()
+            .arg(
+                Arg::new("version")
+                    .short('v')
+                    .long("version")
+                    .action(ArgAction::Version)
+                    .help("Print version"),
+            )
+            .get_matches();
+        Cli::from_arg_matches(&matches)?
+    };
     let http_client = build_http_client()?;
     match cli.command {
+        Command::Version => {
+            println!("omnigraph {}", env!("CARGO_PKG_VERSION"));
+        }
         Command::Init { schema, uri } => {
             let schema_source = fs::read_to_string(&schema)?;
             ensure_local_repo_parent(&uri)?;
@@ -961,7 +1008,7 @@ async fn main() -> Result<()> {
             mode,
             json,
         } => {
-            let config = load_config(config.as_ref())?;
+            let config = load_cli_config(config.as_ref())?;
             let uri = resolve_local_uri(&config, uri, target.as_deref(), "load")?;
             let branch = resolve_branch(&config, branch, None, "main");
             let mut db = Omnigraph::open(&uri).await?;
@@ -996,7 +1043,7 @@ async fn main() -> Result<()> {
                 name,
                 json,
             } => {
-                let config = load_config(config.as_ref())?;
+                let config = load_cli_config(config.as_ref())?;
                 let uri = resolve_local_uri(&config, uri, target.as_deref(), "branch create")?;
                 let from = resolve_branch(&config, from, None, "main");
                 let mut db = Omnigraph::open(&uri).await?;
@@ -1018,7 +1065,7 @@ async fn main() -> Result<()> {
                 config,
                 json,
             } => {
-                let config = load_config(config.as_ref())?;
+                let config = load_cli_config(config.as_ref())?;
                 let uri = resolve_local_uri(&config, uri, target.as_deref(), "branch list")?;
                 let db = Omnigraph::open(&uri).await?;
                 let mut branches = db.branch_list().await?;
@@ -1039,7 +1086,7 @@ async fn main() -> Result<()> {
                 into,
                 json,
             } => {
-                let config = load_config(config.as_ref())?;
+                let config = load_cli_config(config.as_ref())?;
                 let uri = resolve_local_uri(&config, uri, target.as_deref(), "branch merge")?;
                 let into = resolve_branch(&config, into, None, "main");
                 let mut db = Omnigraph::open(&uri).await?;
@@ -1062,7 +1109,7 @@ async fn main() -> Result<()> {
             branch,
             json,
         } => {
-            let config = load_config(config.as_ref())?;
+            let config = load_cli_config(config.as_ref())?;
             let bearer_token =
                 resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
             let uri = resolve_uri(&config, uri, target.as_deref())?;
@@ -1095,7 +1142,7 @@ async fn main() -> Result<()> {
                 config,
                 json,
             } => {
-                let config = load_config(config.as_ref())?;
+                let config = load_cli_config(config.as_ref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let uri = resolve_uri(&config, uri, target.as_deref())?;
@@ -1130,7 +1177,7 @@ async fn main() -> Result<()> {
                 run_id,
                 json,
             } => {
-                let config = load_config(config.as_ref())?;
+                let config = load_cli_config(config.as_ref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let uri = resolve_uri(&config, uri, target.as_deref())?;
@@ -1160,7 +1207,7 @@ async fn main() -> Result<()> {
                 run_id,
                 json,
             } => {
-                let config = load_config(config.as_ref())?;
+                let config = load_cli_config(config.as_ref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let uri = resolve_uri(&config, uri, target.as_deref())?;
@@ -1191,7 +1238,7 @@ async fn main() -> Result<()> {
                 run_id,
                 json,
             } => {
-                let config = load_config(config.as_ref())?;
+                let config = load_cli_config(config.as_ref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let uri = resolve_uri(&config, uri, target.as_deref())?;
@@ -1233,7 +1280,7 @@ async fn main() -> Result<()> {
                 bail!("exactly one of --alias or --query must be provided");
             }
 
-            let config = load_config(config.as_ref())?;
+            let config = load_cli_config(config.as_ref())?;
             let alias = resolve_alias(&config, alias.as_deref(), AliasCommand::Read)?;
             let alias_name = alias.as_ref().map(|(name, _)| *name);
             let alias_config = alias.as_ref().map(|(_, alias)| *alias);
@@ -1247,13 +1294,8 @@ async fn main() -> Result<()> {
             let target_name = target
                 .as_deref()
                 .or_else(|| alias_config.and_then(|alias| alias.target.as_deref()));
-            let bearer_token =
-                resolve_remote_bearer_token(&config, uri.as_deref(), target_name)?;
-            let uri = resolve_uri(
-                &config,
-                uri,
-                target_name,
-            )?;
+            let bearer_token = resolve_remote_bearer_token(&config, uri.as_deref(), target_name)?;
+            let uri = resolve_uri(&config, uri, target_name)?;
             let query_source = resolve_query_source(
                 &config,
                 query.as_ref(),
@@ -1319,7 +1361,7 @@ async fn main() -> Result<()> {
                 bail!("exactly one of --alias or --query must be provided");
             }
 
-            let config = load_config(config.as_ref())?;
+            let config = load_cli_config(config.as_ref())?;
             let alias = resolve_alias(&config, alias.as_deref(), AliasCommand::Change)?;
             let alias_name = alias.as_ref().map(|(name, _)| *name);
             let alias_config = alias.as_ref().map(|(_, alias)| *alias);
@@ -1333,13 +1375,8 @@ async fn main() -> Result<()> {
             let target_name = target
                 .as_deref()
                 .or_else(|| alias_config.and_then(|alias| alias.target.as_deref()));
-            let bearer_token =
-                resolve_remote_bearer_token(&config, uri.as_deref(), target_name)?;
-            let uri = resolve_uri(
-                &config,
-                uri,
-                target_name,
-            )?;
+            let bearer_token = resolve_remote_bearer_token(&config, uri.as_deref(), target_name)?;
+            let uri = resolve_uri(&config, uri, target_name)?;
             let query_source = resolve_query_source(
                 &config,
                 query.as_ref(),
@@ -1396,8 +1433,9 @@ mod tests {
     use std::fs;
 
     use super::{
-        DEFAULT_BEARER_TOKEN_ENV, apply_bearer_token, bearer_token_from_env_file,
-        normalize_bearer_token, parse_env_assignment, resolve_remote_bearer_token,
+        DEFAULT_BEARER_TOKEN_ENV, apply_bearer_token, bearer_token_from_env_file, load_cli_config,
+        load_env_file_into_process, normalize_bearer_token, parse_env_assignment,
+        resolve_remote_bearer_token,
     };
     use omnigraph_server::load_config;
     use reqwest::header::AUTHORIZATION;
@@ -1474,6 +1512,46 @@ mod tests {
     }
 
     #[test]
+    fn load_env_file_into_process_sets_missing_values_without_overriding_existing_ones() {
+        let temp = tempdir().unwrap();
+        let env_file = temp.path().join(".env.omni");
+        fs::write(
+            &env_file,
+            "AUTOLOAD_ONLY=from-file\nAUTOLOAD_PRESET=from-file\n",
+        )
+        .unwrap();
+
+        let missing_key = "AUTOLOAD_ONLY";
+        let preset_key = "AUTOLOAD_PRESET";
+        let previous_missing = std::env::var_os(missing_key);
+        let previous_preset = std::env::var_os(preset_key);
+
+        unsafe {
+            std::env::remove_var(missing_key);
+            std::env::set_var(preset_key, "from-env");
+        }
+
+        load_env_file_into_process(&env_file).unwrap();
+
+        assert_eq!(std::env::var(missing_key).unwrap(), "from-file");
+        assert_eq!(std::env::var(preset_key).unwrap(), "from-env");
+
+        unsafe {
+            if let Some(value) = previous_missing {
+                std::env::set_var(missing_key, value);
+            } else {
+                std::env::remove_var(missing_key);
+            }
+
+            if let Some(value) = previous_preset {
+                std::env::set_var(preset_key, value);
+            } else {
+                std::env::remove_var(preset_key);
+            }
+        }
+    }
+
+    #[test]
     fn resolve_remote_bearer_token_uses_scoped_env_file_with_global_fallback() {
         let temp = tempdir().unwrap();
         fs::write(
@@ -1522,6 +1600,50 @@ cli:
                 std::env::set_var(DEFAULT_BEARER_TOKEN_ENV, value);
             } else {
                 std::env::remove_var(DEFAULT_BEARER_TOKEN_ENV);
+            }
+        }
+    }
+
+    #[test]
+    fn load_cli_config_autoloads_env_file_into_process() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("omnigraph.yaml"),
+            r#"
+auth:
+  env_file: .env.omni
+targets:
+  demo:
+    uri: s3://bucket/prefix
+"#,
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join(".env.omni"),
+            "AUTOLOAD_FROM_CONFIG=loaded\n",
+        )
+        .unwrap();
+
+        let key = "AUTOLOAD_FROM_CONFIG";
+        let previous = std::env::var_os(key);
+        unsafe {
+            std::env::remove_var(key);
+        }
+
+        let config_path = temp.path().join("omnigraph.yaml");
+        let config = load_cli_config(Some(&config_path)).unwrap();
+
+        assert_eq!(
+            config.resolve_target_uri(None, Some("demo"), None).unwrap(),
+            "s3://bucket/prefix"
+        );
+        assert_eq!(std::env::var(key).unwrap(), "loaded");
+
+        unsafe {
+            if let Some(value) = previous {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
             }
         }
     }
