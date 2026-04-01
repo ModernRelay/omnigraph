@@ -10,7 +10,8 @@ phases:
     commands:
       - set -euo pipefail
       - yum install -y clang gcc gcc-c++ make protobuf-compiler protobuf-devel tar gzip
-      - curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain 1.91.0
+      - RUST_CHANNEL="$(grep '^channel' rust-toolchain.toml | cut -d'"' -f2)"
+      - curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain "${RUST_CHANNEL}"
       - source "$HOME/.cargo/env"
   pre_build:
     commands:
@@ -31,7 +32,7 @@ phases:
         if [[ -n "${OMNIGRAPH_ECR_REPOSITORY:-}" ]]; then
           account_id="$(aws sts get-caller-identity --query Account --output text)"
           registry="${account_id}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-          image_tag="${CODEBUILD_RESOLVED_SOURCE_VERSION:-manual}"
+          image_tag="${OMNIGRAPH_SOURCE_VERSION:-${CODEBUILD_RESOLVED_SOURCE_VERSION:-manual}}"
           aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${registry}"
           docker build -t "${registry}/${OMNIGRAPH_ECR_REPOSITORY}:${image_tag}" .
           docker push "${registry}/${OMNIGRAPH_ECR_REPOSITORY}:${image_tag}"

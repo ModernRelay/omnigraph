@@ -84,10 +84,8 @@ resource "aws_codebuild_project" "package" {
   service_role = aws_iam_role.codebuild_package.arn
 
   source {
-    type            = "GITHUB"
-    location        = "https://github.com/${var.github_repository}.git"
-    buildspec       = "buildspec.package.yml"
-    git_clone_depth = 1
+    # Source is supplied by GitHub Actions via S3 source overrides.
+    type = "NO_SOURCE"
   }
 
   environment {

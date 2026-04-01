@@ -20,7 +20,7 @@ concurrency:
 jobs:
   codebuild_package:
     name: Package via CodeBuild (AL2023)
-    if: ${{ vars.AWS_CODEBUILD_PACKAGE_PROJECT != '' && vars.AWS_ROLE_TO_ASSUME != '' && vars.AWS_REGION != '' }}
+    if: ${{ vars.AWS_CODEBUILD_PACKAGE_PROJECT != '' && vars.AWS_ROLE_TO_ASSUME != '' && vars.AWS_REGION != '' && vars.AWS_ARTIFACT_BUCKET != '' }}
     runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       id-token: write
@@ -28,6 +28,7 @@ jobs:
     env:
       AWS_REGION: ${{ vars.AWS_REGION }}
       AWS_CODEBUILD_PACKAGE_PROJECT: ${{ vars.AWS_CODEBUILD_PACKAGE_PROJECT }}
+      AWS_ARTIFACT_BUCKET: ${{ vars.AWS_ARTIFACT_BUCKET }}
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -46,12 +47,56 @@ jobs:
           fi
           echo "value=${source_ref}" >> "$GITHUB_OUTPUT"
 
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.source_ref.outputs.value }}
+          fetch-depth: 1
+
+      - name: Resolve source commit
+        id: source_commit
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Create source bundle
+        id: source_bundle
+        env:
+          SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
+          BUNDLE_PATH: ${{ runner.temp }}/omnigraph-source.zip
+        run: |
+          bundle_path="${RUNNER_TEMP}/omnigraph-source.zip"
+          python3 - <<'PY'
+          import os
+          import subprocess
+          import zipfile
+
+          bundle_path = os.environ["BUNDLE_PATH"]
+          files = subprocess.check_output(["git", "ls-files", "-z"], text=False).decode().split("\0")
+          with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+              for path in files:
+                  if path:
+                      archive.write(path, arcname=path)
+          PY
+          source_key="sources/${SOURCE_SHA}/omnigraph-source.zip"
+          echo "path=${bundle_path}" >> "$GITHUB_OUTPUT"
+          echo "key=${source_key}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload source bundle
+        run: |
+          aws s3 cp \
+            "${{ steps.source_bundle.outputs.path }}" \
+            "s3://${AWS_ARTIFACT_BUCKET}/${{ steps.source_bundle.outputs.key }}"
+
       - name: Start CodeBuild package job
         id: start
         run: |
           build_id="$(aws codebuild start-build \
             --project-name "${AWS_CODEBUILD_PACKAGE_PROJECT}" \
-            --source-version "${{ steps.source_ref.outputs.value }}" \
+            --source-type-override S3 \
+            --source-location-override "${AWS_ARTIFACT_BUCKET}/${{ steps.source_bundle.outputs.key }}" \
+            --buildspec-override buildspec.package.yml \
+            --environment-variables-override \
+              name=OMNIGRAPH_SOURCE_VERSION,value="${{ steps.source_commit.outputs.sha }}",type=PLAINTEXT \
             --query 'build.id' \
             --output text)"
           echo "build_id=${build_id}" >> "$GITHUB_OUTPUT"
