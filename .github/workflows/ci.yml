@@ -32,10 +32,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libprotobuf-dev
 
-      - name: Install Rust 1.91.0
+      - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.91.0
+          toolchain: stable
 
       - name: Cache Rust build data
         uses: Swatinem/rust-cache@v2
@@ -70,10 +70,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libprotobuf-dev python3-pip
 
-      - name: Install Rust 1.91.0
+      - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.91.0
+          toolchain: stable
 
       - name: Cache Rust build data
         uses: Swatinem/rust-cache@v2
