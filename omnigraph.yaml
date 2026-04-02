@@ -1,0 +1,46 @@
+project:
+  name: Omnigraph Project
+
+targets:
+  local:
+    uri: 's3://omnigraph-repo-541614060502-us-east-1/repos/mr-context-graph/releases/2026-04-02-7269ebb'
+    # bearer_token_env: OMNIGRAPH_BEARER_TOKEN
+
+server:
+  target: local
+  bind: 127.0.0.1:8080
+
+cli:
+  target: local
+  branch: main
+  output_format: table
+  table_max_column_width: 80
+  table_cell_layout: truncate
+
+query:
+  roots:
+    - queries
+    - .
+
+aliases:
+  # owner:
+  #   command: read
+  #   query: context.gq
+  #   name: decision_owner
+  #   args: [slug]
+  #   target: local
+  #   branch: main
+  #   format: kv
+  #
+  # attach_trace:
+  #   command: change
+  #   query: mutations.gq
+  #   name: attach_trace
+  #   args: [decision_slug, trace_slug]
+  #   target: local
+  #   branch: main
+
+# auth:
+#   env_file: ./.env.omni
+
+policy: {}

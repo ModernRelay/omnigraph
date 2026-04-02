@@ -4,24 +4,28 @@ use std::path::PathBuf;
 
 use clap::{Arg, ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{Result, bail};
-use omnigraph::db::{MergeOutcome, Omnigraph, ReadTarget, RunId, SnapshotId};
+use omnigraph::db::{Omnigraph, ReadTarget, RunId, SnapshotId};
 use omnigraph::loader::LoadMode;
 use omnigraph_compiler::json_params_to_param_map;
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::{JsonParamMode, ParamMap};
 use omnigraph_server::api::{
-    ChangeOutput, ChangeRequest, ErrorOutput, ReadOutput, ReadRequest, RunListOutput, RunOutput,
-    SnapshotOutput, SnapshotTableOutput, read_output, run_output, snapshot_payload,
+    BranchCreateOutput, BranchCreateRequest, BranchListOutput, BranchMergeOutput,
+    BranchMergeRequest, ChangeOutput, ChangeRequest, ErrorOutput, ReadOutput, ReadRequest,
+    RunListOutput, RunOutput, SnapshotOutput, SnapshotTableOutput, read_output, run_output,
+    snapshot_payload,
 };
 use omnigraph_server::{AliasCommand, OmnigraphConfig, ReadOutputFormat, load_config};
 use reqwest::Method;
 use reqwest::header::AUTHORIZATION;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 
+mod embed;
 mod read_format;
 
+use embed::{EmbedArgs, EmbedOutput, execute_embed};
 use read_format::{ReadRenderOptions, render_read};
 
 const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
@@ -39,6 +43,8 @@ struct Cli {
 enum Command {
     /// Print the CLI version
     Version,
+    /// Generate, clean, or refresh explicit seed embeddings
+    Embed(EmbedArgs),
     /// Initialize a new repo from a schema
     Init {
         #[arg(long)]
@@ -274,34 +280,6 @@ impl CliLoadMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum CliMergeOutcome {
-    AlreadyUpToDate,
-    FastForward,
-    Merged,
-}
-
-impl From<MergeOutcome> for CliMergeOutcome {
-    fn from(value: MergeOutcome) -> Self {
-        match value {
-            MergeOutcome::AlreadyUpToDate => CliMergeOutcome::AlreadyUpToDate,
-            MergeOutcome::FastForward => CliMergeOutcome::FastForward,
-            MergeOutcome::Merged => CliMergeOutcome::Merged,
-        }
-    }
-}
-
-impl CliMergeOutcome {
-    fn as_str(self) -> &'static str {
-        match self {
-            CliMergeOutcome::AlreadyUpToDate => "already_up_to_date",
-            CliMergeOutcome::FastForward => "fast_forward",
-            CliMergeOutcome::Merged => "merged",
-        }
-    }
-}
-
 #[derive(Debug, Serialize)]
 struct LoadOutput<'a> {
     uri: &'a str,
@@ -309,25 +287,6 @@ struct LoadOutput<'a> {
     mode: &'a str,
     nodes_loaded: usize,
     edges_loaded: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct BranchCreateOutput<'a> {
-    uri: &'a str,
-    from: &'a str,
-    name: &'a str,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct BranchListOutput {
-    branches: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct BranchMergeOutput<'a> {
-    source: &'a str,
-    target: &'a str,
-    outcome: CliMergeOutcome,
 }
 
 fn ensure_local_repo_parent(uri: &str) -> Result<()> {
@@ -626,6 +585,19 @@ fn print_load_human(
         mode.as_str(),
         nodes_loaded,
         edges_loaded
+    );
+}
+
+fn print_embed_human(output: &EmbedOutput) {
+    println!(
+        "embedded {} rows (selected {}, cleaned {}) from {} -> {} [{} {}d]",
+        output.embedded_rows,
+        output.selected_rows,
+        output.cleaned_rows,
+        output.input,
+        output.output,
+        output.mode,
+        output.dimension
     );
 }
 
@@ -992,6 +964,14 @@ async fn main() -> Result<()> {
         Command::Version => {
             println!("omnigraph {}", env!("CARGO_PKG_VERSION"));
         }
+        Command::Embed(args) => {
+            let output = execute_embed(&args).await?;
+            if args.json {
+                print_json(&output)?;
+            } else {
+                print_embed_human(&output);
+            }
+        }
         Command::Init { schema, uri } => {
             let schema_source = fs::read_to_string(&schema)?;
             ensure_local_repo_parent(&uri)?;
@@ -1044,19 +1024,36 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_cli_config(config.as_ref())?;
-                let uri = resolve_local_uri(&config, uri, target.as_deref(), "branch create")?;
+                let bearer_token =
+                    resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
+                let uri = resolve_uri(&config, uri, target.as_deref())?;
                 let from = resolve_branch(&config, from, None, "main");
-                let mut db = Omnigraph::open(&uri).await?;
-                db.branch_create_from(ReadTarget::branch(&from), &name)
-                    .await?;
-                if json {
-                    print_json(&BranchCreateOutput {
-                        uri: &uri,
-                        from: &from,
-                        name: &name,
-                    })?;
+                let payload = if is_remote_uri(&uri) {
+                    remote_json::<BranchCreateOutput>(
+                        &http_client,
+                        Method::POST,
+                        remote_url(&uri, "/branches"),
+                        Some(serde_json::to_value(BranchCreateRequest {
+                            from: Some(from.clone()),
+                            name: name.clone(),
+                        })?),
+                        bearer_token.as_deref(),
+                    )
+                    .await?
                 } else {
-                    println!("created branch {} from {}", name, from);
+                    let mut db = Omnigraph::open(&uri).await?;
+                    db.branch_create_from(ReadTarget::branch(&from), &name)
+                        .await?;
+                    BranchCreateOutput {
+                        uri: uri.clone(),
+                        from: from.clone(),
+                        name: name.clone(),
+                    }
+                };
+                if json {
+                    print_json(&payload)?;
+                } else {
+                    println!("created branch {} from {}", payload.name, payload.from);
                 }
             }
             BranchCommand::List {
@@ -1066,14 +1063,28 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_cli_config(config.as_ref())?;
-                let uri = resolve_local_uri(&config, uri, target.as_deref(), "branch list")?;
-                let db = Omnigraph::open(&uri).await?;
-                let mut branches = db.branch_list().await?;
-                branches.sort();
-                if json {
-                    print_json(&BranchListOutput { branches })?;
+                let bearer_token =
+                    resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
+                let uri = resolve_uri(&config, uri, target.as_deref())?;
+                let payload = if is_remote_uri(&uri) {
+                    remote_json::<BranchListOutput>(
+                        &http_client,
+                        Method::GET,
+                        remote_url(&uri, "/branches"),
+                        None,
+                        bearer_token.as_deref(),
+                    )
+                    .await?
                 } else {
-                    for branch in branches {
+                    let db = Omnigraph::open(&uri).await?;
+                    let mut branches = db.branch_list().await?;
+                    branches.sort();
+                    BranchListOutput { branches }
+                };
+                if json {
+                    print_json(&payload)?;
+                } else {
+                    for branch in payload.branches {
                         println!("{}", branch);
                     }
                 }
@@ -1087,18 +1098,40 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_cli_config(config.as_ref())?;
-                let uri = resolve_local_uri(&config, uri, target.as_deref(), "branch merge")?;
+                let bearer_token =
+                    resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
+                let uri = resolve_uri(&config, uri, target.as_deref())?;
                 let into = resolve_branch(&config, into, None, "main");
-                let mut db = Omnigraph::open(&uri).await?;
-                let outcome: CliMergeOutcome = db.branch_merge(&source, &into).await?.into();
-                if json {
-                    print_json(&BranchMergeOutput {
-                        source: &source,
-                        target: &into,
-                        outcome,
-                    })?;
+                let payload = if is_remote_uri(&uri) {
+                    remote_json::<BranchMergeOutput>(
+                        &http_client,
+                        Method::POST,
+                        remote_url(&uri, "/branches/merge"),
+                        Some(serde_json::to_value(BranchMergeRequest {
+                            source: source.clone(),
+                            target: Some(into.clone()),
+                        })?),
+                        bearer_token.as_deref(),
+                    )
+                    .await?
                 } else {
-                    println!("merged {} into {}: {}", source, into, outcome.as_str());
+                    let mut db = Omnigraph::open(&uri).await?;
+                    let outcome = db.branch_merge(&source, &into).await?;
+                    BranchMergeOutput {
+                        source: source.clone(),
+                        target: into.clone(),
+                        outcome: outcome.into(),
+                    }
+                };
+                if json {
+                    print_json(&payload)?;
+                } else {
+                    println!(
+                        "merged {} into {}: {}",
+                        payload.source,
+                        payload.target,
+                        payload.outcome.as_str()
+                    );
                 }
             }
         },

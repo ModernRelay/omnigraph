@@ -120,9 +120,9 @@ variable "codebuild_compute_type" {
 }
 
 variable "codebuild_image" {
-  description = "CodeBuild image. Must be AL2023-compatible."
+  description = "CodeBuild image. Must be AL2023-compatible x86_64."
   type        = string
-  default     = "aws/codebuild/amazonlinux-aarch64-standard:3.0"
+  default     = "aws/codebuild/amazonlinux-x86_64-standard:5.0"
 }
 
 variable "github_repository" {

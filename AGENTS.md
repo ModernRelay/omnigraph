@@ -164,7 +164,7 @@ Treat these as historical/stale unless you are explicitly reviving them:
 
 ## Toolchain & Conventions
 
-- Rust 1.91.0, edition 2024 (pinned in `rust-toolchain.toml`)
+- Rust stable channel, edition 2024 (`rust-toolchain.toml` tracks `stable`, no pinned version)
 - CI runs `cargo test --workspace --locked` and requires `protobuf-compiler` system dep
 - Tokio async runtime
 - Errors via `thiserror`
@@ -240,6 +240,30 @@ Integration tests live under `crates/omnigraph/tests/`:
 - `lance_version_columns.rs` — Lance version column behavior
 
 Server tests: `crates/omnigraph-server/tests/server.rs`
+CLI tests: `crates/omnigraph-cli/tests/cli.rs`, `system_local.rs`, `system_remote.rs`
+
+## S3 Integration Tests
+
+S3 tests (`crates/omnigraph/tests/s3_storage.rs`, plus S3-specific tests in server and CLI) require a local RustFS (S3-compatible) instance. CI runs these in the `rustfs_integration` job. To run locally:
+
+```bash
+# Start RustFS
+docker run -d --name rustfs -p 9000:9000 -p 9001:9001 \
+  -e RUSTFS_ACCESS_KEY=rustfsadmin -e RUSTFS_SECRET_KEY=rustfsadmin \
+  rustfs/rustfs:latest /data
+
+# Create test bucket
+AWS_ACCESS_KEY_ID=rustfsadmin AWS_SECRET_ACCESS_KEY=rustfsadmin \
+  aws --endpoint-url http://127.0.0.1:9000 s3api create-bucket --bucket omnigraph-ci
+
+# Run S3 tests (requires these env vars)
+export AWS_ACCESS_KEY_ID=rustfsadmin AWS_SECRET_ACCESS_KEY=rustfsadmin
+export AWS_REGION=us-east-1 AWS_ENDPOINT_URL=http://127.0.0.1:9000
+export AWS_ENDPOINT_URL_S3=http://127.0.0.1:9000
+export AWS_ALLOW_HTTP=true AWS_S3_FORCE_PATH_STYLE=true
+export OMNIGRAPH_S3_TEST_BUCKET=omnigraph-ci OMNIGRAPH_S3_TEST_PREFIX=local-dev
+cargo test --locked -p omnigraph --test s3_storage -- --nocapture
+```
 
 ## Companion: lance-explore
 
