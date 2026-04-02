@@ -5,8 +5,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use api::{
-    ChangeOutput, ChangeRequest, ErrorCode, ErrorOutput, HealthOutput, ReadOutput, ReadRequest,
-    RunListOutput, SnapshotQuery, snapshot_payload,
+    BranchCreateOutput, BranchCreateRequest, BranchListOutput, BranchMergeOutput,
+    BranchMergeRequest, ChangeOutput, ChangeRequest, ErrorCode, ErrorOutput, HealthOutput,
+    ReadOutput, ReadRequest, RunListOutput, SnapshotQuery, snapshot_payload,
 };
 use axum::extract::DefaultBodyLimit;
 use axum::extract::{Path, Query, Request, State};
@@ -185,6 +186,8 @@ pub fn build_app(state: AppState) -> Router {
         .route("/snapshot", get(server_snapshot))
         .route("/read", post(server_read))
         .route("/change", post(server_change))
+        .route("/branches", get(server_branch_list).post(server_branch_create))
+        .route("/branches/merge", post(server_branch_merge))
         .route("/runs", get(server_run_list))
         .route("/runs/{run_id}", get(server_run_show))
         .route("/runs/{run_id}/publish", post(server_run_publish))
@@ -323,6 +326,53 @@ async fn server_change(
         query_name: selected_name,
         affected_nodes: result.affected_nodes,
         affected_edges: result.affected_edges,
+    }))
+}
+
+async fn server_branch_list(
+    State(state): State<AppState>,
+) -> std::result::Result<Json<BranchListOutput>, ApiError> {
+    let mut branches = {
+        let db = Arc::clone(&state.db).read_owned().await;
+        db.branch_list().await.map_err(ApiError::from_omni)?
+    };
+    branches.sort();
+    Ok(Json(BranchListOutput { branches }))
+}
+
+async fn server_branch_create(
+    State(state): State<AppState>,
+    Json(request): Json<BranchCreateRequest>,
+) -> std::result::Result<Json<BranchCreateOutput>, ApiError> {
+    let from = request.from.unwrap_or_else(|| "main".to_string());
+    {
+        let mut db = Arc::clone(&state.db).write_owned().await;
+        db.branch_create_from(ReadTarget::branch(&from), &request.name)
+            .await
+            .map_err(ApiError::from_omni)?;
+    }
+    Ok(Json(BranchCreateOutput {
+        uri: state.uri().to_string(),
+        from,
+        name: request.name,
+    }))
+}
+
+async fn server_branch_merge(
+    State(state): State<AppState>,
+    Json(request): Json<BranchMergeRequest>,
+) -> std::result::Result<Json<BranchMergeOutput>, ApiError> {
+    let target = request.target.unwrap_or_else(|| "main".to_string());
+    let outcome = {
+        let mut db = Arc::clone(&state.db).write_owned().await;
+        db.branch_merge(&request.source, &target)
+            .await
+            .map_err(ApiError::from_omni)?
+    };
+    Ok(Json(BranchMergeOutput {
+        source: request.source,
+        target,
+        outcome: outcome.into(),
     }))
 }
 

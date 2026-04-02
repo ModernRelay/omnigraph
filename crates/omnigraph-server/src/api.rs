@@ -1,4 +1,4 @@
-use omnigraph::db::{ReadTarget, RunRecord, Snapshot};
+use omnigraph::db::{MergeOutcome, ReadTarget, RunRecord, Snapshot};
 use omnigraph_compiler::result::QueryResult;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -36,6 +36,65 @@ pub struct RunOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunListOutput {
     pub runs: Vec<RunOutput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchCreateRequest {
+    pub from: Option<String>,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchCreateOutput {
+    pub uri: String,
+    pub from: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchListOutput {
+    pub branches: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchMergeRequest {
+    pub source: String,
+    pub target: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchMergeOutcome {
+    AlreadyUpToDate,
+    FastForward,
+    Merged,
+}
+
+impl From<MergeOutcome> for BranchMergeOutcome {
+    fn from(value: MergeOutcome) -> Self {
+        match value {
+            MergeOutcome::AlreadyUpToDate => Self::AlreadyUpToDate,
+            MergeOutcome::FastForward => Self::FastForward,
+            MergeOutcome::Merged => Self::Merged,
+        }
+    }
+}
+
+impl BranchMergeOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AlreadyUpToDate => "already_up_to_date",
+            Self::FastForward => "fast_forward",
+            Self::Merged => "merged",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchMergeOutput {
+    pub source: String,
+    pub target: String,
+    pub outcome: BranchMergeOutcome,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

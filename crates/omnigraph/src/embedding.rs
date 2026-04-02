@@ -13,6 +13,8 @@ const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_RETRY_ATTEMPTS: usize = 4;
 const DEFAULT_RETRY_BACKOFF_MS: u64 = 200;
+const QUERY_TASK_TYPE: &str = "RETRIEVAL_QUERY";
+const DOCUMENT_TASK_TYPE: &str = "RETRIEVAL_DOCUMENT";
 
 #[derive(Clone, Debug)]
 enum EmbeddingTransport {
@@ -25,7 +27,7 @@ enum EmbeddingTransport {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct EmbeddingClient {
+pub struct EmbeddingClient {
     retry_attempts: usize,
     retry_backoff_ms: u64,
     transport: EmbeddingTransport,
@@ -57,7 +59,7 @@ struct GoogleErrorBody {
 }
 
 impl EmbeddingClient {
-    pub(crate) fn from_env() -> Result<Self> {
+    pub fn from_env() -> Result<Self> {
         let retry_attempts =
             parse_env_usize("OMNIGRAPH_EMBED_RETRY_ATTEMPTS", DEFAULT_RETRY_ATTEMPTS);
         let retry_backoff_ms =
@@ -113,10 +115,27 @@ impl EmbeddingClient {
         }
     }
 
-    pub(crate) async fn embed_query_text(
+    pub async fn embed_query_text(
         &self,
         input: &str,
         expected_dim: usize,
+    ) -> Result<Vec<f32>> {
+        self.embed_text(input, expected_dim, QUERY_TASK_TYPE).await
+    }
+
+    pub async fn embed_document_text(
+        &self,
+        input: &str,
+        expected_dim: usize,
+    ) -> Result<Vec<f32>> {
+        self.embed_text(input, expected_dim, DOCUMENT_TASK_TYPE).await
+    }
+
+    async fn embed_text(
+        &self,
+        input: &str,
+        expected_dim: usize,
+        task_type: &'static str,
     ) -> Result<Vec<f32>> {
         if expected_dim == 0 {
             return Err(OmniError::manifest_internal(
@@ -127,7 +146,7 @@ impl EmbeddingClient {
         match &self.transport {
             EmbeddingTransport::Mock => Ok(mock_embedding(input, expected_dim)),
             EmbeddingTransport::Gemini { .. } => {
-                self.with_retry(|| self.embed_query_text_gemini_once(input, expected_dim))
+                self.with_retry(|| self.embed_text_gemini_once(input, expected_dim, task_type))
                     .await
             }
         }
@@ -156,10 +175,11 @@ impl EmbeddingClient {
         }
     }
 
-    async fn embed_query_text_gemini_once(
+    async fn embed_text_gemini_once(
         &self,
         input: &str,
         expected_dim: usize,
+        task_type: &'static str,
     ) -> std::result::Result<Vec<f32>, EmbedCallError> {
         let (api_key, base_url, http) = match &self.transport {
             EmbeddingTransport::Gemini {
@@ -173,7 +193,7 @@ impl EmbeddingClient {
         let response = http
             .post(gemini_endpoint(base_url))
             .header("x-goog-api-key", api_key)
-            .json(&build_gemini_request(input, expected_dim))
+            .json(&build_gemini_request(input, expected_dim, task_type))
             .send()
             .await;
         let response = match response {
@@ -235,7 +255,7 @@ fn gemini_endpoint(base_url: &str) -> String {
     )
 }
 
-fn build_gemini_request(input: &str, expected_dim: usize) -> Value {
+fn build_gemini_request(input: &str, expected_dim: usize, task_type: &'static str) -> Value {
     json!({
         "model": format!("models/{}", GEMINI_EMBED_MODEL),
         "content": {
@@ -245,7 +265,7 @@ fn build_gemini_request(input: &str, expected_dim: usize) -> Value {
                 }
             ]
         },
-        "taskType": "RETRIEVAL_QUERY",
+        "taskType": task_type,
         "outputDimensionality": expected_dim,
     })
 }
@@ -395,11 +415,17 @@ mod tests {
 
     #[test]
     fn gemini_request_uses_preview_model_retrieval_query_and_dimension() {
-        let request = build_gemini_request("alpha", 4);
+        let request = build_gemini_request("alpha", 4, QUERY_TASK_TYPE);
         assert_eq!(request["model"], "models/gemini-embedding-2-preview");
-        assert_eq!(request["taskType"], "RETRIEVAL_QUERY");
+        assert_eq!(request["taskType"], QUERY_TASK_TYPE);
         assert_eq!(request["outputDimensionality"], 4);
         assert_eq!(request["content"]["parts"][0]["text"], "alpha");
+    }
+
+    #[test]
+    fn gemini_document_request_uses_retrieval_document_task_type() {
+        let request = build_gemini_request("alpha", 4, DOCUMENT_TASK_TYPE);
+        assert_eq!(request["taskType"], DOCUMENT_TASK_TYPE);
     }
 
     #[test]

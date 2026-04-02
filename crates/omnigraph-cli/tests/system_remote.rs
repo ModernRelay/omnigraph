@@ -204,3 +204,100 @@ query ordered_person($name: String) {
     assert_eq!(lines.next().unwrap(), "p.age,p.name");
     assert_eq!(lines.next().unwrap(), "30,Alice");
 }
+
+#[test]
+#[ignore = "requires loopback socket permissions in sandboxed runners"]
+fn remote_branch_create_list_merge_flow() {
+    let repo = SystemRepo::loaded();
+    let server = repo.spawn_server();
+    let config = repo.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
+    let mutation_file = repo.write_query(
+        "system-remote-branch-change.gq",
+        r#"
+query insert_person($name: String, $age: I32) {
+    insert Person { name: $name, age: $age }
+}
+"#,
+    );
+
+    let initial = parse_stdout_json(&output_success(
+        cli()
+            .arg("branch")
+            .arg("list")
+            .arg("--config")
+            .arg(&config)
+            .arg("--json"),
+    ));
+    assert_eq!(initial["branches"], json!(["main"]));
+
+    let created = parse_stdout_json(&output_success(
+        cli()
+            .arg("branch")
+            .arg("create")
+            .arg("--config")
+            .arg(&config)
+            .arg("--from")
+            .arg("main")
+            .arg("feature")
+            .arg("--json"),
+    ));
+    assert_eq!(created["from"], "main");
+    assert_eq!(created["name"], "feature");
+
+    let listed = parse_stdout_json(&output_success(
+        cli()
+            .arg("branch")
+            .arg("list")
+            .arg("--config")
+            .arg(&config)
+            .arg("--json"),
+    ));
+    assert_eq!(listed["branches"], json!(["feature", "main"]));
+
+    let changed = parse_stdout_json(&output_success(
+        cli()
+            .arg("change")
+            .arg("--config")
+            .arg(&config)
+            .arg("--query")
+            .arg(&mutation_file)
+            .arg("--branch")
+            .arg("feature")
+            .arg("--params")
+            .arg(r#"{"name":"Zoe","age":33}"#)
+            .arg("--json"),
+    ));
+    assert_eq!(changed["branch"], "feature");
+    assert_eq!(changed["affected_nodes"], 1);
+
+    let merged = parse_stdout_json(&output_success(
+        cli()
+            .arg("branch")
+            .arg("merge")
+            .arg("--config")
+            .arg(&config)
+            .arg("feature")
+            .arg("--into")
+            .arg("main")
+            .arg("--json"),
+    ));
+    assert_eq!(merged["source"], "feature");
+    assert_eq!(merged["target"], "main");
+    assert_eq!(merged["outcome"], "fast_forward");
+
+    let verify = parse_stdout_json(&output_success(
+        cli()
+            .arg("read")
+            .arg("--config")
+            .arg(&config)
+            .arg("--query")
+            .arg(fixture("test.gq"))
+            .arg("--name")
+            .arg("get_person")
+            .arg("--params")
+            .arg(r#"{"name":"Zoe"}"#)
+            .arg("--json"),
+    ));
+    assert_eq!(verify["row_count"], 1);
+    assert_eq!(verify["rows"][0]["p.name"], "Zoe");
+}

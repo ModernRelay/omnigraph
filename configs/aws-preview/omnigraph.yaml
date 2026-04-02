@@ -1,0 +1,237 @@
+project:
+  name: "Omnigraph AWS Preview"
+
+targets:
+  preview:
+    uri: https://d1lk4b7ad2a56j.cloudfront.net
+    bearer_token_env: OMNIGRAPH_PREVIEW_BEARER_TOKEN
+
+auth:
+  env_file: ./.env.omni
+
+cli:
+  target: preview
+  branch: main
+  output_format: table
+  table_max_column_width: 80
+  table_cell_layout: truncate
+
+query:
+  roots:
+    - ../../../mr-omni/queries
+
+aliases:
+  decisions:
+    command: read
+    query: queries.gq
+    name: all_decisions
+    format: table
+
+  signals:
+    command: read
+    query: queries.gq
+    name: all_signals
+    format: table
+
+  claims:
+    command: read
+    query: queries.gq
+    name: all_claims
+    format: table
+
+  refs:
+    command: read
+    query: queries.gq
+    name: all_references
+    format: table
+
+  policies:
+    command: read
+    query: queries.gq
+    name: all_policies
+    format: table
+
+  traces:
+    command: read
+    query: queries.gq
+    name: all_traces
+    format: table
+
+  team:
+    command: read
+    query: queries.gq
+    name: team_members
+    format: table
+
+  dec:
+    command: read
+    query: queries.gq
+    name: decision_lookup
+    args: [slug]
+    format: json
+
+  sig:
+    command: read
+    query: queries.gq
+    name: signal_lookup
+    args: [slug]
+    format: json
+
+  clm:
+    command: read
+    query: queries.gq
+    name: claim_lookup
+    args: [slug]
+    format: json
+
+  ref:
+    command: read
+    query: queries.gq
+    name: reference_lookup
+    args: [slug]
+    format: json
+
+  domain:
+    command: read
+    query: queries.gq
+    name: decisions_by_domain
+    args: [domain]
+    format: table
+
+  status:
+    command: read
+    query: queries.gq
+    name: decisions_by_status
+    args: [status]
+    format: table
+
+  evidence:
+    command: read
+    query: queries.gq
+    name: signals_for_claim
+    args: [claim]
+    format: table
+
+  why:
+    command: read
+    query: queries.gq
+    name: decision_claims
+    args: [decision]
+    format: table
+
+  impact:
+    command: read
+    query: queries.gq
+    name: signal_claims
+    args: [signal]
+    format: table
+
+  about:
+    command: read
+    query: queries.gq
+    name: signals_for_reference
+    args: [ref]
+    format: table
+
+  about-dec:
+    command: read
+    query: queries.gq
+    name: decisions_for_reference
+    args: [ref]
+    format: table
+
+  meeting:
+    command: read
+    query: queries.gq
+    name: trace_decisions
+    args: [trace]
+    format: table
+
+  meeting-sig:
+    command: read
+    query: queries.gq
+    name: trace_signals
+    args: [trace]
+    format: table
+
+  screened:
+    command: read
+    query: queries.gq
+    name: decisions_screened_by
+    args: [policy]
+    format: table
+
+  proof:
+    command: read
+    query: queries.gq
+    name: claim_evidence
+    args: [claim]
+    format: table
+
+  unsupported:
+    command: read
+    query: queries.gq
+    name: unsupported_claims
+    format: table
+
+  unexecuted:
+    command: read
+    query: queries.gq
+    name: unexecuted_decisions
+    format: table
+
+  orphans:
+    command: read
+    query: queries.gq
+    name: orphan_signals
+    format: table
+
+  unscreened:
+    command: read
+    query: queries.gq
+    name: unscreened_decisions
+    format: table
+
+  sem-dec:
+    command: read
+    query: queries.gq
+    name: search_decisions
+    args: [q]
+    format: table
+
+  sem-sig:
+    command: read
+    query: queries.gq
+    name: search_signals
+    args: [q]
+    format: table
+
+  sem-clm:
+    command: read
+    query: queries.gq
+    name: search_claims
+    args: [q]
+    format: table
+
+  sem-ref:
+    command: read
+    query: queries.gq
+    name: search_references
+    args: [q]
+    format: table
+
+  sem-pol:
+    command: read
+    query: queries.gq
+    name: search_policies
+    args: [q]
+    format: table
+
+  sem-trace:
+    command: read
+    query: queries.gq
+    name: search_traces
+    args: [q]
+    format: table
+
+policy: {}

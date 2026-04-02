@@ -1,3 +1,5 @@
+use std::fs;
+
 use omnigraph::db::{Omnigraph, ReadTarget};
 use serde_json::Value;
 use tempfile::tempdir;
@@ -36,6 +38,91 @@ fn long_version_flag_prints_current_cli_version() {
     assert_eq!(
         stdout.trim(),
         format!("omnigraph {}", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn embed_seed_fills_missing_and_preserves_existing_vectors_by_default() {
+    let temp = tempdir().unwrap();
+    let seed = write_seed_fixture(temp.path());
+
+    let output = output_success(
+        cli()
+            .env("OMNIGRAPH_EMBEDDINGS_MOCK", "1")
+            .arg("embed")
+            .arg("--seed")
+            .arg(&seed)
+            .arg("--json"),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["mode"], "fill_missing");
+    assert_eq!(payload["embedded_rows"], 1);
+    assert_eq!(payload["selected_rows"], 2);
+
+    let embedded = read_embedded_rows(temp.path().join("build/seed.embedded.jsonl"));
+    assert_eq!(
+        embedded[0]["data"]["embedding"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    assert_eq!(embedded[1]["data"]["embedding"], serde_json::json!([0.1, 0.2]));
+}
+
+#[test]
+fn embed_clean_removes_selected_embeddings() {
+    let temp = tempdir().unwrap();
+    let seed = write_seed_fixture(temp.path());
+
+    let output = output_success(
+        cli()
+            .arg("embed")
+            .arg("--seed")
+            .arg(&seed)
+            .arg("--clean")
+            .arg("--select")
+            .arg("Decision:slug=dec-beta")
+            .arg("--json"),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["mode"], "clean");
+    assert_eq!(payload["cleaned_rows"], 1);
+
+    let embedded = read_embedded_rows(temp.path().join("build/seed.embedded.jsonl"));
+    assert!(embedded[0]["data"].get("embedding").is_none());
+    assert!(embedded[1]["data"].get("embedding").is_none());
+}
+
+#[test]
+fn embed_select_reembeds_only_matching_rows() {
+    let temp = tempdir().unwrap();
+    let seed = write_seed_fixture(temp.path());
+
+    let output = output_success(
+        cli()
+            .env("OMNIGRAPH_EMBEDDINGS_MOCK", "1")
+            .arg("embed")
+            .arg("--seed")
+            .arg(&seed)
+            .arg("--select")
+            .arg("Decision:slug=dec-beta")
+            .arg("--json"),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["mode"], "reembed_selected");
+    assert_eq!(payload["embedded_rows"], 1);
+    assert_eq!(payload["selected_rows"], 1);
+
+    let embedded = read_embedded_rows(temp.path().join("build/seed.embedded.jsonl"));
+    assert!(embedded[0]["data"].get("embedding").is_none());
+    assert_ne!(embedded[1]["data"]["embedding"], serde_json::json!([0.1, 0.2]));
+    assert_eq!(
+        embedded[1]["data"]["embedding"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
     );
 }
 
@@ -620,6 +707,53 @@ fn snapshot_json_returns_manifest_version_and_tables() {
     assert_eq!(payload["branch"], "main");
     assert!(payload["manifest_version"].as_u64().unwrap() >= 1);
     assert!(payload["tables"].as_array().unwrap().len() >= 4);
+}
+
+fn write_seed_fixture(root: &std::path::Path) -> std::path::PathBuf {
+    fs::create_dir_all(root.join("data")).unwrap();
+    fs::create_dir_all(root.join("build")).unwrap();
+    let raw_seed = root.join("data/seed.jsonl");
+    let seed = root.join("seed.yaml");
+
+    fs::write(
+        &raw_seed,
+        concat!(
+            "{\"type\":\"Decision\",\"data\":{\"slug\":\"dec-alpha\",\"intent\":\"Alpha ship\"}}\n",
+            "{\"type\":\"Decision\",\"data\":{\"slug\":\"dec-beta\",\"intent\":\"Beta ship\",\"embedding\":[0.1,0.2]}}\n"
+        ),
+    )
+    .unwrap();
+
+    fs::write(
+        &seed,
+        concat!(
+            "graph:\n",
+            "  slug: mr-context-graph\n",
+            "sources:\n",
+            "  raw_seed: ./data/seed.jsonl\n",
+            "artifacts:\n",
+            "  embedded_seed: ./build/seed.embedded.jsonl\n",
+            "embeddings:\n",
+            "  model: gemini-embedding-2-preview\n",
+            "  dimension: 4\n",
+            "  types:\n",
+            "    Decision:\n",
+            "      target: embedding\n",
+            "      fields: [slug, intent]\n"
+        ),
+    )
+    .unwrap();
+
+    seed
+}
+
+fn read_embedded_rows(path: std::path::PathBuf) -> Vec<Value> {
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
 }
 
 #[test]

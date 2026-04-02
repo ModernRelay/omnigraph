@@ -127,7 +127,7 @@ resource "aws_instance" "omnigraph" {
   key_name               = var.key_pair_name != "" ? var.key_pair_name : null
 
   root_block_device {
-    volume_size = 20
+    volume_size = 30
     volume_type = "gp3"
   }
 

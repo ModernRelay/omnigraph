@@ -13,6 +13,26 @@ Update the AWS Terraform stack so Omnigraph can:
 
 This plan is intentionally not resource-scarce. If a resource materially improves packaging, deploy safety, rollback, or future migration, add it now.
 
+## Status
+
+**Terraform config is written and validated.** Plan shows 37 to add, 1 to change, 3 to destroy (instance replace from user_data change). Pending `terraform apply`.
+
+### Checklist
+
+- [x] Repo bucket with versioning, encryption, public access block, lifecycle, TLS-only policy — `infra/s3.tf`
+- [x] Artifact bucket with versioning, encryption, public access block, lifecycle, TLS-only policy — `infra/s3.tf`
+- [x] Logs bucket — `infra/s3.tf`
+- [x] S3 gateway VPC endpoint on private route table — `infra/s3.tf`
+- [x] CodeBuild packaging project on AL2023 — `infra/build.tf`
+- [x] CodeBuild IAM role and log group — `infra/build.tf`
+- [x] GitHub OIDC provider and role — `infra/oidc.tf`
+- [x] ECR repository — `infra/build.tf`
+- [x] `repo_target_uri` SSM parameter — `infra/secrets.tf`
+- [x] EC2 IAM policy for repo bucket access — `infra/compute.tf`
+- [x] CloudWatch alarms (ALB 5XX, CodeBuild failures, EC2 status check) — `infra/logs.tf`
+- [ ] Apply
+- [ ] Set GitHub repo variables (`AWS_REGION`, `AWS_ROLE_TO_ASSUME`, `AWS_CODEBUILD_PACKAGE_PROJECT`)
+
 ## Decision Summary
 
 ### What stays
@@ -43,6 +63,18 @@ This plan is intentionally not resource-scarce. If a resource materially improve
 - no ECR-backed runtime deploy
 - no ALB target group migration
 - no CloudFront origin change
+
+## Concrete Resource Names
+
+| Resource | Name |
+|---|---|
+| Repo bucket | `omnigraph-repo-541614060502-us-east-1` |
+| Artifact bucket | `omnigraph-artifacts-541614060502-us-east-1` |
+| Logs bucket | `omnigraph-s3-logs-541614060502-us-east-1` |
+| ECR repo | `omnigraph-server` |
+| CodeBuild project | `omnigraph-package-al2023` |
+| GitHub OIDC role | `omnigraph-github-actions` |
+| Target URI SSM param | `/omnigraph/server/target-uri` |
 
 ## Terraform Resources To Add
 
@@ -349,12 +381,6 @@ Add variables for:
 - `codebuild_image`
 - `github_repository`
 - `github_oidc_subjects`
-- `enable_ecr_packaging`
-
-Optional:
-
-- `repo_release_retention_days`
-- `artifact_retention_days`
 
 ### `infra/secrets.tf`
 
@@ -448,23 +474,12 @@ Do not add these in this pass:
 
 Those belong to the later post-S3-validation compute migration.
 
-## Concrete Minimum Done Definition
+## Post-Apply: GitHub Repo Variables
 
-Terraform update is complete when all of these exist:
+After apply, set these in GitHub repo settings (Settings > Secrets and variables > Actions > Variables):
 
-- repo bucket with versioning, encryption, public access block, lifecycle, and TLS-only policy
-- artifact bucket with versioning, encryption, public access block, lifecycle, and TLS-only policy
-- logs bucket
-- S3 gateway VPC endpoint on the private route table
-- CodeBuild packaging project on AL2023
-- CodeBuild IAM role and log group
-- GitHub OIDC provider and role
-- ECR repository
-- `repo_target_uri` SSM parameter
-- EC2 IAM policy for repo bucket access
-
-At that point, the stack is ready for:
-
-- `EC2 + S3-backed Omnigraph repo`
-- AL2023-compatible server packaging
-- a later clean move to ECS/Fargate without redoing storage or packaging
+| Variable | Value |
+|---|---|
+| `AWS_REGION` | `us-east-1` |
+| `AWS_ROLE_TO_ASSUME` | *(from `github_actions_role_arn` output)* |
+| `AWS_CODEBUILD_PACKAGE_PROJECT` | `omnigraph-package-al2023` |

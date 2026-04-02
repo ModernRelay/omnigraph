@@ -7,7 +7,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph_server::api::{ChangeRequest, ErrorOutput, ReadRequest};
+use omnigraph_server::api::{BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorOutput, ReadRequest};
 use omnigraph_server::{AppState, build_app};
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -294,6 +294,133 @@ async fn repeated_read_after_change_sees_updated_state_from_same_app() {
     assert_eq!(read_status, StatusCode::OK);
     assert_eq!(read_body["row_count"], 1);
     assert_eq!(read_body["rows"][0]["p.name"], "Mina");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_branch_list_create_merge_flow_works() {
+    let (_temp, app) = app_for_loaded_repo().await;
+
+    let (list_status, list_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/branches")
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(list_status, StatusCode::OK);
+    assert_eq!(list_body["branches"], json!(["main"]));
+
+    let create = BranchCreateRequest {
+        from: Some("main".to_string()),
+        name: "feature".to_string(),
+    };
+    let (create_status, create_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/branches")
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&create).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::OK);
+    assert_eq!(create_body["from"], "main");
+    assert_eq!(create_body["name"], "feature");
+
+    let (list_status, list_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/branches")
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(list_status, StatusCode::OK);
+    assert_eq!(list_body["branches"], json!(["feature", "main"]));
+
+    let change = ChangeRequest {
+        query_source: MUTATION_QUERIES.to_string(),
+        query_name: Some("insert_person".to_string()),
+        params: Some(json!({ "name": "Zoe", "age": 33 })),
+        branch: Some("feature".to_string()),
+    };
+    let (change_status, change_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/change")
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&change).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(change_status, StatusCode::OK);
+    assert_eq!(change_body["branch"], "feature");
+    assert_eq!(change_body["affected_nodes"], 1);
+
+    let read_main_before = ReadRequest {
+        query_source: fs::read_to_string(fixture("test.gq")).unwrap(),
+        query_name: Some("get_person".to_string()),
+        params: Some(json!({ "name": "Zoe" })),
+        branch: Some("main".to_string()),
+        snapshot: None,
+    };
+    let (read_status, read_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/read")
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&read_main_before).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(read_status, StatusCode::OK);
+    assert_eq!(read_body["row_count"], 0);
+
+    let merge = BranchMergeRequest {
+        source: "feature".to_string(),
+        target: Some("main".to_string()),
+    };
+    let (merge_status, merge_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/branches/merge")
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&merge).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(merge_status, StatusCode::OK);
+    assert_eq!(merge_body["source"], "feature");
+    assert_eq!(merge_body["target"], "main");
+    assert_eq!(merge_body["outcome"], "fast_forward");
+
+    let read_main_after = ReadRequest {
+        query_source: fs::read_to_string(fixture("test.gq")).unwrap(),
+        query_name: Some("get_person".to_string()),
+        params: Some(json!({ "name": "Zoe" })),
+        branch: Some("main".to_string()),
+        snapshot: None,
+    };
+    let (read_status, read_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/read")
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&read_main_after).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(read_status, StatusCode::OK);
+    assert_eq!(read_body["row_count"], 1);
+    assert_eq!(read_body["rows"][0]["p.name"], "Zoe");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -161,7 +161,7 @@ fn free_port() -> u16 {
 fn spawn_server_process(mut command: StdCommand, repo: &Path) -> TestServer {
     let port = free_port();
     let bind = format!("127.0.0.1:{}", port);
-    let child = command
+    let mut child = command
         .arg(repo)
         .arg("--bind")
         .arg(&bind)
@@ -171,7 +171,7 @@ fn spawn_server_process(mut command: StdCommand, repo: &Path) -> TestServer {
         .unwrap();
     let base_url = format!("http://{}", bind);
     let client = Client::new();
-    for _ in 0..50 {
+    for _ in 0..300 {
         if client
             .get(format!("{}/healthz", base_url))
             .send()
@@ -179,6 +179,9 @@ fn spawn_server_process(mut command: StdCommand, repo: &Path) -> TestServer {
             .unwrap_or(false)
         {
             return TestServer { child, base_url };
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("server exited before becoming healthy: {status}");
         }
         sleep(Duration::from_millis(100));
     }
