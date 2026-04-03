@@ -1,3 +1,4 @@
 **
 !Dockerfile
+!docker/entrypoint.sh
 !target/release/omnigraph-server

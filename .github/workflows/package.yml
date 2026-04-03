@@ -29,6 +29,7 @@ jobs:
       AWS_REGION: ${{ vars.AWS_REGION }}
       AWS_CODEBUILD_PACKAGE_PROJECT: ${{ vars.AWS_CODEBUILD_PACKAGE_PROJECT }}
       AWS_ARTIFACT_BUCKET: ${{ vars.AWS_ARTIFACT_BUCKET }}
+      OMNIGRAPH_ECR_REPOSITORY: omnigraph-server
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -97,6 +98,7 @@ jobs:
             --buildspec-override buildspec.package.yml \
             --environment-variables-override \
               name=OMNIGRAPH_SOURCE_VERSION,value="${{ steps.source_commit.outputs.sha }}",type=PLAINTEXT \
+              name=OMNIGRAPH_ECR_REPOSITORY,value="${OMNIGRAPH_ECR_REPOSITORY}",type=PLAINTEXT \
             --query 'build.id' \
             --output text)"
           echo "build_id=${build_id}" >> "$GITHUB_OUTPUT"

@@ -1,270 +1,281 @@
-# WAL Streaming Architecture
+# Graph WAL / Change Streaming Architecture
 
 ## 1. Purpose
 
-This document defines the right long-term architecture for Omnigraph change streaming.
+This document defines the right long-term architecture for answering one question:
 
-The core decision is:
+- **what changed in the graph?**
 
-- **Omnigraph core should produce a canonical WAL**
-- **stream delivery should happen in a separate process**
-- **sink execution and consumer cursor state should not live inside the main database runtime**
+The answer needs to work for:
 
-This is the architecture to build toward.
+- one in-process consumer
+- many consumers
+- polling/library mode
+- a separate streaming worker
 
-It is intentionally different from an in-process polling-and-sink model.
+without redesigning the consumer-facing event model every time the deployment model changes.
+
+This document keeps the term **WAL** for continuity, but the concrete artifact described here is a
+**graph-level commit-time change log**, not Lance's storage-level WAL.
 
 ## 2. Core Decision
 
-Omnigraph should not treat subscriptions as “diff snapshots and fire sinks from the DB handle.”
+Omnigraph should not standardize on:
+
+- diff snapshots on every poll
+- read Lance MemWAL directly
+- execute sinks from inside the main database runtime
 
 Instead:
 
-1. writes produce committed graph changes
-2. committed graph changes produce WAL batches
-3. a separate streaming worker reads WAL
-4. the worker enriches if needed
-5. the worker delivers to sinks
-6. the worker owns cursor and retry state
+1. writes determine the committed graph delta
+2. Omnigraph persists an immutable change batch for that committed graph delta
+3. the graph commit row points to that batch
+4. library consumers and stream workers read the same committed change batches
+5. enrichment happens downstream from the canonical change log
+6. delivery cursors and retry state live outside the graph repo
 
 That gives the clean separation of concerns:
 
 - **database**: commit graph state correctly
-- **WAL**: describe committed graph changes canonically
-- **stream worker**: manage delivery and retries
-- **sinks**: push changes to external systems
+- **graph WAL / CDC log**: describe committed graph changes canonically
+- **library pollers / stream worker**: read committed change batches
+- **sinks**: deliver to external systems
 
-## 3. Architectural Principles
+## 3. What The Change Source Should Be
 
-### 3.1 Single Source Of Truth
+There are three candidate sources of "what changed":
 
-The committed graph state is the source of truth.
+### 3.1 Snapshot Diffing
 
-The WAL is the canonical change log derived from committed writes.
-Sinks are downstream effects only.
+Snapshot diffing is acceptable as a bootstrap and fallback, but it is not the right scaling model.
 
-### 3.2 No Sink Logic In The Core Runtime
+Pros:
 
-The main Omnigraph runtime should not:
+- zero write-path overhead
+- no extra persisted artifacts
+- useful for debugging and old-commit fallback
 
-- spawn shell commands
-- POST webhooks
-- call Inngest
-- own retry policies
-- own delivery cursors
+Cons:
 
-Those are streaming concerns, not database concerns.
+- every consumer re-derives the same logical change set
+- N consumers means N identical diffs
+- rapid polling keeps recomputing already-known facts
 
-### 3.3 Commit First, Deliver Later
+This remains useful for:
 
-Graph commits must not depend on external delivery.
+- ad hoc inspection
+- migration fallback
+- validating the new change log against current behavior
 
-Writers should never block on:
+It should not remain the primary change source for subscriptions or streaming.
 
-- HTTP delivery
-- subprocess success
-- downstream agent availability
+### 3.2 Lance MemWAL
 
-### 3.4 Consumer Progress Is Operational State
+Lance MemWAL is a storage/write optimization, not the correct application-level change abstraction.
 
-Consumer cursor state is not graph state.
+Problems:
 
-It should not:
+- one logical graph mutation can span multiple table-level WAL entries
+- consumers would need to reconstruct graph events from storage internals
+- internal metadata writes would be mixed with user-visible graph changes
+- the abstraction level is too low
 
-- branch with the graph
-- merge with the graph
-- roll back when the graph rolls back
-- live inside the graph repo as part of database history
+MemWAL matters for write batching and checkpoint cadence, not as the public CDC surface.
 
-### 3.5 Enrichment Is Optional And Downstream
+### 3.3 Commit-Time Graph Change Batches
 
-The WAL should contain stable graph-level change facts.
+This is the correct abstraction.
 
-Full entity hydration should be a worker concern, not the canonical WAL payload.
+The write path already knows what it changed:
 
-## 4. Recommended System Shape
+- inserts know the inserted IDs
+- updates know the matched IDs
+- deletes know the deleted IDs and cascaded edge deletes
+- loads know every parsed entity
+- merges know the resolved graph delta
 
-```text
-Omnigraph Write Path
-    ↓
-Committed Graph State
-    ↓
-WAL Batch Per Commit
-    ↓
-WAL Stream Worker
-    ↓
-Optional Enrichment
-    ↓
-Sink Delivery
+That information should be captured once at commit time and persisted as an immutable change batch.
+
+## 4. Architectural Principles
+
+### 4.1 The Graph Commit Is The Visibility Boundary
+
+Consumers must only process changes that belong to a commit that is visible on a branch.
+
+Internal staging state should not be public change history.
+
+### 4.2 The Canonical Log Should Be Minimal
+
+The graph WAL should contain stable graph-level facts:
+
+- commit identity
+- branch visibility
+- entity identity
+- operation kind
+- optional cheap metadata
+
+It should not be the final sink payload.
+
+### 4.3 Enrichment Is Downstream
+
+Entity hydration, webhook shaping, and sink-specific payload choices belong in library consumers or
+the stream worker, not in the canonical persisted log.
+
+### 4.4 Consumer Progress Is Not Graph State
+
+Consumer cursors:
+
+- should not branch or merge
+- should not roll back with the repo
+- should not live inside the graph repo
+
+### 4.5 One Writer Per Repo Still Applies
+
+This design improves change streaming. It does not introduce distributed write coordination.
+
+Omnigraph remains a single-writer-per-repo system until a separate multi-writer design exists.
+
+## 5. Canonical Change Model
+
+Conceptually:
+
+```rust
+struct ChangeBatch {
+    commit_id: String,
+    parent_commit_id: Option<String>,
+    branch: String,
+    pre_manifest_version: u64,
+    post_manifest_version: u64,
+    timestamp: i64,
+    source: ChangeSource,
+    entry_count: u64,
+}
+
+struct ChangeEntry {
+    event_seq: u64,
+    table_key: String,
+    kind: EntityKind,
+    type_name: String,
+    entity_id: String,
+    op: ChangeOp,
+    endpoints: Option<Endpoints>,
+    changed_fields: Option<Vec<String>>,
+}
 ```
 
-Components:
+Important constraints:
 
-- **Omnigraph core**
-  - applies writes
-  - creates graph commits
-  - writes WAL batches
-- **WAL storage**
-  - durable, ordered by branch commit history
-- **stream worker**
-  - reads committed WAL
-  - owns cursor and retry state
-  - delivers to sinks
-- **sinks**
-  - shell
-  - webhook
-  - Inngest
-  - future queue/bus integrations
+- one immutable batch per committed graph commit
+- entries are graph-level, not storage-level
+- no full entity payloads in the canonical log
+- `event_seq` is stable within the batch
 
-## 5. What Goes In The WAL
+Recommended `source` values:
 
-The WAL should contain **graph-level committed events**, not fully enriched sink payloads.
+- `load`
+- `mutate`
+- `merge`
+- `publish_run`
 
-Each event should include at least:
+## 6. Storage Model
 
-- `graph_commit_id`
-- `branch`
-- `manifest_version`
-- `parent_commit_id`
-- `event_seq`
-- `kind`
-  - `node`
-  - `edge`
-- `type_name`
-- `entity_id`
-- `op`
-  - `insert`
-  - `update`
-  - `delete`
-- `endpoints`
-  - edges only
-- `timestamp`
-- optional `changed_fields`
-- optional `source`
-  - `load`
-  - `mutate`
-  - `merge`
-  - `publish_run`
+Recommended persisted shape:
 
-The WAL should **not** try to be the final webhook payload.
+- `_graph_commits.lance` remains the commit DAG and branch visibility source
+- each graph commit row gains:
+  - `changes_uri`
+  - `change_count`
+  - `pre_manifest_version`
+  - `post_manifest_version`
 
-Reason:
+Recommended object layout:
 
-- sink formats will evolve
-- enrichment policy will evolve
-- full payload snapshots are heavier and less stable
-- canonical logs should stay minimal and durable
+- `_changes/commits/<graph_commit_id>.arrow`
 
-## 6. WAL Storage Model
+Arrow is a good fit because:
 
-Do **not** start with one giant global append-only subscription table.
+- the change data is tabular
+- the runtime already uses Arrow/Lance heavily
+- it avoids inventing a second event encoding stack
 
-The cleaner model is:
+The important properties are:
 
-- one WAL batch per committed graph commit
-- commit graph row points to that batch
+- **immutable**
+- **commit-scoped**
+- **cheap to read**
+- **referenced by the graph commit row**
 
-Recommended shape:
+## 7. Publication Semantics
 
-- `_graph_commits.lance` remains the branch and commit DAG
-- each commit row gains a WAL pointer, such as:
-  - `wal_uri`
-  - `wal_event_count`
+Publication order matters.
 
-Recommended WAL object layout:
+Recommended order:
 
-- `wal/commits/<graph_commit_id>.jsonl`
-- or `wal/commits/<graph_commit_id>.json.zst`
-- or another immutable batch format
+1. compute the committed graph delta
+2. write the immutable change batch artifact
+3. write the graph commit row referencing that batch and recording pre/post manifest versions
+4. publish that commit into the branch-visible history
 
-The important property is not the exact encoding.
-The important property is:
+Required guarantees:
 
-- **WAL is immutable**
-- **WAL is commit-scoped**
-- **commit graph is the visibility barrier**
+- if the change batch write succeeds but the commit never becomes visible:
+  - the batch is harmless orphan data and may be garbage-collected
+- if a commit is visible in branch history:
+  - its referenced change batch must exist and be readable
+- consumers only process commits that are visible in branch history
 
-## 7. Why Per-Commit WAL Batches Are Better
+This is the key reason to prefer per-commit immutable batches over one shared append-only change table.
 
-This is better than a single shared append-only WAL table because it avoids awkward atomicity problems.
+## 8. Branch Semantics And Ordering
 
-Recommended write order:
-
-1. compute the committed change batch
-2. write the WAL batch artifact for the future commit
-3. write the graph commit row that references the WAL batch
-4. publish that commit into the branch head
-
-This gives clean semantics:
-
-- if WAL batch write succeeds but commit fails:
-  - orphan batch exists
-  - it is harmless and can be garbage-collected
-- if commit row exists:
-  - the referenced WAL batch must exist
-- workers only stream commits that are actually visible in commit history
-
-That is much cleaner than trying to make one shared WAL table globally atomic with manifest updates.
-
-## 8. Write Path Responsibilities
-
-The write path should do exactly these streaming-related things:
-
-1. determine the net graph changes for the committed branch transition
-2. encode those changes into a WAL batch
-3. persist the WAL batch
-4. record the graph commit with a pointer to that WAL batch
-
-The write path should not:
-
-- execute sinks
-- manage retry
-- manage consumer cursors
-- know about delivery endpoints
-
-## 9. Branch Semantics
-
-WAL must follow **branch-visible commits**, not internal staging branches.
+Consumers should see **branch-visible commits**, not arbitrary DAG traversal.
 
 Rules:
 
-- internal run branches do not emit public WAL
-- `publish_run()` emits WAL for the target branch commit that becomes visible
-- merge emits WAL for the target branch’s new merged commit
-- source branch history remains source branch history
+- internal run branches do not emit public change history
+- `publish_run()` emits the target branch commit that became visible
+- merge emits the target branch's new merged commit
+- a consumer subscribed to `main` sees only commits visible on `main`
 
-A worker subscribing to branch `main` should see:
+Ordering must be explicit:
 
-- only commits that become visible on `main`
-- in branch commit order
+- consumers process commits in the branch's published commit order
+- not "walk ancestors backward and hope the order is obvious"
 
-That is the right external mental model.
+The cursor unit is:
 
-## 10. Worker Architecture
+- `graph_commit_id`
 
-The worker should be a separate binary or service.
+That is the natural unit of "what has been processed."
 
-Suggested name:
+## 9. Core Read API
 
-- `omnigraph-stream`
+The same committed change batches should power both:
 
-Responsibilities:
+- in-process/library polling
+- a separate `omnigraph-stream` worker
 
-- discover new graph commits on a branch
-- fetch the WAL batch for each unseen commit
-- optionally hydrate entity payloads from snapshots
-- deliver to sinks
-- persist consumer progress
-- handle retries and dead-letter policy
+Suggested runtime API:
 
-This worker can be deployed:
+```rust
+async fn read_changes(
+    branch: &str,
+    after_commit: Option<&str>,
+) -> Result<Vec<ChangeBatchRef>>
+```
 
-- locally
-- on EC2
-- in ECS
-- on-prem with RustFS/MinIO-backed repos
+Where each `ChangeBatchRef` contains:
 
-## 11. Cursor And Retry State
+- commit metadata
+- branch visibility metadata
+- batch location
+- pre/post snapshot references
+
+This API should not do sink delivery.
+It should expose committed change history.
+
+## 10. Cursor Model
 
 Cursor state should be external to the graph repo.
 
@@ -283,72 +294,76 @@ Good storage options:
 
 - SQLite for simple local installs
 - DynamoDB for AWS-managed deployments
-- Postgres for general server-side deployments
+- Postgres for general server deployments
 
-Do **not** store delivery cursors inside the graph repo itself.
+Do not store delivery cursors inside the graph repo.
 
-Reasons:
+## 11. Enrichment Model
 
-- consumer state is not graph state
-- consumer state should not branch or merge
-- repo rollback should not silently roll back delivery state
-- multiple independent consumers need isolation
+The worker or library consumer may expose two modes:
 
-## 12. Enrichment Model
+- **raw change events**
+- **enriched change events**
 
-The worker may expose two delivery modes:
+Enrichment must use exact snapshot context, not "whatever HEAD is when I happen to process it."
 
-- **raw WAL events**
-- **enriched events**
+Rules:
 
-Enriched event flow:
+- insert and update hydrate from the **post-commit snapshot**
+- delete hydrates from the **pre-commit snapshot** when payload is needed
+- canonical change batches stay minimal
 
-1. worker reads WAL event
-2. worker opens the relevant snapshot context
-3. insert and update can hydrate from the post-commit snapshot
-4. delete can hydrate from the pre-commit snapshot if needed
-5. sink receives the enriched payload
+That is why the commit metadata needs exact pre/post manifest references.
 
-That preserves a clean layering:
+## 12. Write Path Responsibilities
 
-- WAL stays canonical and minimal
-- enrichment stays configurable
-- sinks stay decoupled from storage internals
+The write path should do exactly these streaming-related things:
 
-## 13. Sink Layer
+1. determine the net committed graph delta
+2. write that delta into an immutable change batch
+3. record the graph commit with a pointer to that batch and pre/post manifest metadata
+4. publish the commit into branch-visible history
 
-Sinks belong in the worker, not in the core runtime.
+The write path should not:
 
-Initial sinks can still be:
+- execute sinks
+- own retry policy
+- own consumer cursors
+- know about delivery endpoints
 
-- shell
-- webhook
-- Inngest
+## 13. Implementation Constraint: Do Not Buffer Huge Loads In Memory
 
-But they should be worker plugins over a common sink trait.
+`Vec<ChangeEntry>` is a good conceptual model, but not the right implementation strategy for large loads.
 
-That lets the database stay stable while delivery evolves independently.
+Large `load_jsonl` operations and large merges should write change entries incrementally through a
+streaming batch writer.
 
-## 14. Recommended APIs
+The producer should conceptually build a batch, but physically it should support:
 
-## Core runtime
+- incremental append
+- bounded memory
+- final immutable batch materialization
 
-Keep the core runtime focused on graph operations plus WAL production.
+## 14. Relationship To Lance MemWAL
 
-Possible internal API shape:
+Lance MemWAL does not change the public change model.
 
-```rust
-struct WalEvent { ... }
-struct WalBatch { ... }
+With MemWAL:
 
-fn build_wal_batch(...) -> WalBatch
-async fn persist_wal_batch(...) -> Result<WalBatchRef>
-async fn record_graph_commit_with_wal(...) -> Result<GraphCommitId>
-```
+- writes may be buffered and checkpointed differently
+- a single checkpoint may cover multiple low-level writes
+- the graph change batch is produced at the commit/checkpoint publication boundary
 
-## Worker
+The important point is:
 
-The worker should expose operational commands like:
+- the **cadence** of batch production may change
+- the **format and consumer model** should not
+
+## 15. Worker Architecture
+
+The worker should remain a separate binary or service.
+
+Suggested commands:
 
 ```text
 omnigraph-stream run
@@ -358,86 +373,78 @@ omnigraph-stream replay --from-commit ...
 omnigraph-stream reset-consumer ...
 ```
 
-## 15. Deployment Model
+Responsibilities:
 
-### Current bridge phase
+- discover unseen branch-visible commits
+- read change batches
+- optionally enrich from exact snapshots
+- deliver to sinks
+- persist cursor and retry state
 
-Before full streaming rollout:
+The core runtime and the worker should share the same change-batch model.
 
-- Omnigraph can still expose manual inspection APIs
-- but sink delivery should not become part of the main server contract
+## 16. Relationship To The Current Subscriptions System
 
-### Target AWS shape
+The current in-process subscriptions implementation remains useful as a bridge for:
 
-- Omnigraph server runtime
-- separate `omnigraph-stream` worker service
-- shared S3-backed repo
-- external cursor store
-- independent scaling and restart behavior
+- event shape validation
+- filter semantics
+- sink trait design
+- enrichment policy experiments
 
-### Target on-prem shape
+But it should be treated as:
 
-- Omnigraph server runtime
-- separate stream worker
-- RustFS or another S3-compatible store
-- local SQLite or another external cursor store
+- **Phase 1 bootstrap**
 
-## 16. What This Means For The Current Subscriptions Work
+not the final change-streaming architecture.
 
-The current in-process subscriptions implementation is still useful as a prototype for:
+Snapshot diffing should remain available for:
 
-- event shape
-- sink trait ideas
-- enrichment rules
-- filtering semantics
-
-But it should not be treated as the final architecture.
-
-The right end state is:
-
-- WAL in the core
-- streaming worker outside the core
-- cursor state outside the repo
+- debugging
+- ad hoc inspection
+- old-commit fallback during migration
 
 ## 17. Phased Plan
 
-### Phase 1
+### Phase 1: Bootstrap
 
-- define canonical WAL event schema
-- produce WAL batches for committed writes
-- attach WAL pointer to graph commits
+- keep snapshot diffing as the active change source
+- use it for library-mode polling
+- keep validating event and sink semantics
 
-### Phase 2
+### Phase 2: Commit-Time Change Batches
+
+- define the canonical change batch schema
+- produce one immutable batch per committed graph commit
+- attach `changes_uri` and manifest metadata to graph commits
+- make library polling read change batches instead of diffing snapshots
+
+### Phase 3: Separate Stream Worker
 
 - build `omnigraph-stream`
-- support one branch and one consumer
-- raw event replay only
+- move sink execution and retries out of the main runtime
+- use external cursor storage
 
-### Phase 3
+### Phase 4: MemWAL / Checkpoint Integration
 
-- add enrichment in the worker
-- add sink plugins
-- add external cursor store implementations
-
-### Phase 4
-
-- add operational tooling:
-  - replay
-  - reset
-  - dead-letter handling
-  - metrics
+- allow batch production at checkpoint publication boundaries when needed
+- keep the same consumer-facing change model
 
 ## 18. Bottom Line
 
-The right architecture is not:
+The right long-term architecture is not:
 
-- “diff snapshots in the DB handle and fire sinks from there”
+- diff snapshots forever
+- read Lance's storage WAL directly
+- fire sinks from the DB handle
 
 The right architecture is:
 
 - **Omnigraph writes committed graph state**
-- **Omnigraph emits WAL**
-- **a separate worker streams WAL**
+- **Omnigraph persists a graph-level commit-time change log**
+- **library consumers and stream workers read the same committed change batches**
 - **the worker enriches and delivers**
+- **cursor state stays outside the repo**
 
-That is the clean separation of concerns and the architecture that will scale operationally.
+That is the clean boundary that scales from one local poller to a dedicated streaming service without
+changing the core consumer model.

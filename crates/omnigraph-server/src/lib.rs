@@ -1,6 +1,8 @@
 pub mod api;
 pub mod config;
 
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -17,7 +19,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use color_eyre::eyre::{Result, bail};
+use color_eyre::eyre::{Result, WrapErr, bail};
 pub use config::{
     AliasCommand, AliasConfig, CliDefaults, DEFAULT_CONFIG_FILE, OmnigraphConfig, ProjectConfig,
     QueryDefaults, ReadOutputFormat, ServerDefaults, TableCellLayout, TargetConfig, load_config,
@@ -44,7 +46,7 @@ pub struct ServerConfig {
 pub struct AppState {
     uri: String,
     db: Arc<RwLock<Omnigraph>>,
-    bearer_token: Option<Arc<str>>,
+    bearer_tokens: Arc<HashMap<Arc<str>, Arc<str>>>,
 }
 
 #[derive(Debug)]
@@ -56,14 +58,30 @@ pub struct ApiError {
 
 impl AppState {
     pub fn new(uri: String, db: Omnigraph) -> Self {
-        Self::new_with_bearer_token(uri, db, None)
+        Self::new_with_bearer_tokens(uri, db, Vec::new())
     }
 
     pub fn new_with_bearer_token(uri: String, db: Omnigraph, bearer_token: Option<String>) -> Self {
+        let bearer_tokens = normalize_bearer_token(bearer_token)
+            .into_iter()
+            .map(|token| ("default".to_string(), token))
+            .collect();
+        Self::new_with_bearer_tokens(uri, db, bearer_tokens)
+    }
+
+    pub fn new_with_bearer_tokens(
+        uri: String,
+        db: Omnigraph,
+        bearer_tokens: Vec<(String, String)>,
+    ) -> Self {
+        let bearer_tokens = bearer_tokens
+            .into_iter()
+            .map(|(actor, token)| (Arc::<str>::from(token), Arc::<str>::from(actor)))
+            .collect();
         Self {
             uri,
             db: Arc::new(RwLock::new(db)),
-            bearer_token: bearer_token.map(Arc::<str>::from),
+            bearer_tokens: Arc::new(bearer_tokens),
         }
     }
 
@@ -75,17 +93,32 @@ impl AppState {
         uri: impl Into<String>,
         bearer_token: Option<String>,
     ) -> Result<Self> {
+        let bearer_tokens = normalize_bearer_token(bearer_token)
+            .into_iter()
+            .map(|token| ("default".to_string(), token))
+            .collect();
+        Self::open_with_bearer_tokens(uri, bearer_tokens).await
+    }
+
+    pub async fn open_with_bearer_tokens(
+        uri: impl Into<String>,
+        bearer_tokens: Vec<(String, String)>,
+    ) -> Result<Self> {
         let uri = uri.into();
         let db = Omnigraph::open(&uri).await?;
-        Ok(Self::new_with_bearer_token(uri, db, bearer_token))
+        Ok(Self::new_with_bearer_tokens(uri, db, bearer_tokens))
     }
 
     pub fn uri(&self) -> &str {
         &self.uri
     }
 
-    fn bearer_token(&self) -> Option<&str> {
-        self.bearer_token.as_deref()
+    fn requires_bearer_auth(&self) -> bool {
+        !self.bearer_tokens.is_empty()
+    }
+
+    fn authenticate_bearer_token(&self, provided_token: &str) -> Option<Arc<str>> {
+        self.bearer_tokens.get(provided_token).cloned()
     }
 }
 
@@ -186,7 +219,10 @@ pub fn build_app(state: AppState) -> Router {
         .route("/snapshot", get(server_snapshot))
         .route("/read", post(server_read))
         .route("/change", post(server_change))
-        .route("/branches", get(server_branch_list).post(server_branch_create))
+        .route(
+            "/branches",
+            get(server_branch_list).post(server_branch_create),
+        )
         .route("/branches/merge", post(server_branch_merge))
         .route("/runs", get(server_run_list))
         .route("/runs/{run_id}", get(server_run_show))
@@ -207,7 +243,7 @@ pub fn build_app(state: AppState) -> Router {
 
 pub async fn serve(config: ServerConfig) -> Result<()> {
     let state =
-        AppState::open_with_bearer_token(config.uri.clone(), server_bearer_token_from_env())
+        AppState::open_with_bearer_tokens(config.uri.clone(), server_bearer_tokens_from_env()?)
             .await?;
     let listener = TcpListener::bind(&config.bind).await?;
     info!(uri = %config.uri, bind = %config.bind, "serving omnigraph");
@@ -236,9 +272,9 @@ async fn require_bearer_auth(
     request: Request,
     next: Next,
 ) -> std::result::Result<Response, ApiError> {
-    let Some(expected_token) = state.bearer_token() else {
+    if !state.requires_bearer_auth() {
         return Ok(next.run(request).await);
-    };
+    }
 
     let Some(header) = request
         .headers()
@@ -252,7 +288,7 @@ async fn require_bearer_auth(
         return Err(ApiError::unauthorized("missing bearer token"));
     };
 
-    if provided_token != expected_token {
+    if state.authenticate_bearer_token(provided_token).is_none() {
         return Err(ApiError::unauthorized("invalid bearer token"));
     }
 
@@ -469,13 +505,78 @@ fn normalize_bearer_token(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn server_bearer_token_from_env() -> Option<String> {
-    normalize_bearer_token(std::env::var("OMNIGRAPH_SERVER_BEARER_TOKEN").ok())
+fn normalize_bearer_actor(value: String) -> Result<String> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        bail!("bearer token actor names must not be blank");
+    }
+    Ok(value)
+}
+
+fn parse_bearer_tokens_json(value: &str) -> Result<Vec<(String, String)>> {
+    let entries: HashMap<String, String> = serde_json::from_str(value)
+        .wrap_err("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON must be a JSON object of actor->token")?;
+    Ok(entries.into_iter().collect())
+}
+
+fn read_bearer_tokens_file(path: &str) -> Result<Vec<(String, String)>> {
+    let contents = fs::read_to_string(path)
+        .wrap_err_with(|| format!("failed to read bearer tokens file at {path}"))?;
+    parse_bearer_tokens_json(&contents)
+        .wrap_err_with(|| format!("failed to parse bearer tokens file at {path}"))
+}
+
+fn validate_bearer_tokens(entries: Vec<(String, String)>) -> Result<Vec<(String, String)>> {
+    let mut seen_actors = HashSet::new();
+    let mut seen_tokens = HashSet::new();
+    let mut normalized = Vec::with_capacity(entries.len());
+
+    for (actor, token) in entries {
+        let actor = normalize_bearer_actor(actor)?;
+        let Some(token) = normalize_bearer_token(Some(token)) else {
+            bail!("bearer token for actor '{actor}' must not be blank");
+        };
+        if !seen_actors.insert(actor.clone()) {
+            bail!("duplicate bearer token actor '{actor}'");
+        }
+        if !seen_tokens.insert(token.clone()) {
+            bail!("duplicate bearer token value configured");
+        }
+        normalized.push((actor, token));
+    }
+
+    normalized.sort_by(|(left, _), (right, _)| left.cmp(right));
+    Ok(normalized)
+}
+
+fn server_bearer_tokens_from_env() -> Result<Vec<(String, String)>> {
+    let mut entries = Vec::new();
+
+    if let Some(token) = normalize_bearer_token(std::env::var("OMNIGRAPH_SERVER_BEARER_TOKEN").ok())
+    {
+        entries.push(("default".to_string(), token));
+    }
+
+    if let Some(path) =
+        normalize_bearer_token(std::env::var("OMNIGRAPH_SERVER_BEARER_TOKENS_FILE").ok())
+    {
+        entries.extend(read_bearer_tokens_file(&path)?);
+    } else if let Some(json) =
+        normalize_bearer_token(std::env::var("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON").ok())
+    {
+        entries.extend(parse_bearer_tokens_json(&json)?);
+    }
+
+    validate_bearer_tokens(entries)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{load_server_settings, normalize_bearer_token};
+    use super::{
+        load_server_settings, normalize_bearer_token, parse_bearer_tokens_json,
+        server_bearer_tokens_from_env,
+    };
+    use std::env;
     use std::fs;
     use tempfile::tempdir;
 
@@ -566,6 +667,79 @@ server:
         assert_eq!(
             normalize_bearer_token(Some(" demo-token ".to_string())).as_deref(),
             Some("demo-token")
+        );
+    }
+
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|(name, _)| (*name, env::var(name).ok()))
+                .collect::<Vec<_>>();
+            for (name, value) in vars {
+                unsafe {
+                    match value {
+                        Some(value) => env::set_var(name, value),
+                        None => env::remove_var(name),
+                    }
+                }
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in self.saved.drain(..) {
+                unsafe {
+                    match value {
+                        Some(value) => env::set_var(name, value),
+                        None => env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parse_bearer_tokens_json_reads_actor_token_map() {
+        let tokens = parse_bearer_tokens_json(r#"{"alice":" token-a ","bob":"token-b"}"#).unwrap();
+        assert_eq!(tokens.len(), 2);
+        assert!(tokens.contains(&("alice".to_string(), " token-a ".to_string())));
+        assert!(tokens.contains(&("bob".to_string(), "token-b".to_string())));
+    }
+
+    #[test]
+    fn server_bearer_tokens_from_env_reads_legacy_token_and_token_file() {
+        let temp = tempdir().unwrap();
+        let tokens_path = temp.path().join("tokens.json");
+        fs::write(
+            &tokens_path,
+            r#"{"team-01":"token-one","team-02":"token-two"}"#,
+        )
+        .unwrap();
+
+        let _guard = EnvGuard::set(&[
+            ("OMNIGRAPH_SERVER_BEARER_TOKEN", Some(" legacy-token ")),
+            (
+                "OMNIGRAPH_SERVER_BEARER_TOKENS_FILE",
+                Some(tokens_path.to_str().unwrap()),
+            ),
+            ("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", None),
+        ]);
+
+        let tokens = server_bearer_tokens_from_env().unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                ("default".to_string(), "legacy-token".to_string()),
+                ("team-01".to_string(), "token-one".to_string()),
+                ("team-02".to_string(), "token-two".to_string()),
+            ]
         );
     }
 }

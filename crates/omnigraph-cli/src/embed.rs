@@ -132,10 +132,13 @@ struct RowSelector {
 }
 
 #[derive(Debug)]
-struct EmbedRow {
-    type_name: String,
-    data: Map<String, Value>,
-    root: Map<String, Value>,
+enum EmbedRow {
+    Entity {
+        type_name: String,
+        data: Map<String, Value>,
+        root: Map<String, Value>,
+    },
+    Passthrough(Map<String, Value>),
 }
 
 pub(crate) fn resolve_embed_job(args: &EmbedArgs) -> Result<EmbedJob> {
@@ -239,10 +242,17 @@ pub(crate) async fn run_embed_job(job: &EmbedJob) -> Result<EmbedOutput> {
             selected_rows += 1;
         }
 
-        if let Some(type_spec) = job.spec.types.get(&row.type_name) {
+        if let Some(type_spec) = row
+            .type_name()
+            .and_then(|type_name| job.spec.types.get(type_name))
+        {
             match job.mode {
                 EmbedMode::Clean => {
-                    if selected && row.data.remove(&type_spec.target).is_some() {
+                    if selected
+                        && row
+                            .data_mut()
+                            .is_some_and(|data| data.remove(&type_spec.target).is_some())
+                    {
                         cleaned_rows += 1;
                     }
                 }
@@ -262,7 +272,9 @@ pub(crate) async fn run_embed_job(job: &EmbedJob) -> Result<EmbedOutput> {
                     let reembed_selected = !job.selectors.is_empty();
                     if selected
                         && (reembed_selected
-                            || embedding_missing(row.data.get(&type_spec.target)))
+                            || embedding_missing(
+                                row.data().and_then(|data| data.get(&type_spec.target)),
+                            ))
                     {
                         embed_row(
                             &mut row,
@@ -388,17 +400,15 @@ impl RowSelector {
 fn parse_row(raw: &str, line_number: usize) -> Result<EmbedRow> {
     let mut root = serde_json::from_str::<Map<String, Value>>(raw)
         .map_err(|err| eyre!("line {} is not valid JSON: {}", line_number, err))?;
-    let type_name = root
-        .get("type")
-        .and_then(Value::as_str)
-        .ok_or_else(|| eyre!("line {} is missing string field 'type'", line_number))?
-        .to_string();
+    let Some(type_name) = root.get("type").and_then(Value::as_str).map(str::to_string) else {
+        return Ok(EmbedRow::Passthrough(root));
+    };
     let data = root
         .remove("data")
         .and_then(|value| value.as_object().cloned())
         .ok_or_else(|| eyre!("line {} is missing object field 'data'", line_number))?;
 
-    Ok(EmbedRow {
+    Ok(EmbedRow::Entity {
         type_name,
         data,
         root,
@@ -406,12 +416,40 @@ fn parse_row(raw: &str, line_number: usize) -> Result<EmbedRow> {
 }
 
 impl EmbedRow {
-    fn into_value(mut self) -> Value {
-        self.root
-            .insert("type".to_string(), Value::String(self.type_name));
-        self.root
-            .insert("data".to_string(), Value::Object(self.data));
-        Value::Object(self.root)
+    fn into_value(self) -> Value {
+        match self {
+            Self::Entity {
+                type_name,
+                data,
+                mut root,
+            } => {
+                root.insert("type".to_string(), Value::String(type_name));
+                root.insert("data".to_string(), Value::Object(data));
+                Value::Object(root)
+            }
+            Self::Passthrough(root) => Value::Object(root),
+        }
+    }
+
+    fn type_name(&self) -> Option<&str> {
+        match self {
+            Self::Entity { type_name, .. } => Some(type_name.as_str()),
+            Self::Passthrough(_) => None,
+        }
+    }
+
+    fn data(&self) -> Option<&Map<String, Value>> {
+        match self {
+            Self::Entity { data, .. } => Some(data),
+            Self::Passthrough(_) => None,
+        }
+    }
+
+    fn data_mut(&mut self) -> Option<&mut Map<String, Value>> {
+        match self {
+            Self::Entity { data, .. } => Some(data),
+            Self::Passthrough(_) => None,
+        }
     }
 }
 
@@ -420,7 +458,14 @@ fn row_matches_selection(
     type_filter: &HashSet<String>,
     selectors: &[RowSelector],
 ) -> bool {
-    let matches_type = type_filter.is_empty() || type_filter.contains(&row.type_name);
+    let Some(type_name) = row.type_name() else {
+        return false;
+    };
+    let Some(data) = row.data() else {
+        return false;
+    };
+
+    let matches_type = type_filter.is_empty() || type_filter.contains(type_name);
     if !matches_type {
         return false;
     }
@@ -429,7 +474,7 @@ fn row_matches_selection(
     }
     selectors
         .iter()
-        .any(|selector| selector.matches(&row.type_name, &row.data))
+        .any(|selector| selector.matches(type_name, data))
 }
 
 fn embedding_missing(value: Option<&Value>) -> bool {
@@ -481,13 +526,19 @@ async fn embed_row(
     dimension: usize,
     client: &EmbeddingClient,
 ) -> Result<()> {
-    let text = build_embedding_text(&row.type_name, &row.data, &spec.fields);
+    let type_name = row
+        .type_name()
+        .ok_or_else(|| eyre!("cannot embed non-entity seed rows"))?
+        .to_string();
+    let data = row
+        .data_mut()
+        .ok_or_else(|| eyre!("cannot embed non-entity seed rows"))?;
+    let text = build_embedding_text(&type_name, data, &spec.fields);
     if text.trim().is_empty() {
         return Ok(());
     }
     let embedding = client.embed_document_text(&text, dimension).await?;
-    row.data
-        .insert(spec.target.clone(), json!(embedding));
+    data.insert(spec.target.clone(), json!(embedding));
     Ok(())
 }
 

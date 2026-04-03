@@ -28,7 +28,10 @@ This plan is intentionally not resource-scarce. If a resource materially improve
 - [x] GitHub OIDC provider and role — `infra/oidc.tf`
 - [x] ECR repository — `infra/build.tf`
 - [x] `repo_target_uri` SSM parameter — `infra/secrets.tf`
+- [x] `server_image` SSM parameter — `infra/secrets.tf`
 - [x] EC2 IAM policy for repo bucket access — `infra/compute.tf`
+- [x] EC2 IAM attachment for ECR read-only pull access — `infra/compute.tf`
+- [x] EC2 IAM read access for team token path `/omnigraph/server/tokens/*` — `infra/compute.tf`
 - [x] CloudWatch alarms (ALB 5XX, CodeBuild failures, EC2 status check) — `infra/logs.tf`
 - [ ] Apply
 - [ ] Set GitHub repo variables (`AWS_REGION`, `AWS_ROLE_TO_ASSUME`, `AWS_CODEBUILD_PACKAGE_PROJECT`)
@@ -55,6 +58,7 @@ This plan is intentionally not resource-scarce. If a resource materially improve
 - add an ECR repository now, even though runtime is still EC2
 - extend the EC2 instance role so the current server can read and write the S3 repo bucket
 - add a runtime SSM parameter for the active Omnigraph target URI
+- add a runtime SSM parameter for the active `omnigraph-server` image
 
 ### What does not change yet
 
@@ -75,6 +79,8 @@ This plan is intentionally not resource-scarce. If a resource materially improve
 | CodeBuild project | `omnigraph-package-al2023` |
 | GitHub OIDC role | `omnigraph-github-actions` |
 | Target URI SSM param | `/omnigraph/server/target-uri` |
+| Server image SSM param | `/omnigraph/server/image` |
+| Team token path | `/omnigraph/server/tokens/<actor>` |
 
 ## Terraform Resources To Add
 
@@ -483,3 +489,60 @@ After apply, set these in GitHub repo settings (Settings > Secrets and variables
 | `AWS_REGION` | `us-east-1` |
 | `AWS_ROLE_TO_ASSUME` | *(from `github_actions_role_arn` output)* |
 | `AWS_CODEBUILD_PACKAGE_PROJECT` | `omnigraph-package-al2023` |
+## 8. Runtime Image Selection
+
+Add a second runtime SSM parameter for the active server image:
+
+- `aws_ssm_parameter.server_image`
+
+Why:
+
+- graph deploy and server deploy should remain separate
+- the EC2 bridge host should read a stable image reference at startup
+- rollback should mean restoring the previous exact image ref, not copying binaries onto the host
+
+Recommended value shape:
+
+- `<account>.dkr.ecr.<region>.amazonaws.com/omnigraph-server:<git-sha>`
+
+## 9. EC2 Runtime Bootstrap Changes
+
+Update `infra/templates/user_data.sh` so the instance becomes a Docker host instead of a native-binary host.
+
+The bootstrap should:
+
+- install and enable Docker
+- keep SSM agent and EC2 Instance Connect
+- fetch from SSM:
+  - bearer token
+  - Gemini key
+  - target URI
+  - server image
+- write `/etc/omnigraph/server.env`
+- install a Docker-based `omnigraph-server.service`
+
+That unit should:
+
+- log in to ECR with the instance role
+- pull `$OMNIGRAPH_SERVER_IMAGE`
+- run `docker run --network host --env-file /etc/omnigraph/server.env ...`
+
+This makes EC2 use the same runtime artifact shape as the later ECS/Fargate path.
+
+## 10. GitHub Deploy Workflow Inputs
+
+Set these GitHub repo vars in addition to the existing package vars:
+
+- `AWS_ECR_REPOSITORY_URL`
+- `AWS_EC2_INSTANCE_ID`
+- `AWS_SERVER_IMAGE_PARAM`
+- optional `AWS_SERVER_TOKENS_PATH`
+- optional `AWS_ENDPOINT_URL`
+- optional `AWS_BEARER_TOKEN_PARAM`
+
+These are used by the manual `Deploy Preview Server` workflow, which:
+
+- resolves a commit-tagged image from ECR
+- updates `/omnigraph/server/image`
+- restarts the preview EC2 host over SSM
+- smoke-tests the public endpoint

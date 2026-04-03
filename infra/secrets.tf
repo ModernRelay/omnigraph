@@ -18,3 +18,10 @@ resource "aws_ssm_parameter" "repo_target_uri" {
   type        = "String"
   value       = var.initial_repo_target_uri != "" ? var.initial_repo_target_uri : "file:///var/lib/omnigraph/data/${var.repo_name}"
 }
+
+resource "aws_ssm_parameter" "server_image" {
+  name        = "/${var.project_name}/server/image"
+  description = "Active omnigraph-server container image reference"
+  type        = "String"
+  value       = var.initial_server_image != "" ? var.initial_server_image : "${aws_ecr_repository.omnigraph_server.repository_url}:bootstrap"
+}

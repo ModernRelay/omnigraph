@@ -18,8 +18,8 @@ use omnigraph_server::api::{
 use omnigraph_server::{AliasCommand, OmnigraphConfig, ReadOutputFormat, load_config};
 use reqwest::Method;
 use reqwest::header::AUTHORIZATION;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 mod embed;

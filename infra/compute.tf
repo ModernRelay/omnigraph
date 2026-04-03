@@ -70,6 +70,11 @@ resource "aws_iam_role_policy_attachment" "ssm_core" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
+resource "aws_iam_role_policy_attachment" "ecr_read_only" {
+  role       = aws_iam_role.ec2.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+}
+
 data "aws_iam_policy_document" "read_ssm_secrets" {
   statement {
     actions = ["ssm:GetParameter"]
@@ -77,6 +82,14 @@ data "aws_iam_policy_document" "read_ssm_secrets" {
       aws_ssm_parameter.bearer_token.arn,
       aws_ssm_parameter.gemini_api_key.arn,
       aws_ssm_parameter.repo_target_uri.arn,
+      aws_ssm_parameter.server_image.arn,
+    ]
+  }
+
+  statement {
+    actions = ["ssm:GetParametersByPath"]
+    resources = [
+      "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${var.project_name}/server/tokens/*",
     ]
   }
 }
@@ -136,11 +149,12 @@ resource "aws_instance" "omnigraph" {
     ssm_token_name      = aws_ssm_parameter.bearer_token.name
     ssm_gemini_key_name = aws_ssm_parameter.gemini_api_key.name
     ssm_target_uri_name = aws_ssm_parameter.repo_target_uri.name
+    ssm_image_name      = aws_ssm_parameter.server_image.name
+    ssm_tokens_path     = "/${var.project_name}/server/tokens/"
     ebs_device          = "/dev/xvdf"
     data_dir            = "/var/lib/omnigraph"
     repo_name           = var.repo_name
     config_dir          = "/etc/omnigraph"
-    bin_dir             = "/opt/omnigraph/bin"
   }))
 
   tags = { Name = var.project_name }

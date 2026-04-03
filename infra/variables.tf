@@ -111,6 +111,12 @@ variable "initial_repo_target_uri" {
   default     = ""
 }
 
+variable "initial_server_image" {
+  description = "Initial container image reference for omnigraph-server. Leave empty to use the bootstrap tag placeholder."
+  type        = string
+  default     = ""
+}
+
 # --- Build ---
 
 variable "codebuild_compute_type" {

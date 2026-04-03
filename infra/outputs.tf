@@ -65,3 +65,8 @@ output "repo_target_uri_param" {
   description = "SSM parameter name for active repo target URI"
   value       = aws_ssm_parameter.repo_target_uri.name
 }
+
+output "server_image_param" {
+  description = "SSM parameter name for the active omnigraph-server image reference"
+  value       = aws_ssm_parameter.server_image.name
+}

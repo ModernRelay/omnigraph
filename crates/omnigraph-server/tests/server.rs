@@ -7,7 +7,9 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::{LoadMode, load_jsonl};
-use omnigraph_server::api::{BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorOutput, ReadRequest};
+use omnigraph_server::api::{
+    BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorOutput, ReadRequest,
+};
 use omnigraph_server::{AppState, build_app};
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -85,6 +87,23 @@ async fn app_for_loaded_repo_with_auth(token: &str) -> (tempfile::TempDir, Route
         repo.to_string_lossy().to_string(),
         db,
         Some(token.to_string()),
+    );
+    (temp, build_app(state))
+}
+
+async fn app_for_loaded_repo_with_auth_tokens(
+    tokens: &[(&str, &str)],
+) -> (tempfile::TempDir, Router) {
+    let temp = init_loaded_repo().await;
+    let repo = repo_path(temp.path());
+    let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let state = AppState::new_with_bearer_tokens(
+        repo.to_string_lossy().to_string(),
+        db,
+        tokens
+            .iter()
+            .map(|(actor, token)| ((*actor).to_string(), (*token).to_string()))
+            .collect(),
     );
     (temp, build_app(state))
 }
@@ -242,6 +261,27 @@ async fn protected_routes_accept_valid_bearer_token_while_healthz_stays_open() {
             .uri("/runs")
             .method(Method::GET)
             .header("authorization", "Bearer demo-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["runs"].is_array());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn protected_routes_accept_any_configured_team_bearer_token() {
+    let (_temp, app) =
+        app_for_loaded_repo_with_auth_tokens(&[("team-01", "token-one"), ("team-02", "token-two")])
+            .await;
+
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/runs")
+            .method(Method::GET)
+            .header("authorization", "Bearer token-two")
             .body(Body::empty())
             .unwrap(),
     )

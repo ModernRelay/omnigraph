@@ -115,20 +115,13 @@ impl EmbeddingClient {
         }
     }
 
-    pub async fn embed_query_text(
-        &self,
-        input: &str,
-        expected_dim: usize,
-    ) -> Result<Vec<f32>> {
+    pub async fn embed_query_text(&self, input: &str, expected_dim: usize) -> Result<Vec<f32>> {
         self.embed_text(input, expected_dim, QUERY_TASK_TYPE).await
     }
 
-    pub async fn embed_document_text(
-        &self,
-        input: &str,
-        expected_dim: usize,
-    ) -> Result<Vec<f32>> {
-        self.embed_text(input, expected_dim, DOCUMENT_TASK_TYPE).await
+    pub async fn embed_document_text(&self, input: &str, expected_dim: usize) -> Result<Vec<f32>> {
+        self.embed_text(input, expected_dim, DOCUMENT_TASK_TYPE)
+            .await
     }
 
     async fn embed_text(

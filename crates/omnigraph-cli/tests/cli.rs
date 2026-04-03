@@ -61,13 +61,13 @@ fn embed_seed_fills_missing_and_preserves_existing_vectors_by_default() {
 
     let embedded = read_embedded_rows(temp.path().join("build/seed.embedded.jsonl"));
     assert_eq!(
-        embedded[0]["data"]["embedding"]
-            .as_array()
-            .unwrap()
-            .len(),
+        embedded[0]["data"]["embedding"].as_array().unwrap().len(),
         4
     );
-    assert_eq!(embedded[1]["data"]["embedding"], serde_json::json!([0.1, 0.2]));
+    assert_eq!(
+        embedded[1]["data"]["embedding"],
+        serde_json::json!([0.1, 0.2])
+    );
 }
 
 #[test]
@@ -116,14 +116,38 @@ fn embed_select_reembeds_only_matching_rows() {
 
     let embedded = read_embedded_rows(temp.path().join("build/seed.embedded.jsonl"));
     assert!(embedded[0]["data"].get("embedding").is_none());
-    assert_ne!(embedded[1]["data"]["embedding"], serde_json::json!([0.1, 0.2]));
+    assert_ne!(
+        embedded[1]["data"]["embedding"],
+        serde_json::json!([0.1, 0.2])
+    );
     assert_eq!(
-        embedded[1]["data"]["embedding"]
-            .as_array()
-            .unwrap()
-            .len(),
+        embedded[1]["data"]["embedding"].as_array().unwrap().len(),
         4
     );
+}
+
+#[test]
+fn embed_seed_preserves_non_entity_rows() {
+    let temp = tempdir().unwrap();
+    let seed = write_seed_fixture_with_edge(temp.path());
+
+    let output = output_success(
+        cli()
+            .env("OMNIGRAPH_EMBEDDINGS_MOCK", "1")
+            .arg("embed")
+            .arg("--seed")
+            .arg(&seed)
+            .arg("--json"),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["rows"], 3);
+    assert_eq!(payload["embedded_rows"], 1);
+
+    let embedded = read_embedded_rows(temp.path().join("build/seed.embedded.jsonl"));
+    assert_eq!(embedded.len(), 3);
+    assert_eq!(embedded[2]["edge"], "Triggered");
+    assert_eq!(embedded[2]["from"], "sig-alpha");
+    assert_eq!(embedded[2]["to"], "dec-alpha");
 }
 
 #[test]
@@ -744,6 +768,21 @@ fn write_seed_fixture(root: &std::path::Path) -> std::path::PathBuf {
     )
     .unwrap();
 
+    seed
+}
+
+fn write_seed_fixture_with_edge(root: &std::path::Path) -> std::path::PathBuf {
+    let seed = write_seed_fixture(root);
+    let raw_seed = root.join("data/seed.jsonl");
+    fs::write(
+        &raw_seed,
+        concat!(
+            "{\"type\":\"Decision\",\"data\":{\"slug\":\"dec-alpha\",\"intent\":\"Alpha ship\"}}\n",
+            "{\"type\":\"Decision\",\"data\":{\"slug\":\"dec-beta\",\"intent\":\"Beta ship\",\"embedding\":[0.1,0.2]}}\n",
+            "{\"edge\":\"Triggered\",\"from\":\"sig-alpha\",\"to\":\"dec-alpha\"}\n"
+        ),
+    )
+    .unwrap();
     seed
 }
 
