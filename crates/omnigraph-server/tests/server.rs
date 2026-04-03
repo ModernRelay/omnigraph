@@ -5,10 +5,11 @@ use std::path::{Path, PathBuf};
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
-use omnigraph::db::Omnigraph;
+use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_server::api::{
-    BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorOutput, ReadRequest,
+    BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorOutput, ExportRequest,
+    ReadRequest,
 };
 use omnigraph_server::{AppState, build_app};
 use serde_json::{Value, json};
@@ -271,6 +272,63 @@ async fn protected_routes_accept_valid_bearer_token_while_healthz_stays_open() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn export_route_returns_jsonl_for_branch_snapshot() {
+    let token = "demo-token";
+    let temp = init_loaded_repo().await;
+    let repo = repo_path(temp.path());
+    let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    db.branch_create_from(ReadTarget::branch("main"), "feature")
+        .await
+        .unwrap();
+    db.load(
+        "feature",
+        r#"{"type":"Person","data":{"name":"Eve","age":29}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    let expected = db.export_jsonl("feature", &["Person".to_string()], &[]).await.unwrap();
+    drop(db);
+
+    let state = AppState::new_with_bearer_token(
+        repo.to_string_lossy().to_string(),
+        Omnigraph::open(repo.to_str().unwrap()).await.unwrap(),
+        Some(token.to_string()),
+    );
+    let app = build_app(state);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/export")
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", token))
+                .body(Body::from(
+                    serde_json::to_vec(&ExportRequest {
+                        branch: Some("feature".to_string()),
+                        type_names: vec!["Person".to_string()],
+                        table_keys: Vec::new(),
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "application/x-ndjson; charset=utf-8"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert_eq!(text, expected);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn protected_routes_accept_any_configured_team_bearer_token() {
     let (_temp, app) =
         app_for_loaded_repo_with_auth_tokens(&[("team-01", "token-one"), ("team-02", "token-two")])
@@ -289,6 +347,151 @@ async fn protected_routes_accept_any_configured_team_bearer_token() {
 
     assert_eq!(status, StatusCode::OK);
     assert!(body["runs"].is_array());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn authenticated_change_stamps_actor_on_runs_and_commits() {
+    let (_temp, app) =
+        app_for_loaded_repo_with_auth_tokens(&[("act-andrew", "token-one")]).await;
+
+    let change = ChangeRequest {
+        query_source: MUTATION_QUERIES.to_string(),
+        query_name: Some("insert_person".to_string()),
+        params: Some(json!({ "name": "Mina", "age": 28 })),
+        branch: Some("main".to_string()),
+    };
+    let (change_status, change_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/change")
+            .method(Method::POST)
+            .header("authorization", "Bearer token-one")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&change).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(change_status, StatusCode::OK);
+    assert_eq!(change_body["actor_id"], "act-andrew");
+
+    let (runs_status, runs_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/runs")
+            .method(Method::GET)
+            .header("authorization", "Bearer token-one")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(runs_status, StatusCode::OK);
+    let run = runs_body["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|run| run["operation_hash"] == "mutation:insert_person:branch=main")
+        .expect("mutation run should be present");
+    assert_eq!(run["actor_id"], "act-andrew");
+    assert_eq!(run["status"], "published");
+
+    let (commits_status, commits_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/commits?branch=main")
+            .method(Method::GET)
+            .header("authorization", "Bearer token-one")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(commits_status, StatusCode::OK);
+    let head = commits_body["commits"]
+        .as_array()
+        .unwrap()
+        .last()
+        .expect("head commit should exist");
+    assert_eq!(head["actor_id"], "act-andrew");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
+    let (_temp, app) = app_for_loaded_repo_with_auth_tokens(&[
+        ("act-andrew", "token-one"),
+        ("act-ragnor", "token-two"),
+    ])
+    .await;
+
+    let create = BranchCreateRequest {
+        from: Some("main".to_string()),
+        name: "feature".to_string(),
+    };
+    let (create_status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri("/branches")
+            .method(Method::POST)
+            .header("authorization", "Bearer token-one")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&create).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::OK);
+
+    let change = ChangeRequest {
+        query_source: MUTATION_QUERIES.to_string(),
+        query_name: Some("insert_person".to_string()),
+        params: Some(json!({ "name": "Zoe", "age": 33 })),
+        branch: Some("feature".to_string()),
+    };
+    let (change_status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri("/change")
+            .method(Method::POST)
+            .header("authorization", "Bearer token-one")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&change).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(change_status, StatusCode::OK);
+
+    let merge = BranchMergeRequest {
+        source: "feature".to_string(),
+        target: Some("main".to_string()),
+    };
+    let (merge_status, merge_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/branches/merge")
+            .method(Method::POST)
+            .header("authorization", "Bearer token-two")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&merge).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(merge_status, StatusCode::OK);
+    assert_eq!(merge_body["actor_id"], "act-ragnor");
+
+    let (commit_status, commit_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/commits?branch=main")
+            .method(Method::GET)
+            .header("authorization", "Bearer token-two")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(commit_status, StatusCode::OK);
+    let head = commit_body["commits"]
+        .as_array()
+        .unwrap()
+        .last()
+        .expect("head commit should exist");
+    assert_eq!(head["actor_id"], "act-ragnor");
 }
 
 #[tokio::test(flavor = "multi_thread")]

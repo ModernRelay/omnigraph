@@ -6,6 +6,7 @@ use arrow_array::{Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use futures::TryStreamExt;
 use lance::Dataset;
 
+use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{Omnigraph, ReadTarget, RunStatus};
 use omnigraph::error::OmniError;
 use omnigraph::loader::{LoadMode, load_jsonl};
@@ -477,4 +478,38 @@ async fn concurrent_conflicting_run_publish_fails_cleanly() {
     assert_eq!(run_a_record.status, RunStatus::Published);
     let run_b_record = db.get_run(&run_b.run_id).await.unwrap();
     assert_eq!(run_b_record.status, RunStatus::Running);
+}
+
+#[tokio::test]
+async fn public_mutation_records_actor_on_run_and_published_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    db.mutate_as(
+        "main",
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 31)]),
+        Some("act-andrew"),
+    )
+    .await
+    .unwrap();
+
+    let runs = db.list_runs().await.unwrap();
+    let run = runs
+        .iter()
+        .find(|run| run.operation_hash.as_deref() == Some("mutation:set_age:branch=main"))
+        .expect("published mutation run should exist");
+    assert_eq!(run.actor_id.as_deref(), Some("act-andrew"));
+    assert_eq!(run.status, RunStatus::Published);
+
+    let head = CommitGraph::open(uri)
+        .await
+        .unwrap()
+        .head_commit()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(head.actor_id.as_deref(), Some("act-andrew"));
 }

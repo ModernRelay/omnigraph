@@ -15,6 +15,7 @@ use lance_file::version::LanceFileVersion;
 use crate::error::{OmniError, Result};
 
 const GRAPH_RUNS_DIR: &str = "_graph_runs.lance";
+const GRAPH_RUN_ACTORS_DIR: &str = "_graph_run_actors.lance";
 pub(crate) const INTERNAL_RUN_BRANCH_PREFIX: &str = "__run__";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -76,6 +77,7 @@ pub struct RunRecord {
     pub base_snapshot_id: String,
     pub base_manifest_version: u64,
     pub operation_hash: Option<String>,
+    pub actor_id: Option<String>,
     pub status: RunStatus,
     pub published_snapshot_id: Option<String>,
     pub created_at: i64,
@@ -88,6 +90,7 @@ impl RunRecord {
         base_snapshot_id: impl Into<String>,
         base_manifest_version: u64,
         operation_hash: Option<String>,
+        actor_id: Option<String>,
     ) -> Result<Self> {
         let now = now_micros()?;
         let run_id = RunId::new(ulid::Ulid::new().to_string());
@@ -98,6 +101,7 @@ impl RunRecord {
             base_snapshot_id: base_snapshot_id.into(),
             base_manifest_version,
             operation_hash,
+            actor_id,
             status: RunStatus::Running,
             published_snapshot_id: None,
             created_at: now,
@@ -117,6 +121,7 @@ impl RunRecord {
             base_snapshot_id: self.base_snapshot_id.clone(),
             base_manifest_version: self.base_manifest_version,
             operation_hash: self.operation_hash.clone(),
+            actor_id: self.actor_id.clone(),
             status,
             published_snapshot_id,
             created_at: self.created_at,
@@ -127,7 +132,10 @@ impl RunRecord {
 
 pub struct RunRegistry {
     dataset: Dataset,
+    actor_dataset: Option<Dataset>,
     latest_by_id: HashMap<String, RunRecord>,
+    actor_by_run_id: HashMap<String, String>,
+    root_uri: String,
 }
 
 impl RunRegistry {
@@ -144,9 +152,13 @@ impl RunRegistry {
         let dataset = Dataset::write(reader, &uri as &str, Some(params))
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let actor_dataset = create_run_actor_dataset(root_uri).await?;
         Ok(Self {
             dataset,
+            actor_dataset: Some(actor_dataset),
             latest_by_id: HashMap::new(),
+            actor_by_run_id: HashMap::new(),
+            root_uri: root_uri.to_string(),
         })
     }
 
@@ -154,10 +166,18 @@ impl RunRegistry {
         let dataset = Dataset::open(&graph_runs_uri(root_uri))
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
-        let latest_by_id = load_run_cache(&dataset).await?;
+        let actor_dataset = Dataset::open(&graph_run_actors_uri(root_uri)).await.ok();
+        let actor_by_run_id = match &actor_dataset {
+            Some(dataset) => load_run_actor_cache(dataset).await?,
+            None => HashMap::new(),
+        };
+        let latest_by_id = load_run_cache(&dataset, &actor_by_run_id).await?;
         Ok(Self {
             dataset,
+            actor_dataset,
             latest_by_id,
+            actor_by_run_id,
+            root_uri: root_uri.to_string(),
         })
     }
 
@@ -165,7 +185,13 @@ impl RunRegistry {
         self.dataset = Dataset::open(&graph_runs_uri(root_uri))
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
-        self.latest_by_id = load_run_cache(&self.dataset).await?;
+        self.actor_dataset = Dataset::open(&graph_run_actors_uri(root_uri)).await.ok();
+        self.actor_by_run_id = match &self.actor_dataset {
+            Some(dataset) => load_run_actor_cache(dataset).await?,
+            None => HashMap::new(),
+        };
+        self.latest_by_id = load_run_cache(&self.dataset, &self.actor_by_run_id).await?;
+        self.root_uri = root_uri.to_string();
         Ok(())
     }
 
@@ -177,7 +203,14 @@ impl RunRegistry {
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         self.dataset = ds;
-        merge_latest_run(&mut self.latest_by_id, record.clone());
+        if let Some(actor_id) = &record.actor_id {
+            self.append_actor(record.run_id.as_str(), actor_id).await?;
+        }
+        let mut record = record.clone();
+        if record.actor_id.is_none() {
+            record.actor_id = self.actor_by_run_id.get(record.run_id.as_str()).cloned();
+        }
+        merge_latest_run(&mut self.latest_by_id, record);
         Ok(())
     }
 
@@ -198,6 +231,32 @@ impl RunRegistry {
         });
         Ok(runs)
     }
+
+    async fn append_actor(&mut self, run_id: &str, actor_id: &str) -> Result<()> {
+        if self.actor_by_run_id.get(run_id).is_some_and(|existing| existing == actor_id) {
+            return Ok(());
+        }
+
+        let record = RunActorRecord {
+            run_id: run_id.to_string(),
+            actor_id: actor_id.to_string(),
+            created_at: now_micros()?,
+        };
+        let batch = run_actors_to_batch(&[record])?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], run_actor_schema());
+        let mut dataset = match self.actor_dataset.take() {
+            Some(dataset) => dataset,
+            None => create_run_actor_dataset(&self.root_uri).await?,
+        };
+        dataset
+            .append(reader, None)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        self.actor_by_run_id
+            .insert(run_id.to_string(), actor_id.to_string());
+        self.actor_dataset = Some(dataset);
+        Ok(())
+    }
 }
 
 pub(crate) fn is_internal_run_branch(name: &str) -> bool {
@@ -211,6 +270,10 @@ pub(crate) fn internal_run_branch_name(run_id: &RunId) -> String {
 
 pub(crate) fn graph_runs_uri(root_uri: &str) -> String {
     format!("{}/{}", root_uri.trim_end_matches('/'), GRAPH_RUNS_DIR)
+}
+
+fn graph_run_actors_uri(root_uri: &str) -> String {
+    format!("{}/{}", root_uri.trim_end_matches('/'), GRAPH_RUN_ACTORS_DIR)
 }
 
 fn run_registry_schema() -> SchemaRef {
@@ -236,7 +299,36 @@ fn run_registry_schema() -> SchemaRef {
     ]))
 }
 
-async fn load_run_cache(dataset: &Dataset) -> Result<HashMap<String, RunRecord>> {
+fn run_actor_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("run_id", DataType::Utf8, false),
+        Field::new("actor_id", DataType::Utf8, false),
+        Field::new(
+            "created_at",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+    ]))
+}
+
+async fn create_run_actor_dataset(root_uri: &str) -> Result<Dataset> {
+    let batch = RecordBatch::new_empty(run_actor_schema());
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], run_actor_schema());
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    Dataset::write(reader, &graph_run_actors_uri(root_uri) as &str, Some(params))
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+async fn load_run_cache(
+    dataset: &Dataset,
+    actor_by_run_id: &HashMap<String, String>,
+) -> Result<HashMap<String, RunRecord>> {
     let batches: Vec<RecordBatch> = dataset
         .scan()
         .try_into_stream()
@@ -247,10 +339,35 @@ async fn load_run_cache(dataset: &Dataset) -> Result<HashMap<String, RunRecord>>
         .map_err(|e| OmniError::Lance(e.to_string()))?;
 
     let mut latest_by_id = HashMap::new();
-    for record in load_runs_from_batches(&batches)? {
+    for mut record in load_runs_from_batches(&batches)? {
+        record.actor_id = actor_by_run_id.get(record.run_id.as_str()).cloned();
         merge_latest_run(&mut latest_by_id, record);
     }
     Ok(latest_by_id)
+}
+
+async fn load_run_actor_cache(dataset: &Dataset) -> Result<HashMap<String, String>> {
+    let batches: Vec<RecordBatch> = dataset
+        .scan()
+        .try_into_stream()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?
+        .try_collect()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+    let mut actors = HashMap::new();
+    for batch in batches {
+        let run_ids = string_column(&batch, "run_id", "run actor registry")?;
+        let actor_ids = string_column(&batch, "actor_id", "run actor registry")?;
+        for row in 0..batch.num_rows() {
+            actors.insert(
+                run_ids.value(row).to_string(),
+                actor_ids.value(row).to_string(),
+            );
+        }
+    }
+    Ok(actors)
 }
 
 fn load_runs_from_batches(batches: &[RecordBatch]) -> Result<Vec<RunRecord>> {
@@ -279,6 +396,7 @@ fn load_runs_from_batches(batches: &[RecordBatch]) -> Result<Vec<RunRecord>> {
                 } else {
                     Some(operation_hashes.value(row).to_string())
                 },
+                actor_id: None,
                 status: RunStatus::parse(statuses.value(row))?,
                 published_snapshot_id: if published_snapshot_ids.is_null(row) {
                     None
@@ -399,6 +517,32 @@ fn runs_to_batch(records: &[RunRecord]) -> Result<RecordBatch> {
             Arc::new(StringArray::from(published_snapshot_ids)),
             Arc::new(TimestampMicrosecondArray::from(created_ats)),
             Arc::new(TimestampMicrosecondArray::from(updated_ats)),
+        ],
+    )
+    .map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunActorRecord {
+    run_id: String,
+    actor_id: String,
+    created_at: i64,
+}
+
+fn run_actors_to_batch(records: &[RunActorRecord]) -> Result<RecordBatch> {
+    let run_ids: Vec<&str> = records.iter().map(|record| record.run_id.as_str()).collect();
+    let actor_ids: Vec<&str> = records
+        .iter()
+        .map(|record| record.actor_id.as_str())
+        .collect();
+    let created_ats: Vec<i64> = records.iter().map(|record| record.created_at).collect();
+
+    RecordBatch::try_new(
+        run_actor_schema(),
+        vec![
+            Arc::new(StringArray::from(run_ids)),
+            Arc::new(StringArray::from(actor_ids)),
+            Arc::new(TimestampMicrosecondArray::from(created_ats)),
         ],
     )
     .map_err(|e| OmniError::Lance(e.to_string()))

@@ -8,13 +8,14 @@ use std::sync::Arc;
 
 use api::{
     BranchCreateOutput, BranchCreateRequest, BranchListOutput, BranchMergeOutput,
-    BranchMergeRequest, ChangeOutput, ChangeRequest, ErrorCode, ErrorOutput, HealthOutput,
-    ReadOutput, ReadRequest, RunListOutput, SnapshotQuery, snapshot_payload,
+    BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput, CommitListQuery,
+    ErrorCode, ErrorOutput, ExportRequest, HealthOutput, ReadOutput, ReadRequest, RunListOutput,
+    SnapshotQuery, snapshot_payload,
 };
 use axum::extract::DefaultBodyLimit;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{Extension, Path, Query, Request, State};
 use axum::http::StatusCode;
-use axum::http::header::AUTHORIZATION;
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -47,6 +48,15 @@ pub struct AppState {
     uri: String,
     db: Arc<RwLock<Omnigraph>>,
     bearer_tokens: Arc<HashMap<Arc<str>, Arc<str>>>,
+}
+
+#[derive(Debug, Clone)]
+struct AuthenticatedActor(Arc<str>);
+
+impl AuthenticatedActor {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Debug)]
@@ -217,6 +227,7 @@ pub fn load_server_settings(
 pub fn build_app(state: AppState) -> Router {
     let protected = Router::new()
         .route("/snapshot", get(server_snapshot))
+        .route("/export", post(server_export))
         .route("/read", post(server_read))
         .route("/change", post(server_change))
         .route(
@@ -228,6 +239,8 @@ pub fn build_app(state: AppState) -> Router {
         .route("/runs/{run_id}", get(server_run_show))
         .route("/runs/{run_id}/publish", post(server_run_publish))
         .route("/runs/{run_id}/abort", post(server_run_abort))
+        .route("/commits", get(server_commit_list))
+        .route("/commits/{commit_id}", get(server_commit_show))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_auth,
@@ -269,7 +282,7 @@ async fn server_health() -> Json<HealthOutput> {
 
 async fn require_bearer_auth(
     State(state): State<AppState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> std::result::Result<Response, ApiError> {
     if !state.requires_bearer_auth() {
@@ -288,9 +301,10 @@ async fn require_bearer_auth(
         return Err(ApiError::unauthorized("missing bearer token"));
     };
 
-    if state.authenticate_bearer_token(provided_token).is_none() {
+    let Some(actor) = state.authenticate_bearer_token(provided_token) else {
         return Err(ApiError::unauthorized("invalid bearer token"));
-    }
+    };
+    request.extensions_mut().insert(AuthenticatedActor(actor));
 
     Ok(next.run(request).await)
 }
@@ -340,11 +354,32 @@ async fn server_read(
     Ok(Json(api::read_output(selected_name, &target, result)))
 }
 
+async fn server_export(
+    State(state): State<AppState>,
+    Json(request): Json<ExportRequest>,
+) -> std::result::Result<Response, ApiError> {
+    let branch = request.branch.unwrap_or_else(|| "main".to_string());
+    let payload = {
+        let db = Arc::clone(&state.db).read_owned().await;
+        db.export_jsonl(&branch, &request.type_names, &request.table_keys)
+            .await
+            .map_err(ApiError::from_omni)?
+    };
+    Ok((
+        StatusCode::OK,
+        [(CONTENT_TYPE, "application/x-ndjson; charset=utf-8")],
+        payload,
+    )
+        .into_response())
+}
+
 async fn server_change(
     State(state): State<AppState>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<ChangeRequest>,
 ) -> std::result::Result<Json<ChangeOutput>, ApiError> {
     let branch = request.branch.unwrap_or_else(|| "main".to_string());
+    let actor_id = actor.as_ref().map(|Extension(actor)| actor.as_str());
     let (selected_name, query_params) =
         select_named_query(&request.query_source, request.query_name.as_deref())
             .map_err(|err| ApiError::bad_request(err.to_string()))?;
@@ -353,7 +388,13 @@ async fn server_change(
 
     let result = {
         let mut db = Arc::clone(&state.db).write_owned().await;
-        db.mutate(&branch, &request.query_source, &selected_name, &params)
+        db.mutate_as(
+            &branch,
+            &request.query_source,
+            &selected_name,
+            &params,
+            actor_id,
+        )
             .await
             .map_err(ApiError::from_omni)?
     };
@@ -362,6 +403,7 @@ async fn server_change(
         query_name: selected_name,
         affected_nodes: result.affected_nodes,
         affected_edges: result.affected_edges,
+        actor_id: actor_id.map(str::to_string),
     }))
 }
 
@@ -378,6 +420,7 @@ async fn server_branch_list(
 
 async fn server_branch_create(
     State(state): State<AppState>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<BranchCreateRequest>,
 ) -> std::result::Result<Json<BranchCreateOutput>, ApiError> {
     let from = request.from.unwrap_or_else(|| "main".to_string());
@@ -391,17 +434,20 @@ async fn server_branch_create(
         uri: state.uri().to_string(),
         from,
         name: request.name,
+        actor_id: actor.map(|Extension(actor)| actor.as_str().to_string()),
     }))
 }
 
 async fn server_branch_merge(
     State(state): State<AppState>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<BranchMergeRequest>,
 ) -> std::result::Result<Json<BranchMergeOutput>, ApiError> {
     let target = request.target.unwrap_or_else(|| "main".to_string());
+    let actor_id = actor.as_ref().map(|Extension(actor)| actor.as_str());
     let outcome = {
         let mut db = Arc::clone(&state.db).write_owned().await;
-        db.branch_merge(&request.source, &target)
+        db.branch_merge_as(&request.source, &target, actor_id)
             .await
             .map_err(ApiError::from_omni)?
     };
@@ -409,6 +455,7 @@ async fn server_branch_merge(
         source: request.source,
         target,
         outcome: outcome.into(),
+        actor_id: actor_id.map(str::to_string),
     }))
 }
 
@@ -439,12 +486,16 @@ async fn server_run_show(
 
 async fn server_run_publish(
     State(state): State<AppState>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Path(run_id): Path<String>,
 ) -> std::result::Result<Json<api::RunOutput>, ApiError> {
     let run_id = RunId::new(run_id);
+    let actor_id = actor.as_ref().map(|Extension(actor)| actor.as_str());
     let run = {
         let mut db = Arc::clone(&state.db).write_owned().await;
-        db.publish_run(&run_id).await.map_err(ApiError::from_omni)?;
+        db.publish_run_as(&run_id, actor_id)
+            .await
+            .map_err(ApiError::from_omni)?;
         db.get_run(&run_id).await.map_err(ApiError::from_omni)?
     };
     Ok(Json(api::run_output(&run)))
@@ -461,6 +512,32 @@ async fn server_run_abort(
             .map_err(ApiError::from_omni)?
     };
     Ok(Json(api::run_output(&run)))
+}
+
+async fn server_commit_list(
+    State(state): State<AppState>,
+    Query(query): Query<CommitListQuery>,
+) -> std::result::Result<Json<CommitListOutput>, ApiError> {
+    let commits = {
+        let db = Arc::clone(&state.db).read_owned().await;
+        db.list_commits(query.branch.as_deref())
+            .await
+            .map_err(ApiError::from_omni)?
+    };
+    Ok(Json(CommitListOutput {
+        commits: commits.iter().map(api::commit_output).collect(),
+    }))
+}
+
+async fn server_commit_show(
+    State(state): State<AppState>,
+    Path(commit_id): Path<String>,
+) -> std::result::Result<Json<api::CommitOutput>, ApiError> {
+    let commit = {
+        let db = Arc::clone(&state.db).read_owned().await;
+        db.get_commit(&commit_id).await.map_err(ApiError::from_omni)?
+    };
+    Ok(Json(api::commit_output(&commit)))
 }
 
 fn read_target_from_request(branch: Option<String>, snapshot: Option<String>) -> ReadTarget {

@@ -337,6 +337,40 @@ async fn branch_merge_records_single_latest_commit_with_two_parents() {
 }
 
 #[tokio::test]
+async fn branch_merge_records_actor_on_latest_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = init_and_load(&dir).await;
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+    mutate_branch(
+        &mut feature,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+
+    let outcome = main
+        .branch_merge_as("feature", "main", Some("act-ragnor"))
+        .await
+        .unwrap();
+    assert_eq!(outcome, MergeOutcome::FastForward);
+
+    let head = CommitGraph::open(uri)
+        .await
+        .unwrap()
+        .head_commit()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(head.actor_id.as_deref(), Some("act-ragnor"));
+}
+
+#[tokio::test]
 async fn already_up_to_date_branch_merge_returns_without_new_commit() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();

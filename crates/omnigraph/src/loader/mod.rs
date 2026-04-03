@@ -328,12 +328,14 @@ async fn load_jsonl_reader<R: BufRead>(
 fn build_node_batch(node_type: &NodeType, rows: &[JsonValue]) -> Result<RecordBatch> {
     let schema = node_type.arrow_schema.clone();
 
-    // Build id column: @key value or ULID
+    // Build id column: explicit id, @key value, or generated ULID.
     let ids: Vec<String> = rows
         .iter()
         .map(|row| {
+            let explicit_id = row.get("id").and_then(|v| v.as_str()).map(str::to_string);
             if let Some(key_prop) = node_type.key_property() {
-                row.get(key_prop)
+                let key_value = row
+                    .get(key_prop)
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .ok_or_else(|| {
@@ -341,7 +343,18 @@ fn build_node_batch(node_type: &NodeType, rows: &[JsonValue]) -> Result<RecordBa
                             "node {} missing @key property '{}'",
                             node_type.name, key_prop
                         ))
-                    })
+                    })?;
+                if let Some(explicit_id) = explicit_id {
+                    if explicit_id != key_value {
+                        return Err(OmniError::manifest(format!(
+                            "node {} has explicit id '{}' that does not match @key property '{}' value '{}'",
+                            node_type.name, explicit_id, key_prop, key_value
+                        )));
+                    }
+                }
+                Ok(key_value)
+            } else if let Some(explicit_id) = explicit_id {
+                Ok(explicit_id)
             } else {
                 Ok(generate_id())
             }
@@ -372,7 +385,15 @@ fn build_edge_batch(
 ) -> Result<RecordBatch> {
     let schema = edge_type.arrow_schema.clone();
 
-    let ids: Vec<String> = (0..rows.len()).map(|_| generate_id()).collect();
+    let ids: Vec<String> = rows
+        .iter()
+        .map(|(_, _, data)| {
+            data.get("id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(generate_id)
+        })
+        .collect();
     let srcs: Vec<&str> = rows.iter().map(|(from, _, _)| from.as_str()).collect();
     let dsts: Vec<&str> = rows.iter().map(|(_, to, _)| to.as_str()).collect();
 

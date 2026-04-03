@@ -3169,6 +3169,34 @@ impl Omnigraph {
         query_name: &str,
         params: &ParamMap,
     ) -> Result<MutationResult> {
+        self.mutate_as(branch, query_source, query_name, params, None)
+            .await
+    }
+
+    pub async fn mutate_as(
+        &mut self,
+        branch: &str,
+        query_source: &str,
+        query_name: &str,
+        params: &ParamMap,
+        actor_id: Option<&str>,
+    ) -> Result<MutationResult> {
+        let previous_actor = self.audit_actor_id.clone();
+        self.audit_actor_id = actor_id.map(str::to_string);
+        let result = self
+            .mutate_with_current_actor(branch, query_source, query_name, params)
+            .await;
+        self.audit_actor_id = previous_actor;
+        result
+    }
+
+    async fn mutate_with_current_actor(
+        &mut self,
+        branch: &str,
+        query_source: &str,
+        query_name: &str,
+        params: &ParamMap,
+    ) -> Result<MutationResult> {
         let requested = Self::normalize_branch_name(branch)?;
         let resolved_params = enrich_mutation_params(params)?;
         let operation = format!(
@@ -3297,7 +3325,20 @@ impl Omnigraph {
     }
 
     pub async fn branch_merge(&mut self, source: &str, target: &str) -> Result<MergeOutcome> {
-        self.branch_merge_impl(source, target, false).await
+        self.branch_merge_as(source, target, None).await
+    }
+
+    pub async fn branch_merge_as(
+        &mut self,
+        source: &str,
+        target: &str,
+        actor_id: Option<&str>,
+    ) -> Result<MergeOutcome> {
+        let previous_actor = self.audit_actor_id.clone();
+        self.audit_actor_id = actor_id.map(str::to_string);
+        let result = self.branch_merge_impl(source, target, false).await;
+        self.audit_actor_id = previous_actor;
+        result
     }
 
     pub(crate) async fn branch_merge_internal(

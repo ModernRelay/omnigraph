@@ -11,9 +11,9 @@ use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::{JsonParamMode, ParamMap};
 use omnigraph_server::api::{
     BranchCreateOutput, BranchCreateRequest, BranchListOutput, BranchMergeOutput,
-    BranchMergeRequest, ChangeOutput, ChangeRequest, ErrorOutput, ReadOutput, ReadRequest,
-    RunListOutput, RunOutput, SnapshotOutput, SnapshotTableOutput, read_output, run_output,
-    snapshot_payload,
+    BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput, CommitOutput, ErrorOutput,
+    ExportRequest, ReadOutput, ReadRequest, RunListOutput, RunOutput,
+    SnapshotOutput, SnapshotTableOutput, commit_output, read_output, run_output, snapshot_payload,
 };
 use omnigraph_server::{AliasCommand, OmnigraphConfig, ReadOutputFormat, load_config};
 use reqwest::Method;
@@ -87,10 +87,32 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Export a full graph snapshot as JSONL
+    Export {
+        /// Repo URI
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long)]
+        jsonl: bool,
+        #[arg(long = "type")]
+        type_names: Vec<String>,
+        #[arg(long = "table")]
+        table_keys: Vec<String>,
+    },
     /// Run operations
     Run {
         #[command(subcommand)]
         command: RunCommand,
+    },
+    /// Commit history operations
+    Commit {
+        #[command(subcommand)]
+        command: CommitCommand,
     },
     /// Execute a read query against a branch or snapshot
     Read {
@@ -239,6 +261,35 @@ enum RunCommand {
         #[arg(long)]
         config: Option<PathBuf>,
         run_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CommitCommand {
+    /// List graph commits
+    List {
+        /// Repo URI
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a graph commit
+    Show {
+        /// Repo URI
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        commit_id: String,
         #[arg(long)]
         json: bool,
     },
@@ -462,6 +513,31 @@ async fn remote_json<T: DeserializeOwned>(
     Ok(serde_json::from_str(&text)?)
 }
 
+async fn remote_text(
+    client: &reqwest::Client,
+    method: Method,
+    url: String,
+    body: Option<Value>,
+    bearer_token: Option<&str>,
+) -> Result<String> {
+    let request = apply_bearer_token(client.request(method, url), bearer_token);
+    let request = if let Some(body) = body {
+        request.json(&body)
+    } else {
+        request
+    };
+    let response = request.send().await?;
+    let status = response.status();
+    let text = response.text().await?;
+    if !status.is_success() {
+        if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
+            bail!(error.error);
+        }
+        bail!("server returned {}: {}", status, text);
+    }
+    Ok(text)
+}
+
 fn resolve_uri(
     config: &OmnigraphConfig,
     cli_uri: Option<String>,
@@ -639,13 +715,23 @@ fn print_change_human(output: &ChangeOutput) {
         "changed {} via {}: {} nodes, {} edges",
         output.branch, output.query_name, output.affected_nodes, output.affected_edges
     );
+    if let Some(actor_id) = &output.actor_id {
+        println!("actor_id: {}", actor_id);
+    }
 }
 
 fn print_run_list_human(runs: &[RunOutput]) {
     for run in runs {
         println!(
-            "{} {} target={} branch={}",
-            run.run_id, run.status, run.target_branch, run.run_branch
+            "{} {} target={} branch={}{}",
+            run.run_id,
+            run.status,
+            run.target_branch,
+            run.run_branch,
+            run.actor_id
+                .as_deref()
+                .map(|actor| format!(" actor={}", actor))
+                .unwrap_or_default()
         );
     }
 }
@@ -657,6 +743,9 @@ fn print_run_human(run: &RunOutput) {
     println!("run_branch: {}", run.run_branch);
     println!("base_snapshot_id: {}", run.base_snapshot_id);
     println!("base_manifest_version: {}", run.base_manifest_version);
+    if let Some(actor_id) = &run.actor_id {
+        println!("actor_id: {}", actor_id);
+    }
     if let Some(operation_hash) = &run.operation_hash {
         println!("operation_hash: {}", operation_hash);
     }
@@ -665,6 +754,42 @@ fn print_run_human(run: &RunOutput) {
     }
     println!("created_at: {}", run.created_at);
     println!("updated_at: {}", run.updated_at);
+}
+
+fn print_commit_list_human(commits: &[CommitOutput]) {
+    for commit in commits {
+        let branch = commit.manifest_branch.as_deref().unwrap_or("main");
+        println!(
+            "{} branch={} version={}{}",
+            commit.graph_commit_id,
+            branch,
+            commit.manifest_version,
+            commit
+                .actor_id
+                .as_deref()
+                .map(|actor| format!(" actor={}", actor))
+                .unwrap_or_default()
+        );
+    }
+}
+
+fn print_commit_human(commit: &CommitOutput) {
+    println!("graph_commit_id: {}", commit.graph_commit_id);
+    println!(
+        "manifest_branch: {}",
+        commit.manifest_branch.as_deref().unwrap_or("main")
+    );
+    println!("manifest_version: {}", commit.manifest_version);
+    if let Some(parent_commit_id) = &commit.parent_commit_id {
+        println!("parent_commit_id: {}", parent_commit_id);
+    }
+    if let Some(merged_parent_commit_id) = &commit.merged_parent_commit_id {
+        println!("merged_parent_commit_id: {}", merged_parent_commit_id);
+    }
+    if let Some(actor_id) = &commit.actor_id {
+        println!("actor_id: {}", actor_id);
+    }
+    println!("created_at: {}", commit.created_at);
 }
 
 fn resolve_read_format(
@@ -917,6 +1042,7 @@ async fn execute_change(
         query_name: selected_name,
         affected_nodes: result.affected_nodes,
         affected_edges: result.affected_edges,
+        actor_id: None,
     })
 }
 
@@ -938,6 +1064,38 @@ async fn execute_change_remote(
             query_name: query_name.map(ToOwned::to_owned),
             params: params_json.cloned(),
             branch: Some(branch.to_string()),
+        })?),
+        bearer_token,
+    )
+    .await
+}
+
+async fn execute_export(
+    uri: &str,
+    branch: &str,
+    type_names: &[String],
+    table_keys: &[String],
+) -> Result<String> {
+    let db = Omnigraph::open(uri).await?;
+    Ok(db.export_jsonl(branch, type_names, table_keys).await?)
+}
+
+async fn execute_export_remote(
+    client: &reqwest::Client,
+    uri: &str,
+    branch: &str,
+    type_names: &[String],
+    table_keys: &[String],
+    bearer_token: Option<&str>,
+) -> Result<String> {
+    remote_text(
+        client,
+        Method::POST,
+        remote_url(uri, "/export"),
+        Some(serde_json::to_value(ExportRequest {
+            branch: Some(branch.to_string()),
+            type_names: type_names.to_vec(),
+            table_keys: table_keys.to_vec(),
         })?),
         bearer_token,
     )
@@ -1048,6 +1206,7 @@ async fn main() -> Result<()> {
                         uri: uri.clone(),
                         from: from.clone(),
                         name: name.clone(),
+                        actor_id: None,
                     }
                 };
                 if json {
@@ -1121,6 +1280,7 @@ async fn main() -> Result<()> {
                         source: source.clone(),
                         target: into.clone(),
                         outcome: outcome.into(),
+                        actor_id: None,
                     }
                 };
                 if json {
@@ -1132,6 +1292,77 @@ async fn main() -> Result<()> {
                         payload.target,
                         payload.outcome.as_str()
                     );
+                }
+            }
+        },
+        Command::Commit { command } => match command {
+            CommitCommand::List {
+                uri,
+                target,
+                config,
+                branch,
+                json,
+            } => {
+                let config = load_cli_config(config.as_ref())?;
+                let bearer_token =
+                    resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
+                let uri = resolve_uri(&config, uri, target.as_deref())?;
+                let commits = if is_remote_uri(&uri) {
+                    remote_json::<CommitListOutput>(
+                        &http_client,
+                        Method::GET,
+                        if let Some(branch) = branch.as_deref() {
+                            format!("{}?branch={}", remote_url(&uri, "/commits"), branch)
+                        } else {
+                            remote_url(&uri, "/commits")
+                        },
+                        None,
+                        bearer_token.as_deref(),
+                    )
+                    .await?
+                    .commits
+                } else {
+                    let db = Omnigraph::open(&uri).await?;
+                    db.list_commits(branch.as_deref())
+                        .await?
+                        .iter()
+                        .map(commit_output)
+                        .collect::<Vec<_>>()
+                };
+                if json {
+                    print_json(&CommitListOutput { commits })?;
+                } else {
+                    print_commit_list_human(&commits);
+                }
+            }
+            CommitCommand::Show {
+                uri,
+                target,
+                config,
+                commit_id,
+                json,
+            } => {
+                let config = load_cli_config(config.as_ref())?;
+                let bearer_token =
+                    resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
+                let uri = resolve_uri(&config, uri, target.as_deref())?;
+                let commit = if is_remote_uri(&uri) {
+                    remote_json::<CommitOutput>(
+                        &http_client,
+                        Method::GET,
+                        remote_url(&uri, &format!("/commits/{}", commit_id)),
+                        None,
+                        bearer_token.as_deref(),
+                    )
+                    .await?
+                } else {
+                    let db = Omnigraph::open(&uri).await?;
+                    commit_output(&db.get_commit(&commit_id).await?)
+                };
+                if json {
+                    print_json(&commit)?;
+                } else {
+                    print_commit_human(&commit);
                 }
             }
         },
@@ -1167,6 +1398,35 @@ async fn main() -> Result<()> {
             } else {
                 print_snapshot_human(&payload.branch, payload.manifest_version, &payload.tables);
             }
+        }
+        Command::Export {
+            uri,
+            target,
+            config,
+            branch,
+            jsonl: _,
+            type_names,
+            table_keys,
+        } => {
+            let config = load_cli_config(config.as_ref())?;
+            let bearer_token =
+                resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
+            let uri = resolve_uri(&config, uri, target.as_deref())?;
+            let branch = resolve_branch(&config, branch, None, "main");
+            let output = if is_remote_uri(&uri) {
+                execute_export_remote(
+                    &http_client,
+                    &uri,
+                    &branch,
+                    &type_names,
+                    &table_keys,
+                    bearer_token.as_deref(),
+                )
+                .await?
+            } else {
+                execute_export(&uri, &branch, &type_names, &table_keys).await?
+            };
+            print!("{output}");
         }
         Command::Run { command } => match command {
             RunCommand::List {
