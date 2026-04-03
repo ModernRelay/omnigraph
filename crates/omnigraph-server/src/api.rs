@@ -1,4 +1,4 @@
-use omnigraph::db::{MergeOutcome, ReadTarget, RunRecord, Snapshot};
+use omnigraph::db::{GraphCommit, MergeOutcome, ReadTarget, RunRecord, Snapshot};
 use omnigraph_compiler::result::QueryResult;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -27,6 +27,7 @@ pub struct RunOutput {
     pub base_snapshot_id: String,
     pub base_manifest_version: u64,
     pub operation_hash: Option<String>,
+    pub actor_id: Option<String>,
     pub status: String,
     pub published_snapshot_id: Option<String>,
     pub created_at: i64,
@@ -49,6 +50,7 @@ pub struct BranchCreateOutput {
     pub uri: String,
     pub from: String,
     pub name: String,
+    pub actor_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +97,7 @@ pub struct BranchMergeOutput {
     pub source: String,
     pub target: String,
     pub outcome: BranchMergeOutcome,
+    pub actor_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +122,23 @@ pub struct ChangeOutput {
     pub query_name: String,
     pub affected_nodes: usize,
     pub affected_edges: usize,
+    pub actor_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitOutput {
+    pub graph_commit_id: String,
+    pub manifest_branch: Option<String>,
+    pub manifest_version: u64,
+    pub parent_commit_id: Option<String>,
+    pub merged_parent_commit_id: Option<String>,
+    pub actor_id: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitListOutput {
+    pub commits: Vec<CommitOutput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,8 +158,22 @@ pub struct ChangeRequest {
     pub branch: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportRequest {
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub type_names: Vec<String>,
+    #[serde(default)]
+    pub table_keys: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SnapshotQuery {
+    pub branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommitListQuery {
     pub branch: Option<String>,
 }
 
@@ -193,10 +227,23 @@ pub fn run_output(run: &RunRecord) -> RunOutput {
         base_snapshot_id: run.base_snapshot_id.as_str().to_string(),
         base_manifest_version: run.base_manifest_version,
         operation_hash: run.operation_hash.clone(),
+        actor_id: run.actor_id.clone(),
         status: run.status.as_str().to_string(),
         published_snapshot_id: run.published_snapshot_id.clone(),
         created_at: run.created_at,
         updated_at: run.updated_at,
+    }
+}
+
+pub fn commit_output(commit: &GraphCommit) -> CommitOutput {
+    CommitOutput {
+        graph_commit_id: commit.graph_commit_id.clone(),
+        manifest_branch: commit.manifest_branch.clone(),
+        manifest_version: commit.manifest_version,
+        parent_commit_id: commit.parent_commit_id.clone(),
+        merged_parent_commit_id: commit.merged_parent_commit_id.clone(),
+        actor_id: commit.actor_id.clone(),
+        created_at: commit.created_at,
     }
 }
 

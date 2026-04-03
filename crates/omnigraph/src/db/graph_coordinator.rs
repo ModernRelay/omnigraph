@@ -354,12 +354,13 @@ impl GraphCoordinator {
         Ok(())
     }
 
-    pub(crate) async fn commit_updates(
+    pub(crate) async fn commit_updates_with_actor(
         &mut self,
         updates: &[SubTableUpdate],
+        actor_id: Option<&str>,
     ) -> Result<PublishedSnapshot> {
         let manifest_version = self.commit_manifest_updates(updates).await?;
-        let snapshot_id = self.record_graph_commit(manifest_version).await?;
+        let snapshot_id = self.record_graph_commit(manifest_version, actor_id).await?;
         Ok(PublishedSnapshot {
             manifest_version,
             _snapshot_id: snapshot_id,
@@ -378,6 +379,7 @@ impl GraphCoordinator {
     pub(crate) async fn record_graph_commit(
         &mut self,
         manifest_version: u64,
+        actor_id: Option<&str>,
     ) -> Result<SnapshotId> {
         self.ensure_commit_graph_initialized().await?;
         let current_branch = self.current_branch().map(str::to_string);
@@ -389,7 +391,7 @@ impl GraphCoordinator {
         };
         failpoints::maybe_fail("graph_publish.before_commit_append")?;
         let graph_commit_id = commit_graph
-            .append_commit(current_branch.as_deref(), manifest_version)
+            .append_commit(current_branch.as_deref(), manifest_version, actor_id)
             .await?;
         Ok(SnapshotId::new(graph_commit_id))
     }
@@ -399,6 +401,7 @@ impl GraphCoordinator {
         manifest_version: u64,
         parent_commit_id: &str,
         merged_parent_commit_id: &str,
+        actor_id: Option<&str>,
     ) -> Result<SnapshotId> {
         self.ensure_commit_graph_initialized().await?;
         let current_branch = self.current_branch().map(str::to_string);
@@ -412,6 +415,7 @@ impl GraphCoordinator {
                 manifest_version,
                 parent_commit_id,
                 merged_parent_commit_id,
+                actor_id,
             )
             .await?;
         Ok(SnapshotId::new(graph_commit_id))
@@ -481,6 +485,24 @@ impl GraphCoordinator {
         }
         let run_registry = RunRegistry::open(self.root_uri()).await?;
         run_registry.list_runs().await
+    }
+
+    pub(crate) async fn list_commits(&self) -> Result<Vec<GraphCommit>> {
+        if let Some(commit_graph) = &self.commit_graph {
+            return commit_graph.load_commits().await;
+        }
+        if !self
+            .storage
+            .exists(&graph_commits_uri(self.root_uri()))
+            .await?
+        {
+            return Ok(Vec::new());
+        }
+        let commit_graph = match self.current_branch() {
+            Some(branch) => CommitGraph::open_at_branch(self.root_uri(), branch).await?,
+            None => CommitGraph::open(self.root_uri()).await?,
+        };
+        commit_graph.load_commits().await
     }
 }
 

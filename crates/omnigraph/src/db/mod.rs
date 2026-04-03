@@ -4,6 +4,7 @@ pub mod manifest;
 mod omnigraph;
 mod run_registry;
 
+pub use commit_graph::GraphCommit;
 pub use graph_coordinator::{GraphCoordinator, ReadTarget, ResolvedTarget, SnapshotId};
 pub use manifest::{Snapshot, SubTableEntry, SubTableUpdate};
 pub use omnigraph::{MergeOutcome, Omnigraph};

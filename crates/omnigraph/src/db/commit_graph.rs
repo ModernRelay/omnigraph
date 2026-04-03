@@ -14,6 +14,7 @@ use lance_file::version::LanceFileVersion;
 use crate::error::{OmniError, Result};
 
 const GRAPH_COMMITS_DIR: &str = "_graph_commits.lance";
+const GRAPH_COMMIT_ACTORS_DIR: &str = "_graph_commit_actors.lance";
 
 #[derive(Debug, Clone)]
 pub struct GraphCommit {
@@ -22,13 +23,16 @@ pub struct GraphCommit {
     pub manifest_version: u64,
     pub parent_commit_id: Option<String>,
     pub merged_parent_commit_id: Option<String>,
+    pub actor_id: Option<String>,
     pub created_at: i64,
 }
 
 pub struct CommitGraph {
     root_uri: String,
     dataset: Dataset,
+    actor_dataset: Option<Dataset>,
     active_branch: Option<String>,
+    actor_by_commit_id: HashMap<String, String>,
     commit_by_id: HashMap<String, GraphCommit>,
     head_commit: Option<GraphCommit>,
 }
@@ -43,6 +47,7 @@ impl CommitGraph {
             manifest_version,
             parent_commit_id: None,
             merged_parent_commit_id: None,
+            actor_id: None,
             created_at: now_micros()?,
         };
 
@@ -57,11 +62,14 @@ impl CommitGraph {
         let dataset = Dataset::write(reader, &uri as &str, Some(params))
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let actor_dataset = create_commit_actor_dataset(root).await?;
 
         Ok(Self {
             root_uri: root.to_string(),
             dataset,
+            actor_dataset: Some(actor_dataset),
             active_branch: None,
+            actor_by_commit_id: HashMap::new(),
             commit_by_id: HashMap::from([(genesis.graph_commit_id.clone(), genesis.clone())]),
             head_commit: Some(genesis),
         })
@@ -72,11 +80,18 @@ impl CommitGraph {
         let dataset = Dataset::open(&graph_commits_uri(root))
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
-        let (commit_by_id, head_commit) = load_commit_cache(&dataset).await?;
+        let actor_dataset = Dataset::open(&graph_commit_actors_uri(root)).await.ok();
+        let actor_by_commit_id = match &actor_dataset {
+            Some(dataset) => load_commit_actor_cache(dataset).await?,
+            None => HashMap::new(),
+        };
+        let (commit_by_id, head_commit) = load_commit_cache(&dataset, &actor_by_commit_id).await?;
         Ok(Self {
             root_uri: root.to_string(),
             dataset,
+            actor_dataset,
             active_branch: None,
+            actor_by_commit_id,
             commit_by_id,
             head_commit,
         })
@@ -91,11 +106,18 @@ impl CommitGraph {
             .checkout_branch(branch)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
-        let (commit_by_id, head_commit) = load_commit_cache(&dataset).await?;
+        let actor_dataset = Dataset::open(&graph_commit_actors_uri(root)).await.ok();
+        let actor_by_commit_id = match &actor_dataset {
+            Some(dataset) => load_commit_actor_cache(dataset).await?,
+            None => HashMap::new(),
+        };
+        let (commit_by_id, head_commit) = load_commit_cache(&dataset, &actor_by_commit_id).await?;
         Ok(Self {
             root_uri: root.to_string(),
             dataset,
+            actor_dataset,
             active_branch: Some(branch.to_string()),
+            actor_by_commit_id,
             commit_by_id,
             head_commit,
         })
@@ -113,7 +135,13 @@ impl CommitGraph {
                 .await
                 .map_err(|e| OmniError::Lance(e.to_string()))?;
         }
-        let (commit_by_id, head_commit) = load_commit_cache(&self.dataset).await?;
+        self.actor_dataset = Dataset::open(&graph_commit_actors_uri(&root)).await.ok();
+        self.actor_by_commit_id = match &self.actor_dataset {
+            Some(dataset) => load_commit_actor_cache(dataset).await?,
+            None => HashMap::new(),
+        };
+        let (commit_by_id, head_commit) =
+            load_commit_cache(&self.dataset, &self.actor_by_commit_id).await?;
         self.commit_by_id = commit_by_id;
         self.head_commit = head_commit;
         Ok(())
@@ -135,6 +163,7 @@ impl CommitGraph {
         &mut self,
         manifest_branch: Option<&str>,
         manifest_version: u64,
+        actor_id: Option<&str>,
     ) -> Result<String> {
         let parent_commit_id = self.head_commit_id().await?;
         self.append_commit_with_parents(
@@ -142,6 +171,7 @@ impl CommitGraph {
             manifest_version,
             parent_commit_id.as_deref(),
             None,
+            actor_id,
         )
         .await
     }
@@ -152,12 +182,14 @@ impl CommitGraph {
         manifest_version: u64,
         parent_commit_id: &str,
         merged_parent_commit_id: &str,
+        actor_id: Option<&str>,
     ) -> Result<String> {
         self.append_commit_with_parents(
             manifest_branch,
             manifest_version,
             Some(parent_commit_id),
             Some(merged_parent_commit_id),
+            actor_id,
         )
         .await
     }
@@ -168,6 +200,7 @@ impl CommitGraph {
         manifest_version: u64,
         parent_commit_id: Option<&str>,
         merged_parent_commit_id: Option<&str>,
+        actor_id: Option<&str>,
     ) -> Result<String> {
         let graph_commit_id = ulid::Ulid::new().to_string();
         let commit = GraphCommit {
@@ -176,6 +209,7 @@ impl CommitGraph {
             manifest_version,
             parent_commit_id: parent_commit_id.map(|s| s.to_string()),
             merged_parent_commit_id: merged_parent_commit_id.map(|s| s.to_string()),
+            actor_id: actor_id.map(str::to_string),
             created_at: now_micros()?,
         };
 
@@ -186,6 +220,9 @@ impl CommitGraph {
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         self.dataset = ds;
+        if let Some(actor_id) = actor_id {
+            self.append_actor(&graph_commit_id, actor_id).await?;
+        }
         self.commit_by_id
             .insert(graph_commit_id.clone(), commit.clone());
         if should_replace_head(self.head_commit.as_ref(), &commit) {
@@ -193,6 +230,36 @@ impl CommitGraph {
         }
 
         Ok(graph_commit_id)
+    }
+
+    async fn append_actor(&mut self, graph_commit_id: &str, actor_id: &str) -> Result<()> {
+        if self
+            .actor_by_commit_id
+            .get(graph_commit_id)
+            .is_some_and(|existing| existing == actor_id)
+        {
+            return Ok(());
+        }
+
+        let record = CommitActorRecord {
+            graph_commit_id: graph_commit_id.to_string(),
+            actor_id: actor_id.to_string(),
+            created_at: now_micros()?,
+        };
+        let batch = commit_actors_to_batch(&[record])?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], commit_actor_schema());
+        let mut dataset = match self.actor_dataset.take() {
+            Some(dataset) => dataset,
+            None => create_commit_actor_dataset(&self.root_uri).await?,
+        };
+        dataset
+            .append(reader, None)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        self.actor_by_commit_id
+            .insert(graph_commit_id.to_string(), actor_id.to_string());
+        self.actor_dataset = Some(dataset);
+        Ok(())
     }
 
     pub async fn head_commit(&self) -> Result<Option<GraphCommit>> {
@@ -272,6 +339,14 @@ fn graph_commits_uri(root_uri: &str) -> String {
     format!("{}/{}", root_uri.trim_end_matches('/'), GRAPH_COMMITS_DIR)
 }
 
+fn graph_commit_actors_uri(root_uri: &str) -> String {
+    format!(
+        "{}/{}",
+        root_uri.trim_end_matches('/'),
+        GRAPH_COMMIT_ACTORS_DIR
+    )
+}
+
 fn commit_graph_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("graph_commit_id", DataType::Utf8, false),
@@ -285,6 +360,46 @@ fn commit_graph_schema() -> SchemaRef {
             false,
         ),
     ]))
+}
+
+fn commit_actor_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("graph_commit_id", DataType::Utf8, false),
+        Field::new("actor_id", DataType::Utf8, false),
+        Field::new(
+            "created_at",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+    ]))
+}
+
+#[derive(Debug, Clone)]
+struct CommitActorRecord {
+    graph_commit_id: String,
+    actor_id: String,
+    created_at: i64,
+}
+
+async fn create_commit_actor_dataset(root_uri: &str) -> Result<Dataset> {
+    let uri = graph_commit_actors_uri(root_uri);
+    let batch = RecordBatch::new_empty(commit_actor_schema());
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], commit_actor_schema());
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    match Dataset::write(reader, &uri as &str, Some(params)).await {
+        Ok(dataset) => Ok(dataset),
+        Err(err) if err.to_string().contains("Dataset already exists") => {
+            Dataset::open(&uri)
+                .await
+                .map_err(|open_err| OmniError::Lance(open_err.to_string()))
+        }
+        Err(err) => Err(OmniError::Lance(err.to_string())),
+    }
 }
 
 fn commits_to_batch(commits: &[GraphCommit]) -> Result<RecordBatch> {
@@ -320,6 +435,7 @@ fn commits_to_batch(commits: &[GraphCommit]) -> Result<RecordBatch> {
 
 async fn load_commit_cache(
     dataset: &Dataset,
+    actor_by_commit_id: &HashMap<String, String>,
 ) -> Result<(HashMap<String, GraphCommit>, Option<GraphCommit>)> {
     let batches: Vec<RecordBatch> = dataset
         .scan()
@@ -330,7 +446,12 @@ async fn load_commit_cache(
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
 
-    let commits = load_commits_from_batches(&batches)?;
+    let mut commits = load_commits_from_batches(&batches)?;
+    for commit in &mut commits {
+        commit.actor_id = actor_by_commit_id
+            .get(commit.graph_commit_id.as_str())
+            .cloned();
+    }
     let mut commit_by_id = HashMap::with_capacity(commits.len());
     let mut head_commit = None;
     for commit in commits {
@@ -340,6 +461,30 @@ async fn load_commit_cache(
         commit_by_id.insert(commit.graph_commit_id.clone(), commit);
     }
     Ok((commit_by_id, head_commit))
+}
+
+async fn load_commit_actor_cache(dataset: &Dataset) -> Result<HashMap<String, String>> {
+    let batches: Vec<RecordBatch> = dataset
+        .scan()
+        .try_into_stream()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?
+        .try_collect()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+    let mut actors = HashMap::new();
+    for batch in batches {
+        let commit_ids = string_column(&batch, "graph_commit_id", "commit actor registry")?;
+        let actor_ids = string_column(&batch, "actor_id", "commit actor registry")?;
+        for row in 0..batch.num_rows() {
+            actors.insert(
+                commit_ids.value(row).to_string(),
+                actor_ids.value(row).to_string(),
+            );
+        }
+    }
+    Ok(actors)
 }
 
 fn load_commits_from_batches(batches: &[RecordBatch]) -> Result<Vec<GraphCommit>> {
@@ -371,11 +516,34 @@ fn load_commits_from_batches(batches: &[RecordBatch]) -> Result<Vec<GraphCommit>
                 } else {
                     Some(merged_parents.value(row).to_string())
                 },
+                actor_id: None,
                 created_at: created.value(row),
             });
         }
     }
     Ok(commits)
+}
+
+fn commit_actors_to_batch(records: &[CommitActorRecord]) -> Result<RecordBatch> {
+    let commit_ids: Vec<&str> = records
+        .iter()
+        .map(|record| record.graph_commit_id.as_str())
+        .collect();
+    let actor_ids: Vec<&str> = records
+        .iter()
+        .map(|record| record.actor_id.as_str())
+        .collect();
+    let created_at: Vec<i64> = records.iter().map(|record| record.created_at).collect();
+
+    RecordBatch::try_new(
+        commit_actor_schema(),
+        vec![
+            Arc::new(StringArray::from(commit_ids)),
+            Arc::new(StringArray::from(actor_ids)),
+            Arc::new(TimestampMicrosecondArray::from(created_at)),
+        ],
+    )
+    .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
 fn should_replace_head(current: Option<&GraphCommit>, candidate: &GraphCommit) -> bool {

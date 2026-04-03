@@ -259,6 +259,64 @@ fn read_json_outputs_rows_for_named_query() {
 }
 
 #[test]
+fn export_jsonl_outputs_source_rows_for_selected_branch_and_type() {
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    init_repo(&repo);
+    load_fixture(&repo);
+
+    output_success(
+        cli()
+            .arg("branch")
+            .arg("create")
+            .arg("--uri")
+            .arg(&repo)
+            .arg("--from")
+            .arg("main")
+            .arg("feature"),
+    );
+
+    let feature_data = temp.path().join("feature-export.jsonl");
+    write_jsonl(
+        &feature_data,
+        r#"{"type":"Person","data":{"name":"Eve","age":29}}"#,
+    );
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--data")
+            .arg(&feature_data)
+            .arg("--branch")
+            .arg("feature")
+            .arg("--mode")
+            .arg("append")
+            .arg(&repo),
+    );
+
+    let output = output_success(
+        cli()
+            .arg("export")
+            .arg(&repo)
+            .arg("--branch")
+            .arg("feature")
+            .arg("--type")
+            .arg("Person")
+            .arg("--jsonl"),
+    );
+    let rows = stdout_string(&output)
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(rows.len(), 5);
+    assert!(rows.iter().all(|row| row["type"] == "Person"));
+    assert!(rows.iter().all(|row| row.get("edge").is_none()));
+    assert!(rows
+        .iter()
+        .any(|row| row["data"]["name"].as_str() == Some("Eve")));
+}
+
+#[test]
 fn read_can_resolve_uri_from_config() {
     let temp = tempdir().unwrap();
     let repo = repo_path(temp.path());

@@ -301,3 +301,132 @@ query insert_person($name: String, $age: I32) {
     assert_eq!(verify["row_count"], 1);
     assert_eq!(verify["rows"][0]["p.name"], "Zoe");
 }
+
+#[test]
+#[ignore = "requires loopback socket permissions in sandboxed runners"]
+fn remote_export_round_trips_full_branch_graph() {
+    let repo = SystemRepo::loaded();
+    let server = repo.spawn_server();
+    let config = repo.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
+    let mutation_file = repo.write_query(
+        "system-remote-export-change.gq",
+        r#"
+query insert_person($name: String, $age: I32) {
+    insert Person { name: $name, age: $age }
+}
+
+query add_friend($from: String, $to: String) {
+    insert Knows { from: $from, to: $to }
+}
+"#,
+    );
+
+    output_success(
+        cli()
+            .arg("branch")
+            .arg("create")
+            .arg("--config")
+            .arg(&config)
+            .arg("--from")
+            .arg("main")
+            .arg("feature"),
+    );
+
+    output_success(
+        cli()
+            .arg("change")
+            .arg("--config")
+            .arg(&config)
+            .arg("--query")
+            .arg(&mutation_file)
+            .arg("--name")
+            .arg("insert_person")
+            .arg("--branch")
+            .arg("feature")
+            .arg("--params")
+            .arg(r#"{"name":"Eve","age":29}"#)
+            .arg("--json"),
+    );
+    output_success(
+        cli()
+            .arg("change")
+            .arg("--config")
+            .arg(&config)
+            .arg("--query")
+            .arg(&mutation_file)
+            .arg("--name")
+            .arg("add_friend")
+            .arg("--branch")
+            .arg("feature")
+            .arg("--params")
+            .arg(r#"{"from":"Alice","to":"Eve"}"#)
+            .arg("--json"),
+    );
+
+    let exported = stdout_string(&output_success(
+        cli()
+            .arg("export")
+            .arg("--config")
+            .arg(&config)
+            .arg("--branch")
+            .arg("feature")
+            .arg("--jsonl"),
+    ));
+    let export_path = repo.write_jsonl("system-remote-exported.jsonl", &exported);
+    let imported_repo = repo.path().parent().unwrap().join("imported-remote-export.omni");
+
+    output_success(
+        cli()
+            .arg("init")
+            .arg("--schema")
+            .arg(fixture("test.pg"))
+            .arg(&imported_repo),
+    );
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--data")
+            .arg(&export_path)
+            .arg(&imported_repo),
+    );
+
+    let snapshot = parse_stdout_json(&output_success(
+        cli()
+            .arg("snapshot")
+            .arg(&imported_repo)
+            .arg("--json"),
+    ));
+    assert_eq!(
+        snapshot["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|table| table["table_key"] == "node:Person")
+            .unwrap()["row_count"],
+        5
+    );
+    assert_eq!(
+        snapshot["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|table| table["table_key"] == "edge:Knows")
+            .unwrap()["row_count"],
+        4
+    );
+
+    let eve = parse_stdout_json(&output_success(
+        cli()
+            .arg("read")
+            .arg(&imported_repo)
+            .arg("--query")
+            .arg(fixture("test.gq"))
+            .arg("--name")
+            .arg("get_person")
+            .arg("--params")
+            .arg(r#"{"name":"Eve"}"#)
+            .arg("--json"),
+    ));
+    assert_eq!(eve["row_count"], 1);
+    assert_eq!(eve["rows"][0]["p.name"], "Eve");
+}
