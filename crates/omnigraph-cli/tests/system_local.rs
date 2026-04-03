@@ -36,8 +36,12 @@ query add_friend($from: String, $to: String) {
 }
 
 fn snapshot_table_row_count(repo: &SystemRepo, table_key: &str) -> u64 {
+    snapshot_table_row_count_at(repo.path(), table_key)
+}
+
+fn snapshot_table_row_count_at(repo: &std::path::Path, table_key: &str) -> u64 {
     let payload = parse_stdout_json(&output_success(
-        cli().arg("snapshot").arg(repo.path()).arg("--json"),
+        cli().arg("snapshot").arg(repo).arg("--json"),
     ));
     payload["tables"]
         .as_array()
@@ -289,6 +293,99 @@ fn local_cli_end_to_end_branch_change_merge_flow() {
         runs.iter()
             .any(|run| run["target_branch"] == "feature" && run["status"] == "published")
     );
+}
+
+#[test]
+fn local_cli_export_round_trips_full_branch_graph() {
+    let repo = SystemRepo::loaded();
+
+    output_success(
+        cli()
+            .arg("branch")
+            .arg("create")
+            .arg("--uri")
+            .arg(repo.path())
+            .arg("--from")
+            .arg("main")
+            .arg("feature"),
+    );
+
+    let feature_data = repo.write_jsonl(
+        "system-local-export-feature.jsonl",
+        r#"{"type":"Person","data":{"name":"Eve","age":29}}
+{"edge":"Knows","from":"Alice","to":"Eve"}"#,
+    );
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--data")
+            .arg(&feature_data)
+            .arg("--branch")
+            .arg("feature")
+            .arg("--mode")
+            .arg("append")
+            .arg(repo.path()),
+    );
+
+    let exported = stdout_string(&output_success(
+        cli()
+            .arg("export")
+            .arg(repo.path())
+            .arg("--branch")
+            .arg("feature")
+            .arg("--jsonl"),
+    ));
+    let export_path = repo.write_jsonl("system-local-exported.jsonl", &exported);
+    let imported_repo = repo.path().parent().unwrap().join("imported-export.omni");
+
+    output_success(
+        cli()
+            .arg("init")
+            .arg("--schema")
+            .arg(fixture("test.pg"))
+            .arg(&imported_repo),
+    );
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--data")
+            .arg(&export_path)
+            .arg(&imported_repo),
+    );
+
+    assert_eq!(snapshot_table_row_count_at(&imported_repo, "node:Person"), 5);
+    assert_eq!(snapshot_table_row_count_at(&imported_repo, "node:Company"), 2);
+    assert_eq!(snapshot_table_row_count_at(&imported_repo, "edge:Knows"), 4);
+    assert_eq!(snapshot_table_row_count_at(&imported_repo, "edge:WorksAt"), 2);
+
+    let eve = parse_stdout_json(&output_success(
+        cli()
+            .arg("read")
+            .arg(&imported_repo)
+            .arg("--query")
+            .arg(fixture("test.gq"))
+            .arg("--name")
+            .arg("get_person")
+            .arg("--params")
+            .arg(r#"{"name":"Eve"}"#)
+            .arg("--json"),
+    ));
+    assert_eq!(eve["row_count"], 1);
+    assert_eq!(eve["rows"][0]["p.name"], "Eve");
+
+    let friends = parse_stdout_json(&output_success(
+        cli()
+            .arg("read")
+            .arg(&imported_repo)
+            .arg("--query")
+            .arg(fixture("test.gq"))
+            .arg("--name")
+            .arg("friends_of")
+            .arg("--params")
+            .arg(r#"{"name":"Alice"}"#)
+            .arg("--json"),
+    ));
+    assert_eq!(friends["row_count"], 3);
 }
 
 #[test]
