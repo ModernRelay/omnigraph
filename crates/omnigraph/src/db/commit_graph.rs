@@ -382,6 +382,7 @@ struct CommitActorRecord {
 }
 
 async fn create_commit_actor_dataset(root_uri: &str) -> Result<Dataset> {
+    let uri = graph_commit_actors_uri(root_uri);
     let batch = RecordBatch::new_empty(commit_actor_schema());
     let reader = RecordBatchIterator::new(vec![Ok(batch)], commit_actor_schema());
     let params = WriteParams {
@@ -390,9 +391,15 @@ async fn create_commit_actor_dataset(root_uri: &str) -> Result<Dataset> {
         data_storage_version: Some(LanceFileVersion::V2_2),
         ..Default::default()
     };
-    Dataset::write(reader, &graph_commit_actors_uri(root_uri) as &str, Some(params))
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))
+    match Dataset::write(reader, &uri as &str, Some(params)).await {
+        Ok(dataset) => Ok(dataset),
+        Err(err) if err.to_string().contains("Dataset already exists") => {
+            Dataset::open(&uri)
+                .await
+                .map_err(|open_err| OmniError::Lance(open_err.to_string()))
+        }
+        Err(err) => Err(OmniError::Lance(err.to_string())),
+    }
 }
 
 fn commits_to_batch(commits: &[GraphCommit]) -> Result<RecordBatch> {
