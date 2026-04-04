@@ -186,6 +186,7 @@ pub struct HealthOutput {
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     Unauthorized,
+    Forbidden,
     BadRequest,
     NotFound,
     Conflict,

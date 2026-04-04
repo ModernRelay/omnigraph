@@ -60,9 +60,10 @@ async fn export_jsonl_round_trips_branch_snapshot() {
 
     let imported_main_dir = tempfile::tempdir().unwrap();
     let imported_feature_dir = tempfile::tempdir().unwrap();
-    let mut imported_main = Omnigraph::init(imported_main_dir.path().to_str().unwrap(), TEST_SCHEMA)
-        .await
-        .unwrap();
+    let mut imported_main =
+        Omnigraph::init(imported_main_dir.path().to_str().unwrap(), TEST_SCHEMA)
+            .await
+            .unwrap();
     let mut imported_feature =
         Omnigraph::init(imported_feature_dir.path().to_str().unwrap(), TEST_SCHEMA)
             .await

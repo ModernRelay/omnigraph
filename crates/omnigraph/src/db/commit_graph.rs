@@ -393,11 +393,9 @@ async fn create_commit_actor_dataset(root_uri: &str) -> Result<Dataset> {
     };
     match Dataset::write(reader, &uri as &str, Some(params)).await {
         Ok(dataset) => Ok(dataset),
-        Err(err) if err.to_string().contains("Dataset already exists") => {
-            Dataset::open(&uri)
-                .await
-                .map_err(|open_err| OmniError::Lance(open_err.to_string()))
-        }
+        Err(err) if err.to_string().contains("Dataset already exists") => Dataset::open(&uri)
+            .await
+            .map_err(|open_err| OmniError::Lance(open_err.to_string())),
         Err(err) => Err(OmniError::Lance(err.to_string())),
     }
 }

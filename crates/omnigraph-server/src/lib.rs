@@ -1,5 +1,6 @@
 pub mod api;
 pub mod config;
+pub mod policy;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -8,8 +9,8 @@ use std::sync::Arc;
 
 use api::{
     BranchCreateOutput, BranchCreateRequest, BranchListOutput, BranchMergeOutput,
-    BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput, CommitListQuery,
-    ErrorCode, ErrorOutput, ExportRequest, HealthOutput, ReadOutput, ReadRequest, RunListOutput,
+    BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput, CommitListQuery, ErrorCode,
+    ErrorOutput, ExportRequest, HealthOutput, ReadOutput, ReadRequest, RunListOutput,
     SnapshotQuery, snapshot_payload,
 };
 use axum::extract::DefaultBodyLimit;
@@ -22,14 +23,19 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use color_eyre::eyre::{Result, WrapErr, bail};
 pub use config::{
-    AliasCommand, AliasConfig, CliDefaults, DEFAULT_CONFIG_FILE, OmnigraphConfig, ProjectConfig,
-    QueryDefaults, ReadOutputFormat, ServerDefaults, TableCellLayout, TargetConfig, load_config,
+    AliasCommand, AliasConfig, CliDefaults, DEFAULT_CONFIG_FILE, OmnigraphConfig, PolicySettings,
+    ProjectConfig, QueryDefaults, ReadOutputFormat, ServerDefaults, TableCellLayout, TargetConfig,
+    load_config,
 };
 use omnigraph::db::{Omnigraph, ReadTarget, RunId};
 use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph_compiler::json_params_to_param_map;
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::{JsonParamMode, ParamMap};
+pub use policy::{
+    PolicyAction, PolicyCompiler, PolicyConfig, PolicyDecision, PolicyEngine, PolicyExpectation,
+    PolicyRequest, PolicyTestConfig,
+};
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
@@ -41,6 +47,7 @@ use tracing_subscriber::EnvFilter;
 pub struct ServerConfig {
     pub uri: String,
     pub bind: String,
+    pub policy_file: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -48,6 +55,7 @@ pub struct AppState {
     uri: String,
     db: Arc<RwLock<Omnigraph>>,
     bearer_tokens: Arc<HashMap<Arc<str>, Arc<str>>>,
+    policy_engine: Option<Arc<PolicyEngine>>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +92,15 @@ impl AppState {
         db: Omnigraph,
         bearer_tokens: Vec<(String, String)>,
     ) -> Self {
+        Self::new_with_bearer_tokens_and_policy(uri, db, bearer_tokens, None)
+    }
+
+    pub fn new_with_bearer_tokens_and_policy(
+        uri: String,
+        db: Omnigraph,
+        bearer_tokens: Vec<(String, String)>,
+        policy_engine: Option<PolicyEngine>,
+    ) -> Self {
         let bearer_tokens = bearer_tokens
             .into_iter()
             .map(|(actor, token)| (Arc::<str>::from(token), Arc::<str>::from(actor)))
@@ -92,6 +109,7 @@ impl AppState {
             uri,
             db: Arc::new(RwLock::new(db)),
             bearer_tokens: Arc::new(bearer_tokens),
+            policy_engine: policy_engine.map(Arc::new),
         }
     }
 
@@ -119,16 +137,42 @@ impl AppState {
         Ok(Self::new_with_bearer_tokens(uri, db, bearer_tokens))
     }
 
+    pub async fn open_with_bearer_tokens_and_policy(
+        uri: impl Into<String>,
+        bearer_tokens: Vec<(String, String)>,
+        policy_file: Option<&PathBuf>,
+    ) -> Result<Self> {
+        let uri = uri.into();
+        let db = Omnigraph::open(&uri).await?;
+        let policy_engine = match policy_file {
+            Some(path) => Some(PolicyEngine::load(path, &uri)?),
+            None => None,
+        };
+        if policy_engine.is_some() && bearer_tokens.is_empty() {
+            bail!("policy requires at least one configured bearer token actor");
+        }
+        Ok(Self::new_with_bearer_tokens_and_policy(
+            uri,
+            db,
+            bearer_tokens,
+            policy_engine,
+        ))
+    }
+
     pub fn uri(&self) -> &str {
         &self.uri
     }
 
     fn requires_bearer_auth(&self) -> bool {
-        !self.bearer_tokens.is_empty()
+        !self.bearer_tokens.is_empty() || self.policy_engine.is_some()
     }
 
     fn authenticate_bearer_token(&self, provided_token: &str) -> Option<Arc<str>> {
         self.bearer_tokens.get(provided_token).cloned()
+    }
+
+    fn policy_engine(&self) -> Option<&PolicyEngine> {
+        self.policy_engine.as_deref()
     }
 }
 
@@ -137,6 +181,14 @@ impl ApiError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             code: ErrorCode::Unauthorized,
+            message: message.into(),
+        }
+    }
+
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: ErrorCode::Forbidden,
             message: message.into(),
         }
     }
@@ -220,8 +272,13 @@ pub fn load_server_settings(
     let uri =
         config.resolve_target_uri(cli_uri, cli_target.as_deref(), config.server_target_name())?;
     let bind = cli_bind.unwrap_or_else(|| config.server_bind().to_string());
+    let policy_file = config.resolve_policy_file();
 
-    Ok(ServerConfig { uri, bind })
+    Ok(ServerConfig {
+        uri,
+        bind,
+        policy_file,
+    })
 }
 
 pub fn build_app(state: AppState) -> Router {
@@ -255,9 +312,12 @@ pub fn build_app(state: AppState) -> Router {
 }
 
 pub async fn serve(config: ServerConfig) -> Result<()> {
-    let state =
-        AppState::open_with_bearer_tokens(config.uri.clone(), server_bearer_tokens_from_env()?)
-            .await?;
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        config.uri.clone(),
+        server_bearer_tokens_from_env()?,
+        config.policy_file.as_ref(),
+    )
+    .await?;
     let listener = TcpListener::bind(&config.bind).await?;
     info!(uri = %config.uri, bind = %config.bind, "serving omnigraph");
     axum::serve(listener, build_app(state))
@@ -309,11 +369,59 @@ async fn require_bearer_auth(
     Ok(next.run(request).await)
 }
 
+fn log_policy_decision(actor_id: &str, request: &PolicyRequest, decision: &PolicyDecision) {
+    info!(
+        actor_id = actor_id,
+        action = %request.action,
+        branch = request.branch.as_deref().unwrap_or(""),
+        target_branch = request.target_branch.as_deref().unwrap_or(""),
+        allowed = decision.allowed,
+        matched_rule_id = decision.matched_rule_id.as_deref().unwrap_or(""),
+        "policy decision"
+    );
+}
+
+fn authorize_request(
+    state: &AppState,
+    actor: Option<&AuthenticatedActor>,
+    request: PolicyRequest,
+) -> std::result::Result<(), ApiError> {
+    let Some(engine) = state.policy_engine() else {
+        return Ok(());
+    };
+    let Some(actor) = actor else {
+        return Err(ApiError::unauthorized("missing bearer token"));
+    };
+    let decision = engine
+        .authorize(&request)
+        .map_err(|err| ApiError::internal(format!("policy: {err}")))?;
+    log_policy_decision(actor.as_str(), &request, &decision);
+    if decision.allowed {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(decision.message))
+    }
+}
+
 async fn server_snapshot(
     State(state): State<AppState>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Query(query): Query<SnapshotQuery>,
 ) -> std::result::Result<Json<api::SnapshotOutput>, ApiError> {
     let branch = query.branch.unwrap_or_else(|| "main".to_string());
+    authorize_request(
+        &state,
+        actor.as_ref().map(|Extension(actor)| actor),
+        PolicyRequest {
+            actor_id: actor
+                .as_ref()
+                .map(|Extension(actor)| actor.as_str().to_string())
+                .unwrap_or_default(),
+            action: PolicyAction::Read,
+            branch: Some(branch.clone()),
+            target_branch: None,
+        },
+    )?;
     let snapshot = {
         let db = Arc::clone(&state.db).read_owned().await;
         db.snapshot_of(ReadTarget::branch(branch.as_str()))
@@ -325,6 +433,7 @@ async fn server_snapshot(
 
 async fn server_read(
     State(state): State<AppState>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<ReadRequest>,
 ) -> std::result::Result<Json<ReadOutput>, ApiError> {
     if request.branch.is_some() && request.snapshot.is_some() {
@@ -334,6 +443,22 @@ async fn server_read(
     }
 
     let target = read_target_from_request(request.branch, request.snapshot);
+    authorize_request(
+        &state,
+        actor.as_ref().map(|Extension(actor)| actor),
+        PolicyRequest {
+            actor_id: actor
+                .as_ref()
+                .map(|Extension(actor)| actor.as_str().to_string())
+                .unwrap_or_default(),
+            action: PolicyAction::Read,
+            branch: match &target {
+                ReadTarget::Branch(branch) => Some(branch.clone()),
+                ReadTarget::Snapshot(_) => None,
+            },
+            target_branch: None,
+        },
+    )?;
     let (selected_name, query_params) =
         select_named_query(&request.query_source, request.query_name.as_deref())
             .map_err(|err| ApiError::bad_request(err.to_string()))?;
@@ -356,9 +481,23 @@ async fn server_read(
 
 async fn server_export(
     State(state): State<AppState>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<ExportRequest>,
 ) -> std::result::Result<Response, ApiError> {
     let branch = request.branch.unwrap_or_else(|| "main".to_string());
+    authorize_request(
+        &state,
+        actor.as_ref().map(|Extension(actor)| actor),
+        PolicyRequest {
+            actor_id: actor
+                .as_ref()
+                .map(|Extension(actor)| actor.as_str().to_string())
+                .unwrap_or_default(),
+            action: PolicyAction::Export,
+            branch: Some(branch.clone()),
+            target_branch: None,
+        },
+    )?;
     let payload = {
         let db = Arc::clone(&state.db).read_owned().await;
         db.export_jsonl(&branch, &request.type_names, &request.table_keys)
@@ -380,6 +519,16 @@ async fn server_change(
 ) -> std::result::Result<Json<ChangeOutput>, ApiError> {
     let branch = request.branch.unwrap_or_else(|| "main".to_string());
     let actor_id = actor.as_ref().map(|Extension(actor)| actor.as_str());
+    authorize_request(
+        &state,
+        actor.as_ref().map(|Extension(actor)| actor),
+        PolicyRequest {
+            actor_id: actor_id.map(str::to_string).unwrap_or_default(),
+            action: PolicyAction::Change,
+            branch: Some(branch.clone()),
+            target_branch: None,
+        },
+    )?;
     let (selected_name, query_params) =
         select_named_query(&request.query_source, request.query_name.as_deref())
             .map_err(|err| ApiError::bad_request(err.to_string()))?;
@@ -395,8 +544,8 @@ async fn server_change(
             &params,
             actor_id,
         )
-            .await
-            .map_err(ApiError::from_omni)?
+        .await
+        .map_err(ApiError::from_omni)?
     };
     Ok(Json(ChangeOutput {
         branch,
@@ -409,7 +558,21 @@ async fn server_change(
 
 async fn server_branch_list(
     State(state): State<AppState>,
+    actor: Option<Extension<AuthenticatedActor>>,
 ) -> std::result::Result<Json<BranchListOutput>, ApiError> {
+    authorize_request(
+        &state,
+        actor.as_ref().map(|Extension(actor)| actor),
+        PolicyRequest {
+            actor_id: actor
+                .as_ref()
+                .map(|Extension(actor)| actor.as_str().to_string())
+                .unwrap_or_default(),
+            action: PolicyAction::Read,
+            branch: None,
+            target_branch: None,
+        },
+    )?;
     let mut branches = {
         let db = Arc::clone(&state.db).read_owned().await;
         db.branch_list().await.map_err(ApiError::from_omni)?
@@ -424,6 +587,19 @@ async fn server_branch_create(
     Json(request): Json<BranchCreateRequest>,
 ) -> std::result::Result<Json<BranchCreateOutput>, ApiError> {
     let from = request.from.unwrap_or_else(|| "main".to_string());
+    authorize_request(
+        &state,
+        actor.as_ref().map(|Extension(actor)| actor),
+        PolicyRequest {
+            actor_id: actor
+                .as_ref()
+                .map(|Extension(actor)| actor.as_str().to_string())
+                .unwrap_or_default(),
+            action: PolicyAction::BranchCreate,
+            branch: Some(from.clone()),
+            target_branch: Some(request.name.clone()),
+        },
+    )?;
     {
         let mut db = Arc::clone(&state.db).write_owned().await;
         db.branch_create_from(ReadTarget::branch(&from), &request.name)
@@ -445,6 +621,16 @@ async fn server_branch_merge(
 ) -> std::result::Result<Json<BranchMergeOutput>, ApiError> {
     let target = request.target.unwrap_or_else(|| "main".to_string());
     let actor_id = actor.as_ref().map(|Extension(actor)| actor.as_str());
+    authorize_request(
+        &state,
+        actor.as_ref().map(|Extension(actor)| actor),
+        PolicyRequest {
+            actor_id: actor_id.map(str::to_string).unwrap_or_default(),
+            action: PolicyAction::BranchMerge,
+            branch: Some(request.source.clone()),
+            target_branch: Some(target.clone()),
+        },
+    )?;
     let outcome = {
         let mut db = Arc::clone(&state.db).write_owned().await;
         db.branch_merge_as(&request.source, &target, actor_id)
@@ -461,7 +647,21 @@ async fn server_branch_merge(
 
 async fn server_run_list(
     State(state): State<AppState>,
+    actor: Option<Extension<AuthenticatedActor>>,
 ) -> std::result::Result<Json<RunListOutput>, ApiError> {
+    authorize_request(
+        &state,
+        actor.as_ref().map(|Extension(actor)| actor),
+        PolicyRequest {
+            actor_id: actor
+                .as_ref()
+                .map(|Extension(actor)| actor.as_str().to_string())
+                .unwrap_or_default(),
+            action: PolicyAction::Read,
+            branch: None,
+            target_branch: None,
+        },
+    )?;
     let runs = {
         let db = Arc::clone(&state.db).read_owned().await;
         db.list_runs().await.map_err(ApiError::from_omni)?
@@ -473,8 +673,22 @@ async fn server_run_list(
 
 async fn server_run_show(
     State(state): State<AppState>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Path(run_id): Path<String>,
 ) -> std::result::Result<Json<api::RunOutput>, ApiError> {
+    authorize_request(
+        &state,
+        actor.as_ref().map(|Extension(actor)| actor),
+        PolicyRequest {
+            actor_id: actor
+                .as_ref()
+                .map(|Extension(actor)| actor.as_str().to_string())
+                .unwrap_or_default(),
+            action: PolicyAction::Read,
+            branch: None,
+            target_branch: None,
+        },
+    )?;
     let run = {
         let db = Arc::clone(&state.db).read_owned().await;
         db.get_run(&RunId::new(run_id))
@@ -491,6 +705,23 @@ async fn server_run_publish(
 ) -> std::result::Result<Json<api::RunOutput>, ApiError> {
     let run_id = RunId::new(run_id);
     let actor_id = actor.as_ref().map(|Extension(actor)| actor.as_str());
+    let target_branch = {
+        let db = Arc::clone(&state.db).read_owned().await;
+        db.get_run(&run_id)
+            .await
+            .map_err(ApiError::from_omni)?
+            .target_branch
+    };
+    authorize_request(
+        &state,
+        actor.as_ref().map(|Extension(actor)| actor),
+        PolicyRequest {
+            actor_id: actor_id.map(str::to_string).unwrap_or_default(),
+            action: PolicyAction::RunPublish,
+            branch: None,
+            target_branch: Some(target_branch),
+        },
+    )?;
     let run = {
         let mut db = Arc::clone(&state.db).write_owned().await;
         db.publish_run_as(&run_id, actor_id)
@@ -503,21 +734,55 @@ async fn server_run_publish(
 
 async fn server_run_abort(
     State(state): State<AppState>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Path(run_id): Path<String>,
 ) -> std::result::Result<Json<api::RunOutput>, ApiError> {
-    let run = {
-        let mut db = Arc::clone(&state.db).write_owned().await;
-        db.abort_run(&RunId::new(run_id))
+    let run_id = RunId::new(run_id);
+    let target_branch = {
+        let db = Arc::clone(&state.db).read_owned().await;
+        db.get_run(&run_id)
             .await
             .map_err(ApiError::from_omni)?
+            .target_branch
+    };
+    authorize_request(
+        &state,
+        actor.as_ref().map(|Extension(actor)| actor),
+        PolicyRequest {
+            actor_id: actor
+                .as_ref()
+                .map(|Extension(actor)| actor.as_str().to_string())
+                .unwrap_or_default(),
+            action: PolicyAction::RunAbort,
+            branch: None,
+            target_branch: Some(target_branch),
+        },
+    )?;
+    let run = {
+        let mut db = Arc::clone(&state.db).write_owned().await;
+        db.abort_run(&run_id).await.map_err(ApiError::from_omni)?
     };
     Ok(Json(api::run_output(&run)))
 }
 
 async fn server_commit_list(
     State(state): State<AppState>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Query(query): Query<CommitListQuery>,
 ) -> std::result::Result<Json<CommitListOutput>, ApiError> {
+    authorize_request(
+        &state,
+        actor.as_ref().map(|Extension(actor)| actor),
+        PolicyRequest {
+            actor_id: actor
+                .as_ref()
+                .map(|Extension(actor)| actor.as_str().to_string())
+                .unwrap_or_default(),
+            action: PolicyAction::Read,
+            branch: query.branch.clone(),
+            target_branch: None,
+        },
+    )?;
     let commits = {
         let db = Arc::clone(&state.db).read_owned().await;
         db.list_commits(query.branch.as_deref())
@@ -531,11 +796,27 @@ async fn server_commit_list(
 
 async fn server_commit_show(
     State(state): State<AppState>,
+    actor: Option<Extension<AuthenticatedActor>>,
     Path(commit_id): Path<String>,
 ) -> std::result::Result<Json<api::CommitOutput>, ApiError> {
+    authorize_request(
+        &state,
+        actor.as_ref().map(|Extension(actor)| actor),
+        PolicyRequest {
+            actor_id: actor
+                .as_ref()
+                .map(|Extension(actor)| actor.as_str().to_string())
+                .unwrap_or_default(),
+            action: PolicyAction::Read,
+            branch: None,
+            target_branch: None,
+        },
+    )?;
     let commit = {
         let db = Arc::clone(&state.db).read_owned().await;
-        db.get_commit(&commit_id).await.map_err(ApiError::from_omni)?
+        db.get_commit(&commit_id)
+            .await
+            .map_err(ApiError::from_omni)?
     };
     Ok(Json(api::commit_output(&commit)))
 }

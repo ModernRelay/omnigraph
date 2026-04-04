@@ -7,6 +7,76 @@ use serde_json::json;
 
 use support::*;
 
+const REMOTE_POLICY_E2E_YAML: &str = r#"
+version: 1
+groups:
+  team: [act-bruno]
+  admins: [act-ragnor]
+protected_branches: [main]
+rules:
+  - id: team-read
+    allow:
+      actors: { group: team }
+      actions: [read]
+      branch_scope: any
+  - id: team-branch-create
+    allow:
+      actors: { group: team }
+      actions: [branch_create]
+      target_branch_scope: unprotected
+  - id: team-write-unprotected
+    allow:
+      actors: { group: team }
+      actions: [change]
+      branch_scope: unprotected
+  - id: admins-promote
+    allow:
+      actors: { group: admins }
+      actions: [branch_merge, run_publish]
+      target_branch_scope: protected
+"#;
+
+fn yaml_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn remote_policy_server_config(repo: &SystemRepo) -> String {
+    format!(
+        "\
+project:
+  name: remote-policy-e2e
+targets:
+  local:
+    uri: {}
+server:
+  target: local
+policy:
+  file: ./policy.yaml
+",
+        yaml_string(&repo.path().to_string_lossy())
+    )
+}
+
+fn remote_policy_client_config(url: &str) -> String {
+    format!(
+        "\
+targets:
+  dev:
+    uri: {}
+    bearer_token_env: POLICY_TEST_TOKEN
+cli:
+  target: dev
+  branch: main
+query:
+  roots:
+    - .
+auth:
+  env_file: ./.env.omni
+",
+        yaml_string(url)
+    )
+}
+
 #[test]
 #[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn remote_server_and_cli_end_to_end_flow() {
@@ -373,7 +443,11 @@ query add_friend($from: String, $to: String) {
             .arg("--jsonl"),
     ));
     let export_path = repo.write_jsonl("system-remote-exported.jsonl", &exported);
-    let imported_repo = repo.path().parent().unwrap().join("imported-remote-export.omni");
+    let imported_repo = repo
+        .path()
+        .parent()
+        .unwrap()
+        .join("imported-remote-export.omni");
 
     output_success(
         cli()
@@ -391,10 +465,7 @@ query add_friend($from: String, $to: String) {
     );
 
     let snapshot = parse_stdout_json(&output_success(
-        cli()
-            .arg("snapshot")
-            .arg(&imported_repo)
-            .arg("--json"),
+        cli().arg("snapshot").arg(&imported_repo).arg("--json"),
     ));
     assert_eq!(
         snapshot["tables"]
@@ -429,4 +500,129 @@ query add_friend($from: String, $to: String) {
     ));
     assert_eq!(eve["row_count"], 1);
     assert_eq!(eve["rows"][0]["p.name"], "Eve");
+}
+
+#[test]
+#[ignore = "requires loopback socket permissions in sandboxed runners"]
+fn remote_policy_enforces_branch_first_cli_workflow() {
+    let repo = SystemRepo::loaded();
+    let server_config =
+        repo.write_config("server-policy.yaml", &remote_policy_server_config(&repo));
+    repo.write_config("policy.yaml", REMOTE_POLICY_E2E_YAML);
+    let server = repo.spawn_server_with_config_env(
+        &server_config,
+        &[(
+            "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+            r#"{"act-bruno":"team-token","act-ragnor":"admin-token"}"#,
+        )],
+    );
+    let client_config = repo.write_config(
+        "omnigraph-policy.yaml",
+        &remote_policy_client_config(&server.base_url),
+    );
+    repo.write_config(".env.omni", "POLICY_TEST_TOKEN=team-token\n");
+    let mutation_file = repo.write_query(
+        "system-remote-policy-change.gq",
+        r#"
+query insert_person($name: String, $age: I32) {
+    insert Person { name: $name, age: $age }
+}
+"#,
+    );
+
+    let snapshot = parse_stdout_json(&output_success(
+        cli()
+            .arg("snapshot")
+            .arg("--config")
+            .arg(&client_config)
+            .arg("--json"),
+    ));
+    assert_eq!(snapshot["branch"], "main");
+
+    let denied_main_change = output_failure(
+        cli()
+            .arg("change")
+            .arg("--config")
+            .arg(&client_config)
+            .arg("--query")
+            .arg(&mutation_file)
+            .arg("--params")
+            .arg(r#"{"name":"PolicyRemote","age":41}"#)
+            .arg("--json"),
+    );
+    let denied_main_stderr = String::from_utf8(denied_main_change.stderr).unwrap();
+    assert!(denied_main_stderr.contains("policy denied action 'change' on branch 'main'"));
+
+    let created = parse_stdout_json(&output_success(
+        cli()
+            .arg("branch")
+            .arg("create")
+            .arg("--config")
+            .arg(&client_config)
+            .arg("--from")
+            .arg("main")
+            .arg("feature")
+            .arg("--json"),
+    ));
+    assert_eq!(created["name"], "feature");
+
+    let changed = parse_stdout_json(&output_success(
+        cli()
+            .arg("change")
+            .arg("--config")
+            .arg(&client_config)
+            .arg("--query")
+            .arg(&mutation_file)
+            .arg("--branch")
+            .arg("feature")
+            .arg("--params")
+            .arg(r#"{"name":"PolicyRemote","age":41}"#)
+            .arg("--json"),
+    ));
+    assert_eq!(changed["branch"], "feature");
+    assert_eq!(changed["affected_nodes"], 1);
+
+    let denied_merge = output_failure(
+        cli()
+            .arg("branch")
+            .arg("merge")
+            .arg("--config")
+            .arg(&client_config)
+            .arg("feature")
+            .arg("--into")
+            .arg("main")
+            .arg("--json"),
+    );
+    let denied_merge_stderr = String::from_utf8(denied_merge.stderr).unwrap();
+    assert!(denied_merge_stderr.contains("policy denied action 'branch_merge'"));
+
+    let merged = parse_stdout_json(&output_success(
+        cli()
+            .env("POLICY_TEST_TOKEN", "admin-token")
+            .arg("branch")
+            .arg("merge")
+            .arg("--config")
+            .arg(&client_config)
+            .arg("feature")
+            .arg("--into")
+            .arg("main")
+            .arg("--json"),
+    ));
+    assert_eq!(merged["target"], "main");
+
+    let verify = parse_stdout_json(&output_success(
+        cli()
+            .arg("read")
+            .arg("--config")
+            .arg(&client_config)
+            .arg("--query")
+            .arg(fixture("test.gq"))
+            .arg("--name")
+            .arg("get_person")
+            .arg("--params")
+            .arg(r#"{"name":"PolicyRemote"}"#)
+            .arg("--json"),
+    ));
+    assert_eq!(verify["row_count"], 1);
+    assert_eq!(verify["rows"][0]["p.name"], "PolicyRemote");
 }

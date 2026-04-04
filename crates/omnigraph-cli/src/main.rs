@@ -12,10 +12,13 @@ use omnigraph_compiler::{JsonParamMode, ParamMap};
 use omnigraph_server::api::{
     BranchCreateOutput, BranchCreateRequest, BranchListOutput, BranchMergeOutput,
     BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput, CommitOutput, ErrorOutput,
-    ExportRequest, ReadOutput, ReadRequest, RunListOutput, RunOutput,
-    SnapshotOutput, SnapshotTableOutput, commit_output, read_output, run_output, snapshot_payload,
+    ExportRequest, ReadOutput, ReadRequest, RunListOutput, RunOutput, SnapshotOutput,
+    SnapshotTableOutput, commit_output, read_output, run_output, snapshot_payload,
 };
-use omnigraph_server::{AliasCommand, OmnigraphConfig, ReadOutputFormat, load_config};
+use omnigraph_server::{
+    AliasCommand, OmnigraphConfig, PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest,
+    PolicyTestConfig, ReadOutputFormat, load_config,
+};
 use reqwest::Method;
 use reqwest::header::AUTHORIZATION;
 use serde::Serialize;
@@ -164,6 +167,11 @@ enum Command {
         #[arg()]
         alias_args: Vec<String>,
     },
+    /// Policy administration and diagnostics
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -292,6 +300,33 @@ enum CommitCommand {
         commit_id: String,
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PolicyCommand {
+    /// Validate policy YAML and compiled Cedar policy state
+    Validate {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Run declarative policy tests from policy.tests.yaml
+    Test {
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Explain one policy decision locally
+    Explain {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        actor: String,
+        #[arg(long)]
+        action: PolicyAction,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long = "target-branch")]
+        target_branch: Option<String>,
     },
 }
 
@@ -438,6 +473,31 @@ fn load_cli_config(config_path: Option<&PathBuf>) -> Result<OmnigraphConfig> {
         load_env_file_into_process(&path)?;
     }
     Ok(config)
+}
+
+fn resolve_policy_engine(config: &OmnigraphConfig) -> Result<PolicyEngine> {
+    let policy_file = config
+        .resolve_policy_file()
+        .ok_or_else(|| color_eyre::eyre::eyre!("policy.file must be set in omnigraph.yaml"))?;
+    PolicyEngine::load(&policy_file, &policy_repo_id(config))
+}
+
+fn resolve_policy_tests_path(config: &OmnigraphConfig) -> Result<PathBuf> {
+    config.resolve_policy_tests_file().ok_or_else(|| {
+        color_eyre::eyre::eyre!(
+            "policy.tests.yaml requires policy.file to be set in omnigraph.yaml"
+        )
+    })
+}
+
+fn policy_repo_id(config: &OmnigraphConfig) -> String {
+    if let Some(name) = &config.project.name {
+        return name.clone();
+    }
+    config
+        .resolve_target_uri(None, None, config.server_target_name())
+        .or_else(|_| config.resolve_target_uri(None, None, config.cli_target_name()))
+        .unwrap_or_else(|_| "default".to_string())
 }
 
 fn resolve_remote_bearer_token(
@@ -792,6 +852,25 @@ fn print_commit_human(commit: &CommitOutput) {
     println!("created_at: {}", commit.created_at);
 }
 
+fn print_policy_explain(decision: &PolicyDecision, request: &PolicyRequest) {
+    println!(
+        "decision: {}",
+        if decision.allowed { "allow" } else { "deny" }
+    );
+    println!("actor: {}", request.actor_id);
+    println!("action: {}", request.action);
+    if let Some(branch) = &request.branch {
+        println!("branch: {}", branch);
+    }
+    if let Some(target_branch) = &request.target_branch {
+        println!("target_branch: {}", target_branch);
+    }
+    if let Some(rule_id) = &decision.matched_rule_id {
+        println!("matched_rule: {}", rule_id);
+    }
+    println!("message: {}", decision.message);
+}
+
 fn resolve_read_format(
     config: &OmnigraphConfig,
     cli_format: Option<ReadOutputFormat>,
@@ -905,8 +984,9 @@ aliases:
 
 # auth:
 #   env_file: ./.env.omni
-
-policy: {{}}
+#
+# policy:
+#   file: ./policy.yaml
 ",
             yaml_string(uri),
         ),
@@ -1717,6 +1797,46 @@ async fn main() -> Result<()> {
                 print_change_human(&output);
             }
         }
+        Command::Policy { command } => match command {
+            PolicyCommand::Validate { config } => {
+                let config = load_cli_config(config.as_ref())?;
+                let engine = resolve_policy_engine(&config)?;
+                let policy_file = config
+                    .resolve_policy_file()
+                    .expect("policy file should exist after resolve_policy_engine");
+                println!(
+                    "policy valid: {} [{} actors]",
+                    policy_file.display(),
+                    engine.known_actor_count()
+                );
+            }
+            PolicyCommand::Test { config } => {
+                let config = load_cli_config(config.as_ref())?;
+                let engine = resolve_policy_engine(&config)?;
+                let tests_path = resolve_policy_tests_path(&config)?;
+                let tests = PolicyTestConfig::load(&tests_path)?;
+                engine.run_tests(&tests)?;
+                println!("policy tests passed: {} cases", tests.cases.len());
+            }
+            PolicyCommand::Explain {
+                config,
+                actor,
+                action,
+                branch,
+                target_branch,
+            } => {
+                let config = load_cli_config(config.as_ref())?;
+                let engine = resolve_policy_engine(&config)?;
+                let request = PolicyRequest {
+                    actor_id: actor,
+                    action,
+                    branch,
+                    target_branch,
+                };
+                let decision = engine.authorize(&request)?;
+                print_policy_explain(&decision, &request);
+            }
+        },
     }
     Ok(())
 }

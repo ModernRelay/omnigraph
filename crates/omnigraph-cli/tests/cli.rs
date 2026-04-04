@@ -8,6 +8,63 @@ mod support;
 
 use support::*;
 
+const POLICY_YAML: &str = r#"
+version: 1
+groups:
+  team: [act-andrew, act-bruno]
+  admins: [act-andrew]
+protected_branches: [main]
+rules:
+  - id: team-read
+    allow:
+      actors: { group: team }
+      actions: [read]
+      branch_scope: any
+  - id: team-write
+    allow:
+      actors: { group: team }
+      actions: [change]
+      branch_scope: unprotected
+  - id: admins-promote
+    allow:
+      actors: { group: admins }
+      actions: [branch_merge, run_publish]
+      target_branch_scope: protected
+"#;
+
+const POLICY_TESTS_YAML: &str = r#"
+version: 1
+cases:
+  - id: allow-feature-write
+    actor: act-andrew
+    action: change
+    branch: feature
+    expect: allow
+  - id: deny-main-write
+    actor: act-bruno
+    action: change
+    branch: main
+    expect: deny
+"#;
+
+fn write_policy_config_fixture(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let config = root.join("omnigraph.yaml");
+    let policy = root.join("policy.yaml");
+    fs::write(
+        &config,
+        r#"
+project:
+  name: policy-test-repo
+policy:
+  file: ./policy.yaml
+"#,
+    )
+    .unwrap();
+    fs::write(&policy, POLICY_YAML).unwrap();
+    fs::write(root.join("policy.tests.yaml"), POLICY_TESTS_YAML).unwrap();
+    (config, policy)
+}
+
 #[test]
 fn version_command_prints_current_cli_version() {
     let output = output_success(cli().arg("version"));
@@ -311,9 +368,127 @@ fn export_jsonl_outputs_source_rows_for_selected_branch_and_type() {
     assert_eq!(rows.len(), 5);
     assert!(rows.iter().all(|row| row["type"] == "Person"));
     assert!(rows.iter().all(|row| row.get("edge").is_none()));
-    assert!(rows
-        .iter()
-        .any(|row| row["data"]["name"].as_str() == Some("Eve")));
+    assert!(
+        rows.iter()
+            .any(|row| row["data"]["name"].as_str() == Some("Eve"))
+    );
+}
+
+#[test]
+fn policy_validate_accepts_valid_policy_file() {
+    let temp = tempdir().unwrap();
+    let (config, _) = write_policy_config_fixture(temp.path());
+
+    let output = output_success(
+        cli()
+            .arg("policy")
+            .arg("validate")
+            .arg("--config")
+            .arg(&config),
+    );
+    let stdout = stdout_string(&output);
+
+    assert!(stdout.contains("policy valid:"));
+    assert!(stdout.contains("policy.yaml"));
+    assert!(stdout.contains("[2 actors]"));
+}
+
+#[test]
+fn policy_validate_fails_for_invalid_policy_file() {
+    let temp = tempdir().unwrap();
+    let config = temp.path().join("omnigraph.yaml");
+    let policy = temp.path().join("policy.yaml");
+    fs::write(
+        &config,
+        r#"
+project:
+  name: policy-test-repo
+policy:
+  file: ./policy.yaml
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &policy,
+        r#"
+version: 1
+groups:
+  team: [act-andrew]
+rules:
+  - id: duplicate
+    allow:
+      actors: { group: team }
+      actions: [read]
+      branch_scope: any
+  - id: duplicate
+    allow:
+      actors: { group: team }
+      actions: [export]
+      branch_scope: any
+"#,
+    )
+    .unwrap();
+
+    let output = output_failure(
+        cli()
+            .arg("policy")
+            .arg("validate")
+            .arg("--config")
+            .arg(&config),
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("duplicate policy rule id"));
+}
+
+#[test]
+fn policy_test_runs_declarative_cases() {
+    let temp = tempdir().unwrap();
+    let (config, _) = write_policy_config_fixture(temp.path());
+
+    let output = output_success(cli().arg("policy").arg("test").arg("--config").arg(&config));
+    let stdout = stdout_string(&output);
+
+    assert!(stdout.contains("policy tests passed: 2 cases"));
+}
+
+#[test]
+fn policy_explain_reports_decision_and_matched_rule() {
+    let temp = tempdir().unwrap();
+    let (config, _) = write_policy_config_fixture(temp.path());
+
+    let allow = output_success(
+        cli()
+            .arg("policy")
+            .arg("explain")
+            .arg("--config")
+            .arg(&config)
+            .arg("--actor")
+            .arg("act-andrew")
+            .arg("--action")
+            .arg("change")
+            .arg("--branch")
+            .arg("feature"),
+    );
+    let allow_stdout = stdout_string(&allow);
+    assert!(allow_stdout.contains("decision: allow"));
+    assert!(allow_stdout.contains("matched_rule: team-write"));
+
+    let deny = output_success(
+        cli()
+            .arg("policy")
+            .arg("explain")
+            .arg("--config")
+            .arg(&config)
+            .arg("--actor")
+            .arg("act-bruno")
+            .arg("--action")
+            .arg("change")
+            .arg("--branch")
+            .arg("main"),
+    );
+    let deny_stdout = stdout_string(&deny);
+    assert!(deny_stdout.contains("decision: deny"));
+    assert!(deny_stdout.contains("message: policy denied action 'change' on branch 'main'"));
 }
 
 #[test]

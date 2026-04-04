@@ -8,8 +8,7 @@ use axum::http::{Method, Request, StatusCode};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_server::api::{
-    BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorOutput, ExportRequest,
-    ReadRequest,
+    BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorOutput, ExportRequest, ReadRequest,
 };
 use omnigraph_server::{AppState, build_app};
 use serde_json::{Value, json};
@@ -24,6 +23,40 @@ query insert_person($name: String, $age: I32) {
 query set_age($name: String, $age: I32) {
     update Person set { age: $age } where name = $name
 }
+"#;
+
+const POLICY_YAML: &str = r#"
+version: 1
+groups:
+  team: [act-andrew, act-bruno, act-ragnor]
+  admins: [act-ragnor]
+protected_branches: [main]
+rules:
+  - id: team-read
+    allow:
+      actors: { group: team }
+      actions: [read]
+      branch_scope: any
+  - id: admins-export
+    allow:
+      actors: { group: admins }
+      actions: [export]
+      branch_scope: any
+  - id: team-write-unprotected
+    allow:
+      actors: { group: team }
+      actions: [change]
+      branch_scope: unprotected
+  - id: admins-merge
+    allow:
+      actors: { group: admins }
+      actions: [branch_merge]
+      target_branch_scope: protected
+  - id: admins-publish
+    allow:
+      actors: { group: admins }
+      actions: [run_publish]
+      target_branch_scope: protected
 "#;
 
 fn fixture(name: &str) -> PathBuf {
@@ -106,6 +139,27 @@ async fn app_for_loaded_repo_with_auth_tokens(
             .map(|(actor, token)| ((*actor).to_string(), (*token).to_string()))
             .collect(),
     );
+    (temp, build_app(state))
+}
+
+async fn app_for_loaded_repo_with_auth_tokens_and_policy(
+    tokens: &[(&str, &str)],
+    policy: &str,
+) -> (tempfile::TempDir, Router) {
+    let temp = init_loaded_repo().await;
+    let repo = repo_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, policy).unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        repo.to_string_lossy().to_string(),
+        tokens
+            .iter()
+            .map(|(actor, token)| ((*actor).to_string(), (*token).to_string()))
+            .collect(),
+        Some(&policy_path),
+    )
+    .await
+    .unwrap();
     (temp, build_app(state))
 }
 
@@ -287,7 +341,10 @@ async fn export_route_returns_jsonl_for_branch_snapshot() {
     )
     .await
     .unwrap();
-    let expected = db.export_jsonl("feature", &["Person".to_string()], &[]).await.unwrap();
+    let expected = db
+        .export_jsonl("feature", &["Person".to_string()], &[])
+        .await
+        .unwrap();
     drop(db);
 
     let state = AppState::new_with_bearer_token(
@@ -350,9 +407,278 @@ async fn protected_routes_accept_any_configured_team_bearer_token() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn policy_allows_read_but_distinguishes_401_from_403() {
+    let (_temp, app) = app_for_loaded_repo_with_auth_tokens_and_policy(
+        &[("act-bruno", "team-token"), ("act-ragnor", "admin-token")],
+        POLICY_YAML,
+    )
+    .await;
+
+    let (missing_status, missing_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/snapshot?branch=main")
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let missing_error: ErrorOutput = serde_json::from_value(missing_body).unwrap();
+    assert_eq!(missing_status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        missing_error.code,
+        Some(omnigraph_server::api::ErrorCode::Unauthorized)
+    );
+
+    let (snapshot_status, snapshot_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/snapshot?branch=main")
+            .method(Method::GET)
+            .header("authorization", "Bearer team-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(snapshot_status, StatusCode::OK);
+    assert_eq!(snapshot_body["branch"], "main");
+
+    let export_request = ExportRequest {
+        branch: Some("main".to_string()),
+        type_names: Vec::new(),
+        table_keys: Vec::new(),
+    };
+    let (forbidden_status, forbidden_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/export")
+            .method(Method::POST)
+            .header("authorization", "Bearer team-token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&export_request).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    let forbidden_error: ErrorOutput = serde_json::from_value(forbidden_body).unwrap();
+    assert_eq!(forbidden_status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        forbidden_error.code,
+        Some(omnigraph_server::api::ErrorCode::Forbidden)
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/export")
+                .method(Method::POST)
+                .header("authorization", "Bearer admin-token")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&export_request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_blocks_change_on_protected_main_but_allows_unprotected_branch() {
+    let temp = init_loaded_repo().await;
+    let repo = repo_path(temp.path());
+    let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    db.branch_create_from(ReadTarget::branch("main"), "feature")
+        .await
+        .unwrap();
+    drop(db);
+
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, POLICY_YAML).unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        repo.to_string_lossy().to_string(),
+        vec![("act-bruno".to_string(), "team-token".to_string())],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap();
+    let app = build_app(state);
+
+    let main_change = ChangeRequest {
+        query_source: MUTATION_QUERIES.to_string(),
+        query_name: Some("insert_person".to_string()),
+        params: Some(json!({ "name": "Mina", "age": 28 })),
+        branch: Some("main".to_string()),
+    };
+    let (main_status, main_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/change")
+            .method(Method::POST)
+            .header("authorization", "Bearer team-token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&main_change).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    let main_error: ErrorOutput = serde_json::from_value(main_body).unwrap();
+    assert_eq!(main_status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        main_error.code,
+        Some(omnigraph_server::api::ErrorCode::Forbidden)
+    );
+
+    let feature_change = ChangeRequest {
+        query_source: MUTATION_QUERIES.to_string(),
+        query_name: Some("insert_person".to_string()),
+        params: Some(json!({ "name": "Mina", "age": 28 })),
+        branch: Some("feature".to_string()),
+    };
+    let (feature_status, feature_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/change")
+            .method(Method::POST)
+            .header("authorization", "Bearer team-token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&feature_change).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(feature_status, StatusCode::OK);
+    assert_eq!(feature_body["branch"], "feature");
+    assert_eq!(feature_body["affected_nodes"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_blocks_non_admin_merge_to_main_and_allows_admin() {
+    let temp = init_loaded_repo().await;
+    let repo = repo_path(temp.path());
+    let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    db.branch_create_from(ReadTarget::branch("main"), "feature")
+        .await
+        .unwrap();
+    db.load(
+        "feature",
+        r#"{"type":"Person","data":{"name":"Zoe","age":33}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    drop(db);
+
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, POLICY_YAML).unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        repo.to_string_lossy().to_string(),
+        vec![
+            ("act-bruno".to_string(), "team-token".to_string()),
+            ("act-ragnor".to_string(), "admin-token".to_string()),
+        ],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap();
+    let app = build_app(state);
+
+    let merge = BranchMergeRequest {
+        source: "feature".to_string(),
+        target: Some("main".to_string()),
+    };
+    let (deny_status, deny_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/branches/merge")
+            .method(Method::POST)
+            .header("authorization", "Bearer team-token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&merge).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    let deny_error: ErrorOutput = serde_json::from_value(deny_body).unwrap();
+    assert_eq!(deny_status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        deny_error.code,
+        Some(omnigraph_server::api::ErrorCode::Forbidden)
+    );
+
+    let (allow_status, allow_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/branches/merge")
+            .method(Method::POST)
+            .header("authorization", "Bearer admin-token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&merge).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(allow_status, StatusCode::OK);
+    assert_eq!(allow_body["actor_id"], "act-ragnor");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_blocks_non_admin_run_publish_to_main() {
+    let temp = init_loaded_repo().await;
+    let repo = repo_path(temp.path());
+    let run_id = {
+        let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+        db.begin_run("main", Some("policy-publish"))
+            .await
+            .unwrap()
+            .run_id
+            .as_str()
+            .to_string()
+    };
+
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, POLICY_YAML).unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        repo.to_string_lossy().to_string(),
+        vec![
+            ("act-bruno".to_string(), "team-token".to_string()),
+            ("act-ragnor".to_string(), "admin-token".to_string()),
+        ],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap();
+    let app = build_app(state);
+
+    let (deny_status, deny_body) = json_response(
+        &app,
+        Request::builder()
+            .uri(format!("/runs/{run_id}/publish"))
+            .method(Method::POST)
+            .header("authorization", "Bearer team-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let deny_error: ErrorOutput = serde_json::from_value(deny_body).unwrap();
+    assert_eq!(deny_status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        deny_error.code,
+        Some(omnigraph_server::api::ErrorCode::Forbidden)
+    );
+
+    let (allow_status, allow_body) = json_response(
+        &app,
+        Request::builder()
+            .uri(format!("/runs/{run_id}/publish"))
+            .method(Method::POST)
+            .header("authorization", "Bearer admin-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(allow_status, StatusCode::OK);
+    assert_eq!(allow_body["target_branch"], "main");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn authenticated_change_stamps_actor_on_runs_and_commits() {
-    let (_temp, app) =
-        app_for_loaded_repo_with_auth_tokens(&[("act-andrew", "token-one")]).await;
+    let (_temp, app) = app_for_loaded_repo_with_auth_tokens(&[("act-andrew", "token-one")]).await;
 
     let change = ChangeRequest {
         query_source: MUTATION_QUERIES.to_string(),
