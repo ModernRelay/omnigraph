@@ -233,7 +233,11 @@ impl RunRegistry {
     }
 
     async fn append_actor(&mut self, run_id: &str, actor_id: &str) -> Result<()> {
-        if self.actor_by_run_id.get(run_id).is_some_and(|existing| existing == actor_id) {
+        if self
+            .actor_by_run_id
+            .get(run_id)
+            .is_some_and(|existing| existing == actor_id)
+        {
             return Ok(());
         }
 
@@ -273,7 +277,11 @@ pub(crate) fn graph_runs_uri(root_uri: &str) -> String {
 }
 
 fn graph_run_actors_uri(root_uri: &str) -> String {
-    format!("{}/{}", root_uri.trim_end_matches('/'), GRAPH_RUN_ACTORS_DIR)
+    format!(
+        "{}/{}",
+        root_uri.trim_end_matches('/'),
+        GRAPH_RUN_ACTORS_DIR
+    )
 }
 
 fn run_registry_schema() -> SchemaRef {
@@ -320,9 +328,13 @@ async fn create_run_actor_dataset(root_uri: &str) -> Result<Dataset> {
         data_storage_version: Some(LanceFileVersion::V2_2),
         ..Default::default()
     };
-    Dataset::write(reader, &graph_run_actors_uri(root_uri) as &str, Some(params))
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))
+    Dataset::write(
+        reader,
+        &graph_run_actors_uri(root_uri) as &str,
+        Some(params),
+    )
+    .await
+    .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
 async fn load_run_cache(
@@ -530,7 +542,10 @@ struct RunActorRecord {
 }
 
 fn run_actors_to_batch(records: &[RunActorRecord]) -> Result<RecordBatch> {
-    let run_ids: Vec<&str> = records.iter().map(|record| record.run_id.as_str()).collect();
+    let run_ids: Vec<&str> = records
+        .iter()
+        .map(|record| record.run_id.as_str())
+        .collect();
     let actor_ids: Vec<&str> = records
         .iter()
         .map(|record| record.actor_id.as_str())

@@ -60,6 +60,7 @@ fail = "0.5"
 time = { version = "0.3", features = ["formatting"] }
 axum = { version = "0.8", features = ["json", "macros"] }
 url = "2"
+cedar-policy = "4.9"
 
 [profile.dev]
 debug = 0

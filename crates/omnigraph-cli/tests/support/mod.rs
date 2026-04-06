@@ -158,11 +158,10 @@ fn free_port() -> u16 {
     port
 }
 
-fn spawn_server_process(mut command: StdCommand, repo: &Path) -> TestServer {
+fn spawn_server_process(mut command: StdCommand) -> TestServer {
     let port = free_port();
     let bind = format!("127.0.0.1:{}", port);
     let mut child = command
-        .arg(repo)
         .arg("--bind")
         .arg(&bind)
         .stdout(Stdio::null())
@@ -189,7 +188,24 @@ fn spawn_server_process(mut command: StdCommand, repo: &Path) -> TestServer {
 }
 
 pub fn spawn_server(repo: &Path) -> TestServer {
-    spawn_server_process(server_process(), repo)
+    let mut command = server_process();
+    command.arg(repo);
+    spawn_server_process(command)
+}
+
+pub fn spawn_server_with_config(config: &Path) -> TestServer {
+    let mut command = server_process();
+    command.arg("--config").arg(config);
+    spawn_server_process(command)
+}
+
+pub fn spawn_server_with_config_env(config: &Path, envs: &[(&str, &str)]) -> TestServer {
+    let mut command = server_process();
+    command.arg("--config").arg(config);
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    spawn_server_process(command)
 }
 
 pub async fn begin_manual_run(repo: &Path, target_branch: &str) -> String {
@@ -253,5 +269,13 @@ impl SystemRepo {
 
     pub fn spawn_server(&self) -> TestServer {
         spawn_server(&self.repo)
+    }
+
+    pub fn spawn_server_with_config(&self, config: &Path) -> TestServer {
+        spawn_server_with_config(config)
+    }
+
+    pub fn spawn_server_with_config_env(&self, config: &Path, envs: &[(&str, &str)]) -> TestServer {
+        spawn_server_with_config_env(config, envs)
     }
 }

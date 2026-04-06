@@ -9,8 +9,8 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance::blob::{BlobArrayBuilder, blob_field};
-use lance::dataset::scanner::ColumnOrdering;
 use lance::dataset::BlobFile;
+use lance::dataset::scanner::ColumnOrdering;
 use lance::datatypes::BlobKind;
 use omnigraph_compiler::build_catalog;
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
@@ -439,7 +439,10 @@ impl Omnigraph {
         snapshot: &Snapshot,
         table_key: &str,
     ) -> Result<Vec<serde_json::Value>> {
-        let ds = self.table_store.open_snapshot_table(snapshot, table_key).await?;
+        let ds = self
+            .table_store
+            .open_snapshot_table(snapshot, table_key)
+            .await?;
         let ordering = Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]);
         let blob_properties = blob_properties_for_table_key(self.catalog(), table_key)?;
 
@@ -479,7 +482,9 @@ impl Omnigraph {
             .iter()
             .copied()
             .collect::<Vec<_>>();
-        let blob_values = self.export_blob_values(&ds, &batch, &row_ids, blob_properties).await?;
+        let blob_values = self
+            .export_blob_values(&ds, &batch, &row_ids, blob_properties)
+            .await?;
         self.export_rows_from_batch(table_key, &batch, Some(&blob_values))
             .await
     }
@@ -800,7 +805,9 @@ impl Omnigraph {
     }
 
     pub async fn get_commit(&self, commit_id: &str) -> Result<GraphCommit> {
-        self.coordinator.resolve_commit(&SnapshotId::new(commit_id)).await
+        self.coordinator
+            .resolve_commit(&SnapshotId::new(commit_id))
+            .await
     }
 
     pub async fn list_commits(&self, branch: Option<&str>) -> Result<Vec<GraphCommit>> {
@@ -893,11 +900,13 @@ impl Omnigraph {
         let publish_result = if current_target_snapshot_id.as_str() == run.base_snapshot_id {
             let run_for_promotion = run.clone();
             self.sync_branch(&run_for_promotion.target_branch).await?;
-            self.promote_run_snapshot_to_target(&run_for_promotion).await
+            self.promote_run_snapshot_to_target(&run_for_promotion)
+                .await
         } else {
             let run_branch = run.run_branch.clone();
             let target_branch = run.target_branch.clone();
-            self.branch_merge_internal(&run_branch, &target_branch).await?;
+            self.branch_merge_internal(&run_branch, &target_branch)
+                .await?;
             self.reify_internal_run_refs(&target_branch, &run_branch)
                 .await
         };
@@ -1478,9 +1487,10 @@ impl Omnigraph {
         blob_values: Option<&HashMap<String, Vec<Option<String>>>>,
     ) -> Result<Vec<serde_json::Value>> {
         if let Some(type_name) = table_key.strip_prefix("node:") {
-            let node_type = self.catalog.node_types.get(type_name).ok_or_else(|| {
-                OmniError::manifest(format!("unknown node type '{}'", type_name))
-            })?;
+            let node_type =
+                self.catalog.node_types.get(type_name).ok_or_else(|| {
+                    OmniError::manifest(format!("unknown node type '{}'", type_name))
+                })?;
             let mut rows = Vec::with_capacity(batch.num_rows());
             for row in 0..batch.num_rows() {
                 let mut data = serde_json::Map::new();
@@ -1508,9 +1518,10 @@ impl Omnigraph {
         }
 
         if let Some(edge_name) = table_key.strip_prefix("edge:") {
-            let edge_type = self.catalog.edge_types.get(edge_name).ok_or_else(|| {
-                OmniError::manifest(format!("unknown edge type '{}'", edge_name))
-            })?;
+            let edge_type =
+                self.catalog.edge_types.get(edge_name).ok_or_else(|| {
+                    OmniError::manifest(format!("unknown edge type '{}'", edge_name))
+                })?;
             let mut rows = Vec::with_capacity(batch.num_rows());
             for row in 0..batch.num_rows() {
                 let from = named_string_value(batch, "src", row)?;
@@ -1586,7 +1597,10 @@ async fn export_blob_column_values(
         let value = if let Some(uri) = blob.uri() {
             uri.to_string()
         } else {
-            let bytes = blob.read().await.map_err(|e| OmniError::Lance(e.to_string()))?;
+            let bytes = blob
+                .read()
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
             format!(
                 "base64:{}",
                 base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
@@ -1620,20 +1634,14 @@ fn json_value_from_named_column(
     row: usize,
 ) -> Result<serde_json::Value> {
     let column = batch.column_by_name(field_name).ok_or_else(|| {
-        OmniError::Lance(format!(
-            "missing column '{}' in export batch",
-            field_name
-        ))
+        OmniError::Lance(format!("missing column '{}' in export batch", field_name))
     })?;
     json_value_from_array(column.as_ref(), row)
 }
 
 fn named_string_value(batch: &RecordBatch, field_name: &str, row: usize) -> Result<String> {
     let column = batch.column_by_name(field_name).ok_or_else(|| {
-        OmniError::Lance(format!(
-            "missing column '{}' in export batch",
-            field_name
-        ))
+        OmniError::Lance(format!("missing column '{}' in export batch", field_name))
     })?;
     let array = column
         .as_any()

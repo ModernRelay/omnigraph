@@ -6,8 +6,6 @@ use std::path::{Path, PathBuf};
 use clap::ValueEnum;
 use color_eyre::eyre::{Result, bail};
 use serde::{Deserialize, Serialize};
-use serde_yaml::Mapping;
-
 pub const DEFAULT_CONFIG_FILE: &str = "omnigraph.yaml";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -66,6 +64,11 @@ pub struct QueryDefaults {
     pub roots: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PolicySettings {
+    pub file: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AliasCommand {
@@ -102,7 +105,7 @@ pub struct OmnigraphConfig {
     #[serde(default)]
     pub aliases: BTreeMap<String, AliasConfig>,
     #[serde(default)]
-    pub policy: Mapping,
+    pub policy: PolicySettings,
     #[serde(skip)]
     base_dir: PathBuf,
 }
@@ -117,7 +120,7 @@ impl Default for OmnigraphConfig {
             cli: CliDefaults::default(),
             query: QueryDefaults::default(),
             aliases: BTreeMap::new(),
-            policy: Mapping::new(),
+            policy: PolicySettings::default(),
             base_dir: PathBuf::new(),
         }
     }
@@ -192,6 +195,21 @@ impl OmnigraphConfig {
         } else {
             self.base_dir.join(path)
         })
+    }
+
+    pub fn resolve_policy_file(&self) -> Option<PathBuf> {
+        let path = self.policy.file.as_deref()?;
+        let path = Path::new(path);
+        Some(if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.base_dir.join(path)
+        })
+    }
+
+    pub fn resolve_policy_tests_file(&self) -> Option<PathBuf> {
+        let policy_file = self.resolve_policy_file()?;
+        Some(policy_file.with_file_name("policy.tests.yaml"))
     }
 
     pub fn alias(&self, name: &str) -> Result<&AliasConfig> {
@@ -413,12 +431,15 @@ policy: {}
         let temp = tempdir().unwrap();
         fs::write(
             temp.path().join("omnigraph.yaml"),
-            "policy:\n  admission:\n    require_branch: main\n",
+            "policy:\n  file: ./policy.yaml\n",
         )
         .unwrap();
 
         let config = load_config_in(temp.path(), None).unwrap();
-        assert!(!config.policy.is_empty());
+        assert_eq!(
+            config.resolve_policy_file().unwrap(),
+            temp.path().join("policy.yaml")
+        );
     }
 
     #[test]

@@ -13,6 +13,70 @@ use serde_json::Value;
 
 use support::*;
 
+const POLICY_E2E_YAML: &str = r#"
+version: 1
+groups:
+  team: [act-bruno]
+  admins: [act-ragnor]
+protected_branches: [main]
+rules:
+  - id: team-read
+    allow:
+      actors: { group: team }
+      actions: [read]
+      branch_scope: any
+  - id: team-write-unprotected
+    allow:
+      actors: { group: team }
+      actions: [change]
+      branch_scope: unprotected
+  - id: admins-promote
+    allow:
+      actors: { group: admins }
+      actions: [branch_merge, run_publish]
+      target_branch_scope: protected
+"#;
+
+const POLICY_E2E_TESTS_YAML: &str = r#"
+version: 1
+cases:
+  - id: deny-main-change
+    actor: act-bruno
+    action: change
+    branch: main
+    expect: deny
+  - id: allow-feature-change
+    actor: act-bruno
+    action: change
+    branch: feature
+    expect: allow
+"#;
+
+fn yaml_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn local_policy_config(repo: &SystemRepo) -> String {
+    format!(
+        "\
+project:
+  name: policy-e2e-local
+targets:
+  local:
+    uri: {}
+cli:
+  target: local
+  branch: main
+query:
+  roots:
+    - .
+policy:
+  file: ./policy.yaml
+",
+        yaml_string(&repo.path().to_string_lossy())
+    )
+}
+
 fn insert_person_query(repo: &SystemRepo, name: &str) -> std::path::PathBuf {
     repo.write_query(
         name,
@@ -353,10 +417,19 @@ fn local_cli_export_round_trips_full_branch_graph() {
             .arg(&imported_repo),
     );
 
-    assert_eq!(snapshot_table_row_count_at(&imported_repo, "node:Person"), 5);
-    assert_eq!(snapshot_table_row_count_at(&imported_repo, "node:Company"), 2);
+    assert_eq!(
+        snapshot_table_row_count_at(&imported_repo, "node:Person"),
+        5
+    );
+    assert_eq!(
+        snapshot_table_row_count_at(&imported_repo, "node:Company"),
+        2
+    );
     assert_eq!(snapshot_table_row_count_at(&imported_repo, "edge:Knows"), 4);
-    assert_eq!(snapshot_table_row_count_at(&imported_repo, "edge:WorksAt"), 2);
+    assert_eq!(
+        snapshot_table_row_count_at(&imported_repo, "edge:WorksAt"),
+        2
+    );
 
     let eve = parse_stdout_json(&output_success(
         cli()
@@ -948,4 +1021,71 @@ fn local_cli_transactional_load_drift_fails_without_partial_publish() {
             .arg("--json"),
     ));
     assert_eq!(bulk_row["row_count"], 0);
+}
+
+#[test]
+fn local_cli_policy_tooling_is_end_to_end_while_local_writes_stay_unenforced() {
+    let repo = SystemRepo::loaded();
+    let config = repo.write_config("omnigraph-policy.yaml", &local_policy_config(&repo));
+    repo.write_config("policy.yaml", POLICY_E2E_YAML);
+    repo.write_config("policy.tests.yaml", POLICY_E2E_TESTS_YAML);
+    let mutation_file = insert_person_query(&repo, "system-local-policy-change.gq");
+
+    let validate = output_success(
+        cli()
+            .arg("policy")
+            .arg("validate")
+            .arg("--config")
+            .arg(&config),
+    );
+    assert!(stdout_string(&validate).contains("policy valid:"));
+
+    let tests = output_success(cli().arg("policy").arg("test").arg("--config").arg(&config));
+    assert!(stdout_string(&tests).contains("policy tests passed: 2 cases"));
+
+    let explain = output_success(
+        cli()
+            .arg("policy")
+            .arg("explain")
+            .arg("--config")
+            .arg(&config)
+            .arg("--actor")
+            .arg("act-bruno")
+            .arg("--action")
+            .arg("change")
+            .arg("--branch")
+            .arg("main"),
+    );
+    let explain_stdout = stdout_string(&explain);
+    assert!(explain_stdout.contains("decision: deny"));
+    assert!(explain_stdout.contains("branch: main"));
+
+    let local_change = parse_stdout_json(&output_success(
+        cli()
+            .arg("change")
+            .arg("--config")
+            .arg(&config)
+            .arg("--query")
+            .arg(&mutation_file)
+            .arg("--params")
+            .arg(r#"{"name":"PolicyLocal","age":44}"#)
+            .arg("--json"),
+    ));
+    assert_eq!(local_change["branch"], "main");
+    assert_eq!(local_change["affected_nodes"], 1);
+
+    let verify = parse_stdout_json(&output_success(
+        cli()
+            .arg("read")
+            .arg(repo.path())
+            .arg("--query")
+            .arg(fixture("test.gq"))
+            .arg("--name")
+            .arg("get_person")
+            .arg("--params")
+            .arg(r#"{"name":"PolicyLocal"}"#)
+            .arg("--json"),
+    ));
+    assert_eq!(verify["row_count"], 1);
+    assert_eq!(verify["rows"][0]["p.name"], "PolicyLocal");
 }
