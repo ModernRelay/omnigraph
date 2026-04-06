@@ -1,197 +1,172 @@
 # Snapshots
 
-## What a Snapshot Is
+## Current Model
 
-A snapshot is a frozen, consistent read view of the entire graph at a point in time. It records which version of each sub-table is current, not the data itself. All reads within a query go through one snapshot to guarantee cross-type consistency.
+Omnigraph snapshots are now defined by the namespace `__manifest` dataset, not by the older `_manifest.lance` table.
 
-A snapshot is cheap to create (no storage I/O) and immutable once built.
+A snapshot is an immutable, point-in-time view of the whole graph:
 
-```
+- one `__manifest` version = one graph-visible version
+- each table entry pins one Lance table version
+- reads never bypass the snapshot
+
+```text
 Snapshot
   root_uri:  "s3://omnigraph-repo/context"
-  version:   7                                  ← manifest version
+  version:   9                                  # __manifest dataset version
   entries:
-    node:Person   → nodes/a3f8c...  v4  120 rows
-    node:Company  → nodes/7b21e...  v3   45 rows
-    edge:Knows    → edges/c92d1...  v5  200 rows
-    edge:WorksAt  → edges/e1f0a...  v2   90 rows
+    node:Person   -> nodes/a3f8c...  v4  branch=null     rows=120
+    node:Company  -> nodes/7b21e...  v3  branch=null     rows=45
+    edge:Knows    -> edges/c92d1...  v5  branch=feature  rows=200
 ```
 
-Two snapshots pointing to the same sub-table version share the same physical data on disk. A snapshot is a set of pinned pointers, not a copy of data.
+The snapshot contains only coordination metadata. Row data is read lazily from the pinned Lance tables.
 
-## Two-Level Versioning
+## What Lives In `__manifest`
 
-Omnigraph has two independent version spaces:
+`__manifest` is a Lance dataset with:
 
-- **Manifest version** — the database version. Monotonic, one per commit.
-- **Sub-table version** — each Lance dataset (Person, Company, Knows, ...) has its own version timeline.
+- one stable `table` row per logical Omnigraph table
+- one append-only `table_version` row per published table version
 
-The manifest records which sub-table versions are current at each database version:
+The persisted schema is:
 
-```
-Manifest v5:  Person@v2, Company@v1, Knows@v3
-Manifest v6:  Person@v2, Company@v1, Knows@v4    ← only Knows changed
-Manifest v7:  Person@v4, Company@v1, Knows@v4    ← only Person changed
-```
-
-Tables that did not change keep their old pinned version. The manifest is the single coordination point. A write commits new sub-table versions, then atomically advances the manifest. That manifest version becomes the new database version.
-
-## The Manifest
-
-The manifest is itself a Lance dataset (`_manifest.lance`) with one row per sub-table:
-
-| Column | Type | Description |
+| Column | Type | Meaning |
 |---|---|---|
-| `table_key` | String | `"node:Person"`, `"edge:Knows"`, etc. |
-| `table_path` | String | Relative path to the Lance dataset directory |
-| `table_version` | UInt64 | Pinned dataset version |
-| `table_branch` | String? | Lance branch name (null = main) |
-| `row_count` | UInt64 | Row count at this version |
+| `object_id` | Utf8 | `table_key` or `<table_key>$<version>` |
+| `object_type` | Utf8 | `table` or `table_version` |
+| `location` | Utf8? | Relative table path for `table` rows |
+| `metadata` | Utf8? | JSON-encoded table-version metadata |
+| `base_objects` | List<Utf8>? | Reserved |
+| `table_key` | Utf8 | Logical key like `node:Person` |
+| `table_version` | UInt64? | Pinned Lance version for `table_version` rows |
+| `table_branch` | Utf8? | Owning Lance branch for lazy branch forks |
+| `row_count` | UInt64? | Row count for the published table version |
 
-The `table_path` uses a deterministic FNV-1a hash of the type name:
+Omnigraph reconstructs graph state by reading all visible `table_version` rows in `__manifest` and selecting the latest version row per `table_key`.
 
-```
-Person  → nodes/a3f8c0e1b2d34567
-Knows   → edges/c92d10f4a5b67890
-```
+## Two Version Spaces
 
-The `table_branch` field is null when the sub-table is on the main Lance branch. When Omnigraph branching forks a sub-table onto a child branch, this field records which Lance branch to check out before pinning the version.
+There are still two independent version spaces:
 
-## How Snapshot.open() Works
+- `__manifest` version: the graph version
+- sub-table version: the native Lance version of an individual node or edge table
 
-When a query needs data from a specific type, it calls `snapshot.open("node:Person")`. This does three things:
+Example:
 
-```
-1. Look up the entry from the in-memory map
-   → { table_path: "nodes/a3f8c...", table_version: 4, table_branch: None }
-
-2. Open the Lance dataset at {root_uri}/{table_path}
-
-3. If table_branch is set, checkout that Lance branch
-   Then checkout the exact pinned version
-   → Dataset pinned at version 4
+```text
+__manifest v7:  Person@v2, Company@v1, Knows@v3
+__manifest v8:  Person@v2, Company@v1, Knows@v4
+__manifest v9:  Person@v4, Company@v1, Knows@v4
 ```
 
-This is the only path to data. Every read goes through a snapshot, and every snapshot pins every table. There is no way to accidentally read a table at the wrong version.
+Only changed tables advance. Unchanged tables stay pinned to their previous native Lance version.
 
-## How Snapshots Are Created
+## How `Snapshot::open()` Works
 
-### Hot path — from in-memory state
+`Snapshot::open("node:Person")` does not open a table by path directly anymore. It resolves through the namespace layer:
 
-`ManifestCoordinator` holds the current manifest state in memory. Calling `.snapshot()` clones this state into a `Snapshot` struct. No storage I/O.
+1. Look up the pinned `SubTableEntry` from the snapshot map.
+2. Build a branch-aware namespace view for the active graph branch.
+3. Use `DatasetBuilder::from_namespace(...)` to resolve the table.
+4. Load the pinned table version, including `table_branch` when the table was lazily forked on a branch.
 
-```
+That keeps table discovery and version lookup on the Lance namespace path instead of hardcoding dataset opens all over the runtime.
+
+## How Snapshots Are Built
+
+### Hot path
+
+`ManifestCoordinator` keeps the current `ManifestState` in memory. `snapshot()` is just a cheap clone of that state into a `Snapshot`.
+
+```text
 ManifestCoordinator
-  known_state: { version: 7, entries: [...] }
-        |
-        +---> Snapshot { version: 7, entries: HashMap<key, entry> }
+  known_state: { version: 9, entries: [...] }
+      |
+      +--> Snapshot { version: 9, entries: HashMap<table_key, SubTableEntry> }
 ```
 
-This is the normal read path. Every query that targets the current branch head uses this.
+No storage I/O happens on this path.
 
-### Time-travel path — from historical state
+### Historical path
 
-`ManifestCoordinator::snapshot_at(root_uri, branch, version)` reopens the manifest dataset, checks out the requested branch and version, and reads the entries from that historical state:
+`ManifestCoordinator::snapshot_at(root_uri, branch, version)` reopens `__manifest`, checks out the requested branch and manifest version, and reconstructs the historical `ManifestState`.
 
-```
-snapshot_at(root, Some("feature-x"), version=5)
-  |
-  +-- open _manifest.lance
-  +-- checkout_branch("feature-x")
-  +-- checkout_version(5)
-  +-- read entries from that manifest state
-       +---> Snapshot { version: 5, entries: { ... } }
-```
+This is the path used by:
 
-This path is used by `run_query_at()`, `entity_at()`, and the change detection APIs.
+- point-in-time reads
+- `entity_at()`
+- diff and change-detection APIs
 
-## Snapshots and Branches
+## Branch Semantics
 
-Each Omnigraph branch has its own manifest timeline. A branch is a Lance branch on `_manifest.lance`. Opening a branch means checking out that branch on the manifest dataset:
+Omnigraph branches are still Lance branches, but now the graph branch head is the branch head of `__manifest`.
 
-```
-_manifest.lance
-  main          v1 → v2 → v3 → v4 → v5 → v6 → v7
-                           |
-  feature-x                +→ v4 → v5 → v6
+```text
+__manifest
+  main        v1 -> v2 -> v3 -> v4
+                     |
+  feature           +-> v3 -> v4
 ```
 
-A snapshot from `main` at v7 and a snapshot from `feature-x` at v6 may point to the same sub-table version for types that did not diverge. The data is shared; only the pointers differ.
+Sub-tables are still branched lazily:
 
-Sub-tables are branched lazily. If a branch never modifies a type, that type's entry still points at the parent branch's dataset and version. The sub-table is only forked when the branch actually writes to it.
+- if a branch never writes to `node:Person`, the snapshot keeps `table_branch = null`
+- on first branch-local write, the table gets its own Lance branch
+- published `table_version` rows in `__manifest` then record `table_branch = feature`
 
-## Snapshots and Writes
+That keeps branch storage proportional to changed tables instead of copying the whole graph.
 
-Writes never modify a snapshot. The write path is:
+## Write And Publish Flow
 
-```
-1. Capture target branch head (a snapshot)
-2. Create a hidden run branch
-3. Write data to sub-tables on the run branch
-4. Verify target branch head did not advance
-5. Publish: merge run state into target branch
-6. Advance manifest → new snapshot
-```
+There are now two separate control-plane layers:
 
-The old snapshot remains valid and unchanged. Readers holding the old snapshot continue to see the pre-write state. The new snapshot, with updated sub-table versions, becomes visible to subsequent reads.
+### Table-local write path
 
-## The snapshot CLI Command
+- `StagedTableNamespace` owns table-local namespace operations
+- writes still commit native Lance table versions
+- staged table history is visible through the namespace adapter before graph publish
 
-`omnigraph snapshot` is a diagnostic tool that dumps the manifest state for a branch. It reads only the manifest entries, not the actual table data.
+### Graph publish path
 
-```
-$ omnigraph snapshot ./my-repo --branch main
+- `GraphNamespacePublisher` is the graph-visible publish boundary
+- it validates batch publish invariants against `__manifest`
+- it atomically inserts immutable `table_version` rows into `__manifest`
 
-branch: main
-manifest_version: 7
-node:Company   v3  branch=main  rows=45
-node:Person    v4  branch=main  rows=120
-edge:Knows     v5  branch=main  rows=200
-edge:WorksAt   v2  branch=main  rows=90
-```
+That final `__manifest` merge-insert is the graph commit point.
 
-With `--json`, the output is structured:
+## Why Omnigraph Still Has A Publisher Layer
 
-```json
-{
-  "branch": "main",
-  "manifest_version": 7,
-  "tables": [
-    {
-      "table_key": "node:Person",
-      "table_path": "nodes/a3f8c...",
-      "table_version": 4,
-      "table_branch": null,
-      "row_count": 120
-    }
-  ]
-}
-```
+Lance now owns:
 
-This works against both local repos and remote servers (`--target http://...` calls `GET /snapshot?branch=...`).
+- table storage
+- table-local versioning
+- namespace lookup
+- native table history
 
-Useful for answering:
+Omnigraph still owns one thing Lance Rust does not expose directly today:
 
-- What manifest version is this branch at?
-- Which sub-tables changed between branches?
-- Is a sub-table on a forked Lance branch or still on main?
-- How many rows does each type have?
+- branch-aware atomic batch publication of multiple table versions into `__manifest`
 
-## What Is Not in a Snapshot
+That is why `publisher.rs` still exists. It is the last custom graph-specific coordination layer.
 
-A snapshot contains only coordination metadata. It does not hold or cache:
+## CLI / API Shape
 
-- Row data (node properties, edge properties)
-- Blob content
-- Graph topology (the GraphIndex is a separate derived structure)
-- Query results
+`omnigraph snapshot` and `GET /snapshot` still expose:
 
-All row data is read from Lance datasets on demand when a query opens a sub-table through the snapshot. Nothing is retained after the query completes.
+- `manifest_version`
+- per-table `table_key`
+- `table_path`
+- `table_version`
+- `table_branch`
+- `row_count`
 
-## Key Source Files
+The meaning of `manifest_version` is now specifically the `__manifest` dataset version.
 
-- `crates/omnigraph/src/db/manifest.rs` — `Snapshot`, `ManifestCoordinator`, `SubTableEntry`
-- `crates/omnigraph/src/db/graph_coordinator.rs` — coordinates manifest with commit graph and run registry
-- `crates/omnigraph/src/db/omnigraph.rs` — `snapshot_of()`, `snapshot_at_version()`
-- `crates/omnigraph-server/src/api.rs` — `snapshot_payload()`, `SnapshotOutput`
-- `crates/omnigraph-cli/src/main.rs` — `Command::Snapshot` handler
+## Source Files
+
+- `crates/omnigraph/src/db/manifest.rs`
+- `crates/omnigraph/src/db/manifest/repo.rs`
+- `crates/omnigraph/src/db/manifest/state.rs`
+- `crates/omnigraph/src/db/manifest/namespace.rs`
+- `crates/omnigraph/src/db/manifest/publisher.rs`

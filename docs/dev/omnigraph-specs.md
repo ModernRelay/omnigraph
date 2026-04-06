@@ -550,11 +550,15 @@ The boundary is the **Lance dependency line**. Everything above it (compiler) ha
 ```text
 graph-db/                               # repo root (local path or s3:// URI)
 ├── _schema.pg                          # Schema source of truth
-├── _manifest.lance/                    # Lance table: one row per sub-table
+├── __manifest/                         # Namespace manifest table
 │   ├── _versions/                      # MVCC — repo version = manifest version
 │   ├── _refs/branches/                 # Lance-native branch metadata
 │   └── data/
 ├── _graph_commits.lance/               # Tiny graph commit DAG for merge-base resolution
+│   ├── _versions/
+│   ├── _refs/branches/
+│   └── data/
+├── _graph_runs.lance/                  # Run lifecycle metadata
 │   ├── _versions/
 │   ├── _refs/branches/
 │   └── data/
@@ -578,25 +582,36 @@ Sub-table directory names are FNV-1a hashes of the type name (`manifest.rs:type_
 
 ### Manifest Table
 
-The manifest is a Lance table. One row per sub-table. A repo version is one manifest version.
+The live manifest is the namespace `__manifest` Lance table. It stores one
+stable `table` row per logical table and one append-only `table_version` row
+per published table version. A repo version is one `__manifest` version.
 
 | Column | Type | Description |
 |---|---|---|
+| `object_id` | Utf8 | `table_key` or `<table_key>$<version>` |
+| `object_type` | Utf8 | `table` or `table_version` |
+| `location` | Utf8 nullable | Relative table path for `table` rows |
+| `metadata` | Utf8 nullable | JSON-encoded table-version metadata |
+| `base_objects` | List<Utf8> nullable | Reserved |
 | `table_key` | Utf8 | `"node:Person"` or `"edge:Knows"` |
-| `table_path` | Utf8 | `"nodes/a1b2c3d4"` — relative to repo root |
-| `table_version` | UInt64 | Pinned Lance version for this snapshot |
-| `table_branch` | Utf8 (nullable) | Lance branch name on sub-table (null = main) |
-| `row_count` | UInt64 | Rows in sub-table at this version |
+| `table_version` | UInt64 nullable | Pinned Lance version for `table_version` rows |
+| `table_branch` | Utf8 nullable | Lance branch name on sub-table (null = main) |
+| `row_count` | UInt64 nullable | Rows in sub-table at this version |
 
 **Commit protocol** (`ManifestCoordinator::commit`):
-1. Read current state to resolve `table_path` for each key
-2. Build update batch
-3. `merge_insert` on `_manifest.lance` keyed by `table_key` (atomic commit point)
-4. Update `known_state` for read-your-own-writes
+1. Table-local writes produce native Lance versions through the staged namespace path
+2. `GraphNamespacePublisher` validates the requested table versions against current `__manifest` state
+3. `merge_insert` immutable `table_version` rows into `__manifest` keyed by `object_id`
+4. Refresh `known_state` from the committed `__manifest` dataset
 
 **Target contract:** the manifest advance is the graph-level publish point. Sub-table writes and graph-level validation must complete before a new manifest version becomes visible.
 
 The active JSONL load path stages writes, validates edge endpoints and edge cardinality, and advances the manifest only after validation passes.
+
+**Runtime split:**
+- `BranchManifestNamespace` resolves graph-visible table reads from `__manifest`
+- `StagedTableNamespace` handles table-local version discovery and publication during writes
+- `GraphNamespacePublisher` is the remaining graph-specific batch publisher for `__manifest`
 
 ### Sub-Table Schemas
 
@@ -782,10 +797,10 @@ Branches are Lance branches on the manifest table. Sub-tables are branched lazil
 - Omnigraph keeps a tiny `_graph_commits.lance` dataset to track graph commit ancestry
 - This is separate from per-table Lance history and exists to answer one question correctly: "what is the merge base?"
 - Each row records `graph_commit_id`, `manifest_branch`, `manifest_version`, `parent_commit_id`, optional `merged_parent_commit_id`, and `created_at`
-- `_graph_commits.lance` is branched eagerly with `_manifest.lance` because it is small and is required for branch merge
+- `_graph_commits.lance` is branched eagerly with `__manifest` because it is small and is required for branch merge
 
 **Create branch:**
-1. `_manifest.lance` dataset: `ds.create_branch("experiment", version, None)` (zero-copy, inherits all rows)
+1. `__manifest` dataset: `ds.create_branch("experiment", version, None)` (zero-copy, inherits all rows)
 2. `_graph_commits.lance` dataset: `ds.create_branch("experiment", version, None)`
 3. No sub-tables branched yet — `table_branch` remains null
 
@@ -1276,7 +1291,9 @@ Each sub-table dataset (the "base table" in MemWAL terms) can independently have
 
 **Manifest coordination challenge:**
 
-The current model (Step 7) does one manifest commit per mutation. With streaming writes, hundreds of per-row commits per second would thrash `_manifest.lance`. The solution is **manifest commit batching**:
+The current model does one graph publish per mutation. With streaming writes,
+hundreds of per-row commits per second would thrash `__manifest`. The solution
+is **manifest commit batching**:
 
 - `ManifestCoordinator` accumulates `SubTableUpdate` entries in memory
 - Commits periodically (every N writes or every T seconds) via an explicit `checkpoint()` call

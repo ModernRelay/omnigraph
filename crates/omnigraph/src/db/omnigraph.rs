@@ -56,7 +56,7 @@ pub struct Omnigraph {
 impl Omnigraph {
     /// Create a new repo at `uri` from schema source.
     ///
-    /// Creates `_schema.pg`, per-type Lance datasets, and `_manifest.lance`.
+    /// Creates `_schema.pg`, per-type Lance datasets, and `__manifest`.
     pub async fn init(uri: &str, schema_source: &str) -> Result<Self> {
         Self::init_with_storage(uri, schema_source, storage_for_uri(uri)?).await
     }
@@ -93,7 +93,7 @@ impl Omnigraph {
 
     /// Open an existing repo.
     ///
-    /// Reads `_schema.pg`, parses it, builds the catalog, and opens the manifest.
+    /// Reads `_schema.pg`, parses it, builds the catalog, and opens `__manifest`.
     pub async fn open(uri: &str) -> Result<Self> {
         Self::open_with_storage(uri, storage_for_uri(uri)?).await
     }
@@ -565,22 +565,28 @@ impl Omnigraph {
                         .await?
                     }
                 },
-                None => (self.open_dataset_head(&full_path, None).await?, None),
+                None => (
+                    self.table_store
+                        .open_dataset_head_for_write(&table_key, &full_path, None)
+                        .await?,
+                    None,
+                ),
             };
             let row_count = self.table_store.count_rows(&ds, None).await.unwrap_or(0);
             if row_count > 0 {
                 self.build_indices_on_dataset(&table_key, &mut ds).await?;
             }
 
-            let final_version = self.table_store.dataset_version(&ds);
-            if final_version != entry.table_version
+            let state = self.table_store.table_state(&full_path, &ds).await?;
+            if state.version != entry.table_version
                 || resolved_branch.as_deref() != entry.table_branch.as_deref()
             {
                 updates.push(crate::db::SubTableUpdate {
                     table_key,
-                    table_version: final_version,
+                    table_version: state.version,
                     table_branch: resolved_branch,
-                    row_count: row_count as u64,
+                    row_count: state.row_count,
+                    version_metadata: state.version_metadata,
                 });
             }
         }
@@ -605,22 +611,28 @@ impl Omnigraph {
                         .await?
                     }
                 },
-                None => (self.open_dataset_head(&full_path, None).await?, None),
+                None => (
+                    self.table_store
+                        .open_dataset_head_for_write(&table_key, &full_path, None)
+                        .await?,
+                    None,
+                ),
             };
             let row_count = self.table_store.count_rows(&ds, None).await.unwrap_or(0);
             if row_count > 0 {
                 self.build_indices_on_dataset(&table_key, &mut ds).await?;
             }
 
-            let final_version = self.table_store.dataset_version(&ds);
-            if final_version != entry.table_version
+            let state = self.table_store.table_state(&full_path, &ds).await?;
+            if state.version != entry.table_version
                 || resolved_branch.as_deref() != entry.table_branch.as_deref()
             {
                 updates.push(crate::db::SubTableUpdate {
                     table_key,
-                    table_version: final_version,
+                    table_version: state.version,
                     table_branch: resolved_branch,
-                    row_count: row_count as u64,
+                    row_count: state.row_count,
+                    version_metadata: state.version_metadata,
                 });
             }
         }
@@ -956,18 +968,19 @@ impl Omnigraph {
             let source_ds = run_snapshot.open(&table_key).await?;
             let batch = self.batch_for_table_rewrite(&source_ds, &table_key).await?;
 
-            let (mut target_ds, _full_path, table_branch) = self
+            let (mut target_ds, full_path, table_branch) = self
                 .open_for_mutation_on_branch(target_branch.as_deref(), &table_key)
                 .await?;
             let state = self
                 .table_store()
-                .overwrite_batch(&mut target_ds, batch)
+                .overwrite_batch(&full_path, &mut target_ds, batch)
                 .await?;
             updates.push(crate::db::SubTableUpdate {
                 table_key: table_key.clone(),
                 table_version: state.version,
                 table_branch,
                 row_count: state.row_count,
+                version_metadata: state.version_metadata,
             });
             if table_key.starts_with("edge:") {
                 changed_edge_tables = true;
@@ -1005,18 +1018,19 @@ impl Omnigraph {
                 .batch_for_table_rewrite(&source_ds, &entry.table_key)
                 .await?;
 
-            let (mut target_ds, _full_path, table_branch) = self
+            let (mut target_ds, full_path, table_branch) = self
                 .open_for_mutation_on_branch(target_branch.as_deref(), &entry.table_key)
                 .await?;
             let state = self
                 .table_store()
-                .overwrite_batch(&mut target_ds, batch)
+                .overwrite_batch(&full_path, &mut target_ds, batch)
                 .await?;
             updates.push(crate::db::SubTableUpdate {
                 table_key: entry.table_key.clone(),
                 table_version: state.version,
                 table_branch,
                 row_count: state.row_count,
+                version_metadata: state.version_metadata,
             });
             if entry.table_key.starts_with("edge:") {
                 changed_edge_tables = true;
@@ -1061,7 +1075,10 @@ impl Omnigraph {
         let full_path = format!("{}/{}", self.root_uri, entry.table_path);
         match resolved.branch.as_deref() {
             None => {
-                let ds = self.open_dataset_head(&full_path, None).await?;
+                let ds = self
+                    .table_store
+                    .open_dataset_head_for_write(table_key, &full_path, None)
+                    .await?;
                 self.table_store
                     .ensure_expected_version(&ds, table_key, entry.table_version)?;
                 Ok((ds, full_path, None))
@@ -1095,22 +1112,28 @@ impl Omnigraph {
         match entry_branch {
             Some(branch) if branch == active_branch => {
                 let ds = self
-                    .open_dataset_head(full_path, Some(active_branch))
+                    .table_store
+                    .open_dataset_head_for_write(table_key, full_path, Some(active_branch))
                     .await?;
                 self.table_store
                     .ensure_expected_version(&ds, table_key, entry_version)?;
                 Ok((ds, Some(active_branch.to_string())))
             }
             source_branch => {
+                self.fork_dataset_from_entry_state(
+                    table_key,
+                    full_path,
+                    source_branch,
+                    entry_version,
+                    active_branch,
+                )
+                .await?;
                 let ds = self
-                    .fork_dataset_from_entry_state(
-                        table_key,
-                        full_path,
-                        source_branch,
-                        entry_version,
-                        active_branch,
-                    )
+                    .table_store
+                    .open_dataset_head_for_write(table_key, full_path, Some(active_branch))
                     .await?;
+                self.table_store
+                    .ensure_expected_version(&ds, table_key, entry_version)?;
                 Ok((ds, Some(active_branch.to_string())))
             }
         }
@@ -1147,14 +1170,6 @@ impl Omnigraph {
         self.table_store
             .reopen_for_mutation(full_path, table_branch, table_key, expected_version)
             .await
-    }
-
-    pub(crate) async fn open_dataset_head(
-        &self,
-        full_path: &str,
-        branch: Option<&str>,
-    ) -> Result<Dataset> {
-        self.table_store.open_dataset_head(full_path, branch).await
     }
 
     pub(crate) async fn open_dataset_at_state(

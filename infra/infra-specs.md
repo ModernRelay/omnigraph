@@ -38,10 +38,12 @@ This spec is for a demo deployment, not a production HA design.
 
 These constraints drive the infra design:
 
-- The live runtime is local-filesystem oriented for repo metadata and existence checks.
+- The live runtime supports local and `s3://` repo URIs, but this demo spec
+  intentionally assumes one repo on one mounted local volume.
 - The server is one process holding one shared `Omnigraph` handle.
-- The HTTP API currently exposes `healthz`, `snapshot`, `read`, `change`, and `run` endpoints.
-- The server does not expose init, bulk load, branch-create, or branch-merge endpoints.
+- The HTTP API exposes `healthz`, `snapshot`, `read`, `change`, `export`,
+  branch create/list/merge, and run endpoints.
+- The server still does not expose init or bulk-load endpoints.
 - The repo must exist on disk before the service starts.
 
 Practical implication:
@@ -269,7 +271,7 @@ Accepted bootstrap workflows:
 The bootstrap flow must guarantee that:
 
 - `_schema.pg` exists
-- `_manifest.lance` exists
+- `__manifest` exists
 - the repo is readable by the `omnigraph` service user
 
 ## 13. Logging And Monitoring

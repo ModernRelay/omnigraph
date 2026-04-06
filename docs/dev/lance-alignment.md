@@ -1,5 +1,16 @@
 # Omnigraph–Lance Alignment
 
+Historical note: this document predates the Lance 4 / `__manifest` cutover.
+References here to `graph.manifest.json`, `_manifest.lance`, full-directory
+branch copies, and “each branch is a namespace” describe older architecture or
+earlier design options, not the live runtime. For the current implementation,
+see:
+
+- `docs/dev/omnigraph-lance4.md`
+- `docs/dev/snapshots.md`
+- `docs/dev/soc-lance-manifest.md`
+- `docs/dev/namespace-publisher-gap.md`
+
 What must change in Omnigraph's storage, branching, WAL, and manifest layers to align with the Lance format specification — and why.
 
 ---
@@ -680,5 +691,4 @@ Every mutation advances the manifest version. At 100 mutations/day, manifest ver
 | **Per-type datasets** | Keep                                     | Keep                                               | Correct alignment with Lance                                    |
 | **Version pinning**   | Keep                                     | Keep                                               | Correct alignment with Lance                                    |
 | **File format**       | V2.2                                     | V2.2                                               | Correct alignment with Lance                                    |
-
 

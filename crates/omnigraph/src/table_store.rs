@@ -12,20 +12,23 @@ use lance_index::{DatasetIndexExt, IndexType};
 use lance_linalg::distance::MetricType;
 use std::sync::Arc;
 
+use crate::db::manifest::{TableVersionMetadata, open_table_head_for_write};
 use crate::db::{Snapshot, SubTableEntry};
 use crate::error::{OmniError, Result};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableState {
     pub version: u64,
     pub row_count: u64,
+    pub(crate) version_metadata: TableVersionMetadata,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteState {
     pub version: u64,
     pub row_count: u64,
     pub deleted_rows: usize,
+    pub(crate) version_metadata: TableVersionMetadata,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +51,32 @@ impl TableStore {
         format!("{}/{}", self.root_uri, table_path)
     }
 
+    fn table_path_from_dataset_uri(&self, dataset_uri: &str) -> Result<String> {
+        let prefix = format!("{}/", self.root_uri.trim_end_matches('/'));
+        let table_path = dataset_uri
+            .strip_prefix(&prefix)
+            .map(|path| path.to_string())
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "dataset uri '{}' is not under root '{}'",
+                    dataset_uri, self.root_uri
+                ))
+            })?;
+        Ok(table_path
+            .split_once("/tree/")
+            .map(|(path, _)| path.to_string())
+            .unwrap_or(table_path))
+    }
+
+    fn dataset_version_metadata(
+        &self,
+        dataset_uri: &str,
+        ds: &Dataset,
+    ) -> Result<TableVersionMetadata> {
+        let table_path = self.table_path_from_dataset_uri(dataset_uri)?;
+        TableVersionMetadata::from_dataset(&self.root_uri, &table_path, ds)
+    }
+
     pub async fn open_snapshot_table(
         &self,
         snapshot: &Snapshot,
@@ -57,12 +86,7 @@ impl TableStore {
     }
 
     pub async fn open_at_entry(&self, entry: &SubTableEntry) -> Result<Dataset> {
-        self.open_dataset_at_state(
-            &entry.table_path,
-            entry.table_branch.as_deref(),
-            entry.table_version,
-        )
-        .await
+        entry.open(&self.root_uri).await
     }
 
     pub async fn open_dataset_head(
@@ -80,6 +104,16 @@ impl TableStore {
                 .map_err(|e| OmniError::Lance(e.to_string())),
             _ => Ok(ds),
         }
+    }
+
+    pub async fn open_dataset_head_for_write(
+        &self,
+        table_key: &str,
+        dataset_uri: &str,
+        branch: Option<&str>,
+    ) -> Result<Dataset> {
+        let table_path = self.table_path_from_dataset_uri(dataset_uri)?;
+        open_table_head_for_write(&self.root_uri, table_key, &table_path, branch).await
     }
 
     pub async fn open_dataset_at_state(
@@ -120,7 +154,9 @@ impl TableStore {
         table_key: &str,
         expected_version: u64,
     ) -> Result<Dataset> {
-        let ds = self.open_dataset_head(dataset_uri, branch).await?;
+        let ds = self
+            .open_dataset_head_for_write(table_key, dataset_uri, branch)
+            .await?;
         self.ensure_expected_version(&ds, table_key, expected_version)?;
         Ok(ds)
     }
@@ -277,23 +313,29 @@ impl TableStore {
         ds.version().version
     }
 
-    pub async fn table_state(&self, ds: &Dataset) -> Result<TableState> {
+    pub async fn table_state(&self, dataset_uri: &str, ds: &Dataset) -> Result<TableState> {
         Ok(TableState {
             version: self.dataset_version(ds),
             row_count: self.count_rows(ds, None).await? as u64,
+            version_metadata: self.dataset_version_metadata(dataset_uri, ds)?,
         })
     }
 
-    pub async fn append_batch(&self, ds: &mut Dataset, batch: RecordBatch) -> Result<TableState> {
+    pub async fn append_batch(
+        &self,
+        dataset_uri: &str,
+        ds: &mut Dataset,
+        batch: RecordBatch,
+    ) -> Result<TableState> {
         if batch.num_rows() == 0 {
-            return self.table_state(ds).await;
+            return self.table_state(dataset_uri, ds).await;
         }
         let schema = batch.schema();
         let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema);
         ds.append(reader, None)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
-        self.table_state(ds).await
+        self.table_state(dataset_uri, ds).await
     }
 
     pub async fn append_or_create_batch(
@@ -325,17 +367,19 @@ impl TableStore {
 
     pub async fn overwrite_batch(
         &self,
+        dataset_uri: &str,
         ds: &mut Dataset,
         batch: RecordBatch,
     ) -> Result<TableState> {
         ds.truncate_table()
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
-        self.append_batch(ds, batch).await
+        self.append_batch(dataset_uri, ds, batch).await
     }
 
     pub async fn merge_insert_batch(
         &self,
+        dataset_uri: &str,
         ds: Dataset,
         batch: RecordBatch,
         key_columns: Vec<String>,
@@ -343,7 +387,7 @@ impl TableStore {
         when_not_matched: WhenNotMatched,
     ) -> Result<TableState> {
         if batch.num_rows() == 0 {
-            return self.table_state(&ds).await;
+            return self.table_state(dataset_uri, &ds).await;
         }
 
         let ds = Arc::new(ds);
@@ -360,11 +404,12 @@ impl TableStore {
             .execute(lance_datafusion::utils::reader_to_stream(Box::new(reader)))
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
-        self.table_state(&new_ds).await
+        self.table_state(dataset_uri, &new_ds).await
     }
 
     pub async fn merge_insert_batches(
         &self,
+        dataset_uri: &str,
         ds: Dataset,
         batches: Vec<RecordBatch>,
         key_columns: Vec<String>,
@@ -372,7 +417,7 @@ impl TableStore {
         when_not_matched: WhenNotMatched,
     ) -> Result<TableState> {
         if batches.is_empty() {
-            return self.table_state(&ds).await;
+            return self.table_state(dataset_uri, &ds).await;
         }
         let batch = if batches.len() == 1 {
             batches.into_iter().next().unwrap()
@@ -380,11 +425,23 @@ impl TableStore {
             let schema = batches[0].schema();
             concat_batches(&schema, &batches).map_err(|e| OmniError::Lance(e.to_string()))?
         };
-        self.merge_insert_batch(ds, batch, key_columns, when_matched, when_not_matched)
-            .await
+        self.merge_insert_batch(
+            dataset_uri,
+            ds,
+            batch,
+            key_columns,
+            when_matched,
+            when_not_matched,
+        )
+        .await
     }
 
-    pub async fn delete_where(&self, ds: &mut Dataset, filter: &str) -> Result<DeleteState> {
+    pub async fn delete_where(
+        &self,
+        dataset_uri: &str,
+        ds: &mut Dataset,
+        filter: &str,
+    ) -> Result<DeleteState> {
         let delete_result = ds
             .delete(filter)
             .await
@@ -393,6 +450,8 @@ impl TableStore {
             version: delete_result.new_dataset.version().version,
             row_count: self.count_rows(&delete_result.new_dataset, None).await? as u64,
             deleted_rows: delete_result.num_deleted_rows as usize,
+            version_metadata: self
+                .dataset_version_metadata(dataset_uri, &delete_result.new_dataset)?,
         })
     }
 

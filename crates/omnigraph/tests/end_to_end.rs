@@ -19,7 +19,7 @@ async fn init_creates_schema_file_and_manifest() {
     let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
     assert!(dir.path().join("_schema.pg").exists());
-    assert!(dir.path().join("_manifest.lance").exists());
+    assert!(dir.path().join("__manifest").exists());
     assert_eq!(db.catalog().node_types.len(), 2);
     assert_eq!(db.catalog().edge_types.len(), 2);
 }
