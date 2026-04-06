@@ -1221,6 +1221,76 @@ node Person {
 }
 
 #[tokio::test]
+async fn range_constraint_float_rejects_out_of_bounds() {
+    let schema = r#"
+node Measurement {
+    name: String @key
+    temperature: F64?
+    @range(temperature, 0.0..100.0)
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+
+    let data = r#"{"type": "Measurement", "data": {"name": "hot", "temperature": 150.5}}"#;
+    let result = load_jsonl(&mut db, data, LoadMode::Overwrite).await;
+    assert!(result.is_err(), "expected range violation for float");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("@range violation"), "error: {}", err);
+}
+
+#[tokio::test]
+async fn range_constraint_float_allows_within_bounds() {
+    let schema = r#"
+node Measurement {
+    name: String @key
+    temperature: F64?
+    @range(temperature, 0.0..100.0)
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+
+    let data = r#"{"type": "Measurement", "data": {"name": "warm", "temperature": 37.5}}"#;
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let snap = snapshot_main(&db).await.unwrap();
+    let ds = snap.open("node:Measurement").await.unwrap();
+    assert_eq!(ds.count_rows(None).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn range_constraint_negative_float_bounds() {
+    let schema = r#"
+node Measurement {
+    name: String @key
+    temperature: F64?
+    @range(temperature, -40.0..60.0)
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+
+    // Within bounds — should succeed
+    let data = r#"{"type": "Measurement", "data": {"name": "cold", "temperature": -20.0}}"#;
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    // Below minimum — should fail
+    let data = r#"{"type": "Measurement", "data": {"name": "arctic", "temperature": -50.0}}"#;
+    let result = load_jsonl(&mut db, data, LoadMode::Overwrite).await;
+    assert!(result.is_err(), "expected range violation for -50.0");
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("@range violation"), "error: {}", err);
+}
+
+#[tokio::test]
 async fn check_constraint_rejects_bad_pattern() {
     let schema = r#"
 node Order {

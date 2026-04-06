@@ -339,6 +339,8 @@ fn extract_range_bounds(
         if child.as_rule() == Rule::literal
             || child.as_rule() == Rule::integer
             || child.as_rule() == Rule::float_lit
+            || child.as_rule() == Rule::signed_integer
+            || child.as_rule() == Rule::signed_float
         {
             let bound = parse_constraint_bound(&child)?;
             if !seen_bound {
@@ -1267,6 +1269,78 @@ node Person {
                         |c| matches!(c, Constraint::Range { property, .. } if property == "age")
                     )
                 );
+            }
+            _ => panic!("expected Node"),
+        }
+    }
+
+    #[test]
+    fn test_parse_range_float_bounds() {
+        let input = r#"
+node Measurement {
+    name: String @key
+    temperature: F64?
+    @range(temperature, 0.0..100.0)
+}
+"#;
+        let schema = parse_schema(input).unwrap();
+        match &schema.declarations[0] {
+            SchemaDecl::Node(n) => {
+                assert!(n.constraints.iter().any(|c| matches!(
+                    c,
+                    Constraint::Range { property, min, max }
+                    if property == "temperature"
+                        && matches!(min, Some(ConstraintBound::Float(f)) if *f == 0.0)
+                        && matches!(max, Some(ConstraintBound::Float(f)) if *f == 100.0)
+                )));
+            }
+            _ => panic!("expected Node"),
+        }
+    }
+
+    #[test]
+    fn test_parse_range_negative_float_bounds() {
+        let input = r#"
+node Measurement {
+    name: String @key
+    temperature: F64?
+    @range(temperature, -40.0..60.0)
+}
+"#;
+        let schema = parse_schema(input).unwrap();
+        match &schema.declarations[0] {
+            SchemaDecl::Node(n) => {
+                assert!(n.constraints.iter().any(|c| matches!(
+                    c,
+                    Constraint::Range { property, min, max }
+                    if property == "temperature"
+                        && matches!(min, Some(ConstraintBound::Float(f)) if *f == -40.0)
+                        && matches!(max, Some(ConstraintBound::Float(f)) if *f == 60.0)
+                )));
+            }
+            _ => panic!("expected Node"),
+        }
+    }
+
+    #[test]
+    fn test_parse_range_negative_integer_bounds() {
+        let input = r#"
+node Account {
+    name: String @key
+    balance: I64?
+    @range(balance, -1000..1000)
+}
+"#;
+        let schema = parse_schema(input).unwrap();
+        match &schema.declarations[0] {
+            SchemaDecl::Node(n) => {
+                assert!(n.constraints.iter().any(|c| matches!(
+                    c,
+                    Constraint::Range { property, min, max }
+                    if property == "balance"
+                        && matches!(min, Some(ConstraintBound::Integer(n)) if *n == -1000)
+                        && matches!(max, Some(ConstraintBound::Integer(n)) if *n == 1000)
+                )));
             }
             _ => panic!("expected Node"),
         }
