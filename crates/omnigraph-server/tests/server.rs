@@ -91,6 +91,16 @@ fn repo_path(root: &Path) -> PathBuf {
     root.join("server.omni")
 }
 
+async fn manifest_dataset_version(repo: &Path) -> u64 {
+    Omnigraph::open(repo.to_string_lossy().as_ref())
+        .await
+        .unwrap()
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version()
+}
+
 fn s3_test_repo_uri(suite: &str) -> Option<String> {
     let bucket = env::var("OMNIGRAPH_S3_TEST_BUCKET").ok()?;
     let prefix = env::var("OMNIGRAPH_S3_TEST_PREFIX")
@@ -480,6 +490,31 @@ async fn policy_allows_read_but_distinguishes_401_from_403() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_route_returns_manifest_dataset_version() {
+    let (temp, app) = app_for_loaded_repo().await;
+    let repo = repo_path(temp.path());
+    let expected_manifest_version = manifest_dataset_version(&repo).await;
+
+    let (snapshot_status, snapshot_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/snapshot?branch=main")
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(snapshot_status, StatusCode::OK);
+    assert_eq!(snapshot_body["branch"], "main");
+    assert_eq!(
+        snapshot_body["manifest_version"].as_u64().unwrap(),
+        expected_manifest_version
+    );
+    assert!(snapshot_body["tables"].is_array());
 }
 
 #[tokio::test(flavor = "multi_thread")]

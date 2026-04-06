@@ -16,6 +16,8 @@ lance-datafusion = { workspace = true }
 lance-file = { workspace = true }
 lance-index = { workspace = true }
 lance-linalg = { workspace = true }
+lance-namespace = { workspace = true }
+lance-table = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-ord = { workspace = true }
@@ -41,4 +43,5 @@ url = { workspace = true }
 [dev-dependencies]
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.3.0" }
 tokio = { workspace = true }
+lance-namespace-impls = { workspace = true }
 serial_test = "3"

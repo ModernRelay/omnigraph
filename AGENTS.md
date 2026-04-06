@@ -88,10 +88,12 @@ Read queries go through:
 **Storage model:**
 
 - Schema source lives at `_schema.pg`
-- Manifest lives at `_manifest.lance`
+- Manifest lives at `__manifest`
 - Node datasets live at `nodes/{hash}`
 - Edge datasets live at `edges/{hash}`
-- Manifest rows track `table_key`, `table_path`, `table_version`, `table_branch`, and `row_count`
+- `__manifest` stores one stable `table` row per logical graph table plus
+  append-only `table_version` rows with `table_key`, `table_path`,
+  `table_version`, `table_branch`, and `row_count`
 
 `Snapshot` opens each sub-table at the pinned dataset version from the manifest, which is the current consistency boundary.
 
@@ -102,7 +104,7 @@ Read queries go through:
 - Typechecker for read queries and mutations
 - IR lowering for reads and mutations
 - Lance-backed manifest coordination
-- Repo init/open against local filesystem paths
+- Repo init/open against local filesystem paths and `s3://` URIs
 - JSONL loading into per-type Lance datasets
 - Value constraint validation for `@range` and `@check`
 - Edge cardinality validation after load
@@ -117,11 +119,11 @@ Read queries go through:
 - Change detection API: diff(), changes_since(), diff_commits(), entity_at(), snapshot_at_version()
 - Runs (transactional branches): create, load into, publish, abort — run registry tracks lifecycle and status
 - HTTP server (Axum): read queries, mutations, snapshot inspection, run management
+- Cedar policy engine: action-based RBAC authorization with branch and namespace scoping
 
 ## Important Current Limits
 
 - Point-in-time query execution (`run_query_at`) is implemented (Step 10b)
-- `init`/`open` currently use local filesystem paths; `s3://` support is not wired up yet
 - There are stale files under `crates/omnigraph/src/loader/` from an older design; the live exported loader is `crates/omnigraph/src/loader/mod.rs`
 - Aggregates typecheck in the compiler, but runtime projection/execution is still partial
 - List `contains` is lowered/typechecked, but executor support is incomplete
@@ -148,7 +150,7 @@ Treat these as historical/stale unless you are explicitly reviving them:
 - `crates/omnigraph-compiler/src/ir/lower.rs` — AST to IR lowering
 - `crates/omnigraph/src/db/omnigraph.rs` — top-level DB handle
 - `crates/omnigraph/src/db/graph_coordinator.rs` — coordinates manifest, commit graph, and run registry
-- `crates/omnigraph/src/db/manifest.rs` — manifest and snapshot coordination
+- `crates/omnigraph/src/db/manifest.rs` — manifest and snapshot coordination (refactored into sub-modules: `layout.rs`, `metadata.rs`, `namespace.rs`, `publisher.rs`, `repo.rs`, `state.rs`)
 - `crates/omnigraph/src/db/run_registry.rs` — transactional branch (run) lifecycle management
 - `crates/omnigraph/src/db/commit_graph.rs` — graph commit DAG for merge-base resolution
 - `crates/omnigraph/src/exec/mod.rs` — query and mutation executor
@@ -156,11 +158,12 @@ Treat these as historical/stale unless you are explicitly reviving them:
 - `crates/omnigraph/src/loader/mod.rs` — active JSONL loader
 - `crates/omnigraph/src/changes/mod.rs` — change detection (diff_snapshots, ChangeSet, two-path lineage-aware diff)
 - `crates/omnigraph/src/table_store.rs` — opens/creates Lance datasets by URI
-- `crates/omnigraph/src/storage.rs` — filesystem abstraction (local; S3 not yet wired)
+- `crates/omnigraph/src/storage.rs` — URI-aware metadata storage abstraction for local and S3-compatible roots
 - `crates/omnigraph-server/src/lib.rs` — HTTP server: routing, auth middleware, request handlers
 - `crates/omnigraph-server/src/api.rs` — request/response types for the REST API
 - `crates/omnigraph-server/src/config.rs` — YAML config loading (`omnigraph.yaml`) and CLI flag resolution
-- `crates/omnigraph-cli/src/main.rs` — current CLI surface (stubbed)
+- `crates/omnigraph-server/src/policy.rs` — Cedar policy engine for authorization (action-based RBAC with branch/namespace scoping)
+- `crates/omnigraph-cli/src/main.rs` — current CLI surface
 
 ## Toolchain & Conventions
 
@@ -171,6 +174,7 @@ Treat these as historical/stale unless you are explicitly reviving them:
 - Parse diagnostics via `ariadne`
 - CLI errors via `color-eyre`
 - Logging via `tracing`
+- Authorization via `cedar-policy` (Cedar policy language for RBAC)
 - Workspace dependencies centralized in root `Cargo.toml`
 
 ## Bug Prevention
@@ -236,6 +240,7 @@ Integration tests live under `crates/omnigraph/tests/`:
 - `changes.rs` — change detection and diff APIs
 - `point_in_time.rs` — historical snapshot queries
 - `runs.rs` — transactional branch (run) lifecycle
+- `export.rs` — graph export tests
 - `failpoints.rs` — fault injection tests via `fail` crate
 - `lance_version_columns.rs` — Lance version column behavior
 
@@ -292,3 +297,9 @@ poetry run lance-explore node ~/code/omnigraph-test cerebras
 - Canonicalization: `docs/dev/omnigraph-canon.md`
 - Lance v4: `docs/dev/omnigraph-lance4.md`
 - Seed data: `docs/dev/omnigraph-seed.md`
+- Snapshots: `docs/dev/snapshots.md`
+- Sync: `docs/dev/sync.md`
+- WAL streaming: `docs/dev/WAL-streaming.md`
+- Container runtime: `docs/dev/container-runtime.md`
+- Lance Namespace: `docs/dev/lance-namespace.md`
+- Namespace/publisher gap: `docs/dev/namespace-publisher-gap.md`

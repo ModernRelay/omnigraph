@@ -222,14 +222,15 @@ async fn load_jsonl_reader<R: BufRead>(
             .entry(&table_key)
             .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
 
-        let (new_version, total_rows, table_branch) =
+        let (state, table_branch) =
             write_batch_to_dataset(db, branch, &table_key, batch, mode).await?;
 
         updates.push(crate::db::SubTableUpdate {
             table_key,
-            table_version: new_version,
+            table_version: state.version,
             table_branch,
-            row_count: total_rows,
+            row_count: state.row_count,
+            version_metadata: state.version_metadata,
         });
         result.nodes_loaded.insert(type_name.clone(), loaded_count);
     }
@@ -290,14 +291,15 @@ async fn load_jsonl_reader<R: BufRead>(
             .entry(&table_key)
             .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
 
-        let (new_version, total_rows, table_branch) =
+        let (state, table_branch) =
             write_batch_to_dataset(db, branch, &table_key, batch, mode).await?;
 
         updates.push(crate::db::SubTableUpdate {
             table_key,
-            table_version: new_version,
+            table_version: state.version,
             table_branch,
-            row_count: total_rows,
+            row_count: state.row_count,
+            version_metadata: state.version_metadata,
         });
         result.edges_loaded.insert(edge_name.clone(), loaded_count);
     }
@@ -836,23 +838,26 @@ async fn write_batch_to_dataset(
     table_key: &str,
     batch: RecordBatch,
     mode: LoadMode,
-) -> Result<(u64, u64, Option<String>)> {
-    let (mut ds, _full_path, table_branch) =
+) -> Result<(crate::table_store::TableState, Option<String>)> {
+    let (mut ds, full_path, table_branch) =
         db.open_for_mutation_on_branch(branch, table_key).await?;
     let table_store = db.table_store();
 
     match mode {
         LoadMode::Overwrite => {
-            let state = table_store.overwrite_batch(&mut ds, batch).await?;
-            Ok((state.version, state.row_count, table_branch))
+            let state = table_store
+                .overwrite_batch(&full_path, &mut ds, batch)
+                .await?;
+            Ok((state, table_branch))
         }
         LoadMode::Append => {
-            let state = table_store.append_batch(&mut ds, batch).await?;
-            Ok((state.version, state.row_count, table_branch))
+            let state = table_store.append_batch(&full_path, &mut ds, batch).await?;
+            Ok((state, table_branch))
         }
         LoadMode::Merge => {
             let state = table_store
                 .merge_insert_batch(
+                    &full_path,
                     ds,
                     batch,
                     vec!["id".to_string()],
@@ -860,7 +865,7 @@ async fn write_batch_to_dataset(
                     lance::dataset::WhenNotMatched::InsertAll,
                 )
                 .await?;
-            Ok((state.version, state.row_count, table_branch))
+            Ok((state, table_branch))
         }
     }
 }

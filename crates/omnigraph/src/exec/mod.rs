@@ -950,6 +950,7 @@ async fn publish_adopted_source_state(
             table_version: source_entry.table_version,
             table_branch: None,
             row_count: source_entry.row_count,
+            version_metadata: source_entry.version_metadata.clone(),
         }),
         // Source on main, target on branch — pointer switch to main version
         // (target reads from main, same lineage)
@@ -958,6 +959,7 @@ async fn publish_adopted_source_state(
             table_version: source_entry.table_version,
             table_branch: None,
             row_count: source_entry.row_count,
+            version_metadata: source_entry.version_metadata.clone(),
         }),
         // Source on branch, target on main — apply delta to preserve version metadata
         (None, Some(_source_branch)) => {
@@ -972,6 +974,9 @@ async fn publish_adopted_source_state(
                         .unwrap_or(source_entry.table_version),
                     table_branch: None,
                     row_count: source_entry.row_count,
+                    version_metadata: target_entry
+                        .map(|entry| entry.version_metadata.clone())
+                        .unwrap_or_else(|| source_entry.version_metadata.clone()),
                 }),
             }
         }
@@ -991,6 +996,7 @@ async fn publish_adopted_source_state(
                         table_version: target_entry.unwrap().table_version,
                         table_branch: Some(target_branch.to_string()),
                         row_count: source_entry.row_count,
+                        version_metadata: target_entry.unwrap().version_metadata.clone(),
                     }),
                 }
             } else {
@@ -1006,11 +1012,13 @@ async fn publish_adopted_source_state(
                         target_branch,
                     )
                     .await?;
+                let state = target_db.table_store().table_state(&full_path, &ds).await?;
                 Ok(crate::db::SubTableUpdate {
                     table_key: table_key.to_string(),
-                    table_version: ds.version().version,
+                    table_version: state.version,
                     table_branch: Some(target_branch.to_string()),
-                    row_count: source_entry.row_count,
+                    row_count: state.row_count,
+                    version_metadata: state.version_metadata,
                 })
             }
         }
@@ -1039,6 +1047,7 @@ async fn publish_rewritten_merge_table(
             let state = target_db
                 .table_store()
                 .merge_insert_batches(
+                    &full_path,
                     current_ds,
                     batches,
                     vec!["id".to_string()],
@@ -1067,14 +1076,14 @@ async fn publish_rewritten_merge_table(
         let filter = format!("id IN ({})", escaped.join(", "));
         target_db
             .table_store()
-            .delete_where(&mut current_ds, &filter)
+            .delete_where(&full_path, &mut current_ds, &filter)
             .await?;
     }
 
     // Phase 3: rebuild indices
     let row_count = target_db
         .table_store()
-        .table_state(&current_ds)
+        .table_state(&full_path, &current_ds)
         .await?
         .row_count;
     if row_count > 0 {
@@ -1082,12 +1091,17 @@ async fn publish_rewritten_merge_table(
             .build_indices_on_dataset(table_key, &mut current_ds)
             .await?;
     }
+    let final_state = target_db
+        .table_store()
+        .table_state(&full_path, &current_ds)
+        .await?;
 
     Ok(crate::db::SubTableUpdate {
         table_key: table_key.to_string(),
-        table_version: current_ds.version().version,
+        table_version: final_state.version,
         table_branch,
-        row_count,
+        row_count: final_state.row_count,
+        version_metadata: final_state.version_metadata,
     })
 }
 
@@ -3581,7 +3595,7 @@ impl Omnigraph {
             let batch = build_insert_batch(&schema, &id, &resolved, &blob_props)?;
             crate::loader::validate_value_constraints(&batch, node_type)?;
             let has_key = node_type.key_property().is_some();
-            let (new_version, row_count, table_branch) = if has_key {
+            let (state, table_branch) = if has_key {
                 self.upsert_batch(type_name, true, schema, batch).await?
             } else {
                 self.append_batch(type_name, true, schema, batch).await?
@@ -3590,9 +3604,10 @@ impl Omnigraph {
             let table_key = format!("node:{}", type_name);
             self.commit_updates(&[crate::db::SubTableUpdate {
                 table_key,
-                table_version: new_version,
+                table_version: state.version,
                 table_branch,
-                row_count,
+                row_count: state.row_count,
+                version_metadata: state.version_metadata,
             }])
             .await?;
 
@@ -3608,15 +3623,15 @@ impl Omnigraph {
 
             let batch = build_insert_batch(&schema, &id, &resolved, &blob_props)?;
             validate_edge_insert_endpoints(self, type_name, &resolved).await?;
-            let (new_version, row_count, table_branch) =
-                self.append_batch(type_name, false, schema, batch).await?;
+            let (state, table_branch) = self.append_batch(type_name, false, schema, batch).await?;
 
             let table_key = format!("edge:{}", type_name);
             self.commit_updates(&[crate::db::SubTableUpdate {
                 table_key,
-                table_version: new_version,
+                table_version: state.version,
                 table_branch,
-                row_count,
+                row_count: state.row_count,
+                version_metadata: state.version_metadata,
             }])
             .await?;
 
@@ -3638,15 +3653,18 @@ impl Omnigraph {
         is_node: bool,
         _schema: SchemaRef,
         batch: RecordBatch,
-    ) -> Result<(u64, u64, Option<String>)> {
+    ) -> Result<(crate::table_store::TableState, Option<String>)> {
         let table_key = if is_node {
             format!("node:{}", type_name)
         } else {
             format!("edge:{}", type_name)
         };
-        let (mut ds, _full_path, table_branch) = self.open_for_mutation(&table_key).await?;
-        let state = self.table_store().append_batch(&mut ds, batch).await?;
-        Ok((state.version, state.row_count, table_branch))
+        let (mut ds, full_path, table_branch) = self.open_for_mutation(&table_key).await?;
+        let state = self
+            .table_store()
+            .append_batch(&full_path, &mut ds, batch)
+            .await?;
+        Ok((state, table_branch))
     }
 
     /// Upsert a batch into a sub-table using merge_insert keyed by "id".
@@ -3657,16 +3675,17 @@ impl Omnigraph {
         is_node: bool,
         _schema: SchemaRef,
         batch: RecordBatch,
-    ) -> Result<(u64, u64, Option<String>)> {
+    ) -> Result<(crate::table_store::TableState, Option<String>)> {
         let table_key = if is_node {
             format!("node:{}", type_name)
         } else {
             format!("edge:{}", type_name)
         };
-        let (ds, _full_path, table_branch) = self.open_for_mutation(&table_key).await?;
+        let (ds, full_path, table_branch) = self.open_for_mutation(&table_key).await?;
         let state = self
             .table_store()
             .merge_insert_batch(
+                &full_path,
                 ds,
                 batch,
                 vec!["id".to_string()],
@@ -3674,7 +3693,7 @@ impl Omnigraph {
                 lance::dataset::WhenNotMatched::InsertAll,
             )
             .await?;
-        Ok((state.version, state.row_count, table_branch))
+        Ok((state, table_branch))
     }
 
     async fn execute_update(
@@ -3763,6 +3782,7 @@ impl Omnigraph {
         let update_state = self
             .table_store()
             .merge_insert_batch(
+                &full_path,
                 ds,
                 updated,
                 vec!["id".to_string()],
@@ -3771,8 +3791,7 @@ impl Omnigraph {
             )
             .await?;
 
-        let mut final_version = update_state.version;
-        let mut final_row_count = update_state.row_count;
+        let mut final_state = update_state;
 
         // Phase 2: If there are blob assignments, apply them separately
         let blob_assignments: HashMap<&str, &Literal> = resolved
@@ -3821,12 +3840,13 @@ impl Omnigraph {
                     &table_key,
                     &full_path,
                     table_branch.as_deref(),
-                    final_version,
+                    final_state.version,
                 )
                 .await?;
             let blob_state = self
                 .table_store()
                 .merge_insert_batch(
+                    &full_path,
                     ds,
                     blob_batch,
                     vec!["id".to_string()],
@@ -3835,15 +3855,15 @@ impl Omnigraph {
                 )
                 .await?;
 
-            final_version = blob_state.version;
-            final_row_count = blob_state.row_count;
+            final_state = blob_state;
         }
 
         self.commit_updates(&[crate::db::SubTableUpdate {
             table_key,
-            table_version: final_version,
+            table_version: final_state.version,
             table_branch,
-            row_count: final_row_count,
+            row_count: final_state.row_count,
+            version_metadata: final_state.version_metadata,
         }])
         .await?;
 
@@ -3918,13 +3938,17 @@ impl Omnigraph {
                 initial_version,
             )
             .await?;
-        let delete_state = self.table_store().delete_where(&mut ds, &pred_sql).await?;
+        let delete_state = self
+            .table_store()
+            .delete_where(&full_path, &mut ds, &pred_sql)
+            .await?;
 
         let mut updates = vec![crate::db::SubTableUpdate {
             table_key,
             table_version: delete_state.version,
             table_branch: table_branch.clone(),
             row_count: delete_state.row_count,
+            version_metadata: delete_state.version_metadata,
         }];
 
         let mut affected_edges = 0usize;
@@ -3955,12 +3979,12 @@ impl Omnigraph {
 
             let edge_table_key = format!("edge:{}", edge_name);
             let cascade_filter = cascade_filters.join(" OR ");
-            let (mut edge_ds, _edge_full_path, edge_table_branch) =
+            let (mut edge_ds, edge_full_path, edge_table_branch) =
                 self.open_for_mutation(&edge_table_key).await?;
 
             let edge_delete = self
                 .table_store()
-                .delete_where(&mut edge_ds, &cascade_filter)
+                .delete_where(&edge_full_path, &mut edge_ds, &cascade_filter)
                 .await?;
 
             affected_edges += edge_delete.deleted_rows;
@@ -3971,6 +3995,7 @@ impl Omnigraph {
                     table_version: edge_delete.version,
                     table_branch: edge_table_branch,
                     row_count: edge_delete.row_count,
+                    version_metadata: edge_delete.version_metadata,
                 });
             }
         }
@@ -3996,9 +4021,12 @@ impl Omnigraph {
         let pred_sql = predicate_to_sql(predicate, params, true)?;
 
         let table_key = format!("edge:{}", type_name);
-        let (mut ds, _full_path, table_branch) = self.open_for_mutation(&table_key).await?;
+        let (mut ds, full_path, table_branch) = self.open_for_mutation(&table_key).await?;
 
-        let delete_state = self.table_store().delete_where(&mut ds, &pred_sql).await?;
+        let delete_state = self
+            .table_store()
+            .delete_where(&full_path, &mut ds, &pred_sql)
+            .await?;
         let affected = delete_state.deleted_rows;
 
         if affected > 0 {
@@ -4007,6 +4035,7 @@ impl Omnigraph {
                 table_version: delete_state.version,
                 table_branch,
                 row_count: delete_state.row_count,
+                version_metadata: delete_state.version_metadata,
             }])
             .await?;
 

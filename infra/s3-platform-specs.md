@@ -2,7 +2,8 @@
 
 ## 1. Purpose
 
-This document defines the target architecture after Omnigraph moves from a host-local repo to an S3-compatible repo.
+This document defines the platform architecture for running Omnigraph against an
+S3-compatible repo root.
 
 This is the recommended futureproof direction because it separates:
 
@@ -34,13 +35,12 @@ Practical result:
 
 ## 3. Why S3 First
 
-Today the runtime still assumes local metadata storage:
+Today the runtime already supports S3-compatible repo roots:
 
-- only `LocalStorageAdapter` exists in `crates/omnigraph/src/storage.rs`
-- `_schema.pg` is read and written through that adapter in `crates/omnigraph/src/db/omnigraph.rs`
-- graph commit and run registry existence checks use `storage.exists(...)` in `crates/omnigraph/src/db/graph_coordinator.rs`
-
-That means Omnigraph is not yet truly object-store-native even though Lance itself supports object storage.
+- `_schema.pg` goes through the URI-aware storage adapter in `crates/omnigraph/src/storage.rs`
+- repo init/open/load paths accept `s3://...` roots
+- graph commit and run registry existence checks are scheme-aware
+- test coverage exists for direct S3 repo lifecycle in the runtime, CLI, and server
 
 S3 compatibility is the key boundary to fix first because:
 
@@ -49,37 +49,28 @@ S3 compatibility is the key boundary to fix first because:
 - it makes graph deploys immutable and versioned
 - it separates runtime failures from storage failures
 
-## 4. Application Changes Required
-
-Infra alone cannot deliver S3-backed Omnigraph. The app must change first.
+## 4. Application Boundaries And Remaining Constraints
 
 ### 4.1 Storage Adapter
 
-Add an `S3StorageAdapter` implementing:
+The runtime now has a scheme-aware storage layer:
 
-- `read_text`
-- `write_text`
-- `exists`
+- `LocalStorageAdapter`
+- `S3StorageAdapter`
+- URI normalization and joining helpers for local, `file://`, and `s3://` roots
 
 Expected scope:
 
 - `_schema.pg`
-- any future text metadata files
 - existence checks for graph registry datasets
-
-Implementation notes:
-
-- use the AWS Rust SDK or `object_store`
-- support `s3://bucket/prefix/...` URIs
-- use `HeadObject` or equivalent for `exists`
-- keep `LocalStorageAdapter` for local dev and tests
+- any future text metadata files
 
 ### 4.2 Repo Root Semantics
 
 The following paths must work correctly under an S3 prefix:
 
 - `_schema.pg`
-- `_manifest.lance`
+- `__manifest`
 - `_graph_commits.lance`
 - `_graph_runs.lance`
 - `nodes/...`
@@ -87,9 +78,9 @@ The following paths must work correctly under an S3 prefix:
 
 `join_uri` and URI normalization must preserve scheme-aware path joining and must not assume local filesystem semantics.
 
-### 4.3 Open / Init / Load / Refresh
+### 4.3 Live S3 Code Paths
 
-The live code paths that need S3 correctness are:
+The live code paths that already need to stay S3-correct are:
 
 - `Omnigraph::init`
 - `Omnigraph::open`

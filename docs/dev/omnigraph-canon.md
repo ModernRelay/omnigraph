@@ -45,14 +45,16 @@ The core mental model is:
 A repo currently contains:
 
 - `_schema.pg`: source schema
-- `_manifest.lance`: one row per node or edge table with `table_path`, `table_version`, `table_branch`, and `row_count`
+- `__manifest`: namespace-style manifest table with one stable `table` row per
+  logical graph table and one append-only `table_version` row per published
+  table version
 - `nodes/<hash>`: one Lance dataset per node type
 - `edges/<hash>`: one Lance dataset per edge type
 - `_graph_commits.lance`: commit DAG used for branch history and merge-base resolution
 - `_graph_runs.lance`: transactional run log
 
 Important consequence:
-the manifest version is the database version.
+the `__manifest` dataset version is the database version.
 A read is consistent because all tables are opened through one pinned manifest snapshot.
 
 Repo roots are now URI-based, not local-path-only.
@@ -144,9 +146,9 @@ Current operations:
 
 Branching is built on Lance branches plus Omnigraph metadata:
 
-- `_manifest.lance` is branched
+- `__manifest` is branched
 - sub-table datasets are branched lazily
-- `_graph_commits.lance` tracks branch history and merge commits
+- `_graph_commits.lance` is branched eagerly and tracks branch history and merge commits
 
 Lazy branching matters:
 
@@ -206,8 +208,9 @@ A `Snapshot` is just:
 
 Opening a table from a snapshot means:
 
-- open the dataset
-- checkout the correct Lance branch if needed
+- resolve the table through the branch-aware namespace layer
+- open the dataset at the pinned `table_path`
+- checkout the correct Lance branch when `table_branch` is set
 - checkout the exact pinned version
 
 ## 10. Change Detection

@@ -17,7 +17,15 @@ Living document tracking the build of the Lance-native graph database.
 
 ## Current Status
 
-**324 registered tests passing.** Steps 0–10b complete. Step 10c is next.
+The active runtime has completed the Lance 4 SDK bump and the namespace-style
+manifest refactor. The workspace test suite currently passes end to end.
+
+Current storage/control-plane shape:
+
+- `__manifest` is the graph publish boundary
+- namespace adapters own table lookup and table-local version management
+- `publisher.rs` is the remaining Omnigraph-owned graph batch publish layer
+- `_graph_commits.lance` and `_graph_runs.lance` remain Omnigraph metadata tables
 
 ```
 Step 0  ✅  Crate restructuring
@@ -50,11 +58,12 @@ Step 11    Hook system (entity-change + query-result triggers)
 ```
 graph-db/                                 # repo root (local path or s3:// URI)
 ├── _schema.pg                            # Schema source of truth
-├── _manifest.lance/                      # Lance table: one row per sub-table
+├── __manifest/                           # Namespace manifest table
 │   ├── _versions/                        # MVCC — repo version = manifest version
 │   ├── _refs/branches/                   # Lance-native branch metadata
-│   ├── _refs/tags/                       # Lance-native tag metadata
-│   └── tree/{branch}/                    # Branch-specific manifest versions
+│   └── data/
+├── _graph_commits.lance/                 # Graph commit DAG
+├── _graph_runs.lance/                    # Run lifecycle metadata
 ├── nodes/
 │   ├── {hash}/                           # Per-type dataset (FNV-1a hash of type name)
 │   │   ├── _versions/
@@ -67,17 +76,24 @@ graph-db/                                 # repo root (local path or s3:// URI)
     └── ...
 ```
 
-**Manifest table schema:**
+**`__manifest` schema:**
 
 | Column | Type | Description |
 |---|---|---|
-| `table_key` | Utf8 | `"node:Person"` or `"edge:Knows"`. Unenforced primary key. |
-| `table_path` | Utf8 | `"nodes/a1b2c3d4..."` — relative to repo root, stable hash |
-| `table_version` | UInt64 | Pinned Lance version for this snapshot |
-| `table_branch` | Utf8 (nullable) | Lance branch name on sub-table (null = main) |
-| `row_count` | UInt64 | Rows in sub-table at this version |
+| `object_id` | Utf8 | `table_key` or `<table_key>$<version>` |
+| `object_type` | Utf8 | `table` or `table_version` |
+| `location` | Utf8 nullable | Relative table path for `table` rows |
+| `metadata` | Utf8 nullable | JSON-encoded table-version metadata |
+| `base_objects` | List<Utf8> nullable | Reserved |
+| `table_key` | Utf8 | `"node:Person"` or `"edge:Knows"` |
+| `table_version` | UInt64 nullable | Pinned Lance version for `table_version` rows |
+| `table_branch` | Utf8 nullable | Lance branch name on sub-table (`null` = main) |
+| `row_count` | UInt64 nullable | Rows in sub-table at this version |
 
-All datasets created with `enable_stable_row_ids = true` and `LanceFileVersion::V2_2`.
+`table_version_management=true` is set on `__manifest`. Omnigraph reconstructs
+graph state by selecting the latest visible `table_version` row per `table_key`.
+All datasets are created with `enable_stable_row_ids = true` and
+`LanceFileVersion::V2_2`.
 
 ---
 
@@ -130,7 +146,10 @@ String IDs everywhere: node `id` Utf8, edge `id`/`src`/`dst` Utf8. `key_property
 
 ### Step 2: ManifestCoordinator ✅
 
-`_manifest.lance` table: init, state, commit (merge_insert by table_key), open_sub_table. Tests: 154.
+Originally `_manifest.lance`; now replaced by namespace-style `__manifest`.
+`ManifestCoordinator` owns snapshot state, refresh, and graph publish against
+`__manifest`, while namespace adapters own table lookup and table-local version
+operations.
 
 ### Step 3: Omnigraph Init/Open ✅
 
@@ -255,7 +274,7 @@ Close the remaining single-graph correctness gaps before adding branch and merge
 **Publish-after-validation load flow:**
 - Stage node and edge writes against sub-table datasets first
 - Validate endpoint existence and edge cardinality against the staged candidate graph state
-- Advance `_manifest.lance` only after validation succeeds
+- Advance `__manifest` only after validation succeeds
 - If staging succeeds but validation fails, old graph state remains visible because the manifest is unchanged
 
 **Non-goals for Step 8b:**
@@ -323,19 +342,19 @@ Suggested columns:
 
 Rules:
 - Every manifest-advancing graph write appends one row to `_graph_commits.lance`
-- `_graph_commits.lance` is branched eagerly alongside `_manifest.lance` because it is tiny and is required for merge-base resolution
+- `_graph_commits.lance` is branched eagerly alongside `__manifest` because it is tiny and is required for merge-base resolution
 - When opening an older repo that predates Step 9, bootstrap a genesis commit pointing at the current main manifest version
 
 This avoids relying on Lance branch creation metadata alone. Lance's `parent_version` is enough to describe branch creation, but not enough to serve as a complete graph merge-base model after repeated merges.
 
 **Create branch** (`Omnigraph::branch_create`):
-1. Open `_manifest.lance` and `_graph_commits.lance`
+1. Open `__manifest` and `_graph_commits.lance`
 2. `ds.create_branch("experiment")` on both datasets
 3. No sub-tables branched yet — `table_branch` remains null in all manifest rows
 4. Branch head in `_graph_commits.lance` initially matches the parent's current head
 
 **Open at branch** (`Omnigraph::open_branch`):
-1. Open `_manifest.lance` at the requested branch
+1. Open `__manifest` at the requested branch
 2. Open `_graph_commits.lance` at the same branch
 3. Read manifest state → build Snapshot
 4. For each sub-table: if `table_branch` is null, open at `table_version` on main. If set, checkout that sub-table branch first, then the pinned version

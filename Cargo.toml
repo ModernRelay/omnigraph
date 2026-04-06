@@ -27,11 +27,14 @@ datafusion-common = "52"
 datafusion-expr = "52"
 datafusion-functions-aggregate = "52"
 
-lance = { version = "3.0", default-features = false, features = ["aws"] }
-lance-datafusion = "3.0"
-lance-file = "3.0"
-lance-index = "3.0"
-lance-linalg = "3.0"
+lance = { version = "4.0.0", default-features = false, features = ["aws"] }
+lance-datafusion = "4.0.0"
+lance-file = "4.0.0"
+lance-index = "4.0.0"
+lance-linalg = "4.0.0"
+lance-namespace = "4.0.0"
+lance-namespace-impls = "4.0.0"
+lance-table = "4.0.0"
 
 ulid = "1"
 futures = "0.3"

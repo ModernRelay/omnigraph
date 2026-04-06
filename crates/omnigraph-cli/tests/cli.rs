@@ -47,6 +47,18 @@ cases:
     expect: deny
 "#;
 
+fn manifest_dataset_version(repo: &std::path::Path) -> u64 {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        Omnigraph::open(repo.to_string_lossy().as_ref())
+            .await
+            .unwrap()
+            .snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version()
+    })
+}
+
 fn write_policy_config_fixture(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
     let config = root.join("omnigraph.yaml");
     let policy = root.join("policy.yaml");
@@ -218,7 +230,7 @@ fn init_creates_repo_successfully_on_missing_local_directory() {
 
     assert!(stdout.contains("initialized"));
     assert!(repo.join("_schema.pg").exists());
-    assert!(repo.join("_manifest.lance").exists());
+    assert!(repo.join("__manifest").exists());
     assert!(temp.path().join("omnigraph.yaml").exists());
 }
 
@@ -962,7 +974,10 @@ fn snapshot_json_returns_manifest_version_and_tables() {
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
 
     assert_eq!(payload["branch"], "main");
-    assert!(payload["manifest_version"].as_u64().unwrap() >= 1);
+    assert_eq!(
+        payload["manifest_version"].as_u64().unwrap(),
+        manifest_dataset_version(&repo)
+    );
     assert!(payload["tables"].as_array().unwrap().len() >= 4);
 }
 

@@ -49,11 +49,16 @@ After `init`, a repo directory contains:
 ```text
 <repo>/
   _schema.pg
-  _manifest.lance/
+  __manifest/
   nodes/{hash}/
   edges/{hash}/
   _graph_commits.lance/        # appears once branch history/merge metadata is initialized
+  _graph_runs.lance/           # appears once transactional runs are initialized
 ```
+
+`__manifest` is the graph publish boundary. Omnigraph branches are Lance
+branches on `__manifest`, and sub-table dataset branches are created lazily on
+first branch-local write.
 
 ## Test Fixtures
 
@@ -65,7 +70,12 @@ Example datasets in `crates/omnigraph/tests/fixtures/`:
 
 ## lance-explore
 
-Companion Python CLI for inspecting Lance datasets in a repo. Lives at `../lance-explore`.
+Companion Python CLI for inspecting the graph-visible pinned Lance datasets in a
+repo. Lives at `../lance-explore`.
+
+It uses `omnigraph snapshot --json` as the source of truth for graph state, then
+opens the concrete tables at the pinned `table_version` / `table_branch` from
+that snapshot.
 
 ```bash
 cd ../lance-explore
