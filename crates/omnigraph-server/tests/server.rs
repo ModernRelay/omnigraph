@@ -856,6 +856,76 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn branch_merge_conflict_response_includes_structured_conflicts() {
+    let temp = init_loaded_repo().await;
+    let repo = repo_path(temp.path());
+    let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    db.branch_create_from(ReadTarget::branch("main"), "feature")
+        .await
+        .unwrap();
+    db.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "set_age",
+        &omnigraph_compiler::json_params_to_param_map(
+            Some(&json!({"name": "Alice", "age": 31 })),
+            &omnigraph_compiler::find_named_query(MUTATION_QUERIES, "set_age")
+                .unwrap()
+                .params,
+            omnigraph_compiler::JsonParamMode::Standard,
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    db.mutate(
+        "feature",
+        MUTATION_QUERIES,
+        "set_age",
+        &omnigraph_compiler::json_params_to_param_map(
+            Some(&json!({"name": "Alice", "age": 32 })),
+            &omnigraph_compiler::find_named_query(MUTATION_QUERIES, "set_age")
+                .unwrap()
+                .params,
+            omnigraph_compiler::JsonParamMode::Standard,
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    drop(db);
+
+    let state = AppState::open(repo.to_string_lossy().to_string())
+        .await
+        .unwrap();
+    let app = build_app(state);
+    let merge = BranchMergeRequest {
+        source: "feature".to_string(),
+        target: Some("main".to_string()),
+    };
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/branches/merge")
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&merge).unwrap()))
+            .unwrap(),
+    )
+    .await;
+
+    let error: ErrorOutput = serde_json::from_value(body).unwrap();
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error.code, Some(omnigraph_server::api::ErrorCode::Conflict));
+    assert!(error.error.contains("merge conflict"));
+    assert!(error.merge_conflicts.iter().any(|conflict| {
+        conflict.table_key == "node:Person"
+            && conflict.row_id.as_deref() == Some("Alice")
+            && conflict.kind == omnigraph_server::api::MergeConflictKindOutput::DivergentUpdate
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn repeated_read_after_change_sees_updated_state_from_same_app() {
     let (_temp, app) = app_for_loaded_repo().await;
 
@@ -1241,6 +1311,11 @@ async fn publish_conflict_returns_conflict_status() {
     let error: ErrorOutput = serde_json::from_value(body).unwrap();
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(error.code, Some(omnigraph_server::api::ErrorCode::Conflict));
+    assert!(error.merge_conflicts.iter().any(|conflict| {
+        conflict.table_key == "node:Person"
+            && conflict.row_id.as_deref() == Some("Alice")
+            && conflict.kind == omnigraph_server::api::MergeConflictKindOutput::DivergentUpdate
+    }));
 }
 
 #[tokio::test(flavor = "multi_thread")]

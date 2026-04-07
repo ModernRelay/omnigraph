@@ -163,8 +163,22 @@ Branch merge is a three-way merge using:
 - target head
 - merge base from `CommitGraph`
 
+The current v1 merge contract is conservative:
+
+- source-only changes are adopted into the target
+- target-only changes remain in the target
+- doubly changed rows auto-merge only when both branches produce the same final row state
+- otherwise the merge stops with typed conflicts instead of guessing
+
 The merge logic is row-oriented and tries to preserve row-version metadata for unchanged rows.
-It detects divergent updates, divergent inserts, and orphan-edge conflicts.
+Current typed conflicts include divergent insert, divergent update, delete-vs-update, orphan-edge, unique, cardinality, and value-constraint violations.
+
+Merged candidate graphs are validated before publish, and HTTP callers receive structured conflict entries when a merge is rejected.
+
+Deliberately not in v1:
+
+- property-wise auto-merge for disjoint field edits on the same row
+- manual or interactive conflict resolution
 
 `publish_run()` uses the same internal merge machinery, but only for hidden transactional run branches.
 

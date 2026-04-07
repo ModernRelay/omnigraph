@@ -22,6 +22,44 @@ query set_doc_title($slug: String, $title: String) {
 }
 "#;
 
+const UNIQUE_SCHEMA: &str = r#"
+node User {
+    name: String @key
+    email: String?
+    @unique(email)
+}
+"#;
+
+const UNIQUE_DATA: &str = r#"{"type":"User","data":{"name":"Alice","email":"alice@example.com"}}"#;
+
+const UNIQUE_MUTATIONS: &str = r#"
+query insert_user($name: String, $email: String) {
+    insert User { name: $name, email: $email }
+}
+"#;
+
+const CARDINALITY_SCHEMA: &str = r#"
+node Person {
+    name: String @key
+}
+
+node Company {
+    name: String @key
+}
+
+edge WorksAt: Person -> Company @card(0..1)
+"#;
+
+const CARDINALITY_DATA: &str = r#"{"type":"Person","data":{"name":"Alice"}}
+{"type":"Company","data":{"name":"Acme"}}
+{"type":"Company","data":{"name":"Beta"}}"#;
+
+const CARDINALITY_MUTATIONS: &str = r#"
+query add_employment($person: String, $company: String) {
+    insert WorksAt { from: $person, to: $company }
+}
+"#;
+
 async fn init_search_db(dir: &tempfile::TempDir) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, SEARCH_SCHEMA).await.unwrap();
@@ -29,6 +67,19 @@ async fn init_search_db(dir: &tempfile::TempDir) -> Omnigraph {
         .await
         .unwrap();
     db.ensure_indices().await.unwrap();
+    db
+}
+
+async fn init_db_from_schema_and_data(
+    dir: &tempfile::TempDir,
+    schema: &str,
+    data: &str,
+) -> Omnigraph {
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
     db
 }
 
@@ -460,6 +511,55 @@ async fn branch_merge_returns_merged_for_non_fast_forward_auto_merge() {
     .await
     .unwrap();
     assert_eq!(eve.num_rows(), 1);
+}
+
+#[tokio::test]
+async fn branch_merge_allows_identical_updates_on_both_sides() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = init_and_load(&dir).await;
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+
+    mutate_main(
+        &mut main,
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 31)]),
+    )
+    .await
+    .unwrap();
+
+    mutate_branch(
+        &mut feature,
+        "feature",
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 31)]),
+    )
+    .await
+    .unwrap();
+
+    let outcome = main.branch_merge("feature", "main").await.unwrap();
+    assert_eq!(outcome, MergeOutcome::Merged);
+
+    let alice = query_main(
+        &mut main,
+        TEST_QUERIES,
+        "get_person",
+        &params(&[("$name", "Alice")]),
+    )
+    .await
+    .unwrap()
+    .concat_batches()
+    .unwrap();
+    let ages = alice
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    assert_eq!(ages.value(0), 31);
 }
 
 #[tokio::test]
@@ -1011,6 +1111,87 @@ async fn branch_merge_reports_orphan_edge_conflict() {
         OmniError::MergeConflicts(conflicts) => {
             assert!(conflicts.iter().any(|conflict| {
                 conflict.table_key == "edge:Knows" && conflict.kind == MergeConflictKind::OrphanEdge
+            }));
+        }
+        other => panic!("expected merge conflicts, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn branch_merge_reports_unique_violation_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = init_db_from_schema_and_data(&dir, UNIQUE_SCHEMA, UNIQUE_DATA).await;
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+
+    mutate_main(
+        &mut main,
+        UNIQUE_MUTATIONS,
+        "insert_user",
+        &params(&[("$name", "Bob"), ("$email", "dup@example.com")]),
+    )
+    .await
+    .unwrap();
+
+    mutate_branch(
+        &mut feature,
+        "feature",
+        UNIQUE_MUTATIONS,
+        "insert_user",
+        &params(&[("$name", "Carol"), ("$email", "dup@example.com")]),
+    )
+    .await
+    .unwrap();
+
+    let err = main.branch_merge("feature", "main").await.unwrap_err();
+    match err {
+        OmniError::MergeConflicts(conflicts) => {
+            assert!(conflicts.iter().any(|conflict| {
+                conflict.table_key == "node:User"
+                    && conflict.kind == MergeConflictKind::UniqueViolation
+            }));
+        }
+        other => panic!("expected merge conflicts, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn branch_merge_reports_cardinality_violation_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main =
+        init_db_from_schema_and_data(&dir, CARDINALITY_SCHEMA, CARDINALITY_DATA).await;
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+
+    mutate_main(
+        &mut main,
+        CARDINALITY_MUTATIONS,
+        "add_employment",
+        &params(&[("$person", "Alice"), ("$company", "Acme")]),
+    )
+    .await
+    .unwrap();
+
+    mutate_branch(
+        &mut feature,
+        "feature",
+        CARDINALITY_MUTATIONS,
+        "add_employment",
+        &params(&[("$person", "Alice"), ("$company", "Beta")]),
+    )
+    .await
+    .unwrap();
+
+    let err = main.branch_merge("feature", "main").await.unwrap_err();
+    match err {
+        OmniError::MergeConflicts(conflicts) => {
+            assert!(conflicts.iter().any(|conflict| {
+                conflict.table_key == "edge:WorksAt"
+                    && conflict.kind == MergeConflictKind::CardinalityViolation
             }));
         }
         other => panic!("expected merge conflicts, got {other:?}"),

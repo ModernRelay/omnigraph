@@ -72,6 +72,7 @@ pub struct ApiError {
     status: StatusCode,
     code: ErrorCode,
     message: String,
+    merge_conflicts: Vec<api::MergeConflictOutput>,
 }
 
 impl AppState {
@@ -182,6 +183,7 @@ impl ApiError {
             status: StatusCode::UNAUTHORIZED,
             code: ErrorCode::Unauthorized,
             message: message.into(),
+            merge_conflicts: Vec::new(),
         }
     }
 
@@ -190,6 +192,7 @@ impl ApiError {
             status: StatusCode::FORBIDDEN,
             code: ErrorCode::Forbidden,
             message: message.into(),
+            merge_conflicts: Vec::new(),
         }
     }
 
@@ -198,6 +201,7 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             code: ErrorCode::BadRequest,
             message: message.into(),
+            merge_conflicts: Vec::new(),
         }
     }
 
@@ -206,6 +210,7 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             code: ErrorCode::NotFound,
             message: message.into(),
+            merge_conflicts: Vec::new(),
         }
     }
 
@@ -214,6 +219,7 @@ impl ApiError {
             status: StatusCode::CONFLICT,
             code: ErrorCode::Conflict,
             message: message.into(),
+            merge_conflicts: Vec::new(),
         }
     }
 
@@ -222,6 +228,16 @@ impl ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: ErrorCode::Internal,
             message: message.into(),
+            merge_conflicts: Vec::new(),
+        }
+    }
+
+    fn merge_conflict(conflicts: Vec<api::MergeConflictOutput>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: ErrorCode::Conflict,
+            message: summarize_merge_conflicts(&conflicts),
+            merge_conflicts: conflicts,
         }
     }
 
@@ -235,13 +251,41 @@ impl ApiError {
                 ManifestErrorKind::Conflict => Self::conflict(err.message),
                 ManifestErrorKind::Internal => Self::internal(err.message),
             },
-            OmniError::MergeConflicts(conflicts) => {
-                Self::conflict(format!("merge conflicts: {:?}", conflicts))
-            }
+            OmniError::MergeConflicts(conflicts) => Self::merge_conflict(
+                conflicts.iter().map(api::MergeConflictOutput::from).collect(),
+            ),
             OmniError::Lance(message) => Self::internal(format!("storage: {message}")),
             OmniError::Io(err) => Self::internal(format!("io: {err}")),
         }
     }
+}
+
+fn summarize_merge_conflicts(conflicts: &[api::MergeConflictOutput]) -> String {
+    if conflicts.is_empty() {
+        return "merge conflicts".to_string();
+    }
+
+    let preview: Vec<String> = conflicts
+        .iter()
+        .take(3)
+        .map(|conflict| match conflict.row_id.as_deref() {
+            Some(row_id) => format!(
+                "{}:{} ({})",
+                conflict.table_key,
+                row_id,
+                conflict.kind.as_str()
+            ),
+            None => format!("{} ({})", conflict.table_key, conflict.kind.as_str()),
+        })
+        .collect();
+
+    let suffix = if conflicts.len() > preview.len() {
+        format!("; and {} more", conflicts.len() - preview.len())
+    } else {
+        String::new()
+    };
+
+    format!("merge conflicts: {}{}", preview.join("; "), suffix)
 }
 
 impl IntoResponse for ApiError {
@@ -251,6 +295,7 @@ impl IntoResponse for ApiError {
             Json(ErrorOutput {
                 error: self.message,
                 code: Some(self.code),
+                merge_conflicts: self.merge_conflicts,
             }),
         )
             .into_response()
