@@ -1528,6 +1528,83 @@ query get_article($slug: String) {
     assert_eq!(qr.num_rows(), 1);
 }
 
+// ─── Regression: blob update null → non-null ─────────────────────────────────
+
+#[tokio::test]
+async fn blob_update_null_to_non_null() {
+    // Regression: updating a blob column that was previously all-null panicked
+    // with assertion `left: 0, right: 1` in lance-table stream.rs because the
+    // two-phase blob update sent a blob-only batch to merge_insert on a dataset
+    // with zero blob fragments.
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+
+    // Load a row with blob = null (no blob data in dataset)
+    let data = r#"{"type": "Document", "data": {"title": "kid-a"}}"#;
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    // Update: null → non-null blob. Previously panicked with assertion
+    // `left: 0, right: 1` in lance-table stream.rs.
+    let result = mutate_main(
+        &mut db,
+        BLOB_MUTATIONS,
+        "update_doc_content",
+        &params(&[("$title", "kid-a"), ("$content", "base64:AQID")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.affected_nodes, 1);
+
+    // Verify the row still exists after the update
+    let qr = query_main(
+        &mut db,
+        BLOB_QUERIES,
+        "get_doc",
+        &params(&[("$title", "kid-a")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(qr.num_rows(), 1);
+}
+
+// ─── Regression: blob load with external file URI ────────────────────────────
+
+#[tokio::test]
+async fn blob_load_external_file_uri() {
+    // Regression: loading blobs with external file:// URIs was rejected with
+    // "External blob URI '...' is outside registered external bases" because
+    // allow_external_blob_outside_bases was not set on data table write paths.
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    // Create a temp file to reference
+    let blob_dir = tempfile::tempdir().unwrap();
+    let blob_path = blob_dir.path().join("test.txt");
+    std::fs::write(&blob_path, b"Hello from file").unwrap();
+    let file_uri = format!("file://{}", blob_path.display());
+
+    let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+    let data = format!(
+        r#"{{"type": "Document", "data": {{"title": "from-file", "content": "{}"}}}}"#,
+        file_uri
+    );
+
+    // Load with external URI
+    load_jsonl(&mut db, &data, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    // Verify the blob is accessible
+    let blob = db
+        .read_blob("Document", "from-file", "content")
+        .await
+        .unwrap();
+    assert!(blob.uri().is_some(), "external blob should have a URI");
+}
+
 // ─── Regression: execute_update on edge type ─────────────────────────────────
 
 #[tokio::test]

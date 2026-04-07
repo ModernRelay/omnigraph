@@ -3139,12 +3139,31 @@ fn apply_assignments(
 ) -> Result<RecordBatch> {
     let schema = batch.schema();
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+    let mut out_fields: Vec<Field> = Vec::with_capacity(schema.fields().len());
 
     for field in schema.fields().iter() {
         if blob_properties.contains(field.name()) {
-            // Blob columns aren't in the scan result — skip
-            continue;
+            // Blob columns aren't in the scan result. If this blob has an
+            // assignment, build the blob array inline so the single
+            // merge_insert covers both scalar and blob updates. Unassigned
+            // blob columns are omitted — merge_insert only touches columns
+            // present in the batch.
+            if let Some(Literal::String(uri)) = assignments.get(field.name()) {
+                let mut builder = BlobArrayBuilder::new(batch.num_rows());
+                for _ in 0..batch.num_rows() {
+                    crate::loader::append_blob_value(&mut builder, uri)?;
+                }
+                let blob_field = lance::blob::blob_field(field.name(), true);
+                out_fields.push(blob_field);
+                columns.push(
+                    builder
+                        .finish()
+                        .map_err(|e| OmniError::Lance(e.to_string()))?,
+                );
+            }
+            // else: no assignment for this blob column — skip it
         } else if let Some(lit) = assignments.get(field.name()) {
+            out_fields.push(field.as_ref().clone());
             columns.push(literal_to_typed_array(
                 lit,
                 field.data_type(),
@@ -3157,19 +3176,12 @@ fn apply_assignments(
                     field.name()
                 ))
             })?;
+            out_fields.push(field.as_ref().clone());
             columns.push(col.clone());
         }
     }
 
-    // Build schema without blob columns
-    let non_blob_fields: Vec<_> = schema
-        .fields()
-        .iter()
-        .filter(|f| !blob_properties.contains(f.name()))
-        .map(|f| f.as_ref().clone())
-        .collect();
-
-    RecordBatch::try_new(Arc::new(Schema::new(non_blob_fields)), columns)
+    RecordBatch::try_new(Arc::new(Schema::new(out_fields)), columns)
         .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
@@ -3791,79 +3803,12 @@ impl Omnigraph {
             )
             .await?;
 
-        let mut final_state = update_state;
-
-        // Phase 2: If there are blob assignments, apply them separately
-        let blob_assignments: HashMap<&str, &Literal> = resolved
-            .iter()
-            .filter(|(k, _)| blob_props.contains(k.as_str()))
-            .map(|(k, v)| (k.as_str(), v))
-            .collect();
-
-        if !blob_assignments.is_empty() {
-            // Extract matched IDs from the scan result
-            let id_col = matched.column_by_name("id").ok_or_else(|| {
-                OmniError::manifest("matched batch missing 'id' column".to_string())
-            })?;
-            let ids = id_col
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| OmniError::manifest("id column is not Utf8".to_string()))?;
-
-            // Build batch: id + blob columns
-            let mut blob_fields = vec![Field::new("id", DataType::Utf8, false)];
-            let mut blob_columns: Vec<ArrayRef> = vec![Arc::new(ids.clone())];
-
-            for blob_prop in &blob_props {
-                if let Some(Literal::String(uri)) = blob_assignments.get(blob_prop.as_str()) {
-                    let mut builder = BlobArrayBuilder::new(ids.len());
-                    for _ in 0..ids.len() {
-                        crate::loader::append_blob_value(&mut builder, uri)?;
-                    }
-                    let blob_field = lance::blob::blob_field(blob_prop, true);
-                    blob_fields.push(blob_field);
-                    blob_columns.push(
-                        builder
-                            .finish()
-                            .map_err(|e| OmniError::Lance(e.to_string()))?,
-                    );
-                }
-            }
-
-            let blob_schema = Arc::new(Schema::new(blob_fields));
-            let blob_batch = RecordBatch::try_new(blob_schema.clone(), blob_columns)
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
-
-            // Re-open for blob merge_insert (version guard from open_for_mutation)
-            let ds = self
-                .reopen_for_mutation(
-                    &table_key,
-                    &full_path,
-                    table_branch.as_deref(),
-                    final_state.version,
-                )
-                .await?;
-            let blob_state = self
-                .table_store()
-                .merge_insert_batch(
-                    &full_path,
-                    ds,
-                    blob_batch,
-                    vec!["id".to_string()],
-                    lance::dataset::WhenMatched::UpdateAll,
-                    lance::dataset::WhenNotMatched::DoNothing,
-                )
-                .await?;
-
-            final_state = blob_state;
-        }
-
         self.commit_updates(&[crate::db::SubTableUpdate {
             table_key,
-            table_version: final_state.version,
+            table_version: update_state.version,
             table_branch,
-            row_count: final_state.row_count,
-            version_metadata: final_state.version_metadata,
+            row_count: update_state.row_count,
+            version_metadata: update_state.version_metadata,
         }])
         .await?;
 

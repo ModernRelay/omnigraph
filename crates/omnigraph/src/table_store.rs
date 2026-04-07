@@ -332,7 +332,12 @@ impl TableStore {
         }
         let schema = batch.schema();
         let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema);
-        ds.append(reader, None)
+        let params = WriteParams {
+            mode: WriteMode::Append,
+            allow_external_blob_outside_bases: true,
+            ..Default::default()
+        };
+        ds.append(reader, Some(params))
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         self.table_state(dataset_uri, ds).await
@@ -346,7 +351,12 @@ impl TableStore {
         let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         match dataset {
             Some(mut ds) => {
-                ds.append(reader, None)
+                let params = WriteParams {
+                    mode: WriteMode::Append,
+                    allow_external_blob_outside_bases: true,
+                    ..Default::default()
+                };
+                ds.append(reader, Some(params))
                     .await
                     .map_err(|e| OmniError::Lance(e.to_string()))?;
                 Ok(ds)
@@ -356,6 +366,7 @@ impl TableStore {
                     mode: WriteMode::Create,
                     enable_stable_row_ids: true,
                     data_storage_version: Some(LanceFileVersion::V2_2),
+                    allow_external_blob_outside_bases: true,
                     ..Default::default()
                 };
                 Dataset::write(reader, dataset_uri, Some(params))
@@ -390,6 +401,10 @@ impl TableStore {
             return self.table_state(dataset_uri, &ds).await;
         }
 
+        // TODO(lance-upstream): MergeInsertBuilder does not accept WriteParams,
+        // so allow_external_blob_outside_bases cannot be set here. External URI
+        // blobs via merge_insert (LoadMode::Merge, mutations) are unsupported
+        // until Lance exposes WriteParams on MergeInsertBuilder.
         let ds = Arc::new(ds);
         let job = MergeInsertBuilder::try_new(ds, key_columns)
             .map_err(|e| OmniError::Lance(e.to_string()))?
@@ -507,6 +522,7 @@ impl TableStore {
             mode: WriteMode::Create,
             enable_stable_row_ids: true,
             data_storage_version: Some(LanceFileVersion::V2_2),
+            allow_external_blob_outside_bases: true,
             ..Default::default()
         };
         Dataset::write(reader, dataset_uri, Some(params))
