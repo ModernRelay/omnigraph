@@ -212,8 +212,11 @@ impl LanceNamespace for BranchManifestNamespace {
                 message: format!("table {} not found", table_key),
             }))
         })?;
-        let table_uri =
-            table_uri_for_path(&self.root_uri, &entry.table_path, self.branch.as_deref());
+        let table_uri = table_uri_for_path(
+            &self.root_uri,
+            &entry.table_path,
+            entry.table_branch.as_deref(),
+        );
 
         Ok(DescribeTableResponse {
             table: Some(entry.table_key.clone()),

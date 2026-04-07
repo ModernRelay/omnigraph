@@ -3,8 +3,11 @@ use std::sync::Arc;
 use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
+use lance::dataset::builder::DatasetBuilder;
 use lance_namespace::LanceNamespace;
-use lance_namespace::models::{DescribeTableVersionRequest, ListTableVersionsRequest};
+use lance_namespace::models::{
+    DescribeTableRequest, DescribeTableVersionRequest, ListTableVersionsRequest,
+};
 use lance_namespace_impls::DirectoryNamespaceBuilder;
 use tokio::sync::Mutex;
 
@@ -404,6 +407,118 @@ async fn test_snapshot_at_reads_branch_pinned_historical_state() {
             .await
             .unwrap(),
         0
+    );
+}
+
+#[tokio::test]
+async fn test_branch_manifest_namespace_uses_entry_owner_branch_for_latest_table_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+
+    let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    mc.create_branch("feature").await.unwrap();
+
+    let snap = mc.snapshot();
+    let person_entry = snap.entry("node:Person").unwrap().clone();
+    let company_entry = snap.entry("node:Company").unwrap().clone();
+
+    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.table_path))
+        .await
+        .unwrap();
+    person_ds
+        .create_branch("feature", person_entry.table_version, None)
+        .await
+        .unwrap();
+    let mut feature_person_ds = person_ds.checkout_branch("feature").await.unwrap();
+    let person_schema = Arc::new(feature_person_ds.schema().into());
+    let person_batch = RecordBatch::try_new(
+        Arc::clone(&person_schema),
+        vec![
+            Arc::new(StringArray::from(vec!["person-1"])),
+            Arc::new(StringArray::from(vec!["Alice"])),
+            Arc::new(Int32Array::from(vec![Some(30)])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(person_batch)], person_schema);
+    feature_person_ds.append(reader, None).await.unwrap();
+    let feature_person_version = feature_person_ds.version().version;
+    let feature_person_metadata = table_version_metadata_for_state(
+        uri,
+        &person_entry.table_path,
+        Some("feature"),
+        feature_person_version,
+    )
+    .await
+    .unwrap();
+
+    branch_manifest_namespace(uri, Some("feature"))
+        .create_table_version(feature_person_metadata.to_create_table_version_request(
+            "node:Person",
+            feature_person_version,
+            1,
+            Some("feature"),
+        ))
+        .await
+        .unwrap();
+
+    let feature_namespace = branch_manifest_namespace(uri, Some("feature"));
+
+    let inherited_company = feature_namespace
+        .describe_table(DescribeTableRequest {
+            id: Some(vec!["node:Company".to_string()]),
+            with_table_uri: Some(true),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let inherited_company_uri = inherited_company.table_uri.as_deref().unwrap();
+    assert!(
+        !inherited_company_uri.contains("/tree/feature"),
+        "inherited table should resolve to its owning branch, got {inherited_company_uri}"
+    );
+
+    let branch_owned_person = feature_namespace
+        .describe_table(DescribeTableRequest {
+            id: Some(vec!["node:Person".to_string()]),
+            with_table_uri: Some(true),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let branch_owned_person_uri = branch_owned_person.table_uri.as_deref().unwrap();
+    assert!(
+        branch_owned_person_uri.contains("/tree/feature"),
+        "branch-owned table should resolve to feature branch, got {branch_owned_person_uri}"
+    );
+
+    let inherited_company_ds = DatasetBuilder::from_namespace(
+        Arc::clone(&feature_namespace),
+        vec!["node:Company".to_string()],
+    )
+    .await
+    .unwrap()
+    .with_branch("feature", None)
+    .load()
+    .await
+    .unwrap();
+    assert_eq!(inherited_company_ds.count_rows(None).await.unwrap(), 0);
+
+    let branch_owned_person_ds = DatasetBuilder::from_namespace(
+        Arc::clone(&feature_namespace),
+        vec!["node:Person".to_string()],
+    )
+    .await
+    .unwrap()
+    .with_branch("feature", None)
+    .load()
+    .await
+    .unwrap();
+    assert_eq!(branch_owned_person_ds.count_rows(None).await.unwrap(), 1);
+    assert_eq!(
+        company_entry.table_branch, None,
+        "sanity check: company table stays inherited on feature"
     );
 }
 
