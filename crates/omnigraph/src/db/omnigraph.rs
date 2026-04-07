@@ -220,7 +220,9 @@ impl Omnigraph {
         &self,
         target: impl Into<ReadTarget>,
     ) -> Result<Option<String>> {
-        self.resolved_target(target).await.map(|resolved| resolved.branch)
+        self.resolved_target(target)
+            .await
+            .map(|resolved| resolved.branch)
     }
 
     /// Synchronize this handle's write base to the latest head of the named branch.
@@ -645,7 +647,8 @@ impl Omnigraph {
         }
 
         if !updates.is_empty() {
-            self.commit_updates_on_branch(branch, &updates).await?;
+            self.commit_prepared_updates_on_branch(branch, &updates)
+                .await?;
         }
 
         Ok(())
@@ -1196,12 +1199,14 @@ impl Omnigraph {
         ds: &mut Dataset,
     ) -> Result<()> {
         if let Some(type_name) = table_key.strip_prefix("node:") {
-            self.table_store
-                .create_btree_index(ds, &["id"])
-                .await
-                .map_err(|e| {
-                    OmniError::Lance(format!("create BTree index on {}(id): {}", table_key, e))
-                })?;
+            if !self.table_store.has_btree_index(ds, "id").await? {
+                self.table_store
+                    .create_btree_index(ds, &["id"])
+                    .await
+                    .map_err(|e| {
+                        OmniError::Lance(format!("create BTree index on {}(id): {}", table_key, e))
+                    })?;
+            }
 
             if let Some(node_type) = self.catalog.node_types.get(type_name) {
                 for index_cols in &node_type.indices {
@@ -1211,27 +1216,31 @@ impl Omnigraph {
                     let prop_name = &index_cols[0];
                     if let Some(prop_type) = node_type.properties.get(prop_name) {
                         if matches!(prop_type.scalar, ScalarType::String) && !prop_type.list {
-                            self.table_store
-                                .create_inverted_index(ds, prop_name.as_str())
-                                .await
-                                .map_err(|e| {
-                                    OmniError::Lance(format!(
-                                        "create Inverted index on {}({}): {}",
-                                        table_key, prop_name, e
-                                    ))
-                                })?;
+                            if !self.table_store.has_fts_index(ds, prop_name).await? {
+                                self.table_store
+                                    .create_inverted_index(ds, prop_name.as_str())
+                                    .await
+                                    .map_err(|e| {
+                                        OmniError::Lance(format!(
+                                            "create Inverted index on {}({}): {}",
+                                            table_key, prop_name, e
+                                        ))
+                                    })?;
+                            }
                         } else if matches!(prop_type.scalar, ScalarType::Vector(_))
                             && !prop_type.list
                         {
-                            self.table_store
-                                .create_vector_index(ds, prop_name.as_str())
-                                .await
-                                .map_err(|e| {
-                                    OmniError::Lance(format!(
-                                        "create Vector index on {}({}): {}",
-                                        table_key, prop_name, e
-                                    ))
-                                })?;
+                            if !self.table_store.has_vector_index(ds, prop_name).await? {
+                                self.table_store
+                                    .create_vector_index(ds, prop_name.as_str())
+                                    .await
+                                    .map_err(|e| {
+                                        OmniError::Lance(format!(
+                                            "create Vector index on {}({}): {}",
+                                            table_key, prop_name, e
+                                        ))
+                                    })?;
+                            }
                         }
                     }
                 }
@@ -1240,24 +1249,30 @@ impl Omnigraph {
         }
 
         if table_key.starts_with("edge:") {
-            self.table_store
-                .create_btree_index(ds, &["id"])
-                .await
-                .map_err(|e| {
-                    OmniError::Lance(format!("create BTree index on {}(id): {}", table_key, e))
-                })?;
-            self.table_store
-                .create_btree_index(ds, &["src"])
-                .await
-                .map_err(|e| {
-                    OmniError::Lance(format!("create BTree index on {}(src): {}", table_key, e))
-                })?;
-            self.table_store
-                .create_btree_index(ds, &["dst"])
-                .await
-                .map_err(|e| {
-                    OmniError::Lance(format!("create BTree index on {}(dst): {}", table_key, e))
-                })?;
+            if !self.table_store.has_btree_index(ds, "id").await? {
+                self.table_store
+                    .create_btree_index(ds, &["id"])
+                    .await
+                    .map_err(|e| {
+                        OmniError::Lance(format!("create BTree index on {}(id): {}", table_key, e))
+                    })?;
+            }
+            if !self.table_store.has_btree_index(ds, "src").await? {
+                self.table_store
+                    .create_btree_index(ds, &["src"])
+                    .await
+                    .map_err(|e| {
+                        OmniError::Lance(format!("create BTree index on {}(src): {}", table_key, e))
+                    })?;
+            }
+            if !self.table_store.has_btree_index(ds, "dst").await? {
+                self.table_store
+                    .create_btree_index(ds, &["dst"])
+                    .await
+                    .map_err(|e| {
+                        OmniError::Lance(format!("create BTree index on {}(dst): {}", table_key, e))
+                    })?;
+            }
             return Ok(());
         }
 
@@ -1267,7 +1282,52 @@ impl Omnigraph {
         )))
     }
 
-    pub(crate) async fn commit_updates(
+    async fn prepare_updates_for_commit(
+        &self,
+        branch: Option<&str>,
+        updates: &[crate::db::SubTableUpdate],
+    ) -> Result<Vec<crate::db::SubTableUpdate>> {
+        if updates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let snapshot = self.snapshot_for_branch(branch).await?;
+        let mut prepared = Vec::with_capacity(updates.len());
+
+        for update in updates {
+            let Some(entry) = snapshot.entry(&update.table_key) else {
+                return Err(OmniError::manifest(format!(
+                    "no manifest entry for {}",
+                    update.table_key
+                )));
+            };
+
+            let mut prepared_update = update.clone();
+            if prepared_update.row_count > 0 {
+                let full_path = format!("{}/{}", self.root_uri, entry.table_path);
+                let mut ds = self
+                    .reopen_for_mutation(
+                        &prepared_update.table_key,
+                        &full_path,
+                        prepared_update.table_branch.as_deref(),
+                        prepared_update.table_version,
+                    )
+                    .await?;
+                self.build_indices_on_dataset(&prepared_update.table_key, &mut ds)
+                    .await?;
+                let state = self.table_store.table_state(&full_path, &ds).await?;
+                prepared_update.table_version = state.version;
+                prepared_update.row_count = state.row_count;
+                prepared_update.version_metadata = state.version_metadata;
+            }
+
+            prepared.push(prepared_update);
+        }
+
+        Ok(prepared)
+    }
+
+    async fn commit_prepared_updates(
         &mut self,
         updates: &[crate::db::SubTableUpdate],
     ) -> Result<u64> {
@@ -1280,6 +1340,44 @@ impl Omnigraph {
             .commit_updates_with_actor(updates, actor_id.as_deref())
             .await?;
         Ok(manifest_version)
+    }
+
+    async fn commit_prepared_updates_on_branch(
+        &mut self,
+        branch: Option<&str>,
+        updates: &[crate::db::SubTableUpdate],
+    ) -> Result<u64> {
+        let current_branch = self.coordinator.current_branch().map(str::to_string);
+        let requested_branch = branch.map(str::to_string);
+        if requested_branch == current_branch {
+            return self.commit_prepared_updates(updates).await;
+        }
+
+        let mut coordinator = match requested_branch.as_deref() {
+            Some(branch) => {
+                GraphCoordinator::open_branch(self.uri(), branch, Arc::clone(&self.storage)).await?
+            }
+            None => GraphCoordinator::open(self.uri(), Arc::clone(&self.storage)).await?,
+        };
+        let actor_id = self.current_audit_actor().map(str::to_string);
+        let PublishedSnapshot {
+            manifest_version,
+            _snapshot_id: _,
+        } = coordinator
+            .commit_updates_with_actor(updates, actor_id.as_deref())
+            .await?;
+        Ok(manifest_version)
+    }
+
+    pub(crate) async fn commit_updates(
+        &mut self,
+        updates: &[crate::db::SubTableUpdate],
+    ) -> Result<u64> {
+        let current_branch = self.coordinator.current_branch().map(str::to_string);
+        let prepared = self
+            .prepare_updates_for_commit(current_branch.as_deref(), updates)
+            .await?;
+        self.commit_prepared_updates(&prepared).await
     }
 
     pub(crate) async fn commit_manifest_updates(
@@ -1312,26 +1410,9 @@ impl Omnigraph {
         branch: Option<&str>,
         updates: &[crate::db::SubTableUpdate],
     ) -> Result<u64> {
-        let current_branch = self.coordinator.current_branch().map(str::to_string);
-        let requested_branch = branch.map(|branch| branch.to_string());
-        if requested_branch == current_branch {
-            return self.commit_updates(updates).await;
-        }
-
-        let mut coordinator = match requested_branch.as_deref() {
-            Some(branch) => {
-                GraphCoordinator::open_branch(self.uri(), branch, Arc::clone(&self.storage)).await?
-            }
-            None => GraphCoordinator::open(self.uri(), Arc::clone(&self.storage)).await?,
-        };
-        let actor_id = self.current_audit_actor().map(str::to_string);
-        let PublishedSnapshot {
-            manifest_version,
-            _snapshot_id: _,
-        } = coordinator
-            .commit_updates_with_actor(updates, actor_id.as_deref())
-            .await?;
-        Ok(manifest_version)
+        let prepared = self.prepare_updates_for_commit(branch, updates).await?;
+        self.commit_prepared_updates_on_branch(branch, &prepared)
+            .await
     }
 
     pub(crate) async fn ensure_commit_graph_initialized(&mut self) -> Result<()> {

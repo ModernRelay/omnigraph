@@ -32,7 +32,7 @@ use super::metadata::parse_namespace_version_request;
 use super::state::{
     manifest_rows_batch, manifest_schema, read_manifest_entries, read_manifest_state,
 };
-use super::{OBJECT_TYPE_TABLE_VERSION, SubTableUpdate};
+use super::{OBJECT_TYPE_TABLE_VERSION, SubTableEntry, SubTableUpdate};
 
 #[async_trait]
 pub(super) trait ManifestBatchPublisher: Send + Sync {
@@ -70,7 +70,11 @@ impl GraphNamespacePublisher {
 
     async fn load_publish_state(
         &self,
-    ) -> Result<(Dataset, HashMap<String, ()>, HashMap<(String, u64), ()>)> {
+    ) -> Result<(
+        Dataset,
+        HashMap<String, ()>,
+        HashMap<(String, u64), SubTableEntry>,
+    )> {
         let dataset = self.dataset().await?;
         let current = read_manifest_state(&dataset).await?;
         let existing_entries = read_manifest_entries(&dataset).await?;
@@ -81,7 +85,12 @@ impl GraphNamespacePublisher {
             .collect();
         let existing_versions = existing_entries
             .iter()
-            .map(|entry| ((entry.table_key.clone(), entry.table_version), ()))
+            .map(|entry| {
+                (
+                    (entry.table_key.clone(), entry.table_version),
+                    entry.clone(),
+                )
+            })
             .collect();
         Ok((dataset, known_tables, existing_versions))
     }
@@ -89,7 +98,7 @@ impl GraphNamespacePublisher {
     fn build_pending_rows(
         requests: &[CreateTableVersionRequest],
         known_tables: &HashMap<String, ()>,
-        existing_versions: &HashMap<(String, u64), ()>,
+        existing_versions: &HashMap<(String, u64), SubTableEntry>,
     ) -> Result<Vec<PendingVersionRow>> {
         let mut request_versions = HashMap::<(String, u64), ()>::new();
         let mut rows = Vec::with_capacity(requests.len());
@@ -106,10 +115,9 @@ impl GraphNamespacePublisher {
                     .to_string(),
                 ));
             }
-            if existing_versions.contains_key(&(table_key.clone(), table_version))
-                || request_versions
-                    .insert((table_key.clone(), table_version), ())
-                    .is_some()
+            if request_versions
+                .insert((table_key.clone(), table_version), ())
+                .is_some()
             {
                 return Err(OmniError::Lance(
                     NamespaceError::ConcurrentModification {
@@ -120,6 +128,21 @@ impl GraphNamespacePublisher {
                     }
                     .to_string(),
                 ));
+            }
+            if let Some(existing) = existing_versions.get(&(table_key.clone(), table_version)) {
+                let is_owner_branch_handoff =
+                    existing.row_count == row_count && existing.table_branch != table_branch;
+                if !is_owner_branch_handoff {
+                    return Err(OmniError::Lance(
+                        NamespaceError::ConcurrentModification {
+                            message: format!(
+                                "table version {} already exists for {}",
+                                table_version, table_key
+                            ),
+                        }
+                        .to_string(),
+                    ));
+                }
             }
 
             rows.push(PendingVersionRow {
@@ -174,7 +197,7 @@ impl GraphNamespacePublisher {
         let dataset = Arc::new(dataset);
         let mut merge_builder = MergeInsertBuilder::try_new(dataset, vec!["object_id".to_string()])
             .map_err(|e| OmniError::Lance(e.to_string()))?;
-        merge_builder.when_matched(WhenMatched::Fail);
+        merge_builder.when_matched(WhenMatched::UpdateAll);
         merge_builder.when_not_matched(WhenNotMatched::InsertAll);
         merge_builder.conflict_retries(5);
         merge_builder.use_index(false);

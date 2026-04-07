@@ -728,6 +728,93 @@ async fn test_batch_create_table_versions_rejects_duplicate_requests_without_adv
 }
 
 #[tokio::test]
+async fn test_batch_create_table_versions_allows_owner_branch_handoff_at_same_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+
+    let mut main_mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    main_mc.create_branch("feature").await.unwrap();
+
+    let snap = main_mc.snapshot();
+    let person_entry = snap.entry("node:Person").unwrap().clone();
+    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.table_path))
+        .await
+        .unwrap();
+    person_ds
+        .create_branch("feature", person_entry.table_version, None)
+        .await
+        .unwrap();
+    let mut feature_ds = person_ds.checkout_branch("feature").await.unwrap();
+    let person_schema = Arc::new(feature_ds.schema().into());
+    let person_batch = RecordBatch::try_new(
+        Arc::clone(&person_schema),
+        vec![
+            Arc::new(StringArray::from(vec!["person-1"])),
+            Arc::new(StringArray::from(vec!["Alice"])),
+            Arc::new(Int32Array::from(vec![Some(30)])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(person_batch)], person_schema);
+    feature_ds.append(reader, None).await.unwrap();
+    let feature_version = feature_ds.version().version;
+    let feature_metadata = table_version_metadata_for_state(
+        uri,
+        &person_entry.table_path,
+        Some("feature"),
+        feature_version,
+    )
+    .await
+    .unwrap();
+
+    branch_manifest_namespace(uri, Some("feature"))
+        .create_table_version(feature_metadata.to_create_table_version_request(
+            "node:Person",
+            feature_version,
+            1,
+            Some("feature"),
+        ))
+        .await
+        .unwrap();
+
+    let mut feature_mc = ManifestCoordinator::open_at_branch(uri, "feature")
+        .await
+        .unwrap();
+    feature_mc.create_branch("experiment").await.unwrap();
+    feature_ds
+        .create_branch("experiment", feature_version, None)
+        .await
+        .unwrap();
+    let experiment_metadata = table_version_metadata_for_state(
+        uri,
+        &person_entry.table_path,
+        Some("experiment"),
+        feature_version,
+    )
+    .await
+    .unwrap();
+
+    GraphNamespacePublisher::new(uri, Some("experiment"))
+        .publish_requests(&[experiment_metadata.to_create_table_version_request(
+            "node:Person",
+            feature_version,
+            1,
+            Some("experiment"),
+        )])
+        .await
+        .unwrap();
+
+    let experiment_mc = ManifestCoordinator::open_at_branch(uri, "experiment")
+        .await
+        .unwrap();
+    let experiment_snapshot = experiment_mc.snapshot();
+    let experiment_entry = experiment_snapshot.entry("node:Person").unwrap();
+    assert_eq!(experiment_entry.table_version, feature_version);
+    assert_eq!(experiment_entry.table_branch.as_deref(), Some("experiment"));
+}
+
+#[tokio::test]
 async fn test_staged_namespace_lists_native_table_versions_before_publish() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();

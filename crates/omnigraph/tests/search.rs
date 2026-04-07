@@ -8,6 +8,7 @@ use serial_test::serial;
 
 use omnigraph::db::Omnigraph;
 use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph_compiler::query::ast::Literal;
 use omnigraph_compiler::result::QueryResult;
 
 use helpers::*;
@@ -58,6 +59,16 @@ query hybrid_search_string($vq: String, $tq: String) {
     limit 3
 }
 "#;
+const SEARCH_MUTATIONS: &str = r#"
+query insert_doc($slug: String, $title: String, $body: String, $embedding: Vector(4)) {
+    insert Doc {
+        slug: $slug,
+        title: $title,
+        body: $body,
+        embedding: $embedding
+    }
+}
+"#;
 
 async fn init_search_db(dir: &tempfile::TempDir) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
@@ -65,7 +76,6 @@ async fn init_search_db(dir: &tempfile::TempDir) -> Omnigraph {
     load_jsonl(&mut db, SEARCH_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
-    db.ensure_indices().await.unwrap();
     db
 }
 
@@ -75,7 +85,6 @@ async fn init_mock_embedding_search_db(dir: &tempfile::TempDir) -> Omnigraph {
     load_jsonl(&mut db, &mock_embedding_seed_data(), LoadMode::Overwrite)
         .await
         .unwrap();
-    db.ensure_indices().await.unwrap();
     db
 }
 
@@ -157,6 +166,21 @@ fn result_slugs(result: &QueryResult) -> Vec<String> {
     (0..slugs.len())
         .map(|index| slugs.value(index).to_string())
         .collect()
+}
+
+async fn doc_user_index_count(db: &Omnigraph) -> usize {
+    let ds = snapshot_main(db)
+        .await
+        .unwrap()
+        .open("node:Doc")
+        .await
+        .unwrap();
+    ds.load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|idx| !is_system_index(idx))
+        .count()
 }
 
 struct EnvGuard {
@@ -531,6 +555,51 @@ async fn bm25_returns_ranked_results() {
     assert!(result.num_rows() <= 3, "bm25 should respect limit 3");
 }
 
+#[tokio::test]
+#[serial]
+async fn mutation_commit_refreshes_search_indices_without_manual_ensure() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    assert_eq!(doc_user_index_count(&db).await, 4);
+
+    let mut mutation_params = vector_param("$embedding", &[0.9, 0.1, 0.1, 0.1]);
+    mutation_params.insert(
+        "slug".to_string(),
+        Literal::String("quasar-notes".to_string()),
+    );
+    mutation_params.insert(
+        "title".to_string(),
+        Literal::String("Quasar Notes".to_string()),
+    );
+    mutation_params.insert(
+        "body".to_string(),
+        Literal::String("Quasar observations and telescope notes".to_string()),
+    );
+
+    db.mutate("main", SEARCH_MUTATIONS, "insert_doc", &mutation_params)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        doc_user_index_count(&db).await,
+        4,
+        "mutation commit should refresh required indices without duplicating them"
+    );
+
+    let result = query_main(
+        &mut db,
+        SEARCH_QUERIES,
+        "text_search",
+        &params(&[("$q", "Quasar")]),
+    )
+    .await
+    .unwrap();
+    assert!(
+        result_slugs(&result).contains(&"quasar-notes".to_string()),
+        "newly inserted row should be searchable without an explicit ensure_indices step"
+    );
+}
+
 // ─── RRF hybrid search ─────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -554,7 +623,7 @@ async fn rrf_fuses_vector_and_text() {
 
 #[tokio::test]
 #[serial]
-async fn ensure_indices_creates_vector_index_for_vector_annotations() {
+async fn load_commit_creates_vector_index_for_vector_annotations() {
     let schema = r#"
 node Doc {
     slug: String @key
@@ -570,7 +639,6 @@ node Doc {
     load_jsonl(&mut db, data, LoadMode::Overwrite)
         .await
         .unwrap();
-    db.ensure_indices().await.unwrap();
 
     let ds = snapshot_main(&db)
         .await
@@ -589,7 +657,7 @@ node Doc {
 
 #[tokio::test]
 #[serial]
-async fn ensure_indices_creates_inverted_indices_for_string_annotations() {
+async fn load_commit_creates_inverted_indices_for_string_annotations() {
     let dir = tempfile::tempdir().unwrap();
     let db = init_search_db(&dir).await;
 

@@ -6,10 +6,12 @@ use lance::Dataset;
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream, Scanner};
 use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
 use lance::datatypes::BlobHandling;
+use lance::index::scalar::IndexDetails;
 use lance_file::version::LanceFileVersion;
 use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
-use lance_index::{DatasetIndexExt, IndexType};
+use lance_index::{DatasetIndexExt, IndexType, is_system_index};
 use lance_linalg::distance::MetricType;
+use lance_table::format::IndexMetadata;
 use std::sync::Arc;
 
 use crate::db::manifest::{TableVersionMetadata, open_table_head_for_write};
@@ -468,6 +470,66 @@ impl TableStore {
             version_metadata: self
                 .dataset_version_metadata(dataset_uri, &delete_result.new_dataset)?,
         })
+    }
+
+    async fn user_indices_for_column(
+        &self,
+        ds: &Dataset,
+        column: &str,
+    ) -> Result<Vec<IndexMetadata>> {
+        let field_id = ds
+            .schema()
+            .field(column)
+            .map(|field| field.id)
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "dataset is missing expected index column '{}'",
+                    column
+                ))
+            })?;
+        let indices = ds
+            .load_indices()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        Ok(indices
+            .iter()
+            .filter(|index| !is_system_index(index))
+            .filter(|index| index.fields.len() == 1 && index.fields[0] == field_id)
+            .cloned()
+            .collect())
+    }
+
+    pub async fn has_btree_index(&self, ds: &Dataset, column: &str) -> Result<bool> {
+        let indices = self.user_indices_for_column(ds, column).await?;
+        Ok(indices.iter().any(|index| {
+            index
+                .index_details
+                .as_ref()
+                .map(|details| details.type_url.ends_with("BTreeIndexDetails"))
+                .unwrap_or(false)
+        }))
+    }
+
+    pub async fn has_fts_index(&self, ds: &Dataset, column: &str) -> Result<bool> {
+        let indices = self.user_indices_for_column(ds, column).await?;
+        Ok(indices.iter().any(|index| {
+            index
+                .index_details
+                .as_ref()
+                .map(|details| IndexDetails(details.clone()).supports_fts())
+                .unwrap_or(false)
+        }))
+    }
+
+    pub async fn has_vector_index(&self, ds: &Dataset, column: &str) -> Result<bool> {
+        let indices = self.user_indices_for_column(ds, column).await?;
+        Ok(indices.iter().any(|index| {
+            index
+                .index_details
+                .as_ref()
+                .map(|details| IndexDetails(details.clone()).is_vector())
+                .unwrap_or(false)
+        }))
     }
 
     pub async fn create_btree_index(&self, ds: &mut Dataset, columns: &[&str]) -> Result<()> {
