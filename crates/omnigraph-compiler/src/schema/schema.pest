@@ -30,7 +30,7 @@ body_constraint = { "@" ~ constraint_name ~ "(" ~ constraint_args ~ ")" }
 constraint_name = { "key" | "unique" | "index" | "range" | "check" }
 constraint_args = { constraint_arg ~ ("," ~ constraint_arg)* }
 constraint_arg = { range_bound | literal | ident }
-range_bound = { (integer | float_lit) ~ ".." ~ (integer | float_lit)? | ".." ~ (integer | float_lit) }
+range_bound = { (signed_float | signed_integer) ~ ".." ~ (signed_float | signed_integer)? | ".." ~ (signed_float | signed_integer) }
 
 type_ref = { core_type ~ "?"? }
 core_type = { list_type | enum_type | vector_type | base_type }
@@ -51,6 +51,9 @@ string_lit = @{ "\"" ~ string_char* ~ "\"" }
 string_char = @{ !("\"" | "\\") ~ ANY | "\\" ~ ANY }
 float_lit = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
 integer = @{ ASCII_DIGIT+ }
+
+signed_float   = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+signed_integer = @{ "-"? ~ ASCII_DIGIT+ }
 bool_lit = { "true" | "false" }
 
 type_name = @{ ASCII_ALPHA_UPPER ~ (ASCII_ALPHANUMERIC | "_")* }

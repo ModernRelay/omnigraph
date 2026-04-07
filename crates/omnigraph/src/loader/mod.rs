@@ -927,6 +927,12 @@ pub(crate) fn validate_value_constraints(
             }
             let value = extract_numeric_value(col, row);
             if let Some(val) = value {
+                if val.is_nan() {
+                    return Err(OmniError::manifest(format!(
+                        "@range violation on {}.{}: value is NaN",
+                        node_type.name, rc.property
+                    )));
+                }
                 if let Some(ref min) = rc.min {
                     let min_f = literal_value_to_f64(min);
                     if val < min_f {
@@ -1310,5 +1316,49 @@ edge WorksAt: Person -> Company
         let bad = r#"{"type": "FakeType", "data": {"name": "x"}}"#;
         let result = load_jsonl(&mut db, bad, LoadMode::Overwrite).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_range_constraint_rejects_nan() {
+        use arrow_array::{Float64Array, RecordBatch, StringArray};
+        use omnigraph_compiler::catalog::{LiteralValue, NodeType, RangeConstraint};
+        use std::sync::Arc;
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("name", arrow_schema::DataType::Utf8, false),
+            arrow_schema::Field::new("score", arrow_schema::DataType::Float64, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["bad"])),
+                Arc::new(Float64Array::from(vec![f64::NAN])),
+            ],
+        )
+        .unwrap();
+
+        let node_type = NodeType {
+            name: "Test".to_string(),
+            implements: vec![],
+            properties: Default::default(),
+            key: None,
+            unique_constraints: vec![],
+            indices: vec![],
+            range_constraints: vec![RangeConstraint {
+                property: "score".to_string(),
+                min: Some(LiteralValue::Float(0.0)),
+                max: Some(LiteralValue::Float(1.0)),
+            }],
+            check_constraints: vec![],
+            embed_sources: Default::default(),
+            blob_properties: Default::default(),
+            arrow_schema: schema,
+        };
+
+        let result = validate_value_constraints(&batch, &node_type);
+        assert!(result.is_err(), "expected NaN to be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("NaN"), "error should mention NaN: {}", err);
     }
 }
