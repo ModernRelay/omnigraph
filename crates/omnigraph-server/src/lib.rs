@@ -443,6 +443,17 @@ async fn server_read(
     }
 
     let target = read_target_from_request(request.branch, request.snapshot);
+    let policy_branch = match &target {
+        ReadTarget::Branch(branch) => Some(branch.clone()),
+        ReadTarget::Snapshot(_) if state.policy_engine().is_some() && actor.is_some() => {
+            let db = Arc::clone(&state.db).read_owned().await;
+            db.resolved_branch_of(target.clone())
+                .await
+                .map(|branch| branch.or_else(|| Some("main".to_string())))
+                .map_err(ApiError::from_omni)?
+        }
+        ReadTarget::Snapshot(_) => None,
+    };
     authorize_request(
         &state,
         actor.as_ref().map(|Extension(actor)| actor),
@@ -452,10 +463,7 @@ async fn server_read(
                 .map(|Extension(actor)| actor.as_str().to_string())
                 .unwrap_or_default(),
             action: PolicyAction::Read,
-            branch: match &target {
-                ReadTarget::Branch(branch) => Some(branch.clone()),
-                ReadTarget::Snapshot(_) => None,
-            },
+            branch: policy_branch,
             target_branch: None,
         },
     )?;

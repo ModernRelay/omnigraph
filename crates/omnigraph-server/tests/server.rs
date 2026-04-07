@@ -59,6 +59,19 @@ rules:
       target_branch_scope: protected
 "#;
 
+const POLICY_PROTECTED_READ_YAML: &str = r#"
+version: 1
+groups:
+  team: [act-bruno]
+protected_branches: [main]
+rules:
+  - id: protected-read
+    allow:
+      actors: { group: team }
+      actions: [read]
+      branch_scope: protected
+"#;
+
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../omnigraph/tests/fixtures")
@@ -490,6 +503,50 @@ async fn policy_allows_read_but_distinguishes_401_from_403() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_uses_resolved_branch_for_snapshot_reads() {
+    let temp = init_loaded_repo().await;
+    let repo = repo_path(temp.path());
+    let snapshot_id = {
+        let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+        db.resolve_snapshot("main").await.unwrap().to_string()
+    };
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, POLICY_PROTECTED_READ_YAML).unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        repo.to_string_lossy().to_string(),
+        vec![("act-bruno".to_string(), "team-token".to_string())],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap();
+    let app = build_app(state);
+
+    let read = ReadRequest {
+        query_source: fs::read_to_string(fixture("test.gq")).unwrap(),
+        query_name: Some("get_person".to_string()),
+        params: Some(json!({ "name": "Alice" })),
+        branch: None,
+        snapshot: Some(snapshot_id),
+    };
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/read")
+            .method(Method::POST)
+            .header("authorization", "Bearer team-token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&read).unwrap()))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["target"]["branch"], Value::Null);
+    assert_eq!(body["target"]["snapshot"].as_str(), read.snapshot.as_deref());
+    assert_eq!(body["row_count"], 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

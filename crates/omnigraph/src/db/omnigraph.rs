@@ -216,6 +216,13 @@ impl Omnigraph {
             .map(|snapshot| snapshot.version())
     }
 
+    pub async fn resolved_branch_of(
+        &self,
+        target: impl Into<ReadTarget>,
+    ) -> Result<Option<String>> {
+        self.resolved_target(target).await.map(|resolved| resolved.branch)
+    }
+
     /// Synchronize this handle's write base to the latest head of the named branch.
     pub async fn sync_branch(&mut self, branch: &str) -> Result<()> {
         let branch = normalize_branch_name(branch)?;
