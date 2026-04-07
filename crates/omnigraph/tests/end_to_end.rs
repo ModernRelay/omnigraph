@@ -1053,23 +1053,12 @@ async fn blob_update_mutation() {
 
     assert_eq!(result.affected_nodes, 1);
 
-    // Query it back — blob metadata should still be present
-    let qr = query_main(
-        &mut db,
-        BLOB_QUERIES,
-        "get_doc",
-        &params(&[("$title", "updatable")]),
-    )
-    .await
-    .unwrap();
-    assert_eq!(qr.num_rows(), 1);
-    let json = qr.to_sdk_json();
-    let row = json.as_array().unwrap().first().unwrap();
-    // Blob column present (data was actually updated via separate merge_insert)
-    assert!(
-        row.get("d.content").is_some(),
-        "content column should be present after update"
-    );
+    let blob = db
+        .read_blob("Document", "updatable", "content")
+        .await
+        .unwrap();
+    let bytes = blob.read().await.unwrap();
+    assert_eq!(&bytes[..], &[4, 5, 6]);
 }
 
 // ─── Blob read API ───────────────────────────────────────────────────────
@@ -1558,16 +1547,9 @@ async fn blob_update_null_to_non_null() {
     .unwrap();
     assert_eq!(result.affected_nodes, 1);
 
-    // Verify the row still exists after the update
-    let qr = query_main(
-        &mut db,
-        BLOB_QUERIES,
-        "get_doc",
-        &params(&[("$title", "kid-a")]),
-    )
-    .await
-    .unwrap();
-    assert_eq!(qr.num_rows(), 1);
+    let blob = db.read_blob("Document", "kid-a", "content").await.unwrap();
+    let bytes = blob.read().await.unwrap();
+    assert_eq!(&bytes[..], &[1, 2, 3]);
 }
 
 // ─── Regression: blob load with external file URI ────────────────────────────

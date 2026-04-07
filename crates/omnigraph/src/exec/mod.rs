@@ -3130,18 +3130,20 @@ fn predicate_to_sql(
 }
 
 /// Replace specific columns in a RecordBatch with new literal values.
-/// Apply scalar assignments to a batch. Blob columns are excluded from the
-/// scan result and handled separately via a second merge_insert in execute_update.
+/// Blob columns are excluded from the scan result, so assigned blob values are
+/// synthesized from the full table schema and included inline in the update
+/// batch. Unassigned blob columns are omitted so merge_insert leaves them
+/// untouched.
 fn apply_assignments(
+    full_schema: &SchemaRef,
     batch: &RecordBatch,
     assignments: &HashMap<String, Literal>,
     blob_properties: &HashSet<String>,
 ) -> Result<RecordBatch> {
-    let schema = batch.schema();
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-    let mut out_fields: Vec<Field> = Vec::with_capacity(schema.fields().len());
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(full_schema.fields().len());
+    let mut out_fields: Vec<Field> = Vec::with_capacity(full_schema.fields().len());
 
-    for field in schema.fields().iter() {
+    for field in full_schema.fields().iter() {
         if blob_properties.contains(field.name()) {
             // Blob columns aren't in the scan result. If this blob has an
             // assignment, build the blob array inline so the single
@@ -3778,7 +3780,7 @@ impl Omnigraph {
         for a in assignments {
             resolved.insert(a.property.clone(), resolve_expr_value(&a.value, params)?);
         }
-        let updated = apply_assignments(&matched, &resolved, &blob_props)?;
+        let updated = apply_assignments(&schema, &matched, &resolved, &blob_props)?;
         crate::loader::validate_value_constraints(&updated, &self.catalog().node_types[type_name])?;
 
         // Re-open for merge_insert (scan consumed the dataset;
