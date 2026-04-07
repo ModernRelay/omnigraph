@@ -1812,10 +1812,17 @@ async fn dangling_edge_src_rejected_on_load() {
 async fn ensure_indices_does_not_error_on_repeated_call() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
+    let version_after_load = version_main(&db).await.unwrap();
 
-    // ensure_indices is called during load; calling it again should not error
+    // load commits now enforce required indices; repeated ensure_indices calls
+    // should be a no-op at the manifest level.
     db.ensure_indices().await.unwrap();
+    let version_after_first = version_main(&db).await.unwrap();
     db.ensure_indices().await.unwrap();
+    let version_after_second = version_main(&db).await.unwrap();
+
+    assert_eq!(version_after_first, version_after_load);
+    assert_eq!(version_after_second, version_after_load);
 
     // Data should still be queryable after index operations
     let snap = snapshot_main(&db).await.unwrap();
