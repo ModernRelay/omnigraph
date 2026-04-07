@@ -1,4 +1,5 @@
 use omnigraph::db::{GraphCommit, MergeOutcome, ReadTarget, RunRecord, Snapshot};
+use omnigraph::error::{MergeConflict, MergeConflictKind};
 use omnigraph_compiler::result::QueryResult;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -100,6 +101,65 @@ pub struct BranchMergeOutput {
     pub actor_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeConflictKindOutput {
+    DivergentInsert,
+    DivergentUpdate,
+    DeleteVsUpdate,
+    OrphanEdge,
+    UniqueViolation,
+    CardinalityViolation,
+    ValueConstraintViolation,
+}
+
+impl MergeConflictKindOutput {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DivergentInsert => "divergent_insert",
+            Self::DivergentUpdate => "divergent_update",
+            Self::DeleteVsUpdate => "delete_vs_update",
+            Self::OrphanEdge => "orphan_edge",
+            Self::UniqueViolation => "unique_violation",
+            Self::CardinalityViolation => "cardinality_violation",
+            Self::ValueConstraintViolation => "value_constraint_violation",
+        }
+    }
+}
+
+impl From<MergeConflictKind> for MergeConflictKindOutput {
+    fn from(value: MergeConflictKind) -> Self {
+        match value {
+            MergeConflictKind::DivergentInsert => Self::DivergentInsert,
+            MergeConflictKind::DivergentUpdate => Self::DivergentUpdate,
+            MergeConflictKind::DeleteVsUpdate => Self::DeleteVsUpdate,
+            MergeConflictKind::OrphanEdge => Self::OrphanEdge,
+            MergeConflictKind::UniqueViolation => Self::UniqueViolation,
+            MergeConflictKind::CardinalityViolation => Self::CardinalityViolation,
+            MergeConflictKind::ValueConstraintViolation => Self::ValueConstraintViolation,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeConflictOutput {
+    pub table_key: String,
+    pub row_id: Option<String>,
+    pub kind: MergeConflictKindOutput,
+    pub message: String,
+}
+
+impl From<&MergeConflict> for MergeConflictOutput {
+    fn from(value: &MergeConflict) -> Self {
+        Self {
+            table_key: value.table_key.clone(),
+            row_id: value.row_id.clone(),
+            kind: value.kind.into(),
+            message: value.message.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadTargetOutput {
     pub branch: Option<String>,
@@ -198,6 +258,8 @@ pub struct ErrorOutput {
     pub error: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<ErrorCode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merge_conflicts: Vec<MergeConflictOutput>,
 }
 
 pub fn snapshot_payload(branch: &str, snapshot: &Snapshot) -> SnapshotOutput {
