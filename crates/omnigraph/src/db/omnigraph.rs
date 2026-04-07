@@ -1596,19 +1596,34 @@ async fn export_blob_column_values(
         return Ok(values);
     }
 
-    let blobs = Arc::new(source_ds.clone())
-        .take_blobs(&non_null_row_ids, column_name)
+    // Sort row IDs before calling take_blobs — Lance 4's unsorted path has
+    // a bug that duplicates the _rowaddr column in the returned batch.
+    let mut perm: Vec<usize> = (0..non_null_row_ids.len()).collect();
+    perm.sort_by_key(|&i| non_null_row_ids[i]);
+    let sorted_ids: Vec<u64> = perm.iter().map(|&i| non_null_row_ids[i]).collect();
+
+    let sorted_blobs = Arc::new(source_ds.clone())
+        .take_blobs(&sorted_ids, column_name)
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
 
-    if blobs.len() != non_null_positions.len() {
+    if sorted_blobs.len() != non_null_positions.len() {
         return Err(OmniError::Lance(format!(
             "blob export for '{}' lost alignment with selected rows",
             column_name
         )));
     }
 
-    for (position, blob) in non_null_positions.into_iter().zip(blobs.into_iter()) {
+    // Restore original order via inverse permutation. Build an index that
+    // maps each original position to the sorted position so we can iterate
+    // non_null_positions in order and pick the right blob.
+    let mut inverse_perm = vec![0usize; perm.len()];
+    for (sorted_pos, &orig_pos) in perm.iter().enumerate() {
+        inverse_perm[orig_pos] = sorted_pos;
+    }
+
+    for (idx, position) in non_null_positions.into_iter().enumerate() {
+        let blob = &sorted_blobs[inverse_perm[idx]];
         let value = if let Some(uri) = blob.uri() {
             uri.to_string()
         } else {
