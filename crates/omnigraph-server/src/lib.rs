@@ -43,6 +43,9 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+const SERVER_SOURCE_VERSION: Option<&str> = option_env!("OMNIGRAPH_SOURCE_VERSION");
+
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub uri: String,
@@ -382,6 +385,8 @@ async fn shutdown_signal() {
 async fn server_health() -> Json<HealthOutput> {
     Json(HealthOutput {
         status: "ok".to_string(),
+        version: SERVER_VERSION.to_string(),
+        source_version: SERVER_SOURCE_VERSION.map(str::to_string),
     })
 }
 
