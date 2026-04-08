@@ -360,6 +360,77 @@ fn local_cli_end_to_end_branch_change_merge_flow() {
 }
 
 #[test]
+fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
+    let repo = SystemRepo::loaded();
+    let ingest_data = repo.write_jsonl(
+        "system-local-ingest.jsonl",
+        r#"{"type":"Person","data":{"name":"Zoe","age":33}}
+{"type":"Person","data":{"name":"Bob","age":26}}"#,
+    );
+
+    let ingest_payload = parse_stdout_json(&output_success(
+        cli()
+            .arg("ingest")
+            .arg("--data")
+            .arg(&ingest_data)
+            .arg("--branch")
+            .arg("feature-ingest")
+            .arg(repo.path())
+            .arg("--json"),
+    ));
+    assert_eq!(ingest_payload["branch"], "feature-ingest");
+    assert_eq!(ingest_payload["base_branch"], "main");
+    assert_eq!(ingest_payload["branch_created"], true);
+    assert_eq!(ingest_payload["mode"], "merge");
+    assert_eq!(ingest_payload["tables"][0]["table_key"], "node:Person");
+    assert_eq!(ingest_payload["tables"][0]["rows_loaded"], 2);
+
+    let feature_snapshot = parse_stdout_json(&output_success(
+        cli()
+            .arg("snapshot")
+            .arg(repo.path())
+            .arg("--branch")
+            .arg("feature-ingest")
+            .arg("--json"),
+    ));
+    assert_eq!(feature_snapshot["branch"], "feature-ingest");
+
+    let zoe = parse_stdout_json(&output_success(
+        cli()
+            .arg("read")
+            .arg(repo.path())
+            .arg("--query")
+            .arg(fixture("test.gq"))
+            .arg("--name")
+            .arg("get_person")
+            .arg("--branch")
+            .arg("feature-ingest")
+            .arg("--params")
+            .arg(r#"{"name":"Zoe"}"#)
+            .arg("--json"),
+    ));
+    assert_eq!(zoe["row_count"], 1);
+    assert_eq!(zoe["rows"][0]["p.name"], "Zoe");
+
+    let bob = parse_stdout_json(&output_success(
+        cli()
+            .arg("read")
+            .arg(repo.path())
+            .arg("--query")
+            .arg(fixture("test.gq"))
+            .arg("--name")
+            .arg("get_person")
+            .arg("--branch")
+            .arg("feature-ingest")
+            .arg("--params")
+            .arg(r#"{"name":"Bob"}"#)
+            .arg("--json"),
+    ));
+    assert_eq!(bob["row_count"], 1);
+    assert_eq!(bob["rows"][0]["p.age"], 26);
+}
+
+#[test]
 fn local_cli_export_round_trips_full_branch_graph() {
     let repo = SystemRepo::loaded();
 

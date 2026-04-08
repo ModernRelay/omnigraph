@@ -1,5 +1,6 @@
 use omnigraph::db::{GraphCommit, MergeOutcome, ReadTarget, RunRecord, Snapshot};
 use omnigraph::error::{MergeConflict, MergeConflictKind};
+use omnigraph::loader::{IngestResult, LoadMode};
 use omnigraph_compiler::result::QueryResult;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -186,6 +187,23 @@ pub struct ChangeOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestTableOutput {
+    pub table_key: String,
+    pub rows_loaded: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestOutput {
+    pub uri: String,
+    pub branch: String,
+    pub base_branch: String,
+    pub branch_created: bool,
+    pub mode: LoadMode,
+    pub tables: Vec<IngestTableOutput>,
+    pub actor_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitOutput {
     pub graph_commit_id: String,
     pub manifest_branch: Option<String>,
@@ -216,6 +234,14 @@ pub struct ChangeRequest {
     pub query_name: Option<String>,
     pub params: Option<Value>,
     pub branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestRequest {
+    pub branch: Option<String>,
+    pub from: Option<String>,
+    pub mode: Option<LoadMode>,
+    pub data: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -326,6 +352,25 @@ pub fn read_output(query_name: String, target: &ReadTarget, result: QueryResult)
         row_count: result.num_rows(),
         columns,
         rows: result.to_rust_json(),
+    }
+}
+
+pub fn ingest_output(uri: &str, result: &IngestResult, actor_id: Option<String>) -> IngestOutput {
+    IngestOutput {
+        uri: uri.to_string(),
+        branch: result.branch.clone(),
+        base_branch: result.base_branch.clone(),
+        branch_created: result.branch_created,
+        mode: result.mode,
+        tables: result
+            .tables
+            .iter()
+            .map(|table| IngestTableOutput {
+                table_key: table.table_key.clone(),
+                rows_loaded: table.rows_loaded,
+            })
+            .collect(),
+        actor_id,
     }
 }
 

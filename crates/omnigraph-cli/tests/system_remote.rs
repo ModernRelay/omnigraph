@@ -504,6 +504,147 @@ query add_friend($from: String, $to: String) {
 
 #[test]
 #[ignore = "requires loopback socket permissions in sandboxed runners"]
+fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
+    let repo = SystemRepo::loaded();
+    let server = repo.spawn_server();
+    let config = repo.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
+    let ingest_data = repo.write_jsonl(
+        "system-remote-ingest.jsonl",
+        r#"{"type":"Person","data":{"name":"Zoe","age":33}}
+{"type":"Person","data":{"name":"Bob","age":26}}"#,
+    );
+
+    let ingest_payload = parse_stdout_json(&output_success(
+        cli()
+            .arg("ingest")
+            .arg("--config")
+            .arg(&config)
+            .arg("--data")
+            .arg(&ingest_data)
+            .arg("--branch")
+            .arg("feature-ingest")
+            .arg("--json"),
+    ));
+    assert_eq!(ingest_payload["branch"], "feature-ingest");
+    assert_eq!(ingest_payload["base_branch"], "main");
+    assert_eq!(ingest_payload["branch_created"], true);
+    assert_eq!(ingest_payload["mode"], "merge");
+    assert_eq!(ingest_payload["tables"][0]["table_key"], "node:Person");
+    assert_eq!(ingest_payload["tables"][0]["rows_loaded"], 2);
+
+    let feature_snapshot = parse_stdout_json(&output_success(
+        cli()
+            .arg("snapshot")
+            .arg("--config")
+            .arg(&config)
+            .arg("--branch")
+            .arg("feature-ingest")
+            .arg("--json"),
+    ));
+    assert_eq!(feature_snapshot["branch"], "feature-ingest");
+
+    let zoe = parse_stdout_json(&output_success(
+        cli()
+            .arg("read")
+            .arg("--config")
+            .arg(&config)
+            .arg("--query")
+            .arg(fixture("test.gq"))
+            .arg("--name")
+            .arg("get_person")
+            .arg("--branch")
+            .arg("feature-ingest")
+            .arg("--params")
+            .arg(r#"{"name":"Zoe"}"#)
+            .arg("--json"),
+    ));
+    assert_eq!(zoe["row_count"], 1);
+    assert_eq!(zoe["rows"][0]["p.name"], "Zoe");
+}
+
+#[test]
+#[ignore = "requires loopback socket permissions in sandboxed runners"]
+fn remote_ingest_reuses_existing_branch_and_merges_updates() {
+    let repo = SystemRepo::loaded();
+    let server = repo.spawn_server();
+    let config = repo.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
+
+    output_success(
+        cli()
+            .arg("branch")
+            .arg("create")
+            .arg("--config")
+            .arg(&config)
+            .arg("--from")
+            .arg("main")
+            .arg("feature-ingest"),
+    );
+
+    let ingest_data = repo.write_jsonl(
+        "system-remote-ingest-merge.jsonl",
+        r#"{"type":"Person","data":{"name":"Bob","age":26}}
+{"type":"Person","data":{"name":"Zoe","age":33}}"#,
+    );
+
+    let ingest_payload = parse_stdout_json(&output_success(
+        cli()
+            .arg("ingest")
+            .arg("--config")
+            .arg(&config)
+            .arg("--data")
+            .arg(&ingest_data)
+            .arg("--branch")
+            .arg("feature-ingest")
+            .arg("--from")
+            .arg("missing-base")
+            .arg("--json"),
+    ));
+    assert_eq!(ingest_payload["branch"], "feature-ingest");
+    assert_eq!(ingest_payload["base_branch"], "missing-base");
+    assert_eq!(ingest_payload["branch_created"], false);
+    assert_eq!(ingest_payload["mode"], "merge");
+    assert_eq!(ingest_payload["tables"][0]["table_key"], "node:Person");
+    assert_eq!(ingest_payload["tables"][0]["rows_loaded"], 2);
+
+    let bob = parse_stdout_json(&output_success(
+        cli()
+            .arg("read")
+            .arg("--config")
+            .arg(&config)
+            .arg("--query")
+            .arg(fixture("test.gq"))
+            .arg("--name")
+            .arg("get_person")
+            .arg("--branch")
+            .arg("feature-ingest")
+            .arg("--params")
+            .arg(r#"{"name":"Bob"}"#)
+            .arg("--json"),
+    ));
+    assert_eq!(bob["row_count"], 1);
+    assert_eq!(bob["rows"][0]["p.age"], 26);
+
+    let zoe = parse_stdout_json(&output_success(
+        cli()
+            .arg("read")
+            .arg("--config")
+            .arg(&config)
+            .arg("--query")
+            .arg(fixture("test.gq"))
+            .arg("--name")
+            .arg("get_person")
+            .arg("--branch")
+            .arg("feature-ingest")
+            .arg("--params")
+            .arg(r#"{"name":"Zoe"}"#)
+            .arg("--json"),
+    ));
+    assert_eq!(zoe["row_count"], 1);
+    assert_eq!(zoe["rows"][0]["p.name"], "Zoe");
+}
+
+#[test]
+#[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn remote_policy_enforces_branch_first_cli_workflow() {
     let repo = SystemRepo::loaded();
     let server_config =

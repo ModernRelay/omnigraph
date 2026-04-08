@@ -12,8 +12,9 @@ use omnigraph_compiler::{JsonParamMode, ParamMap};
 use omnigraph_server::api::{
     BranchCreateOutput, BranchCreateRequest, BranchListOutput, BranchMergeOutput,
     BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput, CommitOutput, ErrorOutput,
-    ExportRequest, ReadOutput, ReadRequest, RunListOutput, RunOutput, SnapshotOutput,
-    SnapshotTableOutput, commit_output, read_output, run_output, snapshot_payload,
+    ExportRequest, IngestOutput, IngestRequest, ReadOutput, ReadRequest, RunListOutput, RunOutput,
+    SnapshotOutput, SnapshotTableOutput, commit_output, ingest_output, read_output, run_output,
+    snapshot_payload,
 };
 use omnigraph_server::{
     AliasCommand, OmnigraphConfig, PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest,
@@ -68,6 +69,25 @@ enum Command {
         #[arg(long)]
         branch: Option<String>,
         #[arg(long, default_value = "overwrite")]
+        mode: CliLoadMode,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ingest data into a reviewable named branch
+    Ingest {
+        /// Repo URI
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long, default_value = "merge")]
         mode: CliLoadMode,
         #[arg(long)]
         json: bool,
@@ -724,6 +744,27 @@ fn print_load_human(
     );
 }
 
+fn print_ingest_human(output: &IngestOutput) {
+    println!(
+        "ingested {} into branch {} from {} with {} ({})",
+        output.uri,
+        output.branch,
+        output.base_branch,
+        output.mode.as_str(),
+        if output.branch_created {
+            "branch created"
+        } else {
+            "branch exists"
+        }
+    );
+    for table in &output.tables {
+        println!("{} rows_loaded={}", table.table_key, table.rows_loaded);
+    }
+    if let Some(actor_id) = &output.actor_id {
+        println!("actor_id: {}", actor_id);
+    }
+}
+
 fn print_embed_human(output: &EmbedOutput) {
     println!(
         "embedded {} rows (selected {}, cleaned {}) from {} -> {} [{} {}d]",
@@ -1250,6 +1291,50 @@ async fn main() -> Result<()> {
                     payload.nodes_loaded,
                     payload.edges_loaded,
                 );
+            }
+        }
+        Command::Ingest {
+            uri,
+            target,
+            config,
+            data,
+            branch,
+            from,
+            mode,
+            json,
+        } => {
+            let config = load_cli_config(config.as_ref())?;
+            let bearer_token =
+                resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
+            let uri = resolve_uri(&config, uri, target.as_deref())?;
+            let branch = resolve_branch(&config, branch, None, "main");
+            let from = resolve_branch(&config, from, None, "main");
+            let payload = if is_remote_uri(&uri) {
+                let data = fs::read_to_string(&data)?;
+                remote_json::<IngestOutput>(
+                    &http_client,
+                    Method::POST,
+                    remote_url(&uri, "/ingest"),
+                    Some(serde_json::to_value(IngestRequest {
+                        branch: Some(branch.clone()),
+                        from: Some(from.clone()),
+                        mode: Some(mode.into()),
+                        data,
+                    })?),
+                    bearer_token.as_deref(),
+                )
+                .await?
+            } else {
+                let mut db = Omnigraph::open(&uri).await?;
+                let result = db
+                    .ingest_file(&branch, Some(&from), &data.to_string_lossy(), mode.into())
+                    .await?;
+                ingest_output(&uri, &result, None)
+            };
+            if json {
+                print_json(&payload)?;
+            } else {
+                print_ingest_human(&payload);
             }
         }
         Command::Branch { command } => match command {

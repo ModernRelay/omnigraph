@@ -16,6 +16,7 @@ use arrow_schema::DataType;
 use base64::Engine;
 use lance::blob::BlobArrayBuilder;
 use omnigraph_compiler::catalog::NodeType;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::db::Omnigraph;
@@ -28,8 +29,24 @@ pub struct LoadResult {
     pub edges_loaded: HashMap<String, usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestTableResult {
+    pub table_key: String,
+    pub rows_loaded: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngestResult {
+    pub branch: String,
+    pub base_branch: String,
+    pub branch_created: bool,
+    pub mode: LoadMode,
+    pub tables: Vec<IngestTableResult>,
+}
+
 /// Load mode for data ingestion.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LoadMode {
     /// Overwrite existing data.
     Overwrite,
@@ -54,6 +71,86 @@ pub async fn load_jsonl_file(db: &mut Omnigraph, path: &str, mode: LoadMode) -> 
 }
 
 impl Omnigraph {
+    pub async fn ingest(
+        &mut self,
+        branch: &str,
+        from: Option<&str>,
+        data: &str,
+        mode: LoadMode,
+    ) -> Result<IngestResult> {
+        self.ingest_as(branch, from, data, mode, None).await
+    }
+
+    pub async fn ingest_as(
+        &mut self,
+        branch: &str,
+        from: Option<&str>,
+        data: &str,
+        mode: LoadMode,
+        actor_id: Option<&str>,
+    ) -> Result<IngestResult> {
+        let previous_actor = self.audit_actor_id.clone();
+        self.audit_actor_id = actor_id.map(str::to_string);
+        let result = self
+            .ingest_with_current_actor(branch, from, data, mode)
+            .await;
+        self.audit_actor_id = previous_actor;
+        result
+    }
+
+    pub async fn ingest_file(
+        &mut self,
+        branch: &str,
+        from: Option<&str>,
+        path: &str,
+        mode: LoadMode,
+    ) -> Result<IngestResult> {
+        self.ingest_file_as(branch, from, path, mode, None).await
+    }
+
+    pub async fn ingest_file_as(
+        &mut self,
+        branch: &str,
+        from: Option<&str>,
+        path: &str,
+        mode: LoadMode,
+        actor_id: Option<&str>,
+    ) -> Result<IngestResult> {
+        let data = std::fs::read_to_string(path).map_err(OmniError::Io)?;
+        self.ingest_as(branch, from, &data, mode, actor_id).await
+    }
+
+    async fn ingest_with_current_actor(
+        &mut self,
+        branch: &str,
+        from: Option<&str>,
+        data: &str,
+        mode: LoadMode,
+    ) -> Result<IngestResult> {
+        let target_branch =
+            Self::normalize_branch_name(branch)?.unwrap_or_else(|| "main".to_string());
+        let base_branch = Self::normalize_branch_name(from.unwrap_or("main"))?
+            .unwrap_or_else(|| "main".to_string());
+        let branch_created = !self
+            .branch_list()
+            .await?
+            .iter()
+            .any(|name| name == &target_branch);
+        if branch_created {
+            self.branch_create_from(crate::db::ReadTarget::branch(&base_branch), &target_branch)
+                .await?;
+        }
+
+        let result = self.load(&target_branch, data, mode).await?;
+        Ok(IngestResult {
+            branch: target_branch,
+            base_branch,
+            branch_created,
+            mode,
+            tables: result.to_ingest_tables(),
+        })
+    }
+
     pub async fn load(&mut self, branch: &str, data: &str, mode: LoadMode) -> Result<LoadResult> {
         let requested = Self::normalize_branch_name(branch)?.unwrap_or_else(|| "main".to_string());
         if crate::db::is_internal_run_branch(&requested) {
@@ -121,6 +218,29 @@ impl LoadMode {
             LoadMode::Append => "append",
             LoadMode::Merge => "merge",
         }
+    }
+}
+
+impl LoadResult {
+    pub fn to_ingest_tables(&self) -> Vec<IngestTableResult> {
+        let mut tables = self
+            .nodes_loaded
+            .iter()
+            .map(|(type_name, rows_loaded)| IngestTableResult {
+                table_key: format!("node:{type_name}"),
+                rows_loaded: *rows_loaded,
+            })
+            .chain(
+                self.edges_loaded
+                    .iter()
+                    .map(|(edge_name, rows_loaded)| IngestTableResult {
+                        table_key: format!("edge:{edge_name}"),
+                        rows_loaded: *rows_loaded,
+                    }),
+            )
+            .collect::<Vec<_>>();
+        tables.sort_by(|a, b| a.table_key.cmp(&b.table_key));
+        tables
     }
 }
 
@@ -1159,6 +1279,7 @@ mod tests {
     use crate::db::Omnigraph;
     use arrow_array::Array;
     use futures::TryStreamExt;
+    use std::collections::HashMap;
 
     const TEST_SCHEMA: &str = r#"
 node Person {
@@ -1316,6 +1437,150 @@ edge WorksAt: Person -> Company
         let bad = r#"{"type": "FakeType", "data": {"name": "x"}}"#;
         let result = load_jsonl(&mut db, bad, LoadMode::Overwrite).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_ingest_creates_branch_and_reports_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        let result = db
+            .ingest("feature", Some("main"), TEST_DATA, LoadMode::Overwrite)
+            .await
+            .unwrap();
+
+        assert_eq!(result.branch, "feature");
+        assert_eq!(result.base_branch, "main");
+        assert!(result.branch_created);
+        assert_eq!(result.mode, LoadMode::Overwrite);
+        assert_eq!(
+            result.tables,
+            vec![
+                IngestTableResult {
+                    table_key: "edge:Knows".to_string(),
+                    rows_loaded: 1
+                },
+                IngestTableResult {
+                    table_key: "edge:WorksAt".to_string(),
+                    rows_loaded: 1
+                },
+                IngestTableResult {
+                    table_key: "node:Company".to_string(),
+                    rows_loaded: 1
+                },
+                IngestTableResult {
+                    table_key: "node:Person".to_string(),
+                    rows_loaded: 2
+                },
+            ]
+        );
+        assert!(
+            db.branch_list()
+                .await
+                .unwrap()
+                .contains(&"feature".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ingest_existing_branch_ignores_from_and_merges_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+            .await
+            .unwrap();
+        db.branch_create_from(crate::db::ReadTarget::branch("main"), "feature")
+            .await
+            .unwrap();
+
+        let result = db
+            .ingest(
+                "feature",
+                Some("missing-base"),
+                r#"{"type":"Person","data":{"name":"Bob","age":26}}
+{"type":"Person","data":{"name":"Eve","age":31}}"#,
+                LoadMode::Merge,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.branch, "feature");
+        assert_eq!(result.base_branch, "missing-base");
+        assert!(!result.branch_created);
+        assert_eq!(result.mode, LoadMode::Merge);
+        assert_eq!(
+            result.tables,
+            vec![IngestTableResult {
+                table_key: "node:Person".to_string(),
+                rows_loaded: 2
+            }]
+        );
+
+        let snap = db
+            .snapshot_of(crate::db::ReadTarget::branch("feature"))
+            .await
+            .unwrap();
+        let person_ds = snap.open("node:Person").await.unwrap();
+        assert_eq!(person_ds.count_rows(None).await.unwrap(), 3);
+
+        let batches: Vec<RecordBatch> = person_ds
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut ages_by_id = HashMap::new();
+        for batch in &batches {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let ages = batch
+                .column_by_name("age")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            for idx in 0..ids.len() {
+                ages_by_id.insert(ids.value(idx).to_string(), ages.value(idx));
+            }
+        }
+
+        assert_eq!(ages_by_id.get("Bob"), Some(&26));
+        assert_eq!(ages_by_id.get("Eve"), Some(&31));
+        assert_eq!(ages_by_id.get("Alice"), Some(&30));
+    }
+
+    #[tokio::test]
+    async fn test_ingest_as_stamps_actor_on_branch_head_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        db.ingest_as(
+            "feature",
+            Some("main"),
+            TEST_DATA,
+            LoadMode::Overwrite,
+            Some("act-andrew"),
+        )
+        .await
+        .unwrap();
+
+        let head = db
+            .list_commits(Some("feature"))
+            .await
+            .unwrap()
+            .into_iter()
+            .last()
+            .unwrap();
+        assert_eq!(head.actor_id.as_deref(), Some("act-andrew"));
     }
 
     #[test]
