@@ -208,6 +208,18 @@ impl GraphCoordinator {
         })
     }
 
+    pub async fn branch_descendants(&self, name: &str) -> Result<Vec<String>> {
+        self.manifest
+            .descendant_branches(name)
+            .await
+            .map(|branches| {
+                branches
+                    .into_iter()
+                    .filter(|branch| !is_internal_run_branch(branch))
+                    .collect()
+            })
+    }
+
     pub async fn branch_create(&mut self, name: &str) -> Result<()> {
         let branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
@@ -217,6 +229,32 @@ impl GraphCoordinator {
         if let Some(commit_graph) = &mut self.commit_graph {
             commit_graph.create_branch(&branch).await?;
         }
+        Ok(())
+    }
+
+    pub async fn branch_delete(&mut self, name: &str) -> Result<()> {
+        let branch = normalize_branch_name(name)?
+            .ok_or_else(|| OmniError::manifest("cannot delete branch 'main'".to_string()))?;
+        if self.current_branch() == Some(branch.as_str()) {
+            return Err(OmniError::manifest_conflict(format!(
+                "cannot delete currently active branch '{}'",
+                branch
+            )));
+        }
+
+        self.manifest.delete_branch(&branch).await?;
+
+        if let Some(commit_graph) = &mut self.commit_graph {
+            commit_graph.delete_branch(&branch).await?;
+        } else if self
+            .storage
+            .exists(&graph_commits_uri(self.root_uri()))
+            .await?
+        {
+            let mut commit_graph = CommitGraph::open(self.root_uri()).await?;
+            commit_graph.delete_branch(&branch).await?;
+        }
+
         Ok(())
     }
 

@@ -159,6 +159,16 @@ impl CommitGraph {
         Ok(())
     }
 
+    pub async fn delete_branch(&mut self, name: &str) -> Result<()> {
+        let mut ds = Dataset::open(&graph_commits_uri(&self.root_uri))
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        ds.delete_branch(name)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        self.refresh().await
+    }
+
     pub async fn append_commit(
         &mut self,
         manifest_branch: Option<&str>,

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::error::{OmniError, Result};
@@ -19,7 +19,7 @@ mod repo;
 #[path = "manifest/state.rs"]
 mod state;
 
-use layout::open_manifest_dataset;
+use layout::{manifest_uri, open_manifest_dataset};
 pub(crate) use metadata::TableVersionMetadata;
 #[cfg(test)]
 use metadata::{OMNIGRAPH_ROW_COUNT_KEY, table_version_metadata_for_state};
@@ -272,6 +272,19 @@ impl ManifestCoordinator {
         Ok(())
     }
 
+    pub async fn delete_branch(&mut self, name: &str) -> Result<()> {
+        let uri = manifest_uri(&self.root_uri);
+        let mut ds = Dataset::open(&uri)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        ds.delete_branch(name)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        self.dataset = open_manifest_dataset(&self.root_uri, self.active_branch.as_deref()).await?;
+        self.known_state = read_manifest_state(&self.dataset).await?;
+        Ok(())
+    }
+
     pub async fn list_branches(&self) -> Result<Vec<String>> {
         let branches = self
             .dataset
@@ -283,6 +296,36 @@ impl ManifestCoordinator {
         let mut all = vec!["main".to_string()];
         all.extend(names);
         Ok(all)
+    }
+
+    pub async fn descendant_branches(&self, name: &str) -> Result<Vec<String>> {
+        let branches = self
+            .dataset
+            .list_branches()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let mut frontier = vec![name.to_string()];
+        let mut descendants = Vec::new();
+        let mut seen = HashSet::new();
+
+        while let Some(parent) = frontier.pop() {
+            let mut children = branches
+                .iter()
+                .filter_map(|(branch, contents)| {
+                    (contents.parent_branch.as_deref() == Some(parent.as_str()))
+                        .then_some(branch.clone())
+                })
+                .collect::<Vec<_>>();
+            children.sort();
+            for child in children {
+                if seen.insert(child.clone()) {
+                    frontier.push(child.clone());
+                    descendants.push(child);
+                }
+            }
+        }
+
+        Ok(descendants)
     }
 
     /// Root URI of the repo.

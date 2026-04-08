@@ -227,6 +227,12 @@ async fn public_branch_apis_reject_internal_run_refs() {
         other => panic!("unexpected error: {}", other),
     }
 
+    let delete_err = db.branch_delete(&run.run_branch).await.unwrap_err();
+    match delete_err {
+        OmniError::Manifest(message) => assert!(message.message.contains("internal run ref")),
+        other => panic!("unexpected error: {}", other),
+    }
+
     let fork_err = db
         .branch_create_from(ReadTarget::branch(run.run_branch.as_str()), "child")
         .await
@@ -235,6 +241,18 @@ async fn public_branch_apis_reject_internal_run_refs() {
         OmniError::Manifest(message) => assert!(message.message.contains("internal run ref")),
         other => panic!("unexpected error: {}", other),
     }
+}
+
+#[tokio::test]
+async fn branch_delete_rejects_target_branches_with_active_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+    let run = db.begin_run("feature", Some("delete-guard")).await.unwrap();
+
+    let err = db.branch_delete("feature").await.unwrap_err();
+    assert!(err.to_string().contains(run.run_id.as_str()));
+    assert!(err.to_string().contains("targeting it is running"));
 }
 
 #[tokio::test]

@@ -1161,8 +1161,7 @@ async fn branch_merge_reports_unique_violation_conflict() {
 async fn branch_merge_reports_cardinality_violation_conflict() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut main =
-        init_db_from_schema_and_data(&dir, CARDINALITY_SCHEMA, CARDINALITY_DATA).await;
+    let mut main = init_db_from_schema_and_data(&dir, CARDINALITY_SCHEMA, CARDINALITY_DATA).await;
     main.branch_create("feature").await.unwrap();
 
     let mut feature = Omnigraph::open(uri).await.unwrap();
@@ -1227,8 +1226,77 @@ async fn branch_api_rejects_reserved_main_and_same_source_target_merge() {
     let err = db.branch_create("main").await.unwrap_err();
     assert!(err.to_string().contains("cannot create branch 'main'"));
 
+    let err = db.branch_delete("main").await.unwrap_err();
+    assert!(err.to_string().contains("cannot delete branch 'main'"));
+
     let err = db.branch_merge("main", "main").await.unwrap_err();
     assert!(err.to_string().contains("distinct source and target"));
+
+    db.branch_create("feature").await.unwrap();
+    db.sync_branch("feature").await.unwrap();
+    let err = db.branch_delete("feature").await.unwrap_err();
+    assert!(err.to_string().contains("currently active branch"));
+}
+
+#[tokio::test]
+async fn branch_delete_removes_owned_table_branches_and_allows_recreate() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = init_and_load(&dir).await;
+
+    main.branch_create("feature").await.unwrap();
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+    mutate_branch(
+        &mut feature,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+
+    main.branch_delete("feature").await.unwrap();
+    assert_eq!(main.branch_list().await.unwrap(), vec!["main"]);
+
+    main.branch_create("feature").await.unwrap();
+    mutate_branch(
+        &mut main,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Frank")], &[("$age", 41)]),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(count_rows_branch(&main, "feature", "node:Person").await, 5);
+}
+
+#[tokio::test]
+async fn branch_delete_rejects_branches_still_referenced_by_descendants() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = init_and_load(&dir).await;
+
+    main.branch_create("feature").await.unwrap();
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+    mutate_branch(
+        &mut feature,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+    feature
+        .branch_create_from(ReadTarget::branch("feature"), "experiment")
+        .await
+        .unwrap();
+
+    let err = main.branch_delete("feature").await.unwrap_err();
+    assert!(err.to_string().contains("still depends on it"));
 }
 
 // ─── Step 9b: Surgical merge publish tests ──────────────────────────────────

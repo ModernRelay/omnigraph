@@ -51,7 +51,7 @@ rules:
   - id: admins-merge
     allow:
       actors: { group: admins }
-      actions: [branch_merge]
+      actions: [branch_delete, branch_merge]
       target_branch_scope: protected
   - id: admins-publish
     allow:
@@ -1359,6 +1359,85 @@ async fn remote_branch_list_create_merge_flow_works() {
     assert_eq!(read_status, StatusCode::OK);
     assert_eq!(read_body["row_count"], 1);
     assert_eq!(read_body["rows"][0]["p.name"], "Zoe");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_branch_delete_flow_works() {
+    let (_temp, app) = app_for_loaded_repo().await;
+
+    let create = BranchCreateRequest {
+        from: Some("main".to_string()),
+        name: "feature".to_string(),
+    };
+    let (create_status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri("/branches")
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&create).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(create_status, StatusCode::OK);
+
+    let (delete_status, delete_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/branches/feature")
+            .method(Method::DELETE)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(delete_status, StatusCode::OK);
+    assert_eq!(delete_body["name"], "feature");
+
+    let (list_status, list_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/branches")
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(list_status, StatusCode::OK);
+    assert_eq!(list_body["branches"], json!(["main"]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn branch_delete_denies_without_policy_permission() {
+    let (temp, app) = app_for_loaded_repo_with_auth_tokens_and_policy(
+        &[("act-andrew", "token-admin"), ("act-bruno", "token-team")],
+        POLICY_YAML,
+    )
+    .await;
+    let repo = repo_path(temp.path());
+
+    let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    db.branch_create_from(ReadTarget::branch("main"), "feature")
+        .await
+        .unwrap();
+    drop(db);
+
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/branches/feature")
+            .method(Method::DELETE)
+            .header("authorization", "Bearer token-team")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("policy denied action 'branch_delete'")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
