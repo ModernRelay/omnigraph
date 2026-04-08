@@ -10,11 +10,11 @@ use omnigraph_compiler::json_params_to_param_map;
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::{JsonParamMode, ParamMap};
 use omnigraph_server::api::{
-    BranchCreateOutput, BranchCreateRequest, BranchListOutput, BranchMergeOutput,
-    BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput, CommitOutput, ErrorOutput,
-    ExportRequest, IngestOutput, IngestRequest, ReadOutput, ReadRequest, RunListOutput, RunOutput,
-    SnapshotOutput, SnapshotTableOutput, commit_output, ingest_output, read_output, run_output,
-    snapshot_payload,
+    BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
+    BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
+    CommitOutput, ErrorOutput, ExportRequest, IngestOutput, IngestRequest, ReadOutput, ReadRequest,
+    RunListOutput, RunOutput, SnapshotOutput, SnapshotTableOutput, commit_output, ingest_output,
+    read_output, run_output, snapshot_payload,
 };
 use omnigraph_server::{
     AliasCommand, OmnigraphConfig, PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest,
@@ -223,6 +223,19 @@ enum BranchCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Delete a branch
+    Delete {
+        /// Repo URI
+        #[arg(long)]
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Merge a source branch into a target branch
     Merge {
         /// Repo URI
@@ -413,6 +426,14 @@ fn is_remote_uri(uri: &str) -> bool {
 
 fn remote_url(base: &str, path: &str) -> String {
     format!("{}{}", base.trim_end_matches('/'), path)
+}
+
+fn remote_branch_url(base: &str, branch: &str) -> Result<String> {
+    let mut url = reqwest::Url::parse(&format!("{}/", base.trim_end_matches('/')))?;
+    url.path_segments_mut()
+        .map_err(|_| color_eyre::eyre::eyre!("invalid remote base url"))?
+        .extend(["branches", branch]);
+    Ok(url.to_string())
 }
 
 fn normalize_bearer_token(value: Option<String>) -> Option<String> {
@@ -1411,6 +1432,41 @@ async fn main() -> Result<()> {
                     for branch in payload.branches {
                         println!("{}", branch);
                     }
+                }
+            }
+            BranchCommand::Delete {
+                uri,
+                target,
+                config,
+                name,
+                json,
+            } => {
+                let config = load_cli_config(config.as_ref())?;
+                let bearer_token =
+                    resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
+                let uri = resolve_uri(&config, uri, target.as_deref())?;
+                let payload = if is_remote_uri(&uri) {
+                    remote_json::<BranchDeleteOutput>(
+                        &http_client,
+                        Method::DELETE,
+                        remote_branch_url(&uri, &name)?,
+                        None,
+                        bearer_token.as_deref(),
+                    )
+                    .await?
+                } else {
+                    let mut db = Omnigraph::open(&uri).await?;
+                    db.branch_delete(&name).await?;
+                    BranchDeleteOutput {
+                        uri: uri.clone(),
+                        name: name.clone(),
+                        actor_id: None,
+                    }
+                };
+                if json {
+                    print_json(&payload)?;
+                } else {
+                    println!("deleted branch {}", payload.name);
                 }
             }
             BranchCommand::Merge {

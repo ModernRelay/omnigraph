@@ -118,6 +118,15 @@ impl TableStore {
         open_table_head_for_write(&self.root_uri, table_key, &table_path, branch).await
     }
 
+    pub async fn delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()> {
+        let mut ds = Dataset::open(dataset_uri)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        ds.delete_branch(branch)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))
+    }
+
     pub async fn open_dataset_at_state(
         &self,
         table_path: &str,

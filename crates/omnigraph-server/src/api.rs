@@ -61,6 +61,13 @@ pub struct BranchListOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchDeleteOutput {
+    pub uri: String,
+    pub name: String,
+    pub actor_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BranchMergeRequest {
     pub source: String,
     pub target: Option<String>,

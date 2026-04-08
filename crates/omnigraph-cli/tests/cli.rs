@@ -834,6 +834,64 @@ fn branch_list_outputs_sorted_branches() {
 }
 
 #[test]
+fn branch_delete_json_outputs_name_and_removes_branch() {
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    init_repo(&repo);
+
+    output_success(
+        cli()
+            .arg("branch")
+            .arg("create")
+            .arg("--uri")
+            .arg(&repo)
+            .arg("--from")
+            .arg("main")
+            .arg("feature"),
+    );
+
+    let output = output_success(
+        cli()
+            .arg("branch")
+            .arg("delete")
+            .arg("--uri")
+            .arg(&repo)
+            .arg("feature")
+            .arg("--json"),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["name"], "feature");
+    assert_eq!(payload["uri"], repo.to_string_lossy().as_ref());
+
+    let listed = output_success(cli().arg("branch").arg("list").arg("--uri").arg(&repo));
+    let stdout = stdout_string(&listed);
+    let lines = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(lines, vec!["main"]);
+}
+
+#[test]
+fn branch_delete_rejects_main() {
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    init_repo(&repo);
+
+    let output = output_failure(
+        cli()
+            .arg("branch")
+            .arg("delete")
+            .arg("--uri")
+            .arg(&repo)
+            .arg("main"),
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("cannot delete branch 'main'"));
+}
+
+#[test]
 fn branch_merge_defaults_target_to_main() {
     let temp = tempdir().unwrap();
     let repo = repo_path(temp.path());

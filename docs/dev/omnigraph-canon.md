@@ -558,7 +558,7 @@ The CLI is now a real operator surface for:
 - `init`
 - `load`
 - `ingest`
-- `branch create/list/merge`
+- `branch create/list/delete/merge`
 - `snapshot`
 - `read`
 - `change`
@@ -680,7 +680,7 @@ These caches are refreshed or invalidated on branch sync, refresh, and write-sid
 - Lance-backed snapshots
 - per-type node and edge storage
 - public transactional load and mutate
-- branch create and merge
+- branch create, delete, and merge
 - graph traversal
 - time-travel reads
 - diff and change APIs

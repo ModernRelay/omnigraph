@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{
@@ -19,7 +19,7 @@ use omnigraph_compiler::types::ScalarType;
 
 use crate::db::graph_coordinator::{GraphCoordinator, PublishedSnapshot};
 use crate::db::run_registry::{RunRecord, RunStatus, is_internal_run_branch};
-use crate::error::{OmniError, Result};
+use crate::error::{ManifestErrorKind, OmniError, Result};
 use crate::runtime_cache::RuntimeCache;
 use crate::storage::{StorageAdapter, join_uri, normalize_root_uri, storage_for_uri};
 use crate::table_store::TableStore;
@@ -708,6 +708,118 @@ impl Omnigraph {
         self.coordinator.current_branch()
     }
 
+    async fn ensure_branch_delete_safe(&self, branch: &str, branches: &[String]) -> Result<()> {
+        let descendants = self.coordinator.branch_descendants(branch).await?;
+        if let Some(descendant) = descendants.first() {
+            return Err(OmniError::manifest_conflict(format!(
+                "cannot delete branch '{}' because descendant branch '{}' still depends on it",
+                branch, descendant
+            )));
+        }
+
+        for run in self.list_runs().await? {
+            if run.target_branch == branch
+                && matches!(run.status, RunStatus::Running | RunStatus::Failed)
+            {
+                return Err(OmniError::manifest_conflict(format!(
+                    "cannot delete branch '{}' while run '{}' targeting it is {}",
+                    branch,
+                    run.run_id,
+                    run.status.as_str()
+                )));
+            }
+        }
+
+        for other_branch in branches
+            .iter()
+            .filter(|candidate| candidate.as_str() != branch)
+        {
+            let snapshot = self
+                .snapshot_of(ReadTarget::branch(other_branch.as_str()))
+                .await?;
+            if snapshot
+                .entries()
+                .any(|entry| entry.table_branch.as_deref() == Some(branch))
+            {
+                return Err(OmniError::manifest_conflict(format!(
+                    "cannot delete branch '{}' because branch '{}' still depends on it",
+                    branch, other_branch
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup_deleted_branch_tables(
+        &self,
+        branch: &str,
+        owned_tables: &[(String, String)],
+    ) -> Result<()> {
+        let mut seen_paths = HashSet::new();
+        let mut cleanup_targets = owned_tables
+            .iter()
+            .filter(|(_, table_path)| seen_paths.insert(table_path.clone()))
+            .cloned()
+            .collect::<Vec<_>>();
+        cleanup_targets.sort_by(|left, right| left.0.cmp(&right.0));
+
+        for (table_key, table_path) in cleanup_targets {
+            let dataset_uri = self.table_store.dataset_uri(&table_path);
+            if let Err(err) = self.table_store.delete_branch(&dataset_uri, branch).await {
+                return Err(OmniError::manifest_internal(format!(
+                    "branch '{}' was deleted but cleanup failed for {}: {}",
+                    branch, table_key, err
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn delete_branch_storage_only(&mut self, branch: &str) -> Result<()> {
+        if self.coordinator.current_branch() == Some(branch) {
+            return Err(OmniError::manifest_conflict(format!(
+                "cannot delete currently active branch '{}'",
+                branch
+            )));
+        }
+
+        let branch_snapshot = self.snapshot_of(ReadTarget::branch(branch)).await?;
+        let owned_tables = branch_snapshot
+            .entries()
+            .filter(|entry| entry.table_branch.as_deref() == Some(branch))
+            .map(|entry| (entry.table_key.clone(), entry.table_path.clone()))
+            .collect::<Vec<_>>();
+
+        self.coordinator.branch_delete(branch).await?;
+        self.cleanup_deleted_branch_tables(branch, &owned_tables)
+            .await
+    }
+
+    async fn cleanup_terminal_run_branches_for_target(&mut self, branch: &str) -> Result<()> {
+        let terminal_run_branches = self
+            .list_runs()
+            .await?
+            .into_iter()
+            .filter(|run| {
+                run.target_branch == branch
+                    && matches!(run.status, RunStatus::Published | RunStatus::Aborted)
+            })
+            .map(|run| run.run_branch)
+            .collect::<Vec<_>>();
+
+        for run_branch in terminal_run_branches {
+            match self.delete_branch_storage_only(&run_branch).await {
+                Ok(()) => {}
+                Err(OmniError::Manifest(err)) if err.kind == ManifestErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
         normalize_branch_name(branch)
     }
@@ -766,6 +878,25 @@ impl Omnigraph {
 
     pub async fn branch_list(&self) -> Result<Vec<String>> {
         self.coordinator.branch_list().await
+    }
+
+    pub async fn branch_delete(&mut self, name: &str) -> Result<()> {
+        ensure_public_branch_ref(name, "branch_delete")?;
+        self.refresh().await?;
+        let branch = normalize_branch_name(name)?
+            .ok_or_else(|| OmniError::manifest("cannot delete branch 'main'".to_string()))?;
+        let branches = self.coordinator.branch_list().await?;
+        if !branches.iter().any(|candidate| candidate == &branch) {
+            return Err(OmniError::manifest_not_found(format!(
+                "branch '{}' not found",
+                branch
+            )));
+        }
+
+        self.ensure_branch_delete_safe(&branch, &branches).await?;
+        self.cleanup_terminal_run_branches_for_target(&branch)
+            .await?;
+        self.delete_branch_storage_only(&branch).await
     }
 
     pub(crate) async fn latest_branch_snapshot_id(&self, branch: &str) -> Result<SnapshotId> {

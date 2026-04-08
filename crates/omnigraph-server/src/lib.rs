@@ -8,10 +8,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use api::{
-    BranchCreateOutput, BranchCreateRequest, BranchListOutput, BranchMergeOutput,
-    BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput, CommitListQuery, ErrorCode,
-    ErrorOutput, ExportRequest, HealthOutput, IngestOutput, IngestRequest, ReadOutput, ReadRequest,
-    RunListOutput, SnapshotQuery, ingest_output, snapshot_payload,
+    BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
+    BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
+    CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, HealthOutput, IngestOutput,
+    IngestRequest, ReadOutput, ReadRequest, RunListOutput, SnapshotQuery, ingest_output,
+    snapshot_payload,
 };
 use axum::extract::DefaultBodyLimit;
 use axum::extract::{Extension, Path, Query, Request, State};
@@ -19,7 +20,7 @@ use axum::http::StatusCode;
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use color_eyre::eyre::{Result, WrapErr, bail};
 pub use config::{
@@ -348,6 +349,7 @@ pub fn build_app(state: AppState) -> Router {
             "/branches",
             get(server_branch_list).post(server_branch_create),
         )
+        .route("/branches/{branch}", delete(server_branch_delete))
         .route("/branches/merge", post(server_branch_merge))
         .route("/runs", get(server_run_list))
         .route("/runs/{run_id}", get(server_run_show))
@@ -734,6 +736,35 @@ async fn server_branch_create(
         from,
         name: request.name,
         actor_id: actor.map(|Extension(actor)| actor.as_str().to_string()),
+    }))
+}
+
+async fn server_branch_delete(
+    State(state): State<AppState>,
+    actor: Option<Extension<AuthenticatedActor>>,
+    Path(branch): Path<String>,
+) -> std::result::Result<Json<BranchDeleteOutput>, ApiError> {
+    let actor_id = actor.as_ref().map(|Extension(actor)| actor.as_str());
+    authorize_request(
+        &state,
+        actor.as_ref().map(|Extension(actor)| actor),
+        PolicyRequest {
+            actor_id: actor_id.map(str::to_string).unwrap_or_default(),
+            action: PolicyAction::BranchDelete,
+            branch: None,
+            target_branch: Some(branch.clone()),
+        },
+    )?;
+    {
+        let mut db = Arc::clone(&state.db).write_owned().await;
+        db.branch_delete(&branch)
+            .await
+            .map_err(ApiError::from_omni)?;
+    }
+    Ok(Json(BranchDeleteOutput {
+        uri: state.uri().to_string(),
+        name: branch,
+        actor_id: actor_id.map(str::to_string),
     }))
 }
 

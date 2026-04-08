@@ -20,6 +20,7 @@ pub enum PolicyAction {
     Export,
     Change,
     BranchCreate,
+    BranchDelete,
     BranchMerge,
     RunPublish,
     RunAbort,
@@ -33,6 +34,7 @@ impl PolicyAction {
             Self::Export => "export",
             Self::Change => "change",
             Self::BranchCreate => "branch_create",
+            Self::BranchDelete => "branch_delete",
             Self::BranchMerge => "branch_merge",
             Self::RunPublish => "run_publish",
             Self::RunAbort => "run_abort",
@@ -47,7 +49,11 @@ impl PolicyAction {
     fn uses_target_branch_scope(self) -> bool {
         matches!(
             self,
-            Self::BranchCreate | Self::BranchMerge | Self::RunPublish | Self::RunAbort
+            Self::BranchCreate
+                | Self::BranchDelete
+                | Self::BranchMerge
+                | Self::RunPublish
+                | Self::RunAbort
         )
     }
 }
@@ -67,6 +73,7 @@ impl FromStr for PolicyAction {
             "export" => Ok(Self::Export),
             "change" => Ok(Self::Change),
             "branch_create" => Ok(Self::BranchCreate),
+            "branch_delete" => Ok(Self::BranchDelete),
             "branch_merge" => Ok(Self::BranchMerge),
             "run_publish" => Ok(Self::RunPublish),
             "run_abort" => Ok(Self::RunAbort),
@@ -585,6 +592,7 @@ namespace Omnigraph {
     action "export" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
     action "change" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
     action "branch_create" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
+    action "branch_delete" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
     action "branch_merge" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
     action "run_publish" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
     action "run_abort" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
@@ -719,7 +727,7 @@ rules:
   - id: admins-promote
     allow:
       actors: { group: admins }
-      actions: [branch_merge, run_publish]
+      actions: [branch_delete, branch_merge, run_publish]
       target_branch_scope: protected
 "#,
         )
@@ -740,7 +748,7 @@ rules:
         let deny = engine
             .authorize(&PolicyRequest {
                 actor_id: "act-bruno".to_string(),
-                action: PolicyAction::BranchMerge,
+                action: PolicyAction::BranchDelete,
                 branch: None,
                 target_branch: Some("main".to_string()),
             })
@@ -750,7 +758,7 @@ rules:
         let admin = engine
             .authorize(&PolicyRequest {
                 actor_id: "act-andrew".to_string(),
-                action: PolicyAction::BranchMerge,
+                action: PolicyAction::BranchDelete,
                 branch: None,
                 target_branch: Some("main".to_string()),
             })

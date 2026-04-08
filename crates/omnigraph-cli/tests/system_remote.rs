@@ -374,6 +374,47 @@ query insert_person($name: String, $age: I32) {
 
 #[test]
 #[ignore = "requires loopback socket permissions in sandboxed runners"]
+fn remote_branch_delete_removes_branch() {
+    let repo = SystemRepo::loaded();
+    let server = repo.spawn_server();
+    let config = repo.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
+
+    parse_stdout_json(&output_success(
+        cli()
+            .arg("branch")
+            .arg("create")
+            .arg("--config")
+            .arg(&config)
+            .arg("--from")
+            .arg("main")
+            .arg("feature")
+            .arg("--json"),
+    ));
+
+    let deleted = parse_stdout_json(&output_success(
+        cli()
+            .arg("branch")
+            .arg("delete")
+            .arg("--config")
+            .arg(&config)
+            .arg("feature")
+            .arg("--json"),
+    ));
+    assert_eq!(deleted["name"], "feature");
+
+    let listed = parse_stdout_json(&output_success(
+        cli()
+            .arg("branch")
+            .arg("list")
+            .arg("--config")
+            .arg(&config)
+            .arg("--json"),
+    ));
+    assert_eq!(listed["branches"], json!(["main"]));
+}
+
+#[test]
+#[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn remote_export_round_trips_full_branch_graph() {
     let repo = SystemRepo::loaded();
     let server = repo.spawn_server();
