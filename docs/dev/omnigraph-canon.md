@@ -529,6 +529,7 @@ Important branching behavior:
 - `GET /snapshot`
 - `POST /read`
 - `POST /change`
+- `POST /ingest`
 - `GET /runs`
 - `GET /runs/{id}`
 - `POST /runs/{id}/publish`
@@ -547,7 +548,7 @@ Important current details:
 
 - bearer auth is supported via `OMNIGRAPH_SERVER_BEARER_TOKEN`
 - `/healthz` stays open even when bearer auth is enabled
-- request body limit is `1 MiB`
+- request body limit is `1 MiB`, except `/ingest` which allows `32 MiB`
 - manifest errors are typed and mapped to HTTP status by `ManifestErrorKind`
 
 ## 21. CLI And Config
@@ -556,6 +557,7 @@ The CLI is now a real operator surface for:
 
 - `init`
 - `load`
+- `ingest`
 - `branch create/list/merge`
 - `snapshot`
 - `read`
@@ -579,6 +581,8 @@ Current output formats for reads:
 Important current details:
 
 - remote operations reuse one `reqwest::Client` per process
+- `load` is still local-only; branch-first bulk ingest goes through `ingest`
+- v1 remote `ingest` sends inline JSONL to the server and inherits the `32 MiB` request cap
 - read output preserves query projection order end to end via `ReadOutput.columns`
 - relative query paths resolve against config `base_dir`, not ambient cwd
 - target-scoped bearer token env names are supported in config

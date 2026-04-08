@@ -10,8 +10,8 @@ use std::sync::Arc;
 use api::{
     BranchCreateOutput, BranchCreateRequest, BranchListOutput, BranchMergeOutput,
     BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput, CommitListQuery, ErrorCode,
-    ErrorOutput, ExportRequest, HealthOutput, ReadOutput, ReadRequest, RunListOutput,
-    SnapshotQuery, snapshot_payload,
+    ErrorOutput, ExportRequest, HealthOutput, IngestOutput, IngestRequest, ReadOutput, ReadRequest,
+    RunListOutput, SnapshotQuery, ingest_output, snapshot_payload,
 };
 use axum::extract::DefaultBodyLimit;
 use axum::extract::{Extension, Path, Query, Request, State};
@@ -42,6 +42,9 @@ use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
+
+const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 1_048_576;
+const INGEST_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -252,7 +255,10 @@ impl ApiError {
                 ManifestErrorKind::Internal => Self::internal(err.message),
             },
             OmniError::MergeConflicts(conflicts) => Self::merge_conflict(
-                conflicts.iter().map(api::MergeConflictOutput::from).collect(),
+                conflicts
+                    .iter()
+                    .map(api::MergeConflictOutput::from)
+                    .collect(),
             ),
             OmniError::Lance(message) => Self::internal(format!("storage: {message}")),
             OmniError::Io(err) => Self::internal(format!("io: {err}")),
@@ -333,6 +339,10 @@ pub fn build_app(state: AppState) -> Router {
         .route("/read", post(server_read))
         .route("/change", post(server_change))
         .route(
+            "/ingest",
+            post(server_ingest).layer(DefaultBodyLimit::max(INGEST_REQUEST_BODY_LIMIT_BYTES)),
+        )
+        .route(
             "/branches",
             get(server_branch_list).post(server_branch_create),
         )
@@ -351,7 +361,7 @@ pub fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(server_health))
         .merge(protected)
-        .layer(DefaultBodyLimit::max(1_048_576))
+        .layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT_BYTES))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -607,6 +617,62 @@ async fn server_change(
         affected_edges: result.affected_edges,
         actor_id: actor_id.map(str::to_string),
     }))
+}
+
+async fn server_ingest(
+    State(state): State<AppState>,
+    actor: Option<Extension<AuthenticatedActor>>,
+    Json(request): Json<IngestRequest>,
+) -> std::result::Result<Json<IngestOutput>, ApiError> {
+    let branch = request.branch.unwrap_or_else(|| "main".to_string());
+    let from = request.from.unwrap_or_else(|| "main".to_string());
+    let mode = request.mode.unwrap_or(omnigraph::loader::LoadMode::Merge);
+    let actor_id = actor.as_ref().map(|Extension(actor)| actor.as_str());
+
+    let branch_exists = {
+        let db = Arc::clone(&state.db).read_owned().await;
+        db.branch_list()
+            .await
+            .map_err(ApiError::from_omni)?
+            .into_iter()
+            .any(|name| name == branch)
+    };
+
+    if !branch_exists {
+        authorize_request(
+            &state,
+            actor.as_ref().map(|Extension(actor)| actor),
+            PolicyRequest {
+                actor_id: actor_id.map(str::to_string).unwrap_or_default(),
+                action: PolicyAction::BranchCreate,
+                branch: Some(from.clone()),
+                target_branch: Some(branch.clone()),
+            },
+        )?;
+    }
+    authorize_request(
+        &state,
+        actor.as_ref().map(|Extension(actor)| actor),
+        PolicyRequest {
+            actor_id: actor_id.map(str::to_string).unwrap_or_default(),
+            action: PolicyAction::Change,
+            branch: Some(branch.clone()),
+            target_branch: None,
+        },
+    )?;
+
+    let result = {
+        let mut db = Arc::clone(&state.db).write_owned().await;
+        db.ingest_as(&branch, Some(&from), &request.data, mode, actor_id)
+            .await
+            .map_err(ApiError::from_omni)?
+    };
+
+    Ok(Json(ingest_output(
+        state.uri(),
+        &result,
+        actor_id.map(str::to_string),
+    )))
 }
 
 async fn server_branch_list(

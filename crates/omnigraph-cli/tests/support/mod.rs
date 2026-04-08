@@ -25,6 +25,8 @@ pub fn cli_process() -> StdCommand {
 fn server_process() -> StdCommand {
     if let Some(path) = std::env::var_os("CARGO_BIN_EXE_omnigraph-server") {
         StdCommand::new(path)
+    } else if let Some(path) = built_server_binary() {
+        StdCommand::new(path)
     } else {
         let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
         let mut cmd = StdCommand::new(cargo);
@@ -35,6 +37,15 @@ fn server_process() -> StdCommand {
             .arg("--");
         cmd
     }
+}
+
+fn built_server_binary() -> Option<PathBuf> {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let candidate = workspace_root
+        .join("target")
+        .join("debug")
+        .join(format!("omnigraph-server{}", std::env::consts::EXE_SUFFIX));
+    candidate.exists().then_some(candidate)
 }
 
 pub fn fixture(name: &str) -> PathBuf {

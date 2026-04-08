@@ -8,7 +8,8 @@ use axum::http::{Method, Request, StatusCode};
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_server::api::{
-    BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorOutput, ExportRequest, ReadRequest,
+    BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorOutput, ExportRequest,
+    IngestRequest, ReadRequest,
 };
 use omnigraph_server::{AppState, build_app};
 use serde_json::{Value, json};
@@ -70,6 +71,19 @@ rules:
       actors: { group: team }
       actions: [read]
       branch_scope: protected
+"#;
+
+const INGEST_CREATE_ONLY_POLICY_YAML: &str = r#"
+version: 1
+groups:
+  team: [act-bruno]
+protected_branches: [main]
+rules:
+  - id: team-branch-create
+    allow:
+      actors: { group: team }
+      actions: [branch_create]
+      target_branch_scope: unprotected
 "#;
 
 fn fixture(name: &str) -> PathBuf {
@@ -545,7 +559,10 @@ async fn policy_uses_resolved_branch_for_snapshot_reads() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["target"]["branch"], Value::Null);
-    assert_eq!(body["target"]["snapshot"].as_str(), read.snapshot.as_deref());
+    assert_eq!(
+        body["target"]["snapshot"].as_str(),
+        read.snapshot.as_deref()
+    );
     assert_eq!(body["row_count"], 1);
 }
 
@@ -829,6 +846,191 @@ async fn authenticated_change_stamps_actor_on_runs_and_commits() {
         .last()
         .expect("head commit should exist");
     assert_eq!(head["actor_id"], "act-andrew");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
+    let (temp, app) = app_for_loaded_repo_with_auth_tokens(&[("act-andrew", "token-one")]).await;
+    let repo = repo_path(temp.path());
+    let ingest = IngestRequest {
+        branch: Some("feature-ingest".to_string()),
+        from: Some("main".to_string()),
+        mode: Some(LoadMode::Merge),
+        data: r#"{"type":"Person","data":{"name":"Zoe","age":33}}
+{"type":"Person","data":{"name":"Bob","age":26}}"#
+            .to_string(),
+    };
+
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/ingest")
+            .method(Method::POST)
+            .header("authorization", "Bearer token-one")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&ingest).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["branch"], "feature-ingest");
+    assert_eq!(body["base_branch"], "main");
+    assert_eq!(body["branch_created"], true);
+    assert_eq!(body["mode"], "merge");
+    assert_eq!(body["actor_id"], "act-andrew");
+    assert_eq!(body["tables"][0]["table_key"], "node:Person");
+    assert_eq!(body["tables"][0]["rows_loaded"], 2);
+
+    let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let snapshot = db
+        .snapshot_of(ReadTarget::branch("feature-ingest"))
+        .await
+        .unwrap();
+    let person_ds = snapshot.open("node:Person").await.unwrap();
+    assert_eq!(person_ds.count_rows(None).await.unwrap(), 5);
+    let head = db
+        .list_commits(Some("feature-ingest"))
+        .await
+        .unwrap()
+        .into_iter()
+        .last()
+        .unwrap();
+    assert_eq!(head.actor_id.as_deref(), Some("act-andrew"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_existing_branch_skips_branch_create_policy_check() {
+    let temp = init_loaded_repo().await;
+    let repo = repo_path(temp.path());
+    {
+        let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+        db.branch_create_from(ReadTarget::branch("main"), "feature")
+            .await
+            .unwrap();
+    }
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, POLICY_YAML).unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        repo.to_string_lossy().to_string(),
+        vec![("act-bruno".to_string(), "team-token".to_string())],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap();
+    let app = build_app(state);
+    let ingest = IngestRequest {
+        branch: Some("feature".to_string()),
+        from: Some("other-base".to_string()),
+        mode: Some(LoadMode::Merge),
+        data: r#"{"type":"Person","data":{"name":"Zoe","age":33}}"#.to_string(),
+    };
+
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/ingest")
+            .method(Method::POST)
+            .header("authorization", "Bearer team-token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&ingest).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["branch"], "feature");
+    assert_eq!(body["branch_created"], false);
+    assert_eq!(body["base_branch"], "other-base");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_denies_missing_branch_without_branch_create_permission() {
+    let (_temp, app) = app_for_loaded_repo_with_auth_tokens_and_policy(
+        &[("act-bruno", "team-token")],
+        POLICY_YAML,
+    )
+    .await;
+    let ingest = IngestRequest {
+        branch: Some("feature".to_string()),
+        from: Some("main".to_string()),
+        mode: Some(LoadMode::Merge),
+        data: r#"{"type":"Person","data":{"name":"Zoe","age":33}}"#.to_string(),
+    };
+
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/ingest")
+            .method(Method::POST)
+            .header("authorization", "Bearer team-token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&ingest).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    let error: ErrorOutput = serde_json::from_value(body).unwrap();
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        error.code,
+        Some(omnigraph_server::api::ErrorCode::Forbidden)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_denies_when_actor_lacks_change_permission() {
+    let (_temp, app) = app_for_loaded_repo_with_auth_tokens_and_policy(
+        &[("act-bruno", "team-token")],
+        INGEST_CREATE_ONLY_POLICY_YAML,
+    )
+    .await;
+    let ingest = IngestRequest {
+        branch: Some("feature".to_string()),
+        from: Some("main".to_string()),
+        mode: Some(LoadMode::Merge),
+        data: r#"{"type":"Person","data":{"name":"Zoe","age":33}}"#.to_string(),
+    };
+
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/ingest")
+            .method(Method::POST)
+            .header("authorization", "Bearer team-token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&ingest).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    let error: ErrorOutput = serde_json::from_value(body).unwrap();
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        error.code,
+        Some(omnigraph_server::api::ErrorCode::Forbidden)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_rejects_payloads_over_32_mib() {
+    let (_temp, app) = app_for_loaded_repo().await;
+    let oversize = IngestRequest {
+        branch: Some("feature".to_string()),
+        from: Some("main".to_string()),
+        mode: Some(LoadMode::Merge),
+        data: "x".repeat(33 * 1024 * 1024),
+    };
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/ingest")
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&oversize).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
 #[tokio::test(flavor = "multi_thread")]

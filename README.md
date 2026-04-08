@@ -14,17 +14,26 @@ Active workspace crates:
 # Initialize a repo from a schema
 cargo run -p omnigraph-cli -- init --schema ./schema.pg ./demo.omni
 
-# Load JSONL data into the default branch
+# Load JSONL data into the default branch (local repos only)
 cargo run -p omnigraph-cli -- load --data ./data.jsonl ./demo.omni
 
-# Load JSONL data into a specific branch
+# Load JSONL data into a specific branch (local repos only)
 cargo run -p omnigraph-cli -- load --branch feature-x --data ./data.jsonl ./demo.omni
 
-# Control load mode explicitly
+# Control local load mode explicitly
 cargo run -p omnigraph-cli -- load --mode merge --data ./data.jsonl ./demo.omni
 
-# Emit machine-readable load output
+# Emit machine-readable local load output
 cargo run -p omnigraph-cli -- load --data ./data.jsonl --json ./demo.omni
+
+# Create or reuse a reviewable branch and ingest JSONL into it
+cargo run -p omnigraph-cli -- ingest --data ./data.jsonl --branch ingest/customer-sync ./demo.omni
+
+# Auto-create the ingest branch from an explicit base branch
+cargo run -p omnigraph-cli -- ingest --data ./data.jsonl --branch ingest/customer-sync --from main ./demo.omni
+
+# Remote ingest sends inline JSONL to omnigraph-server (v1 limit: 32 MiB)
+cargo run -p omnigraph-cli -- ingest --config ./omnigraph.yaml --data ./data.jsonl --branch ingest/customer-sync --json
 
 # Create a branch
 cargo run -p omnigraph-cli -- branch create --uri ./demo.omni --from main feature-x
@@ -59,6 +68,10 @@ After `init`, a repo directory contains:
 `__manifest` is the graph publish boundary. Omnigraph branches are Lance
 branches on `__manifest`, and sub-table dataset branches are created lazily on
 first branch-local write.
+
+`load` remains the lower-level local bulk loader. `ingest` is the reviewable
+bulk-ingest path: it writes into a normal named branch so the result can be
+inspected with `snapshot`, `read`, and `export` before a later explicit merge.
 
 ## Merge Semantics
 
