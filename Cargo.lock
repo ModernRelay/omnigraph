@@ -4505,7 +4505,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -4542,7 +4542,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -4561,7 +4561,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-compiler"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -4581,7 +4581,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "cedar-policy",
