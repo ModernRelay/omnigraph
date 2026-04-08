@@ -45,6 +45,8 @@ use tracing_subscriber::EnvFilter;
 
 const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 1_048_576;
 const INGEST_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+const SERVER_SOURCE_VERSION: Option<&str> = option_env!("OMNIGRAPH_SOURCE_VERSION");
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -392,6 +394,8 @@ async fn shutdown_signal() {
 async fn server_health() -> Json<HealthOutput> {
     Json(HealthOutput {
         status: "ok".to_string(),
+        version: SERVER_VERSION.to_string(),
+        source_version: SERVER_SOURCE_VERSION.map(str::to_string),
     })
 }
 
