@@ -75,6 +75,7 @@ Schema evolution is now intentionally fail-closed in phase 1:
 - `_schema.pg` is still the human-authored source, but editing it does not change the accepted schema
 - if `_schema.pg`, `_schema.ir.json`, or `__schema_state.json` drift out of sync, Omnigraph rejects reads and writes with a conflict
 - legacy repos can auto-bootstrap schema state only when they are effectively single-branch (`main` only)
+- `omnigraph schema plan` is the first migration-facing surface, but it is local-only and plan-only; no schema apply path exists yet
 
 ## 4. Compiler Layer
 
@@ -567,6 +568,7 @@ The CLI is now a real operator surface for:
 - `init`
 - `load`
 - `ingest`
+- `schema plan`
 - `branch create/list/delete/merge`
 - `snapshot`
 - `read`

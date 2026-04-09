@@ -114,6 +114,23 @@ pub(crate) async fn read_current_source_ir(
     compile_schema_source(&source)
 }
 
+pub(crate) async fn read_accepted_schema_ir(
+    root_uri: &str,
+    storage: Arc<dyn StorageAdapter>,
+) -> Result<SchemaIR> {
+    match read_schema_contract(root_uri, storage.as_ref()).await? {
+        SchemaContractRead::Present { ir, state } => {
+            validate_persisted_schema_contract(&ir, &state)?;
+            Ok(ir)
+        }
+        SchemaContractRead::MissingAll | SchemaContractRead::PartialMissing => {
+            Err(schema_lock_conflict(
+                "repo is missing persisted schema state; manual coordination is required before schema changes are allowed",
+            ))
+        }
+    }
+}
+
 pub(crate) fn schema_source_uri(root_uri: &str) -> String {
     join_uri(root_uri, SCHEMA_SOURCE_FILENAME)
 }

@@ -15,7 +15,9 @@ use lance::datatypes::BlobKind;
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::types::ScalarType;
-use omnigraph_compiler::{SchemaIR, build_catalog_from_ir, build_schema_ir};
+use omnigraph_compiler::{
+    SchemaIR, SchemaMigrationPlan, build_catalog_from_ir, build_schema_ir, plan_schema_migration,
+};
 
 use crate::db::graph_coordinator::{GraphCoordinator, PublishedSnapshot};
 use crate::db::run_registry::{RunRecord, RunStatus, is_internal_run_branch};
@@ -27,8 +29,8 @@ use crate::table_store::TableStore;
 use super::commit_graph::GraphCommit;
 use super::manifest::Snapshot;
 use super::schema_state::{
-    SCHEMA_SOURCE_FILENAME, load_or_bootstrap_schema_contract, validate_schema_contract,
-    write_schema_contract,
+    SCHEMA_SOURCE_FILENAME, load_or_bootstrap_schema_contract, read_accepted_schema_ir,
+    validate_schema_contract, write_schema_contract,
 };
 use super::{ReadTarget, ResolvedTarget, RunId, SnapshotId};
 
@@ -147,6 +149,14 @@ impl Omnigraph {
 
     pub(crate) async fn ensure_schema_state_valid(&self) -> Result<()> {
         validate_schema_contract(self.uri(), Arc::clone(&self.storage)).await
+    }
+
+    pub async fn plan_schema(&self, desired_schema_source: &str) -> Result<SchemaMigrationPlan> {
+        self.ensure_schema_state_valid().await?;
+        let accepted_ir = read_accepted_schema_ir(self.uri(), Arc::clone(&self.storage)).await?;
+        let desired_ir = read_schema_ir_from_source(desired_schema_source)?;
+        plan_schema_migration(&accepted_ir, &desired_ir)
+            .map_err(|err| OmniError::manifest(err.to_string()))
     }
 
     pub(crate) fn table_store(&self) -> &TableStore {
@@ -2297,6 +2307,7 @@ fn json_value_from_array(array: &dyn Array, row: usize) -> Result<serde_json::Va
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use omnigraph_compiler::{SchemaMigrationStep, SchemaTypeKind};
     use std::fs;
     use std::sync::Mutex;
 
@@ -2547,6 +2558,46 @@ edge WorksAt: Person -> Company
 
         let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
         assert!(snapshot.entry("node:Person").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_plan_schema_reports_supported_additive_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        let desired = TEST_SCHEMA.replace(
+            "    age: I32?\n}",
+            "    age: I32?\n    nickname: String?\n}",
+        );
+
+        let plan = db.plan_schema(&desired).await.unwrap();
+        assert!(plan.supported);
+        assert!(plan.steps.iter().any(|step| matches!(
+            step,
+            SchemaMigrationStep::AddProperty {
+                type_kind: SchemaTypeKind::Node,
+                type_name,
+                property_name,
+                ..
+            } if type_name == "Person" && property_name == "nickname"
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_plan_schema_rejects_when_schema_contract_has_drifted() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        let drifted = TEST_SCHEMA.replace("age: I32?", "age: I64?");
+        fs::write(dir.path().join("_schema.pg"), drifted).unwrap();
+
+        let err = db.plan_schema(TEST_SCHEMA).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("current _schema.pg no longer matches the accepted compiled schema")
+        );
     }
 
     #[tokio::test]

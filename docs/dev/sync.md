@@ -18,6 +18,7 @@ Use [omnigraph-canon.md](/Users/andrew/code/omnigraph/docs/dev/omnigraph-canon.m
 - current top-level commands include:
   - `init`
   - `load`
+  - `schema plan`
   - `branch create`
   - `branch list`
   - `branch merge`
@@ -85,6 +86,10 @@ What does not currently exist as a first-class product surface:
   - existing repos are schema-immutable
   - `_schema.pg` edits are rejected unless a future migration flow updates the accepted IR/state in lockstep
   - public non-`main` branches block legacy schema-state bootstrap entirely
+- the next implemented step is plan-only:
+  - `omnigraph schema plan --schema new.pg <repo>` diffs desired schema against the accepted persisted schema IR
+  - it reports supported additive or explicit-rename steps versus unsupported changes
+  - it does not apply migrations yet
 
 ## SDK And Surface Area
 

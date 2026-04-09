@@ -1,4 +1,5 @@
 pub mod schema_ir;
+pub mod schema_plan;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
