@@ -127,6 +127,7 @@ impl Omnigraph {
         data: &str,
         mode: LoadMode,
     ) -> Result<IngestResult> {
+        self.ensure_schema_state_valid().await?;
         let target_branch =
             Self::normalize_branch_name(branch)?.unwrap_or_else(|| "main".to_string());
         let base_branch = Self::normalize_branch_name(from.unwrap_or("main"))?
@@ -152,6 +153,7 @@ impl Omnigraph {
     }
 
     pub async fn load(&mut self, branch: &str, data: &str, mode: LoadMode) -> Result<LoadResult> {
+        self.ensure_schema_state_valid().await?;
         let requested = Self::normalize_branch_name(branch)?.unwrap_or_else(|| "main".to_string());
         if crate::db::is_internal_run_branch(&requested) {
             return self

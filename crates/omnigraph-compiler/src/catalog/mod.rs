@@ -1,3 +1,5 @@
+pub mod schema_ir;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 

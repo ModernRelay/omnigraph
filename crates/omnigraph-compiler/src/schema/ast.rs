@@ -1,24 +1,25 @@
 use crate::types::PropType;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SchemaFile {
     pub declarations: Vec<SchemaDecl>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SchemaDecl {
     Interface(InterfaceDecl),
     Node(NodeDecl),
     Edge(EdgeDecl),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InterfaceDecl {
     pub name: String,
     pub properties: Vec<PropDecl>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeDecl {
     pub name: String,
     pub annotations: Vec<Annotation>,
@@ -27,7 +28,7 @@ pub struct NodeDecl {
     pub constraints: Vec<Constraint>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EdgeDecl {
     pub name: String,
     pub from_type: String,
@@ -38,14 +39,14 @@ pub struct EdgeDecl {
     pub constraints: Vec<Constraint>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PropDecl {
     pub name: String,
     pub prop_type: PropType,
     pub annotations: Vec<Annotation>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Annotation {
     pub name: String,
     pub value: Option<String>,
@@ -56,7 +57,7 @@ pub struct Annotation {
 /// Property-level annotations (`@key`, `@unique`, `@index`) are desugared
 /// into these during parsing, so both syntactic positions produce the same
 /// representation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Constraint {
     Key(Vec<String>),
     Unique(Vec<String>),
@@ -73,14 +74,14 @@ pub enum Constraint {
 }
 
 /// A numeric bound used in `@range` constraints.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ConstraintBound {
     Integer(i64),
     Float(f64),
 }
 
 /// Edge cardinality: `@card(min..max)`. Default is `0..*`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Cardinality {
     pub min: u32,
     pub max: Option<u32>,

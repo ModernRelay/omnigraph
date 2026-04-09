@@ -25,7 +25,7 @@ The live runtime model is:
 
 Supporting pieces:
 
-- `Catalog`: typed graph model compiled from `_schema.pg`
+- `Catalog`: typed graph model compiled from the accepted persisted schema IR
 - `TableStore`: Lance dataset open, scan, append, merge, and index operations
 - `RuntimeCache`: async interior cache for derived read-side structures
 - `GraphIndex`: topology-only traversal index built from edge tables
@@ -45,6 +45,8 @@ The core mental model is:
 A repo currently contains:
 
 - `_schema.pg`: source schema
+- `_schema.ir.json`: accepted compiled schema contract used by runtime open and future migration work
+- `__schema_state.json`: recorded schema IR hash plus schema identity version
 - `__manifest`: namespace-style manifest table with one stable `table` row per
   logical graph table and one append-only `table_version` row per published
   table version
@@ -65,7 +67,14 @@ Current supported repo root forms are:
 - `s3://...`
 
 That support is real in the runtime now, not just aspirational.
-Repo metadata like `_schema.pg`, `_graph_commits.lance`, and `_graph_runs.lance` go through the storage adapter.
+Repo metadata like `_schema.pg`, `_schema.ir.json`, `__schema_state.json`, `_graph_commits.lance`, and `_graph_runs.lance` go through the storage adapter.
+
+Schema evolution is now intentionally fail-closed in phase 1:
+
+- `_schema.ir.json` is the accepted machine contract for an existing repo
+- `_schema.pg` is still the human-authored source, but editing it does not change the accepted schema
+- if `_schema.pg`, `_schema.ir.json`, or `__schema_state.json` drift out of sync, Omnigraph rejects reads and writes with a conflict
+- legacy repos can auto-bootstrap schema state only when they are effectively single-branch (`main` only)
 
 ## 4. Compiler Layer
 

@@ -80,6 +80,11 @@ What does not currently exist as a first-class product surface:
 - schema migration tooling is still largely missing
 - schema branching and schema merge policy are not solved
 - there is no production-grade schema migration workflow yet
+- phase 1 now persists `_schema.ir.json` and `__schema_state.json` as the accepted schema contract for a repo
+- phase 1 schema policy is fail-closed:
+  - existing repos are schema-immutable
+  - `_schema.pg` edits are rejected unless a future migration flow updates the accepted IR/state in lockstep
+  - public non-`main` branches block legacy schema-state bootstrap entirely
 
 ## SDK And Surface Area
 
@@ -148,7 +153,8 @@ My view:
 
 My view:
 - the notes are right that schema migration is a major unresolved area
-- but there is not enough clarity yet to declare “superset wins” or “branch schema dominates” as policy
+- fail-closed immutability is the correct current policy until a real migration workflow exists
+- branch-local schema evolution should stay out of scope until accepted-schema state and migration planning are first-class
 
 ## SDK Strategy
 

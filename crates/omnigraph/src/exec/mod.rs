@@ -51,6 +51,7 @@ impl Omnigraph {
         query_name: &str,
         params: &ParamMap,
     ) -> Result<QueryResult> {
+        self.ensure_schema_state_valid().await?;
         let resolved = self.resolved_target(target).await?;
 
         let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
@@ -89,6 +90,7 @@ impl Omnigraph {
         query_name: &str,
         params: &ParamMap,
     ) -> Result<QueryResult> {
+        self.ensure_schema_state_valid().await?;
         let snapshot = self.snapshot_at_version(version).await?;
 
         let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
@@ -3225,6 +3227,7 @@ impl Omnigraph {
         query_name: &str,
         params: &ParamMap,
     ) -> Result<MutationResult> {
+        self.ensure_schema_state_valid().await?;
         let requested = Self::normalize_branch_name(branch)?;
         let resolved_params = enrich_mutation_params(params)?;
         let operation = format!(
