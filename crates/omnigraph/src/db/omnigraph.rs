@@ -12,10 +12,10 @@ use lance::blob::{BlobArrayBuilder, blob_field};
 use lance::dataset::BlobFile;
 use lance::dataset::scanner::ColumnOrdering;
 use lance::datatypes::BlobKind;
-use omnigraph_compiler::build_catalog;
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::types::ScalarType;
+use omnigraph_compiler::{SchemaIR, build_catalog_from_ir, build_schema_ir};
 
 use crate::db::graph_coordinator::{GraphCoordinator, PublishedSnapshot};
 use crate::db::run_registry::{RunRecord, RunStatus, is_internal_run_branch};
@@ -26,9 +26,11 @@ use crate::table_store::TableStore;
 
 use super::commit_graph::GraphCommit;
 use super::manifest::Snapshot;
+use super::schema_state::{
+    SCHEMA_SOURCE_FILENAME, load_or_bootstrap_schema_contract, validate_schema_contract,
+    write_schema_contract,
+};
 use super::{ReadTarget, ResolvedTarget, RunId, SnapshotId};
-
-const SCHEMA_FILENAME: &str = "_schema.pg";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeOutcome {
@@ -67,14 +69,14 @@ impl Omnigraph {
         storage: Arc<dyn StorageAdapter>,
     ) -> Result<Self> {
         let root = normalize_root_uri(uri)?;
-        // Parse and validate schema
-        let schema_ast = parse_schema(schema_source)?;
-        let mut catalog = build_catalog(&schema_ast)?;
+        let schema_ir = read_schema_ir_from_source(schema_source)?;
+        let mut catalog = build_catalog_from_ir(&schema_ir)?;
         fixup_blob_schemas(&mut catalog);
 
         // Write _schema.pg
-        let schema_path = join_uri(&root, SCHEMA_FILENAME);
+        let schema_path = join_uri(&root, SCHEMA_SOURCE_FILENAME);
         storage.write_text(&schema_path, schema_source).await?;
+        write_schema_contract(&root, storage.as_ref(), &schema_ir).await?;
 
         // Create manifest + per-type datasets
         let coordinator = GraphCoordinator::init(&root, &catalog, Arc::clone(&storage)).await?;
@@ -104,15 +106,20 @@ impl Omnigraph {
     ) -> Result<Self> {
         let root = normalize_root_uri(uri)?;
         // Read _schema.pg
-        let schema_path = join_uri(&root, SCHEMA_FILENAME);
+        let schema_path = join_uri(&root, SCHEMA_SOURCE_FILENAME);
         let schema_source = storage.read_text(&schema_path).await?;
-
-        // Parse and validate schema
-        let schema_ast = parse_schema(&schema_source)?;
-        let mut catalog = build_catalog(&schema_ast)?;
-        fixup_blob_schemas(&mut catalog);
-
+        let current_source_ir = read_schema_ir_from_source(&schema_source)?;
         let coordinator = GraphCoordinator::open(&root, Arc::clone(&storage)).await?;
+        let branches = coordinator.branch_list().await?;
+        let (accepted_ir, _) = load_or_bootstrap_schema_contract(
+            &root,
+            Arc::clone(&storage),
+            &branches,
+            &current_source_ir,
+        )
+        .await?;
+        let mut catalog = build_catalog_from_ir(&accepted_ir)?;
+        fixup_blob_schemas(&mut catalog);
 
         Ok(Self {
             root_uri: root.clone(),
@@ -136,6 +143,10 @@ impl Omnigraph {
 
     pub fn uri(&self) -> &str {
         &self.root_uri
+    }
+
+    pub(crate) async fn ensure_schema_state_valid(&self) -> Result<()> {
+        validate_schema_contract(self.uri(), Arc::clone(&self.storage)).await
     }
 
     pub(crate) fn table_store(&self) -> &TableStore {
@@ -170,6 +181,7 @@ impl Omnigraph {
         &self,
         branch: Option<&str>,
     ) -> Result<ResolvedTarget> {
+        self.ensure_schema_state_valid().await?;
         let requested = ReadTarget::Branch(branch.unwrap_or("main").to_string());
         let normalized = normalize_branch_name(branch.unwrap_or("main"))?;
         if normalized.as_deref() == self.coordinator.current_branch() {
@@ -227,6 +239,7 @@ impl Omnigraph {
 
     /// Synchronize this handle's write base to the latest head of the named branch.
     pub async fn sync_branch(&mut self, branch: &str) -> Result<()> {
+        self.ensure_schema_state_valid().await?;
         let branch = normalize_branch_name(branch)?;
         self.coordinator = self.open_coordinator_for_branch(branch.as_deref()).await?;
         self.runtime_cache.invalidate_all().await;
@@ -241,6 +254,7 @@ impl Omnigraph {
     }
 
     pub async fn resolve_snapshot(&self, branch: &str) -> Result<SnapshotId> {
+        self.ensure_schema_state_valid().await?;
         self.coordinator.resolve_snapshot_id(branch).await
     }
 
@@ -248,6 +262,7 @@ impl Omnigraph {
         &self,
         target: impl Into<ReadTarget>,
     ) -> Result<ResolvedTarget> {
+        self.ensure_schema_state_valid().await?;
         self.coordinator.resolve_target(&target.into()).await
     }
 
@@ -333,6 +348,7 @@ impl Omnigraph {
 
     /// Create a Snapshot at any historical manifest version.
     pub async fn snapshot_at_version(&self, version: u64) -> Result<Snapshot> {
+        self.ensure_schema_state_valid().await?;
         self.coordinator.snapshot_at_version(version).await
     }
 
@@ -342,6 +358,7 @@ impl Omnigraph {
         type_names: &[String],
         table_keys: &[String],
     ) -> Result<String> {
+        self.ensure_schema_state_valid().await?;
         let snapshot = self.snapshot_of(ReadTarget::branch(branch)).await?;
         self.export_snapshot_jsonl(&snapshot, type_names, table_keys)
             .await
@@ -502,6 +519,7 @@ impl Omnigraph {
 
     /// Get or build the graph index for the current snapshot.
     pub async fn graph_index(&self) -> Result<Arc<crate::graph_index::GraphIndex>> {
+        self.ensure_schema_state_valid().await?;
         let resolved = self
             .coordinator
             .resolve_target(&ReadTarget::Branch(
@@ -549,6 +567,7 @@ impl Omnigraph {
     }
 
     pub(crate) async fn ensure_indices_for_branch(&mut self, branch: Option<&str>) -> Result<()> {
+        self.ensure_schema_state_valid().await?;
         let resolved = self.resolved_branch_target(branch).await?;
         let snapshot = resolved.snapshot;
         let mut updates = Vec::new();
@@ -664,6 +683,7 @@ impl Omnigraph {
     /// let bytes = blob.read().await?;
     /// ```
     pub async fn read_blob(&self, type_name: &str, id: &str, property: &str) -> Result<BlobFile> {
+        self.ensure_schema_state_valid().await?;
         let node_type = self
             .catalog
             .node_types
@@ -837,6 +857,7 @@ impl Omnigraph {
     }
 
     pub async fn branch_create(&mut self, name: &str) -> Result<()> {
+        self.ensure_schema_state_valid().await?;
         ensure_public_branch_ref(name, "branch_create")?;
         self.coordinator.branch_create(name).await
     }
@@ -877,10 +898,12 @@ impl Omnigraph {
     }
 
     pub async fn branch_list(&self) -> Result<Vec<String>> {
+        self.ensure_schema_state_valid().await?;
         self.coordinator.branch_list().await
     }
 
     pub async fn branch_delete(&mut self, name: &str) -> Result<()> {
+        self.ensure_schema_state_valid().await?;
         ensure_public_branch_ref(name, "branch_delete")?;
         self.refresh().await?;
         let branch = normalize_branch_name(name)?
@@ -921,6 +944,7 @@ impl Omnigraph {
         operation_hash: Option<&str>,
         actor_id: Option<&str>,
     ) -> Result<RunRecord> {
+        self.ensure_schema_state_valid().await?;
         ensure_public_branch_ref(target_branch, "begin_run")?;
         let target_branch =
             normalize_branch_name(target_branch)?.unwrap_or_else(|| "main".to_string());
@@ -950,20 +974,24 @@ impl Omnigraph {
     }
 
     pub async fn get_run(&self, run_id: &RunId) -> Result<RunRecord> {
+        self.ensure_schema_state_valid().await?;
         self.coordinator.get_run(run_id).await
     }
 
     pub async fn list_runs(&self) -> Result<Vec<RunRecord>> {
+        self.ensure_schema_state_valid().await?;
         self.coordinator.list_runs().await
     }
 
     pub async fn get_commit(&self, commit_id: &str) -> Result<GraphCommit> {
+        self.ensure_schema_state_valid().await?;
         self.coordinator
             .resolve_commit(&SnapshotId::new(commit_id))
             .await
     }
 
     pub async fn list_commits(&self, branch: Option<&str>) -> Result<Vec<GraphCommit>> {
+        self.ensure_schema_state_valid().await?;
         let branch = match branch {
             Some(branch) => normalize_branch_name(branch)?,
             None => None,
@@ -973,6 +1001,7 @@ impl Omnigraph {
     }
 
     pub async fn abort_run(&mut self, run_id: &RunId) -> Result<RunRecord> {
+        self.ensure_schema_state_valid().await?;
         let run = self.get_run(run_id).await?;
         match run.status {
             RunStatus::Running | RunStatus::Failed => {
@@ -992,6 +1021,7 @@ impl Omnigraph {
     }
 
     pub async fn fail_run(&mut self, run_id: &RunId) -> Result<RunRecord> {
+        self.ensure_schema_state_valid().await?;
         let run = self.get_run(run_id).await?;
         match run.status {
             RunStatus::Running => {
@@ -1020,6 +1050,7 @@ impl Omnigraph {
         run_id: &RunId,
         actor_id: Option<&str>,
     ) -> Result<SnapshotId> {
+        self.ensure_schema_state_valid().await?;
         let run = self.get_run(run_id).await?;
         match run.status {
             RunStatus::Running => {}
@@ -2063,6 +2094,11 @@ fn fixup_blob_schemas(catalog: &mut Catalog) {
     }
 }
 
+fn read_schema_ir_from_source(schema_source: &str) -> Result<SchemaIR> {
+    let schema_ast = parse_schema(schema_source)?;
+    build_schema_ir(&schema_ast).map_err(|err| OmniError::manifest(err.to_string()))
+}
+
 fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result<Arc<Schema>> {
     if let Some(type_name) = table_key.strip_prefix("node:") {
         let node_type: &NodeType = catalog
@@ -2261,6 +2297,7 @@ fn json_value_from_array(array: &dyn Array, row: usize) -> Result<serde_json::Va
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use std::fs;
     use std::sync::Mutex;
 
     use crate::storage::{LocalStorageAdapter, StorageAdapter, join_uri};
@@ -2328,6 +2365,8 @@ edge WorksAt: Person -> Company
 
         // Schema file written
         assert!(dir.path().join("_schema.pg").exists());
+        assert!(dir.path().join("_schema.ir.json").exists());
+        assert!(dir.path().join("__schema_state.json").exists());
 
         // Manifest created with correct entries
         let snap = db.snapshot();
@@ -2371,16 +2410,143 @@ edge WorksAt: Person -> Company
             .await
             .unwrap();
         assert!(adapter.writes().contains(&join_uri(uri, "_schema.pg")));
+        assert!(adapter.writes().contains(&join_uri(uri, "_schema.ir.json")));
+        assert!(
+            adapter
+                .writes()
+                .contains(&join_uri(uri, "__schema_state.json"))
+        );
 
         Omnigraph::open_with_storage(uri, adapter.clone())
             .await
             .unwrap();
         assert!(adapter.reads().contains(&join_uri(uri, "_schema.pg")));
+        assert!(adapter.reads().contains(&join_uri(uri, "_schema.ir.json")));
+        assert!(
+            adapter
+                .reads()
+                .contains(&join_uri(uri, "__schema_state.json"))
+        );
+        assert!(
+            adapter
+                .exists_checks()
+                .contains(&join_uri(uri, "_schema.ir.json"))
+        );
+        assert!(
+            adapter
+                .exists_checks()
+                .contains(&join_uri(uri, "__schema_state.json"))
+        );
         assert!(
             adapter
                 .exists_checks()
                 .contains(&join_uri(uri, "_graph_commits.lance"))
         );
+    }
+
+    #[tokio::test]
+    async fn test_open_bootstraps_legacy_schema_state_for_main_only_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        fs::remove_file(dir.path().join("_schema.ir.json")).unwrap();
+        fs::remove_file(dir.path().join("__schema_state.json")).unwrap();
+
+        let db = Omnigraph::open(uri).await.unwrap();
+        assert_eq!(db.catalog().node_types.len(), 2);
+        assert!(dir.path().join("_schema.ir.json").exists());
+        assert!(dir.path().join("__schema_state.json").exists());
+    }
+
+    #[tokio::test]
+    async fn test_open_rejects_legacy_repo_with_public_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        db.branch_create("feature").await.unwrap();
+
+        fs::remove_file(dir.path().join("_schema.ir.json")).unwrap();
+        fs::remove_file(dir.path().join("__schema_state.json")).unwrap();
+
+        let err = match Omnigraph::open(uri).await {
+            Ok(_) => panic!("expected legacy repo with public branch to fail schema bootstrap"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(message.contains("public branches block schema evolution entirely"));
+    }
+
+    #[tokio::test]
+    async fn test_long_lived_handle_rejects_schema_source_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        let drifted = TEST_SCHEMA.replace("age: I32?", "age: I64?");
+        fs::write(dir.path().join("_schema.pg"), drifted).unwrap();
+
+        let err = match db.snapshot_of(ReadTarget::branch("main")).await {
+            Ok(_) => panic!("expected schema source drift to be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("current _schema.pg no longer matches the accepted compiled schema")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_long_lived_handle_rejects_schema_ir_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        fs::write(dir.path().join("_schema.ir.json"), "{not valid json").unwrap();
+
+        let err = match db.snapshot_of(ReadTarget::branch("main")).await {
+            Ok(_) => panic!("expected schema IR drift to be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("accepted compiled schema contract in _schema.ir.json is invalid")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_long_lived_handle_rejects_ir_and_source_updates_without_state_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        let drifted = TEST_SCHEMA.replace("age: I32?", "age: I64?");
+        let drifted_ir = read_schema_ir_from_source(&drifted).unwrap();
+        let drifted_ir_json = omnigraph_compiler::schema_ir_pretty_json(&drifted_ir).unwrap();
+        fs::write(dir.path().join("_schema.pg"), drifted).unwrap();
+        fs::write(dir.path().join("_schema.ir.json"), drifted_ir_json).unwrap();
+
+        let err = match db.snapshot_of(ReadTarget::branch("main")).await {
+            Ok(_) => panic!("expected schema state mismatch to be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("accepted compiled schema does not match the recorded schema state")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_comment_only_schema_edit_keeps_schema_state_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        let commented = format!("// comment-only drift\n{}", TEST_SCHEMA);
+        fs::write(dir.path().join("_schema.pg"), commented).unwrap();
+
+        let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+        assert!(snapshot.entry("node:Person").is_some());
     }
 
     #[tokio::test]

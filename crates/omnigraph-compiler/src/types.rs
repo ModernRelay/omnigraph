@@ -1,8 +1,9 @@
 use arrow_schema::DataType;
+use serde::{Deserialize, Serialize};
 
 const MAX_VECTOR_DIM: u32 = i32::MAX as u32;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ScalarType {
     String,
     Bool,
@@ -96,7 +97,7 @@ impl std::fmt::Display for ScalarType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PropType {
     pub scalar: ScalarType,
     pub nullable: bool,

@@ -3,6 +3,7 @@ pub mod graph_coordinator;
 pub mod manifest;
 mod omnigraph;
 mod run_registry;
+mod schema_state;
 
 pub use commit_graph::GraphCommit;
 pub use graph_coordinator::{GraphCoordinator, ReadTarget, ResolvedTarget, SnapshotId};

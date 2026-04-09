@@ -118,6 +118,12 @@ fn repo_path(root: &Path) -> PathBuf {
     root.join("server.omni")
 }
 
+fn drifted_test_schema() -> String {
+    fs::read_to_string(fixture("test.pg"))
+        .unwrap()
+        .replace("age: I32?", "age: I64?")
+}
+
 async fn manifest_dataset_version(repo: &Path) -> u64 {
     Omnigraph::open(repo.to_string_lossy().as_ref())
         .await
@@ -312,6 +318,91 @@ async fn healthz_succeeds_after_startup() {
         Some(source_version) => assert_eq!(body["source_version"], source_version),
         None => assert!(body.get("source_version").is_none()),
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_drift_returns_conflict_for_snapshot_read_and_change() {
+    let (temp, app) = app_for_loaded_repo().await;
+    let repo = repo_path(temp.path());
+    fs::write(repo.join("_schema.pg"), drifted_test_schema()).unwrap();
+
+    let (snapshot_status, snapshot_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/snapshot?branch=main")
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let snapshot_error: ErrorOutput = serde_json::from_value(snapshot_body).unwrap();
+    assert_eq!(snapshot_status, StatusCode::CONFLICT);
+    assert_eq!(
+        snapshot_error.code,
+        Some(omnigraph_server::api::ErrorCode::Conflict)
+    );
+    assert!(
+        snapshot_error
+            .error
+            .contains("schema evolution is locked down in phase 1")
+    );
+
+    let read = ReadRequest {
+        query_source: fs::read_to_string(fixture("test.gq")).unwrap(),
+        query_name: Some("get_person".to_string()),
+        params: Some(json!({ "name": "Alice" })),
+        branch: Some("main".to_string()),
+        snapshot: None,
+    };
+    let (read_status, read_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/read")
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&read).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    let read_error: ErrorOutput = serde_json::from_value(read_body).unwrap();
+    assert_eq!(read_status, StatusCode::CONFLICT);
+    assert_eq!(
+        read_error.code,
+        Some(omnigraph_server::api::ErrorCode::Conflict)
+    );
+    assert!(
+        read_error
+            .error
+            .contains("schema evolution is locked down in phase 1")
+    );
+
+    let change = ChangeRequest {
+        query_source: MUTATION_QUERIES.to_string(),
+        query_name: Some("insert_person".to_string()),
+        params: Some(json!({ "name": "Mina", "age": 28 })),
+        branch: Some("main".to_string()),
+    };
+    let (change_status, change_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/change")
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&change).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    let change_error: ErrorOutput = serde_json::from_value(change_body).unwrap();
+    assert_eq!(change_status, StatusCode::CONFLICT);
+    assert_eq!(
+        change_error.code,
+        Some(omnigraph_server::api::ErrorCode::Conflict)
+    );
+    assert!(
+        change_error
+            .error
+            .contains("schema evolution is locked down in phase 1")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
