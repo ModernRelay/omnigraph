@@ -15,8 +15,9 @@ concurrency:
 
 jobs:
   ci:
-    uses: ModernRelay/omnigraph-platform/.github/workflows/reusable-ci.yml@main
+    permissions:
+      contents: read
+    uses: ModernRelay/.github/.github/workflows/omnigraph-ci.yml@v1
     with:
       repository: ${{ github.repository }}
       ref: ${{ github.sha }}
-    secrets: inherit

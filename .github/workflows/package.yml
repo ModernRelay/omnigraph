@@ -23,7 +23,8 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    uses: ModernRelay/omnigraph-platform/.github/workflows/reusable-package.yml@main
+      attestations: write
+    uses: ModernRelay/.github/.github/workflows/omnigraph-package.yml@v1
     with:
       repository: ${{ github.repository }}
       source_ref: ${{ github.event.inputs.source_ref || github.sha }}
@@ -32,4 +33,3 @@ jobs:
       aws_codebuild_package_project: ${{ vars.AWS_CODEBUILD_PACKAGE_PROJECT }}
       aws_artifact_bucket: ${{ vars.AWS_ARTIFACT_BUCKET }}
       omnigraph_ecr_repository: omnigraph-server
-    secrets: inherit

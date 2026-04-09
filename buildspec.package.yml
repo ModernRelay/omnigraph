@@ -21,15 +21,16 @@ phases:
       - set -euo pipefail
       - source "$HOME/.cargo/env"
       - cargo build --release --locked -p omnigraph-server -p omnigraph-cli
-      - mkdir -p dist
+      - mkdir -p dist release
       - install -m 0755 target/release/omnigraph-server dist/omnigraph-server
       - install -m 0755 target/release/omnigraph dist/omnigraph
-      - tar -C dist -czf "dist/omnigraph-linux-x86_64.tar.gz" omnigraph-server omnigraph
+      - tar -C dist -czf "release/omnigraph-linux-x86_64.tar.gz" omnigraph-server omnigraph
       - |
         source_sha="${OMNIGRAPH_SOURCE_VERSION:-${CODEBUILD_RESOLVED_SOURCE_VERSION:-manual}}"
-        artifact_prefix="builds/${source_sha}"
+        build_prefix="builds/${source_sha}"
+        artifact_prefix="${build_prefix}"
         if [[ -n "${OMNIGRAPH_ARTIFACT_BUCKET:-}" ]]; then
-          artifact_prefix="s3://${OMNIGRAPH_ARTIFACT_BUCKET}/builds/${source_sha}"
+          artifact_prefix="s3://${OMNIGRAPH_ARTIFACT_BUCKET}/${build_prefix}"
         fi
         image_ref=""
         image_digest=""
@@ -66,14 +67,22 @@ phases:
             "image_digest": optional("OMNIGRAPH_IMAGE_DIGEST"),
             "artifact_prefix": os.environ["OMNIGRAPH_ARTIFACT_PREFIX"],
         }
-        Path("dist/image.json").write_text(json.dumps(payload, separators=(",", ":")) + "\n")
+        Path("release/image.json").write_text(json.dumps(payload, separators=(",", ":")) + "\n")
         PY
-      - (cd dist && sha256sum omnigraph-linux-x86_64.tar.gz > SHA256SUMS)
+      - (cd release && sha256sum omnigraph-linux-x86_64.tar.gz > SHA256SUMS)
+      - |
+        source_sha="${OMNIGRAPH_SOURCE_VERSION:-${CODEBUILD_RESOLVED_SOURCE_VERSION:-manual}}"
+        if [[ -n "${OMNIGRAPH_ARTIFACT_BUCKET:-}" ]]; then
+          build_prefix="builds/${source_sha}"
+          aws s3 cp "release/omnigraph-linux-x86_64.tar.gz" "s3://${OMNIGRAPH_ARTIFACT_BUCKET}/${build_prefix}/omnigraph-linux-x86_64.tar.gz"
+          aws s3 cp "release/SHA256SUMS" "s3://${OMNIGRAPH_ARTIFACT_BUCKET}/${build_prefix}/SHA256SUMS"
+          aws s3 cp "release/image.json" "s3://${OMNIGRAPH_ARTIFACT_BUCKET}/${build_prefix}/image.json"
+        fi
 
 artifacts:
   files:
-    - dist/omnigraph-linux-x86_64.tar.gz
-    - dist/SHA256SUMS
-    - dist/image.json
-  discard-paths: no
+    - release/omnigraph-linux-x86_64.tar.gz
+    - release/SHA256SUMS
+    - release/image.json
+  discard-paths: yes
   name: $OMNIGRAPH_SOURCE_VERSION

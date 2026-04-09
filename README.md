@@ -10,9 +10,10 @@ Active workspace crates:
 
 ## CI and Platform Ownership
 
-`omnigraph` remains the application source repo. CI and packaging are triggered here
-through thin GitHub Actions wrappers, while Terraform, reusable workflows, deploy
-automation, and environment runbooks live in `ModernRelay/omnigraph-platform`.
+`omnigraph` remains the application source repo. CI and packaging are triggered
+here through thin GitHub Actions wrappers, while public reusable workflows live
+in `ModernRelay/.github` and private deploy/Terraform ownership lives in
+`ModernRelay/omnigraph-platform`.
 
 ## CLI
 
