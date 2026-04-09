@@ -106,10 +106,11 @@ This is the same contract we want later for ECS target groups.
 
 The current package flow is:
 
-1. GitHub Actions packages committed repository source only
+1. `omnigraph` triggers package via the reusable workflow in `ModernRelay/omnigraph-platform`
 2. CodeBuild on Amazon Linux 2023 compiles `target/release/omnigraph-server`
 3. Docker builds the runtime image from that compiled binary
-4. the image is pushed to ECR with the commit SHA as the standard tag
+4. the image is pushed to ECR with the commit SHA as the build tag
+5. `dist/image.json` records `source_sha`, immutable `image_ref`, `image_digest`, and `artifact_prefix`
 
 This avoids:
 
@@ -137,8 +138,8 @@ So deployment stays split:
 
 The standard preview server deploy is now:
 
-1. run `Package`
-2. run `Deploy Preview Server`
+1. run `Package` from `omnigraph`
+2. run `Deploy Preview Server` from `ModernRelay/omnigraph-platform`
 3. that workflow updates `/omnigraph/server/image`
 4. the EC2 host restarts `omnigraph-server.service`, which pulls the new image and runs it via `docker run`
 

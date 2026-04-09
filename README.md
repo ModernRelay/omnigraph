@@ -8,6 +8,12 @@ Active workspace crates:
 - `crates/omnigraph`: Omnigraph storage/runtime, branching, merge, change detection, and query execution
 - `crates/omnigraph-cli`: CLI for repo init/load/branch/snapshot commands
 
+## CI and Platform Ownership
+
+`omnigraph` remains the application source repo. CI and packaging are triggered here
+through thin GitHub Actions wrappers, while Terraform, reusable workflows, deploy
+automation, and environment runbooks live in `ModernRelay/omnigraph-platform`.
+
 ## CLI
 
 ```bash
@@ -40,6 +46,9 @@ cargo run -p omnigraph-cli -- branch create --uri ./demo.omni --from main featur
 
 # List branches
 cargo run -p omnigraph-cli -- branch list --uri ./demo.omni
+
+# Delete a branch
+cargo run -p omnigraph-cli -- branch delete --uri ./demo.omni feature-x
 
 # Merge a branch into main
 cargo run -p omnigraph-cli -- branch merge --uri ./demo.omni feature-x

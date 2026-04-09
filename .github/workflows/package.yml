@@ -18,113 +18,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  codebuild_package:
-    name: Package via CodeBuild (AL2023)
+  package:
     if: ${{ vars.AWS_CODEBUILD_PACKAGE_PROJECT != '' && vars.AWS_ROLE_TO_ASSUME != '' && vars.AWS_REGION != '' && vars.AWS_ARTIFACT_BUCKET != '' }}
-    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       id-token: write
       contents: read
-    env:
-      AWS_REGION: ${{ vars.AWS_REGION }}
-      AWS_CODEBUILD_PACKAGE_PROJECT: ${{ vars.AWS_CODEBUILD_PACKAGE_PROJECT }}
-      AWS_ARTIFACT_BUCKET: ${{ vars.AWS_ARTIFACT_BUCKET }}
-      OMNIGRAPH_ECR_REPOSITORY: omnigraph-server
-    steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Resolve source ref
-        id: source_ref
-        env:
-          WORKFLOW_SOURCE_REF: ${{ github.event.inputs.source_ref }}
-        run: |
-          source_ref="${GITHUB_SHA}"
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && -n "${WORKFLOW_SOURCE_REF}" ]]; then
-            source_ref="${WORKFLOW_SOURCE_REF}"
-          fi
-          echo "value=${source_ref}" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout source
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ steps.source_ref.outputs.value }}
-          fetch-depth: 1
-
-      - name: Resolve source commit
-        id: source_commit
-        run: |
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Create source bundle
-        id: source_bundle
-        env:
-          SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
-          BUNDLE_PATH: ${{ runner.temp }}/omnigraph-source.zip
-        run: |
-          bundle_path="${RUNNER_TEMP}/omnigraph-source.zip"
-          python3 - <<'PY'
-          import os
-          import subprocess
-          import zipfile
-
-          bundle_path = os.environ["BUNDLE_PATH"]
-          files = subprocess.check_output(["git", "ls-files", "-z"], text=False).decode().split("\0")
-          with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-              for path in files:
-                  if path:
-                      archive.write(path, arcname=path)
-          PY
-          source_key="sources/${SOURCE_SHA}/omnigraph-source.zip"
-          echo "path=${bundle_path}" >> "$GITHUB_OUTPUT"
-          echo "key=${source_key}" >> "$GITHUB_OUTPUT"
-
-      - name: Upload source bundle
-        run: |
-          aws s3 cp \
-            "${{ steps.source_bundle.outputs.path }}" \
-            "s3://${AWS_ARTIFACT_BUCKET}/${{ steps.source_bundle.outputs.key }}"
-
-      - name: Start CodeBuild package job
-        id: start
-        run: |
-          build_id="$(aws codebuild start-build \
-            --project-name "${AWS_CODEBUILD_PACKAGE_PROJECT}" \
-            --source-type-override S3 \
-            --source-location-override "${AWS_ARTIFACT_BUCKET}/${{ steps.source_bundle.outputs.key }}" \
-            --buildspec-override buildspec.package.yml \
-            --environment-variables-override \
-              name=OMNIGRAPH_SOURCE_VERSION,value="${{ steps.source_commit.outputs.sha }}",type=PLAINTEXT \
-              name=OMNIGRAPH_ECR_REPOSITORY,value="${OMNIGRAPH_ECR_REPOSITORY}",type=PLAINTEXT \
-            --query 'build.id' \
-            --output text)"
-          echo "build_id=${build_id}" >> "$GITHUB_OUTPUT"
-
-      - name: Wait for CodeBuild completion
-        run: |
-          build_id="${{ steps.start.outputs.build_id }}"
-          while true; do
-            status="$(aws codebuild batch-get-builds --ids "${build_id}" --query 'builds[0].buildStatus' --output text)"
-            echo "CodeBuild status: ${status}"
-            case "${status}" in
-              SUCCEEDED)
-                exit 0
-                ;;
-              FAILED|FAULT|STOPPED|TIMED_OUT)
-                aws codebuild batch-get-builds --ids "${build_id}" --query 'builds[0].logs.deepLink' --output text
-                exit 1
-                ;;
-            esac
-            sleep 15
-          done
-
-      - name: Print CodeBuild logs link
-        if: always()
-        run: |
-          aws codebuild batch-get-builds \
-            --ids "${{ steps.start.outputs.build_id }}" \
-            --query 'builds[0].logs.deepLink' \
-            --output text
+    uses: ModernRelay/omnigraph-platform/.github/workflows/reusable-package.yml@main
+    with:
+      repository: ${{ github.repository }}
+      source_ref: ${{ github.event.inputs.source_ref || github.sha }}
+      aws_region: ${{ vars.AWS_REGION }}
+      aws_role_to_assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+      aws_codebuild_package_project: ${{ vars.AWS_CODEBUILD_PACKAGE_PROJECT }}
+      aws_artifact_bucket: ${{ vars.AWS_ARTIFACT_BUCKET }}
+      omnigraph_ecr_repository: omnigraph-server
+    secrets: inherit

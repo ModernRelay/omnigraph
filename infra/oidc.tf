@@ -71,6 +71,38 @@ data "aws_iam_policy_document" "github_actions_ci" {
     ]
     resources = [aws_ecr_repository.omnigraph_server.arn]
   }
+
+  # Preview deploy parameter reads/writes.
+  statement {
+    actions = [
+      "ssm:GetParameter",
+      "ssm:PutParameter",
+    ]
+    resources = [
+      aws_ssm_parameter.bearer_token.arn,
+      aws_ssm_parameter.repo_target_uri.arn,
+      aws_ssm_parameter.server_image.arn,
+    ]
+  }
+
+  # Team bearer token materialization for preview deploys.
+  statement {
+    actions = [
+      "ssm:GetParametersByPath",
+    ]
+    resources = [
+      "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${var.project_name}/server/tokens/*",
+    ]
+  }
+
+  # Run Command orchestration for the preview EC2 host.
+  statement {
+    actions = [
+      "ssm:SendCommand",
+      "ssm:GetCommandInvocation",
+    ]
+    resources = ["*"]
+  }
 }
 
 resource "aws_iam_role_policy" "github_actions_ci" {

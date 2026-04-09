@@ -141,8 +141,10 @@ variable "github_oidc_subjects" {
   description = "Allowed OIDC sub claims for GitHub Actions."
   type        = list(string)
   default = [
-    "repo:ModernRelay/omnigraph:ref:refs/heads/main",
+    "repo:ModernRelay/omnigraph:ref:refs/heads/*",
     "repo:ModernRelay/omnigraph:ref:refs/tags/*",
+    "repo:ModernRelay/omnigraph-platform:ref:refs/heads/*",
+    "repo:ModernRelay/omnigraph-platform:ref:refs/tags/*",
   ]
 }
 

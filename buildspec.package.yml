@@ -25,17 +25,49 @@ phases:
       - install -m 0755 target/release/omnigraph-server dist/omnigraph-server
       - install -m 0755 target/release/omnigraph dist/omnigraph
       - tar -C dist -czf "dist/omnigraph-linux-x86_64.tar.gz" omnigraph-server omnigraph
-      - printf '{"image":null,"tag":null}\n' > dist/image.json
       - |
+        source_sha="${OMNIGRAPH_SOURCE_VERSION:-${CODEBUILD_RESOLVED_SOURCE_VERSION:-manual}}"
+        artifact_prefix="builds/${source_sha}"
+        if [[ -n "${OMNIGRAPH_ARTIFACT_BUCKET:-}" ]]; then
+          artifact_prefix="s3://${OMNIGRAPH_ARTIFACT_BUCKET}/builds/${source_sha}"
+        fi
+        image_ref=""
+        image_digest=""
         if [[ -n "${OMNIGRAPH_ECR_REPOSITORY:-}" ]]; then
           account_id="$(aws sts get-caller-identity --query Account --output text)"
           registry="${account_id}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-          image_tag="${OMNIGRAPH_SOURCE_VERSION:-${CODEBUILD_RESOLVED_SOURCE_VERSION:-manual}}"
+          image_tag="${source_sha}"
           aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${registry}"
           docker build -t "${registry}/${OMNIGRAPH_ECR_REPOSITORY}:${image_tag}" .
           docker push "${registry}/${OMNIGRAPH_ECR_REPOSITORY}:${image_tag}"
-          printf '{"image":"%s","tag":"%s"}\n' "${registry}/${OMNIGRAPH_ECR_REPOSITORY}" "${image_tag}" > dist/image.json
+          image_digest="$(aws ecr describe-images \
+            --repository-name "${OMNIGRAPH_ECR_REPOSITORY}" \
+            --image-ids "imageTag=${image_tag}" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)"
+          image_ref="${registry}/${OMNIGRAPH_ECR_REPOSITORY}@${image_digest}"
         fi
+        export OMNIGRAPH_SOURCE_SHA="${source_sha}"
+        export OMNIGRAPH_ARTIFACT_PREFIX="${artifact_prefix}"
+        export OMNIGRAPH_IMAGE_REF="${image_ref}"
+        export OMNIGRAPH_IMAGE_DIGEST="${image_digest}"
+        python3 - <<'PY'
+        import json
+        import os
+        from pathlib import Path
+
+        def optional(name: str):
+            value = os.environ.get(name, "").strip()
+            return value or None
+
+        payload = {
+            "source_sha": os.environ["OMNIGRAPH_SOURCE_SHA"],
+            "image_ref": optional("OMNIGRAPH_IMAGE_REF"),
+            "image_digest": optional("OMNIGRAPH_IMAGE_DIGEST"),
+            "artifact_prefix": os.environ["OMNIGRAPH_ARTIFACT_PREFIX"],
+        }
+        Path("dist/image.json").write_text(json.dumps(payload, separators=(",", ":")) + "\n")
+        PY
       - (cd dist && sha256sum omnigraph-linux-x86_64.tar.gz > SHA256SUMS)
 
 artifacts:
@@ -44,3 +76,4 @@ artifacts:
     - dist/SHA256SUMS
     - dist/image.json
   discard-paths: no
+  name: $OMNIGRAPH_SOURCE_VERSION

@@ -85,8 +85,7 @@ resource "aws_codebuild_project" "package" {
 
   source {
     # Source is supplied by GitHub Actions via S3 source overrides.
-    type      = "NO_SOURCE"
-    buildspec = file("${path.module}/buildspec.package.yml")
+    type = "NO_SOURCE"
   }
 
   environment {
