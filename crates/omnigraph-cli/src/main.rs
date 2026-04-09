@@ -8,7 +8,7 @@ use omnigraph::db::{Omnigraph, ReadTarget, RunId, SnapshotId};
 use omnigraph::loader::LoadMode;
 use omnigraph_compiler::json_params_to_param_map;
 use omnigraph_compiler::query::parser::parse_query;
-use omnigraph_compiler::{JsonParamMode, ParamMap};
+use omnigraph_compiler::{JsonParamMode, ParamMap, SchemaMigrationPlan, SchemaMigrationStep};
 use omnigraph_server::api::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
@@ -96,6 +96,11 @@ enum Command {
     Branch {
         #[command(subcommand)]
         command: BranchCommand,
+    },
+    /// Schema planning operations
+    Schema {
+        #[command(subcommand)]
+        command: SchemaCommand,
     },
     /// Show repo snapshot
     Snapshot {
@@ -254,6 +259,23 @@ enum BranchCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum SchemaCommand {
+    /// Plan a schema migration against the accepted persisted schema
+    Plan {
+        /// Repo URI
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        schema: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum RunCommand {
     /// List transactional runs
     List {
@@ -406,6 +428,14 @@ struct LoadOutput<'a> {
     mode: &'a str,
     nodes_loaded: usize,
     edges_loaded: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct SchemaPlanOutput<'a> {
+    uri: &'a str,
+    supported: bool,
+    step_count: usize,
+    steps: &'a [SchemaMigrationStep],
 }
 
 fn ensure_local_repo_parent(uri: &str) -> Result<()> {
@@ -784,6 +814,156 @@ fn print_ingest_human(output: &IngestOutput) {
     if let Some(actor_id) = &output.actor_id {
         println!("actor_id: {}", actor_id);
     }
+}
+
+fn print_schema_plan_human(uri: &str, plan: &SchemaMigrationPlan) {
+    println!("schema plan for {}", uri);
+    println!("supported: {}", if plan.supported { "yes" } else { "no" });
+    if plan.steps.is_empty() {
+        println!("no schema changes");
+        return;
+    }
+    for step in &plan.steps {
+        println!("- {}", render_schema_plan_step(step));
+    }
+}
+
+fn render_schema_plan_step(step: &SchemaMigrationStep) -> String {
+    match step {
+        SchemaMigrationStep::AddType { type_kind, name } => {
+            format!("add {} type '{}'", schema_type_kind_label(*type_kind), name)
+        }
+        SchemaMigrationStep::RenameType {
+            type_kind,
+            from,
+            to,
+        } => format!(
+            "rename {} type '{}' -> '{}'",
+            schema_type_kind_label(*type_kind),
+            from,
+            to
+        ),
+        SchemaMigrationStep::AddProperty {
+            type_kind,
+            type_name,
+            property_name,
+            property_type,
+        } => format!(
+            "add property '{}.{}' ({}) on {} '{}'",
+            type_name,
+            property_name,
+            render_prop_type(property_type),
+            schema_type_kind_label(*type_kind),
+            type_name
+        ),
+        SchemaMigrationStep::RenameProperty {
+            type_kind,
+            type_name,
+            from,
+            to,
+        } => format!(
+            "rename property '{}.{}' -> '{}.{}' on {} '{}'",
+            type_name,
+            from,
+            type_name,
+            to,
+            schema_type_kind_label(*type_kind),
+            type_name
+        ),
+        SchemaMigrationStep::AddConstraint {
+            type_kind,
+            type_name,
+            constraint,
+        } => format!(
+            "add constraint {} on {} '{}'",
+            render_constraint(constraint),
+            schema_type_kind_label(*type_kind),
+            type_name
+        ),
+        SchemaMigrationStep::UpdateTypeMetadata {
+            type_kind,
+            name,
+            annotations,
+        } => format!(
+            "update metadata on {} '{}' ({})",
+            schema_type_kind_label(*type_kind),
+            name,
+            render_annotations(annotations)
+        ),
+        SchemaMigrationStep::UpdatePropertyMetadata {
+            type_kind,
+            type_name,
+            property_name,
+            annotations,
+        } => format!(
+            "update metadata on property '{}.{}' of {} '{}' ({})",
+            type_name,
+            property_name,
+            schema_type_kind_label(*type_kind),
+            type_name,
+            render_annotations(annotations)
+        ),
+        SchemaMigrationStep::UnsupportedChange { entity, reason } => {
+            format!("unsupported change on {}: {}", entity, reason)
+        }
+    }
+}
+
+fn schema_type_kind_label(kind: omnigraph_compiler::SchemaTypeKind) -> &'static str {
+    match kind {
+        omnigraph_compiler::SchemaTypeKind::Interface => "interface",
+        omnigraph_compiler::SchemaTypeKind::Node => "node",
+        omnigraph_compiler::SchemaTypeKind::Edge => "edge",
+    }
+}
+
+fn render_prop_type(prop_type: &omnigraph_compiler::PropType) -> String {
+    let base = if let Some(values) = &prop_type.enum_values {
+        format!("Enum({})", values.join("|"))
+    } else {
+        prop_type.scalar.to_string()
+    };
+    let base = if prop_type.list {
+        format!("[{}]", base)
+    } else {
+        base
+    };
+    if prop_type.nullable {
+        format!("{}?", base)
+    } else {
+        base
+    }
+}
+
+fn render_constraint(constraint: &omnigraph_compiler::schema::ast::Constraint) -> String {
+    match constraint {
+        omnigraph_compiler::schema::ast::Constraint::Key(columns) => {
+            format!("@key({})", columns.join(", "))
+        }
+        omnigraph_compiler::schema::ast::Constraint::Unique(columns) => {
+            format!("@unique({})", columns.join(", "))
+        }
+        omnigraph_compiler::schema::ast::Constraint::Index(columns) => {
+            format!("@index({})", columns.join(", "))
+        }
+        omnigraph_compiler::schema::ast::Constraint::Range { property, min, max } => {
+            format!("@range({}, {:?}, {:?})", property, min, max)
+        }
+        omnigraph_compiler::schema::ast::Constraint::Check { property, pattern } => {
+            format!("@check({}, {:?})", property, pattern)
+        }
+    }
+}
+
+fn render_annotations(annotations: &[omnigraph_compiler::schema::ast::Annotation]) -> String {
+    annotations
+        .iter()
+        .map(|annotation| match &annotation.value {
+            Some(value) => format!("@{}({})", annotation.name, value),
+            None => format!("@{}", annotation.name),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn print_embed_human(output: &EmbedOutput) {
@@ -1584,6 +1764,32 @@ async fn main() -> Result<()> {
                     print_json(&commit)?;
                 } else {
                     print_commit_human(&commit);
+                }
+            }
+        },
+        Command::Schema { command } => match command {
+            SchemaCommand::Plan {
+                uri,
+                target,
+                config,
+                schema,
+                json,
+            } => {
+                let config = load_cli_config(config.as_ref())?;
+                let uri = resolve_local_uri(&config, uri, target.as_deref(), "schema plan")?;
+                let schema_source = fs::read_to_string(&schema)?;
+                let db = Omnigraph::open(&uri).await?;
+                let plan = db.plan_schema(&schema_source).await?;
+                let output = SchemaPlanOutput {
+                    uri: &uri,
+                    supported: plan.supported,
+                    step_count: plan.steps.len(),
+                    steps: &plan.steps,
+                };
+                if json {
+                    print_json(&output)?;
+                } else {
+                    print_schema_plan_human(&uri, &plan);
                 }
             }
         },

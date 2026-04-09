@@ -14,6 +14,9 @@ pub use catalog::schema_ir::{
     SchemaIR, build_catalog_from_ir, build_schema_ir, schema_ir_hash, schema_ir_json,
     schema_ir_pretty_json,
 };
+pub use catalog::schema_plan::{
+    SchemaMigrationPlan, SchemaMigrationStep, SchemaTypeKind, plan_schema_migration,
+};
 pub use ir::ParamMap;
 pub use ir::lower::{lower_mutation_query, lower_query};
 pub use query::ast::Literal;

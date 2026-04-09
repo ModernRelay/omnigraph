@@ -235,6 +235,71 @@ fn init_creates_repo_successfully_on_missing_local_directory() {
 }
 
 #[test]
+fn schema_plan_json_reports_supported_additive_change() {
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    let schema_path = temp.path().join("next.pg");
+    init_repo(&repo);
+
+    let next_schema = fs::read_to_string(fixture("test.pg")).unwrap().replace(
+        "    age: I32?\n}",
+        "    age: I32?\n    nickname: String?\n}",
+    );
+    fs::write(&schema_path, next_schema).unwrap();
+
+    let output = output_success(
+        cli()
+            .arg("schema")
+            .arg("plan")
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json")
+            .arg(&repo),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(payload["supported"], true);
+    assert_eq!(payload["step_count"], 1);
+    assert_eq!(payload["steps"][0]["kind"], "add_property");
+    assert_eq!(payload["steps"][0]["type_kind"], "node");
+    assert_eq!(payload["steps"][0]["type_name"], "Person");
+    assert_eq!(payload["steps"][0]["property_name"], "nickname");
+}
+
+#[test]
+fn schema_plan_json_reports_unsupported_type_change() {
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    let schema_path = temp.path().join("breaking.pg");
+    init_repo(&repo);
+
+    let breaking_schema = fs::read_to_string(fixture("test.pg"))
+        .unwrap()
+        .replace("age: I32?", "age: I64?");
+    fs::write(&schema_path, breaking_schema).unwrap();
+
+    let output = output_success(
+        cli()
+            .arg("schema")
+            .arg("plan")
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json")
+            .arg(&repo),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(payload["supported"], false);
+    assert!(payload["steps"].as_array().unwrap().iter().any(|step| {
+        step["kind"] == "unsupported_change"
+            && step["entity"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Person.age")
+    }));
+}
+
+#[test]
 fn load_json_outputs_summary_for_main_branch() {
     let temp = tempdir().unwrap();
     let repo = repo_path(temp.path());
