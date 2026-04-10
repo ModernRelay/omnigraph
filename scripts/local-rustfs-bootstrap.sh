@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_SLUG="${REPO_SLUG:-ModernRelay/omnigraph-public}"
+REPO_SLUG="${REPO_SLUG:-ModernRelay/omnigraph}"
 SOURCE_REF="${SOURCE_REF:-main}"
 RELEASE_CHANNEL="${RELEASE_CHANNEL:-edge}"
 WORKDIR="${WORKDIR:-$PWD/.omnigraph-rustfs-demo}"
@@ -162,14 +162,15 @@ download_fixture_files() {
 }
 
 download_release_binaries() {
-  local asset archive_dir archive_path checksum_path base_url
+  local asset asset_stem archive_dir archive_path checksum_path base_url
 
   [ "$FORCE_BUILD" = "1" ] && return 1
 
   asset="$(platform_asset_name)" || return 1
+  asset_stem="${asset%.tar.gz}"
   archive_dir="$WORKDIR/release"
   archive_path="$archive_dir/$asset"
-  checksum_path="$archive_dir/$asset.sha256"
+  checksum_path="$archive_dir/$asset_stem.sha256"
   mkdir -p "$archive_dir" "$WORKDIR/bin"
   base_url="$(release_base_url)"
 
@@ -178,7 +179,7 @@ download_release_binaries() {
     "$base_url/$asset" \
     -o "$archive_path" || return 1
   curl -fsSL \
-    "$base_url/$asset.sha256" \
+    "$base_url/$asset_stem.sha256" \
     -o "$checksum_path" || return 1
   verify_checksum "$archive_path" "$checksum_path" || return 1
   tar -C "$WORKDIR/bin" -xzf "$archive_path" || return 1
@@ -231,10 +232,12 @@ setup_binaries() {
     elif [ -n "$repo_root" ]; then
       FIXTURE_DIR="$repo_root/crates/omnigraph/tests/fixtures"
     fi
-  elif [ -n "$repo_root" ]; then
-    build_from_source "$repo_root"
   elif ! download_release_binaries; then
-    build_from_source
+    if [ -n "$repo_root" ]; then
+      build_from_source "$repo_root"
+    else
+      build_from_source
+    fi
   fi
 
   [ -x "$BIN_DIR/omnigraph" ] || die "omnigraph binary not found in $BIN_DIR"

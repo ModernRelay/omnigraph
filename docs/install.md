@@ -3,7 +3,7 @@
 ## Quick Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph-public/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | bash
 ```
 
 By default the installer places:
@@ -15,26 +15,27 @@ in `~/.local/bin`.
 
 The default installer is binary-only. It downloads a published release asset,
 verifies the SHA256 checksum, and unpacks it. It does not build from source.
-If the stable channel is not published yet, use the `edge` channel below.
+If no stable tag is published yet, the installer automatically falls back to
+the rolling `edge` release.
 
 ## Channels
 
 Stable binaries:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph-public/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | bash
 ```
 
 Rolling edge binaries from `main`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph-public/main/scripts/install.sh | RELEASE_CHANNEL=edge bash
+curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | RELEASE_CHANNEL=edge bash
 ```
 
 Install from source:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph-public/main/scripts/install-source.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install-source.sh | bash
 ```
 
 ## Useful Overrides
@@ -42,19 +43,19 @@ curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph-public/main/s
 Install to a different directory:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph-public/main/scripts/install.sh | INSTALL_DIR="$HOME/bin" bash
+curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | INSTALL_DIR="$HOME/bin" bash
 ```
 
 Install a specific tag:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph-public/main/scripts/install.sh | VERSION=v0.1.0 bash
+curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | VERSION=v0.1.0 bash
 ```
 
 Build from a specific git ref:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph-public/main/scripts/install-source.sh | SOURCE_REF=main bash
+curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install-source.sh | SOURCE_REF=main bash
 ```
 
 ## Manual Source Build

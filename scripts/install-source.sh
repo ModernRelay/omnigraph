@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_SLUG="${REPO_SLUG:-ModernRelay/omnigraph-public}"
+REPO_SLUG="${REPO_SLUG:-ModernRelay/omnigraph}"
 SOURCE_REF="${SOURCE_REF:-main}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 TMP_ROOT="${TMPDIR:-/tmp}"

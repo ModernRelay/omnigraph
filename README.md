@@ -8,30 +8,30 @@ workflows, and storage that runs equally well on a local directory or an
 ## Quick Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph-public/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | bash
 ```
 
 This installs `omnigraph` and `omnigraph-server` into `~/.local/bin` from
-published release binaries. It does not compile from source.
-
-If the stable channel is not published yet, use the `edge` channel below.
+published release binaries. It does not compile from source. If no stable tag
+is published yet, the installer automatically falls back to the rolling `edge`
+release.
 
 To install the rolling prerelease binaries from `main` instead:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph-public/main/scripts/install.sh | RELEASE_CHANNEL=edge bash
+curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | RELEASE_CHANNEL=edge bash
 ```
 
 If you want a source build, use:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph-public/main/scripts/install-source.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install-source.sh | bash
 ```
 
 ## One-Command Local RustFS Bootstrap
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph-public/main/scripts/local-rustfs-bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/local-rustfs-bootstrap.sh | bash
 ```
 
 That bootstrap:

@@ -40,7 +40,7 @@ omnigraph-server s3://my-bucket/repos/example/releases/2026-04-10-v0.1.0 \
 The easiest local S3-backed deployment path is:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph-public/main/scripts/local-rustfs-bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/local-rustfs-bootstrap.sh | bash
 ```
 
 The bootstrap:
@@ -53,7 +53,7 @@ The bootstrap:
 Supported behavior:
 
 - downloads the rolling `edge` binary when one exists for the current platform
-- otherwise clones `ModernRelay/omnigraph-public` and builds from source
+- otherwise clones `ModernRelay/omnigraph` and builds from source
 - reuses an existing RustFS container if it is already running
 
 Useful overrides:

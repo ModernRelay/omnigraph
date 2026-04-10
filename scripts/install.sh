@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_SLUG="${REPO_SLUG:-ModernRelay/omnigraph-public}"
+REPO_SLUG="${REPO_SLUG:-ModernRelay/omnigraph}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
 RELEASE_CHANNEL="${RELEASE_CHANNEL:-stable}"
 VERSION="${VERSION:-}"
 TMP_ROOT="${TMPDIR:-/tmp}"
 WORKDIR=""
+SELECTED_CHANNEL=""
 
 log() {
   printf '==> %s\n' "$*"
@@ -61,12 +62,14 @@ checksum_command() {
 }
 
 release_base_url() {
+  local channel="${1:-$RELEASE_CHANNEL}"
+
   if [ -n "$VERSION" ]; then
     printf 'https://github.com/%s/releases/download/%s\n' "$REPO_SLUG" "$VERSION"
     return
   fi
 
-  case "$RELEASE_CHANNEL" in
+  case "$channel" in
     stable)
       printf 'https://github.com/%s/releases/latest/download\n' "$REPO_SLUG"
       ;;
@@ -74,7 +77,7 @@ release_base_url() {
       printf 'https://github.com/%s/releases/download/edge\n' "$REPO_SLUG"
       ;;
     *)
-      die "unsupported RELEASE_CHANNEL '$RELEASE_CHANNEL' (expected stable or edge)"
+      die "unsupported RELEASE_CHANNEL '$channel' (expected stable or edge)"
       ;;
   esac
 }
@@ -99,22 +102,46 @@ verify_checksum() {
   [ "$actual" = "$expected" ] || die "checksum verification failed for $(basename "$archive")"
 }
 
+download_release_files() {
+  local base_url="$1"
+  local asset_name="$2"
+  local checksum_name="$3"
+  local archive="$4"
+  local checksum="$5"
+
+  curl -fsSL "$base_url/$asset_name" -o "$archive" || return 1
+  curl -fsSL "$base_url/$checksum_name" -o "$checksum" || return 1
+}
+
 install_from_release() {
-  local asset archive checksum base_url
+  local asset asset_stem archive checksum base_url
 
   asset="$(platform_asset_name)" || die "no prebuilt binary is available for $(uname -s)/$(uname -m)"
+  asset_stem="${asset%.tar.gz}"
   WORKDIR="$(mktemp -d "$TMP_ROOT/omnigraph-install.XXXXXX")"
   archive="$WORKDIR/$asset"
-  checksum="$WORKDIR/$asset.sha256"
-  base_url="$(release_base_url)"
+  checksum="$WORKDIR/$asset_stem.sha256"
 
-  log "Downloading $asset"
-  curl -fsSL \
-    "$base_url/$asset" \
-    -o "$archive" || die "no published binary found for $asset; use scripts/install-source.sh or build from source"
-  curl -fsSL \
-    "$base_url/$asset.sha256" \
-    -o "$checksum" || die "checksum file for $asset was not found"
+  if [ -n "$VERSION" ]; then
+    SELECTED_CHANNEL="$VERSION"
+    base_url="$(release_base_url)"
+    log "Downloading $asset from $VERSION"
+    download_release_files "$base_url" "$asset" "$asset_stem.sha256" "$archive" "$checksum" || die "no published binary found for $asset at release $VERSION"
+  else
+    SELECTED_CHANNEL="$RELEASE_CHANNEL"
+    base_url="$(release_base_url "$SELECTED_CHANNEL")"
+    log "Downloading $asset from $SELECTED_CHANNEL"
+    if ! download_release_files "$base_url" "$asset" "$asset_stem.sha256" "$archive" "$checksum"; then
+      if [ "$RELEASE_CHANNEL" != "stable" ]; then
+        die "no published binary found for $asset on channel $RELEASE_CHANNEL"
+      fi
+
+      log "Stable release binaries are not published yet; falling back to edge"
+      SELECTED_CHANNEL="edge"
+      base_url="$(release_base_url "$SELECTED_CHANNEL")"
+      download_release_files "$base_url" "$asset" "$asset_stem.sha256" "$archive" "$checksum" || die "no published binary found for $asset on stable or edge; use scripts/install-source.sh or build from source"
+    fi
+  fi
 
   verify_checksum "$archive" "$checksum"
   tar -C "$WORKDIR" -xzf "$archive" || die "failed to unpack $asset"
@@ -133,6 +160,10 @@ Verify:
   $INSTALL_DIR/omnigraph-server --help
 
 EOF
+
+  if [ -n "$SELECTED_CHANNEL" ]; then
+    printf 'Installed from release channel: %s\n' "$SELECTED_CHANNEL"
+  fi
 
   case ":$PATH:" in
     *":$INSTALL_DIR:"*)

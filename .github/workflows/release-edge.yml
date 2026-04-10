@@ -35,7 +35,7 @@ jobs:
         include:
           - runner: ubuntu-latest
             asset_name: omnigraph-linux-x86_64
-          - runner: macos-13
+          - runner: macos-15-intel
             asset_name: omnigraph-macos-x86_64
           - runner: macos-14
             asset_name: omnigraph-macos-arm64
