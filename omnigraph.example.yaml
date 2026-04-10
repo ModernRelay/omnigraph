@@ -1,0 +1,15 @@
+targets:
+  local:
+    uri: ./repo.omni
+  dev:
+    uri: http://127.0.0.1:8080
+    bearer_token_env: OMNIGRAPH_BEARER_TOKEN
+
+cli:
+  target: local
+  branch: main
+
+query:
+  roots:
+    - queries
+    - .

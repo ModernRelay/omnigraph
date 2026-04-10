@@ -1,0 +1,5 @@
+{"type": "Doc", "data": {"slug": "ml-intro", "title": "Introduction to Machine Learning", "body": "Machine learning is a subset of artificial intelligence that focuses on algorithms", "embedding": [0.1, 0.2, 0.3, 0.4]}}
+{"type": "Doc", "data": {"slug": "dl-basics", "title": "Deep Learning Basics", "body": "Deep learning uses neural networks with many layers to learn representations", "embedding": [0.5, 0.6, 0.7, 0.8]}}
+{"type": "Doc", "data": {"slug": "nlp-guide", "title": "Natural Language Processing Guide", "body": "NLP applies machine learning to understand and generate human language", "embedding": [0.2, 0.3, 0.4, 0.5]}}
+{"type": "Doc", "data": {"slug": "cv-overview", "title": "Computer Vision Overview", "body": "Computer vision enables machines to interpret visual information from images", "embedding": [0.8, 0.7, 0.6, 0.5]}}
+{"type": "Doc", "data": {"slug": "rl-intro", "title": "Reinforcement Learning Introduction", "body": "Reinforcement learning trains agents through reward and punishment signals", "embedding": [0.3, 0.4, 0.5, 0.6]}}

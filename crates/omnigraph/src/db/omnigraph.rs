@@ -1,0 +1,2636 @@
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
+
+use arrow_array::{
+    Array, BinaryArray, BooleanArray, Date32Array, FixedSizeListArray, Float32Array, Float64Array,
+    Int32Array, Int64Array, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray,
+    RecordBatch, StringArray, StructArray, UInt32Array, UInt64Array,
+};
+use arrow_schema::{DataType, Field, Schema};
+use lance::Dataset;
+use lance::blob::{BlobArrayBuilder, blob_field};
+use lance::dataset::BlobFile;
+use lance::dataset::scanner::ColumnOrdering;
+use lance::datatypes::BlobKind;
+use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
+use omnigraph_compiler::schema::parser::parse_schema;
+use omnigraph_compiler::types::ScalarType;
+use omnigraph_compiler::{
+    SchemaIR, SchemaMigrationPlan, build_catalog_from_ir, build_schema_ir, plan_schema_migration,
+};
+
+use crate::db::graph_coordinator::{GraphCoordinator, PublishedSnapshot};
+use crate::db::run_registry::{RunRecord, RunStatus, is_internal_run_branch};
+use crate::error::{ManifestErrorKind, OmniError, Result};
+use crate::runtime_cache::RuntimeCache;
+use crate::storage::{StorageAdapter, join_uri, normalize_root_uri, storage_for_uri};
+use crate::table_store::TableStore;
+
+use super::commit_graph::GraphCommit;
+use super::manifest::Snapshot;
+use super::schema_state::{
+    SCHEMA_SOURCE_FILENAME, load_or_bootstrap_schema_contract, read_accepted_schema_ir,
+    validate_schema_contract, write_schema_contract,
+};
+use super::{ReadTarget, ResolvedTarget, RunId, SnapshotId};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeOutcome {
+    AlreadyUpToDate,
+    FastForward,
+    Merged,
+}
+
+/// Top-level handle to an Omnigraph database.
+///
+/// An Omnigraph is a Lance-native graph database with git-style branching.
+/// It stores typed property graphs as per-type Lance datasets coordinated
+/// through a Lance manifest table.
+pub struct Omnigraph {
+    root_uri: String,
+    storage: Arc<dyn StorageAdapter>,
+    coordinator: GraphCoordinator,
+    table_store: TableStore,
+    runtime_cache: RuntimeCache,
+    catalog: Catalog,
+    schema_source: String,
+    pub(crate) audit_actor_id: Option<String>,
+}
+
+impl Omnigraph {
+    /// Create a new repo at `uri` from schema source.
+    ///
+    /// Creates `_schema.pg`, per-type Lance datasets, and `__manifest`.
+    pub async fn init(uri: &str, schema_source: &str) -> Result<Self> {
+        Self::init_with_storage(uri, schema_source, storage_for_uri(uri)?).await
+    }
+
+    pub(crate) async fn init_with_storage(
+        uri: &str,
+        schema_source: &str,
+        storage: Arc<dyn StorageAdapter>,
+    ) -> Result<Self> {
+        let root = normalize_root_uri(uri)?;
+        let schema_ir = read_schema_ir_from_source(schema_source)?;
+        let mut catalog = build_catalog_from_ir(&schema_ir)?;
+        fixup_blob_schemas(&mut catalog);
+
+        // Write _schema.pg
+        let schema_path = join_uri(&root, SCHEMA_SOURCE_FILENAME);
+        storage.write_text(&schema_path, schema_source).await?;
+        write_schema_contract(&root, storage.as_ref(), &schema_ir).await?;
+
+        // Create manifest + per-type datasets
+        let coordinator = GraphCoordinator::init(&root, &catalog, Arc::clone(&storage)).await?;
+
+        Ok(Self {
+            root_uri: root.clone(),
+            storage,
+            coordinator,
+            table_store: TableStore::new(&root),
+            runtime_cache: RuntimeCache::default(),
+            catalog,
+            schema_source: schema_source.to_string(),
+            audit_actor_id: None,
+        })
+    }
+
+    /// Open an existing repo.
+    ///
+    /// Reads `_schema.pg`, parses it, builds the catalog, and opens `__manifest`.
+    pub async fn open(uri: &str) -> Result<Self> {
+        Self::open_with_storage(uri, storage_for_uri(uri)?).await
+    }
+
+    pub(crate) async fn open_with_storage(
+        uri: &str,
+        storage: Arc<dyn StorageAdapter>,
+    ) -> Result<Self> {
+        let root = normalize_root_uri(uri)?;
+        // Read _schema.pg
+        let schema_path = join_uri(&root, SCHEMA_SOURCE_FILENAME);
+        let schema_source = storage.read_text(&schema_path).await?;
+        let current_source_ir = read_schema_ir_from_source(&schema_source)?;
+        let coordinator = GraphCoordinator::open(&root, Arc::clone(&storage)).await?;
+        let branches = coordinator.branch_list().await?;
+        let (accepted_ir, _) = load_or_bootstrap_schema_contract(
+            &root,
+            Arc::clone(&storage),
+            &branches,
+            &current_source_ir,
+        )
+        .await?;
+        let mut catalog = build_catalog_from_ir(&accepted_ir)?;
+        fixup_blob_schemas(&mut catalog);
+
+        Ok(Self {
+            root_uri: root.clone(),
+            storage,
+            coordinator,
+            table_store: TableStore::new(&root),
+            runtime_cache: RuntimeCache::default(),
+            catalog,
+            schema_source,
+            audit_actor_id: None,
+        })
+    }
+
+    pub fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+
+    pub fn schema_source(&self) -> &str {
+        &self.schema_source
+    }
+
+    pub fn uri(&self) -> &str {
+        &self.root_uri
+    }
+
+    pub(crate) async fn ensure_schema_state_valid(&self) -> Result<()> {
+        validate_schema_contract(self.uri(), Arc::clone(&self.storage)).await
+    }
+
+    pub async fn plan_schema(&self, desired_schema_source: &str) -> Result<SchemaMigrationPlan> {
+        self.ensure_schema_state_valid().await?;
+        let accepted_ir = read_accepted_schema_ir(self.uri(), Arc::clone(&self.storage)).await?;
+        let desired_ir = read_schema_ir_from_source(desired_schema_source)?;
+        plan_schema_migration(&accepted_ir, &desired_ir)
+            .map_err(|err| OmniError::manifest(err.to_string()))
+    }
+
+    pub(crate) fn table_store(&self) -> &TableStore {
+        &self.table_store
+    }
+
+    pub(crate) async fn open_coordinator_for_branch(
+        &self,
+        branch: Option<&str>,
+    ) -> Result<GraphCoordinator> {
+        match branch {
+            Some(branch) => {
+                GraphCoordinator::open_branch(self.uri(), branch, Arc::clone(&self.storage)).await
+            }
+            None => GraphCoordinator::open(self.uri(), Arc::clone(&self.storage)).await,
+        }
+    }
+
+    pub(crate) async fn swap_coordinator_for_branch(
+        &mut self,
+        branch: Option<&str>,
+    ) -> Result<GraphCoordinator> {
+        let next = self.open_coordinator_for_branch(branch).await?;
+        Ok(std::mem::replace(&mut self.coordinator, next))
+    }
+
+    pub(crate) fn restore_coordinator(&mut self, coordinator: GraphCoordinator) {
+        self.coordinator = coordinator;
+    }
+
+    pub(crate) async fn resolved_branch_target(
+        &self,
+        branch: Option<&str>,
+    ) -> Result<ResolvedTarget> {
+        self.ensure_schema_state_valid().await?;
+        let requested = ReadTarget::Branch(branch.unwrap_or("main").to_string());
+        let normalized = normalize_branch_name(branch.unwrap_or("main"))?;
+        if normalized.as_deref() == self.coordinator.current_branch() {
+            let snapshot_id = self.coordinator.head_commit_id().await?.unwrap_or_else(|| {
+                SnapshotId::synthetic(
+                    self.coordinator.current_branch(),
+                    self.coordinator.version(),
+                )
+            });
+            return Ok(ResolvedTarget {
+                requested,
+                branch: self.coordinator.current_branch().map(str::to_string),
+                snapshot_id,
+                snapshot: self.coordinator.snapshot(),
+            });
+        }
+        self.coordinator.resolve_target(&requested).await
+    }
+
+    pub(crate) async fn snapshot_for_branch(&self, branch: Option<&str>) -> Result<Snapshot> {
+        self.resolved_branch_target(branch)
+            .await
+            .map(|resolved| resolved.snapshot)
+    }
+
+    pub(crate) fn version(&self) -> u64 {
+        self.coordinator.version()
+    }
+
+    /// Return an immutable Snapshot from the known manifest state. No storage I/O.
+    pub(crate) fn snapshot(&self) -> Snapshot {
+        self.coordinator.snapshot()
+    }
+
+    pub async fn snapshot_of(&self, target: impl Into<ReadTarget>) -> Result<Snapshot> {
+        self.resolved_target(target)
+            .await
+            .map(|resolved| resolved.snapshot)
+    }
+
+    pub async fn version_of(&self, target: impl Into<ReadTarget>) -> Result<u64> {
+        self.snapshot_of(target)
+            .await
+            .map(|snapshot| snapshot.version())
+    }
+
+    pub async fn resolved_branch_of(
+        &self,
+        target: impl Into<ReadTarget>,
+    ) -> Result<Option<String>> {
+        self.resolved_target(target)
+            .await
+            .map(|resolved| resolved.branch)
+    }
+
+    /// Synchronize this handle's write base to the latest head of the named branch.
+    pub async fn sync_branch(&mut self, branch: &str) -> Result<()> {
+        self.ensure_schema_state_valid().await?;
+        let branch = normalize_branch_name(branch)?;
+        self.coordinator = self.open_coordinator_for_branch(branch.as_deref()).await?;
+        self.runtime_cache.invalidate_all().await;
+        Ok(())
+    }
+
+    /// Re-read the handle-local coordinator state from storage.
+    pub(crate) async fn refresh(&mut self) -> Result<()> {
+        self.coordinator.refresh().await?;
+        self.runtime_cache.invalidate_all().await;
+        Ok(())
+    }
+
+    pub async fn resolve_snapshot(&self, branch: &str) -> Result<SnapshotId> {
+        self.ensure_schema_state_valid().await?;
+        self.coordinator.resolve_snapshot_id(branch).await
+    }
+
+    pub(crate) async fn resolved_target(
+        &self,
+        target: impl Into<ReadTarget>,
+    ) -> Result<ResolvedTarget> {
+        self.ensure_schema_state_valid().await?;
+        self.coordinator.resolve_target(&target.into()).await
+    }
+
+    // ─── Change detection ────────────────────────────────────────────────
+
+    pub async fn diff_between(
+        &self,
+        from: impl Into<ReadTarget>,
+        to: impl Into<ReadTarget>,
+        filter: &crate::changes::ChangeFilter,
+    ) -> Result<crate::changes::ChangeSet> {
+        let from_resolved = self.resolved_target(from).await?;
+        let to_resolved = self.resolved_target(to).await?;
+        crate::changes::diff_snapshots(
+            self.uri(),
+            &from_resolved.snapshot,
+            &to_resolved.snapshot,
+            filter,
+            to_resolved.branch.clone().or(from_resolved.branch.clone()),
+        )
+        .await
+    }
+
+    /// Diff two graph commits. Resolves each commit to `(manifest_branch, manifest_version)`
+    /// and creates branch-aware snapshots. Supports cross-branch comparison.
+    pub async fn diff_commits(
+        &self,
+        from_commit_id: &str,
+        to_commit_id: &str,
+        filter: &crate::changes::ChangeFilter,
+    ) -> Result<crate::changes::ChangeSet> {
+        let from_commit = self
+            .coordinator
+            .resolve_commit(&SnapshotId::new(from_commit_id))
+            .await?;
+        let to_commit = self
+            .coordinator
+            .resolve_commit(&SnapshotId::new(to_commit_id))
+            .await?;
+        let from_snap = self
+            .coordinator
+            .resolve_target(&ReadTarget::Snapshot(SnapshotId::new(
+                from_commit.graph_commit_id.clone(),
+            )))
+            .await?;
+        let to_snap = self
+            .coordinator
+            .resolve_target(&ReadTarget::Snapshot(SnapshotId::new(
+                to_commit.graph_commit_id.clone(),
+            )))
+            .await?;
+        crate::changes::diff_snapshots(
+            self.uri(),
+            &from_snap.snapshot,
+            &to_snap.snapshot,
+            filter,
+            to_snap.branch.clone().or(from_snap.branch.clone()),
+        )
+        .await
+    }
+
+    pub async fn entity_at_target(
+        &self,
+        target: impl Into<ReadTarget>,
+        table_key: &str,
+        id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let resolved = self.resolved_target(target).await?;
+        self.entity_from_snapshot(&resolved.snapshot, table_key, id)
+            .await
+    }
+
+    /// Read one entity at a specific manifest version via time travel (on-demand enrichment).
+    pub async fn entity_at(
+        &self,
+        table_key: &str,
+        id: &str,
+        version: u64,
+    ) -> Result<Option<serde_json::Value>> {
+        let snap = self.coordinator.snapshot_at_version(version).await?;
+        self.entity_from_snapshot(&snap, table_key, id).await
+    }
+
+    /// Create a Snapshot at any historical manifest version.
+    pub async fn snapshot_at_version(&self, version: u64) -> Result<Snapshot> {
+        self.ensure_schema_state_valid().await?;
+        self.coordinator.snapshot_at_version(version).await
+    }
+
+    pub async fn export_jsonl(
+        &self,
+        branch: &str,
+        type_names: &[String],
+        table_keys: &[String],
+    ) -> Result<String> {
+        self.ensure_schema_state_valid().await?;
+        let snapshot = self.snapshot_of(ReadTarget::branch(branch)).await?;
+        self.export_snapshot_jsonl(&snapshot, type_names, table_keys)
+            .await
+    }
+
+    async fn entity_from_snapshot(
+        &self,
+        snapshot: &Snapshot,
+        table_key: &str,
+        id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        if snapshot.entry(table_key).is_none() {
+            return Ok(None);
+        }
+
+        let ds = self
+            .table_store
+            .open_snapshot_table(snapshot, table_key)
+            .await?;
+        let filter_sql = format!("id = '{}'", id.replace('\'', "''"));
+        let batches = self
+            .table_store
+            .scan(&ds, None, Some(&filter_sql), None)
+            .await?;
+        let Some(batch) = batches.iter().find(|batch| batch.num_rows() > 0) else {
+            return Ok(None);
+        };
+        Ok(Some(record_batch_row_to_json(batch, 0)?))
+    }
+
+    async fn export_snapshot_jsonl(
+        &self,
+        snapshot: &Snapshot,
+        type_names: &[String],
+        table_keys: &[String],
+    ) -> Result<String> {
+        let selected_tables = self.export_table_keys(snapshot, type_names, table_keys)?;
+        let mut out = String::new();
+        for table_key in selected_tables {
+            for row in self.export_table_rows(snapshot, &table_key).await? {
+                out.push_str(&serde_json::to_string(&row).map_err(|err| {
+                    OmniError::manifest(format!(
+                        "failed to serialize export row for '{}': {}",
+                        table_key, err
+                    ))
+                })?);
+                out.push('\n');
+            }
+        }
+        Ok(out)
+    }
+
+    fn export_table_keys(
+        &self,
+        snapshot: &Snapshot,
+        type_names: &[String],
+        table_keys: &[String],
+    ) -> Result<Vec<String>> {
+        let available = snapshot
+            .entries()
+            .map(|entry| entry.table_key.clone())
+            .collect::<BTreeSet<_>>();
+        let mut selected = BTreeSet::new();
+
+        for table_key in table_keys {
+            if !available.contains(table_key) {
+                return Err(OmniError::manifest(format!(
+                    "unknown export table '{}'",
+                    table_key
+                )));
+            }
+            selected.insert(table_key.clone());
+        }
+
+        for type_name in type_names {
+            let mut matched = false;
+            let node_key = format!("node:{}", type_name);
+            if available.contains(&node_key) {
+                selected.insert(node_key);
+                matched = true;
+            }
+            let edge_key = format!("edge:{}", type_name);
+            if available.contains(&edge_key) {
+                selected.insert(edge_key);
+                matched = true;
+            }
+            if !matched {
+                return Err(OmniError::manifest(format!(
+                    "unknown export type '{}'",
+                    type_name
+                )));
+            }
+        }
+
+        if selected.is_empty() {
+            return Ok(available.into_iter().collect());
+        }
+
+        Ok(selected.into_iter().collect())
+    }
+
+    async fn export_table_rows(
+        &self,
+        snapshot: &Snapshot,
+        table_key: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        let ds = self
+            .table_store
+            .open_snapshot_table(snapshot, table_key)
+            .await?;
+        let ordering = Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]);
+        let blob_properties = blob_properties_for_table_key(self.catalog(), table_key)?;
+
+        if blob_properties.is_empty() {
+            let batch = concat_or_empty_batches(
+                schema_for_table_key(self.catalog(), table_key)?,
+                self.table_store.scan(&ds, None, None, ordering).await?,
+            )?;
+            return self.export_rows_from_batch(table_key, &batch, None).await;
+        }
+
+        let batches = self
+            .table_store
+            .scan_with(&ds, None, None, ordering, true, |_| Ok(()))
+            .await?;
+        if batches.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let scan_schema = batches[0].schema();
+        let batch = if batches.len() == 1 {
+            batches.into_iter().next().unwrap()
+        } else {
+            arrow_select::concat::concat_batches(&scan_schema, &batches)
+                .map_err(|e| OmniError::Lance(e.to_string()))?
+        };
+        let row_ids = batch
+            .column_by_name("_rowid")
+            .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| {
+                OmniError::Lance(format!(
+                    "expected _rowid column when exporting '{}'",
+                    table_key
+                ))
+            })?
+            .values()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let blob_values = self
+            .export_blob_values(&ds, &batch, &row_ids, blob_properties)
+            .await?;
+        self.export_rows_from_batch(table_key, &batch, Some(&blob_values))
+            .await
+    }
+
+    // ─── Graph index ──────────────────────────────────────────────────────
+
+    /// Get or build the graph index for the current snapshot.
+    pub async fn graph_index(&self) -> Result<Arc<crate::graph_index::GraphIndex>> {
+        self.ensure_schema_state_valid().await?;
+        let resolved = self
+            .coordinator
+            .resolve_target(&ReadTarget::Branch(
+                self.coordinator
+                    .current_branch()
+                    .unwrap_or("main")
+                    .to_string(),
+            ))
+            .await?;
+        self.runtime_cache
+            .graph_index(&resolved, &self.catalog)
+            .await
+    }
+
+    pub(crate) async fn graph_index_for_resolved(
+        &self,
+        resolved: &ResolvedTarget,
+    ) -> Result<Arc<crate::graph_index::GraphIndex>> {
+        self.runtime_cache
+            .graph_index(resolved, &self.catalog)
+            .await
+    }
+
+    /// Ensure BTree scalar indices exist on key columns.
+    /// Idempotent — Lance skips if index already exists.
+    ///
+    /// Opens sub-tables at their latest version (not snapshot-pinned) because
+    /// indices must be created on the current head. Any version drift from the
+    /// snapshot is expected and logged. The resulting versions are committed
+    /// back to the manifest.
+    ///
+    /// On named branches, indexing preserves lazy branching:
+    /// unbranched subtables keep inheriting `main`, while subtables inherited
+    /// from an ancestor branch are first forked into the active branch before
+    /// their index metadata is updated.
+    pub async fn ensure_indices(&mut self) -> Result<()> {
+        let current_branch = self.coordinator.current_branch().map(str::to_string);
+        self.ensure_indices_for_branch(current_branch.as_deref())
+            .await
+    }
+
+    pub async fn ensure_indices_on(&mut self, branch: &str) -> Result<()> {
+        let branch = normalize_branch_name(branch)?;
+        self.ensure_indices_for_branch(branch.as_deref()).await
+    }
+
+    pub(crate) async fn ensure_indices_for_branch(&mut self, branch: Option<&str>) -> Result<()> {
+        self.ensure_schema_state_valid().await?;
+        let resolved = self.resolved_branch_target(branch).await?;
+        let snapshot = resolved.snapshot;
+        let mut updates = Vec::new();
+        let active_branch = resolved.branch;
+
+        for type_name in self.catalog.node_types.keys() {
+            let table_key = format!("node:{}", type_name);
+            let Some(entry) = snapshot.entry(&table_key) else {
+                continue;
+            };
+            let full_path = format!("{}/{}", self.root_uri, entry.table_path);
+            let (mut ds, resolved_branch) = match active_branch.as_deref() {
+                Some(active_branch) => match entry.table_branch.as_deref() {
+                    None => continue,
+                    _ => {
+                        self.open_owned_dataset_for_branch_write(
+                            &table_key,
+                            &full_path,
+                            entry.table_branch.as_deref(),
+                            entry.table_version,
+                            active_branch,
+                        )
+                        .await?
+                    }
+                },
+                None => (
+                    self.table_store
+                        .open_dataset_head_for_write(&table_key, &full_path, None)
+                        .await?,
+                    None,
+                ),
+            };
+            let row_count = self.table_store.count_rows(&ds, None).await.unwrap_or(0);
+            if row_count > 0 {
+                self.build_indices_on_dataset(&table_key, &mut ds).await?;
+            }
+
+            let state = self.table_store.table_state(&full_path, &ds).await?;
+            if state.version != entry.table_version
+                || resolved_branch.as_deref() != entry.table_branch.as_deref()
+            {
+                updates.push(crate::db::SubTableUpdate {
+                    table_key,
+                    table_version: state.version,
+                    table_branch: resolved_branch,
+                    row_count: state.row_count,
+                    version_metadata: state.version_metadata,
+                });
+            }
+        }
+
+        for edge_name in self.catalog.edge_types.keys() {
+            let table_key = format!("edge:{}", edge_name);
+            let Some(entry) = snapshot.entry(&table_key) else {
+                continue;
+            };
+            let full_path = format!("{}/{}", self.root_uri, entry.table_path);
+            let (mut ds, resolved_branch) = match active_branch.as_deref() {
+                Some(active_branch) => match entry.table_branch.as_deref() {
+                    None => continue,
+                    _ => {
+                        self.open_owned_dataset_for_branch_write(
+                            &table_key,
+                            &full_path,
+                            entry.table_branch.as_deref(),
+                            entry.table_version,
+                            active_branch,
+                        )
+                        .await?
+                    }
+                },
+                None => (
+                    self.table_store
+                        .open_dataset_head_for_write(&table_key, &full_path, None)
+                        .await?,
+                    None,
+                ),
+            };
+            let row_count = self.table_store.count_rows(&ds, None).await.unwrap_or(0);
+            if row_count > 0 {
+                self.build_indices_on_dataset(&table_key, &mut ds).await?;
+            }
+
+            let state = self.table_store.table_state(&full_path, &ds).await?;
+            if state.version != entry.table_version
+                || resolved_branch.as_deref() != entry.table_branch.as_deref()
+            {
+                updates.push(crate::db::SubTableUpdate {
+                    table_key,
+                    table_version: state.version,
+                    table_branch: resolved_branch,
+                    row_count: state.row_count,
+                    version_metadata: state.version_metadata,
+                });
+            }
+        }
+
+        if !updates.is_empty() {
+            self.commit_prepared_updates_on_branch(branch, &updates)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Read a blob from a node by its string ID and property name.
+    ///
+    /// Returns a `BlobFile` handle with async `read()`, `seek()`, `tell()`,
+    /// and metadata accessors (`size()`, `kind()`, `uri()`).
+    ///
+    /// ```ignore
+    /// let blob = db.read_blob("Document", "readme", "content").await?;
+    /// let bytes = blob.read().await?;
+    /// ```
+    pub async fn read_blob(&self, type_name: &str, id: &str, property: &str) -> Result<BlobFile> {
+        self.ensure_schema_state_valid().await?;
+        let node_type = self
+            .catalog
+            .node_types
+            .get(type_name)
+            .ok_or_else(|| OmniError::manifest(format!("unknown node type '{}'", type_name)))?;
+        if !node_type.blob_properties.contains(property) {
+            return Err(OmniError::manifest(format!(
+                "property '{}' on type '{}' is not a Blob",
+                property, type_name
+            )));
+        }
+
+        let snapshot = self.snapshot();
+        let table_key = format!("node:{}", type_name);
+        let ds = snapshot.open(&table_key).await?;
+
+        let filter_sql = format!("id = '{}'", id.replace('\'', "''"));
+        let row_id = self
+            .table_store
+            .first_row_id_for_filter(&ds, &filter_sql)
+            .await?
+            .ok_or_else(|| {
+                OmniError::manifest(format!("no {} with id '{}' found", type_name, id))
+            })?;
+
+        // Use take_blobs to get the BlobFile handle
+        let ds = Arc::new(ds);
+        let mut blobs = ds
+            .take_blobs(&[row_id], property)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+        blobs.pop().ok_or_else(|| {
+            OmniError::manifest(format!(
+                "blob '{}' on {} '{}' returned no data",
+                property, type_name, id
+            ))
+        })
+    }
+
+    pub(crate) fn active_branch(&self) -> Option<&str> {
+        self.coordinator.current_branch()
+    }
+
+    async fn ensure_branch_delete_safe(&self, branch: &str, branches: &[String]) -> Result<()> {
+        let descendants = self.coordinator.branch_descendants(branch).await?;
+        if let Some(descendant) = descendants.first() {
+            return Err(OmniError::manifest_conflict(format!(
+                "cannot delete branch '{}' because descendant branch '{}' still depends on it",
+                branch, descendant
+            )));
+        }
+
+        for run in self.list_runs().await? {
+            if run.target_branch == branch
+                && matches!(run.status, RunStatus::Running | RunStatus::Failed)
+            {
+                return Err(OmniError::manifest_conflict(format!(
+                    "cannot delete branch '{}' while run '{}' targeting it is {}",
+                    branch,
+                    run.run_id,
+                    run.status.as_str()
+                )));
+            }
+        }
+
+        for other_branch in branches
+            .iter()
+            .filter(|candidate| candidate.as_str() != branch)
+        {
+            let snapshot = self
+                .snapshot_of(ReadTarget::branch(other_branch.as_str()))
+                .await?;
+            if snapshot
+                .entries()
+                .any(|entry| entry.table_branch.as_deref() == Some(branch))
+            {
+                return Err(OmniError::manifest_conflict(format!(
+                    "cannot delete branch '{}' because branch '{}' still depends on it",
+                    branch, other_branch
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn cleanup_deleted_branch_tables(
+        &self,
+        branch: &str,
+        owned_tables: &[(String, String)],
+    ) -> Result<()> {
+        let mut seen_paths = HashSet::new();
+        let mut cleanup_targets = owned_tables
+            .iter()
+            .filter(|(_, table_path)| seen_paths.insert(table_path.clone()))
+            .cloned()
+            .collect::<Vec<_>>();
+        cleanup_targets.sort_by(|left, right| left.0.cmp(&right.0));
+
+        for (table_key, table_path) in cleanup_targets {
+            let dataset_uri = self.table_store.dataset_uri(&table_path);
+            if let Err(err) = self.table_store.delete_branch(&dataset_uri, branch).await {
+                return Err(OmniError::manifest_internal(format!(
+                    "branch '{}' was deleted but cleanup failed for {}: {}",
+                    branch, table_key, err
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn delete_branch_storage_only(&mut self, branch: &str) -> Result<()> {
+        if self.coordinator.current_branch() == Some(branch) {
+            return Err(OmniError::manifest_conflict(format!(
+                "cannot delete currently active branch '{}'",
+                branch
+            )));
+        }
+
+        let branch_snapshot = self.snapshot_of(ReadTarget::branch(branch)).await?;
+        let owned_tables = branch_snapshot
+            .entries()
+            .filter(|entry| entry.table_branch.as_deref() == Some(branch))
+            .map(|entry| (entry.table_key.clone(), entry.table_path.clone()))
+            .collect::<Vec<_>>();
+
+        self.coordinator.branch_delete(branch).await?;
+        self.cleanup_deleted_branch_tables(branch, &owned_tables)
+            .await
+    }
+
+    async fn cleanup_terminal_run_branches_for_target(&mut self, branch: &str) -> Result<()> {
+        let terminal_run_branches = self
+            .list_runs()
+            .await?
+            .into_iter()
+            .filter(|run| {
+                run.target_branch == branch
+                    && matches!(run.status, RunStatus::Published | RunStatus::Aborted)
+            })
+            .map(|run| run.run_branch)
+            .collect::<Vec<_>>();
+
+        for run_branch in terminal_run_branches {
+            match self.delete_branch_storage_only(&run_branch).await {
+                Ok(()) => {}
+                Err(OmniError::Manifest(err)) if err.kind == ManifestErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
+        normalize_branch_name(branch)
+    }
+
+    pub(crate) async fn head_commit_id_for_branch(
+        &self,
+        branch: Option<&str>,
+    ) -> Result<Option<String>> {
+        let mut coordinator = self.open_coordinator_for_branch(branch).await?;
+        coordinator.ensure_commit_graph_initialized().await?;
+        coordinator
+            .head_commit_id()
+            .await
+            .map(|id| id.map(|snapshot_id| snapshot_id.as_str().to_string()))
+    }
+
+    pub async fn branch_create(&mut self, name: &str) -> Result<()> {
+        self.ensure_schema_state_valid().await?;
+        ensure_public_branch_ref(name, "branch_create")?;
+        self.coordinator.branch_create(name).await
+    }
+
+    pub(crate) fn current_audit_actor(&self) -> Option<&str> {
+        self.audit_actor_id.as_deref()
+    }
+
+    pub async fn branch_create_from(
+        &mut self,
+        from: impl Into<ReadTarget>,
+        name: &str,
+    ) -> Result<()> {
+        self.branch_create_from_impl(from, name, false).await
+    }
+
+    async fn branch_create_from_impl(
+        &mut self,
+        from: impl Into<ReadTarget>,
+        name: &str,
+        allow_internal_refs: bool,
+    ) -> Result<()> {
+        let target = from.into();
+        let ReadTarget::Branch(branch_name) = target else {
+            return Err(OmniError::manifest(
+                "branch creation from pinned snapshots is not supported yet".to_string(),
+            ));
+        };
+        if !allow_internal_refs {
+            ensure_public_branch_ref(&branch_name, "branch_create_from")?;
+            ensure_public_branch_ref(name, "branch_create_from")?;
+        }
+        let branch = normalize_branch_name(&branch_name)?;
+        let previous = self.swap_coordinator_for_branch(branch.as_deref()).await?;
+        let result = self.coordinator.branch_create(name).await;
+        self.restore_coordinator(previous);
+        result
+    }
+
+    pub async fn branch_list(&self) -> Result<Vec<String>> {
+        self.ensure_schema_state_valid().await?;
+        self.coordinator.branch_list().await
+    }
+
+    pub async fn branch_delete(&mut self, name: &str) -> Result<()> {
+        self.ensure_schema_state_valid().await?;
+        ensure_public_branch_ref(name, "branch_delete")?;
+        self.refresh().await?;
+        let branch = normalize_branch_name(name)?
+            .ok_or_else(|| OmniError::manifest("cannot delete branch 'main'".to_string()))?;
+        let branches = self.coordinator.branch_list().await?;
+        if !branches.iter().any(|candidate| candidate == &branch) {
+            return Err(OmniError::manifest_not_found(format!(
+                "branch '{}' not found",
+                branch
+            )));
+        }
+
+        self.ensure_branch_delete_safe(&branch, &branches).await?;
+        self.cleanup_terminal_run_branches_for_target(&branch)
+            .await?;
+        self.delete_branch_storage_only(&branch).await
+    }
+
+    pub(crate) async fn latest_branch_snapshot_id(&self, branch: &str) -> Result<SnapshotId> {
+        let normalized = normalize_branch_name(branch)?;
+        let fresh = self
+            .open_coordinator_for_branch(normalized.as_deref())
+            .await?;
+        fresh.resolve_snapshot_id(branch).await
+    }
+
+    pub async fn begin_run(
+        &mut self,
+        target_branch: &str,
+        operation_hash: Option<&str>,
+    ) -> Result<RunRecord> {
+        self.begin_run_as(target_branch, operation_hash, None).await
+    }
+
+    pub async fn begin_run_as(
+        &mut self,
+        target_branch: &str,
+        operation_hash: Option<&str>,
+        actor_id: Option<&str>,
+    ) -> Result<RunRecord> {
+        self.ensure_schema_state_valid().await?;
+        ensure_public_branch_ref(target_branch, "begin_run")?;
+        let target_branch =
+            normalize_branch_name(target_branch)?.unwrap_or_else(|| "main".to_string());
+        let fresh = self
+            .open_coordinator_for_branch(Self::normalize_branch_name(&target_branch)?.as_deref())
+            .await?;
+        let base_snapshot_id = fresh.resolve_snapshot_id(&target_branch).await?;
+        let base_manifest_version = fresh.version();
+        let record = RunRecord::new(
+            target_branch.clone(),
+            base_snapshot_id.as_str(),
+            base_manifest_version,
+            operation_hash.map(str::to_string),
+            actor_id
+                .map(str::to_string)
+                .or_else(|| self.current_audit_actor().map(str::to_string)),
+        )?;
+
+        self.branch_create_from_impl(
+            ReadTarget::branch(target_branch.clone()),
+            &record.run_branch,
+            true,
+        )
+        .await?;
+        self.coordinator.append_run_record(&record).await?;
+        Ok(record)
+    }
+
+    pub async fn get_run(&self, run_id: &RunId) -> Result<RunRecord> {
+        self.ensure_schema_state_valid().await?;
+        self.coordinator.get_run(run_id).await
+    }
+
+    pub async fn list_runs(&self) -> Result<Vec<RunRecord>> {
+        self.ensure_schema_state_valid().await?;
+        self.coordinator.list_runs().await
+    }
+
+    pub async fn get_commit(&self, commit_id: &str) -> Result<GraphCommit> {
+        self.ensure_schema_state_valid().await?;
+        self.coordinator
+            .resolve_commit(&SnapshotId::new(commit_id))
+            .await
+    }
+
+    pub async fn list_commits(&self, branch: Option<&str>) -> Result<Vec<GraphCommit>> {
+        self.ensure_schema_state_valid().await?;
+        let branch = match branch {
+            Some(branch) => normalize_branch_name(branch)?,
+            None => None,
+        };
+        let coordinator = self.open_coordinator_for_branch(branch.as_deref()).await?;
+        coordinator.list_commits().await
+    }
+
+    pub async fn abort_run(&mut self, run_id: &RunId) -> Result<RunRecord> {
+        self.ensure_schema_state_valid().await?;
+        let run = self.get_run(run_id).await?;
+        match run.status {
+            RunStatus::Running | RunStatus::Failed => {
+                let updated = run.with_status(RunStatus::Aborted, None)?;
+                self.coordinator.append_run_record(&updated).await?;
+                Ok(updated)
+            }
+            RunStatus::Published => Err(OmniError::manifest_conflict(format!(
+                "run '{}' is already published",
+                run_id
+            ))),
+            RunStatus::Aborted => Err(OmniError::manifest_conflict(format!(
+                "run '{}' is already aborted",
+                run_id
+            ))),
+        }
+    }
+
+    pub async fn fail_run(&mut self, run_id: &RunId) -> Result<RunRecord> {
+        self.ensure_schema_state_valid().await?;
+        let run = self.get_run(run_id).await?;
+        match run.status {
+            RunStatus::Running => {
+                let updated = run.with_status(RunStatus::Failed, None)?;
+                self.coordinator.append_run_record(&updated).await?;
+                Ok(updated)
+            }
+            RunStatus::Failed => Ok(run),
+            RunStatus::Published => Err(OmniError::manifest_conflict(format!(
+                "run '{}' is already published",
+                run_id
+            ))),
+            RunStatus::Aborted => Err(OmniError::manifest_conflict(format!(
+                "run '{}' is already aborted",
+                run_id
+            ))),
+        }
+    }
+
+    pub async fn publish_run(&mut self, run_id: &RunId) -> Result<SnapshotId> {
+        self.publish_run_as(run_id, None).await
+    }
+
+    pub async fn publish_run_as(
+        &mut self,
+        run_id: &RunId,
+        actor_id: Option<&str>,
+    ) -> Result<SnapshotId> {
+        self.ensure_schema_state_valid().await?;
+        let run = self.get_run(run_id).await?;
+        match run.status {
+            RunStatus::Running => {}
+            RunStatus::Published => {
+                return run
+                    .published_snapshot_id
+                    .clone()
+                    .map(SnapshotId::new)
+                    .ok_or_else(|| {
+                        OmniError::manifest(format!(
+                            "run '{}' is published but missing published snapshot id",
+                            run_id
+                        ))
+                    });
+            }
+            RunStatus::Failed | RunStatus::Aborted => {
+                return Err(OmniError::manifest_conflict(format!(
+                    "run '{}' is not publishable from status '{}'",
+                    run_id,
+                    run.status.as_str()
+                )));
+            }
+        }
+
+        let publish_actor = actor_id
+            .map(str::to_string)
+            .or_else(|| run.actor_id.clone());
+        let current_target_snapshot_id = self.resolve_snapshot(&run.target_branch).await?;
+        let previous_actor = self.audit_actor_id.clone();
+        self.audit_actor_id = publish_actor.clone();
+        let publish_result = if current_target_snapshot_id.as_str() == run.base_snapshot_id {
+            let run_for_promotion = run.clone();
+            self.sync_branch(&run_for_promotion.target_branch).await?;
+            self.promote_run_snapshot_to_target(&run_for_promotion)
+                .await
+        } else {
+            let run_branch = run.run_branch.clone();
+            let target_branch = run.target_branch.clone();
+            self.branch_merge_internal(&run_branch, &target_branch)
+                .await?;
+            self.reify_internal_run_refs(&target_branch, &run_branch)
+                .await
+        };
+        self.audit_actor_id = previous_actor;
+        publish_result?;
+        let published_snapshot_id = self.resolve_snapshot(&run.target_branch).await?;
+        let updated = run.with_status(
+            RunStatus::Published,
+            Some(published_snapshot_id.as_str().to_string()),
+        )?;
+        self.coordinator.append_run_record(&updated).await?;
+        Ok(published_snapshot_id)
+    }
+
+    async fn promote_run_snapshot_to_target(&mut self, run: &RunRecord) -> Result<()> {
+        let target_snapshot = self
+            .snapshot_of(ReadTarget::branch(run.target_branch.as_str()))
+            .await?;
+        let run_snapshot = self
+            .snapshot_of(ReadTarget::branch(run.run_branch.as_str()))
+            .await?;
+        let mut table_keys = std::collections::BTreeSet::new();
+        for entry in target_snapshot.entries() {
+            table_keys.insert(entry.table_key.clone());
+        }
+        for entry in run_snapshot.entries() {
+            table_keys.insert(entry.table_key.clone());
+        }
+
+        let mut updates = Vec::new();
+        let mut changed_edge_tables = false;
+        let target_branch = normalize_branch_name(&run.target_branch)?;
+
+        for table_key in table_keys {
+            let target_entry = target_snapshot.entry(&table_key);
+            let run_entry = run_snapshot.entry(&table_key);
+            if same_manifest_state(target_entry, run_entry) {
+                continue;
+            }
+            let Some(_run_entry) = run_entry else {
+                return Err(OmniError::manifest(format!(
+                    "run '{}' removed table '{}' which publish_run does not support",
+                    run.run_id, table_key
+                )));
+            };
+
+            let source_ds = run_snapshot.open(&table_key).await?;
+            let batch = self.batch_for_table_rewrite(&source_ds, &table_key).await?;
+
+            let (mut target_ds, full_path, table_branch) = self
+                .open_for_mutation_on_branch(target_branch.as_deref(), &table_key)
+                .await?;
+            let state = self
+                .table_store()
+                .overwrite_batch(&full_path, &mut target_ds, batch)
+                .await?;
+            updates.push(crate::db::SubTableUpdate {
+                table_key: table_key.clone(),
+                table_version: state.version,
+                table_branch,
+                row_count: state.row_count,
+                version_metadata: state.version_metadata,
+            });
+            if table_key.starts_with("edge:") {
+                changed_edge_tables = true;
+            }
+        }
+
+        if !updates.is_empty() {
+            self.commit_updates_on_branch(target_branch.as_deref(), &updates)
+                .await?;
+            if changed_edge_tables {
+                self.invalidate_graph_index().await;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn reify_internal_run_refs(
+        &mut self,
+        target_branch: &str,
+        run_branch: &str,
+    ) -> Result<()> {
+        let target_snapshot = self.snapshot_of(ReadTarget::branch(target_branch)).await?;
+        let mut updates = Vec::new();
+        let mut changed_edge_tables = false;
+        let target_branch = normalize_branch_name(target_branch)?;
+
+        for entry in target_snapshot.entries() {
+            if entry.table_branch.as_deref() != Some(run_branch) {
+                continue;
+            }
+
+            let source_ds = target_snapshot.open(&entry.table_key).await?;
+            let batch = self
+                .batch_for_table_rewrite(&source_ds, &entry.table_key)
+                .await?;
+
+            let (mut target_ds, full_path, table_branch) = self
+                .open_for_mutation_on_branch(target_branch.as_deref(), &entry.table_key)
+                .await?;
+            let state = self
+                .table_store()
+                .overwrite_batch(&full_path, &mut target_ds, batch)
+                .await?;
+            updates.push(crate::db::SubTableUpdate {
+                table_key: entry.table_key.clone(),
+                table_version: state.version,
+                table_branch,
+                row_count: state.row_count,
+                version_metadata: state.version_metadata,
+            });
+            if entry.table_key.starts_with("edge:") {
+                changed_edge_tables = true;
+            }
+        }
+
+        if !updates.is_empty() {
+            self.commit_updates_on_branch(target_branch.as_deref(), &updates)
+                .await?;
+            if changed_edge_tables {
+                self.invalidate_graph_index().await;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Open a sub-table for mutation with version-drift guard.
+    ///
+    /// Checks that the dataset's current version matches the snapshot-pinned
+    /// version. If another writer has advanced the version, returns an error
+    /// prompting the caller to refresh and retry (optimistic concurrency).
+    pub(crate) async fn open_for_mutation(
+        &self,
+        table_key: &str,
+    ) -> Result<(Dataset, String, Option<String>)> {
+        let current_branch = self.coordinator.current_branch().map(str::to_string);
+        self.open_for_mutation_on_branch(current_branch.as_deref(), table_key)
+            .await
+    }
+
+    pub(crate) async fn open_for_mutation_on_branch(
+        &self,
+        branch: Option<&str>,
+        table_key: &str,
+    ) -> Result<(Dataset, String, Option<String>)> {
+        let resolved = self.resolved_branch_target(branch).await?;
+        let entry = resolved
+            .snapshot
+            .entry(table_key)
+            .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
+        let full_path = format!("{}/{}", self.root_uri, entry.table_path);
+        match resolved.branch.as_deref() {
+            None => {
+                let ds = self
+                    .table_store
+                    .open_dataset_head_for_write(table_key, &full_path, None)
+                    .await?;
+                self.table_store
+                    .ensure_expected_version(&ds, table_key, entry.table_version)?;
+                Ok((ds, full_path, None))
+            }
+            Some(active_branch) => {
+                let (ds, table_branch) = self
+                    .open_owned_dataset_for_branch_write(
+                        table_key,
+                        &full_path,
+                        entry.table_branch.as_deref(),
+                        entry.table_version,
+                        active_branch,
+                    )
+                    .await?;
+                Ok((ds, full_path, table_branch))
+            }
+        }
+    }
+
+    /// Open the dataset that should receive a branch-local metadata or data
+    /// write, forking it from the manifest-pinned source state when the active
+    /// branch does not yet own the subtable.
+    pub(crate) async fn open_owned_dataset_for_branch_write(
+        &self,
+        table_key: &str,
+        full_path: &str,
+        entry_branch: Option<&str>,
+        entry_version: u64,
+        active_branch: &str,
+    ) -> Result<(Dataset, Option<String>)> {
+        match entry_branch {
+            Some(branch) if branch == active_branch => {
+                let ds = self
+                    .table_store
+                    .open_dataset_head_for_write(table_key, full_path, Some(active_branch))
+                    .await?;
+                self.table_store
+                    .ensure_expected_version(&ds, table_key, entry_version)?;
+                Ok((ds, Some(active_branch.to_string())))
+            }
+            source_branch => {
+                self.fork_dataset_from_entry_state(
+                    table_key,
+                    full_path,
+                    source_branch,
+                    entry_version,
+                    active_branch,
+                )
+                .await?;
+                let ds = self
+                    .table_store
+                    .open_dataset_head_for_write(table_key, full_path, Some(active_branch))
+                    .await?;
+                self.table_store
+                    .ensure_expected_version(&ds, table_key, entry_version)?;
+                Ok((ds, Some(active_branch.to_string())))
+            }
+        }
+    }
+
+    pub(crate) async fn fork_dataset_from_entry_state(
+        &self,
+        table_key: &str,
+        full_path: &str,
+        source_branch: Option<&str>,
+        source_version: u64,
+        active_branch: &str,
+    ) -> Result<Dataset> {
+        let ds = self
+            .table_store
+            .fork_branch_from_state(
+                full_path,
+                source_branch,
+                table_key,
+                source_version,
+                active_branch,
+            )
+            .await?;
+        Ok(ds)
+    }
+
+    pub(crate) async fn reopen_for_mutation(
+        &self,
+        table_key: &str,
+        full_path: &str,
+        table_branch: Option<&str>,
+        expected_version: u64,
+    ) -> Result<Dataset> {
+        self.table_store
+            .reopen_for_mutation(full_path, table_branch, table_key, expected_version)
+            .await
+    }
+
+    pub(crate) async fn open_dataset_at_state(
+        &self,
+        table_path: &str,
+        table_branch: Option<&str>,
+        table_version: u64,
+    ) -> Result<Dataset> {
+        self.table_store
+            .open_dataset_at_state(table_path, table_branch, table_version)
+            .await
+    }
+
+    pub(crate) async fn build_indices_on_dataset(
+        &self,
+        table_key: &str,
+        ds: &mut Dataset,
+    ) -> Result<()> {
+        if let Some(type_name) = table_key.strip_prefix("node:") {
+            if !self.table_store.has_btree_index(ds, "id").await? {
+                self.table_store
+                    .create_btree_index(ds, &["id"])
+                    .await
+                    .map_err(|e| {
+                        OmniError::Lance(format!("create BTree index on {}(id): {}", table_key, e))
+                    })?;
+            }
+
+            if let Some(node_type) = self.catalog.node_types.get(type_name) {
+                for index_cols in &node_type.indices {
+                    if index_cols.len() != 1 {
+                        continue;
+                    }
+                    let prop_name = &index_cols[0];
+                    if let Some(prop_type) = node_type.properties.get(prop_name) {
+                        if matches!(prop_type.scalar, ScalarType::String) && !prop_type.list {
+                            if !self.table_store.has_fts_index(ds, prop_name).await? {
+                                self.table_store
+                                    .create_inverted_index(ds, prop_name.as_str())
+                                    .await
+                                    .map_err(|e| {
+                                        OmniError::Lance(format!(
+                                            "create Inverted index on {}({}): {}",
+                                            table_key, prop_name, e
+                                        ))
+                                    })?;
+                            }
+                        } else if matches!(prop_type.scalar, ScalarType::Vector(_))
+                            && !prop_type.list
+                        {
+                            if !self.table_store.has_vector_index(ds, prop_name).await? {
+                                self.table_store
+                                    .create_vector_index(ds, prop_name.as_str())
+                                    .await
+                                    .map_err(|e| {
+                                        OmniError::Lance(format!(
+                                            "create Vector index on {}({}): {}",
+                                            table_key, prop_name, e
+                                        ))
+                                    })?;
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        if table_key.starts_with("edge:") {
+            if !self.table_store.has_btree_index(ds, "id").await? {
+                self.table_store
+                    .create_btree_index(ds, &["id"])
+                    .await
+                    .map_err(|e| {
+                        OmniError::Lance(format!("create BTree index on {}(id): {}", table_key, e))
+                    })?;
+            }
+            if !self.table_store.has_btree_index(ds, "src").await? {
+                self.table_store
+                    .create_btree_index(ds, &["src"])
+                    .await
+                    .map_err(|e| {
+                        OmniError::Lance(format!("create BTree index on {}(src): {}", table_key, e))
+                    })?;
+            }
+            if !self.table_store.has_btree_index(ds, "dst").await? {
+                self.table_store
+                    .create_btree_index(ds, &["dst"])
+                    .await
+                    .map_err(|e| {
+                        OmniError::Lance(format!("create BTree index on {}(dst): {}", table_key, e))
+                    })?;
+            }
+            return Ok(());
+        }
+
+        Err(OmniError::manifest(format!(
+            "invalid table key '{}'",
+            table_key
+        )))
+    }
+
+    async fn prepare_updates_for_commit(
+        &self,
+        branch: Option<&str>,
+        updates: &[crate::db::SubTableUpdate],
+    ) -> Result<Vec<crate::db::SubTableUpdate>> {
+        if updates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let snapshot = self.snapshot_for_branch(branch).await?;
+        let mut prepared = Vec::with_capacity(updates.len());
+
+        for update in updates {
+            let Some(entry) = snapshot.entry(&update.table_key) else {
+                return Err(OmniError::manifest(format!(
+                    "no manifest entry for {}",
+                    update.table_key
+                )));
+            };
+
+            let mut prepared_update = update.clone();
+            if prepared_update.row_count > 0 {
+                let full_path = format!("{}/{}", self.root_uri, entry.table_path);
+                let mut ds = self
+                    .reopen_for_mutation(
+                        &prepared_update.table_key,
+                        &full_path,
+                        prepared_update.table_branch.as_deref(),
+                        prepared_update.table_version,
+                    )
+                    .await?;
+                self.build_indices_on_dataset(&prepared_update.table_key, &mut ds)
+                    .await?;
+                let state = self.table_store.table_state(&full_path, &ds).await?;
+                prepared_update.table_version = state.version;
+                prepared_update.row_count = state.row_count;
+                prepared_update.version_metadata = state.version_metadata;
+            }
+
+            prepared.push(prepared_update);
+        }
+
+        Ok(prepared)
+    }
+
+    async fn commit_prepared_updates(
+        &mut self,
+        updates: &[crate::db::SubTableUpdate],
+    ) -> Result<u64> {
+        let actor_id = self.current_audit_actor().map(str::to_string);
+        let PublishedSnapshot {
+            manifest_version,
+            _snapshot_id: _,
+        } = self
+            .coordinator
+            .commit_updates_with_actor(updates, actor_id.as_deref())
+            .await?;
+        Ok(manifest_version)
+    }
+
+    async fn commit_prepared_updates_on_branch(
+        &mut self,
+        branch: Option<&str>,
+        updates: &[crate::db::SubTableUpdate],
+    ) -> Result<u64> {
+        let current_branch = self.coordinator.current_branch().map(str::to_string);
+        let requested_branch = branch.map(str::to_string);
+        if requested_branch == current_branch {
+            return self.commit_prepared_updates(updates).await;
+        }
+
+        let mut coordinator = match requested_branch.as_deref() {
+            Some(branch) => {
+                GraphCoordinator::open_branch(self.uri(), branch, Arc::clone(&self.storage)).await?
+            }
+            None => GraphCoordinator::open(self.uri(), Arc::clone(&self.storage)).await?,
+        };
+        let actor_id = self.current_audit_actor().map(str::to_string);
+        let PublishedSnapshot {
+            manifest_version,
+            _snapshot_id: _,
+        } = coordinator
+            .commit_updates_with_actor(updates, actor_id.as_deref())
+            .await?;
+        Ok(manifest_version)
+    }
+
+    pub(crate) async fn commit_updates(
+        &mut self,
+        updates: &[crate::db::SubTableUpdate],
+    ) -> Result<u64> {
+        let current_branch = self.coordinator.current_branch().map(str::to_string);
+        let prepared = self
+            .prepare_updates_for_commit(current_branch.as_deref(), updates)
+            .await?;
+        self.commit_prepared_updates(&prepared).await
+    }
+
+    pub(crate) async fn commit_manifest_updates(
+        &mut self,
+        updates: &[crate::db::SubTableUpdate],
+    ) -> Result<u64> {
+        self.coordinator.commit_manifest_updates(updates).await
+    }
+
+    pub(crate) async fn record_merge_commit(
+        &mut self,
+        manifest_version: u64,
+        parent_commit_id: &str,
+        merged_parent_commit_id: &str,
+    ) -> Result<String> {
+        let actor_id = self.current_audit_actor().map(str::to_string);
+        self.coordinator
+            .record_merge_commit(
+                manifest_version,
+                parent_commit_id,
+                merged_parent_commit_id,
+                actor_id.as_deref(),
+            )
+            .await
+            .map(|snapshot_id| snapshot_id.as_str().to_string())
+    }
+
+    pub(crate) async fn commit_updates_on_branch(
+        &mut self,
+        branch: Option<&str>,
+        updates: &[crate::db::SubTableUpdate],
+    ) -> Result<u64> {
+        let prepared = self.prepare_updates_for_commit(branch, updates).await?;
+        self.commit_prepared_updates_on_branch(branch, &prepared)
+            .await
+    }
+
+    pub(crate) async fn ensure_commit_graph_initialized(&mut self) -> Result<()> {
+        self.coordinator.ensure_commit_graph_initialized().await
+    }
+
+    /// Invalidate the cached graph index. Called after edge mutations.
+    pub(crate) async fn invalidate_graph_index(&self) {
+        self.runtime_cache.invalidate_all().await;
+    }
+
+    async fn batch_for_table_rewrite(
+        &self,
+        source_ds: &Dataset,
+        table_key: &str,
+    ) -> Result<RecordBatch> {
+        let target_schema = schema_for_table_key(self.catalog(), table_key)?;
+        let blob_properties = blob_properties_for_table_key(self.catalog(), table_key)?;
+        if blob_properties.is_empty() {
+            let batches = self.table_store().scan_batches(source_ds).await?;
+            return concat_or_empty_batches(target_schema, batches);
+        }
+
+        let batches = self
+            .table_store()
+            .scan_with(source_ds, None, None, None, true, |_| Ok(()))
+            .await?;
+        let batch = concat_or_empty_batches(target_schema.clone(), batches)?;
+        if batch.num_rows() == 0 {
+            return Ok(batch);
+        }
+
+        let row_ids = batch
+            .column_by_name("_rowid")
+            .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| {
+                OmniError::Lance(format!(
+                    "expected _rowid column when rewriting '{}'",
+                    table_key
+                ))
+            })?;
+        let row_ids: Vec<u64> = row_ids.values().iter().copied().collect();
+
+        let mut columns = Vec::with_capacity(target_schema.fields().len());
+        for field in target_schema.fields() {
+            if blob_properties.contains(field.name()) {
+                let descriptions = batch
+                    .column_by_name(field.name())
+                    .and_then(|col| col.as_any().downcast_ref::<StructArray>())
+                    .ok_or_else(|| {
+                        OmniError::Lance(format!(
+                            "expected blob descriptions for '{}.{}'",
+                            table_key,
+                            field.name()
+                        ))
+                    })?;
+                columns.push(
+                    self.rebuild_blob_column(source_ds, field.name(), descriptions, &row_ids)
+                        .await?,
+                );
+            } else {
+                columns.push(batch.column_by_name(field.name()).cloned().ok_or_else(|| {
+                    OmniError::Lance(format!(
+                        "missing column '{}.{}' in rewrite batch",
+                        table_key,
+                        field.name()
+                    ))
+                })?);
+            }
+        }
+
+        RecordBatch::try_new(target_schema, columns).map_err(|e| OmniError::Lance(e.to_string()))
+    }
+
+    async fn rebuild_blob_column(
+        &self,
+        source_ds: &Dataset,
+        column_name: &str,
+        descriptions: &StructArray,
+        row_ids: &[u64],
+    ) -> Result<Arc<dyn Array>> {
+        let mut builder = BlobArrayBuilder::new(row_ids.len());
+        let mut non_null_row_ids = Vec::new();
+        let mut row_has_blob = Vec::with_capacity(row_ids.len());
+
+        for row in 0..row_ids.len() {
+            let is_null = blob_description_is_null(descriptions, row)?;
+            row_has_blob.push(!is_null);
+            if !is_null {
+                non_null_row_ids.push(row_ids[row]);
+            }
+        }
+
+        let blob_files = if non_null_row_ids.is_empty() {
+            Vec::new()
+        } else {
+            Arc::new(source_ds.clone())
+                .take_blobs(&non_null_row_ids, column_name)
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?
+        };
+
+        let mut files = blob_files.into_iter();
+        for has_blob in row_has_blob {
+            if !has_blob {
+                builder
+                    .push_null()
+                    .map_err(|e| OmniError::Lance(e.to_string()))?;
+                continue;
+            }
+
+            let blob = files.next().ok_or_else(|| {
+                OmniError::Lance(format!(
+                    "blob rewrite for '{}' lost alignment with source rows",
+                    column_name
+                ))
+            })?;
+            if let Some(uri) = blob.uri() {
+                builder
+                    .push_uri(uri)
+                    .map_err(|e| OmniError::Lance(e.to_string()))?;
+            } else {
+                builder
+                    .push_bytes(
+                        blob.read()
+                            .await
+                            .map_err(|e| OmniError::Lance(e.to_string()))?,
+                    )
+                    .map_err(|e| OmniError::Lance(e.to_string()))?;
+            }
+        }
+
+        if files.next().is_some() {
+            return Err(OmniError::Lance(format!(
+                "blob rewrite for '{}' produced extra source blobs",
+                column_name
+            )));
+        }
+
+        builder
+            .finish()
+            .map_err(|e| OmniError::Lance(e.to_string()))
+    }
+
+    async fn export_blob_values(
+        &self,
+        source_ds: &Dataset,
+        batch: &RecordBatch,
+        row_ids: &[u64],
+        blob_properties: &std::collections::HashSet<String>,
+    ) -> Result<HashMap<String, Vec<Option<String>>>> {
+        let mut values = HashMap::with_capacity(blob_properties.len());
+        for property in blob_properties {
+            let descriptions = batch
+                .column_by_name(property)
+                .and_then(|col| col.as_any().downcast_ref::<StructArray>())
+                .ok_or_else(|| {
+                    OmniError::Lance(format!(
+                        "expected blob descriptions for export column '{}'",
+                        property
+                    ))
+                })?;
+            values.insert(
+                property.clone(),
+                export_blob_column_values(source_ds, property, descriptions, row_ids).await?,
+            );
+        }
+        Ok(values)
+    }
+
+    async fn export_rows_from_batch(
+        &self,
+        table_key: &str,
+        batch: &RecordBatch,
+        blob_values: Option<&HashMap<String, Vec<Option<String>>>>,
+    ) -> Result<Vec<serde_json::Value>> {
+        if let Some(type_name) = table_key.strip_prefix("node:") {
+            let node_type =
+                self.catalog.node_types.get(type_name).ok_or_else(|| {
+                    OmniError::manifest(format!("unknown node type '{}'", type_name))
+                })?;
+            let mut rows = Vec::with_capacity(batch.num_rows());
+            for row in 0..batch.num_rows() {
+                let mut data = serde_json::Map::new();
+                data.insert(
+                    "id".to_string(),
+                    json_value_from_named_column(batch, "id", row)?,
+                );
+                for field in node_type.arrow_schema.fields().iter().skip(1) {
+                    data.insert(
+                        field.name().clone(),
+                        export_value_for_field(
+                            batch,
+                            field.name(),
+                            row,
+                            blob_values.and_then(|values| values.get(field.name())),
+                        )?,
+                    );
+                }
+                rows.push(serde_json::json!({
+                    "type": type_name,
+                    "data": serde_json::Value::Object(data),
+                }));
+            }
+            return Ok(rows);
+        }
+
+        if let Some(edge_name) = table_key.strip_prefix("edge:") {
+            let edge_type =
+                self.catalog.edge_types.get(edge_name).ok_or_else(|| {
+                    OmniError::manifest(format!("unknown edge type '{}'", edge_name))
+                })?;
+            let mut rows = Vec::with_capacity(batch.num_rows());
+            for row in 0..batch.num_rows() {
+                let from = named_string_value(batch, "src", row)?;
+                let to = named_string_value(batch, "dst", row)?;
+                let mut data = serde_json::Map::new();
+                data.insert(
+                    "id".to_string(),
+                    json_value_from_named_column(batch, "id", row)?,
+                );
+                for field in edge_type.arrow_schema.fields().iter().skip(3) {
+                    data.insert(
+                        field.name().clone(),
+                        export_value_for_field(
+                            batch,
+                            field.name(),
+                            row,
+                            blob_values.and_then(|values| values.get(field.name())),
+                        )?,
+                    );
+                }
+                rows.push(serde_json::json!({
+                    "edge": edge_name,
+                    "from": from,
+                    "to": to,
+                    "data": serde_json::Value::Object(data),
+                }));
+            }
+            return Ok(rows);
+        }
+
+        Err(OmniError::manifest(format!(
+            "invalid export table key '{}'",
+            table_key
+        )))
+    }
+}
+
+async fn export_blob_column_values(
+    source_ds: &Dataset,
+    column_name: &str,
+    descriptions: &StructArray,
+    row_ids: &[u64],
+) -> Result<Vec<Option<String>>> {
+    let mut non_null_row_ids = Vec::new();
+    let mut non_null_positions = Vec::new();
+    let mut values = vec![None; row_ids.len()];
+
+    for (row, row_id) in row_ids.iter().enumerate() {
+        if blob_description_is_null(descriptions, row)? {
+            continue;
+        }
+        non_null_row_ids.push(*row_id);
+        non_null_positions.push(row);
+    }
+
+    if non_null_row_ids.is_empty() {
+        return Ok(values);
+    }
+
+    // Sort row IDs before calling take_blobs — Lance 4's unsorted path has
+    // a bug that duplicates the _rowaddr column in the returned batch.
+    let mut perm: Vec<usize> = (0..non_null_row_ids.len()).collect();
+    perm.sort_by_key(|&i| non_null_row_ids[i]);
+    let sorted_ids: Vec<u64> = perm.iter().map(|&i| non_null_row_ids[i]).collect();
+
+    let sorted_blobs = Arc::new(source_ds.clone())
+        .take_blobs(&sorted_ids, column_name)
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+    if sorted_blobs.len() != non_null_positions.len() {
+        return Err(OmniError::Lance(format!(
+            "blob export for '{}' lost alignment with selected rows",
+            column_name
+        )));
+    }
+
+    // Restore original order via inverse permutation. Build an index that
+    // maps each original position to the sorted position so we can iterate
+    // non_null_positions in order and pick the right blob.
+    let mut inverse_perm = vec![0usize; perm.len()];
+    for (sorted_pos, &orig_pos) in perm.iter().enumerate() {
+        inverse_perm[orig_pos] = sorted_pos;
+    }
+
+    for (idx, position) in non_null_positions.into_iter().enumerate() {
+        let blob = &sorted_blobs[inverse_perm[idx]];
+        let value = if let Some(uri) = blob.uri() {
+            uri.to_string()
+        } else {
+            let bytes = blob
+                .read()
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            format!(
+                "base64:{}",
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
+            )
+        };
+        values[position] = Some(value);
+    }
+
+    Ok(values)
+}
+
+fn export_value_for_field(
+    batch: &RecordBatch,
+    field_name: &str,
+    row: usize,
+    blob_values: Option<&Vec<Option<String>>>,
+) -> Result<serde_json::Value> {
+    if let Some(blob_values) = blob_values {
+        return Ok(blob_values
+            .get(row)
+            .and_then(|value| value.clone())
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null));
+    }
+    json_value_from_named_column(batch, field_name, row)
+}
+
+fn json_value_from_named_column(
+    batch: &RecordBatch,
+    field_name: &str,
+    row: usize,
+) -> Result<serde_json::Value> {
+    let column = batch.column_by_name(field_name).ok_or_else(|| {
+        OmniError::Lance(format!("missing column '{}' in export batch", field_name))
+    })?;
+    json_value_from_array(column.as_ref(), row)
+}
+
+fn named_string_value(batch: &RecordBatch, field_name: &str, row: usize) -> Result<String> {
+    let column = batch.column_by_name(field_name).ok_or_else(|| {
+        OmniError::Lance(format!("missing column '{}' in export batch", field_name))
+    })?;
+    let array = column
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| OmniError::Lance(format!("expected Utf8 column '{}'", field_name)))?;
+    if array.is_null(row) {
+        return Err(OmniError::Lance(format!(
+            "unexpected null in export column '{}'",
+            field_name
+        )));
+    }
+    Ok(array.value(row).to_string())
+}
+
+pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return Err(OmniError::manifest(
+            "branch name cannot be empty".to_string(),
+        ));
+    }
+    if branch == "main" {
+        return Ok(None);
+    }
+    Ok(Some(branch.to_string()))
+}
+
+fn ensure_public_branch_ref(branch: &str, operation: &str) -> Result<()> {
+    if is_internal_run_branch(branch) {
+        return Err(OmniError::manifest(format!(
+            "{} does not allow internal run ref '{}'",
+            operation, branch
+        )));
+    }
+    Ok(())
+}
+
+fn same_manifest_state(
+    left: Option<&crate::db::SubTableEntry>,
+    right: Option<&crate::db::SubTableEntry>,
+) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            left.table_path == right.table_path
+                && left.table_version == right.table_version
+                && left.table_branch == right.table_branch
+                && left.row_count == right.row_count
+        }
+        _ => false,
+    }
+}
+
+fn concat_or_empty_batches(schema: Arc<Schema>, batches: Vec<RecordBatch>) -> Result<RecordBatch> {
+    if batches.is_empty() {
+        return Ok(RecordBatch::new_empty(schema));
+    }
+    if batches.len() == 1 {
+        return Ok(batches.into_iter().next().unwrap());
+    }
+    let batch_schema = batches[0].schema();
+    arrow_select::concat::concat_batches(&batch_schema, &batches)
+        .map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+fn blob_properties_for_table_key<'a>(
+    catalog: &'a Catalog,
+    table_key: &str,
+) -> Result<&'a std::collections::HashSet<String>> {
+    if let Some(type_name) = table_key.strip_prefix("node:") {
+        return catalog
+            .node_types
+            .get(type_name)
+            .map(|node_type| &node_type.blob_properties)
+            .ok_or_else(|| OmniError::manifest(format!("unknown node type '{}'", type_name)));
+    }
+    if let Some(type_name) = table_key.strip_prefix("edge:") {
+        return catalog
+            .edge_types
+            .get(type_name)
+            .map(|edge_type| &edge_type.blob_properties)
+            .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{}'", type_name)));
+    }
+    Err(OmniError::manifest(format!(
+        "invalid table key '{}'",
+        table_key
+    )))
+}
+
+fn blob_description_is_null(descriptions: &StructArray, row: usize) -> Result<bool> {
+    if descriptions.is_null(row) {
+        return Ok(true);
+    }
+
+    let kind = descriptions
+        .column_by_name("kind")
+        .and_then(|col| col.as_any().downcast_ref::<UInt32Array>())
+        .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row) as u8))
+        .or_else(|| {
+            descriptions
+                .column_by_name("kind")
+                .and_then(|col| col.as_any().downcast_ref::<arrow_array::UInt8Array>())
+                .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)))
+        });
+    let position = descriptions
+        .column_by_name("position")
+        .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+        .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)));
+    let size = descriptions
+        .column_by_name("size")
+        .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+        .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)));
+    let blob_uri = descriptions
+        .column_by_name("blob_uri")
+        .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+        .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)));
+
+    let Some(kind) = kind else {
+        return Ok(true);
+    };
+    let kind = BlobKind::try_from(kind).map_err(|e| OmniError::Lance(e.to_string()))?;
+    if kind != BlobKind::Inline {
+        return Ok(false);
+    }
+
+    Ok(position.unwrap_or(0) == 0 && size.unwrap_or(0) == 0 && blob_uri.unwrap_or("").is_empty())
+}
+
+/// Replace placeholder `LargeBinary` fields with Lance blob v2 fields.
+///
+/// The compiler crate has no Lance dependency, so `ScalarType::Blob` maps to
+/// `DataType::LargeBinary` as a placeholder. This function replaces those
+/// fields with the real blob v2 struct type via `lance::blob::blob_field()`.
+fn fixup_blob_schemas(catalog: &mut Catalog) {
+    for node_type in catalog.node_types.values_mut() {
+        if node_type.blob_properties.is_empty() {
+            continue;
+        }
+        let fields: Vec<Field> = node_type
+            .arrow_schema
+            .fields()
+            .iter()
+            .map(|f| {
+                if node_type.blob_properties.contains(f.name()) {
+                    blob_field(f.name(), f.is_nullable())
+                } else {
+                    f.as_ref().clone()
+                }
+            })
+            .collect();
+        node_type.arrow_schema = Arc::new(Schema::new(fields));
+    }
+    for edge_type in catalog.edge_types.values_mut() {
+        if edge_type.blob_properties.is_empty() {
+            continue;
+        }
+        let fields: Vec<Field> = edge_type
+            .arrow_schema
+            .fields()
+            .iter()
+            .map(|f| {
+                if edge_type.blob_properties.contains(f.name()) {
+                    blob_field(f.name(), f.is_nullable())
+                } else {
+                    f.as_ref().clone()
+                }
+            })
+            .collect();
+        edge_type.arrow_schema = Arc::new(Schema::new(fields));
+    }
+}
+
+fn read_schema_ir_from_source(schema_source: &str) -> Result<SchemaIR> {
+    let schema_ast = parse_schema(schema_source)?;
+    build_schema_ir(&schema_ast).map_err(|err| OmniError::manifest(err.to_string()))
+}
+
+fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result<Arc<Schema>> {
+    if let Some(type_name) = table_key.strip_prefix("node:") {
+        let node_type: &NodeType = catalog
+            .node_types
+            .get(type_name)
+            .ok_or_else(|| OmniError::manifest(format!("unknown node type '{}'", type_name)))?;
+        return Ok(node_type.arrow_schema.clone());
+    }
+    if let Some(type_name) = table_key.strip_prefix("edge:") {
+        let edge_type: &EdgeType = catalog
+            .edge_types
+            .get(type_name)
+            .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{}'", type_name)))?;
+        return Ok(edge_type.arrow_schema.clone());
+    }
+    Err(OmniError::manifest(format!(
+        "invalid table key '{}'",
+        table_key
+    )))
+}
+
+fn record_batch_row_to_json(batch: &RecordBatch, row: usize) -> Result<serde_json::Value> {
+    let mut obj = serde_json::Map::new();
+    for (i, field) in batch.schema().fields().iter().enumerate() {
+        obj.insert(
+            field.name().clone(),
+            json_value_from_array(batch.column(i).as_ref(), row)?,
+        );
+    }
+    Ok(serde_json::Value::Object(obj))
+}
+
+fn json_value_from_array(array: &dyn Array, row: usize) -> Result<serde_json::Value> {
+    if array.is_null(row) {
+        return Ok(serde_json::Value::Null);
+    }
+
+    match array.data_type() {
+        DataType::Utf8 => Ok(serde_json::Value::String(
+            array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| OmniError::Lance("expected StringArray".to_string()))?
+                .value(row)
+                .to_string(),
+        )),
+        DataType::LargeUtf8 => Ok(serde_json::Value::String(
+            array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| OmniError::Lance("expected LargeStringArray".to_string()))?
+                .value(row)
+                .to_string(),
+        )),
+        DataType::Boolean => Ok(serde_json::Value::Bool(
+            array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| OmniError::Lance("expected BooleanArray".to_string()))?
+                .value(row),
+        )),
+        DataType::Int32 => Ok(serde_json::Value::Number(serde_json::Number::from(
+            array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| OmniError::Lance("expected Int32Array".to_string()))?
+                .value(row),
+        ))),
+        DataType::Int64 => Ok(serde_json::Value::Number(serde_json::Number::from(
+            array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| OmniError::Lance("expected Int64Array".to_string()))?
+                .value(row),
+        ))),
+        DataType::UInt32 => Ok(serde_json::Value::Number(serde_json::Number::from(
+            array
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| OmniError::Lance("expected UInt32Array".to_string()))?
+                .value(row),
+        ))),
+        DataType::UInt64 => Ok(serde_json::Value::Number(serde_json::Number::from(
+            array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| OmniError::Lance("expected UInt64Array".to_string()))?
+                .value(row),
+        ))),
+        DataType::Float32 => {
+            let value = array
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| OmniError::Lance("expected Float32Array".to_string()))?
+                .value(row) as f64;
+            Ok(serde_json::Value::Number(
+                serde_json::Number::from_f64(value).ok_or_else(|| {
+                    OmniError::Lance(format!("cannot encode f32 value '{}' as JSON", value))
+                })?,
+            ))
+        }
+        DataType::Float64 => {
+            let value = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| OmniError::Lance("expected Float64Array".to_string()))?
+                .value(row);
+            Ok(serde_json::Value::Number(
+                serde_json::Number::from_f64(value).ok_or_else(|| {
+                    OmniError::Lance(format!("cannot encode f64 value '{}' as JSON", value))
+                })?,
+            ))
+        }
+        DataType::Date32 => Ok(serde_json::Value::Number(serde_json::Number::from(
+            array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| OmniError::Lance("expected Date32Array".to_string()))?
+                .value(row),
+        ))),
+        DataType::Binary => Ok(serde_json::Value::String(base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            array
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| OmniError::Lance("expected BinaryArray".to_string()))?
+                .value(row),
+        ))),
+        DataType::LargeBinary => Ok(serde_json::Value::String(base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            array
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| OmniError::Lance("expected LargeBinaryArray".to_string()))?
+                .value(row),
+        ))),
+        DataType::List(_) => {
+            let list = array
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| OmniError::Lance("expected ListArray".to_string()))?;
+            let values = list.value(row);
+            let mut out = Vec::with_capacity(values.len());
+            for idx in 0..values.len() {
+                out.push(json_value_from_array(values.as_ref(), idx)?);
+            }
+            Ok(serde_json::Value::Array(out))
+        }
+        DataType::LargeList(_) => {
+            let list = array
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .ok_or_else(|| OmniError::Lance("expected LargeListArray".to_string()))?;
+            let values = list.value(row);
+            let mut out = Vec::with_capacity(values.len());
+            for idx in 0..values.len() {
+                out.push(json_value_from_array(values.as_ref(), idx)?);
+            }
+            Ok(serde_json::Value::Array(out))
+        }
+        DataType::FixedSizeList(_, _) => {
+            let list = array
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| OmniError::Lance("expected FixedSizeListArray".to_string()))?;
+            let values = list.value(row);
+            let mut out = Vec::with_capacity(values.len());
+            for idx in 0..values.len() {
+                out.push(json_value_from_array(values.as_ref(), idx)?);
+            }
+            Ok(serde_json::Value::Array(out))
+        }
+        DataType::Struct(fields) => {
+            let struct_array = array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| OmniError::Lance("expected StructArray".to_string()))?;
+            let mut obj = serde_json::Map::new();
+            for (field_idx, field) in fields.iter().enumerate() {
+                obj.insert(
+                    field.name().clone(),
+                    json_value_from_array(struct_array.column(field_idx).as_ref(), row)?,
+                );
+            }
+            Ok(serde_json::Value::Object(obj))
+        }
+        _ => {
+            let value = arrow_cast::display::array_value_to_string(array, row)
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            Ok(serde_json::Value::String(value))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use omnigraph_compiler::{SchemaMigrationStep, SchemaTypeKind};
+    use std::fs;
+    use std::sync::Mutex;
+
+    use crate::storage::{LocalStorageAdapter, StorageAdapter, join_uri};
+
+    const TEST_SCHEMA: &str = r#"
+node Person {
+    name: String @key
+    age: I32?
+}
+node Company {
+    name: String @key
+}
+edge Knows: Person -> Person {
+    since: Date?
+}
+edge WorksAt: Person -> Company
+"#;
+
+    #[derive(Debug, Default)]
+    struct RecordingStorageAdapter {
+        inner: LocalStorageAdapter,
+        reads: Mutex<Vec<String>>,
+        writes: Mutex<Vec<String>>,
+        exists_checks: Mutex<Vec<String>>,
+    }
+
+    impl RecordingStorageAdapter {
+        fn reads(&self) -> Vec<String> {
+            self.reads.lock().unwrap().clone()
+        }
+
+        fn writes(&self) -> Vec<String> {
+            self.writes.lock().unwrap().clone()
+        }
+
+        fn exists_checks(&self) -> Vec<String> {
+            self.exists_checks.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl StorageAdapter for RecordingStorageAdapter {
+        async fn read_text(&self, uri: &str) -> Result<String> {
+            self.reads.lock().unwrap().push(uri.to_string());
+            self.inner.read_text(uri).await
+        }
+
+        async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
+            self.writes.lock().unwrap().push(uri.to_string());
+            self.inner.write_text(uri, contents).await
+        }
+
+        async fn exists(&self, uri: &str) -> Result<bool> {
+            self.exists_checks.lock().unwrap().push(uri.to_string());
+            self.inner.exists(uri).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_init_creates_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        // Schema file written
+        assert!(dir.path().join("_schema.pg").exists());
+        assert!(dir.path().join("_schema.ir.json").exists());
+        assert!(dir.path().join("__schema_state.json").exists());
+
+        // Manifest created with correct entries
+        let snap = db.snapshot();
+        assert!(snap.entry("node:Person").is_some());
+        assert!(snap.entry("node:Company").is_some());
+        assert!(snap.entry("edge:Knows").is_some());
+        assert!(snap.entry("edge:WorksAt").is_some());
+
+        // Catalog is correct
+        assert_eq!(db.catalog().node_types.len(), 2);
+        assert_eq!(db.catalog().edge_types.len(), 2);
+        assert_eq!(
+            db.catalog().node_types["Person"].key_property(),
+            Some("name")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_open_reads_existing_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+
+        Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        // Re-open
+        let db = Omnigraph::open(uri).await.unwrap();
+        assert_eq!(db.catalog().node_types.len(), 2);
+        assert_eq!(db.catalog().edge_types.len(), 2);
+        let snap = db.snapshot();
+        assert!(snap.entry("node:Person").is_some());
+        assert!(snap.entry("edge:Knows").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_init_and_open_route_graph_metadata_through_storage_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let adapter = Arc::new(RecordingStorageAdapter::default());
+
+        Omnigraph::init_with_storage(uri, TEST_SCHEMA, adapter.clone())
+            .await
+            .unwrap();
+        assert!(adapter.writes().contains(&join_uri(uri, "_schema.pg")));
+        assert!(adapter.writes().contains(&join_uri(uri, "_schema.ir.json")));
+        assert!(
+            adapter
+                .writes()
+                .contains(&join_uri(uri, "__schema_state.json"))
+        );
+
+        Omnigraph::open_with_storage(uri, adapter.clone())
+            .await
+            .unwrap();
+        assert!(adapter.reads().contains(&join_uri(uri, "_schema.pg")));
+        assert!(adapter.reads().contains(&join_uri(uri, "_schema.ir.json")));
+        assert!(
+            adapter
+                .reads()
+                .contains(&join_uri(uri, "__schema_state.json"))
+        );
+        assert!(
+            adapter
+                .exists_checks()
+                .contains(&join_uri(uri, "_schema.ir.json"))
+        );
+        assert!(
+            adapter
+                .exists_checks()
+                .contains(&join_uri(uri, "__schema_state.json"))
+        );
+        assert!(
+            adapter
+                .exists_checks()
+                .contains(&join_uri(uri, "_graph_commits.lance"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_open_bootstraps_legacy_schema_state_for_main_only_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        fs::remove_file(dir.path().join("_schema.ir.json")).unwrap();
+        fs::remove_file(dir.path().join("__schema_state.json")).unwrap();
+
+        let db = Omnigraph::open(uri).await.unwrap();
+        assert_eq!(db.catalog().node_types.len(), 2);
+        assert!(dir.path().join("_schema.ir.json").exists());
+        assert!(dir.path().join("__schema_state.json").exists());
+    }
+
+    #[tokio::test]
+    async fn test_open_rejects_legacy_repo_with_public_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        db.branch_create("feature").await.unwrap();
+
+        fs::remove_file(dir.path().join("_schema.ir.json")).unwrap();
+        fs::remove_file(dir.path().join("__schema_state.json")).unwrap();
+
+        let err = match Omnigraph::open(uri).await {
+            Ok(_) => panic!("expected legacy repo with public branch to fail schema bootstrap"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(message.contains("public branches block schema evolution entirely"));
+    }
+
+    #[tokio::test]
+    async fn test_long_lived_handle_rejects_schema_source_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        let drifted = TEST_SCHEMA.replace("age: I32?", "age: I64?");
+        fs::write(dir.path().join("_schema.pg"), drifted).unwrap();
+
+        let err = match db.snapshot_of(ReadTarget::branch("main")).await {
+            Ok(_) => panic!("expected schema source drift to be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("current _schema.pg no longer matches the accepted compiled schema")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_long_lived_handle_rejects_schema_ir_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        fs::write(dir.path().join("_schema.ir.json"), "{not valid json").unwrap();
+
+        let err = match db.snapshot_of(ReadTarget::branch("main")).await {
+            Ok(_) => panic!("expected schema IR drift to be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("accepted compiled schema contract in _schema.ir.json is invalid")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_long_lived_handle_rejects_ir_and_source_updates_without_state_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        let drifted = TEST_SCHEMA.replace("age: I32?", "age: I64?");
+        let drifted_ir = read_schema_ir_from_source(&drifted).unwrap();
+        let drifted_ir_json = omnigraph_compiler::schema_ir_pretty_json(&drifted_ir).unwrap();
+        fs::write(dir.path().join("_schema.pg"), drifted).unwrap();
+        fs::write(dir.path().join("_schema.ir.json"), drifted_ir_json).unwrap();
+
+        let err = match db.snapshot_of(ReadTarget::branch("main")).await {
+            Ok(_) => panic!("expected schema state mismatch to be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("accepted compiled schema does not match the recorded schema state")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_comment_only_schema_edit_keeps_schema_state_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        let commented = format!("// comment-only drift\n{}", TEST_SCHEMA);
+        fs::write(dir.path().join("_schema.pg"), commented).unwrap();
+
+        let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+        assert!(snapshot.entry("node:Person").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_plan_schema_reports_supported_additive_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        let desired = TEST_SCHEMA.replace(
+            "    age: I32?\n}",
+            "    age: I32?\n    nickname: String?\n}",
+        );
+
+        let plan = db.plan_schema(&desired).await.unwrap();
+        assert!(plan.supported);
+        assert!(plan.steps.iter().any(|step| matches!(
+            step,
+            SchemaMigrationStep::AddProperty {
+                type_kind: SchemaTypeKind::Node,
+                type_name,
+                property_name,
+                ..
+            } if type_name == "Person" && property_name == "nickname"
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_plan_schema_rejects_when_schema_contract_has_drifted() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        let drifted = TEST_SCHEMA.replace("age: I32?", "age: I64?");
+        fs::write(dir.path().join("_schema.pg"), drifted).unwrap();
+
+        let err = db.plan_schema(TEST_SCHEMA).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("current _schema.pg no longer matches the accepted compiled schema")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_open_nonexistent_fails() {
+        let result = Omnigraph::open("/tmp/nonexistent_omnigraph_test_xyz").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_version_is_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+
+        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        // Take snapshot before any writes
+        let snap1 = db.snapshot();
+        let v1 = snap1.version();
+
+        // Load data — advances manifest version
+        crate::loader::load_jsonl(
+            &mut db,
+            r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}"#,
+            crate::loader::LoadMode::Overwrite,
+        )
+        .await
+        .unwrap();
+
+        // Snapshot from handle sees new version
+        let snap2 = db.snapshot();
+        assert!(snap2.version() > v1);
+
+        // But the old snapshot is still pinned
+        assert_eq!(snap1.version(), v1);
+    }
+}

@@ -1,0 +1,47 @@
+[package]
+name = "omnigraph"
+version = "0.4.0"
+edition = "2024"
+description = "Lance-native graph database with git-style branching."
+license = "MIT"
+
+[features]
+default = []
+failpoints = ["dep:fail", "fail/failpoints"]
+
+[dependencies]
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.4.0" }
+lance = { workspace = true }
+lance-datafusion = { workspace = true }
+lance-file = { workspace = true }
+lance-index = { workspace = true }
+lance-linalg = { workspace = true }
+lance-namespace = { workspace = true }
+lance-table = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-ord = { workspace = true }
+arrow-select = { workspace = true }
+arrow-cast = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+object_store = { workspace = true }
+ulid = { workspace = true }
+base64 = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+regex = { workspace = true }
+tempfile = { workspace = true }
+fail = { workspace = true, optional = true }
+time = { workspace = true }
+async-trait = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.4.0" }
+tokio = { workspace = true }
+lance-namespace-impls = { workspace = true }
+serial_test = "3"

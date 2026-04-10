@@ -1,0 +1,60 @@
+// Omnigraph Schema Grammar (.pg files)
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT = _{ LINE_COMMENT | BLOCK_COMMENT }
+LINE_COMMENT = _{ "//" ~ (!"\n" ~ ANY)* }
+BLOCK_COMMENT = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
+
+schema_file = { SOI ~ schema_decl* ~ EOI }
+
+schema_decl = { interface_decl | node_decl | edge_decl }
+
+// interface Named { name: String @key }
+interface_decl = { "interface" ~ type_name ~ "{" ~ prop_decl* ~ "}" }
+
+// node Person implements Named, Described { ... }
+node_decl = { "node" ~ type_name ~ annotation* ~ implements_clause? ~ "{" ~ (prop_decl | body_constraint)* ~ "}" }
+implements_clause = { "implements" ~ type_name ~ ("," ~ type_name)* }
+
+// edge Knows: Person -> Person @card(0..1) { ... }
+// edge Knows: Person -> Person
+edge_decl = { "edge" ~ type_name ~ ":" ~ type_name ~ "->" ~ type_name ~ cardinality? ~ annotation* ~ ("{" ~ (prop_decl | body_constraint)* ~ "}")? }
+
+// @card(0..1), @card(1..), @card(0..)
+cardinality = { "@card" ~ "(" ~ integer ~ ".." ~ integer? ~ ")" }
+
+prop_decl = { ident ~ ":" ~ type_ref ~ annotation* }
+
+// Body-level constraints: @key(name), @unique(a, b), @index(a, b), @range(age, 0..200), @check(code, "regex")
+body_constraint = { "@" ~ constraint_name ~ "(" ~ constraint_args ~ ")" }
+constraint_name = { "key" | "unique" | "index" | "range" | "check" }
+constraint_args = { constraint_arg ~ ("," ~ constraint_arg)* }
+constraint_arg = { range_bound | literal | ident }
+range_bound = { (signed_float | signed_integer) ~ ".." ~ (signed_float | signed_integer)? | ".." ~ (signed_float | signed_integer) }
+
+type_ref = { core_type ~ "?"? }
+core_type = { list_type | enum_type | vector_type | base_type }
+list_type = { "[" ~ base_type ~ "]" }
+enum_type = { "enum" ~ "(" ~ enum_value ~ ("," ~ enum_value)* ~ ")" }
+vector_type = { "Vector" ~ "(" ~ integer ~ ")" }
+enum_value = @{ (ASCII_ALPHANUMERIC | "_" | "-")+ }
+
+base_type = { "String" | "Blob" | "Bool" | "I32" | "I64" | "U32" | "U64" | "F32" | "F64" | "DateTime" | "Date" }
+
+// Annotation rule excludes constraint keywords followed by "(" — those are body_constraints
+annotation = { "@" ~ !(constraint_name ~ "(") ~ ident ~ ("(" ~ annotation_arg ~ ")")? }
+annotation_arg = { literal | ident }
+
+literal = { string_lit | float_lit | integer | bool_lit }
+
+string_lit = @{ "\"" ~ string_char* ~ "\"" }
+string_char = @{ !("\"" | "\\") ~ ANY | "\\" ~ ANY }
+float_lit = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+integer = @{ ASCII_DIGIT+ }
+
+signed_float   = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+signed_integer = @{ "-"? ~ ASCII_DIGIT+ }
+bool_lit = { "true" | "false" }
+
+type_name = @{ ASCII_ALPHA_UPPER ~ (ASCII_ALPHANUMERIC | "_")* }
+ident = @{ (ASCII_ALPHA_LOWER | "_") ~ (ASCII_ALPHANUMERIC | "_")* }

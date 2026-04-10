@@ -1,0 +1,6 @@
+node Doc {
+    slug: String @key
+    title: String @index
+    body: String @index
+    embedding: Vector(4)
+}

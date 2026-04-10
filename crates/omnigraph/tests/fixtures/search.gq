@@ -1,0 +1,44 @@
+query text_search($q: String) {
+    match {
+        $d: Doc
+        search($d.title, $q)
+    }
+    return { $d.slug, $d.title }
+}
+
+query fuzzy_search($q: String) {
+    match {
+        $d: Doc
+        fuzzy($d.title, $q, 2)
+    }
+    return { $d.slug, $d.title }
+}
+
+query phrase_search($q: String) {
+    match {
+        $d: Doc
+        match_text($d.body, $q)
+    }
+    return { $d.slug, $d.title }
+}
+
+query vector_search($q: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug, $d.title }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+
+query bm25_search($q: String) {
+    match { $d: Doc }
+    return { $d.slug, $d.title }
+    order { bm25($d.title, $q) }
+    limit 3
+}
+
+query hybrid_search($vq: Vector(4), $tq: String) {
+    match { $d: Doc }
+    return { $d.slug, $d.title }
+    order { rrf(nearest($d.embedding, $vq), bm25($d.title, $tq)) }
+    limit 3
+}

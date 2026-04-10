@@ -1,0 +1,46 @@
+{"type": "Company", "data": {"slug": "aws", "name": "AWS", "sector": "hyperscaler"}}
+{"type": "Company", "data": {"slug": "cerebras", "name": "Cerebras", "sector": "chipmaker"}}
+{"type": "Company", "data": {"slug": "vast", "name": "VAST Data", "sector": "startup"}}
+{"type": "Company", "data": {"slug": "oracle", "name": "Oracle", "sector": "hyperscaler"}}
+{"type": "Company", "data": {"slug": "benchmark", "name": "Benchmark", "sector": "investor"}}
+{"type": "Company", "data": {"slug": "xai", "name": "xAI", "sector": "lab"}}
+{"type": "Company", "data": {"slug": "openai", "name": "OpenAI", "sector": "lab"}}
+{"type": "Company", "data": {"slug": "anthropic", "name": "Anthropic", "sector": "lab"}}
+{"type": "Company", "data": {"slug": "nvidia", "name": "NVIDIA", "sector": "chipmaker"}}
+{"type": "Tech", "data": {"slug": "cs3", "name": "CS-3", "kind": "infra", "tier": "growth"}}
+{"type": "Tech", "data": {"slug": "trainium", "name": "Trainium", "kind": "infra", "tier": "growth"}}
+{"type": "Tech", "data": {"slug": "grok", "name": "Grok", "kind": "model", "tier": "emerging"}}
+{"type": "Tech", "data": {"slug": "vast-ai-os", "name": "VAST AI OS", "kind": "platform", "tier": "growth"}}
+{"type": "Signal", "data": {"slug": "aws-cerebras-inference", "title": "AWS and Cerebras collaborate on disaggregated inference: Trainium for prefill, CS-3 for decode, 5x capacity", "source": "press-release", "strength": "strong", "observed": "2026-03-13"}}
+{"type": "Signal", "data": {"slug": "vast-1b-raise", "title": "VAST Data raises $1B at $30B, unveils AI OS bundling storage, compute, and agent runtimes into one stack", "source": "funding-round", "strength": "strong", "observed": "2026-03-12"}}
+{"type": "Signal", "data": {"slug": "oracle-cerebras-mention", "title": "Oracle names Cerebras alongside NVIDIA and AMD as enterprise AI chip option", "source": "earnings-call", "strength": "moderate", "observed": "2026-03-10"}}
+{"type": "Signal", "data": {"slug": "cerebras-23b-round", "title": "Cerebras valued at $23B after $1B round; Benchmark raises $225M in special vehicles to double down", "source": "funding-round", "strength": "strong", "observed": "2026-02-04"}}
+{"type": "Signal", "data": {"slug": "xai-field-engineers", "title": "xAI deploys engineers on-site at enterprise clients to win deals from OpenAI and Anthropic", "source": "reporting", "strength": "strong", "observed": "2026-03-20"}}
+{"type": "Pattern", "data": {"slug": "rise-of-fde", "name": "Rise of FDE", "category": "expansion"}}
+{"type": "Pattern", "data": {"slug": "alt-chip-breakout", "name": "Alt-chip breakout", "category": "adoption"}}
+{"type": "Pattern", "data": {"slug": "stack-collapse", "name": "Stack collapse", "category": "convergence"}}
+{"type": "Pattern", "data": {"slug": "inference-specialization", "name": "Inference specialization", "category": "convergence"}}
+{"edge": "Builds", "from": "cerebras", "to": "cs3"}
+{"edge": "Builds", "from": "aws", "to": "trainium"}
+{"edge": "Builds", "from": "xai", "to": "grok"}
+{"edge": "Builds", "from": "vast", "to": "vast-ai-os"}
+{"edge": "FundedBy", "from": "cerebras", "to": "benchmark", "data": {"amount": "$225M"}}
+{"edge": "PartnersWith", "from": "aws", "to": "cerebras"}
+{"edge": "PartnersWith", "from": "cerebras", "to": "openai"}
+{"edge": "Mentions", "from": "aws-cerebras-inference", "to": "cs3"}
+{"edge": "Mentions", "from": "aws-cerebras-inference", "to": "trainium"}
+{"edge": "Mentions", "from": "vast-1b-raise", "to": "vast-ai-os"}
+{"edge": "Mentions", "from": "cerebras-23b-round", "to": "cs3"}
+{"edge": "Mentions", "from": "xai-field-engineers", "to": "grok"}
+{"edge": "Indicates", "from": "aws-cerebras-inference", "to": "alt-chip-breakout"}
+{"edge": "Indicates", "from": "aws-cerebras-inference", "to": "inference-specialization"}
+{"edge": "Indicates", "from": "vast-1b-raise", "to": "stack-collapse"}
+{"edge": "Indicates", "from": "oracle-cerebras-mention", "to": "alt-chip-breakout"}
+{"edge": "Indicates", "from": "cerebras-23b-round", "to": "alt-chip-breakout"}
+{"edge": "Indicates", "from": "xai-field-engineers", "to": "rise-of-fde"}
+{"edge": "Involves", "from": "rise-of-fde", "to": "grok"}
+{"edge": "Involves", "from": "alt-chip-breakout", "to": "cs3"}
+{"edge": "Involves", "from": "alt-chip-breakout", "to": "trainium"}
+{"edge": "Involves", "from": "stack-collapse", "to": "vast-ai-os"}
+{"edge": "Involves", "from": "inference-specialization", "to": "cs3"}
+{"edge": "Involves", "from": "inference-specialization", "to": "trainium"}

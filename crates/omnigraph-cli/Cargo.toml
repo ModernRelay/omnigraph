@@ -1,0 +1,28 @@
+[package]
+name = "omnigraph-cli"
+version = "0.4.0"
+edition = "2024"
+description = "CLI for the Omnigraph graph database."
+license = "MIT"
+
+[[bin]]
+name = "omnigraph"
+path = "src/main.rs"
+
+[dependencies]
+omnigraph = { path = "../omnigraph", version = "0.4.0" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.4.0" }
+omnigraph-server = { path = "../omnigraph-server", version = "0.4.0" }
+clap = { workspace = true }
+color-eyre = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+serde_json = { workspace = true }
+tempfile = { workspace = true }
