@@ -13,9 +13,29 @@ By default the installer places:
 
 in `~/.local/bin`.
 
-If a matching release asset exists for your platform, the installer downloads
-and unpacks it. Otherwise it falls back to cloning `ModernRelay/omnigraph-public`
-and building from source.
+The default installer is binary-only. It downloads a published release asset,
+verifies the SHA256 checksum, and unpacks it. It does not build from source.
+If the stable channel is not published yet, use the `edge` channel below.
+
+## Channels
+
+Stable binaries:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph-public/main/scripts/install.sh | bash
+```
+
+Rolling edge binaries from `main`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph-public/main/scripts/install.sh | RELEASE_CHANNEL=edge bash
+```
+
+Install from source:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph-public/main/scripts/install-source.sh | bash
+```
 
 ## Useful Overrides
 
@@ -25,16 +45,16 @@ Install to a different directory:
 curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph-public/main/scripts/install.sh | INSTALL_DIR="$HOME/bin" bash
 ```
 
-Force a source build even if a release asset exists:
+Install a specific tag:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph-public/main/scripts/install.sh | FORCE_BUILD=1 bash
+curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph-public/main/scripts/install.sh | VERSION=v0.1.0 bash
 ```
 
 Build from a specific git ref:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph-public/main/scripts/install.sh | SOURCE_REF=main bash
+curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph-public/main/scripts/install-source.sh | SOURCE_REF=main bash
 ```
 
 ## Manual Source Build

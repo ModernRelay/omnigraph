@@ -3,6 +3,7 @@ set -euo pipefail
 
 REPO_SLUG="${REPO_SLUG:-ModernRelay/omnigraph-public}"
 SOURCE_REF="${SOURCE_REF:-main}"
+RELEASE_CHANNEL="${RELEASE_CHANNEL:-edge}"
 WORKDIR="${WORKDIR:-$PWD/.omnigraph-rustfs-demo}"
 RUSTFS_CONTAINER_NAME="${RUSTFS_CONTAINER_NAME:-omnigraph-rustfs-demo}"
 RUSTFS_IMAGE="${RUSTFS_IMAGE:-rustfs/rustfs:latest}"
@@ -84,6 +85,48 @@ platform_asset_name() {
   esac
 }
 
+checksum_command() {
+  if command -v shasum >/dev/null 2>&1; then
+    printf 'shasum -a 256'
+    return
+  fi
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf 'sha256sum'
+    return
+  fi
+
+  die "missing checksum tool: expected shasum or sha256sum"
+}
+
+release_base_url() {
+  case "$RELEASE_CHANNEL" in
+    stable)
+      printf 'https://github.com/%s/releases/latest/download\n' "$REPO_SLUG"
+      ;;
+    edge)
+      printf 'https://github.com/%s/releases/download/edge\n' "$REPO_SLUG"
+      ;;
+    *)
+      die "unsupported RELEASE_CHANNEL '$RELEASE_CHANNEL' (expected stable or edge)"
+      ;;
+  esac
+}
+
+verify_checksum() {
+  local archive="$1"
+  local checksum_file="$2"
+  local expected actual tool
+
+  expected="$(awk '{print $1}' "$checksum_file")"
+  [ -n "$expected" ] || die "checksum file did not contain a SHA256 digest"
+
+  tool="$(checksum_command)"
+  actual="$($tool "$archive" | awk '{print $1}')"
+
+  [ "$actual" = "$expected" ] || die "checksum verification failed for $(basename "$archive")"
+}
+
 ensure_aws_cli() {
   if command -v aws >/dev/null 2>&1; then
     AWS_BIN="$(command -v aws)"
@@ -119,26 +162,36 @@ download_fixture_files() {
 }
 
 download_release_binaries() {
-  local tag asset archive_dir archive_path
+  local asset archive_dir archive_path checksum_path base_url
 
   [ "$FORCE_BUILD" = "1" ] && return 1
-
-  tag="$(latest_release_tag)"
-  [ -n "$tag" ] || return 1
 
   asset="$(platform_asset_name)" || return 1
   archive_dir="$WORKDIR/release"
   archive_path="$archive_dir/$asset"
+  checksum_path="$archive_dir/$asset.sha256"
   mkdir -p "$archive_dir" "$WORKDIR/bin"
+  base_url="$(release_base_url)"
 
-  log "Downloading release asset $asset from $tag"
+  log "Downloading release asset $asset"
   curl -fsSL \
-    "https://github.com/$REPO_SLUG/releases/download/$tag/$asset" \
+    "$base_url/$asset" \
     -o "$archive_path" || return 1
+  curl -fsSL \
+    "$base_url/$asset.sha256" \
+    -o "$checksum_path" || return 1
+  verify_checksum "$archive_path" "$checksum_path" || return 1
   tar -C "$WORKDIR/bin" -xzf "$archive_path" || return 1
 
   BIN_DIR="$WORKDIR/bin"
-  download_fixture_files "$tag" || return 1
+  if [ "$RELEASE_CHANNEL" = "stable" ]; then
+    local tag
+    tag="$(latest_release_tag)"
+    [ -n "$tag" ] || return 1
+    download_fixture_files "$tag" || return 1
+  else
+    download_fixture_files "main" || return 1
+  fi
 }
 
 build_from_source() {

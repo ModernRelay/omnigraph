@@ -2,9 +2,9 @@
 set -euo pipefail
 
 REPO_SLUG="${REPO_SLUG:-ModernRelay/omnigraph-public}"
-SOURCE_REF="${SOURCE_REF:-main}"
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
-FORCE_BUILD="${FORCE_BUILD:-0}"
+RELEASE_CHANNEL="${RELEASE_CHANNEL:-stable}"
+VERSION="${VERSION:-}"
 TMP_ROOT="${TMPDIR:-/tmp}"
 WORKDIR=""
 
@@ -17,10 +17,6 @@ die() {
   exit 1
 }
 
-need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
-}
-
 cleanup() {
   if [ -n "${WORKDIR:-}" ] && [ -d "$WORKDIR" ]; then
     rm -rf "$WORKDIR"
@@ -28,30 +24,6 @@ cleanup() {
 }
 
 trap cleanup EXIT
-
-repo_root_from_shell() {
-  if [ -f "$PWD/Cargo.toml" ] && [ -d "$PWD/crates" ]; then
-    printf '%s\n' "$PWD"
-    return 0
-  fi
-
-  if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
-    local candidate
-    candidate="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-    if [ -f "$candidate/Cargo.toml" ] && [ -d "$candidate/crates" ]; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  fi
-
-  return 1
-}
-
-latest_release_tag() {
-  local json
-  json="$(curl -fsSL "https://api.github.com/repos/$REPO_SLUG/releases/latest" 2>/dev/null || true)"
-  printf '%s' "$json" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
-}
 
 platform_asset_name() {
   local os arch
@@ -74,56 +46,79 @@ platform_asset_name() {
   esac
 }
 
+checksum_command() {
+  if command -v shasum >/dev/null 2>&1; then
+    printf 'shasum -a 256'
+    return
+  fi
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf 'sha256sum'
+    return
+  fi
+
+  die "missing checksum tool: expected shasum or sha256sum"
+}
+
+release_base_url() {
+  if [ -n "$VERSION" ]; then
+    printf 'https://github.com/%s/releases/download/%s\n' "$REPO_SLUG" "$VERSION"
+    return
+  fi
+
+  case "$RELEASE_CHANNEL" in
+    stable)
+      printf 'https://github.com/%s/releases/latest/download\n' "$REPO_SLUG"
+      ;;
+    edge)
+      printf 'https://github.com/%s/releases/download/edge\n' "$REPO_SLUG"
+      ;;
+    *)
+      die "unsupported RELEASE_CHANNEL '$RELEASE_CHANNEL' (expected stable or edge)"
+      ;;
+  esac
+}
+
 install_from_dir() {
   mkdir -p "$INSTALL_DIR"
   install -m 0755 "$1/omnigraph" "$INSTALL_DIR/omnigraph"
   install -m 0755 "$1/omnigraph-server" "$INSTALL_DIR/omnigraph-server"
 }
 
-install_from_release() {
-  local tag asset archive
+verify_checksum() {
+  local archive="$1"
+  local checksum_file="$2"
+  local expected actual tool
 
-  [ "$FORCE_BUILD" = "1" ] && return 1
+  expected="$(awk '{print $1}' "$checksum_file")"
+  [ -n "$expected" ] || die "checksum file did not contain a SHA256 digest"
 
-  tag="$(latest_release_tag)"
-  [ -n "$tag" ] || return 1
+  tool="$(checksum_command)"
+  actual="$($tool "$archive" | awk '{print $1}')"
 
-  asset="$(platform_asset_name)" || return 1
-  WORKDIR="$(mktemp -d "$TMP_ROOT/omnigraph-install.XXXXXX")"
-  archive="$WORKDIR/$asset"
-
-  log "Downloading $asset from $tag"
-  curl -fsSL \
-    "https://github.com/$REPO_SLUG/releases/download/$tag/$asset" \
-    -o "$archive" || return 1
-
-  tar -C "$WORKDIR" -xzf "$archive" || return 1
-  install_from_dir "$WORKDIR"
-  return 0
+  [ "$actual" = "$expected" ] || die "checksum verification failed for $(basename "$archive")"
 }
 
-build_from_source() {
-  local repo_root
-  repo_root="${1:-}"
+install_from_release() {
+  local asset archive checksum base_url
 
-  if [ -z "$repo_root" ]; then
-    need_cmd git
-    need_cmd cargo
+  asset="$(platform_asset_name)" || die "no prebuilt binary is available for $(uname -s)/$(uname -m)"
+  WORKDIR="$(mktemp -d "$TMP_ROOT/omnigraph-install.XXXXXX")"
+  archive="$WORKDIR/$asset"
+  checksum="$WORKDIR/$asset.sha256"
+  base_url="$(release_base_url)"
 
-    WORKDIR="$(mktemp -d "$TMP_ROOT/omnigraph-install.XXXXXX")"
-    repo_root="$WORKDIR/source"
-    log "Cloning $REPO_SLUG at $SOURCE_REF"
-    git clone --depth 1 --branch "$SOURCE_REF" "https://github.com/$REPO_SLUG.git" "$repo_root"
-  fi
+  log "Downloading $asset"
+  curl -fsSL \
+    "$base_url/$asset" \
+    -o "$archive" || die "no published binary found for $asset; use scripts/install-source.sh or build from source"
+  curl -fsSL \
+    "$base_url/$asset.sha256" \
+    -o "$checksum" || die "checksum file for $asset was not found"
 
-  need_cmd cargo
-  log "Building omnigraph binaries from source"
-  (
-    cd "$repo_root"
-    cargo build --release --locked -p omnigraph-cli -p omnigraph-server
-  )
-
-  install_from_dir "$repo_root/target/release"
+  verify_checksum "$archive" "$checksum"
+  tar -C "$WORKDIR" -xzf "$archive" || die "failed to unpack $asset"
+  install_from_dir "$WORKDIR"
 }
 
 print_summary() {
@@ -149,15 +144,8 @@ EOF
 }
 
 main() {
-  local repo_root
-
-  need_cmd curl
-  repo_root="$(repo_root_from_shell || true)"
-
-  if ! install_from_release; then
-    build_from_source "$repo_root"
-  fi
-
+  command -v curl >/dev/null 2>&1 || die "missing required command: curl"
+  install_from_release
   print_summary
 }
 

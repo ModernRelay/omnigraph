@@ -52,7 +52,7 @@ The bootstrap:
 
 Supported behavior:
 
-- downloads a tagged release binary when one exists for the current platform
+- downloads the rolling `edge` binary when one exists for the current platform
 - otherwise clones `ModernRelay/omnigraph-public` and builds from source
 - reuses an existing RustFS container if it is already running
 

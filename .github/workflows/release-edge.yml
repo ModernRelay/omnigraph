@@ -1,0 +1,91 @@
+name: Release Edge
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  prepare_edge_release:
+    name: Prepare edge release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Force-update edge tag
+        run: |
+          git tag -f edge "$GITHUB_SHA"
+          git push origin refs/tags/edge --force
+
+  build_release:
+    name: Build edge ${{ matrix.asset_name }}
+    needs: prepare_edge_release
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            asset_name: omnigraph-linux-x86_64
+          - runner: macos-13
+            asset_name: omnigraph-macos-x86_64
+          - runner: macos-14
+            asset_name: omnigraph-macos-arm64
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Build release binaries
+        run: cargo build --release --locked -p omnigraph-cli -p omnigraph-server
+
+      - name: Package release archive
+        run: |
+          mkdir -p release
+          install -m 0755 target/release/omnigraph release/omnigraph
+          install -m 0755 target/release/omnigraph-server release/omnigraph-server
+          tar -C release -czf "${{ matrix.asset_name }}.tar.gz" omnigraph omnigraph-server
+          shasum -a 256 "${{ matrix.asset_name }}.tar.gz" > "${{ matrix.asset_name }}.sha256"
+
+      - name: Publish edge release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: edge
+          name: Edge
+          prerelease: true
+          make_latest: false
+          body: |
+            Rolling prerelease from `${{ github.sha }}`.
+          files: |
+            ${{ matrix.asset_name }}.tar.gz
+            ${{ matrix.asset_name }}.sha256

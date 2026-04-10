@@ -11,9 +11,22 @@ workflows, and storage that runs equally well on a local directory or an
 curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph-public/main/scripts/install.sh | bash
 ```
 
-This installs `omnigraph` and `omnigraph-server` into `~/.local/bin`. If no
-tagged release exists for your platform yet, the installer falls back to a
-source build.
+This installs `omnigraph` and `omnigraph-server` into `~/.local/bin` from
+published release binaries. It does not compile from source.
+
+If the stable channel is not published yet, use the `edge` channel below.
+
+To install the rolling prerelease binaries from `main` instead:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph-public/main/scripts/install.sh | RELEASE_CHANNEL=edge bash
+```
+
+If you want a source build, use:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph-public/main/scripts/install-source.sh | bash
+```
 
 ## One-Command Local RustFS Bootstrap
 
@@ -29,6 +42,9 @@ That bootstrap:
 - launches `omnigraph-server` on `127.0.0.1:8080`
 
 Docker must be installed and running first.
+
+The RustFS bootstrap prefers the rolling `edge` binaries and only falls back to
+source builds when release assets are unavailable.
 
 ## Good Fit For
 
