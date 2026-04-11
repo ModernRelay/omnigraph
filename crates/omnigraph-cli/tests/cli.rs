@@ -318,8 +318,10 @@ fn load_json_outputs_summary_for_main_branch() {
 
     assert_eq!(payload["branch"], "main");
     assert_eq!(payload["mode"], "overwrite");
-    assert_eq!(payload["nodes_loaded"], 2);
-    assert_eq!(payload["edges_loaded"], 2);
+    assert_eq!(payload["nodes_loaded"], 6);
+    assert_eq!(payload["edges_loaded"], 5);
+    assert_eq!(payload["node_types_loaded"], 2);
+    assert_eq!(payload["edge_types_loaded"], 2);
 }
 
 #[test]
@@ -361,7 +363,7 @@ fn load_into_feature_branch_with_merge_mode_succeeds() {
 
     assert!(stdout.contains("branch feature"));
     assert!(stdout.contains("with merge"));
-    assert!(stdout.contains("1 node types"));
+    assert!(stdout.contains("1 nodes across 1 node types"));
 }
 
 #[test]
@@ -627,6 +629,46 @@ fn read_alias_from_yaml_config_runs_with_kv_output() {
 
     assert!(stdout.contains("row 1"));
     assert!(stdout.contains("p.name: Alice"));
+}
+
+#[test]
+fn read_alias_uses_alias_target_without_cli_default_and_accepts_url_like_arg() {
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    let config = temp.path().join("omnigraph.yaml");
+    let query = temp.path().join("aliases.gq");
+    let data = temp.path().join("url-like.jsonl");
+    init_repo(&repo);
+    write_jsonl(
+        &data,
+        r#"{"type":"Person","data":{"name":"https://example.com","age":30}}"#,
+    );
+    output_success(cli().arg("load").arg("--data").arg(&data).arg(&repo));
+    write_query_file(
+        &query,
+        &std::fs::read_to_string(fixture("test.gq")).unwrap(),
+    );
+    write_config(
+        &config,
+        &format!(
+            "targets:\n  local:\n    uri: '{}'\nquery:\n  roots:\n    - .\npolicy: {{}}\naliases:\n  owner:\n    command: read\n    query: aliases.gq\n    name: get_person\n    args: [name]\n    target: local\n    format: kv\n",
+            repo.to_string_lossy()
+        ),
+    );
+
+    let output = output_success(
+        cli()
+            .arg("read")
+            .arg("--config")
+            .arg(&config)
+            .arg("--alias")
+            .arg("owner")
+            .arg("https://example.com"),
+    );
+    let stdout = stdout_string(&output);
+
+    assert!(stdout.contains("row 1"));
+    assert!(stdout.contains("p.name: https://example.com"));
 }
 
 #[test]
@@ -1200,6 +1242,35 @@ fn snapshot_human_output_includes_branch_and_table_summaries() {
     assert!(stdout.contains("manifest_version:"));
     assert!(stdout.contains("node:Person v"));
     assert!(stdout.contains("edge:Knows v"));
+}
+
+#[test]
+fn commit_show_accepts_long_uri_flag() {
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    init_repo(&repo);
+    load_fixture(&repo);
+
+    let list = output_success(cli().arg("commit").arg("list").arg(&repo).arg("--json"));
+    let list_payload: Value = serde_json::from_slice(&list.stdout).unwrap();
+    let commit_id = list_payload["commits"][0]["graph_commit_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let output = output_success(
+        cli()
+            .arg("commit")
+            .arg("show")
+            .arg("--uri")
+            .arg(&repo)
+            .arg(&commit_id)
+            .arg("--json"),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(payload["graph_commit_id"], commit_id);
+    assert!(payload["manifest_version"].as_u64().unwrap() >= 1);
 }
 
 #[test]

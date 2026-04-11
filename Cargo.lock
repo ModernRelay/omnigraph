@@ -4588,6 +4588,7 @@ dependencies = [
  "cedar-policy",
  "clap",
  "color-eyre",
+ "futures",
  "omnigraph",
  "omnigraph-compiler",
  "serde",

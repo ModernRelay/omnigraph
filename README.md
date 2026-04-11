@@ -111,8 +111,8 @@ Core repo flow:
 omnigraph init --schema ./schema.pg ./repo.omni
 omnigraph load --data ./data.jsonl --mode overwrite ./repo.omni
 omnigraph snapshot ./repo.omni --branch main --json
-omnigraph read ./repo.omni --query ./queries.gq --name get_person --params '{"name":"Alice"}'
-omnigraph change ./repo.omni --query ./queries.gq --name insert_person --params '{"name":"Mina","age":28}'
+omnigraph read --uri ./repo.omni --query ./queries.gq --name get_person --params '{"name":"Alice"}'
+omnigraph change --uri ./repo.omni --query ./queries.gq --name insert_person --params '{"name":"Mina","age":28}'
 omnigraph branch create --uri ./repo.omni --from main feature-x
 omnigraph branch merge --uri ./repo.omni feature-x --into main
 ```

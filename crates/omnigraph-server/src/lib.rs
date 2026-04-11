@@ -4,6 +4,8 @@ pub mod policy;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -14,6 +16,7 @@ use api::{
     IngestRequest, ReadOutput, ReadRequest, RunListOutput, SnapshotQuery, ingest_output,
     snapshot_payload,
 };
+use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::{Extension, Path, Query, Request, State};
 use axum::http::StatusCode;
@@ -28,6 +31,7 @@ pub use config::{
     ProjectConfig, QueryDefaults, ReadOutputFormat, ServerDefaults, TableCellLayout, TargetConfig,
     load_config,
 };
+use futures::stream;
 use omnigraph::db::{Omnigraph, ReadTarget, RunId};
 use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph_compiler::json_params_to_param_map;
@@ -39,7 +43,7 @@ pub use policy::{
 };
 use serde_json::Value;
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -66,6 +70,23 @@ pub struct AppState {
 
 #[derive(Debug, Clone)]
 struct AuthenticatedActor(Arc<str>);
+
+struct ExportStreamWriter {
+    sender: mpsc::UnboundedSender<std::result::Result<Bytes, io::Error>>,
+}
+
+impl Write for ExportStreamWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.sender
+            .send(Ok(Bytes::copy_from_slice(buf)))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "export stream closed"))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 impl AuthenticatedActor {
     fn as_str(&self) -> &str {
@@ -567,16 +588,28 @@ async fn server_export(
             target_branch: None,
         },
     )?;
-    let payload = {
-        let db = Arc::clone(&state.db).read_owned().await;
-        db.export_jsonl(&branch, &request.type_names, &request.table_keys)
-            .await
-            .map_err(ApiError::from_omni)?
-    };
+    let db = Arc::clone(&state.db);
+    let type_names = request.type_names.clone();
+    let table_keys = request.table_keys.clone();
+    let (tx, rx) = mpsc::unbounded_channel::<std::result::Result<Bytes, io::Error>>();
+    tokio::spawn(async move {
+        let result = {
+            let db = db.read().await;
+            let mut writer = ExportStreamWriter { sender: tx.clone() };
+            db.export_jsonl_to_writer(&branch, &type_names, &table_keys, &mut writer)
+                .await
+        };
+        if let Err(err) = result {
+            let _ = tx.send(Err(io::Error::other(err.to_string())));
+        }
+    });
+    let body = Body::from_stream(stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    }));
     Ok((
         StatusCode::OK,
         [(CONTENT_TYPE, "application/x-ndjson; charset=utf-8")],
-        payload,
+        body,
     )
         .into_response())
 }
