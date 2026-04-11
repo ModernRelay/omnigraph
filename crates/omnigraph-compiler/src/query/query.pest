@@ -16,7 +16,8 @@ query_annotation = { description_annotation | instruction_annotation }
 description_annotation = { "@description" ~ "(" ~ string_lit ~ ")" }
 instruction_annotation = { "@instruction" ~ "(" ~ string_lit ~ ")" }
 
-query_body = { read_query_body | mutation_stmt }
+query_body = { read_query_body | mutation_body }
+mutation_body = { mutation_stmt+ }
 read_query_body = {
     match_clause
     ~ return_clause

@@ -3335,24 +3335,30 @@ impl Omnigraph {
 
         let ir = lower_mutation_query(&query_decl)?;
 
-        match &ir.op {
-            MutationOpIR::Insert {
-                type_name,
-                assignments,
-            } => self.execute_insert(type_name, assignments, params).await,
-            MutationOpIR::Update {
-                type_name,
-                assignments,
-                predicate,
-            } => {
-                self.execute_update(type_name, assignments, predicate, params)
-                    .await
-            }
-            MutationOpIR::Delete {
-                type_name,
-                predicate,
-            } => self.execute_delete(type_name, predicate, params).await,
+        let mut total = MutationResult::default();
+        for op in &ir.ops {
+            let result = match op {
+                MutationOpIR::Insert {
+                    type_name,
+                    assignments,
+                } => self.execute_insert(type_name, assignments, params).await?,
+                MutationOpIR::Update {
+                    type_name,
+                    assignments,
+                    predicate,
+                } => {
+                    self.execute_update(type_name, assignments, predicate, params)
+                        .await?
+                }
+                MutationOpIR::Delete {
+                    type_name,
+                    predicate,
+                } => self.execute_delete(type_name, predicate, params).await?,
+            };
+            total.affected_nodes += result.affected_nodes;
+            total.affected_edges += result.affected_edges;
         }
+        Ok(total)
     }
 
     pub async fn branch_merge(&mut self, source: &str, target: &str) -> Result<MergeOutcome> {

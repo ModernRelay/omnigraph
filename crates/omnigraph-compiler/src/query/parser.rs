@@ -55,7 +55,7 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
     let mut return_clause = Vec::new();
     let mut order_clause = Vec::new();
     let mut limit = None;
-    let mut mutation = None;
+    let mut mutations = Vec::new();
 
     for item in inner {
         match item.as_rule() {
@@ -134,11 +134,18 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
                             }
                         }
                     }
-                    Rule::mutation_stmt => {
-                        let stmt = body.into_inner().next().ok_or_else(|| {
-                            NanoError::Parse("mutation statement cannot be empty".to_string())
-                        })?;
-                        mutation = Some(parse_mutation_stmt(stmt)?);
+                    Rule::mutation_body => {
+                        for mutation_pair in body.into_inner() {
+                            if let Rule::mutation_stmt = mutation_pair.as_rule() {
+                                let stmt =
+                                    mutation_pair.into_inner().next().ok_or_else(|| {
+                                        NanoError::Parse(
+                                            "mutation statement cannot be empty".to_string(),
+                                        )
+                                    })?;
+                                mutations.push(parse_mutation_stmt(stmt)?);
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -156,7 +163,7 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
         return_clause,
         order_clause,
         limit,
-        mutation,
+        mutations,
     })
 }
 
@@ -1265,7 +1272,7 @@ query add_person($name: String, $age: I32) {
 "#;
         let qf = parse_query(input).unwrap();
         let q = &qf.queries[0];
-        match q.mutation.as_ref().expect("expected mutation") {
+        match q.mutations.first().expect("expected mutation") {
             Mutation::Insert(ins) => {
                 assert_eq!(ins.type_name, "Person");
                 assert_eq!(ins.assignments.len(), 2);
@@ -1285,7 +1292,7 @@ query set_age($name: String, $age: I32) {
 "#;
         let qf = parse_query(input).unwrap();
         let q = &qf.queries[0];
-        match q.mutation.as_ref().expect("expected mutation") {
+        match q.mutations.first().expect("expected mutation") {
             Mutation::Update(upd) => {
                 assert_eq!(upd.type_name, "Person");
                 assert_eq!(upd.assignments.len(), 1);
@@ -1305,7 +1312,7 @@ query drop_person($name: String) {
 "#;
         let qf = parse_query(input).unwrap();
         let q = &qf.queries[0];
-        match q.mutation.as_ref().expect("expected mutation") {
+        match q.mutations.first().expect("expected mutation") {
             Mutation::Delete(del) => {
                 assert_eq!(del.type_name, "Person");
                 assert_eq!(del.predicate.property, "name");
@@ -1372,13 +1379,54 @@ query stamp() {
 "#,
         )
         .unwrap();
-        match mutation.queries[0].mutation.as_ref().unwrap() {
+        match mutation.queries[0].mutations.first().unwrap() {
             Mutation::Update(update) => {
                 assert!(matches!(update.assignments[0].value, MatchValue::Now));
                 assert!(matches!(update.predicate.value, MatchValue::Now));
             }
             _ => panic!("expected update mutation"),
         }
+    }
+
+    #[test]
+    fn test_parse_multi_mutation() {
+        let input = r#"
+query add_and_link($name: String, $age: I32, $friend: String) {
+    insert Person { name: $name, age: $age }
+    insert Knows { from: $name, to: $friend }
+}
+"#;
+        let qf = parse_query(input).unwrap();
+        let q = &qf.queries[0];
+        assert_eq!(q.mutations.len(), 2);
+        assert!(matches!(&q.mutations[0], Mutation::Insert(ins) if ins.type_name == "Person"));
+        assert!(matches!(&q.mutations[1], Mutation::Insert(ins) if ins.type_name == "Knows"));
+    }
+
+    #[test]
+    fn test_parse_multi_mutation_mixed_ops() {
+        let input = r#"
+query create_and_clean($name: String, $age: I32, $old: String) {
+    insert Person { name: $name, age: $age }
+    delete Person where name = $old
+}
+"#;
+        let qf = parse_query(input).unwrap();
+        let q = &qf.queries[0];
+        assert_eq!(q.mutations.len(), 2);
+        assert!(matches!(&q.mutations[0], Mutation::Insert(_)));
+        assert!(matches!(&q.mutations[1], Mutation::Delete(_)));
+    }
+
+    #[test]
+    fn test_parse_single_mutation_backward_compat() {
+        let input = r#"
+query add($name: String, $age: I32) {
+    insert Person { name: $name, age: $age }
+}
+"#;
+        let qf = parse_query(input).unwrap();
+        assert_eq!(qf.queries[0].mutations.len(), 1);
     }
 
     #[test]

@@ -58,7 +58,7 @@ impl ResolvedType {
 
 #[derive(Debug, Clone)]
 pub struct MutationTypeContext {
-    pub target_type: String,
+    pub target_types: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,16 +68,20 @@ pub enum CheckedQuery {
 }
 
 pub fn typecheck_query_decl(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedQuery> {
-    if let Some(mutation) = &query.mutation {
-        let target_type = typecheck_mutation(catalog, mutation, &query.params)?;
-        Ok(CheckedQuery::Mutation(MutationTypeContext { target_type }))
+    if !query.mutations.is_empty() {
+        let mut target_types = Vec::with_capacity(query.mutations.len());
+        for mutation in &query.mutations {
+            let target_type = typecheck_mutation(catalog, mutation, &query.params)?;
+            target_types.push(target_type);
+        }
+        Ok(CheckedQuery::Mutation(MutationTypeContext { target_types }))
     } else {
         Ok(CheckedQuery::Read(typecheck_read_query(catalog, query)?))
     }
 }
 
 pub fn typecheck_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeContext> {
-    if query.mutation.is_some() {
+    if !query.mutations.is_empty() {
         return Err(NanoError::Type(
             "mutation query cannot be typechecked with read-query API".to_string(),
         ));
@@ -2557,7 +2561,7 @@ query add_person($name: String, $age: I32) {
         .unwrap();
         let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
         match checked {
-            CheckedQuery::Mutation(ctx) => assert_eq!(ctx.target_type, "Person"),
+            CheckedQuery::Mutation(ctx) => assert_eq!(ctx.target_types[0], "Person"),
             _ => panic!("expected mutation typecheck result"),
         }
     }
@@ -2593,7 +2597,7 @@ query add_doc($slug: String, $body: String) {
         .unwrap();
         let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
         match checked {
-            CheckedQuery::Mutation(ctx) => assert_eq!(ctx.target_type, "Doc"),
+            CheckedQuery::Mutation(ctx) => assert_eq!(ctx.target_types[0], "Doc"),
             _ => panic!("expected mutation typecheck result"),
         }
     }
@@ -2664,7 +2668,7 @@ query add_knows($from: String, $to: String) {
         .unwrap();
         let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
         match checked {
-            CheckedQuery::Mutation(ctx) => assert_eq!(ctx.target_type, "Knows"),
+            CheckedQuery::Mutation(ctx) => assert_eq!(ctx.target_types[0], "Knows"),
             _ => panic!("expected mutation typecheck result"),
         }
     }
@@ -2699,7 +2703,7 @@ query del_knows($from: String) {
         .unwrap();
         let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
         match checked {
-            CheckedQuery::Mutation(ctx) => assert_eq!(ctx.target_type, "Knows"),
+            CheckedQuery::Mutation(ctx) => assert_eq!(ctx.target_types[0], "Knows"),
             _ => panic!("expected mutation typecheck result"),
         }
     }
@@ -2717,6 +2721,43 @@ query upd_knows($from: String) {
         .unwrap();
         let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
         assert!(err.to_string().contains("T16"));
+    }
+
+    #[test]
+    fn test_mutation_multi_insert_typecheck_ok() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query add_and_link($name: String, $age: I32, $friend: String) {
+    insert Person { name: $name, age: $age }
+    insert Knows { from: $name, to: $friend }
+}
+"#,
+        )
+        .unwrap();
+        let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
+        match checked {
+            CheckedQuery::Mutation(ctx) => {
+                assert_eq!(ctx.target_types, vec!["Person", "Knows"]);
+            }
+            _ => panic!("expected mutation typecheck result"),
+        }
+    }
+
+    #[test]
+    fn test_mutation_multi_second_stmt_error() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query bad($name: String, $age: I32) {
+    insert Person { name: $name, age: $age }
+    insert Unknown { foo: $name }
+}
+"#,
+        )
+        .unwrap();
+        let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
+        assert!(err.to_string().contains("T10"));
     }
 
     #[test]
