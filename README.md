@@ -16,6 +16,20 @@ published release binaries. It does not compile from source. If no stable tag
 is published yet, the installer automatically falls back to the rolling `edge`
 release.
 
+Or install with Homebrew:
+
+```bash
+brew tap ModernRelay/tap
+brew install ModernRelay/tap/omnigraph
+```
+
+The Homebrew tap currently builds from source. To install the latest `main`
+from the tap instead of the pinned formula version, use:
+
+```bash
+brew install --HEAD ModernRelay/tap/omnigraph
+```
+
 To install the rolling prerelease binaries from `main` instead:
 
 ```bash

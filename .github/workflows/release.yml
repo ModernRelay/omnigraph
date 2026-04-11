@@ -26,7 +26,7 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5.0.1
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -61,7 +61,7 @@ jobs:
           shasum -a 256 "${{ matrix.asset_name }}.tar.gz" > "${{ matrix.asset_name }}.sha256"
 
       - name: Publish GitHub release assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v2.5.0
         with:
           files: |
             ${{ matrix.asset_name }}.tar.gz

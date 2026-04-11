@@ -18,6 +18,20 @@ verifies the SHA256 checksum, and unpacks it. It does not build from source.
 If no stable tag is published yet, the installer automatically falls back to
 the rolling `edge` release.
 
+## Homebrew
+
+```bash
+brew tap ModernRelay/tap
+brew install ModernRelay/tap/omnigraph
+```
+
+The Homebrew formula currently builds from source. To install the latest `main`
+instead of the pinned formula version:
+
+```bash
+brew install --HEAD ModernRelay/tap/omnigraph
+```
+
 ## Channels
 
 Stable binaries:

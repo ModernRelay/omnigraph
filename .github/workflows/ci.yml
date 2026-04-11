@@ -24,7 +24,7 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5.0.1
 
       - name: Install system dependencies
         run: |
@@ -65,7 +65,7 @@ jobs:
       CARGO_TERM_COLOR: always
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5.0.1
 
       - name: Install system dependencies
         run: |
