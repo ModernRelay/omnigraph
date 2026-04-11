@@ -7,8 +7,25 @@ use omnigraph_compiler::SchemaMigrationStep;
 use omnigraph_compiler::result::QueryResult;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use utoipa::{IntoParams, ToSchema};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Shadow enum for documenting [`LoadMode`] in the OpenAPI schema.
+#[derive(ToSchema)]
+#[schema(as = LoadMode)]
+#[allow(dead_code)]
+enum LoadModeSchema {
+    /// Overwrite existing data.
+    #[schema(rename = "overwrite")]
+    Overwrite,
+    /// Append to existing data.
+    #[schema(rename = "append")]
+    Append,
+    /// Merge by id key (upsert).
+    #[schema(rename = "merge")]
+    Merge,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SnapshotTableOutput {
     pub table_key: String,
     pub table_path: String,
@@ -17,14 +34,14 @@ pub struct SnapshotTableOutput {
     pub row_count: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SnapshotOutput {
     pub branch: String,
     pub manifest_version: u64,
     pub tables: Vec<SnapshotTableOutput>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RunOutput {
     pub run_id: String,
     pub target_branch: String,
@@ -39,18 +56,18 @@ pub struct RunOutput {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RunListOutput {
     pub runs: Vec<RunOutput>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BranchCreateRequest {
     pub from: Option<String>,
     pub name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BranchCreateOutput {
     pub uri: String,
     pub from: String,
@@ -58,25 +75,25 @@ pub struct BranchCreateOutput {
     pub actor_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BranchListOutput {
     pub branches: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BranchDeleteOutput {
     pub uri: String,
     pub name: String,
     pub actor_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BranchMergeRequest {
     pub source: String,
     pub target: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BranchMergeOutcome {
     AlreadyUpToDate,
@@ -104,7 +121,7 @@ impl BranchMergeOutcome {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BranchMergeOutput {
     pub source: String,
     pub target: String,
@@ -112,7 +129,7 @@ pub struct BranchMergeOutput {
     pub actor_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MergeConflictKindOutput {
     DivergentInsert,
@@ -152,7 +169,7 @@ impl From<MergeConflictKind> for MergeConflictKindOutput {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MergeConflictOutput {
     pub table_key: String,
     pub row_id: Option<String>,
@@ -171,13 +188,13 @@ impl From<&MergeConflict> for MergeConflictOutput {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ReadTargetOutput {
     pub branch: Option<String>,
     pub snapshot: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ReadOutput {
     pub query_name: String,
     pub target: ReadTargetOutput,
@@ -187,7 +204,7 @@ pub struct ReadOutput {
     pub rows: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChangeOutput {
     pub branch: String,
     pub query_name: String,
@@ -196,24 +213,25 @@ pub struct ChangeOutput {
     pub actor_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct IngestTableOutput {
     pub table_key: String,
     pub rows_loaded: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct IngestOutput {
     pub uri: String,
     pub branch: String,
     pub base_branch: String,
     pub branch_created: bool,
+    #[schema(value_type = LoadModeSchema)]
     pub mode: LoadMode,
     pub tables: Vec<IngestTableOutput>,
     pub actor_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CommitOutput {
     pub graph_commit_id: String,
     pub manifest_branch: Option<String>,
@@ -224,12 +242,12 @@ pub struct CommitOutput {
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CommitListOutput {
     pub commits: Vec<CommitOutput>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ReadRequest {
     pub query_source: String,
     pub query_name: Option<String>,
@@ -238,7 +256,7 @@ pub struct ReadRequest {
     pub snapshot: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChangeRequest {
     pub query_source: String,
     pub query_name: Option<String>,
@@ -246,30 +264,32 @@ pub struct ChangeRequest {
     pub branch: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SchemaApplyRequest {
     pub schema_source: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SchemaApplyOutput {
     pub uri: String,
     pub supported: bool,
     pub applied: bool,
     pub step_count: usize,
     pub manifest_version: u64,
+    #[schema(value_type = Vec<Value>)]
     pub steps: Vec<SchemaMigrationStep>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct IngestRequest {
     pub branch: Option<String>,
     pub from: Option<String>,
+    #[schema(value_type = Option<LoadModeSchema>)]
     pub mode: Option<LoadMode>,
     pub data: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ExportRequest {
     pub branch: Option<String>,
     #[serde(default)]
@@ -278,17 +298,17 @@ pub struct ExportRequest {
     pub table_keys: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, IntoParams)]
 pub struct SnapshotQuery {
     pub branch: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, IntoParams)]
 pub struct CommitListQuery {
     pub branch: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HealthOutput {
     pub status: String,
     pub version: String,
@@ -296,7 +316,7 @@ pub struct HealthOutput {
     pub source_version: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     Unauthorized,
@@ -307,7 +327,7 @@ pub enum ErrorCode {
     Internal,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ErrorOutput {
     pub error: String,
     #[serde(skip_serializing_if = "Option::is_none")]
