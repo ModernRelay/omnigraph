@@ -12,27 +12,13 @@ curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/
 ```
 
 This installs `omnigraph` and `omnigraph-server` into `~/.local/bin` from
-published release binaries. It does not compile from source. If no stable tag
-is published yet, the installer automatically falls back to the rolling `edge`
-release.
+published release binaries. 
 
 Or install with Homebrew:
 
 ```bash
 brew tap ModernRelay/tap
 brew install ModernRelay/tap/omnigraph
-```
-
-To install the rolling prerelease binaries from `main` instead:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | RELEASE_CHANNEL=edge bash
-```
-
-If you want a source build, use:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install-source.sh | bash
 ```
 
 ## One-Command Local RustFS Bootstrap
