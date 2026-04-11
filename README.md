@@ -23,13 +23,6 @@ brew tap ModernRelay/tap
 brew install ModernRelay/tap/omnigraph
 ```
 
-The Homebrew tap currently builds from source. To install the latest `main`
-from the tap instead of the pinned formula version, use:
-
-```bash
-brew install --HEAD ModernRelay/tap/omnigraph
-```
-
 To install the rolling prerelease binaries from `main` instead:
 
 ```bash
