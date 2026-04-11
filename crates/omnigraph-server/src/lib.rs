@@ -83,12 +83,13 @@ struct SecurityAddon;
 
 impl utoipa::Modify for SecurityAddon {
     fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
-        if let Some(components) = openapi.components.as_mut() {
-            components.add_security_scheme(
+        openapi
+            .components
+            .get_or_insert_with(Default::default)
+            .add_security_scheme(
                 "bearer_token",
                 SecurityScheme::Http(Http::new(HttpAuthScheme::Bearer)),
             );
-        }
     }
 }
 
@@ -476,8 +477,35 @@ async fn server_health() -> Json<HealthOutput> {
     })
 }
 
-async fn server_openapi() -> Json<utoipa::openapi::OpenApi> {
-    Json(ApiDoc::openapi())
+async fn server_openapi(State(state): State<AppState>) -> Json<utoipa::openapi::OpenApi> {
+    let mut doc = ApiDoc::openapi();
+    if !state.requires_bearer_auth() {
+        strip_security(&mut doc);
+    }
+    Json(doc)
+}
+
+fn strip_security(doc: &mut utoipa::openapi::OpenApi) {
+    if let Some(components) = doc.components.as_mut() {
+        components.security_schemes.clear();
+    }
+    for path_item in doc.paths.paths.values_mut() {
+        for op in [
+            path_item.get.as_mut(),
+            path_item.post.as_mut(),
+            path_item.put.as_mut(),
+            path_item.delete.as_mut(),
+            path_item.options.as_mut(),
+            path_item.head.as_mut(),
+            path_item.patch.as_mut(),
+            path_item.trace.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            op.security = None;
+        }
+    }
 }
 
 async fn require_bearer_auth(

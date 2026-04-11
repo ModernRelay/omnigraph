@@ -49,6 +49,19 @@ async fn app_for_loaded_repo() -> (tempfile::TempDir, Router) {
     (temp, app)
 }
 
+async fn app_for_loaded_repo_with_auth(token: &str) -> (tempfile::TempDir, Router) {
+    let temp = init_loaded_repo().await;
+    let repo = repo_path(temp.path());
+    let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let state = AppState::new_with_bearer_token(
+        repo.to_string_lossy().to_string(),
+        db,
+        Some(token.to_string()),
+    );
+    let app = build_app(state);
+    (temp, app)
+}
+
 async fn json_response(app: &Router, request: Request<Body>) -> (StatusCode, Value) {
     let response = app.clone().oneshot(request).await.unwrap();
     let status = response.status();
@@ -832,12 +845,95 @@ fn openapi_spec_round_trips_through_json() {
 }
 
 // ---------------------------------------------------------------------------
-// Endpoint live round-trip: the doc served matches the static generation
+// Open-mode vs auth-mode: served spec reflects runtime config
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn openapi_endpoint_matches_static_generation() {
+async fn open_mode_spec_has_no_security_schemes() {
     let (_temp, app) = app_for_loaded_repo().await;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/openapi.json")
+        .body(Body::empty())
+        .unwrap();
+    let (_, json) = json_response(&app, request).await;
+    let schemes = &json["components"]["securitySchemes"];
+    assert!(
+        schemes.is_null() || schemes.as_object().is_some_and(|m| m.is_empty()),
+        "open-mode spec should have no security schemes"
+    );
+}
+
+#[tokio::test]
+async fn open_mode_spec_has_no_operation_security() {
+    let (_temp, app) = app_for_loaded_repo().await;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/openapi.json")
+        .body(Body::empty())
+        .unwrap();
+    let (_, json) = json_response(&app, request).await;
+    let paths = json["paths"].as_object().unwrap();
+    for (path, methods) in paths {
+        for (method, operation) in methods.as_object().unwrap() {
+            let security = &operation["security"];
+            assert!(
+                security.is_null(),
+                "open-mode: {method} {path} should have no security requirement"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn auth_mode_spec_includes_bearer_token_security_scheme() {
+    let (_temp, app) = app_for_loaded_repo_with_auth("secret").await;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/openapi.json")
+        .body(Body::empty())
+        .unwrap();
+    let (_, json) = json_response(&app, request).await;
+    let scheme = &json["components"]["securitySchemes"]["bearer_token"];
+    assert_eq!(scheme["type"].as_str().unwrap(), "http");
+    assert_eq!(scheme["scheme"].as_str().unwrap(), "bearer");
+}
+
+#[tokio::test]
+async fn auth_mode_spec_has_security_on_protected_operations() {
+    let (_temp, app) = app_for_loaded_repo_with_auth("secret").await;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/openapi.json")
+        .body(Body::empty())
+        .unwrap();
+    let (_, json) = json_response(&app, request).await;
+    let protected_paths = [
+        ("/read", "post"),
+        ("/change", "post"),
+        ("/snapshot", "get"),
+        ("/branches", "get"),
+        ("/runs", "get"),
+        ("/commits", "get"),
+    ];
+    for (path, method) in protected_paths {
+        let security = &json["paths"][path][method]["security"];
+        let arr = security
+            .as_array()
+            .unwrap_or_else(|| panic!("auth-mode: {method} {path} missing security"));
+        let has_bearer = arr
+            .iter()
+            .any(|s| s.as_object().unwrap().contains_key("bearer_token"));
+        assert!(
+            has_bearer,
+            "auth-mode: {method} {path} should require bearer_token"
+        );
+    }
+}
+
+#[tokio::test]
+async fn auth_mode_spec_matches_static_generation() {
+    let (_temp, app) = app_for_loaded_repo_with_auth("secret").await;
     let request = Request::builder()
         .method(Method::GET)
         .uri("/openapi.json")
@@ -845,5 +941,24 @@ async fn openapi_endpoint_matches_static_generation() {
         .unwrap();
     let (_, served) = json_response(&app, request).await;
     let static_doc = openapi_json();
-    assert_eq!(served, static_doc, "served spec must match static generation");
+    assert_eq!(
+        served, static_doc,
+        "auth-mode served spec must match static generation"
+    );
+}
+
+#[tokio::test]
+async fn auth_mode_healthz_still_has_no_security() {
+    let (_temp, app) = app_for_loaded_repo_with_auth("secret").await;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/openapi.json")
+        .body(Body::empty())
+        .unwrap();
+    let (_, json) = json_response(&app, request).await;
+    let healthz = &json["paths"]["/healthz"]["get"];
+    assert!(
+        healthz.get("security").is_none() || healthz["security"].is_null(),
+        "auth-mode: /healthz should still have no security"
+    );
 }
