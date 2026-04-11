@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::Write;
 use std::sync::Arc;
 
 use arrow_array::{
@@ -368,9 +369,23 @@ impl Omnigraph {
         type_names: &[String],
         table_keys: &[String],
     ) -> Result<String> {
+        let mut out = Vec::new();
+        self.export_jsonl_to_writer(branch, type_names, table_keys, &mut out)
+            .await?;
+        String::from_utf8(out)
+            .map_err(|err| OmniError::manifest(format!("export produced invalid UTF-8: {}", err)))
+    }
+
+    pub async fn export_jsonl_to_writer<W: Write>(
+        &self,
+        branch: &str,
+        type_names: &[String],
+        table_keys: &[String],
+        writer: &mut W,
+    ) -> Result<()> {
         self.ensure_schema_state_valid().await?;
         let snapshot = self.snapshot_of(ReadTarget::branch(branch)).await?;
-        self.export_snapshot_jsonl(&snapshot, type_names, table_keys)
+        self.export_snapshot_jsonl_to_writer(&snapshot, type_names, table_keys, writer)
             .await
     }
 
@@ -399,26 +414,19 @@ impl Omnigraph {
         Ok(Some(record_batch_row_to_json(batch, 0)?))
     }
 
-    async fn export_snapshot_jsonl(
+    async fn export_snapshot_jsonl_to_writer<W: Write>(
         &self,
         snapshot: &Snapshot,
         type_names: &[String],
         table_keys: &[String],
-    ) -> Result<String> {
+        writer: &mut W,
+    ) -> Result<()> {
         let selected_tables = self.export_table_keys(snapshot, type_names, table_keys)?;
-        let mut out = String::new();
         for table_key in selected_tables {
-            for row in self.export_table_rows(snapshot, &table_key).await? {
-                out.push_str(&serde_json::to_string(&row).map_err(|err| {
-                    OmniError::manifest(format!(
-                        "failed to serialize export row for '{}': {}",
-                        table_key, err
-                    ))
-                })?);
-                out.push('\n');
-            }
+            self.export_table_to_writer(snapshot, &table_key, writer)
+                .await?;
         }
-        Ok(out)
+        Ok(())
     }
 
     fn export_table_keys(
@@ -470,11 +478,12 @@ impl Omnigraph {
         Ok(selected.into_iter().collect())
     }
 
-    async fn export_table_rows(
+    async fn export_table_to_writer<W: Write>(
         &self,
         snapshot: &Snapshot,
         table_key: &str,
-    ) -> Result<Vec<serde_json::Value>> {
+        writer: &mut W,
+    ) -> Result<()> {
         let ds = self
             .table_store
             .open_snapshot_table(snapshot, table_key)
@@ -483,46 +492,36 @@ impl Omnigraph {
         let blob_properties = blob_properties_for_table_key(self.catalog(), table_key)?;
 
         if blob_properties.is_empty() {
-            let batch = concat_or_empty_batches(
-                schema_for_table_key(self.catalog(), table_key)?,
-                self.table_store.scan(&ds, None, None, ordering).await?,
-            )?;
-            return self.export_rows_from_batch(table_key, &batch, None).await;
+            for batch in self.table_store.scan(&ds, None, None, ordering).await? {
+                self.write_export_rows_from_batch(table_key, &batch, None, writer)?;
+            }
+            return Ok(());
         }
 
         let batches = self
             .table_store
             .scan_with(&ds, None, None, ordering, true, |_| Ok(()))
             .await?;
-        if batches.is_empty() {
-            return Ok(Vec::new());
+        for batch in batches {
+            let row_ids = batch
+                .column_by_name("_rowid")
+                .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+                .ok_or_else(|| {
+                    OmniError::Lance(format!(
+                        "expected _rowid column when exporting '{}'",
+                        table_key
+                    ))
+                })?
+                .values()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+            let blob_values = self
+                .export_blob_values(&ds, &batch, &row_ids, blob_properties)
+                .await?;
+            self.write_export_rows_from_batch(table_key, &batch, Some(&blob_values), writer)?;
         }
-
-        let scan_schema = batches[0].schema();
-        let batch = if batches.len() == 1 {
-            batches.into_iter().next().unwrap()
-        } else {
-            arrow_select::concat::concat_batches(&scan_schema, &batches)
-                .map_err(|e| OmniError::Lance(e.to_string()))?
-        };
-        let row_ids = batch
-            .column_by_name("_rowid")
-            .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
-            .ok_or_else(|| {
-                OmniError::Lance(format!(
-                    "expected _rowid column when exporting '{}'",
-                    table_key
-                ))
-            })?
-            .values()
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
-        let blob_values = self
-            .export_blob_values(&ds, &batch, &row_ids, blob_properties)
-            .await?;
-        self.export_rows_from_batch(table_key, &batch, Some(&blob_values))
-            .await
+        Ok(())
     }
 
     // ─── Graph index ──────────────────────────────────────────────────────
@@ -1755,18 +1754,18 @@ impl Omnigraph {
         Ok(values)
     }
 
-    async fn export_rows_from_batch(
+    fn write_export_rows_from_batch<W: Write>(
         &self,
         table_key: &str,
         batch: &RecordBatch,
         blob_values: Option<&HashMap<String, Vec<Option<String>>>>,
-    ) -> Result<Vec<serde_json::Value>> {
+        writer: &mut W,
+    ) -> Result<()> {
         if let Some(type_name) = table_key.strip_prefix("node:") {
             let node_type =
                 self.catalog.node_types.get(type_name).ok_or_else(|| {
                     OmniError::manifest(format!("unknown node type '{}'", type_name))
                 })?;
-            let mut rows = Vec::with_capacity(batch.num_rows());
             for row in 0..batch.num_rows() {
                 let mut data = serde_json::Map::new();
                 data.insert(
@@ -1784,12 +1783,16 @@ impl Omnigraph {
                         )?,
                     );
                 }
-                rows.push(serde_json::json!({
+                write_export_jsonl_row(
+                    writer,
+                    table_key,
+                    &serde_json::json!({
                     "type": type_name,
                     "data": serde_json::Value::Object(data),
-                }));
+                    }),
+                )?;
             }
-            return Ok(rows);
+            return Ok(());
         }
 
         if let Some(edge_name) = table_key.strip_prefix("edge:") {
@@ -1797,7 +1800,6 @@ impl Omnigraph {
                 self.catalog.edge_types.get(edge_name).ok_or_else(|| {
                     OmniError::manifest(format!("unknown edge type '{}'", edge_name))
                 })?;
-            let mut rows = Vec::with_capacity(batch.num_rows());
             for row in 0..batch.num_rows() {
                 let from = named_string_value(batch, "src", row)?;
                 let to = named_string_value(batch, "dst", row)?;
@@ -1817,14 +1819,18 @@ impl Omnigraph {
                         )?,
                     );
                 }
-                rows.push(serde_json::json!({
+                write_export_jsonl_row(
+                    writer,
+                    table_key,
+                    &serde_json::json!({
                     "edge": edge_name,
                     "from": from,
                     "to": to,
                     "data": serde_json::Value::Object(data),
-                }));
+                    }),
+                )?;
             }
-            return Ok(rows);
+            return Ok(());
         }
 
         Err(OmniError::manifest(format!(
@@ -1832,6 +1838,21 @@ impl Omnigraph {
             table_key
         )))
     }
+}
+
+fn write_export_jsonl_row<W: Write>(
+    writer: &mut W,
+    table_key: &str,
+    row: &serde_json::Value,
+) -> Result<()> {
+    serde_json::to_writer(&mut *writer, row).map_err(|err| {
+        OmniError::manifest(format!(
+            "failed to serialize export row for '{}': {}",
+            table_key, err
+        ))
+    })?;
+    writer.write_all(b"\n")?;
+    Ok(())
 }
 
 async fn export_blob_column_values(
