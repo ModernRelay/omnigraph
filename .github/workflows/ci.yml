@@ -14,8 +14,75 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  classify_changes:
+    name: Classify Changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      run_full_ci: ${{ steps.filter.outputs.run_full_ci }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Detect text-only changes
+        id: filter
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then
+            echo "run_full_ci=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            base="$PR_BASE_SHA"
+            head="$PR_HEAD_SHA"
+          else
+            base="$BEFORE_SHA"
+            head="$GITHUB_SHA"
+            if [[ "$base" == "0000000000000000000000000000000000000000" ]]; then
+              base="$(git rev-parse "${head}^" 2>/dev/null || true)"
+            fi
+          fi
+
+          if [[ -z "${base:-}" ]]; then
+            echo "run_full_ci=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          mapfile -t changed < <(git diff --name-only "$base" "$head")
+          if [[ "${#changed[@]}" -eq 0 ]]; then
+            echo "run_full_ci=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          run_full_ci=false
+          for path in "${changed[@]}"; do
+            case "$path" in
+              *.md|*.mdx|*.txt|*.rst|*.adoc) ;;
+              *)
+                run_full_ci=true
+                break
+                ;;
+            esac
+          done
+
+          printf 'Changed files:\n'
+          printf '  %s\n' "${changed[@]}"
+          echo "run_full_ci=$run_full_ci" >> "$GITHUB_OUTPUT"
+
   test:
     name: Test Workspace
+    needs: classify_changes
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -23,31 +90,42 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
     steps:
+      - name: Skip heavy CI for text-only changes
+        if: needs.classify_changes.outputs.run_full_ci != 'true'
+        run: echo "Text-only change detected; skipping workspace test run."
+
       - name: Checkout source
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
         uses: actions/checkout@v5.0.1
 
       - name: Install system dependencies
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libprotobuf-dev
 
       - name: Install Rust stable
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
 
       - name: Cache Rust build data
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             . -> target
 
       - name: Run workspace tests
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
         run: cargo test --workspace --locked
 
   rustfs_integration:
     name: RustFS S3 Integration
-    needs: test
+    needs:
+      - classify_changes
+      - test
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -64,26 +142,35 @@ jobs:
       OMNIGRAPH_S3_TEST_PREFIX: github-actions
       CARGO_TERM_COLOR: always
     steps:
+      - name: Skip heavy CI for text-only changes
+        if: needs.classify_changes.outputs.run_full_ci != 'true'
+        run: echo "Text-only change detected; skipping RustFS integration tests."
+
       - name: Checkout source
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
         uses: actions/checkout@v5.0.1
 
       - name: Install system dependencies
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libprotobuf-dev python3-pip
 
       - name: Install Rust stable
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
 
       - name: Cache Rust build data
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             . -> target
 
       - name: Start RustFS
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
         run: |
           docker rm -f rustfs >/dev/null 2>&1 || true
           docker run -d \
@@ -96,11 +183,13 @@ jobs:
             /data
 
       - name: Install AWS CLI
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
         run: |
           python3 -m pip install --user awscli
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Create RustFS test bucket
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
         run: |
           for _ in $(seq 1 30); do
             if aws --endpoint-url "${AWS_ENDPOINT_URL_S3}" s3api list-buckets >/dev/null 2>&1; then
@@ -113,11 +202,12 @@ jobs:
             --bucket "${OMNIGRAPH_S3_TEST_BUCKET}" >/dev/null 2>&1 || true
 
       - name: Run RustFS-backed repo tests
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
         run: |
           cargo test --locked -p omnigraph --test s3_storage -- --nocapture
           cargo test --locked -p omnigraph-server --test server server_opens_s3_repo_directly_and_serves_snapshot_and_read -- --nocapture
           cargo test --locked -p omnigraph-cli --test system_local local_cli_s3_end_to_end_init_load_read_flow -- --nocapture
 
       - name: Dump RustFS logs on failure
-        if: failure()
+        if: failure() && needs.classify_changes.outputs.run_full_ci == 'true'
         run: docker logs rustfs
