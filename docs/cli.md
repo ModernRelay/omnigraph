@@ -48,6 +48,7 @@ and configure the matching `bearer_token_env` in `omnigraph.yaml`.
 
 ```bash
 omnigraph schema plan --schema ./next.pg ./repo.omni --json
+omnigraph schema apply --schema ./next.pg ./repo.omni --json
 omnigraph policy validate --config ./omnigraph.yaml
 omnigraph policy test --config ./omnigraph.yaml
 omnigraph policy explain --config ./omnigraph.yaml --actor act-alice --action read --branch main
@@ -87,3 +88,6 @@ The config file can also define:
 - auth env files
 - query aliases for common read and change commands
 - `policy.file` for Cedar authorization rules
+
+When policy is enabled, `schema apply` is authorized through the
+`schema_apply` action and is typically limited to admins on protected `main`.

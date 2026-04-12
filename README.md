@@ -98,7 +98,7 @@ cargo run -p omnigraph-cli -- read \
 ```
 
 Server routes include `/healthz`, `/snapshot`, `/export`, `/read`, `/change`,
-`/ingest`, `/branches`, `/runs`, and `/commits`.
+`/schema/apply`, `/ingest`, `/branches`, `/runs`, and `/commits`.
 
 To require auth, set `OMNIGRAPH_SERVER_BEARER_TOKEN` on the server and set the
 matching bearer token env var in your CLI target config.
@@ -110,6 +110,7 @@ Core repo flow:
 ```bash
 omnigraph init --schema ./schema.pg ./repo.omni
 omnigraph load --data ./data.jsonl --mode overwrite ./repo.omni
+omnigraph schema apply --schema ./next.pg ./repo.omni --json
 omnigraph snapshot ./repo.omni --branch main --json
 omnigraph read --uri ./repo.omni --query ./queries.gq --name get_person --params '{"name":"Alice"}'
 omnigraph change --uri ./repo.omni --query ./queries.gq --name insert_person --params '{"name":"Mina","age":28}'

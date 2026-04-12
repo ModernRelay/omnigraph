@@ -110,6 +110,10 @@ pub fn write_config(path: &Path, source: &str) {
     fs::write(path, source).unwrap();
 }
 
+pub fn write_file(path: &Path, source: &str) {
+    fs::write(path, source).unwrap();
+}
+
 fn yaml_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -275,6 +279,12 @@ impl SystemRepo {
     pub fn write_config(&self, name: &str, source: &str) -> PathBuf {
         let path = self.repo.parent().unwrap().join(name);
         write_config(&path, source);
+        path
+    }
+
+    pub fn write_file(&self, name: &str, source: &str) -> PathBuf {
+        let path = self.repo.parent().unwrap().join(name);
+        write_file(&path, source);
         path
     }
 

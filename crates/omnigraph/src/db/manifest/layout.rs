@@ -40,6 +40,10 @@ pub(super) fn version_object_id(table_key: &str, version: u64) -> String {
     format!("{}${}", table_key, format_table_version(version))
 }
 
+pub(super) fn tombstone_object_id(table_key: &str, version: u64) -> String {
+    format!("{}$tombstone${}", table_key, format_table_version(version))
+}
+
 pub(super) fn table_id_to_key(request_id: Option<&Vec<String>>) -> lance_namespace::Result<String> {
     match request_id {
         Some(request_id) if request_id.len() == 1 && !request_id[0].is_empty() => {

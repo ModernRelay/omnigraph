@@ -2,6 +2,7 @@ mod support;
 
 use std::fs;
 
+use omnigraph::db::Omnigraph;
 use reqwest::blocking::Client;
 use serde_json::json;
 
@@ -215,6 +216,106 @@ query insert_person($name: String, $age: I32) {
             .arg("--json"),
     ));
     assert!(runs_payload["runs"].as_array().unwrap().len() >= 2);
+}
+
+#[test]
+#[ignore = "requires loopback socket permissions in sandboxed runners"]
+fn remote_schema_apply_via_cli_updates_repo() {
+    let repo = SystemRepo::initialized();
+    let server = repo.spawn_server();
+    let config = repo.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
+    let next_schema = repo.write_file(
+        "next.pg",
+        &fs::read_to_string(fixture("test.pg")).unwrap().replace(
+            "    age: I32?\n}",
+            "    age: I32?\n    nickname: String?\n}",
+        ),
+    );
+
+    let payload = parse_stdout_json(&output_success(
+        cli()
+            .arg("schema")
+            .arg("apply")
+            .arg("--config")
+            .arg(&config)
+            .arg("--schema")
+            .arg(&next_schema)
+            .arg("--json"),
+    ));
+    assert_eq!(payload["applied"], true);
+
+    let db = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(Omnigraph::open(repo.path().to_string_lossy().as_ref()))
+        .unwrap();
+    assert!(
+        db.catalog().node_types["Person"]
+            .properties
+            .contains_key("nickname")
+    );
+}
+
+#[test]
+#[ignore = "requires loopback socket permissions in sandboxed runners"]
+fn remote_schema_apply_rejects_unsupported_plan() {
+    let repo = SystemRepo::initialized();
+    let server = repo.spawn_server();
+    let config = repo.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
+    let breaking_schema = repo.write_file(
+        "breaking.pg",
+        &fs::read_to_string(fixture("test.pg"))
+            .unwrap()
+            .replace("age: I32?", "age: I64?"),
+    );
+
+    let output = output_failure(
+        cli()
+            .arg("schema")
+            .arg("apply")
+            .arg("--config")
+            .arg(&config)
+            .arg("--schema")
+            .arg(&breaking_schema),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("changing property type"));
+}
+
+#[test]
+#[ignore = "requires loopback socket permissions in sandboxed runners"]
+fn remote_schema_apply_rejects_when_non_main_branch_exists() {
+    let repo = SystemRepo::initialized();
+    output_success(
+        cli()
+            .arg("branch")
+            .arg("create")
+            .arg("--from")
+            .arg("main")
+            .arg("--uri")
+            .arg(repo.path())
+            .arg("feature"),
+    );
+    let server = repo.spawn_server();
+    let config = repo.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
+    let next_schema = repo.write_file(
+        "next.pg",
+        &fs::read_to_string(fixture("test.pg")).unwrap().replace(
+            "    age: I32?\n}",
+            "    age: I32?\n    nickname: String?\n}",
+        ),
+    );
+
+    let output = output_failure(
+        cli()
+            .arg("schema")
+            .arg("apply")
+            .arg("--config")
+            .arg(&config)
+            .arg("--schema")
+            .arg(&next_schema),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("schema apply requires a repo with only main"));
 }
 
 #[test]

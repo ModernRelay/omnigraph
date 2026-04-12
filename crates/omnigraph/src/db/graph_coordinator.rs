@@ -8,7 +8,7 @@ use crate::failpoints;
 use crate::storage::{StorageAdapter, join_uri, normalize_root_uri};
 
 use super::commit_graph::{CommitGraph, GraphCommit};
-use super::manifest::{ManifestCoordinator, Snapshot, SubTableUpdate};
+use super::manifest::{ManifestChange, ManifestCoordinator, Snapshot, SubTableUpdate};
 use super::run_registry::{RunId, RunRecord, RunRegistry, graph_runs_uri, is_internal_run_branch};
 
 const GRAPH_COMMITS_DIR: &str = "_graph_commits.lance";
@@ -206,6 +206,10 @@ impl GraphCoordinator {
                 .filter(|branch| !is_internal_run_branch(branch))
                 .collect()
         })
+    }
+
+    pub(crate) async fn all_branches(&self) -> Result<Vec<String>> {
+        self.manifest.list_branches().await
     }
 
     pub async fn branch_descendants(&self, name: &str) -> Result<Vec<String>> {
@@ -412,6 +416,28 @@ impl GraphCoordinator {
         let manifest_version = self.manifest.commit(updates).await?;
         failpoints::maybe_fail("graph_publish.after_manifest_commit")?;
         Ok(manifest_version)
+    }
+
+    pub(crate) async fn commit_manifest_changes(
+        &mut self,
+        changes: &[ManifestChange],
+    ) -> Result<u64> {
+        let manifest_version = self.manifest.commit_changes(changes).await?;
+        failpoints::maybe_fail("graph_publish.after_manifest_commit")?;
+        Ok(manifest_version)
+    }
+
+    pub(crate) async fn commit_changes_with_actor(
+        &mut self,
+        changes: &[ManifestChange],
+        actor_id: Option<&str>,
+    ) -> Result<PublishedSnapshot> {
+        let manifest_version = self.commit_manifest_changes(changes).await?;
+        let snapshot_id = self.record_graph_commit(manifest_version, actor_id).await?;
+        Ok(PublishedSnapshot {
+            manifest_version,
+            _snapshot_id: snapshot_id,
+        })
     }
 
     pub(crate) async fn record_graph_commit(

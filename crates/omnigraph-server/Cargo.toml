@@ -29,3 +29,4 @@ futures = { workspace = true }
 tempfile = { workspace = true }
 tower = { workspace = true }
 serial_test = "3"
+lance-index = { workspace = true }

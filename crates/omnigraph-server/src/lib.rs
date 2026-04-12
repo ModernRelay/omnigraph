@@ -13,8 +13,8 @@ use api::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
     CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, HealthOutput, IngestOutput,
-    IngestRequest, ReadOutput, ReadRequest, RunListOutput, SnapshotQuery, ingest_output,
-    snapshot_payload,
+    IngestRequest, ReadOutput, ReadRequest, RunListOutput, SchemaApplyOutput, SchemaApplyRequest,
+    SnapshotQuery, ingest_output, schema_apply_output, snapshot_payload,
 };
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
@@ -362,6 +362,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/export", post(server_export))
         .route("/read", post(server_read))
         .route("/change", post(server_change))
+        .route("/schema/apply", post(server_schema_apply))
         .route(
             "/ingest",
             post(server_ingest).layer(DefaultBodyLimit::max(INGEST_REQUEST_BODY_LIMIT_BYTES)),
@@ -656,6 +657,31 @@ async fn server_change(
         affected_edges: result.affected_edges,
         actor_id: actor_id.map(str::to_string),
     }))
+}
+
+async fn server_schema_apply(
+    State(state): State<AppState>,
+    actor: Option<Extension<AuthenticatedActor>>,
+    Json(request): Json<SchemaApplyRequest>,
+) -> std::result::Result<Json<SchemaApplyOutput>, ApiError> {
+    let actor_id = actor.as_ref().map(|Extension(actor)| actor.as_str());
+    authorize_request(
+        &state,
+        actor.as_ref().map(|Extension(actor)| actor),
+        PolicyRequest {
+            actor_id: actor_id.map(str::to_string).unwrap_or_default(),
+            action: PolicyAction::SchemaApply,
+            branch: None,
+            target_branch: Some("main".to_string()),
+        },
+    )?;
+    let result = {
+        let mut db = Arc::clone(&state.db).write_owned().await;
+        db.apply_schema(&request.schema_source)
+            .await
+            .map_err(ApiError::from_omni)?
+    };
+    Ok(Json(schema_apply_output(state.uri(), result)))
 }
 
 async fn server_ingest(

@@ -1,5 +1,6 @@
 use std::fs;
 
+use lance_index::traits::DatasetIndexExt;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use serde_json::Value;
 use tempfile::tempdir;
@@ -297,6 +298,243 @@ fn schema_plan_json_reports_unsupported_type_change() {
                 .unwrap_or_default()
                 .contains("Person.age")
     }));
+}
+
+#[test]
+fn schema_apply_json_applies_supported_migration() {
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    let schema_path = temp.path().join("next.pg");
+    init_repo(&repo);
+
+    let next_schema = fs::read_to_string(fixture("test.pg")).unwrap().replace(
+        "    age: I32?\n}",
+        "    age: I32?\n    nickname: String?\n}",
+    );
+    fs::write(&schema_path, next_schema).unwrap();
+
+    let output = output_success(
+        cli()
+            .arg("schema")
+            .arg("apply")
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json")
+            .arg(&repo),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(payload["supported"], true);
+    assert_eq!(payload["applied"], true);
+    assert_eq!(payload["step_count"], 1);
+
+    let db = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(Omnigraph::open(repo.to_string_lossy().as_ref()))
+        .unwrap();
+    assert!(
+        db.catalog().node_types["Person"]
+            .properties
+            .contains_key("nickname")
+    );
+}
+
+#[test]
+fn schema_apply_human_reports_noop() {
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    let schema_path = fixture("test.pg");
+    init_repo(&repo);
+
+    let output = output_success(
+        cli()
+            .arg("schema")
+            .arg("apply")
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg(&repo),
+    );
+    let stdout = stdout_string(&output);
+
+    assert!(stdout.contains("applied: no"));
+    assert!(stdout.contains("no schema changes"));
+}
+
+#[test]
+fn schema_apply_json_renames_type_and_updates_snapshot() {
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    let schema_path = temp.path().join("rename.pg");
+    init_repo(&repo);
+
+    let renamed_schema = fs::read_to_string(fixture("test.pg"))
+        .unwrap()
+        .replace("node Person {\n", "node Human @rename_from(\"Person\") {\n")
+        .replace("edge Knows: Person -> Person", "edge Knows: Human -> Human")
+        .replace(
+            "edge WorksAt: Person -> Company",
+            "edge WorksAt: Human -> Company",
+        );
+    fs::write(&schema_path, renamed_schema).unwrap();
+
+    let output = output_success(
+        cli()
+            .arg("schema")
+            .arg("apply")
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json")
+            .arg(&repo),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["applied"], true);
+
+    let db = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(Omnigraph::open(repo.to_string_lossy().as_ref()))
+        .unwrap();
+    let snapshot = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(db.snapshot_of(ReadTarget::branch("main")))
+        .unwrap();
+    assert!(snapshot.entry("node:Human").is_some());
+    assert!(snapshot.entry("node:Person").is_none());
+}
+
+#[test]
+fn schema_apply_json_renames_property_and_updates_catalog() {
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    let schema_path = temp.path().join("rename-property.pg");
+    init_repo(&repo);
+
+    let renamed_schema = fs::read_to_string(fixture("test.pg"))
+        .unwrap()
+        .replace("age: I32?", "years: I32? @rename_from(\"age\")");
+    fs::write(&schema_path, renamed_schema).unwrap();
+
+    let output = output_success(
+        cli()
+            .arg("schema")
+            .arg("apply")
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json")
+            .arg(&repo),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["applied"], true);
+
+    let db = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(Omnigraph::open(repo.to_string_lossy().as_ref()))
+        .unwrap();
+    let person = &db.catalog().node_types["Person"];
+    assert!(person.properties.contains_key("years"));
+    assert!(!person.properties.contains_key("age"));
+}
+
+#[test]
+fn schema_apply_json_adds_index_for_existing_property() {
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    let schema_path = temp.path().join("index.pg");
+    init_repo(&repo);
+
+    let before_index_count = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let db = Omnigraph::open(repo.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+        let dataset = snapshot.open("node:Person").await.unwrap();
+        dataset.load_indices().await.unwrap().len()
+    });
+
+    let indexed_schema = fs::read_to_string(fixture("test.pg"))
+        .unwrap()
+        .replace("name: String @key", "name: String @key @index");
+    fs::write(&schema_path, indexed_schema).unwrap();
+
+    let output = output_success(
+        cli()
+            .arg("schema")
+            .arg("apply")
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json")
+            .arg(&repo),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["applied"], true);
+
+    let after_index_count = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let db = Omnigraph::open(repo.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+        let dataset = snapshot.open("node:Person").await.unwrap();
+        dataset.load_indices().await.unwrap().len()
+    });
+    assert!(after_index_count > before_index_count);
+}
+
+#[test]
+fn schema_apply_rejects_unsupported_plan() {
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    let schema_path = temp.path().join("breaking.pg");
+    init_repo(&repo);
+
+    let breaking_schema = fs::read_to_string(fixture("test.pg"))
+        .unwrap()
+        .replace("age: I32?", "age: I64?");
+    fs::write(&schema_path, breaking_schema).unwrap();
+
+    let output = output_failure(
+        cli()
+            .arg("schema")
+            .arg("apply")
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg(&repo),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("changing property type"));
+}
+
+#[test]
+fn schema_apply_rejects_when_non_main_branch_exists() {
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    let schema_path = temp.path().join("next.pg");
+    init_repo(&repo);
+    output_success(
+        cli()
+            .arg("branch")
+            .arg("create")
+            .arg("--from")
+            .arg("main")
+            .arg("--uri")
+            .arg(&repo)
+            .arg("feature"),
+    );
+
+    let next_schema = fs::read_to_string(fixture("test.pg")).unwrap().replace(
+        "    age: I32?\n}",
+        "    age: I32?\n    nickname: String?\n}",
+    );
+    fs::write(&schema_path, next_schema).unwrap();
+
+    let output = output_failure(
+        cli()
+            .arg("schema")
+            .arg("apply")
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg(&repo),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("schema apply requires a repo with only main"));
 }
 
 #[test]

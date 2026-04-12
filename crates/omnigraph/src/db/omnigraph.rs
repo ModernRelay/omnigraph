@@ -5,7 +5,7 @@ use std::sync::Arc;
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, FixedSizeListArray, Float32Array, Float64Array,
     Int32Array, Int64Array, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray,
-    RecordBatch, StringArray, StructArray, UInt32Array, UInt64Array,
+    RecordBatch, StringArray, StructArray, UInt32Array, UInt64Array, new_null_array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
@@ -17,7 +17,8 @@ use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::types::ScalarType;
 use omnigraph_compiler::{
-    SchemaIR, SchemaMigrationPlan, build_catalog_from_ir, build_schema_ir, plan_schema_migration,
+    SchemaIR, SchemaMigrationPlan, SchemaMigrationStep, SchemaTypeKind, build_catalog_from_ir,
+    build_schema_ir, plan_schema_migration,
 };
 
 use crate::db::graph_coordinator::{GraphCoordinator, PublishedSnapshot};
@@ -28,7 +29,9 @@ use crate::storage::{StorageAdapter, join_uri, normalize_root_uri, storage_for_u
 use crate::table_store::TableStore;
 
 use super::commit_graph::GraphCommit;
-use super::manifest::Snapshot;
+use super::manifest::{
+    ManifestChange, Snapshot, TableRegistration, TableTombstone, table_path_for_table_key,
+};
 use super::schema_state::{
     SCHEMA_SOURCE_FILENAME, load_or_bootstrap_schema_contract, read_accepted_schema_ir,
     validate_schema_contract, write_schema_contract,
@@ -40,6 +43,14 @@ pub enum MergeOutcome {
     AlreadyUpToDate,
     FastForward,
     Merged,
+}
+
+#[derive(Debug, Clone)]
+pub struct SchemaApplyResult {
+    pub supported: bool,
+    pub applied: bool,
+    pub manifest_version: u64,
+    pub steps: Vec<SchemaMigrationStep>,
 }
 
 /// Top-level handle to an Omnigraph database.
@@ -158,6 +169,324 @@ impl Omnigraph {
         let desired_ir = read_schema_ir_from_source(desired_schema_source)?;
         plan_schema_migration(&accepted_ir, &desired_ir)
             .map_err(|err| OmniError::manifest(err.to_string()))
+    }
+
+    pub async fn apply_schema(&mut self, desired_schema_source: &str) -> Result<SchemaApplyResult> {
+        self.ensure_schema_state_valid().await?;
+        let branches = self.coordinator.all_branches().await?;
+        let public_non_main = branches
+            .iter()
+            .filter(|branch| branch.as_str() != "main")
+            .cloned()
+            .collect::<Vec<_>>();
+        if !public_non_main.is_empty() {
+            return Err(OmniError::manifest_conflict(format!(
+                "schema apply requires a repo with only main; found non-main branches: {}",
+                public_non_main.join(", ")
+            )));
+        }
+
+        let accepted_ir = read_accepted_schema_ir(self.uri(), Arc::clone(&self.storage)).await?;
+        let desired_ir = read_schema_ir_from_source(desired_schema_source)?;
+        let plan = plan_schema_migration(&accepted_ir, &desired_ir)
+            .map_err(|err| OmniError::manifest(err.to_string()))?;
+        if !plan.supported {
+            let reason = plan
+                .steps
+                .iter()
+                .find_map(|step| match step {
+                    SchemaMigrationStep::UnsupportedChange { reason, .. } => Some(reason.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("unsupported schema migration plan");
+            return Err(OmniError::manifest(reason.to_string()));
+        }
+        if plan.steps.is_empty() {
+            return Ok(SchemaApplyResult {
+                supported: true,
+                applied: false,
+                manifest_version: self.version(),
+                steps: plan.steps,
+            });
+        }
+
+        let mut desired_catalog = build_catalog_from_ir(&desired_ir)?;
+        fixup_blob_schemas(&mut desired_catalog);
+
+        let snapshot = self.snapshot();
+        let mut added_tables = BTreeSet::new();
+        let mut renamed_tables = HashMap::new();
+        let mut rewritten_tables = BTreeSet::new();
+        let mut indexed_tables = BTreeSet::new();
+        let mut property_renames = HashMap::<String, HashMap<String, String>>::new();
+        let mut changed_edge_tables = false;
+
+        for step in &plan.steps {
+            match step {
+                SchemaMigrationStep::AddType { type_kind, name } => {
+                    let table_key = schema_table_key(*type_kind, name);
+                    if table_key.starts_with("edge:") {
+                        changed_edge_tables = true;
+                    }
+                    added_tables.insert(table_key);
+                }
+                SchemaMigrationStep::RenameType {
+                    type_kind,
+                    from,
+                    to,
+                } => {
+                    let source_key = schema_table_key(*type_kind, from);
+                    let target_key = schema_table_key(*type_kind, to);
+                    if source_key.starts_with("edge:") {
+                        changed_edge_tables = true;
+                    }
+                    renamed_tables.insert(target_key, source_key);
+                }
+                SchemaMigrationStep::AddProperty {
+                    type_kind,
+                    type_name,
+                    ..
+                } => {
+                    let table_key = schema_table_key(*type_kind, type_name);
+                    if table_key.starts_with("edge:") {
+                        changed_edge_tables = true;
+                    }
+                    rewritten_tables.insert(table_key);
+                }
+                SchemaMigrationStep::RenameProperty {
+                    type_kind,
+                    type_name,
+                    from,
+                    to,
+                } => {
+                    let table_key = schema_table_key(*type_kind, type_name);
+                    if table_key.starts_with("edge:") {
+                        changed_edge_tables = true;
+                    }
+                    rewritten_tables.insert(table_key.clone());
+                    property_renames
+                        .entry(table_key)
+                        .or_default()
+                        .insert(to.clone(), from.clone());
+                }
+                SchemaMigrationStep::AddConstraint {
+                    type_kind,
+                    type_name,
+                    ..
+                } => {
+                    indexed_tables.insert(schema_table_key(*type_kind, type_name));
+                }
+                SchemaMigrationStep::UpdateTypeMetadata { .. }
+                | SchemaMigrationStep::UpdatePropertyMetadata { .. } => {}
+                SchemaMigrationStep::UnsupportedChange { reason, .. } => {
+                    return Err(OmniError::manifest(reason.clone()));
+                }
+            }
+        }
+
+        let mut table_registrations = HashMap::<String, String>::new();
+        let mut table_updates = HashMap::<String, crate::db::SubTableUpdate>::new();
+        let mut table_tombstones = HashMap::<String, u64>::new();
+
+        for table_key in &added_tables {
+            let table_path = table_path_for_table_key(table_key)?;
+            let dataset_uri = self.table_store.dataset_uri(&table_path);
+            let schema = schema_for_table_key(&desired_catalog, table_key)?;
+            let mut ds = TableStore::create_empty_dataset(&dataset_uri, &schema).await?;
+            self.build_indices_on_dataset_for_catalog(&desired_catalog, table_key, &mut ds)
+                .await?;
+            let state = self.table_store.table_state(&dataset_uri, &ds).await?;
+            table_registrations.insert(table_key.clone(), table_path);
+            table_updates.insert(
+                table_key.clone(),
+                crate::db::SubTableUpdate {
+                    table_key: table_key.clone(),
+                    table_version: state.version,
+                    table_branch: None,
+                    row_count: state.row_count,
+                    version_metadata: state.version_metadata,
+                },
+            );
+        }
+
+        for (target_table_key, source_table_key) in &renamed_tables {
+            let source_entry = snapshot.entry(source_table_key).ok_or_else(|| {
+                OmniError::manifest(format!(
+                    "missing source table '{}' for schema rename",
+                    source_table_key
+                ))
+            })?;
+            let source_ds = snapshot.open(source_table_key).await?;
+            let batch = self
+                .batch_for_schema_apply_rewrite(
+                    &source_ds,
+                    source_table_key,
+                    &self.catalog,
+                    target_table_key,
+                    &desired_catalog,
+                    property_renames.get(target_table_key),
+                )
+                .await?;
+            let table_path = table_path_for_table_key(target_table_key)?;
+            let dataset_uri = self.table_store.dataset_uri(&table_path);
+            let mut target_ds = TableStore::write_dataset(&dataset_uri, batch).await?;
+            self.build_indices_on_dataset_for_catalog(
+                &desired_catalog,
+                target_table_key,
+                &mut target_ds,
+            )
+            .await?;
+            let state = self
+                .table_store
+                .table_state(&dataset_uri, &target_ds)
+                .await?;
+            table_registrations.insert(target_table_key.clone(), table_path);
+            table_updates.insert(
+                target_table_key.clone(),
+                crate::db::SubTableUpdate {
+                    table_key: target_table_key.clone(),
+                    table_version: state.version,
+                    table_branch: None,
+                    row_count: state.row_count,
+                    version_metadata: state.version_metadata,
+                },
+            );
+            table_tombstones.insert(
+                source_table_key.clone(),
+                source_entry.table_version.saturating_add(1),
+            );
+        }
+
+        for table_key in &rewritten_tables {
+            if added_tables.contains(table_key) || renamed_tables.contains_key(table_key) {
+                continue;
+            }
+            let entry = snapshot.entry(table_key).ok_or_else(|| {
+                OmniError::manifest(format!(
+                    "missing source table '{}' for schema apply",
+                    table_key
+                ))
+            })?;
+            let source_ds = snapshot.open(table_key).await?;
+            let batch = self
+                .batch_for_schema_apply_rewrite(
+                    &source_ds,
+                    table_key,
+                    &self.catalog,
+                    table_key,
+                    &desired_catalog,
+                    property_renames.get(table_key),
+                )
+                .await?;
+            let dataset_uri = self.table_store.dataset_uri(&entry.table_path);
+            let mut target_ds = TableStore::overwrite_dataset(&dataset_uri, batch).await?;
+            let mut state = self
+                .table_store
+                .table_state(&dataset_uri, &target_ds)
+                .await?;
+            if indexed_tables.contains(table_key) {
+                self.build_indices_on_dataset_for_catalog(
+                    &desired_catalog,
+                    table_key,
+                    &mut target_ds,
+                )
+                .await?;
+                state = self
+                    .table_store
+                    .table_state(&dataset_uri, &target_ds)
+                    .await?;
+            }
+            table_updates.insert(
+                table_key.clone(),
+                crate::db::SubTableUpdate {
+                    table_key: table_key.clone(),
+                    table_version: state.version,
+                    table_branch: None,
+                    row_count: state.row_count,
+                    version_metadata: state.version_metadata,
+                },
+            );
+        }
+
+        for table_key in &indexed_tables {
+            if added_tables.contains(table_key)
+                || renamed_tables.contains_key(table_key)
+                || rewritten_tables.contains(table_key)
+            {
+                continue;
+            }
+            let entry = snapshot.entry(table_key).ok_or_else(|| {
+                OmniError::manifest(format!(
+                    "missing table '{}' for schema index apply",
+                    table_key
+                ))
+            })?;
+            let dataset_uri = self.table_store.dataset_uri(&entry.table_path);
+            let mut ds = self
+                .table_store
+                .open_dataset_head_for_write(table_key, &dataset_uri, None)
+                .await?;
+            self.build_indices_on_dataset_for_catalog(&desired_catalog, table_key, &mut ds)
+                .await?;
+            let state = self.table_store.table_state(&dataset_uri, &ds).await?;
+            table_updates.insert(
+                table_key.clone(),
+                crate::db::SubTableUpdate {
+                    table_key: table_key.clone(),
+                    table_version: state.version,
+                    table_branch: None,
+                    row_count: state.row_count,
+                    version_metadata: state.version_metadata,
+                },
+            );
+        }
+
+        let mut manifest_changes = Vec::new();
+        for (table_key, table_path) in table_registrations {
+            manifest_changes.push(ManifestChange::RegisterTable(TableRegistration {
+                table_key,
+                table_path,
+            }));
+        }
+        for update in table_updates.into_values() {
+            manifest_changes.push(ManifestChange::Update(update));
+        }
+        for (table_key, tombstone_version) in table_tombstones {
+            manifest_changes.push(ManifestChange::Tombstone(TableTombstone {
+                table_key,
+                tombstone_version,
+            }));
+        }
+
+        let actor_id = self.current_audit_actor().map(str::to_string);
+        let PublishedSnapshot {
+            manifest_version,
+            _snapshot_id: _,
+        } = self
+            .coordinator
+            .commit_changes_with_actor(&manifest_changes, actor_id.as_deref())
+            .await?;
+
+        let schema_path = join_uri(&self.root_uri, SCHEMA_SOURCE_FILENAME);
+        self.storage
+            .write_text(&schema_path, desired_schema_source)
+            .await?;
+        write_schema_contract(&self.root_uri, self.storage.as_ref(), &desired_ir).await?;
+
+        self.catalog = desired_catalog;
+        self.schema_source = desired_schema_source.to_string();
+        self.coordinator.refresh().await?;
+        self.runtime_cache.invalidate_all().await;
+        if changed_edge_tables {
+            self.invalidate_graph_index().await;
+        }
+
+        Ok(SchemaApplyResult {
+            supported: true,
+            applied: true,
+            manifest_version,
+            steps: plan.steps,
+        })
     }
 
     pub(crate) fn table_store(&self) -> &TableStore {
@@ -1369,6 +1698,16 @@ impl Omnigraph {
         table_key: &str,
         ds: &mut Dataset,
     ) -> Result<()> {
+        self.build_indices_on_dataset_for_catalog(&self.catalog, table_key, ds)
+            .await
+    }
+
+    pub(crate) async fn build_indices_on_dataset_for_catalog(
+        &self,
+        catalog: &Catalog,
+        table_key: &str,
+        ds: &mut Dataset,
+    ) -> Result<()> {
         if let Some(type_name) = table_key.strip_prefix("node:") {
             if !self.table_store.has_btree_index(ds, "id").await? {
                 self.table_store
@@ -1379,7 +1718,7 @@ impl Omnigraph {
                     })?;
             }
 
-            if let Some(node_type) = self.catalog.node_types.get(type_name) {
+            if let Some(node_type) = catalog.node_types.get(type_name) {
                 for index_cols in &node_type.indices {
                     if index_cols.len() != 1 {
                         continue;
@@ -1600,58 +1939,100 @@ impl Omnigraph {
         source_ds: &Dataset,
         table_key: &str,
     ) -> Result<RecordBatch> {
-        let target_schema = schema_for_table_key(self.catalog(), table_key)?;
-        let blob_properties = blob_properties_for_table_key(self.catalog(), table_key)?;
-        if blob_properties.is_empty() {
-            let batches = self.table_store().scan_batches(source_ds).await?;
-            return concat_or_empty_batches(target_schema, batches);
-        }
+        self.batch_for_schema_apply_rewrite(
+            source_ds,
+            table_key,
+            &self.catalog,
+            table_key,
+            &self.catalog,
+            None,
+        )
+        .await
+    }
 
-        let batches = self
-            .table_store()
-            .scan_with(source_ds, None, None, None, true, |_| Ok(()))
-            .await?;
-        let batch = concat_or_empty_batches(target_schema.clone(), batches)?;
-        if batch.num_rows() == 0 {
-            return Ok(batch);
+    async fn batch_for_schema_apply_rewrite(
+        &self,
+        source_ds: &Dataset,
+        source_table_key: &str,
+        source_catalog: &Catalog,
+        target_table_key: &str,
+        target_catalog: &Catalog,
+        property_renames: Option<&HashMap<String, String>>,
+    ) -> Result<RecordBatch> {
+        let target_schema = schema_for_table_key(target_catalog, target_table_key)?;
+        let source_blob_properties =
+            blob_properties_for_table_key(source_catalog, source_table_key)?;
+        let target_blob_properties =
+            blob_properties_for_table_key(target_catalog, target_table_key)?;
+        let needs_row_ids =
+            !source_blob_properties.is_empty() || !target_blob_properties.is_empty();
+        let batches = if needs_row_ids {
+            self.table_store()
+                .scan_with(source_ds, None, None, None, true, |_| Ok(()))
+                .await?
+        } else {
+            self.table_store().scan_batches(source_ds).await?
+        };
+        if batches.is_empty() {
+            return Ok(RecordBatch::new_empty(target_schema));
         }
+        let source_schema = batches[0].schema();
+        let batch = concat_or_empty_batches(source_schema, batches)?;
 
-        let row_ids = batch
-            .column_by_name("_rowid")
-            .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
-            .ok_or_else(|| {
-                OmniError::Lance(format!(
-                    "expected _rowid column when rewriting '{}'",
-                    table_key
-                ))
-            })?;
-        let row_ids: Vec<u64> = row_ids.values().iter().copied().collect();
+        let row_ids = if needs_row_ids {
+            Some(
+                batch
+                    .column_by_name("_rowid")
+                    .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+                    .ok_or_else(|| {
+                        OmniError::Lance(format!(
+                            "expected _rowid column when rewriting '{}'",
+                            source_table_key
+                        ))
+                    })?
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
 
         let mut columns = Vec::with_capacity(target_schema.fields().len());
         for field in target_schema.fields() {
-            if blob_properties.contains(field.name()) {
-                let descriptions = batch
-                    .column_by_name(field.name())
-                    .and_then(|col| col.as_any().downcast_ref::<StructArray>())
-                    .ok_or_else(|| {
-                        OmniError::Lance(format!(
-                            "expected blob descriptions for '{}.{}'",
-                            table_key,
-                            field.name()
-                        ))
-                    })?;
-                columns.push(
-                    self.rebuild_blob_column(source_ds, field.name(), descriptions, &row_ids)
-                        .await?,
-                );
+            let source_name = property_renames
+                .and_then(|renames| renames.get(field.name()))
+                .map(String::as_str)
+                .unwrap_or_else(|| field.name().as_str());
+            if let Some(column) = batch.column_by_name(source_name) {
+                if target_blob_properties.contains(field.name())
+                    && source_blob_properties.contains(source_name)
+                {
+                    let descriptions =
+                        column
+                            .as_any()
+                            .downcast_ref::<StructArray>()
+                            .ok_or_else(|| {
+                                OmniError::Lance(format!(
+                                    "expected blob descriptions for '{}.{}'",
+                                    source_table_key, source_name
+                                ))
+                            })?;
+                    let rebuilt = self
+                        .rebuild_blob_column(
+                            source_ds,
+                            source_name,
+                            descriptions,
+                            row_ids.as_deref().unwrap_or(&[]),
+                        )
+                        .await?;
+                    columns.push(rebuilt);
+                } else {
+                    columns.push(column.clone());
+                }
             } else {
-                columns.push(batch.column_by_name(field.name()).cloned().ok_or_else(|| {
-                    OmniError::Lance(format!(
-                        "missing column '{}.{}' in rewrite batch",
-                        table_key,
-                        field.name()
-                    ))
-                })?);
+                columns.push(new_null_array(field.data_type(), batch.num_rows()));
             }
         }
 
@@ -2130,6 +2511,14 @@ fn read_schema_ir_from_source(schema_source: &str) -> Result<SchemaIR> {
     build_schema_ir(&schema_ast).map_err(|err| OmniError::manifest(err.to_string()))
 }
 
+fn schema_table_key(type_kind: SchemaTypeKind, name: &str) -> String {
+    match type_kind {
+        SchemaTypeKind::Node => format!("node:{}", name),
+        SchemaTypeKind::Edge => format!("edge:{}", name),
+        SchemaTypeKind::Interface => unreachable!("interfaces do not map to tables"),
+    }
+}
+
 fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result<Arc<Schema>> {
     if let Some(type_name) = table_key.strip_prefix("node:") {
         let node_type: &NodeType = catalog
@@ -2327,8 +2716,10 @@ fn json_value_from_array(array: &dyn Array, row: usize) -> Result<serde_json::Va
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::manifest::ManifestCoordinator;
     use async_trait::async_trait;
     use omnigraph_compiler::{SchemaMigrationStep, SchemaTypeKind};
+    use serde_json::Value;
     use std::fs;
     use std::sync::Mutex;
 
@@ -2619,6 +3010,182 @@ edge WorksAt: Person -> Company
             err.to_string()
                 .contains("current _schema.pg no longer matches the accepted compiled schema")
         );
+    }
+
+    async fn table_rows_json(db: &Omnigraph, table_key: &str) -> Vec<Value> {
+        let snapshot = db.snapshot();
+        let ds = snapshot.open(table_key).await.unwrap();
+        let batches = db.table_store().scan_batches(&ds).await.unwrap();
+        batches
+            .into_iter()
+            .flat_map(|batch| {
+                (0..batch.num_rows())
+                    .map(|row| record_batch_row_to_json(&batch, row).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    async fn seed_person_row(db: &mut Omnigraph, name: &str, age: Option<i32>) {
+        let (mut ds, full_path, table_branch) = db.open_for_mutation("node:Person").await.unwrap();
+        let schema: Arc<Schema> = Arc::new(ds.schema().into());
+        let columns: Vec<Arc<dyn Array>> = schema
+            .fields()
+            .iter()
+            .map(|field| match field.name().as_str() {
+                "id" => Arc::new(StringArray::from(vec![name])) as Arc<dyn Array>,
+                "name" => Arc::new(StringArray::from(vec![name])) as Arc<dyn Array>,
+                "age" => Arc::new(Int32Array::from(vec![age])) as Arc<dyn Array>,
+                _ => new_null_array(field.data_type(), 1),
+            })
+            .collect();
+        let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+        let state = db
+            .table_store()
+            .append_batch(&full_path, &mut ds, batch)
+            .await
+            .unwrap();
+        db.commit_updates(&[crate::db::SubTableUpdate {
+            table_key: "node:Person".to_string(),
+            table_version: state.version,
+            table_branch,
+            row_count: state.row_count,
+            version_metadata: state.version_metadata,
+        }])
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_apply_schema_noop_returns_not_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        let result = db.apply_schema(TEST_SCHEMA).await.unwrap();
+        assert!(result.supported);
+        assert!(!result.applied);
+        assert!(result.steps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_apply_schema_adds_nullable_property_and_preserves_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        seed_person_row(&mut db, "Alice", Some(30)).await;
+
+        let desired = TEST_SCHEMA.replace(
+            "    age: I32?\n}",
+            "    age: I32?\n    nickname: String?\n}",
+        );
+        let result = db.apply_schema(&desired).await.unwrap();
+        assert!(result.applied);
+
+        let reopened = Omnigraph::open(uri).await.unwrap();
+        let rows = table_rows_json(&reopened, "node:Person").await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], "Alice");
+        assert_eq!(rows[0]["age"], 30);
+        assert!(rows[0]["nickname"].is_null());
+        assert!(
+            reopened.catalog().node_types["Person"]
+                .properties
+                .contains_key("nickname")
+        );
+        assert!(dir.path().join("_schema.pg").exists());
+    }
+
+    #[tokio::test]
+    async fn test_apply_schema_renames_property_and_preserves_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        seed_person_row(&mut db, "Alice", Some(30)).await;
+
+        let desired = TEST_SCHEMA.replace(
+            "    age: I32?\n}",
+            "    years: I32? @rename_from(\"age\")\n}",
+        );
+        db.apply_schema(&desired).await.unwrap();
+
+        let reopened = Omnigraph::open(uri).await.unwrap();
+        let rows = table_rows_json(&reopened, "node:Person").await;
+        assert_eq!(rows[0]["name"], "Alice");
+        assert_eq!(rows[0]["years"], 30);
+        assert!(rows[0].get("age").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_apply_schema_renames_type_and_preserves_historical_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        seed_person_row(&mut db, "Alice", Some(30)).await;
+        let before_version = db.snapshot().version();
+
+        let desired = TEST_SCHEMA
+            .replace("node Person {\n", "node Human @rename_from(\"Person\") {\n")
+            .replace("edge Knows: Person -> Person", "edge Knows: Human -> Human")
+            .replace(
+                "edge WorksAt: Person -> Company",
+                "edge WorksAt: Human -> Company",
+            );
+        db.apply_schema(&desired).await.unwrap();
+
+        let head = db.snapshot();
+        assert!(head.entry("node:Person").is_none());
+        assert!(head.entry("node:Human").is_some());
+        let historical = ManifestCoordinator::snapshot_at(uri, None, before_version)
+            .await
+            .unwrap();
+        assert!(historical.entry("node:Person").is_some());
+        assert!(historical.entry("node:Human").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_apply_schema_rejects_when_non_main_branch_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        db.branch_create("feature").await.unwrap();
+
+        let desired = TEST_SCHEMA.replace(
+            "    age: I32?\n}",
+            "    age: I32?\n    nickname: String?\n}",
+        );
+        let err = db.apply_schema(&desired).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("schema apply requires a repo with only main")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_apply_schema_adds_index_for_existing_property() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        let desired = TEST_SCHEMA.replace("name: String @key", "name: String @key @index");
+        db.apply_schema(&desired).await.unwrap();
+
+        let snapshot = db.snapshot();
+        let ds = snapshot.open("node:Person").await.unwrap();
+        assert!(db.table_store().has_fts_index(&ds, "name").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_apply_schema_unsupported_plan_does_not_advance_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        let before_version = db.snapshot().version();
+
+        let desired = TEST_SCHEMA.replace("age: I32?", "age: I64?");
+        let err = db.apply_schema(&desired).await.unwrap_err();
+        assert!(err.to_string().contains("changing property type"));
+        assert_eq!(db.snapshot().version(), before_version);
     }
 
     #[tokio::test]

@@ -133,6 +133,63 @@ async fn test_commit_advances_version() {
 }
 
 #[tokio::test]
+async fn test_commit_changes_can_register_new_table_and_tombstone_old_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+
+    let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    let before_version = mc.version();
+    let person_entry = mc.snapshot().entry("node:Person").unwrap().clone();
+
+    let table_key = "node:Human".to_string();
+    let table_path = table_path_for_table_key(&table_key).unwrap();
+    let dataset_uri = format!("{}/{}", uri, table_path);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, true),
+    ]));
+    let ds = crate::table_store::TableStore::create_empty_dataset(&dataset_uri, &schema)
+        .await
+        .unwrap();
+    let state = crate::table_store::TableStore::new(uri)
+        .table_state(&dataset_uri, &ds)
+        .await
+        .unwrap();
+
+    mc.commit_changes(&[
+        ManifestChange::RegisterTable(TableRegistration {
+            table_key: table_key.clone(),
+            table_path: table_path.clone(),
+        }),
+        ManifestChange::Update(SubTableUpdate {
+            table_key: table_key.clone(),
+            table_version: state.version,
+            table_branch: None,
+            row_count: state.row_count,
+            version_metadata: state.version_metadata,
+        }),
+        ManifestChange::Tombstone(TableTombstone {
+            table_key: "node:Person".to_string(),
+            tombstone_version: person_entry.table_version + 1,
+        }),
+    ])
+    .await
+    .unwrap();
+
+    let head = mc.snapshot();
+    assert!(head.entry("node:Human").is_some());
+    assert!(head.entry("node:Person").is_none());
+
+    let historical = ManifestCoordinator::snapshot_at(uri, None, before_version)
+        .await
+        .unwrap();
+    assert!(historical.entry("node:Person").is_some());
+    assert!(historical.entry("node:Human").is_none());
+}
+
+#[tokio::test]
 async fn test_snapshot_open_sub_table() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -889,13 +946,16 @@ impl RecordingPublisher {
 
 #[async_trait]
 impl ManifestBatchPublisher for RecordingPublisher {
-    async fn publish(&self, updates: &[SubTableUpdate]) -> Result<Dataset> {
-        let requests: Vec<CreateTableVersionRequest> = updates
+    async fn publish(&self, changes: &[ManifestChange]) -> Result<Dataset> {
+        let requests: Vec<CreateTableVersionRequest> = changes
             .iter()
-            .map(SubTableUpdate::to_create_table_version_request)
+            .filter_map(|change| match change {
+                ManifestChange::Update(update) => Some(update.to_create_table_version_request()),
+                ManifestChange::RegisterTable(_) | ManifestChange::Tombstone(_) => None,
+            })
             .collect();
         self.requests.lock().await.extend_from_slice(&requests);
-        self.inner.publish_requests(&requests).await
+        self.inner.publish(changes).await
     }
 }
 
@@ -903,7 +963,7 @@ struct FailingPublisher;
 
 #[async_trait]
 impl ManifestBatchPublisher for FailingPublisher {
-    async fn publish(&self, _updates: &[SubTableUpdate]) -> Result<Dataset> {
+    async fn publish(&self, _changes: &[ManifestChange]) -> Result<Dataset> {
         Err(OmniError::manifest(
             "injected batch publisher failure".to_string(),
         ))

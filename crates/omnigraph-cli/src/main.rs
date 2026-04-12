@@ -14,8 +14,9 @@ use omnigraph_server::api::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
     CommitOutput, ErrorOutput, ExportRequest, IngestOutput, IngestRequest, ReadOutput, ReadRequest,
-    RunListOutput, RunOutput, SnapshotOutput, SnapshotTableOutput, commit_output, ingest_output,
-    read_output, run_output, snapshot_payload,
+    RunListOutput, RunOutput, SchemaApplyOutput, SchemaApplyRequest, SnapshotOutput,
+    SnapshotTableOutput, commit_output, ingest_output, read_output, run_output,
+    schema_apply_output, snapshot_payload,
 };
 use omnigraph_server::{
     AliasCommand, OmnigraphConfig, PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest,
@@ -280,6 +281,19 @@ enum SchemaCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Apply a supported schema migration
+    Apply {
+        /// Repo URI
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        schema: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -446,6 +460,20 @@ struct SchemaPlanOutput<'a> {
     supported: bool,
     step_count: usize,
     steps: &'a [SchemaMigrationStep],
+}
+
+fn print_schema_apply_human(output: &SchemaApplyOutput) {
+    println!("schema apply for {}", output.uri);
+    println!("supported: {}", if output.supported { "yes" } else { "no" });
+    println!("applied: {}", if output.applied { "yes" } else { "no" });
+    println!("manifest_version: {}", output.manifest_version);
+    if output.steps.is_empty() {
+        println!("no schema changes");
+        return;
+    }
+    for step in &output.steps {
+        println!("- {}", render_schema_plan_step(step));
+    }
 }
 
 fn ensure_local_repo_parent(uri: &str) -> Result<()> {
@@ -1794,6 +1822,39 @@ async fn main() -> Result<()> {
                     print_json(&output)?;
                 } else {
                     print_schema_plan_human(&uri, &plan);
+                }
+            }
+            SchemaCommand::Apply {
+                uri,
+                target,
+                config,
+                schema,
+                json,
+            } => {
+                let config = load_cli_config(config.as_ref())?;
+                let bearer_token =
+                    resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
+                let uri = resolve_uri(&config, uri, target.as_deref())?;
+                let schema_source = fs::read_to_string(&schema)?;
+                let output = if is_remote_uri(&uri) {
+                    remote_json::<SchemaApplyOutput>(
+                        &http_client,
+                        Method::POST,
+                        remote_url(&uri, "/schema/apply"),
+                        Some(serde_json::to_value(SchemaApplyRequest {
+                            schema_source: schema_source.clone(),
+                        })?),
+                        bearer_token.as_deref(),
+                    )
+                    .await?
+                } else {
+                    let mut db = Omnigraph::open(&uri).await?;
+                    schema_apply_output(&uri, db.apply_schema(&schema_source).await?)
+                };
+                if json {
+                    print_json(&output)?;
+                } else {
+                    print_schema_apply_human(&output);
                 }
             }
         },
