@@ -1,13 +1,13 @@
-{"type": "Actor", "data": {"slug": "aaron", "name": "Aaron"}}
-{"type": "Actor", "data": {"slug": "bruno", "name": "Bruno"}}
-{"type": "Actor", "data": {"slug": "jorge", "name": "Jorge"}}
-{"type": "Actor", "data": {"slug": "muneeb", "name": "Muneeb"}}
-{"type": "Actor", "data": {"slug": "ragnor", "name": "Ragnor"}}
-{"type": "Actor", "data": {"slug": "andrew", "name": "Andrew"}}
-{"type": "Signal", "data": {"slug": "zylon-private-ai-platform", "title": "Zylon.ai positions as complete on-premise enterprise AI platform for regulated industries", "body": "Zylon.ai positions itself as a complete, fully private (100% on-premise) enterprise AI platform built explicitly for regulated industries, emphasizing air-gapped deployability, data sovereignty (no external cloud dependency), and predictable fixed-cost economics (no per-token pricing).", "category": "competitor", "strength": "strong", "observed_at": "2026-03-27", "source": "https://www.zylon.ai/"}}
-{"type": "Decision", "data": {"slug": "create-360-ai-infra", "title": "Create 360 AI Infra offering", "body": "Build a comprehensive 360-degree AI infrastructure offering in response to competitors like Zylon positioning complete on-premise AI platforms for regulated industries.", "status": "proposed", "urgency": "high", "decided_at": "2026-03-27"}}
-{"type": "Trace", "data": {"slug": "jorge-spots-zylon", "title": "Jorge spots Zylon.ai competitor signal", "body": "Jorge identified Zylon.ai as a new competitor positioning a fully private enterprise AI platform targeting regulated industries with air-gapped deployment and fixed-cost pricing.", "kind": "note", "recorded_at": "2026-03-27", "source": "https://www.zylon.ai/"}}
-{"edge": "OwnedBy", "from": "create-360-ai-infra", "to": "andrew"}
-{"edge": "RecordedBy", "from": "jorge-spots-zylon", "to": "jorge"}
-{"edge": "Triggered", "from": "zylon-private-ai-platform", "to": "create-360-ai-infra"}
-{"edge": "Supports", "from": "jorge-spots-zylon", "to": "create-360-ai-infra"}
+{"type": "Actor", "data": {"slug": "owner", "name": "Owner"}}
+{"type": "Actor", "data": {"slug": "analyst", "name": "Analyst"}}
+{"type": "Actor", "data": {"slug": "researcher", "name": "Researcher"}}
+{"type": "Actor", "data": {"slug": "reviewer", "name": "Reviewer"}}
+{"type": "Actor", "data": {"slug": "sponsor", "name": "Sponsor"}}
+{"type": "Actor", "data": {"slug": "operator", "name": "Operator"}}
+{"type": "Signal", "data": {"slug": "private-ai-platform-signal", "title": "Competitor launches private AI platform for regulated industries", "body": "A competitor is positioning a fully private AI platform for regulated industries, emphasizing on-premise deployment, data isolation, and predictable pricing.", "category": "competitor", "strength": "strong", "observed_at": "2026-03-27", "source": "https://example.com/market-signal"}}
+{"type": "Decision", "data": {"slug": "launch-private-ai-offering", "title": "Launch private AI offering", "body": "Evaluate a new private AI offering in response to competitor movement in regulated markets.", "status": "proposed", "urgency": "high", "decided_at": "2026-03-27"}}
+{"type": "Trace", "data": {"slug": "competitor-signal-note", "title": "Competitor signal recorded", "body": "A market note records a new competitor offering focused on private deployment for regulated teams.", "kind": "note", "recorded_at": "2026-03-27", "source": "https://example.com/market-signal"}}
+{"edge": "OwnedBy", "from": "launch-private-ai-offering", "to": "owner"}
+{"edge": "RecordedBy", "from": "competitor-signal-note", "to": "researcher"}
+{"edge": "Triggered", "from": "private-ai-platform-signal", "to": "launch-private-ai-offering"}
+{"edge": "Supports", "from": "competitor-signal-note", "to": "launch-private-ai-offering"}
