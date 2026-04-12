@@ -39,6 +39,10 @@ Docker must be installed and running first.
 The RustFS bootstrap prefers the rolling `edge` binaries and only falls back to
 source builds when release assets are unavailable.
 
+If a previous run left objects under the same repo prefix but did not finish
+initializing the repo, rerun with `RESET_REPO=1` or set `PREFIX` to a new
+value.
+
 ## Good Fit For
 
 - Team knowledge graphs and internal context graphs

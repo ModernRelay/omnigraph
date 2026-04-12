@@ -19,6 +19,7 @@ AWS_ENDPOINT_URL_S3="${AWS_ENDPOINT_URL_S3:-$AWS_ENDPOINT_URL}"
 AWS_ALLOW_HTTP="${AWS_ALLOW_HTTP:-true}"
 AWS_S3_FORCE_PATH_STYLE="${AWS_S3_FORCE_PATH_STYLE:-true}"
 FORCE_BUILD="${FORCE_BUILD:-0}"
+RESET_REPO="${RESET_REPO:-0}"
 
 REPO_URI="s3://$BUCKET/$PREFIX"
 SERVER_LOG="$WORKDIR/omnigraph-server.log"
@@ -290,10 +291,37 @@ ensure_bucket() {
     s3api create-bucket --bucket "$BUCKET" >/dev/null 2>&1 || true
 }
 
+repo_prefix_has_objects() {
+  local key_count
+  key_count="$("$AWS_BIN" --endpoint-url "$AWS_ENDPOINT_URL_S3" \
+    s3api list-objects-v2 \
+    --bucket "$BUCKET" \
+    --prefix "$PREFIX/" \
+    --max-keys 1 \
+    --query 'KeyCount' \
+    --output text 2>/dev/null || true)"
+
+  [ -n "$key_count" ] && [ "$key_count" != "None" ] && [ "$key_count" != "0" ]
+}
+
+reset_repo_prefix() {
+  log "Removing existing objects under $REPO_URI"
+  "$AWS_BIN" --endpoint-url "$AWS_ENDPOINT_URL_S3" \
+    s3 rm "s3://$BUCKET/$PREFIX" --recursive >/dev/null
+}
+
 initialize_repo() {
   if "$BIN_DIR/omnigraph" snapshot "$REPO_URI" --json >/dev/null 2>&1; then
     log "Reusing existing repo at $REPO_URI"
     return
+  fi
+
+  if repo_prefix_has_objects; then
+    if [ "$RESET_REPO" = "1" ]; then
+      reset_repo_prefix
+    else
+      die "found existing objects under $REPO_URI but could not open an Omnigraph repo there. This usually means a previous bootstrap left a partially initialized prefix. Rerun with RESET_REPO=1 to delete that prefix and recreate it, or set PREFIX to a new value."
+    fi
   fi
 
   log "Initializing repo at $REPO_URI"
