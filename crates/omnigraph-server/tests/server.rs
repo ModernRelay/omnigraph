@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
+use lance_index::traits::DatasetIndexExt;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_server::api::{
     BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorOutput, ExportRequest,
-    IngestRequest, ReadRequest,
+    IngestRequest, ReadRequest, SchemaApplyRequest,
 };
 use omnigraph_server::{AppState, build_app};
 use serde_json::{Value, json};
@@ -86,6 +87,19 @@ rules:
       target_branch_scope: unprotected
 "#;
 
+const SCHEMA_APPLY_POLICY_YAML: &str = r#"
+version: 1
+groups:
+  admins: [act-ragnor]
+protected_branches: [main]
+rules:
+  - id: admins-schema-apply
+    allow:
+      actors: { group: admins }
+      actions: [schema_apply]
+      target_branch_scope: protected
+"#;
+
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../omnigraph/tests/fixtures")
@@ -109,6 +123,16 @@ async fn init_repo_with_schema_and_data(schema: &str, data: &str) -> tempfile::T
         .unwrap();
     let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
     load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    temp
+}
+
+async fn init_repo_with_schema(schema: &str) -> tempfile::TempDir {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    fs::create_dir_all(&repo).unwrap();
+    Omnigraph::init(repo.to_str().unwrap(), schema)
         .await
         .unwrap();
     temp
@@ -206,12 +230,343 @@ async fn app_for_loaded_repo_with_auth_tokens_and_policy(
     (temp, build_app(state))
 }
 
+async fn app_for_repo_with_auth_tokens_and_policy(
+    schema: &str,
+    tokens: &[(&str, &str)],
+    policy: &str,
+) -> (tempfile::TempDir, Router) {
+    let temp = init_repo_with_schema(schema).await;
+    let repo = repo_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, policy).unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        repo.to_string_lossy().to_string(),
+        tokens
+            .iter()
+            .map(|(actor, token)| ((*actor).to_string(), (*token).to_string()))
+            .collect(),
+        Some(&policy_path),
+    )
+    .await
+    .unwrap();
+    (temp, build_app(state))
+}
+
+fn additive_schema_with_nickname() -> String {
+    fs::read_to_string(fixture("test.pg")).unwrap().replace(
+        "    age: I32?\n}",
+        "    age: I32?\n    nickname: String?\n}",
+    )
+}
+
+fn renamed_person_schema() -> String {
+    fs::read_to_string(fixture("test.pg"))
+        .unwrap()
+        .replace("node Person {\n", "node Human @rename_from(\"Person\") {\n")
+        .replace("edge Knows: Person -> Person", "edge Knows: Human -> Human")
+        .replace(
+            "edge WorksAt: Person -> Company",
+            "edge WorksAt: Human -> Company",
+        )
+}
+
+fn renamed_age_schema() -> String {
+    fs::read_to_string(fixture("test.pg"))
+        .unwrap()
+        .replace("age: I32?", "years: I32? @rename_from(\"age\")")
+}
+
+fn indexed_name_schema() -> String {
+    fs::read_to_string(fixture("test.pg"))
+        .unwrap()
+        .replace("name: String @key", "name: String @key @index")
+}
+
+fn unsupported_schema_change() -> String {
+    fs::read_to_string(fixture("test.pg"))
+        .unwrap()
+        .replace("age: I32?", "age: I64?")
+}
+
 async fn json_response(app: &Router, request: Request<Body>) -> (StatusCode, Value) {
     let response = app.clone().oneshot(request).await.unwrap();
     let status = response.status();
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let value = serde_json::from_slice(&body).unwrap();
     (status, value)
+}
+
+#[tokio::test]
+async fn schema_apply_route_updates_repo_for_authorized_admin() {
+    let (temp, app) = app_for_repo_with_auth_tokens_and_policy(
+        &fs::read_to_string(fixture("test.pg")).unwrap(),
+        &[("act-ragnor", "admin-token")],
+        SCHEMA_APPLY_POLICY_YAML,
+    )
+    .await;
+    let schema = additive_schema_with_nickname();
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/schema/apply")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer admin-token")
+        .body(Body::from(
+            serde_json::to_vec(&SchemaApplyRequest {
+                schema_source: schema,
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+    let (status, payload) = json_response(&app, request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["applied"], true);
+    let repo = repo_path(temp.path());
+    let reopened = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    assert!(
+        reopened.catalog().node_types["Person"]
+            .properties
+            .contains_key("nickname")
+    );
+}
+
+#[tokio::test]
+async fn schema_apply_route_requires_schema_apply_policy_permission() {
+    let (_temp, app) = app_for_repo_with_auth_tokens_and_policy(
+        &fs::read_to_string(fixture("test.pg")).unwrap(),
+        &[("act-ragnor", "admin-token")],
+        POLICY_YAML,
+    )
+    .await;
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/schema/apply")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer admin-token")
+        .body(Body::from(
+            serde_json::to_vec(&SchemaApplyRequest {
+                schema_source: additive_schema_with_nickname(),
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+    let (status, payload) = json_response(&app, request).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        payload["code"],
+        serde_json::to_value(omnigraph_server::api::ErrorCode::Forbidden).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn schema_apply_route_requires_bearer_token_when_policy_enabled() {
+    let (_temp, app) = app_for_repo_with_auth_tokens_and_policy(
+        &fs::read_to_string(fixture("test.pg")).unwrap(),
+        &[("act-ragnor", "admin-token")],
+        SCHEMA_APPLY_POLICY_YAML,
+    )
+    .await;
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/schema/apply")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&SchemaApplyRequest {
+                schema_source: additive_schema_with_nickname(),
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+    let (status, payload) = json_response(&app, request).await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        payload["code"],
+        serde_json::to_value(omnigraph_server::api::ErrorCode::Unauthorized).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn schema_apply_route_can_rename_type() {
+    let (temp, app) = app_for_repo_with_auth_tokens_and_policy(
+        &fs::read_to_string(fixture("test.pg")).unwrap(),
+        &[("act-ragnor", "admin-token")],
+        SCHEMA_APPLY_POLICY_YAML,
+    )
+    .await;
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/schema/apply")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer admin-token")
+        .body(Body::from(
+            serde_json::to_vec(&SchemaApplyRequest {
+                schema_source: renamed_person_schema(),
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+    let (status, payload) = json_response(&app, request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["applied"], true);
+    let repo = repo_path(temp.path());
+    let reopened = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let snapshot = reopened
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    assert!(snapshot.entry("node:Human").is_some());
+    assert!(snapshot.entry("node:Person").is_none());
+}
+
+#[tokio::test]
+async fn schema_apply_route_can_rename_property() {
+    let (temp, app) = app_for_repo_with_auth_tokens_and_policy(
+        &fs::read_to_string(fixture("test.pg")).unwrap(),
+        &[("act-ragnor", "admin-token")],
+        SCHEMA_APPLY_POLICY_YAML,
+    )
+    .await;
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/schema/apply")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer admin-token")
+        .body(Body::from(
+            serde_json::to_vec(&SchemaApplyRequest {
+                schema_source: renamed_age_schema(),
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+    let (status, payload) = json_response(&app, request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["applied"], true);
+    let repo = repo_path(temp.path());
+    let reopened = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let person = &reopened.catalog().node_types["Person"];
+    assert!(person.properties.contains_key("years"));
+    assert!(!person.properties.contains_key("age"));
+}
+
+#[tokio::test]
+async fn schema_apply_route_can_add_index() {
+    let (temp, app) = app_for_repo_with_auth_tokens_and_policy(
+        &fs::read_to_string(fixture("test.pg")).unwrap(),
+        &[("act-ragnor", "admin-token")],
+        SCHEMA_APPLY_POLICY_YAML,
+    )
+    .await;
+    let repo = repo_path(temp.path());
+    let before_index_count = {
+        let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+        let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+        let dataset = snapshot.open("node:Person").await.unwrap();
+        dataset.load_indices().await.unwrap().len()
+    };
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/schema/apply")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer admin-token")
+        .body(Body::from(
+            serde_json::to_vec(&SchemaApplyRequest {
+                schema_source: indexed_name_schema(),
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+    let (status, payload) = json_response(&app, request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["applied"], true);
+    let reopened = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let snapshot = reopened
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let dataset = snapshot.open("node:Person").await.unwrap();
+    let after_index_count = dataset.load_indices().await.unwrap().len();
+    assert!(after_index_count > before_index_count);
+}
+
+#[tokio::test]
+async fn schema_apply_route_rejects_unsupported_plan() {
+    let (_temp, app) = app_for_repo_with_auth_tokens_and_policy(
+        &fs::read_to_string(fixture("test.pg")).unwrap(),
+        &[("act-ragnor", "admin-token")],
+        SCHEMA_APPLY_POLICY_YAML,
+    )
+    .await;
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/schema/apply")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer admin-token")
+        .body(Body::from(
+            serde_json::to_vec(&SchemaApplyRequest {
+                schema_source: unsupported_schema_change(),
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+    let (status, payload) = json_response(&app, request).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        payload["code"],
+        serde_json::to_value(omnigraph_server::api::ErrorCode::BadRequest).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn schema_apply_route_rejects_when_non_main_branch_exists() {
+    let temp = init_repo_with_schema(&fs::read_to_string(fixture("test.pg")).unwrap()).await;
+    let repo = repo_path(temp.path());
+    let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    db.branch_create("feature").await.unwrap();
+    drop(db);
+
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, SCHEMA_APPLY_POLICY_YAML).unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        repo.to_string_lossy().to_string(),
+        vec![("act-ragnor".to_string(), "admin-token".to_string())],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap();
+    let app = build_app(state);
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/schema/apply")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer admin-token")
+        .body(Body::from(
+            serde_json::to_vec(&SchemaApplyRequest {
+                schema_source: additive_schema_with_nickname(),
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+    let (status, payload) = json_response(&app, request).await;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        payload["code"],
+        serde_json::to_value(omnigraph_server::api::ErrorCode::Conflict).unwrap()
+    );
 }
 
 struct EnvGuard {

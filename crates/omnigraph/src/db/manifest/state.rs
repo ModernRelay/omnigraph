@@ -10,7 +10,7 @@ use crate::error::{OmniError, Result};
 
 use super::layout::version_object_id;
 use super::metadata::TableVersionMetadata;
-use super::{OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_VERSION};
+use super::{OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION};
 
 #[derive(Debug, Clone)]
 pub struct SubTableEntry {
@@ -26,6 +26,19 @@ pub struct SubTableEntry {
 pub(super) struct ManifestState {
     pub(super) version: u64,
     pub(super) entries: Vec<SubTableEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct TableTombstoneEntry {
+    table_key: String,
+    tombstone_version: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ManifestScan {
+    table_locations: HashMap<String, String>,
+    version_entries: Vec<SubTableEntry>,
+    tombstones: Vec<TableTombstoneEntry>,
 }
 
 pub(super) fn manifest_schema() -> SchemaRef {
@@ -48,10 +61,10 @@ pub(super) fn manifest_schema() -> SchemaRef {
 
 pub(super) async fn read_manifest_state(dataset: &Dataset) -> Result<ManifestState> {
     let version = dataset.version().version;
-    let entries = read_manifest_entries(dataset).await?;
+    let scan = read_manifest_scan(dataset).await?;
     let mut latest_versions = HashMap::<String, SubTableEntry>::new();
 
-    for entry in entries {
+    for entry in scan.version_entries {
         match latest_versions.get(&entry.table_key) {
             Some(existing) if existing.table_version >= entry.table_version => {}
             _ => {
@@ -60,13 +73,52 @@ pub(super) async fn read_manifest_state(dataset: &Dataset) -> Result<ManifestSta
         }
     }
 
-    let mut entries: Vec<SubTableEntry> = latest_versions.into_values().collect();
+    let mut tombstones = HashMap::<String, u64>::new();
+    for tombstone in scan.tombstones {
+        match tombstones.get(&tombstone.table_key) {
+            Some(existing) if *existing >= tombstone.tombstone_version => {}
+            _ => {
+                tombstones.insert(tombstone.table_key, tombstone.tombstone_version);
+            }
+        }
+    }
+
+    let mut entries: Vec<SubTableEntry> = latest_versions
+        .into_values()
+        .filter(|entry| {
+            tombstones
+                .get(&entry.table_key)
+                .map(|tombstone_version| *tombstone_version < entry.table_version)
+                .unwrap_or(true)
+        })
+        .collect();
     entries.sort_by(|a, b| a.table_key.cmp(&b.table_key));
 
     Ok(ManifestState { version, entries })
 }
 
 pub(super) async fn read_manifest_entries(dataset: &Dataset) -> Result<Vec<SubTableEntry>> {
+    Ok(read_manifest_scan(dataset).await?.version_entries)
+}
+
+pub(super) async fn read_registered_table_locations(
+    dataset: &Dataset,
+) -> Result<HashMap<String, String>> {
+    Ok(read_manifest_scan(dataset).await?.table_locations)
+}
+
+pub(super) async fn read_tombstone_versions(
+    dataset: &Dataset,
+) -> Result<HashMap<(String, u64), ()>> {
+    Ok(read_manifest_scan(dataset)
+        .await?
+        .tombstones
+        .into_iter()
+        .map(|tombstone| ((tombstone.table_key, tombstone.tombstone_version), ()))
+        .collect())
+}
+
+async fn read_manifest_scan(dataset: &Dataset) -> Result<ManifestScan> {
     let batches: Vec<RecordBatch> = dataset
         .scan()
         .try_into_stream()
@@ -78,6 +130,7 @@ pub(super) async fn read_manifest_entries(dataset: &Dataset) -> Result<Vec<SubTa
 
     let mut table_locations = HashMap::new();
     let mut version_entries = Vec::new();
+    let mut tombstones = Vec::new();
 
     for batch in &batches {
         let object_types = string_column(batch, "object_type")?;
@@ -123,6 +176,13 @@ pub(super) async fn read_manifest_entries(dataset: &Dataset) -> Result<Vec<SubTa
                         version_metadata: TableVersionMetadata::from_json_str(metadata.value(row))?,
                     });
                 }
+                OBJECT_TYPE_TABLE_TOMBSTONE => {
+                    let tombstone_version = required_u64(versions, row, "table_version")?;
+                    tombstones.push(TableTombstoneEntry {
+                        table_key,
+                        tombstone_version,
+                    });
+                }
                 _ => {}
             }
         }
@@ -149,7 +209,11 @@ pub(super) async fn read_manifest_entries(dataset: &Dataset) -> Result<Vec<SubTa
             .then(a.table_version.cmp(&b.table_version))
     });
 
-    Ok(entries)
+    Ok(ManifestScan {
+        table_locations,
+        version_entries: entries,
+        tombstones,
+    })
 }
 
 pub(super) fn entries_to_batch(

@@ -399,6 +399,20 @@ impl TableStore {
         self.append_batch(dataset_uri, ds, batch).await
     }
 
+    pub async fn overwrite_dataset(dataset_uri: &str, batch: RecordBatch) -> Result<Dataset> {
+        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let params = WriteParams {
+            mode: WriteMode::Overwrite,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            allow_external_blob_outside_bases: true,
+            ..Default::default()
+        };
+        Dataset::write(reader, dataset_uri, Some(params))
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))
+    }
+
     pub async fn merge_insert_batch(
         &self,
         dataset_uri: &str,

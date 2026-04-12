@@ -19,7 +19,7 @@ mod repo;
 #[path = "manifest/state.rs"]
 mod state;
 
-use layout::{manifest_uri, open_manifest_dataset};
+use layout::{manifest_uri, open_manifest_dataset, type_name_hash};
 pub(crate) use metadata::TableVersionMetadata;
 #[cfg(test)]
 use metadata::{OMNIGRAPH_ROW_COUNT_KEY, table_version_metadata_for_state};
@@ -36,6 +36,7 @@ use state::{ManifestState, read_manifest_state};
 
 const OBJECT_TYPE_TABLE: &str = "table";
 const OBJECT_TYPE_TABLE_VERSION: &str = "table_version";
+const OBJECT_TYPE_TABLE_TOMBSTONE: &str = "table_tombstone";
 const TABLE_VERSION_MANAGEMENT_KEY: &str = "table_version_management";
 
 /// Immutable point-in-time view of the database.
@@ -85,6 +86,25 @@ impl SubTableUpdate {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct TableRegistration {
+    pub(crate) table_key: String,
+    pub(crate) table_path: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TableTombstone {
+    pub(crate) table_key: String,
+    pub(crate) tombstone_version: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ManifestChange {
+    Update(SubTableUpdate),
+    RegisterTable(TableRegistration),
+    Tombstone(TableTombstone),
+}
+
 impl SubTableEntry {
     pub(crate) async fn open(&self, root_uri: &str) -> Result<Dataset> {
         open_table_at_version_from_manifest(
@@ -95,6 +115,19 @@ impl SubTableEntry {
         )
         .await
     }
+}
+
+pub(crate) fn table_path_for_table_key(table_key: &str) -> Result<String> {
+    if let Some(type_name) = table_key.strip_prefix("node:") {
+        return Ok(format!("nodes/{}", type_name_hash(type_name)));
+    }
+    if let Some(type_name) = table_key.strip_prefix("edge:") {
+        return Ok(format!("edges/{}", type_name_hash(type_name)));
+    }
+    Err(OmniError::manifest(format!(
+        "invalid table key '{}'",
+        table_key
+    )))
 }
 
 /// An update to apply to the manifest via `commit`.
@@ -245,11 +278,20 @@ impl ManifestCoordinator {
     /// Atomically inserts one immutable `table_version` row per updated table.
     /// The merge-insert commit on `__manifest` is the graph-level publish point.
     pub async fn commit(&mut self, updates: &[SubTableUpdate]) -> Result<u64> {
-        if updates.is_empty() {
+        let changes = updates
+            .iter()
+            .cloned()
+            .map(ManifestChange::Update)
+            .collect::<Vec<_>>();
+        self.commit_changes(&changes).await
+    }
+
+    pub(crate) async fn commit_changes(&mut self, changes: &[ManifestChange]) -> Result<u64> {
+        if changes.is_empty() {
             return Ok(self.version());
         }
 
-        self.dataset = self.publisher.publish(updates).await?;
+        self.dataset = self.publisher.publish(changes).await?;
 
         self.known_state = read_manifest_state(&self.dataset).await?;
         Ok(self.version())

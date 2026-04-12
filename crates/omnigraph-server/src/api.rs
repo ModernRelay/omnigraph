@@ -1,6 +1,9 @@
-use omnigraph::db::{GraphCommit, MergeOutcome, ReadTarget, RunRecord, Snapshot};
+use omnigraph::db::{
+    GraphCommit, MergeOutcome, ReadTarget, RunRecord, SchemaApplyResult, Snapshot,
+};
 use omnigraph::error::{MergeConflict, MergeConflictKind};
 use omnigraph::loader::{IngestResult, LoadMode};
+use omnigraph_compiler::SchemaMigrationStep;
 use omnigraph_compiler::result::QueryResult;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -244,6 +247,21 @@ pub struct ChangeRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaApplyRequest {
+    pub schema_source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaApplyOutput {
+    pub uri: String,
+    pub supported: bool,
+    pub applied: bool,
+    pub step_count: usize,
+    pub manifest_version: u64,
+    pub steps: Vec<SchemaMigrationStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestRequest {
     pub branch: Option<String>,
     pub from: Option<String>,
@@ -315,6 +333,17 @@ pub fn snapshot_payload(branch: &str, snapshot: &Snapshot) -> SnapshotOutput {
         branch: branch.to_string(),
         manifest_version: snapshot.version(),
         tables,
+    }
+}
+
+pub fn schema_apply_output(uri: &str, result: SchemaApplyResult) -> SchemaApplyOutput {
+    SchemaApplyOutput {
+        uri: uri.to_string(),
+        supported: result.supported,
+        applied: result.applied,
+        step_count: result.steps.len(),
+        manifest_version: result.manifest_version,
+        steps: result.steps,
     }
 }
 

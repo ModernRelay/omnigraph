@@ -19,6 +19,7 @@ pub enum PolicyAction {
     Read,
     Export,
     Change,
+    SchemaApply,
     BranchCreate,
     BranchDelete,
     BranchMerge,
@@ -33,6 +34,7 @@ impl PolicyAction {
             Self::Read => "read",
             Self::Export => "export",
             Self::Change => "change",
+            Self::SchemaApply => "schema_apply",
             Self::BranchCreate => "branch_create",
             Self::BranchDelete => "branch_delete",
             Self::BranchMerge => "branch_merge",
@@ -50,6 +52,7 @@ impl PolicyAction {
         matches!(
             self,
             Self::BranchCreate
+                | Self::SchemaApply
                 | Self::BranchDelete
                 | Self::BranchMerge
                 | Self::RunPublish
@@ -72,6 +75,7 @@ impl FromStr for PolicyAction {
             "read" => Ok(Self::Read),
             "export" => Ok(Self::Export),
             "change" => Ok(Self::Change),
+            "schema_apply" => Ok(Self::SchemaApply),
             "branch_create" => Ok(Self::BranchCreate),
             "branch_delete" => Ok(Self::BranchDelete),
             "branch_merge" => Ok(Self::BranchMerge),
@@ -591,6 +595,7 @@ namespace Omnigraph {
     action "read" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
     action "export" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
     action "change" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
+    action "schema_apply" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
     action "branch_create" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
     action "branch_delete" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
     action "branch_merge" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
@@ -808,5 +813,45 @@ rules:
         };
 
         engine.run_tests(&tests).unwrap();
+    }
+
+    #[test]
+    fn schema_apply_uses_target_branch_scope() {
+        let policy: PolicyConfig = serde_yaml::from_str(
+            r#"
+version: 1
+groups:
+  admins: [act-ragnor]
+protected_branches: [main]
+rules:
+  - id: admins-schema-apply
+    allow:
+      actors: { group: admins }
+      actions: [schema_apply]
+      target_branch_scope: protected
+"#,
+        )
+        .unwrap();
+
+        let engine = PolicyCompiler::compile(&policy, "repo").unwrap();
+        let allow = engine
+            .authorize(&PolicyRequest {
+                actor_id: "act-ragnor".to_string(),
+                action: PolicyAction::SchemaApply,
+                branch: None,
+                target_branch: Some("main".to_string()),
+            })
+            .unwrap();
+        assert!(allow.allowed);
+
+        let deny = engine
+            .authorize(&PolicyRequest {
+                actor_id: "act-ragnor".to_string(),
+                action: PolicyAction::SchemaApply,
+                branch: None,
+                target_branch: Some("feature".to_string()),
+            })
+            .unwrap();
+        assert!(!deny.allowed);
     }
 }
