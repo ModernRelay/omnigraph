@@ -3371,6 +3371,7 @@ impl Omnigraph {
         target: &str,
         actor_id: Option<&str>,
     ) -> Result<MergeOutcome> {
+        self.ensure_schema_apply_idle("branch_merge").await?;
         let previous_actor = self.audit_actor_id.clone();
         self.audit_actor_id = actor_id.map(str::to_string);
         let result = self.branch_merge_impl(source, target, false).await;

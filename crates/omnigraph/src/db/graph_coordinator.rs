@@ -8,8 +8,9 @@ use crate::failpoints;
 use crate::storage::{StorageAdapter, join_uri, normalize_root_uri};
 
 use super::commit_graph::{CommitGraph, GraphCommit};
+use super::is_internal_system_branch;
 use super::manifest::{ManifestChange, ManifestCoordinator, Snapshot, SubTableUpdate};
-use super::run_registry::{RunId, RunRecord, RunRegistry, graph_runs_uri, is_internal_run_branch};
+use super::run_registry::{RunId, RunRecord, RunRegistry, graph_runs_uri};
 
 const GRAPH_COMMITS_DIR: &str = "_graph_commits.lance";
 
@@ -203,7 +204,7 @@ impl GraphCoordinator {
         self.manifest.list_branches().await.map(|branches| {
             branches
                 .into_iter()
-                .filter(|branch| !is_internal_run_branch(branch))
+                .filter(|branch| !is_internal_system_branch(branch))
                 .collect()
         })
     }
@@ -219,7 +220,7 @@ impl GraphCoordinator {
             .map(|branches| {
                 branches
                     .into_iter()
-                    .filter(|branch| !is_internal_run_branch(branch))
+                    .filter(|branch| !is_internal_system_branch(branch))
                     .collect()
             })
     }
