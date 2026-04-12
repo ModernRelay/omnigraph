@@ -538,6 +538,312 @@ fn schema_apply_rejects_when_non_main_branch_exists() {
 }
 
 #[test]
+fn query_lint_json_with_schema_reports_warnings() {
+    let temp = tempdir().unwrap();
+    let schema_path = temp.path().join("schema.pg");
+    let query_path = temp.path().join("queries.gq");
+    write_file(
+        &schema_path,
+        r#"
+node Policy {
+    slug: String @key
+    name: String?
+    effectiveTo: DateTime?
+}
+"#,
+    );
+    write_query_file(
+        &query_path,
+        r#"
+query update_policy($slug: String, $name: String) {
+    update Policy set { name: $name } where slug = $slug
+}
+"#,
+    );
+
+    let output = output_success(
+        cli()
+            .arg("query")
+            .arg("lint")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json"),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["schema_source"]["kind"], "file");
+    assert_eq!(payload["queries_processed"], 1);
+    assert_eq!(payload["warnings"], 1);
+    assert_eq!(payload["findings"][0]["code"], "L201");
+    assert_eq!(
+        payload["findings"][0]["message"],
+        "Policy.effectiveTo exists in schema but no update query sets it"
+    );
+}
+
+#[test]
+fn query_check_alias_matches_lint_output() {
+    let temp = tempdir().unwrap();
+    let schema_path = temp.path().join("schema.pg");
+    let query_path = temp.path().join("queries.gq");
+    write_file(
+        &schema_path,
+        r#"
+node Person {
+    name: String
+}
+"#,
+    );
+    write_query_file(
+        &query_path,
+        r#"
+query list_people() {
+    match { $p: Person }
+    return { $p.name }
+}
+"#,
+    );
+
+    let lint_output = output_success(
+        cli()
+            .arg("query")
+            .arg("lint")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json"),
+    );
+    let check_output = output_success(
+        cli()
+            .arg("query")
+            .arg("check")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json"),
+    );
+
+    assert_eq!(stdout_string(&lint_output), stdout_string(&check_output));
+}
+
+#[test]
+fn query_lint_can_use_local_repo_via_positional_uri() {
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    let query_path = temp.path().join("queries.gq");
+    init_repo(&repo);
+    write_query_file(
+        &query_path,
+        r#"
+query list_people() {
+    match { $p: Person }
+    return { $p.name }
+}
+"#,
+    );
+
+    let output = output_success(
+        cli()
+            .arg("query")
+            .arg("lint")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--json")
+            .arg(&repo),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["schema_source"]["kind"], "repo");
+    assert_eq!(
+        payload["schema_source"]["uri"].as_str(),
+        Some(repo.to_string_lossy().as_ref())
+    );
+}
+
+#[test]
+fn query_lint_can_resolve_repo_and_query_from_config() {
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    let config_path = temp.path().join("omnigraph.yaml");
+    init_repo(&repo);
+    write_query_file(
+        &temp.path().join("queries.gq"),
+        r#"
+query list_people() {
+    match { $p: Person }
+    return { $p.name }
+}
+"#,
+    );
+    write_config(&config_path, &local_yaml_config(&repo));
+
+    let output = output_success(
+        cli()
+            .arg("query")
+            .arg("lint")
+            .arg("--query")
+            .arg("queries.gq")
+            .arg("--config")
+            .arg(&config_path)
+            .arg("--json"),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["schema_source"]["kind"], "repo");
+    assert_eq!(
+        payload["schema_source"]["uri"].as_str(),
+        Some(repo.to_string_lossy().as_ref())
+    );
+}
+
+#[test]
+fn query_lint_rejects_http_targets_without_schema() {
+    let temp = tempdir().unwrap();
+    let query_path = temp.path().join("queries.gq");
+    write_query_file(
+        &query_path,
+        r#"
+query list_people() {
+    match { $p: Person }
+    return { $p.name }
+}
+"#,
+    );
+
+    let output = output_failure(
+        cli()
+            .arg("query")
+            .arg("lint")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("http://127.0.0.1:8080"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("query lint is only supported against local repo URIs in this milestone")
+    );
+}
+
+#[test]
+fn query_lint_requires_schema_or_resolvable_repo_target() {
+    let temp = tempdir().unwrap();
+    let query_path = temp.path().join("queries.gq");
+    write_query_file(
+        &query_path,
+        r#"
+query list_people() {
+    match { $p: Person }
+    return { $p.name }
+}
+"#,
+    );
+
+    let output = output_failure(
+        cli()
+            .arg("query")
+            .arg("lint")
+            .arg("--query")
+            .arg(&query_path),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("query lint requires --schema <schema.pg> or a resolvable repo target")
+    );
+}
+
+#[test]
+fn query_lint_human_output_reports_warnings() {
+    let temp = tempdir().unwrap();
+    let schema_path = temp.path().join("schema.pg");
+    let query_path = temp.path().join("queries.gq");
+    write_file(
+        &schema_path,
+        r#"
+node Policy {
+    slug: String @key
+    name: String?
+    effectiveTo: DateTime?
+}
+"#,
+    );
+    write_query_file(
+        &query_path,
+        r#"
+query update_policy($slug: String, $name: String) {
+    update Policy set { name: $name } where slug = $slug
+}
+"#,
+    );
+
+    let output = output_success(
+        cli()
+            .arg("query")
+            .arg("lint")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path),
+    );
+    let stdout = stdout_string(&output);
+
+    assert!(stdout.contains("OK    query `update_policy` (mutation)"));
+    assert!(
+        stdout.contains("WARN  Policy.effectiveTo exists in schema but no update query sets it")
+    );
+    assert!(stdout.contains(
+        "INFO  Lint complete: 1 queries processed (0 error(s), 1 warning(s), 0 info item(s))"
+    ));
+}
+
+#[test]
+fn query_lint_human_output_reports_strict_validation_errors() {
+    let temp = tempdir().unwrap();
+    let schema_path = temp.path().join("schema.pg");
+    let query_path = temp.path().join("queries.gq");
+    write_file(
+        &schema_path,
+        r#"
+node Policy {
+    slug: String @key
+    name: String?
+}
+"#,
+    );
+    write_query_file(
+        &query_path,
+        r#"
+query bad_update($slug: String) {
+    update Policy set { priority_level: "high" } where slug = $slug
+}
+"#,
+    );
+
+    let output = output_failure(
+        cli()
+            .arg("query")
+            .arg("lint")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path),
+    );
+    let stdout = stdout_string(&output);
+
+    assert!(stdout.contains("ERROR query `bad_update`:"));
+    assert!(stdout.contains("Policy"));
+    assert!(stdout.contains(
+        "INFO  Lint complete: 1 queries processed (1 error(s), 0 warning(s), 0 info item(s))"
+    ));
+}
+
+#[test]
 fn load_json_outputs_summary_for_main_branch() {
     let temp = tempdir().unwrap();
     let repo = repo_path(temp.path());

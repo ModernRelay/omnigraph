@@ -47,6 +47,9 @@ and configure the matching `bearer_token_env` in `omnigraph.yaml`.
 ## Runs, Policy, And Diagnostics
 
 ```bash
+omnigraph query lint --query ./queries.gq --schema ./schema.pg --json
+omnigraph query check --query ./queries.gq ./repo.omni --json
+
 omnigraph schema plan --schema ./next.pg ./repo.omni --json
 omnigraph schema apply --schema ./next.pg ./repo.omni --json
 omnigraph policy validate --config ./omnigraph.yaml
@@ -58,6 +61,10 @@ omnigraph run show --uri ./repo.omni <run-id> --json
 omnigraph run publish --uri ./repo.omni <run-id> --json
 omnigraph run abort --uri ./repo.omni <run-id> --json
 ```
+
+`query lint` and `query check` are the same command surface. In v1, repo-backed
+lint uses local or `s3://` repo URIs; HTTP targets are only supported when you
+also pass `--schema`.
 
 ## Config
 
