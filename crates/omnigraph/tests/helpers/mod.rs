@@ -35,6 +35,11 @@ query remove_person($name: String) {
 query remove_friendship($from: String) {
     delete Knows where from = $from
 }
+
+query insert_person_and_friend($name: String, $age: I32, $friend: String) {
+    insert Person { name: $name, age: $age }
+    insert Knows { from: $name, to: $friend }
+}
 "#;
 
 /// Init a repo and load the standard test data.

@@ -645,6 +645,43 @@ async fn mutation_insert_edge() {
 }
 
 #[tokio::test]
+async fn mutation_multi_insert_node_and_edge() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    // In one atomic mutation: insert Eve + edge Eve→Alice
+    let result = mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person_and_friend",
+        &mixed_params(&[("$name", "Eve"), ("$friend", "Alice")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(result.affected_edges, 1);
+
+    // Verify traversal: Eve → Alice
+    let qr = query_main(
+        &mut db,
+        TEST_QUERIES,
+        "friends_of",
+        &params(&[("$name", "Eve")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(qr.num_rows(), 1);
+    let batch = qr.concat_batches().unwrap();
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(names.value(0), "Alice");
+}
+
+#[tokio::test]
 async fn mutation_update_node() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;

@@ -15,7 +15,7 @@ pub struct QueryDecl {
     pub return_clause: Vec<Projection>,
     pub order_clause: Vec<Ordering>,
     pub limit: Option<u64>,
-    pub mutation: Option<Mutation>,
+    pub mutations: Vec<Mutation>,
 }
 
 #[derive(Debug, Clone)]

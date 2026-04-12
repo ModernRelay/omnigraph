@@ -19,7 +19,7 @@ pub struct QueryIR {
 pub struct MutationIR {
     pub name: String,
     pub params: Vec<Param>,
-    pub op: MutationOpIR,
+    pub ops: Vec<MutationOpIR>,
 }
 
 #[derive(Debug, Clone)]

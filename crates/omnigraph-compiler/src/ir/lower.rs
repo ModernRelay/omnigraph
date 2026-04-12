@@ -13,7 +13,7 @@ pub fn lower_query(
     query: &QueryDecl,
     type_ctx: &TypeContext,
 ) -> Result<QueryIR> {
-    if query.mutation.is_some() {
+    if !query.mutations.is_empty() {
         return Err(crate::error::NanoError::Plan(
             "cannot lower mutation query with read-query lowerer".to_string(),
         ));
@@ -61,54 +61,67 @@ pub fn lower_query(
 }
 
 pub fn lower_mutation_query(query: &QueryDecl) -> Result<MutationIR> {
-    let mutation = query.mutation.as_ref().ok_or_else(|| {
-        crate::error::NanoError::Plan("query does not contain a mutation body".to_string())
-    })?;
+    if query.mutations.is_empty() {
+        return Err(crate::error::NanoError::Plan(
+            "query does not contain a mutation body".to_string(),
+        ));
+    }
     let param_names: HashSet<String> = query.params.iter().map(|p| p.name.clone()).collect();
 
-    let op = match mutation {
-        Mutation::Insert(insert) => MutationOpIR::Insert {
+    let ops = query
+        .mutations
+        .iter()
+        .map(|m| lower_single_mutation(m, &param_names))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(MutationIR {
+        name: query.name.clone(),
+        params: query.params.clone(),
+        ops,
+    })
+}
+
+fn lower_single_mutation(
+    mutation: &Mutation,
+    param_names: &HashSet<String>,
+) -> Result<MutationOpIR> {
+    match mutation {
+        Mutation::Insert(insert) => Ok(MutationOpIR::Insert {
             type_name: insert.type_name.clone(),
             assignments: insert
                 .assignments
                 .iter()
                 .map(|a| IRAssignment {
                     property: a.property.clone(),
-                    value: lower_match_value(&a.value, &param_names),
+                    value: lower_match_value(&a.value, param_names),
                 })
                 .collect(),
-        },
-        Mutation::Update(update) => MutationOpIR::Update {
+        }),
+        Mutation::Update(update) => Ok(MutationOpIR::Update {
             type_name: update.type_name.clone(),
             assignments: update
                 .assignments
                 .iter()
                 .map(|a| IRAssignment {
                     property: a.property.clone(),
-                    value: lower_match_value(&a.value, &param_names),
+                    value: lower_match_value(&a.value, param_names),
                 })
                 .collect(),
             predicate: IRMutationPredicate {
                 property: update.predicate.property.clone(),
                 op: update.predicate.op,
-                value: lower_match_value(&update.predicate.value, &param_names),
+                value: lower_match_value(&update.predicate.value, param_names),
             },
-        },
-        Mutation::Delete(delete) => MutationOpIR::Delete {
+        }),
+        Mutation::Delete(delete) => Ok(MutationOpIR::Delete {
             type_name: delete.type_name.clone(),
             predicate: IRMutationPredicate {
                 property: delete.predicate.property.clone(),
                 op: delete.predicate.op,
-                value: lower_match_value(&delete.predicate.value, &param_names),
+                value: lower_match_value(&delete.predicate.value, param_names),
             },
-        },
-    };
-
-    Ok(MutationIR {
-        name: query.name.clone(),
-        params: query.params.clone(),
-        op,
-    })
+        }),
+    }
 }
 
 fn lower_clauses(
@@ -543,7 +556,7 @@ query q($name: String, $age: I32) {
         assert!(matches!(checked, CheckedQuery::Mutation(_)));
 
         let ir = lower_mutation_query(&qf.queries[0]).unwrap();
-        match ir.op {
+        match &ir.ops[0] {
             MutationOpIR::Update {
                 type_name,
                 assignments,
@@ -636,7 +649,7 @@ query stamp() {
         assert!(matches!(checked, CheckedQuery::Mutation(_)));
 
         let ir = lower_mutation_query(&qf.queries[0]).unwrap();
-        match ir.op {
+        match &ir.ops[0] {
             MutationOpIR::Update {
                 assignments,
                 predicate,
@@ -653,5 +666,30 @@ query stamp() {
             }
             _ => panic!("expected update mutation op"),
         }
+    }
+
+    #[test]
+    fn test_lower_multi_mutation() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q($name: String, $age: I32, $friend: String) {
+    insert Person { name: $name, age: $age }
+    insert Knows { from: $name, to: $friend }
+}
+"#,
+        )
+        .unwrap();
+        let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
+        assert!(matches!(checked, CheckedQuery::Mutation(_)));
+
+        let ir = lower_mutation_query(&qf.queries[0]).unwrap();
+        assert_eq!(ir.ops.len(), 2);
+        assert!(
+            matches!(&ir.ops[0], MutationOpIR::Insert { type_name, .. } if type_name == "Person")
+        );
+        assert!(
+            matches!(&ir.ops[1], MutationOpIR::Insert { type_name, .. } if type_name == "Knows")
+        );
     }
 }
