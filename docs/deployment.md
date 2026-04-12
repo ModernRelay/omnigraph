@@ -61,6 +61,7 @@ Useful overrides:
 - `WORKDIR=/path/to/state`
 - `BUCKET=omnigraph-local`
 - `PREFIX=repos/context`
+- `RESET_REPO=1` to delete an existing partially initialized repo prefix before recreating it
 - `BIND=127.0.0.1:8080`
 - `RUSTFS_CONTAINER_NAME=omnigraph-rustfs-demo`
 
@@ -73,6 +74,10 @@ The bootstrap expects:
 If `aws` is not installed, the script attempts a user-local AWS CLI install via
 `python3 -m pip`. Docker Desktop or another Docker daemon must already be
 running.
+
+If a previous bootstrap left objects behind under the selected `PREFIX` but did
+not finish initializing the repo, rerun with `RESET_REPO=1` or choose a new
+`PREFIX`.
 
 ## Container Deployment
 
