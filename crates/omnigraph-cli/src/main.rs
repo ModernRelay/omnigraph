@@ -7,9 +7,13 @@ use clap::{Arg, ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcomm
 use color_eyre::eyre::{Result, bail};
 use omnigraph::db::{Omnigraph, ReadTarget, RunId, SnapshotId};
 use omnigraph::loader::LoadMode;
-use omnigraph_compiler::json_params_to_param_map;
 use omnigraph_compiler::query::parser::parse_query;
-use omnigraph_compiler::{JsonParamMode, ParamMap, SchemaMigrationPlan, SchemaMigrationStep};
+use omnigraph_compiler::schema::parser::parse_schema;
+use omnigraph_compiler::{
+    JsonParamMode, ParamMap, QueryLintOutput, QueryLintQueryKind, QueryLintSchemaSource,
+    QueryLintSeverity, QueryLintStatus, SchemaMigrationPlan, SchemaMigrationStep, build_catalog,
+    json_params_to_param_map, lint_query_file,
+};
 use omnigraph_server::api::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
@@ -103,6 +107,11 @@ enum Command {
     Schema {
         #[command(subcommand)]
         command: SchemaCommand,
+    },
+    /// Query validation and linting
+    Query {
+        #[command(subcommand)]
+        command: QueryCommand,
     },
     /// Show repo snapshot
     Snapshot {
@@ -297,6 +306,26 @@ enum SchemaCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum QueryCommand {
+    /// Validate queries and report higher-level drift warnings
+    #[command(visible_alias = "check")]
+    Lint {
+        /// Repo URI
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        query: PathBuf,
+        #[arg(long)]
+        schema: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum RunCommand {
     /// List transactional runs
     List {
@@ -474,6 +503,70 @@ fn print_schema_apply_human(output: &SchemaApplyOutput) {
     for step in &output.steps {
         println!("- {}", render_schema_plan_step(step));
     }
+}
+
+fn query_kind_label(kind: QueryLintQueryKind) -> &'static str {
+    match kind {
+        QueryLintQueryKind::Read => "read",
+        QueryLintQueryKind::Mutation => "mutation",
+    }
+}
+
+fn severity_label(severity: QueryLintSeverity) -> &'static str {
+    match severity {
+        QueryLintSeverity::Error => "ERROR",
+        QueryLintSeverity::Warning => "WARN ",
+        QueryLintSeverity::Info => "INFO ",
+    }
+}
+
+fn print_query_lint_human(output: &QueryLintOutput) {
+    for result in &output.results {
+        match result.status {
+            QueryLintStatus::Ok => {
+                println!(
+                    "OK    query `{}` ({})",
+                    result.name,
+                    query_kind_label(result.kind)
+                );
+            }
+            QueryLintStatus::Error => {
+                println!(
+                    "ERROR query `{}`: {}",
+                    result.name,
+                    result.error.as_deref().unwrap_or("unknown error")
+                );
+            }
+        }
+
+        for warning in &result.warnings {
+            println!("WARN  query `{}`: {}", result.name, warning);
+        }
+    }
+
+    for finding in &output.findings {
+        println!("{} {}", severity_label(finding.severity), finding.message);
+    }
+
+    println!(
+        "INFO  Lint complete: {} queries processed ({} error(s), {} warning(s), {} info item(s))",
+        output.queries_processed, output.errors, output.warnings, output.infos
+    );
+}
+
+fn finish_query_lint(output: &QueryLintOutput, json: bool) -> Result<()> {
+    if json {
+        print_json(output)?;
+    } else {
+        print_query_lint_human(output);
+    }
+
+    if output.status == QueryLintStatus::Error {
+        io::stdout().flush()?;
+        std::process::exit(1);
+    }
+
+    Ok(())
 }
 
 fn ensure_local_repo_parent(uri: &str) -> Result<()> {
@@ -735,18 +828,30 @@ fn resolve_read_target(
     ))
 }
 
+fn resolve_query_path(
+    config: &OmnigraphConfig,
+    explicit_query: Option<&PathBuf>,
+    alias_query: Option<&str>,
+) -> Result<PathBuf> {
+    explicit_query
+        .map(PathBuf::from)
+        .or_else(|| alias_query.map(PathBuf::from))
+        .ok_or_else(|| {
+            color_eyre::eyre::eyre!("exactly one of --query or --alias must be provided")
+        })
+        .and_then(|query_path| config.resolve_query_path(&query_path))
+}
+
 fn resolve_query_source(
     config: &OmnigraphConfig,
     explicit_query: Option<&PathBuf>,
     alias_query: Option<&str>,
 ) -> Result<String> {
-    let query_path = explicit_query
-        .map(PathBuf::from)
-        .or_else(|| alias_query.map(PathBuf::from))
-        .ok_or_else(|| {
-            color_eyre::eyre::eyre!("exactly one of --query or --alias must be provided")
-        })?;
-    Ok(fs::read_to_string(config.resolve_query_path(&query_path)?)?)
+    Ok(fs::read_to_string(resolve_query_path(
+        config,
+        explicit_query,
+        alias_query,
+    )?)?)
 }
 
 fn parse_alias_value(value: &str) -> Value {
@@ -1312,6 +1417,47 @@ fn query_params_from_json(
         .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))
 }
 
+async fn execute_query_lint(
+    config: &OmnigraphConfig,
+    cli_uri: Option<String>,
+    cli_target: Option<&str>,
+    schema_path: Option<&PathBuf>,
+    query_path: &PathBuf,
+) -> Result<QueryLintOutput> {
+    let resolved_query_path = resolve_query_path(config, Some(query_path), None)?;
+    let query_source = fs::read_to_string(&resolved_query_path)?;
+    let query_path = resolved_query_path.to_string_lossy().into_owned();
+
+    if let Some(schema_path) = schema_path {
+        let schema_source = fs::read_to_string(schema_path)?;
+        let schema =
+            parse_schema(&schema_source).map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
+        let catalog =
+            build_catalog(&schema).map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
+        return Ok(lint_query_file(
+            &catalog,
+            &query_source,
+            query_path,
+            QueryLintSchemaSource::file(schema_path.to_string_lossy().into_owned()),
+        ));
+    }
+
+    let has_repo_target =
+        cli_uri.is_some() || cli_target.is_some() || config.cli_target_name().is_some();
+    if !has_repo_target {
+        bail!("query lint requires --schema <schema.pg> or a resolvable repo target");
+    }
+
+    let uri = resolve_local_uri(config, cli_uri, cli_target, "query lint")?;
+    let db = Omnigraph::open(&uri).await?;
+    Ok(lint_query_file(
+        db.catalog(),
+        &query_source,
+        query_path,
+        QueryLintSchemaSource::repo(uri),
+    ))
+}
+
 async fn execute_read(
     uri: &str,
     query_source: &str,
@@ -1856,6 +2002,22 @@ async fn main() -> Result<()> {
                 } else {
                     print_schema_apply_human(&output);
                 }
+            }
+        },
+        Command::Query { command } => match command {
+            QueryCommand::Lint {
+                uri,
+                target,
+                config,
+                query,
+                schema,
+                json,
+            } => {
+                let config = load_cli_config(config.as_ref())?;
+                let output =
+                    execute_query_lint(&config, uri, target.as_deref(), schema.as_ref(), &query)
+                        .await?;
+                finish_query_lint(&output, json)?;
             }
         },
         Command::Snapshot {

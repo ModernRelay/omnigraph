@@ -20,6 +20,11 @@ pub use catalog::schema_plan::{
 pub use ir::ParamMap;
 pub use ir::lower::{lower_mutation_query, lower_query};
 pub use query::ast::Literal;
+pub use query::lint::{
+    QueryLintFinding, QueryLintOutput, QueryLintQueryKind, QueryLintQueryResult,
+    QueryLintSchemaSource, QueryLintSchemaSourceKind, QueryLintSeverity, QueryLintStatus,
+    lint_query_file,
+};
 pub use query_input::{
     JsonParamMode, RunInputError, RunInputResult, ToParam, find_named_query,
     json_params_to_param_map,
