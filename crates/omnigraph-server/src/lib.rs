@@ -47,6 +47,51 @@ use tokio::sync::{RwLock, mpsc};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
+use utoipa::OpenApi;
+use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
+
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "Omnigraph API",
+        description = "HTTP API for the Omnigraph graph database",
+    ),
+    paths(
+        server_health,
+        server_snapshot,
+        server_read,
+        server_export,
+        server_change,
+        server_schema_apply,
+        server_ingest,
+        server_branch_list,
+        server_branch_create,
+        server_branch_delete,
+        server_branch_merge,
+        server_run_list,
+        server_run_show,
+        server_run_publish,
+        server_run_abort,
+        server_commit_list,
+        server_commit_show,
+    ),
+    modifiers(&SecurityAddon),
+)]
+pub struct ApiDoc;
+
+struct SecurityAddon;
+
+impl utoipa::Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        openapi
+            .components
+            .get_or_insert_with(Default::default)
+            .add_security_scheme(
+                "bearer_token",
+                SecurityScheme::Http(Http::new(HttpAuthScheme::Bearer)),
+            );
+    }
+}
 
 const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 1_048_576;
 const INGEST_REQUEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
@@ -386,6 +431,7 @@ pub fn build_app(state: AppState) -> Router {
 
     Router::new()
         .route("/healthz", get(server_health))
+        .route("/openapi.json", get(server_openapi))
         .merge(protected)
         .layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT_BYTES))
         .layer(TraceLayer::new_for_http())
@@ -415,12 +461,51 @@ async fn shutdown_signal() {
     info!("shutdown signal received");
 }
 
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    tag = "health",
+    responses(
+        (status = 200, description = "Server is healthy", body = HealthOutput),
+    ),
+)]
 async fn server_health() -> Json<HealthOutput> {
     Json(HealthOutput {
         status: "ok".to_string(),
         version: SERVER_VERSION.to_string(),
         source_version: SERVER_SOURCE_VERSION.map(str::to_string),
     })
+}
+
+async fn server_openapi(State(state): State<AppState>) -> Json<utoipa::openapi::OpenApi> {
+    let mut doc = ApiDoc::openapi();
+    if !state.requires_bearer_auth() {
+        strip_security(&mut doc);
+    }
+    Json(doc)
+}
+
+fn strip_security(doc: &mut utoipa::openapi::OpenApi) {
+    if let Some(components) = doc.components.as_mut() {
+        components.security_schemes.clear();
+    }
+    for path_item in doc.paths.paths.values_mut() {
+        for op in [
+            path_item.get.as_mut(),
+            path_item.post.as_mut(),
+            path_item.put.as_mut(),
+            path_item.delete.as_mut(),
+            path_item.options.as_mut(),
+            path_item.head.as_mut(),
+            path_item.patch.as_mut(),
+            path_item.trace.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            op.security = None;
+        }
+    }
 }
 
 async fn require_bearer_auth(
@@ -486,6 +571,18 @@ fn authorize_request(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/snapshot",
+    tag = "snapshots",
+    params(SnapshotQuery),
+    responses(
+        (status = 200, description = "Database snapshot", body = api::SnapshotOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
 async fn server_snapshot(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -514,6 +611,19 @@ async fn server_snapshot(
     Ok(Json(snapshot_payload(&branch, &snapshot)))
 }
 
+#[utoipa::path(
+    post,
+    path = "/read",
+    tag = "queries",
+    request_body = ReadRequest,
+    responses(
+        (status = 200, description = "Query results", body = ReadOutput),
+        (status = 400, description = "Bad request", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
 async fn server_read(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -570,6 +680,19 @@ async fn server_read(
     Ok(Json(api::read_output(selected_name, &target, result)))
 }
 
+#[utoipa::path(
+    post,
+    path = "/export",
+    tag = "queries",
+    request_body = ExportRequest,
+    responses(
+        (status = 200, description = "Exported data as NDJSON", content_type = "application/x-ndjson"),
+        (status = 400, description = "Bad request", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
 async fn server_export(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -615,6 +738,20 @@ async fn server_export(
         .into_response())
 }
 
+#[utoipa::path(
+    post,
+    path = "/change",
+    tag = "mutations",
+    request_body = ChangeRequest,
+    responses(
+        (status = 200, description = "Mutation results", body = ChangeOutput),
+        (status = 400, description = "Bad request", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 409, description = "Merge conflict", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
 async fn server_change(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -659,6 +796,19 @@ async fn server_change(
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/schema/apply",
+    tag = "mutations",
+    request_body = SchemaApplyRequest,
+    responses(
+        (status = 200, description = "Schema apply results", body = SchemaApplyOutput),
+        (status = 400, description = "Bad request", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
 async fn server_schema_apply(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -684,6 +834,19 @@ async fn server_schema_apply(
     Ok(Json(schema_apply_output(state.uri(), result)))
 }
 
+#[utoipa::path(
+    post,
+    path = "/ingest",
+    tag = "mutations",
+    request_body = IngestRequest,
+    responses(
+        (status = 200, description = "Ingest results", body = IngestOutput),
+        (status = 400, description = "Bad request", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
 async fn server_ingest(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -740,6 +903,17 @@ async fn server_ingest(
     )))
 }
 
+#[utoipa::path(
+    get,
+    path = "/branches",
+    tag = "branches",
+    responses(
+        (status = 200, description = "List of branches", body = BranchListOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
 async fn server_branch_list(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -765,6 +939,20 @@ async fn server_branch_list(
     Ok(Json(BranchListOutput { branches }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/branches",
+    tag = "branches",
+    request_body = BranchCreateRequest,
+    responses(
+        (status = 200, description = "Branch created", body = BranchCreateOutput),
+        (status = 400, description = "Bad request", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 409, description = "Branch already exists", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
 async fn server_branch_create(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -798,6 +986,21 @@ async fn server_branch_create(
     }))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/branches/{branch}",
+    tag = "branches",
+    params(
+        ("branch" = String, Path, description = "Branch name to delete"),
+    ),
+    responses(
+        (status = 200, description = "Branch deleted", body = BranchDeleteOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 404, description = "Branch not found", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
 async fn server_branch_delete(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -827,6 +1030,20 @@ async fn server_branch_delete(
     }))
 }
 
+#[utoipa::path(
+    post,
+    path = "/branches/merge",
+    tag = "branches",
+    request_body = BranchMergeRequest,
+    responses(
+        (status = 200, description = "Branches merged", body = BranchMergeOutput),
+        (status = 400, description = "Bad request", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 409, description = "Merge conflict", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
 async fn server_branch_merge(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -858,6 +1075,17 @@ async fn server_branch_merge(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/runs",
+    tag = "runs",
+    responses(
+        (status = 200, description = "List of runs", body = RunListOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
 async fn server_run_list(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -884,6 +1112,21 @@ async fn server_run_list(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/runs/{run_id}",
+    tag = "runs",
+    params(
+        ("run_id" = String, Path, description = "Run identifier"),
+    ),
+    responses(
+        (status = 200, description = "Run details", body = api::RunOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 404, description = "Run not found", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
 async fn server_run_show(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -911,6 +1154,21 @@ async fn server_run_show(
     Ok(Json(api::run_output(&run)))
 }
 
+#[utoipa::path(
+    post,
+    path = "/runs/{run_id}/publish",
+    tag = "runs",
+    params(
+        ("run_id" = String, Path, description = "Run identifier"),
+    ),
+    responses(
+        (status = 200, description = "Run published", body = api::RunOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 404, description = "Run not found", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
 async fn server_run_publish(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -945,6 +1203,21 @@ async fn server_run_publish(
     Ok(Json(api::run_output(&run)))
 }
 
+#[utoipa::path(
+    post,
+    path = "/runs/{run_id}/abort",
+    tag = "runs",
+    params(
+        ("run_id" = String, Path, description = "Run identifier"),
+    ),
+    responses(
+        (status = 200, description = "Run aborted", body = api::RunOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 404, description = "Run not found", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
 async fn server_run_abort(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -978,6 +1251,18 @@ async fn server_run_abort(
     Ok(Json(api::run_output(&run)))
 }
 
+#[utoipa::path(
+    get,
+    path = "/commits",
+    tag = "commits",
+    params(CommitListQuery),
+    responses(
+        (status = 200, description = "List of commits", body = CommitListOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
 async fn server_commit_list(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -1007,6 +1292,21 @@ async fn server_commit_list(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/commits/{commit_id}",
+    tag = "commits",
+    params(
+        ("commit_id" = String, Path, description = "Commit identifier"),
+    ),
+    responses(
+        (status = 200, description = "Commit details", body = api::CommitOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 404, description = "Commit not found", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
 async fn server_commit_show(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
