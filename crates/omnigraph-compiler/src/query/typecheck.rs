@@ -189,6 +189,29 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
         ));
     }
 
+    // T9: If any return expression is an aggregate, non-aggregate expressions
+    // must be valid group-by keys (PropAccess or Variable).
+    let has_agg = query
+        .return_clause
+        .iter()
+        .any(|p| matches!(p.expr, Expr::Aggregate { .. }));
+    if has_agg {
+        for proj in &query.return_clause {
+            if !matches!(proj.expr, Expr::Aggregate { .. }) {
+                match &proj.expr {
+                    Expr::PropAccess { .. } | Expr::Variable(_) => {}
+                    _ => {
+                        return Err(NanoError::Type(
+                            "T9: non-aggregate expressions in an aggregate query must be \
+                             property accesses or variables"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     Ok(ctx)
 }
 
@@ -1298,14 +1321,25 @@ fn resolve_expr_type(
         Expr::Aggregate { func, arg } => {
             let arg_type = resolve_expr_type(catalog, arg, ctx, params)?;
 
-            // T8: sum/avg/min/max require numeric
+            // T8: sum/avg require numeric; min/max require numeric or string
             match func {
-                AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max => {
+                AggFunc::Sum | AggFunc::Avg => {
                     if let ResolvedType::Scalar(s) = &arg_type
                         && (s.list || !s.scalar.is_numeric())
                     {
                         return Err(NanoError::Type(format!(
                             "T8: {} requires numeric type, got {}",
+                            func,
+                            s.display_name()
+                        )));
+                    }
+                }
+                AggFunc::Min | AggFunc::Max => {
+                    if let ResolvedType::Scalar(s) = &arg_type
+                        && (s.list || (!s.scalar.is_numeric() && s.scalar != ScalarType::String))
+                    {
+                        return Err(NanoError::Type(format!(
+                            "T8: {} requires numeric or string type, got {}",
                             func,
                             s.display_name()
                         )));
@@ -1340,8 +1374,8 @@ fn infer_projection_field(
         Expr::Aggregate { func, arg } => {
             let (data_type, nullable) = match func {
                 AggFunc::Count => (DataType::Int64, true),
-                AggFunc::Avg => (DataType::Float64, true),
-                _ => {
+                AggFunc::Avg | AggFunc::Sum => (DataType::Float64, true),
+                AggFunc::Min | AggFunc::Max => {
                     let resolved = resolve_expr_type(catalog, arg, ctx, params)?;
                     let (data_type, _) = resolved_type_to_field_shape(catalog, &resolved)?;
                     (data_type, true)
