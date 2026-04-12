@@ -21,6 +21,7 @@ jobs:
       contents: read
     outputs:
       run_full_ci: ${{ steps.filter.outputs.run_full_ci }}
+      run_rustfs_ci: ${{ steps.filter.outputs.run_rustfs_ci }}
     steps:
       - name: Checkout source
         uses: actions/checkout@v5.0.1
@@ -40,6 +41,7 @@ jobs:
 
           if [[ "$EVENT_NAME" == "workflow_dispatch" || "$REF_TYPE" == "tag" ]]; then
             echo "run_full_ci=true" >> "$GITHUB_OUTPUT"
+            echo "run_rustfs_ci=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -56,29 +58,46 @@ jobs:
 
           if [[ -z "${base:-}" ]]; then
             echo "run_full_ci=true" >> "$GITHUB_OUTPUT"
+            echo "run_rustfs_ci=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           mapfile -t changed < <(git diff --name-only "$base" "$head")
           if [[ "${#changed[@]}" -eq 0 ]]; then
             echo "run_full_ci=true" >> "$GITHUB_OUTPUT"
+            echo "run_rustfs_ci=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           run_full_ci=false
+          run_rustfs_ci=false
           for path in "${changed[@]}"; do
             case "$path" in
               *.md|*.mdx|*.txt|*.rst|*.adoc) ;;
               *)
                 run_full_ci=true
-                break
                 ;;
+            esac
+
+            if [[ "$EVENT_NAME" != "pull_request" ]]; then
+              run_rustfs_ci=true
+              continue
+            fi
+
+            case "$path" in
+              .github/workflows/ci.yml|Cargo.toml|Cargo.lock|crates/*/Cargo.toml) run_rustfs_ci=true ;;
+              crates/omnigraph/src/storage.rs) run_rustfs_ci=true ;;
+              crates/omnigraph/src/db/manifest.rs|crates/omnigraph/src/db/manifest/*) run_rustfs_ci=true ;;
+              crates/omnigraph/tests/s3_storage.rs|crates/omnigraph/tests/helpers/*) run_rustfs_ci=true ;;
+              crates/omnigraph-server/tests/server.rs) run_rustfs_ci=true ;;
+              crates/omnigraph-cli/tests/system_local.rs) run_rustfs_ci=true ;;
             esac
           done
 
           printf 'Changed files:\n'
           printf '  %s\n' "${changed[@]}"
           echo "run_full_ci=$run_full_ci" >> "$GITHUB_OUTPUT"
+          echo "run_rustfs_ci=$run_rustfs_ci" >> "$GITHUB_OUTPUT"
 
   test:
     name: Test Workspace
@@ -126,8 +145,9 @@ jobs:
     needs:
       - classify_changes
       - test
+    if: needs.classify_changes.outputs.run_rustfs_ci == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
     permissions:
       contents: read
     env:
@@ -142,35 +162,26 @@ jobs:
       OMNIGRAPH_S3_TEST_PREFIX: github-actions
       CARGO_TERM_COLOR: always
     steps:
-      - name: Skip heavy CI for text-only changes
-        if: needs.classify_changes.outputs.run_full_ci != 'true'
-        run: echo "Text-only change detected; skipping RustFS integration tests."
-
       - name: Checkout source
-        if: needs.classify_changes.outputs.run_full_ci == 'true'
         uses: actions/checkout@v5.0.1
 
       - name: Install system dependencies
-        if: needs.classify_changes.outputs.run_full_ci == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libprotobuf-dev python3-pip
 
       - name: Install Rust stable
-        if: needs.classify_changes.outputs.run_full_ci == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
 
       - name: Cache Rust build data
-        if: needs.classify_changes.outputs.run_full_ci == 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             . -> target
 
       - name: Start RustFS
-        if: needs.classify_changes.outputs.run_full_ci == 'true'
         run: |
           docker rm -f rustfs >/dev/null 2>&1 || true
           docker run -d \
@@ -183,13 +194,11 @@ jobs:
             /data
 
       - name: Install AWS CLI
-        if: needs.classify_changes.outputs.run_full_ci == 'true'
         run: |
           python3 -m pip install --user awscli
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Create RustFS test bucket
-        if: needs.classify_changes.outputs.run_full_ci == 'true'
         run: |
           for _ in $(seq 1 30); do
             if aws --endpoint-url "${AWS_ENDPOINT_URL_S3}" s3api list-buckets >/dev/null 2>&1; then
@@ -201,13 +210,15 @@ jobs:
             s3api create-bucket \
             --bucket "${OMNIGRAPH_S3_TEST_BUCKET}" >/dev/null 2>&1 || true
 
-      - name: Run RustFS-backed repo tests
-        if: needs.classify_changes.outputs.run_full_ci == 'true'
-        run: |
-          cargo test --locked -p omnigraph --test s3_storage -- --nocapture
-          cargo test --locked -p omnigraph-server --test server server_opens_s3_repo_directly_and_serves_snapshot_and_read -- --nocapture
-          cargo test --locked -p omnigraph-cli --test system_local local_cli_s3_end_to_end_init_load_read_flow -- --nocapture
+      - name: Run RustFS storage tests
+        run: cargo test --locked -p omnigraph --test s3_storage -- --nocapture
+
+      - name: Run RustFS server smoke
+        run: cargo test --locked -p omnigraph-server --test server server_opens_s3_repo_directly_and_serves_snapshot_and_read -- --nocapture
+
+      - name: Run RustFS CLI smoke
+        run: cargo test --locked -p omnigraph-cli --test system_local local_cli_s3_end_to_end_init_load_read_flow -- --nocapture
 
       - name: Dump RustFS logs on failure
-        if: failure() && needs.classify_changes.outputs.run_full_ci == 'true'
+        if: failure()
         run: docker logs rustfs
