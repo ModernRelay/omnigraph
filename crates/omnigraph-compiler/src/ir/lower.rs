@@ -243,19 +243,23 @@ fn lower_clauses(
     // until all traversals are consumed.
     let mut remaining: Vec<&Traversal> = traversals.to_vec();
     while !remaining.is_empty() {
-        let before = remaining.len();
-        remaining.retain(|traversal| {
+        let mut next_remaining = Vec::new();
+        for traversal in &remaining {
             let src_bound = bound_vars.contains(&traversal.src);
             let dst_bound = bound_vars.contains(&traversal.dst);
             if !src_bound && !dst_bound {
-                return true; // keep for next pass
+                next_remaining.push(*traversal);
+                continue;
             }
-            // This traversal can be processed — emit the appropriate ops.
-            // (errors inside retain are not ergonomic, so we rely on the
-            // type-checker having validated edge names already.)
-            let Some(edge) = catalog.lookup_edge_by_name(&traversal.edge_name) else {
-                return true; // keep; will error on next pass or after loop
-            };
+
+            let edge = catalog
+                .lookup_edge_by_name(&traversal.edge_name)
+                .ok_or_else(|| {
+                    crate::error::NanoError::Plan(format!(
+                        "lowering traversal referenced missing edge '{}' after typecheck",
+                        traversal.edge_name
+                    ))
+                })?;
 
             let direction = type_ctx
                 .traversals
@@ -340,14 +344,11 @@ fn lower_clauses(
                     bound_vars.insert(traversal.dst.clone());
                 }
             }
-            false // processed — remove from remaining
-        });
-        if remaining.len() == before {
-            // No progress — remaining traversals reference no bound variables.
-            // Fall through; the traversals will be skipped (this would be a
-            // type-check error in practice).
+        }
+        if next_remaining.len() == remaining.len() {
             break;
         }
+        remaining = next_remaining;
     }
 
     // Lower explicit filters
