@@ -1225,6 +1225,7 @@ fn ir_expr_to_sql(expr: &IRExpr, params: &ParamMap) -> Option<String> {
 
 pub(super) fn literal_to_sql(lit: &Literal) -> String {
     match lit {
+        Literal::Null => "NULL".to_string(),
         Literal::String(s) => format!("'{}'", s.replace('\'', "''")),
         Literal::Integer(n) => n.to_string(),
         Literal::Float(f) => f.to_string(),

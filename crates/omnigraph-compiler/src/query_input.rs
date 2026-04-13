@@ -270,7 +270,15 @@ pub fn json_params_to_param_map(
     let mut map = ParamMap::new();
     let object = match params {
         Some(Value::Object(object)) => object,
-        Some(Value::Null) | None => return Ok(map),
+        Some(Value::Null) | None => {
+            // Still fill in Literal::Null for declared nullable params.
+            for param in query_params {
+                if param.nullable {
+                    map.insert(param.name.clone(), Literal::Null);
+                }
+            }
+            return Ok(map);
+        }
         Some(other) => {
             let message = match mode {
                 JsonParamMode::Standard => "params must be a JSON object".to_string(),
@@ -284,12 +292,31 @@ pub fn json_params_to_param_map(
 
     for (key, value) in object {
         let decl = query_params.iter().find(|param| param.name == *key);
-        let literal = if let Some(decl) = decl {
-            json_value_to_literal_typed(key, value, &decl.type_name, mode)?
+        if let Some(decl) = decl {
+            if matches!(value, Value::Null) {
+                if decl.nullable {
+                    map.insert(key.clone(), Literal::Null);
+                } else {
+                    return Err(RunInputError::message(format!(
+                        "param '{}': null is not accepted for non-nullable parameter",
+                        key
+                    )));
+                }
+            } else {
+                let literal = json_value_to_literal_typed(key, value, &decl.type_name, mode)?;
+                map.insert(key.clone(), literal);
+            }
         } else {
-            json_value_to_literal_inferred(key, value, mode)?
+            let literal = json_value_to_literal_inferred(key, value, mode)?;
+            map.insert(key.clone(), literal);
         };
-        map.insert(key.clone(), literal);
+    }
+
+    // Fill in Literal::Null for declared nullable params that were omitted.
+    for param in query_params {
+        if param.nullable && !map.contains_key(&param.name) {
+            map.insert(param.name.clone(), Literal::Null);
+        }
     }
 
     Ok(map)
@@ -568,15 +595,7 @@ fn json_value_to_literal_inferred(
             }
             Ok(Literal::List(out))
         }
-        Value::Null => Err(match mode {
-            JsonParamMode::Standard => {
-                RunInputError::message(format!("param '{}': null is not supported", key))
-            }
-            JsonParamMode::JavaScript => RunInputError::message(format!(
-                "param '{}': null values are not supported as query parameters",
-                key
-            )),
-        }),
+        Value::Null => Ok(Literal::Null),
         Value::Object(_) => Err(match mode {
             JsonParamMode::Standard => {
                 RunInputError::message(format!("param '{}': object is not supported", key))
@@ -888,5 +907,111 @@ query q($tags: [String], $days: [Date]?, $due_at: DateTime) {
             }
             other => panic!("expected date list param, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn nullable_param_omitted_becomes_null() {
+        let query = find_named_query(
+            "query q($name: String, $bio: String?) { match { $u: User } return { $u } }",
+            "q",
+        )
+        .expect("query");
+
+        let params = json_params_to_param_map(
+            Some(&json!({ "name": "Alice" })),
+            &query.params,
+            JsonParamMode::Standard,
+        )
+        .expect("should accept omitted nullable param");
+
+        assert!(matches!(params.get("name"), Some(Literal::String(v)) if v == "Alice"));
+        assert!(matches!(params.get("bio"), Some(Literal::Null)));
+    }
+
+    #[test]
+    fn nullable_param_explicit_null_becomes_null() {
+        let query = find_named_query(
+            "query q($name: String, $bio: String?) { match { $u: User } return { $u } }",
+            "q",
+        )
+        .expect("query");
+
+        let params = json_params_to_param_map(
+            Some(&json!({ "name": "Alice", "bio": null })),
+            &query.params,
+            JsonParamMode::Standard,
+        )
+        .expect("should accept explicit null for nullable param");
+
+        assert!(matches!(params.get("name"), Some(Literal::String(v)) if v == "Alice"));
+        assert!(matches!(params.get("bio"), Some(Literal::Null)));
+    }
+
+    #[test]
+    fn non_nullable_param_rejects_null() {
+        let query = find_named_query(
+            "query q($name: String) { match { $u: User } return { $u } }",
+            "q",
+        )
+        .expect("query");
+
+        let error = json_params_to_param_map(
+            Some(&json!({ "name": null })),
+            &query.params,
+            JsonParamMode::Standard,
+        )
+        .expect_err("null for non-nullable param should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("null is not accepted for non-nullable parameter"),
+            "unexpected error: {}",
+            error
+        );
+    }
+
+    #[test]
+    fn nullable_param_with_value_works_normally() {
+        let query = find_named_query(
+            "query q($bio: String?) { match { $u: User } return { $u } }",
+            "q",
+        )
+        .expect("query");
+
+        let params = json_params_to_param_map(
+            Some(&json!({ "bio": "hello" })),
+            &query.params,
+            JsonParamMode::Standard,
+        )
+        .expect("should accept string value for nullable param");
+
+        assert!(matches!(params.get("bio"), Some(Literal::String(v)) if v == "hello"));
+    }
+
+    #[test]
+    fn inferred_null_param_becomes_literal_null() {
+        let params = json_params_to_param_map(
+            Some(&json!({ "extra": null })),
+            &[],
+            JsonParamMode::Standard,
+        )
+        .expect("inferred null should succeed");
+
+        assert!(matches!(params.get("extra"), Some(Literal::Null)));
+    }
+
+    #[test]
+    fn nullable_params_filled_when_params_is_none() {
+        let query = find_named_query(
+            "query q($bio: String?) { match { $u: User } return { $u } }",
+            "q",
+        )
+        .expect("query");
+
+        let params = json_params_to_param_map(None, &query.params, JsonParamMode::Standard)
+            .expect("None params should succeed with nullable declarations");
+
+        assert!(matches!(params.get("bio"), Some(Literal::Null)));
     }
 }

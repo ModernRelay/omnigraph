@@ -74,6 +74,7 @@ fn evaluate_expr(batch: &RecordBatch, expr: &IRExpr, params: &ParamMap) -> Resul
 /// Create a constant array from a literal value.
 fn literal_to_array(lit: &Literal, num_rows: usize) -> Result<ArrayRef> {
     Ok(match lit {
+        Literal::Null => arrow_array::new_null_array(&DataType::Utf8, num_rows),
         Literal::String(s) => Arc::new(StringArray::from(vec![s.as_str(); num_rows])) as ArrayRef,
         Literal::Integer(n) => {
             // Try to match the most common integer types
@@ -283,6 +284,7 @@ fn list_scalar_type(items: &[Literal]) -> Result<ScalarType> {
 
 fn literal_scalar_type(lit: &Literal) -> Result<ScalarType> {
     match lit {
+        Literal::Null => Ok(ScalarType::String),
         Literal::String(_) => Ok(ScalarType::String),
         Literal::Integer(_) => Ok(ScalarType::I64),
         Literal::Float(_) => Ok(ScalarType::F64),
