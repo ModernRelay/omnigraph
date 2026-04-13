@@ -645,6 +645,7 @@ fn execute_pipeline<'a>(
                     dst_type,
                     min_hops,
                     max_hops,
+                    dst_filters,
                 } => {
                     let gi = graph_index.ok_or_else(|| {
                         OmniError::manifest("graph index required for traversal".to_string())
@@ -652,7 +653,7 @@ fn execute_pipeline<'a>(
                     if let Some(batch) = wide.as_mut() {
                         execute_expand(
                             batch, gi, snapshot, catalog, src_var, dst_var, edge_type, *direction,
-                            dst_type, *min_hops, *max_hops,
+                            dst_type, *min_hops, *max_hops, dst_filters, params,
                         )
                         .await?;
                     }
@@ -683,6 +684,8 @@ async fn execute_expand(
     dst_type: &str,
     min_hops: u32,
     max_hops: Option<u32>,
+    dst_filters: &[IRFilter],
+    params: &ParamMap,
 ) -> Result<()> {
     let src_id_col_name = format!("{}.id", src_var);
     let src_ids = wide
@@ -766,8 +769,15 @@ async fn execute_expand(
         }
     }
 
-    // Hydrate destination nodes from the snapshot
-    let dst_batch = hydrate_nodes(snapshot, catalog, dst_type, &dst_id_list).await?;
+    // Split dst_filters: SQL-pushable go to Lance, the rest applied post-hconcat
+    let pushdown_sql = build_lance_filter(dst_filters, params);
+    let non_pushable: Vec<&IRFilter> = dst_filters
+        .iter()
+        .filter(|f| ir_filter_to_sql(f, params).is_none())
+        .collect();
+
+    // Hydrate destination nodes from the snapshot (with pushed-down filters)
+    let dst_batch = hydrate_nodes(snapshot, catalog, dst_type, &dst_id_list, pushdown_sql.as_deref()).await?;
 
     // Build a mapping from dst_id to row index in dst_batch
     let dst_batch_id_col = dst_batch
@@ -796,15 +806,26 @@ async fn execute_expand(
     let dst_prefixed = prefix_batch(&dst_batch, dst_var)?;
     let aligned_dst = take_batch(&dst_prefixed, &dst_take)?;
     *wide = hconcat_batches(&expanded_wide, &aligned_dst)?;
+
+    // Apply any non-pushable destination filters (e.g. list-contains) in memory
+    for f in &non_pushable {
+        apply_filter(wide, f, params)?;
+    }
+
     Ok(())
 }
 
 /// Load full node rows for a set of IDs from a snapshot.
+///
+/// When `extra_filter_sql` is provided (from deferred destination-binding
+/// filters), it is ANDed with the `id IN (...)` clause so that Lance can
+/// skip non-matching rows at the storage level.
 async fn hydrate_nodes(
     snapshot: &Snapshot,
     catalog: &Catalog,
     type_name: &str,
     ids: &[String],
+    extra_filter_sql: Option<&str>,
 ) -> Result<RecordBatch> {
     let node_type = catalog
         .node_types
@@ -823,7 +844,10 @@ async fn hydrate_nodes(
         .iter()
         .map(|id| format!("'{}'", id.replace('\'', "''")))
         .collect();
-    let filter_sql = format!("id IN ({})", escaped.join(", "));
+    let mut filter_sql = format!("id IN ({})", escaped.join(", "));
+    if let Some(extra) = extra_filter_sql {
+        filter_sql = format!("({}) AND ({})", filter_sql, extra);
+    }
     let has_blobs = !node_type.blob_properties.is_empty();
     let non_blob_cols: Vec<&str> = node_type
         .arrow_schema
@@ -877,12 +901,18 @@ fn try_bulk_anti_join_mask(
         src_var,
         edge_type,
         direction,
+        dst_filters,
         ..
     } = &inner_pipeline[0]
     else {
         return None;
     };
     if src_var != outer_var {
+        return None;
+    }
+    // Bulk CSR check only tests neighbor existence, not destination
+    // properties.  Fall back to the slow path when dst_filters are present.
+    if !dst_filters.is_empty() {
         return None;
     }
     let gi = graph_index?;

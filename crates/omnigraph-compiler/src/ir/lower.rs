@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::catalog::Catalog;
 use crate::error::Result;
@@ -147,158 +147,214 @@ fn lower_clauses(
         }
     }
 
-    // Lower bindings into NodeScan ops
+    // ── Determine which bindings are "deferred" ─────────────────────────
+    //
+    // When multiple bindings in the same match clause are connected by
+    // traversals, only the first-declared binding needs a NodeScan; the
+    // rest will be introduced by Expand operations.  Making them all
+    // NodeScans triggers expensive cross-joins followed by cycle-closing
+    // filters.
+    //
+    // Algorithm: build an undirected graph of variables connected by
+    // traversals, then walk connected components in binding declaration
+    // order.  The first binding in each component becomes the root (gets
+    // a NodeScan); all other bindings in the same component are deferred
+    // — their inline filters become post-Expand Filter ops.
+
+    let binding_set: HashSet<&str> = bindings.iter().map(|b| b.variable.as_str()).collect();
+
+    // Build undirected traversal adjacency (variable → neighbours).
+    // Exclude the anonymous wildcard "_" so it cannot falsely bridge
+    // otherwise-independent components.
+    let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
+    for t in &traversals {
+        let src = t.src.as_str();
+        let dst = t.dst.as_str();
+        if src != "_" && dst != "_" {
+            adj.entry(src).or_default().push(dst);
+            adj.entry(dst).or_default().push(src);
+        }
+    }
+
+    // Walk components to find deferred binding variables
+    let mut deferred_set: HashSet<String> = HashSet::new();
+    let mut component_visited: HashSet<&str> = HashSet::new();
+
+    for binding in &bindings {
+        if component_visited.contains(binding.variable.as_str()) {
+            continue;
+        }
+        // BFS from this binding through the traversal graph
+        let mut queue = VecDeque::new();
+        queue.push_back(binding.variable.as_str());
+        let mut component_bindings: Vec<&str> = Vec::new();
+
+        while let Some(var) = queue.pop_front() {
+            if !component_visited.insert(var) {
+                continue;
+            }
+            if binding_set.contains(var) {
+                component_bindings.push(var);
+            }
+            if let Some(neighbours) = adj.get(var) {
+                for &n in neighbours {
+                    if !component_visited.contains(n) {
+                        queue.push_back(n);
+                    }
+                }
+            }
+        }
+
+        // First binding in the component is the root; defer the rest.
+        for var in component_bindings.into_iter().skip(1) {
+            deferred_set.insert(var.to_string());
+        }
+    }
+
+    // Build deferred filters map for variables introduced by traversals
+    let mut deferred_filters: HashMap<String, Vec<IRFilter>> = HashMap::new();
+
+    // Lower bindings into NodeScan ops (skip deferred ones)
     for binding in &bindings {
         let node_type = catalog
             .node_types
             .get(&binding.type_name)
             .expect("binding type was validated during typecheck");
-        // Collect inline filters from prop matches
-        let mut scan_filters = Vec::new();
-        for pm in &binding.prop_matches {
-            let prop = node_type
-                .properties
-                .get(&pm.prop_name)
-                .expect("binding property was validated during typecheck");
-            let op = if prop.list {
-                CompOp::Contains
-            } else {
-                CompOp::Eq
-            };
-            match &pm.value {
-                MatchValue::Literal(lit) => {
-                    scan_filters.push(IRFilter {
-                        left: IRExpr::PropAccess {
-                            variable: binding.variable.clone(),
-                            property: pm.prop_name.clone(),
-                        },
-                        op,
-                        right: IRExpr::Literal(lit.clone()),
-                    });
-                }
-                MatchValue::Now => {
-                    scan_filters.push(IRFilter {
-                        left: IRExpr::PropAccess {
-                            variable: binding.variable.clone(),
-                            property: pm.prop_name.clone(),
-                        },
-                        op,
-                        right: IRExpr::Param(NOW_PARAM_NAME.to_string()),
-                    });
-                }
-                MatchValue::Variable(v) => {
-                    let right = if param_names.contains(v) {
-                        IRExpr::Param(v.clone())
-                    } else {
-                        IRExpr::Variable(v.clone())
-                    };
-                    scan_filters.push(IRFilter {
-                        left: IRExpr::PropAccess {
-                            variable: binding.variable.clone(),
-                            property: pm.prop_name.clone(),
-                        },
-                        op,
-                        right,
-                    });
-                }
+
+        let binding_filters = build_binding_filters(binding, node_type, param_names);
+
+        if deferred_set.contains(&binding.variable) {
+            // Save filters for emission after the Expand that introduces
+            // this variable.
+            if !binding_filters.is_empty() {
+                deferred_filters.insert(binding.variable.clone(), binding_filters);
             }
+            continue;
         }
 
         pipeline.push(IROp::NodeScan {
             variable: binding.variable.clone(),
             type_name: binding.type_name.clone(),
-            filters: scan_filters,
+            filters: binding_filters,
         });
         bound_vars.insert(binding.variable.clone());
     }
 
-    // Lower traversals into Expand ops
-    // Handle "cycle closing" — if both src and dst are already bound, use a filter
-    for traversal in &traversals {
-        let edge = catalog
-            .lookup_edge_by_name(&traversal.edge_name)
-            .ok_or_else(|| {
-                crate::error::NanoError::Plan(format!(
-                    "lowering traversal referenced missing edge '{}' after typecheck",
-                    traversal.edge_name
-                ))
-            })?;
-
-        // Determine direction from type context
-        let direction = type_ctx
-            .traversals
-            .iter()
-            .find(|rt| {
-                rt.src == traversal.src && rt.dst == traversal.dst && rt.edge_type == edge.name
-            })
-            .map(|rt| rt.direction)
-            .unwrap_or(Direction::Out);
-
-        let dst_type = match direction {
-            Direction::Out => edge.to_type.clone(),
-            Direction::In => edge.from_type.clone(),
-        };
-
-        if bound_vars.contains(&traversal.src) && bound_vars.contains(&traversal.dst) {
-            // Cycle closing: emit expand to a temp var, then filter temp.id = dst.id
-            let temp_var = format!("__temp_{}", traversal.dst);
-            pipeline.push(IROp::Expand {
-                src_var: traversal.src.clone(),
-                dst_var: temp_var.clone(),
-                edge_type: edge.name.clone(),
-                direction,
-                dst_type,
-                min_hops: traversal.min_hops,
-                max_hops: traversal.max_hops,
-            });
-            pipeline.push(IROp::Filter(IRFilter {
-                left: IRExpr::PropAccess {
-                    variable: temp_var,
-                    property: "id".to_string(),
-                },
-                op: CompOp::Eq,
-                right: IRExpr::PropAccess {
-                    variable: traversal.dst.clone(),
-                    property: "id".to_string(),
-                },
-            }));
-        } else if !bound_vars.contains(&traversal.src) && bound_vars.contains(&traversal.dst) {
-            // Reverse expand: dst is bound, src is not.
-            // Swap direction and expand from dst to discover src.
-            let reverse_dir = match direction {
-                Direction::Out => Direction::In,
-                Direction::In => Direction::Out,
-            };
-            let src_type = match direction {
-                Direction::Out => edge.from_type.clone(),
-                Direction::In => edge.to_type.clone(),
-            };
-            pipeline.push(IROp::Expand {
-                src_var: traversal.dst.clone(),
-                dst_var: traversal.src.clone(),
-                edge_type: edge.name.clone(),
-                direction: reverse_dir,
-                dst_type: src_type,
-                min_hops: traversal.min_hops,
-                max_hops: traversal.max_hops,
-            });
-            if traversal.src != "_" {
-                bound_vars.insert(traversal.src.clone());
+    // Lower traversals into Expand ops.
+    //
+    // Traversals are processed iteratively rather than in a single pass
+    // because deferred bindings mean a traversal's source might not be
+    // bound until a prior traversal introduces it.  Each pass processes
+    // every traversal that has at least one bound endpoint; this repeats
+    // until all traversals are consumed.
+    let mut remaining: Vec<&Traversal> = traversals.to_vec();
+    while !remaining.is_empty() {
+        let mut next_remaining = Vec::new();
+        for traversal in &remaining {
+            let src_bound = bound_vars.contains(&traversal.src);
+            let dst_bound = bound_vars.contains(&traversal.dst);
+            if !src_bound && !dst_bound {
+                next_remaining.push(*traversal);
+                continue;
             }
-        } else {
-            pipeline.push(IROp::Expand {
-                src_var: traversal.src.clone(),
-                dst_var: traversal.dst.clone(),
-                edge_type: edge.name.clone(),
-                direction,
-                dst_type,
-                min_hops: traversal.min_hops,
-                max_hops: traversal.max_hops,
-            });
-            if traversal.dst != "_" {
-                bound_vars.insert(traversal.dst.clone());
+
+            let edge = catalog
+                .lookup_edge_by_name(&traversal.edge_name)
+                .ok_or_else(|| {
+                    crate::error::NanoError::Plan(format!(
+                        "lowering traversal referenced missing edge '{}' after typecheck",
+                        traversal.edge_name
+                    ))
+                })?;
+
+            let direction = type_ctx
+                .traversals
+                .iter()
+                .find(|rt| {
+                    rt.src == traversal.src
+                        && rt.dst == traversal.dst
+                        && rt.edge_type == edge.name
+                })
+                .map(|rt| rt.direction)
+                .unwrap_or(Direction::Out);
+
+            let dst_type = match direction {
+                Direction::Out => edge.to_type.clone(),
+                Direction::In => edge.from_type.clone(),
+            };
+
+            if src_bound && dst_bound {
+                // Cycle closing: expand to a temp var, then filter temp.id = dst.id
+                let temp_var = format!("__temp_{}", traversal.dst);
+                pipeline.push(IROp::Expand {
+                    src_var: traversal.src.clone(),
+                    dst_var: temp_var.clone(),
+                    edge_type: edge.name.clone(),
+                    direction,
+                    dst_type,
+                    min_hops: traversal.min_hops,
+                    max_hops: traversal.max_hops,
+                    dst_filters: vec![],
+                });
+                pipeline.push(IROp::Filter(IRFilter {
+                    left: IRExpr::PropAccess {
+                        variable: temp_var,
+                        property: "id".to_string(),
+                    },
+                    op: CompOp::Eq,
+                    right: IRExpr::PropAccess {
+                        variable: traversal.dst.clone(),
+                        property: "id".to_string(),
+                    },
+                }));
+            } else if !src_bound && dst_bound {
+                // Reverse expand: dst is bound, src is not.
+                let reverse_dir = match direction {
+                    Direction::Out => Direction::In,
+                    Direction::In => Direction::Out,
+                };
+                let src_type = match direction {
+                    Direction::Out => edge.from_type.clone(),
+                    Direction::In => edge.to_type.clone(),
+                };
+                let introduced_filters =
+                    deferred_filters.remove(&traversal.src).unwrap_or_default();
+                pipeline.push(IROp::Expand {
+                    src_var: traversal.dst.clone(),
+                    dst_var: traversal.src.clone(),
+                    edge_type: edge.name.clone(),
+                    direction: reverse_dir,
+                    dst_type: src_type,
+                    min_hops: traversal.min_hops,
+                    max_hops: traversal.max_hops,
+                    dst_filters: introduced_filters,
+                });
+                if traversal.src != "_" {
+                    bound_vars.insert(traversal.src.clone());
+                }
+            } else {
+                // Normal expand: src is bound, dst is not.
+                let introduced_filters =
+                    deferred_filters.remove(&traversal.dst).unwrap_or_default();
+                pipeline.push(IROp::Expand {
+                    src_var: traversal.src.clone(),
+                    dst_var: traversal.dst.clone(),
+                    edge_type: edge.name.clone(),
+                    direction,
+                    dst_type,
+                    min_hops: traversal.min_hops,
+                    max_hops: traversal.max_hops,
+                    dst_filters: introduced_filters,
+                });
+                if traversal.dst != "_" {
+                    bound_vars.insert(traversal.dst.clone());
+                }
             }
         }
+        if next_remaining.len() == remaining.len() {
+            break;
+        }
+        remaining = next_remaining;
     }
 
     // Lower explicit filters
@@ -333,6 +389,46 @@ fn lower_clauses(
     }
 
     Ok(())
+}
+
+/// Build IR filters from a binding's inline property matches.
+fn build_binding_filters(
+    binding: &Binding,
+    node_type: &crate::catalog::NodeType,
+    param_names: &HashSet<String>,
+) -> Vec<IRFilter> {
+    let mut filters = Vec::new();
+    for pm in &binding.prop_matches {
+        let prop = node_type
+            .properties
+            .get(&pm.prop_name)
+            .expect("binding property was validated during typecheck");
+        let op = if prop.list {
+            CompOp::Contains
+        } else {
+            CompOp::Eq
+        };
+        let right = match &pm.value {
+            MatchValue::Literal(lit) => IRExpr::Literal(lit.clone()),
+            MatchValue::Now => IRExpr::Param(NOW_PARAM_NAME.to_string()),
+            MatchValue::Variable(v) => {
+                if param_names.contains(v) {
+                    IRExpr::Param(v.clone())
+                } else {
+                    IRExpr::Variable(v.clone())
+                }
+            }
+        };
+        filters.push(IRFilter {
+            left: IRExpr::PropAccess {
+                variable: binding.variable.clone(),
+                property: pm.prop_name.clone(),
+            },
+            op,
+            right,
+        });
+    }
+    filters
 }
 
 fn find_outer_var(clauses: &[Clause], outer_bound: &HashSet<String>) -> Option<String> {
@@ -691,5 +787,453 @@ query q($name: String, $age: I32, $friend: String) {
         assert!(
             matches!(&ir.ops[1], MutationOpIR::Insert { type_name, .. } if type_name == "Knows")
         );
+    }
+
+    /// Destination binding is deferred: NodeScan + Expand + Filter (no cross-join).
+    #[test]
+    fn test_lower_traversal_with_destination_binding() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $p: Person
+        $p worksAt $c
+        $c: Company { name: "Acme" }
+    }
+    return { $p.name, $c.name }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+        // Should be: NodeScan($p) → Expand($p→$c, dst_filters=[name=="Acme"])
+        // NOT:       NodeScan($p) → NodeScan($c) → cross-join → cycle-close
+        assert_eq!(ir.pipeline.len(), 2);
+        assert!(matches!(&ir.pipeline[0], IROp::NodeScan { variable, .. } if variable == "p"));
+        assert!(matches!(
+            &ir.pipeline[1],
+            IROp::Expand { src_var, dst_var, dst_filters, .. }
+            if src_var == "p" && dst_var == "c" && dst_filters.len() == 1
+        ));
+    }
+
+    /// Multi-hop chain: all intermediate and final bindings are deferred.
+    #[test]
+    fn test_lower_chain_defers_all_intermediate_bindings() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $p: Person { name: "Alice" }
+        $p knows $f
+        $f: Person { name: "Bob" }
+        $f worksAt $c
+        $c: Company { name: "Acme" }
+    }
+    return { $c.name }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+        // Should be: NodeScan($p,[name=Alice]) → Expand($p→$f, [name==Bob])
+        //            → Expand($f→$c, [name==Acme])
+        assert_eq!(ir.pipeline.len(), 3);
+        assert!(matches!(&ir.pipeline[0], IROp::NodeScan { variable, .. } if variable == "p"));
+        assert!(matches!(
+            &ir.pipeline[1],
+            IROp::Expand { src_var, dst_var, dst_filters, .. }
+            if src_var == "p" && dst_var == "f" && dst_filters.len() == 1
+        ));
+        assert!(matches!(
+            &ir.pipeline[2],
+            IROp::Expand { src_var, dst_var, dst_filters, .. }
+            if src_var == "f" && dst_var == "c" && dst_filters.len() == 1
+        ));
+    }
+
+    /// Reverse traversal: source binding is deferred when destination is the root.
+    #[test]
+    fn test_lower_reverse_traversal_defers_source_binding() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $c: Company { name: "Acme" }
+        $p worksAt $c
+        $p: Person { name: "Alice" }
+    }
+    return { $p.name }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+        // $c is root (first declared). $p is deferred (connected via traversal).
+        // Traversal $p worksAt $c: $c is bound, $p is not → reverse expand.
+        // Pipeline: NodeScan($c,[name=Acme]) → Expand($c→$p, In, [name==Alice])
+        assert_eq!(ir.pipeline.len(), 2);
+        assert!(matches!(&ir.pipeline[0], IROp::NodeScan { variable, .. } if variable == "c"));
+        assert!(matches!(
+            &ir.pipeline[1],
+            IROp::Expand { src_var, dst_var, dst_filters, .. }
+            if src_var == "c" && dst_var == "p" && dst_filters.len() == 1
+        ));
+    }
+
+    /// Independent bindings (no traversal) still cross-join.
+    #[test]
+    fn test_lower_independent_bindings_still_cross_join() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $p: Person
+        $c: Company
+    }
+    return { $p.name, $c.name }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+        // No traversal connecting them → both get NodeScans (cross-join at runtime)
+        assert_eq!(ir.pipeline.len(), 2);
+        assert!(matches!(&ir.pipeline[0], IROp::NodeScan { variable, .. } if variable == "p"));
+        assert!(matches!(&ir.pipeline[1], IROp::NodeScan { variable, .. } if variable == "c"));
+    }
+
+    /// Destination binding without filters: no NodeScan, no post-expand filter.
+    #[test]
+    fn test_lower_destination_binding_without_filters() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $p: Person
+        $p worksAt $c
+        $c: Company
+    }
+    return { $p.name, $c.name }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+        // $c binding is deferred (no filters) → just NodeScan + Expand
+        assert_eq!(ir.pipeline.len(), 2);
+        assert!(matches!(&ir.pipeline[0], IROp::NodeScan { variable, .. } if variable == "p"));
+        assert!(matches!(
+            &ir.pipeline[1],
+            IROp::Expand { src_var, dst_var, .. }
+            if src_var == "p" && dst_var == "c"
+        ));
+    }
+
+    /// Traversals declared in non-topological order are reordered automatically.
+    #[test]
+    fn test_lower_out_of_order_traversals() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $p: Person
+        $f worksAt $c
+        $p knows $f
+        $f: Person
+        $c: Company { name: "Acme" }
+    }
+    return { $c.name }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+        // Even though "$f worksAt $c" is declared before "$p knows $f",
+        // the iterative lowering processes "$p knows $f" first (because $p
+        // is bound) and then "$f worksAt $c" (once $f is bound).
+        assert_eq!(ir.pipeline.len(), 3);
+        assert!(matches!(&ir.pipeline[0], IROp::NodeScan { variable, .. } if variable == "p"));
+        // First expand: $p → $f (knows)
+        assert!(matches!(
+            &ir.pipeline[1],
+            IROp::Expand { src_var, dst_var, .. }
+            if src_var == "p" && dst_var == "f"
+        ));
+        // Second expand: $f → $c (worksAt), with filter from $c binding
+        assert!(matches!(
+            &ir.pipeline[2],
+            IROp::Expand { src_var, dst_var, dst_filters, .. }
+            if src_var == "f" && dst_var == "c" && dst_filters.len() == 1
+        ));
+    }
+
+    /// Wildcard $_ must not bridge unrelated components in the adjacency graph.
+    #[test]
+    fn test_lower_wildcard_does_not_bridge_components() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $p: Person
+        $p knows $_
+        $c: Company
+    }
+    return { $p.name, $c.name }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+        // $p and $c are in separate components (connected only through $_).
+        // Both must get their own NodeScan — $c must NOT be deferred.
+        // Bindings are emitted first, then traversals.
+        assert_eq!(ir.pipeline.len(), 3);
+        assert!(matches!(&ir.pipeline[0], IROp::NodeScan { variable, .. } if variable == "p"));
+        assert!(matches!(&ir.pipeline[1], IROp::NodeScan { variable, .. } if variable == "c"));
+        // The expand for $p knows $_ (wildcard destination)
+        assert!(matches!(
+            &ir.pipeline[2],
+            IROp::Expand { src_var, dst_var, .. }
+            if src_var == "p" && dst_var == "_"
+        ));
+    }
+
+    /// Fan-out: one root fans to two deferred destinations via different edges.
+    #[test]
+    fn test_lower_fan_out_topology() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $p: Person { name: "Alice" }
+        $p knows $f
+        $f: Person { name: "Bob" }
+        $p worksAt $c
+        $c: Company { name: "Acme" }
+    }
+    return { $f.name, $c.name }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+        // Root: $p. Deferred: $f, $c (both reachable from $p).
+        assert_eq!(ir.pipeline.len(), 3);
+        assert!(matches!(&ir.pipeline[0], IROp::NodeScan { variable, .. } if variable == "p"));
+        assert!(matches!(
+            &ir.pipeline[1],
+            IROp::Expand { src_var, dst_var, dst_filters, .. }
+            if src_var == "p" && dst_var == "f" && dst_filters.len() == 1
+        ));
+        assert!(matches!(
+            &ir.pipeline[2],
+            IROp::Expand { src_var, dst_var, dst_filters, .. }
+            if src_var == "p" && dst_var == "c" && dst_filters.len() == 1
+        ));
+    }
+
+    /// Fan-in: two sources converge on one destination; second source is
+    /// introduced via reverse expand from the shared destination.
+    #[test]
+    fn test_lower_fan_in_topology() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $a: Person { name: "Alice" }
+        $a knows $c
+        $b: Person { name: "Bob" }
+        $b knows $c
+        $c: Person
+    }
+    return { $a.name, $b.name, $c.name }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+        // Root: $a (first in component {a,b,c}). Deferred: $b, $c.
+        // $a knows $c: expand(a→c). $b knows $c: reverse expand(c→b).
+        assert_eq!(ir.pipeline.len(), 3);
+        assert!(matches!(&ir.pipeline[0], IROp::NodeScan { variable, .. } if variable == "a"));
+        assert!(matches!(
+            &ir.pipeline[1],
+            IROp::Expand { src_var, dst_var, dst_filters, .. }
+            if src_var == "a" && dst_var == "c" && dst_filters.is_empty()
+        ));
+        assert!(matches!(
+            &ir.pipeline[2],
+            IROp::Expand { src_var, dst_var, dst_filters, .. }
+            if src_var == "c" && dst_var == "b" && dst_filters.len() == 1
+        ));
+    }
+
+    /// Genuine graph cycle: deferred binding is introduced by first traversal,
+    /// second traversal triggers cycle-closing.
+    #[test]
+    fn test_lower_cycle_with_deferred_binding() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $a: Person
+        $a knows $b
+        $b: Person { name: "Bob" }
+        $b knows $a
+    }
+    return { $a.name }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+        // $b is deferred, introduced by first expand.
+        // Second traversal ($b knows $a) is genuine cycle-closing.
+        assert_eq!(ir.pipeline.len(), 4);
+        assert!(matches!(&ir.pipeline[0], IROp::NodeScan { variable, .. } if variable == "a"));
+        assert!(matches!(
+            &ir.pipeline[1],
+            IROp::Expand { src_var, dst_var, dst_filters, .. }
+            if src_var == "a" && dst_var == "b" && dst_filters.len() == 1
+        ));
+        // Cycle-closing expand to __temp_a
+        assert!(matches!(
+            &ir.pipeline[2],
+            IROp::Expand { src_var, dst_var, dst_filters, .. }
+            if src_var == "b" && dst_var.starts_with("__temp_") && dst_filters.is_empty()
+        ));
+        // Cycle-closing filter: __temp_a.id == a.id
+        assert!(matches!(&ir.pipeline[3], IROp::Filter(_)));
+    }
+
+    /// Multiple filters on a single deferred binding.
+    #[test]
+    fn test_lower_multiple_filters_on_deferred_binding() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $p: Person
+        $p knows $f
+        $f: Person { name: "Bob", age: 25 }
+    }
+    return { $f.name }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+        // Two prop_matches → two dst_filters on the Expand.
+        assert_eq!(ir.pipeline.len(), 2);
+        assert!(matches!(
+            &ir.pipeline[1],
+            IROp::Expand { dst_filters, .. }
+            if dst_filters.len() == 2
+        ));
+    }
+
+    /// Parameter in a deferred binding filter (unit test level).
+    #[test]
+    fn test_lower_param_filter_on_deferred_binding() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q($company: String) {
+    match {
+        $p: Person
+        $p worksAt $c
+        $c: Company { name: $company }
+    }
+    return { $p.name }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+        assert_eq!(ir.pipeline.len(), 2);
+        assert!(matches!(
+            &ir.pipeline[1],
+            IROp::Expand { dst_filters, .. }
+            if dst_filters.len() == 1
+        ));
+        // The filter's right-hand side should be a Param, not a Literal
+        if let IROp::Expand { dst_filters, .. } = &ir.pipeline[1] {
+            assert!(matches!(&dst_filters[0].right, IRExpr::Param(name) if name == "company"));
+        }
+    }
+
+    /// Negation with inner binding: inner binding is NOT deferred because
+    /// bound_vars (from outer scope) is not in binding_set for the inner call.
+    /// This documents current behavior — the inner pipeline uses a NodeScan +
+    /// cycle-closing, which is correct but less efficient than deferral.
+    #[test]
+    fn test_lower_negation_with_inner_binding() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $p: Person
+        not {
+            $p worksAt $c
+            $c: Company { name: "Acme" }
+        }
+    }
+    return { $p.name }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+        // Outer: NodeScan($p) + AntiJoin
+        assert_eq!(ir.pipeline.len(), 2);
+        assert!(matches!(&ir.pipeline[0], IROp::NodeScan { variable, .. } if variable == "p"));
+        let IROp::AntiJoin { inner, .. } = &ir.pipeline[1] else {
+            panic!("expected AntiJoin");
+        };
+        // Inner pipeline: $c is NOT deferred (it's the only binding in the
+        // inner scope), so it gets a NodeScan + cycle-closing (3 ops).
+        assert_eq!(inner.len(), 3);
+        assert!(matches!(&inner[0], IROp::NodeScan { variable, .. } if variable == "c"));
+        assert!(matches!(&inner[1], IROp::Expand { .. }));
+        assert!(matches!(&inner[2], IROp::Filter(_)));
     }
 }
