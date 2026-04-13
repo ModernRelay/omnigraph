@@ -76,3 +76,38 @@ query top_by_age() {
     order { $p.age desc }
     limit 2
 }
+
+// Aggregation: global count (no group key)
+query total_people() {
+    match {
+        $p: Person
+    }
+    return { count($p) as total }
+}
+
+// Aggregation: sum/avg/min/max of age per company
+query age_stats() {
+    match {
+        $p: Person
+        $p worksAt $c
+    }
+    return {
+        $c.name
+        sum($p.age) as total_age
+        avg($p.age) as avg_age
+        min($p.age) as youngest
+        max($p.age) as oldest
+        count($p) as headcount
+    }
+}
+
+// Aggregation: most connected person
+query top_connected() {
+    match {
+        $p: Person
+        $p knows $f
+    }
+    return { $p.name, count($f) as friends }
+    order { friends desc }
+    limit 1
+}

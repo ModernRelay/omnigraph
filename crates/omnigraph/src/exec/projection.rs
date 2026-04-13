@@ -1,25 +1,14 @@
 use super::*;
 
 pub(super) fn apply_filter(
-    bindings: &mut HashMap<String, RecordBatch>,
+    batch: &mut RecordBatch,
     filter: &IRFilter,
     params: &ParamMap,
 ) -> Result<()> {
-    // Find which binding this filter applies to
-    let var_name = match &filter.left {
-        IRExpr::PropAccess { variable, .. } => variable.clone(),
-        _ => return Ok(()), // Can't determine variable
-    };
-
-    let batch = bindings.get(&var_name).ok_or_else(|| {
-        OmniError::manifest(format!("filter references unbound variable '{}'", var_name))
-    })?;
-
     let mask = evaluate_filter(batch, filter, params)?;
     let filtered = arrow_select::filter::filter_record_batch(batch, &mask)
         .map_err(|e| OmniError::Lance(e.to_string()))?;
-
-    bindings.insert(var_name, filtered);
+    *batch = filtered;
     Ok(())
 }
 
@@ -59,12 +48,13 @@ fn evaluate_filter(
     Ok(result)
 }
 
-/// Evaluate an IR expression against a batch, producing an array.
+/// Evaluate an IR expression against a wide batch, producing an array.
 fn evaluate_expr(batch: &RecordBatch, expr: &IRExpr, params: &ParamMap) -> Result<ArrayRef> {
     match expr {
-        IRExpr::PropAccess { property, .. } => {
-            batch.column_by_name(property).cloned().ok_or_else(|| {
-                OmniError::manifest(format!("column '{}' not found in batch", property))
+        IRExpr::PropAccess { variable, property } => {
+            let col_name = format!("{}.{}", variable, property);
+            batch.column_by_name(&col_name).cloned().ok_or_else(|| {
+                OmniError::manifest(format!("column '{}' not found in wide batch", col_name))
             })
         }
         IRExpr::Literal(lit) => literal_to_array(lit, batch.num_rows()),
@@ -307,7 +297,7 @@ fn literal_scalar_type(lit: &Literal) -> Result<ScalarType> {
 
 /// Project return expressions into a result batch.
 pub(super) fn project_return(
-    bindings: &HashMap<String, RecordBatch>,
+    wide_batch: &RecordBatch,
     projections: &[IRProjection],
     params: &ParamMap,
 ) -> Result<RecordBatch> {
@@ -317,11 +307,19 @@ pub(super) fn project_return(
         ));
     }
 
+    // Route to aggregate path if any projection contains an aggregate
+    let has_aggregates = projections
+        .iter()
+        .any(|p| matches!(&p.expr, IRExpr::Aggregate { .. }));
+    if has_aggregates {
+        return aggregate_return(wide_batch, projections, params);
+    }
+
     let mut fields = Vec::with_capacity(projections.len());
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(projections.len());
 
     for proj in projections {
-        let (name, col) = evaluate_projection(bindings, &proj.expr, params)?;
+        let (name, col) = evaluate_projection(wide_batch, &proj.expr, params)?;
         let field_name = proj.alias.as_deref().unwrap_or(&name);
         fields.push(Field::new(
             field_name,
@@ -335,41 +333,40 @@ pub(super) fn project_return(
     RecordBatch::try_new(schema, columns).map_err(|e| OmniError::Lance(e.to_string()))
 }
 
-/// Evaluate a single projection expression.
+/// Evaluate a single projection expression against a wide batch.
 fn evaluate_projection(
-    bindings: &HashMap<String, RecordBatch>,
+    wide_batch: &RecordBatch,
     expr: &IRExpr,
     params: &ParamMap,
 ) -> Result<(String, ArrayRef)> {
     match expr {
         IRExpr::PropAccess { variable, property } => {
-            let batch = bindings.get(variable).ok_or_else(|| {
+            let col_name = format!("{}.{}", variable, property);
+            let col = wide_batch.column_by_name(&col_name).ok_or_else(|| {
                 OmniError::manifest(format!(
-                    "projection references unbound variable '{}'",
-                    variable
+                    "column '{}' not found in wide batch",
+                    col_name
                 ))
             })?;
-            let col = batch.column_by_name(property).ok_or_else(|| {
-                OmniError::manifest(format!(
-                    "column '{}' not found in binding '{}'",
-                    property, variable
-                ))
-            })?;
-            Ok((format!("{}.{}", variable, property), col.clone()))
+            Ok((col_name, col.clone()))
         }
         IRExpr::Literal(lit) => {
-            // Get row count from first binding
-            let num_rows = bindings.values().next().map(|b| b.num_rows()).unwrap_or(0);
-            let arr = literal_to_array(lit, num_rows)?;
+            let arr = literal_to_array(lit, wide_batch.num_rows())?;
             Ok(("literal".to_string(), arr))
         }
         IRExpr::Param(name) => {
             let lit = params
                 .get(name)
                 .ok_or_else(|| OmniError::manifest(format!("parameter '{}' not provided", name)))?;
-            let num_rows = bindings.values().next().map(|b| b.num_rows()).unwrap_or(0);
-            let arr = literal_to_array(lit, num_rows)?;
+            let arr = literal_to_array(lit, wide_batch.num_rows())?;
             Ok((name.clone(), arr))
+        }
+        IRExpr::Variable(name) => {
+            let col_name = format!("{}.id", name);
+            let col = wide_batch.column_by_name(&col_name).ok_or_else(|| {
+                OmniError::manifest(format!("column '{}' not found in wide batch", col_name))
+            })?;
+            Ok((name.clone(), col.clone()))
         }
         _ => Err(OmniError::manifest(format!(
             "unsupported projection expression: {:?}",
@@ -378,11 +375,12 @@ fn evaluate_projection(
     }
 }
 
-/// Apply ordering to a batch.
+/// Apply ordering to a batch. `source` is used to resolve PropAccess columns
+/// (typically the wide batch, or the result batch itself for aggregates).
 pub(super) fn apply_ordering(
     batch: RecordBatch,
     orderings: &[IROrdering],
-    bindings: &HashMap<String, RecordBatch>,
+    source: &RecordBatch,
     _params: &ParamMap,
 ) -> Result<RecordBatch> {
     use arrow_ord::sort::{SortColumn, lexsort_to_indices};
@@ -392,16 +390,11 @@ pub(super) fn apply_ordering(
     for ordering in orderings {
         let col = match &ordering.expr {
             IRExpr::PropAccess { variable, property } => {
-                let binding = bindings.get(variable).ok_or_else(|| {
-                    OmniError::manifest(format!(
-                        "ordering references unbound variable '{}'",
-                        variable
-                    ))
-                })?;
-                binding
-                    .column_by_name(property)
+                let col_name = format!("{}.{}", variable, property);
+                source
+                    .column_by_name(&col_name)
                     .ok_or_else(|| {
-                        OmniError::manifest(format!("column '{}' not found for ordering", property))
+                        OmniError::manifest(format!("column '{}' not found for ordering", col_name))
                     })?
                     .clone()
             }
@@ -441,4 +434,295 @@ pub(super) fn apply_ordering(
         .map_err(|e| OmniError::Lance(e.to_string()))?;
 
     RecordBatch::try_new(batch.schema(), columns).map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+// ─── Aggregate execution ───────────────────────────────────────────────────
+
+/// Project return expressions that contain aggregates.
+fn aggregate_return(
+    wide: &RecordBatch,
+    projections: &[IRProjection],
+    params: &ParamMap,
+) -> Result<RecordBatch> {
+    let num_rows = wide.num_rows();
+
+    struct GroupKey {
+        proj_idx: usize,
+        name: String,
+        column: ArrayRef,
+    }
+    struct AggProj {
+        proj_idx: usize,
+        name: String,
+        func: AggFunc,
+        arg_column: ArrayRef,
+    }
+
+    let mut group_keys: Vec<GroupKey> = Vec::new();
+    let mut agg_projs: Vec<AggProj> = Vec::new();
+
+    for (i, proj) in projections.iter().enumerate() {
+        match &proj.expr {
+            IRExpr::Aggregate { func, arg } => {
+                let (name, col) = evaluate_projection(wide, arg, params)?;
+                let alias = proj.alias.as_deref().unwrap_or(&name);
+                agg_projs.push(AggProj {
+                    proj_idx: i,
+                    name: alias.to_string(),
+                    func: *func,
+                    arg_column: col,
+                });
+            }
+            _ => {
+                let (name, col) = evaluate_projection(wide, &proj.expr, params)?;
+                let alias = proj.alias.as_deref().unwrap_or(&name);
+                group_keys.push(GroupKey {
+                    proj_idx: i,
+                    name: alias.to_string(),
+                    column: col,
+                });
+            }
+        }
+    }
+
+    // Handle empty input: return a single row with count=0, others=null
+    if num_rows == 0 && group_keys.is_empty() {
+        return build_empty_aggregate_result(projections);
+    }
+
+    // Build group assignments
+    let mut group_map: HashMap<String, usize> = HashMap::new();
+    let mut group_indices: Vec<Vec<usize>> = Vec::new();
+    let group_cols: Vec<&ArrayRef> = group_keys.iter().map(|gk| &gk.column).collect();
+
+    if group_keys.is_empty() {
+        group_indices.push((0..num_rows).collect());
+    } else {
+        for row in 0..num_rows {
+            let key = build_group_key(&group_cols, row);
+            let group_idx = match group_map.get(&key) {
+                Some(&idx) => idx,
+                None => {
+                    let idx = group_indices.len();
+                    group_map.insert(key, idx);
+                    group_indices.push(Vec::new());
+                    idx
+                }
+            };
+            group_indices[group_idx].push(row);
+        }
+    }
+
+    let num_groups = group_indices.len();
+    let mut result_columns: Vec<(usize, String, ArrayRef)> =
+        Vec::with_capacity(projections.len());
+
+    for gk in &group_keys {
+        let first_row_indices: Vec<u32> =
+            group_indices.iter().map(|rows| rows[0] as u32).collect();
+        let take_idx = UInt32Array::from(first_row_indices);
+        let col = arrow_select::take::take(gk.column.as_ref(), &take_idx, None)
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        result_columns.push((gk.proj_idx, gk.name.clone(), col));
+    }
+
+    for ap in &agg_projs {
+        let col = compute_aggregate(ap.func, &ap.arg_column, &group_indices, num_groups)?;
+        result_columns.push((ap.proj_idx, ap.name.clone(), col));
+    }
+
+    result_columns.sort_by_key(|(idx, _, _)| *idx);
+
+    let fields: Vec<Field> = result_columns
+        .iter()
+        .map(|(_, name, col)| Field::new(name, col.data_type().clone(), true))
+        .collect();
+    let columns: Vec<ArrayRef> = result_columns.into_iter().map(|(_, _, col)| col).collect();
+
+    let schema = Arc::new(Schema::new(fields));
+    RecordBatch::try_new(schema, columns).map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+/// Build a string key for grouping using length-prefixed encoding.
+fn build_group_key(group_columns: &[&ArrayRef], row: usize) -> String {
+    let mut key = String::new();
+    for col in group_columns {
+        if col.is_null(row) {
+            key.push('N');
+        } else {
+            let val = arrow_cast::display::array_value_to_string(col, row).unwrap_or_default();
+            key.push('L');
+            key.push_str(&val.len().to_string());
+            key.push(':');
+            key.push_str(&val);
+        }
+    }
+    key
+}
+
+fn compute_aggregate(
+    func: AggFunc,
+    arg: &ArrayRef,
+    group_indices: &[Vec<usize>],
+    num_groups: usize,
+) -> Result<ArrayRef> {
+    match func {
+        AggFunc::Count => {
+            let mut builder = Int64Builder::with_capacity(num_groups);
+            for group in group_indices {
+                let count = group.iter().filter(|&&i| !arg.is_null(i)).count();
+                builder.append_value(count as i64);
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
+        AggFunc::Sum => compute_sum(arg, group_indices, num_groups),
+        AggFunc::Avg => compute_avg(arg, group_indices, num_groups),
+        AggFunc::Min => compute_min_max(arg, group_indices, num_groups, true),
+        AggFunc::Max => compute_min_max(arg, group_indices, num_groups, false),
+    }
+}
+
+fn compute_sum(arg: &ArrayRef, group_indices: &[Vec<usize>], num_groups: usize) -> Result<ArrayRef> {
+    macro_rules! sum_numeric {
+        ($arr_type:ty, $arg:expr, $dt:expr) => {{
+            let arr = $arg.as_any().downcast_ref::<$arr_type>().ok_or_else(|| {
+                OmniError::manifest(format!("sum: expected {:?}, got {:?}", $dt, $arg.data_type()))
+            })?;
+            let mut builder = Float64Builder::with_capacity(num_groups);
+            for group in group_indices {
+                let mut sum = None;
+                for &i in group {
+                    if !arr.is_null(i) {
+                        *sum.get_or_insert(0.0f64) += arr.value(i) as f64;
+                    }
+                }
+                match sum {
+                    Some(v) => builder.append_value(v),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }};
+    }
+    match arg.data_type() {
+        dt @ DataType::Int32 => sum_numeric!(Int32Array, arg, dt),
+        dt @ DataType::Int64 => sum_numeric!(Int64Array, arg, dt),
+        dt @ DataType::UInt32 => sum_numeric!(UInt32Array, arg, dt),
+        dt @ DataType::UInt64 => sum_numeric!(UInt64Array, arg, dt),
+        dt @ DataType::Float32 => sum_numeric!(Float32Array, arg, dt),
+        dt @ DataType::Float64 => sum_numeric!(Float64Array, arg, dt),
+        dt => Err(OmniError::manifest(format!("sum: unsupported type {:?}", dt))),
+    }
+}
+
+fn compute_avg(arg: &ArrayRef, group_indices: &[Vec<usize>], num_groups: usize) -> Result<ArrayRef> {
+    macro_rules! avg_typed {
+        ($arr_type:ty, $arg:expr) => {{
+            let arr = $arg.as_any().downcast_ref::<$arr_type>().ok_or_else(|| {
+                OmniError::manifest(format!("avg: expected {:?}, got {:?}", stringify!($arr_type), $arg.data_type()))
+            })?;
+            let mut builder = Float64Builder::with_capacity(num_groups);
+            for group in group_indices {
+                let mut sum = 0.0f64;
+                let mut count = 0usize;
+                for &i in group {
+                    if !arr.is_null(i) { sum += arr.value(i) as f64; count += 1; }
+                }
+                if count > 0 { builder.append_value(sum / count as f64); } else { builder.append_null(); }
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }};
+    }
+    match arg.data_type() {
+        DataType::Int32 => avg_typed!(Int32Array, arg),
+        DataType::Int64 => avg_typed!(Int64Array, arg),
+        DataType::UInt32 => avg_typed!(UInt32Array, arg),
+        DataType::UInt64 => avg_typed!(UInt64Array, arg),
+        DataType::Float32 => avg_typed!(Float32Array, arg),
+        DataType::Float64 => avg_typed!(Float64Array, arg),
+        dt => Err(OmniError::manifest(format!("avg: unsupported type {:?}", dt))),
+    }
+}
+
+fn compute_min_max(arg: &ArrayRef, group_indices: &[Vec<usize>], num_groups: usize, is_min: bool) -> Result<ArrayRef> {
+    macro_rules! minmax_typed {
+        ($arr_type:ty, $builder_type:ty, $arg:expr, $is_min:expr) => {{
+            let arr = $arg.as_any().downcast_ref::<$arr_type>().ok_or_else(|| {
+                OmniError::manifest(format!("min/max: expected {:?}, got {:?}", stringify!($arr_type), $arg.data_type()))
+            })?;
+            let mut builder = <$builder_type>::with_capacity(num_groups);
+            for group in group_indices {
+                let mut result = None;
+                for &i in group {
+                    if !arr.is_null(i) {
+                        let v = arr.value(i);
+                        result = Some(match result {
+                            None => v,
+                            Some(cur) => if $is_min { if v < cur { v } else { cur } } else { if v > cur { v } else { cur } },
+                        });
+                    }
+                }
+                match result { Some(v) => builder.append_value(v), None => builder.append_null() }
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }};
+    }
+    match arg.data_type() {
+        DataType::Int32 => minmax_typed!(Int32Array, Int32Builder, arg, is_min),
+        DataType::Int64 => minmax_typed!(Int64Array, Int64Builder, arg, is_min),
+        DataType::UInt32 => minmax_typed!(UInt32Array, UInt32Builder, arg, is_min),
+        DataType::UInt64 => minmax_typed!(UInt64Array, UInt64Builder, arg, is_min),
+        DataType::Float32 => minmax_typed!(Float32Array, Float32Builder, arg, is_min),
+        DataType::Float64 => minmax_typed!(Float64Array, Float64Builder, arg, is_min),
+        DataType::Utf8 => {
+            let arr = arg.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                OmniError::manifest(format!("min/max: expected Utf8, got {:?}", arg.data_type()))
+            })?;
+            let mut builder = StringBuilder::with_capacity(num_groups, num_groups * 16);
+            for group in group_indices {
+                let mut result: Option<&str> = None;
+                for &i in group {
+                    if !arr.is_null(i) {
+                        let v = arr.value(i);
+                        result = Some(match result {
+                            None => v,
+                            Some(cur) => if is_min { if v < cur { v } else { cur } } else { if v > cur { v } else { cur } },
+                        });
+                    }
+                }
+                match result { Some(v) => builder.append_value(v), None => builder.append_null() }
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
+        dt => Err(OmniError::manifest(format!("min/max: unsupported type {:?}", dt))),
+    }
+}
+
+/// Build a single-row result for an aggregate query with zero input rows and no group keys.
+fn build_empty_aggregate_result(projections: &[IRProjection]) -> Result<RecordBatch> {
+    let mut fields = Vec::with_capacity(projections.len());
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(projections.len());
+
+    for proj in projections {
+        let name = proj.alias.as_deref().unwrap_or("?");
+        match &proj.expr {
+            IRExpr::Aggregate { func, .. } => match func {
+                AggFunc::Count => {
+                    fields.push(Field::new(name, DataType::Int64, true));
+                    columns.push(Arc::new(Int64Array::from(vec![0i64])) as ArrayRef);
+                }
+                _ => {
+                    fields.push(Field::new(name, DataType::Float64, true));
+                    columns.push(Arc::new(Float64Array::from(vec![None as Option<f64>])) as ArrayRef);
+                }
+            },
+            _ => {
+                fields.push(Field::new(name, DataType::Utf8, true));
+                columns.push(Arc::new(StringArray::from(vec![None as Option<&str>])) as ArrayRef);
+            }
+        }
+    }
+
+    let schema = Arc::new(Schema::new(fields));
+    RecordBatch::try_new(schema, columns).map_err(|e| OmniError::Lance(e.to_string()))
 }

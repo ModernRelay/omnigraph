@@ -358,25 +358,21 @@ pub async fn execute_query(
         return execute_rrf_query(ir, params, snapshot, graph_index, catalog, rrf).await;
     }
 
-    let mut bindings: HashMap<String, RecordBatch> = HashMap::new();
-
-    execute_pipeline(
-        &ir.pipeline,
-        params,
-        snapshot,
-        graph_index,
-        catalog,
-        &mut bindings,
-        &search_mode,
-    )
-    .await?;
+    let mut wide: Option<RecordBatch> = None;
+    execute_pipeline(&ir.pipeline, params, snapshot, graph_index, catalog, &mut wide, &search_mode).await?;
+    let wide_batch = wide.unwrap_or_else(|| RecordBatch::new_empty(Arc::new(Schema::empty())));
 
     // Project return expressions
-    let mut result_batch = project_return(&bindings, &ir.return_exprs, params)?;
+    let has_aggregates = ir.return_exprs.iter().any(|p| matches!(&p.expr, IRExpr::Aggregate { .. }));
+    let mut result_batch = project_return(&wide_batch, &ir.return_exprs, params)?;
 
     // Apply ordering (skip if search mode already ordered the results)
     if !ir.order_by.is_empty() && !is_search_ordered(&search_mode) {
-        result_batch = apply_ordering(result_batch, &ir.order_by, &bindings, params)?;
+        result_batch = if has_aggregates {
+            apply_ordering(result_batch.clone(), &ir.order_by, &result_batch, params)?
+        } else {
+            apply_ordering(result_batch, &ir.order_by, &wide_batch, params)?
+        };
     }
 
     // Apply limit
@@ -403,27 +399,27 @@ async fn execute_rrf_query(
     rrf: &RrfMode,
 ) -> Result<QueryResult> {
     // Execute primary search
-    let mut primary_bindings: HashMap<String, RecordBatch> = HashMap::new();
+    let mut primary_wide: Option<RecordBatch> = None;
     execute_pipeline(
         &ir.pipeline,
         params,
         snapshot,
         graph_index,
         catalog,
-        &mut primary_bindings,
+        &mut primary_wide,
         &rrf.primary,
     )
     .await?;
 
     // Execute secondary search
-    let mut secondary_bindings: HashMap<String, RecordBatch> = HashMap::new();
+    let mut secondary_wide: Option<RecordBatch> = None;
     execute_pipeline(
         &ir.pipeline,
         params,
         snapshot,
         graph_index,
         catalog,
-        &mut secondary_bindings,
+        &mut secondary_wide,
         &rrf.secondary,
     )
     .await?;
@@ -438,13 +434,13 @@ async fn execute_rrf_query(
         .or_else(|| rrf.primary.bm25.as_ref().map(|(v, ..)| v.as_str()))
         .ok_or_else(|| OmniError::manifest("rrf primary must be nearest or bm25".to_string()))?;
 
-    let primary_batch = primary_bindings.get(primary_var).ok_or_else(|| {
+    let primary_batch = primary_wide.as_ref().ok_or_else(|| {
         OmniError::manifest(format!(
             "rrf primary variable '{}' not in bindings",
             primary_var
         ))
     })?;
-    let secondary_batch = secondary_bindings.get(primary_var).ok_or_else(|| {
+    let secondary_batch = secondary_wide.as_ref().ok_or_else(|| {
         OmniError::manifest(format!(
             "rrf secondary variable '{}' not in bindings",
             primary_var
@@ -452,8 +448,9 @@ async fn execute_rrf_query(
     })?;
 
     // Build ID → rank maps
-    let primary_ids = extract_id_column(primary_batch)?;
-    let secondary_ids = extract_id_column(secondary_batch)?;
+    let id_col_name = format!("{}.id", primary_var);
+    let primary_ids = extract_id_column_by_name(primary_batch, &id_col_name)?;
+    let secondary_ids = extract_id_column_by_name(secondary_batch, &id_col_name)?;
 
     let mut primary_rank: HashMap<String, usize> = HashMap::new();
     for (i, id) in primary_ids.iter().enumerate() {
@@ -510,24 +507,21 @@ async fn execute_rrf_query(
     // Reconstruct a combined batch for the binding in winning order
     let fused_batch = build_fused_batch(&winning_ids, &id_to_batch_row, primary_batch.schema())?;
 
-    // Replace the binding and project
-    let mut fused_bindings = primary_bindings;
-    fused_bindings.insert(primary_var.to_string(), fused_batch);
-
-    let result_batch = project_return(&fused_bindings, &ir.return_exprs, params)?;
+    // Project directly from fused batch
+    let result_batch = project_return(&fused_batch, &ir.return_exprs, params)?;
 
     // Already ordered by RRF score + already limited
     Ok(QueryResult::new(result_batch.schema(), vec![result_batch]))
 }
 
-fn extract_id_column(batch: &RecordBatch) -> Result<Vec<String>> {
+fn extract_id_column_by_name(batch: &RecordBatch, col_name: &str) -> Result<Vec<String>> {
     let col = batch
-        .column_by_name("id")
-        .ok_or_else(|| OmniError::manifest("batch missing 'id' column for RRF".to_string()))?;
+        .column_by_name(col_name)
+        .ok_or_else(|| OmniError::manifest(format!("batch missing '{}' column for RRF", col_name)))?;
     let ids = col
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| OmniError::manifest("'id' column is not Utf8".to_string()))?;
+        .ok_or_else(|| OmniError::manifest(format!("'{}' column is not Utf8", col_name)))?;
     Ok((0..ids.len()).map(|i| ids.value(i).to_string()).collect())
 }
 
@@ -585,7 +579,7 @@ fn execute_pipeline<'a>(
     snapshot: &'a Snapshot,
     graph_index: Option<&'a GraphIndex>,
     catalog: &'a Catalog,
-    bindings: &'a mut HashMap<String, RecordBatch>,
+    wide: &'a mut Option<RecordBatch>,
     search_mode: &'a SearchMode,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
@@ -632,10 +626,16 @@ fn execute_pipeline<'a>(
                         search_mode,
                     )
                     .await?;
-                    bindings.insert(variable.clone(), batch);
+                    let prefixed = prefix_batch(&batch, variable)?;
+                    *wide = Some(match wide.take() {
+                        None => prefixed,
+                        Some(existing) => cross_join_batches(&existing, &prefixed)?,
+                    });
                 }
                 IROp::Filter(filter) => {
-                    apply_filter(bindings, filter, params)?;
+                    if let Some(batch) = wide.as_mut() {
+                        apply_filter(batch, filter, params)?;
+                    }
                 }
                 IROp::Expand {
                     src_var,
@@ -649,17 +649,20 @@ fn execute_pipeline<'a>(
                     let gi = graph_index.ok_or_else(|| {
                         OmniError::manifest("graph index required for traversal".to_string())
                     })?;
-                    let batch = execute_expand(
-                        bindings, gi, snapshot, catalog, src_var, dst_var, edge_type, *direction,
-                        dst_type, *min_hops, *max_hops,
-                    )
-                    .await?;
-                    bindings.insert(dst_var.clone(), batch);
+                    if let Some(batch) = wide.as_mut() {
+                        execute_expand(
+                            batch, gi, snapshot, catalog, src_var, dst_var, edge_type, *direction,
+                            dst_type, *min_hops, *max_hops,
+                        )
+                        .await?;
+                    }
                 }
                 IROp::AntiJoin { outer_var, inner } => {
                     let gi = graph_index;
-                    execute_anti_join(bindings, inner, params, snapshot, gi, catalog, outer_var)
-                        .await?;
+                    if let Some(batch) = wide.as_mut() {
+                        execute_anti_join(batch, inner, params, snapshot, gi, catalog, outer_var)
+                            .await?;
+                    }
                 }
             }
         }
@@ -669,28 +672,26 @@ fn execute_pipeline<'a>(
 
 /// Execute a graph traversal (Expand).
 async fn execute_expand(
-    bindings: &HashMap<String, RecordBatch>,
+    wide: &mut RecordBatch,
     graph_index: &GraphIndex,
     snapshot: &Snapshot,
     catalog: &Catalog,
     src_var: &str,
-    _dst_var: &str,
+    dst_var: &str,
     edge_type: &str,
     direction: Direction,
     dst_type: &str,
     min_hops: u32,
     max_hops: Option<u32>,
-) -> Result<RecordBatch> {
-    let src_batch = bindings.get(src_var).ok_or_else(|| {
-        OmniError::manifest(format!("expand references unbound variable '{}'", src_var))
-    })?;
-
-    let src_ids = src_batch
-        .column_by_name("id")
-        .ok_or_else(|| OmniError::manifest("source batch missing 'id' column".to_string()))?
+) -> Result<()> {
+    let src_id_col_name = format!("{}.id", src_var);
+    let src_ids = wide
+        .column_by_name(&src_id_col_name)
+        .ok_or_else(|| OmniError::manifest(format!("wide batch missing '{}' column", src_id_col_name)))?
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| OmniError::manifest("source 'id' column is not Utf8".to_string()))?;
+        .ok_or_else(|| OmniError::manifest(format!("'{}' column is not Utf8", src_id_col_name)))?
+        .clone();
 
     // Determine which type index to use for source and destination
     let edge_def = catalog
@@ -720,8 +721,9 @@ async fn execute_expand(
 
     let same_type = src_type_name == dst_type_name;
 
-    // BFS to collect reachable destination dense IDs
-    let mut result_dst_ids: Vec<String> = Vec::new();
+    // BFS to collect (src_row_idx, dst_id) pairs with per-source dedup
+    let mut src_indices: Vec<u32> = Vec::new();
+    let mut dst_id_list: Vec<String> = Vec::new();
     for i in 0..src_ids.len() {
         let src_id = src_ids.value(i);
         let Some(src_dense) = src_type_idx.to_dense(src_id) else {
@@ -749,7 +751,8 @@ async fn execute_expand(
                             if let Some(dst_id) = dst_type_idx.to_id(neighbor) {
                                 let dst_id = dst_id.to_string();
                                 if seen_dst_ids.insert(dst_id.clone()) {
-                                    result_dst_ids.push(dst_id);
+                                    src_indices.push(i as u32);
+                                    dst_id_list.push(dst_id);
                                 }
                             }
                         }
@@ -764,7 +767,36 @@ async fn execute_expand(
     }
 
     // Hydrate destination nodes from the snapshot
-    hydrate_nodes(snapshot, catalog, dst_type, &result_dst_ids).await
+    let dst_batch = hydrate_nodes(snapshot, catalog, dst_type, &dst_id_list).await?;
+
+    // Build a mapping from dst_id to row index in dst_batch
+    let dst_batch_id_col = dst_batch
+        .column_by_name("id")
+        .ok_or_else(|| OmniError::manifest("hydrated batch missing 'id' column".to_string()))?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| OmniError::manifest("hydrated 'id' column is not Utf8".to_string()))?;
+    let dst_id_to_row: HashMap<&str, usize> = (0..dst_batch_id_col.len())
+        .map(|i| (dst_batch_id_col.value(i), i))
+        .collect();
+
+    // Build aligned src/dst index arrays (only for IDs that exist in hydrated batch)
+    let mut final_src_indices: Vec<u32> = Vec::new();
+    let mut dst_indices: Vec<u32> = Vec::new();
+    for (src_idx, dst_id) in src_indices.iter().zip(dst_id_list.iter()) {
+        if let Some(&dst_row) = dst_id_to_row.get(dst_id.as_str()) {
+            final_src_indices.push(*src_idx);
+            dst_indices.push(dst_row as u32);
+        }
+    }
+
+    let src_take = UInt32Array::from(final_src_indices);
+    let dst_take = UInt32Array::from(dst_indices);
+    let expanded_wide = take_batch(wide, &src_take)?;
+    let dst_prefixed = prefix_batch(&dst_batch, dst_var)?;
+    let aligned_dst = take_batch(&dst_prefixed, &dst_take)?;
+    *wide = hconcat_batches(&expanded_wide, &aligned_dst)?;
+    Ok(())
 }
 
 /// Load full node rows for a set of IDs from a snapshot.
@@ -829,15 +861,15 @@ async fn hydrate_nodes(
     Ok(scan_result)
 }
 
-/// Try bulk anti-join via CSR existence check. Returns Some if the inner
+/// Try bulk anti-join via CSR existence check. Returns Some(mask) if the inner
 /// pipeline is a single Expand from outer_var (the common negation pattern).
-fn try_bulk_anti_join(
-    outer_batch: &RecordBatch,
+fn try_bulk_anti_join_mask(
+    wide: &RecordBatch,
     inner_pipeline: &[IROp],
     graph_index: Option<&GraphIndex>,
     catalog: &Catalog,
     outer_var: &str,
-) -> Option<Result<RecordBatch>> {
+) -> Option<BooleanArray> {
     if inner_pipeline.len() != 1 {
         return None;
     }
@@ -866,8 +898,9 @@ fn try_bulk_anti_join(
     }?;
     let type_idx = gi.type_index(src_type_name)?;
 
-    let outer_ids = outer_batch
-        .column_by_name("id")?
+    let id_col_name = format!("{}.id", outer_var);
+    let outer_ids = wide
+        .column_by_name(&id_col_name)?
         .as_any()
         .downcast_ref::<StringArray>()?;
 
@@ -881,16 +914,12 @@ fn try_bulk_anti_join(
         })
         .collect();
 
-    let mask = BooleanArray::from(keep_mask);
-    Some(
-        arrow_select::filter::filter_record_batch(outer_batch, &mask)
-            .map_err(|e| OmniError::Lance(e.to_string())),
-    )
+    Some(BooleanArray::from(keep_mask))
 }
 
-/// Execute an AntiJoin: remove rows from outer_var where the inner pipeline finds matches.
+/// Execute an AntiJoin: remove rows from wide batch where the inner pipeline finds matches.
 async fn execute_anti_join(
-    bindings: &mut HashMap<String, RecordBatch>,
+    wide: &mut RecordBatch,
     inner_pipeline: &[IROp],
     params: &ParamMap,
     snapshot: &Snapshot,
@@ -898,35 +927,22 @@ async fn execute_anti_join(
     catalog: &Catalog,
     outer_var: &str,
 ) -> Result<()> {
-    let outer_batch = bindings.get(outer_var).ok_or_else(|| {
-        OmniError::manifest(format!(
-            "anti-join references unbound variable '{}'",
-            outer_var
-        ))
-    })?;
-
     // Fast path: bulk CSR existence check (O(N), zero Lance I/O)
-    if let Some(result) =
-        try_bulk_anti_join(outer_batch, inner_pipeline, graph_index, catalog, outer_var)
+    if let Some(mask) =
+        try_bulk_anti_join_mask(wide, inner_pipeline, graph_index, catalog, outer_var)
     {
-        bindings.insert(outer_var.to_string(), result?);
+        *wide = arrow_select::filter::filter_record_batch(wide, &mask)
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
         return Ok(());
     }
 
     // Slow path: per-row inner pipeline execution
-    let outer_ids = outer_batch
-        .column_by_name("id")
-        .ok_or_else(|| OmniError::manifest("outer batch missing 'id' column".to_string()))?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| OmniError::manifest("outer 'id' column is not Utf8".to_string()))?;
+    let num_rows = wide.num_rows();
+    let mut keep_mask = vec![true; num_rows];
 
-    let mut keep_mask = vec![true; outer_batch.num_rows()];
-
-    for i in 0..outer_ids.len() {
-        let single_row = outer_batch.slice(i, 1);
-        let mut inner_bindings: HashMap<String, RecordBatch> = HashMap::new();
-        inner_bindings.insert(outer_var.to_string(), single_row);
+    for i in 0..num_rows {
+        let single_row = wide.slice(i, 1);
+        let mut inner_wide: Option<RecordBatch> = Some(single_row);
 
         let no_search = SearchMode::default();
         execute_pipeline(
@@ -935,15 +951,15 @@ async fn execute_anti_join(
             snapshot,
             graph_index,
             catalog,
-            &mut inner_bindings,
+            &mut inner_wide,
             &no_search,
         )
         .await?;
 
-        let has_match = inner_bindings
-            .iter()
-            .filter(|(k, _)| *k != outer_var)
-            .any(|(_, batch)| batch.num_rows() > 0);
+        let has_match = inner_wide
+            .as_ref()
+            .map(|batch| batch.num_rows() > 0)
+            .unwrap_or(false);
 
         if has_match {
             keep_mask[i] = false;
@@ -951,10 +967,8 @@ async fn execute_anti_join(
     }
 
     let mask = BooleanArray::from(keep_mask);
-    let filtered = arrow_select::filter::filter_record_batch(outer_batch, &mask)
+    *wide = arrow_select::filter::filter_record_batch(wide, &mask)
         .map_err(|e| OmniError::Lance(e.to_string()))?;
-
-    bindings.insert(outer_var.to_string(), filtered);
     Ok(())
 }
 
@@ -1219,4 +1233,51 @@ pub(super) fn literal_to_sql(lit: &Literal) -> String {
         Literal::DateTime(s) => format!("'{}'", s.replace('\'', "''")),
         Literal::List(_) => "NULL".to_string(), // Not supported in SQL pushdown
     }
+}
+
+fn prefix_batch(batch: &RecordBatch, variable: &str) -> Result<RecordBatch> {
+    let fields: Vec<Field> = batch.schema().fields().iter().map(|f| {
+        Field::new(format!("{}.{}", variable, f.name()), f.data_type().clone(), f.is_nullable())
+    }).collect();
+    let schema = Arc::new(Schema::new(fields));
+    RecordBatch::try_new(schema, batch.columns().to_vec()).map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+fn cross_join_batches(left: &RecordBatch, right: &RecordBatch) -> Result<RecordBatch> {
+    let n = left.num_rows();
+    let m = right.num_rows();
+    if n == 0 || m == 0 {
+        let mut fields: Vec<Field> = left.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+        fields.extend(right.schema().fields().iter().map(|f| f.as_ref().clone()));
+        return Ok(RecordBatch::new_empty(Arc::new(Schema::new(fields))));
+    }
+    let left_indices: Vec<u32> = (0..n as u32).flat_map(|i| std::iter::repeat(i).take(m)).collect();
+    let right_indices: Vec<u32> = (0..n).flat_map(|_| 0..m as u32).collect();
+    let left_expanded = take_batch(left, &UInt32Array::from(left_indices))?;
+    let right_expanded = take_batch(right, &UInt32Array::from(right_indices))?;
+    hconcat_batches(&left_expanded, &right_expanded)
+}
+
+fn hconcat_batches(left: &RecordBatch, right: &RecordBatch) -> Result<RecordBatch> {
+    let mut fields: Vec<Field> = left.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+    if cfg!(debug_assertions) {
+        let left_schema = left.schema();
+        let left_names: HashSet<&str> = left_schema.fields().iter().map(|f| f.name().as_str()).collect();
+        let right_schema = right.schema();
+        for f in right_schema.fields() {
+            debug_assert!(!left_names.contains(f.name().as_str()), "hconcat_batches: duplicate column '{}'", f.name());
+        }
+    }
+    fields.extend(right.schema().fields().iter().map(|f| f.as_ref().clone()));
+    let mut columns: Vec<ArrayRef> = left.columns().to_vec();
+    columns.extend(right.columns().to_vec());
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+fn take_batch(batch: &RecordBatch, indices: &UInt32Array) -> Result<RecordBatch> {
+    let columns: Vec<ArrayRef> = batch.columns().iter()
+        .map(|col| arrow_select::take::take(col.as_ref(), indices, None))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    RecordBatch::try_new(batch.schema(), columns).map_err(|e| OmniError::Lance(e.to_string()))
 }
