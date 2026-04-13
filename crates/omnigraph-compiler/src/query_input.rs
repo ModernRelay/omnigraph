@@ -270,7 +270,15 @@ pub fn json_params_to_param_map(
     let mut map = ParamMap::new();
     let object = match params {
         Some(Value::Object(object)) => object,
-        Some(Value::Null) | None => return Ok(map),
+        Some(Value::Null) | None => {
+            // Still fill in Literal::Null for declared nullable params.
+            for param in query_params {
+                if param.nullable {
+                    map.insert(param.name.clone(), Literal::Null);
+                }
+            }
+            return Ok(map);
+        }
         Some(other) => {
             let message = match mode {
                 JsonParamMode::Standard => "params must be a JSON object".to_string(),
@@ -991,5 +999,19 @@ query q($tags: [String], $days: [Date]?, $due_at: DateTime) {
         .expect("inferred null should succeed");
 
         assert!(matches!(params.get("extra"), Some(Literal::Null)));
+    }
+
+    #[test]
+    fn nullable_params_filled_when_params_is_none() {
+        let query = find_named_query(
+            "query q($bio: String?) { match { $u: User } return { $u } }",
+            "q",
+        )
+        .expect("query");
+
+        let params = json_params_to_param_map(None, &query.params, JsonParamMode::Standard)
+            .expect("None params should succeed with nullable declarations");
+
+        assert!(matches!(params.get("bio"), Some(Literal::Null)));
     }
 }
