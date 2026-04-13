@@ -396,3 +396,220 @@ query insert_no_name($age: I32) {
 
     assert!(result.is_err(), "insert without @key property should fail");
 }
+
+// ─── Join alignment: traversal + destination binding ───────────────────────
+
+/// Traversal with destination binding filter constrains the source.
+/// Regression: previously over-returned because the lowering created a
+/// cross-join followed by cycle-closing instead of Expand + post-filter.
+#[tokio::test]
+async fn traversal_destination_binding_constrains_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    // Only Alice works at Acme. The binding on $c must constrain $p.
+    let queries = r#"
+query at_acme() {
+    match {
+        $p: Person
+        $p worksAt $c
+        $c: Company { name: "Acme" }
+    }
+    return { $p.name }
+}
+"#;
+    let result = query_main(&mut db, queries, "at_acme", &ParamMap::new())
+        .await
+        .unwrap();
+
+    let batch = result.concat_batches().unwrap();
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(names.len(), 1);
+    assert_eq!(names.value(0), "Alice");
+}
+
+/// Multi-variable projection: columns from source and destination must be
+/// row-aligned.  Previously this could fail with "all columns must have
+/// the same length" when variables had different cardinalities.
+#[tokio::test]
+async fn traversal_multi_variable_projection_aligned() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let queries = r#"
+query employee_companies() {
+    match {
+        $p: Person
+        $p worksAt $c
+        $c: Company
+    }
+    return { $p.name, $c.name }
+}
+"#;
+    let result = query_main(&mut db, queries, "employee_companies", &ParamMap::new())
+        .await
+        .unwrap();
+
+    let batch = result.concat_batches().unwrap();
+    // Alice→Acme, Bob→Globex
+    assert_eq!(batch.num_rows(), 2);
+    let person_names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let company_names = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    let mut pairs: Vec<(&str, &str)> = (0..batch.num_rows())
+        .map(|i| (person_names.value(i), company_names.value(i)))
+        .collect();
+    pairs.sort();
+    assert_eq!(pairs, vec![("Alice", "Acme"), ("Bob", "Globex")]);
+}
+
+/// Multi-hop projection: all three variables must be row-aligned.
+#[tokio::test]
+async fn multi_hop_projection_aligned() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    // Alice knows Bob, Bob knows Diana.
+    // Alice→Bob→Diana is the only 2-hop path.
+    let queries = r#"
+query fof_chain($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows $mid
+        $mid knows $fof
+    }
+    return { $p.name, $mid.name, $fof.name }
+}
+"#;
+    let result = query_main(
+        &mut db,
+        queries,
+        "fof_chain",
+        &params(&[("$name", "Alice")]),
+    )
+    .await
+    .unwrap();
+
+    let batch = result.concat_batches().unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    let col0 = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    let col1 = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+    let col2 = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(col0.value(0), "Alice");
+    assert_eq!(col1.value(0), "Bob");
+    assert_eq!(col2.value(0), "Diana");
+}
+
+/// Multi-hop with destination binding filters at each hop.
+#[tokio::test]
+async fn multi_hop_with_intermediate_binding_filters() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    // Alice knows Bob and Charlie.
+    // Bob knows Diana. Charlie knows nobody.
+    // Filter $mid to only "Bob" → only Alice→Bob→Diana survives.
+    let queries = r#"
+query fof_via($name: String, $mid_name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows $mid
+        $mid: Person { name: $mid_name }
+        $mid knows $fof
+    }
+    return { $fof.name }
+}
+"#;
+    let result = query_main(
+        &mut db,
+        queries,
+        "fof_via",
+        &params(&[("$name", "Alice"), ("$mid_name", "Bob")]),
+    )
+    .await
+    .unwrap();
+
+    let batch = result.concat_batches().unwrap();
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(names.len(), 1);
+    assert_eq!(names.value(0), "Diana");
+}
+
+/// Destination binding with filter + multi-variable return: the classic
+/// "join across a traversal" scenario that triggers the bug.
+#[tokio::test]
+async fn traversal_destination_filter_with_multi_return() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let queries = r#"
+query at_acme_named() {
+    match {
+        $p: Person
+        $p worksAt $c
+        $c: Company { name: "Acme" }
+    }
+    return { $p.name, $c.name }
+}
+"#;
+    let result = query_main(&mut db, queries, "at_acme_named", &ParamMap::new())
+        .await
+        .unwrap();
+
+    let batch = result.concat_batches().unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    let person = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    let company = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(person.value(0), "Alice");
+    assert_eq!(company.value(0), "Acme");
+}
+
+/// Parameterized destination filter exercises param resolution through the
+/// Lance SQL pushdown path (params are resolved to literals in ir_expr_to_sql).
+#[tokio::test]
+async fn traversal_destination_filter_pushdown_with_param() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let queries = r#"
+query at_company($company: String) {
+    match {
+        $p: Person
+        $p worksAt $c
+        $c: Company { name: $company }
+    }
+    return { $p.name, $c.name }
+}
+"#;
+    let result = query_main(
+        &mut db,
+        queries,
+        "at_company",
+        &params(&[("$company", "Globex")]),
+    )
+    .await
+    .unwrap();
+
+    let batch = result.concat_batches().unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    let person = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    let company = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(person.value(0), "Bob");
+    assert_eq!(company.value(0), "Globex");
+}

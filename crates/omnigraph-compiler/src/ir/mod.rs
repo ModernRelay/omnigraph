@@ -70,6 +70,10 @@ pub enum IROp {
         dst_type: String,
         min_hops: u32,
         max_hops: Option<u32>,
+        /// Filters from a deferred destination binding, pushed into the
+        /// Expand so the executor can apply them during hydration (Lance
+        /// SQL pushdown) rather than as a separate post-expand pass.
+        dst_filters: Vec<IRFilter>,
     },
     Filter(IRFilter),
     AntiJoin {

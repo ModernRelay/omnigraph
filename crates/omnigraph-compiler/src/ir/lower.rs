@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::catalog::Catalog;
 use crate::error::Result;
@@ -147,67 +147,89 @@ fn lower_clauses(
         }
     }
 
-    // Lower bindings into NodeScan ops
+    // ── Determine which bindings are "deferred" ─────────────────────────
+    //
+    // When multiple bindings in the same match clause are connected by
+    // traversals, only the first-declared binding needs a NodeScan; the
+    // rest will be introduced by Expand operations.  Making them all
+    // NodeScans triggers expensive cross-joins followed by cycle-closing
+    // filters.
+    //
+    // Algorithm: build an undirected graph of variables connected by
+    // traversals, then walk connected components in binding declaration
+    // order.  The first binding in each component becomes the root (gets
+    // a NodeScan); all other bindings in the same component are deferred
+    // — their inline filters become post-Expand Filter ops.
+
+    let binding_set: HashSet<&str> = bindings.iter().map(|b| b.variable.as_str()).collect();
+
+    // Build undirected traversal adjacency (variable → neighbours)
+    let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
+    for t in &traversals {
+        adj.entry(t.src.as_str()).or_default().push(t.dst.as_str());
+        adj.entry(t.dst.as_str()).or_default().push(t.src.as_str());
+    }
+
+    // Walk components to find deferred binding variables
+    let mut deferred_set: HashSet<String> = HashSet::new();
+    let mut component_visited: HashSet<&str> = HashSet::new();
+
+    for binding in &bindings {
+        if component_visited.contains(binding.variable.as_str()) {
+            continue;
+        }
+        // BFS from this binding through the traversal graph
+        let mut queue = VecDeque::new();
+        queue.push_back(binding.variable.as_str());
+        let mut component_bindings: Vec<&str> = Vec::new();
+
+        while let Some(var) = queue.pop_front() {
+            if !component_visited.insert(var) {
+                continue;
+            }
+            if binding_set.contains(var) {
+                component_bindings.push(var);
+            }
+            if let Some(neighbours) = adj.get(var) {
+                for &n in neighbours {
+                    if !component_visited.contains(n) {
+                        queue.push_back(n);
+                    }
+                }
+            }
+        }
+
+        // First binding in the component is the root; defer the rest.
+        for var in component_bindings.into_iter().skip(1) {
+            deferred_set.insert(var.to_string());
+        }
+    }
+
+    // Build deferred filters map for variables introduced by traversals
+    let mut deferred_filters: HashMap<String, Vec<IRFilter>> = HashMap::new();
+
+    // Lower bindings into NodeScan ops (skip deferred ones)
     for binding in &bindings {
         let node_type = catalog
             .node_types
             .get(&binding.type_name)
             .expect("binding type was validated during typecheck");
-        // Collect inline filters from prop matches
-        let mut scan_filters = Vec::new();
-        for pm in &binding.prop_matches {
-            let prop = node_type
-                .properties
-                .get(&pm.prop_name)
-                .expect("binding property was validated during typecheck");
-            let op = if prop.list {
-                CompOp::Contains
-            } else {
-                CompOp::Eq
-            };
-            match &pm.value {
-                MatchValue::Literal(lit) => {
-                    scan_filters.push(IRFilter {
-                        left: IRExpr::PropAccess {
-                            variable: binding.variable.clone(),
-                            property: pm.prop_name.clone(),
-                        },
-                        op,
-                        right: IRExpr::Literal(lit.clone()),
-                    });
-                }
-                MatchValue::Now => {
-                    scan_filters.push(IRFilter {
-                        left: IRExpr::PropAccess {
-                            variable: binding.variable.clone(),
-                            property: pm.prop_name.clone(),
-                        },
-                        op,
-                        right: IRExpr::Param(NOW_PARAM_NAME.to_string()),
-                    });
-                }
-                MatchValue::Variable(v) => {
-                    let right = if param_names.contains(v) {
-                        IRExpr::Param(v.clone())
-                    } else {
-                        IRExpr::Variable(v.clone())
-                    };
-                    scan_filters.push(IRFilter {
-                        left: IRExpr::PropAccess {
-                            variable: binding.variable.clone(),
-                            property: pm.prop_name.clone(),
-                        },
-                        op,
-                        right,
-                    });
-                }
+
+        let binding_filters = build_binding_filters(binding, node_type, param_names);
+
+        if deferred_set.contains(&binding.variable) {
+            // Save filters for emission after the Expand that introduces
+            // this variable.
+            if !binding_filters.is_empty() {
+                deferred_filters.insert(binding.variable.clone(), binding_filters);
             }
+            continue;
         }
 
         pipeline.push(IROp::NodeScan {
             variable: binding.variable.clone(),
             type_name: binding.type_name.clone(),
-            filters: scan_filters,
+            filters: binding_filters,
         });
         bound_vars.insert(binding.variable.clone());
     }
@@ -250,6 +272,7 @@ fn lower_clauses(
                 dst_type,
                 min_hops: traversal.min_hops,
                 max_hops: traversal.max_hops,
+                dst_filters: vec![],
             });
             pipeline.push(IROp::Filter(IRFilter {
                 left: IRExpr::PropAccess {
@@ -273,6 +296,8 @@ fn lower_clauses(
                 Direction::Out => edge.from_type.clone(),
                 Direction::In => edge.to_type.clone(),
             };
+            let introduced_filters =
+                deferred_filters.remove(&traversal.src).unwrap_or_default();
             pipeline.push(IROp::Expand {
                 src_var: traversal.dst.clone(),
                 dst_var: traversal.src.clone(),
@@ -281,11 +306,14 @@ fn lower_clauses(
                 dst_type: src_type,
                 min_hops: traversal.min_hops,
                 max_hops: traversal.max_hops,
+                dst_filters: introduced_filters,
             });
             if traversal.src != "_" {
                 bound_vars.insert(traversal.src.clone());
             }
         } else {
+            let introduced_filters =
+                deferred_filters.remove(&traversal.dst).unwrap_or_default();
             pipeline.push(IROp::Expand {
                 src_var: traversal.src.clone(),
                 dst_var: traversal.dst.clone(),
@@ -294,6 +322,7 @@ fn lower_clauses(
                 dst_type,
                 min_hops: traversal.min_hops,
                 max_hops: traversal.max_hops,
+                dst_filters: introduced_filters,
             });
             if traversal.dst != "_" {
                 bound_vars.insert(traversal.dst.clone());
@@ -333,6 +362,46 @@ fn lower_clauses(
     }
 
     Ok(())
+}
+
+/// Build IR filters from a binding's inline property matches.
+fn build_binding_filters(
+    binding: &Binding,
+    node_type: &crate::catalog::NodeType,
+    param_names: &HashSet<String>,
+) -> Vec<IRFilter> {
+    let mut filters = Vec::new();
+    for pm in &binding.prop_matches {
+        let prop = node_type
+            .properties
+            .get(&pm.prop_name)
+            .expect("binding property was validated during typecheck");
+        let op = if prop.list {
+            CompOp::Contains
+        } else {
+            CompOp::Eq
+        };
+        let right = match &pm.value {
+            MatchValue::Literal(lit) => IRExpr::Literal(lit.clone()),
+            MatchValue::Now => IRExpr::Param(NOW_PARAM_NAME.to_string()),
+            MatchValue::Variable(v) => {
+                if param_names.contains(v) {
+                    IRExpr::Param(v.clone())
+                } else {
+                    IRExpr::Variable(v.clone())
+                }
+            }
+        };
+        filters.push(IRFilter {
+            left: IRExpr::PropAccess {
+                variable: binding.variable.clone(),
+                property: pm.prop_name.clone(),
+            },
+            op,
+            right,
+        });
+    }
+    filters
 }
 
 fn find_outer_var(clauses: &[Clause], outer_bound: &HashSet<String>) -> Option<String> {
@@ -691,5 +760,161 @@ query q($name: String, $age: I32, $friend: String) {
         assert!(
             matches!(&ir.ops[1], MutationOpIR::Insert { type_name, .. } if type_name == "Knows")
         );
+    }
+
+    /// Destination binding is deferred: NodeScan + Expand + Filter (no cross-join).
+    #[test]
+    fn test_lower_traversal_with_destination_binding() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $p: Person
+        $p worksAt $c
+        $c: Company { name: "Acme" }
+    }
+    return { $p.name, $c.name }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+        // Should be: NodeScan($p) → Expand($p→$c, dst_filters=[name=="Acme"])
+        // NOT:       NodeScan($p) → NodeScan($c) → cross-join → cycle-close
+        assert_eq!(ir.pipeline.len(), 2);
+        assert!(matches!(&ir.pipeline[0], IROp::NodeScan { variable, .. } if variable == "p"));
+        assert!(matches!(
+            &ir.pipeline[1],
+            IROp::Expand { src_var, dst_var, dst_filters, .. }
+            if src_var == "p" && dst_var == "c" && dst_filters.len() == 1
+        ));
+    }
+
+    /// Multi-hop chain: all intermediate and final bindings are deferred.
+    #[test]
+    fn test_lower_chain_defers_all_intermediate_bindings() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $p: Person { name: "Alice" }
+        $p knows $f
+        $f: Person { name: "Bob" }
+        $f worksAt $c
+        $c: Company { name: "Acme" }
+    }
+    return { $c.name }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+        // Should be: NodeScan($p,[name=Alice]) → Expand($p→$f, [name==Bob])
+        //            → Expand($f→$c, [name==Acme])
+        assert_eq!(ir.pipeline.len(), 3);
+        assert!(matches!(&ir.pipeline[0], IROp::NodeScan { variable, .. } if variable == "p"));
+        assert!(matches!(
+            &ir.pipeline[1],
+            IROp::Expand { src_var, dst_var, dst_filters, .. }
+            if src_var == "p" && dst_var == "f" && dst_filters.len() == 1
+        ));
+        assert!(matches!(
+            &ir.pipeline[2],
+            IROp::Expand { src_var, dst_var, dst_filters, .. }
+            if src_var == "f" && dst_var == "c" && dst_filters.len() == 1
+        ));
+    }
+
+    /// Reverse traversal: source binding is deferred when destination is the root.
+    #[test]
+    fn test_lower_reverse_traversal_defers_source_binding() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $c: Company { name: "Acme" }
+        $p worksAt $c
+        $p: Person { name: "Alice" }
+    }
+    return { $p.name }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+        // $c is root (first declared). $p is deferred (connected via traversal).
+        // Traversal $p worksAt $c: $c is bound, $p is not → reverse expand.
+        // Pipeline: NodeScan($c,[name=Acme]) → Expand($c→$p, In, [name==Alice])
+        assert_eq!(ir.pipeline.len(), 2);
+        assert!(matches!(&ir.pipeline[0], IROp::NodeScan { variable, .. } if variable == "c"));
+        assert!(matches!(
+            &ir.pipeline[1],
+            IROp::Expand { src_var, dst_var, dst_filters, .. }
+            if src_var == "c" && dst_var == "p" && dst_filters.len() == 1
+        ));
+    }
+
+    /// Independent bindings (no traversal) still cross-join.
+    #[test]
+    fn test_lower_independent_bindings_still_cross_join() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $p: Person
+        $c: Company
+    }
+    return { $p.name, $c.name }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+        // No traversal connecting them → both get NodeScans (cross-join at runtime)
+        assert_eq!(ir.pipeline.len(), 2);
+        assert!(matches!(&ir.pipeline[0], IROp::NodeScan { variable, .. } if variable == "p"));
+        assert!(matches!(&ir.pipeline[1], IROp::NodeScan { variable, .. } if variable == "c"));
+    }
+
+    /// Destination binding without filters: no NodeScan, no post-expand filter.
+    #[test]
+    fn test_lower_destination_binding_without_filters() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $p: Person
+        $p worksAt $c
+        $c: Company
+    }
+    return { $p.name, $c.name }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+        // $c binding is deferred (no filters) → just NodeScan + Expand
+        assert_eq!(ir.pipeline.len(), 2);
+        assert!(matches!(&ir.pipeline[0], IROp::NodeScan { variable, .. } if variable == "p"));
+        assert!(matches!(
+            &ir.pipeline[1],
+            IROp::Expand { src_var, dst_var, .. }
+            if src_var == "p" && dst_var == "c"
+        ));
     }
 }
