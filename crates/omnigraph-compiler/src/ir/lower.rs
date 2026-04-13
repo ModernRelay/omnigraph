@@ -163,11 +163,17 @@ fn lower_clauses(
 
     let binding_set: HashSet<&str> = bindings.iter().map(|b| b.variable.as_str()).collect();
 
-    // Build undirected traversal adjacency (variable → neighbours)
+    // Build undirected traversal adjacency (variable → neighbours).
+    // Exclude the anonymous wildcard "_" so it cannot falsely bridge
+    // otherwise-independent components.
     let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
     for t in &traversals {
-        adj.entry(t.src.as_str()).or_default().push(t.dst.as_str());
-        adj.entry(t.dst.as_str()).or_default().push(t.src.as_str());
+        let src = t.src.as_str();
+        let dst = t.dst.as_str();
+        if src != "_" && dst != "_" {
+            adj.entry(src).or_default().push(dst);
+            adj.entry(dst).or_default().push(src);
+        }
     }
 
     // Walk components to find deferred binding variables
@@ -977,6 +983,40 @@ query q() {
             &ir.pipeline[2],
             IROp::Expand { src_var, dst_var, dst_filters, .. }
             if src_var == "f" && dst_var == "c" && dst_filters.len() == 1
+        ));
+    }
+
+    /// Wildcard $_ must not bridge unrelated components in the adjacency graph.
+    #[test]
+    fn test_lower_wildcard_does_not_bridge_components() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $p: Person
+        $p knows $_
+        $c: Company
+    }
+    return { $p.name, $c.name }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+        // $p and $c are in separate components (connected only through $_).
+        // Both must get their own NodeScan — $c must NOT be deferred.
+        // Bindings are emitted first, then traversals.
+        assert_eq!(ir.pipeline.len(), 3);
+        assert!(matches!(&ir.pipeline[0], IROp::NodeScan { variable, .. } if variable == "p"));
+        assert!(matches!(&ir.pipeline[1], IROp::NodeScan { variable, .. } if variable == "c"));
+        // The expand for $p knows $_ (wildcard destination)
+        assert!(matches!(
+            &ir.pipeline[2],
+            IROp::Expand { src_var, dst_var, .. }
+            if src_var == "p" && dst_var == "_"
         ));
     }
 }
