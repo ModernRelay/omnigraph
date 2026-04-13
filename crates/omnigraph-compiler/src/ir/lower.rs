@@ -1019,4 +1019,221 @@ query q() {
             if src_var == "p" && dst_var == "_"
         ));
     }
+
+    /// Fan-out: one root fans to two deferred destinations via different edges.
+    #[test]
+    fn test_lower_fan_out_topology() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $p: Person { name: "Alice" }
+        $p knows $f
+        $f: Person { name: "Bob" }
+        $p worksAt $c
+        $c: Company { name: "Acme" }
+    }
+    return { $f.name, $c.name }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+        // Root: $p. Deferred: $f, $c (both reachable from $p).
+        assert_eq!(ir.pipeline.len(), 3);
+        assert!(matches!(&ir.pipeline[0], IROp::NodeScan { variable, .. } if variable == "p"));
+        assert!(matches!(
+            &ir.pipeline[1],
+            IROp::Expand { src_var, dst_var, dst_filters, .. }
+            if src_var == "p" && dst_var == "f" && dst_filters.len() == 1
+        ));
+        assert!(matches!(
+            &ir.pipeline[2],
+            IROp::Expand { src_var, dst_var, dst_filters, .. }
+            if src_var == "p" && dst_var == "c" && dst_filters.len() == 1
+        ));
+    }
+
+    /// Fan-in: two sources converge on one destination; second source is
+    /// introduced via reverse expand from the shared destination.
+    #[test]
+    fn test_lower_fan_in_topology() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $a: Person { name: "Alice" }
+        $a knows $c
+        $b: Person { name: "Bob" }
+        $b knows $c
+        $c: Person
+    }
+    return { $a.name, $b.name, $c.name }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+        // Root: $a (first in component {a,b,c}). Deferred: $b, $c.
+        // $a knows $c: expand(a→c). $b knows $c: reverse expand(c→b).
+        assert_eq!(ir.pipeline.len(), 3);
+        assert!(matches!(&ir.pipeline[0], IROp::NodeScan { variable, .. } if variable == "a"));
+        assert!(matches!(
+            &ir.pipeline[1],
+            IROp::Expand { src_var, dst_var, dst_filters, .. }
+            if src_var == "a" && dst_var == "c" && dst_filters.is_empty()
+        ));
+        assert!(matches!(
+            &ir.pipeline[2],
+            IROp::Expand { src_var, dst_var, dst_filters, .. }
+            if src_var == "c" && dst_var == "b" && dst_filters.len() == 1
+        ));
+    }
+
+    /// Genuine graph cycle: deferred binding is introduced by first traversal,
+    /// second traversal triggers cycle-closing.
+    #[test]
+    fn test_lower_cycle_with_deferred_binding() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $a: Person
+        $a knows $b
+        $b: Person { name: "Bob" }
+        $b knows $a
+    }
+    return { $a.name }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+        // $b is deferred, introduced by first expand.
+        // Second traversal ($b knows $a) is genuine cycle-closing.
+        assert_eq!(ir.pipeline.len(), 4);
+        assert!(matches!(&ir.pipeline[0], IROp::NodeScan { variable, .. } if variable == "a"));
+        assert!(matches!(
+            &ir.pipeline[1],
+            IROp::Expand { src_var, dst_var, dst_filters, .. }
+            if src_var == "a" && dst_var == "b" && dst_filters.len() == 1
+        ));
+        // Cycle-closing expand to __temp_a
+        assert!(matches!(
+            &ir.pipeline[2],
+            IROp::Expand { src_var, dst_var, dst_filters, .. }
+            if src_var == "b" && dst_var.starts_with("__temp_") && dst_filters.is_empty()
+        ));
+        // Cycle-closing filter: __temp_a.id == a.id
+        assert!(matches!(&ir.pipeline[3], IROp::Filter(_)));
+    }
+
+    /// Multiple filters on a single deferred binding.
+    #[test]
+    fn test_lower_multiple_filters_on_deferred_binding() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $p: Person
+        $p knows $f
+        $f: Person { name: "Bob", age: 25 }
+    }
+    return { $f.name }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+        // Two prop_matches → two dst_filters on the Expand.
+        assert_eq!(ir.pipeline.len(), 2);
+        assert!(matches!(
+            &ir.pipeline[1],
+            IROp::Expand { dst_filters, .. }
+            if dst_filters.len() == 2
+        ));
+    }
+
+    /// Parameter in a deferred binding filter (unit test level).
+    #[test]
+    fn test_lower_param_filter_on_deferred_binding() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q($company: String) {
+    match {
+        $p: Person
+        $p worksAt $c
+        $c: Company { name: $company }
+    }
+    return { $p.name }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+        assert_eq!(ir.pipeline.len(), 2);
+        assert!(matches!(
+            &ir.pipeline[1],
+            IROp::Expand { dst_filters, .. }
+            if dst_filters.len() == 1
+        ));
+        // The filter's right-hand side should be a Param, not a Literal
+        if let IROp::Expand { dst_filters, .. } = &ir.pipeline[1] {
+            assert!(matches!(&dst_filters[0].right, IRExpr::Param(name) if name == "company"));
+        }
+    }
+
+    /// Negation with inner binding: inner binding is NOT deferred because
+    /// bound_vars (from outer scope) is not in binding_set for the inner call.
+    /// This documents current behavior — the inner pipeline uses a NodeScan +
+    /// cycle-closing, which is correct but less efficient than deferral.
+    #[test]
+    fn test_lower_negation_with_inner_binding() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $p: Person
+        not {
+            $p worksAt $c
+            $c: Company { name: "Acme" }
+        }
+    }
+    return { $p.name }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+        // Outer: NodeScan($p) + AntiJoin
+        assert_eq!(ir.pipeline.len(), 2);
+        assert!(matches!(&ir.pipeline[0], IROp::NodeScan { variable, .. } if variable == "p"));
+        let IROp::AntiJoin { inner, .. } = &ir.pipeline[1] else {
+            panic!("expected AntiJoin");
+        };
+        // Inner pipeline: $c is NOT deferred (it's the only binding in the
+        // inner scope), so it gets a NodeScan + cycle-closing (3 ops).
+        assert_eq!(inner.len(), 3);
+        assert!(matches!(&inner[0], IROp::NodeScan { variable, .. } if variable == "c"));
+        assert!(matches!(&inner[1], IROp::Expand { .. }));
+        assert!(matches!(&inner[2], IROp::Filter(_)));
+    }
 }

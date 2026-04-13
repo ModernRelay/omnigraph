@@ -613,3 +613,101 @@ query at_company($company: String) {
     assert_eq!(person.value(0), "Bob");
     assert_eq!(company.value(0), "Globex");
 }
+
+/// Fan-out: one source expanded to two different destination types.
+/// Each (friend, company) pair should be a cross-product per source row.
+#[tokio::test]
+async fn fan_out_two_destinations() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let queries = r#"
+query fan_out($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows $f
+        $p worksAt $c
+    }
+    return { $f.name, $c.name }
+}
+"#;
+    // Alice knows Bob and Charlie, works at Acme.
+    // Each friend paired with her company → 2 rows.
+    let result = query_main(
+        &mut db,
+        queries,
+        "fan_out",
+        &params(&[("$name", "Alice")]),
+    )
+    .await
+    .unwrap();
+
+    let batch = result.concat_batches().unwrap();
+    assert_eq!(batch.num_rows(), 2);
+    let friends = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    let companies = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+
+    let mut pairs: Vec<(&str, &str)> = (0..batch.num_rows())
+        .map(|i| (friends.value(i), companies.value(i)))
+        .collect();
+    pairs.sort();
+    assert_eq!(pairs, vec![("Bob", "Acme"), ("Charlie", "Acme")]);
+}
+
+/// Deferred destination filter that matches nothing → empty result.
+#[tokio::test]
+async fn traversal_destination_filter_no_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let queries = r#"
+query at_phantom() {
+    match {
+        $p: Person
+        $p worksAt $c
+        $c: Company { name: "NonExistent" }
+    }
+    return { $p.name }
+}
+"#;
+    let result = query_main(&mut db, queries, "at_phantom", &ParamMap::new())
+        .await
+        .unwrap();
+
+    assert_eq!(result.num_rows(), 0);
+}
+
+/// Negation with inner destination binding filter.
+/// "People who do NOT work at Acme" — uses binding syntax inside negation.
+#[tokio::test]
+async fn negation_with_inner_destination_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let queries = r#"
+query not_at_acme_binding() {
+    match {
+        $p: Person
+        not {
+            $p worksAt $c
+            $c: Company { name: "Acme" }
+        }
+    }
+    return { $p.name }
+}
+"#;
+    // Alice→Acme. Everyone else should be returned.
+    let result = query_main(&mut db, queries, "not_at_acme_binding", &ParamMap::new())
+        .await
+        .unwrap();
+
+    let batch = result.concat_batches().unwrap();
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut names_vec: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
+    names_vec.sort();
+    assert_eq!(names_vec, vec!["Bob", "Charlie", "Diana"]);
+}

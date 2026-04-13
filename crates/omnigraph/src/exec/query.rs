@@ -901,12 +901,18 @@ fn try_bulk_anti_join_mask(
         src_var,
         edge_type,
         direction,
+        dst_filters,
         ..
     } = &inner_pipeline[0]
     else {
         return None;
     };
     if src_var != outer_var {
+        return None;
+    }
+    // Bulk CSR check only tests neighbor existence, not destination
+    // properties.  Fall back to the slow path when dst_filters are present.
+    if !dst_filters.is_empty() {
         return None;
     }
     let gi = graph_index?;
