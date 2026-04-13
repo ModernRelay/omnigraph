@@ -1436,6 +1436,8 @@ fn resolved_type_to_field_shape(
 
 fn literal_type(lit: &Literal) -> Result<PropType> {
     match lit {
+        // Null is compatible with any nullable type; default to String for inference.
+        Literal::Null => Ok(PropType::scalar(ScalarType::String, true)),
         Literal::String(_) => Ok(PropType::scalar(ScalarType::String, false)),
         Literal::Integer(_) => Ok(PropType::scalar(ScalarType::I64, false)),
         Literal::Float(_) => Ok(PropType::scalar(ScalarType::F64, false)),
@@ -1466,6 +1468,18 @@ fn literal_type(lit: &Literal) -> Result<PropType> {
 }
 
 fn check_literal_type(lit: &Literal, expected: &PropType, prop_name: &str) -> Result<()> {
+    // Null is compatible with any nullable property type.
+    if matches!(lit, Literal::Null) {
+        return if expected.nullable {
+            Ok(())
+        } else {
+            Err(NanoError::Type(format!(
+                "T3: property `{}` is non-nullable but got null",
+                prop_name
+            )))
+        };
+    }
+
     if !expected.list
         && let ScalarType::Vector(expected_dim) = expected.scalar
         && let Some(actual_dim) = numeric_vector_literal_dim(lit)

@@ -26,6 +26,7 @@ fn literal_to_typed_array(
     num_rows: usize,
 ) -> Result<ArrayRef> {
     Ok(match (lit, data_type) {
+        (Literal::Null, _) => arrow_array::new_null_array(data_type, num_rows),
         (Literal::String(s), DataType::Utf8) => {
             Arc::new(StringArray::from(vec![s.as_str(); num_rows])) as ArrayRef
         }

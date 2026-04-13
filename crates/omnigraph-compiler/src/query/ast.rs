@@ -160,6 +160,7 @@ impl std::fmt::Display for AggFunc {
 
 #[derive(Debug, Clone)]
 pub enum Literal {
+    Null,
     String(String),
     Integer(i64),
     Float(f64),
