@@ -68,11 +68,11 @@ also pass `--schema`.
 
 ## Config
 
-`omnigraph.yaml` lets the CLI and server share named targets, defaults, and
+`omnigraph.yaml` lets the CLI and server share named graphs, defaults, and
 query roots:
 
 ```yaml
-targets:
+graphs:
   local:
     uri: ./demo.omni
   dev:
@@ -80,7 +80,7 @@ targets:
     bearer_token_env: OMNIGRAPH_BEARER_TOKEN
 
 cli:
-  target: local
+  graph: local
   branch: main
 
 query:

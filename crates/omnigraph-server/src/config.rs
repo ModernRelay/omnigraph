@@ -40,7 +40,8 @@ pub enum TableCellLayout {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CliDefaults {
-    pub target: Option<String>,
+    #[serde(rename = "graph")]
+    pub graph: Option<String>,
     pub branch: Option<String>,
     pub output_format: Option<ReadOutputFormat>,
     pub table_max_column_width: Option<usize>,
@@ -49,7 +50,8 @@ pub struct CliDefaults {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerDefaults {
-    pub target: Option<String>,
+    #[serde(rename = "graph")]
+    pub graph: Option<String>,
     pub bind: Option<String>,
 }
 
@@ -83,7 +85,8 @@ pub struct AliasConfig {
     pub name: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
-    pub target: Option<String>,
+    #[serde(rename = "graph")]
+    pub graph: Option<String>,
     pub branch: Option<String>,
     pub format: Option<ReadOutputFormat>,
 }
@@ -92,8 +95,8 @@ pub struct AliasConfig {
 pub struct OmnigraphConfig {
     #[serde(default)]
     pub project: ProjectConfig,
-    #[serde(default)]
-    pub targets: BTreeMap<String, TargetConfig>,
+    #[serde(default, rename = "graphs")]
+    pub graphs: BTreeMap<String, TargetConfig>,
     #[serde(default)]
     pub server: ServerDefaults,
     #[serde(default)]
@@ -114,7 +117,7 @@ impl Default for OmnigraphConfig {
     fn default() -> Self {
         Self {
             project: ProjectConfig::default(),
-            targets: BTreeMap::new(),
+            graphs: BTreeMap::new(),
             server: ServerDefaults::default(),
             auth: AuthDefaults::default(),
             cli: CliDefaults::default(),
@@ -147,12 +150,12 @@ impl OmnigraphConfig {
         self.cli.table_cell_layout.unwrap_or_default()
     }
 
-    pub fn cli_target_name(&self) -> Option<&str> {
-        self.cli.target.as_deref()
+    pub fn cli_graph_name(&self) -> Option<&str> {
+        self.cli.graph.as_deref()
     }
 
-    pub fn server_target_name(&self) -> Option<&str> {
-        self.server.target.as_deref()
+    pub fn server_graph_name(&self) -> Option<&str> {
+        self.server.graph.as_deref()
     }
 
     pub fn server_bind(&self) -> &str {
@@ -174,7 +177,7 @@ impl OmnigraphConfig {
         })
     }
 
-    pub fn target_bearer_token_env(
+    pub fn graph_bearer_token_env(
         &self,
         explicit_uri: Option<&str>,
         explicit_target: Option<&str>,
@@ -182,7 +185,7 @@ impl OmnigraphConfig {
     ) -> Option<&str> {
         let target_name =
             self.resolve_target_name(explicit_uri, explicit_target, default_target)?;
-        self.targets
+        self.graphs
             .get(target_name)
             .and_then(|target| target.bearer_token_env.as_deref())
     }
@@ -231,9 +234,9 @@ impl OmnigraphConfig {
         let target_name = explicit_target.or(default_target).ok_or_else(|| {
             color_eyre::eyre::eyre!("URI must be provided via <URI>, --target, or config")
         })?;
-        let target = self.targets.get(target_name).ok_or_else(|| {
+        let target = self.graphs.get(target_name).ok_or_else(|| {
             color_eyre::eyre::eyre!(
-                "target '{}' not found in {}",
+                "graph '{}' not found in {}",
                 target_name,
                 DEFAULT_CONFIG_FILE
             )
@@ -332,14 +335,14 @@ mod tests {
         fs::write(
             temp.path().join("omnigraph.yaml"),
             r#"
-targets:
+graphs:
   local:
     uri: ./demo.omni
     bearer_token_env: DEMO_TOKEN
 auth:
   env_file: .env.omni
 cli:
-  target: local
+  graph: local
   branch: main
   output_format: kv
   table_max_column_width: 40
@@ -350,13 +353,13 @@ policy: {}
         .unwrap();
 
         let config = load_config_in(temp.path(), None).unwrap();
-        assert_eq!(config.cli_target_name(), Some("local"));
+        assert_eq!(config.cli_graph_name(), Some("local"));
         assert_eq!(config.cli_branch(), "main");
         assert_eq!(config.cli_output_format(), ReadOutputFormat::Kv);
         assert_eq!(config.table_max_column_width(), 40);
         assert_eq!(config.table_cell_layout(), TableCellLayout::Wrap);
         assert_eq!(
-            config.target_bearer_token_env(None, None, config.cli_target_name()),
+            config.graph_bearer_token_env(None, None, config.cli_graph_name()),
             Some("DEMO_TOKEN")
         );
         assert_eq!(
@@ -366,7 +369,7 @@ policy: {}
         assert_eq!(
             PathBuf::from(
                 config
-                    .resolve_target_uri(None, None, config.cli_target_name())
+                    .resolve_target_uri(None, None, config.cli_graph_name())
                     .unwrap()
             ),
             temp.path().join("./demo.omni")
@@ -380,12 +383,12 @@ policy: {}
         fs::create_dir_all(&child).unwrap();
         fs::write(
             temp.path().join("omnigraph.yaml"),
-            "targets:\n  local:\n    uri: ./demo.omni\n",
+            "graphs:\n  local:\n    uri: ./demo.omni\n",
         )
         .unwrap();
 
         let config = load_config_in(&child, None).unwrap();
-        assert!(config.targets.is_empty());
+        assert!(config.graphs.is_empty());
     }
 
     #[test]
@@ -448,30 +451,30 @@ policy: {}
         fs::write(
             temp.path().join("omnigraph.yaml"),
             r#"
-targets:
+graphs:
   demo:
     uri: https://example.com
     bearer_token_env: DEMO_TOKEN
 cli:
-  target: demo
+  graph: demo
 "#,
         )
         .unwrap();
 
         let config = load_config_in(temp.path(), None).unwrap();
         assert_eq!(
-            config.target_bearer_token_env(
+            config.graph_bearer_token_env(
                 Some("https://override.example.com"),
                 None,
-                config.cli_target_name()
+                config.cli_graph_name()
             ),
             None
         );
         assert_eq!(
-            config.target_bearer_token_env(
+            config.graph_bearer_token_env(
                 Some("https://override.example.com"),
                 Some("demo"),
-                config.cli_target_name()
+                config.cli_graph_name()
             ),
             Some("DEMO_TOKEN")
         );

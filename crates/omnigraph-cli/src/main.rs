@@ -697,8 +697,8 @@ fn policy_repo_id(config: &OmnigraphConfig) -> String {
         return name.clone();
     }
     config
-        .resolve_target_uri(None, None, config.server_target_name())
-        .or_else(|_| config.resolve_target_uri(None, None, config.cli_target_name()))
+        .resolve_target_uri(None, None, config.server_graph_name())
+        .or_else(|_| config.resolve_target_uri(None, None, config.cli_graph_name()))
         .unwrap_or_else(|_| "default".to_string())
 }
 
@@ -708,7 +708,7 @@ fn resolve_remote_bearer_token(
     explicit_target: Option<&str>,
 ) -> Result<Option<String>> {
     let scoped_env =
-        config.target_bearer_token_env(explicit_uri, explicit_target, config.cli_target_name());
+        config.graph_bearer_token_env(explicit_uri, explicit_target, config.cli_graph_name());
     let mut env_names = Vec::new();
     if let Some(name) = scoped_env {
         env_names.push(name.to_string());
@@ -780,7 +780,7 @@ fn resolve_uri(
     cli_uri: Option<String>,
     cli_target: Option<&str>,
 ) -> Result<String> {
-    config.resolve_target_uri(cli_uri, cli_target, config.cli_target_name())
+    config.resolve_target_uri(cli_uri, cli_target, config.cli_graph_name())
 }
 
 fn resolve_local_uri(
@@ -1301,17 +1301,17 @@ fn scaffold_config_if_missing(uri: &str) -> Result<()> {
 project:
   name: Omnigraph Project
 
-targets:
+graphs:
   local:
     uri: {}
     # bearer_token_env: OMNIGRAPH_BEARER_TOKEN
 
 server:
-  target: local
+  graph: local
   bind: 127.0.0.1:8080
 
 cli:
-  target: local
+  graph: local
   branch: main
   output_format: table
   table_max_column_width: 80
@@ -1328,7 +1328,7 @@ aliases:
   #   query: context.gq
   #   name: decision_owner
   #   args: [slug]
-  #   target: local
+  #   graph: local
   #   branch: main
   #   format: kv
   #
@@ -1337,7 +1337,7 @@ aliases:
   #   query: mutations.gq
   #   name: attach_trace
   #   args: [decision_slug, trace_slug]
-  #   target: local
+  #   graph: local
   #   branch: main
 
 # auth:
@@ -1443,7 +1443,7 @@ async fn execute_query_lint(
     }
 
     let has_repo_target =
-        cli_uri.is_some() || cli_target.is_some() || config.cli_target_name().is_some();
+        cli_uri.is_some() || cli_target.is_some() || config.cli_graph_name().is_some();
     if !has_repo_target {
         bail!("query lint requires --schema <schema.pg> or a resolvable repo target");
     }
@@ -2241,15 +2241,15 @@ async fn main() -> Result<()> {
             let alias_config = alias.as_ref().map(|(_, alias)| *alias);
             let target_available = target.is_some()
                 || alias_config
-                    .and_then(|alias| alias.target.as_deref())
+                    .and_then(|alias| alias.graph.as_deref())
                     .is_some()
-                || config.cli_target_name().is_some();
+                || config.cli_graph_name().is_some();
             let (legacy_uri, alias_args) =
                 normalize_legacy_alias_uri(legacy_uri, target_available, alias_name, alias_args);
             let uri = uri.or(legacy_uri);
             let target_name = target
                 .as_deref()
-                .or_else(|| alias_config.and_then(|alias| alias.target.as_deref()));
+                .or_else(|| alias_config.and_then(|alias| alias.graph.as_deref()));
             let bearer_token = resolve_remote_bearer_token(&config, uri.as_deref(), target_name)?;
             let uri = resolve_uri(&config, uri, target_name)?;
             let query_source = resolve_query_source(
@@ -2324,15 +2324,15 @@ async fn main() -> Result<()> {
             let alias_config = alias.as_ref().map(|(_, alias)| *alias);
             let target_available = target.is_some()
                 || alias_config
-                    .and_then(|alias| alias.target.as_deref())
+                    .and_then(|alias| alias.graph.as_deref())
                     .is_some()
-                || config.cli_target_name().is_some();
+                || config.cli_graph_name().is_some();
             let (legacy_uri, alias_args) =
                 normalize_legacy_alias_uri(legacy_uri, target_available, alias_name, alias_args);
             let uri = uri.or(legacy_uri);
             let target_name = target
                 .as_deref()
-                .or_else(|| alias_config.and_then(|alias| alias.target.as_deref()));
+                .or_else(|| alias_config.and_then(|alias| alias.graph.as_deref()));
             let bearer_token = resolve_remote_bearer_token(&config, uri.as_deref(), target_name)?;
             let uri = resolve_uri(&config, uri, target_name)?;
             let query_source = resolve_query_source(
@@ -2555,14 +2555,14 @@ mod tests {
         fs::write(
             temp.path().join("omnigraph.yaml"),
             r#"
-targets:
+graphs:
   demo:
     uri: https://example.com
     bearer_token_env: DEMO_TOKEN
 auth:
   env_file: .env.omni
 cli:
-  target: demo
+  graph: demo
 "#,
         )
         .unwrap();
@@ -2610,7 +2610,7 @@ cli:
             r#"
 auth:
   env_file: .env.omni
-targets:
+graphs:
   demo:
     uri: s3://bucket/prefix
 "#,
