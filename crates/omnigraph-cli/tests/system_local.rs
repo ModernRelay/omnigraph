@@ -61,11 +61,11 @@ fn local_policy_config(repo: &SystemRepo) -> String {
         "\
 project:
   name: policy-e2e-local
-targets:
+graphs:
   local:
     uri: {}
 cli:
-  target: local
+  graph: local
   branch: main
 query:
   roots:
@@ -548,11 +548,11 @@ fn local_cli_s3_end_to_end_init_load_read_flow() {
         &config,
         &format!(
             "\
-targets:
+graphs:
   rustfs:
     uri: '{}'
 cli:
-  target: rustfs
+  graph: rustfs
   branch: main
 query:
   roots:
@@ -707,11 +707,11 @@ fn local_cli_resolves_relative_query_against_config_base_dir() {
         &config,
         &format!(
             "\
-targets:
+graphs:
   local:
     uri: '{}'
 cli:
-  target: local
+  graph: local
   branch: main
 query:
   roots:

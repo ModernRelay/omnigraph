@@ -46,11 +46,11 @@ fn remote_policy_server_config(repo: &SystemRepo) -> String {
         "\
 project:
   name: remote-policy-e2e
-targets:
+graphs:
   local:
     uri: {}
 server:
-  target: local
+  graph: local
 policy:
   file: ./policy.yaml
 ",
@@ -61,12 +61,12 @@ policy:
 fn remote_policy_client_config(url: &str) -> String {
     format!(
         "\
-targets:
+graphs:
   dev:
     uri: {}
     bearer_token_env: POLICY_TEST_TOKEN
 cli:
-  target: dev
+  graph: dev
   branch: main
 query:
   roots:

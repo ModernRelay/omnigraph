@@ -390,7 +390,7 @@ pub fn load_server_settings(
 ) -> Result<ServerConfig> {
     let config = load_config(config_path)?;
     let uri =
-        config.resolve_target_uri(cli_uri, cli_target.as_deref(), config.server_target_name())?;
+        config.resolve_target_uri(cli_uri, cli_target.as_deref(), config.server_graph_name())?;
     let bind = cli_bind.unwrap_or_else(|| config.server_bind().to_string());
     let policy_file = config.resolve_policy_file();
 
@@ -1458,11 +1458,11 @@ mod tests {
         fs::write(
             &config,
             r#"
-targets:
+graphs:
   local:
     uri: /tmp/demo.omni
 server:
-  target: local
+  graph: local
   bind: 0.0.0.0:9090
 "#,
         )
@@ -1480,11 +1480,11 @@ server:
         fs::write(
             &config,
             r#"
-targets:
+graphs:
   local:
     uri: /tmp/demo.omni
 server:
-  target: local
+  graph: local
   bind: 127.0.0.1:8080
 "#,
         )
@@ -1508,13 +1508,13 @@ server:
         fs::write(
             &config,
             r#"
-targets:
+graphs:
   local:
     uri: ./demo.omni
   dev:
     uri: http://127.0.0.1:8080
 server:
-  target: local
+  graph: local
   bind: 127.0.0.1:8080
 "#,
         )

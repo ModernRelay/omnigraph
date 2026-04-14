@@ -121,11 +121,11 @@ fn yaml_string(value: &str) -> String {
 pub fn local_yaml_config(repo: &Path) -> String {
     format!(
         "\
-targets:
+graphs:
   local:
     uri: {}
 cli:
-  target: local
+  graph: local
   branch: main
 query:
   roots:
@@ -139,11 +139,11 @@ policy: {{}}
 pub fn remote_yaml_config(url: &str) -> String {
     format!(
         "\
-targets:
+graphs:
   dev:
     uri: {}
 cli:
-  target: dev
+  graph: dev
   branch: main
 query:
   roots:

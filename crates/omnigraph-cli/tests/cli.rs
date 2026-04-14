@@ -1195,7 +1195,7 @@ fn read_alias_uses_alias_target_without_cli_default_and_accepts_url_like_arg() {
     write_config(
         &config,
         &format!(
-            "targets:\n  local:\n    uri: '{}'\nquery:\n  roots:\n    - .\npolicy: {{}}\naliases:\n  owner:\n    command: read\n    query: aliases.gq\n    name: get_person\n    args: [name]\n    target: local\n    format: kv\n",
+            "graphs:\n  local:\n    uri: '{}'\nquery:\n  roots:\n    - .\npolicy: {{}}\naliases:\n  owner:\n    command: read\n    query: aliases.gq\n    name: get_person\n    args: [name]\n    graph: local\n    format: kv\n",
             repo.to_string_lossy()
         ),
     );
