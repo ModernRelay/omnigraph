@@ -2,6 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](rust-toolchain.toml)
+[![CI](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml/badge.svg)](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml)
 
 Typed graph engine built for reasoning paths, not just storage.  
 Git-style workflows, schema-as-code graph modeling, S3-optimized.
@@ -27,6 +28,8 @@ Or install with Homebrew:
 brew tap ModernRelay/tap
 brew install ModernRelay/tap/omnigraph
 ```
+
+For starter graphs and agent skills to bootstrap and operate Omnigraph, see [`ModernRelay/omnigraph-starters`](https://github.com/ModernRelay/omnigraph-starters).
 
 ## One-Command Local RustFS Bootstrap
 
