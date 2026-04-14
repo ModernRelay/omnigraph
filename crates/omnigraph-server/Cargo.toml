@@ -1,17 +1,20 @@
 [package]
 name = "omnigraph-server"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "HTTP server for the Omnigraph graph database."
 license = "MIT"
+repository = "https://github.com/ModernRelay/omnigraph"
+homepage = "https://github.com/ModernRelay/omnigraph"
+documentation = "https://docs.rs/omnigraph-server"
 
 [[bin]]
 name = "omnigraph-server"
 path = "src/main.rs"
 
 [dependencies]
-omnigraph = { path = "../omnigraph", version = "0.2.1" }
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.2.1" }
+omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.2.2" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.2.2" }
 axum = { workspace = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }
