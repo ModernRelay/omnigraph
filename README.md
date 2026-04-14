@@ -1,9 +1,18 @@
 # Omnigraph
 
-Omnigraph is a typed property graph database built on Lance. It combines
-schema-first graph modeling, typed queries and mutations, Git-style graph
-workflows, and storage that runs equally well on a local directory or an
-`s3://` URI.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](rust-toolchain.toml)
+[![CI](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml/badge.svg)](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml)
+[![Edition 2024](https://img.shields.io/badge/edition-2024-blue.svg)](Cargo.toml)
+
+Typed graph engine built for reasoning paths, not just storage.
+Git-style workflows, schema-as-code graph modeling, S3-optimized.
+
+## Use Cases
+
+- On-prem & hybrid context graphs
+- Backbone for multi-agentic research
+- Enterprise knowledge systems
 
 ## Quick Install
 
@@ -43,95 +52,30 @@ If a previous run left objects under the same repo prefix but did not finish
 initializing the repo, rerun with `RESET_REPO=1` or set `PREFIX` to a new
 value.
 
-## Good Fit For
-
-- Team knowledge graphs and internal context graphs
-- Research, decisions, and evidence tracking
-- Collaborative knowledge systems with reviewable changes
-- Private self-hosted graph backends for local or on-prem AI tooling
-
-## Why Omnigraph
+## Omnigraph CORE
 
 - Typed schema, typed queries, and typed mutations
+- Schema-as-code, query validation and linting
 - Git-style graph workflows: branches, commits, merges, and transactional runs
-- Local-first and S3-native storage with snapshot-pinned reads
-- Graph traversal plus text, fuzzy, BM25, vector, and RRF search in one runtime
-- Policy as code for server-side access control
-
-## Quick Start
-
-From a checkout of this repo:
-
-```bash
-cargo build --workspace
-
-cargo run -p omnigraph-cli -- init \
-  --schema crates/omnigraph/tests/fixtures/test.pg \
-  ./repo.omni
-
-cargo run -p omnigraph-cli -- load \
-  --data crates/omnigraph/tests/fixtures/test.jsonl \
-  ./repo.omni
-
-cargo run -p omnigraph-cli -- read \
-  ./repo.omni \
-  --query crates/omnigraph/tests/fixtures/test.gq \
-  --name friends_of \
-  --params '{"name":"Alice"}'
-```
-
-`init` also scaffolds an `omnigraph.yaml` next to the repo if one does not
-already exist.
-
-## Run A Server
-
-Serve the same repo over HTTP:
-
-```bash
-cargo run -p omnigraph-server -- ./repo.omni --bind 127.0.0.1:8080
-```
-
-Then query it remotely:
-
-```bash
-cargo run -p omnigraph-cli -- read \
-  --target http://127.0.0.1:8080 \
-  --query crates/omnigraph/tests/fixtures/test.gq \
-  --name get_person \
-  --params '{"name":"Alice"}'
-```
-
-Server routes include `/healthz`, `/snapshot`, `/export`, `/read`, `/change`,
-`/schema/apply`, `/ingest`, `/branches`, `/runs`, and `/commits`.
-
-To require auth, set `OMNIGRAPH_SERVER_BEARER_TOKEN` on the server and set the
-matching bearer token env var in your CLI target config.
+- Local, on-prem & cloud S3-native storage with snapshot-pinned reads
+- Graph traversal + text, fuzzy, BM25, vector, and RRF search in one runtime
+- Policy-as-code for server-side access control
+- Single CLI for multiple deployments
 
 ## Common Commands
 
-Core repo flow:
+The same URI works for local paths, `s3://…`, or `http://host:port`.
 
 ```bash
-omnigraph init --schema ./schema.pg ./repo.omni
-omnigraph load --data ./data.jsonl --mode overwrite ./repo.omni
-omnigraph schema apply --schema ./next.pg ./repo.omni --json
-omnigraph snapshot ./repo.omni --branch main --json
-omnigraph read --uri ./repo.omni --query ./queries.gq --name get_person --params '{"name":"Alice"}'
-omnigraph change --uri ./repo.omni --query ./queries.gq --name insert_person --params '{"name":"Mina","age":28}'
-omnigraph branch create --uri ./repo.omni --from main feature-x
-omnigraph branch merge --uri ./repo.omni feature-x --into main
+omnigraph init   --schema ./schema.pg ./repo.omni
+omnigraph load   --data   ./data.jsonl ./repo.omni
+omnigraph read   --query  ./queries.gq --name get_person --params '{"name":"Alice"}' ./repo.omni
+omnigraph change --query  ./queries.gq --name insert_person --params '{"name":"Mina"}' ./repo.omni
+omnigraph branch create --from main feature-x ./repo.omni
+omnigraph branch merge  feature-x --into main ./repo.omni
 ```
 
-More CLI examples, config patterns, and admin commands live in
-[docs/cli.md](docs/cli.md).
-
-## Production Features
-
-- Branches, commits, merge-base-aware graph merges, and transactional runs
-- Snapshot-pinned reads across local and S3-backed repos
-- Traversal plus text, fuzzy, BM25, vector, and RRF search
-- Axum server for reads, changes, export, branches, commits, and runs
-- Cedar-based server-side authorization
+See [docs/cli.md](docs/cli.md) for schema apply, snapshots, ingest, runs, and policy commands.
 
 ## Docs
 
