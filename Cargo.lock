@@ -4504,8 +4504,49 @@ dependencies = [
 ]
 
 [[package]]
-name = "omnigraph"
-version = "0.2.1"
+name = "omnigraph-cli"
+version = "0.2.2"
+dependencies = [
+ "assert_cmd",
+ "clap",
+ "color-eyre",
+ "lance-index",
+ "omnigraph-compiler",
+ "omnigraph-engine",
+ "omnigraph-server",
+ "predicates",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "omnigraph-compiler"
+version = "0.2.2"
+dependencies = [
+ "ahash",
+ "arrow-array",
+ "arrow-cast",
+ "arrow-ipc",
+ "arrow-ord",
+ "arrow-schema",
+ "arrow-select",
+ "pest",
+ "pest_derive",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "omnigraph-engine"
+version = "0.2.2"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -4541,49 +4582,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "omnigraph-cli"
-version = "0.2.1"
-dependencies = [
- "assert_cmd",
- "clap",
- "color-eyre",
- "lance-index",
- "omnigraph",
- "omnigraph-compiler",
- "omnigraph-server",
- "predicates",
- "reqwest",
- "serde",
- "serde_json",
- "serde_yaml",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "omnigraph-compiler"
-version = "0.2.1"
-dependencies = [
- "ahash",
- "arrow-array",
- "arrow-cast",
- "arrow-ipc",
- "arrow-ord",
- "arrow-schema",
- "arrow-select",
- "pest",
- "pest_derive",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "tokio",
-]
-
-[[package]]
 name = "omnigraph-server"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "axum",
  "cedar-policy",
@@ -4591,8 +4591,8 @@ dependencies = [
  "color-eyre",
  "futures",
  "lance-index",
- "omnigraph",
  "omnigraph-compiler",
+ "omnigraph-engine",
  "serde",
  "serde_json",
  "serde_yaml",

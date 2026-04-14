@@ -1,9 +1,12 @@
 [package]
 name = "omnigraph-compiler"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Schema/query compiler for Omnigraph. Zero Lance dependency."
 license = "MIT"
+repository = "https://github.com/ModernRelay/omnigraph"
+homepage = "https://github.com/ModernRelay/omnigraph"
+documentation = "https://docs.rs/omnigraph-compiler"
 
 [dependencies]
 arrow-array = { workspace = true }
