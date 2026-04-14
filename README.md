@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](rust-toolchain.toml)
 
-Typed graph engine built for reasoning paths, not just storage.
+Typed graph engine built for reasoning paths, not just storage.  
 Git-style workflows, schema-as-code graph modeling, S3-optimized.
 
 ## Use Cases
