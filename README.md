@@ -2,8 +2,6 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](rust-toolchain.toml)
-[![CI](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml/badge.svg)](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml)
-[![Edition 2024](https://img.shields.io/badge/edition-2024-blue.svg)](Cargo.toml)
 
 Typed graph engine built for reasoning paths, not just storage.
 Git-style workflows, schema-as-code graph modeling, S3-optimized.
