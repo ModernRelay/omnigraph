@@ -66,3 +66,41 @@ jobs:
           files: |
             ${{ matrix.asset_name }}.tar.gz
             ${{ matrix.asset_name }}.sha256
+
+  update_homebrew_tap:
+    name: Update Homebrew tap
+    needs: build_release
+    if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5.0.1
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@v5.0.1
+        with:
+          repository: ModernRelay/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update formula from release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./scripts/update-homebrew-formula.sh "${GITHUB_REF_NAME}" homebrew-tap/Formula/omnigraph.rb
+
+      - name: Commit and push formula update
+        working-directory: homebrew-tap
+        run: |
+          if git diff --quiet -- Formula/omnigraph.rb; then
+            echo "Formula already up to date"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/omnigraph.rb
+          git commit -m "Update Omnigraph formula to ${GITHUB_REF_NAME}"
+          git push origin HEAD:main
