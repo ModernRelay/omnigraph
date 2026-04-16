@@ -18,7 +18,7 @@ use omnigraph_server::api::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
     CommitOutput, ErrorOutput, ExportRequest, IngestOutput, IngestRequest, ReadOutput, ReadRequest,
-    RunListOutput, RunOutput, SchemaApplyOutput, SchemaApplyRequest, SnapshotOutput,
+    RunListOutput, RunOutput, SchemaApplyOutput, SchemaApplyRequest, SchemaGetOutput, SnapshotOutput,
     SnapshotTableOutput, commit_output, ingest_output, read_output, run_output,
     schema_apply_output, snapshot_payload,
 };
@@ -300,6 +300,17 @@ enum SchemaCommand {
         config: Option<PathBuf>,
         #[arg(long)]
         schema: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Get the current accepted schema source
+    Get {
+        /// Repo URI
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
@@ -2001,6 +2012,37 @@ async fn main() -> Result<()> {
                     print_json(&output)?;
                 } else {
                     print_schema_apply_human(&output);
+                }
+            }
+            SchemaCommand::Get {
+                uri,
+                target,
+                config,
+                json,
+            } => {
+                let config = load_cli_config(config.as_ref())?;
+                let bearer_token =
+                    resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
+                let uri = resolve_uri(&config, uri, target.as_deref())?;
+                let output = if is_remote_uri(&uri) {
+                    remote_json::<SchemaGetOutput>(
+                        &http_client,
+                        Method::GET,
+                        remote_url(&uri, "/schema"),
+                        None,
+                        bearer_token.as_deref(),
+                    )
+                    .await?
+                } else {
+                    let db = Omnigraph::open(&uri).await?;
+                    SchemaGetOutput {
+                        source: db.schema_source().to_string(),
+                    }
+                };
+                if json {
+                    print_json(&output)?;
+                } else {
+                    print!("{}", output.source);
                 }
             }
         },

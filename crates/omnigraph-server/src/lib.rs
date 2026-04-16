@@ -14,7 +14,7 @@ use api::{
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
     CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, HealthOutput, IngestOutput,
     IngestRequest, ReadOutput, ReadRequest, RunListOutput, SchemaApplyOutput, SchemaApplyRequest,
-    SnapshotQuery, ingest_output, schema_apply_output, snapshot_payload,
+    SchemaGetOutput, SnapshotQuery, ingest_output, schema_apply_output, snapshot_payload,
 };
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
@@ -63,6 +63,7 @@ use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
         server_export,
         server_change,
         server_schema_apply,
+        server_schema_get,
         server_ingest,
         server_branch_list,
         server_branch_create,
@@ -407,6 +408,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/export", post(server_export))
         .route("/read", post(server_read))
         .route("/change", post(server_change))
+        .route("/schema", get(server_schema_get))
         .route("/schema/apply", post(server_schema_apply))
         .route(
             "/ingest",
@@ -794,6 +796,41 @@ async fn server_change(
         affected_edges: result.affected_edges,
         actor_id: actor_id.map(str::to_string),
     }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/schema",
+    tag = "schema",
+    responses(
+        (status = 200, description = "Current schema source", body = SchemaGetOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+async fn server_schema_get(
+    State(state): State<AppState>,
+    actor: Option<Extension<AuthenticatedActor>>,
+) -> std::result::Result<Json<SchemaGetOutput>, ApiError> {
+    authorize_request(
+        &state,
+        actor.as_ref().map(|Extension(actor)| actor),
+        PolicyRequest {
+            actor_id: actor
+                .as_ref()
+                .map(|Extension(actor)| actor.as_str().to_string())
+                .unwrap_or_default(),
+            action: PolicyAction::Read,
+            branch: None,
+            target_branch: None,
+        },
+    )?;
+    let source = {
+        let db = Arc::clone(&state.db).read_owned().await;
+        db.schema_source().to_string()
+    };
+    Ok(Json(SchemaGetOutput { source }))
 }
 
 #[utoipa::path(
