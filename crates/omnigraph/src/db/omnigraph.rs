@@ -910,7 +910,7 @@ impl Omnigraph {
             };
 
             let source_ds = run_snapshot.open(&table_key).await?;
-            let batch = self.batch_for_table_rewrite(&source_ds, &table_key).await?;
+            let batch = self.s3_safe_batch_for_table_rewrite(&source_ds, &table_key).await?;
 
             let (mut target_ds, full_path, table_branch) = self
                 .open_for_mutation_on_branch(target_branch.as_deref(), &table_key)
@@ -959,7 +959,7 @@ impl Omnigraph {
 
             let source_ds = target_snapshot.open(&entry.table_key).await?;
             let batch = self
-                .batch_for_table_rewrite(&source_ds, &entry.table_key)
+                .s3_safe_batch_for_table_rewrite(&source_ds, &entry.table_key)
                 .await?;
 
             let (mut target_ds, full_path, table_branch) = self
@@ -1120,6 +1120,45 @@ impl Omnigraph {
         table_key: &str,
     ) -> Result<RecordBatch> {
         schema_apply::batch_for_table_rewrite(self, source_ds, table_key).await
+    }
+
+    /// Like `batch_for_table_rewrite`, but when the repo is S3-backed,
+    /// downloads the dataset files to local before scanning. This avoids
+    /// Lance's concurrent ranged GETs over HTTP which fail on RustFS.
+    async fn s3_safe_batch_for_table_rewrite(
+        &self,
+        source_ds: &Dataset,
+        table_key: &str,
+    ) -> Result<RecordBatch> {
+        use crate::storage::{StorageKind, storage_kind_for_uri};
+        use crate::table_store::TableStore;
+
+        if storage_kind_for_uri(&self.root_uri) != StorageKind::S3 {
+            return self.batch_for_table_rewrite(source_ds, table_key).await;
+        }
+
+        let row_count = self
+            .table_store()
+            .count_rows(source_ds, None)
+            .await
+            .unwrap_or(0);
+        if row_count == 0 {
+            return self.batch_for_table_rewrite(source_ds, table_key).await;
+        }
+
+        let staging = tempfile::Builder::new()
+            .prefix(&format!("omnigraph-scan-{}-", table_key.replace(':', "-")))
+            .tempdir()
+            .map_err(OmniError::from)?;
+        let local_uri = staging.path().join("dataset").to_string_lossy().to_string();
+
+        TableStore::copy_remote_dataset_to_local(source_ds.uri(), &local_uri).await?;
+
+        let local_ds = Dataset::open(&local_uri)
+            .await
+            .map_err(|e| OmniError::Lance(format!("open local staged dataset: {}", e)))?;
+        self.batch_for_table_rewrite(&local_ds, table_key).await
+        // TempDir cleaned on drop.
     }
 }
 

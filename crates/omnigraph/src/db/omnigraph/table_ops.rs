@@ -72,6 +72,21 @@ pub(super) async fn ensure_indices_for_branch(
         };
         let row_count = db.table_store.count_rows(&ds, None).await.unwrap_or(0);
         if row_count > 0 {
+            if is_s3_repo(db) {
+                let staged = build_indices_via_local_staging(db, &table_key, &full_path).await?;
+                if staged.version != entry.table_version
+                    || resolved_branch.as_deref() != entry.table_branch.as_deref()
+                {
+                    updates.push(crate::db::SubTableUpdate {
+                        table_key,
+                        table_version: staged.version,
+                        table_branch: resolved_branch,
+                        row_count: staged.row_count,
+                        version_metadata: staged.version_metadata,
+                    });
+                }
+                continue;
+            }
             build_indices_on_dataset(db, &table_key, &mut ds).await?;
         }
 
@@ -119,6 +134,21 @@ pub(super) async fn ensure_indices_for_branch(
         };
         let row_count = db.table_store.count_rows(&ds, None).await.unwrap_or(0);
         if row_count > 0 {
+            if is_s3_repo(db) {
+                let staged = build_indices_via_local_staging(db, &table_key, &full_path).await?;
+                if staged.version != entry.table_version
+                    || resolved_branch.as_deref() != entry.table_branch.as_deref()
+                {
+                    updates.push(crate::db::SubTableUpdate {
+                        table_key,
+                        table_version: staged.version,
+                        table_branch: resolved_branch,
+                        row_count: staged.row_count,
+                        version_metadata: staged.version_metadata,
+                    });
+                }
+                continue;
+            }
             build_indices_on_dataset(db, &table_key, &mut ds).await?;
         }
 
@@ -366,6 +396,66 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
     )))
 }
 
+/// Build indexes on a local temp Lance dataset, then upload the finished
+/// files (data + indexes) to the remote S3 URI. Avoids Lance's read-back-
+/// from-S3 pattern that breaks on RustFS for larger datasets.
+async fn build_indices_via_local_staging(
+    db: &Omnigraph,
+    table_key: &str,
+    remote_dataset_uri: &str,
+) -> Result<crate::table_store::TableState> {
+    use crate::table_store::TableStore;
+
+    let staging_dir = index_staging_tempdir(table_key)?;
+    let local_uri = staging_dir
+        .path()
+        .join("dataset")
+        .to_string_lossy()
+        .to_string();
+
+    // Download dataset files via individual object GETs (small files, not
+    // ranged reads) which work fine on RustFS.
+    TableStore::copy_remote_dataset_to_local(remote_dataset_uri, &local_uri).await?;
+
+    // Open the local copy and build indexes (fast local I/O, no network).
+    let mut local_ds = Dataset::open(&local_uri)
+        .await
+        .map_err(|e| OmniError::Lance(format!("open local staged dataset: {}", e)))?;
+    build_indices_on_dataset(db, table_key, &mut local_ds).await?;
+
+    // Upload the finished dataset (data + indexes) back to S3.
+    TableStore::copy_local_dataset_to_remote(&local_uri, remote_dataset_uri).await?;
+
+    // Reopen the remote dataset to pick up the newly uploaded files.
+    let reopened = Dataset::open(remote_dataset_uri)
+        .await
+        .map_err(|e| OmniError::Lance(format!("reopen after index staging: {}", e)))?;
+    db.table_store
+        .table_state(remote_dataset_uri, &reopened)
+        .await
+    // TempDir auto-cleans on drop.
+}
+
+const INDEX_STAGING_DIR_ENV: &str = "OMNIGRAPH_INDEX_STAGING_DIR";
+
+fn index_staging_tempdir(table_key: &str) -> Result<tempfile::TempDir> {
+    let prefix = format!("omnigraph-idx-{}-", table_key.replace(':', "-"));
+    if let Ok(root) = std::env::var(INDEX_STAGING_DIR_ENV) {
+        return tempfile::Builder::new()
+            .prefix(&prefix)
+            .tempdir_in(std::path::PathBuf::from(root))
+            .map_err(OmniError::from);
+    }
+    tempfile::Builder::new()
+        .prefix(&prefix)
+        .tempdir()
+        .map_err(OmniError::from)
+}
+
+fn is_s3_repo(db: &Omnigraph) -> bool {
+    crate::storage::storage_kind_for_uri(&db.root_uri) == crate::storage::StorageKind::S3
+}
+
 async fn prepare_updates_for_commit(
     db: &Omnigraph,
     branch: Option<&str>,
@@ -389,19 +479,24 @@ async fn prepare_updates_for_commit(
         let mut prepared_update = update.clone();
         if prepared_update.row_count > 0 {
             let full_path = format!("{}/{}", db.root_uri, entry.table_path);
-            let mut ds = reopen_for_mutation(
-                db,
-                &prepared_update.table_key,
-                &full_path,
-                prepared_update.table_branch.as_deref(),
-                prepared_update.table_version,
-            )
-            .await?;
-            build_indices_on_dataset(db, &prepared_update.table_key, &mut ds).await?;
-            let state = db.table_store.table_state(&full_path, &ds).await?;
-            prepared_update.table_version = state.version;
-            prepared_update.row_count = state.row_count;
-            prepared_update.version_metadata = state.version_metadata;
+            // For S3 repos: skip index building here. Indexes are deferred to
+            // ensure_indices_for_branch after the data commit, using local
+            // staging to avoid the RustFS read-back-from-S3 bug.
+            if !is_s3_repo(db) {
+                let mut ds = reopen_for_mutation(
+                    db,
+                    &prepared_update.table_key,
+                    &full_path,
+                    prepared_update.table_branch.as_deref(),
+                    prepared_update.table_version,
+                )
+                .await?;
+                build_indices_on_dataset(db, &prepared_update.table_key, &mut ds).await?;
+                let state = db.table_store.table_state(&full_path, &ds).await?;
+                prepared_update.table_version = state.version;
+                prepared_update.row_count = state.row_count;
+                prepared_update.version_metadata = state.version_metadata;
+            }
         }
 
         prepared.push(prepared_update);

@@ -189,6 +189,15 @@ impl Omnigraph {
             return Err(err);
         }
 
+        // For S3 repos: indexes were deferred during the load/publish commit
+        // (to avoid Lance's read-back-from-S3 which fails on RustFS). Build
+        // them now via local staging.
+        if crate::storage::storage_kind_for_uri(self.uri())
+            == crate::storage::StorageKind::S3
+        {
+            self.ensure_indices_on(&requested).await?;
+        }
+
         Ok(staged_result)
     }
 
