@@ -73,7 +73,7 @@ pub(super) async fn ensure_indices_for_branch(
         let row_count = db.table_store.count_rows(&ds, None).await.unwrap_or(0);
         if row_count > 0 {
             if is_s3_repo(db) {
-                let staged = build_indices_via_local_staging(db, &table_key, &full_path).await?;
+                let staged = build_indices_via_local_staging(db, &table_key, ds.uri()).await?;
                 if staged.version != entry.table_version
                     || resolved_branch.as_deref() != entry.table_branch.as_deref()
                 {
@@ -135,7 +135,7 @@ pub(super) async fn ensure_indices_for_branch(
         let row_count = db.table_store.count_rows(&ds, None).await.unwrap_or(0);
         if row_count > 0 {
             if is_s3_repo(db) {
-                let staged = build_indices_via_local_staging(db, &table_key, &full_path).await?;
+                let staged = build_indices_via_local_staging(db, &table_key, ds.uri()).await?;
                 if staged.version != entry.table_version
                     || resolved_branch.as_deref() != entry.table_branch.as_deref()
                 {

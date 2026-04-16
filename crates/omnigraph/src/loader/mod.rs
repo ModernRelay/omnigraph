@@ -191,11 +191,17 @@ impl Omnigraph {
 
         // For S3 repos: indexes were deferred during the load/publish commit
         // (to avoid Lance's read-back-from-S3 which fails on RustFS). Build
-        // them now via local staging.
+        // them now via local staging. Index failure after publish is non-fatal:
+        // data is committed, indexes will be built on next ensure_indices call.
         if crate::storage::storage_kind_for_uri(self.uri())
             == crate::storage::StorageKind::S3
         {
-            self.ensure_indices_on(&requested).await?;
+            if let Err(err) = self.ensure_indices_on(&requested).await {
+                tracing::warn!(
+                    "post-publish index build failed (data is committed, indexes pending): {}",
+                    err
+                );
+            }
         }
 
         Ok(staged_result)
