@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arrow_array::{
@@ -12,27 +12,23 @@ use lance::blob::{BlobArrayBuilder, blob_field};
 use lance::dataset::BlobFile;
 use lance::dataset::scanner::ColumnOrdering;
 use lance::datatypes::BlobKind;
+use omnigraph_compiler::build_catalog;
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::types::ScalarType;
-use omnigraph_compiler::{
-    SchemaIR, SchemaMigrationPlan, build_catalog_from_ir, build_schema_ir, plan_schema_migration,
-};
 
 use crate::db::graph_coordinator::{GraphCoordinator, PublishedSnapshot};
 use crate::db::run_registry::{RunRecord, RunStatus, is_internal_run_branch};
-use crate::error::{ManifestErrorKind, OmniError, Result};
+use crate::error::{OmniError, Result};
 use crate::runtime_cache::RuntimeCache;
 use crate::storage::{StorageAdapter, join_uri, normalize_root_uri, storage_for_uri};
-use crate::table_store::TableStore;
+use crate::table_store::{TableState, TableStore};
 
 use super::commit_graph::GraphCommit;
 use super::manifest::Snapshot;
-use super::schema_state::{
-    SCHEMA_SOURCE_FILENAME, load_or_bootstrap_schema_contract, read_accepted_schema_ir,
-    validate_schema_contract, write_schema_contract,
-};
 use super::{ReadTarget, ResolvedTarget, RunId, SnapshotId};
+
+const SCHEMA_FILENAME: &str = "_schema.pg";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeOutcome {
@@ -71,14 +67,14 @@ impl Omnigraph {
         storage: Arc<dyn StorageAdapter>,
     ) -> Result<Self> {
         let root = normalize_root_uri(uri)?;
-        let schema_ir = read_schema_ir_from_source(schema_source)?;
-        let mut catalog = build_catalog_from_ir(&schema_ir)?;
+        // Parse and validate schema
+        let schema_ast = parse_schema(schema_source)?;
+        let mut catalog = build_catalog(&schema_ast)?;
         fixup_blob_schemas(&mut catalog);
 
         // Write _schema.pg
-        let schema_path = join_uri(&root, SCHEMA_SOURCE_FILENAME);
+        let schema_path = join_uri(&root, SCHEMA_FILENAME);
         storage.write_text(&schema_path, schema_source).await?;
-        write_schema_contract(&root, storage.as_ref(), &schema_ir).await?;
 
         // Create manifest + per-type datasets
         let coordinator = GraphCoordinator::init(&root, &catalog, Arc::clone(&storage)).await?;
@@ -108,20 +104,15 @@ impl Omnigraph {
     ) -> Result<Self> {
         let root = normalize_root_uri(uri)?;
         // Read _schema.pg
-        let schema_path = join_uri(&root, SCHEMA_SOURCE_FILENAME);
+        let schema_path = join_uri(&root, SCHEMA_FILENAME);
         let schema_source = storage.read_text(&schema_path).await?;
-        let current_source_ir = read_schema_ir_from_source(&schema_source)?;
-        let coordinator = GraphCoordinator::open(&root, Arc::clone(&storage)).await?;
-        let branches = coordinator.branch_list().await?;
-        let (accepted_ir, _) = load_or_bootstrap_schema_contract(
-            &root,
-            Arc::clone(&storage),
-            &branches,
-            &current_source_ir,
-        )
-        .await?;
-        let mut catalog = build_catalog_from_ir(&accepted_ir)?;
+
+        // Parse and validate schema
+        let schema_ast = parse_schema(&schema_source)?;
+        let mut catalog = build_catalog(&schema_ast)?;
         fixup_blob_schemas(&mut catalog);
+
+        let coordinator = GraphCoordinator::open(&root, Arc::clone(&storage)).await?;
 
         Ok(Self {
             root_uri: root.clone(),
@@ -145,18 +136,6 @@ impl Omnigraph {
 
     pub fn uri(&self) -> &str {
         &self.root_uri
-    }
-
-    pub(crate) async fn ensure_schema_state_valid(&self) -> Result<()> {
-        validate_schema_contract(self.uri(), Arc::clone(&self.storage)).await
-    }
-
-    pub async fn plan_schema(&self, desired_schema_source: &str) -> Result<SchemaMigrationPlan> {
-        self.ensure_schema_state_valid().await?;
-        let accepted_ir = read_accepted_schema_ir(self.uri(), Arc::clone(&self.storage)).await?;
-        let desired_ir = read_schema_ir_from_source(desired_schema_source)?;
-        plan_schema_migration(&accepted_ir, &desired_ir)
-            .map_err(|err| OmniError::manifest(err.to_string()))
     }
 
     pub(crate) fn table_store(&self) -> &TableStore {
@@ -191,7 +170,6 @@ impl Omnigraph {
         &self,
         branch: Option<&str>,
     ) -> Result<ResolvedTarget> {
-        self.ensure_schema_state_valid().await?;
         let requested = ReadTarget::Branch(branch.unwrap_or("main").to_string());
         let normalized = normalize_branch_name(branch.unwrap_or("main"))?;
         if normalized.as_deref() == self.coordinator.current_branch() {
@@ -249,7 +227,6 @@ impl Omnigraph {
 
     /// Synchronize this handle's write base to the latest head of the named branch.
     pub async fn sync_branch(&mut self, branch: &str) -> Result<()> {
-        self.ensure_schema_state_valid().await?;
         let branch = normalize_branch_name(branch)?;
         self.coordinator = self.open_coordinator_for_branch(branch.as_deref()).await?;
         self.runtime_cache.invalidate_all().await;
@@ -264,7 +241,6 @@ impl Omnigraph {
     }
 
     pub async fn resolve_snapshot(&self, branch: &str) -> Result<SnapshotId> {
-        self.ensure_schema_state_valid().await?;
         self.coordinator.resolve_snapshot_id(branch).await
     }
 
@@ -272,7 +248,6 @@ impl Omnigraph {
         &self,
         target: impl Into<ReadTarget>,
     ) -> Result<ResolvedTarget> {
-        self.ensure_schema_state_valid().await?;
         self.coordinator.resolve_target(&target.into()).await
     }
 
@@ -358,7 +333,6 @@ impl Omnigraph {
 
     /// Create a Snapshot at any historical manifest version.
     pub async fn snapshot_at_version(&self, version: u64) -> Result<Snapshot> {
-        self.ensure_schema_state_valid().await?;
         self.coordinator.snapshot_at_version(version).await
     }
 
@@ -368,7 +342,6 @@ impl Omnigraph {
         type_names: &[String],
         table_keys: &[String],
     ) -> Result<String> {
-        self.ensure_schema_state_valid().await?;
         let snapshot = self.snapshot_of(ReadTarget::branch(branch)).await?;
         self.export_snapshot_jsonl(&snapshot, type_names, table_keys)
             .await
@@ -529,7 +502,6 @@ impl Omnigraph {
 
     /// Get or build the graph index for the current snapshot.
     pub async fn graph_index(&self) -> Result<Arc<crate::graph_index::GraphIndex>> {
-        self.ensure_schema_state_valid().await?;
         let resolved = self
             .coordinator
             .resolve_target(&ReadTarget::Branch(
@@ -577,7 +549,6 @@ impl Omnigraph {
     }
 
     pub(crate) async fn ensure_indices_for_branch(&mut self, branch: Option<&str>) -> Result<()> {
-        self.ensure_schema_state_valid().await?;
         let resolved = self.resolved_branch_target(branch).await?;
         let snapshot = resolved.snapshot;
         let mut updates = Vec::new();
@@ -612,6 +583,30 @@ impl Omnigraph {
             };
             let row_count = self.table_store.count_rows(&ds, None).await.unwrap_or(0);
             if row_count > 0 {
+                if crate::storage::storage_kind_for_uri(&self.root_uri)
+                    == crate::storage::StorageKind::S3
+                {
+                    let staged = self
+                        .build_indices_via_local_staging(
+                            &table_key,
+                            &full_path,
+                            entry.table_branch.as_deref(),
+                            entry.table_version,
+                        )
+                        .await?;
+                    if staged.version != entry.table_version
+                        || resolved_branch.as_deref() != entry.table_branch.as_deref()
+                    {
+                        updates.push(crate::db::SubTableUpdate {
+                            table_key,
+                            table_version: staged.version,
+                            table_branch: resolved_branch,
+                            row_count: staged.row_count,
+                            version_metadata: staged.version_metadata,
+                        });
+                    }
+                    continue;
+                }
                 self.build_indices_on_dataset(&table_key, &mut ds).await?;
             }
 
@@ -658,6 +653,30 @@ impl Omnigraph {
             };
             let row_count = self.table_store.count_rows(&ds, None).await.unwrap_or(0);
             if row_count > 0 {
+                if crate::storage::storage_kind_for_uri(&self.root_uri)
+                    == crate::storage::StorageKind::S3
+                {
+                    let staged = self
+                        .build_indices_via_local_staging(
+                            &table_key,
+                            &full_path,
+                            entry.table_branch.as_deref(),
+                            entry.table_version,
+                        )
+                        .await?;
+                    if staged.version != entry.table_version
+                        || resolved_branch.as_deref() != entry.table_branch.as_deref()
+                    {
+                        updates.push(crate::db::SubTableUpdate {
+                            table_key,
+                            table_version: staged.version,
+                            table_branch: resolved_branch,
+                            row_count: staged.row_count,
+                            version_metadata: staged.version_metadata,
+                        });
+                    }
+                    continue;
+                }
                 self.build_indices_on_dataset(&table_key, &mut ds).await?;
             }
 
@@ -693,7 +712,6 @@ impl Omnigraph {
     /// let bytes = blob.read().await?;
     /// ```
     pub async fn read_blob(&self, type_name: &str, id: &str, property: &str) -> Result<BlobFile> {
-        self.ensure_schema_state_valid().await?;
         let node_type = self
             .catalog
             .node_types
@@ -738,118 +756,6 @@ impl Omnigraph {
         self.coordinator.current_branch()
     }
 
-    async fn ensure_branch_delete_safe(&self, branch: &str, branches: &[String]) -> Result<()> {
-        let descendants = self.coordinator.branch_descendants(branch).await?;
-        if let Some(descendant) = descendants.first() {
-            return Err(OmniError::manifest_conflict(format!(
-                "cannot delete branch '{}' because descendant branch '{}' still depends on it",
-                branch, descendant
-            )));
-        }
-
-        for run in self.list_runs().await? {
-            if run.target_branch == branch
-                && matches!(run.status, RunStatus::Running | RunStatus::Failed)
-            {
-                return Err(OmniError::manifest_conflict(format!(
-                    "cannot delete branch '{}' while run '{}' targeting it is {}",
-                    branch,
-                    run.run_id,
-                    run.status.as_str()
-                )));
-            }
-        }
-
-        for other_branch in branches
-            .iter()
-            .filter(|candidate| candidate.as_str() != branch)
-        {
-            let snapshot = self
-                .snapshot_of(ReadTarget::branch(other_branch.as_str()))
-                .await?;
-            if snapshot
-                .entries()
-                .any(|entry| entry.table_branch.as_deref() == Some(branch))
-            {
-                return Err(OmniError::manifest_conflict(format!(
-                    "cannot delete branch '{}' because branch '{}' still depends on it",
-                    branch, other_branch
-                )));
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn cleanup_deleted_branch_tables(
-        &self,
-        branch: &str,
-        owned_tables: &[(String, String)],
-    ) -> Result<()> {
-        let mut seen_paths = HashSet::new();
-        let mut cleanup_targets = owned_tables
-            .iter()
-            .filter(|(_, table_path)| seen_paths.insert(table_path.clone()))
-            .cloned()
-            .collect::<Vec<_>>();
-        cleanup_targets.sort_by(|left, right| left.0.cmp(&right.0));
-
-        for (table_key, table_path) in cleanup_targets {
-            let dataset_uri = self.table_store.dataset_uri(&table_path);
-            if let Err(err) = self.table_store.delete_branch(&dataset_uri, branch).await {
-                return Err(OmniError::manifest_internal(format!(
-                    "branch '{}' was deleted but cleanup failed for {}: {}",
-                    branch, table_key, err
-                )));
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn delete_branch_storage_only(&mut self, branch: &str) -> Result<()> {
-        if self.coordinator.current_branch() == Some(branch) {
-            return Err(OmniError::manifest_conflict(format!(
-                "cannot delete currently active branch '{}'",
-                branch
-            )));
-        }
-
-        let branch_snapshot = self.snapshot_of(ReadTarget::branch(branch)).await?;
-        let owned_tables = branch_snapshot
-            .entries()
-            .filter(|entry| entry.table_branch.as_deref() == Some(branch))
-            .map(|entry| (entry.table_key.clone(), entry.table_path.clone()))
-            .collect::<Vec<_>>();
-
-        self.coordinator.branch_delete(branch).await?;
-        self.cleanup_deleted_branch_tables(branch, &owned_tables)
-            .await
-    }
-
-    async fn cleanup_terminal_run_branches_for_target(&mut self, branch: &str) -> Result<()> {
-        let terminal_run_branches = self
-            .list_runs()
-            .await?
-            .into_iter()
-            .filter(|run| {
-                run.target_branch == branch
-                    && matches!(run.status, RunStatus::Published | RunStatus::Aborted)
-            })
-            .map(|run| run.run_branch)
-            .collect::<Vec<_>>();
-
-        for run_branch in terminal_run_branches {
-            match self.delete_branch_storage_only(&run_branch).await {
-                Ok(()) => {}
-                Err(OmniError::Manifest(err)) if err.kind == ManifestErrorKind::NotFound => {}
-                Err(err) => return Err(err),
-            }
-        }
-
-        Ok(())
-    }
-
     pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
         normalize_branch_name(branch)
     }
@@ -867,7 +773,6 @@ impl Omnigraph {
     }
 
     pub async fn branch_create(&mut self, name: &str) -> Result<()> {
-        self.ensure_schema_state_valid().await?;
         ensure_public_branch_ref(name, "branch_create")?;
         self.coordinator.branch_create(name).await
     }
@@ -908,28 +813,7 @@ impl Omnigraph {
     }
 
     pub async fn branch_list(&self) -> Result<Vec<String>> {
-        self.ensure_schema_state_valid().await?;
         self.coordinator.branch_list().await
-    }
-
-    pub async fn branch_delete(&mut self, name: &str) -> Result<()> {
-        self.ensure_schema_state_valid().await?;
-        ensure_public_branch_ref(name, "branch_delete")?;
-        self.refresh().await?;
-        let branch = normalize_branch_name(name)?
-            .ok_or_else(|| OmniError::manifest("cannot delete branch 'main'".to_string()))?;
-        let branches = self.coordinator.branch_list().await?;
-        if !branches.iter().any(|candidate| candidate == &branch) {
-            return Err(OmniError::manifest_not_found(format!(
-                "branch '{}' not found",
-                branch
-            )));
-        }
-
-        self.ensure_branch_delete_safe(&branch, &branches).await?;
-        self.cleanup_terminal_run_branches_for_target(&branch)
-            .await?;
-        self.delete_branch_storage_only(&branch).await
     }
 
     pub(crate) async fn latest_branch_snapshot_id(&self, branch: &str) -> Result<SnapshotId> {
@@ -954,7 +838,6 @@ impl Omnigraph {
         operation_hash: Option<&str>,
         actor_id: Option<&str>,
     ) -> Result<RunRecord> {
-        self.ensure_schema_state_valid().await?;
         ensure_public_branch_ref(target_branch, "begin_run")?;
         let target_branch =
             normalize_branch_name(target_branch)?.unwrap_or_else(|| "main".to_string());
@@ -984,24 +867,20 @@ impl Omnigraph {
     }
 
     pub async fn get_run(&self, run_id: &RunId) -> Result<RunRecord> {
-        self.ensure_schema_state_valid().await?;
         self.coordinator.get_run(run_id).await
     }
 
     pub async fn list_runs(&self) -> Result<Vec<RunRecord>> {
-        self.ensure_schema_state_valid().await?;
         self.coordinator.list_runs().await
     }
 
     pub async fn get_commit(&self, commit_id: &str) -> Result<GraphCommit> {
-        self.ensure_schema_state_valid().await?;
         self.coordinator
             .resolve_commit(&SnapshotId::new(commit_id))
             .await
     }
 
     pub async fn list_commits(&self, branch: Option<&str>) -> Result<Vec<GraphCommit>> {
-        self.ensure_schema_state_valid().await?;
         let branch = match branch {
             Some(branch) => normalize_branch_name(branch)?,
             None => None,
@@ -1011,7 +890,6 @@ impl Omnigraph {
     }
 
     pub async fn abort_run(&mut self, run_id: &RunId) -> Result<RunRecord> {
-        self.ensure_schema_state_valid().await?;
         let run = self.get_run(run_id).await?;
         match run.status {
             RunStatus::Running | RunStatus::Failed => {
@@ -1031,7 +909,6 @@ impl Omnigraph {
     }
 
     pub async fn fail_run(&mut self, run_id: &RunId) -> Result<RunRecord> {
-        self.ensure_schema_state_valid().await?;
         let run = self.get_run(run_id).await?;
         match run.status {
             RunStatus::Running => {
@@ -1060,7 +937,6 @@ impl Omnigraph {
         run_id: &RunId,
         actor_id: Option<&str>,
     ) -> Result<SnapshotId> {
-        self.ensure_schema_state_valid().await?;
         let run = self.get_run(run_id).await?;
         match run.status {
             RunStatus::Running => {}
@@ -1148,7 +1024,41 @@ impl Omnigraph {
             };
 
             let source_ds = run_snapshot.open(&table_key).await?;
-            let batch = self.batch_for_table_rewrite(&source_ds, &table_key).await?;
+
+            // For S3 repos: download the run branch dataset to local before
+            // scanning, to avoid Lance's concurrent ranged GETs over HTTP.
+            let batch = if crate::storage::storage_kind_for_uri(&self.root_uri)
+                == crate::storage::StorageKind::S3
+            {
+                let row_count = self
+                    .table_store()
+                    .count_rows(&source_ds, None)
+                    .await
+                    .unwrap_or(0);
+                if row_count == 0 {
+                    let target_schema = schema_for_table_key(self.catalog(), &table_key)?;
+                    RecordBatch::new_empty(target_schema)
+                } else {
+                    let staging = tempfile::Builder::new()
+                        .prefix(&format!(
+                            "omnigraph-promote-{}-",
+                            table_key.replace(':', "-")
+                        ))
+                        .tempdir()
+                        .map_err(OmniError::from)?;
+                    let local_uri =
+                        staging.path().join("dataset").to_string_lossy().to_string();
+                    TableStore::copy_remote_dataset_to_local(source_ds.uri(), &local_uri)
+                        .await?;
+                    let local_ds = Dataset::open(&local_uri).await.map_err(|e| {
+                        OmniError::Lance(format!("open local staged dataset: {}", e))
+                    })?;
+                    self.batch_for_table_rewrite(&local_ds, &table_key).await?
+                    // staging dir cleaned on drop
+                }
+            } else {
+                self.batch_for_table_rewrite(&source_ds, &table_key).await?
+            };
 
             let (mut target_ds, full_path, table_branch) = self
                 .open_for_mutation_on_branch(target_branch.as_deref(), &table_key)
@@ -1196,9 +1106,41 @@ impl Omnigraph {
             }
 
             let source_ds = target_snapshot.open(&entry.table_key).await?;
-            let batch = self
-                .batch_for_table_rewrite(&source_ds, &entry.table_key)
-                .await?;
+
+            let batch = if crate::storage::storage_kind_for_uri(&self.root_uri)
+                == crate::storage::StorageKind::S3
+            {
+                let row_count = self
+                    .table_store()
+                    .count_rows(&source_ds, None)
+                    .await
+                    .unwrap_or(0);
+                if row_count == 0 {
+                    let target_schema =
+                        schema_for_table_key(self.catalog(), &entry.table_key)?;
+                    RecordBatch::new_empty(target_schema)
+                } else {
+                    let staging = tempfile::Builder::new()
+                        .prefix(&format!(
+                            "omnigraph-reify-{}-",
+                            entry.table_key.replace(':', "-")
+                        ))
+                        .tempdir()
+                        .map_err(OmniError::from)?;
+                    let local_uri =
+                        staging.path().join("dataset").to_string_lossy().to_string();
+                    TableStore::copy_remote_dataset_to_local(source_ds.uri(), &local_uri)
+                        .await?;
+                    let local_ds = Dataset::open(&local_uri).await.map_err(|e| {
+                        OmniError::Lance(format!("open local staged dataset: {}", e))
+                    })?;
+                    self.batch_for_table_rewrite(&local_ds, &entry.table_key)
+                        .await?
+                }
+            } else {
+                self.batch_for_table_rewrite(&source_ds, &entry.table_key)
+                    .await?
+            };
 
             let (mut target_ds, full_path, table_branch) = self
                 .open_for_mutation_on_branch(target_branch.as_deref(), &entry.table_key)
@@ -1454,6 +1396,63 @@ impl Omnigraph {
         )))
     }
 
+    /// Build indexes on a local temp Lance dataset, then upload the finished
+    /// files (data + indexes) to the remote S3 URI. This avoids the read-back-
+    /// from-S3 pattern that breaks on RustFS for larger datasets.
+    async fn build_indices_via_local_staging(
+        &self,
+        table_key: &str,
+        remote_dataset_uri: &str,
+        _branch: Option<&str>,
+        _version: u64,
+    ) -> Result<TableState> {
+        use crate::storage::{StorageKind, storage_kind_for_uri};
+        use tempfile::Builder as TempDirBuilder;
+
+        debug_assert_eq!(
+            storage_kind_for_uri(&self.root_uri),
+            StorageKind::S3,
+            "build_indices_via_local_staging should only be called for S3 repos"
+        );
+
+        // 1. Create a local temp directory (follows merge_stage_tempdir pattern).
+        let staging_dir = if let Ok(root) = std::env::var("OMNIGRAPH_INDEX_STAGING_DIR") {
+            TempDirBuilder::new()
+                .prefix(&format!("omnigraph-idx-{}-", table_key.replace(':', "-")))
+                .tempdir_in(std::path::PathBuf::from(root))
+                .map_err(OmniError::from)?
+        } else {
+            TempDirBuilder::new()
+                .prefix(&format!("omnigraph-idx-{}-", table_key.replace(':', "-")))
+                .tempdir()
+                .map_err(OmniError::from)?
+        };
+        let local_uri = staging_dir.path().join("dataset").to_string_lossy().to_string();
+
+        // 2. Download the remote dataset files to local. Uses individual object
+        //    GETs (small files, not ranged reads) which work fine on RustFS.
+        TableStore::copy_remote_dataset_to_local(remote_dataset_uri, &local_uri).await?;
+
+        // 3. Open the local copy and build indexes (fast local I/O, no network).
+        let mut local_ds = Dataset::open(&local_uri)
+            .await
+            .map_err(|e| OmniError::Lance(format!("open local staged dataset: {}", e)))?;
+        self.build_indices_on_dataset(table_key, &mut local_ds)
+            .await?;
+
+        // 4. Upload the finished dataset (data + indexes) back to S3.
+        TableStore::copy_local_dataset_to_remote(&local_uri, remote_dataset_uri).await?;
+
+        // 5. Reopen the remote dataset to pick up the newly uploaded files.
+        let reopened = Dataset::open(remote_dataset_uri)
+            .await
+            .map_err(|e| OmniError::Lance(format!("reopen after index staging: {}", e)))?;
+        self.table_store
+            .table_state(remote_dataset_uri, &reopened)
+            .await
+        // TempDir auto-cleans on drop.
+    }
+
     async fn prepare_updates_for_commit(
         &self,
         branch: Option<&str>,
@@ -1477,20 +1476,27 @@ impl Omnigraph {
             let mut prepared_update = update.clone();
             if prepared_update.row_count > 0 {
                 let full_path = format!("{}/{}", self.root_uri, entry.table_path);
-                let mut ds = self
-                    .reopen_for_mutation(
-                        &prepared_update.table_key,
-                        &full_path,
-                        prepared_update.table_branch.as_deref(),
-                        prepared_update.table_version,
-                    )
-                    .await?;
-                self.build_indices_on_dataset(&prepared_update.table_key, &mut ds)
-                    .await?;
-                let state = self.table_store.table_state(&full_path, &ds).await?;
-                prepared_update.table_version = state.version;
-                prepared_update.row_count = state.row_count;
-                prepared_update.version_metadata = state.version_metadata;
+                // For S3 repos: skip index building here. Indexes will be built
+                // via ensure_indices_for_branch after the data commit, using
+                // local staging to avoid the RustFS read-back-from-S3 bug.
+                if crate::storage::storage_kind_for_uri(&self.root_uri)
+                    != crate::storage::StorageKind::S3
+                {
+                    let mut ds = self
+                        .reopen_for_mutation(
+                            &prepared_update.table_key,
+                            &full_path,
+                            prepared_update.table_branch.as_deref(),
+                            prepared_update.table_version,
+                        )
+                        .await?;
+                    self.build_indices_on_dataset(&prepared_update.table_key, &mut ds)
+                        .await?;
+                    let state = self.table_store.table_state(&full_path, &ds).await?;
+                    prepared_update.table_version = state.version;
+                    prepared_update.row_count = state.row_count;
+                    prepared_update.version_metadata = state.version_metadata;
+                }
             }
 
             prepared.push(prepared_update);
@@ -2104,11 +2110,6 @@ fn fixup_blob_schemas(catalog: &mut Catalog) {
     }
 }
 
-fn read_schema_ir_from_source(schema_source: &str) -> Result<SchemaIR> {
-    let schema_ast = parse_schema(schema_source)?;
-    build_schema_ir(&schema_ast).map_err(|err| OmniError::manifest(err.to_string()))
-}
-
 fn schema_for_table_key(catalog: &Catalog, table_key: &str) -> Result<Arc<Schema>> {
     if let Some(type_name) = table_key.strip_prefix("node:") {
         let node_type: &NodeType = catalog
@@ -2307,8 +2308,6 @@ fn json_value_from_array(array: &dyn Array, row: usize) -> Result<serde_json::Va
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use omnigraph_compiler::{SchemaMigrationStep, SchemaTypeKind};
-    use std::fs;
     use std::sync::Mutex;
 
     use crate::storage::{LocalStorageAdapter, StorageAdapter, join_uri};
@@ -2376,8 +2375,6 @@ edge WorksAt: Person -> Company
 
         // Schema file written
         assert!(dir.path().join("_schema.pg").exists());
-        assert!(dir.path().join("_schema.ir.json").exists());
-        assert!(dir.path().join("__schema_state.json").exists());
 
         // Manifest created with correct entries
         let snap = db.snapshot();
@@ -2421,182 +2418,15 @@ edge WorksAt: Person -> Company
             .await
             .unwrap();
         assert!(adapter.writes().contains(&join_uri(uri, "_schema.pg")));
-        assert!(adapter.writes().contains(&join_uri(uri, "_schema.ir.json")));
-        assert!(
-            adapter
-                .writes()
-                .contains(&join_uri(uri, "__schema_state.json"))
-        );
 
         Omnigraph::open_with_storage(uri, adapter.clone())
             .await
             .unwrap();
         assert!(adapter.reads().contains(&join_uri(uri, "_schema.pg")));
-        assert!(adapter.reads().contains(&join_uri(uri, "_schema.ir.json")));
-        assert!(
-            adapter
-                .reads()
-                .contains(&join_uri(uri, "__schema_state.json"))
-        );
-        assert!(
-            adapter
-                .exists_checks()
-                .contains(&join_uri(uri, "_schema.ir.json"))
-        );
-        assert!(
-            adapter
-                .exists_checks()
-                .contains(&join_uri(uri, "__schema_state.json"))
-        );
         assert!(
             adapter
                 .exists_checks()
                 .contains(&join_uri(uri, "_graph_commits.lance"))
-        );
-    }
-
-    #[tokio::test]
-    async fn test_open_bootstraps_legacy_schema_state_for_main_only_repo() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-        fs::remove_file(dir.path().join("_schema.ir.json")).unwrap();
-        fs::remove_file(dir.path().join("__schema_state.json")).unwrap();
-
-        let db = Omnigraph::open(uri).await.unwrap();
-        assert_eq!(db.catalog().node_types.len(), 2);
-        assert!(dir.path().join("_schema.ir.json").exists());
-        assert!(dir.path().join("__schema_state.json").exists());
-    }
-
-    #[tokio::test]
-    async fn test_open_rejects_legacy_repo_with_public_branch() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-        db.branch_create("feature").await.unwrap();
-
-        fs::remove_file(dir.path().join("_schema.ir.json")).unwrap();
-        fs::remove_file(dir.path().join("__schema_state.json")).unwrap();
-
-        let err = match Omnigraph::open(uri).await {
-            Ok(_) => panic!("expected legacy repo with public branch to fail schema bootstrap"),
-            Err(err) => err,
-        };
-        let message = err.to_string();
-        assert!(message.contains("public branches block schema evolution entirely"));
-    }
-
-    #[tokio::test]
-    async fn test_long_lived_handle_rejects_schema_source_drift() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-        let drifted = TEST_SCHEMA.replace("age: I32?", "age: I64?");
-        fs::write(dir.path().join("_schema.pg"), drifted).unwrap();
-
-        let err = match db.snapshot_of(ReadTarget::branch("main")).await {
-            Ok(_) => panic!("expected schema source drift to be rejected"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string()
-                .contains("current _schema.pg no longer matches the accepted compiled schema")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_long_lived_handle_rejects_schema_ir_drift() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-        fs::write(dir.path().join("_schema.ir.json"), "{not valid json").unwrap();
-
-        let err = match db.snapshot_of(ReadTarget::branch("main")).await {
-            Ok(_) => panic!("expected schema IR drift to be rejected"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string()
-                .contains("accepted compiled schema contract in _schema.ir.json is invalid")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_long_lived_handle_rejects_ir_and_source_updates_without_state_update() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-        let drifted = TEST_SCHEMA.replace("age: I32?", "age: I64?");
-        let drifted_ir = read_schema_ir_from_source(&drifted).unwrap();
-        let drifted_ir_json = omnigraph_compiler::schema_ir_pretty_json(&drifted_ir).unwrap();
-        fs::write(dir.path().join("_schema.pg"), drifted).unwrap();
-        fs::write(dir.path().join("_schema.ir.json"), drifted_ir_json).unwrap();
-
-        let err = match db.snapshot_of(ReadTarget::branch("main")).await {
-            Ok(_) => panic!("expected schema state mismatch to be rejected"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string()
-                .contains("accepted compiled schema does not match the recorded schema state")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_comment_only_schema_edit_keeps_schema_state_valid() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-        let commented = format!("// comment-only drift\n{}", TEST_SCHEMA);
-        fs::write(dir.path().join("_schema.pg"), commented).unwrap();
-
-        let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-        assert!(snapshot.entry("node:Person").is_some());
-    }
-
-    #[tokio::test]
-    async fn test_plan_schema_reports_supported_additive_change() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-        let desired = TEST_SCHEMA.replace(
-            "    age: I32?\n}",
-            "    age: I32?\n    nickname: String?\n}",
-        );
-
-        let plan = db.plan_schema(&desired).await.unwrap();
-        assert!(plan.supported);
-        assert!(plan.steps.iter().any(|step| matches!(
-            step,
-            SchemaMigrationStep::AddProperty {
-                type_kind: SchemaTypeKind::Node,
-                type_name,
-                property_name,
-                ..
-            } if type_name == "Person" && property_name == "nickname"
-        )));
-    }
-
-    #[tokio::test]
-    async fn test_plan_schema_rejects_when_schema_contract_has_drifted() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-        let drifted = TEST_SCHEMA.replace("age: I32?", "age: I64?");
-        fs::write(dir.path().join("_schema.pg"), drifted).unwrap();
-
-        let err = db.plan_schema(TEST_SCHEMA).await.unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("current _schema.pg no longer matches the accepted compiled schema")
         );
     }
 

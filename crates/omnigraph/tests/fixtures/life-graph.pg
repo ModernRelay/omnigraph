@@ -1,0 +1,237 @@
+// Life Graph — Personal Memory & Relationship Ontology
+
+
+// ──────────────────────────────────────────────
+// Core Nodes
+// ──────────────────────────────────────────────
+
+node Person {
+    slug: String @key
+    name: String @index
+    relation: enum(family, friend, colleague, acquaintance, professional, mentor, other) @index
+    email: String?
+    phone: String?
+    birthday: Date?
+    location: String?
+    how_met: String?
+    brief: String?
+    notes: String?
+    createdAt: DateTime
+    updatedAt: DateTime
+}
+
+node Event {
+    slug: String @key
+    name: String @index
+    kind: enum(meeting, dinner, trip, call, party, milestone, workout, conference, date, hangout, other) @index
+    brief: String?
+    description: String?
+    date: DateTime @index
+    end_date: DateTime?
+    location: String?
+    mood: String?
+    tags: [String]?
+    createdAt: DateTime
+    updatedAt: DateTime
+}
+
+node Commitment {
+    slug: String @key
+    name: String @index
+    kind: enum(promise, task, deadline, goal, habit, followup) @index
+    status: enum(pending, done, overdue, cancelled, deferred) @index
+    direction: enum(i-committed, they-committed, mutual)?
+    brief: String?
+    description: String?
+    due_date: DateTime?
+    priority: enum(low, medium, high, critical)?
+    tags: [String]?
+    createdAt: DateTime
+    updatedAt: DateTime
+}
+
+node Place {
+    slug: String @key
+    name: String @index
+    kind: enum(city, country, restaurant, office, home, venue, airport, park, cafe, other) @index
+    address: String?
+    lat: F64?
+    lng: F64?
+    brief: String?
+    createdAt: DateTime
+    updatedAt: DateTime
+}
+
+node Note {
+    slug: String @key
+    name: String @index
+    kind: enum(idea, reflection, reminder, insight, quote, dream, journal) @index
+    content: String?
+    tags: [String]?
+    createdAt: DateTime
+    updatedAt: DateTime
+}
+
+node Project {
+    slug: String @key
+    name: String @index
+    kind: enum(work, personal, hobby, side-project, learning, health) @index
+    status: enum(active, paused, completed, abandoned) @index
+    brief: String?
+    description: String?
+    goal: String?
+    createdAt: DateTime
+    updatedAt: DateTime
+}
+
+node Media {
+    slug: String @key
+    name: String @index
+    kind: enum(book, article, movie, show, podcast, album, paper, video, game) @index
+    creator: String?
+    status: enum(want, consuming, finished, abandoned)?
+    rating: F32?
+    url: String?
+    brief: String?
+    notes: String?
+    tags: [String]?
+    createdAt: DateTime
+    updatedAt: DateTime
+}
+
+node Organization {
+    slug: String @key
+    name: String @index
+    kind: enum(company, school, club, community, institution, team) @index
+    brief: String?
+    description: String?
+    website: String?
+    createdAt: DateTime
+    updatedAt: DateTime
+}
+
+
+// ──────────────────────────────────────────────
+// Analytical Nodes
+// ──────────────────────────────────────────────
+
+node WritingStyle {
+    slug: String @key
+    name: String @index
+    source: enum(whatsapp, email, linkedin, slack, x, notes-app, all) @index
+    tone: String?
+    avg_message_length: I32?
+    languages: [String]?
+    greetings: [String]?
+    laugh_style: String?
+    emoji_frequency: String?
+    top_emojis: [String]?
+    punctuation_style: String?
+    vocabulary_signature: [String]?
+    sample_messages: [String]?
+    description: String?
+    analyzedAt: DateTime
+    createdAt: DateTime
+    updatedAt: DateTime
+}
+
+edge StyleOfPerson: WritingStyle -> Person
+
+
+// ──────────────────────────────────────────────
+// Source & Provenance Nodes
+// ──────────────────────────────────────────────
+
+node Artifact {
+    slug: String @key
+    name: String @index
+    kind: enum(message, email, post, document, photo, calendar-entry, voice-note, chat-export) @index
+    source: enum(whatsapp, linkedin, email, calendar, notes-app, web, manual, slack, telegram, instagram, x, other) @index
+    source_ref: String?
+    url: String?
+    content: String?
+    timestamp: DateTime @index
+    createdAt: DateTime
+    updatedAt: DateTime
+}
+
+node Chunk {
+    text: String
+    chunk_index: I32
+    embedding: Vector(3072) @embed("text") @index
+    createdAt: DateTime
+}
+
+
+// ──────────────────────────────────────────────
+// Edges: Person <-> Person
+// ──────────────────────────────────────────────
+
+edge Knows: Person -> Person {
+    context: String?
+    since: Date?
+}
+
+
+// ──────────────────────────────────────────────
+// Edges: Person <-> Event / Organization / Project
+// ──────────────────────────────────────────────
+
+edge Attended: Person -> Event
+
+edge BelongsTo: Person -> Organization {
+    role: String?
+    since: Date?
+}
+
+edge InvolvedIn: Person -> Project {
+    role: String?
+}
+
+
+// ──────────────────────────────────────────────
+// Edges: Event <-> Place / Project
+// ──────────────────────────────────────────────
+
+edge HappenedAt: Event -> Place
+
+edge EventForProject: Event -> Project
+
+
+// ──────────────────────────────────────────────
+// Edges: Commitment connections
+// ──────────────────────────────────────────────
+
+edge PromisedTo: Commitment -> Person
+edge PromisedBy: Commitment -> Person
+edge AroseFrom: Commitment -> Event
+edge CommitmentForProject: Commitment -> Project
+
+
+// ──────────────────────────────────────────────
+// Edges: Note connections
+// ──────────────────────────────────────────────
+
+edge NoteAboutPerson: Note -> Person
+edge NoteFromEvent: Note -> Event
+edge InspiredByMedia: Note -> Media
+edge LinkedNote: Note -> Note
+
+
+// ──────────────────────────────────────────────
+// Edges: Media connections
+// ──────────────────────────────────────────────
+
+edge RecommendedBy: Media -> Person
+edge MediaForProject: Media -> Project
+
+
+// ──────────────────────────────────────────────
+// Edges: Artifact provenance
+// ──────────────────────────────────────────────
+
+edge Mentions: Artifact -> Person
+edge RecordOf: Artifact -> Event
+edge ChunkOf: Chunk -> Artifact @card(1..1) {
+    @unique(src)
+}

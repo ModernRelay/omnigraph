@@ -118,15 +118,6 @@ impl TableStore {
         open_table_head_for_write(&self.root_uri, table_key, &table_path, branch).await
     }
 
-    pub async fn delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()> {
-        let mut ds = Dataset::open(dataset_uri)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        ds.delete_branch(branch)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))
-    }
-
     pub async fn open_dataset_at_state(
         &self,
         table_path: &str,
@@ -599,5 +590,114 @@ impl TableStore {
         Dataset::write(reader, dataset_uri, Some(params))
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))
+    }
+
+    /// Download all files from a remote S3 Lance dataset to a local directory.
+    /// Used to stage S3 datasets locally for safe scanning and index building.
+    pub async fn copy_remote_dataset_to_local(
+        remote_uri: &str,
+        local_dir: &str,
+    ) -> Result<()> {
+        use lance::dataset::builder::DatasetBuilder;
+        use std::path::Path;
+
+        let (remote_store, remote_base, _) = DatasetBuilder::from_uri(remote_uri)
+            .build_object_store()
+            .await
+            .map_err(|e| OmniError::Lance(format!("open remote store for download: {}", e)))?;
+
+        let local_root = Path::new(local_dir);
+        tokio::fs::create_dir_all(local_root)
+            .await
+            .map_err(|e| OmniError::Io(e))?;
+
+        // List all objects under the remote dataset path and download each.
+        let mut stream = remote_store.inner.list(Some(&remote_base));
+        use futures::StreamExt;
+        while let Some(meta) = stream.next().await {
+            let meta =
+                meta.map_err(|e| OmniError::Lance(format!("list remote dataset: {}", e)))?;
+            let relative = meta
+                .location
+                .as_ref()
+                .strip_prefix(remote_base.as_ref())
+                .unwrap_or(meta.location.as_ref())
+                .trim_start_matches('/');
+            if relative.is_empty() {
+                continue;
+            }
+            let local_path = local_root.join(relative);
+            if let Some(parent) = local_path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| OmniError::Io(e))?;
+            }
+            let data = remote_store
+                .inner
+                .get(&meta.location)
+                .await
+                .map_err(|e| OmniError::Lance(format!("download {}: {}", relative, e)))?
+                .bytes()
+                .await
+                .map_err(|e| OmniError::Lance(format!("read body {}: {}", relative, e)))?;
+            tokio::fs::write(&local_path, &data)
+                .await
+                .map_err(|e| OmniError::Io(e))?;
+        }
+        Ok(())
+    }
+
+    /// Copy all files from a local Lance dataset directory to a remote S3 URI.
+    /// Used by the local-staging index build: indexes are built on a local temp
+    /// dataset, then the finished files (data + indexes) are uploaded to S3.
+    pub async fn copy_local_dataset_to_remote(
+        local_dir: &str,
+        remote_uri: &str,
+    ) -> Result<()> {
+        use lance::dataset::builder::DatasetBuilder;
+        use object_store::PutPayload;
+        use std::path::Path;
+
+        let (remote_store, remote_base, _) = DatasetBuilder::from_uri(remote_uri)
+            .build_object_store()
+            .await
+            .map_err(|e| OmniError::Lance(format!("open remote store for copy: {}", e)))?;
+
+        let local_root = Path::new(local_dir);
+
+        // Walk the local directory recursively and upload each file.
+        let mut dirs = vec![local_root.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            let mut entries = tokio::fs::read_dir(&dir)
+                .await
+                .map_err(|e| OmniError::Io(e))?;
+            while let Some(entry) = entries.next_entry().await.map_err(|e| OmniError::Io(e))? {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else {
+                    let relative = path
+                        .strip_prefix(local_root)
+                        .map_err(|e| OmniError::Lance(format!("strip prefix: {}", e)))?;
+                    let remote_path = remote_base.child(relative.to_string_lossy().as_ref());
+                    let bytes = tokio::fs::read(&path)
+                        .await
+                        .map_err(|e| OmniError::Io(e))?;
+                    remote_store
+                        .inner
+                        .put(&remote_path, PutPayload::from_bytes(bytes.into()))
+                        .await
+                        .map_err(|e| {
+                            OmniError::Lance(format!(
+                                "upload {} to {}: {}",
+                                relative.display(),
+                                remote_path,
+                                e
+                            ))
+                        })?;
+                }
+            }
+        }
+        Ok(())
     }
 }

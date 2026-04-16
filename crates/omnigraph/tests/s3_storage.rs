@@ -6,6 +6,59 @@ use omnigraph::loader::{LoadMode, load_jsonl};
 
 use helpers::*;
 
+/// Regression test for MR-640: Lance BTree index creation fails on RustFS
+/// when a node type's Lance data file exceeds a size threshold. The index
+/// builder reads column data back from S3 via ranged GETs, and RustFS breaks
+/// the HTTP response body streaming for larger objects.
+///
+/// Trigger conditions: many rows (14K+) with realistic content (variable-length
+/// strings), multiple indexed properties, and a schema with enough node/edge
+/// types to grow the manifest. Short rows or simple schemas stay under the
+/// threshold and don't reproduce the bug.
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_large_load_builds_indices_without_error() {
+    let Some(uri) = s3_test_repo_uri("large-load-indices") else {
+        eprintln!("skipping s3 large load test: OMNIGRAPH_S3_TEST_BUCKET is not set");
+        return;
+    };
+
+    // The bug requires a complex schema (many node/edge types with multiple
+    // indexed properties) to grow the manifest and Lance metadata past the
+    // RustFS streaming threshold. This is the life-graph schema that originally
+    // surfaced the bug — simpler schemas don't trigger it.
+    let schema = include_str!("fixtures/life-graph.pg");
+
+    let mut db = Omnigraph::init(&uri, schema).await.unwrap();
+
+    // Generate 14,000 rows with wide name + content fields. The `name` column
+    // has @index (inverted index), so wider names = larger index data files.
+    // The threshold is ~1.2MB of indexed string data in a single column — below
+    // this, RustFS serves the ranged GETs fine; above, it breaks mid-stream.
+    let mut lines = Vec::with_capacity(14_000);
+    for i in 0..14_000 {
+        let padding = "x".repeat(50 + (i % 200));
+        // name must be ~80+ chars to push inverted index past RustFS threshold
+        let name = format!(
+            "sender: [DM with Person {person}] This is message content for artifact number {i}",
+            person = i % 200,
+        );
+        lines.push(format!(
+            r#"{{"type":"Artifact","data":{{"slug":"art-{i}","name":"{name}","kind":"message","source":"whatsapp","source_ref":"stanza-{i:08}","content":"[DM with Person {person}] sender: This is message {i}. {padding}","timestamp":"2026-04-15T00:00:00Z","createdAt":"2026-04-15T00:00:00Z","updatedAt":"2026-04-15T00:00:00Z"}}}}"#,
+            person = i % 200,
+        ));
+    }
+    let data = lines.join("\n");
+
+    load_jsonl(&mut db, &data, LoadMode::Overwrite).await.unwrap();
+
+    // Verify data survived the round-trip
+    let reopened = Omnigraph::open(&uri).await.unwrap();
+    let snapshot = reopened.snapshot_of("main").await.unwrap();
+    let ds = snapshot.open("node:Artifact").await.unwrap();
+    let count = ds.count_rows(None).await.unwrap();
+    assert_eq!(count, 14_000, "expected 14,000 Artifact rows after load");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn s3_compatible_repo_lifecycle_works() {
     let Some(uri) = s3_test_repo_uri("omnigraph-runtime") else {
