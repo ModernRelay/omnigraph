@@ -696,7 +696,13 @@ impl TableStore {
                     let relative = path
                         .strip_prefix(local_root)
                         .map_err(|e| OmniError::Lance(format!("strip prefix: {}", e)))?;
-                    let remote_path = remote_base.child(relative.to_string_lossy().as_ref());
+                    // Build the remote path by joining with the base path
+                    // directly, avoiding child() which URL-encodes separators.
+                    // Lance uses raw '/' in S3 keys, not '%2F'.
+                    let remote_path = object_store::path::Path::parse(
+                        &format!("{}/{}", remote_base, relative.to_string_lossy()),
+                    )
+                    .map_err(|e| OmniError::Lance(format!("build remote path: {}", e)))?;
                     let bytes = tokio::fs::read(&path)
                         .await
                         .map_err(OmniError::from)?;

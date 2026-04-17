@@ -211,11 +211,26 @@ fn generate_artifacts(n: usize, offset: usize) -> String {
     lines.join("\n")
 }
 
-/// Helper: count user (non-system) indexes on a dataset.
-async fn count_user_indices(ds: &lance::Dataset) -> usize {
+/// Helper: assert that a dataset has a BTree index on the given column.
+async fn assert_has_btree_index(ds: &lance::Dataset, column: &str) {
     use lance_index::{DatasetIndexExt, is_system_index};
+    let field_id = ds
+        .schema()
+        .field(column)
+        .unwrap_or_else(|| panic!("dataset missing column '{column}'"))
+        .id;
     let indices = ds.load_indices().await.unwrap();
-    indices.iter().filter(|idx| !is_system_index(idx)).count()
+    let has_index = indices.iter().any(|idx| {
+        !is_system_index(idx)
+            && idx.fields.len() == 1
+            && idx.fields[0] == field_id
+            && idx
+                .index_details
+                .as_ref()
+                .map(|d| d.type_url.ends_with("BTreeIndexDetails"))
+                .unwrap_or(false)
+    });
+    assert!(has_index, "expected BTree index on '{column}' but none found");
 }
 
 // -- Threshold test: proves the bug exists and the fix works ----------------
@@ -243,8 +258,7 @@ async fn s3_large_load_builds_indices_without_error() {
     assert_eq!(ds.count_rows(None).await.unwrap(), 14_000);
 
     // Verify indexes were actually built (not just data queryable)
-    // Index building is best-effort on S3; verify data is queryable regardless.
-    let _ = count_user_indices(&ds).await;
+    assert_has_btree_index(&ds, "id").await;
 }
 
 // -- Codepath tests: small data, verify the S3 staging path works ----------
@@ -265,8 +279,7 @@ async fn s3_load_via_run_creates_indices() {
     let reopened = Omnigraph::open(&uri).await.unwrap();
     let snapshot = reopened.snapshot_of("main").await.unwrap();
     let ds = snapshot.open("node:Person").await.unwrap();
-    // Index building is best-effort on S3; verify data is queryable regardless.
-    let _ = count_user_indices(&ds).await;
+    assert_has_btree_index(&ds, "id").await;
 
     let runs = reopened.list_runs().await.unwrap();
     assert!(runs.iter().any(|r| r.status.as_str() == "published"));
@@ -308,8 +321,7 @@ async fn s3_mutation_creates_indices() {
     // Verify indexes exist after mutation
     let snapshot = reopened.snapshot_of("main").await.unwrap();
     let ds = snapshot.open("node:Person").await.unwrap();
-    // Index building is best-effort on S3; verify data is queryable regardless.
-    let _ = count_user_indices(&ds).await;
+    assert_has_btree_index(&ds, "id").await;
 }
 
 /// Load on a named feature branch on S3. Verifies branch-aware index
@@ -338,7 +350,7 @@ async fn s3_load_on_feature_branch_creates_indices() {
     // Feature branch has data + indexes
     let feature_snap = reopened.snapshot_of("feature").await.unwrap();
     let feature_ds = feature_snap.open("node:Person").await.unwrap();
-    let _ = count_user_indices(&feature_ds).await;
+    assert_has_btree_index(&feature_ds, "id").await;
 
     // Main does NOT have the branch-only data
     let mut main_db = Omnigraph::open(&uri).await.unwrap();
@@ -378,8 +390,7 @@ async fn s3_mutation_on_feature_branch_creates_indices() {
     let reopened = Omnigraph::open(&uri).await.unwrap();
     let snap = reopened.snapshot_of("feature").await.unwrap();
     let ds = snap.open("node:Person").await.unwrap();
-    // Index building is best-effort on S3; verify data is queryable regardless.
-    let _ = count_user_indices(&ds).await;
+    assert_has_btree_index(&ds, "id").await;
 
     // Main does NOT see the mutation
     let mut main_db = Omnigraph::open(&uri).await.unwrap();
@@ -415,8 +426,7 @@ async fn s3_sequential_merge_loads_accumulate_with_indices() {
     let snapshot = reopened.snapshot_of("main").await.unwrap();
     let ds = snapshot.open("node:Artifact").await.unwrap();
     assert_eq!(ds.count_rows(None).await.unwrap(), 15_000);
-    // Index building is best-effort on S3; verify data is queryable regardless.
-    let _ = count_user_indices(&ds).await;
+    assert_has_btree_index(&ds, "id").await;
 
     let runs = reopened.list_runs().await.unwrap();
     let published = runs.iter().filter(|r| r.status.as_str() == "published").count();
