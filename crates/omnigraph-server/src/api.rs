@@ -281,6 +281,11 @@ pub struct SchemaApplyOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SchemaOutput {
+    pub schema_source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct IngestRequest {
     pub branch: Option<String>,
     pub from: Option<String>,
