@@ -1,0 +1,60 @@
+edition: "2026-02-23"
+
+organization:
+  name: omnigraph
+  docs: https://github.com/ModernRelay/omnigraph
+  github_org: ModernRelay
+
+targets:
+  typescript:
+    package_name: omnigraph
+    production_repo: ModernRelay/omnigraph-typescript
+    publish:
+      npm: true
+  python:
+    package_name: omnigraph
+    production_repo: ModernRelay/omnigraph-python
+    publish:
+      pypi: true
+
+client_settings:
+  opts:
+    api_key:
+      type: string
+      auth:
+        security_scheme: bearer_token
+    base_url:
+      type: string
+
+resources:
+  $client:
+    methods:
+      read: post /read
+      change: post /change
+      export: post /export
+      ingest: post /ingest
+  schema:
+    methods:
+      apply: post /schema/apply
+  branches:
+    methods:
+      list: get /branches
+      create: post /branches
+      delete: delete /branches/{branch}
+      merge: post /branches/merge
+  runs:
+    methods:
+      list: get /runs
+      retrieve: get /runs/{run_id}
+      publish: post /runs/{run_id}/publish
+      abort: post /runs/{run_id}/abort
+  commits:
+    methods:
+      list: get /commits
+      retrieve: get /commits/{commit_id}
+  snapshots:
+    methods:
+      retrieve: get /snapshot
+
+settings:
+  license: MIT

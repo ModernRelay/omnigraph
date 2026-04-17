@@ -962,3 +962,28 @@ async fn auth_mode_healthz_still_has_no_security() {
         "auth-mode: /healthz should still have no security"
     );
 }
+
+#[test]
+fn openapi_spec_is_up_to_date() {
+    let spec_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../openapi.json");
+
+    let generated = serde_json::to_string_pretty(&openapi_doc()).unwrap() + "\n";
+
+    if env::var("OMNIGRAPH_UPDATE_OPENAPI").is_ok() {
+        fs::write(&spec_path, &generated).unwrap();
+        return;
+    }
+
+    let committed = fs::read_to_string(&spec_path).unwrap_or_else(|_| {
+        panic!(
+            "openapi.json not found at {}. Run: OMNIGRAPH_UPDATE_OPENAPI=1 cargo test -p omnigraph-server --test openapi openapi_spec_is_up_to_date",
+            spec_path.display()
+        )
+    });
+
+    assert_eq!(
+        committed, generated,
+        "openapi.json is out of date. Run: OMNIGRAPH_UPDATE_OPENAPI=1 cargo test -p omnigraph-server --test openapi openapi_spec_is_up_to_date"
+    );
+}

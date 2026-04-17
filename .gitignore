@@ -16,3 +16,4 @@ __pycache__/
 *.pyc
 demo/*.omni/
 .omnigraph-rustfs-demo/
+sdks/

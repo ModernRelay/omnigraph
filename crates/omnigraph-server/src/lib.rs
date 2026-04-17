@@ -465,6 +465,7 @@ async fn shutdown_signal() {
     get,
     path = "/healthz",
     tag = "health",
+    operation_id = "health",
     responses(
         (status = 200, description = "Server is healthy", body = HealthOutput),
     ),
@@ -575,6 +576,7 @@ fn authorize_request(
     get,
     path = "/snapshot",
     tag = "snapshots",
+    operation_id = "getSnapshot",
     params(SnapshotQuery),
     responses(
         (status = 200, description = "Database snapshot", body = api::SnapshotOutput),
@@ -615,6 +617,7 @@ async fn server_snapshot(
     post,
     path = "/read",
     tag = "queries",
+    operation_id = "read",
     request_body = ReadRequest,
     responses(
         (status = 200, description = "Query results", body = ReadOutput),
@@ -684,6 +687,7 @@ async fn server_read(
     post,
     path = "/export",
     tag = "queries",
+    operation_id = "export",
     request_body = ExportRequest,
     responses(
         (status = 200, description = "Exported data as NDJSON", content_type = "application/x-ndjson"),
@@ -742,6 +746,7 @@ async fn server_export(
     post,
     path = "/change",
     tag = "mutations",
+    operation_id = "change",
     request_body = ChangeRequest,
     responses(
         (status = 200, description = "Mutation results", body = ChangeOutput),
@@ -800,6 +805,7 @@ async fn server_change(
     post,
     path = "/schema/apply",
     tag = "mutations",
+    operation_id = "applySchema",
     request_body = SchemaApplyRequest,
     responses(
         (status = 200, description = "Schema apply results", body = SchemaApplyOutput),
@@ -838,6 +844,7 @@ async fn server_schema_apply(
     post,
     path = "/ingest",
     tag = "mutations",
+    operation_id = "ingest",
     request_body = IngestRequest,
     responses(
         (status = 200, description = "Ingest results", body = IngestOutput),
@@ -907,6 +914,7 @@ async fn server_ingest(
     get,
     path = "/branches",
     tag = "branches",
+    operation_id = "listBranches",
     responses(
         (status = 200, description = "List of branches", body = BranchListOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
@@ -943,6 +951,7 @@ async fn server_branch_list(
     post,
     path = "/branches",
     tag = "branches",
+    operation_id = "createBranch",
     request_body = BranchCreateRequest,
     responses(
         (status = 200, description = "Branch created", body = BranchCreateOutput),
@@ -990,6 +999,7 @@ async fn server_branch_create(
     delete,
     path = "/branches/{branch}",
     tag = "branches",
+    operation_id = "deleteBranch",
     params(
         ("branch" = String, Path, description = "Branch name to delete"),
     ),
@@ -1034,6 +1044,7 @@ async fn server_branch_delete(
     post,
     path = "/branches/merge",
     tag = "branches",
+    operation_id = "mergeBranches",
     request_body = BranchMergeRequest,
     responses(
         (status = 200, description = "Branches merged", body = BranchMergeOutput),
@@ -1079,6 +1090,7 @@ async fn server_branch_merge(
     get,
     path = "/runs",
     tag = "runs",
+    operation_id = "listRuns",
     responses(
         (status = 200, description = "List of runs", body = RunListOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
@@ -1116,6 +1128,7 @@ async fn server_run_list(
     get,
     path = "/runs/{run_id}",
     tag = "runs",
+    operation_id = "getRun",
     params(
         ("run_id" = String, Path, description = "Run identifier"),
     ),
@@ -1158,6 +1171,7 @@ async fn server_run_show(
     post,
     path = "/runs/{run_id}/publish",
     tag = "runs",
+    operation_id = "publishRun",
     params(
         ("run_id" = String, Path, description = "Run identifier"),
     ),
@@ -1207,6 +1221,7 @@ async fn server_run_publish(
     post,
     path = "/runs/{run_id}/abort",
     tag = "runs",
+    operation_id = "abortRun",
     params(
         ("run_id" = String, Path, description = "Run identifier"),
     ),
@@ -1255,6 +1270,7 @@ async fn server_run_abort(
     get,
     path = "/commits",
     tag = "commits",
+    operation_id = "listCommits",
     params(CommitListQuery),
     responses(
         (status = 200, description = "List of commits", body = CommitListOutput),
@@ -1296,6 +1312,7 @@ async fn server_commit_list(
     get,
     path = "/commits/{commit_id}",
     tag = "commits",
+    operation_id = "getCommit",
     params(
         ("commit_id" = String, Path, description = "Commit identifier"),
     ),

@@ -1,0 +1,13 @@
+{
+  "project": "omnigraph",
+  "openapi_spec": "../openapi.json",
+  "stainless_config": "./stainless.yml",
+  "targets": {
+    "typescript": {
+      "output_path": "../sdks/omnigraph-typescript"
+    },
+    "python": {
+      "output_path": "../sdks/omnigraph-python"
+    }
+  }
+}
