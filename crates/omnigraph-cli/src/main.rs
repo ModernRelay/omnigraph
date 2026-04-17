@@ -18,7 +18,7 @@ use omnigraph_server::api::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
     CommitOutput, ErrorOutput, ExportRequest, IngestOutput, IngestRequest, ReadOutput, ReadRequest,
-    RunListOutput, RunOutput, SchemaApplyOutput, SchemaApplyRequest, SchemaGetOutput, SnapshotOutput,
+    RunListOutput, RunOutput, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput,
     SnapshotTableOutput, commit_output, ingest_output, read_output, run_output,
     schema_apply_output, snapshot_payload,
 };
@@ -303,8 +303,9 @@ enum SchemaCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Get the current accepted schema source
-    Get {
+    /// Show the current accepted schema source
+    #[command(alias = "get")]
+    Show {
         /// Repo URI
         uri: Option<String>,
         #[arg(long)]
@@ -2014,7 +2015,7 @@ async fn main() -> Result<()> {
                     print_schema_apply_human(&output);
                 }
             }
-            SchemaCommand::Get {
+            SchemaCommand::Show {
                 uri,
                 target,
                 config,
@@ -2025,7 +2026,7 @@ async fn main() -> Result<()> {
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let uri = resolve_uri(&config, uri, target.as_deref())?;
                 let output = if is_remote_uri(&uri) {
-                    remote_json::<SchemaGetOutput>(
+                    remote_json::<SchemaOutput>(
                         &http_client,
                         Method::GET,
                         remote_url(&uri, "/schema"),
@@ -2035,14 +2036,14 @@ async fn main() -> Result<()> {
                     .await?
                 } else {
                     let db = Omnigraph::open(&uri).await?;
-                    SchemaGetOutput {
-                        source: db.schema_source().to_string(),
+                    SchemaOutput {
+                        schema_source: db.schema_source().to_string(),
                     }
                 };
                 if json {
                     print_json(&output)?;
                 } else {
-                    print!("{}", output.source);
+                    println!("{}", output.schema_source);
                 }
             }
         },

@@ -281,8 +281,8 @@ pub struct SchemaApplyOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct SchemaGetOutput {
-    pub source: String,
+pub struct SchemaOutput {
+    pub schema_source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

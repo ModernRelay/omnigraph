@@ -10,7 +10,7 @@ use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_server::api::{
     BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorOutput, ExportRequest,
-    IngestRequest, ReadRequest, SchemaApplyRequest,
+    IngestRequest, ReadRequest, SchemaApplyRequest, SchemaOutput,
 };
 use omnigraph_server::{AppState, build_app};
 use serde_json::{Value, json};
@@ -1040,6 +1040,93 @@ async fn snapshot_route_returns_manifest_dataset_version() {
         expected_manifest_version
     );
     assert!(snapshot_body["tables"].is_array());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_route_returns_current_source() {
+    let (_temp, app) = app_for_loaded_repo().await;
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/schema")
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let output: SchemaOutput = serde_json::from_value(body).unwrap();
+    assert!(output.schema_source.contains("node Person"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_route_requires_bearer_token_when_auth_configured() {
+    let (_temp, app) = app_for_loaded_repo_with_auth("demo-token").await;
+
+    let (missing_status, missing_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/schema")
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let missing_error: ErrorOutput = serde_json::from_value(missing_body).unwrap();
+    assert_eq!(missing_status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        missing_error.code,
+        Some(omnigraph_server::api::ErrorCode::Unauthorized)
+    );
+
+    let (ok_status, ok_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/schema")
+            .method(Method::GET)
+            .header("authorization", "Bearer demo-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(ok_status, StatusCode::OK);
+    let output: SchemaOutput = serde_json::from_value(ok_body).unwrap();
+    assert!(!output.schema_source.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_route_denied_when_actor_lacks_read_permission() {
+    let temp = init_loaded_repo().await;
+    let repo = repo_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    // Policy grants branch_create only — no read action for act-bruno.
+    fs::write(&policy_path, INGEST_CREATE_ONLY_POLICY_YAML).unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        repo.to_string_lossy().to_string(),
+        vec![("act-bruno".to_string(), "team-token".to_string())],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap();
+    let app = build_app(state);
+
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/schema")
+            .method(Method::GET)
+            .header("authorization", "Bearer team-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let error: ErrorOutput = serde_json::from_value(body).unwrap();
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        error.code,
+        Some(omnigraph_server::api::ErrorCode::Forbidden)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

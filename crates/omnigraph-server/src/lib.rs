@@ -14,7 +14,7 @@ use api::{
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
     CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, HealthOutput, IngestOutput,
     IngestRequest, ReadOutput, ReadRequest, RunListOutput, SchemaApplyOutput, SchemaApplyRequest,
-    SchemaGetOutput, SnapshotQuery, ingest_output, schema_apply_output, snapshot_payload,
+    SchemaOutput, SnapshotQuery, ingest_output, schema_apply_output, snapshot_payload,
 };
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
@@ -803,7 +803,7 @@ async fn server_change(
     path = "/schema",
     tag = "schema",
     responses(
-        (status = 200, description = "Current schema source", body = SchemaGetOutput),
+        (status = 200, description = "Current schema source", body = SchemaOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
     ),
@@ -812,7 +812,7 @@ async fn server_change(
 async fn server_schema_get(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
-) -> std::result::Result<Json<SchemaGetOutput>, ApiError> {
+) -> std::result::Result<Json<SchemaOutput>, ApiError> {
     authorize_request(
         &state,
         actor.as_ref().map(|Extension(actor)| actor),
@@ -826,11 +826,11 @@ async fn server_schema_get(
             target_branch: None,
         },
     )?;
-    let source = {
+    let schema_source = {
         let db = Arc::clone(&state.db).read_owned().await;
         db.schema_source().to_string()
     };
-    Ok(Json(SchemaGetOutput { source }))
+    Ok(Json(SchemaOutput { schema_source }))
 }
 
 #[utoipa::path(
