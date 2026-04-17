@@ -894,6 +894,91 @@ async fn protected_routes_accept_any_configured_team_bearer_token() {
     assert!(body["runs"].is_array());
 }
 
+/// Verifies the hashed-token lookup correctly resolves each bearer to its
+/// associated actor, and that the resolved actor — not the handler-supplied
+/// default — is what the policy engine sees. Two tokens for two distinct
+/// actors; policy grants read to actor-A only. Swapping tokens must swap
+/// the policy outcome.
+#[tokio::test(flavor = "multi_thread")]
+async fn bearer_token_resolves_to_correct_actor_for_policy_decisions() {
+    let temp = init_loaded_repo().await;
+    let repo = repo_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(
+        &policy_path,
+        r#"
+version: 1
+groups:
+  readers: [act-a]
+  writers: [act-b]
+protected_branches: [main]
+rules:
+  - id: readers-only
+    allow:
+      actors: { group: readers }
+      actions: [read]
+      branch_scope: any
+"#,
+    )
+    .unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        repo.to_string_lossy().to_string(),
+        vec![
+            ("act-a".to_string(), "token-a".to_string()),
+            ("act-b".to_string(), "token-b".to_string()),
+        ],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap();
+    let app = build_app(state);
+
+    // act-a is authenticated AND authorized.
+    let (ok_status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri("/snapshot?branch=main")
+            .method(Method::GET)
+            .header("authorization", "Bearer token-a")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(ok_status, StatusCode::OK);
+
+    // act-b is authenticated but policy rejects — proves the resolved actor
+    // (not some default) was the policy subject.
+    let (denied_status, denied_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/snapshot?branch=main")
+            .method(Method::GET)
+            .header("authorization", "Bearer token-b")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let denied_error: ErrorOutput = serde_json::from_value(denied_body).unwrap();
+    assert_eq!(denied_status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        denied_error.code,
+        Some(omnigraph_server::api::ErrorCode::Forbidden)
+    );
+
+    // Unknown token: 401, never reaches the policy engine.
+    let (bad_status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri("/snapshot?branch=main")
+            .method(Method::GET)
+            .header("authorization", "Bearer wrong-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(bad_status, StatusCode::UNAUTHORIZED);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn policy_allows_read_but_distinguishes_401_from_403() {
     let (_temp, app) = app_for_loaded_repo_with_auth_tokens_and_policy(
