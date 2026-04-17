@@ -348,3 +348,102 @@ async fn s3_large_load_on_feature_branch() {
     let main_count = main_ds.count_rows(None).await.unwrap();
     assert_eq!(main_count, 0, "main should have 0 Artifact rows");
 }
+
+/// Tests that transactional mutations on S3 repos still work after the
+/// index-deferral change. The mutation path (exec/mutation.rs) goes through
+/// publish_run and must call ensure_indices_on afterward for S3, same as
+/// the loader path. Without this, mutations on S3 would commit data but
+/// never build indexes.
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_mutation_after_load_builds_indices() {
+    let Some(uri) = s3_test_repo_uri("mutation-indices") else {
+        eprintln!("skipping s3 mutation test: OMNIGRAPH_S3_TEST_BUCKET is not set");
+        return;
+    };
+
+    let mut db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    // Mutate via the transactional path (begin_run → mutate → publish_run)
+    db.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "S3-Mutation-Test")], &[("$age", 42)]),
+    )
+    .await
+    .unwrap();
+
+    // Verify the mutation is visible after reopen
+    let mut reopened = Omnigraph::open(&uri).await.unwrap();
+    let result = query_main(
+        &mut reopened,
+        TEST_QUERIES,
+        "get_person",
+        &params(&[("$name", "S3-Mutation-Test")]),
+    )
+    .await
+    .unwrap()
+    .to_rust_json();
+    assert_eq!(result[0]["p.name"], "S3-Mutation-Test");
+    assert_eq!(result[0]["p.age"], 42);
+
+    // Verify a published run was created for the mutation
+    let runs = reopened.list_runs().await.unwrap();
+    assert!(
+        runs.iter().any(|r| r.status.as_str() == "published"),
+        "expected a published run for the mutation"
+    );
+}
+
+/// Tests that mutations work correctly on a non-main branch on S3.
+/// This exercises the branch-aware index staging in the mutation path.
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_mutation_on_feature_branch() {
+    let Some(uri) = s3_test_repo_uri("mutation-feature-branch") else {
+        eprintln!("skipping s3 mutation branch test: OMNIGRAPH_S3_TEST_BUCKET is not set");
+        return;
+    };
+
+    let mut db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    db.branch_create("feature").await.unwrap();
+
+    // Mutate on the feature branch
+    db.mutate(
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Branch-Only")], &[("$age", 33)]),
+    )
+    .await
+    .unwrap();
+
+    // Verify mutation is visible on feature branch
+    let mut reopened = Omnigraph::open(&uri).await.unwrap();
+    let feature_result = query_branch(
+        &mut reopened,
+        "feature",
+        TEST_QUERIES,
+        "get_person",
+        &params(&[("$name", "Branch-Only")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(feature_result.num_rows(), 1);
+
+    // Verify mutation is NOT visible on main
+    let main_result = query_main(
+        &mut reopened,
+        TEST_QUERIES,
+        "get_person",
+        &params(&[("$name", "Branch-Only")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(main_result.num_rows(), 0, "main should not see branch mutation");
+}
