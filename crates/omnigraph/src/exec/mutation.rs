@@ -599,6 +599,20 @@ impl Omnigraph {
             return Err(err);
         }
 
+        // For S3 repos: indexes were deferred during the mutation commit
+        // (to avoid Lance's read-back-from-S3 which fails on RustFS). Build
+        // them now via local staging. Non-fatal: data is already committed.
+        if crate::storage::storage_kind_for_uri(self.uri())
+            == crate::storage::StorageKind::S3
+        {
+            if let Err(err) = self.ensure_indices_on(&target_branch).await {
+                tracing::warn!(
+                    "post-publish index build failed (data is committed, indexes pending): {}",
+                    err
+                );
+            }
+        }
+
         Ok(staged_result)
     }
 

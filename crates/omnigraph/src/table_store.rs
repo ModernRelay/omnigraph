@@ -668,7 +668,10 @@ impl TableStore {
         Ok(())
     }
 
-    /// Copy all files from a local Lance dataset directory to a remote S3 URI.
+    /// Copy new/changed files from a local Lance dataset directory to a remote
+    /// S3 URI. Skips `data/` files that already exist on the remote (they were
+    /// downloaded unchanged during staging). Only uploads index files, version
+    /// manifests, and transaction logs that were created or modified locally.
     pub async fn copy_local_dataset_to_remote(
         local_dir: &str,
         remote_uri: &str,
@@ -681,6 +684,25 @@ impl TableStore {
             .build_object_store()
             .await
             .map_err(|e| OmniError::Lance(format!("open remote store for copy: {}", e)))?;
+
+        // Collect existing remote paths to skip unchanged data files.
+        let mut remote_paths = std::collections::HashSet::new();
+        {
+            let mut stream = remote_store.inner.list(Some(&remote_base));
+            use futures::StreamExt;
+            while let Some(meta) = stream.next().await {
+                if let Ok(meta) = meta {
+                    let relative = meta
+                        .location
+                        .as_ref()
+                        .strip_prefix(remote_base.as_ref())
+                        .unwrap_or(meta.location.as_ref())
+                        .trim_start_matches('/')
+                        .to_string();
+                    remote_paths.insert(relative);
+                }
+            }
+        }
 
         let local_root = Path::new(local_dir);
         let mut dirs = vec![local_root.to_path_buf()];
@@ -696,7 +718,16 @@ impl TableStore {
                     let relative = path
                         .strip_prefix(local_root)
                         .map_err(|e| OmniError::Lance(format!("strip prefix: {}", e)))?;
-                    let remote_path = remote_base.child(relative.to_string_lossy().as_ref());
+                    let relative_str = relative.to_string_lossy();
+
+                    // Skip data files that already exist on remote — they were
+                    // downloaded unchanged during staging. Only upload new files
+                    // (indexes, updated manifests/versions).
+                    if remote_paths.contains(relative_str.as_ref()) {
+                        continue;
+                    }
+
+                    let remote_path = remote_base.child(relative_str.as_ref());
                     let bytes = tokio::fs::read(&path)
                         .await
                         .map_err(OmniError::from)?;
