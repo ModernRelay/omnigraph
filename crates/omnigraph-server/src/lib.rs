@@ -38,7 +38,7 @@ use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph_compiler::json_params_to_param_map;
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::{JsonParamMode, ParamMap};
-pub use auth::{EnvOrFileTokenSource, TokenSource};
+pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 pub use policy::{
     PolicyAction, PolicyCompiler, PolicyConfig, PolicyDecision, PolicyEngine, PolicyExpectation,
     PolicyRequest, PolicyTestConfig,
@@ -464,7 +464,8 @@ pub fn build_app(state: AppState) -> Router {
 }
 
 pub async fn serve(config: ServerConfig) -> Result<()> {
-    let token_source = EnvOrFileTokenSource;
+    let token_source = resolve_token_source().await?;
+    info!(source = token_source.name(), "loaded bearer token source");
     let state = AppState::open_with_bearer_tokens_and_policy(
         config.uri.clone(),
         token_source.load().await?,
