@@ -1,0 +1,57 @@
+name: Package
+
+# Builds both the default and aws-feature omnigraph-server images and pushes
+# them to ECR. Invoked manually via workflow_dispatch — not wired to tags or
+# main pushes today.
+#
+# Prerequisites:
+#   - Repo vars AWS_REGION, AWS_ROLE_TO_ASSUME, AWS_CODEBUILD_PACKAGE_PROJECT,
+#     AWS_ARTIFACT_BUCKET are set.
+#   - The shared workflow at ModernRelay/.github supports the `features` and
+#     `image_tag_suffix` inputs (ModernRelay/.github PR #2 or later).
+#
+# Each invocation produces two ECR tags per source commit:
+#   - <source_sha>         (default features)
+#   - <source_sha>-aws     (--features aws)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Git ref to package (branch, tag, or SHA). Defaults to the workflow's own ref.
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  package_default:
+    name: Package default build
+    uses: ModernRelay/.github/.github/workflows/omnigraph-package.yml@main
+    permissions:
+      id-token: write
+      contents: read
+      attestations: write
+    with:
+      repository: ${{ github.repository }}
+      source_ref: ${{ inputs.source_ref != '' && inputs.source_ref || github.sha }}
+      aws_region: ${{ vars.AWS_REGION }}
+      aws_role_to_assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+      aws_codebuild_package_project: ${{ vars.AWS_CODEBUILD_PACKAGE_PROJECT }}
+      aws_artifact_bucket: ${{ vars.AWS_ARTIFACT_BUCKET }}
+
+  package_aws:
+    name: Package aws-feature build
+    uses: ModernRelay/.github/.github/workflows/omnigraph-package.yml@main
+    permissions:
+      id-token: write
+      contents: read
+      attestations: write
+    with:
+      repository: ${{ github.repository }}
+      source_ref: ${{ inputs.source_ref != '' && inputs.source_ref || github.sha }}
+      aws_region: ${{ vars.AWS_REGION }}
+      aws_role_to_assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+      aws_codebuild_package_project: ${{ vars.AWS_CODEBUILD_PACKAGE_PROJECT }}
+      aws_artifact_bucket: ${{ vars.AWS_ARTIFACT_BUCKET }}
+      features: aws
+      image_tag_suffix: "-aws"
