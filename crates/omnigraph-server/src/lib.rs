@@ -42,6 +42,8 @@ pub use policy::{
     PolicyRequest, PolicyTestConfig,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, mpsc};
 use tower_http::trace::TraceLayer;
@@ -49,6 +51,15 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use utoipa::OpenApi;
 use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
+
+type BearerTokenHash = [u8; 32];
+
+fn hash_bearer_token(token: &str) -> BearerTokenHash {
+    let digest = Sha256::digest(token.as_bytes());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
 
 #[derive(OpenApi)]
 #[openapi(
@@ -110,7 +121,7 @@ pub struct ServerConfig {
 pub struct AppState {
     uri: String,
     db: Arc<RwLock<Omnigraph>>,
-    bearer_tokens: Arc<HashMap<Arc<str>, Arc<str>>>,
+    bearer_tokens: Arc<[(BearerTokenHash, Arc<str>)]>,
     policy_engine: Option<Arc<PolicyEngine>>,
 }
 
@@ -175,14 +186,14 @@ impl AppState {
         bearer_tokens: Vec<(String, String)>,
         policy_engine: Option<PolicyEngine>,
     ) -> Self {
-        let bearer_tokens = bearer_tokens
+        let bearer_tokens: Vec<(BearerTokenHash, Arc<str>)> = bearer_tokens
             .into_iter()
-            .map(|(actor, token)| (Arc::<str>::from(token), Arc::<str>::from(actor)))
+            .map(|(actor, token)| (hash_bearer_token(&token), Arc::<str>::from(actor)))
             .collect();
         Self {
             uri,
             db: Arc::new(RwLock::new(db)),
-            bearer_tokens: Arc::new(bearer_tokens),
+            bearer_tokens: Arc::from(bearer_tokens),
             policy_engine: policy_engine.map(Arc::new),
         }
     }
@@ -242,7 +253,17 @@ impl AppState {
     }
 
     fn authenticate_bearer_token(&self, provided_token: &str) -> Option<Arc<str>> {
-        self.bearer_tokens.get(provided_token).cloned()
+        // Hash the incoming token and compare against every stored digest in
+        // constant time. Iterate all entries unconditionally so total work —
+        // and therefore response timing — doesn't depend on which slot matches.
+        let provided_hash = hash_bearer_token(provided_token);
+        let mut matched: Option<Arc<str>> = None;
+        for (hash, actor) in self.bearer_tokens.iter() {
+            if bool::from(hash.ct_eq(&provided_hash)) && matched.is_none() {
+                matched = Some(Arc::clone(actor));
+            }
+        }
+        matched
     }
 
     fn policy_engine(&self) -> Option<&PolicyEngine> {
@@ -554,7 +575,7 @@ fn log_policy_decision(actor_id: &str, request: &PolicyRequest, decision: &Polic
 fn authorize_request(
     state: &AppState,
     actor: Option<&AuthenticatedActor>,
-    request: PolicyRequest,
+    mut request: PolicyRequest,
 ) -> std::result::Result<(), ApiError> {
     let Some(engine) = state.policy_engine() else {
         return Ok(());
@@ -562,6 +583,10 @@ fn authorize_request(
     let Some(actor) = actor else {
         return Err(ApiError::unauthorized("missing bearer token"));
     };
+    // Authoritative actor_id is the authenticated session, not whatever the
+    // handler put in the request. Prevents an empty-string default at any
+    // call site from ever reaching the engine as a policy subject.
+    request.actor_id = actor.as_str().to_string();
     let decision = engine
         .authorize(&request)
         .map_err(|err| ApiError::internal(format!("policy: {err}")))?;
@@ -1481,12 +1506,42 @@ fn server_bearer_tokens_from_env() -> Result<Vec<(String, String)>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        load_server_settings, normalize_bearer_token, parse_bearer_tokens_json,
+        hash_bearer_token, load_server_settings, normalize_bearer_token, parse_bearer_tokens_json,
         server_bearer_tokens_from_env,
     };
     use std::env;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn hash_bearer_token_produces_32_byte_output() {
+        let hash = hash_bearer_token("any-token");
+        assert_eq!(hash.len(), 32);
+    }
+
+    #[test]
+    fn hash_bearer_token_is_deterministic() {
+        assert_eq!(
+            hash_bearer_token("stable-input"),
+            hash_bearer_token("stable-input"),
+        );
+    }
+
+    #[test]
+    fn hash_bearer_token_differs_for_different_inputs() {
+        assert_ne!(hash_bearer_token("token-a"), hash_bearer_token("token-b"));
+    }
+
+    #[test]
+    fn hash_bearer_token_matches_known_sha256_vector() {
+        // SHA-256("abc"). If this ever fails, the hash function was swapped.
+        let hash = hash_bearer_token("abc");
+        let hex: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
+        assert_eq!(
+            hex,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     #[test]
     fn server_settings_load_from_yaml_config() {
