@@ -1,4 +1,4 @@
-targets:
+graphs:
   local:
     uri: ./repo.omni
   dev:
@@ -6,7 +6,7 @@ targets:
     bearer_token_env: OMNIGRAPH_BEARER_TOKEN
 
 cli:
-  target: local
+  graph: local
   branch: main
 
 query:
