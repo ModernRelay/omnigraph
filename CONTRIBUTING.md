@@ -16,6 +16,22 @@ cargo test --workspace
 If you touch S3-backed flows, the CI model uses a local RustFS instance for
 integration tests.
 
+### Cargo features
+
+`omnigraph-server` has an optional `aws` feature that pulls in the AWS
+Secrets Manager SDK for a bearer-token backend. Default builds omit it —
+most contributors never compile the AWS code path.
+
+When you touch `crates/omnigraph-server/src/auth.rs` or any AWS-conditional
+code, verify both configurations:
+
+```bash
+cargo test -p omnigraph-server                  # default
+cargo test -p omnigraph-server --features aws   # AWS enabled
+```
+
+CI runs both.
+
 ## Pull Requests
 
 - keep changes focused
