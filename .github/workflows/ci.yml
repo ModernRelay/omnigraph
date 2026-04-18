@@ -105,7 +105,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
-      contents: read
+      contents: write
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -113,8 +113,22 @@ jobs:
         if: needs.classify_changes.outputs.run_full_ci != 'true'
         run: echo "Text-only change detected; skipping workspace test run."
 
-      - name: Checkout source
-        if: needs.classify_changes.outputs.run_full_ci == 'true'
+      # For same-repo PRs, check out the PR branch head directly so we can push
+      # a regenerated openapi.json back to it. Fork PRs and push events use the
+      # default checkout (which is read-only for our purposes).
+      - name: Checkout (same-repo PR head)
+        if: |
+          needs.classify_changes.outputs.run_full_ci == 'true' &&
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/checkout@v5.0.1
+        with:
+          ref: ${{ github.head_ref }}
+
+      - name: Checkout (default)
+        if: |
+          needs.classify_changes.outputs.run_full_ci == 'true' &&
+          !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
         uses: actions/checkout@v5.0.1
 
       - name: Install system dependencies
@@ -138,7 +152,28 @@ jobs:
 
       - name: Run workspace tests
         if: needs.classify_changes.outputs.run_full_ci == 'true'
+        # On same-repo PRs, regenerate openapi.json as part of the drift test
+        # so the following step can commit the update. Elsewhere the env var
+        # is empty, leaving the drift test in strict-check mode.
+        env:
+          OMNIGRAPH_UPDATE_OPENAPI: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && '1' || '' }}
         run: cargo test --workspace --locked
+
+      - name: Commit regenerated openapi.json
+        if: |
+          needs.classify_changes.outputs.run_full_ci == 'true' &&
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          if git diff --quiet -- openapi.json; then
+            echo "openapi.json is already in sync."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add openapi.json
+          git commit -m "chore: regenerate openapi.json"
+          git push
 
   test_aws_feature:
     name: Test omnigraph-server --features aws

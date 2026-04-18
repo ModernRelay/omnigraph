@@ -971,7 +971,10 @@ fn openapi_spec_is_up_to_date() {
 
     let generated = serde_json::to_string_pretty(&openapi_doc()).unwrap() + "\n";
 
-    if env::var("OMNIGRAPH_UPDATE_OPENAPI").is_ok() {
+    if !env::var("OMNIGRAPH_UPDATE_OPENAPI")
+        .unwrap_or_default()
+        .is_empty()
+    {
         fs::write(&spec_path, &generated).unwrap();
         return;
     }
