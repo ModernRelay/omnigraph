@@ -1,4 +1,5 @@
 pub mod api;
+pub mod auth;
 pub mod config;
 pub mod policy;
 
@@ -37,6 +38,7 @@ use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph_compiler::json_params_to_param_map;
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::{JsonParamMode, ParamMap};
+pub use auth::{EnvOrFileTokenSource, TokenSource};
 pub use policy::{
     PolicyAction, PolicyCompiler, PolicyConfig, PolicyDecision, PolicyEngine, PolicyExpectation,
     PolicyRequest, PolicyTestConfig,
@@ -462,9 +464,10 @@ pub fn build_app(state: AppState) -> Router {
 }
 
 pub async fn serve(config: ServerConfig) -> Result<()> {
+    let token_source = EnvOrFileTokenSource;
     let state = AppState::open_with_bearer_tokens_and_policy(
         config.uri.clone(),
-        server_bearer_tokens_from_env()?,
+        token_source.load().await?,
         config.policy_file.as_ref(),
     )
     .await?;

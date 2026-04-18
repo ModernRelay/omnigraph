@@ -30,6 +30,7 @@ cedar-policy = { workspace = true }
 futures = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
