@@ -4585,6 +4585,7 @@ dependencies = [
 name = "omnigraph-server"
 version = "0.2.2"
 dependencies = [
+ "async-trait",
  "axum",
  "cedar-policy",
  "clap",
