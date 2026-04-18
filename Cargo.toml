@@ -66,6 +66,7 @@ utoipa = { version = "5", features = ["axum_extras"] }
 url = "2"
 cedar-policy = "4.9"
 sha2 = "0.10"
+subtle = "2"
 
 [profile.dev]
 debug = 0

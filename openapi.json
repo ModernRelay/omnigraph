@@ -922,6 +922,51 @@
         ]
       }
     },
+    "/schema": {
+      "get": {
+        "tags": [
+          "schema"
+        ],
+        "operationId": "getSchema",
+        "responses": {
+          "200": {
+            "description": "Current schema source",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SchemaOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/schema/apply": {
       "post": {
         "tags": [
@@ -1693,6 +1738,17 @@
         }
       },
       "SchemaApplyRequest": {
+        "type": "object",
+        "required": [
+          "schema_source"
+        ],
+        "properties": {
+          "schema_source": {
+            "type": "string"
+          }
+        }
+      },
+      "SchemaOutput": {
         "type": "object",
         "required": [
           "schema_source"

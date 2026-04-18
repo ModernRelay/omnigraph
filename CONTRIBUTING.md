@@ -31,6 +31,22 @@ OMNIGRAPH_UPDATE_OPENAPI=1 cargo test -p omnigraph-server --test openapi openapi
 The workspace test run fails if the committed `openapi.json` drifts from what
 the source generates.
 
+### Cargo features
+
+`omnigraph-server` has an optional `aws` feature that pulls in the AWS
+Secrets Manager SDK for a bearer-token backend. Default builds omit it —
+most contributors never compile the AWS code path.
+
+When you touch `crates/omnigraph-server/src/auth.rs` or any AWS-conditional
+code, verify both configurations:
+
+```bash
+cargo test -p omnigraph-server                  # default
+cargo test -p omnigraph-server --features aws   # AWS enabled
+```
+
+CI runs both.
+
 ## Pull Requests
 
 - keep changes focused

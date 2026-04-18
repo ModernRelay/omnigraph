@@ -12,6 +12,12 @@ documentation = "https://docs.rs/omnigraph-server"
 name = "omnigraph-server"
 path = "src/main.rs"
 
+[features]
+default = []
+# Enables the AWS Secrets Manager bearer-token source. Off by default — on-prem
+# and local-dev builds don't pay the AWS SDK compile cost.
+aws = ["dep:aws-config", "dep:aws-sdk-secretsmanager"]
+
 [dependencies]
 omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.2.2" }
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.2.2" }
@@ -28,6 +34,11 @@ tower-http = { workspace = true }
 utoipa = { workspace = true }
 cedar-policy = { workspace = true }
 futures = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+async-trait = { workspace = true }
+aws-config = { version = "1", optional = true, default-features = false, features = ["rustls", "rt-tokio", "credentials-process", "sso"] }
+aws-sdk-secretsmanager = { version = "1", optional = true, default-features = false, features = ["rustls", "rt-tokio"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

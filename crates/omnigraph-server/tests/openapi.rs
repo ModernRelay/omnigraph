@@ -161,6 +161,7 @@ const EXPECTED_PATHS: &[&str] = &[
     "/read",
     "/export",
     "/change",
+    "/schema",
     "/schema/apply",
     "/ingest",
     "/branches",
