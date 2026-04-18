@@ -9,8 +9,8 @@ name: Package
 #     AWS_ARTIFACT_BUCKET are set. Stored as secrets (not variables) so the
 #     AWS account ID embedded in the role ARN and bucket name stays masked in
 #     public workflow logs.
-#   - The shared workflow at ModernRelay/.github supports the `features` and
-#     `image_tag_suffix` inputs (ModernRelay/.github PR #2 or later).
+#   - The shared workflow at ModernRelay/.github declares these as
+#     on.workflow_call.secrets (see fix/omnigraph-package-use-secrets).
 #
 # Each invocation produces two ECR tags per source commit:
 #   - <source_sha>         (default features)
@@ -36,10 +36,7 @@ jobs:
     with:
       repository: ${{ github.repository }}
       source_ref: ${{ inputs.source_ref != '' && inputs.source_ref || github.sha }}
-      aws_region: ${{ secrets.AWS_REGION }}
-      aws_role_to_assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-      aws_codebuild_package_project: ${{ secrets.AWS_CODEBUILD_PACKAGE_PROJECT }}
-      aws_artifact_bucket: ${{ secrets.AWS_ARTIFACT_BUCKET }}
+    secrets: inherit
 
   package_aws:
     name: Package aws-feature build
@@ -51,9 +48,6 @@ jobs:
     with:
       repository: ${{ github.repository }}
       source_ref: ${{ inputs.source_ref != '' && inputs.source_ref || github.sha }}
-      aws_region: ${{ secrets.AWS_REGION }}
-      aws_role_to_assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-      aws_codebuild_package_project: ${{ secrets.AWS_CODEBUILD_PACKAGE_PROJECT }}
-      aws_artifact_bucket: ${{ secrets.AWS_ARTIFACT_BUCKET }}
       features: aws
       image_tag_suffix: "-aws"
+    secrets: inherit
