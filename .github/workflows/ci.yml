@@ -105,7 +105,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
-      contents: read
+      contents: write
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -113,6 +113,10 @@ jobs:
         if: needs.classify_changes.outputs.run_full_ci != 'true'
         run: echo "Text-only change detected; skipping workspace test run."
 
+      # Default checkout: on pull_request this gives us the merge commit
+      # (refs/pull/N/merge), which is what we want to test. For same-repo PRs
+      # the regenerated openapi.json is pushed to the head branch below via a
+      # separate shallow clone.
       - name: Checkout source
         if: needs.classify_changes.outputs.run_full_ci == 'true'
         uses: actions/checkout@v5.0.1
@@ -138,7 +142,44 @@ jobs:
 
       - name: Run workspace tests
         if: needs.classify_changes.outputs.run_full_ci == 'true'
+        # On same-repo PRs, regenerate openapi.json as part of the drift test
+        # so the following step can commit the update. Elsewhere the env var
+        # is empty, leaving the drift test in strict-check mode.
+        env:
+          OMNIGRAPH_UPDATE_OPENAPI: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && '1' || '' }}
         run: cargo test --workspace --locked
+
+      - name: Commit regenerated openapi.json to PR branch
+        if: |
+          needs.classify_changes.outputs.run_full_ci == 'true' &&
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The workspace was checked out at the PR's merge commit so tests
+          # see the merged state. Pushing the regenerated openapi.json back
+          # to the PR branch is done via a separate shallow clone so the
+          # pushed commit contains only the spec change, not the merge state.
+          if git diff --quiet -- openapi.json; then
+            echo "openapi.json is already in sync."
+            exit 0
+          fi
+          tmp=$(mktemp -d)
+          git clone --depth 1 --branch "${{ github.head_ref }}" \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" \
+            "$tmp"
+          cp openapi.json "$tmp/openapi.json"
+          cd "$tmp"
+          if git diff --quiet -- openapi.json; then
+            echo "openapi.json matches PR branch; nothing to push."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add openapi.json
+          git commit -m "chore: regenerate openapi.json"
+          git push
 
   test_aws_feature:
     name: Test omnigraph-server --features aws
