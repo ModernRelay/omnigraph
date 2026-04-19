@@ -1,0 +1,22 @@
+# Cargo config for the omnigraph workspace.
+#
+# `[env]` entries here apply to anything cargo launches in this repo —
+# `cargo build`, `cargo test`, `cargo run`. Shipped binaries are NOT
+# affected: the env var lives only in the cargo-launched process, not in
+# release artifacts or Docker images.
+
+[env]
+# Lance's DataFusion memory pool per `Omnigraph` instance. Lance defaults
+# to 100 MB (`lance-datafusion/src/exec.rs`), which is fine for a single
+# server process in production.
+#
+# Under `cargo test` it's a problem: the omnigraph-server integration
+# suite spins up many `Omnigraph` instances in parallel (one per test,
+# default `num_cpus` threads), each with concurrent BTree index builds
+# sharing that test's 100 MB pool — saturates quickly and surfaces as
+# `Not enough memory to continue external sort` / `0.0 B remain
+# available for the total pool`.
+#
+# 1 GB is comfortable headroom per-test pool; prod and CI-for-prod
+# builds set the variable themselves (or keep the 100 MB default).
+LANCE_MEM_POOL_SIZE = "1073741824"
