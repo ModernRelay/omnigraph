@@ -113,22 +113,12 @@ jobs:
         if: needs.classify_changes.outputs.run_full_ci != 'true'
         run: echo "Text-only change detected; skipping workspace test run."
 
-      # For same-repo PRs, check out the PR branch head directly so we can push
-      # a regenerated openapi.json back to it. Fork PRs and push events use the
-      # default checkout (which is read-only for our purposes).
-      - name: Checkout (same-repo PR head)
-        if: |
-          needs.classify_changes.outputs.run_full_ci == 'true' &&
-          github.event_name == 'pull_request' &&
-          github.event.pull_request.head.repo.full_name == github.repository
-        uses: actions/checkout@v5.0.1
-        with:
-          ref: ${{ github.head_ref }}
-
-      - name: Checkout (default)
-        if: |
-          needs.classify_changes.outputs.run_full_ci == 'true' &&
-          !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+      # Default checkout: on pull_request this gives us the merge commit
+      # (refs/pull/N/merge), which is what we want to test. For same-repo PRs
+      # the regenerated openapi.json is pushed to the head branch below via a
+      # separate shallow clone.
+      - name: Checkout source
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
         uses: actions/checkout@v5.0.1
 
       - name: Install system dependencies
@@ -159,14 +149,30 @@ jobs:
           OMNIGRAPH_UPDATE_OPENAPI: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && '1' || '' }}
         run: cargo test --workspace --locked
 
-      - name: Commit regenerated openapi.json
+      - name: Commit regenerated openapi.json to PR branch
         if: |
           needs.classify_changes.outputs.run_full_ci == 'true' &&
           github.event_name == 'pull_request' &&
           github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # The workspace was checked out at the PR's merge commit so tests
+          # see the merged state. Pushing the regenerated openapi.json back
+          # to the PR branch is done via a separate shallow clone so the
+          # pushed commit contains only the spec change, not the merge state.
           if git diff --quiet -- openapi.json; then
             echo "openapi.json is already in sync."
+            exit 0
+          fi
+          tmp=$(mktemp -d)
+          git clone --depth 1 --branch "${{ github.head_ref }}" \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" \
+            "$tmp"
+          cp openapi.json "$tmp/openapi.json"
+          cd "$tmp"
+          if git diff --quiet -- openapi.json; then
+            echo "openapi.json matches PR branch; nothing to push."
             exit 0
           fi
           git config user.name "github-actions[bot]"
