@@ -1497,6 +1497,7 @@ fn json_value_from_array(array: &dyn Array, row: usize) -> Result<serde_json::Va
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::is_internal_run_branch;
     use crate::db::manifest::ManifestCoordinator;
     use async_trait::async_trait;
     use omnigraph_compiler::{SchemaMigrationStep, SchemaTypeKind};
@@ -1940,6 +1941,47 @@ edge WorksAt: Person -> Company
             err.to_string()
                 .contains("schema apply requires a repo with only main")
         );
+    }
+
+    #[tokio::test]
+    async fn test_apply_schema_succeeds_after_load_creates_published_run_branch() {
+        // Regression for MR-670: schema apply used to fail after any load or
+        // change because published __run__ branches count as "non-main" in
+        // the blocking-branch check, and there is no CLI path to clean them
+        // up (branch_delete rejects internal refs; run abort rejects
+        // Published runs). Published run branches are intentionally retained
+        // for post-publish inspection — schema apply now filters them out
+        // instead of requiring their deletion.
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        // A load goes through a __run__ branch which remains after publish.
+        crate::loader::load_jsonl(
+            &mut db,
+            r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}"#,
+            crate::loader::LoadMode::Overwrite,
+        )
+        .await
+        .unwrap();
+
+        // Confirm at the coordinator level that a published run branch did
+        // get created and persists after publish.
+        let all_branches = db.coordinator.all_branches().await.unwrap();
+        assert!(
+            all_branches.iter().any(|b| is_internal_run_branch(b)),
+            "expected at least one internal run branch after load, got: {:?}",
+            all_branches
+        );
+
+        // Schema apply should succeed — the filter skips internal system
+        // branches, including __run__ ones.
+        let desired = TEST_SCHEMA.replace(
+            "    age: I32?\n}",
+            "    age: I32?\n    nickname: String?\n}",
+        );
+        let result = db.apply_schema(&desired).await.unwrap();
+        assert!(result.applied, "schema apply should have applied");
     }
 
     #[tokio::test]
