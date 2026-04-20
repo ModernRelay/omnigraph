@@ -1,4 +1,7 @@
-FROM debian:bookworm-slim
+# Pulled from ECR Public (the Debian team mirrors official images there)
+# instead of Docker Hub to avoid anonymous-pull rate limits from AWS
+# CodeBuild, which shares an outbound IP pool with many other accounts.
+FROM public.ecr.aws/debian/debian:bookworm-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
