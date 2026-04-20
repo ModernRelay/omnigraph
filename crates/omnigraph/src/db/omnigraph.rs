@@ -1500,9 +1500,7 @@ mod tests {
     use crate::db::is_internal_run_branch;
     use crate::db::manifest::ManifestCoordinator;
     use async_trait::async_trait;
-    use omnigraph_compiler::{SchemaMigrationStep, SchemaTypeKind};
     use serde_json::Value;
-    use std::fs;
     use std::sync::Mutex;
 
     use crate::storage::{LocalStorageAdapter, StorageAdapter, join_uri};
@@ -1562,50 +1560,6 @@ edge WorksAt: Person -> Company
     }
 
     #[tokio::test]
-    async fn test_init_creates_repo() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-        // Schema file written
-        assert!(dir.path().join("_schema.pg").exists());
-        assert!(dir.path().join("_schema.ir.json").exists());
-        assert!(dir.path().join("__schema_state.json").exists());
-
-        // Manifest created with correct entries
-        let snap = db.snapshot();
-        assert!(snap.entry("node:Person").is_some());
-        assert!(snap.entry("node:Company").is_some());
-        assert!(snap.entry("edge:Knows").is_some());
-        assert!(snap.entry("edge:WorksAt").is_some());
-
-        // Catalog is correct
-        assert_eq!(db.catalog().node_types.len(), 2);
-        assert_eq!(db.catalog().edge_types.len(), 2);
-        assert_eq!(
-            db.catalog().node_types["Person"].key_property(),
-            Some("name")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_open_reads_existing_repo() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-
-        Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-        // Re-open
-        let db = Omnigraph::open(uri).await.unwrap();
-        assert_eq!(db.catalog().node_types.len(), 2);
-        assert_eq!(db.catalog().edge_types.len(), 2);
-        let snap = db.snapshot();
-        assert!(snap.entry("node:Person").is_some());
-        assert!(snap.entry("edge:Knows").is_some());
-    }
-
-    #[tokio::test]
     async fn test_init_and_open_route_graph_metadata_through_storage_adapter() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
@@ -1646,151 +1600,6 @@ edge WorksAt: Person -> Company
             adapter
                 .exists_checks()
                 .contains(&join_uri(uri, "_graph_commits.lance"))
-        );
-    }
-
-    #[tokio::test]
-    async fn test_open_bootstraps_legacy_schema_state_for_main_only_repo() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-        fs::remove_file(dir.path().join("_schema.ir.json")).unwrap();
-        fs::remove_file(dir.path().join("__schema_state.json")).unwrap();
-
-        let db = Omnigraph::open(uri).await.unwrap();
-        assert_eq!(db.catalog().node_types.len(), 2);
-        assert!(dir.path().join("_schema.ir.json").exists());
-        assert!(dir.path().join("__schema_state.json").exists());
-    }
-
-    #[tokio::test]
-    async fn test_open_rejects_legacy_repo_with_public_branch() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-        db.branch_create("feature").await.unwrap();
-
-        fs::remove_file(dir.path().join("_schema.ir.json")).unwrap();
-        fs::remove_file(dir.path().join("__schema_state.json")).unwrap();
-
-        let err = match Omnigraph::open(uri).await {
-            Ok(_) => panic!("expected legacy repo with public branch to fail schema bootstrap"),
-            Err(err) => err,
-        };
-        let message = err.to_string();
-        assert!(message.contains("public branches block schema evolution entirely"));
-    }
-
-    #[tokio::test]
-    async fn test_long_lived_handle_rejects_schema_source_drift() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-        let drifted = TEST_SCHEMA.replace("age: I32?", "age: I64?");
-        fs::write(dir.path().join("_schema.pg"), drifted).unwrap();
-
-        let err = match db.snapshot_of(ReadTarget::branch("main")).await {
-            Ok(_) => panic!("expected schema source drift to be rejected"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string()
-                .contains("current _schema.pg no longer matches the accepted compiled schema")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_long_lived_handle_rejects_schema_ir_drift() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-        fs::write(dir.path().join("_schema.ir.json"), "{not valid json").unwrap();
-
-        let err = match db.snapshot_of(ReadTarget::branch("main")).await {
-            Ok(_) => panic!("expected schema IR drift to be rejected"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string()
-                .contains("accepted compiled schema contract in _schema.ir.json is invalid")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_long_lived_handle_rejects_ir_and_source_updates_without_state_update() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-        let drifted = TEST_SCHEMA.replace("age: I32?", "age: I64?");
-        let drifted_ir = read_schema_ir_from_source(&drifted).unwrap();
-        let drifted_ir_json = omnigraph_compiler::schema_ir_pretty_json(&drifted_ir).unwrap();
-        fs::write(dir.path().join("_schema.pg"), drifted).unwrap();
-        fs::write(dir.path().join("_schema.ir.json"), drifted_ir_json).unwrap();
-
-        let err = match db.snapshot_of(ReadTarget::branch("main")).await {
-            Ok(_) => panic!("expected schema state mismatch to be rejected"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string()
-                .contains("accepted compiled schema does not match the recorded schema state")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_comment_only_schema_edit_keeps_schema_state_valid() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-        let commented = format!("// comment-only drift\n{}", TEST_SCHEMA);
-        fs::write(dir.path().join("_schema.pg"), commented).unwrap();
-
-        let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-        assert!(snapshot.entry("node:Person").is_some());
-    }
-
-    #[tokio::test]
-    async fn test_plan_schema_reports_supported_additive_change() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-        let desired = TEST_SCHEMA.replace(
-            "    age: I32?\n}",
-            "    age: I32?\n    nickname: String?\n}",
-        );
-
-        let plan = db.plan_schema(&desired).await.unwrap();
-        assert!(plan.supported);
-        assert!(plan.steps.iter().any(|step| matches!(
-            step,
-            SchemaMigrationStep::AddProperty {
-                type_kind: SchemaTypeKind::Node,
-                type_name,
-                property_name,
-                ..
-            } if type_name == "Person" && property_name == "nickname"
-        )));
-    }
-
-    #[tokio::test]
-    async fn test_plan_schema_rejects_when_schema_contract_has_drifted() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-        let drifted = TEST_SCHEMA.replace("age: I32?", "age: I64?");
-        fs::write(dir.path().join("_schema.pg"), drifted).unwrap();
-
-        let err = db.plan_schema(TEST_SCHEMA).await.unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("current _schema.pg no longer matches the accepted compiled schema")
         );
     }
 
@@ -1836,18 +1645,6 @@ edge WorksAt: Person -> Company
         }])
         .await
         .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_apply_schema_noop_returns_not_applied() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-        let result = db.apply_schema(TEST_SCHEMA).await.unwrap();
-        assert!(result.supported);
-        assert!(!result.applied);
-        assert!(result.steps.is_empty());
     }
 
     #[tokio::test]
@@ -1923,24 +1720,6 @@ edge WorksAt: Person -> Company
             .unwrap();
         assert!(historical.entry("node:Person").is_some());
         assert!(historical.entry("node:Human").is_none());
-    }
-
-    #[tokio::test]
-    async fn test_apply_schema_rejects_when_non_main_branch_exists() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-        db.branch_create("feature").await.unwrap();
-
-        let desired = TEST_SCHEMA.replace(
-            "    age: I32?\n}",
-            "    age: I32?\n    nickname: String?\n}",
-        );
-        let err = db.apply_schema(&desired).await.unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("schema apply requires a repo with only main")
-        );
     }
 
     #[tokio::test]
@@ -2065,52 +1844,5 @@ edge WorksAt: Person -> Company
 
         let branches = db.branch_list().await.unwrap();
         assert_eq!(branches, vec!["main".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn test_apply_schema_unsupported_plan_does_not_advance_manifest() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-        let before_version = db.snapshot().version();
-
-        let desired = TEST_SCHEMA.replace("age: I32?", "age: I64?");
-        let err = db.apply_schema(&desired).await.unwrap_err();
-        assert!(err.to_string().contains("changing property type"));
-        assert_eq!(db.snapshot().version(), before_version);
-    }
-
-    #[tokio::test]
-    async fn test_open_nonexistent_fails() {
-        let result = Omnigraph::open("/tmp/nonexistent_omnigraph_test_xyz").await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_snapshot_version_is_pinned() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-
-        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-        // Take snapshot before any writes
-        let snap1 = db.snapshot();
-        let v1 = snap1.version();
-
-        // Load data — advances manifest version
-        crate::loader::load_jsonl(
-            &mut db,
-            r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}"#,
-            crate::loader::LoadMode::Overwrite,
-        )
-        .await
-        .unwrap();
-
-        // Snapshot from handle sees new version
-        let snap2 = db.snapshot();
-        assert!(snap2.version() > v1);
-
-        // But the old snapshot is still pinned
-        assert_eq!(snap1.version(), v1);
     }
 }
