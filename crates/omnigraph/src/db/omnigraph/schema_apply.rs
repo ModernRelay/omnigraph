@@ -32,9 +32,13 @@ pub(super) async fn apply_schema_with_lock(
 ) -> Result<SchemaApplyResult> {
     db.ensure_schema_state_valid().await?;
     let branches = db.coordinator.all_branches().await?;
+    // Skip `main`, the schema-apply lock branch, and any internal `__run__`
+    // branches. Stale run branches used to block schema apply forever after
+    // a publish (MR-670); the publish path now cleans them up, but this
+    // filter is defense-in-depth for legacy repos that predate the fix.
     let blocking_branches = branches
         .into_iter()
-        .filter(|branch| branch != "main" && !is_schema_apply_lock_branch(branch))
+        .filter(|branch| branch != "main" && !is_internal_system_branch(branch))
         .collect::<Vec<_>>();
     if !blocking_branches.is_empty() {
         return Err(OmniError::manifest_conflict(format!(
@@ -369,7 +373,7 @@ pub(super) async fn acquire_schema_apply_lock(db: &mut Omnigraph) -> Result<()> 
         .all_branches()
         .await?
         .into_iter()
-        .filter(|branch| branch != "main" && !is_schema_apply_lock_branch(branch))
+        .filter(|branch| branch != "main" && !is_internal_system_branch(branch))
         .collect::<Vec<_>>();
     if !blocking_branches.is_empty() {
         let _ = release_schema_apply_lock(db).await;
