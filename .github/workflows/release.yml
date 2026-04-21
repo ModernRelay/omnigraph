@@ -70,15 +70,24 @@ jobs:
   update_homebrew_tap:
     name: Update Homebrew tap
     needs: build_release
-    if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
     steps:
+      - name: Skip if HOMEBREW_TAP_TOKEN is not configured
+        if: env.HOMEBREW_TAP_TOKEN == ''
+        run: |
+          echo "HOMEBREW_TAP_TOKEN is not set; skipping Homebrew tap update."
+          echo "HOMEBREW_TAP_SKIP=1" >> "$GITHUB_ENV"
+
       - name: Checkout source
+        if: env.HOMEBREW_TAP_SKIP != '1'
         uses: actions/checkout@v5.0.1
 
       - name: Checkout Homebrew tap
+        if: env.HOMEBREW_TAP_SKIP != '1'
         uses: actions/checkout@v5.0.1
         with:
           repository: ModernRelay/homebrew-tap
@@ -86,12 +95,14 @@ jobs:
           path: homebrew-tap
 
       - name: Update formula from release assets
+        if: env.HOMEBREW_TAP_SKIP != '1'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           ./scripts/update-homebrew-formula.sh "${GITHUB_REF_NAME}" homebrew-tap/Formula/omnigraph.rb
 
       - name: Commit and push formula update
+        if: env.HOMEBREW_TAP_SKIP != '1'
         working-directory: homebrew-tap
         run: |
           if git diff --quiet -- Formula/omnigraph.rb; then
