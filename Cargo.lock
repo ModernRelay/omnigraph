@@ -4596,7 +4596,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-cli"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -4616,7 +4616,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-compiler"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -4637,7 +4637,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-engine"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -4674,7 +4674,7 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-server"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "aws-config",
