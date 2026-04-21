@@ -8,7 +8,7 @@ use lance::Dataset;
 
 use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{Omnigraph, ReadTarget, RunStatus};
-use omnigraph::error::OmniError;
+use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::loader::{LoadMode, load_jsonl};
 
 use helpers::*;
@@ -170,7 +170,7 @@ async fn publish_run_merges_internal_branch_into_target_and_marks_record() {
 }
 
 #[tokio::test]
-async fn abort_run_keeps_target_unchanged_and_preserves_hidden_branch_for_inspection() {
+async fn abort_run_leaves_target_unchanged_and_deletes_run_branch() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
     let run = db.begin_run("main", Some("abort-test")).await.unwrap();
@@ -197,7 +197,7 @@ async fn abort_run_keeps_target_unchanged_and_preserves_hidden_branch_for_inspec
         .unwrap();
     assert_eq!(main_qr.num_rows(), 0);
 
-    let run_qr = db
+    let err = db
         .query(
             ReadTarget::branch(run.run_branch.as_str()),
             TEST_QUERIES,
@@ -205,8 +205,13 @@ async fn abort_run_keeps_target_unchanged_and_preserves_hidden_branch_for_inspec
             &params(&[("$name", "Eve")]),
         )
         .await
-        .unwrap();
-    assert_eq!(run_qr.num_rows(), 1);
+        .unwrap_err();
+    assert!(
+        matches!(err, OmniError::Manifest(ref e) if e.kind == ManifestErrorKind::NotFound)
+            || matches!(err, OmniError::Lance(_)),
+        "run branch should be gone after abort, got: {}",
+        err
+    );
 }
 
 #[tokio::test]
@@ -292,21 +297,22 @@ async fn public_load_preserves_staged_edge_ids_on_publish() {
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+    let run = db.begin_run("main", Some("preserve-ids-load")).await.unwrap();
+    db.load(&run.run_branch, TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
 
-    let runs = latest_runs(uri).await;
-    let run_branch = runs[0].run_branch.clone();
-
-    let mut main_ids = collect_column_strings(&read_table(&db, "edge:Knows").await, "id");
-    let mut run_ids = collect_column_strings(
-        &read_table_branch(&db, run_branch.as_str(), "edge:Knows").await,
+    let mut staged_ids = collect_column_strings(
+        &read_table_branch(&db, run.run_branch.as_str(), "edge:Knows").await,
         "id",
     );
+    staged_ids.sort();
+
+    db.publish_run(&run.run_id).await.unwrap();
+
+    let mut main_ids = collect_column_strings(&read_table(&db, "edge:Knows").await, "id");
     main_ids.sort();
-    run_ids.sort();
-    assert_eq!(main_ids, run_ids);
+    assert_eq!(main_ids, staged_ids);
 }
 
 #[tokio::test]
@@ -381,11 +387,14 @@ async fn public_mutation_uses_hidden_transactional_run_and_publishes_it() {
 #[tokio::test]
 async fn public_mutation_preserves_staged_edge_ids_on_publish() {
     let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
     let mut db = init_and_load(&dir).await;
 
+    let run = db
+        .begin_run("main", Some("preserve-ids-mutation"))
+        .await
+        .unwrap();
     db.mutate(
-        "main",
+        run.run_branch.as_str(),
         MUTATION_QUERIES,
         "add_friend",
         &params(&[("$from", "Alice"), ("$to", "Diana")]),
@@ -393,17 +402,17 @@ async fn public_mutation_preserves_staged_edge_ids_on_publish() {
     .await
     .unwrap();
 
-    let runs = latest_runs(uri).await;
-    let latest = runs.last().unwrap();
-
-    let mut main_ids = collect_column_strings(&read_table(&db, "edge:Knows").await, "id");
-    let mut run_ids = collect_column_strings(
-        &read_table_branch(&db, latest.run_branch.as_str(), "edge:Knows").await,
+    let mut staged_ids = collect_column_strings(
+        &read_table_branch(&db, run.run_branch.as_str(), "edge:Knows").await,
         "id",
     );
+    staged_ids.sort();
+
+    db.publish_run(&run.run_id).await.unwrap();
+
+    let mut main_ids = collect_column_strings(&read_table(&db, "edge:Knows").await, "id");
     main_ids.sort();
-    run_ids.sort();
-    assert_eq!(main_ids, run_ids);
+    assert_eq!(main_ids, staged_ids);
 }
 
 #[tokio::test]
@@ -530,4 +539,63 @@ async fn public_mutation_records_actor_on_run_and_published_commit() {
         .unwrap()
         .unwrap();
     assert_eq!(head.actor_id.as_deref(), Some("act-andrew"));
+}
+
+#[tokio::test]
+async fn run_branches_do_not_accumulate_across_repeated_loads() {
+    // MR-674: run branches are transactional scaffolding. Every terminal
+    // state (Published, Aborted, Failed) deletes the branch. Verifying the
+    // invariant end-to-end: after 10 publishes and one abort, only main
+    // should remain.
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+    for i in 0..10 {
+        let payload = format!(
+            r#"{{"type":"Person","data":{{"name":"p{}","age":{}}}}}"#,
+            i, i
+        );
+        load_jsonl(&mut db, &payload, LoadMode::Append)
+            .await
+            .unwrap();
+    }
+
+    let aborted_run = db.begin_run("main", Some("abort-me")).await.unwrap();
+    db.abort_run(&aborted_run.run_id).await.unwrap();
+
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
+    let all_branches = Omnigraph::open(uri)
+        .await
+        .unwrap()
+        .branch_list()
+        .await
+        .unwrap();
+    assert_eq!(all_branches, vec!["main".to_string()]);
+}
+
+#[tokio::test]
+async fn failed_load_deletes_run_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+    let bad = r#"{"type":"Person","data":{"name":"Alice","age":30}}
+{"edge":"Knows","from":"Alice","to":"Missing"}"#;
+    let _ = load_jsonl(&mut db, bad, LoadMode::Overwrite).await;
+
+    let runs = latest_runs(uri).await;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, "failed");
+
+    let err = db
+        .snapshot_of(ReadTarget::branch(runs[0].run_branch.as_str()))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, OmniError::Manifest(ref e) if e.kind == ManifestErrorKind::NotFound)
+            || matches!(err, OmniError::Lance(_)),
+        "failed run's branch should be gone, got: {}",
+        err
+    );
 }
