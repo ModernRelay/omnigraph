@@ -505,9 +505,7 @@ impl Omnigraph {
         }
 
         for run in self.list_runs().await? {
-            if run.target_branch == branch
-                && matches!(run.status, RunStatus::Running | RunStatus::Failed)
-            {
+            if run.target_branch == branch && matches!(run.status, RunStatus::Running) {
                 return Err(OmniError::manifest_conflict(format!(
                     "cannot delete branch '{}' while run '{}' targeting it is {}",
                     branch,
@@ -591,12 +589,21 @@ impl Omnigraph {
             .into_iter()
             .filter(|run| {
                 run.target_branch == branch
-                    && matches!(run.status, RunStatus::Published | RunStatus::Aborted)
+                    && matches!(
+                        run.status,
+                        RunStatus::Published | RunStatus::Aborted | RunStatus::Failed
+                    )
             })
             .map(|run| run.run_branch)
             .collect::<Vec<_>>();
 
+        let live_branches: HashSet<String> =
+            self.coordinator.all_branches().await?.into_iter().collect();
+
         for run_branch in terminal_run_branches {
+            if !live_branches.contains(&run_branch) {
+                continue;
+            }
             match self.delete_branch_storage_only(&run_branch).await {
                 Ok(()) => {}
                 Err(OmniError::Manifest(err)) if err.kind == ManifestErrorKind::NotFound => {}
@@ -776,9 +783,7 @@ impl Omnigraph {
         let run = self.get_run(run_id).await?;
         match run.status {
             RunStatus::Running | RunStatus::Failed => {
-                let updated = run.with_status(RunStatus::Aborted, None)?;
-                self.coordinator.append_run_record(&updated).await?;
-                Ok(updated)
+                self.terminate_run(&run, RunStatus::Aborted, None).await
             }
             RunStatus::Published => Err(OmniError::manifest_conflict(format!(
                 "run '{}' is already published",
@@ -795,11 +800,7 @@ impl Omnigraph {
         self.ensure_schema_state_valid().await?;
         let run = self.get_run(run_id).await?;
         match run.status {
-            RunStatus::Running => {
-                let updated = run.with_status(RunStatus::Failed, None)?;
-                self.coordinator.append_run_record(&updated).await?;
-                Ok(updated)
-            }
+            RunStatus::Running => self.terminate_run(&run, RunStatus::Failed, None).await,
             RunStatus::Failed => Ok(run),
             RunStatus::Published => Err(OmniError::manifest_conflict(format!(
                 "run '{}' is already published",
@@ -810,6 +811,22 @@ impl Omnigraph {
                 run_id
             ))),
         }
+    }
+
+    /// Append a terminal-state run record and delete the `__run__` branch.
+    /// The status record is authoritative; the branch is scaffolding. Delete
+    /// errors are swallowed — a later `branch_delete` of the target will
+    /// retry via `cleanup_terminal_run_branches_for_target`.
+    async fn terminate_run(
+        &mut self,
+        run: &RunRecord,
+        status: RunStatus,
+        published_snapshot_id: Option<String>,
+    ) -> Result<RunRecord> {
+        let updated = run.with_status(status, published_snapshot_id)?;
+        self.coordinator.append_run_record(&updated).await?;
+        let _ = self.delete_branch_storage_only(&updated.run_branch).await;
+        Ok(updated)
     }
 
     pub async fn publish_run(&mut self, run_id: &RunId) -> Result<SnapshotId> {
@@ -869,11 +886,12 @@ impl Omnigraph {
         self.audit_actor_id = previous_actor;
         publish_result?;
         let published_snapshot_id = self.resolve_snapshot(&run.target_branch).await?;
-        let updated = run.with_status(
+        self.terminate_run(
+            &run,
             RunStatus::Published,
             Some(published_snapshot_id.as_str().to_string()),
-        )?;
-        self.coordinator.append_run_record(&updated).await?;
+        )
+        .await?;
         Ok(published_snapshot_id)
     }
 
@@ -1723,19 +1741,17 @@ edge WorksAt: Person -> Company
     }
 
     #[tokio::test]
-    async fn test_apply_schema_succeeds_after_load_creates_published_run_branch() {
-        // Regression for MR-670: schema apply used to fail after any load or
-        // change because published __run__ branches count as "non-main" in
-        // the blocking-branch check, and there is no CLI path to clean them
-        // up (branch_delete rejects internal refs; run abort rejects
-        // Published runs). Published run branches are intentionally retained
-        // for post-publish inspection — schema apply now filters them out
-        // instead of requiring their deletion.
+    async fn test_apply_schema_succeeds_after_load() {
+        // MR-670 + MR-674: schema apply used to be blocked by leftover
+        // __run__ branches. MR-670 added a defense-in-depth filter that
+        // skips internal system branches. MR-674 made run branches
+        // ephemeral on every terminal state, so in practice no __run__
+        // branch survives publish — but the filter still guards the
+        // invariant.
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
-        // A load goes through a __run__ branch which remains after publish.
         crate::loader::load_jsonl(
             &mut db,
             r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}"#,
@@ -1744,17 +1760,13 @@ edge WorksAt: Person -> Company
         .await
         .unwrap();
 
-        // Confirm at the coordinator level that a published run branch did
-        // get created and persists after publish.
         let all_branches = db.coordinator.all_branches().await.unwrap();
         assert!(
-            all_branches.iter().any(|b| is_internal_run_branch(b)),
-            "expected at least one internal run branch after load, got: {:?}",
+            !all_branches.iter().any(|b| is_internal_run_branch(b)),
+            "MR-674: run branch should be deleted after publish, got: {:?}",
             all_branches
         );
 
-        // Schema apply should succeed — the filter skips internal system
-        // branches, including __run__ ones.
         let desired = TEST_SCHEMA.replace(
             "    age: I32?\n}",
             "    age: I32?\n    nickname: String?\n}",
