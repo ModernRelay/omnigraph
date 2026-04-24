@@ -1200,6 +1200,82 @@ async fn blob_scan_with_descriptions_on_nonempty_dataset() {
     );
 }
 
+// ─── Tripwires: Lance-upstream blob projection bug ──────────────────────────
+//
+// exec/query.rs:1019-1106 excludes blob columns from node scans when a filter
+// (or FTS / nearest) is present and reinstates them as null Utf8 placeholders
+// via add_null_blob_columns(). The note at that site claims this is a Lance
+// bug: "BlobsDescriptions + filter triggers a projection assertion."
+//
+// These #[should_panic] tests reproduce the bug directly against the Lance
+// dataset API (not our query layer) on an already-2.2-format table. They pass
+// today because the assertion still fires on lance = 4.0.0 with either the
+// default BlobsDescriptions handling or AllBinary handling. The day Lance
+// fixes it, these tests fail, and the workaround at exec/query.rs:1019-1106
+// can be deleted along with add_null_blob_columns().
+//
+// Probed at: 2026-02 against lance = "4.0.0"
+// Panic site: lance-core-4.0.0/src/datatypes/field.rs:277
+//   `Field::apply_projection` → assertion on projecting a blob field.
+
+#[tokio::test]
+#[should_panic(expected = "projection.contains_field_id")]
+async fn blob_projection_plus_filter_still_panics_default_handling() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+
+    let data = r#"{"type": "Document", "data": {"title": "readme", "content": "base64:SGVsbG8gV29ybGQ="}}
+{"type": "Document", "data": {"title": "other", "content": "base64:QkJC"}}
+"#;
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let snap = snapshot_main(&db).await.unwrap();
+    let ds = snap.open("node:Document").await.unwrap();
+
+    let mut scanner = ds.scan();
+    scanner.project(&["id", "title", "content"]).unwrap();
+    scanner.filter("title = 'readme'").unwrap();
+    let _ = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<RecordBatch>>()
+        .await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "projection.contains_field_id")]
+async fn blob_projection_plus_filter_still_panics_all_binary_handling() {
+    use lance::datatypes::BlobHandling;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+
+    let data = r#"{"type": "Document", "data": {"title": "readme", "content": "base64:SGVsbG8gV29ybGQ="}}
+{"type": "Document", "data": {"title": "other", "content": "base64:QkJC"}}
+"#;
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let snap = snapshot_main(&db).await.unwrap();
+    let ds = snap.open("node:Document").await.unwrap();
+
+    let mut scanner = ds.scan();
+    scanner.blob_handling(BlobHandling::AllBinary);
+    scanner.project(&["id", "title", "content"]).unwrap();
+    scanner.filter("title = 'readme'").unwrap();
+    let _ = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect::<Vec<RecordBatch>>()
+        .await;
+}
+
 // ─── Constraint enforcement ──────────────────────────────────────────────────
 
 #[tokio::test]

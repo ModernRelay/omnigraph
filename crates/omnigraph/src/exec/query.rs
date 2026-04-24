@@ -1018,9 +1018,19 @@ async fn execute_node_scan(
     // Build Lance SQL filter string from non-search IR filters
     let filter_sql = build_lance_filter(filters, params);
 
-    // Blob columns must be excluded from scan when a filter is present
-    // (Lance bug: BlobsDescriptions + filter triggers a projection assertion).
-    // We exclude blob columns and add metadata post-scan via take_blobs_by_indices.
+    // Blob columns must be excluded from scan when a filter is present.
+    // Lance bug: projecting a blob column alongside a filter panics in
+    // lance-core `Field::apply_projection` regardless of BlobHandling
+    // (verified against lance = 4.0.0 on 2.2-format datasets). We exclude
+    // blob columns and add null placeholders post-scan; real blob bytes are
+    // accessed via `Omnigraph::read_blob` → `Dataset::take_blobs`.
+    //
+    // See tripwires in tests/end_to_end.rs:
+    //   blob_projection_plus_filter_still_panics_default_handling
+    //   blob_projection_plus_filter_still_panics_all_binary_handling
+    // The day Lance fixes this, those tests fail and this branch + the
+    // matching branch in `hydrate_nodes` + `add_null_blob_columns` can be
+    // deleted.
     let node_type = &catalog.node_types[type_name];
     let has_blobs = !node_type.blob_properties.is_empty();
     let non_blob_cols: Vec<&str> = node_type
