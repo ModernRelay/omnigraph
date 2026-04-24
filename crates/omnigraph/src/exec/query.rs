@@ -776,8 +776,27 @@ async fn execute_expand(
         .filter(|f| ir_filter_to_sql(f, params).is_none())
         .collect();
 
-    // Hydrate destination nodes from the snapshot (with pushed-down filters)
-    let dst_batch = hydrate_nodes(snapshot, catalog, dst_type, &dst_id_list, pushdown_sql.as_deref()).await?;
+    // Hydrate destination nodes from the snapshot (with pushed-down filters).
+    // Dedupe dst ids before the scan — the post-hydrate alignment HashMap fans
+    // them back out to the original (src, dst) pairs. For multi-hop on a small
+    // destination universe this collapses the IN-list from O(pairs) to
+    // O(unique_dst), often by 100–500×.
+    let unique_dst_list: Vec<String> = {
+        let mut seen: HashSet<&str> = HashSet::with_capacity(dst_id_list.len());
+        dst_id_list
+            .iter()
+            .filter(|s| seen.insert(s.as_str()))
+            .cloned()
+            .collect()
+    };
+    let dst_batch = hydrate_nodes(
+        snapshot,
+        catalog,
+        dst_type,
+        &unique_dst_list,
+        pushdown_sql.as_deref(),
+    )
+    .await?;
 
     // Build a mapping from dst_id to row index in dst_batch
     let dst_batch_id_col = dst_batch
