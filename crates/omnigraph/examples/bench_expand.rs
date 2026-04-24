@@ -7,7 +7,6 @@
 //! `HashSet<String>` vs `HashSet<u32>` dedup inside the BFS inner loop.
 
 use std::collections::HashSet;
-use std::hash::BuildHasherDefault;
 use std::time::Instant;
 
 use omnigraph::db::{Omnigraph, ReadTarget};
@@ -71,7 +70,7 @@ fn generate_jsonl(n: usize, avg_degree: usize, seed: u64) -> String {
     }
     // Simple xorshift-ish PRNG to avoid adding a dep.
     let mut state: u64 = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
-    let mut next = |state: &mut u64| {
+    let next = |state: &mut u64| {
         *state ^= *state << 13;
         *state ^= *state >> 7;
         *state ^= *state << 17;
@@ -174,10 +173,7 @@ fn microbench_dedup() {
     }
     let dur_u32 = t.elapsed();
 
-    // Variant C: HashSet<u32> with ahash (std's BuildHasherDefault<DefaultHasher> vs foldhash).
-    // Use std::collections::HashSet with FxHasher-equivalent via BuildHasherDefault<DefaultHasher>
-    // (skip if we don't want a dep). We'll compare against a bitmap instead.
-    // Variant D: Vec<bool> bitmap
+    // Variant C: Vec<bool> bitmap
     let t = Instant::now();
     let mut emitted_d: usize = 0;
     let mut bitmap = vec![false; UNIVERSE];
@@ -197,9 +193,6 @@ fn microbench_dedup() {
         }
     }
     let dur_bitmap = t.elapsed();
-
-    // Variant E: HashSet<u32> with FxHash-like (BuildHasherDefault<std::collections::hash_map::DefaultHasher> is default; skip).
-    // Use ahash if available — fall back: just report three variants.
 
     println!("\n── Microbench: per-source dedup inner loop ──");
     println!(
@@ -226,8 +219,6 @@ fn microbench_dedup() {
         dur_bitmap.as_nanos() as f64 / (SOURCES * NEIGHBORS_PER_SRC) as f64,
         dur_string.as_secs_f64() / dur_bitmap.as_secs_f64()
     );
-    // Silence unused hasher typedef warning
-    let _ = std::marker::PhantomData::<BuildHasherDefault<std::collections::hash_map::DefaultHasher>>;
 }
 
 #[tokio::main(flavor = "multi_thread")]
