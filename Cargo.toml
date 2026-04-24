@@ -39,6 +39,7 @@ lance-table = "4.0.0"
 ulid = "1"
 futures = "0.3"
 async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 pest = "2"
 pest_derive = "2"
 thiserror = "2"

@@ -29,8 +29,11 @@ use crate::storage::{StorageAdapter, join_uri, normalize_root_uri, storage_for_u
 use crate::table_store::TableStore;
 
 mod export;
+mod optimize;
 mod schema_apply;
 mod table_ops;
+
+pub use optimize::{CleanupPolicyOptions, TableCleanupStats, TableOptimizeStats};
 
 use super::commit_graph::GraphCommit;
 use super::manifest::{
@@ -438,6 +441,22 @@ impl Omnigraph {
 
     pub async fn ensure_indices_on(&mut self, branch: &str) -> Result<()> {
         table_ops::ensure_indices_on(self, branch).await
+    }
+
+    /// Compact small Lance fragments into fewer larger ones across every
+    /// node + edge table on `main`. See [`optimize`] for details.
+    pub async fn optimize(&mut self) -> Result<Vec<optimize::TableOptimizeStats>> {
+        optimize::optimize_all_tables(self).await
+    }
+
+    /// Remove Lance manifests (and the fragments they uniquely own) per the
+    /// given [`optimize::CleanupPolicyOptions`]. Destructive to version
+    /// history. See [`optimize`] for details.
+    pub async fn cleanup(
+        &mut self,
+        options: optimize::CleanupPolicyOptions,
+    ) -> Result<Vec<optimize::TableCleanupStats>> {
+        optimize::cleanup_all_tables(self, options).await
     }
 
     /// Read a blob from a node by its string ID and property name.
