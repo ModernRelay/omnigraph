@@ -159,6 +159,32 @@ pub struct ApiError {
     code: ErrorCode,
     message: String,
     merge_conflicts: Vec<api::MergeConflictOutput>,
+    retry_after_seconds: Option<u64>,
+}
+
+/// Default `Retry-After` for transient backend failures (S3 throttles,
+/// object-store 503s). Conservative — clients respect the server's hint.
+const DEFAULT_RETRY_AFTER_SECONDS: u64 = 5;
+
+/// Substrings in `OmniError::Lance(...)` messages that indicate the failure
+/// is transient and worth retrying. Heuristic — Lance flattens its error
+/// types to `String`, so we pattern-match on shapes object_store and AWS
+/// SDK errors emit when S3 throttles or returns 503.
+const LANCE_TRANSIENT_PATTERNS: &[&str] = &[
+    "throttl",          // "ThrottlingException", "throttled"
+    "slowdown",         // S3 SlowDown (no space)
+    "slow down",        // human-readable variant
+    "503 service",      // "503 Service Unavailable"
+    "service unavailable",
+    "rate limit",
+    "request timeout",
+];
+
+fn lance_message_is_transient(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    LANCE_TRANSIENT_PATTERNS
+        .iter()
+        .any(|pat| lower.contains(pat))
 }
 
 impl AppState {
@@ -280,6 +306,7 @@ impl ApiError {
             code: ErrorCode::Unauthorized,
             message: message.into(),
             merge_conflicts: Vec::new(),
+            retry_after_seconds: None,
         }
     }
 
@@ -289,6 +316,7 @@ impl ApiError {
             code: ErrorCode::Forbidden,
             message: message.into(),
             merge_conflicts: Vec::new(),
+            retry_after_seconds: None,
         }
     }
 
@@ -298,6 +326,7 @@ impl ApiError {
             code: ErrorCode::BadRequest,
             message: message.into(),
             merge_conflicts: Vec::new(),
+            retry_after_seconds: None,
         }
     }
 
@@ -307,6 +336,7 @@ impl ApiError {
             code: ErrorCode::NotFound,
             message: message.into(),
             merge_conflicts: Vec::new(),
+            retry_after_seconds: None,
         }
     }
 
@@ -316,6 +346,7 @@ impl ApiError {
             code: ErrorCode::Conflict,
             message: message.into(),
             merge_conflicts: Vec::new(),
+            retry_after_seconds: None,
         }
     }
 
@@ -325,6 +356,19 @@ impl ApiError {
             code: ErrorCode::Internal,
             message: message.into(),
             merge_conflicts: Vec::new(),
+            retry_after_seconds: None,
+        }
+    }
+
+    /// Mark a transient backend failure: HTTP 503 with `Retry-After`. The
+    /// SDK retries once on this header; permanent errors stay on 500.
+    pub fn transient(message: impl Into<String>, retry_after_seconds: u64) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ErrorCode::Internal,
+            message: message.into(),
+            merge_conflicts: Vec::new(),
+            retry_after_seconds: Some(retry_after_seconds),
         }
     }
 
@@ -334,6 +378,7 @@ impl ApiError {
             code: ErrorCode::Conflict,
             message: summarize_merge_conflicts(&conflicts),
             merge_conflicts: conflicts,
+            retry_after_seconds: None,
         }
     }
 
@@ -353,8 +398,22 @@ impl ApiError {
                     .map(api::MergeConflictOutput::from)
                     .collect(),
             ),
-            OmniError::Lance(message) => Self::internal(format!("storage: {message}")),
-            OmniError::Io(err) => Self::internal(format!("io: {err}")),
+            OmniError::Lance(message) => {
+                if lance_message_is_transient(&message) {
+                    Self::transient(
+                        format!("storage: {message}"),
+                        DEFAULT_RETRY_AFTER_SECONDS,
+                    )
+                } else {
+                    Self::internal(format!("storage: {message}"))
+                }
+            }
+            OmniError::Io(err) => match err.kind() {
+                io::ErrorKind::TimedOut | io::ErrorKind::Interrupted => {
+                    Self::transient(format!("io: {err}"), DEFAULT_RETRY_AFTER_SECONDS)
+                }
+                _ => Self::internal(format!("io: {err}")),
+            },
         }
     }
 }
@@ -389,7 +448,8 @@ fn summarize_merge_conflicts(conflicts: &[api::MergeConflictOutput]) -> String {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
+        let retry_after = self.retry_after_seconds;
+        let mut response = (
             self.status,
             Json(ErrorOutput {
                 error: self.message,
@@ -397,7 +457,15 @@ impl IntoResponse for ApiError {
                 merge_conflicts: self.merge_conflicts,
             }),
         )
-            .into_response()
+            .into_response();
+        if let Some(seconds) = retry_after {
+            if let Ok(value) = axum::http::HeaderValue::from_str(&seconds.to_string()) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, value);
+            }
+        }
+        response
     }
 }
 
@@ -1528,12 +1596,31 @@ fn server_bearer_tokens_from_env() -> Result<Vec<(String, String)>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        hash_bearer_token, load_server_settings, normalize_bearer_token, parse_bearer_tokens_json,
-        server_bearer_tokens_from_env,
+        hash_bearer_token, lance_message_is_transient, load_server_settings,
+        normalize_bearer_token, parse_bearer_tokens_json, server_bearer_tokens_from_env,
     };
     use std::env;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn lance_transient_patterns_are_recognized() {
+        assert!(lance_message_is_transient("503 Service Unavailable"));
+        assert!(lance_message_is_transient("ThrottlingException: Rate exceeded"));
+        assert!(lance_message_is_transient(
+            "S3 returned SlowDown: please reduce your request rate"
+        ));
+        assert!(lance_message_is_transient("Request timeout while writing"));
+    }
+
+    #[test]
+    fn lance_non_transient_messages_are_not_flagged() {
+        assert!(!lance_message_is_transient("data corruption: bad checksum"));
+        assert!(!lance_message_is_transient(
+            "Clone operation should not enter build_manifest"
+        ));
+        assert!(!lance_message_is_transient("permission denied"));
+    }
 
     #[test]
     fn hash_bearer_token_produces_32_byte_output() {

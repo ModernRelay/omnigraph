@@ -12,7 +12,7 @@ use omnigraph_server::api::{
     BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorOutput, ExportRequest,
     IngestRequest, ReadRequest, SchemaApplyRequest, SchemaOutput,
 };
-use omnigraph_server::{AppState, build_app};
+use omnigraph_server::{ApiError, AppState, build_app};
 use serde_json::{Value, json};
 use serial_test::serial;
 use tower::ServiceExt;
@@ -651,6 +651,38 @@ fn mock_embedding(input: &str, dim: usize) -> Vec<f32> {
         out.push((ratio * 2.0) - 1.0);
     }
     normalize_vector(out)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn transient_api_error_emits_503_with_retry_after() {
+    use axum::response::IntoResponse;
+    let response = ApiError::transient("storage: 503 Service Unavailable", 7).into_response();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let header = response
+        .headers()
+        .get(axum::http::header::RETRY_AFTER)
+        .expect("Retry-After missing")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(header, "7");
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["code"], "internal");
+    assert_eq!(value["error"], "storage: 503 Service Unavailable");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn permanent_api_error_has_no_retry_after() {
+    use axum::response::IntoResponse;
+    let response = ApiError::internal("storage: data corrupt").into_response();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .is_none()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
