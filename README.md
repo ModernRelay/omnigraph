@@ -5,8 +5,9 @@
 [![Crates.io](https://img.shields.io/crates/v/omnigraph-cli.svg)](https://crates.io/crates/omnigraph-cli)
 [![CI](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml/badge.svg)](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml)
 
-Typed graph engine built for reasoning paths, not just storage.  
+Typed graph engine as knowledge/context layer for agents. 
 Git-style workflows, schema-as-code graph modeling, S3-optimized.
+Vector/FTS/Graph queries in one runtime.
 
 ## Use Cases
 
