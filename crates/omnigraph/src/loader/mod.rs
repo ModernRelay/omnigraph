@@ -323,30 +323,38 @@ async fn load_jsonl_reader<R: BufRead>(
         }
     }
 
-    // Phase 2: Build per-type RecordBatches and write to Lance
+    // Phase 2: Build per-type RecordBatches and write to Lance.
+    //
+    // Writes to different tables are independent in Lance (each table has its
+    // own manifest + fragments), so we parallelize across types with a bounded
+    // concurrency limit. Serial writes against S3 were the dominant cost of
+    // load — batching and parallelizing per-type cuts wall time by roughly
+    // `LOAD_WRITE_CONCURRENCY`× for wide schemas (see MR-677).
 
     let mut updates = Vec::new();
     let mut result = LoadResult::default();
     let snapshot = db.snapshot_for_branch(branch).await?;
 
-    // Write nodes first (edges reference node IDs)
+    // Phase 2a: build and validate every node batch up front. Cheap and
+    // synchronous — surfaces validation errors before any S3 traffic.
+    let mut prepared_nodes: Vec<(String, String, RecordBatch, usize)> =
+        Vec::with_capacity(node_rows.len());
     for (type_name, rows) in &node_rows {
         let node_type = &catalog.node_types[type_name];
         let batch = build_node_batch(node_type, rows)?;
-
-        // Validate value constraints before writing
         validate_value_constraints(&batch, node_type)?;
-
         let loaded_count = batch.num_rows();
-
         let table_key = format!("node:{}", type_name);
         snapshot
             .entry(&table_key)
             .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
+        prepared_nodes.push((type_name.clone(), table_key, batch, loaded_count));
+    }
 
-        let (state, table_branch) =
-            write_batch_to_dataset(db, branch, &table_key, batch, mode).await?;
+    // Phase 2b: write every node type concurrently, bounded.
+    let node_write_results = write_batches_concurrently(db, branch, mode, prepared_nodes).await?;
 
+    for (type_name, table_key, loaded_count, state, table_branch) in node_write_results {
         updates.push(crate::db::SubTableUpdate {
             table_key,
             table_version: state.version,
@@ -354,7 +362,7 @@ async fn load_jsonl_reader<R: BufRead>(
             row_count: state.row_count,
             version_metadata: state.version_metadata,
         });
-        result.nodes_loaded.insert(type_name.clone(), loaded_count);
+        result.nodes_loaded.insert(type_name, loaded_count);
     }
 
     // Phase 2b: Validate edge referential integrity — every src/dst must
@@ -402,20 +410,23 @@ async fn load_jsonl_reader<R: BufRead>(
         }
     }
 
-    // Write edges
+    // Write edges (parallel per edge type, same pattern as nodes)
+    let mut prepared_edges: Vec<(String, String, RecordBatch, usize)> =
+        Vec::with_capacity(edge_rows.len());
     for (edge_name, rows) in &edge_rows {
         let edge_type = &catalog.edge_types[edge_name];
         let batch = build_edge_batch(edge_type, rows)?;
         let loaded_count = batch.num_rows();
-
         let table_key = format!("edge:{}", edge_name);
         snapshot
             .entry(&table_key)
             .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
+        prepared_edges.push((edge_name.clone(), table_key, batch, loaded_count));
+    }
 
-        let (state, table_branch) =
-            write_batch_to_dataset(db, branch, &table_key, batch, mode).await?;
+    let edge_write_results = write_batches_concurrently(db, branch, mode, prepared_edges).await?;
 
+    for (edge_name, table_key, loaded_count, state, table_branch) in edge_write_results {
         updates.push(crate::db::SubTableUpdate {
             table_key,
             table_version: state.version,
@@ -423,7 +434,7 @@ async fn load_jsonl_reader<R: BufRead>(
             row_count: state.row_count,
             version_metadata: state.version_metadata,
         });
-        result.edges_loaded.insert(edge_name.clone(), loaded_count);
+        result.edges_loaded.insert(edge_name, loaded_count);
     }
 
     // Phase 3: Validate edge cardinality constraints (before commit — invalid
@@ -954,6 +965,64 @@ fn parse_date64_json_value(value: &JsonValue) -> Result<Option<i64>> {
 }
 
 /// Write a batch to a Lance dataset, returning (new_version, total_row_count).
+/// How many per-type Lance writes to run concurrently during a load.
+///
+/// Each write is an independent S3 manifest + fragment write against a
+/// different table. Ops within a single table must still be serial (Lance
+/// OCC on the manifest), but cross-table writes have no shared state.
+///
+/// 8 is a conservative default — enough to overlap S3 round-trip latency
+/// across the typical 10-30 table schemas without flooding the runtime.
+/// Override via `OMNIGRAPH_LOAD_CONCURRENCY` for benchmarking.
+const DEFAULT_LOAD_WRITE_CONCURRENCY: usize = 8;
+
+fn load_write_concurrency() -> usize {
+    std::env::var("OMNIGRAPH_LOAD_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_LOAD_WRITE_CONCURRENCY)
+}
+
+/// Write a set of prepared `(type_name, table_key, batch, row_count)` tuples
+/// concurrently. Returns results in original iteration order so callers can
+/// zip them back to per-type metadata.
+async fn write_batches_concurrently(
+    db: &Omnigraph,
+    branch: Option<&str>,
+    mode: LoadMode,
+    prepared: Vec<(String, String, RecordBatch, usize)>,
+) -> Result<
+    Vec<(
+        String,
+        String,
+        usize,
+        crate::table_store::TableState,
+        Option<String>,
+    )>,
+> {
+    use futures::stream::StreamExt;
+
+    if prepared.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let concurrency = load_write_concurrency().min(prepared.len()).max(1);
+
+    futures::stream::iter(prepared.into_iter().map(
+        |(type_name, table_key, batch, loaded_count)| async move {
+            let (state, table_branch) =
+                write_batch_to_dataset(db, branch, &table_key, batch, mode).await?;
+            Ok::<_, OmniError>((type_name, table_key, loaded_count, state, table_branch))
+        },
+    ))
+    .buffered(concurrency)
+    .collect::<Vec<Result<_>>>()
+    .await
+    .into_iter()
+    .collect()
+}
+
 async fn write_batch_to_dataset(
     db: &Omnigraph,
     branch: Option<&str>,

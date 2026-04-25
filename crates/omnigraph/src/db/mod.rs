@@ -8,7 +8,10 @@ mod schema_state;
 pub use commit_graph::GraphCommit;
 pub use graph_coordinator::{GraphCoordinator, ReadTarget, ResolvedTarget, SnapshotId};
 pub use manifest::{Snapshot, SubTableEntry, SubTableUpdate};
-pub use omnigraph::{MergeOutcome, Omnigraph, SchemaApplyResult};
+pub use omnigraph::{
+    CleanupPolicyOptions, MergeOutcome, Omnigraph, SchemaApplyResult, TableCleanupStats,
+    TableOptimizeStats,
+};
 pub(crate) use run_registry::is_internal_run_branch;
 pub use run_registry::{RunId, RunRecord, RunStatus};
 

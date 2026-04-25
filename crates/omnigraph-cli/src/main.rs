@@ -214,6 +214,39 @@ enum Command {
         #[command(subcommand)]
         command: PolicyCommand,
     },
+    /// Compact small Lance fragments in every table of the repo
+    Optimize {
+        /// Repo URI
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove old Lance versions from every table of the repo (destructive)
+    Cleanup {
+        /// Repo URI
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Number of recent versions to keep per table. Either `--keep` or
+        /// `--older-than` (or both) must be set.
+        #[arg(long)]
+        keep: Option<u32>,
+        /// Only remove versions older than this duration. Accepts Go-style
+        /// durations: `7d`, `24h`, `90m`. At least one of --keep / --older-than.
+        #[arg(long)]
+        older_than: Option<String>,
+        /// Required to actually run; without it, prints what would be removed
+        #[arg(long)]
+        confirm: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -793,6 +826,31 @@ fn resolve_uri(
     cli_target: Option<&str>,
 ) -> Result<String> {
     config.resolve_target_uri(cli_uri, cli_target, config.cli_graph_name())
+}
+
+/// Parse a Go-style compact duration: `7d`, `24h`, `30m`, `90s`, or a plain
+/// integer as seconds. Used by the `cleanup --older-than` flag.
+fn parse_duration_arg(s: &str) -> Result<std::time::Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        bail!("duration is empty");
+    }
+    let (num_part, unit) = match s.char_indices().rev().find(|(_, c)| c.is_ascii_alphabetic()) {
+        Some((i, _)) => (&s[..i + 1 - s[i..].chars().next().unwrap().len_utf8()], &s[i..]),
+        None => (s, ""),
+    };
+    let n: u64 = num_part
+        .parse()
+        .map_err(|e| color_eyre::eyre::eyre!("invalid duration '{}': {}", s, e))?;
+    let secs = match unit {
+        "" | "s" => n,
+        "m" => n * 60,
+        "h" => n * 60 * 60,
+        "d" => n * 60 * 60 * 24,
+        "w" => n * 60 * 60 * 24 * 7,
+        _ => bail!("unknown duration unit '{}'. Supported: s, m, h, d, w", unit),
+    };
+    Ok(std::time::Duration::from_secs(secs))
 }
 
 fn resolve_local_uri(
@@ -2465,6 +2523,111 @@ async fn main() -> Result<()> {
                 print_policy_explain(&decision, &request);
             }
         },
+        Command::Optimize {
+            uri,
+            target,
+            config,
+            json,
+        } => {
+            let config = load_cli_config(config.as_ref())?;
+            let uri = resolve_uri(&config, uri, target.as_deref())?;
+            let mut db = Omnigraph::open(&uri).await?;
+            let stats = db.optimize().await?;
+            if json {
+                let value = serde_json::json!({
+                    "uri": uri,
+                    "tables": stats.iter().map(|s| serde_json::json!({
+                        "table_key": s.table_key,
+                        "fragments_removed": s.fragments_removed,
+                        "fragments_added": s.fragments_added,
+                        "committed": s.committed,
+                    })).collect::<Vec<_>>(),
+                });
+                print_json(&value)?;
+            } else {
+                println!("optimize {} — {} tables", uri, stats.len());
+                for s in &stats {
+                    if s.committed {
+                        println!(
+                            "  {:<40} frags {} → {} ✓",
+                            s.table_key,
+                            s.fragments_removed + s.fragments_added - s.fragments_added,
+                            s.fragments_added
+                        );
+                    } else {
+                        println!("  {:<40} no-op", s.table_key);
+                    }
+                }
+            }
+        }
+        Command::Cleanup {
+            uri,
+            target,
+            config,
+            keep,
+            older_than,
+            confirm,
+            json,
+        } => {
+            let config = load_cli_config(config.as_ref())?;
+            let uri = resolve_uri(&config, uri, target.as_deref())?;
+
+            let older_than_dur = older_than
+                .as_deref()
+                .map(parse_duration_arg)
+                .transpose()?;
+
+            if keep.is_none() && older_than_dur.is_none() {
+                bail!("cleanup requires at least one of --keep or --older-than");
+            }
+
+            let policy_desc = match (keep, older_than_dur) {
+                (Some(k), Some(d)) => format!("keep {} versions, remove anything older than {:?}", k, d),
+                (Some(k), None) => format!("keep {} versions", k),
+                (None, Some(d)) => format!("remove anything older than {:?}", d),
+                _ => unreachable!(),
+            };
+
+            if !confirm {
+                eprintln!(
+                    "cleanup is destructive — rerun with --confirm. Policy for {}: {}",
+                    uri, policy_desc
+                );
+                return Ok(());
+            }
+
+            let options = omnigraph::db::CleanupPolicyOptions {
+                keep_versions: keep,
+                older_than: older_than_dur,
+            };
+
+            let mut db = Omnigraph::open(&uri).await?;
+            let stats = db.cleanup(options).await?;
+            if json {
+                let value = serde_json::json!({
+                    "uri": uri,
+                    "keep_versions": keep,
+                    "older_than_secs": older_than_dur.map(|d| d.as_secs()),
+                    "tables": stats.iter().map(|s| serde_json::json!({
+                        "table_key": s.table_key,
+                        "bytes_removed": s.bytes_removed,
+                        "old_versions_removed": s.old_versions_removed,
+                    })).collect::<Vec<_>>(),
+                });
+                print_json(&value)?;
+            } else {
+                let total_bytes: u64 = stats.iter().map(|s| s.bytes_removed).sum();
+                let total_versions: u64 = stats.iter().map(|s| s.old_versions_removed).sum();
+                println!(
+                    "cleanup {} ({}) — removed {} versions ({} bytes) across {} tables",
+                    uri,
+                    policy_desc,
+                    total_versions,
+                    total_bytes,
+                    stats.len()
+                );
+            }
+        }
     }
     Ok(())
 }
