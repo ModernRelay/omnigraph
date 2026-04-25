@@ -497,6 +497,11 @@ async fn shutdown_signal() {
         (status = 200, description = "Server is healthy", body = HealthOutput),
     ),
 )]
+/// Liveness probe.
+///
+/// Returns server status and version. Unauthenticated; safe to call from any
+/// caller. Use this to confirm the server is reachable before invoking other
+/// endpoints.
 async fn server_health() -> Json<HealthOutput> {
     Json(HealthOutput {
         status: "ok".to_string(),
@@ -616,6 +621,11 @@ fn authorize_request(
     ),
     security(("bearer_token" = [])),
 )]
+/// Read the current snapshot of a branch.
+///
+/// Returns the manifest version plus per-table metadata (path, version, row
+/// count) for every table on the branch. Defaults to `main` when `branch` is
+/// omitted. Read-only.
 async fn server_snapshot(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -658,6 +668,13 @@ async fn server_snapshot(
     ),
     security(("bearer_token" = [])),
 )]
+/// Execute a GQ read query.
+///
+/// Runs the query in `query_source` against either a branch or a frozen
+/// snapshot (mutually exclusive). When `query_source` defines multiple named
+/// queries, pick one with `query_name`. `params` is a JSON object whose keys
+/// match the parameters declared by the query. Returns rows as a JSON array
+/// plus a `columns` list. Read-only.
 async fn server_read(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -728,6 +745,12 @@ async fn server_read(
     ),
     security(("bearer_token" = [])),
 )]
+/// Stream the contents of a branch as NDJSON.
+///
+/// Emits one JSON object per line (`application/x-ndjson`). Filter with
+/// `type_names` (node/edge type names) and/or `table_keys`; both empty
+/// streams the entire branch. Suitable for large exports — the response is
+/// streamed, not buffered. Read-only.
 async fn server_export(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -788,6 +811,12 @@ async fn server_export(
     ),
     security(("bearer_token" = [])),
 )]
+/// Apply a GQ mutation to a branch.
+///
+/// Writes to the named `branch` (defaults to `main`). Mutations are atomic
+/// per call and produce a new commit. Returns counts of nodes and edges
+/// affected. **Destructive**: on success the branch is updated; rejected
+/// mutations may still acquire locks briefly. Returns 409 on merge conflict.
 async fn server_change(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -844,6 +873,11 @@ async fn server_change(
     ),
     security(("bearer_token" = [])),
 )]
+/// Read the current schema source.
+///
+/// Returns the project's schema as a single string in `.pg` source form.
+/// Useful for clients that want to introspect available types and tables
+/// before constructing GQ queries. Read-only.
 async fn server_schema_get(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -882,6 +916,12 @@ async fn server_schema_get(
     ),
     security(("bearer_token" = [])),
 )]
+/// Apply a schema migration.
+///
+/// Diffs `schema_source` against the current schema and applies the resulting
+/// migration steps (add/drop type, add/drop column, etc.). **Destructive**:
+/// some steps drop data. Returns the list of steps applied; if `applied` is
+/// false the diff was unsupported and no changes were made.
 async fn server_schema_apply(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -921,6 +961,13 @@ async fn server_schema_apply(
     ),
     security(("bearer_token" = [])),
 )]
+/// Bulk-ingest NDJSON data into a branch.
+///
+/// `data` is NDJSON with one record per line. `mode` controls behavior on
+/// existing rows: `merge` upserts by id (default), `append` blindly inserts,
+/// `overwrite` replaces table contents. If `branch` does not exist it is
+/// created from `from` (defaults to `main`). **Destructive** when `mode` is
+/// `overwrite` or when ingest produces conflicting writes.
 async fn server_ingest(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -989,6 +1036,9 @@ async fn server_ingest(
     ),
     security(("bearer_token" = [])),
 )]
+/// List all branches.
+///
+/// Returns branch names sorted alphabetically. Read-only.
 async fn server_branch_list(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -1029,6 +1079,11 @@ async fn server_branch_list(
     ),
     security(("bearer_token" = [])),
 )]
+/// Create a new branch.
+///
+/// Forks `name` off of `from` (defaults to `main`). The new branch shares
+/// table data with its parent until it is mutated. Returns 409 if `name`
+/// already exists.
 async fn server_branch_create(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -1078,6 +1133,11 @@ async fn server_branch_create(
     ),
     security(("bearer_token" = [])),
 )]
+/// Delete a branch.
+///
+/// **Irreversible.** Removes the branch pointer; commits remain reachable
+/// only if referenced by another branch. Returns 404 if the branch does not
+/// exist.
 async fn server_branch_delete(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -1122,6 +1182,12 @@ async fn server_branch_delete(
     ),
     security(("bearer_token" = [])),
 )]
+/// Merge one branch into another.
+///
+/// Merges `source` into `target` (defaults to `main`). Outcome is one of
+/// `already_up_to_date`, `fast_forward`, or `merged`. Returns 409 with the
+/// list of conflicts if the merge cannot be completed; the target is left
+/// unchanged in that case. **Destructive** to `target` on success.
 async fn server_branch_merge(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -1165,6 +1231,11 @@ async fn server_branch_merge(
     ),
     security(("bearer_token" = [])),
 )]
+/// List all runs.
+///
+/// A run is an ephemeral branch produced by an agent or background job. The
+/// list includes pending, in-progress, published, and aborted runs across
+/// all target branches. Read-only.
 async fn server_run_list(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -1207,6 +1278,10 @@ async fn server_run_list(
     ),
     security(("bearer_token" = [])),
 )]
+/// Get a single run.
+///
+/// Returns the run's status, target/run branches, base snapshot, and (if
+/// published) the resulting snapshot id. Read-only.
 async fn server_run_show(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -1250,6 +1325,10 @@ async fn server_run_show(
     ),
     security(("bearer_token" = [])),
 )]
+/// Publish a run to its target branch.
+///
+/// Promotes the run's snapshot onto its `target_branch` as a new commit. The
+/// run must be in a publishable state. **Destructive** to the target branch.
 async fn server_run_publish(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -1300,6 +1379,10 @@ async fn server_run_publish(
     ),
     security(("bearer_token" = [])),
 )]
+/// Abort a run.
+///
+/// Marks the run as aborted and releases its working branch. **Irreversible**:
+/// the run cannot be resumed once aborted.
 async fn server_run_abort(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -1346,6 +1429,10 @@ async fn server_run_abort(
     ),
     security(("bearer_token" = [])),
 )]
+/// List commits.
+///
+/// Filter by `branch` to get the commits on a single branch (most recent
+/// first); omit to list across all branches. Read-only.
 async fn server_commit_list(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -1391,6 +1478,10 @@ async fn server_commit_list(
     ),
     security(("bearer_token" = [])),
 )]
+/// Get a single commit.
+///
+/// Returns the commit's manifest version, parent commit(s), and creation
+/// metadata. Read-only.
 async fn server_commit_show(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,

@@ -15,6 +15,8 @@
         "tags": [
           "branches"
         ],
+        "summary": "List all branches.",
+        "description": "Returns branch names sorted alphabetically. Read-only.",
         "operationId": "listBranches",
         "responses": {
           "200": {
@@ -58,6 +60,8 @@
         "tags": [
           "branches"
         ],
+        "summary": "Create a new branch.",
+        "description": "Forks `name` off of `from` (defaults to `main`). The new branch shares\ntable data with its parent until it is mutated. Returns 409 if `name`\nalready exists.",
         "operationId": "createBranch",
         "requestBody": {
           "content": {
@@ -133,6 +137,8 @@
         "tags": [
           "branches"
         ],
+        "summary": "Merge one branch into another.",
+        "description": "Merges `source` into `target` (defaults to `main`). Outcome is one of\n`already_up_to_date`, `fast_forward`, or `merged`. Returns 409 with the\nlist of conflicts if the merge cannot be completed; the target is left\nunchanged in that case. **Destructive** to `target` on success.",
         "operationId": "mergeBranches",
         "requestBody": {
           "content": {
@@ -208,6 +214,8 @@
         "tags": [
           "branches"
         ],
+        "summary": "Delete a branch.",
+        "description": "**Irreversible.** Removes the branch pointer; commits remain reachable\nonly if referenced by another branch. Returns 404 if the branch does not\nexist.",
         "operationId": "deleteBranch",
         "parameters": [
           {
@@ -274,6 +282,8 @@
         "tags": [
           "mutations"
         ],
+        "summary": "Apply a GQ mutation to a branch.",
+        "description": "Writes to the named `branch` (defaults to `main`). Mutations are atomic\nper call and produce a new commit. Returns counts of nodes and edges\naffected. **Destructive**: on success the branch is updated; rejected\nmutations may still acquire locks briefly. Returns 409 on merge conflict.",
         "operationId": "change",
         "requestBody": {
           "content": {
@@ -349,6 +359,8 @@
         "tags": [
           "commits"
         ],
+        "summary": "List commits.",
+        "description": "Filter by `branch` to get the commits on a single branch (most recent\nfirst); omit to list across all branches. Read-only.",
         "operationId": "listCommits",
         "parameters": [
           {
@@ -407,6 +419,8 @@
         "tags": [
           "commits"
         ],
+        "summary": "Get a single commit.",
+        "description": "Returns the commit's manifest version, parent commit(s), and creation\nmetadata. Read-only.",
         "operationId": "getCommit",
         "parameters": [
           {
@@ -473,6 +487,8 @@
         "tags": [
           "queries"
         ],
+        "summary": "Stream the contents of a branch as NDJSON.",
+        "description": "Emits one JSON object per line (`application/x-ndjson`). Filter with\n`type_names` (node/edge type names) and/or `table_keys`; both empty\nstreams the entire branch. Suitable for large exports — the response is\nstreamed, not buffered. Read-only.",
         "operationId": "export",
         "requestBody": {
           "content": {
@@ -534,6 +550,8 @@
         "tags": [
           "health"
         ],
+        "summary": "Liveness probe.",
+        "description": "Returns server status and version. Unauthenticated; safe to call from any\ncaller. Use this to confirm the server is reachable before invoking other\nendpoints.",
         "operationId": "health",
         "responses": {
           "200": {
@@ -554,6 +572,8 @@
         "tags": [
           "mutations"
         ],
+        "summary": "Bulk-ingest NDJSON data into a branch.",
+        "description": "`data` is NDJSON with one record per line. `mode` controls behavior on\nexisting rows: `merge` upserts by id (default), `append` blindly inserts,\n`overwrite` replaces table contents. If `branch` does not exist it is\ncreated from `from` (defaults to `main`). **Destructive** when `mode` is\n`overwrite` or when ingest produces conflicting writes.",
         "operationId": "ingest",
         "requestBody": {
           "content": {
@@ -619,6 +639,8 @@
         "tags": [
           "queries"
         ],
+        "summary": "Execute a GQ read query.",
+        "description": "Runs the query in `query_source` against either a branch or a frozen\nsnapshot (mutually exclusive). When `query_source` defines multiple named\nqueries, pick one with `query_name`. `params` is a JSON object whose keys\nmatch the parameters declared by the query. Returns rows as a JSON array\nplus a `columns` list. Read-only.",
         "operationId": "read",
         "requestBody": {
           "content": {
@@ -684,6 +706,8 @@
         "tags": [
           "runs"
         ],
+        "summary": "List all runs.",
+        "description": "A run is an ephemeral branch produced by an agent or background job. The\nlist includes pending, in-progress, published, and aborted runs across\nall target branches. Read-only.",
         "operationId": "listRuns",
         "responses": {
           "200": {
@@ -729,6 +753,8 @@
         "tags": [
           "runs"
         ],
+        "summary": "Get a single run.",
+        "description": "Returns the run's status, target/run branches, base snapshot, and (if\npublished) the resulting snapshot id. Read-only.",
         "operationId": "getRun",
         "parameters": [
           {
@@ -795,6 +821,8 @@
         "tags": [
           "runs"
         ],
+        "summary": "Abort a run.",
+        "description": "Marks the run as aborted and releases its working branch. **Irreversible**:\nthe run cannot be resumed once aborted.",
         "operationId": "abortRun",
         "parameters": [
           {
@@ -861,6 +889,8 @@
         "tags": [
           "runs"
         ],
+        "summary": "Publish a run to its target branch.",
+        "description": "Promotes the run's snapshot onto its `target_branch` as a new commit. The\nrun must be in a publishable state. **Destructive** to the target branch.",
         "operationId": "publishRun",
         "parameters": [
           {
@@ -927,6 +957,8 @@
         "tags": [
           "schema"
         ],
+        "summary": "Read the current schema source.",
+        "description": "Returns the project's schema as a single string in `.pg` source form.\nUseful for clients that want to introspect available types and tables\nbefore constructing GQ queries. Read-only.",
         "operationId": "getSchema",
         "responses": {
           "200": {
@@ -972,6 +1004,8 @@
         "tags": [
           "mutations"
         ],
+        "summary": "Apply a schema migration.",
+        "description": "Diffs `schema_source` against the current schema and applies the resulting\nmigration steps (add/drop type, add/drop column, etc.). **Destructive**:\nsome steps drop data. Returns the list of steps applied; if `applied` is\nfalse the diff was unsupported and no changes were made.",
         "operationId": "applySchema",
         "requestBody": {
           "content": {
@@ -1037,6 +1071,8 @@
         "tags": [
           "snapshots"
         ],
+        "summary": "Read the current snapshot of a branch.",
+        "description": "Returns the manifest version plus per-table metadata (path, version, row\ncount) for every table on the branch. Defaults to `main` when `branch` is\nomitted. Read-only.",
         "operationId": "getSnapshot",
         "parameters": [
           {
@@ -1128,10 +1164,12 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Parent branch to fork from. Defaults to `main`."
           },
           "name": {
-            "type": "string"
+            "type": "string",
+            "description": "Name of the new branch. Must not already exist."
           }
         }
       },
@@ -1210,13 +1248,15 @@
         ],
         "properties": {
           "source": {
-            "type": "string"
+            "type": "string",
+            "description": "Source branch whose commits will be merged."
           },
           "target": {
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Target branch that will receive the merge. Defaults to `main`."
           }
         }
       },
@@ -1261,17 +1301,23 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Target branch. Defaults to `main`."
           },
-          "params": {},
+          "params": {
+            "description": "JSON object whose keys match the mutation's declared parameters."
+          },
           "query_name": {
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Name of the mutation to run when `query_source` declares multiple."
           },
           "query_source": {
-            "type": "string"
+            "type": "string",
+            "description": "GQ mutation source containing `insert`, `update`, or `delete` statements.\nMay declare multiple named mutations; pick one with `query_name`.",
+            "example": "query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}"
           }
         }
       },
@@ -1305,7 +1351,9 @@
           },
           "created_at": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "description": "Commit creation time as Unix epoch microseconds.",
+            "example": 1714000000000000
           },
           "graph_commit_id": {
             "type": "string"
@@ -1380,19 +1428,22 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Branch to export. Defaults to `main`."
           },
           "table_keys": {
             "type": "array",
             "items": {
               "type": "string"
-            }
+            },
+            "description": "Restrict the export to these table keys. Empty exports all tables."
           },
           "type_names": {
             "type": "array",
             "items": {
               "type": "string"
-            }
+            },
+            "description": "Restrict the export to these node/edge type names. Empty exports all types."
           }
         }
       },
@@ -1467,16 +1518,20 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Target branch. Created from `from` if it does not yet exist. Defaults to `main`."
           },
           "data": {
-            "type": "string"
+            "type": "string",
+            "description": "NDJSON payload: one record per line, each shaped\n`{\"type\": \"<TypeName>\", \"data\": {...}}`.",
+            "example": "{\"type\": \"Person\", \"data\": {\"name\": \"Alice\", \"age\": 30}}\n{\"type\": \"Person\", \"data\": {\"name\": \"Bob\", \"age\": 25}}"
           },
           "from": {
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Parent branch used to create `branch` if it does not exist. Defaults to `main`."
           },
           "mode": {
             "oneOf": [
@@ -1484,7 +1539,8 @@
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/LoadMode"
+                "$ref": "#/components/schemas/LoadMode",
+                "description": "How existing rows are handled. Defaults to `merge`."
               }
             ]
           }
@@ -1590,23 +1646,30 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Branch to read from. Mutually exclusive with `snapshot`. Defaults to `main`."
           },
-          "params": {},
+          "params": {
+            "description": "JSON object whose keys match the query's declared parameters."
+          },
           "query_name": {
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Name of the query to run when `query_source` declares multiple. Optional\nwhen only one query is declared."
           },
           "query_source": {
-            "type": "string"
+            "type": "string",
+            "description": "GQ query source. May declare one or more named queries; pick one with\n`query_name` if there is more than one.",
+            "example": "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
           },
           "snapshot": {
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "Snapshot id to read from. Mutually exclusive with `branch`."
           }
         }
       },
@@ -1670,7 +1733,9 @@
           },
           "created_at": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "description": "Run creation time as Unix epoch microseconds.",
+            "example": 1714000000000000
           },
           "operation_hash": {
             "type": [
@@ -1698,7 +1763,9 @@
           },
           "updated_at": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "description": "Last status change as Unix epoch microseconds.",
+            "example": 1714000000000000
           }
         }
       },
@@ -1744,7 +1811,9 @@
         ],
         "properties": {
           "schema_source": {
-            "type": "string"
+            "type": "string",
+            "description": "Project schema in `.pg` source form. The diff against the current\nschema produces the migration steps that will be applied.",
+            "example": "node Person {\n    name: String @key\n    age: I32?\n}\n\nedge Knows: Person -> Person"
           }
         }
       },
