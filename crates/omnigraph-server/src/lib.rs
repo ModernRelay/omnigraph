@@ -16,6 +16,7 @@ use api::{
     CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, HealthOutput, IngestOutput,
     IngestRequest, ReadOutput, ReadRequest, RunListOutput, SchemaApplyOutput, SchemaApplyRequest,
     SchemaOutput, SnapshotQuery, ingest_output, schema_apply_output, snapshot_payload,
+    unprefix_commit_id, unprefix_run_id,
 };
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
@@ -1227,7 +1228,7 @@ async fn server_run_show(
     )?;
     let run = {
         let db = Arc::clone(&state.db).read_owned().await;
-        db.get_run(&RunId::new(run_id))
+        db.get_run(&RunId::new(unprefix_run_id(&run_id).to_owned()))
             .await
             .map_err(ApiError::from_omni)?
     };
@@ -1255,7 +1256,7 @@ async fn server_run_publish(
     actor: Option<Extension<AuthenticatedActor>>,
     Path(run_id): Path<String>,
 ) -> std::result::Result<Json<api::RunOutput>, ApiError> {
-    let run_id = RunId::new(run_id);
+    let run_id = RunId::new(unprefix_run_id(&run_id).to_owned());
     let actor_id = actor.as_ref().map(|Extension(actor)| actor.as_str());
     let target_branch = {
         let db = Arc::clone(&state.db).read_owned().await;
@@ -1305,7 +1306,7 @@ async fn server_run_abort(
     actor: Option<Extension<AuthenticatedActor>>,
     Path(run_id): Path<String>,
 ) -> std::result::Result<Json<api::RunOutput>, ApiError> {
-    let run_id = RunId::new(run_id);
+    let run_id = RunId::new(unprefix_run_id(&run_id).to_owned());
     let target_branch = {
         let db = Arc::clone(&state.db).read_owned().await;
         db.get_run(&run_id)
@@ -1411,7 +1412,7 @@ async fn server_commit_show(
     )?;
     let commit = {
         let db = Arc::clone(&state.db).read_owned().await;
-        db.get_commit(&commit_id)
+        db.get_commit(unprefix_commit_id(&commit_id))
             .await
             .map_err(ApiError::from_omni)?
     };
@@ -1420,7 +1421,9 @@ async fn server_commit_show(
 
 fn read_target_from_request(branch: Option<String>, snapshot: Option<String>) -> ReadTarget {
     if let Some(snapshot) = snapshot {
-        ReadTarget::snapshot(omnigraph::db::SnapshotId::new(snapshot))
+        ReadTarget::snapshot(omnigraph::db::SnapshotId::new(
+            unprefix_commit_id(&snapshot).to_owned(),
+        ))
     } else {
         ReadTarget::branch(branch.unwrap_or_else(|| "main".to_string()))
     }

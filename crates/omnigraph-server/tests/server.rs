@@ -1095,9 +1095,12 @@ async fn policy_uses_resolved_branch_for_snapshot_reads() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["target"]["branch"], Value::Null);
-    assert_eq!(
-        body["target"]["snapshot"].as_str(),
-        read.snapshot.as_deref()
+    let returned_snapshot = body["target"]["snapshot"].as_str().unwrap();
+    let expected = read.snapshot.as_deref().unwrap();
+    // The server prefixes commit IDs in responses (`cmt_…`); inputs accept either form.
+    assert!(
+        returned_snapshot == expected
+            || returned_snapshot == format!("cmt_{}", expected)
     );
     assert_eq!(body["row_count"], 1);
 }

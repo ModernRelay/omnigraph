@@ -20,7 +20,7 @@ use omnigraph_server::api::{
     CommitOutput, ErrorOutput, ExportRequest, IngestOutput, IngestRequest, ReadOutput, ReadRequest,
     RunListOutput, RunOutput, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput,
     SnapshotTableOutput, commit_output, ingest_output, read_output, run_output,
-    schema_apply_output, snapshot_payload,
+    schema_apply_output, snapshot_payload, unprefix_commit_id, unprefix_run_id,
 };
 use omnigraph_server::{
     AliasCommand, OmnigraphConfig, PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest,
@@ -2006,7 +2006,7 @@ async fn main() -> Result<()> {
                     .await?
                 } else {
                     let db = Omnigraph::open(&uri).await?;
-                    commit_output(&db.get_commit(&commit_id).await?)
+                    commit_output(&db.get_commit(unprefix_commit_id(&commit_id)).await?)
                 };
                 if json {
                     print_json(&commit)?;
@@ -2247,7 +2247,10 @@ async fn main() -> Result<()> {
                     .await?
                 } else {
                     let db = Omnigraph::open(&uri).await?;
-                    run_output(&db.get_run(&RunId::new(run_id)).await?)
+                    run_output(
+                        &db.get_run(&RunId::new(unprefix_run_id(&run_id).to_owned()))
+                            .await?,
+                    )
                 };
                 if json {
                     print_json(&run)?;
@@ -2277,8 +2280,9 @@ async fn main() -> Result<()> {
                     .await?
                 } else {
                     let mut db = Omnigraph::open(&uri).await?;
-                    db.publish_run(&RunId::new(run_id.clone())).await?;
-                    run_output(&db.get_run(&RunId::new(run_id)).await?)
+                    let bare = unprefix_run_id(&run_id).to_owned();
+                    db.publish_run(&RunId::new(bare.clone())).await?;
+                    run_output(&db.get_run(&RunId::new(bare)).await?)
                 };
                 if json {
                     print_json(&run)?;
@@ -2308,7 +2312,10 @@ async fn main() -> Result<()> {
                     .await?
                 } else {
                     let mut db = Omnigraph::open(&uri).await?;
-                    run_output(&db.abort_run(&RunId::new(run_id)).await?)
+                    run_output(
+                        &db.abort_run(&RunId::new(unprefix_run_id(&run_id).to_owned()))
+                            .await?,
+                    )
                 };
                 if json {
                     print_json(&run)?;

@@ -1975,9 +1975,15 @@ fn run_publish_promotes_manual_running_run() {
             .arg("--json"),
     );
     let payload: Value = serde_json::from_slice(&publish_output.stdout).unwrap();
-    assert_eq!(payload["run_id"], run_id);
+    assert_eq!(payload["run_id"], format!("run_{}", run_id));
     assert_eq!(payload["status"], "published");
     assert!(payload["published_snapshot_id"].is_string());
+    assert!(
+        payload["published_snapshot_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("cmt_")
+    );
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
@@ -2018,6 +2024,6 @@ fn run_abort_marks_manual_running_run_aborted() {
             .arg("--json"),
     );
     let payload: Value = serde_json::from_slice(&abort_output.stdout).unwrap();
-    assert_eq!(payload["run_id"], run_id);
+    assert_eq!(payload["run_id"], format!("run_{}", run_id));
     assert_eq!(payload["status"], "aborted");
 }

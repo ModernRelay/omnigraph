@@ -9,6 +9,43 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utoipa::{IntoParams, ToSchema};
 
+/// Prefix prepended to graph commit IDs when surfaced via the API.
+pub const COMMIT_ID_PREFIX: &str = "cmt_";
+/// Prefix prepended to run IDs when surfaced via the API.
+pub const RUN_ID_PREFIX: &str = "run_";
+
+/// Wrap a bare ULID with the commit-ID prefix, leaving an already-prefixed
+/// value untouched. Used at API output sites.
+pub fn prefix_commit_id(id: &str) -> String {
+    if id.starts_with(COMMIT_ID_PREFIX) {
+        id.to_owned()
+    } else {
+        format!("{COMMIT_ID_PREFIX}{id}")
+    }
+}
+
+/// Wrap a bare ULID with the run-ID prefix, leaving an already-prefixed
+/// value untouched. Used at API output sites.
+pub fn prefix_run_id(id: &str) -> String {
+    if id.starts_with(RUN_ID_PREFIX) {
+        id.to_owned()
+    } else {
+        format!("{RUN_ID_PREFIX}{id}")
+    }
+}
+
+/// Strip the commit-ID prefix if present so storage lookups (which key on
+/// bare ULIDs) work whether the caller passed `cmt_01KQ…` or just `01KQ…`.
+pub fn unprefix_commit_id(input: &str) -> &str {
+    input.strip_prefix(COMMIT_ID_PREFIX).unwrap_or(input)
+}
+
+/// Strip the run-ID prefix if present so storage lookups (which key on
+/// bare ULIDs) work whether the caller passed `run_01KQ…` or just `01KQ…`.
+pub fn unprefix_run_id(input: &str) -> &str {
+    input.strip_prefix(RUN_ID_PREFIX).unwrap_or(input)
+}
+
 /// Shadow enum for documenting [`LoadMode`] in the OpenAPI schema.
 #[derive(ToSchema)]
 #[schema(as = LoadMode)]
@@ -374,15 +411,18 @@ pub fn schema_apply_output(uri: &str, result: SchemaApplyResult) -> SchemaApplyO
 
 pub fn run_output(run: &RunRecord) -> RunOutput {
     RunOutput {
-        run_id: run.run_id.as_str().to_string(),
+        run_id: prefix_run_id(run.run_id.as_str()),
         target_branch: run.target_branch.clone(),
         run_branch: run.run_branch.clone(),
-        base_snapshot_id: run.base_snapshot_id.as_str().to_string(),
+        base_snapshot_id: prefix_commit_id(run.base_snapshot_id.as_str()),
         base_manifest_version: run.base_manifest_version,
         operation_hash: run.operation_hash.clone(),
         actor_id: run.actor_id.clone(),
         status: run.status.as_str().to_string(),
-        published_snapshot_id: run.published_snapshot_id.clone(),
+        published_snapshot_id: run
+            .published_snapshot_id
+            .as_deref()
+            .map(prefix_commit_id),
         created_at: run.created_at,
         updated_at: run.updated_at,
     }
@@ -390,11 +430,14 @@ pub fn run_output(run: &RunRecord) -> RunOutput {
 
 pub fn commit_output(commit: &GraphCommit) -> CommitOutput {
     CommitOutput {
-        graph_commit_id: commit.graph_commit_id.clone(),
+        graph_commit_id: prefix_commit_id(&commit.graph_commit_id),
         manifest_branch: commit.manifest_branch.clone(),
         manifest_version: commit.manifest_version,
-        parent_commit_id: commit.parent_commit_id.clone(),
-        merged_parent_commit_id: commit.merged_parent_commit_id.clone(),
+        parent_commit_id: commit.parent_commit_id.as_deref().map(prefix_commit_id),
+        merged_parent_commit_id: commit
+            .merged_parent_commit_id
+            .as_deref()
+            .map(prefix_commit_id),
         actor_id: commit.actor_id.clone(),
         created_at: commit.created_at,
     }
@@ -443,7 +486,67 @@ pub fn read_target_output(target: &ReadTarget) -> ReadTargetOutput {
         },
         ReadTarget::Snapshot(snapshot) => ReadTargetOutput {
             branch: None,
-            snapshot: Some(snapshot.as_str().to_string()),
+            snapshot: Some(prefix_commit_id(snapshot.as_str())),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefix_commit_id_adds_prefix_to_bare_ulid() {
+        assert_eq!(prefix_commit_id("01KQ2JK3PC35ZZW3867A5H7Q15"), "cmt_01KQ2JK3PC35ZZW3867A5H7Q15");
+    }
+
+    #[test]
+    fn prefix_commit_id_is_idempotent() {
+        let already = "cmt_01KQ2JK3PC35ZZW3867A5H7Q15";
+        assert_eq!(prefix_commit_id(already), already);
+    }
+
+    #[test]
+    fn prefix_run_id_adds_prefix_to_bare_ulid() {
+        assert_eq!(prefix_run_id("01KQ2KB5KFPNB7KMFM7816S6J2"), "run_01KQ2KB5KFPNB7KMFM7816S6J2");
+    }
+
+    #[test]
+    fn prefix_run_id_is_idempotent() {
+        let already = "run_01KQ2KB5KFPNB7KMFM7816S6J2";
+        assert_eq!(prefix_run_id(already), already);
+    }
+
+    #[test]
+    fn unprefix_commit_id_strips_prefix() {
+        assert_eq!(
+            unprefix_commit_id("cmt_01KQ2JK3PC35ZZW3867A5H7Q15"),
+            "01KQ2JK3PC35ZZW3867A5H7Q15"
+        );
+    }
+
+    #[test]
+    fn unprefix_commit_id_passes_through_bare_ulid() {
+        // Forward-compat: callers holding old-format IDs from logs continue to work.
+        assert_eq!(
+            unprefix_commit_id("01KQ2JK3PC35ZZW3867A5H7Q15"),
+            "01KQ2JK3PC35ZZW3867A5H7Q15"
+        );
+    }
+
+    #[test]
+    fn unprefix_run_id_strips_prefix() {
+        assert_eq!(
+            unprefix_run_id("run_01KQ2KB5KFPNB7KMFM7816S6J2"),
+            "01KQ2KB5KFPNB7KMFM7816S6J2"
+        );
+    }
+
+    #[test]
+    fn unprefix_run_id_passes_through_bare_ulid() {
+        assert_eq!(
+            unprefix_run_id("01KQ2KB5KFPNB7KMFM7816S6J2"),
+            "01KQ2KB5KFPNB7KMFM7816S6J2"
+        );
     }
 }
