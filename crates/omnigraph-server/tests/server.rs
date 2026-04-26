@@ -1095,13 +1095,12 @@ async fn policy_uses_resolved_branch_for_snapshot_reads() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["target"]["branch"], Value::Null);
+    // The server prefixes commit IDs in responses; inputs accept either form.
+    // The assertion locks the prefixed form so a future regression that drops
+    // `prefix_commit_id` in `read_target_output` is caught here.
     let returned_snapshot = body["target"]["snapshot"].as_str().unwrap();
     let expected = read.snapshot.as_deref().unwrap();
-    // The server prefixes commit IDs in responses (`cmt_…`); inputs accept either form.
-    assert!(
-        returned_snapshot == expected
-            || returned_snapshot == format!("cmt_{}", expected)
-    );
+    assert_eq!(returned_snapshot, format!("cmt_{}", expected));
     assert_eq!(body["row_count"], 1);
 }
 

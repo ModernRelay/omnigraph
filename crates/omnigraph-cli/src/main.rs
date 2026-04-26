@@ -1444,7 +1444,7 @@ fn inferred_config_path(uri: &str) -> Result<PathBuf> {
 
 fn read_target_from_cli(branch: Option<String>, snapshot: Option<String>) -> ReadTarget {
     if let Some(snapshot) = snapshot {
-        ReadTarget::snapshot(SnapshotId::new(snapshot))
+        ReadTarget::snapshot(SnapshotId::new(unprefix_commit_id(&snapshot).to_owned()))
     } else {
         ReadTarget::branch(branch.unwrap_or_else(|| "main".to_string()))
     }
