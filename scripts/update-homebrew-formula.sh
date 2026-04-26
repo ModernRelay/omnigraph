@@ -46,14 +46,12 @@ VERSION="${TAG#v}"
 RELEASE_JSON="$(gh release view "$TAG" --repo "$REPO_SLUG" --json assets)"
 
 MACOS_ARM_URL="https://github.com/${REPO_SLUG}/releases/download/${TAG}/omnigraph-macos-arm64.tar.gz"
-MACOS_X86_URL="https://github.com/${REPO_SLUG}/releases/download/${TAG}/omnigraph-macos-x86_64.tar.gz"
 LINUX_X86_URL="https://github.com/${REPO_SLUG}/releases/download/${TAG}/omnigraph-linux-x86_64.tar.gz"
 
 MACOS_ARM_SHA="$(asset_digest "$RELEASE_JSON" "omnigraph-macos-arm64.tar.gz")"
-MACOS_X86_SHA="$(asset_digest "$RELEASE_JSON" "omnigraph-macos-x86_64.tar.gz")"
 LINUX_X86_SHA="$(asset_digest "$RELEASE_JSON" "omnigraph-linux-x86_64.tar.gz")"
 
-for value in "$MACOS_ARM_SHA" "$MACOS_X86_SHA" "$LINUX_X86_SHA"; do
+for value in "$MACOS_ARM_SHA" "$LINUX_X86_SHA"; do
   if [[ -z "$value" ]]; then
     printf 'error: failed to resolve one or more release asset digests for %s\n' "$TAG" >&2
     exit 1
@@ -70,13 +68,9 @@ class Omnigraph < Formula
   version "${VERSION}"
 
   on_macos do
-    if Hardware::CPU.arm?
-      url "${MACOS_ARM_URL}"
-      sha256 "${MACOS_ARM_SHA}"
-    else
-      url "${MACOS_X86_URL}"
-      sha256 "${MACOS_X86_SHA}"
-    end
+    depends_on arch: :arm64
+    url "${MACOS_ARM_URL}"
+    sha256 "${MACOS_ARM_SHA}"
   end
 
   on_linux do
