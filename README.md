@@ -5,113 +5,157 @@
 [![Crates.io](https://img.shields.io/crates/v/omnigraph-cli.svg)](https://crates.io/crates/omnigraph-cli)
 [![CI](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml/badge.svg)](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml)
 
-Typed graph engine as knowledge/context layer for agents. 
+**A typed, branchable knowledge graph for AI agents. Auditable like source code.**
 
-Git-style workflows, schema-as-code graph modeling, S3-optimized.
+Long-running, multi-agent systems have created a new class of database workload: a shared, evolving knowledge layer that many agents read and write concurrently, that has to be reviewed before changes land, and that fuses graph traversal with full-text and vector retrieval at query time. Omnigraph is built for that workload, on top of the [Lance](https://lance.org/) columnar format. Run it locally, on S3, or anywhere in between.
 
-Vector/FTS/Graph queries in one runtime.
+## What you get
 
-## Use Cases
+| | |
+|---|---|
+| **Schema-as-code** | Define the agent's world (entities, relationships, attributes) as a typed contract. The schema is the ontology agents share, query, and write into. |
+| **Git-style branches, commits, merges** | Each agent writes to its own copy-on-write branch. No locks, no conflicts, no risk to main. A human starts a branch and an agent picks it up; or an agent enriches and a human reviews. **The branch is the handoff.** |
+| **Graph + full-text + vector in one query** | One query traverses relationships, ranks by relevance, and grounds in semantic similarity. No glue between three systems. |
+| **Lakehouse-native** | S3-native storage on the [Lance](https://lance.org/) columnar format. Cheap, scalable, no vendor lock-in. Snapshot-pinned reads for consistent traversal. |
+| **Concurrent typed writes** | Many agents accumulate into the same knowledge base in parallel. Transactional runs keep writes atomic. |
+| **Policy-as-code** | Cedar-based access control for server deployments. Code-defined, code-reviewed. |
 
-- On-prem & hybrid context graphs
-- Backbone for multi-agentic research
-- Enterprise knowledge systems
+## What it looks like
 
-## Quick Install
+A schema is a contract:
+
+```pg
+node Signal {
+    slug: String @key
+    title: String @index
+    body: String @index
+    source: String
+    observed: Date?
+    embedding: Vector(1536)
+}
+
+node Company {
+    slug: String @key
+    name: String
+}
+
+edge Mentions: Signal -> Company
+```
+
+A query traverses the graph, ranks by BM25, fuses with vector similarity:
+
+```gq
+query signals_about($company: String, $q: String, $qv: Vector(1536)) {
+    match {
+        $c: Company { name: $company }
+        $s: Signal
+        $s mentions $c
+    }
+    return { $s.title, $s.source, $s.observed }
+    order { rrf(nearest($s.embedding, $qv), bm25($s.body, $q)) }
+    limit 10
+}
+```
+
+Search and traversal primitives: `traversal` · `text` · `bm25` · `fuzzy` · `vector` · `rrf`. Composable in one query, typechecked at compile time.
+
+## Get started with agents
+
+The fastest path: install an agent skill and let it stand the graph up for you. The skill elicits your domain, picks sources, designs a schema, runs initial research, and loads the data. You bring the sources; the agent builds the knowledge layer.
+
+```bash
+npx skills add ModernRelay/omnigraph-starters@omnigraph-intel-bootstrap
+npx skills add ModernRelay/omnigraph-starters@omnigraph-best-practices
+```
+
+- **`omnigraph-intel-bootstrap`**: bootstrap a new graph from scratch (domain elicitation, schema design, source research, init + load).
+- **`omnigraph-best-practices`**: day-to-day ops. Schema evolution, queries, branches, embeddings, server, policy.
+
+Works in Claude Code and any [skills.sh](https://skills.sh)-compatible agent. See [`ModernRelay/omnigraph-starters`](https://github.com/ModernRelay/omnigraph-starters) for the catalog.
+
+## Templates
+
+Skip schema design. Each starter is a self-contained schema, seed data, and query set for a specific domain. Drop in, point at your data, ship.
+
+| Domain | Status |
+|---|---|
+| AI/ML industry intelligence | ✅ ready |
+| Internal company context (decisions, traces, actors) | 🚧 planned |
+| Biotech & medical research | 🚧 planned |
+| Competitor intelligence | 🚧 planned |
+
+The reference starter uses **SPIKE** (Signal, Pattern, Insight, KnowHow, Element), an opinionated lens for "knowledge that accumulates." It distinguishes dated observations (Signals) from recurring themes (Patterns), synthesized interpretations (Insights), and codified practices (KnowHow), all anchored to concrete Elements. SPIKE is a default; your schema is yours to shape.
+
+## Install
+
+CLI and server binaries:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/install.sh | bash
 ```
 
-This installs `omnigraph` and `omnigraph-server` into `~/.local/bin` from
-published release binaries. 
-
-Or install with Homebrew:
+Or via Homebrew:
 
 ```bash
 brew tap ModernRelay/tap
 brew install ModernRelay/tap/omnigraph
 ```
 
-For starter graphs and agent skills to bootstrap and operate Omnigraph, see [`ModernRelay/omnigraph-starters`](https://github.com/ModernRelay/omnigraph-starters).
+The same URI works for local paths, `s3://…`, or `http://host:port`:
 
-## One-Command Local RustFS Bootstrap
+```bash
+omnigraph init   --schema ./schema.pg ./repo.omni
+omnigraph load   --data   ./data.jsonl ./repo.omni
+omnigraph read   --query  ./queries.gq --name signals_about --params '{"company":"Anthropic"}' ./repo.omni
+omnigraph branch create --from main feature-x ./repo.omni
+omnigraph branch merge  feature-x --into main ./repo.omni
+```
+
+See [`docs/cli.md`](docs/cli.md) for schema apply, snapshots, ingest, runs, and policy.
+
+## Run a local stack
+
+One command spins up RustFS (S3-compatible), creates a repo, loads a fixture, and starts `omnigraph-server` on `127.0.0.1:8080`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/local-rustfs-bootstrap.sh | bash
 ```
 
-That bootstrap:
+Requires Docker. See [`docs/install.md`](docs/install.md) for re-runs, prefix overrides, and source-build fallbacks.
 
-- starts RustFS on `127.0.0.1:9000`
-- creates a bucket and S3-backed repo
-- loads the checked-in context fixture
-- launches `omnigraph-server` on `127.0.0.1:8080`
+## Foundation
 
-Docker must be installed and running first.
+Open source all the way down.
 
-The RustFS bootstrap prefers the rolling `edge` binaries and only falls back to
-source builds when release assets are unavailable.
+- **[Rust](https://www.rust-lang.org/)**: no GC, memory safety without runtime overhead, single binary.
+- **[Apache Arrow](https://arrow.apache.org/)**: in-memory columnar execution, no serialization overhead.
+- **[Lance](https://lance.org/)**: columnar format with built-in versioning. Every write is an immutable snapshot.
+- **[DataFusion](https://datafusion.apache.org/)**: production-grade query planner. Typed graph queries compile to optimized execution plans.
+- **[RustFS](https://rustfs.com/)**: Rust-native S3 backend. Same graph on laptop, VPC, or cloud.
+- **[Cedar](https://www.cedarpolicy.com/)**: deny-first, auditable access control at the query layer.
 
-If a previous run left objects under the same repo prefix but did not finish
-initializing the repo, rerun with `RESET_REPO=1` or set `PREFIX` to a new
-value.
+## Workspace crates
 
-## Omnigraph CORE
+- `crates/omnigraph-compiler`: schema/query parser, typechecker, catalog, IR lowering.
+- `crates/omnigraph`: storage, branching, merge, change detection, query execution.
+- `crates/omnigraph-cli`: CLI for init/load/ingest/read/change/branch/snapshot/export/policy.
+- `crates/omnigraph-server`: Axum HTTP server for remote ops, runs, and policy enforcement.
 
-- Typed schema, typed queries, and typed mutations
-- Schema-as-code, query validation and linting
-- Git-style graph workflows: branches, commits, merges, and transactional runs
-- Local, on-prem & cloud S3-native storage with snapshot-pinned reads
-- Graph traversal + text, fuzzy, BM25, vector, and RRF search in one runtime
-- Policy-as-code for server-side access control
-- Single CLI for multiple deployments
-
-## Common Commands
-
-The same URI works for local paths, `s3://…`, or `http://host:port`.
-
-```bash
-omnigraph init   --schema ./schema.pg ./repo.omni
-omnigraph load   --data   ./data.jsonl ./repo.omni
-omnigraph read   --query  ./queries.gq --name get_person --params '{"name":"Alice"}' ./repo.omni
-omnigraph change --query  ./queries.gq --name insert_person --params '{"name":"Mina"}' ./repo.omni
-omnigraph branch create --from main feature-x ./repo.omni
-omnigraph branch merge  feature-x --into main ./repo.omni
-```
-
-See [docs/cli.md](docs/cli.md) for schema apply, snapshots, ingest, runs, and policy commands.
-
-## Docs
-
-- [Install guide](docs/install.md)
-- [CLI guide](docs/cli.md)
-- [Deployment guide](docs/deployment.md)
-
-## Build And Test
+## Build and test
 
 ```bash
 cargo build --workspace
-cargo check --workspace
 cargo test --workspace
 ```
 
-Notes:
+Notes: Rust stable, edition 2024. CI runs `cargo test --workspace --locked`. Full local test flows need `protobuf-compiler`. S3 integration tests expect an S3-compatible endpoint such as RustFS.
 
-- Rust stable toolchain, edition 2024
-- CI runs `cargo test --workspace --locked`
-- Full CI and some local test flows require `protobuf-compiler`
-- S3 integration tests expect an S3-compatible endpoint such as RustFS
+## Docs
 
-## Workspace Crates
-
-- `crates/omnigraph-compiler`: shared schema/query parser, typechecker, catalog, and IR lowering
-- `crates/omnigraph`: storage/runtime, branching, merge, change detection, and query execution
-- `crates/omnigraph-cli`: CLI for init/load/ingest/read/change/branch/snapshot/export/policy operations
-- `crates/omnigraph-server`: Axum HTTP server for remote reads, changes, ingest, export, branches, commits, and runs
+- [Install guide](docs/install.md). Includes local RustFS setup.
+- [CLI guide](docs/cli.md)
+- [Deployment guide](docs/deployment.md)
 
 ## Contributing
 
-Please open an issue, spec, or design discussion before sending large code
-changes. Design feedback and concrete problem statements are the fastest way to
-collaborate on the roadmap.
+Open an issue, spec, or design discussion before sending large code changes. Concrete problem statements and design feedback are the fastest way to collaborate on the roadmap.
