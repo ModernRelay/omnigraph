@@ -9,7 +9,7 @@
 use axum::{
     body::Body,
     extract::Request,
-    http::{HeaderName, HeaderValue, header},
+    http::{HeaderName, HeaderValue},
     middleware::Next,
     response::Response,
 };
@@ -40,7 +40,7 @@ fn is_valid_inbound(raw: &str) -> bool {
 pub async fn request_id_middleware(mut req: Request<Body>, next: Next) -> Response {
     let inbound = req
         .headers()
-        .get(header::HeaderName::from_static("x-request-id"))
+        .get(&X_REQUEST_ID)
         .and_then(|v| v.to_str().ok())
         .filter(|raw| is_valid_inbound(raw));
 
