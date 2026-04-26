@@ -52,7 +52,11 @@ pub struct RunOutput {
     pub actor_id: Option<String>,
     pub status: String,
     pub published_snapshot_id: Option<String>,
+    /// Run creation time as Unix epoch microseconds.
+    #[schema(example = 1714000000000000i64)]
     pub created_at: i64,
+    /// Last status change as Unix epoch microseconds.
+    #[schema(example = 1714000000000000i64)]
     pub updated_at: i64,
 }
 
@@ -63,7 +67,9 @@ pub struct RunListOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BranchCreateRequest {
+    /// Parent branch to fork from. Defaults to `main`.
     pub from: Option<String>,
+    /// Name of the new branch. Must not already exist.
     pub name: String,
 }
 
@@ -89,7 +95,9 @@ pub struct BranchDeleteOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct BranchMergeRequest {
+    /// Source branch whose commits will be merged.
     pub source: String,
+    /// Target branch that will receive the merge. Defaults to `main`.
     pub target: Option<String>,
 }
 
@@ -239,6 +247,8 @@ pub struct CommitOutput {
     pub parent_commit_id: Option<String>,
     pub merged_parent_commit_id: Option<String>,
     pub actor_id: Option<String>,
+    /// Commit creation time as Unix epoch microseconds.
+    #[schema(example = 1714000000000000i64)]
     pub created_at: i64,
 }
 
@@ -249,23 +259,40 @@ pub struct CommitListOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ReadRequest {
+    /// GQ query source. May declare one or more named queries; pick one with
+    /// `query_name` if there is more than one.
+    #[schema(example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}")]
     pub query_source: String,
+    /// Name of the query to run when `query_source` declares multiple. Optional
+    /// when only one query is declared.
     pub query_name: Option<String>,
+    /// JSON object whose keys match the query's declared parameters.
     pub params: Option<Value>,
+    /// Branch to read from. Mutually exclusive with `snapshot`. Defaults to `main`.
     pub branch: Option<String>,
+    /// Snapshot id to read from. Mutually exclusive with `branch`.
     pub snapshot: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChangeRequest {
+    /// GQ mutation source containing `insert`, `update`, or `delete` statements.
+    /// May declare multiple named mutations; pick one with `query_name`.
+    #[schema(example = "query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}")]
     pub query_source: String,
+    /// Name of the mutation to run when `query_source` declares multiple.
     pub query_name: Option<String>,
+    /// JSON object whose keys match the mutation's declared parameters.
     pub params: Option<Value>,
+    /// Target branch. Defaults to `main`.
     pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SchemaApplyRequest {
+    /// Project schema in `.pg` source form. The diff against the current
+    /// schema produces the migration steps that will be applied.
+    #[schema(example = "node Person {\n    name: String @key\n    age: I32?\n}\n\nedge Knows: Person -> Person")]
     pub schema_source: String,
 }
 
@@ -287,18 +314,27 @@ pub struct SchemaOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct IngestRequest {
+    /// Target branch. Created from `from` if it does not yet exist. Defaults to `main`.
     pub branch: Option<String>,
+    /// Parent branch used to create `branch` if it does not exist. Defaults to `main`.
     pub from: Option<String>,
+    /// How existing rows are handled. Defaults to `merge`.
     #[schema(value_type = Option<LoadModeSchema>)]
     pub mode: Option<LoadMode>,
+    /// NDJSON payload: one record per line, each shaped
+    /// `{"type": "<TypeName>", "data": {...}}`.
+    #[schema(example = "{\"type\": \"Person\", \"data\": {\"name\": \"Alice\", \"age\": 30}}\n{\"type\": \"Person\", \"data\": {\"name\": \"Bob\", \"age\": 25}}")]
     pub data: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ExportRequest {
+    /// Branch to export. Defaults to `main`.
     pub branch: Option<String>,
+    /// Restrict the export to these node/edge type names. Empty exports all types.
     #[serde(default)]
     pub type_names: Vec<String>,
+    /// Restrict the export to these table keys. Empty exports all tables.
     #[serde(default)]
     pub table_keys: Vec<String>,
 }
