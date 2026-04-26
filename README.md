@@ -9,6 +9,12 @@
 
 Long-running, multi-agent systems have created a new class of database workload: a shared, evolving knowledge layer that many agents read and write concurrently, that has to be reviewed before changes land, and that fuses graph traversal with full-text and vector retrieval at query time. Omnigraph is built for that workload, on top of the [Lance](https://lance.org/) columnar format. Run it locally, on S3, or anywhere in between.
 
+## Use cases
+
+- On-prem & hybrid context graphs
+- Backbone for multi-agentic research
+- Enterprise knowledge systems
+
 ## What you get
 
 | | |
