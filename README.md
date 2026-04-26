@@ -5,9 +5,11 @@
 [![Crates.io](https://img.shields.io/crates/v/omnigraph-cli.svg)](https://crates.io/crates/omnigraph-cli)
 [![CI](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml/badge.svg)](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml)
 
-**A typed, branchable knowledge graph for AI agents. Auditable like source code.**
+**A typed, branchable context graph for AI agents.**
 
-Long-running, multi-agent systems have created a new class of database workload: a shared, evolving knowledge layer that many agents read and write concurrently, that has to be reviewed before changes land, and that fuses graph traversal with full-text and vector retrieval at query time. Omnigraph is built for that workload, on top of the [Lance](https://lance.org/) columnar format. Run it locally, on S3, or anywhere in between.
+Knowledge that agents write and humans review. Graph, full-text, and vector retrieval in one typed query. Built on [Lance](https://lance.org/).
+
+Long-running, multi-agent systems need a shared substrate for knowledge that accumulates, links, and survives the next session. Omnigraph is a context graph: a typed, persistent layer that many agents read and write concurrently, that humans review before changes land, and that fuses graph traversal with full-text and vector retrieval at query time. Runs locally, on S3, or anywhere in between.
 
 ## Use cases
 
@@ -19,11 +21,12 @@ Long-running, multi-agent systems have created a new class of database workload:
 
 | | |
 |---|---|
-| **Schema-as-code** | Define the agent's world (entities, relationships, attributes) as a typed contract. The schema is the ontology agents share, query, and write into. |
+| **Schema-as-code** | Define the agent's world (entities, relationships, attributes) as a typed contract. The schema is the ontology agents share, query, and write into. Schemas evolve via reviewable migrations: `schema plan` shows the diff, `schema apply` executes it. |
 | **Git-style branches, commits, merges** | Each agent writes to its own copy-on-write branch. No locks, no conflicts, no risk to main. A human starts a branch and an agent picks it up; or an agent enriches and a human reviews. **The branch is the handoff.** |
-| **Graph + full-text + vector in one query** | One query traverses relationships, ranks by relevance, and grounds in semantic similarity. No glue between three systems. |
-| **Lakehouse-native** | S3-native storage on the [Lance](https://lance.org/) columnar format. Cheap, scalable, no vendor lock-in. Snapshot-pinned reads for consistent traversal. |
-| **Concurrent typed writes** | Many agents accumulate into the same knowledge base in parallel. Transactional runs keep writes atomic. |
+| **Auditable history, point-in-time reads** | Every commit carries actor and timestamp. Query the graph at any past commit. Diff between two snapshots, reproduce a result, trace what an agent learned and when. |
+| **Graph + full-text + vector in one query** | One typed query traverses relationships, ranks by BM25, fuses with vector similarity via RRF. No glue between three systems. |
+| **Multi-modal data, typed columns** | Strings, numbers, dates, embeddings, and binary blobs as first-class typed columns. Documents, images, audio, and video sit alongside graph structure, queryable by metadata and reachable by traversal. |
+| **Lakehouse-native, open formats** | S3-native storage on the [Lance](https://lance.org/) columnar format. Open formats (Lance, Arrow, Parquet) keep your data portable. Snapshot-pinned reads, no vendor lock-in. |
 | **Policy-as-code** | Cedar-based access control for server deployments. Code-defined, code-reviewed. |
 
 ## What it looks like
