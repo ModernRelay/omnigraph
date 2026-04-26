@@ -16,3 +16,12 @@ __pycache__/
 *.pyc
 demo/*.omni/
 .omnigraph-rustfs-demo/
+
+# Local-only working files (not for the public repo)
+.claude/
+.worktrees/
+/CLAUDE.md
+/omnigraph.yaml
+/schema-improvements.md
+/schema-issues.md
+/schema-prior-art.md
