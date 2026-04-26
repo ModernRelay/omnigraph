@@ -140,6 +140,16 @@ Open source all the way down.
 - **[RustFS](https://rustfs.com/)**: Rust-native S3 backend. Same graph on laptop, VPC, or cloud.
 - **[Cedar](https://www.cedarpolicy.com/)**: deny-first, auditable access control at the query layer.
 
+## Coming soon
+
+Active work on the roadmap.
+
+- **Change data capture and subscriptions.** Subscribe to a live feed of graph changes. Agents and downstream systems react in real time, without polling.
+- **Schema-declared sync.** Point at an external source in your schema; the system pulls it on a cadence and keeps the graph current. Agents bring the sources, ingestion stays declarative.
+- **Time-travel inside queries.** Query the graph at any past state, and diff between two states. Reproduce a result, audit a change, see how knowledge evolved.
+- **Polymorphic schema.** Group related types under shared interfaces and query across them in one expression. Cleaner modeling for heterogeneous data.
+- **Modern Relay Cloud.** Managed Omnigraph without running the ops yourself. Isolated per customer.
+
 ## Workspace crates
 
 - `crates/omnigraph-compiler`: schema/query parser, typechecker, catalog, IR lowering.
