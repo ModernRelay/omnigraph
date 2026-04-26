@@ -7,9 +7,9 @@
 
 **A typed, branchable context graph for AI agents.**
 
-Knowledge that agents write and humans review. Graph, full-text, and vector retrieval in one typed query. Built on [Lance](https://lance.org/).
+Versioned. Multi-modal. Lakehouse-native. Open source.
 
-Long-running, multi-agent systems need a shared substrate for knowledge that accumulates, links, and survives the next session. Omnigraph is a context graph: a typed, persistent layer that many agents read and write concurrently, that humans review before changes land, and that fuses graph traversal with full-text and vector retrieval at query time. Runs locally, on S3, or anywhere in between.
+Long-running, multi-agent systems need a shared substrate for knowledge that accumulates, links, and survives the next session. Omnigraph is a context graph: a typed, persistent layer that many agents read and write concurrently, that humans review before changes land, and that fuses graph traversal with full-text and vector retrieval at query time. Built on the [Lance](https://lance.org/) columnar format. Runs locally, on S3, or anywhere in between.
 
 ## Use cases
 
