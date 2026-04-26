@@ -2,7 +2,6 @@ pub mod api;
 pub mod auth;
 pub mod config;
 pub mod policy;
-pub mod request_id;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -461,7 +460,6 @@ pub fn build_app(state: AppState) -> Router {
         .merge(protected)
         .layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT_BYTES))
         .layer(TraceLayer::new_for_http())
-        .layer(middleware::from_fn(request_id::request_id_middleware))
         .with_state(state)
 }
 
