@@ -5,7 +5,7 @@
 [![Crates.io](https://img.shields.io/crates/v/omnigraph-cli.svg)](https://crates.io/crates/omnigraph-cli)
 [![CI](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml/badge.svg)](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml)
 
-**Multi-agent context graph with git-like semantics.
+**Multi-agent context graph with git-like semantics.**
 
 Versioned. Multi-modal. Lakehouse-native. Open source.
 
