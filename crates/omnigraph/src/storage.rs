@@ -20,6 +20,13 @@ pub trait StorageAdapter: Debug + Send + Sync {
     async fn read_text(&self, uri: &str) -> Result<String>;
     async fn write_text(&self, uri: &str, contents: &str) -> Result<()>;
     async fn exists(&self, uri: &str) -> Result<bool>;
+    /// Move a file from `from_uri` to `to_uri`, replacing any existing file at
+    /// `to_uri`. Atomic on local POSIX; on S3 implemented as copy + delete
+    /// (NOT atomic — callers that depend on atomicity for crash recovery must
+    /// tolerate "both source and destination exist after a crash").
+    async fn rename_text(&self, from_uri: &str, to_uri: &str) -> Result<()>;
+    /// Remove a file. Returns Ok(()) if the file does not exist.
+    async fn delete(&self, uri: &str) -> Result<()>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +65,22 @@ impl StorageAdapter for LocalStorageAdapter {
 
     async fn exists(&self, uri: &str) -> Result<bool> {
         Ok(local_path_from_uri(uri)?.exists())
+    }
+
+    async fn rename_text(&self, from_uri: &str, to_uri: &str) -> Result<()> {
+        let from = local_path_from_uri(from_uri)?;
+        let to = local_path_from_uri(to_uri)?;
+        tokio::fs::rename(&from, &to).await?;
+        Ok(())
+    }
+
+    async fn delete(&self, uri: &str) -> Result<()> {
+        let path = local_path_from_uri(uri)?;
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err.into()),
+        }
     }
 }
 
@@ -102,6 +125,33 @@ impl StorageAdapter for S3StorageAdapter {
                 Ok(has_prefix_entries)
             }
             Err(err) => Err(storage_backend_error("exists", uri, err)),
+        }
+    }
+
+    async fn rename_text(&self, from_uri: &str, to_uri: &str) -> Result<()> {
+        // S3 has no atomic rename. Copy then delete; if the copy succeeds and
+        // the delete fails (or the process crashes between them), both
+        // source and destination exist with the same content. Recovery code
+        // must tolerate this case — see schema_state::recover_schema_state_files.
+        let from = self.object_path(from_uri)?;
+        let to = self.object_path(to_uri)?;
+        self.store
+            .copy(&from, &to)
+            .await
+            .map_err(|err| storage_backend_error("rename:copy", from_uri, err))?;
+        self.store
+            .delete(&from)
+            .await
+            .map_err(|err| storage_backend_error("rename:delete", from_uri, err))?;
+        Ok(())
+    }
+
+    async fn delete(&self, uri: &str) -> Result<()> {
+        let location = self.object_path(uri)?;
+        match self.store.delete(&location).await {
+            Ok(()) => Ok(()),
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(err) => Err(storage_backend_error("delete", uri, err)),
         }
     }
 }

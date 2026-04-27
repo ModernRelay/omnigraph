@@ -42,7 +42,9 @@ use super::manifest::{
 };
 use super::schema_state::{
     SCHEMA_SOURCE_FILENAME, load_or_bootstrap_schema_contract, read_accepted_schema_ir,
-    validate_schema_contract, write_schema_contract,
+    recover_schema_state_files, schema_ir_staging_uri, schema_ir_uri, schema_source_staging_uri,
+    schema_source_uri, schema_state_staging_uri, schema_state_uri, validate_schema_contract,
+    write_schema_contract, write_schema_contract_staging,
 };
 use super::{
     ReadTarget, ResolvedTarget, RunId, SCHEMA_APPLY_LOCK_BRANCH, SnapshotId,
@@ -130,11 +132,16 @@ impl Omnigraph {
         storage: Arc<dyn StorageAdapter>,
     ) -> Result<Self> {
         let root = normalize_root_uri(uri)?;
-        // Read _schema.pg
-        let schema_path = join_uri(&root, SCHEMA_SOURCE_FILENAME);
+        // Open the coordinator first so the schema-staging recovery sweep can
+        // compare its snapshot against any leftover staging files. Recovery
+        // either deletes staging (pre-commit crash) or completes the rename
+        // (post-commit crash) before the live schema files are read.
+        let coordinator = GraphCoordinator::open(&root, Arc::clone(&storage)).await?;
+        recover_schema_state_files(&root, Arc::clone(&storage), &coordinator.snapshot()).await?;
+        // Read _schema.pg (post-recovery — may have just been renamed in).
+        let schema_path = schema_source_uri(&root);
         let schema_source = storage.read_text(&schema_path).await?;
         let current_source_ir = read_schema_ir_from_source(&schema_source)?;
-        let coordinator = GraphCoordinator::open(&root, Arc::clone(&storage)).await?;
         let branches = coordinator.branch_list().await?;
         let (accepted_ir, _) = load_or_bootstrap_schema_contract(
             &root,
@@ -1562,6 +1569,8 @@ edge WorksAt: Person -> Company
         reads: Mutex<Vec<String>>,
         writes: Mutex<Vec<String>>,
         exists_checks: Mutex<Vec<String>>,
+        renames: Mutex<Vec<(String, String)>>,
+        deletes: Mutex<Vec<String>>,
     }
 
     impl RecordingStorageAdapter {
@@ -1593,6 +1602,19 @@ edge WorksAt: Person -> Company
         async fn exists(&self, uri: &str) -> Result<bool> {
             self.exists_checks.lock().unwrap().push(uri.to_string());
             self.inner.exists(uri).await
+        }
+
+        async fn rename_text(&self, from_uri: &str, to_uri: &str) -> Result<()> {
+            self.renames
+                .lock()
+                .unwrap()
+                .push((from_uri.to_string(), to_uri.to_string()));
+            self.inner.rename_text(from_uri, to_uri).await
+        }
+
+        async fn delete(&self, uri: &str) -> Result<()> {
+            self.deletes.lock().unwrap().push(uri.to_string());
+            self.inner.delete(uri).await
         }
     }
 

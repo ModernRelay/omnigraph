@@ -314,6 +314,22 @@ pub(super) async fn apply_schema_with_lock(
         )));
     }
 
+    // Atomic schema apply.
+    //
+    // Write the new schema source + IR contract to staging filenames first,
+    // then commit the manifest, then rename staging → final. A crash
+    // between these stages is recoverable on next open via
+    // `recover_schema_state_files`:
+    //   - crash before commit  → manifest unchanged; staging deleted on open
+    //   - crash after commit   → manifest advanced; staging renamed on open
+    let staging_pg_uri = schema_source_staging_uri(&db.root_uri);
+    db.storage
+        .write_text(&staging_pg_uri, desired_schema_source)
+        .await?;
+    write_schema_contract_staging(&db.root_uri, db.storage.as_ref(), &desired_ir).await?;
+
+    crate::failpoints::maybe_fail("schema_apply.after_staging_write")?;
+
     let actor_id = db.current_audit_actor().map(str::to_string);
     let PublishedSnapshot {
         manifest_version,
@@ -323,11 +339,23 @@ pub(super) async fn apply_schema_with_lock(
         .commit_changes_with_actor(&manifest_changes, actor_id.as_deref())
         .await?;
 
-    let schema_path = join_uri(&db.root_uri, SCHEMA_SOURCE_FILENAME);
+    crate::failpoints::maybe_fail("schema_apply.after_manifest_commit")?;
+
     db.storage
-        .write_text(&schema_path, desired_schema_source)
+        .rename_text(&staging_pg_uri, &schema_source_uri(&db.root_uri))
         .await?;
-    write_schema_contract(&db.root_uri, db.storage.as_ref(), &desired_ir).await?;
+    db.storage
+        .rename_text(
+            &schema_ir_staging_uri(&db.root_uri),
+            &schema_ir_uri(&db.root_uri),
+        )
+        .await?;
+    db.storage
+        .rename_text(
+            &schema_state_staging_uri(&db.root_uri),
+            &schema_state_uri(&db.root_uri),
+        )
+        .await?;
 
     db.catalog = desired_catalog;
     db.schema_source = desired_schema_source.to_string();
