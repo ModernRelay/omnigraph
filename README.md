@@ -5,16 +5,16 @@
 [![Crates.io](https://img.shields.io/crates/v/omnigraph-cli.svg)](https://crates.io/crates/omnigraph-cli)
 [![CI](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml/badge.svg)](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml)
 
-Typed graph engine as knowledge/context layer for agents. 
+**Lakehouse-native graph engine with git-style workflows.**
 
-Git-style workflows, schema-as-code graph modeling, S3-optimized.
-
-Vector/FTS/Graph queries in one runtime.
+Branch, commit, and merge typed graph data like source code. Multi-modal, self-hosted, open source.
 
 ## Use Cases
 
 - On-prem & hybrid context graphs
-- Backbone for multi-agentic research
+- Backbone for multi-agent research
+- Incident response graphs
+- Compliance & audit graphs
 - Enterprise knowledge systems
 
 ## Quick Install
