@@ -5,11 +5,11 @@
 [![Crates.io](https://img.shields.io/crates/v/omnigraph-cli.svg)](https://crates.io/crates/omnigraph-cli)
 [![CI](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml/badge.svg)](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml)
 
-**A typed, branchable context graph for AI agents.**
+**Multi-agent context graph with git-like semantics.
 
 Versioned. Multi-modal. Lakehouse-native. Open source.
 
-Long-running, multi-agent systems need a shared substrate for knowledge that accumulates, links, and survives the next session. Omnigraph is a context graph: a typed, persistent layer that many agents read and write concurrently, that humans review before changes land, and that fuses graph traversal with full-text and vector retrieval at query time. Built on the [Lance](https://lance.org/) columnar format. Runs locally, on S3, or anywhere in between.
+Long-running, multi-agent systems need a persistent knowledge layer that structures, accumulates, links, and survives the next session. Omnigraph is a context graph: a typed, persistent layer that many agents read and write concurrently, that humans review before changes land, and that fuses graph traversal with full-text and vector retrieval at query time. Built on the [Lance](https://lance.org/) columnar format. Runs locally, on S3, or anywhere in between.
 
 ## Use cases
 
