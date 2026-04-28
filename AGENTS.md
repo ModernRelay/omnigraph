@@ -2,6 +2,10 @@
 
 This file is the always-on map for AI coding agents (Claude Code, Codex, Cursor, Cline) working in this repo. It is loaded into context on every turn, so it stays as a **map plus the rules and invariants that need to be in scope at all times** — the encyclopedia content lives under [`docs/`](docs/). When you need depth, follow a pointer.
 
+> **Required reading every session: [docs/invariants.md](docs/invariants.md).** Load this in full before proposing, reviewing, or implementing any change — the §IX deny-list and §X review checklist apply to every PR, not only architecture work. Tools that support `@`-imports (Claude Code) auto-include it via the import below; other agents must open it explicitly at the start of each session.
+>
+> @docs/invariants.md
+
 `CLAUDE.md` is a symlink to this file — there is exactly one source of truth. Edit `AGENTS.md`.
 
 **Version surveyed:** 0.3.1
