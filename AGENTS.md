@@ -5,6 +5,8 @@ This file is the always-on map for AI coding agents (Claude Code, Codex, Cursor,
 > **Required reading every session: [docs/invariants.md](docs/invariants.md).** Load this in full before proposing, reviewing, or implementing any change — the §IX deny-list and §X review checklist apply to every PR, not only architecture work. Tools that support `@`-imports (Claude Code) auto-include it via the import below; other agents must open it explicitly at the start of each session.
 >
 > @docs/invariants.md
+>
+> **When you hit a Lance-shaped problem** (file format, fragments, indexes, transactions, branches/tags, compaction, schema evolution, vector / FTS internals): consult [docs/lance.md](docs/lance.md) and fetch the listed upstream URL before grepping our code or guessing. Lance is the substrate; behavior is documented there, not here.
 
 `CLAUDE.md` is a symlink to this file — there is exactly one source of truth. Edit `AGENTS.md`.
 
@@ -60,6 +62,7 @@ Full diagram and concurrency model: [docs/architecture.md](docs/architecture.md)
 | Area | Read |
 |---|---|
 | **Architectural invariants & deny-list (read before any non-trivial proposal or review)** | **[docs/invariants.md](docs/invariants.md)** |
+| **Lance docs index — fetch upstream Lance docs by problem domain** | **[docs/lance.md](docs/lance.md)** |
 | Architecture, L1/L2 framing, concurrency model | [docs/architecture.md](docs/architecture.md) |
 | Storage layout, `__manifest` schema, URI schemes, S3 env vars | [docs/storage.md](docs/storage.md) |
 | `.pg` schema language, types, constraints, annotations, migration planning | [docs/schema-language.md](docs/schema-language.md) |
