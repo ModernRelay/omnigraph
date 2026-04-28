@@ -5,17 +5,27 @@
 [![Crates.io](https://img.shields.io/crates/v/omnigraph-cli.svg)](https://crates.io/crates/omnigraph-cli)
 [![CI](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml/badge.svg)](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml)
 
-Typed graph engine as knowledge/context layer for agents. 
+**Lakehouse-native graph engine with git-style workflows.**
 
-Git-style workflows, schema-as-code graph modeling, S3-optimized.
-
-Vector/FTS/Graph queries in one runtime.
+Branch, commit, and merge typed graph data like source code. Multi-modal, self-hosted, open source.
 
 ## Use Cases
 
 - On-prem & hybrid context graphs
-- Backbone for multi-agentic research
+- Backbone for multi-agent research
+- Incident response graphs
+- Compliance & audit graphs
 - Enterprise knowledge systems
+
+## Capabilities
+
+- Typed schema, typed queries, and typed mutations
+- Schema-as-code, query validation and linting
+- Git-style graph workflows: branches, commits, merges, and transactional runs
+- Local, on-prem & cloud S3-native storage with snapshot-pinned reads
+- Graph traversal + text, fuzzy, BM25, vector, and RRF search in one runtime
+- Policy-as-code for server-side access control
+- Single CLI for multiple deployments
 
 ## Quick Install
 
@@ -56,16 +66,6 @@ source builds when release assets are unavailable.
 If a previous run left objects under the same repo prefix but did not finish
 initializing the repo, rerun with `RESET_REPO=1` or set `PREFIX` to a new
 value.
-
-## Omnigraph CORE
-
-- Typed schema, typed queries, and typed mutations
-- Schema-as-code, query validation and linting
-- Git-style graph workflows: branches, commits, merges, and transactional runs
-- Local, on-prem & cloud S3-native storage with snapshot-pinned reads
-- Graph traversal + text, fuzzy, BM25, vector, and RRF search in one runtime
-- Policy-as-code for server-side access control
-- Single CLI for multiple deployments
 
 ## Common Commands
 
