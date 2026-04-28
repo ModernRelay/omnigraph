@@ -77,16 +77,33 @@ There is **no** coverage tooling in the repo today: no `tarpaulin.toml`, no `cod
 
 If introducing coverage tooling is in scope for your task, the natural first step is `cargo-llvm-cov` wired into a separate CI job, and a per-crate threshold rather than a global one.
 
+## First principle: check what already covers it
+
+**Before writing any new test, check whether an existing test already covers the case.** The cost of duplicating coverage is high: more code to read, more places to keep in sync when behavior changes, and more drift when one copy lags. The cost of *extending* an existing test is usually one extra assertion or one extra fixture row.
+
+How to check:
+
+1. **Map the change to an area** — use the engine integration-test table above (`branching.rs`, `runs.rs`, `search.rs`, etc.). The filename usually names the area.
+2. **Open the file and skim every test fn name.** Test fn names are the index — read them all, not just the first few.
+3. **Grep for the symbol or path you're changing.** `rg <FunctionName>` or `rg <enum_variant>` across all `tests/` directories surfaces existing coverage you might miss.
+4. **Decide one of three outcomes**, in this order of preference:
+   - *Existing test already asserts the new behavior* → no new test needed; this PR is a refactor or no-op behaviorally. Confirm by running the existing test against the change.
+   - *Existing test covers the area but not your case* → **add an assertion or a fixture row to the existing test**, don't write a new function with `init_and_load()` again.
+   - *No existing coverage in any test file* → only then write a new test; put it in the file that owns the area, or open a new file only if the area itself is new.
+
+Three duplicated `init_and_load() → run_query → assert_eq` blocks where one parameterized test would do is the most common form of test rot in this repo. Don't add to it.
+
 ## Before-every-task checklist
 
 When you pick up any change, walk through this:
 
-1. **Find the existing tests covering this area.** Use the table above; for engine work, start with `crates/omnigraph/tests/<area>.rs`. Open the file and read what's already exercised.
-2. **Run them locally before editing.** `cargo test --workspace --locked` for the broad pass; `-p <crate> --test <file>` for a focused loop. Confirm a clean baseline.
-3. **Plan the new test up front.** Decide which test file the new case belongs in (extend an existing one if it owns the area; only add a new file if you're opening a new area).
-4. **Use the helpers.** `init_and_load()`, fixture files, the CLI `support` harness — re-use them. Don't bootstrap a fresh repo by hand if a helper exists.
+1. **Find existing coverage** (per the principle above). Don't just look at the first test file by name — grep for the symbol you're touching across every crate's `tests/`.
+2. **Run those tests locally before editing.** `cargo test --workspace --locked` for the broad pass; `-p <crate> --test <file>` for a focused loop. Confirm a clean baseline.
+3. **Decide extend-vs-new** explicitly. If you can extend an existing test (assertion, fixture row, parameterization), do that. Only add a new test fn or new file if no existing one owns the area.
+4. **Reuse the helpers.** `init_and_load()`, fixture files, the CLI `support` harness — re-use them. Don't bootstrap a fresh repo by hand if a helper exists.
 5. **Mind the boundary.** Per [docs/invariants.md §VII.33](invariants.md), test at the layer the change lives at — planner-level changes deserve planner-level tests, not just end-to-end.
 6. **For substrate-touching changes** (Lance behavior), reach for `failpoints` or fixture-driven scenarios, not stubbed-out mocks.
 7. **For server / API changes**, confirm the OpenAPI regeneration happens in `openapi.rs` and that the diff lands in `openapi.json`.
+8. **Verify your change makes an existing test fail before it makes the new one pass.** If you can break the code without breaking a test, your coverage gap is the problem to fix first.
 
 When in doubt, re-read [docs/invariants.md §VII](invariants.md) — quality gates apply to every change.
