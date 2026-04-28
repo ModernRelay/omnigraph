@@ -84,18 +84,14 @@ Full diagram and concurrency model: [docs/architecture.md](docs/architecture.md)
 
 ## Always-on rules (load these into your working memory)
 
-These invariants need to be in scope on every change — they're the ones that quietly break if forgotten. The full architectural invariants and deny-list live in [docs/invariants.md](docs/invariants.md); §IX (deny-list) is the fastest first-pass when reviewing any change.
+These are architectural rules that need to be in scope on every change. They're framed at the level that survives renames and refactors — the deeper implementation specifics (function names, lock names, branch-prefix conventions, enforcement points) live in the per-area docs and may evolve. The full architectural invariants and deny-list are in [docs/invariants.md](docs/invariants.md); §IX (deny-list) is the fastest first-pass when reviewing any change.
 
-1. **`__manifest` is the atomic-publish boundary.** Multi-dataset commits flip via a single `ManifestBatchPublisher` write. Don't introduce code paths that publish per sub-table outside the batch publisher — you'll lose snapshot isolation across tables.
-2. **`nearest($x.vec, $q)` requires a `LIMIT`.** The compiler enforces it, but if you're touching the query lowering or executor, don't break this rule. ANN without a limit is unbounded.
-3. **Snapshot isolation per query.** A query holds one `Snapshot` for its lifetime. Don't read against `db.head()` mid-query; use the snapshot bound at lowering time.
-4. **Run isolation lives on `__run__<id>` branches.** Mutations inside `begin_run` … `publish_run` must go through `run_branch`, not `target_branch`. Publish picks fast-path (target unmoved) or merge-path (three-way).
-5. **Schema apply is serialized via `__schema_apply_lock__`.** Concurrent `apply_schema` is not safe. Don't bypass the lock.
-6. **`branch_list()` filters internal branches.** `__run__…` and `__schema_apply_lock__` must not appear in user-visible listings, exports, or policy-scoped operations. If you add a new system branch, follow the `__name__` prefix convention and add it to the filter.
-7. **Bearer-token plaintext never persists in process memory.** Tokens are SHA-256 hashed at startup; comparison uses `subtle::ConstantTimeEq`. The actor id is server-resolved from the hash match — it must not be settable by the client.
-8. **Mutations are atomic at the manifest commit boundary.** Multi-statement `change` queries publish one commit. Don't commit per-statement.
-9. **Indexes are built on the branch head, not on a snapshot.** Reads always see the current index state. Lazy fork: a branch that hasn't mutated a sub-table reuses the source's index until the first write.
-10. **Stable type IDs survive renames.** Schema migration uses `stable_type_id` (kind+name hashed at first sight). Don't mint new IDs on rename.
+1. **Multi-dataset publish is atomic across the whole graph.** A graph commit flips every relevant sub-table version visible together, in one manifest write. Don't introduce code paths that publish per sub-table outside the unified publish path — that loses cross-table snapshot isolation.
+2. **Snapshot isolation per query.** A query holds one snapshot for its lifetime. Don't re-read the current head mid-query.
+3. **Mutations are atomic at the commit boundary.** Multi-statement change queries publish one commit. Don't commit per-statement.
+4. **Bearer-token plaintext never persists in process memory.** Tokens are hashed at startup; auth uses constant-time comparison; the actor id is server-resolved from the hash match and must not be settable by the client.
+5. **Reads always see the current index state for the branch they're reading.** Indexes track the branch head, not historical snapshots. If you change index lifecycle, preserve this guarantee.
+6. **Stable type IDs survive renames.** Schema migration relies on identity that's stable across rename — don't mint new IDs on rename.
 
 ### Deny-list (fast-pass review filter — full reasoning in [docs/invariants.md §IX](docs/invariants.md))
 
