@@ -99,6 +99,18 @@ jobs:
           echo "run_full_ci=$run_full_ci" >> "$GITHUB_OUTPUT"
           echo "run_rustfs_ci=$run_rustfs_ci" >> "$GITHUB_OUTPUT"
 
+  check_agents_md:
+    name: Check AGENTS.md Links
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5.0.1
+
+      - name: Verify AGENTS.md ↔ docs/ cross-links
+        run: bash scripts/check-agents-md.sh
+
   test:
     name: Test Workspace
     needs: classify_changes
