@@ -2,7 +2,7 @@
 
 A reference for the `omnigraph` binary's command surface and `omnigraph.yaml` schema. For a quick-start guide, see [cli.md](cli.md).
 
-13 top-level command families, 40+ subcommands. All commands accept either a positional `URI`, `--uri`, or a `--target <name>` resolved against `omnigraph.yaml`.
+17 top-level command families, 40+ subcommands. All commands accept either a positional `URI`, `--uri`, or a `--target <name>` resolved against `omnigraph.yaml`.
 
 ## Top-level commands
 

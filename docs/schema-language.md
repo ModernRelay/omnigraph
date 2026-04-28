@@ -59,7 +59,7 @@ Edge bodies only allow `@unique` and `@index`.
 
 ## Schema IR & stable type IDs
 
-- `IR_VERSION = 1` (`catalog/schema_ir.rs`).
+- `SCHEMA_IR_VERSION = 1` (`catalog/schema_ir.rs`).
 - Each interface/node/edge gets a `stable_type_id` (kind+name hashed) so renames can be tracked.
 - Serialized as JSON for diff/migration plans.
 

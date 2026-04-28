@@ -9,7 +9,7 @@
 - `Manifest(ManifestError { kind: BadRequest|NotFound|Conflict|Internal, … })`
 - `MergeConflicts(Vec<MergeConflict>)`
 
-Compiler-side `NanoError` covers parse / catalog / type / plan / execution / arrow / lance / IO / manifest / unique-constraint, each with structured spans (`SourceSpan { start, end }`) for ariadne-style diagnostics.
+Compiler-side `NanoError` covers parse / catalog / type / storage / plan / execution / arrow / lance / IO / manifest / unique-constraint, each with structured spans (`SourceSpan { start, end }`) for ariadne-style diagnostics.
 
 ## Result serialization (`omnigraph_compiler::result::QueryResult`)
 

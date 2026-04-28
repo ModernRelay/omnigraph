@@ -16,7 +16,7 @@ OmniGraph builds *graph branches* on top by branching every sub-table coherently
 
 ## L2 — Commit graph (`db/commit_graph.rs`)
 
-Stored as a Lance dataset `_graph_commits.lance` (with stable row IDs):
+In-memory shape of a graph commit:
 
 ```
 GraphCommit {
@@ -25,14 +25,20 @@ GraphCommit {
   manifest_version: u64,
   parent_commit_id: Option<String>,
   merged_parent_commit_id: Option<String>,   // populated for merge commits
-  actor_id: Option<String>,
+  actor_id: Option<String>,                  // joined in-memory from _graph_commit_actors.lance, NOT a column on _graph_commits.lance
   created_at: i64 (microseconds since epoch),
 }
 ```
 
+Storage is split across two Lance datasets (both with stable row IDs):
+
+- `_graph_commits.lance` — every column above *except* `actor_id`.
+- `_graph_commit_actors.lance` — optional separate `(graph_commit_id, actor_id)` map, created on demand. The `actor_id` field above is populated by joining this dataset in-memory at load time.
+
+Notes:
+
 - Every successful publish (load / change / merge / schema_apply / publish_run) appends one commit.
 - Merge commits have two parents; linear commits have one.
-- `_graph_commit_actors.lance` — optional separate actor map (created on demand).
 - API: `list_commits(branch)`, `get_commit(id)`, `head_commit_id_for_branch(branch)`.
 
 ## L2 — Snapshots & time travel

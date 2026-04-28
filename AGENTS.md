@@ -2,17 +2,17 @@
 
 This file is the always-on map for AI coding agents (Claude Code, Codex, Cursor, Cline) working in this repo. It is loaded into context on every turn, so it stays as a **map plus the rules and invariants that need to be in scope at all times** — the encyclopedia content lives under [`docs/`](docs/). When you need depth, follow a pointer.
 
-> **Required reading every session, every change:**
->
-> 1. **[docs/invariants.md](docs/invariants.md)** — the architectural invariants and §IX deny-list. Apply to every PR, not only architecture work.
-> 2. **[docs/lance.md](docs/lance.md)** — the curated index of upstream Lance docs. **Consult it before every task** to identify which Lance pages are relevant to what you're about to do, then fetch those upstream URLs before grepping our code or guessing. Lance is the substrate; behavior is documented there, not here.
-> 3. **[docs/testing.md](docs/testing.md)** — the test-coverage map. **Always check what already covers your change before writing a new test.** Extending an existing test (an assertion, a fixture row, a parameterization) is preferred over a duplicated `init_and_load()` block. Walk the before-every-task checklist to identify existing coverage, run those tests as a clean baseline, and only add a new test fn or file when no existing one owns the area.
->
-> Tools that support `@`-imports (Claude Code) auto-include all three files via the imports below. Other agents (Codex, Cursor, Cline, …) must open them explicitly at the start of each session.
->
-> @docs/invariants.md
-> @docs/lance.md
-> @docs/testing.md
+**Required reading every session, every change:**
+
+1. **[docs/invariants.md](docs/invariants.md)** — the architectural invariants and §IX deny-list. Apply to every PR, not only architecture work.
+2. **[docs/lance.md](docs/lance.md)** — the curated index of upstream Lance docs. **Consult it before every task** to identify which Lance pages are relevant to what you're about to do, then fetch those upstream URLs before grepping our code or guessing. Lance is the substrate; behavior is documented there, not here.
+3. **[docs/testing.md](docs/testing.md)** — the test-coverage map. **Always check what already covers your change before writing a new test.** Extending an existing test (an assertion, a fixture row, a parameterization) is preferred over a duplicated `init_and_load()` block. Walk the before-every-task checklist to identify existing coverage, run those tests as a clean baseline, and only add a new test fn or file when no existing one owns the area.
+
+Tools that support `@`-imports (Claude Code) auto-include all three files via the imports below — note these must sit at column 0 (not inside a blockquote) for the parser to recognize them. Other agents (Codex, Cursor, Cline, …) must open them explicitly at the start of each session.
+
+@docs/invariants.md
+@docs/lance.md
+@docs/testing.md
 
 `CLAUDE.md` is a symlink to this file — there is exactly one source of truth. Edit `AGENTS.md`.
 

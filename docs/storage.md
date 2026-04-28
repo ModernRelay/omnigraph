@@ -27,7 +27,7 @@ OmniGraph is **not** a single Lance dataset; it is a *graph* of datasets coordin
   - `object_type` ∈ `table | table_version | table_tombstone`
   - `table_key` ∈ `node:<TypeName> | edge:<EdgeName>`
   - `table_branch` is `null` for the main lineage and the branch name otherwise
-- **Snapshot reconstruction**: latest visible `table_version` per `(table_key, table_branch)` minus tombstones whose `tombstone_version >= table_version`.
+- **Snapshot reconstruction**: latest visible `table_version` per `(table_key, table_branch)` minus tombstones — rows where `object_type = table_tombstone`, whose own `table_version` (acting as the tombstone version) is `>= the entry's table_version`.
 - **Atomic publish**: multi-dataset commits publish via a `ManifestBatchPublisher` so a single write to `__manifest` flips all the new sub-table versions visible at once.
 
 ## URI scheme support (`storage.rs`)
