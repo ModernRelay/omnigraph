@@ -55,6 +55,7 @@ Full diagram and concurrency model: [docs/architecture.md](docs/architecture.md)
 
 | Area | Read |
 |---|---|
+| **Architectural invariants & deny-list (read before any non-trivial proposal or review)** | **[docs/invariants.md](docs/invariants.md)** |
 | Architecture, L1/L2 framing, concurrency model | [docs/architecture.md](docs/architecture.md) |
 | Storage layout, `__manifest` schema, URI schemes, S3 env vars | [docs/storage.md](docs/storage.md) |
 | `.pg` schema language, types, constraints, annotations, migration planning | [docs/schema-language.md](docs/schema-language.md) |
@@ -83,7 +84,7 @@ Full diagram and concurrency model: [docs/architecture.md](docs/architecture.md)
 
 ## Always-on rules (load these into your working memory)
 
-These invariants need to be in scope on every change — they're the ones that quietly break if forgotten.
+These invariants need to be in scope on every change — they're the ones that quietly break if forgotten. The full architectural invariants and deny-list live in [docs/invariants.md](docs/invariants.md); §IX (deny-list) is the fastest first-pass when reviewing any change.
 
 1. **`__manifest` is the atomic-publish boundary.** Multi-dataset commits flip via a single `ManifestBatchPublisher` write. Don't introduce code paths that publish per sub-table outside the batch publisher — you'll lose snapshot isolation across tables.
 2. **`nearest($x.vec, $q)` requires a `LIMIT`.** The compiler enforces it, but if you're touching the query lowering or executor, don't break this rule. ANN without a limit is unbounded.
@@ -95,6 +96,29 @@ These invariants need to be in scope on every change — they're the ones that q
 8. **Mutations are atomic at the manifest commit boundary.** Multi-statement `change` queries publish one commit. Don't commit per-statement.
 9. **Indexes are built on the branch head, not on a snapshot.** Reads always see the current index state. Lazy fork: a branch that hasn't mutated a sub-table reuses the source's index until the first write.
 10. **Stable type IDs survive renames.** Schema migration uses `stable_type_id` (kind+name hashed at first sight). Don't mint new IDs on rename.
+
+### Deny-list (fast-pass review filter — full reasoning in [docs/invariants.md §IX](docs/invariants.md))
+
+If a proposal fits one of these, the burden is on the proposer to justify why this case is the exception:
+
+- Synchronous-inline index updates for indexes expensive to build (vector ANN, FTS) — use the reconciler pattern.
+- Custom WAL / transaction manager / buffer pool — Lance owns these.
+- Job queue for state derivable from manifest — reconciler pattern instead.
+- Per-feature lowering for shapes that share a structure (interfaces, wildcards, alternation) — use one mechanism.
+- Eager materialization of cross-products in multi-hop — factorize; flatten only when needed.
+- Ad-hoc IN-list filtering when SIP fits.
+- String-flattened SQL filter generation when structured pushdown is available.
+- In-process-only `Dataset` impls — `Send + Sync`, remote descriptors.
+- Cost-blind plan choice — lowering-order execution is not a planner.
+- Hidden statistics — if a metric matters for plan choice, it must be exposed through the trait surface.
+- Side-channels for query semantics — search modes, mutations, polymorphism are first-class IR concepts.
+- Discarding rank in retrieval — score and rank propagate as columns.
+- State that drifts from the manifest — derive from observable state.
+- Cloud-only correctness fixes — correctness is always OSS.
+- Forking the codebase for Cloud — trait-extension only.
+- Hand-rolling something Lance already does — check the spec first.
+- Mutating in place state that should be immutable (Lance fragments, index segments) — new segments instead.
+- Silent failures — OOM, timeout, partial result must all be surfaced and bounded.
 
 ---
 
@@ -171,6 +195,8 @@ omnigraph policy explain --actor act-alice --action change --branch main
 ## Maintenance contract for agents
 
 When you change something user-visible, **update the relevant `docs/<area>.md` in the same change**. Pointers from this file to that doc must keep working — CI enforces cross-link integrity via `scripts/check-agents-md.sh`.
+
+When proposing or reviewing a non-trivial change, walk [docs/invariants.md](docs/invariants.md) — at minimum the §IX deny-list and §X review checklist. Add to the deny-list when a new anti-pattern surfaces; relaxing an invariant requires the same review process as code.
 
 Rules:
 
