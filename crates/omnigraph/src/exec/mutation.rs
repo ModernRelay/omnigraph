@@ -712,6 +712,15 @@ impl Omnigraph {
 
             let batch = build_insert_batch(&schema, &id, &resolved, &blob_props)?;
             crate::loader::validate_value_constraints(&batch, node_type)?;
+            crate::loader::validate_enum_constraints(&batch, &node_type.properties, type_name)?;
+            let unique_props = crate::loader::unique_property_names_for_node(node_type);
+            if !unique_props.is_empty() {
+                crate::loader::enforce_unique_constraints_intra_batch(
+                    &batch,
+                    type_name,
+                    &unique_props,
+                )?;
+            }
             let has_key = node_type.key_property().is_some();
             let (state, table_branch) = if has_key {
                 self.upsert_batch(type_name, true, schema, batch).await?
@@ -741,7 +750,26 @@ impl Omnigraph {
 
             let batch = build_insert_batch(&schema, &id, &resolved, &blob_props)?;
             validate_edge_insert_endpoints(self, type_name, &resolved).await?;
+            crate::loader::validate_enum_constraints(&batch, &edge_type.properties, type_name)?;
+            let unique_props = crate::loader::unique_property_names_for_edge(edge_type);
+            if !unique_props.is_empty() {
+                crate::loader::enforce_unique_constraints_intra_batch(
+                    &batch,
+                    type_name,
+                    &unique_props,
+                )?;
+            }
+            let active_branch = self.active_branch().map(str::to_string);
             let (state, table_branch) = self.append_batch(type_name, false, schema, batch).await?;
+
+            crate::loader::validate_edge_cardinality(
+                self,
+                active_branch.as_deref(),
+                type_name,
+                state.version,
+                table_branch.as_deref(),
+            )
+            .await?;
 
             let table_key = format!("edge:{}", type_name);
             self.commit_updates(&[crate::db::SubTableUpdate {
@@ -885,7 +913,17 @@ impl Omnigraph {
             resolved.insert(a.property.clone(), resolve_expr_value(&a.value, params)?);
         }
         let updated = apply_assignments(&schema, &matched, &resolved, &blob_props)?;
-        crate::loader::validate_value_constraints(&updated, &self.catalog().node_types[type_name])?;
+        let node_type = &self.catalog().node_types[type_name];
+        crate::loader::validate_value_constraints(&updated, node_type)?;
+        crate::loader::validate_enum_constraints(&updated, &node_type.properties, type_name)?;
+        let unique_props = crate::loader::unique_property_names_for_node(node_type);
+        if !unique_props.is_empty() {
+            crate::loader::enforce_unique_constraints_intra_batch(
+                &updated,
+                type_name,
+                &unique_props,
+            )?;
+        }
 
         // Re-open for merge_insert (scan consumed the dataset;
         // version guard was already applied by open_for_mutation above)

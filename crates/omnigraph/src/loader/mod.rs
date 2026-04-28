@@ -343,6 +343,11 @@ async fn load_jsonl_reader<R: BufRead>(
         let node_type = &catalog.node_types[type_name];
         let batch = build_node_batch(node_type, rows)?;
         validate_value_constraints(&batch, node_type)?;
+        validate_enum_constraints(&batch, &node_type.properties, type_name)?;
+        let unique_props = unique_property_names_for_node(node_type);
+        if !unique_props.is_empty() {
+            enforce_unique_constraints_intra_batch(&batch, type_name, &unique_props)?;
+        }
         let loaded_count = batch.num_rows();
         let table_key = format!("node:{}", type_name);
         snapshot
@@ -416,6 +421,11 @@ async fn load_jsonl_reader<R: BufRead>(
     for (edge_name, rows) in &edge_rows {
         let edge_type = &catalog.edge_types[edge_name];
         let batch = build_edge_batch(edge_type, rows)?;
+        validate_enum_constraints(&batch, &edge_type.properties, edge_name)?;
+        let unique_props = unique_property_names_for_edge(edge_type);
+        if !unique_props.is_empty() {
+            enforce_unique_constraints_intra_batch(&batch, edge_name, &unique_props)?;
+        }
         let loaded_count = batch.num_rows();
         let table_key = format!("edge:{}", edge_name);
         snapshot
@@ -1177,6 +1187,183 @@ pub(crate) fn validate_value_constraints(
     Ok(())
 }
 
+/// Validate that every enum-typed property in `properties` only contains values
+/// from its declared enum value set. Operates on a single `RecordBatch` so it
+/// can be called from any write path that already holds a batch.
+///
+/// Scalar string enums are checked directly. List-of-enum properties are
+/// checked element-by-element across the underlying string values.
+pub(crate) fn validate_enum_constraints(
+    batch: &RecordBatch,
+    properties: &HashMap<String, omnigraph_compiler::types::PropType>,
+    type_name: &str,
+) -> Result<()> {
+    use arrow_array::{Array, ListArray};
+
+    for (prop_name, prop_type) in properties {
+        let Some(allowed) = prop_type.enum_values.as_ref() else {
+            continue;
+        };
+        let Some(col) = batch.column_by_name(prop_name) else {
+            continue;
+        };
+        if prop_type.list {
+            let Some(list_col) = col.as_any().downcast_ref::<ListArray>() else {
+                continue;
+            };
+            for row in 0..list_col.len() {
+                if list_col.is_null(row) {
+                    continue;
+                }
+                let item_arr = list_col.value(row);
+                let Some(str_arr) = item_arr.as_any().downcast_ref::<StringArray>() else {
+                    continue;
+                };
+                for i in 0..str_arr.len() {
+                    if str_arr.is_null(i) {
+                        continue;
+                    }
+                    let val = str_arr.value(i);
+                    if !allowed.iter().any(|a| a.as_str() == val) {
+                        return Err(OmniError::manifest(format!(
+                            "invalid enum value '{}' for {}.{} (expected: {})",
+                            val,
+                            type_name,
+                            prop_name,
+                            allowed.join(", ")
+                        )));
+                    }
+                }
+            }
+        } else if let Some(str_col) = col.as_any().downcast_ref::<StringArray>() {
+            for row in 0..str_col.len() {
+                if str_col.is_null(row) {
+                    continue;
+                }
+                let val = str_col.value(row);
+                if !allowed.iter().any(|a| a.as_str() == val) {
+                    return Err(OmniError::manifest(format!(
+                        "invalid enum value '{}' for {}.{} (expected: {})",
+                        val,
+                        type_name,
+                        prop_name,
+                        allowed.join(", ")
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Detect duplicate values within a single `RecordBatch` for any of the named
+/// `unique_properties`. Returns an error on the first duplicate found.
+///
+/// Note: this only catches duplicates *within* the batch. Cross-batch
+/// uniqueness against already-committed rows is not enforced here — that
+/// requires a dataset scan and is tracked separately.
+pub(crate) fn enforce_unique_constraints_intra_batch(
+    batch: &RecordBatch,
+    type_name: &str,
+    unique_properties: &[String],
+) -> Result<()> {
+    for property in unique_properties {
+        let Some(col_idx) = batch.schema().index_of(property).ok() else {
+            continue;
+        };
+        let arr = batch.column(col_idx);
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        for row in 0..batch.num_rows() {
+            let Some(value) = scalar_to_string(arr, row) else {
+                continue;
+            };
+            if let Some(prev_row) = seen.insert(value.clone(), row) {
+                return Err(OmniError::manifest(format!(
+                    "@unique violation on {}.{}: value '{}' appears in rows {} and {}",
+                    type_name, property, value, prev_row, row
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reduce a single Arrow scalar at (`array`, `row`) to a `String` for
+/// uniqueness comparison. Returns `None` for null values (nulls are exempt
+/// from uniqueness in standard SQL semantics).
+fn scalar_to_string(array: &ArrayRef, row: usize) -> Option<String> {
+    use arrow_array::Array;
+    if array.is_null(row) {
+        return None;
+    }
+    if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
+        return Some(a.value(row).to_string());
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
+        return Some(a.value(row).to_string());
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
+        return Some(a.value(row).to_string());
+    }
+    if let Some(a) = array.as_any().downcast_ref::<UInt32Array>() {
+        return Some(a.value(row).to_string());
+    }
+    if let Some(a) = array.as_any().downcast_ref::<UInt64Array>() {
+        return Some(a.value(row).to_string());
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Float32Array>() {
+        return Some(a.value(row).to_string());
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
+        return Some(a.value(row).to_string());
+    }
+    if let Some(a) = array.as_any().downcast_ref::<BooleanArray>() {
+        return Some(a.value(row).to_string());
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Date32Array>() {
+        return Some(a.value(row).to_string());
+    }
+    if let Some(a) = array.as_any().downcast_ref::<Date64Array>() {
+        return Some(a.value(row).to_string());
+    }
+    None
+}
+
+/// Build the flat list of property names that must be checked for uniqueness
+/// on a node type. Includes both `@unique` properties (from
+/// `NodeType.unique_constraints`) and the `@key` (which implies uniqueness).
+pub(crate) fn unique_property_names_for_node(
+    node_type: &omnigraph_compiler::catalog::NodeType,
+) -> Vec<String> {
+    let mut props: Vec<String> = node_type
+        .unique_constraints
+        .iter()
+        .flatten()
+        .cloned()
+        .collect();
+    if let Some(key) = &node_type.key {
+        props.extend(key.iter().cloned());
+    }
+    props.sort();
+    props.dedup();
+    props
+}
+
+/// Same as [`unique_property_names_for_node`] but for an edge type.
+pub(crate) fn unique_property_names_for_edge(
+    edge_type: &omnigraph_compiler::catalog::EdgeType,
+) -> Vec<String> {
+    let mut props: Vec<String> = edge_type
+        .unique_constraints
+        .iter()
+        .flatten()
+        .cloned()
+        .collect();
+    props.sort();
+    props.dedup();
+    props
+}
+
 fn extract_numeric_value(col: &ArrayRef, row: usize) -> Option<f64> {
     use arrow_array::{
         Array, Float32Array, Float64Array, Int32Array, Int64Array, UInt32Array, UInt64Array,
@@ -1212,7 +1399,7 @@ fn literal_value_to_f64(v: &omnigraph_compiler::catalog::LiteralValue) -> f64 {
 
 // ─── Edge cardinality validation ─────────────────────────────────────────────
 
-async fn validate_edge_cardinality(
+pub(crate) async fn validate_edge_cardinality(
     db: &crate::db::Omnigraph,
     branch: Option<&str>,
     edge_name: &str,
