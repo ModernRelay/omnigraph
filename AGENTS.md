@@ -6,11 +6,13 @@ This file is the always-on map for AI coding agents (Claude Code, Codex, Cursor,
 >
 > 1. **[docs/invariants.md](docs/invariants.md)** — the architectural invariants and §IX deny-list. Apply to every PR, not only architecture work.
 > 2. **[docs/lance.md](docs/lance.md)** — the curated index of upstream Lance docs. **Consult it before every task** to identify which Lance pages are relevant to what you're about to do, then fetch those upstream URLs before grepping our code or guessing. Lance is the substrate; behavior is documented there, not here.
+> 3. **[docs/testing.md](docs/testing.md)** — the test-coverage map. **Walk the before-every-task checklist** to identify what tests already cover the area you're changing, run them as a clean baseline before editing, plan your new test up front, and reuse the existing helpers / fixtures.
 >
-> Tools that support `@`-imports (Claude Code) auto-include both files via the imports below. Other agents (Codex, Cursor, Cline, …) must open them explicitly at the start of each session.
+> Tools that support `@`-imports (Claude Code) auto-include all three files via the imports below. Other agents (Codex, Cursor, Cline, …) must open them explicitly at the start of each session.
 >
 > @docs/invariants.md
 > @docs/lance.md
+> @docs/testing.md
 
 `CLAUDE.md` is a symlink to this file — there is exactly one source of truth. Edit `AGENTS.md`.
 
@@ -67,6 +69,7 @@ Full diagram and concurrency model: [docs/architecture.md](docs/architecture.md)
 |---|---|
 | **Architectural invariants & deny-list (read before any non-trivial proposal or review)** | **[docs/invariants.md](docs/invariants.md)** |
 | **Lance docs index — fetch upstream Lance docs by problem domain** | **[docs/lance.md](docs/lance.md)** |
+| **Test coverage map — what's covered, what helpers to reuse, before-every-task checklist** | **[docs/testing.md](docs/testing.md)** |
 | Architecture, L1/L2 framing, concurrency model | [docs/architecture.md](docs/architecture.md) |
 | Storage layout, `__manifest` schema, URI schemes, S3 env vars | [docs/storage.md](docs/storage.md) |
 | `.pg` schema language, types, constraints, annotations, migration planning | [docs/schema-language.md](docs/schema-language.md) |
