@@ -48,6 +48,55 @@ Adding a new on-disk shape change is one constant bump (`INTERNAL_MANIFEST_SCHEM
 | v1 (implicit, pre-stamp) | `__manifest.object_id` had no PK annotation; publisher had no row-level CAS protection. |
 | v2 | `__manifest.object_id` carries `lance-schema:unenforced-primary-key=true`; row-level CAS engaged. Stamped as `omnigraph:internal_schema_version=2`. |
 
+## On-disk layout
+
+A repo on disk is a directory tree of Lance datasets. Each dataset follows the standard Lance layout (`_versions/`, `data/`, `_indices/`, `_refs/`); OmniGraph adds the multi-dataset coordination by keeping `__manifest/` alongside the per-type datasets.
+
+```mermaid
+flowchart TB
+    classDef l1 fill:#fef3e8,stroke:#c46900,color:#000
+    classDef l2 fill:#e8f4fd,stroke:#1e6aa8,color:#000
+
+    repo["repo URI<br/>file:// or s3://bucket/prefix"]:::l2
+
+    manifest["__manifest/<br/>L2 catalog of sub-tables"]:::l2
+    nodes["nodes/{fnv1a64-hex}/<br/>one dataset per node type"]:::l2
+    edges["edges/{fnv1a64-hex}/<br/>one dataset per edge type"]:::l2
+    cgraph["_graph_commits.lance/<br/>_graph_commit_actors.lance/"]:::l2
+    runs["_graph_runs.lance/<br/>_graph_run_actors.lance/"]:::l2
+    refs["_refs/branches/{name}.json<br/>graph-level branches"]:::l2
+
+    repo --> manifest
+    repo --> nodes
+    repo --> edges
+    repo --> cgraph
+    repo --> runs
+    repo --> refs
+
+    subgraph dataset[Inside each Lance dataset — L1]
+        ds_v["_versions/{n}.manifest<br/>per-dataset versions"]:::l1
+        ds_data["data/<br/>fragment files (Arrow IPC)"]:::l1
+        ds_idx["_indices/{uuid}/<br/>BTREE · Inverted FTS · IVF/HNSW"]:::l1
+        ds_refs["_refs/<br/>per-dataset Lance branches/tags"]:::l1
+        ds_tx["_transactions/<br/>commit transaction logs"]:::l1
+    end
+
+    nodes -.-> dataset
+    edges -.-> dataset
+    manifest -.-> dataset
+```
+
+**What's where:**
+
+- **Repo root** is one directory (or S3 prefix). Everything below is part of one OmniGraph repo.
+- **`__manifest/`** is a Lance dataset whose rows describe which sub-table version is published at which graph-branch. Reading a snapshot starts here.
+- **`nodes/`** and **`edges/`** are sibling directories holding one Lance dataset per declared type. Names are `fnv1a64-hex` of the type name to keep paths fixed-length and case-safe.
+- **`_graph_commits.lance` / `_graph_runs.lance`** are L2 datasets that record the graph-level commit DAG and run registry respectively (each has a paired `*_actors.lance` for the actor map).
+- **`_refs/branches/{name}.json`** is graph-level branch metadata — pointers from a branch name to the manifest version it heads.
+- **Inside each Lance dataset** (orange): the standard Lance directory layout. `_versions/{n}.manifest` records every commit; `data/` holds the actual Arrow fragments; `_indices/{uuid}/` holds index segments with their own `fragment_bitmap` for partial coverage; `_refs/` holds Lance-native per-dataset branches and tags.
+
+The split — L2 owns the cross-dataset catalog; L1 owns the per-dataset internals — means that schema work (which adds or removes datasets) updates `__manifest`, while data work (which adds fragments) updates `_versions/` inside the affected dataset and then bumps `__manifest`.
+
 ## URI scheme support (`storage.rs`)
 
 | Scheme | Backend | Notes |
