@@ -262,8 +262,9 @@ async fn plan_schema_for_property_type_narrowing_is_not_supported() {
 async fn apply_schema_renames_node_type_via_rename_from_and_preserves_rows() {
     // Covers the stable-type-id contract: renaming a type preserves the
     // underlying Lance dataset (by stable id), so existing rows survive the
-    // rename. This is the "supported" half of the destructive-vs-supported
-    // boundary that the rejections above cover.
+    // rename and become queryable under the new table key. This is the
+    // "supported" half of the destructive-vs-supported boundary that the
+    // rejections above cover.
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
     let people_before = count_rows(&db, "node:Person").await;
@@ -272,8 +273,10 @@ async fn apply_schema_renames_node_type_via_rename_from_and_preserves_rows() {
         "fixture should seed Person rows for this test to be meaningful"
     );
 
+    // Rename Person -> Human (and the keying property name -> full_name).
+    // Edges that referenced Person must update to Human in the same migration.
     let desired = r#"
-node Person @rename_from("Person") {
+node Human @rename_from("Person") {
     full_name: String @key @rename_from("name")
     age: I32?
 }
@@ -282,25 +285,53 @@ node Company {
     name: String @key
 }
 
-edge Knows: Person -> Person {
+edge Knows: Human -> Human {
     since: Date?
 }
 
-edge WorksAt: Person -> Company
+edge WorksAt: Human -> Company
 "#;
 
     let result = db.apply_schema(desired).await.unwrap();
     assert!(result.supported && result.applied);
-    assert!(result.steps.iter().any(|step| matches!(
-        step,
-        SchemaMigrationStep::RenameProperty {
-            type_kind: SchemaTypeKind::Node,
-            type_name,
-            from,
-            to,
-        } if type_name == "Person" && from == "name" && to == "full_name"
-    )));
 
-    // Rows survive the property rename.
-    assert_eq!(count_rows(&db, "node:Person").await, people_before);
+    // Type rename is emitted as a RenameType step.
+    assert!(
+        result.steps.iter().any(|step| matches!(
+            step,
+            SchemaMigrationStep::RenameType {
+                type_kind: SchemaTypeKind::Node,
+                from,
+                to,
+            } if from == "Person" && to == "Human"
+        )),
+        "expected RenameType Person -> Human in {:?}",
+        result.steps
+    );
+    // Property rename rides along under the new type name.
+    assert!(
+        result.steps.iter().any(|step| matches!(
+            step,
+            SchemaMigrationStep::RenameProperty {
+                type_kind: SchemaTypeKind::Node,
+                type_name,
+                from,
+                to,
+            } if type_name == "Human" && from == "name" && to == "full_name"
+        )),
+        "expected RenameProperty name -> full_name on Human in {:?}",
+        result.steps
+    );
+
+    // Rows survive: table key now resolves under the new type name and the
+    // old key is gone.
+    assert_eq!(count_rows(&db, "node:Human").await, people_before);
+    assert!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .entry("node:Person")
+            .is_none(),
+        "old node:Person table key should be unmapped after rename"
+    );
 }
