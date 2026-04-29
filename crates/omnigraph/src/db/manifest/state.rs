@@ -42,8 +42,20 @@ struct ManifestScan {
 }
 
 pub(super) fn manifest_schema() -> SchemaRef {
+    // `object_id` is the merge-insert join key in the publisher; marking it as
+    // Lance's unenforced primary key engages row-level CAS at commit time, so
+    // two concurrent writers that try to land the same `object_id` row are
+    // detected by Lance via bloom-filter intersection (see
+    // `.context/merge-insert-cas-granularity.md`). Without this metadata,
+    // Lance's conflict resolver would silently rebase both writers' new
+    // fragments and admit duplicate rows.
+    let object_id_metadata: HashMap<String, String> =
+        [("lance-schema:unenforced-primary-key", "true")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
     Arc::new(Schema::new(vec![
-        Field::new("object_id", DataType::Utf8, false),
+        Field::new("object_id", DataType::Utf8, false).with_metadata(object_id_metadata),
         Field::new("object_type", DataType::Utf8, false),
         Field::new("location", DataType::Utf8, true),
         Field::new("metadata", DataType::Utf8, true),

@@ -21,6 +21,7 @@ use std::sync::Arc;
 use arrow_array::RecordBatchIterator;
 use async_trait::async_trait;
 use lance::Dataset;
+use lance::Error as LanceError;
 use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
 use lance_namespace::NamespaceError;
 use lance_namespace::models::CreateTableVersionRequest;
@@ -29,6 +30,7 @@ use crate::error::{OmniError, Result};
 
 use super::layout::{open_manifest_dataset, tombstone_object_id, version_object_id};
 use super::metadata::parse_namespace_version_request;
+use super::migrations::migrate_internal_schema;
 use super::state::{
     manifest_rows_batch, manifest_schema, read_manifest_entries, read_registered_table_locations,
     read_tombstone_versions,
@@ -38,9 +40,20 @@ use super::{
     SubTableEntry, SubTableUpdate, TableRegistration, TableTombstone,
 };
 
+/// Bound on the publisher-level retry loop that wraps Lance's row-level CAS
+/// (`TooMuchWriteContention`). Lance's own `conflict_retries` is set to 0 in
+/// `merge_rows` because its auto-rebase is "transparent merge" semantics —
+/// wrong for an OCC contract — so retry is owned here instead, where each
+/// iteration re-runs `load_publish_state` and the expected-version pre-check.
+const PUBLISHER_RETRY_BUDGET: u32 = 5;
+
 #[async_trait]
 pub(super) trait ManifestBatchPublisher: Send + Sync {
-    async fn publish(&self, changes: &[ManifestChange]) -> Result<Dataset>;
+    async fn publish(
+        &self,
+        changes: &[ManifestChange],
+        expected_table_versions: &HashMap<String, u64>,
+    ) -> Result<Dataset>;
 }
 
 pub(super) struct GraphNamespacePublisher {
@@ -82,7 +95,11 @@ impl GraphNamespacePublisher {
         HashMap<(String, u64), SubTableEntry>,
         HashMap<(String, u64), ()>,
     )> {
-        let dataset = self.dataset().await?;
+        let mut dataset = self.dataset().await?;
+        // Run pending internal-schema migrations exactly once per publish on
+        // the open-for-write path; idempotent when the on-disk stamp already
+        // matches this binary. See `db/manifest/migrations.rs`.
+        migrate_internal_schema(&mut dataset).await?;
         let registered_tables = read_registered_table_locations(&dataset).await?;
         let existing_entries = read_manifest_entries(&dataset).await?;
         let existing_versions = existing_entries
@@ -279,6 +296,77 @@ impl GraphNamespacePublisher {
         )
     }
 
+    /// Reduce the loaded `(table_key, table_version) → entry` map and the
+    /// tombstone set to "latest non-tombstoned version per table" — the same
+    /// reduction performed by `read_manifest_state` on the visible snapshot.
+    /// Tombstoned tables fall back to their highest tombstone version so that
+    /// the resulting `actual` reported in `ExpectedVersionMismatch` is
+    /// meaningful even when the caller's expected table no longer exists.
+    fn latest_visible_per_table(
+        existing_versions: &HashMap<(String, u64), SubTableEntry>,
+        existing_tombstones: &HashMap<(String, u64), ()>,
+    ) -> HashMap<String, u64> {
+        let mut max_tombstones = HashMap::<String, u64>::new();
+        for (key, version) in existing_tombstones.keys() {
+            max_tombstones
+                .entry(key.clone())
+                .and_modify(|v| {
+                    if *version > *v {
+                        *v = *version;
+                    }
+                })
+                .or_insert(*version);
+        }
+
+        let mut latest = HashMap::<String, u64>::new();
+        for (key, version) in existing_versions.keys() {
+            let tombstoned = max_tombstones
+                .get(key)
+                .map(|t| *t >= *version)
+                .unwrap_or(false);
+            if tombstoned {
+                continue;
+            }
+            latest
+                .entry(key.clone())
+                .and_modify(|v| {
+                    if *version > *v {
+                        *v = *version;
+                    }
+                })
+                .or_insert(*version);
+        }
+
+        // For tables that have only tombstones (no visible entry), surface the
+        // tombstone version so callers see a non-zero `actual`.
+        for (key, tombstone) in &max_tombstones {
+            latest.entry(key.clone()).or_insert(*tombstone);
+        }
+
+        latest
+    }
+
+    /// Compare each caller-supplied expectation against the manifest's current
+    /// latest visible version per table. The first mismatch is returned as a
+    /// typed `ExpectedVersionMismatch` (`actual = 0` if the table isn't in the
+    /// manifest at all).
+    fn check_expected_table_versions(
+        latest_per_table: &HashMap<String, u64>,
+        expected: &HashMap<String, u64>,
+    ) -> Result<()> {
+        for (table_key, expected_version) in expected {
+            let actual = latest_per_table.get(table_key).copied().unwrap_or(0);
+            if actual != *expected_version {
+                return Err(OmniError::manifest_expected_version_mismatch(
+                    table_key.clone(),
+                    *expected_version,
+                    actual,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     async fn merge_rows(&self, dataset: Dataset, rows: Vec<PendingVersionRow>) -> Result<Dataset> {
         let batch = Self::pending_rows_to_batch(rows)?;
         let reader = RecordBatchIterator::new(vec![Ok(batch)], manifest_schema());
@@ -287,14 +375,18 @@ impl GraphNamespacePublisher {
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         merge_builder.when_matched(WhenMatched::UpdateAll);
         merge_builder.when_not_matched(WhenNotMatched::InsertAll);
-        merge_builder.conflict_retries(5);
+        // 0 here is intentional: Lance's built-in retry uses transparent rebase,
+        // which would let a concurrent writer's row land alongside ours and
+        // silently break the OCC contract on `__manifest`. Retries are owned by
+        // the publisher loop above, where each attempt re-runs the pre-check.
+        merge_builder.conflict_retries(0);
         merge_builder.use_index(false);
         let (new_dataset, _stats) = merge_builder
             .try_build()
             .map_err(|e| OmniError::Lance(e.to_string()))?
             .execute_reader(Box::new(reader))
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+            .map_err(map_lance_publish_error)?;
         Ok(Arc::try_unwrap(new_dataset).unwrap_or_else(|arc| (*arc).clone()))
     }
 
@@ -318,25 +410,90 @@ impl GraphNamespacePublisher {
                 }))
             })
             .collect::<Result<Vec<_>>>()?;
-        self.publish(&changes).await
+        self.publish(&changes, &HashMap::new()).await
     }
+}
+
+/// `Error::TooMuchWriteContention` from Lance's row-level CAS bubbles up here
+/// when a concurrent writer landed a row with the same `object_id` (the
+/// merge-insert join key, annotated as an unenforced primary key on
+/// `__manifest`). Translate it to a typed manifest conflict so callers can
+/// match without parsing strings; everything else is opaque storage.
+fn map_lance_publish_error(err: LanceError) -> OmniError {
+    if matches!(err, LanceError::TooMuchWriteContention { .. }) {
+        return OmniError::manifest_row_level_cas_contention(format!(
+            "manifest publish lost a row-level CAS race: {}",
+            err
+        ));
+    }
+    OmniError::Lance(err.to_string())
 }
 
 #[async_trait]
 impl ManifestBatchPublisher for GraphNamespacePublisher {
-    async fn publish(&self, changes: &[ManifestChange]) -> Result<Dataset> {
-        if changes.is_empty() {
+    async fn publish(
+        &self,
+        changes: &[ManifestChange],
+        expected_table_versions: &HashMap<String, u64>,
+    ) -> Result<Dataset> {
+        if changes.is_empty() && expected_table_versions.is_empty() {
             return self.dataset().await;
         }
 
-        let (dataset, known_tables, existing_versions, existing_tombstones) =
-            self.load_publish_state().await?;
-        let rows = Self::build_pending_rows(
-            changes,
-            &known_tables,
-            &existing_versions,
-            &existing_tombstones,
-        )?;
-        self.merge_rows(dataset, rows).await
+        for attempt in 0..=PUBLISHER_RETRY_BUDGET {
+            let (dataset, known_tables, existing_versions, existing_tombstones) =
+                self.load_publish_state().await?;
+
+            let latest_per_table =
+                Self::latest_visible_per_table(&existing_versions, &existing_tombstones);
+            // Pre-check on every attempt against freshly loaded state so a
+            // concurrent commit that broke the caller's expectation is
+            // surfaced as `ExpectedVersionMismatch` rather than retried.
+            Self::check_expected_table_versions(&latest_per_table, expected_table_versions)?;
+
+            if changes.is_empty() {
+                return Ok(dataset);
+            }
+
+            let rows = Self::build_pending_rows(
+                changes,
+                &known_tables,
+                &existing_versions,
+                &existing_tombstones,
+            )?;
+
+            match self.merge_rows(dataset, rows).await {
+                Ok(new_dataset) => return Ok(new_dataset),
+                Err(err) => {
+                    if attempt < PUBLISHER_RETRY_BUDGET && is_retryable_publish_conflict(&err) {
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
+        Err(OmniError::manifest_conflict(format!(
+            "manifest publish exhausted {} retries against concurrent writers",
+            PUBLISHER_RETRY_BUDGET
+        )))
     }
+}
+
+/// A retryable conflict here means: Lance's row-level CAS rejected our commit
+/// because someone else landed an `object_id` we were also inserting (mapped
+/// from `Error::TooMuchWriteContention` to
+/// `ManifestConflictDetails::RowLevelCasContention`). This is transparent
+/// contention; if the caller's `expected_table_versions` still holds against
+/// the new manifest state, we re-attempt. Other conflict variants (notably
+/// `ExpectedVersionMismatch`) propagate so the caller learns immediately.
+fn is_retryable_publish_conflict(err: &OmniError) -> bool {
+    matches!(
+        err,
+        OmniError::Manifest(m)
+            if matches!(
+                m.details,
+                Some(crate::error::ManifestConflictDetails::RowLevelCasContention)
+            )
+    )
 }

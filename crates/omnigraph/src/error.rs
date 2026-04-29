@@ -10,11 +10,31 @@ pub enum ManifestErrorKind {
     Internal,
 }
 
+/// Structured details for a manifest-level conflict. Set on the `details`
+/// field of `ManifestError` when callers need to match on the specific
+/// concurrency-control failure rather than parse a string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestConflictDetails {
+    /// A caller-supplied per-table expected version did not match the
+    /// manifest's current latest non-tombstoned version for that table.
+    ExpectedVersionMismatch {
+        table_key: String,
+        expected: u64,
+        actual: u64,
+    },
+    /// Lance's row-level CAS rejected the publish because a concurrent writer
+    /// landed a row with the same `object_id`. Distinct from
+    /// `ExpectedVersionMismatch`: the caller's expectations (if any) still
+    /// hold against the new manifest state, so the publisher will retry.
+    RowLevelCasContention,
+}
+
 #[derive(Debug, Clone, Error)]
 #[error("{message}")]
 pub struct ManifestError {
     pub kind: ManifestErrorKind,
     pub message: String,
+    pub details: Option<ManifestConflictDetails>,
 }
 
 impl ManifestError {
@@ -22,7 +42,13 @@ impl ManifestError {
         Self {
             kind,
             message: message.into(),
+            details: None,
         }
+    }
+
+    pub fn with_details(mut self, details: ManifestConflictDetails) -> Self {
+        self.details = Some(details);
+        self
     }
 }
 
@@ -76,5 +102,33 @@ impl OmniError {
 
     pub fn manifest_internal(message: impl Into<String>) -> Self {
         Self::Manifest(ManifestError::new(ManifestErrorKind::Internal, message))
+    }
+
+    pub fn manifest_expected_version_mismatch(
+        table_key: impl Into<String>,
+        expected: u64,
+        actual: u64,
+    ) -> Self {
+        let table_key = table_key.into();
+        let message = format!(
+            "stale view of '{}': expected manifest table version {} but current is {} — refresh and retry",
+            table_key, expected, actual
+        );
+        Self::Manifest(
+            ManifestError::new(ManifestErrorKind::Conflict, message).with_details(
+                ManifestConflictDetails::ExpectedVersionMismatch {
+                    table_key,
+                    expected,
+                    actual,
+                },
+            ),
+        )
+    }
+
+    pub fn manifest_row_level_cas_contention(message: impl Into<String>) -> Self {
+        Self::Manifest(
+            ManifestError::new(ManifestErrorKind::Conflict, message)
+                .with_details(ManifestConflictDetails::RowLevelCasContention),
+        )
     }
 }

@@ -6,7 +6,9 @@
 - `Lance(String)` — storage layer
 - `DataFusion(String)` — execution layer
 - `Io(io::Error)`
-- `Manifest(ManifestError { kind: BadRequest|NotFound|Conflict|Internal, … })`
+- `Manifest(ManifestError { kind: BadRequest|NotFound|Conflict|Internal, details: Option<ManifestConflictDetails>, … })`
+  - `ManifestConflictDetails::ExpectedVersionMismatch { table_key, expected, actual }` — caller's `expected_table_versions` did not match the manifest's current latest non-tombstoned version (set by `OmniError::manifest_expected_version_mismatch`).
+  - `ManifestConflictDetails::RowLevelCasContention` — Lance row-level CAS rejected the publish because a concurrent writer landed the same `object_id`. Retried internally by the publisher; only surfaces if the retry budget exhausts.
 - `MergeConflicts(Vec<MergeConflict>)`
 
 Compiler-side `NanoError` covers parse / catalog / type / storage / plan / execution / arrow / lance / IO / manifest / unique-constraint, each with structured spans (`SourceSpan { start, end }`) for ariadne-style diagnostics.
