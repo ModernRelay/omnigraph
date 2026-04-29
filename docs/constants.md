@@ -7,6 +7,7 @@
 | Run registry dir | `_graph_runs.lance` | `db/run_registry.rs` |
 | Run branch prefix | `__run__` | `db/run_registry.rs` |
 | Schema apply lock | `__schema_apply_lock__` | `db/mod.rs` |
+| Manifest publisher retry budget | `PUBLISHER_RETRY_BUDGET = 5` | `db/manifest/publisher.rs` |
 | Merge stage batch | `MERGE_STAGE_BATCH_ROWS = 8192` | `exec/merge.rs` |
 | Maintenance concurrency | `OMNIGRAPH_MAINTENANCE_CONCURRENCY=8` | `db/omnigraph/optimize.rs` |
 | Graph index cache size | `8` (LRU) | `runtime_cache.rs` |
