@@ -123,9 +123,20 @@ async fn cleanup_older_than_zero_preserves_head() {
 }
 
 #[tokio::test]
-async fn cleanup_then_optimize_succeed_in_sequence() {
+async fn cleanup_then_optimize_preserves_rows_and_table_remains_writable() {
+    // Cleanup destroys version history; the concern is that subsequent
+    // optimize on a freshly-cleaned table could trip over dropped fragment
+    // refs or stale manifests. Assert the sequence preserves row content,
+    // leaves head readable, and doesn't break a subsequent write.
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
+
+    let people_before = count_rows(&db, "node:Person").await;
+    let companies_before = count_rows(&db, "node:Company").await;
+    assert!(
+        people_before > 0 && companies_before > 0,
+        "fixture should seed both Person and Company rows"
+    );
 
     db.cleanup(CleanupPolicyOptions {
         keep_versions: Some(1),
@@ -134,4 +145,12 @@ async fn cleanup_then_optimize_succeed_in_sequence() {
     .await
     .unwrap();
     db.optimize().await.unwrap();
+
+    // Head is preserved through both ops.
+    assert_eq!(count_rows(&db, "node:Person").await, people_before);
+    assert_eq!(count_rows(&db, "node:Company").await, companies_before);
+
+    // Table is still writable after the cleanup+optimize sequence.
+    load_jsonl(&mut db, TEST_DATA, LoadMode::Merge).await.unwrap();
+    assert_eq!(count_rows(&db, "node:Person").await, people_before);
 }
