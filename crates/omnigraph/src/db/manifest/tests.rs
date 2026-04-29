@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
@@ -946,7 +947,11 @@ impl RecordingPublisher {
 
 #[async_trait]
 impl ManifestBatchPublisher for RecordingPublisher {
-    async fn publish(&self, changes: &[ManifestChange]) -> Result<Dataset> {
+    async fn publish(
+        &self,
+        changes: &[ManifestChange],
+        expected_table_versions: &HashMap<String, u64>,
+    ) -> Result<Dataset> {
         let requests: Vec<CreateTableVersionRequest> = changes
             .iter()
             .filter_map(|change| match change {
@@ -955,7 +960,7 @@ impl ManifestBatchPublisher for RecordingPublisher {
             })
             .collect();
         self.requests.lock().await.extend_from_slice(&requests);
-        self.inner.publish(changes).await
+        self.inner.publish(changes, expected_table_versions).await
     }
 }
 
@@ -963,7 +968,11 @@ struct FailingPublisher;
 
 #[async_trait]
 impl ManifestBatchPublisher for FailingPublisher {
-    async fn publish(&self, _changes: &[ManifestChange]) -> Result<Dataset> {
+    async fn publish(
+        &self,
+        _changes: &[ManifestChange],
+        _expected_table_versions: &HashMap<String, u64>,
+    ) -> Result<Dataset> {
         Err(OmniError::manifest(
             "injected batch publisher failure".to_string(),
         ))
@@ -1105,6 +1114,286 @@ async fn test_commit_failure_from_injected_batch_publisher_preserves_visible_sta
             .table_version,
         person_entry.table_version
     );
+}
+
+/// Drive Person to a fresh on-disk dataset version `v` (returns the new
+/// version number) and produce a `SubTableUpdate` ready to publish.
+async fn append_person_and_make_update(
+    uri: &str,
+    person_entry: &SubTableEntry,
+    name: &str,
+) -> SubTableUpdate {
+    let mut person_ds = Dataset::open(&format!("{}/{}", uri, person_entry.table_path))
+        .await
+        .unwrap();
+    let person_schema = Arc::new(person_ds.schema().into());
+    let row = RecordBatch::try_new(
+        Arc::clone(&person_schema),
+        vec![
+            Arc::new(StringArray::from(vec![format!("person-{name}")])),
+            Arc::new(StringArray::from(vec![Some(name.to_string())])),
+            Arc::new(Int32Array::from(vec![Some(30)])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(row)], person_schema);
+    person_ds.append(reader, None).await.unwrap();
+    let new_version = person_ds.version().version;
+    let version_metadata =
+        table_version_metadata_for_state(uri, &person_entry.table_path, None, new_version)
+            .await
+            .unwrap();
+    SubTableUpdate {
+        table_key: "node:Person".to_string(),
+        table_version: new_version,
+        table_branch: None,
+        row_count: 1,
+        version_metadata,
+    }
+}
+
+#[tokio::test]
+async fn test_commit_with_expected_accepts_matching_versions() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    let snap = mc.snapshot();
+    let person_entry = snap.entry("node:Person").unwrap().clone();
+
+    let update = append_person_and_make_update(uri, &person_entry, "Alice").await;
+    let mut expected = HashMap::new();
+    // After init, every table is at table_version=1 — assert that.
+    expected.insert("node:Person".to_string(), 1);
+    expected.insert("node:Company".to_string(), 1);
+
+    mc.commit_with_expected(&[update.clone()], &expected)
+        .await
+        .expect("matching expected versions should publish cleanly");
+
+    let after = mc.snapshot();
+    assert_eq!(
+        after.entry("node:Person").unwrap().table_version,
+        update.table_version
+    );
+}
+
+#[tokio::test]
+async fn test_commit_with_expected_rejects_stale_with_typed_details() {
+    use crate::error::ManifestConflictDetails;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    let snap = mc.snapshot();
+    let person_entry = snap.entry("node:Person").unwrap().clone();
+
+    // Writer A advances Person.
+    let update_a = append_person_and_make_update(uri, &person_entry, "Alice").await;
+    let advanced_version = update_a.table_version;
+    mc.commit(&[update_a]).await.unwrap();
+
+    // Writer B then tries to commit, asserting Person is still at v=1.
+    let update_b = append_person_and_make_update(uri, &person_entry, "Bob").await;
+    let mut stale_expected = HashMap::new();
+    stale_expected.insert("node:Person".to_string(), 1);
+
+    let err = mc
+        .commit_with_expected(&[update_b], &stale_expected)
+        .await
+        .expect_err("stale expected_table_versions should reject");
+
+    match err {
+        OmniError::Manifest(m) => match m.details {
+            Some(ManifestConflictDetails::ExpectedVersionMismatch {
+                table_key,
+                expected,
+                actual,
+            }) => {
+                assert_eq!(table_key, "node:Person");
+                assert_eq!(expected, 1);
+                assert_eq!(actual, advanced_version);
+            }
+            other => panic!("expected ExpectedVersionMismatch details, got {:?}", other),
+        },
+        other => panic!("expected OmniError::Manifest, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_commit_with_expected_catches_drift_on_untouched_table() {
+    use crate::error::ManifestConflictDetails;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    let snap = mc.snapshot();
+    let person_entry = snap.entry("node:Person").unwrap().clone();
+    let company_entry = snap.entry("node:Company").unwrap().clone();
+
+    // Writer A advances Company.
+    let mut company_ds = Dataset::open(&format!("{}/{}", uri, company_entry.table_path))
+        .await
+        .unwrap();
+    let company_schema = Arc::new(company_ds.schema().into());
+    let row = RecordBatch::try_new(
+        Arc::clone(&company_schema),
+        vec![
+            Arc::new(StringArray::from(vec!["company-1"])),
+            Arc::new(StringArray::from(vec!["Acme"])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(row)], company_schema);
+    company_ds.append(reader, None).await.unwrap();
+    let company_version = company_ds.version().version;
+    let company_metadata =
+        table_version_metadata_for_state(uri, &company_entry.table_path, None, company_version)
+            .await
+            .unwrap();
+    mc.commit(&[SubTableUpdate {
+        table_key: "node:Company".to_string(),
+        table_version: company_version,
+        table_branch: None,
+        row_count: 1,
+        version_metadata: company_metadata,
+    }])
+    .await
+    .unwrap();
+
+    // Writer B writes Person but asserts Company is still at v=1.
+    let update_person = append_person_and_make_update(uri, &person_entry, "Bob").await;
+    let mut expected = HashMap::new();
+    expected.insert("node:Company".to_string(), 1);
+
+    let err = mc
+        .commit_with_expected(&[update_person], &expected)
+        .await
+        .expect_err("drift on an untouched expected table should reject");
+
+    let OmniError::Manifest(m) = err else {
+        panic!("expected OmniError::Manifest");
+    };
+    match m.details {
+        Some(ManifestConflictDetails::ExpectedVersionMismatch {
+            ref table_key,
+            expected,
+            actual,
+        }) => {
+            assert_eq!(table_key, "node:Company");
+            assert_eq!(expected, 1);
+            assert_eq!(actual, company_version);
+        }
+        other => panic!("expected ExpectedVersionMismatch, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_commit_with_expected_unknown_table_reports_actual_zero() {
+    use crate::error::ManifestConflictDetails;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+
+    let mut expected = HashMap::new();
+    expected.insert("node:DoesNotExist".to_string(), 7);
+    let err = mc
+        .commit_with_expected(&[], &expected)
+        .await
+        .expect_err("unknown expected table should reject");
+
+    let OmniError::Manifest(m) = err else {
+        panic!("expected OmniError::Manifest");
+    };
+    match m.details {
+        Some(ManifestConflictDetails::ExpectedVersionMismatch {
+            table_key,
+            expected,
+            actual,
+        }) => {
+            assert_eq!(table_key, "node:DoesNotExist");
+            assert_eq!(expected, 7);
+            assert_eq!(actual, 0);
+        }
+        other => panic!("expected ExpectedVersionMismatch, got {:?}", other),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_concurrent_publish_with_overlapping_expected_versions_one_succeeds() {
+    use crate::error::ManifestConflictDetails;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+    let person_entry = mc.snapshot().entry("node:Person").unwrap().clone();
+
+    // Advance the Person dataset once so we have a real on-disk version 2 that
+    // both publishers can target. Both attempt to land the *same*
+    // `version:node:Person@v=2` row in `__manifest`, which is the row-level
+    // CAS conflict the publisher must detect: load_publish_state at the same
+    // baseline → pre-check passes for both → only one merge_insert can land
+    // the unique `object_id`.
+    let update = append_person_and_make_update(uri, &person_entry, "Alice").await;
+
+    let mut expected = HashMap::new();
+    expected.insert("node:Person".to_string(), 1);
+
+    let publisher_a = GraphNamespacePublisher::new(uri, None);
+    let publisher_b = GraphNamespacePublisher::new(uri, None);
+    let changes_a = vec![ManifestChange::Update(update.clone())];
+    let changes_b = vec![ManifestChange::Update(update)];
+    let expected_a = expected.clone();
+    let expected_b = expected;
+
+    let (res_a, res_b) = tokio::join!(
+        async { publisher_a.publish(&changes_a, &expected_a).await },
+        async { publisher_b.publish(&changes_b, &expected_b).await }
+    );
+
+    let (succeeded, err) = match (res_a, res_b) {
+        (Ok(_), Err(e)) => (1, e),
+        (Err(e), Ok(_)) => (1, e),
+        (Ok(_), Ok(_)) => panic!("both writers committed -- OCC failed"),
+        (Err(a), Err(b)) => panic!("both writers failed: {:?} / {:?}", a, b),
+    };
+    assert_eq!(succeeded, 1, "exactly one writer must succeed");
+
+    let OmniError::Manifest(m) = err else {
+        panic!("expected OmniError::Manifest, got {:?}", err);
+    };
+    // The losing writer surfaces either ExpectedVersionMismatch (its retry's
+    // pre-check observed the winner's advance) or a plain Conflict (Lance
+    // row-level CAS rejected, retry exhausted before the pre-check fired).
+    // Both are acceptable typed conflict signals; what matters is that the
+    // failure is not silent.
+    use crate::error::ManifestErrorKind;
+    assert!(
+        matches!(m.kind, ManifestErrorKind::Conflict),
+        "expected Conflict-kind manifest error, got {:?}: {}",
+        m.kind,
+        m.message,
+    );
+    if let Some(ManifestConflictDetails::ExpectedVersionMismatch {
+        ref table_key,
+        expected,
+        ..
+    }) = m.details
+    {
+        assert_eq!(table_key, "node:Person");
+        assert_eq!(expected, 1);
+    }
+
+    // Manifest must reflect exactly one new commit on Person at the requested
+    // version (no duplicate version rows).
+    let mc = ManifestCoordinator::open(uri).await.unwrap();
+    let entry = mc.snapshot().entry("node:Person").unwrap().clone();
+    assert!(entry.table_version > 1, "Person should have advanced past v=1");
 }
 
 #[test]

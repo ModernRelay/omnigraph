@@ -286,12 +286,43 @@ impl ManifestCoordinator {
         self.commit_changes(&changes).await
     }
 
+    /// Same as [`commit`], but with caller-supplied per-table expected
+    /// versions used for optimistic concurrency control. Each entry asserts
+    /// the manifest's current latest non-tombstoned `table_version` for that
+    /// `table_key` is exactly what the caller observed; mismatches surface
+    /// as `OmniError::Manifest` with `ManifestConflictDetails::ExpectedVersionMismatch`.
+    pub async fn commit_with_expected(
+        &mut self,
+        updates: &[SubTableUpdate],
+        expected_table_versions: &HashMap<String, u64>,
+    ) -> Result<u64> {
+        let changes = updates
+            .iter()
+            .cloned()
+            .map(ManifestChange::Update)
+            .collect::<Vec<_>>();
+        self.commit_changes_with_expected(&changes, expected_table_versions)
+            .await
+    }
+
     pub(crate) async fn commit_changes(&mut self, changes: &[ManifestChange]) -> Result<u64> {
-        if changes.is_empty() {
+        self.commit_changes_with_expected(changes, &HashMap::new())
+            .await
+    }
+
+    pub(crate) async fn commit_changes_with_expected(
+        &mut self,
+        changes: &[ManifestChange],
+        expected_table_versions: &HashMap<String, u64>,
+    ) -> Result<u64> {
+        if changes.is_empty() && expected_table_versions.is_empty() {
             return Ok(self.version());
         }
 
-        self.dataset = self.publisher.publish(changes).await?;
+        self.dataset = self
+            .publisher
+            .publish(changes, expected_table_versions)
+            .await?;
 
         self.known_state = read_manifest_state(&self.dataset).await?;
         Ok(self.version())
