@@ -95,16 +95,18 @@ sequenceDiagram
     participant client as Client
     participant og as Omnigraph::mutate<br/>(mutation.rs:511)
     participant cmp as omnigraph-compiler
+    participant runs as RunRegistry
     participant ts as table_store
     participant lance as Lance dataset
     participant mr as ManifestRepo<br/>(manifest.rs:280)
-    participant manifest as __manifest/
 
     client->>og: mutate(target, source, name, params)
     og->>cmp: parse + typecheck_query
     cmp-->>og: CheckedQuery (Mutation IR)
-    og->>og: resolve expression literals<br/>literal_to_typed_array(lit, type, n)
-    loop for each mutation statement
+    og->>runs: begin_run(target, op_hash)<br/>fork __run__<id> from target head
+    runs-->>og: RunRecord
+    loop for each mutation statement (on __run__<id>)
+        og->>og: resolve expression literals<br/>literal_to_typed_array(lit, type, n)
         alt insert
             og->>ts: append RecordBatches
             ts->>lance: WriteMode::Append → new fragment(s)
@@ -116,22 +118,30 @@ sequenceDiagram
             ts->>lance: merge_insert(WhenMatched::Delete)
         end
         lance-->>ts: new dataset version
-        ts-->>og: SubTableUpdate (key, version, row_count)
+        og->>mr: commit_updates(SubTableUpdate)<br/>per-statement commit on __run__<id>
+        mr-->>og: ack
     end
-    og->>mr: commit(updates)
-    mr->>manifest: append rows<br/>(table_version per sub-table)
-    manifest-->>mr: new graph-manifest version
-    mr-->>og: graph version
+    og->>og: OCC: target head unchanged since begin_run?
+    og->>og: publish_run(run_id)
+    alt fast path (target hasn't moved)
+        og->>mr: commit_updates_on_branch(target, updates)<br/>promote run snapshot
+    else merge path (target advanced)
+        og->>og: branch_merge_internal(__run__<id>, target)<br/>three-way merge
+    end
+    mr-->>og: new target snapshot
+    og->>runs: terminate_run(Published)
     og-->>client: MutationResult
 ```
 
 **Code paths:**
 
 - Entry: `Omnigraph::mutate` at `crates/omnigraph/src/exec/mutation.rs:511`
-- Actor-attributed variant: `Omnigraph::mutate_as` at `crates/omnigraph/src/exec/mutation.rs:522`
-- Manifest commit: `ManifestRepo::commit` at `crates/omnigraph/src/db/manifest.rs:280`
+- Per-mutation orchestration: `mutate_with_current_actor` at `crates/omnigraph/src/exec/mutation.rs:539`
+- Per-statement commit on the run-branch: `commit_updates` (called from `execute_insert` / `execute_update` / `execute_delete` in `crates/omnigraph/src/exec/mutation.rs`)
+- Run publish: `Omnigraph::publish_run` at `crates/omnigraph/src/db/omnigraph.rs:858`
+- Manifest commit primitive: `ManifestRepo::commit` at `crates/omnigraph/src/db/manifest.rs:280` (called from both per-statement `commit_updates` and the publish path)
 
-The whole mutation — every statement, every affected sub-table — publishes through one call to `ManifestRepo::commit`. That single append to `__manifest` is what gives multi-statement mutations their atomicity guarantee (per [`docs/invariants.md`](invariants.md) §VI.26).
+Multi-statement mutations don't get atomicity from a single final `commit` — they get it from the **run-branch + publish_run** pattern. Every mutation runs on a fresh `__run__<id>` branch (`begin_run`); each statement individually commits its sub-table updates to that run-branch. After all statements complete, an OCC pre-check verifies the target hasn't moved since the run started, then `publish_run` atomically promotes the run-branch into the target — either via the fast path (direct promotion if the target hasn't moved) or a three-way merge. That final publish is what gives multi-statement mutations their atomicity guarantee (per [`docs/invariants.md`](invariants.md) §VI.26). If anything fails mid-run, the run is failed and the run-branch is dropped without affecting the target. See [runs.md](runs.md) for the full run lifecycle.
 
 ## Bulk loader (`loader/mod.rs`)
 
