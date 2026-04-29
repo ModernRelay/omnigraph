@@ -225,7 +225,7 @@ Today, indexes are built explicitly via `ensure_indices`. Reads degrade graceful
 flowchart LR
     classDef l2 fill:#e8f4fd,stroke:#1e6aa8,color:#000
 
-    cli[omnigraph CLI<br/>13 cmd families]:::l2
+    cli[omnigraph CLI<br/>command families]:::l2
     srv_in[Axum HTTP<br/>REST + OpenAPI]:::l2
     auth[Bearer auth<br/>SHA-256 hashed tokens]:::l2
     pol[Cedar policy gate<br/>per request]:::l2
