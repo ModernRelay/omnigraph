@@ -1396,6 +1396,101 @@ async fn test_concurrent_publish_with_overlapping_expected_versions_one_succeeds
     assert!(entry.table_version > 1, "Person should have advanced past v=1");
 }
 
+#[tokio::test]
+async fn test_init_stamps_internal_schema_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    ManifestCoordinator::init(uri, &catalog).await.unwrap();
+
+    let ds = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(
+        super::migrations::read_stamp(&ds),
+        super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION,
+        "init should stamp the manifest at the current internal schema version",
+    );
+}
+
+#[tokio::test]
+async fn test_publish_migrates_pre_stamp_manifest_to_current_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+
+    // Simulate a v1 (pre-stamp) repo by removing the schema-level stamp on disk.
+    {
+        let mut ds = open_manifest_dataset(uri, None).await.unwrap();
+        ds.update_schema_metadata([(
+            "omnigraph:internal_schema_version".to_string(),
+            None::<String>,
+        )])
+        .await
+        .unwrap();
+        let post = open_manifest_dataset(uri, None).await.unwrap();
+        assert_eq!(
+            super::migrations::read_stamp(&post),
+            1,
+            "stamp removed ⇒ read_stamp falls back to v1",
+        );
+    }
+
+    // Publish a no-op (empty changes) but require state to be loaded by passing
+    // an expected_table_versions that matches the initial state. This forces
+    // the publisher's open-for-write path, which runs the migration.
+    let mut expected = HashMap::new();
+    expected.insert("node:Person".to_string(), 1);
+    GraphNamespacePublisher::new(uri, None)
+        .publish(&[], &expected)
+        .await
+        .unwrap();
+
+    let post = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(
+        super::migrations::read_stamp(&post),
+        super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION,
+        "publish on a v1 repo should leave the manifest stamped at the current version",
+    );
+
+    // Manifest should still serve correctly post-migration.
+    drop(mc);
+    let reopened = ManifestCoordinator::open(uri).await.unwrap();
+    assert!(reopened.snapshot().entry("node:Person").is_some());
+}
+
+#[tokio::test]
+async fn test_publish_rejects_manifest_stamped_at_future_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    ManifestCoordinator::init(uri, &catalog).await.unwrap();
+
+    // Stamp the manifest at a version higher than this binary knows about.
+    let future = super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION + 99;
+    {
+        let mut ds = open_manifest_dataset(uri, None).await.unwrap();
+        ds.update_schema_metadata([(
+            "omnigraph:internal_schema_version".to_string(),
+            Some(future.to_string()),
+        )])
+        .await
+        .unwrap();
+    }
+
+    let mut expected = HashMap::new();
+    expected.insert("node:Person".to_string(), 1);
+    let err = GraphNamespacePublisher::new(uri, None)
+        .publish(&[], &expected)
+        .await
+        .expect_err("future-stamped manifest should reject open-for-write");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("upgrade omnigraph") && msg.contains(&future.to_string()),
+        "expected forward-version refusal, got: {}",
+        msg,
+    );
+}
+
 #[test]
 fn manifest_column_helpers_return_error_for_bad_schema() {
     let batch = RecordBatch::try_new(

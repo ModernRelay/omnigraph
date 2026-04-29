@@ -12,6 +12,7 @@ use crate::error::{OmniError, Result};
 use super::TABLE_VERSION_MANAGEMENT_KEY;
 use super::layout::{manifest_uri, open_manifest_dataset, type_name_hash};
 use super::metadata::TableVersionMetadata;
+use super::migrations::stamp_current_version;
 use super::state::{
     ManifestState, SubTableEntry, entries_to_batch, manifest_schema, read_manifest_state,
 };
@@ -40,6 +41,7 @@ pub(super) async fn init_manifest_repo(
         .update_config([(TABLE_VERSION_MANAGEMENT_KEY, Some("true"))])
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
+    stamp_current_version(&mut dataset).await?;
 
     let known_state = read_manifest_state(&dataset).await?;
     Ok((dataset, known_state))

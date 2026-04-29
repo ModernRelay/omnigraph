@@ -10,6 +10,8 @@ use omnigraph_compiler::catalog::Catalog;
 mod layout;
 #[path = "manifest/metadata.rs"]
 mod metadata;
+#[path = "manifest/migrations.rs"]
+mod migrations;
 #[path = "manifest/namespace.rs"]
 mod namespace;
 #[path = "manifest/publisher.rs"]

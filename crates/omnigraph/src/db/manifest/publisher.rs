@@ -30,6 +30,7 @@ use crate::error::{OmniError, Result};
 
 use super::layout::{open_manifest_dataset, tombstone_object_id, version_object_id};
 use super::metadata::parse_namespace_version_request;
+use super::migrations::migrate_internal_schema;
 use super::state::{
     manifest_rows_batch, manifest_schema, read_manifest_entries, read_registered_table_locations,
     read_tombstone_versions,
@@ -94,7 +95,11 @@ impl GraphNamespacePublisher {
         HashMap<(String, u64), SubTableEntry>,
         HashMap<(String, u64), ()>,
     )> {
-        let dataset = self.dataset().await?;
+        let mut dataset = self.dataset().await?;
+        // Run pending internal-schema migrations exactly once per publish on
+        // the open-for-write path; idempotent when the on-disk stamp already
+        // matches this binary. See `db/manifest/migrations.rs`.
+        migrate_internal_schema(&mut dataset).await?;
         let registered_tables = read_registered_table_locations(&dataset).await?;
         let existing_entries = read_manifest_entries(&dataset).await?;
         let existing_versions = existing_entries
