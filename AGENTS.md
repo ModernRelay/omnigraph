@@ -96,6 +96,20 @@ Full diagram and concurrency model: [docs/architecture.md](docs/architecture.md)
 
 ---
 
+## First principle: minimize ongoing liability
+
+Every line of code, every conditional, every doc paragraph is a future maintenance cost. Pick patterns that contain the cost in *one* place, not scattered across many.
+
+- **One centralized detection point**, not heal hooks in every code path.
+- **One dispatcher / `match`-arm step**, not branch-on-shape in every consumer.
+- **One canonical shape after migration**, not forks on "old vs new" forever.
+- **Three similar lines** beats a premature abstraction. **A hypothetical future requirement** isn't a real one.
+- **Delete dead paths** when their last caller leaves. Don't keep them around as a "just in case".
+
+When evaluating a design, ask: *"what do these paths look like after 5 more changes like this?"* If the answer is "they fork everywhere", pick a shape that converges instead. The always-on rules below and the §IX deny-list in [docs/invariants.md](docs/invariants.md) are specific applications of this principle; when the rules are silent, fall back to it.
+
+---
+
 ## Always-on rules (load these into your working memory)
 
 These are architectural rules that need to be in scope on every change. They're framed at the level that survives renames and refactors — the deeper implementation specifics (function names, lock names, branch-prefix conventions, enforcement points) live in the per-area docs and may evolve. The full architectural invariants and deny-list are in [docs/invariants.md](docs/invariants.md); §IX (deny-list) is the fastest first-pass when reviewing any change.
