@@ -98,15 +98,21 @@ Full diagram and concurrency model: [docs/architecture.md](docs/architecture.md)
 
 ## First principle: minimize ongoing liability
 
-Every line of code, every conditional, every doc paragraph is a future maintenance cost. Pick patterns that contain the cost in *one* place, not scattered across many.
+Every decision — adding code, removing code, picking an abstraction, choosing a layer, writing a doc paragraph — carries an ongoing maintenance cost. Before any change, ask: **which option has the lower ongoing cost over time?** Not "shorter now," not "fastest to ship," but which leaves the codebase narrower in the long run.
 
-- **One centralized detection point**, not heal hooks in every code path.
-- **One dispatcher / `match`-arm step**, not branch-on-shape in every consumer.
-- **One canonical shape after migration**, not forks on "old vs new" forever.
-- **Three similar lines** beats a premature abstraction. **A hypothetical future requirement** isn't a real one.
-- **Delete dead paths** when their last caller leaves. Don't keep them around as a "just in case".
+This is a decision lens, not a code-size rule. It cuts both ways. Sometimes the lower-liability option is:
 
-When evaluating a design, ask: *"what do these paths look like after 5 more changes like this?"* If the answer is "they fork everywhere", pick a shape that converges instead. The always-on rules below and the §IX deny-list in [docs/invariants.md](docs/invariants.md) are specific applications of this principle; when the rules are silent, fall back to it.
+- **More code.** A centralized dispatcher costs more lines than an ad-hoc heal hook, but each future change adds a match arm instead of a new hook scattered through the engine.
+- **Less code.** Three similar lines that may diverge later cost less to maintain than a premature abstraction that has to be retrofitted every time a caller deviates.
+- **DRYing.** Two copies of business logic that must stay in sync are a perpetual drift risk.
+- **Duplication.** Two callers that look similar today but have independent evolution pressure shouldn't be wedged through a shared helper just because the lines match.
+- **Removal.** A "just in case" code path with no caller is pure surface area: tests for it, docs that mention it, future changes that have to consider it.
+- **Addition.** A migration framework, a typed error variant, a feature flag — each adds code now and lowers the cost of every future change in its surface.
+- **A new abstraction**, when the absence forces every consumer to re-derive the same logic. Or **flattening one**, when the abstraction has accumulated more special-cases than the code it replaced.
+
+When evaluating a design, ask: *"what does this look like after 5 more changes like it?"* If the answer is "this converges to one shape", cost is bounded. If it's "this forks every time", the option is mortgaging the future for present convenience — pick differently.
+
+The always-on rules below and the §IX deny-list in [docs/invariants.md](docs/invariants.md) are specific applications of this principle; when the rules are silent, fall back to it.
 
 ---
 
