@@ -17,10 +17,13 @@
 //!    primitive's behavior so a future change either (a) preserves it or
 //!    (b) consciously fixes it (and updates this test).
 
-use arrow_array::{Array, Int32Array, RecordBatch, StringArray};
+use arrow_array::{Array, Int32Array, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
+use futures::TryStreamExt;
+use lance::Dataset;
 use lance::dataset::{WhenMatched, WhenNotMatched};
-use omnigraph::table_store::TableStore;
+use lance_table::format::Fragment;
+use omnigraph::table_store::{StagedWrite, TableStore};
 use std::sync::Arc;
 
 fn person_schema() -> Arc<Schema> {
@@ -71,9 +74,9 @@ async fn stage_append_is_visible_via_scan_with_staged() {
         .await
         .unwrap();
 
-    // Stage a second row.
+    // Stage a second row. First call → empty prior_stages.
     let staged = store
-        .stage_append(&ds, person_batch(&[("bob", Some(25))]))
+        .stage_append(&ds, person_batch(&[("bob", Some(25))]), &[])
         .await
         .unwrap();
 
@@ -157,12 +160,233 @@ async fn count_rows_with_staged_matches_scan() {
         .await
         .unwrap();
     let staged = store
-        .stage_append(&ds, person_batch(&[("bob", Some(25)), ("carol", Some(40))]))
+        .stage_append(
+            &ds,
+            person_batch(&[("bob", Some(25)), ("carol", Some(40))]),
+            &[],
+        )
         .await
         .unwrap();
 
     let count = store
         .count_rows_with_staged(&ds, std::slice::from_ref(&staged), None)
+        .await
+        .unwrap();
+    assert_eq!(count, 3);
+}
+
+/// Two `stage_append` calls on the same dataset must produce
+/// non-overlapping `_rowid` ranges. Without `prior_stages` threading,
+/// both calls would assign IDs starting from `ds.manifest.next_row_id`,
+/// producing overlapping ranges that break read paths consulting the
+/// row-ID index (prefilter, vector search). With the slice threaded
+/// through, the second call offsets by the first call's row count.
+///
+/// This is what enables the engine's multi-statement `insert Knows ...;
+/// insert Knows ...` (multiple appends to the same edge table) under
+/// the D₂′ rule.
+#[tokio::test]
+async fn chained_stage_appends_have_distinct_row_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap());
+
+    let ds = TableStore::write_dataset(&uri, person_batch(&[("seed", Some(0))]))
+        .await
+        .unwrap();
+
+    let s1 = store
+        .stage_append(&ds, person_batch(&[("alice", Some(30))]), &[])
+        .await
+        .unwrap();
+    let s2 = store
+        .stage_append(
+            &ds,
+            person_batch(&[("bob", Some(25))]),
+            std::slice::from_ref(&s1),
+        )
+        .await
+        .unwrap();
+
+    // Scan with row IDs requested. If s1 and s2 had overlapping _rowid
+    // ranges, Lance's scanner would conflict (or surface duplicates) on
+    // the combined fragment list.
+    let staged = vec![s1, s2];
+    let batches = store
+        .scan_with_staged(&ds, &staged, None, None)
+        .await
+        .unwrap();
+    let ids = collect_ids(&batches);
+    assert_eq!(ids, vec!["alice", "bob", "seed"]);
+
+    // Project _rowid explicitly and assert all rows have distinct IDs.
+    let mut scanner = ds.scan();
+    scanner.with_row_id();
+    scanner.with_fragments(combine_for_scan(&ds, &staged));
+    let stream = scanner.try_into_stream().await.unwrap();
+    let projected: Vec<_> = stream.try_collect().await.unwrap();
+    let row_ids: std::collections::BTreeSet<u64> = projected
+        .iter()
+        .flat_map(|b| {
+            let arr = b
+                .column_by_name("_rowid")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+            (0..arr.len()).map(|i| arr.value(i)).collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        row_ids.len(),
+        3,
+        "all 3 rows (1 committed + 2 staged) should have distinct _rowid; \
+         overlap implies stage_append failed to offset by prior_stages"
+    );
+}
+
+/// Helper for the chained-append test: replicate the primitive's
+/// `combine_committed_with_staged` logic so the test can supply a custom
+/// scanner that requests `_rowid`. Kept inline here to avoid making the
+/// engine helper public.
+fn combine_for_scan(ds: &Dataset, staged: &[StagedWrite]) -> Vec<Fragment> {
+    let removed: std::collections::HashSet<u64> = staged
+        .iter()
+        .flat_map(|w| w.removed_fragment_ids.iter().copied())
+        .collect();
+    let mut combined: Vec<_> = ds
+        .manifest
+        .fragments
+        .iter()
+        .filter(|f| !removed.contains(&f.id))
+        .cloned()
+        .collect();
+    for s in staged {
+        combined.extend(s.new_fragments.iter().cloned());
+    }
+    combined
+}
+
+/// `stage_append` + `commit_staged` round-trip: after commit, the
+/// dataset's HEAD reflects the staged data and a fresh scan sees it.
+/// Validates that our pre-assigned `row_id_meta` doesn't break Lance's
+/// commit-time row-ID assignment (transaction.rs:2682).
+#[tokio::test]
+async fn stage_append_then_commit_persists_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap());
+
+    let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    let pre_version = ds.version().version;
+
+    let staged = store
+        .stage_append(&ds, person_batch(&[("bob", Some(25))]), &[])
+        .await
+        .unwrap();
+
+    let new_ds = store
+        .commit_staged(Arc::new(ds.clone()), staged.transaction)
+        .await
+        .unwrap();
+    assert!(
+        new_ds.version().version > pre_version,
+        "commit_staged must advance the dataset version"
+    );
+
+    // Reopen and confirm rows are visible at HEAD.
+    let reopened = Dataset::open(&uri).await.unwrap();
+    let batches = store.scan_batches(&reopened).await.unwrap();
+    assert_eq!(collect_ids(&batches), vec!["alice", "bob"]);
+}
+
+/// `stage_merge_insert` + `commit_staged` round-trip: after commit, the
+/// merged view (existing alice updated + new bob inserted) is visible.
+#[tokio::test]
+async fn stage_merge_insert_then_commit_persists_merged_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap());
+
+    let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+
+    let staged = store
+        .stage_merge_insert(
+            ds.clone(),
+            person_batch(&[("alice", Some(31)), ("bob", Some(25))]),
+            vec!["id".to_string()],
+            WhenMatched::UpdateAll,
+            WhenNotMatched::InsertAll,
+        )
+        .await
+        .unwrap();
+
+    store
+        .commit_staged(Arc::new(ds), staged.transaction)
+        .await
+        .unwrap();
+
+    let reopened = Dataset::open(&uri).await.unwrap();
+    let batches = store.scan_batches(&reopened).await.unwrap();
+    assert_eq!(collect_ids(&batches), vec!["alice", "bob"]);
+
+    // Confirm alice was updated to age=31, not duplicated.
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 2, "merge_insert must not duplicate the matched row");
+}
+
+/// Filter pushdown via `scan_with_staged`: a SQL filter applies across
+/// both committed and staged fragments. This validates the MR-794
+/// ticket's claim that Lance's `with_fragments` preserves pushdown
+/// behavior (per Lance tests `test_scalar_index_respects_fragment_list`
+/// etc.).
+#[tokio::test]
+async fn scan_with_staged_pushes_filter_through_committed_and_staged() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap());
+
+    // Committed: alice=30, carol=40
+    let ds = TableStore::write_dataset(
+        &uri,
+        person_batch(&[("alice", Some(30)), ("carol", Some(40))]),
+    )
+    .await
+    .unwrap();
+
+    // Staged: bob=25, dave=35
+    let staged = store
+        .stage_append(
+            &ds,
+            person_batch(&[("bob", Some(25)), ("dave", Some(35))]),
+            &[],
+        )
+        .await
+        .unwrap();
+
+    // Filter: age >= 30 → expect alice, carol, dave (not bob).
+    let batches = store
+        .scan_with_staged(
+            &ds,
+            std::slice::from_ref(&staged),
+            None,
+            Some("age >= 30"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(collect_ids(&batches), vec!["alice", "carol", "dave"]);
+
+    // Same filter as count: same arithmetic.
+    let count = store
+        .count_rows_with_staged(
+            &ds,
+            std::slice::from_ref(&staged),
+            Some("age >= 30".to_string()),
+        )
         .await
         .unwrap();
     assert_eq!(count, 3);

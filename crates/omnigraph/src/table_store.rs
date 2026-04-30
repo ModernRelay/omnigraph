@@ -564,19 +564,41 @@ impl TableStore {
     /// uncommitted Lance transaction plus the new fragments for
     /// read-your-writes.
     ///
-    /// On stable-row-id datasets we manually populate `row_id_meta` on the
-    /// cloned `new_fragments` we expose for `scan_with_staged`. Lance's
-    /// `InsertBuilder::execute_uncommitted` produces fragments with
-    /// `row_id_meta = None`; row IDs are normally assigned by
+    /// `prior_stages` is the slice of staged writes already accumulated
+    /// against the **same dataset** in the same query. Pass `&[]` for the
+    /// first call; pass the accumulated stages for subsequent calls. The
+    /// primitive uses this to offset row-ID assignment so chained
+    /// `stage_append` calls don't produce overlapping `_rowid` ranges.
+    /// Mirrors `scan_with_staged`'s `&[StagedWrite]` shape — the same
+    /// slice gets passed to both.
+    ///
+    /// On stable-row-id datasets we manually populate `row_id_meta` on
+    /// the cloned `new_fragments` we expose for `scan_with_staged`.
+    /// Lance's `InsertBuilder::execute_uncommitted` produces fragments
+    /// with `row_id_meta = None`; row IDs are normally assigned by
     /// `Transaction::assign_row_ids` during commit. Because
-    /// `scan_with_staged` reads the staged fragments *before* commit, the
-    /// scanner trips on a stable-row-id dataset (`Error::internal("Missing
-    /// row id meta")` from `dataset/rowids.rs:22`). The transaction's
-    /// internal fragment copy stays untouched — Lance assigns IDs there
-    /// independently at commit time, and the two ID assignments don't
-    /// have to agree because no caller threads `_rowid` from the staged
-    /// scan into the commit path.
-    pub async fn stage_append(&self, ds: &Dataset, batch: RecordBatch) -> Result<StagedWrite> {
+    /// `scan_with_staged` reads the staged fragments *before* commit,
+    /// the scanner trips on a stable-row-id dataset
+    /// (`Error::internal("Missing row id meta")` from
+    /// `dataset/rowids.rs:22`). The transaction's internal fragment copy
+    /// stays untouched — Lance assigns IDs there independently at commit
+    /// time, and the two ID assignments don't have to agree because no
+    /// caller threads `_rowid` from the staged scan into the commit
+    /// path.
+    ///
+    /// **Contract: `prior_stages` must contain only previous
+    /// `stage_append` results against the same dataset.** Mixing
+    /// stage_merge_insert into `prior_stages` would over-count because
+    /// merge_insert's `new_fragments` include rewrites that don't add
+    /// rows. The engine's parse-time D₂′ check (per touched table: all
+    /// stage_append OR exactly one stage_merge_insert) guarantees this
+    /// upstream; on the primitive layer it's the caller's responsibility.
+    pub async fn stage_append(
+        &self,
+        ds: &Dataset,
+        batch: RecordBatch,
+        prior_stages: &[StagedWrite],
+    ) -> Result<StagedWrite> {
         if batch.num_rows() == 0 {
             return Err(OmniError::manifest_internal(
                 "stage_append called with empty batch".to_string(),
@@ -603,7 +625,9 @@ impl TableStore {
             }
         };
         if ds.manifest.uses_stable_row_ids() {
-            assign_row_id_meta(&mut new_fragments, ds.manifest.next_row_id)?;
+            let prior_rows = prior_stages_row_count(prior_stages)?;
+            let start_row_id = ds.manifest.next_row_id + prior_rows;
+            assign_row_id_meta(&mut new_fragments, start_row_id)?;
         }
         Ok(StagedWrite {
             transaction,
@@ -936,6 +960,29 @@ impl TableStore {
 /// OR exactly one stage_merge_insert" at parse time (D₂′ in
 /// `exec/mutation.rs`) so this primitive's caller never chains merges.
 /// See `stage_merge_insert` for the full contract.
+/// Sum `physical_rows` across all fragments in the supplied stages.
+/// Used by `stage_append` to compute the row-ID offset for chained
+/// `stage_append` calls against the same dataset.
+///
+/// Assumes `prior_stages` contains only `stage_append` results — see
+/// `stage_append`'s D₂′ contract. For `stage_merge_insert` results the
+/// `new_fragments` include rewrites that don't add new rows, so this
+/// would over-count.
+fn prior_stages_row_count(prior_stages: &[StagedWrite]) -> Result<u64> {
+    let mut total: u64 = 0;
+    for stage in prior_stages {
+        for fragment in &stage.new_fragments {
+            let physical_rows = fragment.physical_rows.ok_or_else(|| {
+                OmniError::manifest_internal(
+                    "prior_stages_row_count: fragment is missing physical_rows".to_string(),
+                )
+            })? as u64;
+            total += physical_rows;
+        }
+    }
+    Ok(total)
+}
+
 /// Assign sequential row IDs to fragments that lack them, starting from
 /// `start_row_id`. Mirrors the relevant arm of Lance's
 /// `Transaction::assign_row_ids` (lance-4.0.0 `dataset/transaction.rs:2682`)
