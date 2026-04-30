@@ -601,6 +601,29 @@ impl TableStore {
     /// fragments. The transaction's `Operation::Update` carries the
     /// fragments-to-remove and fragments-to-add; for read-your-writes we
     /// expose `new_fragments` (rows that will be visible after commit).
+    ///
+    /// **Contract: do not chain `stage_merge_insert` calls on the same
+    /// table within one query.** Each call's `MergeInsertBuilder` runs
+    /// against the supplied dataset's committed view — it does not see
+    /// fragments produced by a previous staged merge on the same table.
+    /// Two chained `stage_merge_insert`s whose source rows share keys will
+    /// each independently produce `Operation::Update` transactions whose
+    /// `new_fragments` contain a row for the shared key. `scan_with_staged`
+    /// (and `count_rows_with_staged`) will then return both — i.e.
+    /// **duplicates by key**.
+    ///
+    /// This is intrinsic to the underlying Lance API: there is no public
+    /// way to make `MergeInsertBuilder` see uncommitted fragments. The
+    /// engine's mutation path enforces the rule "per touched table: all
+    /// stage_append OR exactly one stage_merge_insert" at parse time
+    /// (the D₂′ check landing with [MR-794](https://linear.app/modernrelay/issue/MR-794)
+    /// step 2+ in `exec/mutation.rs`). Multi-table queries and append-chains
+    /// remain safe; only chained merges on a single table are rejected.
+    ///
+    /// Lift path: either a Lance API extension that lets
+    /// `MergeInsertBuilder` accept additional staged fragments, or an
+    /// in-memory pre-merge here that folds prior staged batches into the
+    /// input stream. See `docs/runs.md` and MR-793.
     pub async fn stage_merge_insert(
         &self,
         ds: Dataset,
@@ -877,6 +900,7 @@ impl TableStore {
 ///   1. committed fragments whose IDs are NOT in any staged
 ///      `removed_fragment_ids` (preserves committed order),
 ///   2. all staged `new_fragments` in stage order.
+///
 /// Lance's `Scanner` does not require any particular ordering between
 /// committed and staged fragments — `with_fragments` scopes the scan to
 /// exactly the supplied list. The dedup matters because merge_insert
@@ -884,6 +908,17 @@ impl TableStore {
 /// fragment is in `new_fragments`, the original (which it supersedes) is
 /// in `committed` until manifest commit, and including both would yield
 /// duplicate rows.
+///
+/// **Inter-stage supersession is not handled here.** Each StagedWrite's
+/// `removed_fragment_ids` lists committed-manifest fragment IDs only; a
+/// later staged merge cannot know about an earlier staged merge's
+/// fragments (Lance's `MergeInsertBuilder` runs against the committed
+/// view). If two `stage_merge_insert`s on the same table produce rows
+/// with the same key, the combined view returns duplicates by key. The
+/// engine's mutation path enforces "per touched table: all stage_append
+/// OR exactly one stage_merge_insert" at parse time (D₂′ in
+/// `exec/mutation.rs`) so this primitive's caller never chains merges.
+/// See `stage_merge_insert` for the full contract.
 fn combine_committed_with_staged(ds: &Dataset, staged: &[StagedWrite]) -> Vec<Fragment> {
     let removed: std::collections::HashSet<u64> = staged
         .iter()
