@@ -22,8 +22,7 @@ use omnigraph_compiler::{
 };
 
 use crate::db::graph_coordinator::{GraphCoordinator, PublishedSnapshot};
-use crate::db::run_registry::{RunRecord, RunStatus};
-use crate::error::{ManifestErrorKind, OmniError, Result};
+use crate::error::{OmniError, Result};
 use crate::runtime_cache::RuntimeCache;
 use crate::storage::{StorageAdapter, join_uri, normalize_root_uri, storage_for_uri};
 use crate::table_store::TableStore;
@@ -47,8 +46,8 @@ use super::schema_state::{
     write_schema_contract, write_schema_contract_staging,
 };
 use super::{
-    ReadTarget, ResolvedTarget, RunId, SCHEMA_APPLY_LOCK_BRANCH, SnapshotId,
-    is_internal_system_branch, is_schema_apply_lock_branch,
+    ReadTarget, ResolvedTarget, SCHEMA_APPLY_LOCK_BRANCH, SnapshotId, is_internal_system_branch,
+    is_schema_apply_lock_branch,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -530,17 +529,6 @@ impl Omnigraph {
             )));
         }
 
-        for run in self.list_runs().await? {
-            if run.target_branch == branch && matches!(run.status, RunStatus::Running) {
-                return Err(OmniError::manifest_conflict(format!(
-                    "cannot delete branch '{}' while run '{}' targeting it is {}",
-                    branch,
-                    run.run_id,
-                    run.status.as_str()
-                )));
-            }
-        }
-
         for other_branch in branches
             .iter()
             .filter(|candidate| candidate.as_str() != branch)
@@ -606,38 +594,6 @@ impl Omnigraph {
         self.coordinator.branch_delete(branch).await?;
         self.cleanup_deleted_branch_tables(branch, &owned_tables)
             .await
-    }
-
-    async fn cleanup_terminal_run_branches_for_target(&mut self, branch: &str) -> Result<()> {
-        let terminal_run_branches = self
-            .list_runs()
-            .await?
-            .into_iter()
-            .filter(|run| {
-                run.target_branch == branch
-                    && matches!(
-                        run.status,
-                        RunStatus::Published | RunStatus::Aborted | RunStatus::Failed
-                    )
-            })
-            .map(|run| run.run_branch)
-            .collect::<Vec<_>>();
-
-        let live_branches: HashSet<String> =
-            self.coordinator.all_branches().await?.into_iter().collect();
-
-        for run_branch in terminal_run_branches {
-            if !live_branches.contains(&run_branch) {
-                continue;
-            }
-            match self.delete_branch_storage_only(&run_branch).await {
-                Ok(()) => {}
-                Err(OmniError::Manifest(err)) if err.kind == ManifestErrorKind::NotFound => {}
-                Err(err) => return Err(err),
-            }
-        }
-
-        Ok(())
     }
 
     pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
@@ -720,71 +676,7 @@ impl Omnigraph {
         }
 
         self.ensure_branch_delete_safe(&branch, &branches).await?;
-        self.cleanup_terminal_run_branches_for_target(&branch)
-            .await?;
         self.delete_branch_storage_only(&branch).await
-    }
-
-    pub(crate) async fn latest_branch_snapshot_id(&self, branch: &str) -> Result<SnapshotId> {
-        let normalized = normalize_branch_name(branch)?;
-        let fresh = self
-            .open_coordinator_for_branch(normalized.as_deref())
-            .await?;
-        fresh.resolve_snapshot_id(branch).await
-    }
-
-    pub async fn begin_run(
-        &mut self,
-        target_branch: &str,
-        operation_hash: Option<&str>,
-    ) -> Result<RunRecord> {
-        self.begin_run_as(target_branch, operation_hash, None).await
-    }
-
-    pub async fn begin_run_as(
-        &mut self,
-        target_branch: &str,
-        operation_hash: Option<&str>,
-        actor_id: Option<&str>,
-    ) -> Result<RunRecord> {
-        self.ensure_schema_state_valid().await?;
-        self.ensure_schema_apply_idle("begin_run").await?;
-        ensure_public_branch_ref(target_branch, "begin_run")?;
-        let target_branch =
-            normalize_branch_name(target_branch)?.unwrap_or_else(|| "main".to_string());
-        let fresh = self
-            .open_coordinator_for_branch(Self::normalize_branch_name(&target_branch)?.as_deref())
-            .await?;
-        let base_snapshot_id = fresh.resolve_snapshot_id(&target_branch).await?;
-        let base_manifest_version = fresh.version();
-        let record = RunRecord::new(
-            target_branch.clone(),
-            base_snapshot_id.as_str(),
-            base_manifest_version,
-            operation_hash.map(str::to_string),
-            actor_id
-                .map(str::to_string)
-                .or_else(|| self.current_audit_actor().map(str::to_string)),
-        )?;
-
-        self.branch_create_from_impl(
-            ReadTarget::branch(target_branch.clone()),
-            &record.run_branch,
-            true,
-        )
-        .await?;
-        self.coordinator.append_run_record(&record).await?;
-        Ok(record)
-    }
-
-    pub async fn get_run(&self, run_id: &RunId) -> Result<RunRecord> {
-        self.ensure_schema_state_valid().await?;
-        self.coordinator.get_run(run_id).await
-    }
-
-    pub async fn list_runs(&self) -> Result<Vec<RunRecord>> {
-        self.ensure_schema_state_valid().await?;
-        self.coordinator.list_runs().await
     }
 
     pub async fn get_commit(&self, commit_id: &str) -> Result<GraphCommit> {
@@ -802,238 +694,6 @@ impl Omnigraph {
         };
         let coordinator = self.open_coordinator_for_branch(branch.as_deref()).await?;
         coordinator.list_commits().await
-    }
-
-    pub async fn abort_run(&mut self, run_id: &RunId) -> Result<RunRecord> {
-        self.ensure_schema_state_valid().await?;
-        let run = self.get_run(run_id).await?;
-        match run.status {
-            RunStatus::Running | RunStatus::Failed => {
-                self.terminate_run(&run, RunStatus::Aborted, None).await
-            }
-            RunStatus::Published => Err(OmniError::manifest_conflict(format!(
-                "run '{}' is already published",
-                run_id
-            ))),
-            RunStatus::Aborted => Err(OmniError::manifest_conflict(format!(
-                "run '{}' is already aborted",
-                run_id
-            ))),
-        }
-    }
-
-    pub async fn fail_run(&mut self, run_id: &RunId) -> Result<RunRecord> {
-        self.ensure_schema_state_valid().await?;
-        let run = self.get_run(run_id).await?;
-        match run.status {
-            RunStatus::Running => self.terminate_run(&run, RunStatus::Failed, None).await,
-            RunStatus::Failed => Ok(run),
-            RunStatus::Published => Err(OmniError::manifest_conflict(format!(
-                "run '{}' is already published",
-                run_id
-            ))),
-            RunStatus::Aborted => Err(OmniError::manifest_conflict(format!(
-                "run '{}' is already aborted",
-                run_id
-            ))),
-        }
-    }
-
-    /// Append a terminal-state run record and delete the `__run__` branch.
-    /// The status record is authoritative; the branch is scaffolding. Delete
-    /// errors are swallowed — a later `branch_delete` of the target will
-    /// retry via `cleanup_terminal_run_branches_for_target`.
-    async fn terminate_run(
-        &mut self,
-        run: &RunRecord,
-        status: RunStatus,
-        published_snapshot_id: Option<String>,
-    ) -> Result<RunRecord> {
-        let updated = run.with_status(status, published_snapshot_id)?;
-        self.coordinator.append_run_record(&updated).await?;
-        let _ = self.delete_branch_storage_only(&updated.run_branch).await;
-        Ok(updated)
-    }
-
-    pub async fn publish_run(&mut self, run_id: &RunId) -> Result<SnapshotId> {
-        self.publish_run_as(run_id, None).await
-    }
-
-    pub async fn publish_run_as(
-        &mut self,
-        run_id: &RunId,
-        actor_id: Option<&str>,
-    ) -> Result<SnapshotId> {
-        self.ensure_schema_state_valid().await?;
-        self.ensure_schema_apply_idle("publish_run").await?;
-        let run = self.get_run(run_id).await?;
-        match run.status {
-            RunStatus::Running => {}
-            RunStatus::Published => {
-                return run
-                    .published_snapshot_id
-                    .clone()
-                    .map(SnapshotId::new)
-                    .ok_or_else(|| {
-                        OmniError::manifest(format!(
-                            "run '{}' is published but missing published snapshot id",
-                            run_id
-                        ))
-                    });
-            }
-            RunStatus::Failed | RunStatus::Aborted => {
-                return Err(OmniError::manifest_conflict(format!(
-                    "run '{}' is not publishable from status '{}'",
-                    run_id,
-                    run.status.as_str()
-                )));
-            }
-        }
-
-        let publish_actor = actor_id
-            .map(str::to_string)
-            .or_else(|| run.actor_id.clone());
-        let current_target_snapshot_id = self.resolve_snapshot(&run.target_branch).await?;
-        let previous_actor = self.audit_actor_id.clone();
-        self.audit_actor_id = publish_actor.clone();
-        let publish_result = if current_target_snapshot_id.as_str() == run.base_snapshot_id {
-            let run_for_promotion = run.clone();
-            self.sync_branch(&run_for_promotion.target_branch).await?;
-            self.promote_run_snapshot_to_target(&run_for_promotion)
-                .await
-        } else {
-            let run_branch = run.run_branch.clone();
-            let target_branch = run.target_branch.clone();
-            self.branch_merge_internal(&run_branch, &target_branch)
-                .await?;
-            self.reify_internal_run_refs(&target_branch, &run_branch)
-                .await
-        };
-        self.audit_actor_id = previous_actor;
-        publish_result?;
-        let published_snapshot_id = self.resolve_snapshot(&run.target_branch).await?;
-        self.terminate_run(
-            &run,
-            RunStatus::Published,
-            Some(published_snapshot_id.as_str().to_string()),
-        )
-        .await?;
-        Ok(published_snapshot_id)
-    }
-
-    async fn promote_run_snapshot_to_target(&mut self, run: &RunRecord) -> Result<()> {
-        let target_snapshot = self
-            .snapshot_of(ReadTarget::branch(run.target_branch.as_str()))
-            .await?;
-        let run_snapshot = self
-            .snapshot_of(ReadTarget::branch(run.run_branch.as_str()))
-            .await?;
-        let mut table_keys = std::collections::BTreeSet::new();
-        for entry in target_snapshot.entries() {
-            table_keys.insert(entry.table_key.clone());
-        }
-        for entry in run_snapshot.entries() {
-            table_keys.insert(entry.table_key.clone());
-        }
-
-        let mut updates = Vec::new();
-        let mut changed_edge_tables = false;
-        let target_branch = normalize_branch_name(&run.target_branch)?;
-
-        for table_key in table_keys {
-            let target_entry = target_snapshot.entry(&table_key);
-            let run_entry = run_snapshot.entry(&table_key);
-            if same_manifest_state(target_entry, run_entry) {
-                continue;
-            }
-            let Some(_run_entry) = run_entry else {
-                return Err(OmniError::manifest(format!(
-                    "run '{}' removed table '{}' which publish_run does not support",
-                    run.run_id, table_key
-                )));
-            };
-
-            let source_ds = run_snapshot.open(&table_key).await?;
-            let batch = self.batch_for_table_rewrite(&source_ds, &table_key).await?;
-
-            let (mut target_ds, full_path, table_branch) = self
-                .open_for_mutation_on_branch(target_branch.as_deref(), &table_key)
-                .await?;
-            let state = self
-                .table_store()
-                .overwrite_batch(&full_path, &mut target_ds, batch)
-                .await?;
-            updates.push(crate::db::SubTableUpdate {
-                table_key: table_key.clone(),
-                table_version: state.version,
-                table_branch,
-                row_count: state.row_count,
-                version_metadata: state.version_metadata,
-            });
-            if table_key.starts_with("edge:") {
-                changed_edge_tables = true;
-            }
-        }
-
-        if !updates.is_empty() {
-            self.commit_updates_on_branch(target_branch.as_deref(), &updates)
-                .await?;
-            if changed_edge_tables {
-                self.invalidate_graph_index().await;
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn reify_internal_run_refs(
-        &mut self,
-        target_branch: &str,
-        run_branch: &str,
-    ) -> Result<()> {
-        let target_snapshot = self.snapshot_of(ReadTarget::branch(target_branch)).await?;
-        let mut updates = Vec::new();
-        let mut changed_edge_tables = false;
-        let target_branch = normalize_branch_name(target_branch)?;
-
-        for entry in target_snapshot.entries() {
-            if entry.table_branch.as_deref() != Some(run_branch) {
-                continue;
-            }
-
-            let source_ds = target_snapshot.open(&entry.table_key).await?;
-            let batch = self
-                .batch_for_table_rewrite(&source_ds, &entry.table_key)
-                .await?;
-
-            let (mut target_ds, full_path, table_branch) = self
-                .open_for_mutation_on_branch(target_branch.as_deref(), &entry.table_key)
-                .await?;
-            let state = self
-                .table_store()
-                .overwrite_batch(&full_path, &mut target_ds, batch)
-                .await?;
-            updates.push(crate::db::SubTableUpdate {
-                table_key: entry.table_key.clone(),
-                table_version: state.version,
-                table_branch,
-                row_count: state.row_count,
-                version_metadata: state.version_metadata,
-            });
-            if entry.table_key.starts_with("edge:") {
-                changed_edge_tables = true;
-            }
-        }
-
-        if !updates.is_empty() {
-            self.commit_updates_on_branch(target_branch.as_deref(), &updates)
-                .await?;
-            if changed_edge_tables {
-                self.invalidate_graph_index().await;
-            }
-        }
-
-        Ok(())
     }
 
     /// Open a sub-table for mutation with version-drift guard.
@@ -1112,6 +772,9 @@ impl Omnigraph {
         table_ops::build_indices_on_dataset_for_catalog(self, catalog, table_key, ds).await
     }
 
+    // Used only by in-tree tests (`#[cfg(test)]`); the runtime path now
+    // uses `commit_updates_on_branch_with_expected` exclusively.
+    #[cfg(test)]
     pub(crate) async fn commit_updates(
         &mut self,
         updates: &[crate::db::SubTableUpdate],
@@ -1141,12 +804,19 @@ impl Omnigraph {
         .await
     }
 
-    pub(crate) async fn commit_updates_on_branch(
+    pub(crate) async fn commit_updates_on_branch_with_expected(
         &mut self,
         branch: Option<&str>,
         updates: &[crate::db::SubTableUpdate],
+        expected_table_versions: &std::collections::HashMap<String, u64>,
     ) -> Result<u64> {
-        table_ops::commit_updates_on_branch(self, branch, updates).await
+        table_ops::commit_updates_on_branch_with_expected(
+            self,
+            branch,
+            updates,
+            expected_table_versions,
+        )
+        .await
     }
 
     pub(crate) async fn ensure_commit_graph_initialized(&mut self) -> Result<()> {
@@ -1158,13 +828,6 @@ impl Omnigraph {
         table_ops::invalidate_graph_index(self).await
     }
 
-    async fn batch_for_table_rewrite(
-        &self,
-        source_ds: &Dataset,
-        table_key: &str,
-    ) -> Result<RecordBatch> {
-        schema_apply::batch_for_table_rewrite(self, source_ds, table_key).await
-    }
 }
 
 pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
@@ -1180,7 +843,7 @@ pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
     Ok(Some(branch.to_string()))
 }
 
-fn ensure_public_branch_ref(branch: &str, operation: &str) -> Result<()> {
+pub(crate) fn ensure_public_branch_ref(branch: &str, operation: &str) -> Result<()> {
     if super::is_internal_run_branch(branch) {
         return Err(OmniError::manifest(format!(
             "{} does not allow internal run ref '{}'",
@@ -1194,22 +857,6 @@ fn ensure_public_branch_ref(branch: &str, operation: &str) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-fn same_manifest_state(
-    left: Option<&crate::db::SubTableEntry>,
-    right: Option<&crate::db::SubTableEntry>,
-) -> bool {
-    match (left, right) {
-        (None, None) => true,
-        (Some(left), Some(right)) => {
-            left.table_path == right.table_path
-                && left.table_version == right.table_version
-                && left.table_branch == right.table_branch
-                && left.row_count == right.row_count
-        }
-        _ => false,
-    }
 }
 
 fn concat_or_empty_batches(schema: Arc<Schema>, batches: Vec<RecordBatch>) -> Result<RecordBatch> {

@@ -8,8 +8,6 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use assert_cmd::Command;
-use omnigraph::db::Omnigraph;
-use omnigraph::loader::LoadMode;
 use reqwest::blocking::Client;
 use serde_json::Value;
 use tempfile::{TempDir, tempdir};
@@ -223,21 +221,6 @@ pub fn spawn_server_with_config_env(config: &Path, envs: &[(&str, &str)]) -> Tes
     spawn_server_process(command)
 }
 
-pub async fn begin_manual_run(repo: &Path, target_branch: &str) -> String {
-    let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
-    let run = db
-        .begin_run(target_branch, Some("cli-test-run"))
-        .await
-        .unwrap();
-    db.load(
-        &run.run_branch,
-        r#"{"type":"Person","data":{"name":"Eve","age":29}}"#,
-        LoadMode::Append,
-    )
-    .await
-    .unwrap();
-    run.run_id.as_str().to_string()
-}
 
 pub struct SystemRepo {
     _temp: TempDir,

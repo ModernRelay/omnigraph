@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -10,7 +11,6 @@ use crate::storage::{StorageAdapter, join_uri, normalize_root_uri};
 use super::commit_graph::{CommitGraph, GraphCommit};
 use super::is_internal_system_branch;
 use super::manifest::{ManifestChange, ManifestCoordinator, Snapshot, SubTableUpdate};
-use super::run_registry::{RunId, RunRecord, RunRegistry, graph_runs_uri};
 
 const GRAPH_COMMITS_DIR: &str = "_graph_commits.lance";
 
@@ -93,7 +93,6 @@ pub struct GraphCoordinator {
     storage: Arc<dyn StorageAdapter>,
     manifest: ManifestCoordinator,
     commit_graph: Option<CommitGraph>,
-    run_registry: Option<RunRegistry>,
     bound_branch: Option<String>,
 }
 
@@ -111,7 +110,6 @@ impl GraphCoordinator {
             storage,
             manifest,
             commit_graph,
-            run_registry: None,
             bound_branch: None,
         })
     }
@@ -124,17 +122,11 @@ impl GraphCoordinator {
         } else {
             None
         };
-        let run_registry = if storage.exists(&graph_runs_uri(&root)).await? {
-            Some(RunRegistry::open(&root).await?)
-        } else {
-            None
-        };
         Ok(Self {
             root_uri: root,
             storage,
             manifest,
             commit_graph,
-            run_registry,
             bound_branch: None,
         })
     }
@@ -156,18 +148,12 @@ impl GraphCoordinator {
         } else {
             None
         };
-        let run_registry = if storage.exists(&graph_runs_uri(&root)).await? {
-            Some(RunRegistry::open(&root).await?)
-        } else {
-            None
-        };
 
         Ok(Self {
             root_uri: root,
             storage,
             manifest,
             commit_graph,
-            run_registry,
             bound_branch: Some(branch_name),
         })
     }
@@ -192,10 +178,6 @@ impl GraphCoordinator {
         self.manifest.refresh().await?;
         if let Some(commit_graph) = &mut self.commit_graph {
             commit_graph.refresh().await?;
-        }
-        if let Some(run_registry) = &mut self.run_registry {
-            let root_uri = self.root_uri.clone();
-            run_registry.refresh(&root_uri).await?;
         }
         Ok(())
     }
@@ -382,21 +364,6 @@ impl GraphCoordinator {
         Ok(())
     }
 
-    pub(crate) async fn ensure_run_registry_initialized(&mut self) -> Result<()> {
-        if self.run_registry.is_some() {
-            return Ok(());
-        }
-        if !self
-            .storage
-            .exists(&graph_runs_uri(self.root_uri()))
-            .await?
-        {
-            let _ = RunRegistry::init(self.root_uri()).await?;
-        }
-        self.run_registry = Some(RunRegistry::open(self.root_uri()).await?);
-        Ok(())
-    }
-
     pub(crate) async fn commit_updates_with_actor(
         &mut self,
         updates: &[SubTableUpdate],
@@ -410,11 +377,45 @@ impl GraphCoordinator {
         })
     }
 
+    /// Commit with publisher-level OCC fence. The `expected_table_versions` map
+    /// asserts the manifest's current latest non-tombstoned `table_version` for
+    /// each `table_key` matches what the caller observed before writing.
+    /// Mismatches surface as `OmniError::Manifest` with
+    /// `ManifestConflictDetails::ExpectedVersionMismatch`.
+    pub(crate) async fn commit_updates_with_actor_with_expected(
+        &mut self,
+        updates: &[SubTableUpdate],
+        expected_table_versions: &HashMap<String, u64>,
+        actor_id: Option<&str>,
+    ) -> Result<PublishedSnapshot> {
+        let manifest_version = self
+            .commit_manifest_updates_with_expected(updates, expected_table_versions)
+            .await?;
+        let snapshot_id = self.record_graph_commit(manifest_version, actor_id).await?;
+        Ok(PublishedSnapshot {
+            manifest_version,
+            _snapshot_id: snapshot_id,
+        })
+    }
+
     pub(crate) async fn commit_manifest_updates(
         &mut self,
         updates: &[SubTableUpdate],
     ) -> Result<u64> {
         let manifest_version = self.manifest.commit(updates).await?;
+        failpoints::maybe_fail("graph_publish.after_manifest_commit")?;
+        Ok(manifest_version)
+    }
+
+    pub(crate) async fn commit_manifest_updates_with_expected(
+        &mut self,
+        updates: &[SubTableUpdate],
+        expected_table_versions: &HashMap<String, u64>,
+    ) -> Result<u64> {
+        let manifest_version = self
+            .manifest
+            .commit_with_expected(updates, expected_table_versions)
+            .await?;
         failpoints::maybe_fail("graph_publish.after_manifest_commit")?;
         Ok(manifest_version)
     }
@@ -502,54 +503,6 @@ impl GraphCoordinator {
             None => CommitGraph::open(self.root_uri()).await?,
         };
         Ok(Some(graph))
-    }
-
-    pub(crate) async fn append_run_record(&mut self, record: &RunRecord) -> Result<()> {
-        self.ensure_run_registry_initialized().await?;
-        let Some(run_registry) = &mut self.run_registry else {
-            return Err(OmniError::manifest(
-                "run registry not initialized".to_string(),
-            ));
-        };
-        run_registry.append_record(record).await
-    }
-
-    pub(crate) async fn get_run(&self, run_id: &RunId) -> Result<RunRecord> {
-        if let Some(run_registry) = &self.run_registry {
-            if let Some(run) = run_registry.get_run(run_id).await? {
-                return Ok(run);
-            }
-        }
-        if !self
-            .storage
-            .exists(&graph_runs_uri(self.root_uri()))
-            .await?
-        {
-            return Err(OmniError::manifest_not_found(format!(
-                "run '{}' not found",
-                run_id
-            )));
-        }
-        let run_registry = RunRegistry::open(self.root_uri()).await?;
-        run_registry
-            .get_run(run_id)
-            .await?
-            .ok_or_else(|| OmniError::manifest_not_found(format!("run '{}' not found", run_id)))
-    }
-
-    pub(crate) async fn list_runs(&self) -> Result<Vec<RunRecord>> {
-        if let Some(run_registry) = &self.run_registry {
-            return run_registry.list_runs().await;
-        }
-        if !self
-            .storage
-            .exists(&graph_runs_uri(self.root_uri()))
-            .await?
-        {
-            return Ok(Vec::new());
-        }
-        let run_registry = RunRegistry::open(self.root_uri()).await?;
-        run_registry.list_runs().await
     }
 
     pub(crate) async fn list_commits(&self) -> Result<Vec<GraphCommit>> {

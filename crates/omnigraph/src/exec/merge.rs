@@ -996,32 +996,21 @@ impl Omnigraph {
         self.ensure_schema_apply_idle("branch_merge").await?;
         let previous_actor = self.audit_actor_id.clone();
         self.audit_actor_id = actor_id.map(str::to_string);
-        let result = self.branch_merge_impl(source, target, false).await;
+        let result = self.branch_merge_impl(source, target).await;
         self.audit_actor_id = previous_actor;
         result
-    }
-
-    pub(crate) async fn branch_merge_internal(
-        &mut self,
-        source: &str,
-        target: &str,
-    ) -> Result<MergeOutcome> {
-        self.branch_merge_impl(source, target, true).await
     }
 
     async fn branch_merge_impl(
         &mut self,
         source: &str,
         target: &str,
-        allow_internal_refs: bool,
     ) -> Result<MergeOutcome> {
-        if !allow_internal_refs {
-            if is_internal_run_branch(source) || is_internal_run_branch(target) {
-                return Err(OmniError::manifest(format!(
-                    "branch_merge does not allow internal run refs ('{}' -> '{}')",
-                    source, target
-                )));
-            }
+        if is_internal_run_branch(source) || is_internal_run_branch(target) {
+            return Err(OmniError::manifest(format!(
+                "branch_merge does not allow internal run refs ('{}' -> '{}')",
+                source, target
+            )));
         }
         let source_branch = Omnigraph::normalize_branch_name(source)?;
         let target_branch = Omnigraph::normalize_branch_name(target)?;

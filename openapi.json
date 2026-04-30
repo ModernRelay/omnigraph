@@ -701,257 +701,6 @@
         ]
       }
     },
-    "/runs": {
-      "get": {
-        "tags": [
-          "runs"
-        ],
-        "summary": "List all runs.",
-        "description": "A run is an ephemeral branch produced by an agent or background job. The\nlist includes pending, in-progress, published, and aborted runs across\nall target branches. Read-only.",
-        "operationId": "listRuns",
-        "responses": {
-          "200": {
-            "description": "List of runs",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RunListOutput"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Forbidden",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/runs/{run_id}": {
-      "get": {
-        "tags": [
-          "runs"
-        ],
-        "summary": "Get a single run.",
-        "description": "Returns the run's status, target/run branches, base snapshot, and (if\npublished) the resulting snapshot id. Read-only.",
-        "operationId": "getRun",
-        "parameters": [
-          {
-            "name": "run_id",
-            "in": "path",
-            "description": "Run identifier",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Run details",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RunOutput"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Forbidden",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Run not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/runs/{run_id}/abort": {
-      "post": {
-        "tags": [
-          "runs"
-        ],
-        "summary": "Abort a run.",
-        "description": "Marks the run as aborted and releases its working branch. **Irreversible**:\nthe run cannot be resumed once aborted.",
-        "operationId": "abortRun",
-        "parameters": [
-          {
-            "name": "run_id",
-            "in": "path",
-            "description": "Run identifier",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Run aborted",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RunOutput"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Forbidden",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Run not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/runs/{run_id}/publish": {
-      "post": {
-        "tags": [
-          "runs"
-        ],
-        "summary": "Publish a run to its target branch.",
-        "description": "Promotes the run's snapshot onto its `target_branch` as a new commit. The\nrun must be in a publishable state. **Destructive** to the target branch.",
-        "operationId": "publishRun",
-        "parameters": [
-          {
-            "name": "run_id",
-            "in": "path",
-            "description": "Run identifier",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Run published",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RunOutput"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Forbidden",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Run not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
     "/schema": {
       "get": {
         "tags": [
@@ -1413,6 +1162,17 @@
           "error": {
             "type": "string"
           },
+          "manifest_conflict": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ManifestConflictOutput",
+                "description": "Set when the conflict is a publisher CAS rejection\n(`ManifestConflictDetails::ExpectedVersionMismatch`). The caller's\npre-write view of `table_key` was at version `expected` but the\nmanifest is now at `actual`. Refresh and retry."
+              }
+            ]
+          },
           "merge_conflicts": {
             "type": "array",
             "items": {
@@ -1571,6 +1331,30 @@
           "merge"
         ]
       },
+      "ManifestConflictOutput": {
+        "type": "object",
+        "description": "Structured details for a publisher-level OCC failure. Surfaces alongside\nHTTP 409 when a write was rejected because the caller's pre-write view of\none table's manifest version was stale relative to the current head. The\nexpected/actual fields tell the client which table to refresh.",
+        "required": [
+          "table_key",
+          "expected",
+          "actual"
+        ],
+        "properties": {
+          "actual": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "expected": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "table_key": {
+            "type": "string"
+          }
+        }
+      },
       "MergeConflictKindOutput": {
         "type": "string",
         "enum": [
@@ -1687,85 +1471,6 @@
               "string",
               "null"
             ]
-          }
-        }
-      },
-      "RunListOutput": {
-        "type": "object",
-        "required": [
-          "runs"
-        ],
-        "properties": {
-          "runs": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/RunOutput"
-            }
-          }
-        }
-      },
-      "RunOutput": {
-        "type": "object",
-        "required": [
-          "run_id",
-          "target_branch",
-          "run_branch",
-          "base_snapshot_id",
-          "base_manifest_version",
-          "status",
-          "created_at",
-          "updated_at"
-        ],
-        "properties": {
-          "actor_id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "base_manifest_version": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "base_snapshot_id": {
-            "type": "string"
-          },
-          "created_at": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Run creation time as Unix epoch microseconds.",
-            "example": 1714000000000000
-          },
-          "operation_hash": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "published_snapshot_id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "run_branch": {
-            "type": "string"
-          },
-          "run_id": {
-            "type": "string"
-          },
-          "status": {
-            "type": "string"
-          },
-          "target_branch": {
-            "type": "string"
-          },
-          "updated_at": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Last status change as Unix epoch microseconds.",
-            "example": 1714000000000000
           }
         }
       },

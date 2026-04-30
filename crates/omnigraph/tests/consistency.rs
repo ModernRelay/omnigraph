@@ -518,10 +518,15 @@ query high_value() {
     assert_eq!(values.value(8), 499);
 }
 
-// ─── Regression: public mutation on stale handle still applies to latest head ──────────────
+// ─── Stale handle must refresh-and-retry (no silent rebase) ──────────────
 
 #[tokio::test]
-async fn stale_handle_public_mutation_uses_latest_target_head() {
+async fn stale_handle_public_mutation_must_refresh_then_retry() {
+    // MR-771: with the Run state machine removed, the engine no longer
+    // auto-rebases stale-handle mutations onto the latest target head. The
+    // publisher's `expected_table_versions` CAS makes the contract explicit
+    // — a stale writer fails loudly with `ExpectedVersionMismatch` and the
+    // client decides whether to refresh-and-retry.
     let dir = tempfile::tempdir().unwrap();
     let _db = init_and_load(&dir).await;
     drop(_db);
@@ -530,7 +535,7 @@ async fn stale_handle_public_mutation_uses_latest_target_head() {
     let mut db1 = Omnigraph::open(uri).await.unwrap();
     let mut db2 = Omnigraph::open(uri).await.unwrap();
 
-    // Writer 1 inserts — advances the Person sub-table version
+    // Writer 1 inserts Eve — advances the Person sub-table.
     mutate_main(
         &mut db1,
         MUTATION_QUERIES,
@@ -540,8 +545,26 @@ async fn stale_handle_public_mutation_uses_latest_target_head() {
     .await
     .unwrap();
 
-    // Writer 2 (stale) mutates through the public transactional path.
-    // It should stage from the latest target head rather than replaying a stale write.
+    // Writer 2 is now stale. Its first attempt must fail with
+    // ExpectedVersionMismatch — no silent rebase.
+    let stale_err = mutate_main(
+        &mut db2,
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
+    )
+    .await
+    .expect_err("stale writer must hit ExpectedVersionMismatch");
+    let omnigraph::error::OmniError::Manifest(manifest_err) = stale_err else {
+        panic!("expected Manifest error");
+    };
+    assert!(matches!(
+        manifest_err.details,
+        Some(omnigraph::error::ManifestConflictDetails::ExpectedVersionMismatch { .. })
+    ));
+
+    // Refresh and retry — the canonical client recovery path.
+    db2.sync_branch("main").await.unwrap();
     mutate_main(
         &mut db2,
         MUTATION_QUERIES,
@@ -551,6 +574,7 @@ async fn stale_handle_public_mutation_uses_latest_target_head() {
     .await
     .unwrap();
 
+    // Both Writer 1's insert and Writer 2's update are visible.
     let result = query_main(
         &mut db2,
         TEST_QUERIES,

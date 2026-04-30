@@ -14,8 +14,8 @@ use api::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
     CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, HealthOutput, IngestOutput,
-    IngestRequest, ReadOutput, ReadRequest, RunListOutput, SchemaApplyOutput, SchemaApplyRequest,
-    SchemaOutput, SnapshotQuery, ingest_output, schema_apply_output, snapshot_payload,
+    IngestRequest, ReadOutput, ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput,
+    SnapshotQuery, ingest_output, schema_apply_output, snapshot_payload,
 };
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
@@ -33,8 +33,8 @@ pub use config::{
     load_config,
 };
 use futures::stream;
-use omnigraph::db::{Omnigraph, ReadTarget, RunId};
-use omnigraph::error::{ManifestErrorKind, OmniError};
+use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::error::{ManifestConflictDetails, ManifestErrorKind, OmniError};
 use omnigraph_compiler::json_params_to_param_map;
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::{JsonParamMode, ParamMap};
@@ -82,10 +82,6 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         server_branch_create,
         server_branch_delete,
         server_branch_merge,
-        server_run_list,
-        server_run_show,
-        server_run_publish,
-        server_run_abort,
         server_commit_list,
         server_commit_show,
     ),
@@ -159,6 +155,7 @@ pub struct ApiError {
     code: ErrorCode,
     message: String,
     merge_conflicts: Vec<api::MergeConflictOutput>,
+    manifest_conflict: Option<api::ManifestConflictOutput>,
 }
 
 impl AppState {
@@ -280,6 +277,7 @@ impl ApiError {
             code: ErrorCode::Unauthorized,
             message: message.into(),
             merge_conflicts: Vec::new(),
+            manifest_conflict: None,
         }
     }
 
@@ -289,6 +287,7 @@ impl ApiError {
             code: ErrorCode::Forbidden,
             message: message.into(),
             merge_conflicts: Vec::new(),
+            manifest_conflict: None,
         }
     }
 
@@ -298,6 +297,7 @@ impl ApiError {
             code: ErrorCode::BadRequest,
             message: message.into(),
             merge_conflicts: Vec::new(),
+            manifest_conflict: None,
         }
     }
 
@@ -307,6 +307,7 @@ impl ApiError {
             code: ErrorCode::NotFound,
             message: message.into(),
             merge_conflicts: Vec::new(),
+            manifest_conflict: None,
         }
     }
 
@@ -316,6 +317,7 @@ impl ApiError {
             code: ErrorCode::Conflict,
             message: message.into(),
             merge_conflicts: Vec::new(),
+            manifest_conflict: None,
         }
     }
 
@@ -325,6 +327,7 @@ impl ApiError {
             code: ErrorCode::Internal,
             message: message.into(),
             merge_conflicts: Vec::new(),
+            manifest_conflict: None,
         }
     }
 
@@ -334,6 +337,20 @@ impl ApiError {
             code: ErrorCode::Conflict,
             message: summarize_merge_conflicts(&conflicts),
             merge_conflicts: conflicts,
+            manifest_conflict: None,
+        }
+    }
+
+    fn manifest_version_conflict(
+        message: String,
+        details: api::ManifestConflictOutput,
+    ) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: ErrorCode::Conflict,
+            message,
+            merge_conflicts: Vec::new(),
+            manifest_conflict: Some(details),
         }
     }
 
@@ -344,7 +361,21 @@ impl ApiError {
             OmniError::Manifest(err) => match err.kind {
                 ManifestErrorKind::BadRequest => Self::bad_request(err.message),
                 ManifestErrorKind::NotFound => Self::not_found(err.message),
-                ManifestErrorKind::Conflict => Self::conflict(err.message),
+                ManifestErrorKind::Conflict => match err.details {
+                    Some(ManifestConflictDetails::ExpectedVersionMismatch {
+                        table_key,
+                        expected,
+                        actual,
+                    }) => Self::manifest_version_conflict(
+                        err.message,
+                        api::ManifestConflictOutput {
+                            table_key,
+                            expected,
+                            actual,
+                        },
+                    ),
+                    _ => Self::conflict(err.message),
+                },
                 ManifestErrorKind::Internal => Self::internal(err.message),
             },
             OmniError::MergeConflicts(conflicts) => Self::merge_conflict(
@@ -395,6 +426,7 @@ impl IntoResponse for ApiError {
                 error: self.message,
                 code: Some(self.code),
                 merge_conflicts: self.merge_conflicts,
+                manifest_conflict: self.manifest_conflict,
             }),
         )
             .into_response()
@@ -443,10 +475,6 @@ pub fn build_app(state: AppState) -> Router {
         )
         .route("/branches/{branch}", delete(server_branch_delete))
         .route("/branches/merge", post(server_branch_merge))
-        .route("/runs", get(server_run_list))
-        .route("/runs/{run_id}", get(server_run_show))
-        .route("/runs/{run_id}/publish", post(server_run_publish))
-        .route("/runs/{run_id}/abort", post(server_run_abort))
         .route("/commits", get(server_commit_list))
         .route("/commits/{commit_id}", get(server_commit_show))
         .route_layer(middleware::from_fn_with_state(
@@ -1217,203 +1245,6 @@ async fn server_branch_merge(
         outcome: outcome.into(),
         actor_id: actor_id.map(str::to_string),
     }))
-}
-
-#[utoipa::path(
-    get,
-    path = "/runs",
-    tag = "runs",
-    operation_id = "listRuns",
-    responses(
-        (status = 200, description = "List of runs", body = RunListOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// List all runs.
-///
-/// A run is an ephemeral branch produced by an agent or background job. The
-/// list includes pending, in-progress, published, and aborted runs across
-/// all target branches. Read-only.
-async fn server_run_list(
-    State(state): State<AppState>,
-    actor: Option<Extension<AuthenticatedActor>>,
-) -> std::result::Result<Json<RunListOutput>, ApiError> {
-    authorize_request(
-        &state,
-        actor.as_ref().map(|Extension(actor)| actor),
-        PolicyRequest {
-            actor_id: actor
-                .as_ref()
-                .map(|Extension(actor)| actor.as_str().to_string())
-                .unwrap_or_default(),
-            action: PolicyAction::Read,
-            branch: None,
-            target_branch: None,
-        },
-    )?;
-    let runs = {
-        let db = Arc::clone(&state.db).read_owned().await;
-        db.list_runs().await.map_err(ApiError::from_omni)?
-    };
-    Ok(Json(RunListOutput {
-        runs: runs.iter().map(api::run_output).collect(),
-    }))
-}
-
-#[utoipa::path(
-    get,
-    path = "/runs/{run_id}",
-    tag = "runs",
-    operation_id = "getRun",
-    params(
-        ("run_id" = String, Path, description = "Run identifier"),
-    ),
-    responses(
-        (status = 200, description = "Run details", body = api::RunOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 404, description = "Run not found", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// Get a single run.
-///
-/// Returns the run's status, target/run branches, base snapshot, and (if
-/// published) the resulting snapshot id. Read-only.
-async fn server_run_show(
-    State(state): State<AppState>,
-    actor: Option<Extension<AuthenticatedActor>>,
-    Path(run_id): Path<String>,
-) -> std::result::Result<Json<api::RunOutput>, ApiError> {
-    authorize_request(
-        &state,
-        actor.as_ref().map(|Extension(actor)| actor),
-        PolicyRequest {
-            actor_id: actor
-                .as_ref()
-                .map(|Extension(actor)| actor.as_str().to_string())
-                .unwrap_or_default(),
-            action: PolicyAction::Read,
-            branch: None,
-            target_branch: None,
-        },
-    )?;
-    let run = {
-        let db = Arc::clone(&state.db).read_owned().await;
-        db.get_run(&RunId::new(run_id))
-            .await
-            .map_err(ApiError::from_omni)?
-    };
-    Ok(Json(api::run_output(&run)))
-}
-
-#[utoipa::path(
-    post,
-    path = "/runs/{run_id}/publish",
-    tag = "runs",
-    operation_id = "publishRun",
-    params(
-        ("run_id" = String, Path, description = "Run identifier"),
-    ),
-    responses(
-        (status = 200, description = "Run published", body = api::RunOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 404, description = "Run not found", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// Publish a run to its target branch.
-///
-/// Promotes the run's snapshot onto its `target_branch` as a new commit. The
-/// run must be in a publishable state. **Destructive** to the target branch.
-async fn server_run_publish(
-    State(state): State<AppState>,
-    actor: Option<Extension<AuthenticatedActor>>,
-    Path(run_id): Path<String>,
-) -> std::result::Result<Json<api::RunOutput>, ApiError> {
-    let run_id = RunId::new(run_id);
-    let actor_id = actor.as_ref().map(|Extension(actor)| actor.as_str());
-    let target_branch = {
-        let db = Arc::clone(&state.db).read_owned().await;
-        db.get_run(&run_id)
-            .await
-            .map_err(ApiError::from_omni)?
-            .target_branch
-    };
-    authorize_request(
-        &state,
-        actor.as_ref().map(|Extension(actor)| actor),
-        PolicyRequest {
-            actor_id: actor_id.map(str::to_string).unwrap_or_default(),
-            action: PolicyAction::RunPublish,
-            branch: None,
-            target_branch: Some(target_branch),
-        },
-    )?;
-    let run = {
-        let mut db = Arc::clone(&state.db).write_owned().await;
-        db.publish_run_as(&run_id, actor_id)
-            .await
-            .map_err(ApiError::from_omni)?;
-        db.get_run(&run_id).await.map_err(ApiError::from_omni)?
-    };
-    Ok(Json(api::run_output(&run)))
-}
-
-#[utoipa::path(
-    post,
-    path = "/runs/{run_id}/abort",
-    tag = "runs",
-    operation_id = "abortRun",
-    params(
-        ("run_id" = String, Path, description = "Run identifier"),
-    ),
-    responses(
-        (status = 200, description = "Run aborted", body = api::RunOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 404, description = "Run not found", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// Abort a run.
-///
-/// Marks the run as aborted and releases its working branch. **Irreversible**:
-/// the run cannot be resumed once aborted.
-async fn server_run_abort(
-    State(state): State<AppState>,
-    actor: Option<Extension<AuthenticatedActor>>,
-    Path(run_id): Path<String>,
-) -> std::result::Result<Json<api::RunOutput>, ApiError> {
-    let run_id = RunId::new(run_id);
-    let target_branch = {
-        let db = Arc::clone(&state.db).read_owned().await;
-        db.get_run(&run_id)
-            .await
-            .map_err(ApiError::from_omni)?
-            .target_branch
-    };
-    authorize_request(
-        &state,
-        actor.as_ref().map(|Extension(actor)| actor),
-        PolicyRequest {
-            actor_id: actor
-                .as_ref()
-                .map(|Extension(actor)| actor.as_str().to_string())
-                .unwrap_or_default(),
-            action: PolicyAction::RunAbort,
-            branch: None,
-            target_branch: Some(target_branch),
-        },
-    )?;
-    let run = {
-        let mut db = Arc::clone(&state.db).write_owned().await;
-        db.abort_run(&run_id).await.map_err(ApiError::from_omni)?
-    };
-    Ok(Json(api::run_output(&run)))
 }
 
 #[utoipa::path(

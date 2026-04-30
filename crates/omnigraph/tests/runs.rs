@@ -1,283 +1,43 @@
+//! Tests for the direct-to-target write path (MR-771: Run state machine
+//! removed). The Run/`__run__` staging branch / RunRecord state machine no
+//! longer exists; mutations and loads write directly to target tables and
+//! commit once via the publisher's `expected_table_versions` CAS.
+//!
+//! What this file covers:
+//! - No `__run__*` branches are created by load or mutate.
+//! - Cancellation of a mutation future leaves no graph-level state.
+//! - Concurrent writers to the same table land exactly one publish; the
+//!   loser surfaces `ManifestConflictDetails::ExpectedVersionMismatch`.
+//! - Failed mutations and loads leave the target unchanged.
+//! - Multi-statement mutations are atomic (one commit per query).
+//! - actor_id propagates through to the commit graph.
+
 mod helpers;
 
-use std::collections::HashMap;
-
-use arrow_array::{Array, RecordBatch, StringArray, TimestampMicrosecondArray};
-use futures::TryStreamExt;
-use lance::Dataset;
-
 use omnigraph::db::commit_graph::CommitGraph;
-use omnigraph::db::{Omnigraph, ReadTarget, RunStatus};
-use omnigraph::error::{ManifestErrorKind, OmniError};
+use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::error::{ManifestConflictDetails, ManifestErrorKind, OmniError};
 use omnigraph::loader::{LoadMode, load_jsonl};
 
 use helpers::*;
 
-#[derive(Debug, Clone)]
-struct PersistedRun {
-    run_id: String,
-    target_branch: String,
-    run_branch: String,
-    status: String,
-    updated_at: i64,
-}
-
-async fn latest_runs(uri: &str) -> Vec<PersistedRun> {
-    let runs_uri = format!("{}/_graph_runs.lance", uri);
-    let ds = Dataset::open(&runs_uri).await.unwrap();
-    let batches: Vec<RecordBatch> = ds
-        .scan()
-        .try_into_stream()
-        .await
-        .unwrap()
-        .try_collect()
-        .await
-        .unwrap();
-
-    let mut latest: HashMap<String, PersistedRun> = HashMap::new();
-    for batch in batches {
-        let run_ids = batch
-            .column_by_name("run_id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let target_branches = batch
-            .column_by_name("target_branch")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let run_branches = batch
-            .column_by_name("run_branch")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let statuses = batch
-            .column_by_name("status")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let updated_ats = batch
-            .column_by_name("updated_at")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .unwrap();
-
-        for row in 0..batch.num_rows() {
-            let record = PersistedRun {
-                run_id: run_ids.value(row).to_string(),
-                target_branch: target_branches.value(row).to_string(),
-                run_branch: run_branches.value(row).to_string(),
-                status: statuses.value(row).to_string(),
-                updated_at: updated_ats.value(row),
-            };
-            match latest.get(record.run_id.as_str()) {
-                Some(existing) if existing.updated_at >= record.updated_at => {}
-                _ => {
-                    latest.insert(record.run_id.clone(), record);
-                }
-            }
-        }
-    }
-
-    let mut records = latest.into_values().collect::<Vec<_>>();
-    records.sort_by(|a, b| a.run_id.cmp(&b.run_id));
-    records
-}
-
+/// `omnigraph load` (no `--branch`) writes directly to the target — no
+/// `__run__*` staging branch is created on success.
 #[tokio::test]
-async fn begin_run_creates_hidden_internal_branch_and_isolates_writes() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
-    let base_snapshot = db.resolve_snapshot("main").await.unwrap();
-
-    let run = db.begin_run("main", Some("test-load")).await.unwrap();
-
-    assert!(run.run_branch.starts_with("__run__"));
-    assert_eq!(run.target_branch, "main");
-    assert_eq!(run.base_snapshot_id, base_snapshot.as_str());
-    assert_eq!(run.status, RunStatus::Running);
-    assert_eq!(db.branch_list().await.unwrap(), vec!["main"]);
-
-    db.load(
-        &run.run_branch,
-        r#"{"type":"Person","data":{"name":"Eve","age":22}}"#,
-        LoadMode::Append,
-    )
-    .await
-    .unwrap();
-
-    let main_qr = db
-        .query(
-            ReadTarget::branch("main"),
-            TEST_QUERIES,
-            "get_person",
-            &params(&[("$name", "Eve")]),
-        )
-        .await
-        .unwrap();
-    assert_eq!(main_qr.num_rows(), 0);
-
-    let run_qr = db
-        .query(
-            ReadTarget::branch(run.run_branch.as_str()),
-            TEST_QUERIES,
-            "get_person",
-            &params(&[("$name", "Eve")]),
-        )
-        .await
-        .unwrap();
-    assert_eq!(run_qr.num_rows(), 1);
-}
-
-#[tokio::test]
-async fn publish_run_merges_internal_branch_into_target_and_marks_record() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
-    let run = db.begin_run("main", Some("publish-test")).await.unwrap();
-
-    db.load(
-        &run.run_branch,
-        r#"{"type":"Person","data":{"name":"Eve","age":22}}"#,
-        LoadMode::Append,
-    )
-    .await
-    .unwrap();
-
-    let published_snapshot = db.publish_run(&run.run_id).await.unwrap();
-    let record = db.get_run(&run.run_id).await.unwrap();
-
-    assert_eq!(record.status, RunStatus::Published);
-    assert_eq!(
-        record.published_snapshot_id.as_deref(),
-        Some(published_snapshot.as_str())
-    );
-
-    let main_qr = db
-        .query(
-            ReadTarget::branch("main"),
-            TEST_QUERIES,
-            "get_person",
-            &params(&[("$name", "Eve")]),
-        )
-        .await
-        .unwrap();
-    assert_eq!(main_qr.num_rows(), 1);
-}
-
-#[tokio::test]
-async fn abort_run_leaves_target_unchanged_and_deletes_run_branch() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
-    let run = db.begin_run("main", Some("abort-test")).await.unwrap();
-
-    db.load(
-        &run.run_branch,
-        r#"{"type":"Person","data":{"name":"Eve","age":22}}"#,
-        LoadMode::Append,
-    )
-    .await
-    .unwrap();
-
-    let aborted = db.abort_run(&run.run_id).await.unwrap();
-    assert_eq!(aborted.status, RunStatus::Aborted);
-
-    let main_qr = db
-        .query(
-            ReadTarget::branch("main"),
-            TEST_QUERIES,
-            "get_person",
-            &params(&[("$name", "Eve")]),
-        )
-        .await
-        .unwrap();
-    assert_eq!(main_qr.num_rows(), 0);
-
-    let err = db
-        .query(
-            ReadTarget::branch(run.run_branch.as_str()),
-            TEST_QUERIES,
-            "get_person",
-            &params(&[("$name", "Eve")]),
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, OmniError::Manifest(ref e) if e.kind == ManifestErrorKind::NotFound)
-            || matches!(err, OmniError::Lance(_)),
-        "run branch should be gone after abort, got: {}",
-        err
-    );
-}
-
-#[tokio::test]
-async fn public_branch_apis_reject_internal_run_refs() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
-    let run = db.begin_run("main", Some("guard-test")).await.unwrap();
-
-    let merge_err = db.branch_merge(&run.run_branch, "main").await.unwrap_err();
-    match merge_err {
-        OmniError::Manifest(message) => assert!(message.message.contains("internal run refs")),
-        other => panic!("unexpected error: {}", other),
-    }
-
-    let create_err = db.branch_create(&run.run_branch).await.unwrap_err();
-    match create_err {
-        OmniError::Manifest(message) => assert!(message.message.contains("internal run ref")),
-        other => panic!("unexpected error: {}", other),
-    }
-
-    let delete_err = db.branch_delete(&run.run_branch).await.unwrap_err();
-    match delete_err {
-        OmniError::Manifest(message) => assert!(message.message.contains("internal run ref")),
-        other => panic!("unexpected error: {}", other),
-    }
-
-    let fork_err = db
-        .branch_create_from(ReadTarget::branch(run.run_branch.as_str()), "child")
-        .await
-        .unwrap_err();
-    match fork_err {
-        OmniError::Manifest(message) => assert!(message.message.contains("internal run ref")),
-        other => panic!("unexpected error: {}", other),
-    }
-}
-
-#[tokio::test]
-async fn branch_delete_rejects_target_branches_with_active_runs() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
-    db.branch_create("feature").await.unwrap();
-    let run = db.begin_run("feature", Some("delete-guard")).await.unwrap();
-
-    let err = db.branch_delete("feature").await.unwrap_err();
-    assert!(err.to_string().contains(run.run_id.as_str()));
-    assert!(err.to_string().contains("targeting it is running"));
-}
-
-#[tokio::test]
-async fn public_load_uses_hidden_transactional_run_and_publishes_it() {
+async fn load_does_not_create_run_branch() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
-    let result = load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
         .await
         .unwrap();
-    assert_eq!(result.nodes_loaded.len(), 2);
-    assert_eq!(result.edges_loaded.len(), 2);
-    assert_eq!(db.branch_list().await.unwrap(), vec!["main"]);
 
-    let runs = latest_runs(uri).await;
-    assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0].target_branch, "main");
-    assert_eq!(runs[0].status, "published");
-    assert!(runs[0].run_branch.starts_with("__run__"));
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
+    assert!(
+        !std::path::Path::new(&format!("{}/_graph_runs.lance", uri)).exists(),
+        "run state machine should not write _graph_runs.lance",
+    );
 
     let qr = db
         .query(
@@ -291,64 +51,10 @@ async fn public_load_uses_hidden_transactional_run_and_publishes_it() {
     assert_eq!(qr.num_rows(), 1);
 }
 
+/// `omnigraph change` writes directly to the target. After the call,
+/// `branch_list()` shows only `main`; no run record exists.
 #[tokio::test]
-async fn public_load_preserves_staged_edge_ids_on_publish() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-    let run = db.begin_run("main", Some("preserve-ids-load")).await.unwrap();
-    db.load(&run.run_branch, TEST_DATA, LoadMode::Overwrite)
-        .await
-        .unwrap();
-
-    let mut staged_ids = collect_column_strings(
-        &read_table_branch(&db, run.run_branch.as_str(), "edge:Knows").await,
-        "id",
-    );
-    staged_ids.sort();
-
-    db.publish_run(&run.run_id).await.unwrap();
-
-    let mut main_ids = collect_column_strings(&read_table(&db, "edge:Knows").await, "id");
-    main_ids.sort();
-    assert_eq!(main_ids, staged_ids);
-}
-
-#[tokio::test]
-async fn failed_public_load_marks_run_failed_and_leaves_target_unchanged() {
-    let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-
-    let bad = r#"{"type":"Person","data":{"name":"Alice","age":30}}
-{"edge":"Knows","from":"Alice","to":"Missing"}"#;
-    let err = load_jsonl(&mut db, bad, LoadMode::Overwrite)
-        .await
-        .unwrap_err();
-    match err {
-        OmniError::Manifest(message) => assert!(message.message.contains("not found in Person")),
-        other => panic!("unexpected error: {}", other),
-    }
-
-    let runs = latest_runs(uri).await;
-    assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0].status, "failed");
-    assert!(runs[0].run_branch.starts_with("__run__"));
-
-    let snap = snapshot_main(&db).await.unwrap();
-    let person_count = snap
-        .open("node:Person")
-        .await
-        .unwrap()
-        .count_rows(None)
-        .await
-        .unwrap();
-    assert_eq!(person_count, 0);
-}
-
-#[tokio::test]
-async fn public_mutation_uses_hidden_transactional_run_and_publishes_it() {
+async fn mutation_does_not_create_run_branch() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut db = init_and_load(&dir).await;
@@ -363,62 +69,19 @@ async fn public_mutation_uses_hidden_transactional_run_and_publishes_it() {
         .await
         .unwrap();
     assert_eq!(result.affected_nodes, 1);
-    assert_eq!(result.affected_edges, 0);
 
-    let runs = latest_runs(uri).await;
-    assert!(!runs.is_empty());
-    let latest = runs.last().unwrap();
-    assert_eq!(latest.target_branch, "main");
-    assert_eq!(latest.status, "published");
-    assert!(latest.run_branch.starts_with("__run__"));
-
-    let qr = db
-        .query(
-            ReadTarget::branch("main"),
-            TEST_QUERIES,
-            "get_person",
-            &params(&[("$name", "Eve")]),
-        )
-        .await
-        .unwrap();
-    assert_eq!(qr.num_rows(), 1);
-}
-
-#[tokio::test]
-async fn public_mutation_preserves_staged_edge_ids_on_publish() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
-
-    let run = db
-        .begin_run("main", Some("preserve-ids-mutation"))
-        .await
-        .unwrap();
-    db.mutate(
-        run.run_branch.as_str(),
-        MUTATION_QUERIES,
-        "add_friend",
-        &params(&[("$from", "Alice"), ("$to", "Diana")]),
-    )
-    .await
-    .unwrap();
-
-    let mut staged_ids = collect_column_strings(
-        &read_table_branch(&db, run.run_branch.as_str(), "edge:Knows").await,
-        "id",
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
+    assert!(
+        !std::path::Path::new(&format!("{}/_graph_runs.lance", uri)).exists(),
+        "run state machine should not write _graph_runs.lance",
     );
-    staged_ids.sort();
-
-    db.publish_run(&run.run_id).await.unwrap();
-
-    let mut main_ids = collect_column_strings(&read_table(&db, "edge:Knows").await, "id");
-    main_ids.sort();
-    assert_eq!(main_ids, staged_ids);
 }
 
+/// A failed mutation (validation error mid-query) leaves the target branch's
+/// observable state unchanged. There is nothing for cleanup to delete.
 #[tokio::test]
-async fn failed_public_mutation_marks_run_failed_and_leaves_target_unchanged() {
+async fn failed_mutation_leaves_target_unchanged() {
     let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
     let mut db = init_and_load(&dir).await;
 
     let err = db
@@ -435,12 +98,6 @@ async fn failed_public_mutation_marks_run_failed_and_leaves_target_unchanged() {
         other => panic!("unexpected error: {}", other),
     }
 
-    let runs = latest_runs(uri).await;
-    assert!(!runs.is_empty());
-    let latest = runs.last().unwrap();
-    assert_eq!(latest.status, "failed");
-    assert!(latest.run_branch.starts_with("__run__"));
-
     let qr = db
         .query(
             ReadTarget::branch("main"),
@@ -451,64 +108,293 @@ async fn failed_public_mutation_marks_run_failed_and_leaves_target_unchanged() {
         .await
         .unwrap();
     assert_eq!(qr.num_rows(), 2);
+
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
 }
 
+/// Multi-statement mutations are atomic at the query boundary. The
+/// `insert_person_and_friend` query inserts a person and an edge that
+/// references it; both must land together (read-your-writes within the
+/// query, single publish at the end).
 #[tokio::test]
-async fn concurrent_conflicting_run_publish_fails_cleanly() {
+async fn multi_statement_mutation_is_atomic_with_read_your_writes() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
 
-    let run_a = db.begin_run("main", Some("conflict-a")).await.unwrap();
-    let run_b = db.begin_run("main", Some("conflict-b")).await.unwrap();
+    let result = db
+        .mutate(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person_and_friend",
+            &mixed_params(
+                &[("$name", "Eve"), ("$friend", "Alice")],
+                &[("$age", 22)],
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(result.affected_edges, 1);
 
-    db.mutate(
-        run_a.run_branch.as_str(),
-        MUTATION_QUERIES,
-        "set_age",
-        &mixed_params(&[("$name", "Alice")], &[("$age", 31)]),
-    )
-    .await
-    .unwrap();
-    db.mutate(
-        run_b.run_branch.as_str(),
-        MUTATION_QUERIES,
-        "set_age",
-        &mixed_params(&[("$name", "Alice")], &[("$age", 32)]),
-    )
-    .await
-    .unwrap();
-
-    db.publish_run(&run_a.run_id).await.unwrap();
-    let publish_b = db.publish_run(&run_b.run_id).await;
-    assert!(publish_b.is_err(), "second conflicting publish should fail");
-    let err = publish_b.unwrap_err().to_string();
-    assert!(
-        err.contains("conflict") || err.contains("divergent") || err.contains("Alice"),
-        "unexpected conflict error: {}",
-        err
-    );
-
-    let alice = db
+    // Both writes are visible after one publish.
+    let person = db
         .query(
             ReadTarget::branch("main"),
             TEST_QUERIES,
             "get_person",
-            &params(&[("$name", "Alice")]),
+            &params(&[("$name", "Eve")]),
         )
         .await
         .unwrap();
-    let rows = alice.to_rust_json();
-    assert_eq!(alice.num_rows(), 1);
-    assert_eq!(rows[0]["p.age"], serde_json::json!(31));
+    assert_eq!(person.num_rows(), 1);
 
-    let run_a_record = db.get_run(&run_a.run_id).await.unwrap();
-    assert_eq!(run_a_record.status, RunStatus::Published);
-    let run_b_record = db.get_run(&run_b.run_id).await.unwrap();
-    assert_eq!(run_b_record.status, RunStatus::Running);
+    let friends = db
+        .query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "friends_of",
+            &params(&[("$name", "Eve")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(friends.num_rows(), 1);
 }
 
+/// Mid-query partial failure: op-1 writes a Lance fragment, op-2 fails.
+/// Documents the *current* observable behavior — not the desired one. The
+/// publisher never publishes (good — no manifest commit, target state
+/// unchanged), but Lance HEAD on the touched table is now ahead of the
+/// manifest-recorded version. The next mutation against that table fails
+/// loudly with `ExpectedVersionMismatch` (the engine's
+/// `ensure_expected_version` strict-equality check refuses the drift).
+///
+/// **Known limitation, MR-771 follow-up**: a proper rollback requires
+/// per-table Lance branches (write to a transient branch, fast-forward
+/// main on success, drop on failure). Lance's `restore()` is not a rewind
+/// — it appends a new commit, advancing HEAD further. See `docs/runs.md`
+/// for the workaround (rare in practice: most validation runs before any
+/// Lance write, so this only fires on multi-statement queries where a
+/// late op fails after an earlier op committed).
 #[tokio::test]
-async fn public_mutation_records_actor_on_run_and_published_commit() {
+async fn partial_failure_observably_rolls_back_but_blocks_next_mutation_on_same_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    // Op-1 inserts Person "Eve" successfully (advancing Lance HEAD on
+    // node:Person). Op-2 inserts Knows from Eve to "Missing" — fails at
+    // validate_edge_insert_endpoints because "Missing" doesn't exist.
+    // The query as a whole errors; the publisher never runs.
+    let err = db
+        .mutate(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person_and_friend",
+            &mixed_params(
+                &[("$name", "Eve"), ("$friend", "Missing")],
+                &[("$age", 22)],
+            ),
+        )
+        .await
+        .expect_err("op-2 must fail");
+    let OmniError::Manifest(manifest_err) = err else {
+        panic!("expected Manifest error, got {err:?}");
+    };
+    assert!(
+        manifest_err.message.contains("not found"),
+        "unexpected error: {}",
+        manifest_err.message,
+    );
+
+    // Atomicity at the manifest level: Eve is *not* observable. The Lance
+    // fragment from op-1 exists on disk but is not referenced by the
+    // manifest; readers at the manifest's pinned version see the
+    // pre-mutation state.
+    let eve = db
+        .query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", "Eve")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(eve.num_rows(), 0, "partial Lance write must not be visible");
+
+    // The next mutation against the *same* table fails loudly. Other
+    // tables are unaffected, and reads still work.
+    let blocked = db
+        .mutate(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Frank")], &[("$age", 33)]),
+        )
+        .await
+        .expect_err("next mutation on the touched table is blocked by orphan Lance HEAD");
+    let OmniError::Manifest(blocked_err) = blocked else {
+        panic!("expected Manifest error, got {blocked:?}");
+    };
+    assert!(matches!(
+        blocked_err.details,
+        Some(omnigraph::error::ManifestConflictDetails::ExpectedVersionMismatch { .. })
+    ));
+}
+
+/// Concurrent writers to the same `(table, branch)` produce exactly one
+/// success and one `ExpectedVersionMismatch`. The replacement for the old
+/// `concurrent_conflicting_run_publish_fails_cleanly` test — the OCC fence
+/// has moved from a graph-level run-publish merge into the publisher's
+/// per-table CAS (MR-766 + MR-771).
+///
+/// Drives the race by interleaving two handles that captured the same
+/// pre-write manifest snapshot: A commits first; B's commit then sees
+/// `expected_versions[node:Person] = pre` while the manifest is at
+/// `pre + 1`, and the publisher rejects.
+#[tokio::test]
+async fn concurrent_writers_one_succeeds_one_gets_expected_version_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_string_lossy().into_owned();
+
+    {
+        let mut db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
+        load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+            .await
+            .unwrap();
+    }
+
+    // Open handle B first — it captures the pre-write snapshot. We don't
+    // actually mutate yet; we just want B's coordinator to be at the
+    // pre-A-commit state when we eventually call mutate.
+    let mut db_b = Omnigraph::open(&uri).await.unwrap();
+
+    // Writer A advances the manifest by inserting a new Person.
+    {
+        let mut db_a = Omnigraph::open(&uri).await.unwrap();
+        db_a.mutate(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "WriterA")], &[("$age", 41)]),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Writer B's coordinator is still at the pre-A snapshot. Its mutation
+    // captures expected_versions[node:Person] = pre (stale), then publishes
+    // — the publisher's CAS pre-check sees the manifest is now at post and
+    // rejects with ExpectedVersionMismatch.
+    let result_b = db_b
+        .mutate(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "WriterB")], &[("$age", 42)]),
+        )
+        .await;
+
+    let err = result_b.expect_err("stale writer must hit ExpectedVersionMismatch");
+    let OmniError::Manifest(manifest_err) = err else {
+        panic!("expected Manifest error, got {err:?}");
+    };
+    assert_eq!(manifest_err.kind, ManifestErrorKind::Conflict);
+    let Some(ManifestConflictDetails::ExpectedVersionMismatch {
+        ref table_key,
+        expected,
+        actual,
+    }) = manifest_err.details
+    else {
+        panic!(
+            "expected ExpectedVersionMismatch, got {:?}",
+            manifest_err.details,
+        );
+    };
+    assert_eq!(table_key, "node:Person");
+    assert!(
+        actual > expected,
+        "actual ({actual}) should be ahead of expected ({expected})",
+    );
+}
+
+/// The cancellation hole that motivated MR-771: dropping a mutation future
+/// mid-flight must not leave any graph-level state behind. With the run
+/// state machine gone, only orphaned Lance fragments can remain — and those
+/// are reclaimed by `omnigraph cleanup`.
+///
+/// The test deliberately does NOT assert that the manifest version is
+/// unchanged: `handle.abort()` is racing the spawned task, and on a fast
+/// machine the mutation may complete before cancellation. That is acceptable
+/// — what matters for cancel safety is that no `__run__*` staging branches
+/// are ever created, that `_graph_runs.lance` is never written, and that
+/// any partial state on disk is reachable through the regular manifest /
+/// commit graph pipes (so `omnigraph cleanup` can reclaim it). Asserting
+/// version equality would just be a flake on hosts where the abort lands
+/// late.
+#[tokio::test]
+async fn cancelled_mutation_future_leaves_no_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_string_lossy().into_owned();
+
+    {
+        let mut db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
+        load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+            .await
+            .unwrap();
+    }
+
+    let branches_before = {
+        let db = Omnigraph::open(&uri).await.unwrap();
+        db.branch_list().await.unwrap()
+    };
+
+    let uri_handle = uri.clone();
+    let handle = tokio::spawn(async move {
+        let mut db = Omnigraph::open(&uri_handle).await.unwrap();
+        db.mutate(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        )
+        .await
+    });
+
+    // Cancel the future. Whether the in-flight write managed to land a
+    // fragment (or even fully publish) is timing-dependent and irrelevant —
+    // see the doc comment on this test for why.
+    handle.abort();
+    let _ = handle.await;
+
+    let db = Omnigraph::open(&uri).await.unwrap();
+    let branches_after = db.branch_list().await.unwrap();
+
+    // Cancel-safety property: no graph-level run/staging state remains.
+    //
+    // Note: `branch_list()` already filters `__run__*` via
+    // `is_internal_system_branch`, so a runtime "no `__run__` branches" check
+    // would be vacuous. The structural property that no `__run__` branches
+    // can ever be created is enforced by deletion of `begin_run` etc. in
+    // MR-771 (verified by the build itself — those symbols no longer exist).
+    //
+    // (1) The branch list is unchanged: cancellation/completion cannot
+    //     synthesize new public branches.
+    assert_eq!(
+        branches_after, branches_before,
+        "cancelled mutation must not synthesize new public branches",
+    );
+    // (2) The legacy run-state machine table never reappears on disk.
+    assert!(
+        !std::path::Path::new(&format!("{}/_graph_runs.lance", uri)).exists(),
+        "no _graph_runs.lance after cancel — state machine is gone",
+    );
+}
+
+/// `actor_id` provided to `mutate_as` reaches the commit graph so audit can
+/// reconstruct who published which commit. This used to be plumbed via the
+/// run record; now it goes directly through the publisher and
+/// `record_graph_commit`.
+#[tokio::test]
+async fn mutation_actor_id_lands_in_commit_graph() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut db = init_and_load(&dir).await;
@@ -523,14 +409,6 @@ async fn public_mutation_records_actor_on_run_and_published_commit() {
     .await
     .unwrap();
 
-    let runs = db.list_runs().await.unwrap();
-    let run = runs
-        .iter()
-        .find(|run| run.operation_hash.as_deref() == Some("mutation:set_age:branch=main"))
-        .expect("published mutation run should exist");
-    assert_eq!(run.actor_id.as_deref(), Some("act-andrew"));
-    assert_eq!(run.status, RunStatus::Published);
-
     let head = CommitGraph::open(uri)
         .await
         .unwrap()
@@ -541,12 +419,11 @@ async fn public_mutation_records_actor_on_run_and_published_commit() {
     assert_eq!(head.actor_id.as_deref(), Some("act-andrew"));
 }
 
+/// Repeated loads must not accumulate `__run__*` branches across calls. In
+/// the post-demotion world there are no run branches at all — verify that
+/// 10 sequential loads end with `branch_list() == ["main"]`.
 #[tokio::test]
-async fn run_branches_do_not_accumulate_across_repeated_loads() {
-    // MR-674: run branches are transactional scaffolding. Every terminal
-    // state (Published, Aborted, Failed) deletes the branch. Verifying the
-    // invariant end-to-end: after 10 publishes and one abort, only main
-    // should remain.
+async fn repeated_loads_do_not_accumulate_branches() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
@@ -561,41 +438,37 @@ async fn run_branches_do_not_accumulate_across_repeated_loads() {
             .unwrap();
     }
 
-    let aborted_run = db.begin_run("main", Some("abort-me")).await.unwrap();
-    db.abort_run(&aborted_run.run_id).await.unwrap();
-
     assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
-    let all_branches = Omnigraph::open(uri)
-        .await
-        .unwrap()
-        .branch_list()
-        .await
-        .unwrap();
-    assert_eq!(all_branches, vec!["main".to_string()]);
 }
 
+/// User code must not be able to write to internal `__run__*` names. The
+/// branch-name guard predicate is kept as defense-in-depth (MR-770 will
+/// remove it once production legacy branches are swept).
 #[tokio::test]
-async fn failed_load_deletes_run_branch() {
+async fn public_branch_apis_reject_internal_run_refs() {
     let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let mut db = init_and_load(&dir).await;
 
-    let bad = r#"{"type":"Person","data":{"name":"Alice","age":30}}
-{"edge":"Knows","from":"Alice","to":"Missing"}"#;
-    let _ = load_jsonl(&mut db, bad, LoadMode::Overwrite).await;
+    let create_err = db.branch_create("__run__synthetic").await.unwrap_err();
+    let OmniError::Manifest(err) = create_err else {
+        panic!("expected Manifest error");
+    };
+    assert!(
+        err.message.contains("internal run ref"),
+        "unexpected error: {}",
+        err.message
+    );
 
-    let runs = latest_runs(uri).await;
-    assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0].status, "failed");
-
-    let err = db
-        .snapshot_of(ReadTarget::branch(runs[0].run_branch.as_str()))
+    let merge_err = db
+        .branch_merge("__run__synthetic", "main")
         .await
         .unwrap_err();
+    let OmniError::Manifest(err) = merge_err else {
+        panic!("expected Manifest error");
+    };
     assert!(
-        matches!(err, OmniError::Manifest(ref e) if e.kind == ManifestErrorKind::NotFound)
-            || matches!(err, OmniError::Lance(_)),
-        "failed run's branch should be gone, got: {}",
-        err
+        err.message.contains("internal run refs"),
+        "unexpected error: {}",
+        err.message
     );
 }

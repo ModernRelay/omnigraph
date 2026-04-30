@@ -23,8 +23,6 @@ pub enum PolicyAction {
     BranchCreate,
     BranchDelete,
     BranchMerge,
-    RunPublish,
-    RunAbort,
     Admin,
 }
 
@@ -38,8 +36,6 @@ impl PolicyAction {
             Self::BranchCreate => "branch_create",
             Self::BranchDelete => "branch_delete",
             Self::BranchMerge => "branch_merge",
-            Self::RunPublish => "run_publish",
-            Self::RunAbort => "run_abort",
             Self::Admin => "admin",
         }
     }
@@ -51,12 +47,7 @@ impl PolicyAction {
     fn uses_target_branch_scope(self) -> bool {
         matches!(
             self,
-            Self::BranchCreate
-                | Self::SchemaApply
-                | Self::BranchDelete
-                | Self::BranchMerge
-                | Self::RunPublish
-                | Self::RunAbort
+            Self::BranchCreate | Self::SchemaApply | Self::BranchDelete | Self::BranchMerge
         )
     }
 }
@@ -79,8 +70,6 @@ impl FromStr for PolicyAction {
             "branch_create" => Ok(Self::BranchCreate),
             "branch_delete" => Ok(Self::BranchDelete),
             "branch_merge" => Ok(Self::BranchMerge),
-            "run_publish" => Ok(Self::RunPublish),
-            "run_abort" => Ok(Self::RunAbort),
             "admin" => Ok(Self::Admin),
             other => bail!("unknown policy action '{other}'"),
         }
@@ -599,8 +588,6 @@ namespace Omnigraph {
     action "branch_create" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
     action "branch_delete" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
     action "branch_merge" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
-    action "run_publish" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
-    action "run_abort" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
     action "admin" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
 }
 "#
@@ -732,7 +719,7 @@ rules:
   - id: admins-promote
     allow:
       actors: { group: admins }
-      actions: [branch_delete, branch_merge, run_publish]
+      actions: [branch_delete, branch_merge]
       target_branch_scope: protected
 "#,
         )

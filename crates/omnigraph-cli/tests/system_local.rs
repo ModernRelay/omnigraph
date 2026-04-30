@@ -2,12 +2,7 @@ mod support;
 
 use std::env;
 use std::fs;
-use std::process::Stdio;
-use std::thread::sleep;
-use std::time::Duration;
 
-use omnigraph::db::Omnigraph;
-use omnigraph::loader::LoadMode;
 use reqwest::blocking::Client;
 use serde_json::Value;
 
@@ -33,7 +28,7 @@ rules:
   - id: admins-promote
     allow:
       actors: { group: admins }
-      actions: [branch_merge, run_publish]
+      actions: [branch_merge]
       target_branch_scope: protected
 "#;
 
@@ -115,42 +110,6 @@ fn snapshot_table_row_count_at(repo: &std::path::Path, table_key: &str) -> u64 {
         .unwrap()["row_count"]
         .as_u64()
         .unwrap()
-}
-
-fn wait_for_running_run(repo: &SystemRepo) -> String {
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    for _ in 0..200 {
-        let running = runtime.block_on(async {
-            let db = Omnigraph::open(repo.path().to_str().unwrap())
-                .await
-                .unwrap();
-            db.list_runs()
-                .await
-                .unwrap()
-                .into_iter()
-                .find(|run| run.target_branch == "main" && run.status.as_str() == "running")
-                .map(|run| run.run_id.to_string())
-        });
-        if let Some(run_id) = running {
-            return run_id;
-        }
-        sleep(Duration::from_millis(50));
-    }
-
-    panic!("timed out waiting for running run");
-}
-
-fn bulk_people_jsonl(count: usize) -> String {
-    let mut rows = String::new();
-    for index in 0..count {
-        rows.push_str(&format!(
-            r#"{{"type":"Person","data":{{"name":"Bulk{:05}","age":{}}}}}"#,
-            index,
-            20 + (index % 50)
-        ));
-        rows.push('\n');
-    }
-    rows
 }
 
 fn gemini_base_url() -> String {
@@ -348,15 +307,17 @@ fn local_cli_end_to_end_branch_change_merge_flow() {
     assert_eq!(main_read["row_count"], 1);
     assert_eq!(main_read["rows"][0]["p.name"], "Zoe");
 
-    let runs_payload = parse_stdout_json(&output_success(
-        cli().arg("run").arg("list").arg(repo.path()).arg("--json"),
+    // MR-771: `omnigraph run list` removed. Audit visible via commit list.
+    let commits_payload = parse_stdout_json(&output_success(
+        cli()
+            .arg("commit")
+            .arg("list")
+            .arg(repo.path())
+            .arg("--branch")
+            .arg("main")
+            .arg("--json"),
     ));
-    let runs = runs_payload["runs"].as_array().unwrap();
-    assert!(runs.len() >= 2);
-    assert!(
-        runs.iter()
-            .any(|run| run["target_branch"] == "feature" && run["status"] == "published")
-    );
+    assert!(commits_payload["commits"].as_array().unwrap().len() >= 2);
 }
 
 #[test]
@@ -636,17 +597,8 @@ fn local_cli_failed_load_keeps_target_state_unchanged() {
         snapshot_table_row_count(&repo, "edge:Knows"),
         knows_rows_before
     );
-
-    let runs_payload = parse_stdout_json(&output_success(
-        cli().arg("run").arg("list").arg(repo.path()).arg("--json"),
-    ));
-    assert!(
-        runs_payload["runs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|run| run["target_branch"] == "main" && run["status"] == "failed")
-    );
+    // MR-771: failed loads no longer leave a RunRecord. The atomicity
+    // guarantee is verified above (target tables are unchanged).
 }
 
 #[test]
@@ -679,17 +631,9 @@ fn local_cli_failed_change_keeps_target_state_unchanged() {
             .arg("--json"),
     ));
     assert_eq!(friends_payload["row_count"], 2);
-
-    let runs_payload = parse_stdout_json(&output_success(
-        cli().arg("run").arg("list").arg(repo.path()).arg("--json"),
-    ));
-    assert!(
-        runs_payload["runs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|run| run["target_branch"] == "main" && run["status"] == "failed")
-    );
+    // MR-771: failed mutations no longer leave a RunRecord. The atomicity
+    // guarantee is verified above (the friends_of read above shows main
+    // unchanged).
 }
 
 #[test]
@@ -997,102 +941,12 @@ query vector_search($q: String) {
     assert_eq!(result["rows"][0]["d.slug"], "alpha-doc");
 }
 
-#[test]
-fn local_cli_transactional_load_drift_fails_without_partial_publish() {
-    let repo = SystemRepo::loaded();
-    let large_data = repo.write_jsonl("system-large-load.jsonl", &bulk_people_jsonl(250_000));
-    let person_rows_before = snapshot_table_row_count(&repo, "node:Person");
-
-    let mut load = cli_process();
-    load.arg("load")
-        .arg("--data")
-        .arg(&large_data)
-        .arg("--mode")
-        .arg("merge")
-        .arg(repo.path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let child = load.spawn().unwrap();
-
-    let run_id = wait_for_running_run(&repo);
-
-    tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let mut db = Omnigraph::open(repo.path().to_str().unwrap())
-            .await
-            .unwrap();
-        let interloper = db
-            .begin_run("main", Some("system-test-interloper"))
-            .await
-            .unwrap();
-        db.load(
-            interloper.run_branch.as_str(),
-            r#"{"type":"Person","data":{"name":"Interloper","age":41}}"#,
-            LoadMode::Append,
-        )
-        .await
-        .unwrap();
-        db.publish_run(&interloper.run_id).await.unwrap();
-    });
-
-    let output = child.wait_with_output().unwrap();
-    assert!(
-        !output.status.success(),
-        "load unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(
-        stderr.contains("advanced during transactional load")
-            || stderr.contains("version drift")
-            || stderr.contains("retry"),
-        "unexpected load failure: {stderr}"
-    );
-
-    let run_payload = parse_stdout_json(&output_success(
-        cli()
-            .arg("run")
-            .arg("show")
-            .arg("--uri")
-            .arg(repo.path())
-            .arg(&run_id)
-            .arg("--json"),
-    ));
-    assert_eq!(run_payload["status"], "failed");
-
-    assert_eq!(
-        snapshot_table_row_count(&repo, "node:Person"),
-        person_rows_before + 1
-    );
-
-    let interloper = parse_stdout_json(&output_success(
-        cli()
-            .arg("read")
-            .arg(repo.path())
-            .arg("--query")
-            .arg(fixture("test.gq"))
-            .arg("--name")
-            .arg("get_person")
-            .arg("--params")
-            .arg(r#"{"name":"Interloper"}"#)
-            .arg("--json"),
-    ));
-    assert_eq!(interloper["row_count"], 1);
-
-    let bulk_row = parse_stdout_json(&output_success(
-        cli()
-            .arg("read")
-            .arg(repo.path())
-            .arg("--query")
-            .arg(fixture("test.gq"))
-            .arg("--name")
-            .arg("get_person")
-            .arg("--params")
-            .arg(r#"{"name":"Bulk00000"}"#)
-            .arg("--json"),
-    ));
-    assert_eq!(bulk_row["row_count"], 0);
-}
+// MR-771: the publisher CAS conflict shape is verified end-to-end at the
+// engine level in `crates/omnigraph/tests/runs.rs::concurrent_writers_one_succeeds_one_gets_expected_version_mismatch`
+// and at the HTTP boundary in
+// `crates/omnigraph-server/tests/server.rs::change_conflict_returns_manifest_conflict_409`.
+// The pre-MR-771 CLI-level race was timing-dependent; with direct-publish
+// the surface is the same engine path the unit test already covers.
 
 #[test]
 fn local_cli_policy_tooling_is_end_to_end_while_local_writes_stay_unenforced() {

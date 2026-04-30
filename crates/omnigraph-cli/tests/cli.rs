@@ -29,7 +29,7 @@ rules:
   - id: admins-promote
     allow:
       actors: { group: admins }
-      actions: [branch_merge, run_publish]
+      actions: [branch_merge]
       target_branch_scope: protected
 "#;
 
@@ -1905,119 +1905,7 @@ fn cli_fails_for_invalid_merge_requests() {
     );
 }
 
-#[test]
-fn run_list_and_show_report_published_runs() {
-    let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
-
-    let list_output = output_success(cli().arg("run").arg("list").arg(&repo).arg("--json"));
-    let list_payload: Value = serde_json::from_slice(&list_output.stdout).unwrap();
-    let runs = list_payload["runs"].as_array().unwrap();
-    assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0]["status"], "published");
-    let run_id = runs[0]["run_id"].as_str().unwrap();
-
-    let show_output = output_success(
-        cli()
-            .arg("run")
-            .arg("show")
-            .arg("--uri")
-            .arg(&repo)
-            .arg(run_id)
-            .arg("--json"),
-    );
-    let show_payload: Value = serde_json::from_slice(&show_output.stdout).unwrap();
-    assert_eq!(show_payload["run_id"], run_id);
-    assert_eq!(show_payload["status"], "published");
-    assert_eq!(show_payload["target_branch"], "main");
-}
-
-#[test]
-fn run_list_can_resolve_uri_from_config() {
-    let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    let config = temp.path().join("omnigraph.yaml");
-    init_repo(&repo);
-    load_fixture(&repo);
-    write_config(&config, &local_yaml_config(&repo));
-
-    let output = output_success(
-        cli()
-            .arg("run")
-            .arg("list")
-            .arg("--config")
-            .arg(&config)
-            .arg("--json"),
-    );
-    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(payload["runs"].as_array().unwrap().len(), 1);
-}
-
-#[test]
-fn run_publish_promotes_manual_running_run() {
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
-
-    let run_id = runtime.block_on(begin_manual_run(&repo, "main"));
-
-    let publish_output = output_success(
-        cli()
-            .arg("run")
-            .arg("publish")
-            .arg("--uri")
-            .arg(&repo)
-            .arg(&run_id)
-            .arg("--json"),
-    );
-    let payload: Value = serde_json::from_slice(&publish_output.stdout).unwrap();
-    assert_eq!(payload["run_id"], run_id);
-    assert_eq!(payload["status"], "published");
-    assert!(payload["published_snapshot_id"].is_string());
-
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    runtime.block_on(async {
-        let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
-        let result = db
-            .query(
-                ReadTarget::branch("main"),
-                include_str!("../../omnigraph/tests/fixtures/test.gq"),
-                "get_person",
-                &omnigraph_compiler::ir::ParamMap::from([(
-                    "name".to_string(),
-                    omnigraph_compiler::query::ast::Literal::String("Eve".to_string()),
-                )]),
-            )
-            .await
-            .unwrap();
-        assert_eq!(result.num_rows(), 1);
-    });
-}
-
-#[test]
-fn run_abort_marks_manual_running_run_aborted() {
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
-
-    let run_id = runtime.block_on(begin_manual_run(&repo, "main"));
-
-    let abort_output = output_success(
-        cli()
-            .arg("run")
-            .arg("abort")
-            .arg("--uri")
-            .arg(&repo)
-            .arg(&run_id)
-            .arg("--json"),
-    );
-    let payload: Value = serde_json::from_slice(&abort_output.stdout).unwrap();
-    assert_eq!(payload["run_id"], run_id);
-    assert_eq!(payload["status"], "aborted");
-}
+// MR-771: `omnigraph run list/show/publish/abort` subcommands removed
+// alongside the run state machine. Direct-to-target writes leave nothing
+// for these CLIs to manage. Audit history is now visible via
+// `omnigraph commit list` reading the commit graph.

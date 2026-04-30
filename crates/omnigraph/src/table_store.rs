@@ -147,13 +147,18 @@ impl TableStore {
         table_key: &str,
         expected_version: u64,
     ) -> Result<()> {
-        if ds.version().version != expected_version {
-            return Err(OmniError::manifest_conflict(format!(
-                "version drift on {}: snapshot pinned v{} but dataset is at v{} — call sync_branch() and retry",
+        let actual = ds.version().version;
+        if actual != expected_version {
+            // Use the structured ExpectedVersionMismatch variant so callers
+            // (and the HTTP server) can match on details rather than parsing
+            // the message. This drift is a publisher-style OCC failure: the
+            // caller's pre-write view of the table version is stale relative
+            // to the on-disk Lance head.
+            return Err(OmniError::manifest_expected_version_mismatch(
                 table_key,
                 expected_version,
-                ds.version().version
-            )));
+                actual,
+            ));
         }
         Ok(())
     }

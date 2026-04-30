@@ -32,10 +32,11 @@ pub(super) async fn apply_schema_with_lock(
 ) -> Result<SchemaApplyResult> {
     db.ensure_schema_state_valid().await?;
     let branches = db.coordinator.all_branches().await?;
-    // Skip `main`, the schema-apply lock branch, and any internal `__run__`
-    // branches. Stale run branches used to block schema apply forever after
-    // a publish (MR-670); the publish path now cleans them up, but this
-    // filter is defense-in-depth for legacy repos that predate the fix.
+    // Skip `main` and internal system branches. The schema-apply lock branch
+    // is excluded because it is the cluster-wide schema-apply serializer.
+    // `__run__*` branches are no longer created (MR-771); the filter remains
+    // as defense-in-depth for legacy repos with leftover staging branches —
+    // MR-770 will sweep them and this guard can go.
     let blocking_branches = branches
         .into_iter()
         .filter(|branch| branch != "main" && !is_internal_system_branch(branch))
@@ -452,23 +453,6 @@ pub(super) async fn ensure_snapshot_entry_head_matches(
         .await?;
     db.table_store
         .ensure_expected_version(&ds, &entry.table_key, entry.table_version)
-}
-
-pub(super) async fn batch_for_table_rewrite(
-    db: &Omnigraph,
-    source_ds: &Dataset,
-    table_key: &str,
-) -> Result<RecordBatch> {
-    batch_for_schema_apply_rewrite(
-        db,
-        source_ds,
-        table_key,
-        &db.catalog,
-        table_key,
-        &db.catalog,
-        None,
-    )
-    .await
 }
 
 pub(super) async fn batch_for_schema_apply_rewrite(

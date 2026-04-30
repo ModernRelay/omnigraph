@@ -1,6 +1,4 @@
-use omnigraph::db::{
-    GraphCommit, MergeOutcome, ReadTarget, RunRecord, SchemaApplyResult, Snapshot,
-};
+use omnigraph::db::{GraphCommit, MergeOutcome, ReadTarget, SchemaApplyResult, Snapshot};
 use omnigraph::error::{MergeConflict, MergeConflictKind};
 use omnigraph::loader::{IngestResult, LoadMode};
 use omnigraph_compiler::SchemaMigrationStep;
@@ -39,30 +37,6 @@ pub struct SnapshotOutput {
     pub branch: String,
     pub manifest_version: u64,
     pub tables: Vec<SnapshotTableOutput>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct RunOutput {
-    pub run_id: String,
-    pub target_branch: String,
-    pub run_branch: String,
-    pub base_snapshot_id: String,
-    pub base_manifest_version: u64,
-    pub operation_hash: Option<String>,
-    pub actor_id: Option<String>,
-    pub status: String,
-    pub published_snapshot_id: Option<String>,
-    /// Run creation time as Unix epoch microseconds.
-    #[schema(example = 1714000000000000i64)]
-    pub created_at: i64,
-    /// Last status change as Unix epoch microseconds.
-    #[schema(example = 1714000000000000i64)]
-    pub updated_at: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct RunListOutput {
-    pub runs: Vec<RunOutput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -368,6 +342,17 @@ pub enum ErrorCode {
     Internal,
 }
 
+/// Structured details for a publisher-level OCC failure. Surfaces alongside
+/// HTTP 409 when a write was rejected because the caller's pre-write view of
+/// one table's manifest version was stale relative to the current head. The
+/// expected/actual fields tell the client which table to refresh.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ManifestConflictOutput {
+    pub table_key: String,
+    pub expected: u64,
+    pub actual: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ErrorOutput {
     pub error: String,
@@ -375,6 +360,12 @@ pub struct ErrorOutput {
     pub code: Option<ErrorCode>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merge_conflicts: Vec<MergeConflictOutput>,
+    /// Set when the conflict is a publisher CAS rejection
+    /// (`ManifestConflictDetails::ExpectedVersionMismatch`). The caller's
+    /// pre-write view of `table_key` was at version `expected` but the
+    /// manifest is now at `actual`. Refresh and retry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_conflict: Option<ManifestConflictOutput>,
 }
 
 pub fn snapshot_payload(branch: &str, snapshot: &Snapshot) -> SnapshotOutput {
@@ -405,22 +396,6 @@ pub fn schema_apply_output(uri: &str, result: SchemaApplyResult) -> SchemaApplyO
         step_count: result.steps.len(),
         manifest_version: result.manifest_version,
         steps: result.steps,
-    }
-}
-
-pub fn run_output(run: &RunRecord) -> RunOutput {
-    RunOutput {
-        run_id: run.run_id.as_str().to_string(),
-        target_branch: run.target_branch.clone(),
-        run_branch: run.run_branch.clone(),
-        base_snapshot_id: run.base_snapshot_id.as_str().to_string(),
-        base_manifest_version: run.base_manifest_version,
-        operation_hash: run.operation_hash.clone(),
-        actor_id: run.actor_id.clone(),
-        status: run.status.as_str().to_string(),
-        published_snapshot_id: run.published_snapshot_id.clone(),
-        created_at: run.created_at,
-        updated_at: run.updated_at,
     }
 }
 
