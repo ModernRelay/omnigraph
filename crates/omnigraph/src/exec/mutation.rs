@@ -544,12 +544,15 @@ fn apply_assignments(
 /// with `Lance HEAD > manifest_version`. The next `mutate_as` against the
 /// same table will surface `ExpectedVersionMismatch` (Lance HEAD ahead of
 /// the manifest snapshot). Lance's `restore()` is *not* a rewind — it
-/// creates a new commit, monotonically advancing the version. A proper fix
-/// requires per-table Lance-internal branches (write to a transient branch,
-/// fast-forward main on success, drop branch on failure); tracked as a
-/// follow-up to MR-771. In practice this path is narrow: most validation
-/// runs before any Lance write, so single-statement mutations are
-/// unaffected. See `docs/runs.md`.
+/// creates a new commit, monotonically advancing the version. The proper
+/// fix uses Lance's distributed-write API (`write_fragments` /
+/// `Scanner::with_fragments` / `Operation::Append { fragments }`) — see
+/// [MR-794](https://linear.app/modernrelay/issue/MR-794). The staging
+/// primitives `TableStore::stage_append` / `stage_merge_insert` /
+/// `commit_staged` / `scan_with_staged` are in place; full integration
+/// with this struct is the MR-794 follow-up. In practice this path is
+/// narrow today: most validation runs before any Lance write, so
+/// single-statement mutations are unaffected. See `docs/runs.md`.
 #[derive(Default)]
 struct MutationStaging {
     expected_versions: HashMap<String, u64>,
