@@ -634,7 +634,10 @@ impl TableStore {
         // duplicates / dropped rows). Mirror the commit-time renumbering
         // here, using `ds.manifest.max_fragment_id() + 1` as the base and
         // accounting for prior stages.
-        let next_id_base = ds.manifest.max_fragment_id.unwrap_or(0)
+        // ds.manifest.max_fragment_id is Option<u32>; cast up to u64 because
+        // Lance's Fragment::id (and the commit-time renumbering counter in
+        // Transaction::fragments_with_ids) operate on u64.
+        let next_id_base = ds.manifest.max_fragment_id.unwrap_or(0) as u64
             + 1
             + prior_stages_fragment_count(prior_stages);
         assign_fragment_ids(&mut new_fragments, next_id_base);
@@ -768,6 +771,23 @@ impl TableStore {
     /// filter, a merge_insert that rewrites an existing fragment would
     /// surface twice — once via the original committed fragment, once via
     /// the rewrite in `new_fragments`.
+    ///
+    /// **Filter contract is incomplete on staged fragments.** When `filter`
+    /// is `Some(...)`, Lance pushes the predicate to per-fragment scans
+    /// with stats-based pruning. Uncommitted fragments produced by
+    /// `write_fragments_internal` lack the per-column statistics that
+    /// committed fragments carry; Lance's optimizer drops them from the
+    /// filtered scan even when their data would match. Staged-fragment
+    /// rows are silently absent from the result. `scanner.use_stats(false)`
+    /// does not fix this in lance 4.0.0. Callers needing correct filtered
+    /// reads against staged data should use a different strategy (the
+    /// engine's MR-794 step 2+ design uses in-memory pending-batch
+    /// accumulation + DataFusion `MemTable` instead — see
+    /// `.context/mr-794-step2-design.md`).
+    ///
+    /// This method remains on the surface for primitive-level testing
+    /// (basic stage + scan correctness without filters works) and for
+    /// callers that don't need filter pushdown.
     pub async fn scan_with_staged(
         &self,
         ds: &Dataset,
