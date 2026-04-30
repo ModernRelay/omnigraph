@@ -54,11 +54,6 @@ rules:
       actors: { group: admins }
       actions: [branch_delete, branch_merge]
       target_branch_scope: protected
-  - id: admins-publish
-    allow:
-      actors: { group: admins }
-      actions: [run_publish]
-      target_branch_scope: protected
 "#;
 
 const POLICY_PROTECTED_READ_YAML: &str = r#"
@@ -766,7 +761,7 @@ async fn protected_routes_require_bearer_token() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/runs")
+            .uri("/branches")
             .method(Method::GET)
             .body(Body::empty())
             .unwrap(),
@@ -801,7 +796,7 @@ async fn protected_routes_accept_valid_bearer_token_while_healthz_stays_open() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/runs")
+            .uri("/branches")
             .method(Method::GET)
             .header("authorization", "Bearer demo-token")
             .body(Body::empty())
@@ -810,7 +805,7 @@ async fn protected_routes_accept_valid_bearer_token_while_healthz_stays_open() {
     .await;
 
     assert_eq!(status, StatusCode::OK);
-    assert!(body["runs"].is_array());
+    assert!(body["branches"].is_array());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -882,7 +877,7 @@ async fn protected_routes_accept_any_configured_team_bearer_token() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/runs")
+            .uri("/branches")
             .method(Method::GET)
             .header("authorization", "Bearer token-two")
             .body(Body::empty())
@@ -891,7 +886,7 @@ async fn protected_routes_accept_any_configured_team_bearer_token() {
     .await;
 
     assert_eq!(status, StatusCode::OK);
-    assert!(body["runs"].is_array());
+    assert!(body["branches"].is_array());
 }
 
 /// Verifies the hashed-token lookup correctly resolves each bearer to its
@@ -1350,66 +1345,9 @@ async fn policy_blocks_non_admin_merge_to_main_and_allows_admin() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn policy_blocks_non_admin_run_publish_to_main() {
-    let temp = init_loaded_repo().await;
-    let repo = repo_path(temp.path());
-    let run_id = {
-        let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
-        db.begin_run("main", Some("policy-publish"))
-            .await
-            .unwrap()
-            .run_id
-            .as_str()
-            .to_string()
-    };
-
-    let policy_path = temp.path().join("policy.yaml");
-    fs::write(&policy_path, POLICY_YAML).unwrap();
-    let state = AppState::open_with_bearer_tokens_and_policy(
-        repo.to_string_lossy().to_string(),
-        vec![
-            ("act-bruno".to_string(), "team-token".to_string()),
-            ("act-ragnor".to_string(), "admin-token".to_string()),
-        ],
-        Some(&policy_path),
-    )
-    .await
-    .unwrap();
-    let app = build_app(state);
-
-    let (deny_status, deny_body) = json_response(
-        &app,
-        Request::builder()
-            .uri(format!("/runs/{run_id}/publish"))
-            .method(Method::POST)
-            .header("authorization", "Bearer team-token")
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    let deny_error: ErrorOutput = serde_json::from_value(deny_body).unwrap();
-    assert_eq!(deny_status, StatusCode::FORBIDDEN);
-    assert_eq!(
-        deny_error.code,
-        Some(omnigraph_server::api::ErrorCode::Forbidden)
-    );
-
-    let (allow_status, allow_body) = json_response(
-        &app,
-        Request::builder()
-            .uri(format!("/runs/{run_id}/publish"))
-            .method(Method::POST)
-            .header("authorization", "Bearer admin-token")
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(allow_status, StatusCode::OK);
-    assert_eq!(allow_body["target_branch"], "main");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn authenticated_change_stamps_actor_on_runs_and_commits() {
+async fn authenticated_change_stamps_actor_on_commits() {
+    // MR-771: with the Run state machine removed, actor_id is recorded
+    // directly on the commit graph (no intermediate run record).
     let (_temp, app) = app_for_loaded_repo_with_auth_tokens(&[("act-andrew", "token-one")]).await;
 
     let change = ChangeRequest {
@@ -1431,26 +1369,6 @@ async fn authenticated_change_stamps_actor_on_runs_and_commits() {
     .await;
     assert_eq!(change_status, StatusCode::OK);
     assert_eq!(change_body["actor_id"], "act-andrew");
-
-    let (runs_status, runs_body) = json_response(
-        &app,
-        Request::builder()
-            .uri("/runs")
-            .method(Method::GET)
-            .header("authorization", "Bearer token-one")
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(runs_status, StatusCode::OK);
-    let run = runs_body["runs"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|run| run["operation_hash"] == "mutation:insert_person:branch=main")
-        .expect("mutation run should be present");
-    assert_eq!(run["actor_id"], "act-andrew");
-    assert_eq!(run["status"], "published");
 
     let (commits_status, commits_body) = json_response(
         &app,
@@ -2189,94 +2107,74 @@ query vector_search_string($q: String) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn missing_run_returns_not_found() {
-    let (_temp, app) = app_for_loaded_repo().await;
-    let (status, body) = json_response(
-        &app,
-        Request::builder()
-            .uri("/runs/missing-run")
-            .method(Method::GET)
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-
-    let error: ErrorOutput = serde_json::from_value(body).unwrap();
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(error.code, Some(omnigraph_server::api::ErrorCode::NotFound));
-    assert!(error.error.contains("run 'missing-run' not found"));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn publish_conflict_returns_conflict_status() {
+async fn change_conflict_returns_manifest_conflict_409() {
+    // MR-771: a write that races with another writer surfaces as HTTP 409
+    // with a structured `manifest_conflict` body — `table_key`, `expected`,
+    // and `actual` — so clients can detect-and-retry without parsing the
+    // message. (Replaces the old run-publish merge-conflict shape.)
     let temp = init_loaded_repo().await;
     let repo = repo_path(temp.path());
-    let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
 
-    let run_a = db
-        .begin_run("main", Some("server-conflict-a"))
-        .await
-        .unwrap();
-    let run_b = db
-        .begin_run("main", Some("server-conflict-b"))
-        .await
-        .unwrap();
-    db.mutate(
-        &run_a.run_branch,
-        MUTATION_QUERIES,
-        "set_age",
-        &omnigraph_compiler::json_params_to_param_map(
-            Some(&json!({"name": "Alice", "age": 31 })),
-            &omnigraph_compiler::find_named_query(MUTATION_QUERIES, "set_age")
-                .unwrap()
-                .params,
-            omnigraph_compiler::JsonParamMode::Standard,
-        )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
-    db.mutate(
-        &run_b.run_branch,
-        MUTATION_QUERIES,
-        "set_age",
-        &omnigraph_compiler::json_params_to_param_map(
-            Some(&json!({"name": "Alice", "age": 32 })),
-            &omnigraph_compiler::find_named_query(MUTATION_QUERIES, "set_age")
-                .unwrap()
-                .params,
-            omnigraph_compiler::JsonParamMode::Standard,
-        )
-        .unwrap(),
-    )
-    .await
-    .unwrap();
-    db.publish_run(&run_a.run_id).await.unwrap();
-    drop(db);
-
+    // Build the server first so its handle pins the pre-mutation manifest
+    // version. Then advance the manifest from outside the server. The
+    // server's next /change call will capture stale `expected_versions`
+    // (from its still-pinned snapshot) and the publisher's CAS rejects.
     let state = AppState::open(repo.to_string_lossy().to_string())
         .await
         .unwrap();
     let app = build_app(state);
+
+    {
+        let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+        db.mutate(
+            "main",
+            MUTATION_QUERIES,
+            "set_age",
+            &omnigraph_compiler::json_params_to_param_map(
+                Some(&json!({"name": "Alice", "age": 31 })),
+                &omnigraph_compiler::find_named_query(MUTATION_QUERIES, "set_age")
+                    .unwrap()
+                    .params,
+                omnigraph_compiler::JsonParamMode::Standard,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri(format!("/runs/{}/publish", run_b.run_id.as_str()))
+            .uri("/change")
             .method(Method::POST)
             .header("content-type", "application/json")
-            .body(Body::from(b"{}" as &[u8]))
+            .body(Body::from(
+                serde_json::to_vec(&ChangeRequest {
+                    query_source: MUTATION_QUERIES.to_string(),
+                    query_name: Some("set_age".to_string()),
+                    params: Some(json!({ "name": "Alice", "age": 33 })),
+                    branch: Some("main".to_string()),
+                })
+                .unwrap(),
+            ))
             .unwrap(),
     )
     .await;
 
-    let error: ErrorOutput = serde_json::from_value(body).unwrap();
     assert_eq!(status, StatusCode::CONFLICT);
+    let error: ErrorOutput = serde_json::from_value(body).unwrap();
     assert_eq!(error.code, Some(omnigraph_server::api::ErrorCode::Conflict));
-    assert!(error.merge_conflicts.iter().any(|conflict| {
-        conflict.table_key == "node:Person"
-            && conflict.row_id.as_deref() == Some("Alice")
-            && conflict.kind == omnigraph_server::api::MergeConflictKindOutput::DivergentUpdate
-    }));
+    let conflict = error
+        .manifest_conflict
+        .expect("publisher CAS rejection must populate manifest_conflict body");
+    assert_eq!(conflict.table_key, "node:Person");
+    assert!(
+        conflict.actual > conflict.expected,
+        "actual ({}) should be ahead of expected ({})",
+        conflict.actual,
+        conflict.expected,
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -44,27 +44,16 @@ async fn s3_compatible_repo_lifecycle_works() {
         .await
         .unwrap();
 
-    let run = reopened
-        .begin_run("main", Some("s3-runtime-run"))
-        .await
-        .unwrap();
+    // Direct-to-target load (MR-771): no run lifecycle, single publisher
+    // commit lands the row.
     reopened
         .load(
-            &run.run_branch,
+            "main",
             r#"{"type":"Person","data":{"name":"RunOnly","age":31}}"#,
             LoadMode::Append,
         )
         .await
         .unwrap();
-    reopened.publish_run(&run.run_id).await.unwrap();
-
-    let runs = reopened.list_runs().await.unwrap();
-    assert!(
-        runs.iter()
-            .any(|record| { record.run_id == run.run_id && record.status.as_str() == "published" }),
-        "expected published run record in {:?}",
-        runs
-    );
 
     let mut reopened_again = Omnigraph::open(&uri).await.unwrap();
     let eve = query_main(
@@ -164,15 +153,8 @@ async fn s3_public_load_uses_hidden_run_and_publishes() {
     .await
     .unwrap();
 
-    let runs = db.list_runs().await.unwrap();
-    assert!(
-        runs.iter().any(|record| {
-            record.target_branch == "main" && record.status.as_str() == "published"
-        }),
-        "expected published transactional run in {:?}",
-        runs
-    );
-
+    // Direct-to-target writes (MR-771): no run state machine, just the
+    // published commit lands the row. Verify by reopening and reading.
     let mut reopened = Omnigraph::open(&uri).await.unwrap();
     let loaded = query_main(
         &mut reopened,

@@ -19,10 +19,6 @@ Axum 0.8 + tokio + utoipa-generated OpenAPI. Single repo per process; deploy mul
 | POST | `/branches` | bearer + `branch_create` | create | `server_branch_create` |
 | DELETE | `/branches/{branch}` | bearer + `branch_delete` | delete | `server_branch_delete` |
 | POST | `/branches/merge` | bearer + `branch_merge` | merge `source → target` | `server_branch_merge` |
-| GET | `/runs` | bearer + `read` | list | `server_run_list` |
-| GET | `/runs/{run_id}` | bearer + `read` | show | `server_run_show` |
-| POST | `/runs/{run_id}/publish` | bearer + `run_publish` | publish | `server_run_publish` |
-| POST | `/runs/{run_id}/abort` | bearer + `run_abort` | abort | `server_run_abort` |
 | GET | `/commits?branch=` | bearer + `read` | list | `server_commit_list` |
 | GET | `/commits/{commit_id}` | bearer + `read` | show | `server_commit_show` |
 
@@ -32,7 +28,14 @@ Only `/export` streams (`application/x-ndjson`, MPSC channel + `Body::from_strea
 
 ## Error model
 
-Uniform `ErrorOutput { error, code?, merge_conflicts[] }` with `code ∈ unauthorized | forbidden | bad_request | not_found | conflict | internal`. Merge conflicts attach structured `MergeConflictOutput { table_key, row_id?, kind, message }`.
+Uniform `ErrorOutput { error, code?, merge_conflicts[], manifest_conflict? }` with `code ∈ unauthorized | forbidden | bad_request | not_found | conflict | internal`. Merge conflicts attach structured `MergeConflictOutput { table_key, row_id?, kind, message }`.
+
+`manifest_conflict` is set on **publisher CAS rejections** (HTTP 409): the
+caller's pre-write view of one table's manifest version was stale.
+`ManifestConflictOutput { table_key, expected, actual }` tells the client
+which table to refresh and retry. This is the conflict shape produced by
+concurrent `/change` or `/ingest` calls landing the same `(table, branch)`
+race (MR-771 / MR-766).
 
 HTTP status codes used: 200, 400, 401, 403, 404, 409, 500.
 
@@ -64,5 +67,5 @@ See [deployment.md](deployment.md) for token-source operational details.
 
 - CORS — not configured; add `tower_http::cors` if needed.
 - Rate limiting — none.
-- Pagination — none (commits/branches/runs return everything; export streams).
+- Pagination — none (commits/branches return everything; export streams).
 - Multi-tenant routing — one repo per process.

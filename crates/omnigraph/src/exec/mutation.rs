@@ -340,6 +340,7 @@ fn build_insert_batch(
 
 async fn validate_edge_insert_endpoints(
     db: &Omnigraph,
+    staging: &MutationStaging,
     edge_name: &str,
     assignments: &HashMap<String, Literal>,
 ) -> Result<()> {
@@ -381,26 +382,46 @@ async fn validate_edge_insert_endpoints(
         }
     };
 
-    ensure_node_id_exists(db, &edge_type.from_type, from, "src").await?;
-    ensure_node_id_exists(db, &edge_type.to_type, to, "dst").await?;
+    ensure_node_id_exists(db, staging, &edge_type.from_type, from, "src").await?;
+    ensure_node_id_exists(db, staging, &edge_type.to_type, to, "dst").await?;
     Ok(())
 }
 
 async fn ensure_node_id_exists(
     db: &Omnigraph,
+    staging: &MutationStaging,
     node_type: &str,
     id: &str,
     label: &str,
 ) -> Result<()> {
-    let snapshot = db.snapshot();
     let table_key = format!("node:{}", node_type);
-    let ds = snapshot.open(&table_key).await?;
     let filter = format!("id = '{}'", id.replace('\'', "''"));
-    let exists = ds
-        .count_rows(Some(filter))
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?
-        > 0;
+
+    // Prefer the in-query staged dataset so a same-query insert of the
+    // referenced node is visible to this validation. Fall back to the
+    // pre-mutation manifest snapshot when no prior op touched this table.
+    let exists = if let Some(staged) = staging.latest.get(&table_key) {
+        let ds = db
+            .reopen_for_mutation(
+                &table_key,
+                &staged.full_path,
+                staged.table_branch.as_deref(),
+                staged.table_version,
+            )
+            .await?;
+        ds.count_rows(Some(filter))
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+            > 0
+    } else {
+        let snapshot = db.snapshot();
+        let ds = snapshot.open(&table_key).await?;
+        ds.count_rows(Some(filter))
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+            > 0
+    };
+
     if exists {
         Ok(())
     } else {
@@ -507,6 +528,144 @@ fn apply_assignments(
 
 // ─── Mutation execution ──────────────────────────────────────────────────────
 
+/// Per-query staging state for direct-to-target mutations. Replaces the
+/// `__run__` staging branch with an in-memory accumulator.
+///
+/// Each unique table touched by the mutation is captured at first-open time:
+/// - `expected_versions[table_key]` records the manifest version we observed
+///   pre-write — the publisher's CAS fence at end-of-query.
+/// - `latest[table_key]` records the most recent post-write state on that
+///   table — used to thread between ops within the query so subsequent ops
+///   see prior writes (read-your-writes).
+///
+/// **Known limitation (mid-query partial failure).** If op-N succeeds at the
+/// Lance level (a fragment is committed, advancing the table's Lance HEAD)
+/// and op-N+1 then fails before the publisher commits, the table is left
+/// with `Lance HEAD > manifest_version`. The next `mutate_as` against the
+/// same table will surface `ExpectedVersionMismatch` (Lance HEAD ahead of
+/// the manifest snapshot). Lance's `restore()` is *not* a rewind — it
+/// creates a new commit, monotonically advancing the version. A proper fix
+/// requires per-table Lance-internal branches (write to a transient branch,
+/// fast-forward main on success, drop branch on failure); tracked as a
+/// follow-up to MR-771. In practice this path is narrow: most validation
+/// runs before any Lance write, so single-statement mutations are
+/// unaffected. See `docs/runs.md`.
+#[derive(Default)]
+struct MutationStaging {
+    expected_versions: HashMap<String, u64>,
+    latest: HashMap<String, StagedTable>,
+}
+
+struct StagedTable {
+    table_key: String,
+    table_branch: Option<String>,
+    table_version: u64,
+    row_count: u64,
+    full_path: String,
+    version_metadata: crate::db::manifest::TableVersionMetadata,
+}
+
+trait IntoStagedRecord {
+    fn version(&self) -> u64;
+    fn row_count(&self) -> u64;
+    fn version_metadata(&self) -> &crate::db::manifest::TableVersionMetadata;
+}
+
+impl IntoStagedRecord for crate::table_store::TableState {
+    fn version(&self) -> u64 {
+        self.version
+    }
+    fn row_count(&self) -> u64 {
+        self.row_count
+    }
+    fn version_metadata(&self) -> &crate::db::manifest::TableVersionMetadata {
+        &self.version_metadata
+    }
+}
+
+impl IntoStagedRecord for crate::table_store::DeleteState {
+    fn version(&self) -> u64 {
+        self.version
+    }
+    fn row_count(&self) -> u64 {
+        self.row_count
+    }
+    fn version_metadata(&self) -> &crate::db::manifest::TableVersionMetadata {
+        &self.version_metadata
+    }
+}
+
+impl MutationStaging {
+    fn is_empty(&self) -> bool {
+        self.latest.is_empty()
+    }
+
+    fn record<S: IntoStagedRecord>(
+        &mut self,
+        table_key: String,
+        full_path: String,
+        table_branch: Option<String>,
+        state: &S,
+    ) {
+        self.latest.insert(
+            table_key.clone(),
+            StagedTable {
+                table_key,
+                table_branch,
+                table_version: state.version(),
+                row_count: state.row_count(),
+                full_path,
+                version_metadata: state.version_metadata().clone(),
+            },
+        );
+    }
+
+    fn into_updates(self) -> (Vec<crate::db::SubTableUpdate>, HashMap<String, u64>) {
+        let updates = self
+            .latest
+            .into_values()
+            .map(|st| crate::db::SubTableUpdate {
+                table_key: st.table_key,
+                table_version: st.table_version,
+                table_branch: st.table_branch,
+                row_count: st.row_count,
+                version_metadata: st.version_metadata,
+            })
+            .collect();
+        (updates, self.expected_versions)
+    }
+}
+
+/// Open a sub-table dataset for write in the current mutation query. On the
+/// first touch of a table, captures the pre-write manifest version into
+/// `staging.expected_versions` so the publisher can enforce OCC. On
+/// subsequent touches, re-opens the dataset at the locally-staged version
+/// (the version we wrote in a prior op of the same query) — bypassing the
+/// manifest because nothing has been committed yet.
+async fn open_for_mutation_in_query(
+    db: &Omnigraph,
+    staging: &mut MutationStaging,
+    table_key: &str,
+) -> Result<(Dataset, String, Option<String>)> {
+    if let Some(staged) = staging.latest.get(table_key) {
+        let ds = db
+            .reopen_for_mutation(
+                table_key,
+                &staged.full_path,
+                staged.table_branch.as_deref(),
+                staged.table_version,
+            )
+            .await?;
+        return Ok((ds, staged.full_path.clone(), staged.table_branch.clone()));
+    }
+    let (ds, full_path, table_branch) = db.open_for_mutation(table_key).await?;
+    staging
+        .expected_versions
+        .entry(table_key.to_string())
+        .or_insert(ds.version().version);
+    Ok((ds, full_path, table_branch))
+}
+
 impl Omnigraph {
     pub async fn mutate(
         &mut self,
@@ -546,88 +705,51 @@ impl Omnigraph {
         self.ensure_schema_state_valid().await?;
         let requested = Self::normalize_branch_name(branch)?;
         let resolved_params = enrich_mutation_params(params)?;
-        let operation = format!(
-            "mutation:{}:branch={}",
-            query_name,
-            requested.as_deref().unwrap_or("main")
-        );
 
-        if requested.as_deref().is_some_and(is_internal_run_branch) {
-            return self
-                .execute_named_mutation_on_branch(
-                    requested.as_deref(),
-                    query_source,
-                    query_name,
-                    &resolved_params,
-                )
-                .await;
-        }
+        // Direct-to-target write path. Per-query staging captures pre-write
+        // manifest versions (publisher CAS fence) and threads dataset state
+        // across ops to maintain read-your-writes within a multi-statement
+        // query without per-op manifest commits.
+        let mut staging = MutationStaging::default();
 
-        let target_branch = requested.clone().unwrap_or_else(|| "main".to_string());
-        let target_head_before = self.latest_branch_snapshot_id(&target_branch).await?;
-        let run = self
-            .begin_run(&target_branch, Some(operation.as_str()))
-            .await?;
+        let current = self.active_branch().map(str::to_string);
+        let needs_swap = requested.as_deref() != current.as_deref();
+        let previous = if needs_swap {
+            Some(self.swap_coordinator_for_branch(requested.as_deref()).await?)
+        } else {
+            None
+        };
 
-        let staged_result = match self
-            .execute_named_mutation_on_branch(
-                Some(run.run_branch.as_str()),
-                query_source,
-                query_name,
-                &resolved_params,
-            )
-            .await
-        {
-            Ok(result) => result,
-            Err(err) => {
-                let _ = self.fail_run(&run.run_id).await;
-                return Err(err);
+        let exec_result = self
+            .execute_named_mutation(query_source, query_name, &resolved_params, &mut staging)
+            .await;
+
+        let publish_result = match exec_result {
+            Err(e) => Err(e),
+            Ok(total) => {
+                if staging.is_empty() {
+                    Ok(total)
+                } else {
+                    let (updates, expected_versions) = staging.into_updates();
+                    match self
+                        .commit_updates_on_branch_with_expected(
+                            requested.as_deref(),
+                            &updates,
+                            &expected_versions,
+                        )
+                        .await
+                    {
+                        Ok(_) => Ok(total),
+                        Err(e) => Err(e),
+                    }
+                }
             }
         };
 
-        let target_head_now = self.latest_branch_snapshot_id(&target_branch).await?;
-        if target_head_now.as_str() != target_head_before.as_str() {
-            let _ = self.fail_run(&run.run_id).await;
-            return Err(OmniError::manifest_conflict(format!(
-                "target branch '{}' advanced during transactional mutation; retry",
-                target_branch
-            )));
+        if let Some(previous) = previous {
+            self.restore_coordinator(previous);
         }
-
-        if let Err(err) = self.publish_run(&run.run_id).await {
-            let _ = self.fail_run(&run.run_id).await;
-            return Err(err);
-        }
-
-        Ok(staged_result)
-    }
-
-    async fn execute_named_mutation_on_branch(
-        &mut self,
-        branch: Option<&str>,
-        query_source: &str,
-        query_name: &str,
-        params: &ParamMap,
-    ) -> Result<MutationResult> {
-        let requested = match branch {
-            Some(branch) => Self::normalize_branch_name(branch)?,
-            None => None,
-        };
-        let current = self.active_branch().map(str::to_string);
-        if requested == current {
-            return self
-                .execute_named_mutation(query_source, query_name, params)
-                .await;
-        }
-
-        let previous = self
-            .swap_coordinator_for_branch(requested.as_deref())
-            .await?;
-        let result = self
-            .execute_named_mutation(query_source, query_name, params)
-            .await;
-        self.restore_coordinator(previous);
-        result
+        publish_result
     }
 
     async fn execute_named_mutation(
@@ -635,6 +757,7 @@ impl Omnigraph {
         query_source: &str,
         query_name: &str,
         params: &ParamMap,
+        staging: &mut MutationStaging,
     ) -> Result<MutationResult> {
         let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
             .map_err(|e| OmniError::manifest(e.to_string()))?;
@@ -657,19 +780,25 @@ impl Omnigraph {
                 MutationOpIR::Insert {
                     type_name,
                     assignments,
-                } => self.execute_insert(type_name, assignments, params).await?,
+                } => {
+                    self.execute_insert(type_name, assignments, params, staging)
+                        .await?
+                }
                 MutationOpIR::Update {
                     type_name,
                     assignments,
                     predicate,
                 } => {
-                    self.execute_update(type_name, assignments, predicate, params)
+                    self.execute_update(type_name, assignments, predicate, params, staging)
                         .await?
                 }
                 MutationOpIR::Delete {
                     type_name,
                     predicate,
-                } => self.execute_delete(type_name, predicate, params).await?,
+                } => {
+                    self.execute_delete(type_name, predicate, params, staging)
+                        .await?
+                }
             };
             total.affected_nodes += result.affected_nodes;
             total.affected_edges += result.affected_edges;
@@ -682,6 +811,7 @@ impl Omnigraph {
         type_name: &str,
         assignments: &[IRAssignment],
         params: &ParamMap,
+        staging: &mut MutationStaging,
     ) -> Result<MutationResult> {
         let mut resolved: HashMap<String, Literal> = HashMap::new();
         for a in assignments {
@@ -722,21 +852,14 @@ impl Omnigraph {
                 )?;
             }
             let has_key = node_type.key_property().is_some();
-            let (state, table_branch) = if has_key {
-                self.upsert_batch(type_name, true, schema, batch).await?
+            let table_key = format!("node:{}", type_name);
+            let (state, full_path, table_branch) = if has_key {
+                self.upsert_batch_staged(&table_key, staging, schema, batch).await?
             } else {
-                self.append_batch(type_name, true, schema, batch).await?
+                self.append_batch_staged(&table_key, staging, schema, batch).await?
             };
 
-            let table_key = format!("node:{}", type_name);
-            self.commit_updates(&[crate::db::SubTableUpdate {
-                table_key,
-                table_version: state.version,
-                table_branch,
-                row_count: state.row_count,
-                version_metadata: state.version_metadata,
-            }])
-            .await?;
+            staging.record(table_key, full_path, table_branch, &state);
 
             Ok(MutationResult {
                 affected_nodes: 1,
@@ -749,7 +872,7 @@ impl Omnigraph {
             let id = ulid::Ulid::new().to_string();
 
             let batch = build_insert_batch(&schema, &id, &resolved, &blob_props)?;
-            validate_edge_insert_endpoints(self, type_name, &resolved).await?;
+            validate_edge_insert_endpoints(self, staging, type_name, &resolved).await?;
             crate::loader::validate_enum_constraints(&batch, &edge_type.properties, type_name)?;
             let unique_props = crate::loader::unique_property_names_for_edge(edge_type);
             if !unique_props.is_empty() {
@@ -760,7 +883,10 @@ impl Omnigraph {
                 )?;
             }
             let active_branch = self.active_branch().map(str::to_string);
-            let (state, table_branch) = self.append_batch(type_name, false, schema, batch).await?;
+            let table_key = format!("edge:{}", type_name);
+            let (state, full_path, table_branch) = self
+                .append_batch_staged(&table_key, staging, schema, batch)
+                .await?;
 
             crate::loader::validate_edge_cardinality(
                 self,
@@ -771,15 +897,7 @@ impl Omnigraph {
             )
             .await?;
 
-            let table_key = format!("edge:{}", type_name);
-            self.commit_updates(&[crate::db::SubTableUpdate {
-                table_key,
-                table_version: state.version,
-                table_branch,
-                row_count: state.row_count,
-                version_metadata: state.version_metadata,
-            }])
-            .await?;
+            staging.record(table_key, full_path, table_branch, &state);
 
             self.invalidate_graph_index().await;
 
@@ -792,42 +910,37 @@ impl Omnigraph {
         }
     }
 
-    /// Append a batch to a sub-table, returning (new_version, row_count).
-    async fn append_batch(
+    /// Append a batch to a sub-table within an in-flight mutation, routing
+    /// through `MutationStaging` so subsequent ops in the same query see the
+    /// write before publish. Returns the new state, the full path, and the
+    /// table branch.
+    async fn append_batch_staged(
         &self,
-        type_name: &str,
-        is_node: bool,
+        table_key: &str,
+        staging: &mut MutationStaging,
         _schema: SchemaRef,
         batch: RecordBatch,
-    ) -> Result<(crate::table_store::TableState, Option<String>)> {
-        let table_key = if is_node {
-            format!("node:{}", type_name)
-        } else {
-            format!("edge:{}", type_name)
-        };
-        let (mut ds, full_path, table_branch) = self.open_for_mutation(&table_key).await?;
+    ) -> Result<(crate::table_store::TableState, String, Option<String>)> {
+        let (mut ds, full_path, table_branch) =
+            open_for_mutation_in_query(self, staging, table_key).await?;
         let state = self
             .table_store()
             .append_batch(&full_path, &mut ds, batch)
             .await?;
-        Ok((state, table_branch))
+        Ok((state, full_path, table_branch))
     }
 
-    /// Upsert a batch into a sub-table using merge_insert keyed by "id".
-    /// Used for @key node types to enforce uniqueness.
-    async fn upsert_batch(
+    /// Upsert a batch into a sub-table using merge_insert keyed by "id",
+    /// routing through `MutationStaging`.
+    async fn upsert_batch_staged(
         &self,
-        type_name: &str,
-        is_node: bool,
+        table_key: &str,
+        staging: &mut MutationStaging,
         _schema: SchemaRef,
         batch: RecordBatch,
-    ) -> Result<(crate::table_store::TableState, Option<String>)> {
-        let table_key = if is_node {
-            format!("node:{}", type_name)
-        } else {
-            format!("edge:{}", type_name)
-        };
-        let (ds, full_path, table_branch) = self.open_for_mutation(&table_key).await?;
+    ) -> Result<(crate::table_store::TableState, String, Option<String>)> {
+        let (ds, full_path, table_branch) =
+            open_for_mutation_in_query(self, staging, table_key).await?;
         let state = self
             .table_store()
             .merge_insert_batch(
@@ -839,7 +952,7 @@ impl Omnigraph {
                 lance::dataset::WhenNotMatched::InsertAll,
             )
             .await?;
-        Ok((state, table_branch))
+        Ok((state, full_path, table_branch))
     }
 
     async fn execute_update(
@@ -848,6 +961,7 @@ impl Omnigraph {
         assignments: &[IRAssignment],
         predicate: &IRMutationPredicate,
         params: &ParamMap,
+        staging: &mut MutationStaging,
     ) -> Result<MutationResult> {
         // Defense in depth: ensure this is a node type
         if !self.catalog().node_types.contains_key(type_name) {
@@ -872,7 +986,8 @@ impl Omnigraph {
         let blob_props = self.catalog().node_types[type_name].blob_properties.clone();
 
         let table_key = format!("node:{}", type_name);
-        let (ds, full_path, table_branch) = self.open_for_mutation(&table_key).await?;
+        let (ds, full_path, table_branch) =
+            open_for_mutation_in_query(self, staging, &table_key).await?;
         let initial_version = ds.version().version;
 
         let non_blob_cols: Vec<&str> = schema
@@ -947,14 +1062,7 @@ impl Omnigraph {
             )
             .await?;
 
-        self.commit_updates(&[crate::db::SubTableUpdate {
-            table_key,
-            table_version: update_state.version,
-            table_branch,
-            row_count: update_state.row_count,
-            version_metadata: update_state.version_metadata,
-        }])
-        .await?;
+        staging.record(table_key, full_path, table_branch, &update_state);
 
         Ok(MutationResult {
             affected_nodes: affected_count,
@@ -967,12 +1075,15 @@ impl Omnigraph {
         type_name: &str,
         predicate: &IRMutationPredicate,
         params: &ParamMap,
+        staging: &mut MutationStaging,
     ) -> Result<MutationResult> {
         let is_node = self.catalog().node_types.contains_key(type_name);
         if is_node {
-            self.execute_delete_node(type_name, predicate, params).await
+            self.execute_delete_node(type_name, predicate, params, staging)
+                .await
         } else {
-            self.execute_delete_edge(type_name, predicate, params).await
+            self.execute_delete_edge(type_name, predicate, params, staging)
+                .await
         }
     }
 
@@ -981,11 +1092,13 @@ impl Omnigraph {
         type_name: &str,
         predicate: &IRMutationPredicate,
         params: &ParamMap,
+        staging: &mut MutationStaging,
     ) -> Result<MutationResult> {
         let pred_sql = predicate_to_sql(predicate, params, false)?;
 
         let table_key = format!("node:{}", type_name);
-        let (ds, full_path, table_branch) = self.open_for_mutation(&table_key).await?;
+        let (ds, full_path, table_branch) =
+            open_for_mutation_in_query(self, staging, &table_key).await?;
         let initial_version = ds.version().version;
 
         // Scan matching IDs for cascade
@@ -1032,13 +1145,12 @@ impl Omnigraph {
             .delete_where(&full_path, &mut ds, &pred_sql)
             .await?;
 
-        let mut updates = vec![crate::db::SubTableUpdate {
-            table_key,
-            table_version: delete_state.version,
-            table_branch: table_branch.clone(),
-            row_count: delete_state.row_count,
-            version_metadata: delete_state.version_metadata,
-        }];
+        staging.record(
+            table_key.clone(),
+            full_path.clone(),
+            table_branch.clone(),
+            &delete_state,
+        );
 
         let mut affected_edges = 0usize;
         let escaped: Vec<String> = deleted_ids
@@ -1069,7 +1181,7 @@ impl Omnigraph {
             let edge_table_key = format!("edge:{}", edge_name);
             let cascade_filter = cascade_filters.join(" OR ");
             let (mut edge_ds, edge_full_path, edge_table_branch) =
-                self.open_for_mutation(&edge_table_key).await?;
+                open_for_mutation_in_query(self, staging, &edge_table_key).await?;
 
             let edge_delete = self
                 .table_store()
@@ -1079,17 +1191,14 @@ impl Omnigraph {
             affected_edges += edge_delete.deleted_rows;
 
             if edge_delete.deleted_rows > 0 {
-                updates.push(crate::db::SubTableUpdate {
-                    table_key: edge_table_key,
-                    table_version: edge_delete.version,
-                    table_branch: edge_table_branch,
-                    row_count: edge_delete.row_count,
-                    version_metadata: edge_delete.version_metadata,
-                });
+                staging.record(
+                    edge_table_key,
+                    edge_full_path,
+                    edge_table_branch,
+                    &edge_delete,
+                );
             }
         }
-
-        self.commit_updates(&updates).await?;
 
         if affected_edges > 0 {
             self.invalidate_graph_index().await;
@@ -1106,11 +1215,13 @@ impl Omnigraph {
         type_name: &str,
         predicate: &IRMutationPredicate,
         params: &ParamMap,
+        staging: &mut MutationStaging,
     ) -> Result<MutationResult> {
         let pred_sql = predicate_to_sql(predicate, params, true)?;
 
         let table_key = format!("edge:{}", type_name);
-        let (mut ds, full_path, table_branch) = self.open_for_mutation(&table_key).await?;
+        let (mut ds, full_path, table_branch) =
+            open_for_mutation_in_query(self, staging, &table_key).await?;
 
         let delete_state = self
             .table_store()
@@ -1119,15 +1230,7 @@ impl Omnigraph {
         let affected = delete_state.deleted_rows;
 
         if affected > 0 {
-            self.commit_updates(&[crate::db::SubTableUpdate {
-                table_key,
-                table_version: delete_state.version,
-                table_branch,
-                row_count: delete_state.row_count,
-                version_metadata: delete_state.version_metadata,
-            }])
-            .await?;
-
+            staging.record(table_key, full_path, table_branch, &delete_state);
             self.invalidate_graph_index().await;
         }
 

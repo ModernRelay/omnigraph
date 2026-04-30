@@ -13,7 +13,6 @@ pub use omnigraph::{
     TableOptimizeStats,
 };
 pub(crate) use run_registry::is_internal_run_branch;
-pub use run_registry::{RunId, RunRecord, RunStatus};
 
 pub(crate) const SCHEMA_APPLY_LOCK_BRANCH: &str = "__schema_apply_lock__";
 

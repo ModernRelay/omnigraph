@@ -33,7 +33,7 @@ rules:
   - id: admins-promote
     allow:
       actors: { group: admins }
-      actions: [branch_merge, run_publish]
+      actions: [branch_merge]
       target_branch_scope: protected
 "#;
 
@@ -192,30 +192,9 @@ query insert_person($name: String, $age: I32) {
     assert_eq!(local_verify["row_count"], 1);
     assert_eq!(local_verify["rows"][0]["p.name"], "Mina");
 
-    let manual_run = tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(begin_manual_run(repo.path(), "main"));
-    let publish_payload = parse_stdout_json(&output_success(
-        cli()
-            .arg("run")
-            .arg("publish")
-            .arg("--config")
-            .arg(&config)
-            .arg(&manual_run)
-            .arg("--json"),
-    ));
-    assert_eq!(publish_payload["run_id"], manual_run);
-    assert_eq!(publish_payload["status"], "published");
-
-    let runs_payload = parse_stdout_json(&output_success(
-        cli()
-            .arg("run")
-            .arg("list")
-            .arg("--config")
-            .arg(&config)
-            .arg("--json"),
-    ));
-    assert!(runs_payload["runs"].as_array().unwrap().len() >= 2);
+    // MR-771: `run publish` / `run list` removed. Direct-to-target writes
+    // already landed via the change call above; the commit graph is now
+    // the audit surface (verified separately by `commit list`).
 }
 
 #[test]

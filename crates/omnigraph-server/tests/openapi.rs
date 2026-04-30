@@ -167,10 +167,6 @@ const EXPECTED_PATHS: &[&str] = &[
     "/branches",
     "/branches/{branch}",
     "/branches/merge",
-    "/runs",
-    "/runs/{run_id}",
-    "/runs/{run_id}/publish",
-    "/runs/{run_id}/abort",
     "/commits",
     "/commits/{commit_id}",
 ];
@@ -257,30 +253,6 @@ fn openapi_branch_merge_is_post() {
 }
 
 #[test]
-fn openapi_runs_is_get() {
-    let doc = openapi_json();
-    assert!(doc["paths"]["/runs"]["get"].is_object());
-}
-
-#[test]
-fn openapi_run_show_is_get() {
-    let doc = openapi_json();
-    assert!(doc["paths"]["/runs/{run_id}"]["get"].is_object());
-}
-
-#[test]
-fn openapi_run_publish_is_post() {
-    let doc = openapi_json();
-    assert!(doc["paths"]["/runs/{run_id}/publish"]["post"].is_object());
-}
-
-#[test]
-fn openapi_run_abort_is_post() {
-    let doc = openapi_json();
-    assert!(doc["paths"]["/runs/{run_id}/abort"]["post"].is_object());
-}
-
-#[test]
 fn openapi_commits_is_get() {
     let doc = openapi_json();
     assert!(doc["paths"]["/commits"]["get"].is_object());
@@ -321,10 +293,9 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "ReadOutput",
     "ReadRequest",
     "ReadTargetOutput",
+    "ManifestConflictOutput",
     "SchemaApplyOutput",
     "SchemaApplyRequest",
-    "RunListOutput",
-    "RunOutput",
     "SnapshotOutput",
     "SnapshotTableOutput",
 ];
@@ -490,19 +461,17 @@ fn error_output_schema_has_expected_fields() {
     assert!(props.contains_key("error"));
     assert!(props.contains_key("code"));
     assert!(props.contains_key("merge_conflicts"));
+    assert!(props.contains_key("manifest_conflict"));
 }
 
 #[test]
-fn run_output_schema_has_expected_fields() {
+fn manifest_conflict_output_schema_has_expected_fields() {
     let doc = openapi_json();
-    let schema = &doc["components"]["schemas"]["RunOutput"];
+    let schema = &doc["components"]["schemas"]["ManifestConflictOutput"];
     let props = schema["properties"].as_object().unwrap();
-    assert!(props.contains_key("run_id"));
-    assert!(props.contains_key("target_branch"));
-    assert!(props.contains_key("run_branch"));
-    assert!(props.contains_key("status"));
-    assert!(props.contains_key("created_at"));
-    assert!(props.contains_key("updated_at"));
+    assert!(props.contains_key("table_key"));
+    assert!(props.contains_key("expected"));
+    assert!(props.contains_key("actual"));
 }
 
 #[test]
@@ -621,10 +590,6 @@ fn protected_endpoints_reference_bearer_token_security() {
         ("/branches", "post"),
         ("/branches/{branch}", "delete"),
         ("/branches/merge", "post"),
-        ("/runs", "get"),
-        ("/runs/{run_id}", "get"),
-        ("/runs/{run_id}/publish", "post"),
-        ("/runs/{run_id}/abort", "post"),
         ("/commits", "get"),
         ("/commits/{commit_id}", "get"),
     ];
@@ -665,18 +630,6 @@ fn branch_delete_has_branch_path_parameter() {
         p["name"].as_str() == Some("branch") && p["in"].as_str() == Some("path")
     });
     assert!(has_branch, "DELETE /branches/{{branch}} must have 'branch' path parameter");
-}
-
-#[test]
-fn run_show_has_run_id_path_parameter() {
-    let doc = openapi_json();
-    let params = doc["paths"]["/runs/{run_id}"]["get"]["parameters"]
-        .as_array()
-        .unwrap();
-    let has_run_id = params.iter().any(|p| {
-        p["name"].as_str() == Some("run_id") && p["in"].as_str() == Some("path")
-    });
-    assert!(has_run_id, "GET /runs/{{run_id}} must have 'run_id' path parameter");
 }
 
 #[test]
@@ -914,7 +867,6 @@ async fn auth_mode_spec_has_security_on_protected_operations() {
         ("/change", "post"),
         ("/snapshot", "get"),
         ("/branches", "get"),
-        ("/runs", "get"),
         ("/commits", "get"),
     ];
     for (path, method) in protected_paths {

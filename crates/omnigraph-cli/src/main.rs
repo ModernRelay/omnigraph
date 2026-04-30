@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use clap::{Arg, ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{Result, bail};
-use omnigraph::db::{Omnigraph, ReadTarget, RunId, SnapshotId};
+use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::schema::parser::parse_schema;
@@ -18,9 +18,8 @@ use omnigraph_server::api::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
     CommitOutput, ErrorOutput, ExportRequest, IngestOutput, IngestRequest, ReadOutput, ReadRequest,
-    RunListOutput, RunOutput, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput,
-    SnapshotTableOutput, commit_output, ingest_output, read_output, run_output,
-    schema_apply_output, snapshot_payload,
+    SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput, SnapshotTableOutput,
+    commit_output, ingest_output, read_output, schema_apply_output, snapshot_payload,
 };
 use omnigraph_server::{
     AliasCommand, OmnigraphConfig, PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest,
@@ -142,11 +141,6 @@ enum Command {
         type_names: Vec<String>,
         #[arg(long = "table")]
         table_keys: Vec<String>,
-    },
-    /// Run operations
-    Run {
-        #[command(subcommand)]
-        command: RunCommand,
     },
     /// Commit history operations
     Commit {
@@ -365,60 +359,6 @@ enum QueryCommand {
         query: PathBuf,
         #[arg(long)]
         schema: Option<PathBuf>,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum RunCommand {
-    /// List transactional runs
-    List {
-        /// Repo URI
-        uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show a transactional run
-    Show {
-        /// Repo URI
-        #[arg(long)]
-        uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        run_id: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Publish a transactional run
-    Publish {
-        /// Repo URI
-        #[arg(long)]
-        uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        run_id: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Abort a transactional run
-    Abort {
-        /// Repo URI
-        #[arg(long)]
-        uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        run_id: String,
         #[arg(long)]
         json: bool,
     },
@@ -1212,42 +1152,6 @@ fn print_change_human(output: &ChangeOutput) {
     if let Some(actor_id) = &output.actor_id {
         println!("actor_id: {}", actor_id);
     }
-}
-
-fn print_run_list_human(runs: &[RunOutput]) {
-    for run in runs {
-        println!(
-            "{} {} target={} branch={}{}",
-            run.run_id,
-            run.status,
-            run.target_branch,
-            run.run_branch,
-            run.actor_id
-                .as_deref()
-                .map(|actor| format!(" actor={}", actor))
-                .unwrap_or_default()
-        );
-    }
-}
-
-fn print_run_human(run: &RunOutput) {
-    println!("run_id: {}", run.run_id);
-    println!("status: {}", run.status);
-    println!("target_branch: {}", run.target_branch);
-    println!("run_branch: {}", run.run_branch);
-    println!("base_snapshot_id: {}", run.base_snapshot_id);
-    println!("base_manifest_version: {}", run.base_manifest_version);
-    if let Some(actor_id) = &run.actor_id {
-        println!("actor_id: {}", actor_id);
-    }
-    if let Some(operation_hash) = &run.operation_hash {
-        println!("operation_hash: {}", operation_hash);
-    }
-    if let Some(snapshot_id) = &run.published_snapshot_id {
-        println!("published_snapshot_id: {}", snapshot_id);
-    }
-    println!("created_at: {}", run.created_at);
-    println!("updated_at: {}", run.updated_at);
 }
 
 fn print_commit_list_human(commits: &[CommitOutput]) {
@@ -2190,133 +2094,6 @@ async fn main() -> Result<()> {
                     .await?;
             }
         }
-        Command::Run { command } => match command {
-            RunCommand::List {
-                uri,
-                target,
-                config,
-                json,
-            } => {
-                let config = load_cli_config(config.as_ref())?;
-                let bearer_token =
-                    resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-                let uri = resolve_uri(&config, uri, target.as_deref())?;
-                let runs = if is_remote_uri(&uri) {
-                    remote_json::<RunListOutput>(
-                        &http_client,
-                        Method::GET,
-                        remote_url(&uri, "/runs"),
-                        None,
-                        bearer_token.as_deref(),
-                    )
-                    .await?
-                    .runs
-                } else {
-                    let db = Omnigraph::open(&uri).await?;
-                    db.list_runs()
-                        .await?
-                        .iter()
-                        .map(run_output)
-                        .collect::<Vec<_>>()
-                };
-                if json {
-                    print_json(&RunListOutput { runs })?;
-                } else {
-                    print_run_list_human(&runs);
-                }
-            }
-            RunCommand::Show {
-                uri,
-                target,
-                config,
-                run_id,
-                json,
-            } => {
-                let config = load_cli_config(config.as_ref())?;
-                let bearer_token =
-                    resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-                let uri = resolve_uri(&config, uri, target.as_deref())?;
-                let run = if is_remote_uri(&uri) {
-                    remote_json::<RunOutput>(
-                        &http_client,
-                        Method::GET,
-                        remote_url(&uri, &format!("/runs/{}", run_id)),
-                        None,
-                        bearer_token.as_deref(),
-                    )
-                    .await?
-                } else {
-                    let db = Omnigraph::open(&uri).await?;
-                    run_output(&db.get_run(&RunId::new(run_id)).await?)
-                };
-                if json {
-                    print_json(&run)?;
-                } else {
-                    print_run_human(&run);
-                }
-            }
-            RunCommand::Publish {
-                uri,
-                target,
-                config,
-                run_id,
-                json,
-            } => {
-                let config = load_cli_config(config.as_ref())?;
-                let bearer_token =
-                    resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-                let uri = resolve_uri(&config, uri, target.as_deref())?;
-                let run = if is_remote_uri(&uri) {
-                    remote_json::<RunOutput>(
-                        &http_client,
-                        Method::POST,
-                        remote_url(&uri, &format!("/runs/{}/publish", run_id)),
-                        Some(serde_json::json!({})),
-                        bearer_token.as_deref(),
-                    )
-                    .await?
-                } else {
-                    let mut db = Omnigraph::open(&uri).await?;
-                    db.publish_run(&RunId::new(run_id.clone())).await?;
-                    run_output(&db.get_run(&RunId::new(run_id)).await?)
-                };
-                if json {
-                    print_json(&run)?;
-                } else {
-                    print_run_human(&run);
-                }
-            }
-            RunCommand::Abort {
-                uri,
-                target,
-                config,
-                run_id,
-                json,
-            } => {
-                let config = load_cli_config(config.as_ref())?;
-                let bearer_token =
-                    resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-                let uri = resolve_uri(&config, uri, target.as_deref())?;
-                let run = if is_remote_uri(&uri) {
-                    remote_json::<RunOutput>(
-                        &http_client,
-                        Method::POST,
-                        remote_url(&uri, &format!("/runs/{}/abort", run_id)),
-                        Some(serde_json::json!({})),
-                        bearer_token.as_deref(),
-                    )
-                    .await?
-                } else {
-                    let mut db = Omnigraph::open(&uri).await?;
-                    run_output(&db.abort_run(&RunId::new(run_id)).await?)
-                };
-                if json {
-                    print_json(&run)?;
-                } else {
-                    print_run_human(&run);
-                }
-            }
-        },
         Command::Read {
             uri,
             legacy_uri,

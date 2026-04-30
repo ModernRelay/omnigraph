@@ -425,6 +425,26 @@ async fn commit_prepared_updates(
     Ok(manifest_version)
 }
 
+async fn commit_prepared_updates_with_expected(
+    db: &mut Omnigraph,
+    updates: &[crate::db::SubTableUpdate],
+    expected_table_versions: &std::collections::HashMap<String, u64>,
+) -> Result<u64> {
+    let actor_id = db.current_audit_actor().map(str::to_string);
+    let PublishedSnapshot {
+        manifest_version,
+        _snapshot_id: _,
+    } = db
+        .coordinator
+        .commit_updates_with_actor_with_expected(
+            updates,
+            expected_table_versions,
+            actor_id.as_deref(),
+        )
+        .await?;
+    Ok(manifest_version)
+}
+
 pub(super) async fn commit_prepared_updates_on_branch(
     db: &mut Omnigraph,
     branch: Option<&str>,
@@ -452,6 +472,41 @@ pub(super) async fn commit_prepared_updates_on_branch(
     Ok(manifest_version)
 }
 
+pub(super) async fn commit_prepared_updates_on_branch_with_expected(
+    db: &mut Omnigraph,
+    branch: Option<&str>,
+    updates: &[crate::db::SubTableUpdate],
+    expected_table_versions: &std::collections::HashMap<String, u64>,
+) -> Result<u64> {
+    let current_branch = db.coordinator.current_branch().map(str::to_string);
+    let requested_branch = branch.map(str::to_string);
+    if requested_branch == current_branch {
+        return commit_prepared_updates_with_expected(db, updates, expected_table_versions).await;
+    }
+
+    let mut coordinator = match requested_branch.as_deref() {
+        Some(branch) => {
+            GraphCoordinator::open_branch(db.uri(), branch, Arc::clone(&db.storage)).await?
+        }
+        None => GraphCoordinator::open(db.uri(), Arc::clone(&db.storage)).await?,
+    };
+    let actor_id = db.current_audit_actor().map(str::to_string);
+    let PublishedSnapshot {
+        manifest_version,
+        _snapshot_id: _,
+    } = coordinator
+        .commit_updates_with_actor_with_expected(
+            updates,
+            expected_table_versions,
+            actor_id.as_deref(),
+        )
+        .await?;
+    Ok(manifest_version)
+}
+
+// Used only by in-tree tests (`#[cfg(test)]`); the runtime path now uses
+// `commit_updates_on_branch_with_expected` exclusively.
+#[cfg(test)]
 pub(super) async fn commit_updates(
     db: &mut Omnigraph,
     updates: &[crate::db::SubTableUpdate],
@@ -487,14 +542,19 @@ pub(super) async fn record_merge_commit(
         .map(|snapshot_id| snapshot_id.as_str().to_string())
 }
 
-pub(super) async fn commit_updates_on_branch(
+/// Commit updates with a publisher-level OCC fence. The
+/// `expected_table_versions` map asserts the manifest's pre-write per-table
+/// versions; mismatches surface as `ManifestConflictDetails::ExpectedVersionMismatch`.
+pub(super) async fn commit_updates_on_branch_with_expected(
     db: &mut Omnigraph,
     branch: Option<&str>,
     updates: &[crate::db::SubTableUpdate],
+    expected_table_versions: &std::collections::HashMap<String, u64>,
 ) -> Result<u64> {
     db.ensure_schema_apply_not_locked("write commit").await?;
     let prepared = prepare_updates_for_commit(db, branch, updates).await?;
-    commit_prepared_updates_on_branch(db, branch, &prepared).await
+    commit_prepared_updates_on_branch_with_expected(db, branch, &prepared, expected_table_versions)
+        .await
 }
 
 pub(super) async fn ensure_commit_graph_initialized(db: &mut Omnigraph) -> Result<()> {

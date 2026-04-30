@@ -16,7 +16,7 @@ Tools that support `@`-imports (Claude Code) auto-include all three files via th
 
 `CLAUDE.md` is a symlink to this file — there is exactly one source of truth. Edit `AGENTS.md`.
 
-**Version surveyed:** 0.3.1
+**Version surveyed:** 0.4.0
 **Workspace crates:** `omnigraph-compiler`, `omnigraph` (engine), `omnigraph-cli`, `omnigraph-server`
 **Storage substrate:** Lance 4.x (columnar, versioned, branchable)
 **License:** MIT
@@ -32,7 +32,7 @@ OmniGraph is a typed property-graph engine built as a coordination layer over ma
 - **Languages**: a `.pg` schema language and a `.gq` query language, both Pest-based, with a typed IR.
 - **Multi-modal querying**: vector ANN (`nearest`), full-text (`search`/`fuzzy`/`match_text`/`bm25`), Reciprocal Rank Fusion (`rrf`), and graph traversal (`Expand`, anti-join `not { … }`) in one runtime.
 - **Branches and commits across the whole graph**: Git-style — every successful publish appends to a commit DAG; merges are three-way at the row level.
-- **Transactional runs**: ephemeral `__run__<id>` branches for isolated mutation, fast-path or merge-path publish.
+- **Atomic per-query writes**: `mutate_as` and `load` capture per-table `expected_table_versions` before writing and call `ManifestBatchPublisher::publish` once at the end. Cross-table OCC enforced inside the publisher's row-level CAS; no staging branches, no run state machine.
 - **HTTP server**: Axum + utoipa OpenAPI, bearer auth (SHA-256 hashed, optional AWS Secrets Manager), Cedar policy gating.
 - **CLI** driven by a single `omnigraph.yaml`; multi-format output (json/jsonl/csv/kv/table).
 
@@ -77,7 +77,7 @@ Full diagram and concurrency model: [docs/architecture.md](docs/architecture.md)
 | Indexes (BTREE / inverted / vector / graph topology) | [docs/indexes.md](docs/indexes.md) |
 | Embeddings (compiler + engine clients, env vars, `@embed`) | [docs/embeddings.md](docs/embeddings.md) |
 | Branches, commit graph, snapshots, system branches | [docs/branches-commits.md](docs/branches-commits.md) |
-| Runs (transactional graph mutations, `__run__<id>`, publish paths) | [docs/runs.md](docs/runs.md) |
+| Direct-publish writes (the former Run state machine, now demoted to publisher CAS) | [docs/runs.md](docs/runs.md) |
 | Three-way merge and conflict kinds | [docs/merge.md](docs/merge.md) |
 | Diff / change feed (`diff_between`, `diff_commits`) | [docs/changes.md](docs/changes.md) |
 | Query execution, mutation execution, bulk loader, `load` vs `ingest` | [docs/execution.md](docs/execution.md) |
@@ -211,13 +211,13 @@ omnigraph policy explain --actor act-alice --action change --branch main
 | Query language | — | `.gq` + Pest grammar + IR + lowering + linter |
 | Schema migration planning | — | `plan_schema_migration` + `apply_schema` step types + `__schema_apply_lock__` |
 | Commit graph (DAG) across whole repo | — | `_graph_commits.lance` with linear + merge parents, ULID ids, actor map |
-| Transactional runs | — | `_graph_runs.lance`, `__run__<id>` ephemeral branches, fast-path & merge-path publish |
+| Per-query atomic writes | — | `MutationStaging` accumulator + `commit_with_expected` publisher CAS, single commit per `mutate_as` / `load` |
 | Three-way row-level merge | — | `OrderedTableCursor` + `StagedTableWriter`, structured `MergeConflictKind` |
 | Change feeds | — | `diff_between` / `diff_commits` with manifest fast path + ID streaming |
-| Cedar policy | — | 10 actions, branch / target_branch / protected scopes, validate/test/explain CLI |
+| Cedar policy | — | 8 actions, branch / target_branch / protected scopes, validate/test/explain CLI |
 | HTTP server | — | Axum, OpenAPI via utoipa, bearer auth (SHA-256, AWS Secrets Manager option), policy gating, NDJSON streaming export |
 | CLI with config | — | `omnigraph.yaml`, aliases, multi-format output (json/jsonl/csv/kv/table) |
-| Audit / actor tracking | — | `_as` write APIs + actor maps in commit & run datasets |
+| Audit / actor tracking | — | `_as` write APIs + actor map in commit graph |
 | Local RustFS bootstrap | — | `scripts/local-rustfs-bootstrap.sh` one-shot S3-backed dev environment |
 
 ---
