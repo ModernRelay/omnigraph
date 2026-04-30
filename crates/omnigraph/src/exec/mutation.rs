@@ -636,6 +636,58 @@ impl MutationStaging {
     }
 }
 
+/// RAII helper that restores `Omnigraph::coordinator` on drop. Used by
+/// `mutate_with_current_actor` so a panic between the coordinator swap and
+/// the explicit restore (e.g. an assertion deep inside Lance) does not
+/// leave the handle pinned to the requested branch indefinitely. The
+/// captured coordinator is `take`n on drop and assigned via the
+/// (synchronous) `restore_coordinator` accessor.
+///
+/// Holds a bare `*mut Omnigraph` (no lifetime parameter) deliberately:
+/// borrowing the engine through this guard would lock out the rest of
+/// `mutate_with_current_actor` from calling `&mut self` methods on the
+/// engine while the guard is alive. The unsafe is bounded by the
+/// constructor contract — the caller must not let the guard outlive the
+/// `&mut self` it was built from. In practice this is enforced by the
+/// guard being assigned to a stack-local `_guard` binding inside one
+/// function and never moved out.
+struct CoordinatorRestoreGuard {
+    db: *mut Omnigraph,
+    previous: Option<crate::db::GraphCoordinator>,
+}
+
+// SAFETY: the pointer addresses an `Omnigraph`, which is `Send`. The guard
+// is short-lived and the only operation it performs is the sync
+// `restore_coordinator` field assignment in `Drop`. No reference is shared
+// across threads — the future holding the guard moves between threads
+// (e.g. when an Axum handler is awaited on a worker), and the swap-back is
+// always invoked at most once on whichever thread runs `Drop`.
+unsafe impl Send for CoordinatorRestoreGuard {}
+
+impl CoordinatorRestoreGuard {
+    /// SAFETY: `db` must outlive the returned guard, and the caller must
+    /// not move the guard outside the borrow scope of `db`.
+    fn new(db: &mut Omnigraph, previous: crate::db::GraphCoordinator) -> Self {
+        Self {
+            db: db as *mut Omnigraph,
+            previous: Some(previous),
+        }
+    }
+}
+
+impl Drop for CoordinatorRestoreGuard {
+    fn drop(&mut self) {
+        if let Some(prev) = self.previous.take() {
+            // SAFETY: per the `new` contract, `db` is still valid here.
+            // `restore_coordinator` is a sync field assignment and does not
+            // re-enter the runtime.
+            unsafe {
+                (*self.db).restore_coordinator(prev);
+            }
+        }
+    }
+}
+
 /// Open a sub-table dataset for write in the current mutation query. On the
 /// first touch of a table, captures the pre-write manifest version into
 /// `staging.expected_versions` so the publisher can enforce OCC. On
@@ -704,6 +756,14 @@ impl Omnigraph {
     ) -> Result<MutationResult> {
         self.ensure_schema_state_valid().await?;
         let requested = Self::normalize_branch_name(branch)?;
+        // Reject internal `__run__*` / system-prefixed branches at the public
+        // write boundary. The pre-MR-771 path got this guard transitively via
+        // `begin_run`'s `ensure_public_branch_ref` call; the direct-publish
+        // path needs to assert it explicitly so a caller can't write to
+        // legacy or system staging branches by passing the prefix verbatim.
+        if let Some(name) = requested.as_deref() {
+            crate::db::ensure_public_branch_ref(name, "mutate")?;
+        }
         let resolved_params = enrich_mutation_params(params)?;
 
         // Direct-to-target write path. Per-query staging captures pre-write
@@ -714,8 +774,16 @@ impl Omnigraph {
 
         let current = self.active_branch().map(str::to_string);
         let needs_swap = requested.as_deref() != current.as_deref();
-        let previous = if needs_swap {
-            Some(self.swap_coordinator_for_branch(requested.as_deref()).await?)
+
+        // RAII guard for coordinator state. If we swapped to the requested
+        // branch, the original coordinator is captured here and unconditionally
+        // restored on drop — including on panic from `execute_named_mutation`
+        // or the publisher. Without this, a Lance-internal panic between swap
+        // and restore would leave the handle pinned to the wrong branch for
+        // its remaining lifetime.
+        let _guard = if needs_swap {
+            let previous = self.swap_coordinator_for_branch(requested.as_deref()).await?;
+            Some(CoordinatorRestoreGuard::new(self, previous))
         } else {
             None
         };
@@ -746,9 +814,8 @@ impl Omnigraph {
             }
         };
 
-        if let Some(previous) = previous {
-            self.restore_coordinator(previous);
-        }
+        // `_guard` drops here and restores the coordinator (also restores on
+        // any panic that unwound through this function above).
         publish_result
     }
 

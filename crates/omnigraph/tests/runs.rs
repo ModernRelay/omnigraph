@@ -319,8 +319,17 @@ async fn concurrent_writers_one_succeeds_one_gets_expected_version_mismatch() {
 /// The cancellation hole that motivated MR-771: dropping a mutation future
 /// mid-flight must not leave any graph-level state behind. With the run
 /// state machine gone, only orphaned Lance fragments can remain — and those
-/// are reclaimed by `omnigraph cleanup`. Verify by aborting the future and
-/// asserting the branch list and manifest version are unchanged.
+/// are reclaimed by `omnigraph cleanup`.
+///
+/// The test deliberately does NOT assert that the manifest version is
+/// unchanged: `handle.abort()` is racing the spawned task, and on a fast
+/// machine the mutation may complete before cancellation. That is acceptable
+/// — what matters for cancel safety is that no `__run__*` staging branches
+/// are ever created, that `_graph_runs.lance` is never written, and that
+/// any partial state on disk is reachable through the regular manifest /
+/// commit graph pipes (so `omnigraph cleanup` can reclaim it). Asserting
+/// version equality would just be a flake on hosts where the abort lands
+/// late.
 #[tokio::test]
 async fn cancelled_mutation_future_leaves_no_state() {
     let dir = tempfile::tempdir().unwrap();
@@ -333,13 +342,6 @@ async fn cancelled_mutation_future_leaves_no_state() {
             .unwrap();
     }
 
-    let manifest_version_before = {
-        let db = Omnigraph::open(&uri).await.unwrap();
-        db.snapshot_of(ReadTarget::branch("main"))
-            .await
-            .unwrap()
-            .version()
-    };
     let branches_before = {
         let db = Omnigraph::open(&uri).await.unwrap();
         db.branch_list().await.unwrap()
@@ -358,27 +360,28 @@ async fn cancelled_mutation_future_leaves_no_state() {
     });
 
     // Cancel the future. Whether the in-flight write managed to land a
-    // fragment is timing-dependent and irrelevant; what matters is that no
-    // graph-level state remains pointing at it.
+    // fragment (or even fully publish) is timing-dependent and irrelevant —
+    // see the doc comment on this test for why.
     handle.abort();
     let _ = handle.await;
 
     let db = Omnigraph::open(&uri).await.unwrap();
     let branches_after = db.branch_list().await.unwrap();
-    let manifest_version_after = db
-        .snapshot_of(ReadTarget::branch("main"))
-        .await
-        .unwrap()
-        .version();
 
-    assert_eq!(
-        branches_after, branches_before,
+    // Cancel-safety property: no graph-level run/staging state remains.
+    // (1) No `__run__*` staging branches are created either way.
+    assert!(
+        !branches_after.iter().any(|b| b.starts_with("__run__")),
         "cancelled mutation must not leave a __run__* branch behind",
     );
+    // (2) The branch list is otherwise unchanged: cancellation/completion
+    // cannot synthesize new public branches.
     assert_eq!(
-        manifest_version_after, manifest_version_before,
-        "cancelled mutation must not advance the manifest",
+        branches_after.iter().filter(|b| !b.starts_with("__run__")).count(),
+        branches_before.iter().filter(|b| !b.starts_with("__run__")).count(),
+        "cancelled mutation must not synthesize new public branches",
     );
+    // (3) The legacy run-state machine table never reappears.
     assert!(
         !std::path::Path::new(&format!("{}/_graph_runs.lance", uri)).exists(),
         "no _graph_runs.lance after cancel — state machine is gone",

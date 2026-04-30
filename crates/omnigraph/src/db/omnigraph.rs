@@ -843,7 +843,7 @@ pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
     Ok(Some(branch.to_string()))
 }
 
-fn ensure_public_branch_ref(branch: &str, operation: &str) -> Result<()> {
+pub(crate) fn ensure_public_branch_ref(branch: &str, operation: &str) -> Result<()> {
     if super::is_internal_run_branch(branch) {
         return Err(OmniError::manifest(format!(
             "{} does not allow internal run ref '{}'",

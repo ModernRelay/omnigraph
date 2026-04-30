@@ -12,6 +12,7 @@ pub use omnigraph::{
     CleanupPolicyOptions, MergeOutcome, Omnigraph, SchemaApplyResult, TableCleanupStats,
     TableOptimizeStats,
 };
+pub(crate) use omnigraph::ensure_public_branch_ref;
 pub(crate) use run_registry::is_internal_run_branch;
 
 pub(crate) const SCHEMA_APPLY_LOCK_BRANCH: &str = "__schema_apply_lock__";

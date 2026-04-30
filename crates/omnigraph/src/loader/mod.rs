@@ -154,6 +154,12 @@ impl Omnigraph {
 
     pub async fn load(&mut self, branch: &str, data: &str, mode: LoadMode) -> Result<LoadResult> {
         self.ensure_schema_state_valid().await?;
+        // Reject internal `__run__*` / system-prefixed branches at the public
+        // write boundary. The pre-MR-771 path got this guard transitively via
+        // `begin_run`'s `ensure_public_branch_ref` call; the direct-publish
+        // path needs to assert it explicitly so a caller can't write to
+        // legacy or system staging branches by passing the prefix verbatim.
+        crate::db::ensure_public_branch_ref(branch, "load")?;
         // Branch convention: `None` represents `main`. Re-normalizing to
         // `Some("main")` here would route the publisher commit through a
         // separate coordinator (the cross-branch path in
