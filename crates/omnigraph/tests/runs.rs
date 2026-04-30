@@ -369,19 +369,20 @@ async fn cancelled_mutation_future_leaves_no_state() {
     let branches_after = db.branch_list().await.unwrap();
 
     // Cancel-safety property: no graph-level run/staging state remains.
-    // (1) No `__run__*` staging branches are created either way.
-    assert!(
-        !branches_after.iter().any(|b| b.starts_with("__run__")),
-        "cancelled mutation must not leave a __run__* branch behind",
-    );
-    // (2) The branch list is otherwise unchanged: cancellation/completion
-    // cannot synthesize new public branches.
+    //
+    // Note: `branch_list()` already filters `__run__*` via
+    // `is_internal_system_branch`, so a runtime "no `__run__` branches" check
+    // would be vacuous. The structural property that no `__run__` branches
+    // can ever be created is enforced by deletion of `begin_run` etc. in
+    // MR-771 (verified by the build itself — those symbols no longer exist).
+    //
+    // (1) The branch list is unchanged: cancellation/completion cannot
+    //     synthesize new public branches.
     assert_eq!(
-        branches_after.iter().filter(|b| !b.starts_with("__run__")).count(),
-        branches_before.iter().filter(|b| !b.starts_with("__run__")).count(),
+        branches_after, branches_before,
         "cancelled mutation must not synthesize new public branches",
     );
-    // (3) The legacy run-state machine table never reappears.
+    // (2) The legacy run-state machine table never reappears on disk.
     assert!(
         !std::path::Path::new(&format!("{}/_graph_runs.lance", uri)).exists(),
         "no _graph_runs.lance after cancel — state machine is gone",
