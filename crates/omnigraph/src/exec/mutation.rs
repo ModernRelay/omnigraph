@@ -565,19 +565,59 @@ use super::staging::{MutationStaging, PendingMode};
 /// first touch. The captured version is the publisher's CAS fence at
 /// end-of-query (per-table OCC).
 ///
-/// The dataset is always opened at HEAD on the requested branch. Under
-/// the staged-write rewire (MR-794 step 2+), no per-op commit advances
-/// HEAD, so subsequent opens within the same query observe the same
-/// version. The exception is the inline-commit delete path
-/// (`execute_delete_*`), which still advances HEAD per-op — but D₂ at
-/// parse time prevents inserts/updates and deletes from coexisting in
-/// one query, so this can't conflict with a pending-batch read.
+/// On first touch, opens the dataset at HEAD on the requested branch
+/// via `open_for_mutation_on_branch`, which compares Lance HEAD against
+/// the manifest's pinned version — that fence is the engine's
+/// publisher-style OCC catching cross-writer drift before we make any
+/// changes.
+///
+/// On subsequent touches *within the same query*, behavior depends on
+/// whether the table has already been inline-committed by a delete op:
+///
+/// - **Insert / update path (no inline commit between touches).** Lance
+///   HEAD has not moved since first touch, so a fresh
+///   `open_for_mutation_on_branch` would still match the manifest
+///   pinned version. We just go through it again; `ensure_path` is a
+///   no-op (idempotent on the captured `expected_version`).
+/// - **Delete cascade or multi-delete on the same table.** A prior
+///   `delete_where` on this table has already advanced Lance HEAD past
+///   the manifest's pinned version (the manifest doesn't move until
+///   end-of-query). Going through `open_for_mutation_on_branch` again
+///   would trip its `ensure_expected_version` equality check
+///   (`actual = pinned + 1` vs `expected = pinned`). Instead we route
+///   through `reopen_for_mutation` at the post-inline-commit Lance
+///   version captured in `staging.inline_committed[table_key]`, which
+///   is the source of truth for "where is Lance HEAD right now on
+///   this table within this query."
+///
+/// The `inline_committed` reopen branch closes the cursor-bot HIGH
+/// "multi-delete fails on same table" finding. The branch goes away
+/// once Lance exposes a two-phase delete API
+/// ([lance-format/lance#6658](https://github.com/lance-format/lance/issues/6658))
+/// and we can stage deletes on the same path as inserts/updates.
 async fn open_table_for_mutation(
     db: &Omnigraph,
     staging: &mut MutationStaging,
     branch: Option<&str>,
     table_key: &str,
 ) -> Result<(Dataset, String, Option<String>)> {
+    if let Some(prior) = staging.inline_committed.get(table_key) {
+        let path = staging.paths.get(table_key).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "open_table_for_mutation: inline_committed[{}] without paths entry",
+                table_key
+            ))
+        })?;
+        let ds = db
+            .reopen_for_mutation(
+                table_key,
+                &path.full_path,
+                path.table_branch.as_deref(),
+                prior.table_version,
+            )
+            .await?;
+        return Ok((ds, path.full_path.clone(), path.table_branch.clone()));
+    }
     let (ds, full_path, table_branch) =
         db.open_for_mutation_on_branch(branch, table_key).await?;
     let expected_version = ds.version().version;
@@ -701,6 +741,16 @@ impl Omnigraph {
                 let (updates, expected_versions) = staging
                     .finalize(self, requested.as_deref())
                     .await?;
+                // Failpoint that wedges the documented finalize→publisher
+                // residual: per-table `commit_staged` calls already
+                // advanced Lance HEAD on every touched table; a failure
+                // injected here mirrors the production-rare case where
+                // the publisher's CAS pre-check rejects (or the manifest
+                // write throws) after staged commits succeeded. Used by
+                // `tests/failpoints.rs::finalize_publisher_residual_*`
+                // to pin the documented residual behavior. See
+                // `docs/runs.md` "Finalize → publisher residual".
+                crate::failpoints::maybe_fail("mutation.post_finalize_pre_publisher")?;
                 self.commit_updates_on_branch_with_expected(
                     requested.as_deref(),
                     &updates,
@@ -947,6 +997,12 @@ impl Omnigraph {
             (!blob_props.is_empty()).then_some(non_blob_cols.as_slice());
         let pending_batches = staging.pending_batches(&table_key);
         let pending_schema = staging.pending_schema(&table_key);
+        // Use merge semantics on the union: a committed row whose `id`
+        // also appears in pending has been logically updated by an
+        // earlier op in this query and is shadowed from the scan,
+        // otherwise the predicate runs against stale committed values
+        // and a chained `update where <pred>` can match a row whose
+        // pending value no longer satisfies <pred>.
         let batches = self
             .table_store()
             .scan_with_pending(
@@ -955,6 +1011,7 @@ impl Omnigraph {
                 pending_schema,
                 projection,
                 Some(&pred_sql),
+                Some("id"),
             )
             .await?;
 
@@ -965,11 +1022,14 @@ impl Omnigraph {
             });
         }
 
-        // Concat the matched batches into one. The pending side may have
-        // a slightly different schema (e.g. Lance's `_rowid` column on
-        // the committed side, missing on the pending side). Normalize by
-        // dropping any `_rowid` / `_rowaddr` columns and reordering to
-        // the table's canonical schema.
+        // Concat the matched batches (committed + pending) into one. The
+        // helper trusts that both sides share a schema — Lance returns
+        // dataset-schema-ordered columns and DataFusion returns
+        // MemTable-schema-ordered columns; both should match the catalog's
+        // arrow_schema when the projection is consistent. If they
+        // diverge (typically a blob-table mid-schema-shift), the helper
+        // surfaces a clear error directing the caller to split the
+        // mutation.
         let matched = concat_match_batches_to_schema(&schema, &blob_props, batches)?;
 
         let affected_count = matched.num_rows();
@@ -1218,10 +1278,10 @@ fn concat_match_batches_to_schema(
     })
 }
 
-/// Validate that adding `pending` edges plus the committed edges does not
-/// exceed the per-source cardinality bound on `edge_type`. Reads the `src`
-/// column from both committed (Lance) and pending (in-memory) and counts
-/// per src.
+/// Validate `@card` bounds against committed (Lance) + pending (in-memory)
+/// edges for one edge table. Engine path: each insert produces a fresh
+/// ULID id, so committed and pending cannot share a primary key — no
+/// dedup needed (`dedupe_key_column = None`).
 async fn validate_edge_cardinality_with_pending(
     db: &Omnigraph,
     committed_ds: &Dataset,
@@ -1229,66 +1289,18 @@ async fn validate_edge_cardinality_with_pending(
     table_key: &str,
     edge_type: &omnigraph_compiler::catalog::EdgeType,
 ) -> Result<()> {
-    use std::collections::HashMap as StdHashMap;
-
     if edge_type.cardinality.is_default() {
         return Ok(());
     }
-
-    let mut counts: StdHashMap<String, u32> = StdHashMap::new();
-
-    // Committed side: scan `src` column (cheap, no filter).
-    let committed = db
-        .table_store()
-        .scan(committed_ds, Some(&["src"]), None, None)
-        .await?;
-    for batch in &committed {
-        let srcs = batch
-            .column_by_name("src")
-            .ok_or_else(|| OmniError::Lance("missing 'src' column on edge table".into()))?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| OmniError::Lance("'src' column is not Utf8".into()))?;
-        for i in 0..srcs.len() {
-            if srcs.is_valid(i) {
-                *counts.entry(srcs.value(i).to_string()).or_insert(0) += 1;
-            }
-        }
-    }
-
-    // Pending side: walk in-memory pending batches for `src`.
-    for batch in staging.pending_batches(table_key) {
-        let Some(col) = batch.column_by_name("src") else {
-            continue;
-        };
-        let Some(srcs) = col.as_any().downcast_ref::<StringArray>() else {
-            continue;
-        };
-        for i in 0..srcs.len() {
-            if srcs.is_valid(i) {
-                *counts.entry(srcs.value(i).to_string()).or_insert(0) += 1;
-            }
-        }
-    }
-
-    let card = &edge_type.cardinality;
-    for (src, count) in &counts {
-        if let Some(max) = card.max {
-            if *count > max {
-                return Err(OmniError::manifest(format!(
-                    "@card violation on edge {}: source '{}' has {} edges (max {})",
-                    edge_type.name, src, count, max
-                )));
-            }
-        }
-        // Note: per-source minimum cardinality cannot be checked
-        // mid-query (a bound of `2..` requires both edges to be inserted
-        // before validation). The publisher path could re-validate at
-        // commit time; for now, defer to the loader's end-of-query check.
-        let _ = card.min;
-    }
-
-    Ok(())
+    let counts = super::staging::count_src_per_edge(
+        db,
+        committed_ds,
+        table_key,
+        staging,
+        None,
+    )
+    .await?;
+    super::staging::enforce_cardinality_bounds(edge_type, &counts)
 }
 
 fn enrich_mutation_params(params: &ParamMap) -> Result<ParamMap> {

@@ -75,6 +75,42 @@ will replace it. Operator-driven (rare in agent workloads); document
 permanently until Lance exposes `Operation::Overwrite { fragments }` as
 a two-phase op.
 
+### Finalize → publisher residual
+
+The staged-write rewire eliminates one drift class **by construction at
+the writer layer**: an op that fails before pushing to the in-memory
+accumulator (validation errors, missing endpoints, parse-time D₂
+rejection) leaves Lance HEAD untouched on every staged table. This is
+the case the `partial_failure_leaves_target_queryable_and_unblocks_next_mutation`
+test pins.
+
+A second, narrower drift class remains. `MutationStaging::finalize`
+runs `stage_*` + `commit_staged` per touched table sequentially, then
+the publisher commits the manifest. Lance has no multi-dataset atomic
+commit, so the per-table `commit_staged` calls are independent
+operations: if commit_staged on table N+1 fails *after* commit_staged
+on tables 1..N succeeded, or if the publisher's CAS pre-check rejects
+*after* every commit_staged succeeded, tables 1..N are left at
+`Lance HEAD = manifest_pinned + 1`. The next mutation against those
+tables surfaces `ManifestConflictDetails::ExpectedVersionMismatch` —
+the same loud failure mode the rewire was designed to make rare, just
+no longer "unreachable."
+
+Triggers: transient Lance write errors during finalize (object-store
+retry budget exhaustion, disk full); persistent publisher contention
+exceeding `PUBLISHER_RETRY_BUDGET = 5` retries. Closing this requires
+either a Lance multi-dataset atomic-commit primitive (filed upstream
+alongside the two-phase delete request) or a manifest-layer journal
+that replays staged commits on next open. Both are heavyweight; the
+v1 stance is "narrowed window, documented residual, surface the loud
+error when it fires."
+
+The publisher-CAS contract is unchanged: a *concurrent writer* that
+advances any of our touched tables between snapshot capture and
+publisher commit produces exactly one winner. The residual above is
+about *our* abandoned commits in the failure path, not about
+concurrency races.
+
 ## Conflict shape
 
 Concurrent writers to the same `(table, branch)` produce exactly one

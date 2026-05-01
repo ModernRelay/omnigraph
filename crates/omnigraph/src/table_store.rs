@@ -841,6 +841,22 @@ impl TableStore {
     /// pending side runs it through a fresh DataFusion `SessionContext`
     /// with the batches registered as a `MemTable` named `pending`.
     ///
+    /// `key_column` controls how committed and pending are unioned:
+    /// - **`None` (union semantics)**: every committed row that matches
+    ///   the filter and every pending row that matches the filter is
+    ///   returned. Correct when committed and pending cannot share a
+    ///   primary key — e.g., Append-mode loads with ULID-generated ids,
+    ///   or any read where pending hasn't been used to update committed
+    ///   rows.
+    /// - **`Some(col)` (merge / shadow semantics)**: committed rows whose
+    ///   `col` value appears in any pending batch are EXCLUDED from the
+    ///   result; only pending's view of those rows is returned. Required
+    ///   for Merge-mode reads (e.g., `execute_update` on the engine path)
+    ///   so a chained `update` doesn't see stale committed values that
+    ///   a prior op already updated in pending. Without this, a predicate
+    ///   like `where age > 30` can match a row that an earlier
+    ///   `set age = 20` already moved out of range.
+    ///
     /// When `pending_batches` is empty this delegates to the regular
     /// scan path.
     pub async fn scan_with_pending(
@@ -850,11 +866,30 @@ impl TableStore {
         pending_schema: Option<SchemaRef>,
         projection: Option<&[&str]>,
         filter: Option<&str>,
+        key_column: Option<&str>,
     ) -> Result<Vec<RecordBatch>> {
-        let mut out = self.scan(committed_ds, projection, filter, None).await?;
+        let committed = self.scan(committed_ds, projection, filter, None).await?;
         if pending_batches.is_empty() {
-            return Ok(out);
+            return Ok(committed);
         }
+
+        // Shadow committed rows whose key value also appears in pending.
+        // This makes scan_with_pending implement merge semantics rather
+        // than naive union: any row that has a pending update is
+        // represented ONLY by its pending value, never by both its
+        // (stale) committed value and its (current) pending value.
+        let committed = match key_column {
+            Some(key_col) => {
+                let pending_keys = collect_string_column_values(pending_batches, key_col)?;
+                if pending_keys.is_empty() {
+                    committed
+                } else {
+                    filter_out_rows_where_string_in(committed, key_col, &pending_keys)?
+                }
+            }
+            None => committed,
+        };
+
         let pending = scan_pending_batches(
             pending_batches,
             pending_schema,
@@ -862,60 +897,10 @@ impl TableStore {
             filter,
         )
         .await?;
+
+        let mut out = committed;
         out.extend(pending);
         Ok(out)
-    }
-
-    /// `count_rows` variant that respects in-memory pending batches via
-    /// DataFusion `MemTable`. Used by edge-cardinality validation that
-    /// needs to see staged edges before commit.
-    ///
-    /// Cheaper than `scan_with_pending` for the count case because we
-    /// don't materialize columns on the pending side.
-    pub async fn count_rows_with_pending(
-        &self,
-        committed_ds: &Dataset,
-        pending_batches: &[RecordBatch],
-        pending_schema: Option<SchemaRef>,
-        filter: Option<String>,
-    ) -> Result<usize> {
-        let committed = self.count_rows(committed_ds, filter.clone()).await?;
-        if pending_batches.is_empty() {
-            return Ok(committed);
-        }
-        // Count via DataFusion: COUNT(*) from pending [WHERE filter].
-        let schema =
-            pending_schema.unwrap_or_else(|| pending_batches[0].schema());
-        let ctx = datafusion::execution::context::SessionContext::new();
-        let mem = datafusion::datasource::MemTable::try_new(
-            schema,
-            vec![pending_batches.to_vec()],
-        )
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
-        ctx.register_table("pending", Arc::new(mem))
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        let where_clause = filter
-            .map(|f| format!("WHERE {f}"))
-            .unwrap_or_default();
-        let sql = format!("SELECT COUNT(*) AS c FROM pending {where_clause}");
-        let df = ctx
-            .sql(&sql)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        let pending_count = batches
-            .into_iter()
-            .filter(|b| b.num_rows() > 0)
-            .map(|b| {
-                use arrow_array::cast::AsArray;
-                let arr = b.column(0).as_primitive::<arrow_array::types::Int64Type>();
-                arr.value(0) as usize
-            })
-            .sum::<usize>();
-        Ok(committed + pending_count)
     }
 
     /// `count_rows` variant that respects staged writes. Used for
@@ -1171,6 +1156,81 @@ fn assign_row_id_meta(fragments: &mut [Fragment], start_row_id: u64) -> Result<(
 ///
 /// `pending_batches` must be non-empty (the caller short-circuits on
 /// empty).
+/// Collect the set of values in a Utf8 column across multiple batches.
+/// Used by `scan_with_pending`'s merge-semantic path to identify
+/// committed rows that are shadowed by pending writes. NULL values are
+/// skipped.
+fn collect_string_column_values(
+    batches: &[RecordBatch],
+    column: &str,
+) -> Result<std::collections::HashSet<String>> {
+    use arrow_array::{Array, StringArray};
+    let mut out = std::collections::HashSet::new();
+    for batch in batches {
+        let Some(col) = batch.column_by_name(column) else {
+            return Err(OmniError::Lance(format!(
+                "scan_with_pending: pending batch missing key column '{}'",
+                column
+            )));
+        };
+        let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+            OmniError::Lance(format!(
+                "scan_with_pending: key column '{}' is not Utf8",
+                column
+            ))
+        })?;
+        for i in 0..arr.len() {
+            if arr.is_valid(i) {
+                out.insert(arr.value(i).to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Drop rows from `batches` whose Utf8 `column` value is in `excluded`.
+/// Used by `scan_with_pending`'s merge-semantic path to shadow committed
+/// rows that pending has already updated. Returns the surviving rows.
+fn filter_out_rows_where_string_in(
+    batches: Vec<RecordBatch>,
+    column: &str,
+    excluded: &std::collections::HashSet<String>,
+) -> Result<Vec<RecordBatch>> {
+    use arrow_array::{Array, BooleanArray, StringArray};
+    let mut out = Vec::with_capacity(batches.len());
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            out.push(batch);
+            continue;
+        }
+        let Some(col) = batch.column_by_name(column) else {
+            // The committed scan didn't project this column. We cannot
+            // shadow without it; pass the batch through unchanged.
+            out.push(batch);
+            continue;
+        };
+        let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+            OmniError::Lance(format!(
+                "scan_with_pending: committed column '{}' is not Utf8",
+                column
+            ))
+        })?;
+        let mask: BooleanArray = (0..arr.len())
+            .map(|i| {
+                if arr.is_valid(i) {
+                    Some(!excluded.contains(arr.value(i)))
+                } else {
+                    Some(true)
+                }
+            })
+            .collect();
+        let filtered = arrow_select::filter::filter_record_batch(&batch, &mask)
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        out.push(filtered);
+    }
+    Ok(out)
+}
+
 async fn scan_pending_batches(
     pending_batches: &[RecordBatch],
     pending_schema: Option<SchemaRef>,

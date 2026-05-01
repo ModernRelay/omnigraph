@@ -23,6 +23,8 @@ use std::sync::Arc;
 
 use arrow_array::{Array, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::SchemaRef;
+use lance::Dataset;
+use omnigraph_compiler::catalog::EdgeType;
 
 use crate::db::SubTableUpdate;
 use crate::error::{OmniError, Result};
@@ -388,4 +390,149 @@ fn dedupe_merge_batches_by_id(
     }
     arrow_select::concat::concat_batches(schema, &sliced)
         .map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+// ─── Cardinality helpers (shared by mutation + loader paths) ────────────────
+
+/// Count edges per `src` value across committed (Lance scan) + pending
+/// (in-memory). Caller supplies an opened committed dataset so the
+/// mutation path (which already has one) and the loader path (which
+/// opens via snapshot) share the same body.
+///
+/// `dedupe_key_column` controls whether committed rows are shadowed by
+/// pending:
+/// - `None` — every committed row counts, every pending row counts.
+///   Correct when committed and pending cannot share a primary key
+///   (engine inserts always use fresh ULID edge ids; loader Append
+///   mode uses fresh ids too).
+/// - `Some(col)` — committed rows whose `col` value also appears in any
+///   pending batch are EXCLUDED from the committed count, so a Merge-mode
+///   load that *updates* an existing edge (potentially changing its
+///   `src`) counts the post-update row exactly once. Without this,
+///   `LoadMode::Merge` double-counts.
+pub(crate) async fn count_src_per_edge(
+    db: &crate::db::Omnigraph,
+    committed_ds: &Dataset,
+    table_key: &str,
+    staging: &MutationStaging,
+    dedupe_key_column: Option<&str>,
+) -> Result<HashMap<String, u32>> {
+    let mut counts: HashMap<String, u32> = HashMap::new();
+
+    let pending_batches = staging.pending_batches(table_key);
+
+    // Collect pending key values (for shadow-on-merge dedupe). Only when
+    // dedupe is requested AND there's anything pending.
+    let pending_keys: Option<HashSet<String>> = match dedupe_key_column {
+        Some(col) if !pending_batches.is_empty() => {
+            let mut set = HashSet::new();
+            for batch in pending_batches {
+                if let Some(arr) = batch
+                    .column_by_name(col)
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                {
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            set.insert(arr.value(i).to_string());
+                        }
+                    }
+                }
+            }
+            Some(set)
+        }
+        _ => None,
+    };
+
+    // Committed side: scan `src` plus the dedupe key column when set, so
+    // we can both count and shadow in one pass.
+    let projection: Vec<&str> = match dedupe_key_column {
+        Some(col) if pending_keys.as_ref().is_some_and(|s| !s.is_empty()) => vec!["src", col],
+        _ => vec!["src"],
+    };
+    let committed = db
+        .table_store()
+        .scan(committed_ds, Some(&projection), None, None)
+        .await?;
+    for batch in &committed {
+        let srcs = batch
+            .column_by_name("src")
+            .ok_or_else(|| OmniError::Lance("missing 'src' column on edge table".into()))?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| OmniError::Lance("'src' column is not Utf8".into()))?;
+        // Optional shadow-key column (only present when dedupe is on).
+        let key_arr = match (&pending_keys, dedupe_key_column) {
+            (Some(set), Some(col)) if !set.is_empty() => batch
+                .column_by_name(col)
+                .and_then(|c| c.as_any().downcast_ref::<StringArray>()),
+            _ => None,
+        };
+        for i in 0..srcs.len() {
+            if !srcs.is_valid(i) {
+                continue;
+            }
+            // Shadow this committed row if its key is in pending.
+            if let (Some(arr), Some(set)) = (key_arr, pending_keys.as_ref()) {
+                if arr.is_valid(i) && set.contains(arr.value(i)) {
+                    continue;
+                }
+            }
+            *counts.entry(srcs.value(i).to_string()).or_insert(0) += 1;
+        }
+    }
+
+    // Pending side: walk in-memory batches for `src`. (No dedupe needed —
+    // `dedupe_merge_batches_by_id` runs at finalize-time so any same-id
+    // duplicates within pending are already collapsed by the time the
+    // publisher commits, but cardinality runs before finalize. The
+    // engine's per-op edge insert produces one row per op with a fresh
+    // ULID, so within-pending duplicates are not a concern here.)
+    for batch in pending_batches {
+        let Some(col) = batch.column_by_name("src") else {
+            continue;
+        };
+        let Some(srcs) = col.as_any().downcast_ref::<StringArray>() else {
+            continue;
+        };
+        for i in 0..srcs.len() {
+            if srcs.is_valid(i) {
+                *counts.entry(srcs.value(i).to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    Ok(counts)
+}
+
+/// Apply `@card(min..max)` bounds to a per-source count map.
+///
+/// Both bounds are checked. The `min` check produces a misleading error
+/// during a per-op insert mid-query (a bound of `2..` requires both
+/// edges to be inserted before validation passes), but the historical
+/// behavior was to enforce min per-op anyway — keeping users from
+/// accidentally publishing a graph that violates the schema. Consumers
+/// that need end-of-query semantics call this from after all edge ops
+/// are accumulated (the loader does, via Phase 3).
+pub(crate) fn enforce_cardinality_bounds(
+    edge_type: &EdgeType,
+    counts: &HashMap<String, u32>,
+) -> Result<()> {
+    let card = &edge_type.cardinality;
+    for (src, count) in counts {
+        if let Some(max) = card.max {
+            if *count > max {
+                return Err(OmniError::manifest(format!(
+                    "@card violation on edge {}: source '{}' has {} edges (max {})",
+                    edge_type.name, src, count, max
+                )));
+            }
+        }
+        if *count < card.min {
+            return Err(OmniError::manifest(format!(
+                "@card violation on edge {}: source '{}' has {} edges (min {})",
+                edge_type.name, src, count, card.min
+            )));
+        }
+    }
+    Ok(())
 }

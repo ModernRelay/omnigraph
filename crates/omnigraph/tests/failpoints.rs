@@ -140,6 +140,130 @@ async fn schema_apply_recovers_partial_rename() {
     assert_no_staging_files(dir.path());
 }
 
+/// Pin the documented "finalize → publisher residual" from MR-794.
+///
+/// `MutationStaging::finalize` runs `commit_staged` per touched table
+/// sequentially before the publisher commits the manifest. Lance has no
+/// multi-dataset atomic commit primitive, so a failure between the
+/// per-table staged commits and the manifest commit leaves Lance HEAD
+/// advanced on the touched tables with no manifest update — and the
+/// next mutation surfaces `ExpectedVersionMismatch` on those tables.
+///
+/// This isn't a code bug we can fix without an upstream Lance change;
+/// it's the documented residual (see `docs/runs.md` "Finalize →
+/// publisher residual"). The test pins the behavior so future code
+/// changes catch any silent regression: if someone widens the residual
+/// (e.g. failing earlier in finalize without rolling back), this test
+/// will surface a different error than `ExpectedVersionMismatch`. If
+/// someone narrows the residual (e.g. lance ships multi-dataset commit
+/// and we plumb it), this test will start passing the next mutation
+/// — and someone has to update the assertion + the docs.
+#[tokio::test]
+async fn finalize_publisher_residual_drifts_lance_head_until_next_writer_recovers() {
+    use omnigraph::error::{ManifestConflictDetails, OmniError};
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Omnigraph::init(dir.path().to_str().unwrap(), helpers::TEST_SCHEMA)
+        .await
+        .unwrap();
+
+    {
+        let _failpoint =
+            ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+
+        // First mutation: finalize succeeds (commit_staged advances Lance
+        // HEAD on node:Person), then the failpoint kicks before the
+        // publisher's manifest commit. The caller sees the synthetic
+        // error.
+        let err = mutate_main(
+            &mut db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "injected failpoint triggered: mutation.post_finalize_pre_publisher"
+            ),
+            "unexpected error: {err}"
+        );
+    }
+    // Failpoint dropped — subsequent calls are not synthetic-failed.
+
+    // Next mutation against the same table surfaces the documented
+    // residual: Lance HEAD on node:Person advanced (commit_staged ran),
+    // manifest didn't, so the publisher CAS at next-mutation time
+    // surfaces ExpectedVersionMismatch.
+    let err = mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Frank")], &[("$age", 33)]),
+    )
+    .await
+    .unwrap_err();
+    let OmniError::Manifest(manifest_err) = err else {
+        panic!("expected Manifest error, got {err:?}");
+    };
+    let Some(ManifestConflictDetails::ExpectedVersionMismatch {
+        ref table_key,
+        expected,
+        actual,
+    }) = manifest_err.details
+    else {
+        panic!(
+            "expected ExpectedVersionMismatch (the documented residual), got {:?}",
+            manifest_err.details
+        );
+    };
+    assert_eq!(
+        table_key, "node:Person",
+        "drift should be on the table the failed finalize touched"
+    );
+    assert!(
+        actual > expected,
+        "Lance HEAD on the drifted table should be ahead of manifest pinned: actual={actual} expected={expected}",
+    );
+}
+
+/// Companion to the above — confirms that a finalize→publisher failure
+/// on one table leaves OTHER tables untouched. Subsequent writes to
+/// non-drifted tables proceed normally; the drift is contained.
+#[tokio::test]
+async fn finalize_publisher_residual_does_not_drift_untouched_tables() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Omnigraph::init(dir.path().to_str().unwrap(), helpers::TEST_SCHEMA)
+        .await
+        .unwrap();
+
+    {
+        let _failpoint =
+            ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+        let _ = mutate_main(
+            &mut db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        )
+        .await
+        .expect_err("synthetic failpoint must fire");
+    }
+
+    // node:Person drifted. node:Company didn't — try a Company write.
+    use omnigraph::loader::{LoadMode, load_jsonl};
+    load_jsonl(
+        &mut db,
+        r#"{"type": "Company", "data": {"name": "Acme"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .expect("Company write on a non-drifted table should succeed");
+}
+
 fn assert_no_staging_files(repo: &std::path::Path) {
     for name in [
         "_schema.pg.staging",

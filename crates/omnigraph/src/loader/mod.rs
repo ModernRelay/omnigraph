@@ -521,6 +521,7 @@ async fn load_jsonl_reader<R: BufRead>(
                 edge_type,
                 &table_key,
                 &staging,
+                mode,
             )
             .await?;
         } else if let Some(update) = overwrite_updates.iter().find(|u| u.table_key == table_key) {
@@ -1553,87 +1554,49 @@ pub(crate) async fn validate_edge_cardinality(
 /// Validate edge `@card` cardinality with in-memory pending edges visible.
 ///
 /// Loader-level analog to `exec::mutation::validate_edge_cardinality_with_pending`:
-/// scans committed edges via Lance and unions counts with the pending
-/// edge batches accumulated by the staged loader. Used by Append/Merge
-/// loads (the Overwrite path uses `validate_edge_cardinality` which
-/// opens the just-written Lance version).
+/// opens the committed dataset at the pre-load snapshot version, then
+/// delegates to the shared `count_src_per_edge` + `enforce_cardinality_bounds`
+/// helpers in `exec::staging`. Used by Append/Merge loads (the Overwrite
+/// path uses `validate_edge_cardinality` which opens the just-written
+/// Lance version).
+///
+/// `mode` controls dedup behavior. `LoadMode::Merge` passes `Some("id")`
+/// so committed edges that the load is *updating* (same edge id, possibly
+/// changed `src`) are not double-counted (Cubic P1 finding on PR #68).
+/// `LoadMode::Append` passes `None` because each line generates a fresh
+/// ULID id that never collides with committed.
 async fn validate_edge_cardinality_with_pending_loader(
     db: &Omnigraph,
     branch: Option<&str>,
     edge_type: &omnigraph_compiler::catalog::EdgeType,
     table_key: &str,
     staging: &MutationStaging,
+    mode: LoadMode,
 ) -> Result<()> {
     if edge_type.cardinality.is_default() {
         return Ok(());
     }
-
-    let mut counts: HashMap<String, u32> = HashMap::new();
-
-    // Committed side: open at pre-write version (the snapshot pinned at
-    // load entry; pending writes haven't committed yet).
     let snapshot = db.snapshot_for_branch(branch).await?;
-    if let Some(entry) = snapshot.entry(table_key) {
-        let ds = db
-            .open_dataset_at_state(
-                &entry.table_path,
-                entry.table_branch.as_deref(),
-                entry.table_version,
-            )
+    let Some(entry) = snapshot.entry(table_key) else {
+        // No manifest entry — table doesn't exist yet. Pending-only is
+        // fine; the helper handles empty committed scans.
+        return Ok(());
+    };
+    let ds = db
+        .open_dataset_at_state(
+            &entry.table_path,
+            entry.table_branch.as_deref(),
+            entry.table_version,
+        )
+        .await?;
+    let dedupe_key = match mode {
+        LoadMode::Merge => Some("id"),
+        LoadMode::Append | LoadMode::Overwrite => None,
+    };
+    let counts =
+        crate::exec::staging::count_src_per_edge(db, &ds, table_key, staging, dedupe_key)
             .await?;
-        let batches = db
-            .table_store()
-            .scan(&ds, Some(&["src"]), None, None)
-            .await?;
-        for batch in &batches {
-            let srcs = batch
-                .column_by_name("src")
-                .ok_or_else(|| OmniError::Lance("missing 'src' column".into()))?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| OmniError::Lance("'src' column is not Utf8".into()))?;
-            for i in 0..srcs.len() {
-                if srcs.is_valid(i) {
-                    *counts.entry(srcs.value(i).to_string()).or_insert(0) += 1;
-                }
-            }
-        }
-    }
-
-    // Pending side: walk in-memory pending batches for `src`.
-    for batch in staging.pending_batches(table_key) {
-        let Some(col) = batch.column_by_name("src") else {
-            continue;
-        };
-        let Some(srcs) = col.as_any().downcast_ref::<StringArray>() else {
-            continue;
-        };
-        for i in 0..srcs.len() {
-            if srcs.is_valid(i) {
-                *counts.entry(srcs.value(i).to_string()).or_insert(0) += 1;
-            }
-        }
-    }
-
-    let card = &edge_type.cardinality;
-    for (src, count) in &counts {
-        if let Some(max) = card.max {
-            if *count > max {
-                return Err(OmniError::manifest(format!(
-                    "@card violation on edge {}: source '{}' has {} edges (max {})",
-                    edge_type.name, src, count, max
-                )));
-            }
-        }
-        if *count < card.min {
-            return Err(OmniError::manifest(format!(
-                "@card violation on edge {}: source '{}' has {} edges (min {})",
-                edge_type.name, src, count, card.min
-            )));
-        }
-    }
-
-    Ok(())
+    crate::exec::staging::enforce_cardinality_bounds(edge_type, &counts)
 }
 
 /// Collect all valid node IDs for a given type, with in-memory pending

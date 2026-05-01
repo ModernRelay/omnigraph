@@ -507,6 +507,19 @@ query mixed_insert_and_delete($name: String, $age: I32, $victim: String) {
     insert Person { name: $name, age: $age }
     delete Person where name = $victim
 }
+
+query update_then_filter_by_old_value(
+    $first_name: String, $first_new_age: I32,
+    $second_threshold: I32, $second_new_age: I32
+) {
+    update Person set { age: $first_new_age } where name = $first_name
+    update Person set { age: $second_new_age } where age > $second_threshold
+}
+
+query delete_two_persons($first: String, $second: String) {
+    delete Person where name = $first
+    delete Person where name = $second
+}
 "#;
 
 /// D₂: a query mixing inserts/updates with deletes is rejected at parse
@@ -837,4 +850,273 @@ edge WorksAt: Person -> Company @card(0..1)
         pre_works + 1,
         "follow-up load must succeed (no drift on edge table)",
     );
+}
+
+// ─── PR #68 review-comment fixes — pinned coverage ──────────────────────────
+
+/// Codex P1 / Cubic P1 #1: chained `update` ops in one query must respect
+/// each previous op's view of the rows. Without merge-shadow semantics on
+/// `scan_with_pending`, the second update sees the stale committed value
+/// (the first update's row still appears in the Lance scan because the
+/// pending side hasn't committed), the predicate matches it, and the
+/// dedupe-last-wins step at finalize ends up applying the second update
+/// to a row whose pending value should have shielded it.
+///
+/// Concretely: Alice starts at age=30 in TEST_DATA. Op-1 sets Alice to
+/// age=99. Op-2 updates anyone with age > 50 to age=10. After op-1,
+/// Alice's logical value is age=99 — within op-2's predicate. So op-2
+/// SHOULD update Alice to age=10. The interesting case is: op-2 must
+/// see Alice at age=99 (op-1's pending value), not age=30 (committed).
+/// If the helper unioned without shadowing, op-2 would also match the
+/// stale committed Alice (age=30 doesn't trigger the predicate, but the
+/// row would appear twice and dedupe could pick either). The test
+/// asserts both ends: Alice ends at age=10, the publisher publishes
+/// once.
+#[tokio::test]
+async fn chained_updates_with_overlapping_predicate_respects_intermediate_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let pre_version = version_main(&db).await.unwrap();
+
+    db.mutate(
+        "main",
+        STAGED_QUERIES,
+        "update_then_filter_by_old_value",
+        &mixed_params(
+            &[("$first_name", "Alice")],
+            &[
+                ("$first_new_age", 99),
+                ("$second_threshold", 50),
+                ("$second_new_age", 10),
+            ],
+        ),
+    )
+    .await
+    .unwrap();
+
+    // After op-1: Alice = 99. After op-2 (where age > 50): Alice
+    // matches (99 > 50) → set to 10. End state: Alice = 10.
+    let batches = read_table(&db, "node:Person").await;
+    let mut alice_age: Option<i32> = None;
+    for batch in &batches {
+        let names = batch
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        let ages = batch
+            .column_by_name("age")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::Int32Array>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            if names.is_valid(i) && names.value(i) == "Alice" && ages.is_valid(i) {
+                alice_age = Some(ages.value(i));
+            }
+        }
+    }
+    assert_eq!(
+        alice_age,
+        Some(10),
+        "chained-update final value must reflect the second update applied to op-1's pending value"
+    );
+
+    let post_version = version_main(&db).await.unwrap();
+    assert_eq!(
+        post_version,
+        pre_version + 1,
+        "chained update must publish exactly once",
+    );
+}
+
+/// Cursor Bugbot HIGH: two `delete` ops on the same node table in one
+/// query. Pre-fix, op-2's `open_table_for_mutation` went through
+/// `open_for_mutation_on_branch` which trips `ensure_expected_version`
+/// (Lance HEAD has advanced past the manifest's pinned version after
+/// op-1's inline-commit, but the manifest hasn't moved). Post-fix,
+/// `open_table_for_mutation` reopens via `inline_committed[table_key]`
+/// at the post-delete Lance version. Test asserts both deletes succeed
+/// in one query, both rows are gone, manifest version advances by 1.
+#[tokio::test]
+async fn multi_statement_delete_on_same_node_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let pre_persons = count_rows(&db, "node:Person").await;
+    let pre_version = version_main(&db).await.unwrap();
+
+    db.mutate(
+        "main",
+        STAGED_QUERIES,
+        "delete_two_persons",
+        &params(&[("$first", "Alice"), ("$second", "Bob")]),
+    )
+    .await
+    .expect("multi-delete on same table must succeed");
+
+    assert_eq!(
+        count_rows(&db, "node:Person").await,
+        pre_persons - 2,
+        "both deletes must land",
+    );
+    let post_version = version_main(&db).await.unwrap();
+    assert_eq!(
+        post_version,
+        pre_version + 1,
+        "multi-delete query publishes exactly once at end",
+    );
+
+    // Both rows actually gone:
+    for name in ["Alice", "Bob"] {
+        let qr = db
+            .query(
+                ReadTarget::branch("main"),
+                TEST_QUERIES,
+                "get_person",
+                &params(&[("$name", name)]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(qr.num_rows(), 0, "{name} should be deleted");
+    }
+}
+
+/// Cursor Bugbot HIGH (cascade variant): deleting a node cascades to its
+/// edges, advancing Lance HEAD on the edge table. A subsequent
+/// `delete <Edge>` op in the same query must reopen at the
+/// post-cascade-commit version of the edge table — not trip
+/// `ensure_expected_version` against the manifest's pinned version.
+#[tokio::test]
+async fn cascade_delete_node_then_explicit_delete_edge_on_same_table() {
+    const QUERY: &str = r#"
+query cascade_then_explicit($name: String, $other: String) {
+    delete Person where name = $name
+    delete Knows where from = $other
+}
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let pre_knows = count_rows(&db, "edge:Knows").await;
+
+    db.mutate(
+        "main",
+        QUERY,
+        "cascade_then_explicit",
+        &params(&[("$name", "Alice"), ("$other", "Bob")]),
+    )
+    .await
+    .expect("cascade-then-explicit-delete on same edge table must succeed");
+
+    let post_knows = count_rows(&db, "edge:Knows").await;
+    assert!(
+        post_knows < pre_knows,
+        "cascade + explicit delete should remove edges; pre={pre_knows} post={post_knows}",
+    );
+}
+
+/// Codex P2 / Cursor Bugbot LOW / Cubic P2: the engine cardinality path
+/// must enforce `min` bounds. Pre-fix the engine path silently dropped
+/// the min check (a `let _ = card.min;` line). The loader path always
+/// enforced both. Post-fix, both paths route through
+/// `enforce_cardinality_bounds` which checks both bounds.
+///
+/// Build a custom schema with `Knows: Person -> Person @card(2..*)`.
+/// Inserting a single Knows edge violates min=2. The mutation path must
+/// reject.
+#[tokio::test]
+async fn mutation_insert_edge_enforces_min_cardinality() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    const MIN_CARD_SCHEMA: &str = r#"
+node Person {
+    name: String @key
+}
+edge Knows: Person -> Person @card(2..)
+"#;
+    const MIN_CARD_QUERY: &str = r#"
+query add_friend($from: String, $to: String) {
+    insert Knows { from: $from, to: $to }
+}
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, MIN_CARD_SCHEMA).await.unwrap();
+
+    let seed = r#"{"type": "Person", "data": {"name": "Alice"}}
+{"type": "Person", "data": {"name": "Bob"}}
+"#;
+    load_jsonl(&mut db, seed, LoadMode::Overwrite).await.unwrap();
+
+    // Single insert: count=1 < min=2 → reject with clear message.
+    let err = db
+        .mutate(
+            "main",
+            MIN_CARD_QUERY,
+            "add_friend",
+            &params(&[("$from", "Alice"), ("$to", "Bob")]),
+        )
+        .await
+        .expect_err("min cardinality must reject the engine path");
+    let OmniError::Manifest(manifest_err) = err else {
+        panic!("expected Manifest error, got {err:?}");
+    };
+    assert!(
+        manifest_err.message.contains("@card violation")
+            && manifest_err.message.contains("min 2"),
+        "unexpected error: {}",
+        manifest_err.message,
+    );
+}
+
+/// Cubic P1 #2: `LoadMode::Merge` on edges must NOT double-count the
+/// committed edge AND its updated pending replacement. Build a custom
+/// schema where WorksAt has @card(0..1). Seed Alice with one WorksAt to
+/// Acme. Then Merge-load the SAME edge id (so it's an update, not an
+/// insert) pointing Alice's WorksAt at Bigco. Cardinality must count
+/// Alice's edges as 1 (the post-merge count), not 2 (committed + pending).
+#[tokio::test]
+async fn load_merge_mode_dedupes_edge_for_cardinality_count() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    const CARD_SCHEMA: &str = r#"
+node Person {
+    name: String @key
+}
+node Company {
+    name: String @key
+}
+edge WorksAt: Person -> Company @card(0..1)
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, CARD_SCHEMA).await.unwrap();
+
+    // Seed: Alice + Acme + Bigco + WorksAt(id=w1, Alice→Acme). Note the
+    // loader reads edge ids from the `data.id` field (not top-level), so
+    // we place the id inside `data` for both the seed and the update.
+    let seed = r#"{"type": "Person", "data": {"name": "Alice"}}
+{"type": "Company", "data": {"name": "Acme"}}
+{"type": "Company", "data": {"name": "Bigco"}}
+{"edge": "WorksAt", "from": "Alice", "to": "Acme", "data": {"id": "w1"}}
+"#;
+    load_jsonl(&mut db, seed, LoadMode::Overwrite).await.unwrap();
+
+    // Merge-update the same edge id w1 to point at Bigco. Counted naively
+    // as union, Alice has 2 WorksAt (committed Acme + pending Bigco) which
+    // would trip @card(0..1). With merge dedupe, Alice has 1 WorksAt.
+    let merge_data = r#"{"edge": "WorksAt", "from": "Alice", "to": "Bigco", "data": {"id": "w1"}}
+"#;
+    load_jsonl(&mut db, merge_data, LoadMode::Merge)
+        .await
+        .expect("Merge update must dedupe the committed edge by id");
+
+    // Confirm there's exactly 1 WorksAt edge after merge.
+    assert_eq!(count_rows(&db, "edge:WorksAt").await, 1);
 }
