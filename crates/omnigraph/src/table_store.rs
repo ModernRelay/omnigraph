@@ -868,6 +868,24 @@ impl TableStore {
         filter: Option<&str>,
         key_column: Option<&str>,
     ) -> Result<Vec<RecordBatch>> {
+        // Contract: when merge-shadow semantics are requested via
+        // `key_column`, the committed-side projection MUST include that
+        // column so we can filter committed rows whose key appears in
+        // pending. Silently dropping the shadow when projection omits
+        // the key would re-introduce union semantics behind the
+        // caller's back. Reject up front with a clear error so callers
+        // either (a) include the key in projection or (b) drop
+        // `key_column` if union is what they wanted.
+        if let (Some(key_col), Some(cols)) = (key_column, projection) {
+            if !cols.iter().any(|c| *c == key_col) {
+                return Err(OmniError::Lance(format!(
+                    "scan_with_pending: key_column '{}' must appear in projection \
+                     when merge-shadow semantics are requested (got projection = {:?})",
+                    key_col, cols
+                )));
+            }
+        }
+
         let committed = self.scan(committed_ds, projection, filter, None).await?;
         if pending_batches.is_empty() {
             return Ok(committed);
@@ -1191,6 +1209,11 @@ fn collect_string_column_values(
 /// Drop rows from `batches` whose Utf8 `column` value is in `excluded`.
 /// Used by `scan_with_pending`'s merge-semantic path to shadow committed
 /// rows that pending has already updated. Returns the surviving rows.
+///
+/// `scan_with_pending` validates up front that the projection contains
+/// `column`, so a missing column here is a programmer error — error
+/// loudly instead of silently passing batches through (which would
+/// re-introduce the union semantics the caller asked us to avoid).
 fn filter_out_rows_where_string_in(
     batches: Vec<RecordBatch>,
     column: &str,
@@ -1203,12 +1226,13 @@ fn filter_out_rows_where_string_in(
             out.push(batch);
             continue;
         }
-        let Some(col) = batch.column_by_name(column) else {
-            // The committed scan didn't project this column. We cannot
-            // shadow without it; pass the batch through unchanged.
-            out.push(batch);
-            continue;
-        };
+        let col = batch.column_by_name(column).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "scan_with_pending: committed batch missing key column '{}' \
+                 (the up-front projection check should have rejected this)",
+                column
+            ))
+        })?;
         let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
             OmniError::Lance(format!(
                 "scan_with_pending: committed column '{}' is not Utf8",

@@ -481,12 +481,31 @@ pub(crate) async fn count_src_per_edge(
         }
     }
 
-    // Pending side: walk in-memory batches for `src`. (No dedupe needed —
-    // `dedupe_merge_batches_by_id` runs at finalize-time so any same-id
-    // duplicates within pending are already collapsed by the time the
-    // publisher commits, but cardinality runs before finalize. The
-    // engine's per-op edge insert produces one row per op with a fresh
-    // ULID, so within-pending duplicates are not a concern here.)
+    // Pending side: walk in-memory batches for `src`. When dedupe is on,
+    // collapse rows that share `dedupe_key_column` to their last occurrence
+    // — mirrors `dedupe_merge_batches_by_id`'s last-write-wins applied at
+    // finalize time, so cardinality counts what `commit_staged` will
+    // actually publish, not raw input duplicates.
+    //
+    // Without this, a Merge-mode load whose input JSONL has two rows with
+    // the same edge id would be double-counted here, even though the
+    // finalize-time dedupe would collapse them to one. The result: spurious
+    // `@card` violations on perfectly valid Merge inputs.
+    match dedupe_key_column {
+        Some(key_col) => count_pending_src_with_dedupe(pending_batches, key_col, &mut counts)?,
+        None => count_pending_src_naive(pending_batches, &mut counts),
+    }
+
+    Ok(counts)
+}
+
+/// Count pending edges per `src` with NO dedup. Correct when caller
+/// guarantees pending rows have unique primary keys (engine inserts via
+/// fresh ULID; loader Append mode).
+fn count_pending_src_naive(
+    pending_batches: &[RecordBatch],
+    counts: &mut HashMap<String, u32>,
+) {
     for batch in pending_batches {
         let Some(col) = batch.column_by_name("src") else {
             continue;
@@ -500,8 +519,59 @@ pub(crate) async fn count_src_per_edge(
             }
         }
     }
+}
 
-    Ok(counts)
+/// Count pending edges per `src` after deduping rows that share
+/// `dedupe_key_column`. Last occurrence wins (mirrors
+/// `dedupe_merge_batches_by_id`'s walk-in-reverse contract). Required for
+/// `LoadMode::Merge` where the same edge id may appear multiple times in
+/// one load and finalize will collapse them to the last value.
+fn count_pending_src_with_dedupe(
+    pending_batches: &[RecordBatch],
+    dedupe_key_column: &str,
+    counts: &mut HashMap<String, u32>,
+) -> Result<()> {
+    // Walk in reverse, track seen keys, keep one (key, src) pair per key.
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut kept_srcs: Vec<String> = Vec::new();
+    for batch in pending_batches.iter().rev() {
+        let Some(key_col) = batch.column_by_name(dedupe_key_column) else {
+            // Pending batch is missing the key column — fall back to naive
+            // counting for this batch (caller's contract was about merge
+            // semantics; if the column isn't there we can't dedupe).
+            continue;
+        };
+        let key_arr = key_col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+            OmniError::Lance(format!(
+                "count_src_per_edge: pending '{}' column is not Utf8",
+                dedupe_key_column
+            ))
+        })?;
+        let src_arr = batch
+            .column_by_name("src")
+            .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let Some(srcs) = src_arr else {
+            continue;
+        };
+        for i in (0..batch.num_rows()).rev() {
+            if !srcs.is_valid(i) {
+                continue;
+            }
+            // NULL key: keep (NULL != NULL semantics — every NULL counts).
+            if !key_arr.is_valid(i) {
+                kept_srcs.push(srcs.value(i).to_string());
+                continue;
+            }
+            let key = key_arr.value(i);
+            if seen.insert(key.to_string()) {
+                kept_srcs.push(srcs.value(i).to_string());
+            }
+        }
+    }
+    for src in kept_srcs {
+        *counts.entry(src).or_insert(0) += 1;
+    }
+    Ok(())
 }
 
 /// Apply `@card(min..max)` bounds to a per-source count map.

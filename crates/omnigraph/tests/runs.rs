@@ -1001,7 +1001,15 @@ query cascade_then_explicit($name: String, $other: String) {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
 
+    // TEST_DATA seeds three Knows edges:
+    //   Alice → Bob, Alice → Charlie (cascade target — should be deleted by op-1)
+    //   Bob → Diana                  (explicit target — should be deleted by op-2)
+    // After both ops, all three edges must be gone. A weaker assertion
+    // (just "count decreased") would pass even if op-2 silently no-op'd
+    // — Bob→Diana would survive. The exact-count check makes both ops
+    // independently observable.
     let pre_knows = count_rows(&db, "edge:Knows").await;
+    assert_eq!(pre_knows, 3, "fixture invariant: TEST_DATA seeds 3 Knows edges");
 
     db.mutate(
         "main",
@@ -1012,10 +1020,13 @@ query cascade_then_explicit($name: String, $other: String) {
     .await
     .expect("cascade-then-explicit-delete on same edge table must succeed");
 
+    // Both ops landed: cascade removed Alice→Bob and Alice→Charlie;
+    // explicit removed Bob→Diana. Anything > 0 means one op silently
+    // did nothing (the bug we're guarding against).
     let post_knows = count_rows(&db, "edge:Knows").await;
-    assert!(
-        post_knows < pre_knows,
-        "cascade + explicit delete should remove edges; pre={pre_knows} post={post_knows}",
+    assert_eq!(
+        post_knows, 0,
+        "both cascade + explicit delete must complete (Bob→Diana would survive if op-2 no-op'd)",
     );
 }
 
@@ -1119,4 +1130,147 @@ edge WorksAt: Person -> Company @card(0..1)
 
     // Confirm there's exactly 1 WorksAt edge after merge.
     assert_eq!(count_rows(&db, "edge:WorksAt").await, 1);
+}
+
+/// Cubic P2 (follow-up to PR #68 review of commit 3223b51): a Merge load
+/// whose input has TWO rows with the same edge id must be deduped at
+/// cardinality-count time, not just at finalize. Without dedup, two
+/// pending rows count twice → spurious `@card` violation. With dedup
+/// (last-occurrence-wins, mirroring `dedupe_merge_batches_by_id`), the
+/// pending side counts once.
+///
+/// This is a separate path from `load_merge_mode_dedupes_edge_for_cardinality_count`
+/// (which dedupes committed-vs-pending). Here we verify pending-vs-pending
+/// dedup.
+#[tokio::test]
+async fn load_merge_mode_dedupes_within_pending_for_cardinality_count() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    const CARD_SCHEMA: &str = r#"
+node Person {
+    name: String @key
+}
+node Company {
+    name: String @key
+}
+edge WorksAt: Person -> Company @card(0..1)
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, CARD_SCHEMA).await.unwrap();
+
+    let seed = r#"{"type": "Person", "data": {"name": "Alice"}}
+{"type": "Company", "data": {"name": "Acme"}}
+{"type": "Company", "data": {"name": "Bigco"}}
+"#;
+    load_jsonl(&mut db, seed, LoadMode::Overwrite).await.unwrap();
+
+    // Merge load with the SAME edge id twice — the second row supersedes
+    // the first in the finalize-time dedupe. If pending-counting doesn't
+    // dedupe, Alice has 2 pending edges → @card(0..1) trips → load
+    // fails. With dedupe, Alice has 1 → load succeeds.
+    let dup_data = r#"{"edge": "WorksAt", "from": "Alice", "to": "Acme", "data": {"id": "w1"}}
+{"edge": "WorksAt", "from": "Alice", "to": "Bigco", "data": {"id": "w1"}}
+"#;
+    load_jsonl(&mut db, dup_data, LoadMode::Merge)
+        .await
+        .expect("Merge load with within-input dup ids must dedupe pending count");
+
+    // Exactly one WorksAt edge after the dedup; the second row wins
+    // (last-occurrence) so dst should be Bigco.
+    assert_eq!(count_rows(&db, "edge:WorksAt").await, 1);
+}
+
+/// Cubic P2 (follow-up): `scan_with_pending` must reject a call where
+/// `key_column` is requested but the projection omits that column.
+/// Without the up-front check, the helper silently degraded to union
+/// semantics — letting a chained-update bug slip through unnoticed.
+/// This test verifies the contract is enforced at the API boundary.
+#[tokio::test]
+async fn scan_with_pending_rejects_key_column_missing_from_projection() {
+    use arrow_array::{RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use omnigraph::table_store::TableStore;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap());
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("note", DataType::Utf8, true),
+    ]));
+    let seed = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["a", "b"])) as _,
+            Arc::new(StringArray::from(vec![Some("seed-a"), Some("seed-b")])) as _,
+        ],
+    )
+    .unwrap();
+    let ds = TableStore::write_dataset(&uri, seed).await.unwrap();
+
+    let pending = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["a"])) as _,
+            Arc::new(StringArray::from(vec![Some("pending-a")])) as _,
+        ],
+    )
+    .unwrap();
+
+    // Bad call: key_column = "id" but projection doesn't include "id".
+    // Pre-fix this silently disabled merge-shadowing and returned both
+    // committed "a" and pending "a" rows. Now it must error.
+    let err = store
+        .scan_with_pending(
+            &ds,
+            std::slice::from_ref(&pending),
+            None,
+            Some(&["note"]),
+            None,
+            Some("id"),
+        )
+        .await
+        .expect_err("scan_with_pending must reject merge-shadow with missing key in projection");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("key_column 'id'") && msg.contains("must appear in projection"),
+        "unexpected error: {msg}"
+    );
+
+    // Good call: projection includes the key column. Shadow works:
+    // pending row 'a' shadows committed 'a', so the result has only
+    // committed 'b' + pending 'a'.
+    let batches = store
+        .scan_with_pending(
+            &ds,
+            std::slice::from_ref(&pending),
+            None,
+            Some(&["id", "note"]),
+            None,
+            Some("id"),
+        )
+        .await
+        .expect("projection containing key_column must succeed");
+    let mut ids: Vec<String> = Vec::new();
+    for b in &batches {
+        let arr = b
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        for i in 0..arr.len() {
+            ids.push(arr.value(i).to_string());
+        }
+    }
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["a", "b"],
+        "merge-shadow should drop committed 'a' and surface pending 'a' + committed 'b'"
+    );
 }

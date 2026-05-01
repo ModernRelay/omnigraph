@@ -239,6 +239,48 @@ jobs:
         if: needs.classify_changes.outputs.run_full_ci == 'true'
         run: cargo test --locked -p omnigraph-server --features aws
 
+  test_failpoints_feature:
+    name: Test omnigraph-engine --features failpoints
+    needs: classify_changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Skip for text-only changes
+        if: needs.classify_changes.outputs.run_full_ci != 'true'
+        run: echo "Text-only change detected; skipping failpoints feature build."
+
+      - name: Checkout source
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        uses: actions/checkout@v5.0.1
+
+      - name: Install system dependencies
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - name: Install Rust stable
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust build data
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+          key: failpoints-feature
+
+      - name: Run failpoints test suite
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        run: cargo test --locked -p omnigraph-engine --features failpoints --test failpoints
+
   rustfs_integration:
     name: RustFS S3 Integration
     needs:
