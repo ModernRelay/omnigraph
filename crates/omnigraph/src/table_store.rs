@@ -1168,12 +1168,6 @@ fn assign_row_id_meta(fragments: &mut [Fragment], start_row_id: u64) -> Result<(
     Ok(())
 }
 
-/// Apply `projection` and `filter` to in-memory pending batches via a
-/// fresh DataFusion `SessionContext`. Used by `scan_with_pending` for
-/// the read-your-writes side of MR-794's in-memory accumulator.
-///
-/// `pending_batches` must be non-empty (the caller short-circuits on
-/// empty).
 /// Collect the set of values in a Utf8 column across multiple batches.
 /// Used by `scan_with_pending`'s merge-semantic path to identify
 /// committed rows that are shadowed by pending writes. NULL values are
@@ -1255,6 +1249,21 @@ fn filter_out_rows_where_string_in(
     Ok(out)
 }
 
+/// Apply `projection` and `filter` to in-memory pending batches via a
+/// fresh DataFusion `SessionContext`. Used by `scan_with_pending` for
+/// the read-your-writes side of MR-794's in-memory accumulator.
+///
+/// `pending_batches` must be non-empty (the caller short-circuits on
+/// empty).
+///
+/// **SQL dialect contract.** `filter` is also passed to Lance's scanner
+/// on the committed side. Lance and DataFusion both accept standard
+/// SQL comparison predicates (`col op literal`) and OmniGraph's
+/// `predicate_to_sql` only emits those shapes today (`=`, `!=`, `>`,
+/// `<`, `>=`, `<=`). If a future caller introduces a Lance-specific
+/// scanner extension (vector search, FTS, `_rowid` references) into
+/// the filter, this function will need explicit translation — DataFusion
+/// won't recognize those operators against the in-memory `MemTable`.
 async fn scan_pending_batches(
     pending_batches: &[RecordBatch],
     pending_schema: Option<SchemaRef>,

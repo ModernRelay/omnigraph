@@ -133,6 +133,33 @@ impl MutationStaging {
             // be appended.
             return Ok(());
         }
+        // If we've already accumulated a batch on this table, the new
+        // batch's schema MUST match the existing accumulator's schema.
+        // The mismatch case in practice is a blob-bearing table that
+        // sees an `insert` (full schema, blob columns included) and
+        // then an `update` whose `apply_assignments` output omits
+        // unassigned blob columns (subset schema). Concat-time and
+        // MemTable-construction errors would catch this later, but
+        // surfacing it at the offending `append_batch` call gives the
+        // caller a clearer point of failure attached to the specific
+        // op that introduced the drift.
+        if let Some(existing) = self.pending.get(table_key) {
+            if !schemas_compatible(&existing.schema, &batch.schema()) {
+                return Err(OmniError::manifest(format!(
+                    "table '{}' accumulated mutation batches with mismatched schemas: \
+                     prior batches have {} columns, this batch has {}. \
+                     This typically happens on a blob-bearing table when one \
+                     op uses the full schema (e.g. an `insert`) and another \
+                     omits unassigned blob columns (e.g. an `update` that \
+                     doesn't set every blob property). Split the mutation \
+                     into two queries: one for the inserts, one for the \
+                     updates.",
+                    table_key,
+                    existing.schema.fields().len(),
+                    batch.schema().fields().len(),
+                )));
+            }
+        }
         let entry = self
             .pending
             .entry(table_key.to_string())
@@ -305,6 +332,24 @@ impl MutationStaging {
 /// arbitrary results on duplicates).
 ///
 /// `batches` must be non-empty and all share `schema` (caller enforces).
+/// Compare two schemas for the purposes of `MutationStaging::append_batch`'s
+/// accumulator-compatibility check. We treat schemas as compatible if
+/// they have the same field names and data types in the same order.
+/// Nullability and field metadata differences are tolerated — Lance and
+/// Arrow round-trip these freely and the accumulator's downstream
+/// `concat_batches` is also permissive on those.
+fn schemas_compatible(a: &SchemaRef, b: &SchemaRef) -> bool {
+    if a.fields().len() != b.fields().len() {
+        return false;
+    }
+    for (af, bf) in a.fields().iter().zip(b.fields().iter()) {
+        if af.name() != bf.name() || af.data_type() != bf.data_type() {
+            return false;
+        }
+    }
+    true
+}
+
 fn dedupe_merge_batches_by_id(
     schema: &SchemaRef,
     batches: Vec<RecordBatch>,
@@ -536,10 +581,19 @@ fn count_pending_src_with_dedupe(
     let mut kept_srcs: Vec<String> = Vec::new();
     for batch in pending_batches.iter().rev() {
         let Some(key_col) = batch.column_by_name(dedupe_key_column) else {
-            // Pending batch is missing the key column — fall back to naive
-            // counting for this batch (caller's contract was about merge
-            // semantics; if the column isn't there we can't dedupe).
-            continue;
+            // Pending batch is missing the key column. By construction
+            // this is unreachable: callers in dedupe mode always push
+            // batches whose schema contains the key (loader Merge mode
+            // builds via build_edge_batch which always emits `id`; the
+            // append_batch schema-compatibility check at the call site
+            // would also reject a heterogeneous mix). If it ever fires
+            // it's a programmer error — fail loudly rather than skip
+            // counting (which would let `@card` violations slip).
+            return Err(OmniError::manifest_internal(format!(
+                "count_pending_src_with_dedupe: pending batch missing dedup key column '{}' \
+                 (schema-compat check at append_batch should have rejected this)",
+                dedupe_key_column
+            )));
         };
         let key_arr = key_col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
             OmniError::Lance(format!(

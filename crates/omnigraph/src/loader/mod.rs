@@ -1655,7 +1655,13 @@ async fn collect_node_ids_with_pending(
             .downcast_ref::<StringArray>()
             .ok_or_else(|| OmniError::Lance("'id' column is not Utf8".into()))?;
         for i in 0..batch.num_rows() {
-            ids.insert(id_col.value(i).to_string());
+            // Defensive: `id` is the @key column on every node type and
+            // is non-nullable by schema, but a committed-row corruption
+            // (or future schema change) could surface a NULL. Skip
+            // rather than insert "" — pending-side does the same.
+            if id_col.is_valid(i) {
+                ids.insert(id_col.value(i).to_string());
+            }
         }
     }
 
@@ -1718,6 +1724,9 @@ async fn collect_node_ids(
             .downcast_ref::<StringArray>()
             .unwrap();
         for i in 0..batch.num_rows() {
+            if !id_col.is_valid(i) {
+                continue;
+            }
             ids.insert(id_col.value(i).to_string());
         }
     }

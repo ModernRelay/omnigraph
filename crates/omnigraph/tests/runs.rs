@@ -1274,3 +1274,93 @@ async fn scan_with_pending_rejects_key_column_missing_from_projection() {
         "merge-shadow should drop committed 'a' and surface pending 'a' + committed 'b'"
     );
 }
+
+/// Cursor Bugbot Medium (follow-up on commit 052b6e6): the
+/// `PendingTable.schema` field is captured from the first `append_batch`
+/// call and never updated. On a blob-bearing table, an `insert`
+/// produces a full-schema batch (blob columns included) and an `update`
+/// that doesn't assign every blob produces a subset-schema batch. Mixed
+/// in one query, the second `append_batch` would silently push an
+/// incompatible batch — the mismatch surfaced eventually at
+/// `concat_batches`/MemTable construction inside finalize, but the
+/// failure point was distant from the offending op.
+///
+/// Post-fix: `append_batch` validates the new batch's schema against
+/// the existing accumulator's schema and returns a typed error
+/// directing the caller to split the mutation. The error fires at the
+/// second op (the update), not at end-of-query.
+#[tokio::test]
+async fn append_batch_rejects_mismatched_schema_in_blob_table_at_offending_op() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    const BLOB_SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob?
+    note: String?
+}
+"#;
+    const BLOB_QUERIES: &str = r#"
+query insert_then_update_note(
+    $title: String, $blob: String, $note: String
+) {
+    insert Document { title: $title, content: $blob }
+    update Document set { note: $note } where title = $title
+}
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+
+    // Seed with a Document so the update has something to match (the
+    // mid-query case is the chained-update scenario where the update's
+    // predicate matches the just-inserted row, exercising the in-memory
+    // pending union).
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Document","data":{"title":"seed","content":"base64:AQID"}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+
+    let err = db
+        .mutate(
+            "main",
+            BLOB_QUERIES,
+            "insert_then_update_note",
+            &params(&[
+                ("$title", "letter"),
+                ("$blob", "base64:BAUG"),
+                ("$note", "draft 1"),
+            ]),
+        )
+        .await
+        .expect_err("blob-table mixed insert+update with non-fully-assigned blob must error early");
+    let OmniError::Manifest(manifest_err) = err else {
+        panic!("expected Manifest error, got {err:?}");
+    };
+    assert!(
+        manifest_err.message.contains("mismatched schemas")
+            && manifest_err.message.contains("Split the mutation"),
+        "error must direct user to split: {}",
+        manifest_err.message,
+    );
+
+    // Confirm the manifest didn't advance — early error must be
+    // before any commit.
+    let qr = db
+        .query(
+            ReadTarget::branch("main"),
+            r#"query get_doc($title: String) {
+                match { $d: Document { title: $title } }
+                return { $d.title }
+            }"#,
+            "get_doc",
+            &params(&[("$title", "letter")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(qr.num_rows(), 0, "letter must not be visible after early error");
+}
