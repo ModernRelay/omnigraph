@@ -56,11 +56,11 @@ omnigraph policy validate --config ./omnigraph.yaml
 omnigraph policy test --config ./omnigraph.yaml
 omnigraph policy explain --config ./omnigraph.yaml --actor act-alice --action read --branch main
 
-omnigraph run list ./repo.omni --json
-omnigraph run show --uri ./repo.omni <run-id> --json
-omnigraph run publish --uri ./repo.omni <run-id> --json
-omnigraph run abort --uri ./repo.omni <run-id> --json
+omnigraph commit list ./repo.omni --json
+omnigraph commit show --uri ./repo.omni <commit-id> --json
 ```
+
+(The legacy `omnigraph run list/show/publish/abort` subcommands were removed in MR-771; mutations and loads publish atomically and the commit graph (`omnigraph commit list`) is the audit surface.)
 
 `query lint` and `query check` are the same command surface. In v1, repo-backed
 lint uses local or `s3://` repo URIs; HTTP targets are only supported when you

@@ -20,22 +20,60 @@ publisher's row-level CAS on `__manifest` is the single fence.
 
 A `.gq` query with multiple ops (e.g. `insert Person … insert Knows …`)
 must observe earlier ops' writes when validating later ops (referential
-integrity, edge cardinality). After demotion this is implemented via an
-in-process `MutationStaging` accumulator in
-`crates/omnigraph/src/exec/mutation.rs`:
+integrity, edge cardinality). After MR-794 step 2+ this is implemented
+via an in-memory `MutationStaging` accumulator in
+[`crates/omnigraph/src/exec/staging.rs`](../crates/omnigraph/src/exec/staging.rs),
+shared by both `mutate_as` and the bulk loader:
 
 - On the first touch of each table, the pre-write manifest version is
-  captured into `expected_versions[table_key]`.
-- Subsequent ops on the same table re-open the dataset at the locally
-  staged Lance version (bypassing the manifest, which has not been
-  committed yet) so they see prior writes.
-- One `commit_with_expected(updates, expected_versions)` at the end
-  publishes the lot atomically. Cross-table conflicts surface as
+  captured into `expected_versions[table_key]` (the publisher's CAS
+  fence at end-of-query).
+- Each insert/update op pushes a `RecordBatch` into the per-table
+  pending accumulator. Lance HEAD does **not** advance during op
+  execution.
+- Read sites (validation, predicate matching for `update`) consume
+  `TableStore::scan_with_pending`, which scans committed via Lance
+  and applies the same SQL filter to the pending batches via DataFusion
+  `MemTable`. Same-query writes are visible to subsequent reads.
+- At end-of-query, `MutationStaging::finalize` issues exactly one
+  `stage_*` + `commit_staged` per touched table (concatenating
+  accumulated batches; merge-mode dedupes by `id`, last-write-wins),
+  and the publisher publishes the manifest atomically across all
+  touched sub-tables. Cross-table conflicts surface as
   `ManifestConflictDetails::ExpectedVersionMismatch`.
+- **Deletes still inline-commit.** Lance's `Dataset::delete` is not
+  exposed as a two-phase op in 4.0.0; deletes go through `delete_where`
+  immediately and record their post-write state in
+  `MutationStaging.inline_committed`. The parse-time D₂ rule (below)
+  prevents inserts/updates from coexisting with deletes in one query,
+  so the inline path is safe for delete-only mutations.
 
 This upholds [docs/invariants.md §VI.23](invariants.md) (atomicity per
-query) and §VI.25 (read-your-writes within a multi-statement mutation —
-previously aspirational, now upheld).
+query) and §VI.25 (read-your-writes within a multi-statement mutation,
+upheld).
+
+### D₂ — parse-time mixed-mode rejection
+
+A single mutation query is either insert/update-only or delete-only.
+Mixed → rejected at parse time with a clear error directing the user to
+split the query. Reason: mixing creates ordering hazards
+(insert→delete on the same row would silently no-op because the staged
+insert isn't visible to delete; cascading deletes of just-inserted
+edges break referential integrity). Until Lance exposes a two-phase
+delete API, the parse-time rejection keeps both paths atomic and
+correct. Tracked: MR-793, plus a Lance-upstream ticket.
+
+### `LoadMode::Overwrite` residual
+
+The bulk loader's Append and Merge modes use the staged-write path
+described above. `LoadMode::Overwrite` keeps the legacy inline-commit
+path: truncate-then-append doesn't fit the staged shape cleanly in
+Lance 4.0.0, and overwrite has no in-flight read-your-writes
+requirement (the prior data is being wiped). A mid-overwrite failure
+can leave Lance HEAD on a partially-truncated table; the next overwrite
+will replace it. Operator-driven (rare in agent workloads); document
+permanently until Lance exposes `Operation::Overwrite { fragments }` as
+a two-phase op.
 
 ## Conflict shape
 
@@ -59,40 +97,32 @@ list`.
 `_graph_runs.lance` belongs in MR-770 (the production sweep) — this PR
 stops *creating* run state but does not destroy legacy bytes on disk.
 
-## Known limitation: mid-query partial failure on the same table
+## Mid-query partial failure: closed by MR-794
 
-A multi-statement `.gq` mutation where op-N writes a Lance fragment
-successfully and op-N+1 then fails leaves the touched table at
-`Lance HEAD = manifest_version + 1`. The query is atomic at the manifest
-level (the publisher never publishes, so reads at the pinned manifest
-version do *not* see op-N's data), but the *next* mutation against the
-same table fails loudly with
-`ManifestConflictDetails::ExpectedVersionMismatch` because
-`ensure_expected_version` enforces strict equality between Lance HEAD and
-the manifest's pinned version.
+The pre-MR-794 design had a known limitation: a multi-statement `.gq`
+mutation where op-N inline-committed a Lance fragment and op-N+1 then
+failed left the touched table at `Lance HEAD = manifest_version + 1`,
+blocking the next mutation with `ExpectedVersionMismatch`.
 
-**Why the engine doesn't auto-rollback**: Lance's `Dataset::restore()` is
-*not* a rewind — it appends a new commit (containing the desired
-historical version's data) and advances HEAD further. There is no Lance
-API to delete a committed version. A proper fix requires writing each
-mutation's per-table fragments to a *transient Lance branch* on the
-sub-table, then fast-forwarding main on success or dropping the branch
-on failure. That work is tracked as a follow-up to MR-771; in the
-meantime:
+MR-794 (step 1 + step 2+) closed this for inserts/updates **by
+construction at the writer layer**: insert and update batches accumulate
+in memory; no Lance HEAD advance happens during op execution; one
+`stage_*` + `commit_staged` per touched table runs at end-of-query, and
+only after every op succeeded. A failed op leaves Lance HEAD untouched
+on the staged tables, so the next mutation proceeds normally with no
+drift to reconcile.
 
-- **In practice this is rare.** Most schema-language validation
-  (`@key`, `@enum`, `@range`, intra-batch uniqueness, edge-endpoint
-  existence) runs *before* any Lance write inside the failing op, so
-  single-statement mutations never trip this. The narrow path is
-  multi-statement queries (`insert ... insert ...`,
-  `insert ... update ...`) where a late op fails on validation that
-  depends on earlier ops' staged data.
-- **Workaround**: callers that hit this should refresh the handle and
-  retry the mutation; if Lance HEAD remains drifted the
-  `omnigraph cleanup` command will GC the orphan version once a later
-  successful commit on the same table moves HEAD past it. (`cleanup`
-  cannot reclaim an orphan that *is* the current Lance HEAD; that case
-  needs the per-table-branch follow-up to fully heal.)
+The cancellation case (future drop mid-mutation) inherits the same
+guarantee — the in-memory accumulator evaporates with the dropped task
+and no Lance write was ever issued.
 
-The cancellation case (future drop mid-mutation) has the same shape and
-the same workaround.
+For delete-touching mutations the legacy inline-commit shape is
+preserved (Lance has no public two-phase delete in 4.0.0) — the same
+narrow window remains. The parse-time D₂ rule prevents inserts/updates
+from coexisting with deletes in one query, so a pure-delete failure
+cannot drift any staged-table state. If a delete-only multi-table
+mutation fails mid-cascade, the same workaround as before applies
+(retry; rely on `omnigraph cleanup` once a later successful commit
+moves HEAD past the orphan version). Closing this requires Lance to
+expose `DeleteJob::execute_uncommitted`; tracked in MR-793 and a
+Lance-upstream ticket.

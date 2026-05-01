@@ -37,7 +37,7 @@ Storage is split across two Lance datasets (both with stable row IDs):
 
 Notes:
 
-- Every successful publish (load / change / merge / schema_apply / publish_run) appends one commit.
+- Every successful publish (load / change / merge / schema_apply) appends one commit.
 - Merge commits have two parents; linear commits have one.
 - API: `list_commits(branch)`, `get_commit(id)`, `head_commit_id_for_branch(branch)`.
 
@@ -53,5 +53,5 @@ Notes:
 
 Filtered from `branch_list()` but visible to internals:
 
-- `__run__<run-id>` — ephemeral isolation branch for a transactional run.
 - `__schema_apply_lock__` — serializes schema migrations.
+- `__run__<run-id>` — legacy from the pre-v0.4.0 Run state machine (removed in MR-771). The branch-name guard predicate `is_internal_run_branch` is kept as defense-in-depth so users cannot create a branch matching the legacy prefix; the filter will be removed once production legacy branches are swept (MR-770).

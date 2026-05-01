@@ -4,8 +4,8 @@
 |---|---|---|
 | `MANIFEST_DIR` | `__manifest` | `db/manifest/layout.rs` |
 | Commit graph dir | `_graph_commits.lance` | `db/commit_graph.rs` |
-| Run registry dir | `_graph_runs.lance` | `db/run_registry.rs` |
-| Run branch prefix | `__run__` | `db/run_registry.rs` |
+| Run registry dir (legacy, removed MR-771) | `_graph_runs.lance` | inert post-v0.4.0; reclaimed by MR-770 |
+| Run branch prefix (legacy, removed MR-771) | `__run__` | filtered by `is_internal_run_branch` defense-in-depth |
 | Schema apply lock | `__schema_apply_lock__` | `db/mod.rs` |
 | Manifest publisher retry budget | `PUBLISHER_RETRY_BUDGET = 5` | `db/manifest/publisher.rs` |
 | Internal manifest schema version | `INTERNAL_MANIFEST_SCHEMA_VERSION = 2` | `db/manifest/migrations.rs` |
