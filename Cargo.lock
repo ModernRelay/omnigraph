@@ -4647,6 +4647,7 @@ dependencies = [
  "async-trait",
  "base64",
  "chrono",
+ "datafusion",
  "fail",
  "futures",
  "lance",

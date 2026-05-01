@@ -821,6 +821,103 @@ impl TableStore {
             .map_err(|e| OmniError::Lance(e.to_string()))
     }
 
+    /// Scan committed via Lance + apply the same filter to in-memory
+    /// pending batches via DataFusion `MemTable`, concat the two result
+    /// streams. The replacement for `scan_with_staged` in engine code:
+    /// MR-794 step 2+ accumulates input batches in memory and unions
+    /// them with the committed snapshot at read time, sidestepping the
+    /// `Scanner::with_fragments` filter-pushdown limitation documented
+    /// on `scan_with_staged`.
+    ///
+    /// `committed_ds` should be opened at the pre-mutation
+    /// `expected_version` (the same version captured in `MutationStaging::expected_versions`
+    /// at first touch of the table). `pending_batches` are the per-table
+    /// accumulator's batches in their input shape. `pending_schema` is
+    /// the schema of the accumulated batches; passing `None` falls back
+    /// to the schema of the first pending batch.
+    ///
+    /// `filter` is the Lance / DataFusion SQL predicate. It is applied
+    /// to both sides — Lance pushes it down on the committed side; the
+    /// pending side runs it through a fresh DataFusion `SessionContext`
+    /// with the batches registered as a `MemTable` named `pending`.
+    ///
+    /// When `pending_batches` is empty this delegates to the regular
+    /// scan path.
+    pub async fn scan_with_pending(
+        &self,
+        committed_ds: &Dataset,
+        pending_batches: &[RecordBatch],
+        pending_schema: Option<SchemaRef>,
+        projection: Option<&[&str]>,
+        filter: Option<&str>,
+    ) -> Result<Vec<RecordBatch>> {
+        let mut out = self.scan(committed_ds, projection, filter, None).await?;
+        if pending_batches.is_empty() {
+            return Ok(out);
+        }
+        let pending = scan_pending_batches(
+            pending_batches,
+            pending_schema,
+            projection,
+            filter,
+        )
+        .await?;
+        out.extend(pending);
+        Ok(out)
+    }
+
+    /// `count_rows` variant that respects in-memory pending batches via
+    /// DataFusion `MemTable`. Used by edge-cardinality validation that
+    /// needs to see staged edges before commit.
+    ///
+    /// Cheaper than `scan_with_pending` for the count case because we
+    /// don't materialize columns on the pending side.
+    pub async fn count_rows_with_pending(
+        &self,
+        committed_ds: &Dataset,
+        pending_batches: &[RecordBatch],
+        pending_schema: Option<SchemaRef>,
+        filter: Option<String>,
+    ) -> Result<usize> {
+        let committed = self.count_rows(committed_ds, filter.clone()).await?;
+        if pending_batches.is_empty() {
+            return Ok(committed);
+        }
+        // Count via DataFusion: COUNT(*) from pending [WHERE filter].
+        let schema =
+            pending_schema.unwrap_or_else(|| pending_batches[0].schema());
+        let ctx = datafusion::execution::context::SessionContext::new();
+        let mem = datafusion::datasource::MemTable::try_new(
+            schema,
+            vec![pending_batches.to_vec()],
+        )
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        ctx.register_table("pending", Arc::new(mem))
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let where_clause = filter
+            .map(|f| format!("WHERE {f}"))
+            .unwrap_or_default();
+        let sql = format!("SELECT COUNT(*) AS c FROM pending {where_clause}");
+        let df = ctx
+            .sql(&sql)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let pending_count = batches
+            .into_iter()
+            .filter(|b| b.num_rows() > 0)
+            .map(|b| {
+                use arrow_array::cast::AsArray;
+                let arr = b.column(0).as_primitive::<arrow_array::types::Int64Type>();
+                arr.value(0) as usize
+            })
+            .sum::<usize>();
+        Ok(committed + pending_count)
+    }
+
     /// `count_rows` variant that respects staged writes. Used for
     /// edge-cardinality validation that needs to see staged edges before
     /// commit. Same `committed - removed + new` composition as
@@ -1066,6 +1163,49 @@ fn assign_row_id_meta(fragments: &mut [Fragment], start_row_id: u64) -> Result<(
         next_row_id += physical_rows;
     }
     Ok(())
+}
+
+/// Apply `projection` and `filter` to in-memory pending batches via a
+/// fresh DataFusion `SessionContext`. Used by `scan_with_pending` for
+/// the read-your-writes side of MR-794's in-memory accumulator.
+///
+/// `pending_batches` must be non-empty (the caller short-circuits on
+/// empty).
+async fn scan_pending_batches(
+    pending_batches: &[RecordBatch],
+    pending_schema: Option<SchemaRef>,
+    projection: Option<&[&str]>,
+    filter: Option<&str>,
+) -> Result<Vec<RecordBatch>> {
+    let schema = pending_schema.unwrap_or_else(|| pending_batches[0].schema());
+    let ctx = datafusion::execution::context::SessionContext::new();
+    let mem = datafusion::datasource::MemTable::try_new(
+        schema,
+        vec![pending_batches.to_vec()],
+    )
+    .map_err(|e| OmniError::Lance(e.to_string()))?;
+    ctx.register_table("pending", Arc::new(mem))
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+    let proj = projection
+        .map(|cols| {
+            cols.iter()
+                .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|| "*".to_string());
+    let where_clause = filter
+        .map(|f| format!("WHERE {f}"))
+        .unwrap_or_default();
+    let sql = format!("SELECT {proj} FROM pending {where_clause}");
+    let df = ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    df.collect()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
 fn combine_committed_with_staged(ds: &Dataset, staged: &[StagedWrite]) -> Vec<Fragment> {
