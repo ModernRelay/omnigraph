@@ -115,3 +115,8 @@ Notes:
 Please open an issue, spec, or design discussion before sending large code
 changes. Design feedback and concrete problem statements are the fastest way to
 collaborate on the roadmap.
+
+## Community
+
+Join the [Omnigraph Slack community](https://join.slack.com/t/omnigraphworkspace/shared_invite/zt-3wfpglyxj-lHvJGhuySPfqLtN35uJZNw)
+to ask questions, share feedback, and follow development.
