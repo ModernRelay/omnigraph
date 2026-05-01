@@ -77,6 +77,7 @@ Full diagram and concurrency model: [docs/architecture.md](docs/architecture.md)
 | Indexes (BTREE / inverted / vector / graph topology) | [docs/indexes.md](docs/indexes.md) |
 | Embeddings (compiler + engine clients, env vars, `@embed`) | [docs/embeddings.md](docs/embeddings.md) |
 | Branches, commit graph, snapshots, system branches | [docs/branches-commits.md](docs/branches-commits.md) |
+| Transactions and atomicity (per-query atomic; branches as multi-query transactions) | [docs/transactions.md](docs/transactions.md) |
 | Direct-publish writes (the former Run state machine, now demoted to publisher CAS) | [docs/runs.md](docs/runs.md) |
 | Three-way merge and conflict kinds | [docs/merge.md](docs/merge.md) |
 | Diff / change feed (`diff_between`, `diff_commits`) | [docs/changes.md](docs/changes.md) |
