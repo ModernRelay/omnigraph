@@ -19,6 +19,7 @@ failpoints = ["dep:fail", "fail/failpoints"]
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.3.1" }
 lance = { workspace = true }
 lance-datafusion = { workspace = true }
+datafusion = { workspace = true }
 lance-file = { workspace = true }
 lance-index = { workspace = true }
 lance-linalg = { workspace = true }

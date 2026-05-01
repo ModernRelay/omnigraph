@@ -22,7 +22,7 @@ OmniGraph is **not** a single Lance dataset; it is a *graph* of datasets coordin
   - `edges/{fnv1a64-hex(edge_type_name)}` — one Lance dataset per edge type
   - `__manifest/` — the catalog of all sub-tables and their published versions
   - `_graph_commits.lance` / `_graph_commit_actors.lance` — the commit graph and its actor map
-  - `_graph_runs.lance` / `_graph_run_actors.lance` — the run registry and its actor map
+  - (legacy `_graph_runs.lance` / `_graph_run_actors.lance` from pre-v0.4.0 repos are inert; the run state machine was removed in MR-771 and these files are cleaned up via MR-770's production sweep)
 - **Manifest row schema** (`object_id, object_type, location, metadata, base_objects, table_key, table_version, table_branch, row_count`):
   - `object_type` ∈ `table | table_version | table_tombstone`
   - `table_key` ∈ `node:<TypeName> | edge:<EdgeName>`
@@ -63,14 +63,12 @@ flowchart TB
     nodes["nodes/{fnv1a64-hex}/<br/>one dataset per node type"]:::l2
     edges["edges/{fnv1a64-hex}/<br/>one dataset per edge type"]:::l2
     cgraph["_graph_commits.lance/<br/>_graph_commit_actors.lance/"]:::l2
-    runs["_graph_runs.lance/<br/>_graph_run_actors.lance/"]:::l2
     refs["_refs/branches/{name}.json<br/>graph-level branches"]:::l2
 
     repo --> manifest
     repo --> nodes
     repo --> edges
     repo --> cgraph
-    repo --> runs
     repo --> refs
 
     subgraph dataset[Inside each Lance dataset — L1]
@@ -91,7 +89,7 @@ flowchart TB
 - **Repo root** is one directory (or S3 prefix). Everything below is part of one OmniGraph repo.
 - **`__manifest/`** is a Lance dataset whose rows describe which sub-table version is published at which graph-branch. Reading a snapshot starts here.
 - **`nodes/`** and **`edges/`** are sibling directories holding one Lance dataset per declared type. Names are `fnv1a64-hex` of the type name to keep paths fixed-length and case-safe.
-- **`_graph_commits.lance` / `_graph_runs.lance`** are L2 datasets that record the graph-level commit DAG and run registry respectively (each has a paired `*_actors.lance` for the actor map).
+- **`_graph_commits.lance`** is an L2 dataset that records the graph-level commit DAG, with a paired `_graph_commit_actors.lance` for the actor map. (Pre-v0.4.0 repos also have inert `_graph_runs.lance` / `_graph_run_actors.lance` from the removed Run state machine; MR-770 sweeps these in production.)
 - **`_refs/branches/{name}.json`** is graph-level branch metadata — pointers from a branch name to the manifest version it heads.
 - **Inside each Lance dataset** (orange): the standard Lance directory layout. `_versions/{n}.manifest` records every commit; `data/` holds the actual Arrow fragments; `_indices/{uuid}/` holds index segments with their own `fragment_bitmap` for partial coverage; `_refs/` holds Lance-native per-dataset branches and tags.
 

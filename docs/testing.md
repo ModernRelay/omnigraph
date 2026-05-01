@@ -19,7 +19,8 @@ The engine's `tests/` is the principal coverage surface; most graph-shaped behav
 |---|---|
 | `end_to_end.rs` | Full init → load → query/mutate flow |
 | `branching.rs` | Branch create / list / delete, lazy fork |
-| `runs.rs` | Transactional runs (begin/publish/abort), idempotency |
+| `runs.rs` | Direct-publish writes: cancellation, concurrent-writer CAS, multi-statement atomicity, MR-794 staged-write rewire (D₂ rejection, insert+update coalesce, multi-append coalesce, partial-failure recovery, load RI/cardinality recovery) |
+| `staged_writes.rs` | TableStore staged-write primitives (`stage_append`, `stage_merge_insert`, `commit_staged`, `scan_with_staged`, `count_rows_with_staged`) — primitive-level only; engine code uses the in-memory `MutationStaging` accumulator instead |
 | `lifecycle.rs` | Repo lifecycle, schema state |
 | `point_in_time.rs` | Snapshots, time travel (`snapshot_at_version`, `entity_at`) |
 | `changes.rs` | `diff_between` / `diff_commits` |

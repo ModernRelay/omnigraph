@@ -79,13 +79,16 @@ Hybrid example: `order { rrf(nearest($d.embedding, $q), bm25($d.body, $q_text)) 
 
 ## Mutation execution (`exec/mutation.rs`)
 
-Resolves expression values to literals, converts to typed Arrow arrays (`literal_to_typed_array(lit, DataType, num_rows)`), then writes:
+Resolves expression values to literals, converts to typed Arrow arrays (`literal_to_typed_array(lit, DataType, num_rows)`), then writes via Lance's two-phase distributed-write API at end-of-query:
 
-- `insert` → Lance `WriteMode::Append`
-- `update` → Lance `merge_insert(WhenMatched::Update)`
-- `delete` → Lance `merge_insert(WhenMatched::Delete)` (logical) or filtered overwrite.
+- `insert` (no `@key`, edges) → accumulate into `MutationStaging.pending` (Append mode); finalize calls `stage_append` once per touched table.
+- `insert` (`@key` node) → accumulate into `pending` (Merge mode); finalize calls `stage_merge_insert` once per touched table.
+- `update` → scan committed via Lance + pending via DataFusion `MemTable` (read-your-writes), apply assignments, accumulate into `pending` (Merge mode).
+- `delete` → still inline-commits via `delete_where` (Lance 4.0.0 has no public two-phase delete); recorded into `MutationStaging.inline_committed`.
 
-Multi-statement mutations are atomic at the manifest commit boundary.
+**D₂ parse-time rule.** A single mutation query is either insert/update-only or delete-only. Mixed → reject before any I/O. The check fires in `enforce_no_mixed_destructive_constructive(&ir)` inside `execute_named_mutation`.
+
+Multi-statement mutations are atomic at the publisher commit boundary: every insert/update batch lives in memory until end-of-query, then exactly one `stage_*` + `commit_staged` runs per touched table, then `ManifestBatchPublisher::publish` commits the manifest atomically with per-table `expected_table_versions` CAS.
 
 ### Mutation flow — sequence
 
@@ -93,57 +96,58 @@ Multi-statement mutations are atomic at the manifest commit boundary.
 sequenceDiagram
     autonumber
     participant client as Client
-    participant og as Omnigraph::mutate<br/>(mutation.rs:511)
+    participant og as Omnigraph::mutate_as<br/>(mutation.rs)
     participant cmp as omnigraph-compiler
-    participant runs as RunRegistry
+    participant stg as MutationStaging<br/>(exec/staging.rs)
     participant ts as table_store
     participant lance as Lance dataset
-    participant mr as ManifestRepo<br/>(manifest.rs:280)
+    participant pub as ManifestBatchPublisher
 
-    client->>og: mutate(target, source, name, params)
-    og->>cmp: parse + typecheck_query
-    cmp-->>og: CheckedQuery (Mutation IR)
-    og->>runs: begin_run(target, op_hash)<br/>fork __run__<id> from target head
-    runs-->>og: RunRecord
-    loop for each mutation statement (on __run__<id>)
-        og->>og: resolve expression literals<br/>literal_to_typed_array(lit, type, n)
-        alt insert
-            og->>ts: append RecordBatches
-            ts->>lance: WriteMode::Append → new fragment(s)
-        else update
-            og->>ts: merge_insert keyed by id
-            ts->>lance: merge_insert(WhenMatched::Update)
-        else delete
-            og->>ts: merge_insert with delete predicate
-            ts->>lance: merge_insert(WhenMatched::Delete)
+    client->>og: mutate_as(branch, source, name, params, actor_id)
+    og->>cmp: parse + typecheck + lower_mutation_query
+    cmp-->>og: MutationIR
+    og->>og: enforce_no_mixed_destructive_constructive (D₂)
+    loop for each mutation op
+        og->>og: resolve literals + build batch
+        alt insert / update (accumulate)
+            og->>ts: open dataset @ pre-write version (first touch)
+            og->>stg: ensure_path + append_batch (PendingMode)
+            opt update — scan committed + pending
+                og->>ts: scan_with_pending (Lance + DataFusion MemTable union)
+                ts-->>og: matched batches
+            end
+        else delete (inline-commit, D₂ keeps separate)
+            og->>ts: delete_where (advances Lance HEAD)
+            og->>stg: record_inline (SubTableUpdate)
         end
-        lance-->>ts: new dataset version
-        og->>mr: commit_updates(SubTableUpdate)<br/>per-statement commit on __run__<id>
-        mr-->>og: ack
     end
-    og->>og: OCC: target head unchanged since begin_run?
-    og->>og: publish_run(run_id)
-    alt fast path (target hasn't moved)
-        og->>mr: commit_updates_on_branch(target, updates)<br/>promote run snapshot
-    else merge path (target advanced)
-        og->>og: branch_merge_internal(__run__<id>, target)<br/>three-way merge
+    og->>stg: finalize(db, branch)
+    loop per pending table
+        stg->>ts: stage_append OR stage_merge_insert (one per table)
+        ts-->>stg: StagedWrite (transaction + fragments)
+        stg->>ts: commit_staged (advances Lance HEAD)
+        ts-->>stg: new Dataset
     end
-    mr-->>og: new target snapshot
-    og->>runs: terminate_run(Published)
+    stg-->>og: (updates: Vec<SubTableUpdate>, expected_versions)
+    og->>pub: commit_updates_on_branch_with_expected
+    pub->>pub: publisher CAS (cross-table OCC on __manifest)
+    pub-->>og: new manifest version
     og-->>client: MutationResult
 ```
 
 **Code paths:**
 
-- Entry: `Omnigraph::mutate` at `crates/omnigraph/src/exec/mutation.rs:511`
-- Per-mutation orchestration: `mutate_with_current_actor` at `crates/omnigraph/src/exec/mutation.rs:539`
-- Per-statement commit on the run-branch: `commit_updates` (called from `execute_insert` / `execute_update` / `execute_delete` in `crates/omnigraph/src/exec/mutation.rs`)
-- Run publish: `Omnigraph::publish_run` at `crates/omnigraph/src/db/omnigraph.rs:858`
-- Manifest commit primitive: `ManifestRepo::commit` at `crates/omnigraph/src/db/manifest.rs:280` (called from both per-statement `commit_updates` and the publish path)
+- Entry: `Omnigraph::mutate_as` at `crates/omnigraph/src/exec/mutation.rs`
+- Per-mutation orchestration: `mutate_with_current_actor` at `crates/omnigraph/src/exec/mutation.rs`
+- D₂ check: `enforce_no_mixed_destructive_constructive` (in the same file)
+- Per-op execution: `execute_insert`, `execute_update`, `execute_delete_node`, `execute_delete_edge`
+- Pending-aware reads: `TableStore::scan_with_pending` / `count_rows_with_pending` at `crates/omnigraph/src/table_store.rs`
+- Edge cardinality with pending: `validate_edge_cardinality_with_pending` at `crates/omnigraph/src/exec/mutation.rs`
+- Per-query accumulator: `crates/omnigraph/src/exec/staging.rs` (`MutationStaging`, `PendingTable`, `PendingMode`, `finalize`)
+- End-of-query Lance commit: `TableStore::stage_append`, `stage_merge_insert`, `commit_staged` at `crates/omnigraph/src/table_store.rs`
+- Manifest commit primitive: `commit_updates_on_branch_with_expected` at `crates/omnigraph/src/db/omnigraph/table_ops.rs`
 
-Multi-statement mutations don't get atomicity from a single final `commit` — they get it from the **run-branch + publish_run** pattern. By default a mutation forks a fresh `__run__<id>` branch (`begin_run`); each statement individually commits its sub-table updates to that run-branch. After all statements complete, an OCC pre-check verifies the target hasn't moved since the run started, then `publish_run` atomically promotes the run-branch into the target — either via the fast path (direct promotion if the target hasn't moved) or a three-way merge. That final publish is what gives multi-statement mutations their atomicity guarantee (per [`docs/invariants.md`](invariants.md) §VI.26). If anything fails mid-run, the run is failed and the run-branch is dropped without affecting the target.
-
-One exception: if the caller already targets a `__run__<id>` branch (mutation.rs:555), the mutation runs directly on that branch with no nested run wrapping — the assumption is the caller is managing the surrounding run lifecycle themselves. See [runs.md](runs.md) for the full run lifecycle.
+Atomicity guarantee for multi-statement mutations: a mid-query failure leaves Lance HEAD untouched on staged tables (no inline commit happened during op execution), so the next mutation proceeds normally with no `ExpectedVersionMismatch`. The publisher CAS at the very end either succeeds (manifest advances atomically across all touched sub-tables) or fails with a typed `ManifestConflictDetails::ExpectedVersionMismatch` (no partial publish). See [docs/invariants.md §VI.25 / §VI.32](invariants.md) and [docs/runs.md](runs.md).
 
 ## Bulk loader (`loader/mod.rs`)
 
@@ -156,19 +160,18 @@ One exception: if the caller already targets a `__run__<id>` branch (mutation.rs
 
 ## Load modes (`LoadMode`)
 
-| Mode | Semantics |
-|---|---|
-| `Overwrite` | Replace all data in the target tables on the branch |
-| `Append` | Strict insert; duplicates error |
-| `Merge` | Upsert by id (`merge_insert`) |
+| Mode | Semantics | Path (post-MR-794) |
+|---|---|---|
+| `Overwrite` | Replace all data in the target tables on the branch | Inline-commit per type, then publisher CAS at end-of-load. Truncate-then-append doesn't fit the staged shape; documented residual. |
+| `Append` | Strict insert; duplicates error | In-memory `MutationStaging` accumulator; one `stage_append` + `commit_staged` per touched table at end-of-load; publisher CAS. |
+| `Merge` | Upsert by `id` (`merge_insert`) | Same accumulator; one `stage_merge_insert` per touched table at end-of-load (Merge mode dedupes by `id`, last-write-wins); publisher CAS. |
+
+For Append/Merge, a mid-load failure (RI / cardinality violation, validation error) leaves Lance HEAD untouched on the staged tables — the next load on the same tables proceeds normally with no `ExpectedVersionMismatch`. For Overwrite, a mid-load failure can still leave Lance HEAD on a partially-truncated table; the next overwrite replaces it.
 
 ## `load` vs `ingest`
 
-- `load(branch, data, mode)` — direct load to a branch.
-- `ingest(branch, from, data, mode)` — branch-creating, transactional load:
-  1. If target advanced since the run started, fork a fresh run branch from `from`.
-  2. Load into the run branch (Append).
-  3. If target hasn't moved, fast-publish; otherwise abort.
+- `load(branch, data, mode)` — direct load to a branch (single publisher commit per call).
+- `ingest(branch, from, data, mode)` — branch-creating wrapper: if `branch` doesn't exist, fork it from `from` (default `main`) via `branch_create_from`, then call `load(branch, data, mode)`.
 - Returns `IngestResult { branch, base_branch, branch_created, mode, tables[] }`.
 - `ingest_as(actor_id)` records the actor on the resulting commit.
 

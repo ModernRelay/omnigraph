@@ -192,7 +192,7 @@ query insert_person($name: String, $age: I32) {
     assert_eq!(local_verify["row_count"], 1);
     assert_eq!(local_verify["rows"][0]["p.name"], "Mina");
 
-    // MR-771: `run publish` / `run list` removed. Direct-to-target writes
+    // `run publish` / `run list` removed. Direct-to-target writes
     // already landed via the change call above; the commit graph is now
     // the audit surface (verified separately by `commit list`).
 }

@@ -1430,12 +1430,12 @@ edge WorksAt: Person -> Company
 
     #[tokio::test]
     async fn test_apply_schema_succeeds_after_load() {
-        // MR-670 + MR-674: schema apply used to be blocked by leftover
-        // __run__ branches. MR-670 added a defense-in-depth filter that
-        // skips internal system branches. MR-674 made run branches
-        // ephemeral on every terminal state, so in practice no __run__
-        // branch survives publish — but the filter still guards the
-        // invariant.
+        // Historical: schema apply used to be blocked by leftover
+        // `__run__` branches. A defense-in-depth filter now skips
+        // internal system branches, and run branches were made
+        // ephemeral on every terminal state — so in practice no
+        // `__run__` branch survives publish. The filter still guards
+        // the invariant.
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
@@ -1451,7 +1451,7 @@ edge WorksAt: Person -> Company
         let all_branches = db.coordinator.all_branches().await.unwrap();
         assert!(
             !all_branches.iter().any(|b| is_internal_run_branch(b)),
-            "MR-674: run branch should be deleted after publish, got: {:?}",
+            "run branch should be deleted after publish, got: {:?}",
             all_branches
         );
 

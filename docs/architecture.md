@@ -63,7 +63,7 @@ flowchart TB
     subgraph engine[omnigraph engine]
         plan[exec query and mutation]:::l2
         gi[graph index CSR/CSC<br/>RuntimeCache LRU 8]:::l2
-        coord[coordinator<br/>ManifestRepo · CommitGraph · RunRegistry]:::l2
+        coord[coordinator<br/>ManifestRepo · CommitGraph]:::l2
     end
 
     subgraph storage[storage trait — wraps Lance]
@@ -134,7 +134,7 @@ flowchart TB
         coord[GraphCoordinator]:::l2
         mr[ManifestRepo<br/>db/manifest.rs]:::l2
         cg[CommitGraph<br/>_graph_commits.lance]:::l2
-        rr[RunRegistry<br/>_graph_runs.lance]:::l2
+        stg[MutationStaging<br/>per-query in-memory accumulator<br/>exec/staging.rs]:::l2
     end
 
     subgraph idx[graph index]
@@ -149,17 +149,18 @@ flowchart TB
 
     eq --> gi
     eq --> ts
+    em --> stg
     em --> ts
+    ld --> stg
     ld --> ts
     eq --> mr
     em --> mr
     coord --> mr
     coord --> cg
-    coord --> rr
     ts --> st
 ```
 
-The engine binds the compiler IR to Lance. It owns multi-dataset coordination, the graph topology index, the run registry, and the snapshot/manifest read path.
+The engine binds the compiler IR to Lance. It owns multi-dataset coordination, the graph topology index, the per-query staging accumulator, and the snapshot/manifest read path.
 
 Code paths:
 
@@ -168,6 +169,46 @@ Code paths:
 - Manifest commit: `ManifestRepo::commit` at `crates/omnigraph/src/db/manifest.rs:280`
 - Graph index: `crates/omnigraph/src/graph_index/`
 - Loader: `Omnigraph::ingest` at `crates/omnigraph/src/loader/mod.rs:74`
+
+### Mutation atomicity — in-memory accumulator (MR-794)
+
+Inserts and updates inside `mutate_as` and the bulk loader's
+Append/Merge modes go through `MutationStaging`
+([`crates/omnigraph/src/exec/staging.rs`](../crates/omnigraph/src/exec/staging.rs)),
+a per-query in-memory accumulator. No Lance HEAD advance happens during
+op execution; one `stage_*` + `commit_staged` per touched table runs
+at end-of-query, then the publisher commits the manifest atomically.
+
+```
+op-1 (insert/update) → push RecordBatch → MutationStaging.pending[table]
+op-2 (insert/update) → read committed via Lance + pending via DataFusion
+                       MemTable (read-your-writes) → push batch
+op-N → push batch
+─── end of query ───────────────────────────────────────
+finalize: per pending table:
+   concat batches → stage_append OR stage_merge_insert → commit_staged
+publisher: ManifestBatchPublisher::publish (one cross-table CAS)
+```
+
+A failed op leaves Lance HEAD untouched on the staged tables: the next
+mutation proceeds normally with no drift to reconcile. Concrete
+contracts:
+
+- `D₂` parse-time rule: a query is either insert/update-only or
+  delete-only. Mixed → reject. Deletes still inline-commit (Lance
+  4.0.0 has no public two-phase delete); D₂ keeps the inline path safe.
+- `LoadMode::Overwrite` keeps the inline-commit path
+  (truncate-then-append doesn't fit the staged shape; overwrite has no
+  in-flight read-your-writes requirement).
+- Read sites consume `TableStore::scan_with_pending`, which Lance-scans
+  the committed snapshot at the captured `expected_version` and unions
+  with a DataFusion `MemTable` over the pending batches.
+
+This pattern realizes [docs/invariants.md §VI.25](invariants.md)
+(read-your-writes within a multi-statement mutation) and §VI.32
+(failure scope bounded) for inserts/updates by construction at the
+writer layer. See [docs/runs.md](runs.md) for the publisher CAS
+contract this builds on.
 
 ### Storage trait — today vs. roadmap
 
@@ -256,13 +297,13 @@ Throughout the docs, capabilities are split into:
 - **MVCC**: every Lance write bumps a per-dataset version; the OmniGraph manifest version coordinates which sub-table versions are visible together.
 - **Snapshot isolation**: a query holds one `Snapshot` for its lifetime; concurrent writes don't leak in.
 - **Cross-branch isolation**: copy-on-write means readers and writers on different branches don't block each other.
-- **Run isolation**: each transactional run lives on its own `__run__<id>` branch.
+- **Per-query staging**: `mutate_as` and `load` (Append/Merge) accumulate insert/update batches in an in-memory `MutationStaging`; one `stage_*` + `commit_staged` per touched table runs at end-of-query, then the publisher commits the manifest atomically. A mid-query failure leaves Lance HEAD untouched on staged tables. (MR-794; pre-v0.4.0 used a `__run__<id>` staging branch + Run state machine, removed in MR-771.)
 - **Schema-apply lock**: `__schema_apply_lock__` system branch serializes schema migrations.
 - **Fail-points** (`failpoints` cargo feature): `failpoints::maybe_fail("operation.step")?` in `branch_create`, publish, etc., for deterministic failure injection in tests.
 
 ## Workspace crates
 
 - `omnigraph-compiler` — schema and query grammars, catalog, IR, lowering, type checker, lint, migration planner, OpenAI-style embedding client.
-- `omnigraph` (engine, published as `omnigraph-engine` on crates.io since v0.2.2) — the Lance-backed runtime: manifest, commit graph, run registry, snapshot, exec, merge, loader, Gemini embedding client.
+- `omnigraph` (engine, published as `omnigraph-engine` on crates.io since v0.2.2) — the Lance-backed runtime: manifest, commit graph, snapshot, exec (incl. per-query `MutationStaging` accumulator), merge, loader, Gemini embedding client.
 - `omnigraph-cli` — the `omnigraph` binary.
 - `omnigraph-server` — the `omnigraph-server` binary (Axum HTTP server).

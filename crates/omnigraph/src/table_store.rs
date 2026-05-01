@@ -40,12 +40,12 @@ pub struct DeleteState {
 
 /// A Lance write that has produced fragment files on object storage but is
 /// not yet committed to the dataset's manifest. The staged-write primitives
-/// are defined here for later integration in `MutationStaging`
-/// (`exec/mutation.rs`) and the loader (`loader/mod.rs`) — those rewires
-/// land in [MR-794](https://linear.app/modernrelay/issue/MR-794) step 2+.
-/// The intent: defer Lance commits to end-of-query so a mid-query failure
-/// leaves the touched table at the pre-mutation HEAD instead of drifting
-/// ahead.
+/// are consumed by `MutationStaging` (`exec/staging.rs`,
+/// `exec/mutation.rs`) and the bulk loader (`loader/mod.rs`). The
+/// intent: defer Lance commits to end-of-query so a mid-query failure
+/// leaves the touched table at the pre-mutation HEAD instead of
+/// drifting ahead. See `docs/runs.md` for the publisher-CAS contract
+/// this builds on.
 ///
 /// `transaction` is opaque from our side — Lance owns its semantics. We
 /// commit it via `CommitBuilder::execute(transaction)` (see
@@ -545,7 +545,7 @@ impl TableStore {
         })
     }
 
-    // ─── Staged-write API (MR-794) ───────────────────────────────────────────
+    // ─── Staged-write API ────────────────────────────────────────────────────
     //
     // These primitives wrap Lance's distributed-write API: each call writes
     // fragment files to object storage but does NOT advance the dataset's
@@ -672,16 +672,16 @@ impl TableStore {
     ///
     /// This is intrinsic to the underlying Lance API: there is no public
     /// way to make `MergeInsertBuilder` see uncommitted fragments. The
-    /// engine's mutation path enforces the rule "per touched table: all
-    /// stage_append OR exactly one stage_merge_insert" at parse time
-    /// (the D₂′ check landing with [MR-794](https://linear.app/modernrelay/issue/MR-794)
-    /// step 2+ in `exec/mutation.rs`). Multi-table queries and append-chains
-    /// remain safe; only chained merges on a single table are rejected.
+    /// engine's `MutationStaging` accumulator works around this by
+    /// concatenating per-table batches in memory and issuing exactly
+    /// one `stage_merge_insert` per touched table at end-of-query (with
+    /// last-write-wins dedupe by id) — see `exec/staging.rs`. Direct
+    /// callers of this primitive must respect the contract themselves.
     ///
     /// Lift path: either a Lance API extension that lets
     /// `MergeInsertBuilder` accept additional staged fragments, or an
     /// in-memory pre-merge here that folds prior staged batches into the
-    /// input stream. See `docs/runs.md` and MR-793.
+    /// input stream. See `docs/runs.md`.
     pub async fn stage_merge_insert(
         &self,
         ds: Dataset,
@@ -780,10 +780,10 @@ impl TableStore {
     /// filtered scan even when their data would match. Staged-fragment
     /// rows are silently absent from the result. `scanner.use_stats(false)`
     /// does not fix this in lance 4.0.0. Callers needing correct filtered
-    /// reads against staged data should use a different strategy (the
-    /// engine's MR-794 step 2+ design uses in-memory pending-batch
-    /// accumulation + DataFusion `MemTable` instead — see
-    /// `.context/mr-794-step2-design.md`).
+    /// reads against staged data should use a different strategy — the
+    /// engine's `MutationStaging` accumulator unions in-memory pending
+    /// batches with the committed scan via DataFusion `MemTable` (see
+    /// `scan_with_pending`).
     ///
     /// This method remains on the surface for primitive-level testing
     /// (basic stage + scan correctness without filters works) and for
@@ -819,6 +819,106 @@ impl TableStore {
             .try_collect()
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))
+    }
+
+    /// Scan committed via Lance + apply the same filter to in-memory
+    /// pending batches via DataFusion `MemTable`, concat the two result
+    /// streams. The replacement for `scan_with_staged` in engine code:
+    /// the staged-write writer accumulates input batches in memory and
+    /// unions them with the committed snapshot at read time,
+    /// sidestepping the `Scanner::with_fragments` filter-pushdown
+    /// limitation documented on `scan_with_staged`.
+    ///
+    /// `committed_ds` should be opened at the pre-mutation
+    /// `expected_version` (the same version captured in `MutationStaging::expected_versions`
+    /// at first touch of the table). `pending_batches` are the per-table
+    /// accumulator's batches in their input shape. `pending_schema` is
+    /// the schema of the accumulated batches; passing `None` falls back
+    /// to the schema of the first pending batch.
+    ///
+    /// `filter` is the Lance / DataFusion SQL predicate. It is applied
+    /// to both sides — Lance pushes it down on the committed side; the
+    /// pending side runs it through a fresh DataFusion `SessionContext`
+    /// with the batches registered as a `MemTable` named `pending`.
+    ///
+    /// `key_column` controls how committed and pending are unioned:
+    /// - **`None` (union semantics)**: every committed row that matches
+    ///   the filter and every pending row that matches the filter is
+    ///   returned. Correct when committed and pending cannot share a
+    ///   primary key — e.g., Append-mode loads with ULID-generated ids,
+    ///   or any read where pending hasn't been used to update committed
+    ///   rows.
+    /// - **`Some(col)` (merge / shadow semantics)**: committed rows whose
+    ///   `col` value appears in any pending batch are EXCLUDED from the
+    ///   result; only pending's view of those rows is returned. Required
+    ///   for Merge-mode reads (e.g., `execute_update` on the engine path)
+    ///   so a chained `update` doesn't see stale committed values that
+    ///   a prior op already updated in pending. Without this, a predicate
+    ///   like `where age > 30` can match a row that an earlier
+    ///   `set age = 20` already moved out of range.
+    ///
+    /// When `pending_batches` is empty this delegates to the regular
+    /// scan path.
+    pub async fn scan_with_pending(
+        &self,
+        committed_ds: &Dataset,
+        pending_batches: &[RecordBatch],
+        pending_schema: Option<SchemaRef>,
+        projection: Option<&[&str]>,
+        filter: Option<&str>,
+        key_column: Option<&str>,
+    ) -> Result<Vec<RecordBatch>> {
+        // Contract: when merge-shadow semantics are requested via
+        // `key_column`, the committed-side projection MUST include that
+        // column so we can filter committed rows whose key appears in
+        // pending. Silently dropping the shadow when projection omits
+        // the key would re-introduce union semantics behind the
+        // caller's back. Reject up front with a clear error so callers
+        // either (a) include the key in projection or (b) drop
+        // `key_column` if union is what they wanted.
+        if let (Some(key_col), Some(cols)) = (key_column, projection) {
+            if !cols.iter().any(|c| *c == key_col) {
+                return Err(OmniError::Lance(format!(
+                    "scan_with_pending: key_column '{}' must appear in projection \
+                     when merge-shadow semantics are requested (got projection = {:?})",
+                    key_col, cols
+                )));
+            }
+        }
+
+        let committed = self.scan(committed_ds, projection, filter, None).await?;
+        if pending_batches.is_empty() {
+            return Ok(committed);
+        }
+
+        // Shadow committed rows whose key value also appears in pending.
+        // This makes scan_with_pending implement merge semantics rather
+        // than naive union: any row that has a pending update is
+        // represented ONLY by its pending value, never by both its
+        // (stale) committed value and its (current) pending value.
+        let committed = match key_column {
+            Some(key_col) => {
+                let pending_keys = collect_string_column_values(pending_batches, key_col)?;
+                if pending_keys.is_empty() {
+                    committed
+                } else {
+                    filter_out_rows_where_string_in(committed, key_col, &pending_keys)?
+                }
+            }
+            None => committed,
+        };
+
+        let pending = scan_pending_batches(
+            pending_batches,
+            pending_schema,
+            projection,
+            filter,
+        )
+        .await?;
+
+        let mut out = committed;
+        out.extend(pending);
+        Ok(out)
     }
 
     /// `count_rows` variant that respects staged writes. Used for
@@ -1066,6 +1166,139 @@ fn assign_row_id_meta(fragments: &mut [Fragment], start_row_id: u64) -> Result<(
         next_row_id += physical_rows;
     }
     Ok(())
+}
+
+/// Collect the set of values in a Utf8 column across multiple batches.
+/// Used by `scan_with_pending`'s merge-semantic path to identify
+/// committed rows that are shadowed by pending writes. NULL values are
+/// skipped.
+fn collect_string_column_values(
+    batches: &[RecordBatch],
+    column: &str,
+) -> Result<std::collections::HashSet<String>> {
+    use arrow_array::{Array, StringArray};
+    let mut out = std::collections::HashSet::new();
+    for batch in batches {
+        let Some(col) = batch.column_by_name(column) else {
+            return Err(OmniError::Lance(format!(
+                "scan_with_pending: pending batch missing key column '{}'",
+                column
+            )));
+        };
+        let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+            OmniError::Lance(format!(
+                "scan_with_pending: key column '{}' is not Utf8",
+                column
+            ))
+        })?;
+        for i in 0..arr.len() {
+            if arr.is_valid(i) {
+                out.insert(arr.value(i).to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Drop rows from `batches` whose Utf8 `column` value is in `excluded`.
+/// Used by `scan_with_pending`'s merge-semantic path to shadow committed
+/// rows that pending has already updated. Returns the surviving rows.
+///
+/// `scan_with_pending` validates up front that the projection contains
+/// `column`, so a missing column here is a programmer error — error
+/// loudly instead of silently passing batches through (which would
+/// re-introduce the union semantics the caller asked us to avoid).
+fn filter_out_rows_where_string_in(
+    batches: Vec<RecordBatch>,
+    column: &str,
+    excluded: &std::collections::HashSet<String>,
+) -> Result<Vec<RecordBatch>> {
+    use arrow_array::{Array, BooleanArray, StringArray};
+    let mut out = Vec::with_capacity(batches.len());
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            out.push(batch);
+            continue;
+        }
+        let col = batch.column_by_name(column).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "scan_with_pending: committed batch missing key column '{}' \
+                 (the up-front projection check should have rejected this)",
+                column
+            ))
+        })?;
+        let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+            OmniError::Lance(format!(
+                "scan_with_pending: committed column '{}' is not Utf8",
+                column
+            ))
+        })?;
+        let mask: BooleanArray = (0..arr.len())
+            .map(|i| {
+                if arr.is_valid(i) {
+                    Some(!excluded.contains(arr.value(i)))
+                } else {
+                    Some(true)
+                }
+            })
+            .collect();
+        let filtered = arrow_select::filter::filter_record_batch(&batch, &mask)
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        out.push(filtered);
+    }
+    Ok(out)
+}
+
+/// Apply `projection` and `filter` to in-memory pending batches via a
+/// fresh DataFusion `SessionContext`. Used by `scan_with_pending` for
+/// the read-your-writes side of the in-memory staging accumulator.
+///
+/// `pending_batches` must be non-empty (the caller short-circuits on
+/// empty).
+///
+/// **SQL dialect contract.** `filter` is also passed to Lance's scanner
+/// on the committed side. Lance and DataFusion both accept standard
+/// SQL comparison predicates (`col op literal`) and OmniGraph's
+/// `predicate_to_sql` only emits those shapes today (`=`, `!=`, `>`,
+/// `<`, `>=`, `<=`). If a future caller introduces a Lance-specific
+/// scanner extension (vector search, FTS, `_rowid` references) into
+/// the filter, this function will need explicit translation — DataFusion
+/// won't recognize those operators against the in-memory `MemTable`.
+async fn scan_pending_batches(
+    pending_batches: &[RecordBatch],
+    pending_schema: Option<SchemaRef>,
+    projection: Option<&[&str]>,
+    filter: Option<&str>,
+) -> Result<Vec<RecordBatch>> {
+    let schema = pending_schema.unwrap_or_else(|| pending_batches[0].schema());
+    let ctx = datafusion::execution::context::SessionContext::new();
+    let mem = datafusion::datasource::MemTable::try_new(
+        schema,
+        vec![pending_batches.to_vec()],
+    )
+    .map_err(|e| OmniError::Lance(e.to_string()))?;
+    ctx.register_table("pending", Arc::new(mem))
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+    let proj = projection
+        .map(|cols| {
+            cols.iter()
+                .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|| "*".to_string());
+    let where_clause = filter
+        .map(|f| format!("WHERE {f}"))
+        .unwrap_or_default();
+    let sql = format!("SELECT {proj} FROM pending {where_clause}");
+    let df = ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    df.collect()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
 fn combine_committed_with_staged(ds: &Dataset, staged: &[StagedWrite]) -> Vec<Fragment> {

@@ -161,6 +161,16 @@ jobs:
           OMNIGRAPH_UPDATE_OPENAPI: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && '1' || '' }}
         run: cargo test --workspace --locked
 
+      - name: Run failpoints feature test
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        # Run after the workspace test so the build cache is warm —
+        # enabling --features failpoints is just an incremental rebuild
+        # of omnigraph-engine + the small `fail` crate, not the full
+        # dep tree (lance, datafusion). A separate job with its own
+        # cache key would be a fresh ~20min build on first run; this
+        # is ~30s on a warm cache.
+        run: cargo test --locked -p omnigraph-engine --features failpoints --test failpoints
+
       - name: Commit regenerated openapi.json to PR branch
         if: |
           needs.classify_changes.outputs.run_full_ci == 'true' &&

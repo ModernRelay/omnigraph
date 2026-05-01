@@ -44,7 +44,7 @@ async fn s3_compatible_repo_lifecycle_works() {
         .await
         .unwrap();
 
-    // Direct-to-target load (MR-771): no run lifecycle, single publisher
+    // Direct-to-target load: no run lifecycle, single publisher
     // commit lands the row.
     reopened
         .load(
@@ -153,7 +153,7 @@ async fn s3_public_load_uses_hidden_run_and_publishes() {
     .await
     .unwrap();
 
-    // Direct-to-target writes (MR-771): no run state machine, just the
+    // Direct-to-target writes: no run state machine, just the
     // published commit lands the row. Verify by reopening and reading.
     let mut reopened = Omnigraph::open(&uri).await.unwrap();
     let loaded = query_main(

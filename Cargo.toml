@@ -20,6 +20,7 @@ arrow-select = "57"
 arrow-cast = { version = "57", features = ["prettyprint"] }
 arrow-ord = "57"
 
+datafusion = { version = "52", default-features = false }
 datafusion-physical-plan = "52"
 datafusion-physical-expr = "52"
 datafusion-execution = "52"

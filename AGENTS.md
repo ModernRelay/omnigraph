@@ -32,7 +32,7 @@ OmniGraph is a typed property-graph engine built as a coordination layer over ma
 - **Languages**: a `.pg` schema language and a `.gq` query language, both Pest-based, with a typed IR.
 - **Multi-modal querying**: vector ANN (`nearest`), full-text (`search`/`fuzzy`/`match_text`/`bm25`), Reciprocal Rank Fusion (`rrf`), and graph traversal (`Expand`, anti-join `not { … }`) in one runtime.
 - **Branches and commits across the whole graph**: Git-style — every successful publish appends to a commit DAG; merges are three-way at the row level.
-- **Atomic per-query writes**: `mutate_as` and `load` capture per-table `expected_table_versions` before writing and call `ManifestBatchPublisher::publish` once at the end. Cross-table OCC enforced inside the publisher's row-level CAS; no staging branches, no run state machine.
+- **Atomic per-query writes**: `mutate_as` and `load` accumulate insert/update batches into an in-memory `MutationStaging.pending` per touched table; one `stage_*` + `commit_staged` per table runs at end-of-query, then `ManifestBatchPublisher::publish` commits the manifest atomically with per-table `expected_table_versions` CAS. A mid-query failure leaves Lance HEAD untouched on staged tables — no drift, no run state machine, no staging branches. Deletes still inline-commit; D₂ at parse time prevents inserts/updates and deletes from coexisting in one query.
 - **HTTP server**: Axum + utoipa OpenAPI, bearer auth (SHA-256 hashed, optional AWS Secrets Manager), Cedar policy gating.
 - **CLI** driven by a single `omnigraph.yaml`; multi-format output (json/jsonl/csv/kv/table).
 
@@ -211,7 +211,7 @@ omnigraph policy explain --actor act-alice --action change --branch main
 | Query language | — | `.gq` + Pest grammar + IR + lowering + linter |
 | Schema migration planning | — | `plan_schema_migration` + `apply_schema` step types + `__schema_apply_lock__` |
 | Commit graph (DAG) across whole repo | — | `_graph_commits.lance` with linear + merge parents, ULID ids, actor map |
-| Per-query atomic writes | — | `MutationStaging` accumulator + `commit_with_expected` publisher CAS, single commit per `mutate_as` / `load` |
+| Per-query atomic writes | — | In-memory `MutationStaging.pending` accumulator + `stage_*` / `commit_staged` per touched table at end-of-query + publisher CAS via `commit_with_expected` (single manifest commit per `mutate_as` / `load`); D₂ parse-time rule keeps inserts/updates and deletes from mixing |
 | Three-way row-level merge | — | `OrderedTableCursor` + `StagedTableWriter`, structured `MergeConflictKind` |
 | Change feeds | — | `diff_between` / `diff_commits` with manifest fast path + ID streaming |
 | Cedar policy | — | 8 actions, branch / target_branch / protected scopes, validate/test/explain CLI |
