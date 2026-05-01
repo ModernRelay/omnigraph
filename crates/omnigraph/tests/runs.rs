@@ -1,4 +1,4 @@
-//! Tests for the direct-to-target write path (MR-771: Run state machine
+//! Tests for the direct-to-target write path (Run state machine
 //! removed). The Run/`__run__` staging branch / RunRecord state machine no
 //! longer exists; mutations and loads write directly to target tables and
 //! commit once via the publisher's `expected_table_versions` CAS.
@@ -161,17 +161,17 @@ async fn multi_statement_mutation_is_atomic_with_read_your_writes() {
     assert_eq!(friends.num_rows(), 1);
 }
 
-/// Mid-query partial failure: op-1 stages a Person insert, op-2 fails on
-/// referential integrity (validate_edge_insert_endpoints). Under the
-/// MR-794 staged-write rewire, op-1's batch lives in the in-memory
+/// Mid-query partial failure: op-1 stages a Person insert, op-2 fails
+/// on referential integrity (validate_edge_insert_endpoints). Under
+/// the staged-write writer, op-1's batch lives in the in-memory
 /// accumulator and never reaches Lance — Lance HEAD on `node:Person`
 /// stays at the pre-mutation version. The publisher never publishes,
 /// the manifest never advances, and the next mutation against the same
 /// table proceeds normally (no `ExpectedVersionMismatch`).
 ///
-/// This test pins the post-MR-794 contract:
-/// - Failed multi-statement mutation surfaces a clear error, no manifest
-///   commit, no observable state change.
+/// Pins the staged-write contract:
+/// - Failed multi-statement mutation surfaces a clear error, no
+///   manifest commit, no observable state change.
 /// - The touched tables stay queryable and writable from the next
 ///   query — Lance HEAD has not drifted.
 #[tokio::test]
@@ -228,7 +228,7 @@ async fn partial_failure_leaves_target_queryable_and_unblocks_next_mutation() {
             &mixed_params(&[("$name", "Frank")], &[("$age", 33)]),
         )
         .await
-        .expect("next mutation on the touched table must succeed under MR-794");
+        .expect("next mutation on the touched table must succeed under the staged-write writer");
     assert_eq!(
         result.affected_nodes, 1,
         "follow-up insert should report 1 affected node"
@@ -251,7 +251,7 @@ async fn partial_failure_leaves_target_queryable_and_unblocks_next_mutation() {
 /// success and one `ExpectedVersionMismatch`. The replacement for the old
 /// `concurrent_conflicting_run_publish_fails_cleanly` test — the OCC fence
 /// has moved from a graph-level run-publish merge into the publisher's
-/// per-table CAS (MR-766 + MR-771).
+/// per-table CAS.
 ///
 /// Drives the race by interleaving two handles that captured the same
 /// pre-write manifest snapshot: A commits first; B's commit then sees
@@ -323,7 +323,7 @@ async fn concurrent_writers_one_succeeds_one_gets_expected_version_mismatch() {
     );
 }
 
-/// The cancellation hole that motivated MR-771: dropping a mutation future
+/// The cancellation hole that motivated removing the Run state machine: dropping a mutation future
 /// mid-flight must not leave any graph-level state behind. With the run
 /// state machine gone, only orphaned Lance fragments can remain — and those
 /// are reclaimed by `omnigraph cleanup`.
@@ -381,7 +381,7 @@ async fn cancelled_mutation_future_leaves_no_state() {
     // `is_internal_system_branch`, so a runtime "no `__run__` branches" check
     // would be vacuous. The structural property that no `__run__` branches
     // can ever be created is enforced by deletion of `begin_run` etc. in
-    // MR-771 (verified by the build itself — those symbols no longer exist).
+    // (verified by the build itself — those symbols no longer exist).
     //
     // (1) The branch list is unchanged: cancellation/completion cannot
     //     synthesize new public branches.
@@ -448,9 +448,10 @@ async fn repeated_loads_do_not_accumulate_branches() {
     assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
 }
 
-/// User code must not be able to write to internal `__run__*` names. The
-/// branch-name guard predicate is kept as defense-in-depth (MR-770 will
-/// remove it once production legacy branches are swept).
+/// User code must not be able to write to internal `__run__*` names.
+/// The branch-name guard predicate is kept as defense-in-depth; it
+/// will be removed once a future production sweep retires the legacy
+/// branches.
 #[tokio::test]
 async fn public_branch_apis_reject_internal_run_refs() {
     let dir = tempfile::tempdir().unwrap();
@@ -480,11 +481,11 @@ async fn public_branch_apis_reject_internal_run_refs() {
     );
 }
 
-// ─── MR-794: staged-write rewire — additional contract tests ────────────────
+// ─── Staged-write rewire — additional contract tests ───────────────────────
 
-/// Mutation queries used only by the MR-794 tests below. Kept in the test
-/// file (not in helpers' shared `MUTATION_QUERIES`) to keep their scope
-/// local to the staged-write coverage.
+/// Mutation queries used only by the staged-write tests below. Kept in
+/// the test file (not in helpers' shared `MUTATION_QUERIES`) to keep
+/// their scope local to the staged-write coverage.
 const STAGED_QUERIES: &str = r#"
 query insert_two_persons($a_name: String, $a_age: I32, $b_name: String, $b_age: I32) {
     insert Person { name: $a_name, age: $a_age }
@@ -852,10 +853,10 @@ edge WorksAt: Person -> Company @card(0..1)
     );
 }
 
-// ─── PR #68 review-comment fixes — pinned coverage ──────────────────────────
+// ─── Chained-mutation correctness — pinned coverage ─────────────────────────
 
-/// Codex P1 / Cubic P1 #1: chained `update` ops in one query must respect
-/// each previous op's view of the rows. Without merge-shadow semantics on
+/// Chained `update` ops in one query must respect each previous op's
+/// view of the rows. Without merge-shadow semantics on
 /// `scan_with_pending`, the second update sees the stale committed value
 /// (the first update's row still appears in the Lance scan because the
 /// pending side hasn't committed), the predicate matches it, and the
@@ -932,8 +933,8 @@ async fn chained_updates_with_overlapping_predicate_respects_intermediate_value(
     );
 }
 
-/// Cursor Bugbot HIGH: two `delete` ops on the same node table in one
-/// query. Pre-fix, op-2's `open_table_for_mutation` went through
+/// Two `delete` ops on the same node table in one query. Pre-fix,
+/// op-2's `open_table_for_mutation` went through
 /// `open_for_mutation_on_branch` which trips `ensure_expected_version`
 /// (Lance HEAD has advanced past the manifest's pinned version after
 /// op-1's inline-commit, but the manifest hasn't moved). Post-fix,
@@ -984,7 +985,7 @@ async fn multi_statement_delete_on_same_node_table() {
     }
 }
 
-/// Cursor Bugbot HIGH (cascade variant): deleting a node cascades to its
+/// Cascade-then-explicit variant: deleting a node cascades to its
 /// edges, advancing Lance HEAD on the edge table. A subsequent
 /// `delete <Edge>` op in the same query must reopen at the
 /// post-cascade-commit version of the edge table — not trip
@@ -1030,11 +1031,10 @@ query cascade_then_explicit($name: String, $other: String) {
     );
 }
 
-/// Codex P2 / Cursor Bugbot LOW / Cubic P2: the engine cardinality path
-/// must enforce `min` bounds. Pre-fix the engine path silently dropped
-/// the min check (a `let _ = card.min;` line). The loader path always
-/// enforced both. Post-fix, both paths route through
-/// `enforce_cardinality_bounds` which checks both bounds.
+/// The engine cardinality path must enforce `min` bounds. Pre-fix the
+/// engine path silently dropped the min check (a `let _ = card.min;`
+/// line). The loader path always enforced both. Post-fix, both paths
+/// route through `enforce_cardinality_bounds` which checks both bounds.
 ///
 /// Build a custom schema with `Knows: Person -> Person @card(2..*)`.
 /// Inserting a single Knows edge violates min=2. The mutation path must
@@ -1085,8 +1085,8 @@ query add_friend($from: String, $to: String) {
     );
 }
 
-/// Cubic P1 #2: `LoadMode::Merge` on edges must NOT double-count the
-/// committed edge AND its updated pending replacement. Build a custom
+/// `LoadMode::Merge` on edges must NOT double-count the committed
+/// edge AND its updated pending replacement. Build a custom
 /// schema where WorksAt has @card(0..1). Seed Alice with one WorksAt to
 /// Acme. Then Merge-load the SAME edge id (so it's an update, not an
 /// insert) pointing Alice's WorksAt at Bigco. Cardinality must count
@@ -1132,12 +1132,11 @@ edge WorksAt: Person -> Company @card(0..1)
     assert_eq!(count_rows(&db, "edge:WorksAt").await, 1);
 }
 
-/// Cubic P2 (follow-up to PR #68 review of commit 3223b51): a Merge load
-/// whose input has TWO rows with the same edge id must be deduped at
-/// cardinality-count time, not just at finalize. Without dedup, two
-/// pending rows count twice → spurious `@card` violation. With dedup
-/// (last-occurrence-wins, mirroring `dedupe_merge_batches_by_id`), the
-/// pending side counts once.
+/// A Merge load whose input has TWO rows with the same edge id must be
+/// deduped at cardinality-count time, not just at finalize. Without
+/// dedup, two pending rows count twice → spurious `@card` violation.
+/// With dedup (last-occurrence-wins, mirroring
+/// `dedupe_merge_batches_by_id`), the pending side counts once.
 ///
 /// This is a separate path from `load_merge_mode_dedupes_edge_for_cardinality_count`
 /// (which dedupes committed-vs-pending). Here we verify pending-vs-pending
@@ -1182,11 +1181,11 @@ edge WorksAt: Person -> Company @card(0..1)
     assert_eq!(count_rows(&db, "edge:WorksAt").await, 1);
 }
 
-/// Cubic P2 (follow-up): `scan_with_pending` must reject a call where
-/// `key_column` is requested but the projection omits that column.
-/// Without the up-front check, the helper silently degraded to union
-/// semantics — letting a chained-update bug slip through unnoticed.
-/// This test verifies the contract is enforced at the API boundary.
+/// `scan_with_pending` must reject a call where `key_column` is
+/// requested but the projection omits that column. Without the
+/// up-front check, the helper silently degraded to union semantics —
+/// letting a chained-update bug slip through unnoticed. This test
+/// verifies the contract is enforced at the API boundary.
 #[tokio::test]
 async fn scan_with_pending_rejects_key_column_missing_from_projection() {
     use arrow_array::{RecordBatch, StringArray};
@@ -1275,20 +1274,19 @@ async fn scan_with_pending_rejects_key_column_missing_from_projection() {
     );
 }
 
-/// Cursor Bugbot Medium (follow-up on commit 052b6e6): the
-/// `PendingTable.schema` field is captured from the first `append_batch`
-/// call and never updated. On a blob-bearing table, an `insert`
-/// produces a full-schema batch (blob columns included) and an `update`
-/// that doesn't assign every blob produces a subset-schema batch. Mixed
-/// in one query, the second `append_batch` would silently push an
+/// `PendingTable.schema` is captured from the first `append_batch` call
+/// and never updated. On a blob-bearing table, an `insert` produces a
+/// full-schema batch (blob columns included) and an `update` that
+/// doesn't assign every blob produces a subset-schema batch. Mixed in
+/// one query, the second `append_batch` would silently push an
 /// incompatible batch — the mismatch surfaced eventually at
 /// `concat_batches`/MemTable construction inside finalize, but the
 /// failure point was distant from the offending op.
 ///
-/// Post-fix: `append_batch` validates the new batch's schema against
-/// the existing accumulator's schema and returns a typed error
-/// directing the caller to split the mutation. The error fires at the
-/// second op (the update), not at end-of-query.
+/// `append_batch` validates the new batch's schema against the existing
+/// accumulator's schema and returns a typed error directing the caller
+/// to split the mutation. The error fires at the second op (the
+/// update), not at end-of-query.
 #[tokio::test]
 async fn append_batch_rejects_mismatched_schema_in_blob_table_at_offending_op() {
     use omnigraph::loader::{LoadMode, load_jsonl};

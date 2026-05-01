@@ -34,9 +34,9 @@ pub(super) async fn apply_schema_with_lock(
     let branches = db.coordinator.all_branches().await?;
     // Skip `main` and internal system branches. The schema-apply lock branch
     // is excluded because it is the cluster-wide schema-apply serializer.
-    // `__run__*` branches are no longer created (MR-771); the filter remains
-    // as defense-in-depth for legacy repos with leftover staging branches —
-    // MR-770 will sweep them and this guard can go.
+    // `__run__*` branches are no longer created; the filter remains as
+    // defense-in-depth for legacy repos with leftover staging branches.
+    // A future production sweep will let this guard go.
     let blocking_branches = branches
         .into_iter()
         .filter(|branch| branch != "main" && !is_internal_system_branch(branch))

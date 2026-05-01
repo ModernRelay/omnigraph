@@ -1905,7 +1905,7 @@ fn cli_fails_for_invalid_merge_requests() {
     );
 }
 
-// MR-771: `omnigraph run list/show/publish/abort` subcommands removed
+// `omnigraph run list/show/publish/abort` subcommands removed
 // alongside the run state machine. Direct-to-target writes leave nothing
 // for these CLIs to manage. Audit history is now visible via
 // `omnigraph commit list` reading the commit graph.

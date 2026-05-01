@@ -522,11 +522,12 @@ query high_value() {
 
 #[tokio::test]
 async fn stale_handle_public_mutation_must_refresh_then_retry() {
-    // MR-771: with the Run state machine removed, the engine no longer
-    // auto-rebases stale-handle mutations onto the latest target head. The
-    // publisher's `expected_table_versions` CAS makes the contract explicit
-    // — a stale writer fails loudly with `ExpectedVersionMismatch` and the
-    // client decides whether to refresh-and-retry.
+    // With the Run state machine removed, the engine no longer
+    // auto-rebases stale-handle mutations onto the latest target head.
+    // The publisher's `expected_table_versions` CAS makes the contract
+    // explicit — a stale writer fails loudly with
+    // `ExpectedVersionMismatch` and the client decides whether to
+    // refresh-and-retry.
     let dir = tempfile::tempdir().unwrap();
     let _db = init_and_load(&dir).await;
     drop(_db);

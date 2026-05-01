@@ -590,9 +590,9 @@ use super::staging::{MutationStaging, PendingMode};
 ///   is the source of truth for "where is Lance HEAD right now on
 ///   this table within this query."
 ///
-/// The `inline_committed` reopen branch closes the cursor-bot HIGH
-/// "multi-delete fails on same table" finding. The branch goes away
-/// once Lance exposes a two-phase delete API
+/// The `inline_committed` reopen branch closes the multi-delete-on-same-table
+/// failure path that pre-staged-write engines inherited. The branch goes
+/// away once Lance exposes a two-phase delete API
 /// ([lance-format/lance#6658](https://github.com/lance-format/lance/issues/6658))
 /// and we can stage deletes on the same path as inserts/updates.
 async fn open_table_for_mutation(
@@ -633,9 +633,9 @@ async fn open_table_for_mutation(
 /// D₂ parse-time check: a single mutation query is either insert/update-only
 /// or delete-only. Mixed → reject before any I/O.
 ///
-/// Reason: under the staged-write rewire (MR-794 step 2+), inserts and
-/// updates accumulate in memory and commit at end-of-query, while deletes
-/// still inline-commit (Lance lacks a public two-phase delete in 4.0.0).
+/// Reason: under the staged-write writer, inserts and updates
+/// accumulate in memory and commit at end-of-query, while deletes still
+/// inline-commit (Lance lacks a public two-phase delete in 4.0.0).
 /// Mixing creates ordering hazards (same-row insert→delete becomes a no-op
 /// because the staged insert isn't visible to delete; cascading deletes
 /// of just-inserted edges break referential integrity by silent design).
@@ -661,7 +661,7 @@ fn enforce_no_mixed_destructive_constructive(
             "mutation '{}' on the same query mixes inserts/updates and deletes; \
              split into separate mutations: (1) inserts and updates, then (2) deletes. \
              This restriction lifts when Lance exposes a two-phase delete API \
-             (tracked: MR-793 / Lance-upstream).",
+             (tracked: lance-format/lance#6658).",
             ir.name
         )));
     }
@@ -706,11 +706,10 @@ impl Omnigraph {
     ) -> Result<MutationResult> {
         self.ensure_schema_state_valid().await?;
         let requested = Self::normalize_branch_name(branch)?;
-        // Reject internal `__run__*` / system-prefixed branches at the public
-        // write boundary. The pre-MR-771 path got this guard transitively via
-        // `begin_run`'s `ensure_public_branch_ref` call; the direct-publish
-        // path needs to assert it explicitly so a caller can't write to
-        // legacy or system staging branches by passing the prefix verbatim.
+        // Reject internal `__run__*` / system-prefixed branches at the
+        // public write boundary. Direct-publish paths assert this
+        // explicitly so a caller can't write to legacy or system
+        // staging branches by passing the prefix verbatim.
         if let Some(name) = requested.as_deref() {
             crate::db::ensure_public_branch_ref(name, "mutate")?;
         }

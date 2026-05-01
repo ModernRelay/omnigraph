@@ -140,7 +140,8 @@ async fn schema_apply_recovers_partial_rename() {
     assert_no_staging_files(dir.path());
 }
 
-/// Pin the documented "finalize → publisher residual" from MR-794.
+/// Pin the documented "finalize → publisher residual" of the
+/// staged-write commit path.
 ///
 /// `MutationStaging::finalize` runs `commit_staged` per touched table
 /// sequentially before the publisher commits the manifest. Lance has no

@@ -40,12 +40,12 @@ pub struct DeleteState {
 
 /// A Lance write that has produced fragment files on object storage but is
 /// not yet committed to the dataset's manifest. The staged-write primitives
-/// are defined here for later integration in `MutationStaging`
-/// (`exec/mutation.rs`) and the loader (`loader/mod.rs`) — those rewires
-/// land in [MR-794](https://linear.app/modernrelay/issue/MR-794) step 2+.
-/// The intent: defer Lance commits to end-of-query so a mid-query failure
-/// leaves the touched table at the pre-mutation HEAD instead of drifting
-/// ahead.
+/// are consumed by `MutationStaging` (`exec/staging.rs`,
+/// `exec/mutation.rs`) and the bulk loader (`loader/mod.rs`). The
+/// intent: defer Lance commits to end-of-query so a mid-query failure
+/// leaves the touched table at the pre-mutation HEAD instead of
+/// drifting ahead. See `docs/runs.md` for the publisher-CAS contract
+/// this builds on.
 ///
 /// `transaction` is opaque from our side — Lance owns its semantics. We
 /// commit it via `CommitBuilder::execute(transaction)` (see
@@ -545,7 +545,7 @@ impl TableStore {
         })
     }
 
-    // ─── Staged-write API (MR-794) ───────────────────────────────────────────
+    // ─── Staged-write API ────────────────────────────────────────────────────
     //
     // These primitives wrap Lance's distributed-write API: each call writes
     // fragment files to object storage but does NOT advance the dataset's
@@ -672,16 +672,16 @@ impl TableStore {
     ///
     /// This is intrinsic to the underlying Lance API: there is no public
     /// way to make `MergeInsertBuilder` see uncommitted fragments. The
-    /// engine's mutation path enforces the rule "per touched table: all
-    /// stage_append OR exactly one stage_merge_insert" at parse time
-    /// (the D₂′ check landing with [MR-794](https://linear.app/modernrelay/issue/MR-794)
-    /// step 2+ in `exec/mutation.rs`). Multi-table queries and append-chains
-    /// remain safe; only chained merges on a single table are rejected.
+    /// engine's `MutationStaging` accumulator works around this by
+    /// concatenating per-table batches in memory and issuing exactly
+    /// one `stage_merge_insert` per touched table at end-of-query (with
+    /// last-write-wins dedupe by id) — see `exec/staging.rs`. Direct
+    /// callers of this primitive must respect the contract themselves.
     ///
     /// Lift path: either a Lance API extension that lets
     /// `MergeInsertBuilder` accept additional staged fragments, or an
     /// in-memory pre-merge here that folds prior staged batches into the
-    /// input stream. See `docs/runs.md` and MR-793.
+    /// input stream. See `docs/runs.md`.
     pub async fn stage_merge_insert(
         &self,
         ds: Dataset,
@@ -780,10 +780,10 @@ impl TableStore {
     /// filtered scan even when their data would match. Staged-fragment
     /// rows are silently absent from the result. `scanner.use_stats(false)`
     /// does not fix this in lance 4.0.0. Callers needing correct filtered
-    /// reads against staged data should use a different strategy (the
-    /// engine's MR-794 step 2+ design uses in-memory pending-batch
-    /// accumulation + DataFusion `MemTable` instead — see
-    /// `.context/mr-794-step2-design.md`).
+    /// reads against staged data should use a different strategy — the
+    /// engine's `MutationStaging` accumulator unions in-memory pending
+    /// batches with the committed scan via DataFusion `MemTable` (see
+    /// `scan_with_pending`).
     ///
     /// This method remains on the surface for primitive-level testing
     /// (basic stage + scan correctness without filters works) and for
@@ -824,10 +824,10 @@ impl TableStore {
     /// Scan committed via Lance + apply the same filter to in-memory
     /// pending batches via DataFusion `MemTable`, concat the two result
     /// streams. The replacement for `scan_with_staged` in engine code:
-    /// MR-794 step 2+ accumulates input batches in memory and unions
-    /// them with the committed snapshot at read time, sidestepping the
-    /// `Scanner::with_fragments` filter-pushdown limitation documented
-    /// on `scan_with_staged`.
+    /// the staged-write writer accumulates input batches in memory and
+    /// unions them with the committed snapshot at read time,
+    /// sidestepping the `Scanner::with_fragments` filter-pushdown
+    /// limitation documented on `scan_with_staged`.
     ///
     /// `committed_ds` should be opened at the pre-mutation
     /// `expected_version` (the same version captured in `MutationStaging::expected_versions`
@@ -1251,7 +1251,7 @@ fn filter_out_rows_where_string_in(
 
 /// Apply `projection` and `filter` to in-memory pending batches via a
 /// fresh DataFusion `SessionContext`. Used by `scan_with_pending` for
-/// the read-your-writes side of MR-794's in-memory accumulator.
+/// the read-your-writes side of the in-memory staging accumulator.
 ///
 /// `pending_batches` must be non-empty (the caller short-circuits on
 /// empty).

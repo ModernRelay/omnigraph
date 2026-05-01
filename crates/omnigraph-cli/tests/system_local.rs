@@ -307,7 +307,7 @@ fn local_cli_end_to_end_branch_change_merge_flow() {
     assert_eq!(main_read["row_count"], 1);
     assert_eq!(main_read["rows"][0]["p.name"], "Zoe");
 
-    // MR-771: `omnigraph run list` removed. Audit visible via commit list.
+    // `omnigraph run list` removed. Audit visible via commit list.
     let commits_payload = parse_stdout_json(&output_success(
         cli()
             .arg("commit")
@@ -597,8 +597,8 @@ fn local_cli_failed_load_keeps_target_state_unchanged() {
         snapshot_table_row_count(&repo, "edge:Knows"),
         knows_rows_before
     );
-    // MR-771: failed loads no longer leave a RunRecord. The atomicity
-    // guarantee is verified above (target tables are unchanged).
+    // Failed loads leave no run record (the run lifecycle has been
+    // removed); atomicity is verified above by the unchanged target.
 }
 
 #[test]
@@ -631,9 +631,8 @@ fn local_cli_failed_change_keeps_target_state_unchanged() {
             .arg("--json"),
     ));
     assert_eq!(friends_payload["row_count"], 2);
-    // MR-771: failed mutations no longer leave a RunRecord. The atomicity
-    // guarantee is verified above (the friends_of read above shows main
-    // unchanged).
+    // Failed mutations leave no run record (the run lifecycle has been
+    // removed); atomicity is verified above by the unchanged target.
 }
 
 #[test]
@@ -941,12 +940,13 @@ query vector_search($q: String) {
     assert_eq!(result["rows"][0]["d.slug"], "alpha-doc");
 }
 
-// MR-771: the publisher CAS conflict shape is verified end-to-end at the
-// engine level in `crates/omnigraph/tests/runs.rs::concurrent_writers_one_succeeds_one_gets_expected_version_mismatch`
+// The publisher CAS conflict shape is verified end-to-end at the engine
+// level in
+// `crates/omnigraph/tests/runs.rs::concurrent_writers_one_succeeds_one_gets_expected_version_mismatch`
 // and at the HTTP boundary in
 // `crates/omnigraph-server/tests/server.rs::change_conflict_returns_manifest_conflict_409`.
-// The pre-MR-771 CLI-level race was timing-dependent; with direct-publish
-// the surface is the same engine path the unit test already covers.
+// A CLI-level race would be timing-dependent; with direct-publish the
+// surface is the same engine path the unit test already covers.
 
 #[test]
 fn local_cli_policy_tooling_is_end_to_end_while_local_writes_stay_unenforced() {

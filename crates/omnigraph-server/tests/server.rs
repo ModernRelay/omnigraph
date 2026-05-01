@@ -1346,7 +1346,7 @@ async fn policy_blocks_non_admin_merge_to_main_and_allows_admin() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn authenticated_change_stamps_actor_on_commits() {
-    // MR-771: with the Run state machine removed, actor_id is recorded
+    // With the Run state machine removed, actor_id is recorded
     // directly on the commit graph (no intermediate run record).
     let (_temp, app) = app_for_loaded_repo_with_auth_tokens(&[("act-andrew", "token-one")]).await;
 
@@ -2108,10 +2108,10 @@ query vector_search_string($q: String) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn change_conflict_returns_manifest_conflict_409() {
-    // MR-771: a write that races with another writer surfaces as HTTP 409
-    // with a structured `manifest_conflict` body — `table_key`, `expected`,
-    // and `actual` — so clients can detect-and-retry without parsing the
-    // message. (Replaces the old run-publish merge-conflict shape.)
+    // A write that races with another writer surfaces as HTTP 409 with
+    // a structured `manifest_conflict` body — `table_key`, `expected`,
+    // and `actual` — so clients can detect-and-retry without parsing
+    // the message.
     let temp = init_loaded_repo().await;
     let repo = repo_path(temp.path());
 

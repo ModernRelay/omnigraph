@@ -15,8 +15,8 @@
 //!   retention. Destructive to version history — callers should gate this
 //!   behind an explicit confirm flag at the CLI layer.
 //!
-//! Both walk every node + edge table on the `main` branch. Run branches are
-//! ephemeral by design (MR-670 / MR-674) so we do not optimize them.
+//! Both walk every node + edge table on the `main` branch. Run branches
+//! are ephemeral by design so we do not optimize them.
 
 use std::time::Duration;
 

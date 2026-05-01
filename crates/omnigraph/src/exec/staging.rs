@@ -1,4 +1,4 @@
-//! Per-query staging accumulator for direct-publish writes (MR-794 step 2+).
+//! Per-query staging accumulator for direct-publish writes.
 //!
 //! `MutationStaging` accumulates per-table input batches in memory during a
 //! `mutate_as` or `load` query, then at end-of-query commits each touched
@@ -74,7 +74,7 @@ pub(crate) struct StagedTablePath {
 
 /// Per-query staging state.
 ///
-/// Replaces the post-MR-771 inline-commit `MutationStaging.latest` map with
+/// Replaces the legacy inline-commit `MutationStaging.latest` map with
 /// an in-memory accumulator that defers all Lance HEAD advances to
 /// end-of-query. After this rewire the bug class "Lance HEAD drifts ahead
 /// of `__manifest`" is unreachable in `mutate_as` and `load` for inserts

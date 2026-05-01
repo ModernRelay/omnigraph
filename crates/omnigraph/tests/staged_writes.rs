@@ -1,20 +1,21 @@
-//! Primitive-level tests for `TableStore`'s staged-write API
-//! (MR-794 step 1). These exercise `stage_append`, `stage_merge_insert`,
-//! `scan_with_staged`, and `count_rows_with_staged` directly against a
-//! Lance dataset — no Omnigraph engine involved. The engine-level rewire
-//! (MR-794 step 2+) lives in `tests/runs.rs` once it lands.
+//! Primitive-level tests for `TableStore`'s staged-write API. These
+//! exercise `stage_append`, `stage_merge_insert`, `scan_with_staged`,
+//! and `count_rows_with_staged` directly against a Lance dataset — no
+//! Omnigraph engine involved. The engine-level use of these primitives
+//! is exercised by `tests/runs.rs`.
 //!
 //! Test surface here:
 //! 1. `stage_append` + `scan_with_staged` shows committed + staged data
 //!    without duplicates.
 //! 2. `stage_merge_insert` of a row that supersedes a committed fragment
-//!    surfaces only the rewritten row, not both — the
-//!    `removed_fragment_ids` dedup landed in PR #66's `730631c`.
-//! 3. **Documented contract**: chained `stage_merge_insert` calls on the
-//!    same dataset whose source rows share keys produce duplicate rows in
-//!    `scan_with_staged`. The engine's parse-time D₂′ check (MR-794 step
-//!    2+) prevents callers from triggering this; this test pins the
-//!    primitive's behavior so a future change either (a) preserves it or
+//!    surfaces only the rewritten row, not both, via the
+//!    `removed_fragment_ids` dedup contract.
+//! 3. **Documented contract**: chained `stage_merge_insert` calls on
+//!    the same dataset whose source rows share keys produce duplicate
+//!    rows in `scan_with_staged`. The engine's accumulator dedupes by
+//!    id at finalize time so this primitive-level pitfall doesn't
+//!    surface in production paths; this test pins the primitive's
+//!    behavior so a future change either (a) preserves it or
 //!    (b) consciously fixes it (and updates this test).
 
 use arrow_array::{Array, Int32Array, RecordBatch, StringArray, UInt64Array};
@@ -120,8 +121,9 @@ async fn stage_merge_insert_dedupes_superseded_committed_fragment() {
     assert!(
         !staged.removed_fragment_ids.is_empty(),
         "merge_insert that rewrites a committed row must set removed_fragment_ids \
-         (this is the dedup invariant from PR #66 commit 730631c — its absence \
-         was caught by Cubic/Cursor/Codex on PR #66)"
+         so the scan-with-staged composer can shadow the superseded committed \
+         fragment — without it, the committed row and its rewrite both appear, \
+         producing duplicates by key"
     );
 
     // scan_with_staged: alice appears exactly once, with the new age.
@@ -347,11 +349,11 @@ async fn stage_merge_insert_then_commit_persists_merged_view() {
 /// silently absent. `scanner.use_stats(false)` does not bypass this in
 /// lance 4.0.0.
 ///
-/// This test pins the actual behavior so a future change either preserves
-/// it (and updates the doc) or fixes it (and rewrites this test). The
-/// engine's MR-794 step 2+ design uses in-memory pending-batch
-/// accumulation + DataFusion `MemTable` for read-your-writes instead, so
-/// production code is unaffected.
+/// This test pins the actual behavior so a future change either
+/// preserves it (and updates the doc) or fixes it (and rewrites this
+/// test). The engine's `MutationStaging` accumulator unions in-memory
+/// pending batches with the committed scan via DataFusion `MemTable`
+/// for read-your-writes instead, so production code is unaffected.
 #[tokio::test]
 async fn scan_with_staged_with_filter_silently_drops_staged_rows() {
     let dir = tempfile::tempdir().unwrap();
@@ -485,6 +487,8 @@ async fn chained_stage_merge_insert_with_shared_key_documents_duplicate_behavior
          here because this assertion failed: either (a) the primitive was \
          improved to dedupe across stages (good — update to assert == 1) \
          or (b) something subtler broke (investigate before changing the \
-         assertion). See PR #67 Codex P1 thread + .context/mr-794-step2-design.md §3.1."
+         assertion). The engine's MutationStaging accumulator dedupes by \
+         id at finalize time so this primitive-level pitfall doesn't \
+         surface in production paths — see exec/staging.rs."
     );
 }
