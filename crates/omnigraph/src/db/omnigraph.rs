@@ -81,6 +81,26 @@ pub struct Omnigraph {
     pub(crate) audit_actor_id: Option<String>,
 }
 
+/// Whether [`Omnigraph::open`] runs the MR-847 recovery sweep.
+///
+/// Recovery requires Lance writes (`Dataset::restore`, `ManifestBatchPublisher::publish`).
+/// Read-only consumers — NDJSON export, `commit list`, `read`, schema
+/// inspection — should not trigger writes (they may run with read-only
+/// object-store credentials, and silent open-time mutations are surprising).
+/// They also don't need recovery: reads always resolve through the manifest
+/// pin, which is the consistent snapshot regardless of any Phase B → Phase C
+/// drift on the per-table side.
+///
+/// See `.context/mr-847-design.md` § "Read-only opens".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenMode {
+    /// Run the recovery sweep on open. Default for `Omnigraph::open`.
+    ReadWrite,
+    /// Skip the recovery sweep. Use for read-only consumers via
+    /// [`Omnigraph::open_read_only`].
+    ReadOnly,
+}
+
 impl Omnigraph {
     /// Create a new repo at `uri` from schema source.
     ///
@@ -119,16 +139,33 @@ impl Omnigraph {
         })
     }
 
-    /// Open an existing repo.
+    /// Open an existing repo (read-write).
     ///
     /// Reads `_schema.pg`, parses it, builds the catalog, and opens `__manifest`.
+    /// Runs the MR-847 recovery sweep before returning — see [`OpenMode`].
     pub async fn open(uri: &str) -> Result<Self> {
-        Self::open_with_storage(uri, storage_for_uri(uri)?).await
+        Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadWrite).await
     }
 
+    /// Open an existing repo for read-only consumers (NDJSON export,
+    /// `commit list`, etc.). Skips the MR-847 recovery sweep — see [`OpenMode`].
+    pub async fn open_read_only(uri: &str) -> Result<Self> {
+        Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadOnly).await
+    }
+
+    /// `open_with_storage` retained for existing callers (init/test paths).
+    /// Defaults to `OpenMode::ReadWrite`.
     pub(crate) async fn open_with_storage(
         uri: &str,
         storage: Arc<dyn StorageAdapter>,
+    ) -> Result<Self> {
+        Self::open_with_storage_and_mode(uri, storage, OpenMode::ReadWrite).await
+    }
+
+    pub(crate) async fn open_with_storage_and_mode(
+        uri: &str,
+        storage: Arc<dyn StorageAdapter>,
+        mode: OpenMode,
     ) -> Result<Self> {
         let root = normalize_root_uri(uri)?;
         // Open the coordinator first so the schema-staging recovery sweep can
@@ -137,6 +174,22 @@ impl Omnigraph {
         // (post-commit crash) before the live schema files are read.
         let coordinator = GraphCoordinator::open(&root, Arc::clone(&storage)).await?;
         recover_schema_state_files(&root, Arc::clone(&storage), &coordinator.snapshot()).await?;
+        // MR-847 recovery sweep: close the Phase B → Phase C residual on
+        // any sidecar left over from a crashed writer. ReadOnly skips —
+        // recovery requires Lance writes (Dataset::restore, manifest publish);
+        // a read-only consumer (NDJSON export, commit list) sees the
+        // manifest-pinned content regardless of drift, so it doesn't need
+        // recovery and shouldn't trigger object-store writes. Continuous
+        // in-process recovery for long-running servers is MR-856 (background
+        // reconciler).
+        if matches!(mode, OpenMode::ReadWrite) {
+            crate::db::manifest::recover_manifest_drift(
+                &root,
+                storage.as_ref(),
+                &coordinator.snapshot(),
+            )
+            .await?;
+        }
         // Read _schema.pg (post-recovery — may have just been renamed in).
         let schema_path = schema_source_uri(&root);
         let schema_source = storage.read_text(&schema_path).await?;

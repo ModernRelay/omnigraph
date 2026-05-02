@@ -32,6 +32,7 @@ pub(crate) use namespace::open_table_head_for_write;
 #[cfg(test)]
 use namespace::{branch_manifest_namespace, staged_table_namespace};
 use publisher::{GraphNamespacePublisher, ManifestBatchPublisher};
+pub(crate) use recovery::recover_manifest_drift;
 use repo::{init_manifest_repo, open_manifest_repo, snapshot_state_at};
 pub use state::SubTableEntry;
 #[cfg(test)]

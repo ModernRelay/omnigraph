@@ -42,9 +42,12 @@
 
 use lance::Dataset;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::error::{OmniError, Result};
 use crate::storage::StorageAdapter;
+
+use super::Snapshot;
 
 /// Subdirectory under the repo root holding sidecar files.
 pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
@@ -382,6 +385,134 @@ fn fragment_ids(ds: &Dataset) -> Vec<u64> {
     let mut ids: Vec<u64> = ds.manifest.fragments.iter().map(|f| f.id).collect();
     ids.sort_unstable();
     ids
+}
+
+/// Open-time recovery sweep — the entry point invoked from
+/// `Omnigraph::open` (gated on `OpenMode::ReadWrite`).
+///
+/// Enumerates every sidecar in `__recovery/`, classifies each table per
+/// the sidecar's intent, and applies the all-or-nothing decision:
+/// roll-forward (every table eligible), roll-back (mixed or unexpected
+/// state), or abort (invariant violation).
+///
+/// **Phase 3 scope** (this commit): roll-back path is fully implemented;
+/// roll-forward errors out with a "Phase 4" placeholder so the
+/// open-time wiring + sidecar I/O + classification + decision dispatch
+/// can land independently of the audit/manifest-publish work. Tests
+/// exercising the end-to-end roll-forward path land alongside Phase 4.
+///
+/// Idempotency: a crash mid-sweep leaves the sidecar (deletion is the
+/// final step). Re-opening re-classifies; the fragment-set short-circuit
+/// in [`restore_table_to_version`] prevents version pile-up under
+/// repeated mid-rollback crashes.
+///
+/// Concurrency: today (pre-MR-686) recovery runs synchronously in
+/// `Omnigraph::open` *before* the engine is wrapped in the server's
+/// `Arc<RwLock<Omnigraph>>`. No request handlers can race. Under MR-686
+/// + MR-856 (background reconciler) the per-(table_key, branch) queues
+/// will need acquisition before the sweep restores or publishes — see
+/// `.context/mr-847-design.md` "Concurrency policy" §"After MR-686".
+pub(crate) async fn recover_manifest_drift(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    snapshot: &Snapshot,
+) -> Result<()> {
+    let sidecars = list_sidecars(root_uri, storage).await?;
+    if sidecars.is_empty() {
+        return Ok(());
+    }
+
+    for sidecar in sidecars {
+        process_sidecar(root_uri, storage, snapshot, &sidecar).await?;
+    }
+    Ok(())
+}
+
+async fn process_sidecar(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+) -> Result<()> {
+    let mut classifications = Vec::with_capacity(sidecar.tables.len());
+    for pin in &sidecar.tables {
+        let lance_head = open_lance_head(&pin.table_path).await?;
+        let manifest_pinned = snapshot
+            .entry(&pin.table_key)
+            .map(|e| e.table_version)
+            .unwrap_or(0);
+        classifications.push(classify_table(pin, lance_head, manifest_pinned));
+    }
+
+    match decide(&classifications) {
+        SidecarDecision::Abort => {
+            // Surface loudly without deleting the sidecar — operator must
+            // investigate. This includes any classification of
+            // InvariantViolation (Lance HEAD < manifest pinned: should be
+            // impossible).
+            return Err(OmniError::manifest_internal(format!(
+                "recovery sidecar '{}' has invariant violation; refusing to act \
+                 — operator review required (sidecar at '{}', classifications: {:?})",
+                sidecar.operation_id,
+                sidecar_uri(root_uri, &sidecar.operation_id),
+                classifications,
+            )));
+        }
+        SidecarDecision::RollBack => {
+            warn!(
+                operation_id = sidecar.operation_id.as_str(),
+                writer_kind = ?sidecar.writer_kind,
+                "recovery: rolling back sidecar (mixed or unexpected state)"
+            );
+            // Restore every table whose Lance HEAD has drifted from the
+            // manifest pin (RolledPastExpected, UnexpectedAtP1,
+            // UnexpectedMultistep). NoMovement tables are already at
+            // expected_version — no action. The fragment-set short-circuit
+            // in restore_table_to_version makes drift-with-equivalent-content
+            // a no-op (sound: equal fragment-ids ⇒ equal content).
+            for (pin, cls) in sidecar.tables.iter().zip(classifications.iter()) {
+                if matches!(
+                    cls,
+                    TableClassification::RolledPastExpected
+                        | TableClassification::UnexpectedAtP1
+                        | TableClassification::UnexpectedMultistep
+                ) {
+                    restore_table_to_version(&pin.table_path, pin.expected_version).await?;
+                }
+            }
+            // Audit row write deferred to Phase 4 (recovery audit model).
+            // For now: delete sidecar as the final step.
+            delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+            Ok(())
+        }
+        SidecarDecision::RollForward => {
+            // Phase 4 implements the audit row + ManifestBatchPublisher
+            // pin extension. Until then, surface loudly so we don't
+            // silently leave drift.
+            Err(OmniError::manifest_internal(format!(
+                "recovery sidecar '{}' is roll-forward eligible but the \
+                 roll-forward path is not yet implemented (MR-847 Phase 4); \
+                 sidecar left in place at '{}'",
+                sidecar.operation_id,
+                sidecar_uri(root_uri, &sidecar.operation_id),
+            )))
+        }
+    }
+}
+
+async fn open_lance_head(table_path: &str) -> Result<u64> {
+    let ds = Dataset::open(table_path)
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    Ok(ds.version().version)
+}
+
+async fn delete_sidecar_by_operation_id(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    operation_id: &str,
+) -> Result<()> {
+    storage.delete(&sidecar_uri(root_uri, operation_id)).await
 }
 
 /// Convenience: build a [`RecoverySidecar`] with auto-generated
