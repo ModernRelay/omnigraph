@@ -4,7 +4,7 @@ OmniGraph sits on top of Lance. Many problems — index lifecycle, branching, tr
 
 This file is the curated entry point. **When you hit a Lance-shaped problem, find the matching topic below and fetch the listed URL(s) before guessing.** Don't grep our codebase for behavior that is documented authoritatively in Lance.
 
-Base URL: `https://lance.org`. Use `WebFetch` (or your tool's equivalent) on the full URLs. Keep this index curated to relevant material — the upstream sitemap has hundreds of URLs (notably the Namespace REST API model surface, Spark/Trino/Databricks integrations) that we don't use.
+Base URL: `https://lance.org`. **Fetch the FULL page content, not summaries** — use `npx mdrip <url>` (or `npx mdrip --max-chars 200000 <url>` for very long pages). Tools that summarize pages (like Claude's `WebFetch`) routinely drop load-bearing details — defaults, `pub(crate)` blockers, sub-specs hidden behind navigation hubs. If `npx mdrip` is unavailable, fall back to `curl <url> | pandoc -f html -t markdown` or paste the rendered page text manually; **never act on a summarized fetch alone**. Keep this index curated to relevant material — the upstream sitemap has hundreds of URLs (notably the Namespace REST API model surface, Spark/Trino/Databricks integrations) that we don't use.
 
 > **Substrate boundary check.** Before fetching, recall [docs/invariants.md §I](invariants.md): if Lance already does the thing, we don't reimplement it. The most common reason to read these docs is to confirm a substrate behavior, not to learn what to clone.
 
@@ -155,3 +155,14 @@ If a future need pulls one of these into scope, add a row to the matching domain
 ## Maintenance
 
 When Lance ships a major release that changes any of the above (file format bump, new index type, transaction semantics change, new branching primitive), refresh this index in the same change as the omnigraph upgrade. Stale Lance pointers are worse than no pointers.
+
+### Last alignment audit: 2026-05-02 (Lance 4.0.1 upstream; omnigraph pinned at 4.0.0)
+
+A full read-through of every index page above was performed in the MR-793 cycle. Findings (no code changes required for PR #70):
+
+- The MemWAL "three sub-pages" (Overview / Details / Implementation) turned out to be **anchor sections on the single existing page** at `https://lance.org/format/table/mem_wal/` — not separate URLs. Fetched in full via `npx mdrip`. Findings: MemWAL is opt-in (requires an unenforced primary key + explicit shard config; omnigraph doesn't use it), operates intra-table (LSM-tree for streaming writes into one Lance table), and does NOT overlap with MR-847's cross-table manifest-vs-Lance-HEAD recovery problem. MR-847's design is unaffected.
+- The distributed-indexing guide names Python APIs (`commit_existing_index_segments`, `merge_existing_index_segments`); the Rust analogues exist via `CreateIndexBuilder::execute_uncommitted` for scalar indices but **`build_index_metadata_from_segments` is `pub(crate)`** and blocks vector-index two-phase commits from outside the lance crate. Filed [lance-format/lance#6666](https://github.com/lance-format/lance/issues/6666) as a companion to [#6658](https://github.com/lance-format/lance/issues/6658).
+- "Stable Row ID for Index" is documented as **experimental** in lance-4.0.x. Our datasets enable stable row IDs at the dataset level (`WriteParams::enable_stable_row_ids = true`); confirming whether our created indices opt into stable-row-id mode is a follow-up worth doing before MR-848 (index reconciler) lands.
+- Fragment Reuse Index (FRI) is documented as one of three compaction strategies. omnigraph currently uses option 2 (immediate index rewrite at compaction time, via `omnigraph optimize`'s post-compaction rebuild). Adopting FRI is the explicit option for compaction-friendly index updates; relevant to MR-848.
+
+Bump this date stanza on the next alignment pass.
