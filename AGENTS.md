@@ -198,7 +198,7 @@ omnigraph policy explain --actor act-alice --action change --branch main
 | Columnar storage on object store | ✅ Arrow/Lance | URI normalization, S3 env-var plumbing |
 | Per-dataset versioning + time travel | ✅ | `snapshot_at_version`, `entity_at`, snapshot-pinned reads across many tables |
 | Per-dataset branches | ✅ | **Graph-level** branches (atomic across all sub-tables), lazy fork, system branch filtering |
-| Atomic single-dataset commits | ✅ | **Atomic multi-dataset publish** via `__manifest` + `ManifestBatchPublisher` |
+| Atomic single-dataset commits | ✅ | **Atomic multi-dataset publish** via `__manifest` + `ManifestBatchPublisher`. Engine-internal write APIs sit behind a sealed `TableStorage` trait (MR-793) — `stage_*` + `commit_staged` are the only paths to advance Lance HEAD; inline-commit Lance APIs are not reachable through the trait surface |
 | Compaction (`compact_files`) | ✅ | `omnigraph optimize` orchestrates over all node/edge tables, bounded concurrency |
 | Cleanup (`cleanup_old_versions`) | ✅ | `omnigraph cleanup` with `--keep` / `--older-than` policy |
 | BTREE / inverted (FTS) / vector indexes | ✅ | `ensure_indices` builds them on every relevant column; idempotent; lazy across branches |

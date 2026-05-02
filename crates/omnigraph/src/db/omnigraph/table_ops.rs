@@ -286,15 +286,18 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
 ) -> Result<()> {
     if let Some(type_name) = table_key.strip_prefix("node:") {
         if !db.table_store.has_btree_index(ds, "id").await? {
-            db.table_store
-                .create_btree_index(ds, &["id"])
-                .await
-                .map_err(|e| {
-                    OmniError::Lance(format!("create BTree index on {}(id): {}", table_key, e))
-                })?;
+            stage_and_commit_btree(db, table_key, ds, &["id"]).await?;
         }
 
         if let Some(node_type) = catalog.node_types.get(type_name) {
+            // Per MR-793 §10 OQ3: stage scalar indices first (BTree,
+            // Inverted), then call `create_vector_index` inline. The
+            // inline-commit on a vector index advances HEAD, which would
+            // invalidate any uncommitted scalar index transactions if we
+            // stacked them. Today the per-stage shape commits each
+            // scalar index immediately so the order constraint is
+            // implicit, but if we ever batch scalar stages we must
+            // ensure they all land before the vector inline-commit.
             for index_cols in &node_type.indices {
                 if index_cols.len() != 1 {
                     continue;
@@ -303,18 +306,16 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
                 if let Some(prop_type) = node_type.properties.get(prop_name) {
                     if matches!(prop_type.scalar, ScalarType::String) && !prop_type.list {
                         if !db.table_store.has_fts_index(ds, prop_name).await? {
-                            db.table_store
-                                .create_inverted_index(ds, prop_name.as_str())
-                                .await
-                                .map_err(|e| {
-                                    OmniError::Lance(format!(
-                                        "create Inverted index on {}({}): {}",
-                                        table_key, prop_name, e
-                                    ))
-                                })?;
+                            stage_and_commit_inverted(db, table_key, ds, prop_name.as_str())
+                                .await?;
                         }
                     } else if matches!(prop_type.scalar, ScalarType::Vector(_)) && !prop_type.list {
                         if !db.table_store.has_vector_index(ds, prop_name).await? {
+                            // Inline-commit residual: lance-4.0.0 does not
+                            // expose `build_index_metadata_from_segments` as
+                            // `pub`, so vector indices cannot be staged from
+                            // outside the lance crate. Document at the call
+                            // site; companion ticket to lance-format/lance#6658.
                             db.table_store
                                 .create_vector_index(ds, prop_name.as_str())
                                 .await
@@ -334,28 +335,13 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
 
     if table_key.starts_with("edge:") {
         if !db.table_store.has_btree_index(ds, "id").await? {
-            db.table_store
-                .create_btree_index(ds, &["id"])
-                .await
-                .map_err(|e| {
-                    OmniError::Lance(format!("create BTree index on {}(id): {}", table_key, e))
-                })?;
+            stage_and_commit_btree(db, table_key, ds, &["id"]).await?;
         }
         if !db.table_store.has_btree_index(ds, "src").await? {
-            db.table_store
-                .create_btree_index(ds, &["src"])
-                .await
-                .map_err(|e| {
-                    OmniError::Lance(format!("create BTree index on {}(src): {}", table_key, e))
-                })?;
+            stage_and_commit_btree(db, table_key, ds, &["src"]).await?;
         }
         if !db.table_store.has_btree_index(ds, "dst").await? {
-            db.table_store
-                .create_btree_index(ds, &["dst"])
-                .await
-                .map_err(|e| {
-                    OmniError::Lance(format!("create BTree index on {}(dst): {}", table_key, e))
-                })?;
+            stage_and_commit_btree(db, table_key, ds, &["dst"]).await?;
         }
         return Ok(());
     }
@@ -364,6 +350,76 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
         "invalid table key '{}'",
         table_key
     )))
+}
+
+/// Stage a BTREE index transaction and commit it, advancing the in-memory
+/// `*ds` to the new HEAD. MR-793 Phase 4: replaces the previous
+/// inline-commit `create_btree_index(ds)` call with the staged primitive
+/// + an immediate `commit_staged`. Per-call behavior is unchanged
+/// (HEAD advances once per index), but the bytes-on-disk and HEAD-advance
+/// are now decoupled at the `TableStore` API surface — a caller that
+/// needs end-of-batch atomicity can stage many transactions and commit
+/// them in one pass (Phase 8's index reconciler relies on this).
+async fn stage_and_commit_btree(
+    db: &Omnigraph,
+    table_key: &str,
+    ds: &mut Dataset,
+    columns: &[&str],
+) -> Result<()> {
+    let staged = db
+        .table_store
+        .stage_create_btree_index(ds, columns)
+        .await
+        .map_err(|e| {
+            OmniError::Lance(format!(
+                "stage_create_btree_index on {}({:?}): {}",
+                table_key, columns, e
+            ))
+        })?;
+    let new_ds = db
+        .table_store
+        .commit_staged(Arc::new(ds.clone()), staged.transaction)
+        .await
+        .map_err(|e| {
+            OmniError::Lance(format!(
+                "commit BTree index on {}({:?}): {}",
+                table_key, columns, e
+            ))
+        })?;
+    *ds = new_ds;
+    Ok(())
+}
+
+/// Stage an INVERTED (FTS) index transaction and commit it. See
+/// `stage_and_commit_btree` for the MR-793 Phase 4 rationale.
+async fn stage_and_commit_inverted(
+    db: &Omnigraph,
+    table_key: &str,
+    ds: &mut Dataset,
+    column: &str,
+) -> Result<()> {
+    let staged = db
+        .table_store
+        .stage_create_inverted_index(ds, column)
+        .await
+        .map_err(|e| {
+            OmniError::Lance(format!(
+                "stage_create_inverted_index on {}({}): {}",
+                table_key, column, e
+            ))
+        })?;
+    let new_ds = db
+        .table_store
+        .commit_staged(Arc::new(ds.clone()), staged.transaction)
+        .await
+        .map_err(|e| {
+            OmniError::Lance(format!(
+                "commit Inverted index on {}({}): {}",
+                table_key, column, e
+            ))
+        })?;
+    *ds = new_ds;
+    Ok(())
 }
 
 async fn prepare_updates_for_commit(

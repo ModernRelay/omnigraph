@@ -200,6 +200,19 @@ impl Omnigraph {
         &self.table_store
     }
 
+    /// Engine-facing trait surface around `TableStore`.
+    ///
+    /// MR-793 Phase 1: this is the canonical accessor for newly-written
+    /// engine code. The trait's signatures use opaque `SnapshotHandle` /
+    /// `StagedHandle` instead of leaking `lance::Dataset` /
+    /// `lance::dataset::transaction::Transaction`. Existing call sites
+    /// that still use `db.table_store.X(...)` (the inherent struct
+    /// methods) are migrated incrementally — see §9 of
+    /// `.context/mr-793-design.md`.
+    pub(crate) fn storage(&self) -> &dyn crate::storage_layer::TableStorage {
+        &self.table_store
+    }
+
     pub(crate) async fn open_coordinator_for_branch(
         &self,
         branch: Option<&str>,

@@ -492,3 +492,269 @@ async fn chained_stage_merge_insert_with_shared_key_documents_duplicate_behavior
          surface in production paths — see exec/staging.rs."
     );
 }
+
+// ─── MR-793 Phase 2: stage_overwrite + scalar index staging ─────────────────
+
+/// `stage_overwrite` writes replacement fragments to object storage but
+/// does NOT advance Lance HEAD until `commit_staged` runs. Mirrors
+/// `stage_append`'s contract.
+#[tokio::test]
+async fn stage_overwrite_does_not_advance_head_until_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap());
+
+    let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    let pre_version = ds.version().version;
+
+    let staged = store
+        .stage_overwrite(&ds, person_batch(&[("zoe", Some(99))]))
+        .await
+        .unwrap();
+    assert_eq!(
+        ds.version().version,
+        pre_version,
+        "stage_overwrite must not advance HEAD"
+    );
+    // Reopen at HEAD; still pre-version (no commit happened on disk).
+    let reopened = Dataset::open(&uri).await.unwrap();
+    assert_eq!(reopened.version().version, pre_version);
+
+    // After commit_staged, HEAD advances and the dataset shows the
+    // overwrite result (zoe alone — alice replaced).
+    let new_ds = store
+        .commit_staged(Arc::new(ds.clone()), staged.transaction)
+        .await
+        .unwrap();
+    assert!(new_ds.version().version > pre_version);
+    let after = store.scan_batches(&new_ds).await.unwrap();
+    assert_eq!(collect_ids(&after), vec!["zoe"]);
+}
+
+/// `stage_overwrite` semantically REPLACES every committed fragment.
+/// `removed_fragment_ids` lists every committed fragment so
+/// `scan_with_staged` shows only the staged rows (not committed + staged).
+#[tokio::test]
+async fn stage_overwrite_replaces_all_fragments() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap());
+
+    let ds = TableStore::write_dataset(
+        &uri,
+        person_batch(&[("alice", Some(30)), ("bob", Some(25))]),
+    )
+    .await
+    .unwrap();
+    let committed_fragment_ids: std::collections::HashSet<u64> =
+        ds.manifest.fragments.iter().map(|f| f.id).collect();
+
+    let staged = store
+        .stage_overwrite(&ds, person_batch(&[("zoe", Some(99))]))
+        .await
+        .unwrap();
+    let removed: std::collections::HashSet<u64> =
+        staged.removed_fragment_ids.iter().copied().collect();
+    assert_eq!(
+        removed, committed_fragment_ids,
+        "stage_overwrite must list every committed fragment as removed so \
+         scan_with_staged shadows them all (overwrite semantics — pre-data \
+         is being wiped)"
+    );
+
+    let batches = store
+        .scan_with_staged(&ds, std::slice::from_ref(&staged), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        collect_ids(&batches),
+        vec!["zoe"],
+        "scan_with_staged must show only the staged row, not committed + staged"
+    );
+}
+
+/// `stage_create_btree_index` writes index segments to object storage
+/// but does NOT advance Lance HEAD until `commit_staged`. After commit,
+/// the index is queryable.
+#[tokio::test]
+async fn stage_create_btree_index_does_not_advance_head_until_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap());
+
+    let ds = TableStore::write_dataset(
+        &uri,
+        person_batch(&[("alice", Some(30)), ("bob", Some(25))]),
+    )
+    .await
+    .unwrap();
+    let pre_version = ds.version().version;
+    assert!(
+        !store.has_btree_index(&ds, "id").await.unwrap(),
+        "fresh dataset has no btree index on `id`"
+    );
+
+    let staged = store.stage_create_btree_index(&ds, &["id"]).await.unwrap();
+    assert_eq!(
+        ds.version().version,
+        pre_version,
+        "stage_create_btree_index must not advance HEAD"
+    );
+    let reopened = Dataset::open(&uri).await.unwrap();
+    assert_eq!(
+        reopened.version().version,
+        pre_version,
+        "no Lance commit happened on disk"
+    );
+    assert!(
+        !store.has_btree_index(&reopened, "id").await.unwrap(),
+        "index is not visible until commit_staged"
+    );
+
+    let new_ds = store
+        .commit_staged(Arc::new(ds.clone()), staged.transaction)
+        .await
+        .unwrap();
+    assert!(new_ds.version().version > pre_version);
+    assert!(
+        store.has_btree_index(&new_ds, "id").await.unwrap(),
+        "after commit_staged, the index IS visible"
+    );
+}
+
+/// `stage_create_inverted_index` (FTS) — same shape as the BTREE test.
+#[tokio::test]
+async fn stage_create_inverted_index_does_not_advance_head_until_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap());
+
+    let ds = TableStore::write_dataset(
+        &uri,
+        person_batch(&[("alice", Some(30)), ("bob", Some(25))]),
+    )
+    .await
+    .unwrap();
+    let pre_version = ds.version().version;
+
+    let staged = store
+        .stage_create_inverted_index(&ds, "id")
+        .await
+        .unwrap();
+    assert_eq!(
+        ds.version().version,
+        pre_version,
+        "stage_create_inverted_index must not advance HEAD"
+    );
+    assert!(!store.has_fts_index(&ds, "id").await.unwrap());
+
+    let new_ds = store
+        .commit_staged(Arc::new(ds.clone()), staged.transaction)
+        .await
+        .unwrap();
+    assert!(new_ds.version().version > pre_version);
+    assert!(
+        store.has_fts_index(&new_ds, "id").await.unwrap(),
+        "after commit_staged, the FTS index IS visible"
+    );
+}
+
+/// Pin the inline-commit behavior of `delete_where`. Lance 4.0.0 does
+/// NOT expose a public `DeleteJob::execute_uncommitted`
+/// (`pub(crate)` — see lance-format/lance#6658). MR-793 deliberately
+/// does NOT introduce a `stage_delete` wrapper that would secretly
+/// inline-commit (a side-channel — see design doc §3.2). Instead, the
+/// trait keeps `delete_where` as the only delete entry point, named
+/// honestly.
+///
+/// **When Lance #6658 lands**: this test will need to flip — replace
+/// the assertion with a `stage_delete` + `commit_staged` round-trip
+/// and remove the residual line in `docs/runs.md`.
+#[tokio::test]
+async fn delete_where_advances_head_inline_documents_residual() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap());
+
+    let mut ds = TableStore::write_dataset(
+        &uri,
+        person_batch(&[("alice", Some(30)), ("bob", Some(25))]),
+    )
+    .await
+    .unwrap();
+    let pre_version = ds.version().version;
+
+    let result = store
+        .delete_where(&uri, &mut ds, "id = 'alice'")
+        .await
+        .unwrap();
+    assert_eq!(result.deleted_rows, 1);
+    assert!(
+        result.version > pre_version,
+        "delete_where ADVANCES Lance HEAD inline (the residual). When \
+         lance-format/lance#6658 ships and we migrate to stage_delete + \
+         commit_staged, flip this assertion to assert that staging does \
+         NOT advance HEAD."
+    );
+}
+
+/// Companion to `delete_where_*`: pin the inline-commit behavior of
+/// `create_vector_index`. Lance 4.0.0 vector indices take the
+/// "segment commit path" which calls `build_index_metadata_from_segments`
+/// (`pub(crate)` in lance-4.0.0 `src/index.rs:111`). Until upstream
+/// exposes that helper (companion ticket to #6658), MR-793's trait
+/// surface deliberately does NOT include `stage_create_vector_index` —
+/// see design doc Appendix A.3.
+#[tokio::test]
+async fn create_vector_index_advances_head_inline_documents_residual() {
+    use arrow_array::FixedSizeListArray;
+    use arrow_schema::FieldRef;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/vec.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap());
+
+    // Build a small dataset with a fixed-size vector column. Vector index
+    // training requires multiple rows; provide enough.
+    let dim = 4usize;
+    let n_rows = 8usize;
+    let item_field: FieldRef = Arc::new(Field::new("item", DataType::Float32, true));
+    let vec_field = Field::new(
+        "embedding",
+        DataType::FixedSizeList(item_field.clone(), dim as i32),
+        false,
+    );
+    let id_field = Field::new("id", DataType::Utf8, false);
+    let schema = Arc::new(Schema::new(vec![id_field, vec_field]));
+
+    let ids: Vec<String> = (0..n_rows).map(|i| format!("v{}", i)).collect();
+    let id_arr = StringArray::from(ids);
+    let flat: Vec<f32> = (0..(n_rows * dim)).map(|i| i as f32).collect();
+    let values = arrow_array::Float32Array::from(flat);
+    let vec_arr =
+        FixedSizeListArray::new(item_field, dim as i32, Arc::new(values), None);
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(id_arr), Arc::new(vec_arr)],
+    )
+    .unwrap();
+
+    let mut ds = TableStore::write_dataset(&uri, batch).await.unwrap();
+    let pre_version = ds.version().version;
+    assert!(!store.has_vector_index(&ds, "embedding").await.unwrap());
+
+    store
+        .create_vector_index(&mut ds, "embedding")
+        .await
+        .unwrap();
+    assert!(
+        ds.version().version > pre_version,
+        "create_vector_index ADVANCES Lance HEAD inline (the residual). \
+         When the upstream Lance helper `build_index_metadata_from_segments` \
+         is made `pub`, add `stage_create_vector_index` to the trait and \
+         flip this test to assert staging does NOT advance HEAD."
+    );
+    assert!(store.has_vector_index(&ds, "embedding").await.unwrap());
+}

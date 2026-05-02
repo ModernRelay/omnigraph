@@ -4,7 +4,7 @@ use arrow_select::concat::concat_batches;
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream, Scanner};
-use lance::dataset::transaction::{Operation, Transaction};
+use lance::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use lance::dataset::{
     CommitBuilder, InsertBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode,
     WriteParams,
@@ -758,6 +758,172 @@ impl TableStore {
             .execute(transaction)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))
+    }
+
+    /// Stage an overwrite (write_fragments + Operation::Overwrite { schema, fragments }).
+    /// Returns a StagedWrite carrying the replacement fragments. HEAD does
+    /// NOT advance.
+    ///
+    /// Lance shape: `InsertBuilder::with_params(WriteParams { mode: Overwrite, .. })
+    /// .execute_uncommitted(vec![batch])` produces a `Transaction` whose
+    /// `Operation::Overwrite` carries the new schema + fragments. The
+    /// transaction is committed via `commit_staged` (same call as
+    /// `stage_append`).
+    ///
+    /// MR-793 Phase 2: introduces this for the schema_apply rewrite path.
+    /// Lance API verified in `.context/mr-793-design.md` Appendix A.1.
+    pub async fn stage_overwrite(
+        &self,
+        ds: &Dataset,
+        batch: RecordBatch,
+    ) -> Result<StagedWrite> {
+        if batch.num_rows() == 0 {
+            return Err(OmniError::manifest_internal(
+                "stage_overwrite called with empty batch".to_string(),
+            ));
+        }
+        let params = WriteParams {
+            mode: WriteMode::Overwrite,
+            allow_external_blob_outside_bases: true,
+            ..Default::default()
+        };
+        let transaction = InsertBuilder::new(Arc::new(ds.clone()))
+            .with_params(&params)
+            .execute_uncommitted(vec![batch])
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let mut new_fragments = match &transaction.operation {
+            Operation::Overwrite { fragments, .. } => fragments.clone(),
+            other => {
+                return Err(OmniError::manifest_internal(format!(
+                    "stage_overwrite: unexpected Lance operation {:?}",
+                    std::mem::discriminant(other)
+                )));
+            }
+        };
+        // Overwrite REPLACES every committed fragment, and Lance restarts
+        // fragment-ID and row-ID counters at the post-commit version.
+        // For our pre-commit staged view we need to:
+        //   1) Renumber temporary fragment IDs (Lance returns them as
+        //      `id = 0` from `execute_uncommitted` — see stage_append
+        //      for the same fix). For Overwrite there are no committed
+        //      fragments to collide with (they're all in
+        //      removed_fragment_ids below), so start at 1.
+        //   2) For stable-row-id datasets, assign row_id_meta starting
+        //      at 0 (Overwrite is a fresh-start) so `scan_with_staged`
+        //      doesn't hit the "Missing row id meta" panic in
+        //      lance-4.0.0 dataset/rowids.rs:22.
+        assign_fragment_ids(&mut new_fragments, 1);
+        if ds.manifest.uses_stable_row_ids() {
+            assign_row_id_meta(&mut new_fragments, 0)?;
+        }
+        // Overwrite REPLACES every committed fragment. For
+        // read-your-writes via scan_with_staged, list every committed
+        // fragment in removed_fragment_ids so the post-stage view shows
+        // ONLY the staged fragments.
+        let removed_fragment_ids: Vec<u64> =
+            ds.manifest.fragments.iter().map(|f| f.id).collect();
+        Ok(StagedWrite {
+            transaction,
+            new_fragments,
+            removed_fragment_ids,
+        })
+    }
+
+    /// Stage a BTREE scalar index build. Returns a StagedWrite whose
+    /// transaction commits via `commit_staged`. HEAD does NOT advance.
+    ///
+    /// Lance shape: `CreateIndexBuilder::execute_uncommitted` returns
+    /// `IndexMetadata`; we manually wrap it in `Operation::CreateIndex
+    /// { new_indices, removed_indices }` via the public `TransactionBuilder`,
+    /// replicating the simple (non-segment-commit-path) branch of Lance's
+    /// `CreateIndexBuilder::execute` (lance-4.0.0 `src/index/create.rs:502-512`).
+    ///
+    /// `removed_indices` mirrors `execute()` lines 466-476: when the
+    /// build replaces an existing same-named index, those entries are
+    /// listed for tombstoning by the manifest commit.
+    ///
+    /// MR-793 Phase 2: scalar index types (BTree, Inverted) are
+    /// stage-able. Vector indices are NOT (segment-commit-path requires
+    /// `build_index_metadata_from_segments` which is `pub(crate)` in
+    /// lance-4.0.0); see `create_vector_index` and Appendix A.3.
+    pub async fn stage_create_btree_index(
+        &self,
+        ds: &Dataset,
+        columns: &[&str],
+    ) -> Result<StagedWrite> {
+        let params = ScalarIndexParams::default();
+        let mut ds_clone = ds.clone();
+        let new_idx = ds_clone
+            .create_index_builder(columns, IndexType::BTree, &params)
+            .replace(true)
+            .execute_uncommitted()
+            .await
+            .map_err(|e| {
+                OmniError::Lance(format!("stage_create_btree_index: {}", e))
+            })?;
+        let removed_indices: Vec<IndexMetadata> = ds
+            .load_indices()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+            .iter()
+            .filter(|idx| idx.name == new_idx.name)
+            .cloned()
+            .collect();
+        let transaction = TransactionBuilder::new(
+            new_idx.dataset_version,
+            Operation::CreateIndex {
+                new_indices: vec![new_idx],
+                removed_indices,
+            },
+        )
+        .build();
+        Ok(StagedWrite {
+            transaction,
+            new_fragments: Vec::new(),
+            removed_fragment_ids: Vec::new(),
+        })
+    }
+
+    /// Stage an INVERTED (FTS) scalar index build. Same shape as
+    /// `stage_create_btree_index`; see its docs for the Lance API
+    /// citation and contract notes.
+    pub async fn stage_create_inverted_index(
+        &self,
+        ds: &Dataset,
+        column: &str,
+    ) -> Result<StagedWrite> {
+        let params = InvertedIndexParams::default();
+        let mut ds_clone = ds.clone();
+        let new_idx = ds_clone
+            .create_index_builder(&[column], IndexType::Inverted, &params)
+            .replace(true)
+            .execute_uncommitted()
+            .await
+            .map_err(|e| {
+                OmniError::Lance(format!("stage_create_inverted_index: {}", e))
+            })?;
+        let removed_indices: Vec<IndexMetadata> = ds
+            .load_indices()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+            .iter()
+            .filter(|idx| idx.name == new_idx.name)
+            .cloned()
+            .collect();
+        let transaction = TransactionBuilder::new(
+            new_idx.dataset_version,
+            Operation::CreateIndex {
+                new_indices: vec![new_idx],
+                removed_indices,
+            },
+        )
+        .build();
+        Ok(StagedWrite {
+            transaction,
+            new_fragments: Vec::new(),
+            removed_fragment_ids: Vec::new(),
+        })
     }
 
     /// Run a scan with optional uncommitted staged writes visible

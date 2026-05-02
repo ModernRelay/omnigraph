@@ -911,7 +911,14 @@ async fn publish_rewritten_merge_table(
     let mut current_ds = ds;
 
     // Phase 1: merge_insert changed/new rows (preserves _row_created_at_version for
-    // existing rows, bumps _row_last_updated_at_version only for actually-changed rows)
+    // existing rows, bumps _row_last_updated_at_version only for actually-changed rows).
+    //
+    // MR-793 Phase 5: routed through the staged primitive so a failure
+    // between writing fragments and committing leaves no Lance-HEAD
+    // drift. The commit_staged here is per-table per-call (Lance has no
+    // multi-dataset atomic commit); the residual sits at this single
+    // commit point, narrowed from the previous "merge_insert + delete +
+    // index" multi-step inline-commit chain.
     if let Some(delta) = &staged.delta_staged {
         let batches: Vec<RecordBatch> = target_db
             .table_store()
@@ -921,29 +928,40 @@ async fn publish_rewritten_merge_table(
             .filter(|batch| batch.num_rows() > 0)
             .collect();
         if !batches.is_empty() {
-            let state = target_db
+            // Concat into one batch — stage_merge_insert takes a single batch.
+            let combined = if batches.len() == 1 {
+                batches.into_iter().next().unwrap()
+            } else {
+                let schema = batches[0].schema();
+                arrow_select::concat::concat_batches(&schema, &batches)
+                    .map_err(|e| OmniError::Lance(e.to_string()))?
+            };
+            let staged_merge = target_db
                 .table_store()
-                .merge_insert_batches(
-                    &full_path,
-                    current_ds,
-                    batches,
+                .stage_merge_insert(
+                    current_ds.clone(),
+                    combined,
                     vec!["id".to_string()],
                     lance::dataset::WhenMatched::UpdateAll,
                     lance::dataset::WhenNotMatched::InsertAll,
                 )
                 .await?;
             current_ds = target_db
-                .reopen_for_mutation(
-                    table_key,
-                    &full_path,
-                    table_branch.as_deref(),
-                    state.version,
-                )
+                .table_store()
+                .commit_staged(Arc::new(current_ds), staged_merge.transaction)
                 .await?;
         }
     }
 
-    // Phase 2: delete removed rows via deletion vectors
+    // Phase 2: delete removed rows via deletion vectors.
+    //
+    // INLINE-COMMIT RESIDUAL: lance-4.0.0 does not expose a public
+    // two-phase delete API (DeleteJob is `pub(crate)` —
+    // lance-format/lance#6658 is open with no PRs). MR-793 deliberately
+    // does NOT introduce a `stage_delete` wrapper that would secretly
+    // inline-commit (a side-channel — see design doc §3.2). When the
+    // upstream API ships, swap this `delete_where` call for
+    // `stage_delete` + `commit_staged`.
     if !staged.deleted_ids.is_empty() {
         let escaped: Vec<String> = staged
             .deleted_ids
@@ -957,7 +975,13 @@ async fn publish_rewritten_merge_table(
             .await?;
     }
 
-    // Phase 3: rebuild indices
+    // Phase 3: rebuild indices.
+    //
+    // `build_indices_on_dataset` was migrated in MR-793 Phase 4 to use
+    // `stage_create_btree_index` / `stage_create_inverted_index` +
+    // `commit_staged` for scalar indices. Vector indices remain inline
+    // (residual — `build_index_metadata_from_segments` is `pub(crate)`
+    // in lance-4.0.0; companion ticket to lance-format/lance#6658).
     let row_count = target_db
         .table_store()
         .table_state(&full_path, &current_ds)

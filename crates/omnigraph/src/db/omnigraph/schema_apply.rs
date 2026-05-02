@@ -237,7 +237,26 @@ pub(super) async fn apply_schema_with_lock(
         )
         .await?;
         let dataset_uri = db.table_store.dataset_uri(&entry.table_path);
-        let mut target_ds = TableStore::overwrite_dataset(&dataset_uri, batch).await?;
+        // MR-793 Phase 6: route through stage_overwrite + commit_staged
+        // for non-empty batches. Lance's `InsertBuilder::execute_uncommitted`
+        // errors on empty data (lance-4.0.0 `src/dataset/write/insert.rs:144`),
+        // so the empty-rewrite case stays on `overwrite_dataset` (which
+        // accepts empty input). The empty case is rare in schema_apply
+        // — it only fires when the source table itself was already empty
+        // — and schema_apply runs under `__schema_apply_lock__` so the
+        // narrow inline-commit residual is bounded.
+        let mut target_ds = if batch.num_rows() == 0 {
+            TableStore::overwrite_dataset(&dataset_uri, batch).await?
+        } else {
+            let existing = db
+                .table_store
+                .open_dataset_head_for_write(table_key, &dataset_uri, None)
+                .await?;
+            let staged = db.table_store.stage_overwrite(&existing, batch).await?;
+            db.table_store
+                .commit_staged(Arc::new(existing), staged.transaction)
+                .await?
+        };
         db.build_indices_on_dataset_for_catalog(&desired_catalog, table_key, &mut target_ds)
             .await?;
         let state = db.table_store.table_state(&dataset_uri, &target_ds).await?;

@@ -63,6 +63,44 @@ edges break referential integrity). Until Lance exposes a two-phase
 delete API, the parse-time rejection keeps both paths atomic and
 correct. Tracked: MR-793, plus a Lance-upstream ticket.
 
+### MR-793 status (storage trait two-phase invariant) — partial
+
+MR-793 hoists the staged-write pattern into a `TableStorage` trait
+surface with sealed-trait enforcement and opaque `SnapshotHandle` /
+`StagedHandle` types — see `crates/omnigraph/src/storage_layer.rs`.
+The trait is the canonical surface for new engine code; existing call
+sites still use the inherent `TableStore` methods (mechanical migration
+deferred to a follow-up cycle — tracked).
+
+Three writers have been migrated onto staged primitives:
+
+* **`ensure_indices`** (`db/omnigraph/table_ops.rs::build_indices_on_dataset_for_catalog`)
+  — scalar indices (BTree, Inverted) now use `stage_create_*_index` +
+  `commit_staged`. Vector indices stay inline (residual — Lance
+  `build_index_metadata_from_segments` is `pub(crate)` in 4.0.0;
+  companion ticket to lance-format/lance#6658 needed).
+* **`branch_merge::publish_rewritten_merge_table`**
+  (`exec/merge.rs`) — merge_insert now uses `stage_merge_insert` +
+  `commit_staged`. Deletes stay inline (Lance #6658 residual).
+* **`schema_apply` rewritten_tables** (`db/omnigraph/schema_apply.rs`)
+  — non-empty rewrites use `stage_overwrite` + `commit_staged`.
+  Empty-batch rewrites stay inline (Lance `InsertBuilder::execute_uncommitted`
+  rejects empty data; the empty case is rare and bounded by the
+  schema-apply lock branch).
+
+A defense-in-depth integration test (`tests/forbidden_apis.rs`) walks
+engine source and fails if non-allow-listed code calls Lance's
+inline-commit APIs directly. The trait surface itself is the primary
+enforcement (sealed + only-callable-via-trait once call sites land);
+the grep test catches type-system bypass attempts.
+
+The "finalize → publisher residual" described below applies equally to
+the migrated writers — Lance has no multi-dataset atomic commit
+primitive, so the per-table commit_staged → manifest publish gap is
+the same drift class. Closing it requires either upstream Lance
+multi-dataset commit OR the omnigraph-side recovery-on-open reconciler
+described in `.context/mr-793-design.md` §15 (deferred to MR-795).
+
 ### `LoadMode::Overwrite` residual
 
 The bulk loader's Append and Merge modes use the staged-write path
