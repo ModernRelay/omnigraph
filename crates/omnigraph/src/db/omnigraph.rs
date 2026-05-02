@@ -1276,6 +1276,10 @@ edge WorksAt: Person -> Company
             self.deletes.lock().unwrap().push(uri.to_string());
             self.inner.delete(uri).await
         }
+
+        async fn list_dir(&self, dir_uri: &str) -> Result<Vec<String>> {
+            self.inner.list_dir(dir_uri).await
+        }
     }
 
     #[tokio::test]

@@ -27,6 +27,10 @@ pub trait StorageAdapter: Debug + Send + Sync {
     async fn rename_text(&self, from_uri: &str, to_uri: &str) -> Result<()>;
     /// Remove a file. Returns Ok(()) if the file does not exist.
     async fn delete(&self, uri: &str) -> Result<()>;
+    /// List all files (non-recursively, files only) directly under `dir_uri`.
+    /// Returns full URIs (same scheme as `dir_uri`). The result is unordered.
+    /// Returns Ok(empty) if the directory does not exist or is empty.
+    async fn list_dir(&self, dir_uri: &str) -> Result<Vec<String>>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +85,27 @@ impl StorageAdapter for LocalStorageAdapter {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err.into()),
         }
+    }
+
+    async fn list_dir(&self, dir_uri: &str) -> Result<Vec<String>> {
+        let path = local_path_from_uri(dir_uri)?;
+        let mut out = Vec::new();
+        let mut entries = match tokio::fs::read_dir(&path).await {
+            Ok(e) => e,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(err) => return Err(err.into()),
+        };
+        let dir_str = dir_uri.trim_end_matches('/');
+        while let Some(entry) = entries.next_entry().await? {
+            let ft = entry.file_type().await?;
+            if !ft.is_file() {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                out.push(format!("{}/{}", dir_str, name));
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -153,6 +178,43 @@ impl StorageAdapter for S3StorageAdapter {
             Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(err) => Err(storage_backend_error("delete", uri, err)),
         }
+    }
+
+    async fn list_dir(&self, dir_uri: &str) -> Result<Vec<String>> {
+        // Normalize: ensure the URI describes a directory (trailing '/') so
+        // we don't match sibling paths with a shared prefix
+        // (e.g. listing `__recovery` shouldn't match `__recovery_log/...`).
+        let dir_with_slash = if dir_uri.ends_with('/') {
+            dir_uri.to_string()
+        } else {
+            format!("{}/", dir_uri)
+        };
+        // object_store::Path strips the trailing '/'; re-add it for filtering.
+        let prefix_loc = self.object_path(&dir_with_slash)?;
+        let prefix_with_slash = format!("{}/", prefix_loc.as_ref());
+
+        let mut entries = self.store.list(Some(&prefix_loc));
+        let mut out = Vec::new();
+        let bucket_root = format!("{}{}/", S3_SCHEME_PREFIX, self.bucket);
+        while let Some(meta) = entries
+            .try_next()
+            .await
+            .map_err(|err| storage_backend_error("list_dir", dir_uri, err))?
+        {
+            let key_str = meta.location.as_ref();
+            // Require the directory boundary to filter out sibling-prefix
+            // matches (object_store's `list` is prefix-based, not dir-based).
+            if !key_str.starts_with(&prefix_with_slash) {
+                continue;
+            }
+            let suffix = &key_str[prefix_with_slash.len()..];
+            // Non-recursive: skip anything inside a sub-directory.
+            if suffix.contains('/') {
+                continue;
+            }
+            out.push(format!("{}{}", bucket_root, key_str));
+        }
+        Ok(out)
     }
 }
 

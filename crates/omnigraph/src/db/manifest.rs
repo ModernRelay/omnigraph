@@ -16,6 +16,8 @@ mod migrations;
 mod namespace;
 #[path = "manifest/publisher.rs"]
 mod publisher;
+#[path = "manifest/recovery.rs"]
+mod recovery;
 #[path = "manifest/repo.rs"]
 mod repo;
 #[path = "manifest/state.rs"]
