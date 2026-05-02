@@ -99,6 +99,7 @@ const ALLOW_LIST_FILES: &[&str] = &[
     "storage_layer.rs",      // The trait module.
     "commit_graph.rs",       // Maintains `_graph_commits.lance` system table.
     "graph_coordinator.rs",  // Drives the manifest publisher / branch coordinator.
+    "recovery_audit.rs",     // Maintains `_graph_commit_recoveries.lance` (MR-847 audit trail).
 ];
 
 /// Directories exempt from the guard. Files under these paths may use

@@ -1167,6 +1167,47 @@ impl Omnigraph {
 
         validate_merge_candidates(self, source_snapshot, &target_snapshot, &candidates).await?;
 
+        // MR-847 sidecar: protect the per-table commit_staged loop. Pins
+        // every table that will be touched by `publish_adopted_source_state`
+        // or `publish_rewritten_merge_table`. BranchMerge uses loose
+        // classification — the publish path may run multiple commit_staged
+        // calls per table (publish_rewritten_merge_table does
+        // stage_merge_insert + delete_where + index rebuilds per the
+        // existing branch-merge code path).
+        let recovery_pins: Vec<crate::db::manifest::SidecarTablePin> = ordered_table_keys
+            .iter()
+            .filter(|tk| candidates.contains_key(*tk))
+            .filter_map(|table_key| {
+                let entry = target_snapshot.entry(table_key)?;
+                Some(crate::db::manifest::SidecarTablePin {
+                    table_key: table_key.clone(),
+                    table_path: self.table_store().dataset_uri(&entry.table_path),
+                    expected_version: entry.table_version,
+                    post_commit_pin: entry.table_version + 1,
+                })
+            })
+            .collect();
+        let recovery_handle = if recovery_pins.is_empty() {
+            None
+        } else {
+            let sidecar = crate::db::manifest::new_sidecar(
+                crate::db::manifest::SidecarKind::BranchMerge,
+                target_snapshot
+                    .entry(ordered_table_keys.first().map(String::as_str).unwrap_or(""))
+                    .and_then(|e| e.table_branch.clone()),
+                self.audit_actor_id.clone(),
+                recovery_pins,
+            );
+            Some(
+                crate::db::manifest::write_sidecar(
+                    self.root_uri(),
+                    self.storage_adapter(),
+                    &sidecar,
+                )
+                .await?,
+            )
+        };
+
         let mut updates = Vec::new();
         let mut changed_edge_tables = false;
         for table_key in &ordered_table_keys {
@@ -1200,6 +1241,11 @@ impl Omnigraph {
         } else {
             self.commit_manifest_updates(&updates).await?
         };
+
+        // MR-847 sidecar lifecycle: delete after manifest publish.
+        if let Some(handle) = recovery_handle {
+            crate::db::manifest::delete_sidecar(&handle, self.storage_adapter()).await?;
+        }
         self.record_merge_commit(
             manifest_version,
             target_head_commit_id,

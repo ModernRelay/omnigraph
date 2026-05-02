@@ -151,6 +151,43 @@ pub(super) async fn apply_schema_with_lock(
     let mut table_updates = HashMap::<String, crate::db::SubTableUpdate>::new();
     let mut table_tombstones = HashMap::<String, u64>::new();
 
+    // MR-847 sidecar: protect the per-table commit_staged loop in
+    // rewritten_tables + indexed_tables. The post_commit_pin we record
+    // here is a lower bound (expected + 1); the classifier loose-matches
+    // for SidecarKind::SchemaApply because the actual N depends on how
+    // many indices need building. See classify_table's loose-match arm.
+    let recovery_pins: Vec<crate::db::manifest::SidecarTablePin> = rewritten_tables
+        .iter()
+        .chain(indexed_tables.iter().filter(|t| {
+            !rewritten_tables.contains(*t)
+                && !added_tables.contains(*t)
+                && !renamed_tables.contains_key(*t)
+        }))
+        .filter_map(|table_key| {
+            let entry = snapshot.entry(table_key)?;
+            Some(crate::db::manifest::SidecarTablePin {
+                table_key: table_key.clone(),
+                table_path: db.table_store.dataset_uri(&entry.table_path),
+                expected_version: entry.table_version,
+                post_commit_pin: entry.table_version + 1,
+            })
+        })
+        .collect();
+    let recovery_handle = if recovery_pins.is_empty() {
+        None
+    } else {
+        let sidecar = crate::db::manifest::new_sidecar(
+            crate::db::manifest::SidecarKind::SchemaApply,
+            Some("__schema_apply_lock__".to_string()),
+            db.audit_actor_id.clone(),
+            recovery_pins,
+        );
+        Some(
+            crate::db::manifest::write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar)
+                .await?,
+        )
+    };
+
     for table_key in &added_tables {
         let table_path = table_path_for_table_key(table_key)?;
         let dataset_uri = db.table_store.dataset_uri(&table_path);
@@ -394,6 +431,15 @@ pub(super) async fn apply_schema_with_lock(
     db.runtime_cache.invalidate_all().await;
     if changed_edge_tables {
         db.invalidate_graph_index().await;
+    }
+
+    // MR-847 sidecar lifecycle: delete after the manifest commit succeeded.
+    // If this delete fails, the sidecar persists; on next open the sweep
+    // sees every table at the post-publish manifest pin (NoMovement) and
+    // the sidecar is treated as a stale artifact (recovery is a no-op
+    // and the sidecar is cleaned up).
+    if let Some(handle) = recovery_handle {
+        crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await?;
     }
 
     Ok(SchemaApplyResult {

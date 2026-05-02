@@ -42,6 +42,51 @@ pub(super) async fn ensure_indices_for_branch(
     let mut updates = Vec::new();
     let active_branch = resolved.branch;
 
+    // MR-847 sidecar: protect the per-table commit_staged loop in
+    // build_indices_on_dataset (one commit per index built). Pins every
+    // node + edge table that's eligible for index work; the classifier
+    // loose-matches for SidecarKind::EnsureIndices (the actual N depends
+    // on which indices are missing). Skip sidecar entirely when the
+    // catalog has no tables that could need indexing — steady-state
+    // calls then incur no sidecar I/O.
+    let mut recovery_pins: Vec<crate::db::manifest::SidecarTablePin> = Vec::new();
+    for type_name in db.catalog.node_types.keys() {
+        let table_key = format!("node:{}", type_name);
+        if let Some(entry) = snapshot.entry(&table_key) {
+            recovery_pins.push(crate::db::manifest::SidecarTablePin {
+                table_key,
+                table_path: format!("{}/{}", db.root_uri, entry.table_path),
+                expected_version: entry.table_version,
+                post_commit_pin: entry.table_version + 1,
+            });
+        }
+    }
+    for edge_name in db.catalog.edge_types.keys() {
+        let table_key = format!("edge:{}", edge_name);
+        if let Some(entry) = snapshot.entry(&table_key) {
+            recovery_pins.push(crate::db::manifest::SidecarTablePin {
+                table_key,
+                table_path: format!("{}/{}", db.root_uri, entry.table_path),
+                expected_version: entry.table_version,
+                post_commit_pin: entry.table_version + 1,
+            });
+        }
+    }
+    let recovery_handle = if recovery_pins.is_empty() {
+        None
+    } else {
+        let sidecar = crate::db::manifest::new_sidecar(
+            crate::db::manifest::SidecarKind::EnsureIndices,
+            active_branch.clone(),
+            db.audit_actor_id.clone(),
+            recovery_pins,
+        );
+        Some(
+            crate::db::manifest::write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar)
+                .await?,
+        )
+    };
+
     for type_name in db.catalog.node_types.keys() {
         let table_key = format!("node:{}", type_name);
         let Some(entry) = snapshot.entry(&table_key) else {
@@ -138,6 +183,13 @@ pub(super) async fn ensure_indices_for_branch(
 
     if !updates.is_empty() {
         commit_prepared_updates_on_branch(db, branch, &updates).await?;
+    }
+
+    // MR-847 sidecar lifecycle: delete after the manifest publish (or no-op
+    // when there were no updates — sidecar covered the per-table commit
+    // window regardless).
+    if let Some(handle) = recovery_handle {
+        crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await?;
     }
 
     Ok(())

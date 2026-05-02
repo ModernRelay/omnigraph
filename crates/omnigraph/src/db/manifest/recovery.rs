@@ -313,10 +313,26 @@ pub(crate) fn parse_sidecar(sidecar_uri: &str, body: &str) -> Result<RecoverySid
 }
 
 /// Classify one table's observed state vs. the sidecar's intent.
+///
+/// `kind` adjusts the precision of the `RolledPastExpected` predicate:
+/// - **Strict** (`Mutation`, `Load`, `BranchMerge`): exactly one
+///   `commit_staged` per table, so `lance_head == manifest_pinned + 1`
+///   AND `post_commit_pin == lance_head` is required.
+/// - **Loose** (`SchemaApply`, `EnsureIndices`): the writer may run
+///   N ≥ 1 `commit_staged` calls per table (one per index built + one
+///   for the overwrite, etc.) and the exact N is hard to compute at
+///   sidecar-write time. The loose match accepts any
+///   `lance_head > manifest_pinned` as `RolledPastExpected` when
+///   `pin.expected_version == manifest_pinned` (the writer's CAS
+///   target matches what the manifest currently shows). The risk this
+///   admits — an external agent advancing HEAD between sidecar write
+///   and recovery — is out of scope for the single-coordinator model
+///   (MR-668 territory).
 pub(crate) fn classify_table(
     pin: &SidecarTablePin,
     lance_head: u64,
     manifest_pinned: u64,
+    kind: SidecarKind,
 ) -> TableClassification {
     use TableClassification::*;
     if lance_head < manifest_pinned {
@@ -328,15 +344,30 @@ pub(crate) fn classify_table(
         return NoMovement;
     }
     // lance_head > manifest_pinned
-    if lance_head == manifest_pinned + 1 {
-        if pin.expected_version == manifest_pinned && pin.post_commit_pin == lance_head {
-            RolledPastExpected
+    let strict = matches!(
+        kind,
+        SidecarKind::Mutation | SidecarKind::Load | SidecarKind::BranchMerge,
+    );
+    if strict {
+        if lance_head == manifest_pinned + 1 {
+            if pin.expected_version == manifest_pinned && pin.post_commit_pin == lance_head {
+                RolledPastExpected
+            } else {
+                UnexpectedAtP1
+            }
         } else {
-            UnexpectedAtP1
+            // lance_head > manifest_pinned + 1
+            UnexpectedMultistep
         }
     } else {
-        // lance_head > manifest_pinned + 1
-        UnexpectedMultistep
+        // Loose match for multi-commit writers (SchemaApply, EnsureIndices).
+        if pin.expected_version == manifest_pinned {
+            RolledPastExpected
+        } else if lance_head == manifest_pinned + 1 {
+            UnexpectedAtP1
+        } else {
+            UnexpectedMultistep
+        }
     }
 }
 
@@ -455,7 +486,12 @@ async fn process_sidecar(
             .entry(&pin.table_key)
             .map(|e| e.table_version)
             .unwrap_or(0);
-        classifications.push(classify_table(pin, lance_head, manifest_pinned));
+        classifications.push(classify_table(
+            pin,
+            lance_head,
+            manifest_pinned,
+            sidecar.writer_kind,
+        ));
     }
 
     match decide(&classifications) {
@@ -564,17 +600,18 @@ async fn roll_forward_all(root_uri: &str, sidecar: &RecoverySidecar) -> Result<u
     let mut expected: HashMap<String, u64> = HashMap::with_capacity(sidecar.tables.len());
 
     for pin in &sidecar.tables {
-        // Read the post-commit dataset at `post_commit_pin` to capture the
-        // row count + version metadata that the manifest row needs. Cheap:
-        // these are manifest-level values, not a row scan.
-        let post_ds = Dataset::open(&pin.table_path)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?
-            .checkout_version(pin.post_commit_pin)
+        // Open the dataset at its CURRENT Lance HEAD (not at the sidecar's
+        // post_commit_pin). For strict-match writers (Mutation/Load/
+        // BranchMerge) HEAD == post_commit_pin by construction. For
+        // loose-match writers (SchemaApply/EnsureIndices) HEAD may be
+        // higher than post_commit_pin (multiple commit_staged calls per
+        // table); we want to publish to the actual current HEAD.
+        let head_ds = Dataset::open(&pin.table_path)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let head_version = head_ds.version().version;
 
-        let row_count = post_ds
+        let row_count = head_ds
             .count_rows(None)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
@@ -584,12 +621,12 @@ async fn roll_forward_all(root_uri: &str, sidecar: &RecoverySidecar) -> Result<u
             super::metadata::TableVersionMetadata::from_dataset(
                 root_uri,
                 &table_relative_path,
-                &post_ds,
+                &head_ds,
             )?;
 
         updates.push(ManifestChange::Update(SubTableUpdate {
             table_key: pin.table_key.clone(),
-            table_version: pin.post_commit_pin,
+            table_version: head_version,
             table_branch: sidecar.branch.clone(),
             row_count,
             version_metadata,
@@ -763,33 +800,36 @@ mod tests {
     #[test]
     fn classify_no_movement_when_head_equals_pinned() {
         let pin = make_pin("node:Person", "irrelevant", 5, 6);
-        assert_eq!(classify_table(&pin, 5, 5), TableClassification::NoMovement);
+        assert_eq!(
+            classify_table(&pin, 5, 5, SidecarKind::Mutation),
+            TableClassification::NoMovement,
+        );
     }
 
     #[test]
-    fn classify_rolled_past_expected_when_sidecar_matches() {
+    fn classify_rolled_past_expected_when_sidecar_matches_strict() {
         let pin = make_pin("node:Person", "irrelevant", 5, 6);
         assert_eq!(
-            classify_table(&pin, 6, 5),
+            classify_table(&pin, 6, 5, SidecarKind::Mutation),
             TableClassification::RolledPastExpected,
         );
     }
 
     #[test]
-    fn classify_unexpected_at_p1_when_sidecar_does_not_match() {
+    fn classify_unexpected_at_p1_when_sidecar_does_not_match_strict() {
         // Same +1 drift but post_commit_pin says it should be 7, not 6.
         let pin = make_pin("node:Person", "irrelevant", 5, 7);
         assert_eq!(
-            classify_table(&pin, 6, 5),
+            classify_table(&pin, 6, 5, SidecarKind::Mutation),
             TableClassification::UnexpectedAtP1,
         );
     }
 
     #[test]
-    fn classify_unexpected_multistep_when_head_jumped_more_than_one() {
+    fn classify_unexpected_multistep_when_head_jumped_more_than_one_strict() {
         let pin = make_pin("node:Person", "irrelevant", 5, 6);
         assert_eq!(
-            classify_table(&pin, 8, 5),
+            classify_table(&pin, 8, 5, SidecarKind::Mutation),
             TableClassification::UnexpectedMultistep,
         );
     }
@@ -798,7 +838,50 @@ mod tests {
     fn classify_invariant_violation_when_head_below_pinned() {
         let pin = make_pin("node:Person", "irrelevant", 5, 6);
         assert_eq!(
-            classify_table(&pin, 3, 5),
+            classify_table(&pin, 3, 5, SidecarKind::Mutation),
+            TableClassification::InvariantViolation { observed: 3 },
+        );
+    }
+
+    // Loose-match writers (SchemaApply, EnsureIndices) accept any
+    // lance_head > expected_version as RolledPastExpected when the
+    // expected version still matches the manifest pin. The exact
+    // post_commit_pin is allowed to be a lower bound.
+    #[test]
+    fn classify_loose_match_accepts_multi_commit_drift_for_schema_apply() {
+        let pin = make_pin("node:Person", "irrelevant", 5, 6);
+        // Sidecar's post_commit_pin says 6, but Lance HEAD is 8 (SchemaApply
+        // built two indices). Strict would say UnexpectedMultistep; loose
+        // accepts it as RolledPastExpected.
+        assert_eq!(
+            classify_table(&pin, 8, 5, SidecarKind::SchemaApply),
+            TableClassification::RolledPastExpected,
+        );
+    }
+
+    #[test]
+    fn classify_loose_match_accepts_multi_commit_drift_for_ensure_indices() {
+        let pin = make_pin("node:Person", "irrelevant", 5, 6);
+        assert_eq!(
+            classify_table(&pin, 9, 5, SidecarKind::EnsureIndices),
+            TableClassification::RolledPastExpected,
+        );
+    }
+
+    #[test]
+    fn classify_loose_match_no_movement_unchanged() {
+        let pin = make_pin("node:Person", "irrelevant", 5, 6);
+        assert_eq!(
+            classify_table(&pin, 5, 5, SidecarKind::SchemaApply),
+            TableClassification::NoMovement,
+        );
+    }
+
+    #[test]
+    fn classify_loose_match_invariant_violation_unchanged() {
+        let pin = make_pin("node:Person", "irrelevant", 5, 6);
+        assert_eq!(
+            classify_table(&pin, 3, 5, SidecarKind::SchemaApply),
             TableClassification::InvariantViolation { observed: 3 },
         );
     }
