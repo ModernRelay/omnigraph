@@ -2,6 +2,7 @@ pub mod commit_graph;
 pub mod graph_coordinator;
 pub mod manifest;
 mod omnigraph;
+mod recovery_audit;
 mod run_registry;
 mod schema_state;
 

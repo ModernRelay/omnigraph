@@ -40,14 +40,28 @@
 //!
 //! See `.context/mr-847-design.md` for the full design.
 
+use std::collections::HashMap;
+
 use lance::Dataset;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::db::commit_graph::CommitGraph;
+use crate::db::recovery_audit::{
+    now_micros, RecoveryAudit, RecoveryAuditRecord, RecoveryKind, TableOutcome,
+};
 use crate::error::{OmniError, Result};
 use crate::storage::StorageAdapter;
 
 use super::Snapshot;
+use super::publisher::{GraphNamespacePublisher, ManifestBatchPublisher};
+use super::{ManifestChange, SubTableUpdate};
+
+/// System actor identifier recorded on every recovery commit. Operators
+/// distinguish recovery commits from user commits in `omnigraph commit list`
+/// by filtering on this actor; the original sidecar's actor (if any) flows
+/// into the audit row's `recovery_for_actor` field.
+pub(crate) const RECOVERY_ACTOR: &str = "omnigraph:recovery";
 
 /// Subdirectory under the repo root holding sidecar files.
 pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
@@ -450,13 +464,13 @@ async fn process_sidecar(
             // investigate. This includes any classification of
             // InvariantViolation (Lance HEAD < manifest pinned: should be
             // impossible).
-            return Err(OmniError::manifest_internal(format!(
+            Err(OmniError::manifest_internal(format!(
                 "recovery sidecar '{}' has invariant violation; refusing to act \
                  — operator review required (sidecar at '{}', classifications: {:?})",
                 sidecar.operation_id,
                 sidecar_uri(root_uri, &sidecar.operation_id),
                 classifications,
-            )));
+            )))
         }
         SidecarDecision::RollBack => {
             warn!(
@@ -470,6 +484,7 @@ async fn process_sidecar(
             // expected_version — no action. The fragment-set short-circuit
             // in restore_table_to_version makes drift-with-equivalent-content
             // a no-op (sound: equal fragment-ids ⇒ equal content).
+            let mut outcomes = Vec::with_capacity(sidecar.tables.len());
             for (pin, cls) in sidecar.tables.iter().zip(classifications.iter()) {
                 if matches!(
                     cls,
@@ -478,26 +493,154 @@ async fn process_sidecar(
                         | TableClassification::UnexpectedMultistep
                 ) {
                     restore_table_to_version(&pin.table_path, pin.expected_version).await?;
+                    outcomes.push(TableOutcome {
+                        table_key: pin.table_key.clone(),
+                        from_version: snapshot
+                            .entry(&pin.table_key)
+                            .map(|e| e.table_version)
+                            .unwrap_or(0),
+                        to_version: pin.expected_version,
+                    });
                 }
             }
-            // Audit row write deferred to Phase 4 (recovery audit model).
-            // For now: delete sidecar as the final step.
+            // Manifest pin doesn't move on rollback; record an audit-only
+            // commit at the existing version so operators can correlate via
+            // `omnigraph commit list --filter actor=omnigraph:recovery`.
+            record_audit(
+                root_uri,
+                sidecar,
+                snapshot.version(),
+                RecoveryKind::RolledBack,
+                outcomes,
+            )
+            .await?;
             delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
             Ok(())
         }
         SidecarDecision::RollForward => {
-            // Phase 4 implements the audit row + ManifestBatchPublisher
-            // pin extension. Until then, surface loudly so we don't
-            // silently leave drift.
-            Err(OmniError::manifest_internal(format!(
-                "recovery sidecar '{}' is roll-forward eligible but the \
-                 roll-forward path is not yet implemented (MR-847 Phase 4); \
-                 sidecar left in place at '{}'",
-                sidecar.operation_id,
-                sidecar_uri(root_uri, &sidecar.operation_id),
-            )))
+            warn!(
+                operation_id = sidecar.operation_id.as_str(),
+                writer_kind = ?sidecar.writer_kind,
+                "recovery: rolling forward sidecar (Phase B completed; \
+                 Phase C did not land)"
+            );
+            let new_manifest_version = roll_forward_all(root_uri, sidecar).await?;
+            let outcomes: Vec<TableOutcome> = sidecar
+                .tables
+                .iter()
+                .map(|pin| TableOutcome {
+                    table_key: pin.table_key.clone(),
+                    from_version: pin.expected_version,
+                    to_version: pin.post_commit_pin,
+                })
+                .collect();
+            record_audit(
+                root_uri,
+                sidecar,
+                new_manifest_version,
+                RecoveryKind::RolledForward,
+                outcomes,
+            )
+            .await?;
+            delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+            Ok(())
         }
     }
+}
+
+/// Atomically extend every table's manifest pin from `expected_version` to
+/// `post_commit_pin` via a single `ManifestBatchPublisher::publish` call.
+/// Returns the new manifest version produced by the publish.
+///
+/// All-or-nothing at the substrate: the publish writes one `__manifest`
+/// row-level CAS that either advances every listed pin together or fails
+/// with `ExpectedVersionMismatch` (no partial publish). The publisher's
+/// internal `PUBLISHER_RETRY_BUDGET = 5` handles transient row-level CAS
+/// contention; persistent contention surfaces the typed conflict error to
+/// the recovery sweep, which leaves the sidecar in place for the next
+/// open's retry.
+async fn roll_forward_all(root_uri: &str, sidecar: &RecoverySidecar) -> Result<u64> {
+    let mut updates: Vec<ManifestChange> = Vec::with_capacity(sidecar.tables.len());
+    let mut expected: HashMap<String, u64> = HashMap::with_capacity(sidecar.tables.len());
+
+    for pin in &sidecar.tables {
+        // Read the post-commit dataset at `post_commit_pin` to capture the
+        // row count + version metadata that the manifest row needs. Cheap:
+        // these are manifest-level values, not a row scan.
+        let post_ds = Dataset::open(&pin.table_path)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+            .checkout_version(pin.post_commit_pin)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+
+        let row_count = post_ds
+            .count_rows(None)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
+
+        let table_relative_path = super::table_path_for_table_key(&pin.table_key)?;
+        let version_metadata =
+            super::metadata::TableVersionMetadata::from_dataset(
+                root_uri,
+                &table_relative_path,
+                &post_ds,
+            )?;
+
+        updates.push(ManifestChange::Update(SubTableUpdate {
+            table_key: pin.table_key.clone(),
+            table_version: pin.post_commit_pin,
+            table_branch: sidecar.branch.clone(),
+            row_count,
+            version_metadata,
+        }));
+        expected.insert(pin.table_key.clone(), pin.expected_version);
+    }
+
+    let publisher = GraphNamespacePublisher::new(root_uri, sidecar.branch.as_deref());
+    let new_dataset = publisher.publish(&updates, &expected).await?;
+    Ok(new_dataset.version().version)
+}
+
+/// Append the audit row describing this recovery action.
+///
+/// Two-part write: (a) `_graph_commits.lance` row anchored on the recovery
+/// actor (`omnigraph:recovery`); (b) `_graph_commit_recoveries.lance` row
+/// linking back to (a) and naming the original actor + per-table outcomes.
+/// Same not-atomic-pair-write shape as the existing `_graph_commits`
+/// + `_graph_commit_actors` split — a crash between the two leaves an
+/// orphan commit row with no audit row. The recovery sweep tolerates this:
+/// on re-entry the classifier surfaces `NoMovement` for already-restored /
+/// already-published tables, the action is a no-op, and the audit append
+/// is retried.
+async fn record_audit(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+    manifest_version: u64,
+    kind: RecoveryKind,
+    outcomes: Vec<TableOutcome>,
+) -> Result<()> {
+    let mut graph = CommitGraph::open(root_uri).await?;
+    let graph_commit_id = graph
+        .append_commit(
+            sidecar.branch.as_deref(),
+            manifest_version,
+            Some(RECOVERY_ACTOR),
+        )
+        .await?;
+    let mut audit = RecoveryAudit::open(root_uri).await?;
+    audit
+        .append(RecoveryAuditRecord {
+            graph_commit_id,
+            recovery_kind: kind,
+            recovery_for_actor: sidecar.actor_id.clone(),
+            operation_id: sidecar.operation_id.clone(),
+            sidecar_writer_kind: format!("{:?}", sidecar.writer_kind),
+            per_table_outcomes: outcomes,
+            created_at: now_micros()?,
+        })
+        .await?;
+    Ok(())
 }
 
 async fn open_lance_head(table_path: &str) -> Result<u64> {

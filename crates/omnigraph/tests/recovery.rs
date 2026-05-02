@@ -5,10 +5,9 @@
 //! Phase B → Phase C residual, reopen the engine, and assert the sweep's
 //! decision-tree dispatch did the right thing.
 //!
-//! The four tests here pin Phase 3 scope (open-time invocation,
-//! `OpenMode::{ReadWrite, ReadOnly}`, roll-back path, schema-version
-//! refusal). The roll-forward path is Phase 4 — exercised by tests in
-//! the Phase 4 commit.
+//! The Phase 3 tests pin open-time invocation, `OpenMode::{ReadWrite,
+//! ReadOnly}`, the roll-back path, and schema-version refusal. The Phase
+//! 4 tests pin the roll-forward path + audit row recording.
 
 use std::path::Path;
 
@@ -244,5 +243,324 @@ async fn recovery_rolls_back_synthetic_drift_on_open() {
     assert!(
         list_recovery_dir(dir.path()).is_empty(),
         "second open must be a clean no-op"
+    );
+}
+
+// =====================================================================
+// Phase 4 — roll-forward path + audit row recording
+// =====================================================================
+
+/// Helper: count rows in `_graph_commit_recoveries.lance` at the given root.
+async fn count_recovery_audit_rows(repo_root: &Path) -> usize {
+    let recoveries_dir = repo_root.join("_graph_commit_recoveries.lance");
+    if !recoveries_dir.exists() {
+        return 0;
+    }
+    let ds = Dataset::open(recoveries_dir.to_str().unwrap())
+        .await
+        .expect("recoveries dataset opens");
+    use futures::TryStreamExt;
+    let batches: Vec<arrow_array::RecordBatch> =
+        ds.scan().try_into_stream().await.unwrap().try_collect().await.unwrap();
+    batches.iter().map(|b| b.num_rows()).sum()
+}
+
+/// Helper: read the most recent recovery audit row's `recovery_kind`,
+/// `recovery_for_actor`, and `operation_id`. Returns `None` if no rows.
+async fn read_latest_recovery_audit(
+    repo_root: &Path,
+) -> Option<(String, Option<String>, String, String)> {
+    let recoveries_dir = repo_root.join("_graph_commit_recoveries.lance");
+    if !recoveries_dir.exists() {
+        return None;
+    }
+    let ds = Dataset::open(recoveries_dir.to_str().unwrap())
+        .await
+        .ok()?;
+    use arrow_array::{Array, StringArray};
+    use futures::TryStreamExt;
+    let batches: Vec<arrow_array::RecordBatch> =
+        ds.scan().try_into_stream().await.ok()?.try_collect().await.ok()?;
+    let last_batch = batches.iter().filter(|b| b.num_rows() > 0).last()?;
+    let row = last_batch.num_rows() - 1;
+    let kinds = last_batch
+        .column_by_name("recovery_kind")?
+        .as_any()
+        .downcast_ref::<StringArray>()?;
+    let for_actors = last_batch
+        .column_by_name("recovery_for_actor")?
+        .as_any()
+        .downcast_ref::<StringArray>()?;
+    let ops = last_batch
+        .column_by_name("operation_id")?
+        .as_any()
+        .downcast_ref::<StringArray>()?;
+    let writers = last_batch
+        .column_by_name("sidecar_writer_kind")?
+        .as_any()
+        .downcast_ref::<StringArray>()?;
+    Some((
+        kinds.value(row).to_string(),
+        if for_actors.is_null(row) {
+            None
+        } else {
+            Some(for_actors.value(row).to_string())
+        },
+        ops.value(row).to_string(),
+        writers.value(row).to_string(),
+    ))
+}
+
+/// Helper: count `_graph_commits.lance` rows tagged with the recovery actor.
+async fn count_recovery_actor_commits(repo_root: &Path) -> usize {
+    let actors_dir = repo_root.join("_graph_commit_actors.lance");
+    if !actors_dir.exists() {
+        return 0;
+    }
+    let ds = Dataset::open(actors_dir.to_str().unwrap()).await.unwrap();
+    use arrow_array::{Array, StringArray};
+    use futures::TryStreamExt;
+    let batches: Vec<arrow_array::RecordBatch> =
+        ds.scan().try_into_stream().await.unwrap().try_collect().await.unwrap();
+    let mut count = 0;
+    for batch in &batches {
+        let actors = batch
+            .column_by_name("actor_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..actors.len() {
+            if actors.value(i) == "omnigraph:recovery" {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+#[tokio::test]
+async fn recovery_rolls_forward_after_phase_b_completes() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+    use omnigraph::table_store::TableStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    // Bootstrap: init + load 2 rows. Manifest pin and Lance HEAD both
+    // advance via the legitimate publisher path.
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
+{"type":"Person","data":{"name":"bob","age":25}}
+"#;
+    load_jsonl(&mut db, test_data, LoadMode::Append).await.unwrap();
+    drop(db);
+
+    let person_uri = node_table_uri(uri, "Person");
+    let store = TableStore::new(uri);
+    let mut ds = Dataset::open(&person_uri).await.unwrap();
+    let head_before = ds.version().version;
+
+    // Synthesize a successful Phase B: advance Lance HEAD by one
+    // (delete_where with no-match — no fragment changes, but version bumps).
+    let _ = store
+        .delete_where(&person_uri, &mut ds, "1 = 2")
+        .await
+        .unwrap();
+    let head_after = ds.version().version;
+    assert_eq!(head_after, head_before + 1);
+
+    // Drop a sidecar that MATCHES the synthesized state
+    // (expected=head_before, post_commit_pin=head_after) — classifier
+    // returns RolledPastExpected, decision is RollForward.
+    let sidecar_json = format!(
+        r#"{{
+            "schema_version": 1,
+            "operation_id": "01H00000000000000000000RF",
+            "started_at": "0",
+            "branch": null,
+            "actor_id": "act-alice",
+            "writer_kind": "Mutation",
+            "tables": [
+                {{
+                    "table_key": "node:Person",
+                    "table_path": "{}",
+                    "expected_version": {},
+                    "post_commit_pin": {}
+                }}
+            ]
+        }}"#,
+        person_uri, head_before, head_after
+    );
+    write_sidecar_file(dir.path(), "01H00000000000000000000RF", &sidecar_json);
+
+    // Reopen — sweep must roll forward, advancing the manifest pin to
+    // head_after via a single ManifestBatchPublisher::publish call.
+    let _db = Omnigraph::open(uri).await.unwrap();
+
+    // Sidecar deleted (sweep completed end-to-end).
+    assert!(
+        !list_recovery_dir(dir.path()).contains(&"01H00000000000000000000RF.json".to_string()),
+        "sidecar must be deleted after successful roll-forward"
+    );
+
+    // Audit row recorded.
+    assert_eq!(
+        count_recovery_audit_rows(dir.path()).await,
+        1,
+        "roll-forward must record exactly one audit row"
+    );
+    assert_eq!(
+        count_recovery_actor_commits(dir.path()).await,
+        1,
+        "roll-forward must record exactly one commit-graph row tagged with omnigraph:recovery"
+    );
+    let audit = read_latest_recovery_audit(dir.path()).await;
+    assert_eq!(
+        audit,
+        Some((
+            "RolledForward".to_string(),
+            Some("act-alice".to_string()),
+            "01H00000000000000000000RF".to_string(),
+            "Mutation".to_string(),
+        )),
+        "audit row content mismatch"
+    );
+
+    // Idempotency: reopen is a no-op.
+    let _db2 = Omnigraph::open(uri).await.unwrap();
+    assert!(
+        list_recovery_dir(dir.path()).is_empty(),
+        "second open must be a clean no-op"
+    );
+    assert_eq!(
+        count_recovery_audit_rows(dir.path()).await,
+        1,
+        "second open must NOT record a new audit row"
+    );
+}
+
+#[tokio::test]
+async fn recovery_rolls_back_records_audit_row_with_recovery_actor() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+    use omnigraph::table_store::TableStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
+"#;
+    load_jsonl(&mut db, test_data, LoadMode::Append).await.unwrap();
+    drop(db);
+
+    let person_uri = node_table_uri(uri, "Person");
+    let store = TableStore::new(uri);
+    let mut ds = Dataset::open(&person_uri).await.unwrap();
+    let head_before = ds.version().version;
+    let _ = store
+        .delete_where(&person_uri, &mut ds, "1 = 2")
+        .await
+        .unwrap();
+    let head_after = ds.version().version;
+    let _ = head_after;
+
+    // Sidecar with MISMATCHED post_commit_pin → classifier returns
+    // UnexpectedAtP1 → decision is RollBack.
+    let sidecar_json = format!(
+        r#"{{
+            "schema_version": 1,
+            "operation_id": "01H00000000000000000000AB",
+            "started_at": "0",
+            "branch": null,
+            "actor_id": "act-bob",
+            "writer_kind": "Load",
+            "tables": [
+                {{
+                    "table_key": "node:Person",
+                    "table_path": "{}",
+                    "expected_version": {},
+                    "post_commit_pin": {}
+                }}
+            ]
+        }}"#,
+        person_uri, head_before, head_before
+    );
+    write_sidecar_file(dir.path(), "01H00000000000000000000AB", &sidecar_json);
+
+    let _db = Omnigraph::open(uri).await.unwrap();
+
+    // Audit row recorded for RolledBack.
+    assert_eq!(count_recovery_audit_rows(dir.path()).await, 1);
+    assert_eq!(count_recovery_actor_commits(dir.path()).await, 1);
+    let audit = read_latest_recovery_audit(dir.path()).await;
+    assert_eq!(
+        audit,
+        Some((
+            "RolledBack".to_string(),
+            Some("act-bob".to_string()),
+            "01H00000000000000000000AB".to_string(),
+            "Load".to_string(),
+        )),
+    );
+}
+
+#[tokio::test]
+async fn recovery_rolls_forward_with_null_actor() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+    use omnigraph::table_store::TableStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
+"#;
+    load_jsonl(&mut db, test_data, LoadMode::Append).await.unwrap();
+    drop(db);
+
+    let person_uri = node_table_uri(uri, "Person");
+    let store = TableStore::new(uri);
+    let mut ds = Dataset::open(&person_uri).await.unwrap();
+    let head_before = ds.version().version;
+    let _ = store
+        .delete_where(&person_uri, &mut ds, "1 = 2")
+        .await
+        .unwrap();
+    let head_after = ds.version().version;
+
+    // Sidecar with no actor_id (CLI-driven mutation; common case).
+    let sidecar_json = format!(
+        r#"{{
+            "schema_version": 1,
+            "operation_id": "01H00000000000000000000NA",
+            "started_at": "0",
+            "branch": null,
+            "actor_id": null,
+            "writer_kind": "EnsureIndices",
+            "tables": [
+                {{
+                    "table_key": "node:Person",
+                    "table_path": "{}",
+                    "expected_version": {},
+                    "post_commit_pin": {}
+                }}
+            ]
+        }}"#,
+        person_uri, head_before, head_after
+    );
+    write_sidecar_file(dir.path(), "01H00000000000000000000NA", &sidecar_json);
+
+    let _db = Omnigraph::open(uri).await.unwrap();
+
+    let audit = read_latest_recovery_audit(dir.path()).await;
+    assert_eq!(
+        audit,
+        Some((
+            "RolledForward".to_string(),
+            None, // recovery_for_actor is None when sidecar.actor_id is None
+            "01H00000000000000000000NA".to_string(),
+            "EnsureIndices".to_string(),
+        )),
     );
 }
