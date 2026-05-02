@@ -172,7 +172,7 @@ impl Omnigraph {
         // compare its snapshot against any leftover staging files. Recovery
         // either deletes staging (pre-commit crash) or completes the rename
         // (post-commit crash) before the live schema files are read.
-        let coordinator = GraphCoordinator::open(&root, Arc::clone(&storage)).await?;
+        let mut coordinator = GraphCoordinator::open(&root, Arc::clone(&storage)).await?;
         recover_schema_state_files(&root, Arc::clone(&storage), &coordinator.snapshot()).await?;
         // MR-847 recovery sweep: close the Phase B → Phase C residual on
         // any sidecar left over from a crashed writer. ReadOnly skips —
@@ -189,6 +189,11 @@ impl Omnigraph {
                 &coordinator.snapshot(),
             )
             .await?;
+            // Roll-forward advances the manifest pin and the audit appends
+            // commits to _graph_commits.lance + _graph_commit_recoveries.lance.
+            // The coordinator's in-memory snapshot is now stale; refresh so
+            // the returned Omnigraph carries the post-recovery state.
+            coordinator.refresh().await?;
         }
         // Read _schema.pg (post-recovery — may have just been renamed in).
         let schema_path = schema_source_uri(&root);
@@ -264,6 +269,20 @@ impl Omnigraph {
     /// `.context/mr-793-design.md`.
     pub(crate) fn storage(&self) -> &dyn crate::storage_layer::TableStorage {
         &self.table_store
+    }
+
+    /// Engine-level access to the object-store adapter (S3 / local fs).
+    /// Used by the MR-847 recovery sidecar protocol — writers in the
+    /// engine call this to write/delete sidecars at `__recovery/{ulid}.json`.
+    pub(crate) fn storage_adapter(&self) -> &dyn crate::storage::StorageAdapter {
+        self.storage.as_ref()
+    }
+
+    /// Engine-level access to the repo's normalized root URI. Used by
+    /// the MR-847 recovery sidecar protocol to compute `__recovery/`
+    /// paths.
+    pub(crate) fn root_uri(&self) -> &str {
+        &self.root_uri
     }
 
     pub(crate) async fn open_coordinator_for_branch(

@@ -140,43 +140,53 @@ async fn schema_apply_recovers_partial_rename() {
     assert_no_staging_files(dir.path());
 }
 
-/// Pin the documented "finalize → publisher residual" of the
-/// staged-write commit path.
+/// Prove the MR-847 recovery sweep closes the "finalize → publisher
+/// residual" across one open cycle — the post-MR-847 contract.
 ///
 /// `MutationStaging::finalize` runs `commit_staged` per touched table
 /// sequentially before the publisher commits the manifest. Lance has no
 /// multi-dataset atomic commit primitive, so a failure between the
 /// per-table staged commits and the manifest commit leaves Lance HEAD
-/// advanced on the touched tables with no manifest update — and the
-/// next mutation surfaces `ExpectedVersionMismatch` on those tables.
+/// advanced on the touched tables with no manifest update.
 ///
-/// This isn't a code bug we can fix without an upstream Lance change;
-/// it's the documented residual (see `docs/runs.md` "Finalize →
-/// publisher residual"). The test pins the behavior so future code
-/// changes catch any silent regression: if someone widens the residual
-/// (e.g. failing earlier in finalize without rolling back), this test
-/// will surface a different error than `ExpectedVersionMismatch`. If
-/// someone narrows the residual (e.g. lance ships multi-dataset commit
-/// and we plumb it), this test will start passing the next mutation
-/// — and someone has to update the assertion + the docs.
+/// Pre-MR-847: the next mutation surfaced `ExpectedVersionMismatch` and
+/// the residual persisted until process restart. Post-MR-847: the
+/// finalize writes a sidecar at `__recovery/{ulid}.json` BEFORE Phase B,
+/// the failpoint fires AFTER finalize but BEFORE the publisher, the
+/// engine handle is dropped, and the next `Omnigraph::open` runs the
+/// recovery sweep. The sweep classifies every table in the sidecar as
+/// `RolledPastExpected` (Lance HEAD == expected + 1, post_commit_pin
+/// matches), decides RollForward, atomically extends every manifest pin
+/// via `ManifestBatchPublisher::publish`, records an audit row, and
+/// deletes the sidecar.
+///
+/// After this test passes:
+/// - The originally-attempted insert ("Eve") is visible via a normal
+///   query.
+/// - The next mutation succeeds without `ExpectedVersionMismatch`.
+/// - `_graph_commit_recoveries.lance` carries an audit row with
+///   `recovery_kind=RolledForward` and the original sidecar's
+///   `actor_id` in `recovery_for_actor`.
+///
+/// Continuous in-process recovery (no restart needed between failure
+/// and recovery) is MR-856 (background reconciler).
 #[tokio::test]
-async fn finalize_publisher_residual_drifts_lance_head_until_next_writer_recovers() {
-    use omnigraph::error::{ManifestConflictDetails, OmniError};
-
+async fn recovery_rolls_forward_after_finalize_publisher_failure() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
-    let mut db = Omnigraph::init(dir.path().to_str().unwrap(), helpers::TEST_SCHEMA)
-        .await
-        .unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
 
+    // Phase A: trigger the residual.
     {
+        let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
         let _failpoint =
             ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
 
-        // First mutation: finalize succeeds (commit_staged advances Lance
-        // HEAD on node:Person), then the failpoint kicks before the
-        // publisher's manifest commit. The caller sees the synthetic
-        // error.
+        // The mutation's finalize completes (commit_staged advances Lance
+        // HEAD on node:Person AND writes a `__recovery/{ulid}.json`
+        // sidecar). Then the failpoint kicks in before the publisher's
+        // manifest commit, so the manifest pin stays at the pre-write
+        // version. The sidecar persists for the next-open recovery sweep.
         let err = mutate_main(
             &mut db,
             MUTATION_QUERIES,
@@ -191,42 +201,70 @@ async fn finalize_publisher_residual_drifts_lance_head_until_next_writer_recover
             ),
             "unexpected error: {err}"
         );
-    }
-    // Failpoint dropped — subsequent calls are not synthetic-failed.
 
-    // Next mutation against the same table surfaces the documented
-    // residual: Lance HEAD on node:Person advanced (commit_staged ran),
-    // manifest didn't, so the publisher CAS at next-mutation time
-    // surfaces ExpectedVersionMismatch.
-    let err = mutate_main(
+        // Sidecar must still exist on disk for the recovery sweep to find.
+        let recovery_dir = dir.path().join("__recovery");
+        let sidecars: Vec<_> = std::fs::read_dir(&recovery_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(
+            sidecars.len(),
+            1,
+            "exactly one sidecar should persist after the finalize failure"
+        );
+
+        // Drop the failpoint scope and the engine handle.
+    }
+
+    // Phase B: reopen runs the recovery sweep. The sweep finds the
+    // sidecar, classifies node:Person as RolledPastExpected, decides
+    // RollForward, publishes the manifest update, records the audit
+    // row, deletes the sidecar.
+    let mut db = Omnigraph::open(&uri).await.unwrap();
+
+    // Sidecar gone — sweep completed end to end.
+    let recovery_dir = dir.path().join("__recovery");
+    if recovery_dir.exists() {
+        let remaining: Vec<_> = std::fs::read_dir(&recovery_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            remaining.is_empty(),
+            "sidecar must be deleted after successful roll-forward; remaining: {:?}",
+            remaining,
+        );
+    }
+
+    // The originally-attempted "Eve" insert is now visible — the recovery
+    // sweep extended the manifest pin to include the staged commit.
+    let person_count = helpers::count_rows(&db, "node:Person").await;
+    assert_eq!(
+        person_count, 1,
+        "exactly one person (Eve) must be visible after roll-forward"
+    );
+
+    // The next mutation on the same table succeeds — no ExpectedVersionMismatch.
+    mutate_main(
         &mut db,
         MUTATION_QUERIES,
         "insert_person",
         &mixed_params(&[("$name", "Frank")], &[("$age", 33)]),
     )
     .await
-    .unwrap_err();
-    let OmniError::Manifest(manifest_err) = err else {
-        panic!("expected Manifest error, got {err:?}");
-    };
-    let Some(ManifestConflictDetails::ExpectedVersionMismatch {
-        ref table_key,
-        expected,
-        actual,
-    }) = manifest_err.details
-    else {
-        panic!(
-            "expected ExpectedVersionMismatch (the documented residual), got {:?}",
-            manifest_err.details
-        );
-    };
+    .expect("next mutation must succeed after recovery rolled forward");
+    let person_count = helpers::count_rows(&db, "node:Person").await;
     assert_eq!(
-        table_key, "node:Person",
-        "drift should be on the table the failed finalize touched"
+        person_count, 2,
+        "Frank's insert must land normally after recovery"
     );
+
+    // Audit row recorded.
+    let audit_dir = dir.path().join("_graph_commit_recoveries.lance");
     assert!(
-        actual > expected,
-        "Lance HEAD on the drifted table should be ahead of manifest pinned: actual={actual} expected={expected}",
+        audit_dir.exists(),
+        "_graph_commit_recoveries.lance must exist after a successful recovery"
     );
 }
 

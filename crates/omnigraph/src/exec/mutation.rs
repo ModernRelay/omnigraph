@@ -737,18 +737,23 @@ impl Omnigraph {
             Err(e) => Err(e),
             Ok(total) if staging.is_empty() => Ok(total),
             Ok(total) => {
-                let (updates, expected_versions) = staging
-                    .finalize(self, requested.as_deref())
+                let (updates, expected_versions, sidecar_handle) = staging
+                    .finalize(
+                        self,
+                        requested.as_deref(),
+                        crate::db::manifest::SidecarKind::Mutation,
+                    )
                     .await?;
                 // Failpoint that wedges the documented finalize→publisher
                 // residual: per-table `commit_staged` calls already
                 // advanced Lance HEAD on every touched table; a failure
                 // injected here mirrors the production-rare case where
                 // the publisher's CAS pre-check rejects (or the manifest
-                // write throws) after staged commits succeeded. Used by
-                // `tests/failpoints.rs::finalize_publisher_residual_*`
-                // to pin the documented residual behavior. See
-                // `docs/runs.md` "Finalize → publisher residual".
+                // write throws) after staged commits succeeded. The
+                // sidecar written inside `staging.finalize()` persists
+                // across this failure so the next `Omnigraph::open`
+                // (MR-847 recovery sweep) can roll forward — see
+                // `tests/failpoints.rs::recovery_rolls_forward_after_finalize_publisher_failure`.
                 crate::failpoints::maybe_fail("mutation.post_finalize_pre_publisher")?;
                 self.commit_updates_on_branch_with_expected(
                     requested.as_deref(),
@@ -756,6 +761,14 @@ impl Omnigraph {
                     &expected_versions,
                 )
                 .await?;
+                // Phase C succeeded — sidecar can be deleted. If this
+                // delete fails, the next open's sweep classifies every
+                // table as NoMovement (manifest pin == Lance HEAD ==
+                // post_commit_pin) and the sidecar is treated as a
+                // stale artifact (cleaned up via the Phase 2 logic).
+                if let Some(handle) = sidecar_handle {
+                    crate::db::manifest::delete_sidecar(&handle, self.storage_adapter()).await?;
+                }
                 Ok(total)
             }
         }
