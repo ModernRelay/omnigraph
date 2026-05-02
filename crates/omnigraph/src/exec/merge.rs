@@ -1236,6 +1236,12 @@ impl Omnigraph {
             updates.push(update);
         }
 
+        // MR-847 failpoint: pin the per-writer Phase B → Phase C residual
+        // for branch_merge. Lance HEAD has advanced on every touched
+        // table (publish_*) but the manifest publish below hasn't run.
+        // Used by `tests/failpoints.rs::branch_merge_phase_b_failure_recovered_on_next_open`.
+        crate::failpoints::maybe_fail("branch_merge.post_phase_b_pre_manifest_commit")?;
+
         let manifest_version = if updates.is_empty() {
             self.version()
         } else {

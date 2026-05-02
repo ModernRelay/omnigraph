@@ -181,6 +181,13 @@ pub(super) async fn ensure_indices_for_branch(
         }
     }
 
+    // MR-847 failpoint: pin the per-writer Phase B → Phase C residual for
+    // ensure_indices. Lance HEAD has advanced on every touched table
+    // (one commit_staged per index built) but the manifest publish below
+    // hasn't run. Used by
+    // `tests/failpoints.rs::ensure_indices_phase_b_failure_recovered_on_next_open`.
+    crate::failpoints::maybe_fail("ensure_indices.post_phase_b_pre_manifest_commit")?;
+
     if !updates.is_empty() {
         commit_prepared_updates_on_branch(db, branch, &updates).await?;
     }

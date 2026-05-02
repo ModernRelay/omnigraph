@@ -176,9 +176,16 @@ pub(super) async fn apply_schema_with_lock(
     let recovery_handle = if recovery_pins.is_empty() {
         None
     } else {
+        // `branch=None` because schema_apply publishes against main —
+        // the `__schema_apply_lock__` branch is purely a serialization
+        // sentinel (acquire_schema_apply_lock creates it; the manifest
+        // publish via coordinator.commit_changes_with_actor below targets
+        // the coordinator's active branch, which is the pre-lock branch).
+        // If the lock release fires before recovery, the lock branch is
+        // gone — the sidecar must not reference it.
         let sidecar = crate::db::manifest::new_sidecar(
             crate::db::manifest::SidecarKind::SchemaApply,
-            Some("__schema_apply_lock__".to_string()),
+            None,
             db.audit_actor_id.clone(),
             recovery_pins,
         );
