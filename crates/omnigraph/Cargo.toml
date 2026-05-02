@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-engine"
-version = "0.3.1"
+version = "0.4.1"
 edition = "2024"
 description = "Runtime engine for the Omnigraph graph database."
 license = "MIT"
@@ -16,7 +16,7 @@ default = []
 failpoints = ["dep:fail", "fail/failpoints"]
 
 [dependencies]
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.3.1" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.4.1" }
 lance = { workspace = true }
 lance-datafusion = { workspace = true }
 datafusion = { workspace = true }
@@ -49,7 +49,7 @@ url = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.3.1" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.4.1" }
 tokio = { workspace = true }
 lance-namespace-impls = { workspace = true }
 serial_test = "3"

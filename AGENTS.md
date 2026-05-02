@@ -16,7 +16,7 @@ Tools that support `@`-imports (Claude Code) auto-include all three files via th
 
 `CLAUDE.md` is a symlink to this file — there is exactly one source of truth. Edit `AGENTS.md`.
 
-**Version surveyed:** 0.4.0
+**Version surveyed:** 0.4.1
 **Workspace crates:** `omnigraph-compiler`, `omnigraph` (engine), `omnigraph-cli`, `omnigraph-server`
 **Storage substrate:** Lance 4.x (columnar, versioned, branchable)
 **License:** MIT

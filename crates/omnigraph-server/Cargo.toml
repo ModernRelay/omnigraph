@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-server"
-version = "0.3.1"
+version = "0.4.1"
 edition = "2024"
 description = "HTTP server for the Omnigraph graph database."
 license = "MIT"
@@ -19,8 +19,8 @@ default = []
 aws = ["dep:aws-config", "dep:aws-sdk-secretsmanager"]
 
 [dependencies]
-omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.3.1" }
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.3.1" }
+omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.4.1" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.4.1" }
 axum = { workspace = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }
