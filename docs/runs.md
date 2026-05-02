@@ -101,6 +101,23 @@ the same drift class. Closing it requires either upstream Lance
 multi-dataset commit OR the omnigraph-side recovery-on-open reconciler
 described in `.context/mr-793-design.md` §15 (deferred to MR-795).
 
+### Inline-commit method residuals on `TableStorage` (MR-793 acceptance §1 option b)
+
+MR-793's acceptance criterion §1 ("`TableStore` public API has no method that performs a manifest commit as a side effect of writing") is met **per-method** by enumerating every inline-commit method that remains on the trait surface, naming why it cannot yet be removed, and keeping the residual comment at every call site:
+
+| Method on `TableStore` | Inline-commit reason | Closes when |
+|---|---|---|
+| `delete_where` | `DeleteJob` is `pub(crate)` in lance-4.0.0 — no public two-phase delete API | [lance-format/lance#6658](https://github.com/lance-format/lance/issues/6658) lands and `stage_delete` joins the trait |
+| `create_vector_index` | Vector indices take Lance's "segment commit path"; the helper `build_index_metadata_from_segments` is `pub(crate)` | [lance-format/lance#6666](https://github.com/lance-format/lance/issues/6666) lands and `stage_create_vector_index` joins the trait |
+| `append_batch` | Legacy inherent method; some engine call sites haven't migrated to `stage_append + commit_staged` yet | MR-793 Phase 1b (call-site conversion) + Phase 9 (demote to `pub(crate)`) |
+| `merge_insert_batch` / `merge_insert_batches` | Legacy inherent method | Same — Phase 1b + Phase 9 |
+| `overwrite_batch` | Legacy inherent method | Same — Phase 1b + Phase 9 |
+| `create_btree_index` (inherent) | Legacy inherent method (the migrated callers use `stage_create_btree_index` + `commit_staged`; the inherent stays for tests / un-migrated paths) | Same — Phase 1b + Phase 9 |
+| `create_inverted_index` (inherent) | Same | Same — Phase 1b + Phase 9 + index-class split (MR-848) |
+| `truncate_table` (inherent on `TableStore`) | Used by `overwrite_batch` internally | Phase 9 |
+
+After **lance#6658 + lance#6666 ship + MR-793 Phase 1b + MR-793 Phase 9 all complete**, the trait surface exposes only staged-write primitives + `commit_staged`. Until then this matrix names every residual explicitly, every call site carries a one-line residual comment, and no engine code outside `table_store.rs` is permitted to reach the inline-commit Lance APIs (enforced by the `tests/forbidden_apis.rs` guard).
+
 ### `LoadMode::Overwrite` residual
 
 The bulk loader's Append and Merge modes use the staged-write path
