@@ -105,6 +105,7 @@ These are user-visible commitments. They state what the engine guarantees and wh
 Specific defaults (timeout values, memory caps, TTL windows) are *configuration*, not invariants — see [docs/constants.md](constants.md) and per-deployment configuration. The invariant is that bounds and contracts exist, not their numerical values.
 
 23. **Atomicity is per-query.** Every `.gq` query is atomic — multi-statement mutations are all-or-nothing via the substrate's atomic-commit primitive. No cross-query `BEGIN`/`COMMIT`; branches and merges fill that role for agent workflows.
+    *Status: upheld at the writer-trait surface for inserts / updates / scalar-index builds / merge_insert / overwrite after MR-793 PR #70 — the sealed `TableStorage` trait routes those through `stage_*` + `commit_staged`, so a Phase A failure (between writing fragments and committing) leaves no Lance-HEAD drift on touched tables. **Per-table commit_staged → manifest publish window remains** — a failure between commits across multiple touched tables can leave drift on the partially-committed tables. Lance has no multi-dataset atomic commit primitive; closing this requires the recovery-on-open reconciler tracked in MR-847. Additionally, two writer paths still inline-commit pending upstream Lance work: `delete_where` (lance-format/lance#6658) and `create_vector_index` (lance-format/lance#6666).*
 
 24. **Schema integrity is strict at commit.** Type validation, required-field presence (auto-filled from `@default` if declared), uniqueness across batches and versions, and referential integrity — all enforced before commit succeeds. Per-write softening flags are opt-in, never default.
     *Status: aspirational — referential integrity at scale requires SIP-backed cross-table validation; not yet implemented. Cross-batch / cross-version uniqueness tracked in MR-714.*
@@ -140,6 +141,7 @@ Specific defaults (timeout values, memory caps, TTL windows) are *configuration*
 These are *how* we realize the invariants today. They are committed conventions — until we explicitly revise them, new code follows them. They are not eternal: a future architecture review may replace any of these with a different mechanism that upholds the same invariants. The deny-list (§IX) protects them in the meantime.
 
 35. **Reconciler pattern for derivable state.** Index coverage, statistics, anything derivable from manifest state — reconciled, not job-queued. *Realizes the "don't maintain state parallel to the substrate" invariant.* See MR-737 §5.16.
+    *Status: partial after MR-793 PR #70 — scalar index builds (BTree, Inverted) now route through the staged primitives `stage_create_*_index` + `commit_staged` instead of inline `create_*_index`; this is the building block. The reconciler pattern itself (background `IndexReconciler` task driven by manifest commits, removing synchronous index work from the publish path) is tracked in MR-848. Vector indices remain inline-commit until lance-format/lance#6666 ships.*
 
 36. **Polymorphism via Union, not per-feature lowering.** Interfaces / wildcards / alternation on nodes and edges share one IR (`Polymorphism<T>`) and one lowering (Union of per-type concrete plans). *Realizes "shared mechanism for shared shape."* See MR-737 §5.13.
     *Status: aspirational — node interfaces in MR-579; edge wildcards in MR-744.*
@@ -170,6 +172,7 @@ These are *how* we realize the invariants today. They are committed conventions 
 44. **Tests at every boundary.** `MemStorage` for engine tests; planner-only tests; executor-only tests with a stub storage. No layer tested only via end-to-end.
 
 45. **Reference implementation per trait.** Every trait has a primary impl (Lance for storage) and at least a test impl.
+    *Status: partial after MR-793 PR #70 — `TableStorage` (the engine-internal staged-write trait, sealed) has its primary impl on `TableStore` (Lance-backed). The trait's signatures use opaque `SnapshotHandle` / `StagedHandle` types so a future test impl (e.g., `MemStorage`) can land without changing call sites. No test impl yet; `tempfile::tempdir()` + Lance is the de-facto test substrate today (see [docs/testing.md](testing.md)).*
 
 46. **Documented capability surface.** New capabilities are documented with what they advertise, who consumes them, how the planner uses them.
 

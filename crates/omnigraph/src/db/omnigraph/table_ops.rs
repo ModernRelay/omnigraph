@@ -376,6 +376,10 @@ async fn stage_and_commit_btree(
                 table_key, columns, e
             ))
         })?;
+    // Failpoint between stage and commit. Used by `tests/failpoints.rs`
+    // to demonstrate that a Phase A failure in the staged-index path
+    // leaves no Lance-HEAD drift on the touched table.
+    crate::failpoints::maybe_fail("ensure_indices.post_stage_pre_commit_btree")?;
     let new_ds = db
         .table_store
         .commit_staged(Arc::new(ds.clone()), staged.transaction)

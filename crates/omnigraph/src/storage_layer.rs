@@ -1,17 +1,32 @@
 //! Storage trait surface — MR-793.
 //!
-//! `TableStorage` is the engine-internal trait that funnels every Lance
-//! data write through staged primitives. Engine code (in `exec/`,
-//! `db/omnigraph/`, `loader/`) holds `Arc<dyn TableStorage>` instead of
-//! a concrete `TableStore`; the inline-commit Lance APIs
-//! (`Dataset::append`, `MergeInsertBuilder::execute`, etc.) are not
-//! reachable through the trait surface.
+//! `TableStorage` is the engine-internal trait that exposes the
+//! staged-write primitives (`stage_append`, `stage_merge_insert`,
+//! `stage_overwrite`, `stage_create_btree_index`,
+//! `stage_create_inverted_index`) plus `commit_staged` as the canonical
+//! way for new engine writers to advance Lance HEAD without coupling
+//! "write bytes" with "advance HEAD" in one Lance API call.
+//!
+//! ## Transitional residuals on the trait
+//!
+//! Several inline-commit methods remain on the trait surface as
+//! documented residuals: `delete_where` (Lance 4.0.0's `DeleteJob` is
+//! `pub(crate)` — see [#6658](https://github.com/lance-format/lance/issues/6658)),
+//! `create_vector_index` (segment-commit-path requires
+//! `build_index_metadata_from_segments` which is `pub(crate)` — see
+//! [#6666](https://github.com/lance-format/lance/issues/6666)), and the
+//! legacy `append_batch` / `merge_insert_batches` / `overwrite_batch` /
+//! `create_btree_index` / `create_inverted_index` paths kept while
+//! engine call sites finish migrating off of them (Phase 1b / Phase 9
+//! of MR-793). These are named honestly at every call site; the
+//! forbidden-API guard test catches direct lance::* misuse outside the
+//! storage layer.
 //!
 //! ## Sealed
 //!
 //! `TableStorage: sealed::Sealed`. Only types in this crate can implement
-//! the trait, so the staged-write invariant cannot be subverted by a
-//! downstream impl.
+//! the trait, so a downstream crate cannot subvert the contract by
+//! providing its own impl.
 //!
 //! ## Opaque handles
 //!
@@ -21,15 +36,15 @@
 //! through. This is the §III.9 alignment: `lance::Dataset` does not
 //! appear in trait signatures.
 //!
-//! ## Scope (MR-793 Phase 1)
+//! ## Migration status (MR-793 PR #70)
 //!
-//! The trait surface mirrors the methods engine code currently calls on
-//! `TableStore`. Subsequent MR-793 phases:
-//! * Phase 2 — add `stage_overwrite`, `stage_create_btree_index`,
-//!   `stage_create_inverted_index` to the trait.
-//! * Phase 4–6 — migrate writers (`ensure_indices`, `branch_merge`,
-//!   `schema_apply`) onto the staged primitives.
-//! * Phase 9 — demote unused inline-commit methods to `pub(crate)`.
+//! Phases 1a / 2 / 4 / 5 / 6 are landed: trait scaffolding, three new
+//! staged primitives (`stage_overwrite`, scalar index staging), and
+//! migration of `ensure_indices`, `branch_merge`, `schema_apply` onto
+//! the staged surface. Phase 1b (call-site conversion to
+//! `Arc<dyn TableStorage>`), Phase 9 (demote unused inline-commit
+//! methods to `pub(crate)`), Phase 7 (recovery reconciler — MR-847),
+//! and Phase 8 (index reconciler — MR-848) are deferred to follow-ups.
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -38,7 +53,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use lance::Dataset;
-use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream, Scanner};
+use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream};
 use lance::dataset::{WhenMatched, WhenNotMatched};
 
 use crate::db::{Snapshot, SubTableEntry};
@@ -126,9 +141,12 @@ impl StagedHandle {
     }
 }
 
-/// Helper: convert a slice of `StagedHandle` references to a Vec of
-/// `&StagedWrite` for handing to `TableStore::stage_append`'s
-/// `prior_stages` parameter. The lifetime is tied to the input slice.
+/// Helper: clone the inner `StagedWrite` out of each `StagedHandle` and
+/// collect into a `Vec<StagedWrite>` for handing to
+/// `TableStore::stage_append`'s `prior_stages` parameter. The result is
+/// owned (not borrowed) — callers that already had a `&[StagedHandle]`
+/// pay a clone cost per element. `StagedWrite::clone` is cheap because
+/// `Transaction` and `Vec<Fragment>` are shallow-clone friendly.
 pub(crate) fn staged_handles_as_writes(handles: &[StagedHandle]) -> Vec<StagedWrite> {
     handles.iter().map(|h| h.inner.clone()).collect()
 }
@@ -357,7 +375,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         dataset_uri: &str,
         snapshot: SnapshotHandle,
         filter: &str,
-    ) -> Result<DeleteState>;
+    ) -> Result<(SnapshotHandle, DeleteState)>;
 
     async fn has_btree_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool>;
     async fn has_fts_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool>;
@@ -744,10 +762,11 @@ impl TableStorage for TableStore {
         dataset_uri: &str,
         snapshot: SnapshotHandle,
         filter: &str,
-    ) -> Result<DeleteState> {
+    ) -> Result<(SnapshotHandle, DeleteState)> {
         let mut ds = Arc::try_unwrap(snapshot.into_arc())
             .unwrap_or_else(|arc| (*arc).clone());
-        TableStore::delete_where(self, dataset_uri, &mut ds, filter).await
+        let state = TableStore::delete_where(self, dataset_uri, &mut ds, filter).await?;
+        Ok((SnapshotHandle::new(ds), state))
     }
 
     async fn has_btree_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool> {
@@ -817,8 +836,3 @@ impl TableStorage for TableStore {
         TableStore::scan_stream(snapshot.dataset(), projection, filter, order_by, with_row_id).await
     }
 }
-
-// Suppress unused-import warning when the module is built without the
-// `Scanner` type being referenced from the trait.
-#[allow(dead_code)]
-fn _scanner_type_marker(_: &Scanner) {}

@@ -42,20 +42,50 @@
 use std::path::{Path, PathBuf};
 
 const FORBIDDEN_PATTERNS: &[&str] = &[
+    // Builder types — direct construction is the side door around the
+    // staged-write surface.
     "MergeInsertBuilder",
     "InsertBuilder::",
     "DeleteBuilder",
     "CommitBuilder::new",
     ".create_index_builder(",
     ".create_index_segment_builder(",
+    // Associated-function forms of inline-commit Lance APIs. These would
+    // only appear in source if the file imports `lance::Dataset` and
+    // calls the static fn — exactly the misuse we want to catch. These
+    // patterns deliberately exclude `.append(` / `.delete(` / `.write(`
+    // because those would over-match (`.delete_branch(`, `Vec::append`,
+    // arrow-array `.append(`, etc.).
+    "Dataset::write",
+    "Dataset::append",
+    "Dataset::delete",
+    "Dataset::merge_insert",
+    "Dataset::add_columns",
+    "Dataset::update_columns",
+    "Dataset::drop_columns",
+    "Dataset::truncate_table",
+    "Dataset::restore",
+    // Lance-specific method names that don't clash with our `TableStore`
+    // wrappers (we use `merge_insert_batch{,es}`, `add_columns_to_*`,
+    // etc. — never the bare Lance names). Engine code that writes
+    // `ds.merge_insert(...)` against a `Dataset` value is reaching
+    // around the trait surface.
+    ".merge_insert(",
+    ".add_columns(",
+    ".update_columns(",
+    ".drop_columns(",
+    ".truncate_table(",
 ];
 
 /// Files exempt from the guard. These are the legitimate storage-layer
-/// implementations that USE the forbidden APIs to provide the staged
-/// primitives.
+/// or manifest-layer implementations that USE the forbidden APIs to
+/// provide the staged primitives or to maintain the system tables
+/// (commit graph, manifest).
 const ALLOW_LIST_FILES: &[&str] = &[
-    "table_store.rs",      // The storage layer itself.
-    "storage_layer.rs",    // The trait module.
+    "table_store.rs",        // The storage layer itself.
+    "storage_layer.rs",      // The trait module.
+    "commit_graph.rs",       // Maintains `_graph_commits.lance` system table.
+    "graph_coordinator.rs",  // Drives the manifest publisher / branch coordinator.
 ];
 
 /// Directories exempt from the guard. Files under these paths may use

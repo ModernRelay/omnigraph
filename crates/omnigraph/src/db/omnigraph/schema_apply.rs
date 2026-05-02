@@ -248,9 +248,20 @@ pub(super) async fn apply_schema_with_lock(
         let mut target_ds = if batch.num_rows() == 0 {
             TableStore::overwrite_dataset(&dataset_uri, batch).await?
         } else {
+            // Pass `entry.table_branch.as_deref()` (not `None`) for
+            // consistency with the indexed_tables block below. Schema
+            // apply runs under `__schema_apply_lock__` which today
+            // rejects non-main branches, so `entry.table_branch` is
+            // expected to be `None`. But the defensive passthrough
+            // means a future relaxation of the lock-check can't quietly
+            // open the wrong HEAD here.
             let existing = db
                 .table_store
-                .open_dataset_head_for_write(table_key, &dataset_uri, None)
+                .open_dataset_head_for_write(
+                    table_key,
+                    &dataset_uri,
+                    entry.table_branch.as_deref(),
+                )
                 .await?;
             let staged = db.table_store.stage_overwrite(&existing, batch).await?;
             db.table_store
