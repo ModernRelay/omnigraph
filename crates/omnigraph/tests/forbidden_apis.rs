@@ -75,6 +75,19 @@ const FORBIDDEN_PATTERNS: &[&str] = &[
     ".update_columns(",
     ".drop_columns(",
     ".truncate_table(",
+    // `.restore(` is Lance-specific (no other library in this workspace
+    // exposes a `.restore(` method); safe to ban without false-positive
+    // risk. Used to revert a Lance dataset to a prior version — never
+    // an operation engine code should perform directly.
+    ".restore(",
+    // NOT included: `.append(`, `.delete(`, `.write(`. Each over-matches
+    // legitimate non-Lance uses (`Vec::append`, `String::append`, arrow
+    // array `BuilderArray::append`, `ObjectStore::delete`, etc.).
+    // Engine code calling `ds.append(reader, params)` against an
+    // imported `lance::Dataset` is the residual bypass route this guard
+    // does NOT catch — but the trait surface itself is the primary
+    // enforcement (sealed + only-callable-via-trait once Phase 1b
+    // call-site conversion completes), so this gap is bounded.
 ];
 
 /// Files exempt from the guard. These are the legitimate storage-layer
