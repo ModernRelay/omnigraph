@@ -62,13 +62,15 @@ flowchart TB
     manifest["__manifest/<br/>L2 catalog of sub-tables"]:::l2
     nodes["nodes/{fnv1a64-hex}/<br/>one dataset per node type"]:::l2
     edges["edges/{fnv1a64-hex}/<br/>one dataset per edge type"]:::l2
-    cgraph["_graph_commits.lance/<br/>_graph_commit_actors.lance/"]:::l2
+    cgraph["_graph_commits.lance/<br/>_graph_commit_actors.lance/<br/>_graph_commit_recoveries.lance/"]:::l2
+    recovery["__recovery/{ulid}.json<br/>MR-847 sidecars (transient)"]:::l2
     refs["_refs/branches/{name}.json<br/>graph-level branches"]:::l2
 
     repo --> manifest
     repo --> nodes
     repo --> edges
     repo --> cgraph
+    repo --> recovery
     repo --> refs
 
     subgraph dataset[Inside each Lance dataset — L1]
@@ -90,6 +92,8 @@ flowchart TB
 - **`__manifest/`** is a Lance dataset whose rows describe which sub-table version is published at which graph-branch. Reading a snapshot starts here.
 - **`nodes/`** and **`edges/`** are sibling directories holding one Lance dataset per declared type. Names are `fnv1a64-hex` of the type name to keep paths fixed-length and case-safe.
 - **`_graph_commits.lance`** is an L2 dataset that records the graph-level commit DAG, with a paired `_graph_commit_actors.lance` for the actor map. (Pre-v0.4.0 repos also have inert `_graph_runs.lance` / `_graph_run_actors.lance` from the removed Run state machine; MR-770 sweeps these in production.)
+- **`_graph_commit_recoveries.lance`** (MR-847) — one row per recovery sweep action. Joined to `_graph_commits.lance` by `graph_commit_id`; the linked commit row carries `actor_id=omnigraph:recovery`. Operators correlate recoveries with the original mutations they rolled forward / back via this join. See `crates/omnigraph/src/db/recovery_audit.rs`.
+- **`__recovery/{ulid}.json`** (MR-847) — transient sidecar files written by the four migrated writers (`MutationStaging::finalize`, `schema_apply`, `branch_merge`, `ensure_indices`) before Phase B begins, deleted after Phase C succeeds. A sidecar persisting after process exit means the writer crashed in the Phase B → Phase C window; the next `Omnigraph::open` recovery sweep processes it. Steady-state directory is empty. See `crates/omnigraph/src/db/manifest/recovery.rs`.
 - **`_refs/branches/{name}.json`** is graph-level branch metadata — pointers from a branch name to the manifest version it heads.
 - **Inside each Lance dataset** (orange): the standard Lance directory layout. `_versions/{n}.manifest` records every commit; `data/` holds the actual Arrow fragments; `_indices/{uuid}/` holds index segments with their own `fragment_bitmap` for partial coverage; `_refs/` holds Lance-native per-dataset branches and tags.
 
