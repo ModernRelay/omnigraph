@@ -65,6 +65,31 @@ pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
 /// see [`SidecarSchemaError`]).
 pub(crate) const SIDECAR_SCHEMA_VERSION: u32 = 1;
 
+/// Selects which recovery actions are allowed in a sweep.
+///
+/// Open-time recovery (`Omnigraph::open` with `OpenMode::ReadWrite`)
+/// runs the full sweep — `Dataset::restore` is safe because no other
+/// writers are active yet. In-process recovery (called from
+/// `Omnigraph::refresh` during a long-running server) must NOT call
+/// `Dataset::restore`: it "wins" against concurrent Append/Update/
+/// Delete/CreateIndex/Merge per `check_restore_txn`, silently orphaning
+/// the concurrent writer's commit (pinned by
+/// `tests/staged_writes.rs::lance_restore_loses_to_concurrent_append_via_orphaning`).
+/// Roll-forward is safe under concurrency because
+/// `ManifestBatchPublisher::publish` uses row-level CAS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryMode {
+    /// Open-time: the full sweep. RolledPastExpected → roll forward;
+    /// mixed/unexpected → roll back via `Dataset::restore`; invariant
+    /// violation → abort with a loud error.
+    Full,
+    /// In-process (refresh): roll-forward only. Sidecars that would
+    /// require restore or abort are LEFT ON DISK for the next ReadWrite
+    /// open. Closes the common case (mutation/load finalize → publisher
+    /// failure) without restart.
+    RollForwardOnly,
+}
+
 /// Categorizes the writer that produced a sidecar so audit trail and
 /// observability can attribute recoveries to the right code path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -468,6 +493,7 @@ pub(crate) async fn recover_manifest_drift(
     root_uri: &str,
     storage: std::sync::Arc<dyn StorageAdapter>,
     coordinator: &mut GraphCoordinator,
+    mode: RecoveryMode,
 ) -> Result<()> {
     let sidecars = list_sidecars(root_uri, storage.as_ref()).await?;
     if sidecars.is_empty() {
@@ -502,7 +528,8 @@ pub(crate) async fn recover_manifest_drift(
                 coordinator.snapshot()
             }
         };
-        process_sidecar(root_uri, storage.as_ref(), &branch_snapshot, &sidecar).await?;
+        process_sidecar(root_uri, storage.as_ref(), &branch_snapshot, &sidecar, mode)
+            .await?;
     }
     // Final refresh so the caller sees the post-sweep state.
     coordinator.refresh().await?;
@@ -514,6 +541,7 @@ async fn process_sidecar(
     storage: &dyn StorageAdapter,
     snapshot: &Snapshot,
     sidecar: &RecoverySidecar,
+    mode: RecoveryMode,
 ) -> Result<()> {
     let mut classifications = Vec::with_capacity(sidecar.tables.len());
     for pin in &sidecar.tables {
@@ -532,20 +560,46 @@ async fn process_sidecar(
     }
 
     match decide(&classifications) {
-        SidecarDecision::Abort => {
-            // Surface loudly without deleting the sidecar — operator must
-            // investigate. This includes any classification of
-            // InvariantViolation (Lance HEAD < manifest pinned: should be
-            // impossible).
-            Err(OmniError::manifest_internal(format!(
-                "recovery sidecar '{}' has invariant violation; refusing to act \
-                 — operator review required (sidecar at '{}', classifications: {:?})",
-                sidecar.operation_id,
-                sidecar_uri(root_uri, &sidecar.operation_id),
-                classifications,
-            )))
-        }
+        SidecarDecision::Abort => match mode {
+            RecoveryMode::Full => {
+                // Surface loudly without deleting the sidecar — operator
+                // must investigate. This includes any InvariantViolation
+                // classification (Lance HEAD < manifest pinned: should
+                // be impossible).
+                Err(OmniError::manifest_internal(format!(
+                    "recovery sidecar '{}' has invariant violation; refusing to act \
+                     — operator review required (sidecar at '{}', classifications: {:?})",
+                    sidecar.operation_id,
+                    sidecar_uri(root_uri, &sidecar.operation_id),
+                    classifications,
+                )))
+            }
+            RecoveryMode::RollForwardOnly => {
+                // In-process refresh-time recovery: leave the sidecar
+                // and defer the loud abort to the next ReadWrite open.
+                // Operator-actionable error surfacing belongs at open,
+                // not silently inside refresh.
+                warn!(
+                    operation_id = sidecar.operation_id.as_str(),
+                    writer_kind = ?sidecar.writer_kind,
+                    "recovery: deferring sidecar with invariant violation to next ReadWrite open"
+                );
+                Ok(())
+            }
+        },
         SidecarDecision::RollBack => {
+            if matches!(mode, RecoveryMode::RollForwardOnly) {
+                // In-process recovery cannot run Dataset::restore safely
+                // (would orphan a concurrent writer's commit). Leave the
+                // sidecar in place; the next ReadWrite open will handle
+                // it via the full sweep.
+                warn!(
+                    operation_id = sidecar.operation_id.as_str(),
+                    writer_kind = ?sidecar.writer_kind,
+                    "recovery: deferring rollback-eligible sidecar to next ReadWrite open"
+                );
+                return Ok(());
+            }
             warn!(
                 operation_id = sidecar.operation_id.as_str(),
                 writer_kind = ?sidecar.writer_kind,

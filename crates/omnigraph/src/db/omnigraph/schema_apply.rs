@@ -381,7 +381,7 @@ pub(super) async fn apply_schema_with_lock(
         }));
     }
 
-    db.refresh().await?;
+    db.refresh_coordinator_only().await?;
     if db.version() != base_manifest_version {
         return Err(OmniError::manifest_conflict(format!(
             "schema apply lost its write lease: main advanced from v{} to v{} while schema apply was in progress",
@@ -469,13 +469,13 @@ pub(super) async fn apply_schema_with_lock(
 }
 
 pub(super) async fn ensure_schema_apply_idle(db: &mut Omnigraph, operation: &str) -> Result<()> {
-    db.refresh().await?;
+    db.refresh_coordinator_only().await?;
     ensure_schema_apply_not_locked(db, operation).await
 }
 
 pub(super) async fn acquire_schema_apply_lock(db: &mut Omnigraph) -> Result<()> {
     db.ensure_schema_state_valid().await?;
-    db.refresh().await?;
+    db.refresh_coordinator_only().await?;
     let branches = db.coordinator.all_branches().await?;
     if branches
         .iter()
@@ -489,7 +489,7 @@ pub(super) async fn acquire_schema_apply_lock(db: &mut Omnigraph) -> Result<()> 
     db.coordinator
         .branch_create(SCHEMA_APPLY_LOCK_BRANCH)
         .await?;
-    db.refresh().await?;
+    db.refresh_coordinator_only().await?;
 
     let blocking_branches = db
         .coordinator
@@ -513,7 +513,12 @@ pub(super) async fn release_schema_apply_lock(db: &mut Omnigraph) -> Result<()> 
     db.coordinator
         .branch_delete(SCHEMA_APPLY_LOCK_BRANCH)
         .await?;
-    db.refresh().await
+    // Use refresh_coordinator_only — the full Omnigraph::refresh would
+    // run roll-forward-only recovery, and on the failure path the
+    // in-flight schema_apply sidecar is still on disk; recovery would
+    // race the caller's own publish (or roll forward an aborted apply
+    // we want to leave for next-open).
+    db.refresh_coordinator_only().await
 }
 
 pub(super) async fn ensure_schema_apply_not_locked(db: &Omnigraph, operation: &str) -> Result<()> {

@@ -267,6 +267,236 @@ async fn recovery_rolls_forward_after_finalize_publisher_failure() {
     );
 }
 
+/// Refresh-time recovery (Option B): the in-process `Omnigraph::refresh`
+/// runs roll-forward-only recovery, closing the long-running-server
+/// residual without restart.
+///
+/// Setup: trigger `mutation.post_finalize_pre_publisher` once. The
+/// sidecar persists. Without dropping the engine, call `db.refresh()`.
+/// The post-condition: sidecar gone; Eve visible; subsequent mutation
+/// on the same handle succeeds without restart and without
+/// ExpectedVersionMismatch.
+#[tokio::test]
+async fn refresh_runs_roll_forward_recovery_in_process() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+
+    // Phase A: trigger the residual (sidecar persists; manifest unchanged).
+    {
+        let _failpoint =
+            ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+        let err = mutate_main(
+            &mut db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "injected failpoint triggered: mutation.post_finalize_pre_publisher"
+            ),
+            "unexpected error: {err}"
+        );
+        let recovery_dir = dir.path().join("__recovery");
+        assert_eq!(
+            std::fs::read_dir(&recovery_dir).unwrap().count(),
+            1,
+            "exactly one sidecar must persist after the finalize failure"
+        );
+    }
+
+    // Phase B: explicit refresh runs roll-forward-only recovery
+    // in-process — no restart needed. Sidecar finds the Person drift,
+    // classifies RolledPastExpected, rolls forward via publisher CAS,
+    // and deletes the sidecar.
+    db.refresh().await.expect("refresh must succeed");
+
+    // Sidecar must be gone — refresh-time recovery rolled it forward.
+    let recovery_dir = dir.path().join("__recovery");
+    if recovery_dir.exists() {
+        let remaining: Vec<_> = std::fs::read_dir(&recovery_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            remaining.is_empty(),
+            "sidecar must be deleted by refresh-time roll-forward; remaining: {:?}",
+            remaining,
+        );
+    }
+
+    // Eve (the originally-attempted insert) is visible without restart.
+    let person_count = helpers::count_rows(&db, "node:Person").await;
+    assert_eq!(
+        person_count, 1,
+        "Eve must be visible after refresh-time roll-forward"
+    );
+
+    // A direct Person mutation also succeeds without ExpectedVersionMismatch.
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Frank")], &[("$age", 33)]),
+    )
+    .await
+    .expect("Person insert must succeed after refresh-time recovery");
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 2);
+}
+
+/// Refresh-time recovery must NOT call `Dataset::restore` — it can
+/// silently orphan a concurrent writer's commit. Sidecars that would
+/// require rollback must be left on disk for the next ReadWrite open.
+///
+/// Setup: synthesize a sidecar that would classify as `UnexpectedAtP1`
+/// (rollback territory) — strict-match Mutation kind with
+/// expected_version != manifest_pinned. Trigger refresh and assert:
+/// sidecar still on disk, Lance HEAD unchanged (no restore commit).
+/// Then drop + open: full sweep handles it.
+#[tokio::test]
+async fn refresh_defers_rollback_eligible_sidecar_to_next_open() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+    use omnigraph::table_store::TableStore;
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    // Bootstrap.
+    let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Person","data":{"name":"alice","age":30}}
+"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+
+    // Capture Person's full URI and manifest pin.
+    let snapshot = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let entry = snapshot.entry("node:Person").unwrap();
+    let person_uri = format!("{}/{}", uri.trim_end_matches('/'), entry.table_path);
+    let manifest_pin = entry.table_version;
+
+    // Drift Person's Lance HEAD ahead of the manifest pin (without
+    // touching the manifest) so the classifier can reach UnexpectedAtP1
+    // / UnexpectedMultistep / RolledPastExpected paths that require
+    // a real restore on rollback.
+    let store = TableStore::new(&uri);
+    let mut ds = lance::Dataset::open(&person_uri).await.unwrap();
+    store
+        .delete_where(&person_uri, &mut ds, "1 = 2")
+        .await
+        .unwrap();
+    let head_after_drift = ds.version().version;
+    assert_eq!(head_after_drift, manifest_pin + 1);
+
+    // Synthesize a sidecar with expected_version that DOES NOT match
+    // the current manifest pin AND post_commit_pin == lance_head →
+    // strict Mutation classifier sees lance_head == manifest_pinned + 1
+    // but expected != manifest_pinned → UnexpectedAtP1. decide → RollBack.
+    //
+    // expected_version must be a REAL Lance version (`restore_table_to_version`
+    // calls `checkout_version` on it, and an unknown version errors). Use
+    // manifest_pin - 1 which exists from the bootstrap commit chain.
+    let bogus_expected = manifest_pin - 1;
+    let bogus_post = head_after_drift;
+    let sidecar_json = format!(
+        r#"{{
+            "schema_version": 1,
+            "operation_id": "01H0000000000000000000RBCK",
+            "started_at": "0",
+            "branch": null,
+            "actor_id": "act-rollback",
+            "writer_kind": "Mutation",
+            "tables": [
+                {{
+                    "table_key":"node:Person",
+                    "table_path":"{}",
+                    "expected_version":{},
+                    "post_commit_pin":{}
+                }}
+            ]
+        }}"#,
+        person_uri, bogus_expected, bogus_post,
+    );
+    let recovery_dir = dir.path().join("__recovery");
+    std::fs::create_dir_all(&recovery_dir).unwrap();
+    std::fs::write(
+        recovery_dir.join("01H0000000000000000000RBCK.json"),
+        &sidecar_json,
+    )
+    .unwrap();
+
+    // Capture pre-refresh Lance HEAD on Person.
+    let pre_head = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .version()
+        .version;
+
+    // Trigger refresh-time recovery directly. Sidecar is rollback-
+    // eligible (UnexpectedAtP1); RollForwardOnly mode defers it,
+    // leaving the sidecar on disk and Lance HEAD unchanged on Person.
+    db.refresh().await.expect("refresh must succeed (deferring rollback)");
+
+    // Sidecar still on disk.
+    assert_eq!(
+        std::fs::read_dir(&recovery_dir).unwrap().count(),
+        1,
+        "rollback-eligible sidecar must be deferred to next ReadWrite open",
+    );
+
+    // Lance HEAD on Person unchanged — no restore ran.
+    let post_head = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    assert_eq!(
+        pre_head, post_head,
+        "refresh-time recovery must NOT call Dataset::restore on Person; \
+         pre_head={pre_head}, post_head={post_head}",
+    );
+
+    // Cross-check: drop the engine and reopen — full sweep handles
+    // the rollback (will use Dataset::restore safely; no concurrent
+    // writers at open time).
+    drop(db);
+    let _db = Omnigraph::open(&uri).await.unwrap();
+    // After full-sweep recovery, the sidecar should be processed
+    // (deleted). Sidecar's tables are eligible for rollback (UnexpectedAtP1):
+    // restore happens on Person (HEAD advances by 1).
+    let remaining = if recovery_dir.exists() {
+        std::fs::read_dir(&recovery_dir).unwrap().count()
+    } else {
+        0
+    };
+    assert_eq!(
+        remaining, 0,
+        "full sweep at next open must process the deferred sidecar",
+    );
+    let final_head = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    assert!(
+        final_head > post_head,
+        "full sweep must run Dataset::restore (head advances); \
+         post_head={post_head}, final_head={final_head}",
+    );
+}
+
 /// Companion to the above — confirms that a finalize→publisher failure
 /// on one table leaves OTHER tables untouched. Subsequent writes to
 /// non-drifted tables proceed normally; the drift is contained.

@@ -190,6 +190,7 @@ impl Omnigraph {
                 &root,
                 Arc::clone(&storage),
                 &mut coordinator,
+                crate::db::manifest::RecoveryMode::Full,
             )
             .await?;
         }
@@ -374,8 +375,43 @@ impl Omnigraph {
         Ok(())
     }
 
-    /// Re-read the handle-local coordinator state from storage.
-    pub(crate) async fn refresh(&mut self) -> Result<()> {
+    /// Re-read the handle-local coordinator state from storage AND run
+    /// roll-forward-only recovery: closes the in-process Phase B → Phase C
+    /// residual (e.g. `MutationStaging::finalize` crash mid-publish in a
+    /// long-running server) without restart. Roll-forward uses
+    /// `ManifestBatchPublisher::publish`'s row-level CAS — safe under
+    /// concurrency. Sidecars that would require `Dataset::restore` are
+    /// deferred to the next ReadWrite open (restore can silently orphan
+    /// a concurrent writer's commit if invoked under concurrency).
+    ///
+    /// Steady state cost: one `list_dir` of `__recovery/` (typically
+    /// returns empty → early return). No additional Lance reads.
+    ///
+    /// Engine-internal callers that already hold an in-flight sidecar
+    /// (e.g. `schema_apply` mid-write) MUST use
+    /// [`refresh_coordinator_only`](Self::refresh_coordinator_only) to
+    /// avoid the recovery sweep racing their own sidecar.
+    pub async fn refresh(&mut self) -> Result<()> {
+        self.coordinator.refresh().await?;
+        crate::db::manifest::recover_manifest_drift(
+            &self.root_uri,
+            Arc::clone(&self.storage),
+            &mut self.coordinator,
+            crate::db::manifest::RecoveryMode::RollForwardOnly,
+        )
+        .await?;
+        self.runtime_cache.invalidate_all().await;
+        Ok(())
+    }
+
+    /// Refresh coordinator state and invalidate the runtime cache WITHOUT
+    /// running the recovery sweep. Engine-internal callers that hold an
+    /// in-flight sidecar (e.g. `schema_apply::apply_schema_with_lock`'s
+    /// internal lease-check refresh) need this variant: running recovery
+    /// here would observe the caller's own sidecar, classify it as
+    /// RolledPastExpected, and roll it forward — racing the caller's
+    /// own publish path.
+    pub(crate) async fn refresh_coordinator_only(&mut self) -> Result<()> {
         self.coordinator.refresh().await?;
         self.runtime_cache.invalidate_all().await;
         Ok(())

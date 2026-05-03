@@ -193,12 +193,19 @@ Triggers for the residual: transient Lance write errors during finalize
 (object-store retry budget exhaustion, disk full); persistent publisher
 contention exceeding `PUBLISHER_RETRY_BUDGET = 5` retries.
 
-**Long-running servers**: between Phase B failure and the next
-`Omnigraph::open` (typically a server restart), subsequent writers on
-the affected tables surface
-`ManifestConflictDetails::ExpectedVersionMismatch`. Continuous
-in-process recovery (no restart required) is the goal of a future
-background reconciler.
+**Long-running servers**: `Omnigraph::refresh` runs roll-forward-only
+recovery in-process — the common Phase B → Phase C residual closes
+without a restart. The next mutation on the same handle (after refresh)
+no longer surfaces `ExpectedVersionMismatch` for the failed table.
+Sidecars that would require a `Dataset::restore` (mixed / unexpected
+state) are deferred to the next `OpenMode::ReadWrite` open: restore is
+unsafe under concurrency because Lance's `check_restore_txn` accepts
+the restore against in-flight Append/Update/Delete commits and
+silently orphans them (pinned by
+`tests/staged_writes.rs::lance_restore_loses_to_concurrent_append_via_orphaning`).
+Continuous in-process recovery for the rollback path is the goal of a
+future background reconciler with per-(table, branch) writer-queue
+acquisition.
 
 The publisher-CAS contract is unchanged: a *concurrent writer* that
 advances any of our touched tables between snapshot capture and
