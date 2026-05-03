@@ -767,7 +767,26 @@ impl Omnigraph {
                 // post_commit_pin) and the sidecar is treated as a
                 // stale artifact (cleaned up via the Phase 2 logic).
                 if let Some(handle) = sidecar_handle {
-                    crate::db::manifest::delete_sidecar(&handle, self.storage_adapter()).await?;
+                    // Best-effort cleanup: the manifest publish already
+                    // succeeded, so the user's mutation is durable. A
+                    // failed delete leaves the sidecar on disk; the
+                    // next open's recovery sweep classifies every table
+                    // as `NoMovement` (manifest pin == Lance HEAD ==
+                    // post_commit_pin) and tidies up. Failing the user
+                    // here would return an error for a write that
+                    // already landed (PR #72 review).
+                    if let Err(err) = crate::db::manifest::delete_sidecar(
+                        &handle,
+                        self.storage_adapter(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            error = %err,
+                            operation_id = handle.operation_id.as_str(),
+                            "MR-847 sidecar cleanup failed; the next open's recovery sweep will resolve it"
+                        );
+                    }
                 }
                 Ok(total)
             }

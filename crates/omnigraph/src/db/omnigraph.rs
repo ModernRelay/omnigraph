@@ -169,31 +169,30 @@ impl Omnigraph {
     ) -> Result<Self> {
         let root = normalize_root_uri(uri)?;
         // Open the coordinator first so the schema-staging recovery sweep can
-        // compare its snapshot against any leftover staging files. Recovery
-        // either deletes staging (pre-commit crash) or completes the rename
-        // (post-commit crash) before the live schema files are read.
+        // compare its snapshot against any leftover staging files.
         let mut coordinator = GraphCoordinator::open(&root, Arc::clone(&storage)).await?;
-        recover_schema_state_files(&root, Arc::clone(&storage), &coordinator.snapshot()).await?;
-        // MR-847 recovery sweep: close the Phase B → Phase C residual on
-        // any sidecar left over from a crashed writer. ReadOnly skips —
-        // recovery requires Lance writes (Dataset::restore, manifest publish);
-        // a read-only consumer (NDJSON export, commit list) sees the
-        // manifest-pinned content regardless of drift, so it doesn't need
-        // recovery and shouldn't trigger object-store writes. Continuous
-        // in-process recovery for long-running servers is MR-856 (background
-        // reconciler).
+        // Both the schema-state recovery sweep AND the MR-847 recovery sweep
+        // are gated on `OpenMode::ReadWrite`. Read-only consumers (NDJSON
+        // export, `commit list`, schema show) shouldn't trigger object-store
+        // mutations: they may run with read-only credentials, and silent
+        // open-time writes are surprising. Both sweeps' work is recoverable
+        // on the next ReadWrite open, so skipping under ReadOnly doesn't
+        // lose any safety guarantees — the manifest pin is the consistent
+        // snapshot regardless of drift on the per-table side or leftover
+        // schema-staging files.
         if matches!(mode, OpenMode::ReadWrite) {
+            recover_schema_state_files(&root, Arc::clone(&storage), &coordinator.snapshot())
+                .await?;
+            // MR-847 recovery sweep: close the Phase B → Phase C residual on
+            // any sidecar left over from a crashed writer. Continuous
+            // in-process recovery for long-running servers is MR-856
+            // (background reconciler).
             crate::db::manifest::recover_manifest_drift(
                 &root,
                 storage.as_ref(),
-                &coordinator.snapshot(),
+                &mut coordinator,
             )
             .await?;
-            // Roll-forward advances the manifest pin and the audit appends
-            // commits to _graph_commits.lance + _graph_commit_recoveries.lance.
-            // The coordinator's in-memory snapshot is now stale; refresh so
-            // the returned Omnigraph carries the post-recovery state.
-            coordinator.refresh().await?;
         }
         // Read _schema.pg (post-recovery — may have just been renamed in).
         let schema_path = schema_source_uri(&root);

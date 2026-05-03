@@ -543,9 +543,18 @@ async fn load_jsonl_reader<R: BufRead>(
         db.commit_updates_on_branch_with_expected(branch, &updates, &expected_versions)
             .await?;
         // MR-847: sidecar protects the per-table commit_staged →
-        // manifest publish window. Phase C succeeded — clean up.
+        // manifest publish window. Phase C succeeded — clean up
+        // best-effort (PR #72 review).
         if let Some(handle) = sidecar_handle {
-            crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await?;
+            if let Err(err) =
+                crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await
+            {
+                tracing::warn!(
+                    error = %err,
+                    operation_id = handle.operation_id.as_str(),
+                    "MR-847 sidecar cleanup failed; the next open's recovery sweep will resolve it"
+                );
+            }
         }
     } else {
         // LoadMode::Overwrite keeps the legacy inline-commit path —

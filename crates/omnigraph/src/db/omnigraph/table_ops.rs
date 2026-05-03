@@ -43,19 +43,25 @@ pub(super) async fn ensure_indices_for_branch(
     let active_branch = resolved.branch;
 
     // MR-847 sidecar: protect the per-table commit_staged loop in
-    // build_indices_on_dataset (one commit per index built). Pins every
-    // node + edge table that's eligible for index work; the classifier
-    // loose-matches for SidecarKind::EnsureIndices (the actual N depends
-    // on which indices are missing). Skip sidecar entirely when the
-    // catalog has no tables that could need indexing — steady-state
-    // calls then incur no sidecar I/O.
+    // build_indices_on_dataset (one commit per index built). Only pins
+    // tables that ACTUALLY need index work — the classifier
+    // loose-matches for SidecarKind::EnsureIndices (the actual N
+    // depends on which indices are missing), but if a table needs zero
+    // commits and gets pinned, the all-or-nothing decision rule treats
+    // it as `NoMovement` and rolls back legitimately-committed work on
+    // sibling tables (PR #72 review). Steady-state runs (everything
+    // already indexed) skip the sidecar entirely.
     let mut recovery_pins: Vec<crate::db::manifest::SidecarTablePin> = Vec::new();
     for type_name in db.catalog.node_types.keys() {
         let table_key = format!("node:{}", type_name);
-        if let Some(entry) = snapshot.entry(&table_key) {
+        let Some(entry) = snapshot.entry(&table_key) else {
+            continue;
+        };
+        let full_path = format!("{}/{}", db.root_uri, entry.table_path);
+        if needs_index_work_node(db, type_name, &table_key, &full_path).await? {
             recovery_pins.push(crate::db::manifest::SidecarTablePin {
                 table_key,
-                table_path: format!("{}/{}", db.root_uri, entry.table_path),
+                table_path: full_path,
                 expected_version: entry.table_version,
                 post_commit_pin: entry.table_version + 1,
             });
@@ -63,10 +69,14 @@ pub(super) async fn ensure_indices_for_branch(
     }
     for edge_name in db.catalog.edge_types.keys() {
         let table_key = format!("edge:{}", edge_name);
-        if let Some(entry) = snapshot.entry(&table_key) {
+        let Some(entry) = snapshot.entry(&table_key) else {
+            continue;
+        };
+        let full_path = format!("{}/{}", db.root_uri, entry.table_path);
+        if needs_index_work_edge(db, &table_key, &full_path).await? {
             recovery_pins.push(crate::db::manifest::SidecarTablePin {
                 table_key,
-                table_path: format!("{}/{}", db.root_uri, entry.table_path),
+                table_path: full_path,
                 expected_version: entry.table_version,
                 post_commit_pin: entry.table_version + 1,
             });
@@ -192,14 +202,83 @@ pub(super) async fn ensure_indices_for_branch(
         commit_prepared_updates_on_branch(db, branch, &updates).await?;
     }
 
-    // MR-847 sidecar lifecycle: delete after the manifest publish (or no-op
-    // when there were no updates — sidecar covered the per-table commit
-    // window regardless).
+    // MR-847 sidecar lifecycle: delete after the manifest publish (or
+    // no-op when there were no updates — sidecar covered the per-table
+    // commit window regardless). Best-effort cleanup (PR #72 review).
     if let Some(handle) = recovery_handle {
-        crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await?;
+        if let Err(err) =
+            crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await
+        {
+            tracing::warn!(
+                error = %err,
+                operation_id = handle.operation_id.as_str(),
+                "MR-847 sidecar cleanup failed; the next open's recovery sweep will resolve it"
+            );
+        }
     }
 
     Ok(())
+}
+
+/// Returns true if the node table is missing at least one declared
+/// scalar/vector index that `build_indices_on_dataset_for_catalog` would
+/// build. Used by `ensure_indices_for_branch` to scope the MR-847
+/// recovery sidecar to tables that will actually receive commit_staged
+/// calls — listing untouched tables would force a rollback under the
+/// all-or-nothing decision rule when any one of them ends up
+/// `NoMovement` on recovery.
+async fn needs_index_work_node(
+    db: &Omnigraph,
+    type_name: &str,
+    table_key: &str,
+    full_path: &str,
+) -> Result<bool> {
+    let ds = db
+        .table_store
+        .open_dataset_head_for_write(table_key, full_path, None)
+        .await?;
+    if !db.table_store.has_btree_index(&ds, "id").await? {
+        return Ok(true);
+    }
+    let Some(node_type) = db.catalog.node_types.get(type_name) else {
+        return Ok(false);
+    };
+    for index_cols in &node_type.indices {
+        if index_cols.len() != 1 {
+            continue;
+        }
+        let prop_name = &index_cols[0];
+        let Some(prop_type) = node_type.properties.get(prop_name) else {
+            continue;
+        };
+        if matches!(prop_type.scalar, ScalarType::String) && !prop_type.list {
+            if !db.table_store.has_fts_index(&ds, prop_name).await? {
+                return Ok(true);
+            }
+        } else if matches!(prop_type.scalar, ScalarType::Vector(_)) && !prop_type.list {
+            if !db.table_store.has_vector_index(&ds, prop_name).await? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Companion to `needs_index_work_node` for edge tables. Edges always
+/// need three BTree indices (id, src, dst); returns true if any are
+/// missing.
+async fn needs_index_work_edge(
+    db: &Omnigraph,
+    table_key: &str,
+    full_path: &str,
+) -> Result<bool> {
+    let ds = db
+        .table_store
+        .open_dataset_head_for_write(table_key, full_path, None)
+        .await?;
+    Ok(!db.table_store.has_btree_index(&ds, "id").await?
+        || !db.table_store.has_btree_index(&ds, "src").await?
+        || !db.table_store.has_btree_index(&ds, "dst").await?)
 }
 
 pub(super) async fn open_for_mutation(

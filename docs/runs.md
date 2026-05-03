@@ -171,12 +171,17 @@ recovery sweep in `crates/omnigraph/src/db/manifest/recovery.rs`:
   Lance HEAD to the manifest pin. Classify per the all-or-nothing
   decision tree (RolledPastExpected / NoMovement / UnexpectedAtP1 /
   UnexpectedMultistep / InvariantViolation).
-- If every table is `RolledPastExpected`, **roll forward**: a single
-  `ManifestBatchPublisher::publish` call extends every pin atomically.
+- If any table is `InvariantViolation` (Lance HEAD < manifest pinned —
+  should be impossible), **abort** with a loud error and leave the
+  sidecar on disk for operator review.
+- Otherwise, if every table is `RolledPastExpected`, **roll forward**:
+  a single `ManifestBatchPublisher::publish` call extends every pin
+  atomically.
 - Otherwise **roll back**: per-table `Dataset::restore` to the
   expected_version (with a fragment-set short-circuit so repeated
   mid-sweep crashes don't pile up versions).
-- Either way, an audit row is recorded — `_graph_commits.lance` carries
+- After a successful roll-forward or roll-back, an audit row is
+  recorded — `_graph_commits.lance` carries
   a commit tagged `actor_id = "omnigraph:recovery"`, and a sibling
   `_graph_commit_recoveries.lance` row carries `recovery_kind`,
   `recovery_for_actor` (the original sidecar's actor), `operation_id`,

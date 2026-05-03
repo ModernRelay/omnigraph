@@ -47,6 +47,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::db::commit_graph::CommitGraph;
+use crate::db::graph_coordinator::GraphCoordinator;
 use crate::db::recovery_audit::{
     now_micros, RecoveryAudit, RecoveryAuditRecord, RecoveryKind, TableOutcome,
 };
@@ -264,7 +265,14 @@ pub(crate) async fn list_sidecars(
     storage: &dyn StorageAdapter,
 ) -> Result<Vec<RecoverySidecar>> {
     let dir = recovery_dir_uri(root_uri);
-    let uris = storage.list_dir(&dir).await?;
+    let mut uris = storage.list_dir(&dir).await?;
+    // Sort by URI so the sweep processes sidecars deterministically.
+    // Sidecar filenames are ULIDs, which are lexicographically sortable
+    // === chronologically sortable; the older sidecar is processed
+    // before the newer one. Without this sort, `list_dir` returns
+    // filesystem-order results which are nondeterministic and can mask
+    // ordering-sensitive bugs. (PR #72 review.)
+    uris.sort();
     let mut out = Vec::with_capacity(uris.len());
     for uri in uris {
         // Skip non-JSON files defensively; the directory is ours but a
@@ -315,14 +323,15 @@ pub(crate) fn parse_sidecar(sidecar_uri: &str, body: &str) -> Result<RecoverySid
 /// Classify one table's observed state vs. the sidecar's intent.
 ///
 /// `kind` adjusts the precision of the `RolledPastExpected` predicate:
-/// - **Strict** (`Mutation`, `Load`, `BranchMerge`): exactly one
-///   `commit_staged` per table, so `lance_head == manifest_pinned + 1`
-///   AND `post_commit_pin == lance_head` is required.
-/// - **Loose** (`SchemaApply`, `EnsureIndices`): the writer may run
-///   N ≥ 1 `commit_staged` calls per table (one per index built + one
-///   for the overwrite, etc.) and the exact N is hard to compute at
-///   sidecar-write time. The loose match accepts any
-///   `lance_head > manifest_pinned` as `RolledPastExpected` when
+/// - **Strict** (`Mutation`, `Load`): exactly one `commit_staged` per
+///   table, so `lance_head == manifest_pinned + 1` AND
+///   `post_commit_pin == lance_head` is required.
+/// - **Loose** (`SchemaApply`, `EnsureIndices`, `BranchMerge`): the
+///   writer may run N ≥ 1 `commit_staged` calls per table (one per
+///   index built + one for the overwrite, etc.; merge tables run
+///   merge_insert + delete_where + index rebuilds) and the exact N
+///   is hard to compute at sidecar-write time. The loose match accepts
+///   any `lance_head > manifest_pinned` as `RolledPastExpected` when
 ///   `pin.expected_version == manifest_pinned` (the writer's CAS
 ///   target matches what the manifest currently shows). The risk this
 ///   admits — an external agent advancing HEAD between sidecar write
@@ -344,10 +353,7 @@ pub(crate) fn classify_table(
         return NoMovement;
     }
     // lance_head > manifest_pinned
-    let strict = matches!(
-        kind,
-        SidecarKind::Mutation | SidecarKind::Load | SidecarKind::BranchMerge,
-    );
+    let strict = matches!(kind, SidecarKind::Mutation | SidecarKind::Load);
     if strict {
         if lance_head == manifest_pinned + 1 {
             if pin.expected_version == manifest_pinned && pin.post_commit_pin == lance_head {
@@ -440,12 +446,6 @@ fn fragment_ids(ds: &Dataset) -> Vec<u64> {
 /// roll-forward (every table eligible), roll-back (mixed or unexpected
 /// state), or abort (invariant violation).
 ///
-/// **Phase 3 scope** (this commit): roll-back path is fully implemented;
-/// roll-forward errors out with a "Phase 4" placeholder so the
-/// open-time wiring + sidecar I/O + classification + decision dispatch
-/// can land independently of the audit/manifest-publish work. Tests
-/// exercising the end-to-end roll-forward path land alongside Phase 4.
-///
 /// Idempotency: a crash mid-sweep leaves the sidecar (deletion is the
 /// final step). Re-opening re-classifies; the fragment-set short-circuit
 /// in [`restore_table_to_version`] prevents version pile-up under
@@ -460,16 +460,26 @@ fn fragment_ids(ds: &Dataset) -> Vec<u64> {
 pub(crate) async fn recover_manifest_drift(
     root_uri: &str,
     storage: &dyn StorageAdapter,
-    snapshot: &Snapshot,
+    coordinator: &mut GraphCoordinator,
 ) -> Result<()> {
     let sidecars = list_sidecars(root_uri, storage).await?;
     if sidecars.is_empty() {
         return Ok(());
     }
 
+    // PR #72 review (chatgpt-codex + cubic): refresh the coordinator
+    // snapshot BEFORE each sidecar's classification. Sidecar N's
+    // roll-forward writes manifest changes that sidecar N+1 must
+    // observe, otherwise sidecar N+1 classifies its tables against
+    // stale pins and may incorrectly roll back work that landed
+    // moments earlier. Refresh is cheap (one Lance manifest read).
     for sidecar in sidecars {
-        process_sidecar(root_uri, storage, snapshot, &sidecar).await?;
+        coordinator.refresh().await?;
+        let snapshot = coordinator.snapshot();
+        process_sidecar(root_uri, storage, &snapshot, &sidecar).await?;
     }
+    // Final refresh so the caller sees the post-sweep state.
+    coordinator.refresh().await?;
     Ok(())
 }
 
@@ -886,6 +896,40 @@ mod tests {
         );
     }
 
+    /// PR #72 review (cubic + cursor) flagged that BranchMerge is in
+    /// the strict classifier set, but `publish_rewritten_merge_table`
+    /// runs multiple `commit_staged` calls per table (merge_insert +
+    /// delete_where + index rebuilds — the comment in `merge.rs`
+    /// explicitly says so). Strict classification rolls back valid
+    /// completed Phase B work as `UnexpectedMultistep`. BranchMerge
+    /// must be loose-matched like SchemaApply / EnsureIndices.
+    #[test]
+    fn classify_loose_match_accepts_multi_commit_drift_for_branch_merge() {
+        let pin = make_pin("node:Person", "irrelevant", 5, 6);
+        assert_eq!(
+            classify_table(&pin, 8, 5, SidecarKind::BranchMerge),
+            TableClassification::RolledPastExpected,
+        );
+    }
+
+    #[test]
+    fn classify_loose_match_branch_merge_no_movement_unchanged() {
+        let pin = make_pin("node:Person", "irrelevant", 5, 6);
+        assert_eq!(
+            classify_table(&pin, 5, 5, SidecarKind::BranchMerge),
+            TableClassification::NoMovement,
+        );
+    }
+
+    #[test]
+    fn classify_loose_match_branch_merge_invariant_violation_unchanged() {
+        let pin = make_pin("node:Person", "irrelevant", 5, 6);
+        assert_eq!(
+            classify_table(&pin, 3, 5, SidecarKind::BranchMerge),
+            TableClassification::InvariantViolation { observed: 3 },
+        );
+    }
+
     #[test]
     fn decide_roll_forward_when_all_classifications_match() {
         let cls = vec![
@@ -1045,5 +1089,46 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_empty());
+    }
+
+    /// PR #72 review (cubic) flagged that `list_dir` returns
+    /// filesystem-order results, making sidecar processing
+    /// nondeterministic. Sidecar filenames are ULIDs (lexicographically
+    /// sortable === chronologically sortable), so sorting by URI gives
+    /// deterministic, time-ordered processing — the older sidecar
+    /// processed before the newer one.
+    #[tokio::test]
+    async fn list_sidecars_returns_deterministic_order() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(RECOVERY_DIR_NAME)).unwrap();
+        let storage = LocalStorageAdapter::default();
+        let root = dir.path().to_str().unwrap();
+
+        // Write sidecars in REVERSE chronological order (newest first).
+        // The classifier shouldn't care, but the sweep needs deterministic
+        // processing for reproducibility.
+        let ids = ["01H000000000000000000000ZZ", "01H000000000000000000000MM", "01H000000000000000000000AA"];
+        for id in &ids {
+            let sc = new_sidecar(
+                SidecarKind::Mutation,
+                None,
+                None,
+                vec![make_pin("node:Person", "/dev/null/x.lance", 1, 2)],
+            );
+            // Override operation_id to use our deterministic ID.
+            let mut sc = sc;
+            sc.operation_id = id.to_string();
+            write_sidecar(root, &storage, &sc).await.unwrap();
+        }
+
+        let listed = list_sidecars(root, &storage).await.unwrap();
+        let listed_ids: Vec<&str> = listed.iter().map(|s| s.operation_id.as_str()).collect();
+        let mut sorted_ids = listed_ids.clone();
+        sorted_ids.sort();
+        assert_eq!(
+            listed_ids, sorted_ids,
+            "list_sidecars must return sidecars in deterministic (sorted) order; got {:?}",
+            listed_ids,
+        );
     }
 }

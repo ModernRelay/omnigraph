@@ -1190,11 +1190,19 @@ impl Omnigraph {
         let recovery_handle = if recovery_pins.is_empty() {
             None
         } else {
+            // PR #72 review (chatgpt-codex + cubic): use the merge target
+            // branch directly, NOT a heuristic derived from
+            // `ordered_table_keys.first()`. The first sorted table key may
+            // not be in the target snapshot at all (its `entry()` returns
+            // None → branch becomes None == main), and the SubTableEntry's
+            // `table_branch` field isn't necessarily the merge target
+            // branch. The caller `branch_merge` calls
+            // `swap_coordinator_for_branch(target_branch)` before invoking
+            // this function, so `self.active_branch()` is the target.
+            let target_branch = self.active_branch().map(str::to_string);
             let sidecar = crate::db::manifest::new_sidecar(
                 crate::db::manifest::SidecarKind::BranchMerge,
-                target_snapshot
-                    .entry(ordered_table_keys.first().map(String::as_str).unwrap_or(""))
-                    .and_then(|e| e.table_branch.clone()),
+                target_branch,
                 self.audit_actor_id.clone(),
                 recovery_pins,
             );
@@ -1249,8 +1257,17 @@ impl Omnigraph {
         };
 
         // MR-847 sidecar lifecycle: delete after manifest publish.
+        // Best-effort cleanup (PR #72 review).
         if let Some(handle) = recovery_handle {
-            crate::db::manifest::delete_sidecar(&handle, self.storage_adapter()).await?;
+            if let Err(err) =
+                crate::db::manifest::delete_sidecar(&handle, self.storage_adapter()).await
+            {
+                tracing::warn!(
+                    error = %err,
+                    operation_id = handle.operation_id.as_str(),
+                    "MR-847 sidecar cleanup failed; the next open's recovery sweep will resolve it"
+                );
+            }
         }
         self.record_merge_commit(
             manifest_version,

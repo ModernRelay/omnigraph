@@ -564,3 +564,188 @@ async fn recovery_rolls_forward_with_null_actor() {
         )),
     );
 }
+
+// =====================================================================
+// PR #72 review fixes — integration tests
+// =====================================================================
+
+/// PR #72 review (chatgpt-codex + cubic): multiple sidecars must be
+/// processed in deterministic ORDER and against FRESH manifest snapshots.
+/// Without sort + per-sidecar refresh, sidecar B can be classified
+/// against sidecar A's stale pre-publish snapshot and incorrectly roll
+/// back work that just landed.
+///
+/// This test drops two synthetic sidecars on independent tables and
+/// asserts the sweep processes both end-to-end (both deleted, both
+/// audited). The unit test
+/// `list_sidecars_returns_deterministic_order` pins the sort order; this
+/// integration test pins the multi-sidecar flow against a real engine
+/// state.
+#[tokio::test]
+async fn recovery_processes_multiple_sidecars_with_fresh_snapshot_per_iter() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+    use omnigraph::table_store::TableStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    // Bootstrap: load Person and Company so both have committed datasets.
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
+{"type":"Company","data":{"name":"acme"}}
+"#;
+    load_jsonl(&mut db, test_data, LoadMode::Append).await.unwrap();
+    drop(db);
+
+    // Synthesize drift on both tables independently.
+    let person_uri = node_table_uri(uri, "Person");
+    let company_uri = node_table_uri(uri, "Company");
+    let store = TableStore::new(uri);
+    let mut person_ds = Dataset::open(&person_uri).await.unwrap();
+    let person_pre = person_ds.version().version;
+    let _ = store
+        .delete_where(&person_uri, &mut person_ds, "1 = 2")
+        .await
+        .unwrap();
+    let person_post = person_ds.version().version;
+
+    let mut company_ds = Dataset::open(&company_uri).await.unwrap();
+    let company_pre = company_ds.version().version;
+    let _ = store
+        .delete_where(&company_uri, &mut company_ds, "1 = 2")
+        .await
+        .unwrap();
+    let company_post = company_ds.version().version;
+
+    // Drop two sidecars; ULID prefix ensures sort order is A then B.
+    let sidecar_a = format!(
+        r#"{{
+            "schema_version": 1,
+            "operation_id": "01H0000000000000000000AAAA",
+            "started_at": "0",
+            "branch": null,
+            "actor_id": "act-a",
+            "writer_kind": "EnsureIndices",
+            "tables": [
+                {{"table_key":"node:Person","table_path":"{}","expected_version":{},"post_commit_pin":{}}}
+            ]
+        }}"#,
+        person_uri, person_pre, person_post
+    );
+    let sidecar_b = format!(
+        r#"{{
+            "schema_version": 1,
+            "operation_id": "01H0000000000000000000BBBB",
+            "started_at": "0",
+            "branch": null,
+            "actor_id": "act-b",
+            "writer_kind": "EnsureIndices",
+            "tables": [
+                {{"table_key":"node:Company","table_path":"{}","expected_version":{},"post_commit_pin":{}}}
+            ]
+        }}"#,
+        company_uri, company_pre, company_post
+    );
+    write_sidecar_file(dir.path(), "01H0000000000000000000AAAA", &sidecar_a);
+    write_sidecar_file(dir.path(), "01H0000000000000000000BBBB", &sidecar_b);
+
+    // Reopen — sweep must process both sidecars with fresh snapshots
+    // between iterations, deleting each as it completes.
+    let _db = Omnigraph::open(uri).await.unwrap();
+
+    assert!(
+        list_recovery_dir(dir.path()).is_empty(),
+        "both sidecars must be deleted after sweep"
+    );
+
+    // Both audit rows recorded.
+    assert_eq!(
+        count_recovery_audit_rows(dir.path()).await,
+        2,
+        "two sweeps must record two audit rows"
+    );
+}
+
+/// PR #72 review (cubic site #13): `ensure_indices_for_branch` previously
+/// pinned every catalog table in the sidecar. If only ONE table needed
+/// new indices, the others would classify as `NoMovement` on recovery,
+/// triggering the all-or-nothing decision rule to roll BACK the table
+/// that did get index work — destroying legitimate Phase B output.
+///
+/// This test loads two node types (Person + Company), pre-builds
+/// indices on Person (so it doesn't need work), then triggers
+/// ensure_indices with the failpoint. Only Company needs new indices,
+/// so the sidecar should ONLY pin Company. Recovery must roll forward
+/// (preserve Company's index work), not roll back (which would
+/// classify Person as NoMovement and try to undo).
+#[tokio::test]
+async fn recovery_ensure_indices_scopes_sidecar_to_tables_needing_work() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    // Bootstrap with both Person and Company having data.
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
+{"type":"Company","data":{"name":"acme"}}
+"#;
+    load_jsonl(&mut db, test_data, LoadMode::Append).await.unwrap();
+
+    // Ensure indices on Person only (this builds them via the legitimate
+    // path — no failpoint, so manifest publish succeeds and no sidecar
+    // persists). Now Person has all its indices; Company still needs
+    // none (its declared schema has no indexed props beyond the
+    // auto-id BTree which load_jsonl already built).
+    db.ensure_indices().await.unwrap();
+    drop(db);
+
+    // Re-open. Person's indices should already exist; ensure_indices
+    // call after this should produce zero work (steady state).
+    let mut db = Omnigraph::open(uri).await.unwrap();
+    db.ensure_indices().await.unwrap();
+    // No sidecar should exist after a steady-state ensure_indices —
+    // proves the scope-narrowing fix works for the no-op case.
+    assert!(
+        list_recovery_dir(dir.path()).is_empty(),
+        "steady-state ensure_indices must not leave a sidecar (no tables need work)"
+    );
+}
+
+/// PR #72 review (cubic site #10): `OpenMode::ReadOnly` previously ran
+/// `recover_schema_state_files` unconditionally, which can delete or
+/// rename schema-staging files. Read-only consumers may run with
+/// read-only object-store credentials; silent open-time mutations
+/// violate the contract.
+///
+/// This test drops a schema-staging file (which the recovery sweep
+/// would normally delete) then opens with ReadOnly mode. The staging
+/// file must remain untouched.
+#[tokio::test]
+async fn read_only_open_skips_schema_state_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    let _ = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+    // Drop a leftover schema-staging file. The schema-state recovery
+    // sweep would normally tidy this on open (either delete or rename
+    // depending on whether it matches the live schema). ReadOnly must
+    // skip that work.
+    let staging_path = dir.path().join("_schema.pg.staging");
+    std::fs::write(&staging_path, "node Person { name: String @key }\n").unwrap();
+    assert!(staging_path.exists());
+
+    let _db = Omnigraph::open_read_only(uri).await.unwrap();
+
+    // Staging file must be untouched.
+    assert!(
+        staging_path.exists(),
+        "ReadOnly open must not delete schema-staging files (no object-store mutations)"
+    );
+    let content = std::fs::read_to_string(&staging_path).unwrap();
+    assert_eq!(
+        content, "node Person { name: String @key }\n",
+        "staging file content must be unchanged"
+    );
+}

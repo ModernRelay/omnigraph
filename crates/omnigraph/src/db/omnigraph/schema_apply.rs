@@ -441,12 +441,22 @@ pub(super) async fn apply_schema_with_lock(
     }
 
     // MR-847 sidecar lifecycle: delete after the manifest commit succeeded.
-    // If this delete fails, the sidecar persists; on next open the sweep
-    // sees every table at the post-publish manifest pin (NoMovement) and
-    // the sidecar is treated as a stale artifact (recovery is a no-op
-    // and the sidecar is cleaned up).
+    // Best-effort: if this delete fails, the sidecar persists; on next open
+    // the sweep sees every table at the post-publish manifest pin
+    // (NoMovement) and the sidecar is treated as a stale artifact
+    // (recovery is a no-op and the sidecar is cleaned up). Failing the
+    // schema_apply call would report failure for a migration that
+    // already succeeded (PR #72 review).
     if let Some(handle) = recovery_handle {
-        crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await?;
+        if let Err(err) =
+            crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await
+        {
+            tracing::warn!(
+                error = %err,
+                operation_id = handle.operation_id.as_str(),
+                "MR-847 sidecar cleanup failed; the next open's recovery sweep will resolve it"
+            );
+        }
     }
 
     Ok(SchemaApplyResult {
