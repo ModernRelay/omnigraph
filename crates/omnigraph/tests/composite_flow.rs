@@ -368,14 +368,4 @@ async fn composite_flow_init_load_branch_merge_time_travel_optimize_cleanup() {
     .await
     .unwrap();
     assert!(!final_total.batches().is_empty());
-
-    let final_total = query_main(
-        &mut db,
-        TEST_QUERIES,
-        "total_people",
-        &ParamMap::default(),
-    )
-    .await
-    .unwrap();
-    assert!(!final_total.batches().is_empty());
 }

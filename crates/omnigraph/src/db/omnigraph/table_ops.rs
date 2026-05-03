@@ -57,6 +57,15 @@ pub(super) async fn ensure_indices_for_branch(
         let Some(entry) = snapshot.entry(&table_key) else {
             continue;
         };
+        // Match the processing loop's branch filter: when running on a
+        // feature branch, main-branch tables (table_branch = None) are
+        // skipped (`None => continue` at ~line 118). Pinning them here
+        // would force NoMovement on recovery and trigger an all-or-
+        // nothing rollback of legitimately-committed work on the
+        // feature-branch tables.
+        if active_branch.is_some() && entry.table_branch.is_none() {
+            continue;
+        }
         let full_path = format!("{}/{}", db.root_uri, entry.table_path);
         if needs_index_work_node(
             db,
@@ -80,6 +89,9 @@ pub(super) async fn ensure_indices_for_branch(
         let Some(entry) = snapshot.entry(&table_key) else {
             continue;
         };
+        if active_branch.is_some() && entry.table_branch.is_none() {
+            continue;
+        }
         let full_path = format!("{}/{}", db.root_uri, entry.table_path);
         if needs_index_work_edge(db, &table_key, &full_path, entry.table_branch.as_deref())
             .await?

@@ -6,7 +6,7 @@ use fail::FailScenario;
 use omnigraph::db::Omnigraph;
 use omnigraph::failpoints::ScopedFailPoint;
 
-use helpers::{MUTATION_QUERIES, mixed_params, mutate_main};
+use helpers::{MUTATION_QUERIES, mixed_params, mutate_main, version_main};
 
 const SCHEMA_V1: &str = "node Person { name: String @key }\n";
 const SCHEMA_V2_ADDED_TYPE: &str =
@@ -421,6 +421,13 @@ async fn schema_apply_phase_b_failure_recovered_on_next_open() {
         .unwrap();
     }
 
+    // Capture pre-failure manifest version so we can assert the recovery
+    // sweep advances it.
+    let pre_failure_version = {
+        let db = Omnigraph::open(&uri).await.unwrap();
+        version_main(&db).await.unwrap()
+    };
+
     // Phase A: trigger the residual via `schema_apply.after_staging_write`.
     // This failpoint fires AFTER the rewritten_tables/indexed_tables loops
     // (Lance HEAD advanced) AND AFTER the schema-state staging files are
@@ -479,7 +486,7 @@ edge WorksAt: Person -> Company
     // SchemaApply (loose-match) — classifier accepts the multi-commit
     // drift on Person, decision is RollForward, manifest extends to the
     // current Lance HEAD.
-    let _db = Omnigraph::open(&uri).await.unwrap();
+    let db = Omnigraph::open(&uri).await.unwrap();
 
     // Sidecar gone, audit row recorded.
     let recovery_dir = dir.path().join("__recovery");
@@ -499,6 +506,16 @@ edge WorksAt: Person -> Company
         audit_dir.exists(),
         "_graph_commit_recoveries.lance must exist after schema_apply recovery"
     );
+
+    // Recovery sweep must have advanced the manifest pin on the rewritten
+    // table: roll-forward published the post-failure Lance HEAD.
+    let post_recovery_version = version_main(&db).await.unwrap();
+    assert!(
+        post_recovery_version > pre_failure_version,
+        "manifest version must advance post-recovery; pre={pre_failure_version}, \
+         post={post_recovery_version}",
+    );
+    drop(db);
 }
 
 #[tokio::test]
@@ -509,8 +526,12 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
 
-    // Seed main with a row, branch off, mutate the branch, then attempt
-    // a merge with the failpoint active.
+    // Seed main with a row, branch off, mutate BOTH sides so the merge
+    // produces at least one `RewriteMerged` candidate (target moved past
+    // base too — required for the recovery sidecar to pin anything; the
+    // sidecar only pins RewriteMerged candidates because they're the
+    // only path that always advances Lance HEAD via
+    // `publish_rewritten_merge_table`).
     {
         let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
         load_jsonl(
@@ -530,7 +551,23 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
         )
         .await
         .unwrap();
+        // Mutate main too so the merge sees target ≠ base for Person —
+        // forces RewriteMerged classification.
+        mutate_main(
+            &mut db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Carol")], &[("$age", 50)]),
+        )
+        .await
+        .unwrap();
     }
+
+    // Capture pre-failure state on main for post-recovery comparison.
+    let pre_failure_version = {
+        let db = Omnigraph::open(&uri).await.unwrap();
+        version_main(&db).await.unwrap()
+    };
 
     // Phase A: failpoint fires after the per-table publish loop completes
     // but before commit_manifest_updates. Sidecar persists.
@@ -558,10 +595,13 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
         );
     }
 
-    // Phase B: reopen runs the sweep. BranchMerge is strict-classified
-    // (single commit_staged per table for the merge_insert path), so the
-    // sidecar's post_commit_pin should match observed Lance HEAD.
-    let _db = Omnigraph::open(&uri).await.unwrap();
+    // Phase B: reopen runs the sweep. BranchMerge uses LOOSE
+    // classification — `publish_rewritten_merge_table` runs multiple
+    // commit_staged calls per table (stage_merge_insert + delete_where +
+    // index rebuilds), so post_commit_pin in the sidecar is a lower
+    // bound; the loose-match classifier accepts any HEAD > expected_version
+    // when expected_version == manifest_pinned.
+    let db = Omnigraph::open(&uri).await.unwrap();
 
     let recovery_dir = dir.path().join("__recovery");
     if recovery_dir.exists() {
@@ -580,6 +620,15 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
         audit_dir.exists(),
         "_graph_commit_recoveries.lance must exist after branch_merge recovery"
     );
+
+    // Recovery must have advanced main's manifest pin (the merge published).
+    let post_recovery_version = version_main(&db).await.unwrap();
+    assert!(
+        post_recovery_version > pre_failure_version,
+        "manifest version must advance post-recovery; pre={pre_failure_version}, \
+         post={post_recovery_version}",
+    );
+    drop(db);
 }
 
 /// `ensure_indices` only writes a sidecar when at least one table

@@ -10,7 +10,10 @@
 //! row recording.
 
 use std::path::Path;
+use std::sync::Arc;
 
+use arrow_array::{Int32Array, RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use omnigraph::db::Omnigraph;
 
@@ -49,6 +52,30 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x100_0000_01b3);
     }
     hash
+}
+
+/// Build a Person RecordBatch matching the post-init Lance schema:
+/// `id: Utf8, age: Int32?, name: Utf8`. Used by tests that need to advance
+/// Lance HEAD with real fragment changes (not no-op deletes) bypassing
+/// `__manifest`.
+fn person_batch(rows: &[(&str, &str, Option<i32>)]) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, true),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let ids: Vec<&str> = rows.iter().map(|(id, _, _)| *id).collect();
+    let names: Vec<&str> = rows.iter().map(|(_, name, _)| *name).collect();
+    let ages: Vec<Option<i32>> = rows.iter().map(|(_, _, age)| *age).collect();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(ids)),
+            Arc::new(Int32Array::from(ages)),
+            Arc::new(StringArray::from(names)),
+        ],
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -780,8 +807,11 @@ async fn recovery_ensure_indices_handles_empty_tables() {
 ///   expected=v1, post=v2.
 /// - Sidecar B: kind=EnsureIndices (loose), refers to Person at
 ///   expected=v2, post=v3.
-/// - Lance HEAD for Person sits at v3 (both writers' Phase B fragments
-///   chained but neither's Phase C landed).
+/// - Lance HEAD for Person sits at v3, and v1, v2, v3 have DIFFERENT
+///   fragment-id sets (each version added a real row via append_batch).
+///   This means `restore_table_to_version`'s fragment-set short-circuit
+///   does NOT fire under the bug path — a real `Dataset::restore`
+///   actually runs there, producing HEAD=v4.
 ///
 /// Outcome paths:
 ///
@@ -839,18 +869,31 @@ async fn recovery_multi_sidecar_requires_fresh_snapshot_for_correctness() {
     let mut ds = Dataset::open(&person_uri).await.unwrap();
     let v1 = ds.version().version;
 
-    // Advance Lance HEAD twice to mimic two consecutive
-    // would-be-publishes that didn't land:
-    //   - First "writer" advanced HEAD v1 → v2.
-    //   - Second "writer" advanced HEAD v2 → v3.
-    // Manifest stays at v1 throughout because we're synthesizing.
-    let _ = store
-        .delete_where(&person_uri, &mut ds, "1 = 2")
+    // Advance Lance HEAD twice via raw append_batch to mimic two
+    // consecutive would-be-publishes that didn't land. Each append adds
+    // a new fragment, so v1, v2, v3 have DIFFERENT fragment-id sets —
+    // restore_table_to_version's fragment-set short-circuit will not
+    // fire when classifier dispatches to rollback (the
+    // differentiator we rely on).
+    //
+    // Bypassing __manifest is what `delete_where` and `append_batch`
+    // both do (direct on Lance); using append_batch (instead of no-op
+    // deletes) is what makes the fragment-set differ across versions.
+    store
+        .append_batch(
+            &person_uri,
+            &mut ds,
+            person_batch(&[("bob-id", "bob", Some(25))]),
+        )
         .await
         .unwrap();
     let v2 = ds.version().version;
-    let _ = store
-        .delete_where(&person_uri, &mut ds, "1 = 2")
+    store
+        .append_batch(
+            &person_uri,
+            &mut ds,
+            person_batch(&[("carol-id", "carol", Some(40))]),
+        )
         .await
         .unwrap();
     let v3 = ds.version().version;

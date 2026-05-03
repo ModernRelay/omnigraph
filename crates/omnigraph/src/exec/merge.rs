@@ -1168,17 +1168,38 @@ impl Omnigraph {
         validate_merge_candidates(self, source_snapshot, &target_snapshot, &candidates).await?;
 
         // Recovery sidecar: protect the per-table commit_staged loop.
-        // Pins every table that will be touched by
-        // `publish_adopted_source_state` or `publish_rewritten_merge_table`.
-        // BranchMerge uses loose classification — the publish path may
-        // run multiple commit_staged calls per table
-        // (publish_rewritten_merge_table does stage_merge_insert +
-        // delete_where + index rebuilds per the existing branch-merge
-        // code path).
+        // Pin only `RewriteMerged` candidates because they always
+        // advance Lance HEAD through `publish_rewritten_merge_table`
+        // (which runs stage_merge_insert + delete_where + index
+        // rebuilds — multiple commit_staged calls per table; loose
+        // classification handles the multi-step drift).
+        //
+        // `AdoptSourceState` candidates are NOT pinned: their publish
+        // path is `publish_adopted_source_state`, whose subcases mostly
+        // don't advance Lance HEAD (pure manifest pointer switch, or
+        // fork via `fork_dataset_from_entry_state` which only adds a
+        // Lance branch ref). If those subcases were pinned, recovery
+        // would classify them as NoMovement and the all-or-nothing
+        // decision would force a rollback that destroys legitimately-
+        // committed work on sibling RewriteMerged tables.
+        //
+        // Residual: two `AdoptSourceState` subcases (when source has a
+        // table_branch AND the source delta is non-empty) internally
+        // call `publish_rewritten_merge_table` and DO advance HEAD.
+        // Those are not covered by this sidecar — if they fail mid-
+        // commit, the residual persists until the next ReadWrite open
+        // detects it via a subsequent ExpectedVersionMismatch from a
+        // later writer that touches the same table. Closing this gap
+        // requires pre-computing source deltas during candidate
+        // classification (a structural change to `CandidateTableState`)
+        // and is left as follow-up work.
         let recovery_pins: Vec<crate::db::manifest::SidecarTablePin> = ordered_table_keys
             .iter()
-            .filter(|tk| candidates.contains_key(*tk))
             .filter_map(|table_key| {
+                let candidate = candidates.get(table_key)?;
+                if !matches!(candidate, CandidateTableState::RewriteMerged(_)) {
+                    return None;
+                }
                 let entry = target_snapshot.entry(table_key)?;
                 Some(crate::db::manifest::SidecarTablePin {
                     table_key: table_key.clone(),
