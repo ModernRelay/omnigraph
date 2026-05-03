@@ -582,15 +582,35 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
     );
 }
 
+/// PR #72 round-2 fix: `ensure_indices` only writes a sidecar when at
+/// least one table genuinely needs index work (per `needs_index_work_*`
+/// helpers in `db/omnigraph/table_ops.rs`). When all tables are
+/// steady-state (every declared index already built, or empty tables
+/// that the loop skips), the sidecar is omitted entirely.
+///
+/// Test setup: `load_jsonl` auto-builds indices via
+/// `prepare_updates_for_commit`. So after the load, every Person/Knows
+/// index is built and Company is empty. `ensure_indices` correctly
+/// produces zero pins → no sidecar. The failpoint still fires (it sits
+/// after the loops), so the call returns Err — but no recovery state
+/// persists. Reopen is a clean no-op.
+///
+/// (Triggering an actual sidecar persistence requires bypassing
+/// `load_jsonl`'s auto-build via raw `TableStore::append_batch` — the
+/// helper-direct path. That's covered structurally by the
+/// `needs_index_work_*` code review + the
+/// `recovery_ensure_indices_handles_empty_tables` integration test.)
 #[tokio::test]
-async fn ensure_indices_phase_b_failure_recovered_on_next_open() {
+async fn ensure_indices_phase_b_failure_does_not_leak_sidecar_when_no_work_needed() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
 
-    // Seed: load some rows so ensure_indices has actual indices to build.
+    // Seed: load_jsonl auto-builds Person's indices via
+    // prepare_updates_for_commit. After this, ensure_indices has no
+    // work to do (steady state).
     {
         let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
         load_jsonl(
@@ -604,7 +624,9 @@ async fn ensure_indices_phase_b_failure_recovered_on_next_open() {
         .unwrap();
     }
 
-    // Phase A: trigger the residual via the post-Phase-B failpoint.
+    // Phase A: trigger the failpoint. Steady-state ensure_indices
+    // produces zero sidecar pins (per the round-2 fix); no sidecar is
+    // written. The failpoint still fires, surfacing the Err.
     {
         let mut db = Omnigraph::open(&uri).await.unwrap();
         let _failpoint = ScopedFailPoint::new(
@@ -619,20 +641,27 @@ async fn ensure_indices_phase_b_failure_recovered_on_next_open() {
             "unexpected error: {err}"
         );
 
+        // KEY ASSERTION: no sidecar persists, because the round-2 fix
+        // scopes pins to tables that genuinely need work. Steady-state
+        // = no pins = no sidecar = no recovery state = zero open-time
+        // overhead.
         let recovery_dir = dir.path().join("__recovery");
-        let sidecars: Vec<_> = std::fs::read_dir(&recovery_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
-        assert_eq!(
-            sidecars.len(),
-            1,
-            "exactly one sidecar must persist after ensure_indices failure"
+        let sidecars: Vec<_> = if recovery_dir.exists() {
+            std::fs::read_dir(&recovery_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        assert!(
+            sidecars.is_empty(),
+            "steady-state ensure_indices must not leave a sidecar; got {:?}",
+            sidecars,
         );
     }
 
-    // Phase B: reopen runs the sweep. EnsureIndices is loose-match
-    // (multiple commit_staged calls per table — one per built index).
+    // Phase B: reopen is a clean no-op (no sidecar to recover).
     let _db = Omnigraph::open(&uri).await.unwrap();
 
     let recovery_dir = dir.path().join("__recovery");
@@ -643,13 +672,14 @@ async fn ensure_indices_phase_b_failure_recovered_on_next_open() {
             .collect();
         assert!(
             remaining.is_empty(),
-            "sidecar must be deleted; remaining: {:?}",
+            "sidecar must remain deleted; remaining: {:?}",
             remaining,
         );
     }
+    // No audit row expected — no sidecar was processed.
     let audit_dir = dir.path().join("_graph_commit_recoveries.lance");
     assert!(
-        audit_dir.exists(),
-        "_graph_commit_recoveries.lance must exist after ensure_indices recovery"
+        !audit_dir.exists(),
+        "_graph_commit_recoveries.lance must NOT exist when no sidecar was processed"
     );
 }

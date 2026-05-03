@@ -58,7 +58,15 @@ pub(super) async fn ensure_indices_for_branch(
             continue;
         };
         let full_path = format!("{}/{}", db.root_uri, entry.table_path);
-        if needs_index_work_node(db, type_name, &table_key, &full_path).await? {
+        if needs_index_work_node(
+            db,
+            type_name,
+            &table_key,
+            &full_path,
+            entry.table_branch.as_deref(),
+        )
+        .await?
+        {
             recovery_pins.push(crate::db::manifest::SidecarTablePin {
                 table_key,
                 table_path: full_path,
@@ -73,7 +81,9 @@ pub(super) async fn ensure_indices_for_branch(
             continue;
         };
         let full_path = format!("{}/{}", db.root_uri, entry.table_path);
-        if needs_index_work_edge(db, &table_key, &full_path).await? {
+        if needs_index_work_edge(db, &table_key, &full_path, entry.table_branch.as_deref())
+            .await?
+        {
             recovery_pins.push(crate::db::manifest::SidecarTablePin {
                 table_key,
                 table_path: full_path,
@@ -222,21 +232,33 @@ pub(super) async fn ensure_indices_for_branch(
 
 /// Returns true if the node table is missing at least one declared
 /// scalar/vector index that `build_indices_on_dataset_for_catalog` would
-/// build. Used by `ensure_indices_for_branch` to scope the MR-847
-/// recovery sidecar to tables that will actually receive commit_staged
-/// calls — listing untouched tables would force a rollback under the
-/// all-or-nothing decision rule when any one of them ends up
-/// `NoMovement` on recovery.
+/// build AND has at least one row (the ensure_indices loop has
+/// `if row_count > 0 { build_indices(...) }`, so empty tables produce
+/// zero commits and must NOT be pinned in the sidecar — pinning them
+/// would force `NoMovement` classification on recovery and trigger the
+/// all-or-nothing rollback of sibling tables' legitimate index work).
+///
+/// Per the actual `build_indices_on_dataset_for_catalog` implementation
+/// (this file, ~line 419-491), nodes get BTree (id) + per-prop FTS
+/// (@search String) + per-prop Vector indices; edges get BTree only
+/// (id, src, dst). The two helpers mirror that asymmetry — see PR #72
+/// round-2 review and the `needs_index_work_edge` doc comment.
 async fn needs_index_work_node(
     db: &Omnigraph,
     type_name: &str,
     table_key: &str,
     full_path: &str,
+    table_branch: Option<&str>,
 ) -> Result<bool> {
     let ds = db
         .table_store
-        .open_dataset_head_for_write(table_key, full_path, None)
+        .open_dataset_head_for_write(table_key, full_path, table_branch)
         .await?;
+    // Empty tables skipped by the ensure_indices loop — must not pin them
+    // in the sidecar (PR #72 round-2 review).
+    if db.table_store.count_rows(&ds, None).await.unwrap_or(0) == 0 {
+        return Ok(false);
+    }
     if !db.table_store.has_btree_index(&ds, "id").await? {
         return Ok(true);
     }
@@ -264,18 +286,31 @@ async fn needs_index_work_node(
     Ok(false)
 }
 
-/// Companion to `needs_index_work_node` for edge tables. Edges always
-/// need three BTree indices (id, src, dst); returns true if any are
-/// missing.
+/// Companion to `needs_index_work_node` for edge tables.
+///
+/// **Intentional asymmetry with the node helper**: edges only need
+/// BTree indices (id, src, dst) per `build_indices_on_dataset_for_catalog`
+/// at the edge branch (this file, lines 474-485). FTS / vector indices
+/// on edge properties are not built today; if they ever are, this
+/// helper plus the build function must be updated together. (PR #72
+/// round-1 cursor finding flagged the FTS/vector omission as a
+/// possible inconsistency — confirmed intentional.)
+///
+/// Empty edge tables are skipped by the ensure_indices loop the same
+/// way node tables are; see `needs_index_work_node`.
 async fn needs_index_work_edge(
     db: &Omnigraph,
     table_key: &str,
     full_path: &str,
+    table_branch: Option<&str>,
 ) -> Result<bool> {
     let ds = db
         .table_store
-        .open_dataset_head_for_write(table_key, full_path, None)
+        .open_dataset_head_for_write(table_key, full_path, table_branch)
         .await?;
+    if db.table_store.count_rows(&ds, None).await.unwrap_or(0) == 0 {
+        return Ok(false);
+    }
     Ok(!db.table_store.has_btree_index(&ds, "id").await?
         || !db.table_store.has_btree_index(&ds, "src").await?
         || !db.table_store.has_btree_index(&ds, "dst").await?)
