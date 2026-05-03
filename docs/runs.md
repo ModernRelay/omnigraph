@@ -130,7 +130,7 @@ will replace it. Operator-driven (rare in agent workloads); document
 permanently until Lance exposes `Operation::Overwrite { fragments }` as
 a two-phase op.
 
-### Open-time recovery sweep (MR-847)
+### Open-time recovery sweep
 
 The staged-write rewire eliminates one drift class **by construction at
 the writer layer**: an op that fails before pushing to the in-memory
@@ -140,7 +140,7 @@ the case the `partial_failure_leaves_target_queryable_and_unblocks_next_mutation
 test pins.
 
 A second, narrower drift class — the **finalize → publisher window** —
-is closed across one open cycle by the MR-847 recovery sweep:
+is closed across one open cycle by the open-time recovery sweep:
 
 `MutationStaging::finalize` runs `stage_*` + `commit_staged` per touched
 table sequentially, then the publisher commits the manifest. Lance has
@@ -197,8 +197,8 @@ contention exceeding `PUBLISHER_RETRY_BUDGET = 5` retries.
 `Omnigraph::open` (typically a server restart), subsequent writers on
 the affected tables surface
 `ManifestConflictDetails::ExpectedVersionMismatch`. Continuous
-in-process recovery (no restart required) arrives with MR-856
-(background recovery reconciler).
+in-process recovery (no restart required) is the goal of a future
+background reconciler.
 
 The publisher-CAS contract is unchanged: a *concurrent writer* that
 advances any of our touched tables between snapshot capture and

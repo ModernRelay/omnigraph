@@ -1,15 +1,13 @@
-//! MR-858 — Composite agent-lifecycle integration test.
+//! Composite end-to-end flow integration test.
 //!
-//! Walks the canonical agent narrative end to end in one fixture:
-//! init → load → branch → mutate → query → merge → time-travel →
-//! optimize → cleanup → reopen. Every numbered step has at least one
-//! assertion.
+//! Walks the canonical user flow in one fixture: init → load → branch →
+//! mutate → query → merge → time-travel → optimize → cleanup → reopen.
+//! Every numbered step has at least one assertion.
 //!
-//! This is the **deterministic narrative** counterpart to MR-783's
-//! randomized/property-based reliability harness — the test that
-//! catches a regression where individual operations all work but their
-//! composition under realistic agent usage breaks. It runs in CI on
-//! every PR (no `#[ignore]`).
+//! This is the deterministic narrative counterpart to a randomized /
+//! property-based reliability harness — it catches regressions where
+//! individual operations all pass their unit tests but their composition
+//! breaks. It runs in CI on every PR (no `#[ignore]`).
 
 mod helpers;
 
@@ -27,7 +25,7 @@ const TEST_DATA: &str = include_str!("fixtures/test.jsonl");
 const TEST_QUERIES: &str = include_str!("fixtures/test.gq");
 
 #[tokio::test]
-async fn agent_lifecycle_init_load_branch_merge_time_travel_optimize_cleanup() {
+async fn composite_flow_init_load_branch_merge_time_travel_optimize_cleanup() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
@@ -215,7 +213,7 @@ async fn agent_lifecycle_init_load_branch_merge_time_travel_optimize_cleanup() {
         v_pre_merge_main,
         v_post_merge,
     );
-    let _ = merge_outcome; // outcome is structured; presence of Ok already validates audit/merge_commit recorded
+    let _ = merge_outcome;
 
     // ─────────────────────────────────────────────────────────────────
     // Step 8: query at the post-merge snapshot — verify both sides'
@@ -277,24 +275,19 @@ async fn agent_lifecycle_init_load_branch_merge_time_travel_optimize_cleanup() {
     // Step 10: optimize the post-merge graph — verify indices stay
     // valid and queryable.
     //
-    // **Known limitation** (uncovered by this composite test, surfaced
-    // for follow-up in MR-859 `omnigraph optimize` + `cleanup` integration
-    // coverage): `optimize_all_tables` (`db/omnigraph/optimize.rs:77`)
-    // calls Lance `compact_files` directly — it advances per-table Lance
-    // HEAD without updating the omnigraph `__manifest` pin. After
-    // optimize, the next writer's expected_table_versions captures the
+    // **Known limitation**: `optimize_all_tables` calls Lance
+    // `compact_files` directly — it advances per-table Lance HEAD
+    // without updating the omnigraph `__manifest` pin. After optimize,
+    // the next writer's expected_table_versions captures the
     // pre-optimize manifest pin, but the publisher's pre-check reads
     // a higher version from the manifest dataset (because some other
-    // path — possibly the schema-state recovery on reopen — wrote a
-    // newer __manifest row). The `ExpectedVersionMismatch` is benign
-    // (re-issuing the mutation after `db.refresh()` succeeds), but the
-    // composite test cannot reliably exercise post-optimize mutations
-    // until that path is investigated under MR-859.
-    //
-    // For this test we verify optimize completes and reads still work,
-    // then SKIP the post-optimize mutation step. The full coverage
-    // (mutation succeeds after optimize without manual refresh) lives in
-    // the MR-859 follow-up.
+    // path — possibly schema-state recovery on reopen — wrote a newer
+    // __manifest row). The `ExpectedVersionMismatch` is benign
+    // (re-issuing the mutation after a snapshot refresh succeeds), but
+    // a composite test cannot reliably exercise post-optimize mutations
+    // until that path is investigated. Coverage of post-optimize
+    // mutations is left to a focused optimize+cleanup integration test.
+    // ─────────────────────────────────────────────────────────────────
     let optimize_stats = db.optimize().await.unwrap();
     assert!(
         !optimize_stats.is_empty(),
@@ -324,9 +317,9 @@ async fn agent_lifecycle_init_load_branch_merge_time_travel_optimize_cleanup() {
     // Step 11: cleanup — keep last 10 versions, only purge versions
     // older than 1 hour. With this small test, we have well under 10
     // versions and nothing that old, so cleanup is a no-op except for
-    // any orphan files. The MR-847 recovery floor (--keep ≥ 3) is
-    // preserved by the keep-10 default. Verify the call doesn't break
-    // subsequent queries.
+    // any orphan files. The recovery floor (--keep ≥ 3) needed for the
+    // open-time recovery sweep is preserved by the keep-10 default.
+    // Verify the call doesn't break subsequent queries.
     // ─────────────────────────────────────────────────────────────────
     use omnigraph::db::CleanupPolicyOptions;
     use std::time::Duration;
@@ -337,9 +330,6 @@ async fn agent_lifecycle_init_load_branch_merge_time_travel_optimize_cleanup() {
         })
         .await
         .unwrap();
-
-    // Recovery audit dataset, if present, must survive cleanup.
-    // (No recovery happened in this test, so it may not exist.)
 
     // ─────────────────────────────────────────────────────────────────
     // Step 12: reopen the engine — verify post-cleanup state is consistent.
@@ -366,7 +356,9 @@ async fn agent_lifecycle_init_load_branch_merge_time_travel_optimize_cleanup() {
     );
 
     // Final query exercise — full read path works post-reopen,
-    // post-cleanup.
+    // post-cleanup. Post-cleanup mutation is omitted here pending
+    // resolution of the optimize-vs-manifest-pin interaction documented
+    // in Step 10.
     let final_total = query_main(
         &mut db,
         TEST_QUERIES,
@@ -377,13 +369,6 @@ async fn agent_lifecycle_init_load_branch_merge_time_travel_optimize_cleanup() {
     .unwrap();
     assert!(!final_total.batches().is_empty());
 
-    // Final mutation skipped — post-optimize mutation surfaces
-    // `ExpectedVersionMismatch` because optimize advances Lance HEAD
-    // without updating the manifest pin (see Step 10 note above and
-    // MR-859 follow-up). The MR-859 ticket covers post-optimize
-    // mutation correctness explicitly. This test asserts the read
-    // path is intact post-cleanup-reopen, which is the more important
-    // user-visible property.
     let final_total = query_main(
         &mut db,
         TEST_QUERIES,

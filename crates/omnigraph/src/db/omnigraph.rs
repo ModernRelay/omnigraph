@@ -81,17 +81,15 @@ pub struct Omnigraph {
     pub(crate) audit_actor_id: Option<String>,
 }
 
-/// Whether [`Omnigraph::open`] runs the MR-847 recovery sweep.
+/// Whether [`Omnigraph::open`] runs the open-time recovery sweep.
 ///
 /// Recovery requires Lance writes (`Dataset::restore`, `ManifestBatchPublisher::publish`).
 /// Read-only consumers — NDJSON export, `commit list`, `read`, schema
 /// inspection — should not trigger writes (they may run with read-only
-/// object-store credentials, and silent open-time mutations are surprising).
-/// They also don't need recovery: reads always resolve through the manifest
-/// pin, which is the consistent snapshot regardless of any Phase B → Phase C
-/// drift on the per-table side.
-///
-/// See `.context/mr-847-design.md` § "Read-only opens".
+/// object-store credentials, and silent open-time mutations are
+/// surprising). They also don't need recovery: reads always resolve
+/// through the manifest pin, which is the consistent snapshot regardless
+/// of any Phase B → Phase C drift on the per-table side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenMode {
     /// Run the recovery sweep on open. Default for `Omnigraph::open`.
@@ -142,13 +140,13 @@ impl Omnigraph {
     /// Open an existing repo (read-write).
     ///
     /// Reads `_schema.pg`, parses it, builds the catalog, and opens `__manifest`.
-    /// Runs the MR-847 recovery sweep before returning — see [`OpenMode`].
+    /// Runs the open-time recovery sweep before returning — see [`OpenMode`].
     pub async fn open(uri: &str) -> Result<Self> {
         Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadWrite).await
     }
 
     /// Open an existing repo for read-only consumers (NDJSON export,
-    /// `commit list`, etc.). Skips the MR-847 recovery sweep — see [`OpenMode`].
+    /// `commit list`, etc.). Skips the recovery sweep — see [`OpenMode`].
     pub async fn open_read_only(uri: &str) -> Result<Self> {
         Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadOnly).await
     }
@@ -171,22 +169,23 @@ impl Omnigraph {
         // Open the coordinator first so the schema-staging recovery sweep can
         // compare its snapshot against any leftover staging files.
         let mut coordinator = GraphCoordinator::open(&root, Arc::clone(&storage)).await?;
-        // Both the schema-state recovery sweep AND the MR-847 recovery sweep
-        // are gated on `OpenMode::ReadWrite`. Read-only consumers (NDJSON
-        // export, `commit list`, schema show) shouldn't trigger object-store
-        // mutations: they may run with read-only credentials, and silent
-        // open-time writes are surprising. Both sweeps' work is recoverable
-        // on the next ReadWrite open, so skipping under ReadOnly doesn't
-        // lose any safety guarantees — the manifest pin is the consistent
-        // snapshot regardless of drift on the per-table side or leftover
-        // schema-staging files.
+        // Both the schema-state recovery sweep AND the manifest-drift
+        // recovery sweep are gated on `OpenMode::ReadWrite`. Read-only
+        // consumers (NDJSON export, `commit list`, schema show) shouldn't
+        // trigger object-store mutations: they may run with read-only
+        // credentials, and silent open-time writes are surprising. Both
+        // sweeps' work is recoverable on the next ReadWrite open, so
+        // skipping under ReadOnly doesn't lose any safety guarantees —
+        // the manifest pin is the consistent snapshot regardless of
+        // drift on the per-table side or leftover schema-staging files.
         if matches!(mode, OpenMode::ReadWrite) {
             recover_schema_state_files(&root, Arc::clone(&storage), &coordinator.snapshot())
                 .await?;
-            // MR-847 recovery sweep: close the Phase B → Phase C residual on
+            // Recovery sweep: close the Phase B → Phase C residual on
             // any sidecar left over from a crashed writer. Continuous
-            // in-process recovery for long-running servers is MR-856
-            // (background reconciler).
+            // in-process recovery for long-running servers (no restart
+            // required between Phase B failure and recovery) is a
+            // separate background-reconciler effort.
             crate::db::manifest::recover_manifest_drift(
                 &root,
                 storage.as_ref(),
@@ -259,27 +258,25 @@ impl Omnigraph {
 
     /// Engine-facing trait surface around `TableStore`.
     ///
-    /// MR-793 Phase 1: this is the canonical accessor for newly-written
-    /// engine code. The trait's signatures use opaque `SnapshotHandle` /
-    /// `StagedHandle` instead of leaking `lance::Dataset` /
+    /// This is the canonical accessor for newly-written engine code. The
+    /// trait's signatures use opaque `SnapshotHandle` / `StagedHandle`
+    /// instead of leaking `lance::Dataset` /
     /// `lance::dataset::transaction::Transaction`. Existing call sites
     /// that still use `db.table_store.X(...)` (the inherent struct
-    /// methods) are migrated incrementally — see §9 of
-    /// `.context/mr-793-design.md`.
+    /// methods) are migrated incrementally.
     pub(crate) fn storage(&self) -> &dyn crate::storage_layer::TableStorage {
         &self.table_store
     }
 
     /// Engine-level access to the object-store adapter (S3 / local fs).
-    /// Used by the MR-847 recovery sidecar protocol — writers in the
-    /// engine call this to write/delete sidecars at `__recovery/{ulid}.json`.
+    /// Used by the recovery sidecar protocol — writers in the engine
+    /// call this to write/delete sidecars at `__recovery/{ulid}.json`.
     pub(crate) fn storage_adapter(&self) -> &dyn crate::storage::StorageAdapter {
         self.storage.as_ref()
     }
 
     /// Engine-level access to the repo's normalized root URI. Used by
-    /// the MR-847 recovery sidecar protocol to compute `__recovery/`
-    /// paths.
+    /// the recovery sidecar protocol to compute `__recovery/` paths.
     pub(crate) fn root_uri(&self) -> &str {
         &self.root_uri
     }

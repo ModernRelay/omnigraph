@@ -238,12 +238,12 @@ impl MutationStaging {
         let mut updates: Vec<SubTableUpdate> =
             inline_committed.into_values().collect();
 
-        // MR-847 — sidecar protocol. Build the per-table pin list BEFORE
-        // any Lance commit_staged runs, then write the sidecar so a crash
-        // between Phase B (this loop's commit_staged calls) and Phase C
-        // (the manifest publish in the caller) is recoverable on next
-        // open. Skipped when `pending` is empty (delete-only mutation;
-        // D₂ parse-time rule keeps deletes out of this code path so this
+        // Sidecar protocol: build the per-table pin list BEFORE any Lance
+        // commit_staged runs, then write the sidecar so a crash between
+        // Phase B (this loop's commit_staged calls) and Phase C (the
+        // manifest publish in the caller) is recoverable on next open.
+        // Skipped when `pending` is empty (delete-only mutation; the D₂
+        // parse-time rule keeps deletes out of this code path so this
         // branch is reached only for the inline-committed-only case).
         let pins: Vec<SidecarTablePin> = pending
             .iter()

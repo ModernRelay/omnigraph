@@ -42,14 +42,14 @@ pub(super) async fn ensure_indices_for_branch(
     let mut updates = Vec::new();
     let active_branch = resolved.branch;
 
-    // MR-847 sidecar: protect the per-table commit_staged loop in
+    // Recovery sidecar: protect the per-table commit_staged loop in
     // build_indices_on_dataset (one commit per index built). Only pins
     // tables that ACTUALLY need index work — the classifier
     // loose-matches for SidecarKind::EnsureIndices (the actual N
     // depends on which indices are missing), but if a table needs zero
-    // commits and gets pinned, the all-or-nothing decision rule treats
-    // it as `NoMovement` and rolls back legitimately-committed work on
-    // sibling tables (PR #72 review). Steady-state runs (everything
+    // commits and gets pinned, the all-or-nothing decision rule
+    // classifies it as `NoMovement` and rolls back legitimately-
+    // committed work on sibling tables. Steady-state runs (everything
     // already indexed) skip the sidecar entirely.
     let mut recovery_pins: Vec<crate::db::manifest::SidecarTablePin> = Vec::new();
     for type_name in db.catalog.node_types.keys() {
@@ -201,7 +201,7 @@ pub(super) async fn ensure_indices_for_branch(
         }
     }
 
-    // MR-847 failpoint: pin the per-writer Phase B → Phase C residual for
+    // Failpoint: pin the per-writer Phase B → Phase C residual for
     // ensure_indices. Lance HEAD has advanced on every touched table
     // (one commit_staged per index built) but the manifest publish below
     // hasn't run. Used by
@@ -212,9 +212,10 @@ pub(super) async fn ensure_indices_for_branch(
         commit_prepared_updates_on_branch(db, branch, &updates).await?;
     }
 
-    // MR-847 sidecar lifecycle: delete after the manifest publish (or
-    // no-op when there were no updates — sidecar covered the per-table
-    // commit window regardless). Best-effort cleanup (PR #72 review).
+    // Recovery sidecar lifecycle: delete after the manifest publish (or
+    // no-op when there were no updates — the sidecar covered the
+    // per-table commit window regardless). Best-effort cleanup; failing
+    // the user here would error a call that already succeeded.
     if let Some(handle) = recovery_handle {
         if let Err(err) =
             crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await
@@ -222,7 +223,7 @@ pub(super) async fn ensure_indices_for_branch(
             tracing::warn!(
                 error = %err,
                 operation_id = handle.operation_id.as_str(),
-                "MR-847 sidecar cleanup failed; the next open's recovery sweep will resolve it"
+                "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
             );
         }
     }
@@ -241,8 +242,8 @@ pub(super) async fn ensure_indices_for_branch(
 /// Per the actual `build_indices_on_dataset_for_catalog` implementation
 /// (this file, ~line 419-491), nodes get BTree (id) + per-prop FTS
 /// (@search String) + per-prop Vector indices; edges get BTree only
-/// (id, src, dst). The two helpers mirror that asymmetry — see PR #72
-/// round-2 review and the `needs_index_work_edge` doc comment.
+/// (id, src, dst). The two helpers mirror that asymmetry — see the
+/// `needs_index_work_edge` doc comment.
 async fn needs_index_work_node(
     db: &Omnigraph,
     type_name: &str,
@@ -254,9 +255,14 @@ async fn needs_index_work_node(
         .table_store
         .open_dataset_head_for_write(table_key, full_path, table_branch)
         .await?;
-    // Empty tables skipped by the ensure_indices loop — must not pin them
-    // in the sidecar (PR #72 round-2 review).
-    if db.table_store.count_rows(&ds, None).await.unwrap_or(0) == 0 {
+    // Empty tables are skipped by the ensure_indices loop, so they must
+    // not be pinned in the sidecar — pinning a table that produces zero
+    // commits classifies as NoMovement on recovery and forces all-or-
+    // nothing rollback of sibling tables' legitimate index work.
+    // Errors from count_rows are propagated: silently treating them as
+    // "0 rows" risks skipping a table that is actually about to be
+    // modified.
+    if db.table_store.count_rows(&ds, None).await? == 0 {
         return Ok(false);
     }
     if !db.table_store.has_btree_index(&ds, "id").await? {
@@ -292,9 +298,7 @@ async fn needs_index_work_node(
 /// BTree indices (id, src, dst) per `build_indices_on_dataset_for_catalog`
 /// at the edge branch (this file, lines 474-485). FTS / vector indices
 /// on edge properties are not built today; if they ever are, this
-/// helper plus the build function must be updated together. (PR #72
-/// round-1 cursor finding flagged the FTS/vector omission as a
-/// possible inconsistency — confirmed intentional.)
+/// helper plus the build function must be updated together.
 ///
 /// Empty edge tables are skipped by the ensure_indices loop the same
 /// way node tables are; see `needs_index_work_node`.
@@ -308,7 +312,7 @@ async fn needs_index_work_edge(
         .table_store
         .open_dataset_head_for_write(table_key, full_path, table_branch)
         .await?;
-    if db.table_store.count_rows(&ds, None).await.unwrap_or(0) == 0 {
+    if db.table_store.count_rows(&ds, None).await? == 0 {
         return Ok(false);
     }
     Ok(!db.table_store.has_btree_index(&ds, "id").await?
@@ -463,14 +467,14 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
         }
 
         if let Some(node_type) = catalog.node_types.get(type_name) {
-            // Per MR-793 §10 OQ3: stage scalar indices first (BTree,
-            // Inverted), then call `create_vector_index` inline. The
-            // inline-commit on a vector index advances HEAD, which would
-            // invalidate any uncommitted scalar index transactions if we
-            // stacked them. Today the per-stage shape commits each
-            // scalar index immediately so the order constraint is
-            // implicit, but if we ever batch scalar stages we must
-            // ensure they all land before the vector inline-commit.
+            // Stage scalar indices first (BTree, Inverted), then call
+            // `create_vector_index` inline. The inline-commit on a vector
+            // index advances HEAD, which would invalidate any uncommitted
+            // scalar index transactions if we stacked them. Today the
+            // per-stage shape commits each scalar index immediately so
+            // the order constraint is implicit, but if we ever batch
+            // scalar stages we must ensure they all land before the
+            // vector inline-commit.
             for index_cols in &node_type.indices {
                 if index_cols.len() != 1 {
                     continue;
@@ -526,13 +530,13 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
 }
 
 /// Stage a BTREE index transaction and commit it, advancing the in-memory
-/// `*ds` to the new HEAD. MR-793 Phase 4: replaces the previous
-/// inline-commit `create_btree_index(ds)` call with the staged primitive
-/// + an immediate `commit_staged`. Per-call behavior is unchanged
-/// (HEAD advances once per index), but the bytes-on-disk and HEAD-advance
-/// are now decoupled at the `TableStore` API surface — a caller that
-/// needs end-of-batch atomicity can stage many transactions and commit
-/// them in one pass (Phase 8's index reconciler relies on this).
+/// `*ds` to the new HEAD. The staged primitive + immediate `commit_staged`
+/// pair replaced the earlier inline-commit `create_btree_index(ds)` call.
+/// Per-call behavior is unchanged (HEAD advances once per index), but
+/// the bytes-on-disk and HEAD-advance are now decoupled at the
+/// `TableStore` API surface — a caller that needs end-of-batch atomicity
+/// can stage many transactions and commit them in one pass (the eventual
+/// index reconciler relies on this).
 async fn stage_and_commit_btree(
     db: &Omnigraph,
     table_key: &str,
@@ -568,7 +572,7 @@ async fn stage_and_commit_btree(
 }
 
 /// Stage an INVERTED (FTS) index transaction and commit it. See
-/// `stage_and_commit_btree` for the MR-793 Phase 4 rationale.
+/// `stage_and_commit_btree` for the rationale.
 async fn stage_and_commit_inverted(
     db: &Omnigraph,
     table_key: &str,

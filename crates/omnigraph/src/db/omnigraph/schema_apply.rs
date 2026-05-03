@@ -151,7 +151,7 @@ pub(super) async fn apply_schema_with_lock(
     let mut table_updates = HashMap::<String, crate::db::SubTableUpdate>::new();
     let mut table_tombstones = HashMap::<String, u64>::new();
 
-    // MR-847 sidecar: protect the per-table commit_staged loop in
+    // Recovery sidecar: protect the per-table commit_staged loop in
     // rewritten_tables + indexed_tables. The post_commit_pin we record
     // here is a lower bound (expected + 1); the classifier loose-matches
     // for SidecarKind::SchemaApply because the actual N depends on how
@@ -281,8 +281,8 @@ pub(super) async fn apply_schema_with_lock(
         )
         .await?;
         let dataset_uri = db.table_store.dataset_uri(&entry.table_path);
-        // MR-793 Phase 6: route through stage_overwrite + commit_staged
-        // for non-empty batches. Lance's `InsertBuilder::execute_uncommitted`
+        // Route through stage_overwrite + commit_staged for non-empty
+        // batches. Lance's `InsertBuilder::execute_uncommitted`
         // errors on empty data (lance-4.0.0 `src/dataset/write/insert.rs:144`),
         // so the empty-rewrite case stays on `overwrite_dataset` (which
         // accepts empty input). The empty case is rare in schema_apply
@@ -440,13 +440,13 @@ pub(super) async fn apply_schema_with_lock(
         db.invalidate_graph_index().await;
     }
 
-    // MR-847 sidecar lifecycle: delete after the manifest commit succeeded.
-    // Best-effort: if this delete fails, the sidecar persists; on next open
-    // the sweep sees every table at the post-publish manifest pin
-    // (NoMovement) and the sidecar is treated as a stale artifact
-    // (recovery is a no-op and the sidecar is cleaned up). Failing the
-    // schema_apply call would report failure for a migration that
-    // already succeeded (PR #72 review).
+    // Recovery sidecar lifecycle: delete after the manifest commit
+    // succeeded. Best-effort: if this delete fails, the sidecar persists
+    // and on next open the sweep sees every table at the post-publish
+    // manifest pin (NoMovement) and the sidecar is treated as a stale
+    // artifact (recovery is a no-op and the sidecar is cleaned up).
+    // Failing the schema_apply call would report failure for a migration
+    // that already succeeded.
     if let Some(handle) = recovery_handle {
         if let Err(err) =
             crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await
@@ -454,7 +454,7 @@ pub(super) async fn apply_schema_with_lock(
             tracing::warn!(
                 error = %err,
                 operation_id = handle.operation_id.as_str(),
-                "MR-847 sidecar cleanup failed; the next open's recovery sweep will resolve it"
+                "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
             );
         }
     }

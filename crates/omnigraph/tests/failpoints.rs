@@ -140,8 +140,8 @@ async fn schema_apply_recovers_partial_rename() {
     assert_no_staging_files(dir.path());
 }
 
-/// Prove the MR-847 recovery sweep closes the "finalize → publisher
-/// residual" across one open cycle — the post-MR-847 contract.
+/// Prove the recovery sweep closes the "finalize → publisher residual"
+/// across one open cycle.
 ///
 /// `MutationStaging::finalize` runs `commit_staged` per touched table
 /// sequentially before the publisher commits the manifest. Lance has no
@@ -149,16 +149,15 @@ async fn schema_apply_recovers_partial_rename() {
 /// per-table staged commits and the manifest commit leaves Lance HEAD
 /// advanced on the touched tables with no manifest update.
 ///
-/// Pre-MR-847: the next mutation surfaced `ExpectedVersionMismatch` and
-/// the residual persisted until process restart. Post-MR-847: the
-/// finalize writes a sidecar at `__recovery/{ulid}.json` BEFORE Phase B,
-/// the failpoint fires AFTER finalize but BEFORE the publisher, the
-/// engine handle is dropped, and the next `Omnigraph::open` runs the
-/// recovery sweep. The sweep classifies every table in the sidecar as
-/// `RolledPastExpected` (Lance HEAD == expected + 1, post_commit_pin
-/// matches), decides RollForward, atomically extends every manifest pin
-/// via `ManifestBatchPublisher::publish`, records an audit row, and
-/// deletes the sidecar.
+/// Closing the residual: finalize writes a sidecar at
+/// `__recovery/{ulid}.json` BEFORE Phase B, the failpoint fires AFTER
+/// finalize but BEFORE the publisher, the engine handle is dropped, and
+/// the next `Omnigraph::open` runs the recovery sweep. The sweep
+/// classifies every table in the sidecar as `RolledPastExpected` (Lance
+/// HEAD == expected + 1, post_commit_pin matches), decides RollForward,
+/// atomically extends every manifest pin via
+/// `ManifestBatchPublisher::publish`, records an audit row, and deletes
+/// the sidecar.
 ///
 /// After this test passes:
 /// - The originally-attempted insert ("Eve") is visible via a normal
@@ -169,7 +168,7 @@ async fn schema_apply_recovers_partial_rename() {
 ///   `actor_id` in `recovery_for_actor`.
 ///
 /// Continuous in-process recovery (no restart needed between failure
-/// and recovery) is MR-856 (background reconciler).
+/// and recovery) is the goal of a future background reconciler.
 #[tokio::test]
 async fn recovery_rolls_forward_after_finalize_publisher_failure() {
     let _scenario = FailScenario::setup();
@@ -303,11 +302,11 @@ async fn finalize_publisher_residual_does_not_drift_untouched_tables() {
     .expect("Company write on a non-drifted table should succeed");
 }
 
-/// MR-793 Phase 4 acceptance bar — proves that a Phase A failure in
-/// the staged-index path (`stage_create_btree_index` succeeded;
-/// `commit_staged` not yet called) leaves NO Lance-HEAD drift on the
-/// existing tables. Subsequent operations against those tables succeed
-/// without `ExpectedVersionMismatch`.
+/// Acceptance test: a Phase A failure in the staged-index path
+/// (`stage_create_btree_index` succeeded; `commit_staged` not yet
+/// called) leaves NO Lance-HEAD drift on the existing tables.
+/// Subsequent operations against those tables succeed without
+/// `ExpectedVersionMismatch`.
 ///
 /// Path: `apply_schema(v1 → v2)` adds a new node type. The
 /// `added_tables` loop in `schema_apply` creates the empty dataset and
@@ -384,14 +383,15 @@ fn assert_no_staging_files(repo: &std::path::Path) {
 }
 
 // =====================================================================
-// MR-847 Phase 9 — per-writer Phase B → Phase C recovery integration
+// Per-writer Phase B → Phase C recovery integration
 // =====================================================================
 //
-// Each of the four migrated writers writes a sidecar BEFORE its per-table
-// commit_staged loop and deletes it AFTER the manifest publish. The
-// `recovery_rolls_forward_after_finalize_publisher_failure` test above
-// covers MutationStaging::finalize. The three tests below cover the
-// other three writers: schema_apply, branch_merge, ensure_indices.
+// Each of the four migrated writers writes a sidecar BEFORE its
+// per-table commit_staged loop and deletes it AFTER the manifest
+// publish. The `recovery_rolls_forward_after_finalize_publisher_failure`
+// test above covers MutationStaging::finalize. The three tests below
+// cover the other three writers: schema_apply, branch_merge,
+// ensure_indices.
 //
 // Each follows the same shape: trigger the writer with a failpoint
 // active in the Phase B → Phase C window, drop the engine, reopen,
@@ -424,7 +424,7 @@ async fn schema_apply_phase_b_failure_recovered_on_next_open() {
     // Phase A: trigger the residual via `schema_apply.after_staging_write`.
     // This failpoint fires AFTER the rewritten_tables/indexed_tables loops
     // (Lance HEAD advanced) AND AFTER the schema-state staging files are
-    // written, but BEFORE the manifest publish. The MR-847 sidecar persists.
+    // written, but BEFORE the manifest publish. The recovery sidecar persists.
     {
         let mut db = Omnigraph::open(&uri).await.unwrap();
         let _failpoint = ScopedFailPoint::new("schema_apply.after_staging_write", "return");
@@ -434,7 +434,7 @@ async fn schema_apply_phase_b_failure_recovered_on_next_open() {
         // overall table set — required to keep `recover_schema_state_files`
         // (which runs BEFORE recover_manifest_drift) happy: it can't
         // disambiguate property-only migrations and would reject the
-        // open before the MR-847 sweep ever ran.
+        // open before the recovery sweep ever ran.
         let v2_schema = r#"node Person {
     name: String @key
     age: I32?
@@ -582,11 +582,11 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
     );
 }
 
-/// PR #72 round-2 fix: `ensure_indices` only writes a sidecar when at
-/// least one table genuinely needs index work (per `needs_index_work_*`
-/// helpers in `db/omnigraph/table_ops.rs`). When all tables are
-/// steady-state (every declared index already built, or empty tables
-/// that the loop skips), the sidecar is omitted entirely.
+/// `ensure_indices` only writes a sidecar when at least one table
+/// genuinely needs index work (per `needs_index_work_*` helpers in
+/// `db/omnigraph/table_ops.rs`). When all tables are steady-state
+/// (every declared index already built, or empty tables that the loop
+/// skips), the sidecar is omitted entirely.
 ///
 /// Test setup: `load_jsonl` auto-builds indices via
 /// `prepare_updates_for_commit`. So after the load, every Person/Knows
@@ -595,11 +595,11 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
 /// after the loops), so the call returns Err — but no recovery state
 /// persists. Reopen is a clean no-op.
 ///
-/// (Triggering an actual sidecar persistence requires bypassing
+/// Triggering an actual sidecar persistence requires bypassing
 /// `load_jsonl`'s auto-build via raw `TableStore::append_batch` — the
 /// helper-direct path. That's covered structurally by the
-/// `needs_index_work_*` code review + the
-/// `recovery_ensure_indices_handles_empty_tables` integration test.)
+/// `needs_index_work_*` code path and the
+/// `recovery_ensure_indices_handles_empty_tables` integration test.
 #[tokio::test]
 async fn ensure_indices_phase_b_failure_does_not_leak_sidecar_when_no_work_needed() {
     use omnigraph::loader::{LoadMode, load_jsonl};
@@ -625,8 +625,9 @@ async fn ensure_indices_phase_b_failure_does_not_leak_sidecar_when_no_work_neede
     }
 
     // Phase A: trigger the failpoint. Steady-state ensure_indices
-    // produces zero sidecar pins (per the round-2 fix); no sidecar is
-    // written. The failpoint still fires, surfacing the Err.
+    // produces zero sidecar pins (the helpers scope pins to tables
+    // that genuinely need work); no sidecar is written. The failpoint
+    // still fires, surfacing the Err.
     {
         let mut db = Omnigraph::open(&uri).await.unwrap();
         let _failpoint = ScopedFailPoint::new(
@@ -641,8 +642,8 @@ async fn ensure_indices_phase_b_failure_does_not_leak_sidecar_when_no_work_neede
             "unexpected error: {err}"
         );
 
-        // KEY ASSERTION: no sidecar persists, because the round-2 fix
-        // scopes pins to tables that genuinely need work. Steady-state
+        // KEY ASSERTION: no sidecar persists, because the helpers
+        // scope pins to tables that genuinely need work. Steady-state
         // = no pins = no sidecar = no recovery state = zero open-time
         // overhead.
         let recovery_dir = dir.path().join("__recovery");

@@ -64,10 +64,10 @@ impl StorageAdapter for LocalStorageAdapter {
     async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
         let path = local_path_from_uri(uri)?;
         // Ensure parent directory exists. S3 has no equivalent (PutObject
-        // is path-agnostic). For local fs, callers like the MR-847
-        // recovery sidecar protocol expect transparent directory
-        // creation under the repo root (the `__recovery/` directory
-        // doesn't pre-exist; first sidecar write creates it).
+        // is path-agnostic). For local fs, callers like the recovery
+        // sidecar protocol expect transparent directory creation under
+        // the repo root (the `__recovery/` directory doesn't pre-exist;
+        // first sidecar write creates it).
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 tokio::fs::create_dir_all(parent).await?;

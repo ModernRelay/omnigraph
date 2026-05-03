@@ -1,4 +1,4 @@
-//! MR-793 Phase 3 — forbidden-API guard test.
+//! Forbidden-API guard test.
 //!
 //! Engine code (`exec/`, `db/omnigraph/`, `loader/`, `changes/`) MUST NOT
 //! call Lance's inline-commit data-write APIs directly. The
@@ -29,15 +29,15 @@
 //!   the cross-table manifest commit. Documented exception.
 //! - `crates/omnigraph/src/storage_layer.rs` — IS the trait module.
 //!
-//! ## Initial state (MR-793 Phase 3)
+//! ## Transitional allow-list
 //!
-//! At the time this test was written, MR-793 has migrated three writers
-//! (ensure_indices, branch_merge, schema_apply rewrites) onto staged
-//! primitives. Other engine call sites (the bulk loader, exec/mutation,
-//! exec/query, etc.) still use the legacy inherent `TableStore` methods
-//! — they're not visible at the trait boundary, but they DO call lance
-//! types. The allow-list below reflects this transitional state. Phase 9
-//! tightens the allow-list as call sites migrate.
+//! The migration of writers onto staged primitives is incremental.
+//! Several writers (ensure_indices, branch_merge, schema_apply rewrites)
+//! already route through the staged primitives; others (bulk loader,
+//! exec/mutation, exec/query) still use the legacy inherent
+//! `TableStore` methods — they're not visible at the trait boundary, but
+//! they DO call lance types. The file-level allow-list below reflects
+//! this transitional state and tightens as call sites migrate.
 
 use std::path::{Path, PathBuf};
 
@@ -99,7 +99,7 @@ const ALLOW_LIST_FILES: &[&str] = &[
     "storage_layer.rs",      // The trait module.
     "commit_graph.rs",       // Maintains `_graph_commits.lance` system table.
     "graph_coordinator.rs",  // Drives the manifest publisher / branch coordinator.
-    "recovery_audit.rs",     // Maintains `_graph_commit_recoveries.lance` (MR-847 audit trail).
+    "recovery_audit.rs",     // Maintains `_graph_commit_recoveries.lance` (recovery audit trail).
 ];
 
 /// Directories exempt from the guard. Files under these paths may use
@@ -203,7 +203,7 @@ fn engine_code_does_not_call_forbidden_lance_apis() {
 
     if !violations.is_empty() {
         panic!(
-            "MR-793 forbidden-API guard found {} violation(s) in engine code. \
+            "Forbidden-API guard found {} violation(s) in engine code. \
              Engine code MUST route through the `TableStorage` trait (or its \
              inherent counterparts on `TableStore`) instead of calling Lance's \
              inline-commit APIs directly. If a use is genuinely justified, add \

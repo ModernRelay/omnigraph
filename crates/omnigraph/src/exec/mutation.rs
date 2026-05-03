@@ -751,8 +751,8 @@ impl Omnigraph {
                 // the publisher's CAS pre-check rejects (or the manifest
                 // write throws) after staged commits succeeded. The
                 // sidecar written inside `staging.finalize()` persists
-                // across this failure so the next `Omnigraph::open`
-                // (MR-847 recovery sweep) can roll forward — see
+                // across this failure so the next `Omnigraph::open`'s
+                // recovery sweep can roll forward — see
                 // `tests/failpoints.rs::recovery_rolls_forward_after_finalize_publisher_failure`.
                 crate::failpoints::maybe_fail("mutation.post_finalize_pre_publisher")?;
                 self.commit_updates_on_branch_with_expected(
@@ -774,7 +774,7 @@ impl Omnigraph {
                     // as `NoMovement` (manifest pin == Lance HEAD ==
                     // post_commit_pin) and tidies up. Failing the user
                     // here would return an error for a write that
-                    // already landed (PR #72 review).
+                    // already landed.
                     if let Err(err) = crate::db::manifest::delete_sidecar(
                         &handle,
                         self.storage_adapter(),
@@ -784,7 +784,7 @@ impl Omnigraph {
                         tracing::warn!(
                             error = %err,
                             operation_id = handle.operation_id.as_str(),
-                            "MR-847 sidecar cleanup failed; the next open's recovery sweep will resolve it"
+                            "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
                         );
                     }
                 }

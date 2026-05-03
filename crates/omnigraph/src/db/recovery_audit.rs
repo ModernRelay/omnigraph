@@ -1,4 +1,4 @@
-//! MR-847 Phase 4 — Recovery audit row storage in `_graph_commit_recoveries.lance`.
+//! Recovery audit row storage in `_graph_commit_recoveries.lance`.
 //!
 //! Sibling to `_graph_commits.lance` (`commit_graph.rs`). Each successful
 //! recovery sweep — roll-forward or roll-back — records one row here so
@@ -6,12 +6,12 @@
 //! `omnigraph commit list --filter actor=omnigraph:recovery` with the
 //! original actor whose mutation was rolled forward / back.
 //!
-//! The schema-migration alternative (adding `recovery_for_actor` and
-//! `recovery_kind` columns to `_graph_commits.lance` itself) was
-//! considered and rejected for MR-847 — see `.context/mr-847-design.md`
-//! § "Recovery audit model". Sibling-table is additive, doesn't bump
+//! Sibling-table is additive: it doesn't bump
 //! `INTERNAL_MANIFEST_SCHEMA_VERSION`, and can be removed in favor of a
-//! schema migration later if the join cost matters.
+//! schema migration later if the join cost matters. The schema-migration
+//! alternative (adding `recovery_for_actor` and `recovery_kind` columns
+//! to `_graph_commits.lance` itself) was considered and rejected to keep
+//! this change additive.
 //!
 //! Atomicity caveat: append to `_graph_commit_recoveries.lance` is
 //! sequential w.r.t. the `CommitGraph::append_commit` write. A crash

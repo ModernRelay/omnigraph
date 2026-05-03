@@ -1,8 +1,8 @@
-//! MR-847 — Recovery-on-open primitives.
+//! Recovery-on-open primitives.
 //!
 //! This module implements the building blocks of the per-sidecar recovery
 //! sweep that closes the documented Phase B → Phase C residual (see
-//! `docs/runs.md` "Finalize → publisher residual"). The high-level shape:
+//! `docs/runs.md` "Open-time recovery sweep"). The high-level shape:
 //!
 //! 1. Each writer that performs a multi-table commit writes a small JSON
 //!    sidecar at `__recovery/{ulid}.json` BEFORE its per-table
@@ -17,11 +17,6 @@
 //!    `post_commit_pin` AND matches the sidecar) or rolls back all
 //!    `RolledPastExpected` tables to `expected_version`.
 //!
-//! Phase 2 (this commit) ships only the primitives: sidecar I/O,
-//! classifier, decision dispatcher, restore-with-fragment-set-shortcut.
-//! No integration into `Omnigraph::open` or any writer yet — those land
-//! in Phase 3+.
-//!
 //! ## Verified Lance behavior the rollback path depends on
 //!
 //! - `Dataset::restore()` takes no version arg; restores
@@ -33,12 +28,10 @@
 //!   CreateIndex/Merge — see `check_restore_txn` at lance-4.0.0
 //!   `src/io/commit/conflict_resolver.rs:986`. The hazard is documented
 //!   by `tests/staged_writes.rs::lance_restore_loses_to_concurrent_append_via_orphaning`.
-//!   MR-847 sidesteps this by running recovery only at `Omnigraph::open`
-//!   (before any other writers can race); MR-856's continuous-recovery
-//!   reconciler must guard via per-(table_key, branch) queue acquisition
-//!   once MR-686 lands.
-//!
-//! See `.context/mr-847-design.md` for the full design.
+//!   This module sidesteps the hazard by running recovery only at
+//!   `Omnigraph::open` (before any other writers can race). A future
+//!   continuous in-process recovery reconciler will need to guard via
+//!   per-(table_key, branch) queue acquisition.
 
 use std::collections::HashMap;
 
@@ -271,7 +264,7 @@ pub(crate) async fn list_sidecars(
     // === chronologically sortable; the older sidecar is processed
     // before the newer one. Without this sort, `list_dir` returns
     // filesystem-order results which are nondeterministic and can mask
-    // ordering-sensitive bugs. (PR #72 review.)
+    // ordering-sensitive bugs.
     uris.sort();
     let mut out = Vec::with_capacity(uris.len());
     for uri in uris {
@@ -335,8 +328,7 @@ pub(crate) fn parse_sidecar(sidecar_uri: &str, body: &str) -> Result<RecoverySid
 ///   `pin.expected_version == manifest_pinned` (the writer's CAS
 ///   target matches what the manifest currently shows). The risk this
 ///   admits — an external agent advancing HEAD between sidecar write
-///   and recovery — is out of scope for the single-coordinator model
-///   (MR-668 territory).
+///   and recovery — is out of scope for the single-coordinator model.
 pub(crate) fn classify_table(
     pin: &SidecarTablePin,
     lance_head: u64,
@@ -451,12 +443,11 @@ fn fragment_ids(ds: &Dataset) -> Vec<u64> {
 /// in [`restore_table_to_version`] prevents version pile-up under
 /// repeated mid-rollback crashes.
 ///
-/// Concurrency: today (pre-MR-686) recovery runs synchronously in
-/// `Omnigraph::open` *before* the engine is wrapped in the server's
-/// `Arc<RwLock<Omnigraph>>`. No request handlers can race. Under MR-686
-/// + MR-856 (background reconciler) the per-(table_key, branch) queues
-/// will need acquisition before the sweep restores or publishes — see
-/// `.context/mr-847-design.md` "Concurrency policy" §"After MR-686".
+/// Concurrency: today recovery runs synchronously in `Omnigraph::open`
+/// *before* the engine is wrapped in the server's `Arc<RwLock<Omnigraph>>`.
+/// No request handlers can race. A future per-(table_key, branch) writer
+/// queue model (paired with a background reconciler) will need to acquire
+/// queues before the sweep restores or publishes.
 pub(crate) async fn recover_manifest_drift(
     root_uri: &str,
     storage: &dyn StorageAdapter,
@@ -467,12 +458,12 @@ pub(crate) async fn recover_manifest_drift(
         return Ok(());
     }
 
-    // PR #72 review (chatgpt-codex + cubic): refresh the coordinator
-    // snapshot BEFORE each sidecar's classification. Sidecar N's
-    // roll-forward writes manifest changes that sidecar N+1 must
-    // observe, otherwise sidecar N+1 classifies its tables against
-    // stale pins and may incorrectly roll back work that landed
-    // moments earlier. Refresh is cheap (one Lance manifest read).
+    // Refresh the coordinator snapshot BEFORE each sidecar's
+    // classification. Sidecar N's roll-forward writes manifest changes
+    // that sidecar N+1 must observe, otherwise sidecar N+1 classifies
+    // its tables against stale pins and may incorrectly roll back work
+    // that landed moments earlier. Refresh is cheap (one Lance manifest
+    // read).
     for sidecar in sidecars {
         coordinator.refresh().await?;
         let snapshot = coordinator.snapshot();
@@ -896,13 +887,12 @@ mod tests {
         );
     }
 
-    /// PR #72 review (cubic + cursor) flagged that BranchMerge is in
-    /// the strict classifier set, but `publish_rewritten_merge_table`
-    /// runs multiple `commit_staged` calls per table (merge_insert +
-    /// delete_where + index rebuilds — the comment in `merge.rs`
-    /// explicitly says so). Strict classification rolls back valid
-    /// completed Phase B work as `UnexpectedMultistep`. BranchMerge
-    /// must be loose-matched like SchemaApply / EnsureIndices.
+    /// BranchMerge must be loose-matched, not strict: while the strict
+    /// classifier expects exactly one `commit_staged` per table,
+    /// `publish_rewritten_merge_table` runs multiple per table
+    /// (merge_insert + delete_where + index rebuilds — the comment in
+    /// `merge.rs` explicitly says so). Strict classification would roll
+    /// back valid completed Phase B work as `UnexpectedMultistep`.
     #[test]
     fn classify_loose_match_accepts_multi_commit_drift_for_branch_merge() {
         let pin = make_pin("node:Person", "irrelevant", 5, 6);
@@ -1091,12 +1081,11 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    /// PR #72 review (cubic) flagged that `list_dir` returns
-    /// filesystem-order results, making sidecar processing
-    /// nondeterministic. Sidecar filenames are ULIDs (lexicographically
-    /// sortable === chronologically sortable), so sorting by URI gives
-    /// deterministic, time-ordered processing — the older sidecar
-    /// processed before the newer one.
+    /// `list_dir` returns filesystem-order results, which would make
+    /// sidecar processing nondeterministic. Sidecar filenames are ULIDs
+    /// (lexicographically sortable === chronologically sortable), so
+    /// sorting by URI gives deterministic, time-ordered processing —
+    /// the older sidecar processed before the newer one.
     #[tokio::test]
     async fn list_sidecars_returns_deterministic_order() {
         let dir = tempfile::tempdir().unwrap();

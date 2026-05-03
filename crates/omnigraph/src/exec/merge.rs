@@ -913,9 +913,9 @@ async fn publish_rewritten_merge_table(
     // Phase 1: merge_insert changed/new rows (preserves _row_created_at_version for
     // existing rows, bumps _row_last_updated_at_version only for actually-changed rows).
     //
-    // MR-793 Phase 5: routed through the staged primitive so a failure
-    // between writing fragments and committing leaves no Lance-HEAD
-    // drift. The commit_staged here is per-table per-call (Lance has no
+    // Routed through the staged primitive so a failure between writing
+    // fragments and committing leaves no Lance-HEAD drift. The
+    // commit_staged here is per-table per-call (Lance has no
     // multi-dataset atomic commit); the residual sits at this single
     // commit point, narrowed from the previous "merge_insert + delete +
     // index" multi-step inline-commit chain.
@@ -957,11 +957,11 @@ async fn publish_rewritten_merge_table(
     //
     // INLINE-COMMIT RESIDUAL: lance-4.0.0 does not expose a public
     // two-phase delete API (DeleteJob is `pub(crate)` —
-    // lance-format/lance#6658 is open with no PRs). MR-793 deliberately
-    // does NOT introduce a `stage_delete` wrapper that would secretly
-    // inline-commit (a side-channel — see design doc §3.2). When the
-    // upstream API ships, swap this `delete_where` call for
-    // `stage_delete` + `commit_staged`.
+    // lance-format/lance#6658 is open with no PRs). We deliberately do
+    // NOT introduce a `stage_delete` wrapper that would secretly
+    // inline-commit (it would create a side-channel between the staged
+    // and inline write paths). When the upstream API ships, swap this
+    // `delete_where` call for `stage_delete` + `commit_staged`.
     if !staged.deleted_ids.is_empty() {
         let escaped: Vec<String> = staged
             .deleted_ids
@@ -977,11 +977,11 @@ async fn publish_rewritten_merge_table(
 
     // Phase 3: rebuild indices.
     //
-    // `build_indices_on_dataset` was migrated in MR-793 Phase 4 to use
-    // `stage_create_btree_index` / `stage_create_inverted_index` +
-    // `commit_staged` for scalar indices. Vector indices remain inline
-    // (residual — `build_index_metadata_from_segments` is `pub(crate)`
-    // in lance-4.0.0; companion ticket to lance-format/lance#6658).
+    // `build_indices_on_dataset` uses `stage_create_btree_index` /
+    // `stage_create_inverted_index` + `commit_staged` for scalar
+    // indices. Vector indices remain inline-commit
+    // (`build_index_metadata_from_segments` is `pub(crate)` in lance-
+    // 4.0.0 — companion ticket to lance-format/lance#6658).
     let row_count = target_db
         .table_store()
         .table_state(&full_path, &current_ds)
@@ -1167,13 +1167,14 @@ impl Omnigraph {
 
         validate_merge_candidates(self, source_snapshot, &target_snapshot, &candidates).await?;
 
-        // MR-847 sidecar: protect the per-table commit_staged loop. Pins
-        // every table that will be touched by `publish_adopted_source_state`
-        // or `publish_rewritten_merge_table`. BranchMerge uses loose
-        // classification — the publish path may run multiple commit_staged
-        // calls per table (publish_rewritten_merge_table does
-        // stage_merge_insert + delete_where + index rebuilds per the
-        // existing branch-merge code path).
+        // Recovery sidecar: protect the per-table commit_staged loop.
+        // Pins every table that will be touched by
+        // `publish_adopted_source_state` or `publish_rewritten_merge_table`.
+        // BranchMerge uses loose classification — the publish path may
+        // run multiple commit_staged calls per table
+        // (publish_rewritten_merge_table does stage_merge_insert +
+        // delete_where + index rebuilds per the existing branch-merge
+        // code path).
         let recovery_pins: Vec<crate::db::manifest::SidecarTablePin> = ordered_table_keys
             .iter()
             .filter(|tk| candidates.contains_key(*tk))
@@ -1190,15 +1191,15 @@ impl Omnigraph {
         let recovery_handle = if recovery_pins.is_empty() {
             None
         } else {
-            // PR #72 review (chatgpt-codex + cubic): use the merge target
-            // branch directly, NOT a heuristic derived from
-            // `ordered_table_keys.first()`. The first sorted table key may
-            // not be in the target snapshot at all (its `entry()` returns
-            // None → branch becomes None == main), and the SubTableEntry's
-            // `table_branch` field isn't necessarily the merge target
-            // branch. The caller `branch_merge` calls
-            // `swap_coordinator_for_branch(target_branch)` before invoking
-            // this function, so `self.active_branch()` is the target.
+            // Use the merge target branch directly, NOT a heuristic
+            // derived from `ordered_table_keys.first()`. The first
+            // sorted table key may not be in the target snapshot at all
+            // (its `entry()` returns None → branch becomes None == main),
+            // and the SubTableEntry's `table_branch` field isn't
+            // necessarily the merge target branch. The caller
+            // `branch_merge` calls `swap_coordinator_for_branch(target_branch)`
+            // before invoking this function, so `self.active_branch()`
+            // is the target.
             let target_branch = self.active_branch().map(str::to_string);
             let sidecar = crate::db::manifest::new_sidecar(
                 crate::db::manifest::SidecarKind::BranchMerge,
@@ -1244,10 +1245,10 @@ impl Omnigraph {
             updates.push(update);
         }
 
-        // MR-847 failpoint: pin the per-writer Phase B → Phase C residual
-        // for branch_merge. Lance HEAD has advanced on every touched
-        // table (publish_*) but the manifest publish below hasn't run.
-        // Used by `tests/failpoints.rs::branch_merge_phase_b_failure_recovered_on_next_open`.
+        // Failpoint: pin the per-writer Phase B → Phase C residual for
+        // branch_merge. Lance HEAD has advanced on every touched table
+        // (publish_*) but the manifest publish below hasn't run. Used
+        // by `tests/failpoints.rs::branch_merge_phase_b_failure_recovered_on_next_open`.
         crate::failpoints::maybe_fail("branch_merge.post_phase_b_pre_manifest_commit")?;
 
         let manifest_version = if updates.is_empty() {
@@ -1256,8 +1257,9 @@ impl Omnigraph {
             self.commit_manifest_updates(&updates).await?
         };
 
-        // MR-847 sidecar lifecycle: delete after manifest publish.
-        // Best-effort cleanup (PR #72 review).
+        // Recovery sidecar lifecycle: delete after manifest publish.
+        // Best-effort cleanup; the merge already landed durably so
+        // failing the user here is undesirable.
         if let Some(handle) = recovery_handle {
             if let Err(err) =
                 crate::db::manifest::delete_sidecar(&handle, self.storage_adapter()).await
@@ -1265,7 +1267,7 @@ impl Omnigraph {
                 tracing::warn!(
                     error = %err,
                     operation_id = handle.operation_id.as_str(),
-                    "MR-847 sidecar cleanup failed; the next open's recovery sweep will resolve it"
+                    "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
                 );
             }
         }

@@ -1,13 +1,13 @@
-//! MR-847 — open-time recovery sweep integration tests.
+//! Open-time recovery sweep integration tests.
 //!
 //! These exercise the full `Omnigraph::open` cycle: drop a synthetic
 //! sidecar into `__recovery/`, advance some Lance HEADs to simulate the
 //! Phase B → Phase C residual, reopen the engine, and assert the sweep's
 //! decision-tree dispatch did the right thing.
 //!
-//! The Phase 3 tests pin open-time invocation, `OpenMode::{ReadWrite,
-//! ReadOnly}`, the roll-back path, and schema-version refusal. The Phase
-//! 4 tests pin the roll-forward path + audit row recording.
+//! Coverage: open-time invocation, `OpenMode::{ReadWrite, ReadOnly}`,
+//! roll-back path, schema-version refusal, roll-forward path, and audit
+//! row recording.
 
 use std::path::Path;
 
@@ -311,6 +311,35 @@ async fn read_latest_recovery_audit(
     ))
 }
 
+/// Helper: read every recovery audit row's `recovery_kind` value, in
+/// storage order (multiple batches concatenated). Used by the
+/// multi-sidecar fresh-snapshot test as a diagnostic alongside the
+/// post-recovery Lance HEAD assertion.
+async fn list_recovery_audit_kinds(repo_root: &Path) -> Vec<String> {
+    let recoveries_dir = repo_root.join("_graph_commit_recoveries.lance");
+    if !recoveries_dir.exists() {
+        return Vec::new();
+    }
+    let ds = Dataset::open(recoveries_dir.to_str().unwrap()).await.unwrap();
+    use arrow_array::{Array, StringArray};
+    use futures::TryStreamExt;
+    let batches: Vec<arrow_array::RecordBatch> =
+        ds.scan().try_into_stream().await.unwrap().try_collect().await.unwrap();
+    let mut out = Vec::new();
+    for batch in batches {
+        let kinds = batch
+            .column_by_name("recovery_kind")
+            .expect("recovery_kind column present")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("recovery_kind is Utf8");
+        for i in 0..kinds.len() {
+            out.push(kinds.value(i).to_string());
+        }
+    }
+    out
+}
+
 /// Helper: count `_graph_commits.lance` rows tagged with the recovery actor.
 async fn count_recovery_actor_commits(repo_root: &Path) -> usize {
     let actors_dir = repo_root.join("_graph_commit_actors.lance");
@@ -566,21 +595,19 @@ async fn recovery_rolls_forward_with_null_actor() {
 }
 
 // =====================================================================
-// PR #72 review fixes — integration tests
+// Multi-sidecar processing — integration tests
 // =====================================================================
 
-/// PR #72 review (chatgpt-codex + cubic): multiple sidecars must be
-/// processed in deterministic ORDER and against FRESH manifest snapshots.
-/// Without sort + per-sidecar refresh, sidecar B can be classified
-/// against sidecar A's stale pre-publish snapshot and incorrectly roll
-/// back work that just landed.
+/// Multiple sidecars must be processed in deterministic ORDER and against
+/// FRESH manifest snapshots. Without sort + per-sidecar refresh, sidecar
+/// B can be classified against sidecar A's stale pre-publish snapshot
+/// and incorrectly roll back work that just landed.
 ///
 /// This test drops two synthetic sidecars on independent tables and
 /// asserts the sweep processes both end-to-end (both deleted, both
-/// audited). The unit test
-/// `list_sidecars_returns_deterministic_order` pins the sort order; this
-/// integration test pins the multi-sidecar flow against a real engine
-/// state.
+/// audited). The unit test `list_sidecars_returns_deterministic_order`
+/// pins the sort order; this integration test pins the multi-sidecar
+/// flow against a real engine state.
 #[tokio::test]
 async fn recovery_processes_multiple_sidecars_with_fresh_snapshot_per_iter() {
     use omnigraph::loader::{LoadMode, load_jsonl};
@@ -666,19 +693,18 @@ async fn recovery_processes_multiple_sidecars_with_fresh_snapshot_per_iter() {
     );
 }
 
-/// PR #72 review (cubic site #13): `ensure_indices_for_branch` previously
-/// pinned every catalog table in the sidecar. If only ONE table needed
+/// `ensure_indices_for_branch` must only pin tables that actually need
+/// new index work. If it pinned every catalog table and only one needed
 /// new indices, the others would classify as `NoMovement` on recovery,
 /// triggering the all-or-nothing decision rule to roll BACK the table
 /// that did get index work — destroying legitimate Phase B output.
 ///
 /// Steady-state case: when nothing needs indexing, no sidecar should
-/// be written. A sibling test
-/// `recovery_ensure_indices_skips_empty_tables_in_sidecar_scope`
-/// (PR #72 round-2 review) covers the more nuanced empty-table case
-/// where the existing ensure_indices loop has
-/// `if row_count > 0 { build_indices(...) }` — empty tables produce
-/// zero commits and would otherwise force NoMovement → rollback.
+/// be written. The sibling test `recovery_ensure_indices_handles_empty_tables`
+/// covers the more nuanced empty-table case where the existing
+/// ensure_indices loop has `if row_count > 0 { build_indices(...) }` —
+/// empty tables produce zero commits and would otherwise force
+/// NoMovement → rollback.
 #[tokio::test]
 async fn recovery_ensure_indices_steady_state_no_sidecar() {
     use omnigraph::loader::{LoadMode, load_jsonl};
@@ -702,28 +728,26 @@ async fn recovery_ensure_indices_steady_state_no_sidecar() {
     );
 }
 
-/// PR #72 round-2 review (cubic): empty tables (zero rows) bypass
-/// `build_indices_on_dataset` because `ensure_indices_for_branch` has
-/// `if row_count > 0 { build_indices(...) }`. The needs_index_work_*
-/// helpers must match this — pinning an empty table means recovery
-/// classifies it as `NoMovement` (no commits ever ran) and rolls back
-/// any sibling table's legitimate index work.
+/// Empty tables (zero rows) bypass `build_indices_on_dataset` because
+/// `ensure_indices_for_branch` has `if row_count > 0 { build_indices(...) }`.
+/// The `needs_index_work_*` helpers must match this — pinning an empty
+/// table means recovery classifies it as `NoMovement` (no commits ever
+/// ran) and rolls back any sibling table's legitimate index work.
 ///
 /// Integration verification: after a real init + ensure_indices on a
 /// repo where every table is empty, the recovery sweep must complete
-/// cleanly (no leftover sidecar) AND the next ensure_indices must
-/// also leave no sidecar — proving the empty-table-scoping fix lets
+/// cleanly (no leftover sidecar) AND the next ensure_indices must also
+/// leave no sidecar — proving the empty-table-scoping behavior lets
 /// steady-state runs incur zero sidecar I/O. The
-/// `count_rows == 0 → return false` short-circuit in
-/// `needs_index_work_*` is what makes this work.
+/// `count_rows == 0 → return false` short-circuit in `needs_index_work_*`
+/// is what makes this work.
 ///
-/// (A stronger assertion that captures the sidecar mid-flight and
-/// verifies the persisted JSON omits empty tables would require
-/// bypassing `load_jsonl` — which auto-builds indices via
-/// `prepare_updates_for_commit`. Pinning that with a unit test on the
-/// helpers directly would require bootstrapping an engine plus raw
-/// Lance writes; deferred as a follow-up. The behavioral correctness
-/// is verified by code inspection + bot review concurrence.)
+/// A stronger assertion that captured the sidecar mid-flight and verified
+/// the persisted JSON omits empty tables would require bypassing
+/// `load_jsonl` (which auto-builds indices via
+/// `prepare_updates_for_commit`); pinning that with a unit test on the
+/// helpers directly would require bootstrapping an engine plus raw Lance
+/// writes — left as a follow-up.
 #[tokio::test]
 async fn recovery_ensure_indices_handles_empty_tables() {
     let dir = tempfile::tempdir().unwrap();
@@ -745,26 +769,50 @@ async fn recovery_ensure_indices_handles_empty_tables() {
     );
 }
 
-/// PR #72 round-2 review (cubic site #4 follow-up): the original
-/// `recovery_processes_multiple_sidecars_with_fresh_snapshot_per_iter`
-/// test used independent tables so the fresh-snapshot fix wasn't
-/// load-bearing. This test makes the second sidecar's classification
-/// DEPEND on the first sidecar's manifest update — proving the refresh
-/// is required for correctness.
+/// Multi-sidecar processing must refresh the manifest snapshot between
+/// sidecars: sidecar N's roll-forward writes manifest changes that
+/// sidecar N+1 must observe, otherwise N+1 classifies its tables
+/// against stale pins and may incorrectly run a Dataset::restore that
+/// would not have run under a fresh view.
 ///
 /// Setup:
 /// - Sidecar A: kind=EnsureIndices (loose), refers to Person at
-///   expected=v1, post=v2. After processing, manifest pin advances
-///   to wherever Lance HEAD is at the time.
+///   expected=v1, post=v2.
 /// - Sidecar B: kind=EnsureIndices (loose), refers to Person at
-///   expected=v2 (the post-A manifest pin).
+///   expected=v2, post=v3.
+/// - Lance HEAD for Person sits at v3 (both writers' Phase B fragments
+///   chained but neither's Phase C landed).
 ///
-/// Without the fresh-snapshot refresh, sidecar B's `expected_version=v2`
-/// is compared against the pre-A snapshot's pin (v1), failing the
-/// loose-match `pin.expected_version == manifest_pinned` predicate
-/// → classified as UnexpectedAtP1 → RollBack. With the refresh,
-/// expected=v2 matches the new pin v2 → RolledPastExpected → roll
-/// forward succeeds.
+/// Outcome paths:
+///
+/// **Stale-snapshot bug** (no per-sidecar refresh):
+///   Sidecar A's classifier sees pre-recovery pin=v1, expected=v1
+///   matches → RolledPastExpected → RollForward to HEAD=v3. Manifest
+///   advances Person v1 → v3. Sidecar B's classifier still sees the
+///   STALE pin v1: lance_head=v3, manifest_pinned=v1, expected=v2.
+///   Loose-match predicate `expected == manifest_pinned` fails (v2 !=
+///   v1); `lance_head == manifest_pinned + 1` fails (v3 != v2) →
+///   UnexpectedMultistep → RollBack. Restore Person to expected=v2,
+///   creating Lance HEAD v4.
+///
+/// **Fresh-snapshot fix** (refresh per sidecar):
+///   Sidecar A: same as above; manifest pin advances to v3.
+///   Sidecar B refresh: classifier now sees pin=v3, lance_head=v3,
+///   expected=v2. lance_head == manifest_pinned → NoMovement → RollBack
+///   decision but the rollback loop has no eligible tables (only
+///   {RolledPastExpected, UnexpectedAtP1, UnexpectedMultistep} are
+///   restored), so it's a no-op rollback. Lance HEAD stays at v3.
+///
+/// **Differentiating assertion**: post-recovery Lance HEAD for Person
+/// must be == v3 (no restore happened). The stale-snapshot bug would
+/// have advanced HEAD to v4 via Dataset::restore.
+///
+/// Note: the audit row for sidecar B is "RolledBack" in the fix path
+/// because the all-or-nothing decision sees NoMovement. Overlapping-
+/// sidecar scenarios where one writer's HEAD-chained work absorbs the
+/// other's are rare in practice — per-(table, branch) writer
+/// serialization prevents them in steady state — but the recovery
+/// sweep handles them safely without forward-progress drift.
 #[tokio::test]
 async fn recovery_multi_sidecar_requires_fresh_snapshot_for_correctness() {
     use omnigraph::loader::{LoadMode, load_jsonl};
@@ -856,13 +904,41 @@ async fn recovery_multi_sidecar_requires_fresh_snapshot_for_correctness() {
         2,
         "two sidecars → two audit rows"
     );
+
+    // The "sidecars deleted + audit rows present" assertions above are
+    // necessary but not sufficient — both pass even when sidecar B rolls
+    // back under a stale snapshot (the bug path), because the sidecar is
+    // still deleted and an audit row is still written. The differentiating
+    // signal is the post-recovery Lance HEAD for Person:
+    //   - Fresh-snapshot fix: sidecar B is no-op rollback (NoMovement);
+    //     no Dataset::restore runs; HEAD stays at v3.
+    //   - Stale-snapshot bug: sidecar B classifies as UnexpectedMultistep;
+    //     restore advances HEAD to v4.
+    let ds_after = Dataset::open(&person_uri).await.unwrap();
+    assert_eq!(
+        ds_after.version().version,
+        v3,
+        "Person Lance HEAD must remain v3 (no restore from stale-snapshot rollback); got {} \
+         — a higher value indicates sidecar B classified UnexpectedMultistep against the \
+         stale pre-recovery pin and ran a restore",
+        ds_after.version().version
+    );
+    // Sanity: the audit kinds are diagnostic — first sidecar rolls forward
+    // (RolledPastExpected → RollForward); second is no-op rollback in this
+    // overlapping-sidecar scenario.
+    let kinds = list_recovery_audit_kinds(dir.path()).await;
+    assert_eq!(kinds.len(), 2, "expected 2 audit rows, got {:?}", kinds);
+    assert!(
+        matches!(kinds[0].as_str(), "RolledForward"),
+        "first sidecar must roll forward; got {:?}",
+        kinds
+    );
 }
 
-/// PR #72 review (cubic site #10): `OpenMode::ReadOnly` previously ran
-/// `recover_schema_state_files` unconditionally, which can delete or
-/// rename schema-staging files. Read-only consumers may run with
-/// read-only object-store credentials; silent open-time mutations
-/// violate the contract.
+/// `OpenMode::ReadOnly` must NOT run `recover_schema_state_files`,
+/// which can delete or rename schema-staging files. Read-only consumers
+/// may run with read-only object-store credentials, and silent open-time
+/// mutations violate the contract.
 ///
 /// This test drops a schema-staging file (which the recovery sweep
 /// would normally delete) then opens with ReadOnly mode. The staging
