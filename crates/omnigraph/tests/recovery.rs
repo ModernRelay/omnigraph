@@ -17,6 +17,8 @@ use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use omnigraph::db::Omnigraph;
 
+mod helpers;
+
 const TEST_SCHEMA: &str = include_str!("fixtures/test.pg");
 
 fn write_sidecar_file(repo_root: &Path, operation_id: &str, json: &str) {
@@ -975,6 +977,155 @@ async fn recovery_multi_sidecar_requires_fresh_snapshot_for_correctness() {
         matches!(kinds[0].as_str(), "RolledForward"),
         "first sidecar must roll forward; got {:?}",
         kinds
+    );
+}
+
+/// A sidecar from a feature-branch writer must be classified against
+/// THAT FEATURE BRANCH's manifest pin and Lance HEAD — not main's.
+/// Otherwise:
+///   - `snapshot.entry(table_key)` returns main's entry (or None) and
+///     `manifest_pinned` is wrong.
+///   - `Dataset::open(path)` returns the default ref's HEAD (main),
+///     missing the feature branch's actual drift.
+/// Either way, the classifier sees NoMovement → RollBack as no-op →
+/// sidecar deleted while feature's drift remains. Subsequent feature
+/// writers surface ExpectedVersionMismatch.
+///
+/// Setup:
+/// - Load alice on main.
+/// - Create `feature` branch.
+/// - Mutate feature (insert bob) → feature's manifest pin AND Lance
+///   HEAD on the feature branch advance.
+/// - Capture feature's post-mutate manifest pin (v_pin) and Lance HEAD
+///   (v_head).
+/// - Synthesize a sidecar with `branch=Some("feature")`, pin Person at
+///   `expected=v_pin, post=v_pin+1`, `table_branch=Some("feature")`.
+/// - Drop the engine and append_batch on Person's feature branch to
+///   advance HEAD to v_pin+1 (bypass manifest).
+///
+/// On reopen, recovery must:
+///   - Open a per-branch coordinator at `feature` for snapshot
+///     classification.
+///   - Open Person's Lance dataset at the `feature` ref for HEAD read.
+///   - Classify as RolledPastExpected and roll forward.
+#[tokio::test]
+async fn recovery_classifies_feature_branch_sidecar_against_feature_branch() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+    use omnigraph::table_store::TableStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Person","data":{"name":"alice","age":30}}
+"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    db.branch_create("feature").await.unwrap();
+    db.mutate(
+        "feature",
+        helpers::MUTATION_QUERIES,
+        "insert_person",
+        &helpers::mixed_params(&[("$name", "bob")], &[("$age", 40)]),
+    )
+    .await
+    .unwrap();
+
+    // Capture feature-branch state.
+    let feature_snapshot = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("feature"))
+        .await
+        .unwrap();
+    let feature_entry = feature_snapshot
+        .entry("node:Person")
+        .expect("feature snapshot must have Person entry");
+    let v_pin = feature_entry.table_version;
+    let feature_branch_name = feature_entry.table_branch.clone();
+    drop(db);
+
+    // Bypass the manifest: append directly to Person's Lance HEAD on the
+    // feature branch ref to advance HEAD past v_pin.
+    let person_uri = node_table_uri(uri, "Person");
+    let store = TableStore::new(uri);
+    let mut ds = store
+        .open_dataset_head(&person_uri, feature_branch_name.as_deref())
+        .await
+        .unwrap();
+    store
+        .append_batch(
+            &person_uri,
+            &mut ds,
+            person_batch(&[("carol-id", "carol", Some(40))]),
+        )
+        .await
+        .unwrap();
+    let v_head = ds.version().version;
+    assert_eq!(v_head, v_pin + 1, "append must advance HEAD by 1");
+
+    // Synthesize a sidecar saying the writer's intent was to publish
+    // feature's pin v_pin → v_pin+1. (Mutation kind = strict match.)
+    let sidecar_json = format!(
+        r#"{{
+            "schema_version": 1,
+            "operation_id": "01H0000000000000000000FEAT",
+            "started_at": "0",
+            "branch": "feature",
+            "actor_id": "act-feature",
+            "writer_kind": "Mutation",
+            "tables": [
+                {{
+                    "table_key":"node:Person",
+                    "table_path":"{}",
+                    "expected_version":{},
+                    "post_commit_pin":{},
+                    "table_branch":{}
+                }}
+            ]
+        }}"#,
+        person_uri,
+        v_pin,
+        v_head,
+        match &feature_branch_name {
+            Some(b) => format!("\"{}\"", b),
+            None => "null".to_string(),
+        },
+    );
+    write_sidecar_file(dir.path(), "01H0000000000000000000FEAT", &sidecar_json);
+
+    // Reopen — recovery sweep must process the feature-branch sidecar
+    // against feature's snapshot, not main's. With the fix, feature's
+    // manifest pin advances v_pin → v_head.
+    let db = Omnigraph::open(uri).await.unwrap();
+    assert!(
+        list_recovery_dir(dir.path()).is_empty(),
+        "feature-branch sidecar must be processed (deleted) after recovery"
+    );
+
+    // The post-recovery feature snapshot must show Person pinned at v_head.
+    let post_feature_snapshot = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("feature"))
+        .await
+        .unwrap();
+    let post_entry = post_feature_snapshot
+        .entry("node:Person")
+        .expect("Person must still be pinned on feature");
+    assert_eq!(
+        post_entry.table_version, v_head,
+        "feature manifest pin must advance v_pin={} → v_head={}; got {} \
+         — without branch-aware recovery, classification would have \
+         compared against main and rolled back / no-op'd",
+        v_pin, v_head, post_entry.table_version,
+    );
+
+    // Audit row recorded for the recovery action.
+    assert_eq!(
+        count_recovery_audit_rows(dir.path()).await,
+        1,
+        "feature-branch sidecar recovery must record one audit row",
     );
 }
 

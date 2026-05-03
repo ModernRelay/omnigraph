@@ -95,6 +95,15 @@ pub(crate) struct SidecarTablePin {
     /// Lance HEAD that the writer's `commit_staged` would produce
     /// (typically `expected_version + 1`).
     pub post_commit_pin: u64,
+    /// Lance branch ref this table lives on (mirrors
+    /// `SubTableEntry::table_branch`). Required for the recovery sweep
+    /// to open the dataset at the correct ref — `Dataset::open(path)`
+    /// alone returns the default ref (typically main), which would
+    /// classify a feature-branch sidecar against main's HEAD and silently
+    /// no-op or roll back the wrong table version. Optional for backward
+    /// compatibility with older sidecars; `None` means main / default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_branch: Option<String>,
 }
 
 /// In-memory representation of the on-disk JSON sidecar.
@@ -107,6 +116,16 @@ pub(crate) struct RecoverySidecar {
     pub actor_id: Option<String>,
     pub writer_kind: SidecarKind,
     pub tables: Vec<SidecarTablePin>,
+    /// For `SidecarKind::BranchMerge` only: the source branch's HEAD
+    /// commit id at the time the sidecar was written. Used by the
+    /// recovery sweep's audit step to call `append_merge_commit`
+    /// (recording `merged_parent_commit_id`) instead of `append_commit`,
+    /// so future merges between the same pair recognize "already up-to-
+    /// date" and merge-base computations stay correct. Optional for
+    /// backward compatibility — older sidecars (or non-BranchMerge
+    /// kinds) carry `None` and recovery falls back to `append_commit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_source_commit_id: Option<String>,
 }
 
 /// Opaque handle returned by [`write_sidecar`] so the caller can delete
@@ -391,43 +410,40 @@ pub(crate) fn decide(classifications: &[TableClassification]) -> SidecarDecision
 /// Restore a single table's Lance HEAD to `expected_version`, producing a
 /// new commit at HEAD+1 with content == content-at-`expected_version`.
 ///
-/// Idempotency: if the latest Lance commit's fragment-id set already equals
-/// the fragment-id set at `expected_version`, this is a no-op. Soundness —
-/// Lance fragments are immutable; equal fragment-ids ⇒ equal content.
-/// This guards against version pile-up under repeated mid-rollback crashes
-/// (see `docs/runs.md` "Finalize → publisher residual" + `.context/mr-847-design.md`
-/// §"Fragment-set equality short-circuit").
+/// Always runs the actual `Dataset::restore` — there is NO fragment-set
+/// short-circuit because equal fragment IDs do NOT imply equal content:
+/// Lance index commits and deletion-vector updates change the manifest
+/// (and therefore the user-visible state) without changing fragment IDs.
+/// Skipping the restore in those cases would leave Lance HEAD ahead of
+/// the manifest with no recovery artifact left.
+///
+/// Cost: under repeated mid-rollback crashes (rare), Lance HEAD
+/// accumulates extra restore commits that `omnigraph cleanup` reclaims.
+/// Bounded by the number of recovery iterations — typically 1.
 pub(crate) async fn restore_table_to_version(
     table_path: &str,
+    branch: Option<&str>,
     expected_version: u64,
 ) -> Result<()> {
     let head = Dataset::open(table_path)
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
-    let target = head
+    let head = match branch {
+        Some(b) if b != "main" => head
+            .checkout_branch(b)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?,
+        _ => head,
+    };
+    let mut to_restore = head
         .checkout_version(expected_version)
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
-
-    if fragment_ids(&head) == fragment_ids(&target) {
-        // Lance HEAD already reflects target content (a prior restore
-        // landed; we just didn't get to delete the sidecar). No-op.
-        return Ok(());
-    }
-
-    // checkout returns a NEW Dataset; restore() takes &mut self.
-    let mut to_restore = target;
     to_restore
         .restore()
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
     Ok(())
-}
-
-fn fragment_ids(ds: &Dataset) -> Vec<u64> {
-    let mut ids: Vec<u64> = ds.manifest.fragments.iter().map(|f| f.id).collect();
-    ids.sort_unstable();
-    ids
 }
 
 /// Open-time recovery sweep — the entry point invoked from
@@ -439,9 +455,9 @@ fn fragment_ids(ds: &Dataset) -> Vec<u64> {
 /// state), or abort (invariant violation).
 ///
 /// Idempotency: a crash mid-sweep leaves the sidecar (deletion is the
-/// final step). Re-opening re-classifies; the fragment-set short-circuit
-/// in [`restore_table_to_version`] prevents version pile-up under
-/// repeated mid-rollback crashes.
+/// final step). Re-opening re-classifies; repeated rollbacks of the
+/// same table append extra Lance restore commits which `omnigraph
+/// cleanup` reclaims.
 ///
 /// Concurrency: today recovery runs synchronously in `Omnigraph::open`
 /// *before* the engine is wrapped in the server's `Arc<RwLock<Omnigraph>>`.
@@ -450,24 +466,43 @@ fn fragment_ids(ds: &Dataset) -> Vec<u64> {
 /// queues before the sweep restores or publishes.
 pub(crate) async fn recover_manifest_drift(
     root_uri: &str,
-    storage: &dyn StorageAdapter,
+    storage: std::sync::Arc<dyn StorageAdapter>,
     coordinator: &mut GraphCoordinator,
 ) -> Result<()> {
-    let sidecars = list_sidecars(root_uri, storage).await?;
+    let sidecars = list_sidecars(root_uri, storage.as_ref()).await?;
     if sidecars.is_empty() {
         return Ok(());
     }
 
-    // Refresh the coordinator snapshot BEFORE each sidecar's
-    // classification. Sidecar N's roll-forward writes manifest changes
-    // that sidecar N+1 must observe, otherwise sidecar N+1 classifies
-    // its tables against stale pins and may incorrectly roll back work
-    // that landed moments earlier. Refresh is cheap (one Lance manifest
-    // read).
+    // For each sidecar, classify against a FRESH snapshot AT THE
+    // SIDECAR'S BRANCH. Two reasons:
+    // 1. Per-sidecar refresh: sidecar N's roll-forward writes manifest
+    //    changes that sidecar N+1 must observe, otherwise N+1 classifies
+    //    its tables against stale pins.
+    // 2. Per-branch snapshot: a sidecar from a feature-branch writer
+    //    pins entries on that feature branch. Classifying against the
+    //    main coordinator's snapshot would compare to main's pins (and
+    //    main's Lance HEAD if pin.table_branch isn't honored), silently
+    //    no-op'ing or rolling back the wrong table version. Open a
+    //    separate per-branch coordinator and use ITS snapshot.
     for sidecar in sidecars {
-        coordinator.refresh().await?;
-        let snapshot = coordinator.snapshot();
-        process_sidecar(root_uri, storage, &snapshot, &sidecar).await?;
+        let branch_snapshot = match sidecar.branch.as_deref() {
+            Some(b) => {
+                let mut branch_coord = GraphCoordinator::open_branch(
+                    root_uri,
+                    b,
+                    std::sync::Arc::clone(&storage),
+                )
+                .await?;
+                branch_coord.refresh().await?;
+                branch_coord.snapshot()
+            }
+            None => {
+                coordinator.refresh().await?;
+                coordinator.snapshot()
+            }
+        };
+        process_sidecar(root_uri, storage.as_ref(), &branch_snapshot, &sidecar).await?;
     }
     // Final refresh so the caller sees the post-sweep state.
     coordinator.refresh().await?;
@@ -482,7 +517,8 @@ async fn process_sidecar(
 ) -> Result<()> {
     let mut classifications = Vec::with_capacity(sidecar.tables.len());
     for pin in &sidecar.tables {
-        let lance_head = open_lance_head(&pin.table_path).await?;
+        let lance_head =
+            open_lance_head(&pin.table_path, pin.table_branch.as_deref()).await?;
         let manifest_pinned = snapshot
             .entry(&pin.table_key)
             .map(|e| e.table_version)
@@ -518,9 +554,9 @@ async fn process_sidecar(
             // Restore every table whose Lance HEAD has drifted from the
             // manifest pin (RolledPastExpected, UnexpectedAtP1,
             // UnexpectedMultistep). NoMovement tables are already at
-            // expected_version — no action. The fragment-set short-circuit
-            // in restore_table_to_version makes drift-with-equivalent-content
-            // a no-op (sound: equal fragment-ids ⇒ equal content).
+            // expected_version — no action. Restore is unconditional;
+            // repeated mid-rollback crashes accumulate a few extra
+            // Lance commits that `omnigraph cleanup` reclaims.
             let mut outcomes = Vec::with_capacity(sidecar.tables.len());
             for (pin, cls) in sidecar.tables.iter().zip(classifications.iter()) {
                 if matches!(
@@ -529,7 +565,12 @@ async fn process_sidecar(
                         | TableClassification::UnexpectedAtP1
                         | TableClassification::UnexpectedMultistep
                 ) {
-                    restore_table_to_version(&pin.table_path, pin.expected_version).await?;
+                    restore_table_to_version(
+                        &pin.table_path,
+                        pin.table_branch.as_deref(),
+                        pin.expected_version,
+                    )
+                    .await?;
                     outcomes.push(TableOutcome {
                         table_key: pin.table_key.clone(),
                         from_version: snapshot
@@ -601,15 +642,22 @@ async fn roll_forward_all(root_uri: &str, sidecar: &RecoverySidecar) -> Result<u
     let mut expected: HashMap<String, u64> = HashMap::with_capacity(sidecar.tables.len());
 
     for pin in &sidecar.tables {
-        // Open the dataset at its CURRENT Lance HEAD (not at the sidecar's
-        // post_commit_pin). For strict-match writers (Mutation/Load/
-        // BranchMerge) HEAD == post_commit_pin by construction. For
-        // loose-match writers (SchemaApply/EnsureIndices) HEAD may be
-        // higher than post_commit_pin (multiple commit_staged calls per
-        // table); we want to publish to the actual current HEAD.
+        // Open the dataset at its CURRENT Lance HEAD on the pin's branch
+        // (not at the sidecar's post_commit_pin). For strict-match writers
+        // (Mutation/Load) HEAD == post_commit_pin by construction. For
+        // loose-match writers (SchemaApply/EnsureIndices/BranchMerge) HEAD
+        // may be higher than post_commit_pin (multiple commit_staged
+        // calls per table); we want to publish to the actual current HEAD.
         let head_ds = Dataset::open(&pin.table_path)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let head_ds = match pin.table_branch.as_deref() {
+            Some(b) if b != "main" => head_ds
+                .checkout_branch(b)
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?,
+            _ => head_ds,
+        };
         let head_version = head_ds.version().version;
 
         let row_count = head_ds
@@ -628,7 +676,7 @@ async fn roll_forward_all(root_uri: &str, sidecar: &RecoverySidecar) -> Result<u
         updates.push(ManifestChange::Update(SubTableUpdate {
             table_key: pin.table_key.clone(),
             table_version: head_version,
-            table_branch: sidecar.branch.clone(),
+            table_branch: pin.table_branch.clone(),
             row_count,
             version_metadata,
         }));
@@ -659,13 +707,42 @@ async fn record_audit(
     outcomes: Vec<TableOutcome>,
 ) -> Result<()> {
     let mut graph = CommitGraph::open(root_uri).await?;
-    let graph_commit_id = graph
-        .append_commit(
-            sidecar.branch.as_deref(),
-            manifest_version,
-            Some(RECOVERY_ACTOR),
-        )
-        .await?;
+    // BranchMerge sidecars carry the source branch's HEAD commit id so
+    // recovery can record this as a MERGE commit (with parent linkage)
+    // instead of a plain commit. Without the merge parent, future
+    // `branch_merge feature → main` between the same pair would not
+    // recognize "already up-to-date" and merge-base computations break.
+    let graph_commit_id = match (
+        sidecar.writer_kind,
+        sidecar.merge_source_commit_id.as_deref(),
+        kind,
+    ) {
+        (SidecarKind::BranchMerge, Some(source_id), RecoveryKind::RolledForward) => {
+            // For BranchMerge roll-forward, fetch the current branch
+            // tip as the parent — at open-time recovery this is the
+            // pre-merge tip (no other writers have run yet).
+            let parent_commit_id =
+                graph.head_commit_id().await?.unwrap_or_default();
+            graph
+                .append_merge_commit(
+                    sidecar.branch.as_deref(),
+                    manifest_version,
+                    &parent_commit_id,
+                    source_id,
+                    Some(RECOVERY_ACTOR),
+                )
+                .await?
+        }
+        _ => {
+            graph
+                .append_commit(
+                    sidecar.branch.as_deref(),
+                    manifest_version,
+                    Some(RECOVERY_ACTOR),
+                )
+                .await?
+        }
+    };
     let mut audit = RecoveryAudit::open(root_uri).await?;
     audit
         .append(RecoveryAuditRecord {
@@ -681,10 +758,42 @@ async fn record_audit(
     Ok(())
 }
 
-async fn open_lance_head(table_path: &str) -> Result<u64> {
+/// Returns `true` if any `SchemaApply` sidecar is present in
+/// `__recovery/`. Schema-state recovery (`recover_schema_state_files`)
+/// uses this to skip its normal pre-vs-post-commit disambiguation —
+/// when a SchemaApply sidecar is present, we know the writer reached
+/// Phase B (Lance HEADs advanced) but didn't complete Phase C (manifest
+/// publish + staging→final renames). The right action is to complete
+/// the rename so the recovery sweep's roll-forward step sees the new
+/// catalog. Without this, the disambiguation logic deletes the staging
+/// files (since manifest still pins the old table set) and leaves the
+/// repo with new-schema data on disk but the old `_schema.pg` live —
+/// real corruption.
+pub(crate) async fn has_schema_apply_sidecar(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+) -> Result<bool> {
+    let sidecars = list_sidecars(root_uri, storage).await?;
+    Ok(sidecars
+        .iter()
+        .any(|s| matches!(s.writer_kind, SidecarKind::SchemaApply)))
+}
+
+/// Open the Lance dataset at `table_path` checked out at the given
+/// branch ref (or default if `branch` is None or "main") and return its
+/// HEAD version. Recovery uses this so feature-branch sidecars classify
+/// against the feature-branch's Lance HEAD, not main's.
+async fn open_lance_head(table_path: &str, branch: Option<&str>) -> Result<u64> {
     let ds = Dataset::open(table_path)
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
+    let ds = match branch {
+        Some(b) if b != "main" => ds
+            .checkout_branch(b)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?,
+        _ => ds,
+    };
     Ok(ds.version().version)
 }
 
@@ -718,6 +827,7 @@ pub(crate) fn new_sidecar(
         actor_id,
         writer_kind,
         tables,
+        merge_source_commit_id: None,
     }
 }
 
@@ -756,6 +866,7 @@ mod tests {
             table_path: table_path.to_string(),
             expected_version: expected,
             post_commit_pin: post,
+            table_branch: None,
         }
     }
 
@@ -985,7 +1096,7 @@ mod tests {
         let head_before = ds.version().version;
         assert_eq!(head_before, 3);
 
-        restore_table_to_version(&uri, 1).await.unwrap();
+        restore_table_to_version(&uri, None, 1).await.unwrap();
 
         let post = Dataset::open(&uri).await.unwrap();
         assert_eq!(post.version().version, head_before + 1);
@@ -1001,7 +1112,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_table_to_version_no_ops_when_fragments_already_match() {
+    async fn restore_table_to_version_always_appends_a_commit() {
+        // Restore is unconditional — equal fragment IDs do NOT imply
+        // equal content (Lance index commits and deletion-vector
+        // updates change the manifest without touching fragment IDs).
+        // Repeated restore calls each produce a new HEAD+1 commit.
         let dir = tempfile::tempdir().unwrap();
         let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
         let store = TableStore::new(dir.path().to_str().unwrap());
@@ -1014,16 +1129,19 @@ mod tests {
             .await
             .unwrap();
         // First restore: HEAD goes from 2 to 3 (with content == v1).
-        restore_table_to_version(&uri, 1).await.unwrap();
+        restore_table_to_version(&uri, None, 1).await.unwrap();
         let mid = Dataset::open(&uri).await.unwrap().version().version;
         assert_eq!(mid, 3);
 
-        // Second restore to v1: content already matches; no-op.
-        restore_table_to_version(&uri, 1).await.unwrap();
+        // Second restore to v1: still appends a commit (HEAD = 4) because
+        // restore is unconditional. The pile-up is bounded and reclaimed
+        // by `omnigraph cleanup`.
+        restore_table_to_version(&uri, None, 1).await.unwrap();
         let post = Dataset::open(&uri).await.unwrap().version().version;
         assert_eq!(
-            post, mid,
-            "second restore must short-circuit via fragment-set equality"
+            post,
+            mid + 1,
+            "restore must always append a commit (no fragment-set short-circuit)"
         );
     }
 

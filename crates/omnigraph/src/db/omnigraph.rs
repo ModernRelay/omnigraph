@@ -188,7 +188,7 @@ impl Omnigraph {
             // separate background-reconciler effort.
             crate::db::manifest::recover_manifest_drift(
                 &root,
-                storage.as_ref(),
+                Arc::clone(&storage),
                 &mut coordinator,
             )
             .await?;

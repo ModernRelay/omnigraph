@@ -1206,6 +1206,7 @@ impl Omnigraph {
                     table_path: self.table_store().dataset_uri(&entry.table_path),
                     expected_version: entry.table_version,
                     post_commit_pin: entry.table_version + 1,
+                    table_branch: entry.table_branch.clone(),
                 })
             })
             .collect();
@@ -1222,12 +1223,18 @@ impl Omnigraph {
             // before invoking this function, so `self.active_branch()`
             // is the target.
             let target_branch = self.active_branch().map(str::to_string);
-            let sidecar = crate::db::manifest::new_sidecar(
+            let mut sidecar = crate::db::manifest::new_sidecar(
                 crate::db::manifest::SidecarKind::BranchMerge,
                 target_branch,
                 self.audit_actor_id.clone(),
                 recovery_pins,
             );
+            // Carry the source branch's HEAD commit id so the recovery
+            // sweep's audit step can record this as a MERGE commit
+            // (linked to the source) instead of a plain commit. Without
+            // this, future merges between the same pair lose
+            // already-up-to-date detection and merge-base correctness.
+            sidecar.merge_source_commit_id = Some(source_head_commit_id.to_string());
             Some(
                 crate::db::manifest::write_sidecar(
                     self.root_uri(),

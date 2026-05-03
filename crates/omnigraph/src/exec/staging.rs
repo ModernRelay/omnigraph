@@ -265,6 +265,7 @@ impl MutationStaging {
                     table_path: path.full_path.clone(),
                     expected_version: expected,
                     post_commit_pin: expected + 1,
+                    table_branch: path.table_branch.clone(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;

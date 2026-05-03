@@ -319,6 +319,25 @@ pub(crate) async fn recover_schema_state_files(
         return Ok(());
     }
 
+    // Schema-apply atomicity: when a SchemaApply sidecar is present,
+    // the writer reached Phase B (Lance HEADs advanced) but didn't
+    // complete Phase C (manifest publish + staging→final renames). The
+    // recovery sweep about to run will roll the table versions forward
+    // to the new Lance HEADs; we MUST also rename the staging files
+    // forward so the catalog matches. Without this, the disambiguation
+    // logic below sees actual_keys == live_keys (manifest didn't move)
+    // and deletes the staging files, leaving the repo with new-schema
+    // data on disk but the old `_schema.pg` live — corruption.
+    if crate::db::manifest::has_schema_apply_sidecar(root_uri, storage.as_ref()).await? {
+        warn!(
+            "recovery: SchemaApply sidecar present; completing schema-staging rename so the \
+             manifest-drift sweep's roll-forward sees the new catalog (manifest v{})",
+            snapshot.version()
+        );
+        complete_staging_rename(root_uri, storage.as_ref()).await?;
+        return Ok(());
+    }
+
     if !pg_exists {
         // _schema.pg.staging is gone but at least one of the other staging
         // files is still present. This is a partial-rename: the post-commit

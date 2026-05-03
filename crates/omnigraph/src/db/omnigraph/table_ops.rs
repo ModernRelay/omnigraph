@@ -81,6 +81,7 @@ pub(super) async fn ensure_indices_for_branch(
                 table_path: full_path,
                 expected_version: entry.table_version,
                 post_commit_pin: entry.table_version + 1,
+                table_branch: entry.table_branch.clone(),
             });
         }
     }
@@ -101,6 +102,7 @@ pub(super) async fn ensure_indices_for_branch(
                 table_path: full_path,
                 expected_version: entry.table_version,
                 post_commit_pin: entry.table_version + 1,
+                table_branch: entry.table_branch.clone(),
             });
         }
     }

@@ -515,6 +515,22 @@ edge WorksAt: Person -> Company
         "manifest version must advance post-recovery; pre={pre_failure_version}, \
          post={post_recovery_version}",
     );
+
+    // Schema-apply atomicity: the live `_schema.pg` must reflect the
+    // NEW schema (city column on Person, Tag node type) — not the old.
+    // Without the schema-staging coordination, the schema-state
+    // recovery would have deleted the staging files (because manifest
+    // hadn't advanced when it ran), leaving a corrupt repo with new-
+    // schema data on disk but old-schema catalog.
+    let live_schema = std::fs::read_to_string(dir.path().join("_schema.pg")).unwrap();
+    assert!(
+        live_schema.contains("city: String?"),
+        "_schema.pg must reflect the NEW schema (city column added); got:\n{live_schema}",
+    );
+    assert!(
+        live_schema.contains("node Tag"),
+        "_schema.pg must reflect the NEW schema (Tag type added); got:\n{live_schema}",
+    );
     drop(db);
 }
 
@@ -628,6 +644,55 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
         "manifest version must advance post-recovery; pre={pre_failure_version}, \
          post={post_recovery_version}",
     );
+
+    // The recovered branch_merge must record a MERGE commit (with
+    // `merged_parent_commit_id` set), not a plain commit. Without
+    // this, future merges between the same pair lose
+    // already-up-to-date detection. We verify by reading
+    // `_graph_commits.lance` and asserting the most recent commit
+    // tagged with the recovery actor has a non-null
+    // `merged_parent_commit_id`.
+    {
+        use arrow_array::{Array, StringArray};
+        use futures::TryStreamExt;
+        let commits_dir = dir.path().join("_graph_commits.lance");
+        let ds = lance::Dataset::open(commits_dir.to_str().unwrap())
+            .await
+            .unwrap();
+        let batches: Vec<arrow_array::RecordBatch> = ds
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let mut found_recovery_merge = false;
+        for batch in batches {
+            let merged = batch
+                .column_by_name("merged_parent_commit_id")
+                .expect("merged_parent_commit_id column present")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("merged_parent_commit_id is Utf8");
+            // The actor_id lives in _graph_commit_actors; cross-checking
+            // is heavier than necessary. Detecting any non-null
+            // merged_parent_commit_id in the post-recovery state is
+            // sufficient: only a recovered branch_merge can produce one
+            // here (we never completed a normal merge in this test).
+            for i in 0..merged.len() {
+                if !merged.is_null(i) {
+                    found_recovery_merge = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            found_recovery_merge,
+            "recovered branch_merge must record `merged_parent_commit_id` so future \
+             merges detect already-up-to-date — no merge-parent-tagged commit found",
+        );
+    }
     drop(db);
 }
 

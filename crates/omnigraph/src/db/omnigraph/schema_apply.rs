@@ -170,6 +170,7 @@ pub(super) async fn apply_schema_with_lock(
                 table_path: db.table_store.dataset_uri(&entry.table_path),
                 expected_version: entry.table_version,
                 post_commit_pin: entry.table_version + 1,
+                table_branch: entry.table_branch.clone(),
             })
         })
         .collect();
