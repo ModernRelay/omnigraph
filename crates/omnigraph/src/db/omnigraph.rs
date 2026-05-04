@@ -81,6 +81,24 @@ pub struct Omnigraph {
     pub(crate) audit_actor_id: Option<String>,
 }
 
+/// Whether [`Omnigraph::open`] runs the open-time recovery sweep.
+///
+/// Recovery requires Lance writes (`Dataset::restore`, `ManifestBatchPublisher::publish`).
+/// Read-only consumers — NDJSON export, `commit list`, `read`, schema
+/// inspection — should not trigger writes (they may run with read-only
+/// object-store credentials, and silent open-time mutations are
+/// surprising). They also don't need recovery: reads always resolve
+/// through the manifest pin, which is the consistent snapshot regardless
+/// of any Phase B → Phase C drift on the per-table side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenMode {
+    /// Run the recovery sweep on open. Default for `Omnigraph::open`.
+    ReadWrite,
+    /// Skip the recovery sweep. Use for read-only consumers via
+    /// [`Omnigraph::open_read_only`].
+    ReadOnly,
+}
+
 impl Omnigraph {
     /// Create a new repo at `uri` from schema source.
     ///
@@ -119,24 +137,63 @@ impl Omnigraph {
         })
     }
 
-    /// Open an existing repo.
+    /// Open an existing repo (read-write).
     ///
     /// Reads `_schema.pg`, parses it, builds the catalog, and opens `__manifest`.
+    /// Runs the open-time recovery sweep before returning — see [`OpenMode`].
     pub async fn open(uri: &str) -> Result<Self> {
-        Self::open_with_storage(uri, storage_for_uri(uri)?).await
+        Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadWrite).await
     }
 
+    /// Open an existing repo for read-only consumers (NDJSON export,
+    /// `commit list`, etc.). Skips the recovery sweep — see [`OpenMode`].
+    pub async fn open_read_only(uri: &str) -> Result<Self> {
+        Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadOnly).await
+    }
+
+    /// `open_with_storage` retained for existing callers (init/test paths).
+    /// Defaults to `OpenMode::ReadWrite`.
     pub(crate) async fn open_with_storage(
         uri: &str,
         storage: Arc<dyn StorageAdapter>,
     ) -> Result<Self> {
+        Self::open_with_storage_and_mode(uri, storage, OpenMode::ReadWrite).await
+    }
+
+    pub(crate) async fn open_with_storage_and_mode(
+        uri: &str,
+        storage: Arc<dyn StorageAdapter>,
+        mode: OpenMode,
+    ) -> Result<Self> {
         let root = normalize_root_uri(uri)?;
         // Open the coordinator first so the schema-staging recovery sweep can
-        // compare its snapshot against any leftover staging files. Recovery
-        // either deletes staging (pre-commit crash) or completes the rename
-        // (post-commit crash) before the live schema files are read.
-        let coordinator = GraphCoordinator::open(&root, Arc::clone(&storage)).await?;
-        recover_schema_state_files(&root, Arc::clone(&storage), &coordinator.snapshot()).await?;
+        // compare its snapshot against any leftover staging files.
+        let mut coordinator = GraphCoordinator::open(&root, Arc::clone(&storage)).await?;
+        // Both the schema-state recovery sweep AND the manifest-drift
+        // recovery sweep are gated on `OpenMode::ReadWrite`. Read-only
+        // consumers (NDJSON export, `commit list`, schema show) shouldn't
+        // trigger object-store mutations: they may run with read-only
+        // credentials, and silent open-time writes are surprising. Both
+        // sweeps' work is recoverable on the next ReadWrite open, so
+        // skipping under ReadOnly doesn't lose any safety guarantees —
+        // the manifest pin is the consistent snapshot regardless of
+        // drift on the per-table side or leftover schema-staging files.
+        if matches!(mode, OpenMode::ReadWrite) {
+            recover_schema_state_files(&root, Arc::clone(&storage), &coordinator.snapshot())
+                .await?;
+            // Recovery sweep: close the Phase B → Phase C residual on
+            // any sidecar left over from a crashed writer. Continuous
+            // in-process recovery for long-running servers (no restart
+            // required between Phase B failure and recovery) is a
+            // separate background-reconciler effort.
+            crate::db::manifest::recover_manifest_drift(
+                &root,
+                Arc::clone(&storage),
+                &mut coordinator,
+                crate::db::manifest::RecoveryMode::Full,
+            )
+            .await?;
+        }
         // Read _schema.pg (post-recovery — may have just been renamed in).
         let schema_path = schema_source_uri(&root);
         let schema_source = storage.read_text(&schema_path).await?;
@@ -202,15 +259,27 @@ impl Omnigraph {
 
     /// Engine-facing trait surface around `TableStore`.
     ///
-    /// MR-793 Phase 1: this is the canonical accessor for newly-written
-    /// engine code. The trait's signatures use opaque `SnapshotHandle` /
-    /// `StagedHandle` instead of leaking `lance::Dataset` /
+    /// This is the canonical accessor for newly-written engine code. The
+    /// trait's signatures use opaque `SnapshotHandle` / `StagedHandle`
+    /// instead of leaking `lance::Dataset` /
     /// `lance::dataset::transaction::Transaction`. Existing call sites
     /// that still use `db.table_store.X(...)` (the inherent struct
-    /// methods) are migrated incrementally — see §9 of
-    /// `.context/mr-793-design.md`.
+    /// methods) are migrated incrementally.
     pub(crate) fn storage(&self) -> &dyn crate::storage_layer::TableStorage {
         &self.table_store
+    }
+
+    /// Engine-level access to the object-store adapter (S3 / local fs).
+    /// Used by the recovery sidecar protocol — writers in the engine
+    /// call this to write/delete sidecars at `__recovery/{ulid}.json`.
+    pub(crate) fn storage_adapter(&self) -> &dyn crate::storage::StorageAdapter {
+        self.storage.as_ref()
+    }
+
+    /// Engine-level access to the repo's normalized root URI. Used by
+    /// the recovery sidecar protocol to compute `__recovery/` paths.
+    pub(crate) fn root_uri(&self) -> &str {
+        &self.root_uri
     }
 
     pub(crate) async fn open_coordinator_for_branch(
@@ -306,8 +375,88 @@ impl Omnigraph {
         Ok(())
     }
 
-    /// Re-read the handle-local coordinator state from storage.
-    pub(crate) async fn refresh(&mut self) -> Result<()> {
+    /// Re-read the handle-local coordinator state from storage AND run
+    /// in-process recovery. Closes the Phase B → Phase C residual (e.g.
+    /// `MutationStaging::finalize` crash mid-publish in a long-running
+    /// server) without restart.
+    ///
+    /// Composition mirrors `Omnigraph::open_with_storage_and_mode`'s
+    /// recovery sequence, in the same order, with one restriction: the
+    /// manifest-drift sweep runs in `RollForwardOnly` mode (rollback /
+    /// abort cases defer to the next ReadWrite open because
+    /// `Dataset::restore` is unsafe under concurrency). Each step:
+    ///
+    /// 1. `coordinator.refresh()` — re-read manifest.
+    /// 2. `recover_schema_state_files` — complete an in-flight
+    ///    schema_apply's staging→final rename if a SchemaApply sidecar
+    ///    is on disk; idempotent + early-returns when no staging files
+    ///    exist. Required BEFORE manifest-drift recovery so a
+    ///    SchemaApply roll-forward doesn't publish the manifest while
+    ///    the staging files remain unrenamed (which would corrupt the
+    ///    repo: data on new schema, catalog on old).
+    /// 3. `recover_manifest_drift(... RollForwardOnly)` — close the
+    ///    finalize→publisher residual via roll-forward; defer rollback
+    ///    work to next ReadWrite open.
+    /// 4. `runtime_cache.invalidate_all` — drop stale per-snapshot caches.
+    ///
+    /// Steady state cost: one `list_dir` of `__recovery/` (typically
+    /// returns empty → early return for both passes). No additional
+    /// Lance reads.
+    ///
+    /// Engine-internal callers that already hold an in-flight sidecar
+    /// (e.g. `schema_apply` mid-write) MUST use
+    /// [`refresh_coordinator_only`](Self::refresh_coordinator_only) to
+    /// avoid the recovery sweep racing their own sidecar.
+    pub async fn refresh(&mut self) -> Result<()> {
+        self.coordinator.refresh().await?;
+        recover_schema_state_files(
+            &self.root_uri,
+            Arc::clone(&self.storage),
+            &self.coordinator.snapshot(),
+        )
+        .await?;
+        crate::db::manifest::recover_manifest_drift(
+            &self.root_uri,
+            Arc::clone(&self.storage),
+            &mut self.coordinator,
+            crate::db::manifest::RecoveryMode::RollForwardOnly,
+        )
+        .await?;
+        // Re-read the schema source / catalog from disk: schema-state
+        // recovery above may have renamed staging files into place
+        // (completing an in-flight schema_apply), so the on-disk
+        // `_schema.pg` and IR contract may now reflect a NEWER schema
+        // than the in-memory `self.catalog` / `self.schema_source`.
+        // Without this reload subsequent ops on the handle would use
+        // stale catalog metadata against post-migration data on disk.
+        // Mirrors `open_with_storage_and_mode`'s schema-load sequence.
+        let schema_path = schema_source_uri(&self.root_uri);
+        let schema_source = self.storage.read_text(&schema_path).await?;
+        let current_source_ir = read_schema_ir_from_source(&schema_source)?;
+        let branches = self.coordinator.branch_list().await?;
+        let (accepted_ir, _) = load_or_bootstrap_schema_contract(
+            &self.root_uri,
+            Arc::clone(&self.storage),
+            &branches,
+            &current_source_ir,
+        )
+        .await?;
+        let mut catalog = build_catalog_from_ir(&accepted_ir)?;
+        fixup_blob_schemas(&mut catalog);
+        self.schema_source = schema_source;
+        self.catalog = catalog;
+        self.runtime_cache.invalidate_all().await;
+        Ok(())
+    }
+
+    /// Refresh coordinator state and invalidate the runtime cache WITHOUT
+    /// running the recovery sweep. Engine-internal callers that hold an
+    /// in-flight sidecar (e.g. `schema_apply::apply_schema_with_lock`'s
+    /// internal lease-check refresh) need this variant: running recovery
+    /// here would observe the caller's own sidecar, classify it as
+    /// RolledPastExpected, and roll it forward — racing the caller's
+    /// own publish path.
+    pub(crate) async fn refresh_coordinator_only(&mut self) -> Result<()> {
         self.coordinator.refresh().await?;
         self.runtime_cache.invalidate_all().await;
         Ok(())
@@ -1275,6 +1424,10 @@ edge WorksAt: Person -> Company
         async fn delete(&self, uri: &str) -> Result<()> {
             self.deletes.lock().unwrap().push(uri.to_string());
             self.inner.delete(uri).await
+        }
+
+        async fn list_dir(&self, dir_uri: &str) -> Result<Vec<String>> {
+            self.inner.list_dir(dir_uri).await
         }
     }
 

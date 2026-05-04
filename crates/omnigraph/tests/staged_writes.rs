@@ -397,8 +397,7 @@ async fn scan_with_staged_with_filter_silently_drops_staged_rows() {
          If you're here because this assertion failed: either (a) Lance \
          exposed a way to scan uncommitted fragments without stats-based \
          pruning (good — update to assert == [alice, carol, dave]), or \
-         (b) something changed in our scan_with_staged path. See PR #67 \
-         test fix discussion + .context/mr-794-step2-design.md §1.1."
+         (b) something changed in our scan_with_staged path."
     );
 
     // Without filter, staged data IS visible — confirms the issue is
@@ -493,7 +492,7 @@ async fn chained_stage_merge_insert_with_shared_key_documents_duplicate_behavior
     );
 }
 
-// ─── MR-793 Phase 2: stage_overwrite + scalar index staging ─────────────────
+// ─── stage_overwrite + scalar index staging ─────────────────
 
 /// `stage_overwrite` writes replacement fragments to object storage but
 /// does NOT advance Lance HEAD until `commit_staged` runs. Mirrors
@@ -663,11 +662,11 @@ async fn stage_create_inverted_index_does_not_advance_head_until_commit() {
 
 /// Pin the inline-commit behavior of `delete_where`. Lance 4.0.0 does
 /// NOT expose a public `DeleteJob::execute_uncommitted`
-/// (`pub(crate)` — see lance-format/lance#6658). MR-793 deliberately
+/// (`pub(crate)` — see lance-format/lance#6658). The trait deliberately
 /// does NOT introduce a `stage_delete` wrapper that would secretly
-/// inline-commit (a side-channel — see design doc §3.2). Instead, the
-/// trait keeps `delete_where` as the only delete entry point, named
-/// honestly.
+/// inline-commit (a side-channel between the staged and inline write
+/// paths). Instead, the trait keeps `delete_where` as the only delete
+/// entry point, named honestly.
 ///
 /// **When Lance #6658 lands**: this test will need to flip — replace
 /// the assertion with a `stage_delete` + `commit_staged` round-trip
@@ -704,9 +703,10 @@ async fn delete_where_advances_head_inline_documents_residual() {
 /// `create_vector_index`. Lance 4.0.0 vector indices take the
 /// "segment commit path" which calls `build_index_metadata_from_segments`
 /// (`pub(crate)` in lance-4.0.0 `src/index.rs:111`). Until upstream
-/// exposes that helper (companion ticket to #6658), MR-793's trait
-/// surface deliberately does NOT include `stage_create_vector_index` —
-/// see design doc Appendix A.3.
+/// exposes that helper (companion ticket to lance-format/lance#6658),
+/// the trait surface deliberately does NOT include
+/// `stage_create_vector_index` — same rationale as `stage_delete`'s
+/// absence (no side-channel between staged and inline write paths).
 #[tokio::test]
 async fn create_vector_index_advances_head_inline_documents_residual() {
     use arrow_array::FixedSizeListArray;
@@ -757,4 +757,192 @@ async fn create_vector_index_advances_head_inline_documents_residual() {
          flip this test to assert staging does NOT advance HEAD."
     );
     assert!(store.has_vector_index(&ds, "embedding").await.unwrap());
+}
+
+/// Empirical pin of `Dataset::restore` semantics for the recovery sweep.
+///
+/// The recovery sweep depends on the `restore` invariant: from HEAD =
+/// `h`, calling `Dataset::checkout_version(p).await?` then
+/// `Dataset::restore().await?` produces a NEW commit at HEAD = `h + 1`
+/// with content == content at version `p`.
+///
+/// The Lance source confirms this — `restore()` (no args) takes the
+/// currently-checked-out version's content and applies it via
+/// `apply_commit` against the latest manifest, advancing HEAD by one.
+/// See lance-4.0.0 `src/dataset.rs:1106` and the transaction-spec
+/// example at https://lance.org/format/table/transaction/.
+///
+/// If the lance bump (4.0.0 → 4.x) ever changes this delta or the call
+/// signature, the recovery sweep's rollback path breaks; this test
+/// surfaces the regression at compile/test time rather than under
+/// production drift recovery.
+#[tokio::test]
+async fn lance_restore_appends_one_commit_with_checked_out_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap());
+
+    // Build version history: v1 = {alice}, v2 = {alice, bob}, v3 = {alice, bob, carol}.
+    let mut ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    assert_eq!(ds.version().version, 1);
+
+    store
+        .append_batch(&uri, &mut ds, person_batch(&[("bob", Some(25))]))
+        .await
+        .unwrap();
+    assert_eq!(ds.version().version, 2);
+
+    store
+        .append_batch(&uri, &mut ds, person_batch(&[("carol", Some(40))]))
+        .await
+        .unwrap();
+    assert_eq!(ds.version().version, 3);
+
+    let head_before = ds.version().version;
+
+    // Recovery's rollback shape: open + checkout(p) + restore().
+    let head_ds = Dataset::open(&uri).await.unwrap();
+    let mut to_restore = head_ds.checkout_version(1).await.unwrap();
+    assert_eq!(to_restore.manifest.version, 1);
+    to_restore.restore().await.unwrap();
+
+    // Verify against a fresh open — the previous handle's view doesn't
+    // tell us what other openers see.
+    let post = Dataset::open(&uri).await.unwrap();
+    assert_eq!(
+        post.version().version,
+        head_before + 1,
+        "Dataset::restore must append exactly one commit (HEAD + 1). If \
+         this assertion fires, lance changed restore semantics — re-read \
+         lance src/dataset.rs::restore and update the recovery sweep's \
+         rollback path before proceeding."
+    );
+
+    // Content equality: the restored HEAD must match version 1 (just alice).
+    let scanner = post.scan();
+    let batches: Vec<RecordBatch> = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let ids = collect_ids(&batches);
+    assert_eq!(
+        ids,
+        vec!["alice".to_string()],
+        "post-restore content must equal version 1's content; got {:?}",
+        ids,
+    );
+}
+
+/// Empirical pin of the `Dataset::restore` concurrency hazard that
+/// motivates the recovery sweep's open-time-only invocation strategy
+/// and any future continuous-recovery reconciler's queue-acquisition
+/// requirement.
+///
+/// `Dataset::restore`'s `check_restore_txn` (lance-4.0.0
+/// `src/io/commit/conflict_resolver.rs:986`) returns `Ok(())` against
+/// almost every other op (Append, Update, Delete, CreateIndex, Merge, …),
+/// so a Restore commits successfully even with concurrent commits in
+/// flight. The symmetric checks (lines 318, 473, 634, 787, 853, 947, 978,
+/// 1018, 1059, 1115, 1187, 1280) classify Restore as incompatible from
+/// the *other* op's POV — but the *other* op already committed before the
+/// Restore arrived, so it sees no conflict. Net: the Restore appends a
+/// rewind commit AFTER the legitimate concurrent Append, silently
+/// orphaning that Append's data from the active timeline.
+///
+/// The recovery sweep sidesteps this by running only at `Omnigraph::open`
+/// (before any other writers can race). A future continuous-recovery
+/// reconciler must acquire per-(table_key, branch) queues for sidecar
+/// tables before invoking restore — otherwise this hazard becomes
+/// reachable during in-flight tenant traffic.
+///
+/// This test is the load-bearing constraint any future reconciler must
+/// honor.
+#[tokio::test]
+async fn lance_restore_loses_to_concurrent_append_via_orphaning() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap());
+
+    // v1: seed with alice.
+    let _ = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+
+    // Recovery handle: opened at the latest, then checked out at v1 (the
+    // pin we'd "rollback" to in a real recovery scenario). This handle
+    // has NOT yet called restore.
+    let recovery_open = Dataset::open(&uri).await.unwrap();
+    let mut recovery_handle = recovery_open.checkout_version(1).await.unwrap();
+
+    // Concurrent legitimate writer: appends bob, advancing HEAD to v2.
+    // This simulates a per-table-queue model where another tenant wrote
+    // between recovery's open and recovery's restore call.
+    let mut writer_handle = Dataset::open(&uri).await.unwrap();
+    store
+        .append_batch(&uri, &mut writer_handle, person_batch(&[("bob", Some(25))]))
+        .await
+        .unwrap();
+    assert_eq!(writer_handle.version().version, 2);
+
+    // Recovery now restores. Because restore's `check_restore_txn` returns
+    // Ok against Append, this commits at v3 with content == v1 (just alice).
+    recovery_handle.restore().await.unwrap();
+
+    // Re-open and inspect: HEAD is v3, content is just alice. Bob is gone
+    // from the active timeline.
+    let post = Dataset::open(&uri).await.unwrap();
+    assert_eq!(
+        post.version().version,
+        3,
+        "Restore commits at HEAD+1 even when a concurrent commit landed \
+         between recovery's open and recovery's restore call. If this \
+         assertion fails, lance changed restore-vs-append conflict \
+         semantics — re-read check_restore_txn and update the recovery \
+         sweep's concurrency analysis."
+    );
+
+    let scanner = post.scan();
+    let batches: Vec<RecordBatch> = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let ids = collect_ids(&batches);
+    assert_eq!(
+        ids,
+        vec!["alice".to_string()],
+        "Concurrent Append's row 'bob' was silently orphaned by the \
+         Restore. Active-timeline contents == v1's contents. The recovery \
+         sweep sidesteps this hazard via open-time-only invocation; any \
+         future continuous-recovery reconciler must guard against it via \
+         per-(table, branch) queue acquisition. Got: {:?}",
+        ids,
+    );
+
+    // Sanity: bob's commit IS still readable via explicit checkout_version(2).
+    // The data isn't gone from disk — it's just unreachable from HEAD until
+    // cleanup_old_versions reclaims the orphan.
+    let v2 = Dataset::open(&uri)
+        .await
+        .unwrap()
+        .checkout_version(2)
+        .await
+        .unwrap();
+    let v2_batches: Vec<RecordBatch> = v2
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let v2_ids = collect_ids(&v2_batches);
+    assert_eq!(v2_ids, vec!["alice".to_string(), "bob".to_string()]);
 }

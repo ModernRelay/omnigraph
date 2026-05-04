@@ -537,10 +537,34 @@ async fn load_jsonl_reader<R: BufRead>(
 
     // Phase 4: Atomic manifest commit with publisher-level OCC.
     if use_staging {
-        let (updates, expected_versions) = staging.finalize(db, branch).await?;
+        let (updates, expected_versions, sidecar_handle) = staging
+            .finalize(db, branch, crate::db::manifest::SidecarKind::Load)
+            .await?;
         db.commit_updates_on_branch_with_expected(branch, &updates, &expected_versions)
             .await?;
+        // The recovery sidecar protects the per-table commit_staged →
+        // manifest publish window. Phase C succeeded — clean up
+        // best-effort: failing the user here would error out a write
+        // that already landed durably.
+        if let Some(handle) = sidecar_handle {
+            if let Err(err) =
+                crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await
+            {
+                tracing::warn!(
+                    error = %err,
+                    operation_id = handle.operation_id.as_str(),
+                    "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
+                );
+            }
+        }
     } else {
+        // LoadMode::Overwrite keeps the legacy inline-commit path —
+        // truncate-then-append doesn't fit the staged shape (see
+        // `docs/runs.md` "LoadMode::Overwrite residual"). The recovery
+        // sidecar is not applicable here because the writer doesn't go
+        // through MutationStaging; per-table inline commits + a final
+        // manifest publish handle their own residual via the documented
+        // operator workflow (re-run overwrite to recover).
         db.commit_updates_on_branch_with_expected(
             branch,
             &overwrite_updates,

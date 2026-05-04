@@ -42,6 +42,97 @@ pub(super) async fn ensure_indices_for_branch(
     let mut updates = Vec::new();
     let active_branch = resolved.branch;
 
+    // Recovery sidecar: protect the per-table commit_staged loop in
+    // build_indices_on_dataset (one commit per index built). Only pins
+    // tables that ACTUALLY need index work — the classifier
+    // loose-matches for SidecarKind::EnsureIndices (the actual N
+    // depends on which indices are missing), but if a table needs zero
+    // commits and gets pinned, the all-or-nothing decision rule
+    // classifies it as `NoMovement` and rolls back legitimately-
+    // committed work on sibling tables. Steady-state runs (everything
+    // already indexed) skip the sidecar entirely.
+    let mut recovery_pins: Vec<crate::db::manifest::SidecarTablePin> = Vec::new();
+    for type_name in db.catalog.node_types.keys() {
+        let table_key = format!("node:{}", type_name);
+        let Some(entry) = snapshot.entry(&table_key) else {
+            continue;
+        };
+        // Match the processing loop's branch filter: when running on a
+        // feature branch, main-branch tables (table_branch = None) are
+        // skipped (`None => continue` at ~line 118). Pinning them here
+        // would force NoMovement on recovery and trigger an all-or-
+        // nothing rollback of legitimately-committed work on the
+        // feature-branch tables.
+        if active_branch.is_some() && entry.table_branch.is_none() {
+            continue;
+        }
+        let full_path = format!("{}/{}", db.root_uri, entry.table_path);
+        if needs_index_work_node(
+            db,
+            type_name,
+            &table_key,
+            &full_path,
+            entry.table_branch.as_deref(),
+        )
+        .await?
+        {
+            recovery_pins.push(crate::db::manifest::SidecarTablePin {
+                table_key,
+                table_path: full_path,
+                expected_version: entry.table_version,
+                post_commit_pin: entry.table_version + 1,
+                // Use active_branch (where commits actually land), NOT
+                // entry.table_branch (where the table currently lives).
+                // open_owned_dataset_for_branch_write forks a feature
+                // branch from a main-branch table on first write — the
+                // resulting commit lands on active_branch. Recovery's
+                // open_lance_head must check the same branch.
+                table_branch: active_branch.clone(),
+            });
+        }
+    }
+    for edge_name in db.catalog.edge_types.keys() {
+        let table_key = format!("edge:{}", edge_name);
+        let Some(entry) = snapshot.entry(&table_key) else {
+            continue;
+        };
+        if active_branch.is_some() && entry.table_branch.is_none() {
+            continue;
+        }
+        let full_path = format!("{}/{}", db.root_uri, entry.table_path);
+        if needs_index_work_edge(db, &table_key, &full_path, entry.table_branch.as_deref())
+            .await?
+        {
+            recovery_pins.push(crate::db::manifest::SidecarTablePin {
+                table_key,
+                table_path: full_path,
+                expected_version: entry.table_version,
+                post_commit_pin: entry.table_version + 1,
+                // Use active_branch (where commits actually land), NOT
+                // entry.table_branch (where the table currently lives).
+                // open_owned_dataset_for_branch_write forks a feature
+                // branch from a main-branch table on first write — the
+                // resulting commit lands on active_branch. Recovery's
+                // open_lance_head must check the same branch.
+                table_branch: active_branch.clone(),
+            });
+        }
+    }
+    let recovery_handle = if recovery_pins.is_empty() {
+        None
+    } else {
+        let sidecar = crate::db::manifest::new_sidecar(
+            crate::db::manifest::SidecarKind::EnsureIndices,
+            active_branch.clone(),
+            db.audit_actor_id.clone(),
+            recovery_pins,
+        );
+        Some(
+            crate::db::manifest::write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar)
+                .await?,
+        )
+    };
+
     for type_name in db.catalog.node_types.keys() {
         let table_key = format!("node:{}", type_name);
         let Some(entry) = snapshot.entry(&table_key) else {
@@ -136,11 +227,123 @@ pub(super) async fn ensure_indices_for_branch(
         }
     }
 
+    // Failpoint: pin the per-writer Phase B → Phase C residual for
+    // ensure_indices. Lance HEAD has advanced on every touched table
+    // (one commit_staged per index built) but the manifest publish below
+    // hasn't run. Used by
+    // `tests/failpoints.rs::ensure_indices_phase_b_failure_recovered_on_next_open`.
+    crate::failpoints::maybe_fail("ensure_indices.post_phase_b_pre_manifest_commit")?;
+
     if !updates.is_empty() {
         commit_prepared_updates_on_branch(db, branch, &updates).await?;
     }
 
+    // Recovery sidecar lifecycle: delete after the manifest publish (or
+    // no-op when there were no updates — the sidecar covered the
+    // per-table commit window regardless). Best-effort cleanup; failing
+    // the user here would error a call that already succeeded.
+    if let Some(handle) = recovery_handle {
+        if let Err(err) =
+            crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await
+        {
+            tracing::warn!(
+                error = %err,
+                operation_id = handle.operation_id.as_str(),
+                "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
+            );
+        }
+    }
+
     Ok(())
+}
+
+/// Returns true if the node table is missing at least one declared
+/// scalar/vector index that `build_indices_on_dataset_for_catalog` would
+/// build AND has at least one row (the ensure_indices loop has
+/// `if row_count > 0 { build_indices(...) }`, so empty tables produce
+/// zero commits and must NOT be pinned in the sidecar — pinning them
+/// would force `NoMovement` classification on recovery and trigger the
+/// all-or-nothing rollback of sibling tables' legitimate index work).
+///
+/// Per the actual `build_indices_on_dataset_for_catalog` implementation
+/// (this file, ~line 419-491), nodes get BTree (id) + per-prop FTS
+/// (@search String) + per-prop Vector indices; edges get BTree only
+/// (id, src, dst). The two helpers mirror that asymmetry — see the
+/// `needs_index_work_edge` doc comment.
+async fn needs_index_work_node(
+    db: &Omnigraph,
+    type_name: &str,
+    table_key: &str,
+    full_path: &str,
+    table_branch: Option<&str>,
+) -> Result<bool> {
+    let ds = db
+        .table_store
+        .open_dataset_head_for_write(table_key, full_path, table_branch)
+        .await?;
+    // Empty tables are skipped by the ensure_indices loop, so they must
+    // not be pinned in the sidecar — pinning a table that produces zero
+    // commits classifies as NoMovement on recovery and forces all-or-
+    // nothing rollback of sibling tables' legitimate index work.
+    // Errors from count_rows are propagated: silently treating them as
+    // "0 rows" risks skipping a table that is actually about to be
+    // modified.
+    if db.table_store.count_rows(&ds, None).await? == 0 {
+        return Ok(false);
+    }
+    if !db.table_store.has_btree_index(&ds, "id").await? {
+        return Ok(true);
+    }
+    let Some(node_type) = db.catalog.node_types.get(type_name) else {
+        return Ok(false);
+    };
+    for index_cols in &node_type.indices {
+        if index_cols.len() != 1 {
+            continue;
+        }
+        let prop_name = &index_cols[0];
+        let Some(prop_type) = node_type.properties.get(prop_name) else {
+            continue;
+        };
+        if matches!(prop_type.scalar, ScalarType::String) && !prop_type.list {
+            if !db.table_store.has_fts_index(&ds, prop_name).await? {
+                return Ok(true);
+            }
+        } else if matches!(prop_type.scalar, ScalarType::Vector(_)) && !prop_type.list {
+            if !db.table_store.has_vector_index(&ds, prop_name).await? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Companion to `needs_index_work_node` for edge tables.
+///
+/// **Intentional asymmetry with the node helper**: edges only need
+/// BTree indices (id, src, dst) per `build_indices_on_dataset_for_catalog`
+/// at the edge branch (this file, lines 474-485). FTS / vector indices
+/// on edge properties are not built today; if they ever are, this
+/// helper plus the build function must be updated together.
+///
+/// Empty edge tables are skipped by the ensure_indices loop the same
+/// way node tables are; see `needs_index_work_node`.
+async fn needs_index_work_edge(
+    db: &Omnigraph,
+    table_key: &str,
+    full_path: &str,
+    table_branch: Option<&str>,
+) -> Result<bool> {
+    let ds = db
+        .table_store
+        .open_dataset_head_for_write(table_key, full_path, table_branch)
+        .await?;
+    if db.table_store.count_rows(&ds, None).await? == 0 {
+        return Ok(false);
+    }
+    Ok(!db.table_store.has_btree_index(&ds, "id").await?
+        || !db.table_store.has_btree_index(&ds, "src").await?
+        || !db.table_store.has_btree_index(&ds, "dst").await?)
 }
 
 pub(super) async fn open_for_mutation(
@@ -290,14 +493,14 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
         }
 
         if let Some(node_type) = catalog.node_types.get(type_name) {
-            // Per MR-793 §10 OQ3: stage scalar indices first (BTree,
-            // Inverted), then call `create_vector_index` inline. The
-            // inline-commit on a vector index advances HEAD, which would
-            // invalidate any uncommitted scalar index transactions if we
-            // stacked them. Today the per-stage shape commits each
-            // scalar index immediately so the order constraint is
-            // implicit, but if we ever batch scalar stages we must
-            // ensure they all land before the vector inline-commit.
+            // Stage scalar indices first (BTree, Inverted), then call
+            // `create_vector_index` inline. The inline-commit on a vector
+            // index advances HEAD, which would invalidate any uncommitted
+            // scalar index transactions if we stacked them. Today the
+            // per-stage shape commits each scalar index immediately so
+            // the order constraint is implicit, but if we ever batch
+            // scalar stages we must ensure they all land before the
+            // vector inline-commit.
             for index_cols in &node_type.indices {
                 if index_cols.len() != 1 {
                     continue;
@@ -353,13 +556,13 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
 }
 
 /// Stage a BTREE index transaction and commit it, advancing the in-memory
-/// `*ds` to the new HEAD. MR-793 Phase 4: replaces the previous
-/// inline-commit `create_btree_index(ds)` call with the staged primitive
-/// + an immediate `commit_staged`. Per-call behavior is unchanged
-/// (HEAD advances once per index), but the bytes-on-disk and HEAD-advance
-/// are now decoupled at the `TableStore` API surface — a caller that
-/// needs end-of-batch atomicity can stage many transactions and commit
-/// them in one pass (Phase 8's index reconciler relies on this).
+/// `*ds` to the new HEAD. The staged primitive + immediate `commit_staged`
+/// pair replaced the earlier inline-commit `create_btree_index(ds)` call.
+/// Per-call behavior is unchanged (HEAD advances once per index), but
+/// the bytes-on-disk and HEAD-advance are now decoupled at the
+/// `TableStore` API surface — a caller that needs end-of-batch atomicity
+/// can stage many transactions and commit them in one pass (the eventual
+/// index reconciler relies on this).
 async fn stage_and_commit_btree(
     db: &Omnigraph,
     table_key: &str,
@@ -395,7 +598,7 @@ async fn stage_and_commit_btree(
 }
 
 /// Stage an INVERTED (FTS) index transaction and commit it. See
-/// `stage_and_commit_btree` for the MR-793 Phase 4 rationale.
+/// `stage_and_commit_btree` for the rationale.
 async fn stage_and_commit_inverted(
     db: &Omnigraph,
     table_key: &str,

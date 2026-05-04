@@ -2,6 +2,7 @@ pub mod commit_graph;
 pub mod graph_coordinator;
 pub mod manifest;
 mod omnigraph;
+mod recovery_audit;
 mod run_registry;
 mod schema_state;
 
@@ -9,8 +10,8 @@ pub use commit_graph::GraphCommit;
 pub use graph_coordinator::{GraphCoordinator, ReadTarget, ResolvedTarget, SnapshotId};
 pub use manifest::{Snapshot, SubTableEntry, SubTableUpdate};
 pub use omnigraph::{
-    CleanupPolicyOptions, MergeOutcome, Omnigraph, SchemaApplyResult, TableCleanupStats,
-    TableOptimizeStats,
+    CleanupPolicyOptions, MergeOutcome, Omnigraph, OpenMode, SchemaApplyResult,
+    TableCleanupStats, TableOptimizeStats,
 };
 pub(crate) use omnigraph::ensure_public_branch_ref;
 pub(crate) use run_registry::is_internal_run_branch;

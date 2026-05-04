@@ -130,7 +130,7 @@ will replace it. Operator-driven (rare in agent workloads); document
 permanently until Lance exposes `Operation::Overwrite { fragments }` as
 a two-phase op.
 
-### Finalize → publisher residual
+### Open-time recovery sweep
 
 The staged-write rewire eliminates one drift class **by construction at
 the writer layer**: an op that fails before pushing to the in-memory
@@ -139,26 +139,73 @@ rejection) leaves Lance HEAD untouched on every staged table. This is
 the case the `partial_failure_leaves_target_queryable_and_unblocks_next_mutation`
 test pins.
 
-A second, narrower drift class remains. `MutationStaging::finalize`
-runs `stage_*` + `commit_staged` per touched table sequentially, then
-the publisher commits the manifest. Lance has no multi-dataset atomic
-commit, so the per-table `commit_staged` calls are independent
-operations: if commit_staged on table N+1 fails *after* commit_staged
-on tables 1..N succeeded, or if the publisher's CAS pre-check rejects
-*after* every commit_staged succeeded, tables 1..N are left at
-`Lance HEAD = manifest_pinned + 1`. The next mutation against those
-tables surfaces `ManifestConflictDetails::ExpectedVersionMismatch` —
-the same loud failure mode the rewire was designed to make rare, just
-no longer "unreachable."
+A second, narrower drift class — the **finalize → publisher window** —
+is closed across one open cycle by the open-time recovery sweep:
 
-Triggers: transient Lance write errors during finalize (object-store
-retry budget exhaustion, disk full); persistent publisher contention
-exceeding `PUBLISHER_RETRY_BUDGET = 5` retries. Closing this requires
-either a Lance multi-dataset atomic-commit primitive (filed upstream
-alongside the two-phase delete request) or a manifest-layer journal
-that replays staged commits on next open. Both are heavyweight; the
-v1 stance is "narrowed window, documented residual, surface the loud
-error when it fires."
+`MutationStaging::finalize` runs `stage_*` + `commit_staged` per touched
+table sequentially, then the publisher commits the manifest. Lance has
+no multi-dataset atomic commit, so the per-table `commit_staged` calls
+are independent operations: if commit_staged on table N+1 fails *after*
+commit_staged on tables 1..N succeeded, or if the publisher's CAS
+pre-check rejects *after* every commit_staged succeeded, tables 1..N
+are left at `Lance HEAD = manifest_pinned + 1`.
+
+**Recovery protocol** (lifecycle of every staged-write writer —
+`MutationStaging::finalize`, `schema_apply::apply_schema_with_lock`,
+`branch_merge_on_current_target`, `ensure_indices_for_branch`):
+
+1. **Phase A**: writer writes a sidecar JSON to
+   `__recovery/{ulid}.json` BEFORE its first `commit_staged`. The
+   sidecar names every `(table_key, table_path, expected_version,
+   post_commit_pin)` it intends to commit + the writer kind +
+   actor_id.
+2. **Phase B**: writer's per-table `commit_staged` loop runs.
+3. **Phase C**: publisher commits the manifest.
+4. **Phase D**: writer deletes the sidecar.
+
+A failure between Phase A and Phase D leaves the sidecar on disk. The
+next `Omnigraph::open` (gated on `OpenMode::ReadWrite`) runs the
+recovery sweep in `crates/omnigraph/src/db/manifest/recovery.rs`:
+
+- For each sidecar in `__recovery/`, compare every named table's
+  Lance HEAD to the manifest pin. Classify per the all-or-nothing
+  decision tree (RolledPastExpected / NoMovement / UnexpectedAtP1 /
+  UnexpectedMultistep / InvariantViolation).
+- If any table is `InvariantViolation` (Lance HEAD < manifest pinned —
+  should be impossible), **abort** with a loud error and leave the
+  sidecar on disk for operator review.
+- Otherwise, if every table is `RolledPastExpected`, **roll forward**:
+  a single `ManifestBatchPublisher::publish` call extends every pin
+  atomically.
+- Otherwise **roll back**: per-table `Dataset::restore` to the
+  expected_version (with a fragment-set short-circuit so repeated
+  mid-sweep crashes don't pile up versions).
+- After a successful roll-forward or roll-back, an audit row is
+  recorded — `_graph_commits.lance` carries
+  a commit tagged `actor_id = "omnigraph:recovery"`, and a sibling
+  `_graph_commit_recoveries.lance` row carries `recovery_kind`,
+  `recovery_for_actor` (the original sidecar's actor), `operation_id`,
+  per-table outcomes. Operators run `omnigraph commit list --filter
+  actor=omnigraph:recovery` to find recoveries.
+- Sidecar deleted as the final step.
+
+Triggers for the residual: transient Lance write errors during finalize
+(object-store retry budget exhaustion, disk full); persistent publisher
+contention exceeding `PUBLISHER_RETRY_BUDGET = 5` retries.
+
+**Long-running servers**: `Omnigraph::refresh` runs roll-forward-only
+recovery in-process — the common Phase B → Phase C residual closes
+without a restart. The next mutation on the same handle (after refresh)
+no longer surfaces `ExpectedVersionMismatch` for the failed table.
+Sidecars that would require a `Dataset::restore` (mixed / unexpected
+state) are deferred to the next `OpenMode::ReadWrite` open: restore is
+unsafe under concurrency because Lance's `check_restore_txn` accepts
+the restore against in-flight Append/Update/Delete commits and
+silently orphans them (pinned by
+`tests/staged_writes.rs::lance_restore_loses_to_concurrent_append_via_orphaning`).
+Continuous in-process recovery for the rollback path is the goal of a
+future background reconciler with per-(table, branch) writer-queue
+acquisition.
 
 The publisher-CAS contract is unchanged: a *concurrent writer* that
 advances any of our touched tables between snapshot capture and

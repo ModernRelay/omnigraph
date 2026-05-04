@@ -27,6 +27,9 @@ use lance::Dataset;
 use omnigraph_compiler::catalog::EdgeType;
 
 use crate::db::SubTableUpdate;
+use crate::db::manifest::{
+    new_sidecar, write_sidecar, RecoverySidecarHandle, SidecarKind, SidecarTablePin,
+};
 use crate::error::{OmniError, Result};
 
 /// Whether the per-table accumulator should commit via `stage_append`
@@ -218,8 +221,13 @@ impl MutationStaging {
     pub(crate) async fn finalize(
         self,
         db: &crate::db::Omnigraph,
-        _branch: Option<&str>,
-    ) -> Result<(Vec<SubTableUpdate>, HashMap<String, u64>)> {
+        branch: Option<&str>,
+        sidecar_kind: SidecarKind,
+    ) -> Result<(
+        Vec<SubTableUpdate>,
+        HashMap<String, u64>,
+        Option<RecoverySidecarHandle>,
+    )> {
         let MutationStaging {
             expected_versions,
             paths,
@@ -229,6 +237,50 @@ impl MutationStaging {
 
         let mut updates: Vec<SubTableUpdate> =
             inline_committed.into_values().collect();
+
+        // Sidecar protocol: build the per-table pin list BEFORE any Lance
+        // commit_staged runs, then write the sidecar so a crash between
+        // Phase B (this loop's commit_staged calls) and Phase C (the
+        // manifest publish in the caller) is recoverable on next open.
+        // Skipped when `pending` is empty (delete-only mutation; the D₂
+        // parse-time rule keeps deletes out of this code path so this
+        // branch is reached only for the inline-committed-only case).
+        let pins: Vec<SidecarTablePin> = pending
+            .iter()
+            .map(|(table_key, _)| {
+                let path = paths.get(table_key).ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "MutationStaging::finalize: missing path for table '{}'",
+                        table_key,
+                    ))
+                })?;
+                let expected = *expected_versions.get(table_key).ok_or_else(|| {
+                    OmniError::manifest_internal(format!(
+                        "MutationStaging::finalize: missing expected version for table '{}'",
+                        table_key,
+                    ))
+                })?;
+                Ok::<SidecarTablePin, OmniError>(SidecarTablePin {
+                    table_key: table_key.clone(),
+                    table_path: path.full_path.clone(),
+                    expected_version: expected,
+                    post_commit_pin: expected + 1,
+                    table_branch: path.table_branch.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let sidecar_handle = if pins.is_empty() {
+            None
+        } else {
+            let sidecar = new_sidecar(
+                sidecar_kind,
+                branch.map(|s| s.to_string()),
+                db.audit_actor_id.clone(),
+                pins,
+            );
+            Some(write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar).await?)
+        };
 
         for (table_key, table) in pending {
             let path = paths.get(&table_key).ok_or_else(|| {
@@ -318,7 +370,7 @@ impl MutationStaging {
             });
         }
 
-        Ok((updates, expected_versions))
+        Ok((updates, expected_versions, sidecar_handle))
     }
 }
 

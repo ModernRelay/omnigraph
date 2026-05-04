@@ -55,3 +55,9 @@ Filtered from `branch_list()` but visible to internals:
 
 - `__schema_apply_lock__` — serializes schema migrations.
 - `__run__<run-id>` — legacy from the pre-v0.4.0 Run state machine (removed in MR-771). The branch-name guard predicate `is_internal_run_branch` is kept as defense-in-depth so users cannot create a branch matching the legacy prefix; the filter will be removed once production legacy branches are swept (MR-770).
+
+## L2 — Recovery audit trail
+
+The four migrated writers (`MutationStaging::finalize`, `schema_apply`, `branch_merge`, `ensure_indices`) protect their multi-table commits with a sidecar at `__recovery/{ulid}.json` written before Phase B and deleted after Phase C. The next `Omnigraph::open` (gated on `OpenMode::ReadWrite`) runs the recovery sweep in `crates/omnigraph/src/db/manifest/recovery.rs`: classify per-table state, decide all-or-nothing per sidecar, roll forward / back, record an audit row.
+
+Audit rows live in `_graph_commit_recoveries.lance` (sibling to `_graph_commits.lance`) and reference the commit graph by `graph_commit_id`. The linked recovery commit is identified by that same `graph_commit_id`, and `actor_id="omnigraph:recovery"` is stored in `_graph_commit_actors.lance` (joined by `graph_commit_id`) — `_graph_commits.lance` itself does not carry the `actor_id` column. To find recoveries for a specific original actor: `omnigraph commit list --filter actor=omnigraph:recovery`, then join to `_graph_commit_recoveries.lance` by `graph_commit_id` to read `recovery_for_actor`. Schema: see `crates/omnigraph/src/db/recovery_audit.rs`.
