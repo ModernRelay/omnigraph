@@ -422,6 +422,29 @@ impl Omnigraph {
             crate::db::manifest::RecoveryMode::RollForwardOnly,
         )
         .await?;
+        // Re-read the schema source / catalog from disk: schema-state
+        // recovery above may have renamed staging files into place
+        // (completing an in-flight schema_apply), so the on-disk
+        // `_schema.pg` and IR contract may now reflect a NEWER schema
+        // than the in-memory `self.catalog` / `self.schema_source`.
+        // Without this reload subsequent ops on the handle would use
+        // stale catalog metadata against post-migration data on disk.
+        // Mirrors `open_with_storage_and_mode`'s schema-load sequence.
+        let schema_path = schema_source_uri(&self.root_uri);
+        let schema_source = self.storage.read_text(&schema_path).await?;
+        let current_source_ir = read_schema_ir_from_source(&schema_source)?;
+        let branches = self.coordinator.branch_list().await?;
+        let (accepted_ir, _) = load_or_bootstrap_schema_contract(
+            &self.root_uri,
+            Arc::clone(&self.storage),
+            &branches,
+            &current_source_ir,
+        )
+        .await?;
+        let mut catalog = build_catalog_from_ir(&accepted_ir)?;
+        fixup_blob_schemas(&mut catalog);
+        self.schema_source = schema_source;
+        self.catalog = catalog;
         self.runtime_cache.invalidate_all().await;
         Ok(())
     }

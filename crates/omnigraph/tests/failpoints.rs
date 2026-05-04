@@ -975,6 +975,42 @@ async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
         .unwrap();
     }
 
+    // Capture target_branch's commit-graph head BEFORE the failed merge.
+    // This is the commit the recovery's merge commit must claim as its
+    // `parent_commit_id` (D2 — without the per-branch CommitGraph fix,
+    // recovery would record the GLOBAL head as parent instead).
+    let target_branch_head_before_failure = {
+        let commits_dir = dir.path().join("_graph_commits.lance");
+        let ds = lance::Dataset::open(commits_dir.to_str().unwrap())
+            .await
+            .unwrap()
+            .checkout_branch("target_branch")
+            .await
+            .unwrap();
+        use arrow_array::{Array, StringArray};
+        use futures::TryStreamExt;
+        let batches: Vec<arrow_array::RecordBatch> =
+            ds.scan().try_into_stream().await.unwrap().try_collect().await.unwrap();
+        // Grab the latest commit_id by created_at order (the per-branch
+        // checkout ensures we only see target_branch's commits).
+        let mut latest: Option<(i64, String)> = None;
+        for batch in batches {
+            let ids = batch
+                .column_by_name("graph_commit_id").unwrap()
+                .as_any().downcast_ref::<StringArray>().unwrap();
+            let created = batch
+                .column_by_name("created_at").unwrap()
+                .as_any().downcast_ref::<arrow_array::TimestampMicrosecondArray>().unwrap();
+            for i in 0..ids.len() {
+                let ts = created.value(i);
+                if latest.as_ref().is_none_or(|(t, _)| ts > *t) {
+                    latest = Some((ts, ids.value(i).to_string()));
+                }
+            }
+        }
+        latest.expect("target_branch must have at least one commit (the insert-Bob mutate)").1
+    };
+
     // Phase A: failpoint fires after the per-table publish loop completes
     // but before commit_manifest_updates. Sidecar persists with
     // branch=Some("target_branch").
@@ -1019,17 +1055,19 @@ async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
         );
     }
 
-    // Audit row for a merge commit was recorded with a non-null
-    // merged_parent_commit_id — proves the recovery sweep used the
-    // branch-specific commit-graph head as parent (not the global
-    // head). Also assert the recovery audit's recovery_kind ==
-    // RolledForward.
+    // Find the recovery commit on target_branch's commit graph and
+    // assert its `parent_commit_id` matches the head we captured BEFORE
+    // the failed merge. This is what catches D2: without the
+    // per-branch CommitGraph fix, recovery records the GLOBAL head as
+    // parent, which on this test setup is the source_branch's
+    // insert-Carol commit (a different ULID), and the assertion fails.
+    //
+    // `merged_parent_commit_id` alone is insufficient — it's
+    // independently populated from sidecar.merge_source_commit_id, so
+    // it would be set correctly even with D2's bug.
     use arrow_array::{Array, StringArray};
     use futures::TryStreamExt;
     let commits_dir = dir.path().join("_graph_commits.lance");
-    // Recovery wrote the merge commit to the target_branch's Lance ref
-    // on the commit_graph dataset (per CommitGraph::open_at_branch).
-    // Open at that ref to find the merge commit.
     let ds = lance::Dataset::open(commits_dir.to_str().unwrap())
         .await
         .unwrap()
@@ -1044,7 +1082,8 @@ async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
         .try_collect()
         .await
         .unwrap();
-    let mut found_recovery_merge = false;
+    let mut recovery_merge_parent: Option<String> = None;
+    let mut recovery_merge_merged_parent: Option<String> = None;
     for batch in batches {
         let merged = batch
             .column_by_name("merged_parent_commit_id")
@@ -1052,17 +1091,44 @@ async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("merged_parent_commit_id is Utf8");
+        let parents = batch
+            .column_by_name("parent_commit_id")
+            .expect("parent_commit_id column present")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("parent_commit_id is Utf8");
         for i in 0..merged.len() {
             if !merged.is_null(i) {
-                found_recovery_merge = true;
+                // First (and only — single recovery, single merge commit)
+                // commit with a merged parent IS the recovery commit.
+                recovery_merge_parent = if parents.is_null(i) {
+                    None
+                } else {
+                    Some(parents.value(i).to_string())
+                };
+                recovery_merge_merged_parent = Some(merged.value(i).to_string());
                 break;
             }
         }
+        if recovery_merge_parent.is_some() {
+            break;
+        }
     }
+    let recovery_parent = recovery_merge_parent
+        .expect("non-main branch_merge recovery must record a merge commit with parent_commit_id");
+    assert_eq!(
+        recovery_parent, target_branch_head_before_failure,
+        "recovery merge commit's parent_commit_id must == target_branch's pre-failure head; \
+         expected {}, got {} — this would regress to the GLOBAL head if D2's per-branch \
+         CommitGraph::open_at_branch fix were removed",
+        target_branch_head_before_failure, recovery_parent,
+    );
+    // Sanity: merged_parent is set from the source branch (independent
+    // of D2; would be correct even with the bug, but we still verify
+    // it's non-null so the row is a true merge commit).
     assert!(
-        found_recovery_merge,
-        "non-main branch_merge recovery must record `merged_parent_commit_id` on the \
-         target branch's commit graph",
+        recovery_merge_merged_parent.is_some(),
+        "recovery merge commit must have non-null merged_parent_commit_id"
     );
 }
 
