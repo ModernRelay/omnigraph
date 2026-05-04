@@ -926,6 +926,146 @@ async fn branch_merge_phase_b_failure_recovered_on_next_open() {
     drop(db);
 }
 
+/// Branch-axis variant of the branch_merge recovery test: target is a
+/// non-main branch. Catches the branch-specific commit-graph head bug
+/// (D2) — without `CommitGraph::open_at_branch`, the recovery sweep
+/// would record the global head as the merge parent on a non-main
+/// target, and future merges between the same pair would lose
+/// already-up-to-date detection.
+#[tokio::test]
+async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    // Setup:
+    //   main: alice
+    //   target_branch (off main): + bob (target moved past base)
+    //   source_branch (off main): + carol (source moved past base)
+    // Merge: source_branch → target_branch
+    {
+        let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+        load_jsonl(
+            &mut db,
+            r#"{"type":"Person","data":{"name":"alice","age":30}}
+"#,
+            LoadMode::Append,
+        )
+        .await
+        .unwrap();
+        db.branch_create("target_branch").await.unwrap();
+        db.mutate(
+            "target_branch",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Bob")], &[("$age", 40)]),
+        )
+        .await
+        .unwrap();
+        db.branch_create("source_branch").await.unwrap();
+        db.mutate(
+            "source_branch",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Carol")], &[("$age", 50)]),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Phase A: failpoint fires after the per-table publish loop completes
+    // but before commit_manifest_updates. Sidecar persists with
+    // branch=Some("target_branch").
+    {
+        let mut db = Omnigraph::open(&uri).await.unwrap();
+        let _failpoint =
+            ScopedFailPoint::new("branch_merge.post_phase_b_pre_manifest_commit", "return");
+        let err = db
+            .branch_merge("source_branch", "target_branch")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "injected failpoint triggered: branch_merge.post_phase_b_pre_manifest_commit"
+            ),
+            "unexpected error: {err}"
+        );
+        let recovery_dir = dir.path().join("__recovery");
+        let sidecar_count = std::fs::read_dir(&recovery_dir).unwrap().count();
+        assert_eq!(
+            sidecar_count,
+            1,
+            "exactly one sidecar must persist after non-main branch_merge failure"
+        );
+    }
+
+    // Phase B: reopen runs full sweep. The BranchMerge sidecar's branch
+    // = Some("target_branch"); D2 fix opens a per-branch CommitGraph
+    // for the audit append so the merge-parent linkage is correct.
+    let _db = Omnigraph::open(&uri).await.unwrap();
+
+    let recovery_dir = dir.path().join("__recovery");
+    if recovery_dir.exists() {
+        let remaining: Vec<_> = std::fs::read_dir(&recovery_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(
+            remaining.is_empty(),
+            "sidecar must be deleted; remaining: {:?}",
+            remaining,
+        );
+    }
+
+    // Audit row for a merge commit was recorded with a non-null
+    // merged_parent_commit_id — proves the recovery sweep used the
+    // branch-specific commit-graph head as parent (not the global
+    // head). Also assert the recovery audit's recovery_kind ==
+    // RolledForward.
+    use arrow_array::{Array, StringArray};
+    use futures::TryStreamExt;
+    let commits_dir = dir.path().join("_graph_commits.lance");
+    // Recovery wrote the merge commit to the target_branch's Lance ref
+    // on the commit_graph dataset (per CommitGraph::open_at_branch).
+    // Open at that ref to find the merge commit.
+    let ds = lance::Dataset::open(commits_dir.to_str().unwrap())
+        .await
+        .unwrap()
+        .checkout_branch("target_branch")
+        .await
+        .unwrap();
+    let batches: Vec<arrow_array::RecordBatch> = ds
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut found_recovery_merge = false;
+    for batch in batches {
+        let merged = batch
+            .column_by_name("merged_parent_commit_id")
+            .expect("merged_parent_commit_id column present")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("merged_parent_commit_id is Utf8");
+        for i in 0..merged.len() {
+            if !merged.is_null(i) {
+                found_recovery_merge = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        found_recovery_merge,
+        "non-main branch_merge recovery must record `merged_parent_commit_id` on the \
+         target branch's commit graph",
+    );
+}
+
 /// `ensure_indices` only writes a sidecar when at least one table
 /// genuinely needs index work (per `needs_index_work_*` helpers in
 /// `db/omnigraph/table_ops.rs`). When all tables are steady-state

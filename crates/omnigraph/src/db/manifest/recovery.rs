@@ -656,14 +656,22 @@ async fn process_sidecar(
                 "recovery: rolling forward sidecar (Phase B completed; \
                  Phase C did not land)"
             );
-            let new_manifest_version = roll_forward_all(root_uri, sidecar).await?;
+            let (new_manifest_version, published_versions) =
+                roll_forward_all(root_uri, sidecar).await?;
+            // `to_version` records the ACTUAL Lance HEAD published for
+            // each table (not pin.post_commit_pin, which is a lower bound
+            // for loose-match writers like SchemaApply / EnsureIndices /
+            // BranchMerge that run multiple commit_staged calls per table).
             let outcomes: Vec<TableOutcome> = sidecar
                 .tables
                 .iter()
                 .map(|pin| TableOutcome {
                     table_key: pin.table_key.clone(),
                     from_version: pin.expected_version,
-                    to_version: pin.post_commit_pin,
+                    to_version: published_versions
+                        .get(&pin.table_key)
+                        .copied()
+                        .unwrap_or(pin.post_commit_pin),
                 })
                 .collect();
             record_audit(
@@ -691,9 +699,19 @@ async fn process_sidecar(
 /// contention; persistent contention surfaces the typed conflict error to
 /// the recovery sweep, which leaves the sidecar in place for the next
 /// open's retry.
-async fn roll_forward_all(root_uri: &str, sidecar: &RecoverySidecar) -> Result<u64> {
+/// Returns `(new_manifest_version, per_table_published_versions)`. The
+/// per-table map is what the audit row's `to_version` should record —
+/// for loose-match writers the actual Lance HEAD can be higher than the
+/// sidecar's `post_commit_pin` (which is a lower bound), so the pin is
+/// the wrong source of truth for an operator-facing audit field.
+async fn roll_forward_all(
+    root_uri: &str,
+    sidecar: &RecoverySidecar,
+) -> Result<(u64, HashMap<String, u64>)> {
     let mut updates: Vec<ManifestChange> = Vec::with_capacity(sidecar.tables.len());
     let mut expected: HashMap<String, u64> = HashMap::with_capacity(sidecar.tables.len());
+    let mut published_versions: HashMap<String, u64> =
+        HashMap::with_capacity(sidecar.tables.len());
 
     for pin in &sidecar.tables {
         // Open the dataset at its CURRENT Lance HEAD on the pin's branch
@@ -735,11 +753,12 @@ async fn roll_forward_all(root_uri: &str, sidecar: &RecoverySidecar) -> Result<u
             version_metadata,
         }));
         expected.insert(pin.table_key.clone(), pin.expected_version);
+        published_versions.insert(pin.table_key.clone(), head_version);
     }
 
     let publisher = GraphNamespacePublisher::new(root_uri, sidecar.branch.as_deref());
     let new_dataset = publisher.publish(&updates, &expected).await?;
-    Ok(new_dataset.version().version)
+    Ok((new_dataset.version().version, published_versions))
 }
 
 /// Append the audit row describing this recovery action.
@@ -760,24 +779,31 @@ async fn record_audit(
     kind: RecoveryKind,
     outcomes: Vec<TableOutcome>,
 ) -> Result<()> {
-    let mut graph = CommitGraph::open(root_uri).await?;
     // BranchMerge sidecars carry the source branch's HEAD commit id so
     // recovery can record this as a MERGE commit (with parent linkage)
     // instead of a plain commit. Without the merge parent, future
     // `branch_merge feature → main` between the same pair would not
     // recognize "already up-to-date" and merge-base computations break.
+    //
+    // For BranchMerge on a non-main target, the parent commit id is the
+    // TARGET BRANCH's tip — `CommitGraph::open()` returns the global
+    // commit graph whose `head_commit_id()` is the global head and would
+    // record the wrong parent. Open the per-branch instance instead.
     let graph_commit_id = match (
         sidecar.writer_kind,
         sidecar.merge_source_commit_id.as_deref(),
         kind,
     ) {
         (SidecarKind::BranchMerge, Some(source_id), RecoveryKind::RolledForward) => {
-            // For BranchMerge roll-forward, fetch the current branch
-            // tip as the parent — at open-time recovery this is the
-            // pre-merge tip (no other writers have run yet).
+            let mut branch_graph = match sidecar.branch.as_deref() {
+                Some(target_branch) => {
+                    CommitGraph::open_at_branch(root_uri, target_branch).await?
+                }
+                None => CommitGraph::open(root_uri).await?,
+            };
             let parent_commit_id =
-                graph.head_commit_id().await?.unwrap_or_default();
-            graph
+                branch_graph.head_commit_id().await?.unwrap_or_default();
+            branch_graph
                 .append_merge_commit(
                     sidecar.branch.as_deref(),
                     manifest_version,
@@ -788,6 +814,7 @@ async fn record_audit(
                 .await?
         }
         _ => {
+            let mut graph = CommitGraph::open(root_uri).await?;
             graph
                 .append_commit(
                     sidecar.branch.as_deref(),

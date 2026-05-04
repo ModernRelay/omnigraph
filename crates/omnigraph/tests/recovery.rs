@@ -1121,11 +1121,141 @@ async fn recovery_classifies_feature_branch_sidecar_against_feature_branch() {
         v_pin, v_head, post_entry.table_version,
     );
 
-    // Audit row recorded for the recovery action.
+    // Audit row recorded for the recovery action — and the row's
+    // recovery_kind == RolledForward (proves the branch-aware classifier
+    // got us through the eligible path; without it, the snapshot lookup
+    // against main's pin would have produced NoMovement → RollBack).
+    let kinds = list_recovery_audit_kinds(dir.path()).await;
     assert_eq!(
-        count_recovery_audit_rows(dir.path()).await,
-        1,
-        "feature-branch sidecar recovery must record one audit row",
+        kinds, vec!["RolledForward".to_string()],
+        "feature-branch sidecar recovery must record exactly one RolledForward audit row; got {:?}",
+        kinds,
+    );
+}
+
+/// Companion to the roll-forward feature-branch test: branch-axis
+/// rollback. Synthesize a feature-branch sidecar that classifies as
+/// rollback-eligible (UnexpectedAtP1) and assert the recovery sweep
+/// processes the sidecar against the FEATURE branch (not main) and runs
+/// the rollback. Without branch-aware recovery, classification would
+/// happen against main's snapshot/HEAD — likely NoMovement → no-op
+/// rollback that doesn't touch the actually-drifted feature ref.
+#[tokio::test]
+async fn recovery_rolls_back_feature_branch_sidecar_against_feature_branch() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+    use omnigraph::table_store::TableStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Person","data":{"name":"alice","age":30}}
+"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    db.branch_create("feature").await.unwrap();
+    db.mutate(
+        "feature",
+        helpers::MUTATION_QUERIES,
+        "insert_person",
+        &helpers::mixed_params(&[("$name", "bob")], &[("$age", 40)]),
+    )
+    .await
+    .unwrap();
+
+    let feature_snapshot = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("feature"))
+        .await
+        .unwrap();
+    let feature_entry = feature_snapshot
+        .entry("node:Person")
+        .expect("feature snapshot must have Person entry");
+    let v_pin = feature_entry.table_version;
+    let feature_branch_name = feature_entry.table_branch.clone();
+    drop(db);
+
+    // Bypass the manifest: append on the feature ref to advance HEAD past
+    // the manifest pin.
+    let person_uri = node_table_uri(uri, "Person");
+    let store = TableStore::new(uri);
+    let mut ds = store
+        .open_dataset_head(&person_uri, feature_branch_name.as_deref())
+        .await
+        .unwrap();
+    store
+        .append_batch(
+            &person_uri,
+            &mut ds,
+            person_batch(&[("dave-id", "dave", Some(50))]),
+        )
+        .await
+        .unwrap();
+    let v_head = ds.version().version;
+    assert_eq!(v_head, v_pin + 1);
+
+    // Sidecar with bogus expected (mismatch) AND post_commit_pin == v_head.
+    // Strict Mutation classifier sees lance_head == manifest_pinned + 1
+    // but expected != manifest_pinned → UnexpectedAtP1 → RollBack.
+    let bogus_expected = v_pin.saturating_sub(1);
+    let sidecar_json = format!(
+        r#"{{
+            "schema_version": 1,
+            "operation_id": "01H0000000000000000000FRB1",
+            "started_at": "0",
+            "branch": "feature",
+            "actor_id": "act-feature-rb",
+            "writer_kind": "Mutation",
+            "tables": [
+                {{
+                    "table_key":"node:Person",
+                    "table_path":"{}",
+                    "expected_version":{},
+                    "post_commit_pin":{},
+                    "table_branch":{}
+                }}
+            ]
+        }}"#,
+        person_uri,
+        bogus_expected,
+        v_head,
+        match &feature_branch_name {
+            Some(b) => format!("\"{}\"", b),
+            None => "null".to_string(),
+        },
+    );
+    write_sidecar_file(dir.path(), "01H0000000000000000000FRB1", &sidecar_json);
+
+    // Reopen with full sweep — RollBack is allowed at open time.
+    let _db = Omnigraph::open(uri).await.unwrap();
+    assert!(
+        list_recovery_dir(dir.path()).is_empty(),
+        "feature-branch rollback sidecar must be deleted after recovery"
+    );
+
+    // Audit kind == RolledBack (proves classifier saw feature's HEAD,
+    // not main's; main's view of Person would be NoMovement → no audit
+    // row attribution).
+    let kinds = list_recovery_audit_kinds(dir.path()).await;
+    assert_eq!(
+        kinds, vec!["RolledBack".to_string()],
+        "feature-branch rollback must record one RolledBack audit row; got {:?}",
+        kinds,
+    );
+
+    // Lance HEAD on the feature ref must have advanced (real restore ran).
+    let post = store
+        .open_dataset_head(&person_uri, feature_branch_name.as_deref())
+        .await
+        .unwrap();
+    assert!(
+        post.version().version > v_head,
+        "real restore must have appended a commit on feature; v_head={}, post={}",
+        v_head,
+        post.version().version,
     );
 }
 

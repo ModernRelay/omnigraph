@@ -376,16 +376,32 @@ impl Omnigraph {
     }
 
     /// Re-read the handle-local coordinator state from storage AND run
-    /// roll-forward-only recovery: closes the in-process Phase B → Phase C
-    /// residual (e.g. `MutationStaging::finalize` crash mid-publish in a
-    /// long-running server) without restart. Roll-forward uses
-    /// `ManifestBatchPublisher::publish`'s row-level CAS — safe under
-    /// concurrency. Sidecars that would require `Dataset::restore` are
-    /// deferred to the next ReadWrite open (restore can silently orphan
-    /// a concurrent writer's commit if invoked under concurrency).
+    /// in-process recovery. Closes the Phase B → Phase C residual (e.g.
+    /// `MutationStaging::finalize` crash mid-publish in a long-running
+    /// server) without restart.
+    ///
+    /// Composition mirrors `Omnigraph::open_with_storage_and_mode`'s
+    /// recovery sequence, in the same order, with one restriction: the
+    /// manifest-drift sweep runs in `RollForwardOnly` mode (rollback /
+    /// abort cases defer to the next ReadWrite open because
+    /// `Dataset::restore` is unsafe under concurrency). Each step:
+    ///
+    /// 1. `coordinator.refresh()` — re-read manifest.
+    /// 2. `recover_schema_state_files` — complete an in-flight
+    ///    schema_apply's staging→final rename if a SchemaApply sidecar
+    ///    is on disk; idempotent + early-returns when no staging files
+    ///    exist. Required BEFORE manifest-drift recovery so a
+    ///    SchemaApply roll-forward doesn't publish the manifest while
+    ///    the staging files remain unrenamed (which would corrupt the
+    ///    repo: data on new schema, catalog on old).
+    /// 3. `recover_manifest_drift(... RollForwardOnly)` — close the
+    ///    finalize→publisher residual via roll-forward; defer rollback
+    ///    work to next ReadWrite open.
+    /// 4. `runtime_cache.invalidate_all` — drop stale per-snapshot caches.
     ///
     /// Steady state cost: one `list_dir` of `__recovery/` (typically
-    /// returns empty → early return). No additional Lance reads.
+    /// returns empty → early return for both passes). No additional
+    /// Lance reads.
     ///
     /// Engine-internal callers that already hold an in-flight sidecar
     /// (e.g. `schema_apply` mid-write) MUST use
@@ -393,6 +409,12 @@ impl Omnigraph {
     /// avoid the recovery sweep racing their own sidecar.
     pub async fn refresh(&mut self) -> Result<()> {
         self.coordinator.refresh().await?;
+        recover_schema_state_files(
+            &self.root_uri,
+            Arc::clone(&self.storage),
+            &self.coordinator.snapshot(),
+        )
+        .await?;
         crate::db::manifest::recover_manifest_drift(
             &self.root_uri,
             Arc::clone(&self.storage),

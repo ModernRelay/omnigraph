@@ -81,7 +81,13 @@ pub(super) async fn ensure_indices_for_branch(
                 table_path: full_path,
                 expected_version: entry.table_version,
                 post_commit_pin: entry.table_version + 1,
-                table_branch: entry.table_branch.clone(),
+                // Use active_branch (where commits actually land), NOT
+                // entry.table_branch (where the table currently lives).
+                // open_owned_dataset_for_branch_write forks a feature
+                // branch from a main-branch table on first write — the
+                // resulting commit lands on active_branch. Recovery's
+                // open_lance_head must check the same branch.
+                table_branch: active_branch.clone(),
             });
         }
     }
@@ -102,7 +108,13 @@ pub(super) async fn ensure_indices_for_branch(
                 table_path: full_path,
                 expected_version: entry.table_version,
                 post_commit_pin: entry.table_version + 1,
-                table_branch: entry.table_branch.clone(),
+                // Use active_branch (where commits actually land), NOT
+                // entry.table_branch (where the table currently lives).
+                // open_owned_dataset_for_branch_write forks a feature
+                // branch from a main-branch table on first write — the
+                // resulting commit lands on active_branch. Recovery's
+                // open_lance_head must check the same branch.
+                table_branch: active_branch.clone(),
             });
         }
     }
