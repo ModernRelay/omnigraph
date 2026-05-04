@@ -170,8 +170,7 @@ async fn finalize_publisher_residual_drifts_lance_head_until_next_writer_recover
         .unwrap();
 
     {
-        let _failpoint =
-            ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+        let _failpoint = ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
 
         // First mutation: finalize succeeds (commit_staged advances Lance
         // HEAD on node:Person), then the failpoint kicks before the
@@ -186,9 +185,8 @@ async fn finalize_publisher_residual_drifts_lance_head_until_next_writer_recover
         .await
         .unwrap_err();
         assert!(
-            err.to_string().contains(
-                "injected failpoint triggered: mutation.post_finalize_pre_publisher"
-            ),
+            err.to_string()
+                .contains("injected failpoint triggered: mutation.post_finalize_pre_publisher"),
             "unexpected error: {err}"
         );
     }
@@ -242,8 +240,7 @@ async fn finalize_publisher_residual_does_not_drift_untouched_tables() {
         .unwrap();
 
     {
-        let _failpoint =
-            ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+        let _failpoint = ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
         let _ = mutate_main(
             &mut db,
             MUTATION_QUERIES,
@@ -303,13 +300,14 @@ async fn ensure_indices_phase_a_btree_failure_leaves_existing_tables_writable() 
     // node:Project table's btree-on-id build. (TEST_SCHEMA already
     // has Person + Company + Knows + WorksAt — pick a name that isn't
     // already declared.)
-    let extended_schema = format!("{}\nnode Project {{ name: String @key }}\n", helpers::TEST_SCHEMA);
+    let extended_schema = format!(
+        "{}\nnode Project {{ name: String @key }}\n",
+        helpers::TEST_SCHEMA
+    );
 
     {
-        let _failpoint = ScopedFailPoint::new(
-            "ensure_indices.post_stage_pre_commit_btree",
-            "return",
-        );
+        let _failpoint =
+            ScopedFailPoint::new("ensure_indices.post_stage_pre_commit_btree", "return");
         let err = db.apply_schema(&extended_schema).await.unwrap_err();
         assert!(
             err.to_string()

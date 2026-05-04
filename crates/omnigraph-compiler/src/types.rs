@@ -16,6 +16,7 @@ pub enum ScalarType {
     Date,
     DateTime,
     Vector(u32),
+    VectorInferred,
     Blob,
 }
 
@@ -58,6 +59,9 @@ impl ScalarType {
             Self::Date => DataType::Date32,
             Self::DateTime => DataType::Date64,
             Self::Blob => DataType::LargeBinary,
+            Self::VectorInferred => {
+                panic!("bare Vector must be resolved before Arrow schema construction")
+            }
             Self::Vector(dim) => {
                 let dim = i32::try_from(*dim)
                     .expect("vector dimension exceeds Arrow FixedSizeList i32 bound");
@@ -91,6 +95,7 @@ impl std::fmt::Display for ScalarType {
             Self::Date => "Date",
             Self::DateTime => "DateTime",
             Self::Blob => "Blob",
+            Self::VectorInferred => return write!(f, "Vector"),
             Self::Vector(dim) => return write!(f, "Vector({})", dim),
         };
         write!(f, "{}", s)

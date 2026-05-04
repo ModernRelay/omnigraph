@@ -32,6 +32,31 @@ fn test_build_catalog() {
 }
 
 #[test]
+fn test_catalog_tracks_embedding_config_and_specs() {
+    let schema = parse_schema(
+        r#"
+config {
+embedding_model: "gemini-embedding-2-preview"
+}
+
+node Doc {
+title: String
+embedding: Vector @embed(title) @index
+}
+"#,
+    )
+    .unwrap();
+    let catalog = build_catalog(&schema).unwrap();
+    assert_eq!(catalog.config.embedding_model, "gemini-embedding-2-preview");
+    let doc = &catalog.node_types["Doc"];
+    let spec = &doc.embedding_specs["embedding"];
+    assert_eq!(spec.source_prop, "title");
+    assert_eq!(spec.model, "gemini-embedding-2-preview");
+    assert_eq!(spec.dimensions, 3072);
+    assert_eq!(doc.embed_sources["embedding"], "title");
+}
+
+#[test]
 fn test_edge_lookup() {
     let schema = parse_schema(test_schema()).unwrap();
     let catalog = build_catalog(&schema).unwrap();
@@ -131,6 +156,7 @@ edge Emits: Person -> Signal
 #[test]
 fn test_edge_lookup_handles_non_ascii_leading_character() {
     let schema = SchemaFile {
+        config: Default::default(),
         declarations: vec![
             SchemaDecl::Node(NodeDecl {
                 name: "Person".to_string(),

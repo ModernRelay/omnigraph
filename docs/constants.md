@@ -14,7 +14,8 @@
 | Graph index cache size | `8` (LRU) | `runtime_cache.rs` |
 | Default body limit | `1 MB` | `omnigraph-server/lib.rs` |
 | Ingest body limit | `32 MB` | `omnigraph-server/lib.rs` |
-| Engine embed model | `gemini-embedding-2-preview` | `omnigraph/embedding.rs` |
+| Default schema embed model | `gemini-embedding-2-preview` | `omnigraph-compiler/embedding_models.rs` |
+| Supported schema embed models | `gemini-embedding-2-preview` (Gemini, 3072 dims) | `omnigraph-compiler/embedding_models.rs` |
 | Compiler embed model | `text-embedding-3-small` | `omnigraph-compiler/embedding.rs` |
 | Embed timeout | `30 000 ms` | both clients |
 | Embed retries | `4` | both clients |

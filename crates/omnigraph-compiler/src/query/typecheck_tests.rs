@@ -57,7 +57,7 @@ fn setup_embed_vector() -> Catalog {
 node Doc {
 slug: String
 body: String?
-embedding: Vector(3) @embed(body)
+embedding: Vector @embed(body)
 }
 "#,
     )

@@ -112,7 +112,10 @@ pub(super) async fn migrate_internal_schema(dataset: &mut Dataset) -> Result<()>
 async fn migrate_v1_to_v2(dataset: &mut Dataset) -> Result<()> {
     dataset
         .update_field_metadata()
-        .update("object_id", [(OBJECT_ID_PK_KEY.to_string(), "true".to_string())])
+        .update(
+            "object_id",
+            [(OBJECT_ID_PK_KEY.to_string(), "true".to_string())],
+        )
         .map_err(|e| OmniError::Lance(e.to_string()))?
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
@@ -121,10 +124,7 @@ async fn migrate_v1_to_v2(dataset: &mut Dataset) -> Result<()> {
 
 async fn set_stamp(dataset: &mut Dataset, version: u32) -> Result<()> {
     dataset
-        .update_schema_metadata([(
-            INTERNAL_SCHEMA_VERSION_KEY.to_string(),
-            version.to_string(),
-        )])
+        .update_schema_metadata([(INTERNAL_SCHEMA_VERSION_KEY.to_string(), version.to_string())])
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
     Ok(())

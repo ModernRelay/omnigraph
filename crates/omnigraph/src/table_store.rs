@@ -772,11 +772,7 @@ impl TableStore {
     ///
     /// MR-793 Phase 2: introduces this for the schema_apply rewrite path.
     /// Lance API verified in `.context/mr-793-design.md` Appendix A.1.
-    pub async fn stage_overwrite(
-        &self,
-        ds: &Dataset,
-        batch: RecordBatch,
-    ) -> Result<StagedWrite> {
+    pub async fn stage_overwrite(&self, ds: &Dataset, batch: RecordBatch) -> Result<StagedWrite> {
         if batch.num_rows() == 0 {
             return Err(OmniError::manifest_internal(
                 "stage_overwrite called with empty batch".to_string(),
@@ -821,8 +817,7 @@ impl TableStore {
         // read-your-writes via scan_with_staged, list every committed
         // fragment in removed_fragment_ids so the post-stage view shows
         // ONLY the staged fragments.
-        let removed_fragment_ids: Vec<u64> =
-            ds.manifest.fragments.iter().map(|f| f.id).collect();
+        let removed_fragment_ids: Vec<u64> = ds.manifest.fragments.iter().map(|f| f.id).collect();
         Ok(StagedWrite {
             transaction,
             new_fragments,
@@ -859,9 +854,7 @@ impl TableStore {
             .replace(true)
             .execute_uncommitted()
             .await
-            .map_err(|e| {
-                OmniError::Lance(format!("stage_create_btree_index: {}", e))
-            })?;
+            .map_err(|e| OmniError::Lance(format!("stage_create_btree_index: {}", e)))?;
         let removed_indices: Vec<IndexMetadata> = ds
             .load_indices()
             .await
@@ -900,9 +893,7 @@ impl TableStore {
             .replace(true)
             .execute_uncommitted()
             .await
-            .map_err(|e| {
-                OmniError::Lance(format!("stage_create_inverted_index: {}", e))
-            })?;
+            .map_err(|e| OmniError::Lance(format!("stage_create_inverted_index: {}", e)))?;
         let removed_indices: Vec<IndexMetadata> = ds
             .load_indices()
             .await
@@ -1074,13 +1065,8 @@ impl TableStore {
             None => committed,
         };
 
-        let pending = scan_pending_batches(
-            pending_batches,
-            pending_schema,
-            projection,
-            filter,
-        )
-        .await?;
+        let pending =
+            scan_pending_batches(pending_batches, pending_schema, projection, filter).await?;
 
         let mut out = committed;
         out.extend(pending);
@@ -1438,11 +1424,8 @@ async fn scan_pending_batches(
 ) -> Result<Vec<RecordBatch>> {
     let schema = pending_schema.unwrap_or_else(|| pending_batches[0].schema());
     let ctx = datafusion::execution::context::SessionContext::new();
-    let mem = datafusion::datasource::MemTable::try_new(
-        schema,
-        vec![pending_batches.to_vec()],
-    )
-    .map_err(|e| OmniError::Lance(e.to_string()))?;
+    let mem = datafusion::datasource::MemTable::try_new(schema, vec![pending_batches.to_vec()])
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
     ctx.register_table("pending", Arc::new(mem))
         .map_err(|e| OmniError::Lance(e.to_string()))?;
 
@@ -1454,9 +1437,7 @@ async fn scan_pending_batches(
                 .join(", ")
         })
         .unwrap_or_else(|| "*".to_string());
-    let where_clause = filter
-        .map(|f| format!("WHERE {f}"))
-        .unwrap_or_default();
+    let where_clause = filter.map(|f| format!("WHERE {f}")).unwrap_or_default();
     let sql = format!("SELECT {proj} FROM pending {where_clause}");
     let df = ctx
         .sql(&sql)

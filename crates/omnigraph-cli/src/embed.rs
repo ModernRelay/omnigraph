@@ -6,10 +6,13 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 use color_eyre::eyre::{Result, bail, eyre};
 use omnigraph::embedding::EmbeddingClient;
+use omnigraph_compiler::{
+    DEFAULT_EMBEDDING_MODEL, embedding_model_by_name, supported_embedding_model_names,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-const DEFAULT_EMBED_MODEL: &str = "gemini-embedding-2-preview";
+const DEFAULT_EMBED_MODEL: &str = DEFAULT_EMBEDDING_MODEL;
 
 #[derive(Debug, Args, Clone)]
 pub(crate) struct EmbedArgs {
@@ -180,10 +183,11 @@ pub(crate) fn resolve_embed_job(args: &EmbedArgs) -> Result<EmbedJob> {
         (input, output, spec)
     };
 
-    if spec.model != DEFAULT_EMBED_MODEL {
+    if embedding_model_by_name(&spec.model).is_none() {
         bail!(
-            "only {} is supported for explicit seed embeddings right now",
-            DEFAULT_EMBED_MODEL
+            "unsupported embedding model '{}' (supported: {})",
+            spec.model,
+            supported_embedding_model_names()
         );
     }
 
@@ -261,6 +265,7 @@ pub(crate) async fn run_embed_job(job: &EmbedJob) -> Result<EmbedOutput> {
                         embed_row(
                             &mut row,
                             type_spec,
+                            &job.spec.model,
                             job.spec.dimension,
                             client.as_ref().unwrap(),
                         )
@@ -279,6 +284,7 @@ pub(crate) async fn run_embed_job(job: &EmbedJob) -> Result<EmbedOutput> {
                         embed_row(
                             &mut row,
                             type_spec,
+                            &job.spec.model,
                             job.spec.dimension,
                             client.as_ref().unwrap(),
                         )
@@ -523,6 +529,7 @@ fn build_embedding_text(type_name: &str, data: &Map<String, Value>, fields: &[St
 async fn embed_row(
     row: &mut EmbedRow,
     spec: &EmbedTypeSpec,
+    model: &str,
     dimension: usize,
     client: &EmbeddingClient,
 ) -> Result<()> {
@@ -537,7 +544,7 @@ async fn embed_row(
     if text.trim().is_empty() {
         return Ok(());
     }
-    let embedding = client.embed_document_text(&text, dimension).await?;
+    let embedding = client.embed_document_text(&text, model, dimension).await?;
     data.insert(spec.target.clone(), json!(embedding));
     Ok(())
 }

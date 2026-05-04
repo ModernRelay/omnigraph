@@ -159,7 +159,7 @@ node Doc {
 slug: String @key
 body: String?
 summary: String?
-embedding: Vector(3)? @embed(body)
+embedding: Vector? @embed(body)
 }
 "#,
         ),

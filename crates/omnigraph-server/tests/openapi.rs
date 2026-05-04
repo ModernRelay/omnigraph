@@ -129,7 +129,11 @@ async fn openapi_endpoint_does_not_require_auth() {
         .body(Body::empty())
         .unwrap();
     let (status, _) = json_response(&app, request).await;
-    assert_eq!(status, StatusCode::OK, "/openapi.json should not require auth");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "/openapi.json should not require auth"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -626,10 +630,13 @@ fn branch_delete_has_branch_path_parameter() {
     let params = doc["paths"]["/branches/{branch}"]["delete"]["parameters"]
         .as_array()
         .unwrap();
-    let has_branch = params.iter().any(|p| {
-        p["name"].as_str() == Some("branch") && p["in"].as_str() == Some("path")
-    });
-    assert!(has_branch, "DELETE /branches/{{branch}} must have 'branch' path parameter");
+    let has_branch = params
+        .iter()
+        .any(|p| p["name"].as_str() == Some("branch") && p["in"].as_str() == Some("path"));
+    assert!(
+        has_branch,
+        "DELETE /branches/{{branch}} must have 'branch' path parameter"
+    );
 }
 
 #[test]
@@ -638,10 +645,13 @@ fn commit_show_has_commit_id_path_parameter() {
     let params = doc["paths"]["/commits/{commit_id}"]["get"]["parameters"]
         .as_array()
         .unwrap();
-    let has_commit_id = params.iter().any(|p| {
-        p["name"].as_str() == Some("commit_id") && p["in"].as_str() == Some("path")
-    });
-    assert!(has_commit_id, "GET /commits/{{commit_id}} must have 'commit_id' path parameter");
+    let has_commit_id = params
+        .iter()
+        .any(|p| p["name"].as_str() == Some("commit_id") && p["in"].as_str() == Some("path"));
+    assert!(
+        has_commit_id,
+        "GET /commits/{{commit_id}} must have 'commit_id' path parameter"
+    );
 }
 
 #[test]
@@ -650,10 +660,13 @@ fn snapshot_has_branch_query_parameter() {
     let params = doc["paths"]["/snapshot"]["get"]["parameters"]
         .as_array()
         .unwrap();
-    let has_branch = params.iter().any(|p| {
-        p["name"].as_str() == Some("branch") && p["in"].as_str() == Some("query")
-    });
-    assert!(has_branch, "GET /snapshot must have 'branch' query parameter");
+    let has_branch = params
+        .iter()
+        .any(|p| p["name"].as_str() == Some("branch") && p["in"].as_str() == Some("query"));
+    assert!(
+        has_branch,
+        "GET /snapshot must have 'branch' query parameter"
+    );
 }
 
 #[test]
@@ -662,10 +675,13 @@ fn commits_has_branch_query_parameter() {
     let params = doc["paths"]["/commits"]["get"]["parameters"]
         .as_array()
         .unwrap();
-    let has_branch = params.iter().any(|p| {
-        p["name"].as_str() == Some("branch") && p["in"].as_str() == Some("query")
-    });
-    assert!(has_branch, "GET /commits must have 'branch' query parameter");
+    let has_branch = params
+        .iter()
+        .any(|p| p["name"].as_str() == Some("branch") && p["in"].as_str() == Some("query"));
+    assert!(
+        has_branch,
+        "GET /commits must have 'branch' query parameter"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -741,8 +757,7 @@ fn error_responses_reference_error_output_schema() {
     ];
 
     for (path, method, status) in paths_with_errors {
-        let content =
-            &doc["paths"][path][method]["responses"][status]["content"];
+        let content = &doc["paths"][path][method]["responses"][status]["content"];
         let schema = &content["application/json"]["schema"];
         let ref_path = schema["$ref"].as_str().unwrap();
         assert!(
@@ -918,8 +933,7 @@ async fn auth_mode_healthz_still_has_no_security() {
 
 #[test]
 fn openapi_spec_is_up_to_date() {
-    let spec_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../openapi.json");
+    let spec_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../openapi.json");
 
     let generated = serde_json::to_string_pretty(&openapi_doc()).unwrap() + "\n";
 

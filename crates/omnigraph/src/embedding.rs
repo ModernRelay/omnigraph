@@ -7,8 +7,11 @@ use serde_json::{Value, json};
 use tokio::time::sleep;
 
 use crate::error::{OmniError, Result};
+use omnigraph_compiler::embedding_model_by_name;
 
-const GEMINI_EMBED_MODEL: &str = "gemini-embedding-2-preview";
+#[cfg(test)]
+use omnigraph_compiler::DEFAULT_EMBEDDING_MODEL;
+
 const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_RETRY_ATTEMPTS: usize = 4;
@@ -115,21 +118,36 @@ impl EmbeddingClient {
         }
     }
 
-    pub async fn embed_query_text(&self, input: &str, expected_dim: usize) -> Result<Vec<f32>> {
-        self.embed_text(input, expected_dim, QUERY_TASK_TYPE).await
+    pub async fn embed_query_text(
+        &self,
+        input: &str,
+        model: &str,
+        expected_dim: usize,
+    ) -> Result<Vec<f32>> {
+        self.embed_text(input, model, expected_dim, QUERY_TASK_TYPE)
+            .await
     }
 
-    pub async fn embed_document_text(&self, input: &str, expected_dim: usize) -> Result<Vec<f32>> {
-        self.embed_text(input, expected_dim, DOCUMENT_TASK_TYPE)
+    pub async fn embed_document_text(
+        &self,
+        input: &str,
+        model: &str,
+        expected_dim: usize,
+    ) -> Result<Vec<f32>> {
+        self.embed_text(input, model, expected_dim, DOCUMENT_TASK_TYPE)
             .await
     }
 
     async fn embed_text(
         &self,
         input: &str,
+        model: &str,
         expected_dim: usize,
         task_type: &'static str,
     ) -> Result<Vec<f32>> {
+        embedding_model_by_name(model).ok_or_else(|| {
+            OmniError::manifest_internal(format!("unsupported embedding model '{}'", model))
+        })?;
         if expected_dim == 0 {
             return Err(OmniError::manifest_internal(
                 "embedding dimension must be greater than zero",
@@ -139,8 +157,10 @@ impl EmbeddingClient {
         match &self.transport {
             EmbeddingTransport::Mock => Ok(mock_embedding(input, expected_dim)),
             EmbeddingTransport::Gemini { .. } => {
-                self.with_retry(|| self.embed_text_gemini_once(input, expected_dim, task_type))
-                    .await
+                self.with_retry(|| {
+                    self.embed_text_gemini_once(input, model, expected_dim, task_type)
+                })
+                .await
             }
         }
     }
@@ -171,6 +191,7 @@ impl EmbeddingClient {
     async fn embed_text_gemini_once(
         &self,
         input: &str,
+        model: &str,
         expected_dim: usize,
         task_type: &'static str,
     ) -> std::result::Result<Vec<f32>, EmbedCallError> {
@@ -184,9 +205,9 @@ impl EmbeddingClient {
         };
 
         let response = http
-            .post(gemini_endpoint(base_url))
+            .post(gemini_endpoint(base_url, model))
             .header("x-goog-api-key", api_key)
-            .json(&build_gemini_request(input, expected_dim, task_type))
+            .json(&build_gemini_request(input, model, expected_dim, task_type))
             .send()
             .await;
         let response = match response {
@@ -240,17 +261,22 @@ impl EmbeddingClient {
     }
 }
 
-fn gemini_endpoint(base_url: &str) -> String {
+fn gemini_endpoint(base_url: &str, model: &str) -> String {
     format!(
         "{}/models/{}:embedContent",
         base_url.trim_end_matches('/'),
-        GEMINI_EMBED_MODEL
+        model
     )
 }
 
-fn build_gemini_request(input: &str, expected_dim: usize, task_type: &'static str) -> Value {
+fn build_gemini_request(
+    input: &str,
+    model: &str,
+    expected_dim: usize,
+    task_type: &'static str,
+) -> Value {
     json!({
-        "model": format!("models/{}", GEMINI_EMBED_MODEL),
+        "model": format!("models/{}", model),
         "content": {
             "parts": [
                 {
@@ -398,9 +424,18 @@ mod tests {
     #[tokio::test]
     async fn mock_embeddings_are_deterministic() {
         let client = EmbeddingClient::mock_for_tests();
-        let a = client.embed_query_text("alpha", 8).await.unwrap();
-        let b = client.embed_query_text("alpha", 8).await.unwrap();
-        let c = client.embed_query_text("beta", 8).await.unwrap();
+        let a = client
+            .embed_query_text("alpha", DEFAULT_EMBEDDING_MODEL, 8)
+            .await
+            .unwrap();
+        let b = client
+            .embed_query_text("alpha", DEFAULT_EMBEDDING_MODEL, 8)
+            .await
+            .unwrap();
+        let c = client
+            .embed_query_text("beta", DEFAULT_EMBEDDING_MODEL, 8)
+            .await
+            .unwrap();
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_eq!(a.len(), 8);
@@ -408,7 +443,7 @@ mod tests {
 
     #[test]
     fn gemini_request_uses_preview_model_retrieval_query_and_dimension() {
-        let request = build_gemini_request("alpha", 4, QUERY_TASK_TYPE);
+        let request = build_gemini_request("alpha", DEFAULT_EMBEDDING_MODEL, 4, QUERY_TASK_TYPE);
         assert_eq!(request["model"], "models/gemini-embedding-2-preview");
         assert_eq!(request["taskType"], QUERY_TASK_TYPE);
         assert_eq!(request["outputDimensionality"], 4);
@@ -417,7 +452,7 @@ mod tests {
 
     #[test]
     fn gemini_document_request_uses_retrieval_document_task_type() {
-        let request = build_gemini_request("alpha", 4, DOCUMENT_TASK_TYPE);
+        let request = build_gemini_request("alpha", DEFAULT_EMBEDDING_MODEL, 4, DOCUMENT_TASK_TYPE);
         assert_eq!(request["taskType"], DOCUMENT_TASK_TYPE);
     }
 

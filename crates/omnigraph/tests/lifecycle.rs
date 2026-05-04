@@ -3,8 +3,8 @@ mod helpers;
 use std::fs;
 
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph_compiler::{build_schema_ir, schema_ir_pretty_json};
 use omnigraph_compiler::schema::parser::parse_schema;
+use omnigraph_compiler::{build_schema_ir, schema_ir_pretty_json};
 
 use helpers::*;
 

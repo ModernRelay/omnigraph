@@ -4,9 +4,11 @@ use pest::Parser;
 use pest::error::InputLocation;
 use pest_derive::Parser;
 
+use crate::embedding_models::{embedding_model_by_name, supported_embedding_model_names};
 use crate::error::{
     NanoError, ParseDiagnostic, Result, SourceSpan, decode_string_literal, render_span,
 };
+use crate::schema::ast::SchemaConfig;
 use crate::types::{PropType, ScalarType};
 
 use super::ast::*;
@@ -22,16 +24,32 @@ pub fn parse_schema(input: &str) -> Result<SchemaFile> {
 pub fn parse_schema_diagnostic(input: &str) -> std::result::Result<SchemaFile, ParseDiagnostic> {
     let pairs = SchemaParser::parse(Rule::schema_file, input).map_err(pest_error_to_diagnostic)?;
 
+    let mut config = SchemaConfig::default();
     let mut declarations = Vec::new();
     for pair in pairs {
         if pair.as_rule() == Rule::schema_file {
             for inner in pair.into_inner() {
-                if let Rule::schema_decl = inner.as_rule() {
-                    declarations.push(parse_schema_decl(inner).map_err(nano_error_to_diagnostic)?);
+                match inner.as_rule() {
+                    Rule::config_decl => {
+                        config = parse_config_decl(inner).map_err(nano_error_to_diagnostic)?;
+                    }
+                    Rule::schema_decl => {
+                        declarations
+                            .push(parse_schema_decl(inner).map_err(nano_error_to_diagnostic)?);
+                    }
+                    _ => {}
                 }
             }
         }
     }
+
+    let model = embedding_model_by_name(&config.embedding_model).ok_or_else(|| {
+        nano_error_to_diagnostic(NanoError::Parse(format!(
+            "unsupported embedding_model '{}' (supported: {})",
+            config.embedding_model,
+            supported_embedding_model_names()
+        )))
+    })?;
 
     // Collect interfaces for resolution (clone to avoid borrow conflict)
     let interfaces: Vec<InterfaceDecl> = declarations
@@ -50,10 +68,52 @@ pub fn parse_schema_diagnostic(input: &str) -> std::result::Result<SchemaFile, P
         }
     }
 
-    let schema = SchemaFile { declarations };
+    resolve_embedding_vectors(&mut declarations, &config.embedding_model, model.dimensions)
+        .map_err(nano_error_to_diagnostic)?;
+
+    let schema = SchemaFile {
+        config,
+        declarations,
+    };
     validate_schema_annotations(&schema).map_err(nano_error_to_diagnostic)?;
     validate_constraints(&schema).map_err(nano_error_to_diagnostic)?;
     Ok(schema)
+}
+
+fn parse_config_decl(pair: pest::iterators::Pair<Rule>) -> Result<SchemaConfig> {
+    let mut config = SchemaConfig::default();
+    let mut seen_embedding_model = false;
+    for item in pair.into_inner() {
+        if item.as_rule() != Rule::config_entry {
+            continue;
+        }
+        let mut inner = item.into_inner();
+        let key = inner.next().unwrap().as_str();
+        let value = inner
+            .next()
+            .ok_or_else(|| NanoError::Parse(format!("config.{} requires a value", key)))?;
+        match key {
+            "embedding_model" => {
+                if seen_embedding_model {
+                    return Err(NanoError::Parse(
+                        "config declares embedding_model multiple times".to_string(),
+                    ));
+                }
+                seen_embedding_model = true;
+                let model = decode_string_literal(value.as_str())?;
+                if model.trim().is_empty() {
+                    return Err(NanoError::Parse(
+                        "config.embedding_model requires a non-empty model name".to_string(),
+                    ));
+                }
+                config.embedding_model = model;
+            }
+            other => {
+                return Err(NanoError::Parse(format!("unknown config key '{}'", other)));
+            }
+        }
+    }
+    Ok(config)
 }
 
 fn pest_error_to_diagnostic(err: pest::error::Error<Rule>) -> ParseDiagnostic {
@@ -487,11 +547,10 @@ fn parse_type_ref(pair: pest::iterators::Pair<Rule>) -> Result<PropType> {
             Ok(PropType::scalar(scalar, nullable))
         }
         Rule::vector_type => {
-            let dim_text = inner
-                .into_inner()
-                .next()
-                .ok_or_else(|| NanoError::Parse("Vector type missing dimension".to_string()))?
-                .as_str();
+            let Some(dim_pair) = inner.into_inner().next() else {
+                return Ok(PropType::scalar(ScalarType::VectorInferred, nullable));
+            };
+            let dim_text = dim_pair.as_str();
             let dim = dim_text
                 .parse::<u32>()
                 .map_err(|e| NanoError::Parse(format!("invalid Vector dimension: {}", e)))?;
@@ -597,12 +656,97 @@ fn validate_string_annotation(
     Ok(())
 }
 
+fn resolve_embedding_vectors(
+    declarations: &mut [SchemaDecl],
+    embedding_model: &str,
+    model_dimensions: u32,
+) -> Result<()> {
+    for decl in declarations {
+        match decl {
+            SchemaDecl::Interface(interface) => {
+                resolve_embedding_vectors_for_type(
+                    &interface.name,
+                    &mut interface.properties,
+                    false,
+                    embedding_model,
+                    model_dimensions,
+                )?;
+            }
+            SchemaDecl::Node(node) => {
+                resolve_embedding_vectors_for_type(
+                    &node.name,
+                    &mut node.properties,
+                    false,
+                    embedding_model,
+                    model_dimensions,
+                )?;
+            }
+            SchemaDecl::Edge(edge) => {
+                resolve_embedding_vectors_for_type(
+                    &edge.name,
+                    &mut edge.properties,
+                    true,
+                    embedding_model,
+                    model_dimensions,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_embedding_vectors_for_type(
+    type_name: &str,
+    properties: &mut [PropDecl],
+    is_edge: bool,
+    embedding_model: &str,
+    model_dimensions: u32,
+) -> Result<()> {
+    for prop in properties {
+        let has_embed = prop.annotations.iter().any(|ann| ann.name == "embed");
+        match prop.prop_type.scalar {
+            ScalarType::VectorInferred => {
+                if is_edge || !has_embed {
+                    return Err(NanoError::Parse(format!(
+                        "bare Vector is only supported on node or interface properties with @embed ({}.{})",
+                        type_name, prop.name
+                    )));
+                }
+                if prop.prop_type.list {
+                    return Err(NanoError::Parse(format!(
+                        "bare Vector is not supported on list property {}.{}",
+                        type_name, prop.name
+                    )));
+                }
+                prop.prop_type.scalar = ScalarType::Vector(model_dimensions);
+            }
+            ScalarType::Vector(dim) if has_embed && dim != model_dimensions => {
+                return Err(NanoError::Parse(format!(
+                    "@embed target {}.{} uses Vector({}), but embedding_model '{}' produces {} dimensions",
+                    type_name, prop.name, dim, embedding_model, model_dimensions
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 // ─── Annotation Validation (metadata only) ───────────────────────────────────
 
 fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
     for decl in &schema.declarations {
         match decl {
-            SchemaDecl::Interface(_) => {} // Interfaces have no type-level annotations
+            SchemaDecl::Interface(interface) => {
+                for prop in &interface.properties {
+                    validate_property_annotations(
+                        prop,
+                        &interface.name,
+                        &interface.properties,
+                        false,
+                    )?;
+                }
+            }
             SchemaDecl::Node(node) => {
                 // Reject constraint annotations on node level (must be on properties or as body constraints)
                 for ann in &node.annotations {

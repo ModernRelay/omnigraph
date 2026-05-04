@@ -407,9 +407,7 @@ pub(crate) async fn recover_schema_state_files(
 async fn cleanup_staging_files(root_uri: &str, storage: &dyn StorageAdapter) -> Result<()> {
     storage.delete(&schema_source_staging_uri(root_uri)).await?;
     storage.delete(&schema_ir_staging_uri(root_uri)).await?;
-    storage
-        .delete(&schema_state_staging_uri(root_uri))
-        .await?;
+    storage.delete(&schema_state_staging_uri(root_uri)).await?;
     Ok(())
 }
 

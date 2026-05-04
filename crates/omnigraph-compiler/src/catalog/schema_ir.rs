@@ -5,7 +5,9 @@ use sha2::{Digest, Sha256};
 
 use crate::catalog::{Catalog, build_catalog};
 use crate::error::{NanoError, Result};
-use crate::schema::ast::{Annotation, Cardinality, Constraint, PropDecl, SchemaDecl, SchemaFile};
+use crate::schema::ast::{
+    Annotation, Cardinality, Constraint, PropDecl, SchemaConfig, SchemaDecl, SchemaFile,
+};
 use crate::types::PropType;
 
 const SCHEMA_IR_VERSION: u32 = 1;
@@ -13,6 +15,8 @@ const SCHEMA_IR_VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SchemaIR {
     pub ir_version: u32,
+    #[serde(default)]
+    pub config: SchemaConfig,
     pub interfaces: Vec<InterfaceIR>,
     pub nodes: Vec<NodeIR>,
     pub edges: Vec<EdgeIR>,
@@ -111,6 +115,7 @@ pub fn build_schema_ir(schema: &SchemaFile) -> Result<SchemaIR> {
 
     Ok(SchemaIR {
         ir_version: SCHEMA_IR_VERSION,
+        config: schema.config.clone(),
         interfaces,
         nodes,
         edges,
@@ -126,6 +131,7 @@ pub fn build_catalog_from_ir(ir: &SchemaIR) -> Result<Catalog> {
     }
 
     let schema = SchemaFile {
+        config: ir.config.clone(),
         declarations: ir
             .interfaces
             .iter()

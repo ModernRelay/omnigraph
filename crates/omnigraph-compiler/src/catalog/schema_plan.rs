@@ -62,6 +62,15 @@ pub enum SchemaMigrationStep {
         property_name: String,
         annotations: Vec<Annotation>,
     },
+    UpdateSchemaConfig {
+        embedding_model: String,
+    },
+    ReembedProperty {
+        type_name: String,
+        property_name: String,
+        embedding_model: String,
+        dimensions: u32,
+    },
     UnsupportedChange {
         entity: String,
         reason: String,
@@ -73,11 +82,18 @@ pub fn plan_schema_migration(
     desired: &SchemaIR,
 ) -> Result<SchemaMigrationPlan> {
     let mut steps = Vec::new();
+    let changed_embedding_model = accepted.config.embedding_model != desired.config.embedding_model;
+    if changed_embedding_model {
+        steps.push(SchemaMigrationStep::UpdateSchemaConfig {
+            embedding_model: desired.config.embedding_model.clone(),
+        });
+    }
     let interface_renames = plan_interfaces(&accepted.interfaces, &desired.interfaces, &mut steps);
     let node_renames = plan_nodes(
         &accepted.nodes,
         &desired.nodes,
         &interface_renames,
+        changed_embedding_model.then_some(desired.config.embedding_model.as_str()),
         &mut steps,
     );
     plan_edges(&accepted.edges, &desired.edges, &node_renames, &mut steps);
@@ -109,6 +125,7 @@ fn plan_interfaces(
                 &interface.name,
                 &existing.properties,
                 &interface.properties,
+                None,
                 steps,
             );
             continue;
@@ -140,6 +157,7 @@ fn plan_nodes(
     accepted: &[NodeIR],
     desired: &[NodeIR],
     interface_renames: &HashMap<String, String>,
+    changed_embedding_model: Option<&str>,
     steps: &mut Vec<SchemaMigrationStep>,
 ) -> HashMap<String, String> {
     let accepted_by_name = accepted
@@ -215,6 +233,7 @@ fn plan_nodes(
             &node.name,
             &existing.properties,
             &node.properties,
+            changed_embedding_model,
             steps,
         );
         plan_constraints(
@@ -329,6 +348,7 @@ fn plan_edges(
             &edge.name,
             &existing.properties,
             &edge.properties,
+            None,
             steps,
         );
         plan_constraints(
@@ -360,6 +380,7 @@ fn plan_properties(
     type_name: &str,
     accepted: &[PropertyIR],
     desired: &[PropertyIR],
+    changed_embedding_model: Option<&str>,
     steps: &mut Vec<SchemaMigrationStep>,
 ) -> HashMap<String, String> {
     let accepted_by_name = accepted
@@ -433,17 +454,43 @@ fn plan_properties(
         }
 
         if existing.prop_type != property.prop_type {
-            steps.push(SchemaMigrationStep::UnsupportedChange {
-                entity: format!(
-                    "{}:{}.{}",
-                    schema_type_kind_key(type_kind),
-                    type_name,
-                    property.name
-                ),
-                reason: format!(
-                    "changing property type for '{}.{}' is not supported in schema migration v1",
-                    type_name, property.name
-                ),
+            if type_kind == SchemaTypeKind::Node
+                && is_embed_property(existing)
+                && is_embed_property(property)
+                && let Some(model) = changed_embedding_model
+                && let Some(dimensions) = vector_dimensions(&property.prop_type)
+            {
+                steps.push(SchemaMigrationStep::ReembedProperty {
+                    type_name: type_name.to_string(),
+                    property_name: property.name.clone(),
+                    embedding_model: model.to_string(),
+                    dimensions,
+                });
+            } else {
+                steps.push(SchemaMigrationStep::UnsupportedChange {
+                    entity: format!(
+                        "{}:{}.{}",
+                        schema_type_kind_key(type_kind),
+                        type_name,
+                        property.name
+                    ),
+                    reason: format!(
+                        "changing property type for '{}.{}' is not supported in schema migration v1",
+                        type_name, property.name
+                    ),
+                });
+            }
+        } else if type_kind == SchemaTypeKind::Node
+            && is_embed_property(existing)
+            && is_embed_property(property)
+            && let Some(model) = changed_embedding_model
+            && let Some(dimensions) = vector_dimensions(&property.prop_type)
+        {
+            steps.push(SchemaMigrationStep::ReembedProperty {
+                type_name: type_name.to_string(),
+                property_name: property.name.clone(),
+                embedding_model: model.to_string(),
+                dimensions,
             });
         }
 
@@ -534,6 +581,23 @@ fn plan_constraints(
                 ),
             }),
         }
+    }
+}
+
+fn is_embed_property(property: &PropertyIR) -> bool {
+    property
+        .annotations
+        .iter()
+        .any(|annotation| annotation.name == "embed")
+}
+
+fn vector_dimensions(prop_type: &PropType) -> Option<u32> {
+    if prop_type.list {
+        return None;
+    }
+    match prop_type.scalar {
+        crate::types::ScalarType::Vector(dim) => Some(dim),
+        _ => None,
     }
 }
 

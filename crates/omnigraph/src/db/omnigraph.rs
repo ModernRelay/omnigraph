@@ -840,7 +840,6 @@ impl Omnigraph {
     pub(crate) async fn invalidate_graph_index(&self) {
         table_ops::invalidate_graph_index(self).await
     }
-
 }
 
 pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {

@@ -1,9 +1,25 @@
+use crate::embedding_models::DEFAULT_EMBEDDING_MODEL;
 use crate::types::PropType;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SchemaFile {
+    #[serde(default)]
+    pub config: SchemaConfig,
     pub declarations: Vec<SchemaDecl>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchemaConfig {
+    pub embedding_model: String,
+}
+
+impl Default for SchemaConfig {
+    fn default() -> Self {
+        Self {
+            embedding_model: DEFAULT_EMBEDDING_MODEL.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

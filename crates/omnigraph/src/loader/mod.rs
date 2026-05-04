@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::db::Omnigraph;
+use crate::embedding::EmbeddingClient;
 use crate::error::{OmniError, Result};
 use crate::exec::staging::{MutationStaging, PendingMode};
 
@@ -304,6 +305,8 @@ async fn load_jsonl_reader<R: BufRead>(
         }
     }
 
+    materialize_missing_node_embeddings(&catalog, &mut node_rows).await?;
+
     // Phase 2: Build per-type RecordBatches and accumulate into the
     // staging pipeline. For Append/Merge, batches go into an in-memory
     // accumulator and a single `stage_*` + `commit_staged` per touched
@@ -356,16 +359,10 @@ async fn load_jsonl_reader<R: BufRead>(
     // accumulator. Overwrite → concurrent inline-commit (legacy path).
     if use_staging {
         for (type_name, table_key, batch, loaded_count) in prepared_nodes {
-            let (ds, full_path, table_branch) = db
-                .open_for_mutation_on_branch(branch, &table_key)
-                .await?;
+            let (ds, full_path, table_branch) =
+                db.open_for_mutation_on_branch(branch, &table_key).await?;
             let expected_version = ds.version().version;
-            staging.ensure_path(
-                &table_key,
-                full_path,
-                table_branch,
-                expected_version,
-            );
+            staging.ensure_path(&table_key, full_path, table_branch, expected_version);
             let schema = batch.schema();
             staging.append_batch(&table_key, schema, pending_mode, batch)?;
             result.nodes_loaded.insert(type_name, loaded_count);
@@ -392,13 +389,7 @@ async fn load_jsonl_reader<R: BufRead>(
     for (edge_name, rows) in &edge_rows {
         let edge_type = &catalog.edge_types[edge_name];
         let from_ids = if use_staging {
-            collect_node_ids_with_pending(
-                db,
-                branch,
-                &edge_type.from_type,
-                &staging,
-            )
-            .await?
+            collect_node_ids_with_pending(db, branch, &edge_type.from_type, &staging).await?
         } else {
             collect_node_ids(
                 db,
@@ -411,13 +402,7 @@ async fn load_jsonl_reader<R: BufRead>(
             .await?
         };
         let to_ids = if use_staging {
-            collect_node_ids_with_pending(
-                db,
-                branch,
-                &edge_type.to_type,
-                &staging,
-            )
-            .await?
+            collect_node_ids_with_pending(db, branch, &edge_type.to_type, &staging).await?
         } else {
             collect_node_ids(
                 db,
@@ -477,16 +462,10 @@ async fn load_jsonl_reader<R: BufRead>(
     // Phase 2e: write every edge type. Same dispatch as Phase 2b.
     if use_staging {
         for (edge_name, table_key, batch, loaded_count) in prepared_edges {
-            let (ds, full_path, table_branch) = db
-                .open_for_mutation_on_branch(branch, &table_key)
-                .await?;
+            let (ds, full_path, table_branch) =
+                db.open_for_mutation_on_branch(branch, &table_key).await?;
             let expected_version = ds.version().version;
-            staging.ensure_path(
-                &table_key,
-                full_path,
-                table_branch,
-                expected_version,
-            );
+            staging.ensure_path(&table_key, full_path, table_branch, expected_version);
             let schema = batch.schema();
             staging.append_batch(&table_key, schema, pending_mode, batch)?;
             result.edges_loaded.insert(edge_name, loaded_count);
@@ -515,12 +494,7 @@ async fn load_jsonl_reader<R: BufRead>(
         let table_key = format!("edge:{}", edge_name);
         if use_staging {
             validate_edge_cardinality_with_pending_loader(
-                db,
-                branch,
-                edge_type,
-                &table_key,
-                &staging,
-                mode,
+                db, branch, edge_type, &table_key, &staging, mode,
             )
             .await?;
         } else if let Some(update) = overwrite_updates.iter().find(|u| u.table_key == table_key) {
@@ -541,15 +515,102 @@ async fn load_jsonl_reader<R: BufRead>(
         db.commit_updates_on_branch_with_expected(branch, &updates, &expected_versions)
             .await?;
     } else {
-        db.commit_updates_on_branch_with_expected(
-            branch,
-            &overwrite_updates,
-            &overwrite_expected,
-        )
-        .await?;
+        db.commit_updates_on_branch_with_expected(branch, &overwrite_updates, &overwrite_expected)
+            .await?;
     }
 
     Ok(result)
+}
+
+async fn materialize_missing_node_embeddings(
+    catalog: &omnigraph_compiler::catalog::Catalog,
+    node_rows: &mut HashMap<String, Vec<JsonValue>>,
+) -> Result<()> {
+    let needs_embeddings = node_rows.iter().any(|(type_name, rows)| {
+        catalog
+            .node_types
+            .get(type_name)
+            .map(|node_type| {
+                !node_type.embedding_specs.is_empty()
+                    && rows.iter().any(|row| {
+                        node_type.embedding_specs.keys().any(|target| {
+                            row.get(target).map(|value| value.is_null()).unwrap_or(true)
+                        })
+                    })
+            })
+            .unwrap_or(false)
+    });
+    if !needs_embeddings {
+        return Ok(());
+    }
+
+    let client = EmbeddingClient::from_env()?;
+    for (type_name, rows) in node_rows {
+        let Some(node_type) = catalog.node_types.get(type_name) else {
+            continue;
+        };
+        if node_type.embedding_specs.is_empty() {
+            continue;
+        }
+        for (row_idx, row) in rows.iter_mut().enumerate() {
+            if !row.is_object() {
+                return Err(OmniError::manifest(format!(
+                    "node {} row {} data must be a JSON object",
+                    type_name,
+                    row_idx + 1
+                )));
+            }
+            for spec in node_type.embedding_specs.values() {
+                let should_embed = row
+                    .get(&spec.target_prop)
+                    .map(|value| value.is_null())
+                    .unwrap_or(true);
+                if !should_embed {
+                    continue;
+                }
+                let target_prop_type =
+                    node_type.properties.get(&spec.target_prop).ok_or_else(|| {
+                        OmniError::manifest_internal(format!(
+                            "embedding target {}.{} missing from catalog",
+                            type_name, spec.target_prop
+                        ))
+                    })?;
+                let source_text = match row.get(&spec.source_prop) {
+                    Some(value) if value.is_null() && target_prop_type.nullable => continue,
+                    Some(value) => value.as_str().map(str::to_string).ok_or_else(|| {
+                        OmniError::manifest(format!(
+                            "node {} row {} @embed source property '{}' must be String",
+                            type_name,
+                            row_idx + 1,
+                            spec.source_prop
+                        ))
+                    })?,
+                    None if target_prop_type.nullable => continue,
+                    None => {
+                        return Err(OmniError::manifest(format!(
+                            "node {} row {} missing @embed source property '{}' for '{}'",
+                            type_name,
+                            row_idx + 1,
+                            spec.source_prop,
+                            spec.target_prop
+                        )));
+                    }
+                };
+                let vector = client
+                    .embed_document_text(&source_text, &spec.model, spec.dimensions as usize)
+                    .await?;
+                let data_obj = row.as_object_mut().ok_or_else(|| {
+                    OmniError::manifest(format!(
+                        "node {} row {} data must be a JSON object",
+                        type_name,
+                        row_idx + 1
+                    ))
+                })?;
+                data_obj.insert(spec.target_prop.clone(), serde_json::json!(vector));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn build_node_batch(node_type: &NodeType, rows: &[JsonValue]) -> Result<RecordBatch> {
@@ -1593,8 +1654,7 @@ async fn validate_edge_cardinality_with_pending_loader(
         LoadMode::Append | LoadMode::Overwrite => None,
     };
     let counts =
-        crate::exec::staging::count_src_per_edge(db, &ds, table_key, staging, dedupe_key)
-            .await?;
+        crate::exec::staging::count_src_per_edge(db, &ds, table_key, staging, dedupe_key).await?;
     crate::exec::staging::enforce_cardinality_bounds(edge_type, &counts)
 }
 
@@ -2077,6 +2137,7 @@ edge WorksAt: Person -> Company
             }],
             check_constraints: vec![],
             embed_sources: Default::default(),
+            embedding_specs: Default::default(),
             blob_properties: Default::default(),
             arrow_schema: schema,
         };

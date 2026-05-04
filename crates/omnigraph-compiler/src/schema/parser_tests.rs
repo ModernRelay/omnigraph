@@ -271,9 +271,9 @@ age: I32?
     match &schema.declarations[0] {
         SchemaDecl::Node(n) => {
             assert!(
-                n.constraints.iter().any(
-                    |c| matches!(c, Constraint::Range { property, .. } if property == "age")
-                )
+                n.constraints
+                    .iter()
+                    .any(|c| matches!(c, Constraint::Range { property, .. } if property == "age"))
             );
         }
         _ => panic!("expected Node"),
@@ -491,7 +491,7 @@ fn test_parse_embed_annotation_identifier_arg() {
     let input = r#"
 node Doc {
 title: String
-embedding: Vector(3) @embed(title)
+embedding: Vector @embed(title)
 }
 "#;
     let schema = parse_schema(input).unwrap();
@@ -669,7 +669,7 @@ fn test_reject_embed_without_source_property() {
     let input = r#"
 node Doc {
 title: String
-embedding: Vector(3) @embed
+embedding: Vector @embed
 }
 "#;
     let err = parse_schema(input).unwrap_err();
@@ -695,7 +695,7 @@ fn test_reject_embed_unknown_source_property() {
     let input = r#"
 node Doc {
 title: String
-embedding: Vector(3) @embed(body)
+embedding: Vector @embed(body)
 }
 "#;
     let err = parse_schema(input).unwrap_err();
@@ -710,7 +710,7 @@ fn test_reject_embed_source_not_string() {
     let input = r#"
 node Doc {
 body: I32
-embedding: Vector(3) @embed(body)
+embedding: Vector @embed(body)
 }
 "#;
     let err = parse_schema(input).unwrap_err();
@@ -722,7 +722,7 @@ fn test_reject_embed_on_edge_property() {
     let input = r#"
 node Doc { title: String }
 edge Linked: Doc -> Doc {
-embedding: Vector(3) @embed(title)
+embedding: Vector(3072) @embed(title)
 }
 "#;
     let err = parse_schema(input).unwrap_err();
@@ -917,6 +917,82 @@ embedding: Vector(3)
         },
         _ => panic!("expected node"),
     }
+}
+
+#[test]
+fn test_parse_schema_config_embedding_model() {
+    let input = r#"
+config {
+embedding_model: "gemini-embedding-2-preview"
+}
+
+node Doc {
+title: String
+}
+"#;
+    let schema = parse_schema(input).unwrap();
+    assert_eq!(schema.config.embedding_model, "gemini-embedding-2-preview");
+}
+
+#[test]
+fn test_bare_vector_embed_infers_configured_model_dimension() {
+    let input = r#"
+config {
+embedding_model: "gemini-embedding-2-preview"
+}
+
+node Doc {
+title: String
+embedding: Vector @embed(title)
+}
+"#;
+    let schema = parse_schema(input).unwrap();
+    match &schema.declarations[0] {
+        SchemaDecl::Node(n) => match n.properties[1].prop_type.scalar {
+            ScalarType::Vector(dim) => assert_eq!(dim, 3072),
+            other => panic!("expected inferred vector type, got {:?}", other),
+        },
+        _ => panic!("expected node"),
+    }
+}
+
+#[test]
+fn test_reject_unknown_embedding_model() {
+    let input = r#"
+config {
+embedding_model: "not-a-model"
+}
+
+node Doc {
+title: String
+embedding: Vector @embed(title)
+}
+"#;
+    let err = parse_schema(input).unwrap_err();
+    assert!(err.to_string().contains("unsupported embedding_model"));
+}
+
+#[test]
+fn test_reject_bare_vector_without_embed() {
+    let input = r#"
+node Doc {
+embedding: Vector
+}
+"#;
+    let err = parse_schema(input).unwrap_err();
+    assert!(err.to_string().contains("bare Vector"));
+}
+
+#[test]
+fn test_reject_embed_vector_dimension_mismatching_model() {
+    let input = r#"
+node Doc {
+title: String
+embedding: Vector(3) @embed(title)
+}
+"#;
+    let err = parse_schema(input).unwrap_err();
+    assert!(err.to_string().contains("produces 3072 dimensions"));
 }
 
 #[test]

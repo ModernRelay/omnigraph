@@ -72,6 +72,10 @@ policy:
 
 Precedence (high to low): explicit `--params` / `--params-file`, alias positional args, `omnigraph.yaml` defaults. JS-safe-integer handling is built in (`is_js_safe_integer_i64`, `JS_MAX_SAFE_INTEGER_U64`) so 64-bit ids round-trip safely through JSON clients.
 
+## Embedding models
+
+Schema-declared embeddings use strict supported model names from `omnigraph-compiler/src/embedding_models.rs`. The default is `gemini-embedding-2-preview`. The offline `omnigraph embed` pipeline validates its spec model against the same registry.
+
 ## Bearer token resolution (CLI)
 
 1. `graphs.<name>.bearer_token_env`

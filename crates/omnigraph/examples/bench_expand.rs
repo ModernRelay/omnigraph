@@ -239,7 +239,9 @@ async fn main() {
 
         let jsonl = generate_jsonl(n, avg_deg, 42);
         let t = Instant::now();
-        load_jsonl(&mut db, &jsonl, LoadMode::Overwrite).await.unwrap();
+        load_jsonl(&mut db, &jsonl, LoadMode::Overwrite)
+            .await
+            .unwrap();
         let load_elapsed = t.elapsed();
 
         println!(

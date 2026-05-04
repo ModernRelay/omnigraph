@@ -271,9 +271,7 @@ fn lower_clauses(
                 .traversals
                 .iter()
                 .find(|rt| {
-                    rt.src == traversal.src
-                        && rt.dst == traversal.dst
-                        && rt.edge_type == edge.name
+                    rt.src == traversal.src && rt.dst == traversal.dst && rt.edge_type == edge.name
                 })
                 .map(|rt| rt.direction)
                 .unwrap_or(Direction::Out);
