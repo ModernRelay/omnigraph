@@ -176,10 +176,9 @@ pub async fn cleanup_all_tables(
                 clean_referenced_branches: false,
                 delete_rate_limit: None,
             };
-            let removed: RemovalStats =
-                lance::dataset::cleanup::cleanup_old_versions(&ds, policy)
-                    .await
-                    .map_err(|e| OmniError::Lance(e.to_string()))?;
+            let removed: RemovalStats = lance::dataset::cleanup::cleanup_old_versions(&ds, policy)
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
             Ok(TableCleanupStats {
                 table_key,
                 bytes_removed: removed.bytes_removed,
@@ -198,12 +197,7 @@ fn all_table_keys(catalog: &omnigraph_compiler::catalog::Catalog) -> Vec<String>
         .node_types
         .keys()
         .map(|n| format!("node:{}", n))
-        .chain(
-            catalog
-                .edge_types
-                .keys()
-                .map(|n| format!("edge:{}", n)),
-        )
+        .chain(catalog.edge_types.keys().map(|n| format!("edge:{}", n)))
         .collect();
     keys.sort();
     keys

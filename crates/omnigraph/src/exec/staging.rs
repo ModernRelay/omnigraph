@@ -104,10 +104,12 @@ impl MutationStaging {
         table_branch: Option<String>,
         expected_version: u64,
     ) {
-        self.paths.entry(table_key.to_string()).or_insert(StagedTablePath {
-            full_path,
-            table_branch,
-        });
+        self.paths
+            .entry(table_key.to_string())
+            .or_insert(StagedTablePath {
+                full_path,
+                table_branch,
+            });
         self.expected_versions
             .entry(table_key.to_string())
             .or_insert(expected_version);
@@ -174,7 +176,8 @@ impl MutationStaging {
 
     /// Record a delete that already inline-committed at the Lance layer.
     pub(crate) fn record_inline(&mut self, update: SubTableUpdate) {
-        self.inline_committed.insert(update.table_key.clone(), update);
+        self.inline_committed
+            .insert(update.table_key.clone(), update);
     }
 
     /// Read-your-writes accessor: the accumulated pending batches for
@@ -227,8 +230,7 @@ impl MutationStaging {
             inline_committed,
         } = self;
 
-        let mut updates: Vec<SubTableUpdate> =
-            inline_committed.into_values().collect();
+        let mut updates: Vec<SubTableUpdate> = inline_committed.into_values().collect();
 
         for (table_key, table) in pending {
             let path = paths.get(&table_key).ok_or_else(|| {
@@ -267,18 +269,13 @@ impl MutationStaging {
             // mode is exempt because no-key node and edge inserts use
             // ULID-generated ids that are unique within a query.
             let combined = match table.mode {
-                PendingMode::Merge => {
-                    dedupe_merge_batches_by_id(&table.schema, table.batches)?
-                }
+                PendingMode::Merge => dedupe_merge_batches_by_id(&table.schema, table.batches)?,
                 PendingMode::Append => {
                     if table.batches.len() == 1 {
                         table.batches.into_iter().next().unwrap()
                     } else {
-                        arrow_select::concat::concat_batches(
-                            &table.schema,
-                            &table.batches,
-                        )
-                        .map_err(|e| OmniError::Lance(e.to_string()))?
+                        arrow_select::concat::concat_batches(&table.schema, &table.batches)
+                            .map_err(|e| OmniError::Lance(e.to_string()))?
                     }
                 }
             };
@@ -286,9 +283,7 @@ impl MutationStaging {
             // Commit via Lance's two-phase write: stage produces
             // uncommitted fragments + transaction; commit advances HEAD.
             let staged = match table.mode {
-                PendingMode::Append => {
-                    db.table_store().stage_append(&ds, combined, &[]).await?
-                }
+                PendingMode::Append => db.table_store().stage_append(&ds, combined, &[]).await?,
                 PendingMode::Merge => {
                     db.table_store()
                         .stage_merge_insert(
@@ -547,10 +542,7 @@ pub(crate) async fn count_src_per_edge(
 /// Count pending edges per `src` with NO dedup. Correct when caller
 /// guarantees pending rows have unique primary keys (engine inserts via
 /// fresh ULID; loader Append mode).
-fn count_pending_src_naive(
-    pending_batches: &[RecordBatch],
-    counts: &mut HashMap<String, u32>,
-) {
+fn count_pending_src_naive(pending_batches: &[RecordBatch], counts: &mut HashMap<String, u32>) {
     for batch in pending_batches {
         let Some(col) = batch.column_by_name("src") else {
             continue;
@@ -595,12 +587,15 @@ fn count_pending_src_with_dedupe(
                 dedupe_key_column
             )));
         };
-        let key_arr = key_col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-            OmniError::Lance(format!(
-                "count_src_per_edge: pending '{}' column is not Utf8",
-                dedupe_key_column
-            ))
-        })?;
+        let key_arr = key_col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                OmniError::Lance(format!(
+                    "count_src_per_edge: pending '{}' column is not Utf8",
+                    dedupe_key_column
+                ))
+            })?;
         let src_arr = batch
             .column_by_name("src")
             .and_then(|c| c.as_any().downcast_ref::<StringArray>());

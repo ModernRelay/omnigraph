@@ -1393,7 +1393,10 @@ async fn test_concurrent_publish_with_overlapping_expected_versions_one_succeeds
     // version (no duplicate version rows).
     let mc = ManifestCoordinator::open(uri).await.unwrap();
     let entry = mc.snapshot().entry("node:Person").unwrap().clone();
-    assert!(entry.table_version > 1, "Person should have advanced past v=1");
+    assert!(
+        entry.table_version > 1,
+        "Person should have advanced past v=1"
+    );
 }
 
 #[tokio::test]

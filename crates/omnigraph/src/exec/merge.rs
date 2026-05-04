@@ -1025,11 +1025,7 @@ impl Omnigraph {
         result
     }
 
-    async fn branch_merge_impl(
-        &mut self,
-        source: &str,
-        target: &str,
-    ) -> Result<MergeOutcome> {
+    async fn branch_merge_impl(&mut self, source: &str, target: &str) -> Result<MergeOutcome> {
         if is_internal_run_branch(source) || is_internal_run_branch(target) {
             return Err(OmniError::manifest(format!(
                 "branch_merge does not allow internal run refs ('{}' -> '{}')",

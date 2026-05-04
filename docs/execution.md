@@ -177,4 +177,4 @@ For Append/Merge, a mid-load failure (RI / cardinality violation, validation err
 
 ## Embeddings during load
 
-If a node type has `@embed` properties, the loader calls the engine embedding client (Gemini, RETRIEVAL_DOCUMENT) per row to populate the vector column. See [embeddings.md](embeddings.md).
+If a node type has `@embed` properties and a row omits the target vector, the loader calls the engine embedding client (RETRIEVAL_DOCUMENT) using the schema-declared model for that property. The generated vector is inserted before Arrow batch construction, so required embedded vector fields may be satisfied by providing only their source text. See [embeddings.md](embeddings.md).

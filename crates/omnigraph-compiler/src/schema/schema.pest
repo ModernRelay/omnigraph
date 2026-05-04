@@ -5,9 +5,13 @@ COMMENT = _{ LINE_COMMENT | BLOCK_COMMENT }
 LINE_COMMENT = _{ "//" ~ (!"\n" ~ ANY)* }
 BLOCK_COMMENT = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
 
-schema_file = { SOI ~ schema_decl* ~ EOI }
+schema_file = { SOI ~ config_decl? ~ schema_decl* ~ EOI }
 
 schema_decl = { interface_decl | node_decl | edge_decl }
+
+config_decl = { "config" ~ "{" ~ config_entry* ~ "}" }
+config_entry = { config_key ~ ":" ~ string_lit }
+config_key = { "embedding_model" }
 
 // interface Named { name: String @key }
 interface_decl = { "interface" ~ type_name ~ "{" ~ prop_decl* ~ "}" }
@@ -36,7 +40,7 @@ type_ref = { core_type ~ "?"? }
 core_type = { list_type | enum_type | vector_type | base_type }
 list_type = { "[" ~ base_type ~ "]" }
 enum_type = { "enum" ~ "(" ~ enum_value ~ ("," ~ enum_value)* ~ ")" }
-vector_type = { "Vector" ~ "(" ~ integer ~ ")" }
+vector_type = { "Vector" ~ ("(" ~ integer ~ ")")? }
 enum_value = @{ (ASCII_ALPHANUMERIC | "_" | "-")+ }
 
 base_type = { "String" | "Blob" | "Bool" | "I32" | "I64" | "U32" | "U64" | "F32" | "F64" | "DateTime" | "Date" }

@@ -221,7 +221,6 @@ pub fn spawn_server_with_config_env(config: &Path, envs: &[(&str, &str)]) -> Tes
     spawn_server_process(command)
 }
 
-
 pub struct SystemRepo {
     _temp: TempDir,
     repo: PathBuf,

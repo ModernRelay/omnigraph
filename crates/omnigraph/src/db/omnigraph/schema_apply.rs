@@ -1,4 +1,5 @@
 use super::*;
+use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
 
 pub(super) async fn plan_schema(
     db: &Omnigraph,
@@ -139,6 +140,16 @@ pub(super) async fn apply_schema_with_lock(
             } => {
                 indexed_tables.insert(schema_table_key(*type_kind, type_name));
             }
+            SchemaMigrationStep::UpdateSchemaConfig { .. } => {
+                for node_type in desired_catalog.node_types.values() {
+                    if !node_type.embedding_specs.is_empty() {
+                        rewritten_tables.insert(format!("node:{}", node_type.name));
+                    }
+                }
+            }
+            SchemaMigrationStep::ReembedProperty { type_name, .. } => {
+                rewritten_tables.insert(format!("node:{}", type_name));
+            }
             SchemaMigrationStep::UpdateTypeMetadata { .. }
             | SchemaMigrationStep::UpdatePropertyMetadata { .. } => {}
             SchemaMigrationStep::UnsupportedChange { reason, .. } => {
@@ -257,11 +268,7 @@ pub(super) async fn apply_schema_with_lock(
             // open the wrong HEAD here.
             let existing = db
                 .table_store
-                .open_dataset_head_for_write(
-                    table_key,
-                    &dataset_uri,
-                    entry.table_branch.as_deref(),
-                )
+                .open_dataset_head_for_write(table_key, &dataset_uri, entry.table_branch.as_deref())
                 .await?;
             let staged = db.table_store.stage_overwrite(&existing, batch).await?;
             db.table_store
@@ -538,7 +545,18 @@ pub(super) async fn batch_for_schema_apply_rewrite(
             .map(String::as_str)
             .unwrap_or_else(|| field.name().as_str());
         if let Some(column) = batch.column_by_name(source_name) {
-            if target_blob_properties.contains(field.name())
+            if let Some(rebuilt) = rebuild_embedding_column_if_needed(
+                db,
+                &batch,
+                target_table_key,
+                target_catalog,
+                field,
+                property_renames,
+            )
+            .await?
+            {
+                columns.push(rebuilt);
+            } else if target_blob_properties.contains(field.name())
                 && source_blob_properties.contains(source_name)
             {
                 let descriptions =
@@ -564,11 +582,107 @@ pub(super) async fn batch_for_schema_apply_rewrite(
                 columns.push(column.clone());
             }
         } else {
-            columns.push(new_null_array(field.data_type(), batch.num_rows()));
+            if let Some(rebuilt) = rebuild_embedding_column_if_needed(
+                db,
+                &batch,
+                target_table_key,
+                target_catalog,
+                field,
+                property_renames,
+            )
+            .await?
+            {
+                columns.push(rebuilt);
+            } else {
+                columns.push(new_null_array(field.data_type(), batch.num_rows()));
+            }
         }
     }
 
     RecordBatch::try_new(target_schema, columns).map_err(|e| OmniError::Lance(e.to_string()))
+}
+
+async fn rebuild_embedding_column_if_needed(
+    _db: &Omnigraph,
+    batch: &RecordBatch,
+    target_table_key: &str,
+    target_catalog: &Catalog,
+    field: &Field,
+    property_renames: Option<&HashMap<String, String>>,
+) -> Result<Option<Arc<dyn Array>>> {
+    let Some(type_name) = target_table_key.strip_prefix("node:") else {
+        return Ok(None);
+    };
+    let Some(node_type) = target_catalog.node_types.get(type_name) else {
+        return Ok(None);
+    };
+    let Some(spec) = node_type.embedding_specs.get(field.name()) else {
+        return Ok(None);
+    };
+    let source_name = property_renames
+        .and_then(|renames| renames.get(&spec.source_prop))
+        .map(String::as_str)
+        .unwrap_or(spec.source_prop.as_str());
+    let source_column = batch.column_by_name(source_name).ok_or_else(|| {
+        OmniError::manifest(format!(
+            "missing @embed source column '{}.{}' while rewriting '{}'",
+            type_name, spec.source_prop, target_table_key
+        ))
+    })?;
+    let source_strings = source_column
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            OmniError::manifest(format!(
+                "@embed source column '{}.{}' must be String while rewriting '{}'",
+                type_name, spec.source_prop, target_table_key
+            ))
+        })?;
+    let DataType::FixedSizeList(child_field, dim) = field.data_type() else {
+        return Err(OmniError::manifest(format!(
+            "@embed target '{}.{}' must be a vector column",
+            type_name,
+            field.name()
+        )));
+    };
+    let client = crate::embedding::EmbeddingClient::from_env()?;
+    let mut builder = FixedSizeListBuilder::with_capacity(
+        Float32Builder::with_capacity(batch.num_rows() * (*dim as usize)),
+        *dim,
+        batch.num_rows(),
+    )
+    .with_field(child_field.clone());
+    for row in 0..batch.num_rows() {
+        if source_strings.is_null(row) {
+            if field.is_nullable() {
+                for _ in 0..*dim {
+                    builder.values().append_null();
+                }
+                builder.append(false);
+                continue;
+            }
+            return Err(OmniError::manifest(format!(
+                "@embed source column '{}.{}' is null for non-nullable '{}.{}' row {}",
+                type_name,
+                spec.source_prop,
+                type_name,
+                field.name(),
+                row + 1
+            )));
+        }
+        let vector = client
+            .embed_document_text(
+                source_strings.value(row),
+                &spec.model,
+                spec.dimensions as usize,
+            )
+            .await?;
+        for value in vector {
+            builder.values().append_value(value);
+        }
+        builder.append(true);
+    }
+    Ok(Some(Arc::new(builder.finish())))
 }
 
 async fn rebuild_blob_column(

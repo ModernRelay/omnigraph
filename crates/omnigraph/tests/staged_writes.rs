@@ -132,7 +132,11 @@ async fn stage_merge_insert_dedupes_superseded_committed_fragment() {
         .await
         .unwrap();
     let ids = collect_ids(&batches);
-    assert_eq!(ids, vec!["alice"], "merge_insert must not surface duplicates");
+    assert_eq!(
+        ids,
+        vec!["alice"],
+        "merge_insert must not surface duplicates"
+    );
 
     // Confirm the visible row is the rewritten one.
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -382,12 +386,7 @@ async fn scan_with_staged_with_filter_silently_drops_staged_rows() {
     // Actual: dave (staged, age=35) is dropped — only the committed matches
     // come back.
     let batches = store
-        .scan_with_staged(
-            &ds,
-            std::slice::from_ref(&staged),
-            None,
-            Some("age >= 30"),
-        )
+        .scan_with_staged(&ds, std::slice::from_ref(&staged), None, Some("age >= 30"))
         .await
         .unwrap();
     assert_eq!(
@@ -404,12 +403,7 @@ async fn scan_with_staged_with_filter_silently_drops_staged_rows() {
     // Without filter, staged data IS visible — confirms the issue is
     // specifically filter pushdown, not fragment scanning per se.
     let unfiltered = store
-        .scan_with_staged(
-            &ds,
-            std::slice::from_ref(&staged),
-            None,
-            None,
-        )
+        .scan_with_staged(&ds, std::slice::from_ref(&staged), None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -639,10 +633,7 @@ async fn stage_create_inverted_index_does_not_advance_head_until_commit() {
     .unwrap();
     let pre_version = ds.version().version;
 
-    let staged = store
-        .stage_create_inverted_index(&ds, "id")
-        .await
-        .unwrap();
+    let staged = store.stage_create_inverted_index(&ds, "id").await.unwrap();
     assert_eq!(
         ds.version().version,
         pre_version,
@@ -733,13 +724,9 @@ async fn create_vector_index_advances_head_inline_documents_residual() {
     let id_arr = StringArray::from(ids);
     let flat: Vec<f32> = (0..(n_rows * dim)).map(|i| i as f32).collect();
     let values = arrow_array::Float32Array::from(flat);
-    let vec_arr =
-        FixedSizeListArray::new(item_field, dim as i32, Arc::new(values), None);
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![Arc::new(id_arr), Arc::new(vec_arr)],
-    )
-    .unwrap();
+    let vec_arr = FixedSizeListArray::new(item_field, dim as i32, Arc::new(values), None);
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(id_arr), Arc::new(vec_arr)]).unwrap();
 
     let mut ds = TableStore::write_dataset(&uri, batch).await.unwrap();
     let pre_version = ds.version().version;

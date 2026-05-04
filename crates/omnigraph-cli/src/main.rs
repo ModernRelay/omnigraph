@@ -775,8 +775,15 @@ fn parse_duration_arg(s: &str) -> Result<std::time::Duration> {
     if s.is_empty() {
         bail!("duration is empty");
     }
-    let (num_part, unit) = match s.char_indices().rev().find(|(_, c)| c.is_ascii_alphabetic()) {
-        Some((i, _)) => (&s[..i + 1 - s[i..].chars().next().unwrap().len_utf8()], &s[i..]),
+    let (num_part, unit) = match s
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_ascii_alphabetic())
+    {
+        Some((i, _)) => (
+            &s[..i + 1 - s[i..].chars().next().unwrap().len_utf8()],
+            &s[i..],
+        ),
         None => (s, ""),
     };
     let n: u64 = num_part
@@ -1034,6 +1041,18 @@ fn render_schema_plan_step(step: &SchemaMigrationStep) -> String {
             schema_type_kind_label(*type_kind),
             type_name,
             render_annotations(annotations)
+        ),
+        SchemaMigrationStep::UpdateSchemaConfig { embedding_model } => {
+            format!("update schema embedding model to '{}'", embedding_model)
+        }
+        SchemaMigrationStep::ReembedProperty {
+            type_name,
+            property_name,
+            embedding_model,
+            dimensions,
+        } => format!(
+            "recompute embeddings for '{}.{}' using '{}' (Vector({}))",
+            type_name, property_name, embedding_model, dimensions
         ),
         SchemaMigrationStep::UnsupportedChange { entity, reason } => {
             format!("unsupported change on {}: {}", entity, reason)
@@ -2349,17 +2368,16 @@ async fn main() -> Result<()> {
             let config = load_cli_config(config.as_ref())?;
             let uri = resolve_uri(&config, uri, target.as_deref())?;
 
-            let older_than_dur = older_than
-                .as_deref()
-                .map(parse_duration_arg)
-                .transpose()?;
+            let older_than_dur = older_than.as_deref().map(parse_duration_arg).transpose()?;
 
             if keep.is_none() && older_than_dur.is_none() {
                 bail!("cleanup requires at least one of --keep or --older-than");
             }
 
             let policy_desc = match (keep, older_than_dur) {
-                (Some(k), Some(d)) => format!("keep {} versions, remove anything older than {:?}", k, d),
+                (Some(k), Some(d)) => {
+                    format!("keep {} versions, remove anything older than {:?}", k, d)
+                }
                 (Some(k), None) => format!("keep {} versions", k),
                 (None, Some(d)) => format!("remove anything older than {:?}", d),
                 _ => unreachable!(),

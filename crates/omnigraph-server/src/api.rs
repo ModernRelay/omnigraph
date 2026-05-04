@@ -235,7 +235,9 @@ pub struct CommitListOutput {
 pub struct ReadRequest {
     /// GQ query source. May declare one or more named queries; pick one with
     /// `query_name` if there is more than one.
-    #[schema(example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}")]
+    #[schema(
+        example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
+    )]
     pub query_source: String,
     /// Name of the query to run when `query_source` declares multiple. Optional
     /// when only one query is declared.
@@ -252,7 +254,9 @@ pub struct ReadRequest {
 pub struct ChangeRequest {
     /// GQ mutation source containing `insert`, `update`, or `delete` statements.
     /// May declare multiple named mutations; pick one with `query_name`.
-    #[schema(example = "query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}")]
+    #[schema(
+        example = "query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}"
+    )]
     pub query_source: String,
     /// Name of the mutation to run when `query_source` declares multiple.
     pub query_name: Option<String>,
@@ -266,7 +270,9 @@ pub struct ChangeRequest {
 pub struct SchemaApplyRequest {
     /// Project schema in `.pg` source form. The diff against the current
     /// schema produces the migration steps that will be applied.
-    #[schema(example = "node Person {\n    name: String @key\n    age: I32?\n}\n\nedge Knows: Person -> Person")]
+    #[schema(
+        example = "node Person {\n    name: String @key\n    age: I32?\n}\n\nedge Knows: Person -> Person"
+    )]
     pub schema_source: String,
 }
 
@@ -297,7 +303,9 @@ pub struct IngestRequest {
     pub mode: Option<LoadMode>,
     /// NDJSON payload: one record per line, each shaped
     /// `{"type": "<TypeName>", "data": {...}}`.
-    #[schema(example = "{\"type\": \"Person\", \"data\": {\"name\": \"Alice\", \"age\": 30}}\n{\"type\": \"Person\", \"data\": {\"name\": \"Bob\", \"age\": 25}}")]
+    #[schema(
+        example = "{\"type\": \"Person\", \"data\": {\"name\": \"Alice\", \"age\": 30}}\n{\"type\": \"Person\", \"data\": {\"name\": \"Bob\", \"age\": 25}}"
+    )]
     pub data: String,
 }
 

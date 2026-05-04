@@ -618,8 +618,7 @@ async fn open_table_for_mutation(
             .await?;
         return Ok((ds, path.full_path.clone(), path.table_branch.clone()));
     }
-    let (ds, full_path, table_branch) =
-        db.open_for_mutation_on_branch(branch, table_key).await?;
+    let (ds, full_path, table_branch) = db.open_for_mutation_on_branch(branch, table_key).await?;
     let expected_version = ds.version().version;
     staging.ensure_path(
         table_key,
@@ -737,9 +736,8 @@ impl Omnigraph {
             Err(e) => Err(e),
             Ok(total) if staging.is_empty() => Ok(total),
             Ok(total) => {
-                let (updates, expected_versions) = staging
-                    .finalize(self, requested.as_deref())
-                    .await?;
+                let (updates, expected_versions) =
+                    staging.finalize(self, requested.as_deref()).await?;
                 // Failpoint that wedges the documented finalize→publisher
                 // residual: per-table `commit_staged` calls already
                 // advanced Lance HEAD on every touched table; a failure
@@ -801,15 +799,8 @@ impl Omnigraph {
                     assignments,
                     predicate,
                 } => {
-                    self.execute_update(
-                        type_name,
-                        assignments,
-                        predicate,
-                        params,
-                        branch,
-                        staging,
-                    )
-                    .await?
+                    self.execute_update(type_name, assignments, predicate, params, branch, staging)
+                        .await?
                 }
                 MutationOpIR::Delete {
                     type_name,
@@ -919,14 +910,8 @@ impl Omnigraph {
             // + iterate pending edges in-memory for the `src` column,
             // group-by-src. The pending side already includes the row
             // we just appended (above).
-            validate_edge_cardinality_with_pending(
-                self,
-                &ds,
-                staging,
-                &table_key,
-                edge_type,
-            )
-            .await?;
+            validate_edge_cardinality_with_pending(self, &ds, staging, &table_key, edge_type)
+                .await?;
 
             self.invalidate_graph_index().await;
 
@@ -1291,14 +1276,8 @@ async fn validate_edge_cardinality_with_pending(
     if edge_type.cardinality.is_default() {
         return Ok(());
     }
-    let counts = super::staging::count_src_per_edge(
-        db,
-        committed_ds,
-        table_key,
-        staging,
-        None,
-    )
-    .await?;
+    let counts =
+        super::staging::count_src_per_edge(db, committed_ds, table_key, staging, None).await?;
     super::staging::enforce_cardinality_bounds(edge_type, &counts)
 }
 

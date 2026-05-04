@@ -260,9 +260,9 @@ fn literal_list_to_array(items: &[Literal], num_rows: usize) -> Result<ArrayRef>
             }
             Ok(Arc::new(builder.finish()))
         }
-        ScalarType::Vector(_) | ScalarType::Blob => Err(OmniError::manifest(
-            "unsupported list literal element type".to_string(),
-        )),
+        ScalarType::Vector(_) | ScalarType::VectorInferred | ScalarType::Blob => Err(
+            OmniError::manifest("unsupported list literal element type".to_string()),
+        ),
     }
 }
 
@@ -345,10 +345,7 @@ fn evaluate_projection(
         IRExpr::PropAccess { variable, property } => {
             let col_name = format!("{}.{}", variable, property);
             let col = wide_batch.column_by_name(&col_name).ok_or_else(|| {
-                OmniError::manifest(format!(
-                    "column '{}' not found in wide batch",
-                    col_name
-                ))
+                OmniError::manifest(format!("column '{}' not found in wide batch", col_name))
             })?;
             Ok((col_name, col.clone()))
         }
@@ -516,12 +513,10 @@ fn aggregate_return(
     }
 
     let num_groups = group_indices.len();
-    let mut result_columns: Vec<(usize, String, ArrayRef)> =
-        Vec::with_capacity(projections.len());
+    let mut result_columns: Vec<(usize, String, ArrayRef)> = Vec::with_capacity(projections.len());
 
     for gk in &group_keys {
-        let first_row_indices: Vec<u32> =
-            group_indices.iter().map(|rows| rows[0] as u32).collect();
+        let first_row_indices: Vec<u32> = group_indices.iter().map(|rows| rows[0] as u32).collect();
         let take_idx = UInt32Array::from(first_row_indices);
         let col = arrow_select::take::take(gk.column.as_ref(), &take_idx, None)
             .map_err(|e| OmniError::Lance(e.to_string()))?;
@@ -584,11 +579,19 @@ fn compute_aggregate(
     }
 }
 
-fn compute_sum(arg: &ArrayRef, group_indices: &[Vec<usize>], num_groups: usize) -> Result<ArrayRef> {
+fn compute_sum(
+    arg: &ArrayRef,
+    group_indices: &[Vec<usize>],
+    num_groups: usize,
+) -> Result<ArrayRef> {
     macro_rules! sum_numeric {
         ($arr_type:ty, $arg:expr, $dt:expr) => {{
             let arr = $arg.as_any().downcast_ref::<$arr_type>().ok_or_else(|| {
-                OmniError::manifest(format!("sum: expected {:?}, got {:?}", $dt, $arg.data_type()))
+                OmniError::manifest(format!(
+                    "sum: expected {:?}, got {:?}",
+                    $dt,
+                    $arg.data_type()
+                ))
             })?;
             let mut builder = Float64Builder::with_capacity(num_groups);
             for group in group_indices {
@@ -613,24 +616,42 @@ fn compute_sum(arg: &ArrayRef, group_indices: &[Vec<usize>], num_groups: usize) 
         dt @ DataType::UInt64 => sum_numeric!(UInt64Array, arg, dt),
         dt @ DataType::Float32 => sum_numeric!(Float32Array, arg, dt),
         dt @ DataType::Float64 => sum_numeric!(Float64Array, arg, dt),
-        dt => Err(OmniError::manifest(format!("sum: unsupported type {:?}", dt))),
+        dt => Err(OmniError::manifest(format!(
+            "sum: unsupported type {:?}",
+            dt
+        ))),
     }
 }
 
-fn compute_avg(arg: &ArrayRef, group_indices: &[Vec<usize>], num_groups: usize) -> Result<ArrayRef> {
+fn compute_avg(
+    arg: &ArrayRef,
+    group_indices: &[Vec<usize>],
+    num_groups: usize,
+) -> Result<ArrayRef> {
     macro_rules! avg_typed {
         ($arr_type:ty, $arg:expr) => {{
             let arr = $arg.as_any().downcast_ref::<$arr_type>().ok_or_else(|| {
-                OmniError::manifest(format!("avg: expected {:?}, got {:?}", stringify!($arr_type), $arg.data_type()))
+                OmniError::manifest(format!(
+                    "avg: expected {:?}, got {:?}",
+                    stringify!($arr_type),
+                    $arg.data_type()
+                ))
             })?;
             let mut builder = Float64Builder::with_capacity(num_groups);
             for group in group_indices {
                 let mut sum = 0.0f64;
                 let mut count = 0usize;
                 for &i in group {
-                    if !arr.is_null(i) { sum += arr.value(i) as f64; count += 1; }
+                    if !arr.is_null(i) {
+                        sum += arr.value(i) as f64;
+                        count += 1;
+                    }
                 }
-                if count > 0 { builder.append_value(sum / count as f64); } else { builder.append_null(); }
+                if count > 0 {
+                    builder.append_value(sum / count as f64);
+                } else {
+                    builder.append_null();
+                }
             }
             Ok(Arc::new(builder.finish()) as ArrayRef)
         }};
@@ -642,15 +663,27 @@ fn compute_avg(arg: &ArrayRef, group_indices: &[Vec<usize>], num_groups: usize) 
         DataType::UInt64 => avg_typed!(UInt64Array, arg),
         DataType::Float32 => avg_typed!(Float32Array, arg),
         DataType::Float64 => avg_typed!(Float64Array, arg),
-        dt => Err(OmniError::manifest(format!("avg: unsupported type {:?}", dt))),
+        dt => Err(OmniError::manifest(format!(
+            "avg: unsupported type {:?}",
+            dt
+        ))),
     }
 }
 
-fn compute_min_max(arg: &ArrayRef, group_indices: &[Vec<usize>], num_groups: usize, is_min: bool) -> Result<ArrayRef> {
+fn compute_min_max(
+    arg: &ArrayRef,
+    group_indices: &[Vec<usize>],
+    num_groups: usize,
+    is_min: bool,
+) -> Result<ArrayRef> {
     macro_rules! minmax_typed {
         ($arr_type:ty, $builder_type:ty, $arg:expr, $is_min:expr) => {{
             let arr = $arg.as_any().downcast_ref::<$arr_type>().ok_or_else(|| {
-                OmniError::manifest(format!("min/max: expected {:?}, got {:?}", stringify!($arr_type), $arg.data_type()))
+                OmniError::manifest(format!(
+                    "min/max: expected {:?}, got {:?}",
+                    stringify!($arr_type),
+                    $arg.data_type()
+                ))
             })?;
             let mut builder = <$builder_type>::with_capacity(num_groups);
             for group in group_indices {
@@ -660,11 +693,20 @@ fn compute_min_max(arg: &ArrayRef, group_indices: &[Vec<usize>], num_groups: usi
                         let v = arr.value(i);
                         result = Some(match result {
                             None => v,
-                            Some(cur) => if $is_min { if v < cur { v } else { cur } } else { if v > cur { v } else { cur } },
+                            Some(cur) => {
+                                if $is_min {
+                                    if v < cur { v } else { cur }
+                                } else {
+                                    if v > cur { v } else { cur }
+                                }
+                            }
                         });
                     }
                 }
-                match result { Some(v) => builder.append_value(v), None => builder.append_null() }
+                match result {
+                    Some(v) => builder.append_value(v),
+                    None => builder.append_null(),
+                }
             }
             Ok(Arc::new(builder.finish()) as ArrayRef)
         }};
@@ -688,15 +730,27 @@ fn compute_min_max(arg: &ArrayRef, group_indices: &[Vec<usize>], num_groups: usi
                         let v = arr.value(i);
                         result = Some(match result {
                             None => v,
-                            Some(cur) => if is_min { if v < cur { v } else { cur } } else { if v > cur { v } else { cur } },
+                            Some(cur) => {
+                                if is_min {
+                                    if v < cur { v } else { cur }
+                                } else {
+                                    if v > cur { v } else { cur }
+                                }
+                            }
                         });
                     }
                 }
-                match result { Some(v) => builder.append_value(v), None => builder.append_null() }
+                match result {
+                    Some(v) => builder.append_value(v),
+                    None => builder.append_null(),
+                }
             }
             Ok(Arc::new(builder.finish()) as ArrayRef)
         }
-        dt => Err(OmniError::manifest(format!("min/max: unsupported type {:?}", dt))),
+        dt => Err(OmniError::manifest(format!(
+            "min/max: unsupported type {:?}",
+            dt
+        ))),
     }
 }
 
@@ -715,7 +769,8 @@ fn build_empty_aggregate_result(projections: &[IRProjection]) -> Result<RecordBa
                 }
                 _ => {
                     fields.push(Field::new(name, DataType::Float64, true));
-                    columns.push(Arc::new(Float64Array::from(vec![None as Option<f64>])) as ArrayRef);
+                    columns
+                        .push(Arc::new(Float64Array::from(vec![None as Option<f64>])) as ArrayRef);
                 }
             },
             _ => {

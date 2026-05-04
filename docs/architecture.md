@@ -303,7 +303,7 @@ Throughout the docs, capabilities are split into:
 
 ## Workspace crates
 
-- `omnigraph-compiler` — schema and query grammars, catalog, IR, lowering, type checker, lint, migration planner, OpenAI-style embedding client.
-- `omnigraph` (engine, published as `omnigraph-engine` on crates.io since v0.2.2) — the Lance-backed runtime: manifest, commit graph, snapshot, exec (incl. per-query `MutationStaging` accumulator), merge, loader, Gemini embedding client.
+- `omnigraph-compiler` — schema and query grammars, schema-declared embedding model registry, catalog, IR, lowering, type checker, lint, migration planner, OpenAI-style embedding client.
+- `omnigraph` (engine, published as `omnigraph-engine` on crates.io since v0.2.2) — the Lance-backed runtime: manifest, commit graph, snapshot, exec (incl. per-query `MutationStaging` accumulator), merge, loader, schema-selected Gemini embedding client.
 - `omnigraph-cli` — the `omnigraph` binary.
 - `omnigraph-server` — the `omnigraph-server` binary (Axum HTTP server).

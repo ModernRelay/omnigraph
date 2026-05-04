@@ -7,11 +7,14 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use crate::error::{NanoError, Result};
-use crate::schema::ast::{Cardinality, Constraint, ConstraintBound, SchemaDecl, SchemaFile};
+use crate::schema::ast::{
+    Cardinality, Constraint, ConstraintBound, SchemaConfig, SchemaDecl, SchemaFile,
+};
 use crate::types::{PropType, ScalarType};
 
 #[derive(Debug, Clone)]
 pub struct Catalog {
+    pub config: SchemaConfig,
     pub node_types: HashMap<String, NodeType>,
     pub edge_types: HashMap<String, EdgeType>,
     /// Maps normalized lowercase edge name -> EdgeType key (e.g. "knows" -> "Knows")
@@ -44,8 +47,18 @@ pub struct NodeType {
     pub check_constraints: Vec<CheckConstraint>,
     /// Maps @embed target property -> source text property
     pub embed_sources: HashMap<String, String>,
+    /// Embedding generation specs keyed by target vector property.
+    pub embedding_specs: HashMap<String, EmbeddingSpec>,
     pub blob_properties: HashSet<String>,
     pub arrow_schema: SchemaRef,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingSpec {
+    pub target_prop: String,
+    pub source_prop: String,
+    pub model: String,
+    pub dimensions: u32,
 }
 
 impl NodeType {
@@ -150,6 +163,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
 
             let mut properties = HashMap::new();
             let mut embed_sources = HashMap::new();
+            let mut embedding_specs = HashMap::new();
             let mut blob_properties = HashSet::new();
             for prop in &node.properties {
                 properties.insert(prop.name.clone(), prop.prop_type.clone());
@@ -163,7 +177,25 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                     .find(|ann| ann.name == "embed")
                     .and_then(|ann| ann.value.clone())
                 {
-                    embed_sources.insert(prop.name.clone(), source_prop);
+                    let dimensions = match prop.prop_type.scalar {
+                        ScalarType::Vector(dim) => dim,
+                        _ => {
+                            return Err(NanoError::Catalog(format!(
+                                "@embed target {}.{} must be Vector",
+                                node.name, prop.name
+                            )));
+                        }
+                    };
+                    embed_sources.insert(prop.name.clone(), source_prop.clone());
+                    embedding_specs.insert(
+                        prop.name.clone(),
+                        EmbeddingSpec {
+                            target_prop: prop.name.clone(),
+                            source_prop,
+                            model: schema.config.embedding_model.clone(),
+                            dimensions,
+                        },
+                    );
                 }
             }
 
@@ -226,6 +258,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                     range_constraints,
                     check_constraints,
                     embed_sources,
+                    embedding_specs,
                     blob_properties,
                     arrow_schema,
                 },
@@ -314,6 +347,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
     }
 
     Ok(Catalog {
+        config: schema.config.clone(),
         node_types,
         edge_types,
         edge_name_index,
