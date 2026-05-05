@@ -179,8 +179,9 @@ impl Omnigraph {
         // the manifest pin is the consistent snapshot regardless of
         // drift on the per-table side or leftover schema-staging files.
         if matches!(mode, OpenMode::ReadWrite) {
-            recover_schema_state_files(&root, Arc::clone(&storage), &coordinator.snapshot())
-                .await?;
+            let schema_state_recovery =
+                recover_schema_state_files(&root, Arc::clone(&storage), &coordinator.snapshot())
+                    .await?;
             // Recovery sweep: close the Phase B → Phase C residual on
             // any sidecar left over from a crashed writer. Continuous
             // in-process recovery for long-running servers (no restart
@@ -191,6 +192,7 @@ impl Omnigraph {
                 Arc::clone(&storage),
                 &mut coordinator,
                 crate::db::manifest::RecoveryMode::Full,
+                schema_state_recovery,
             )
             .await?;
         }
@@ -409,7 +411,7 @@ impl Omnigraph {
     /// avoid the recovery sweep racing their own sidecar.
     pub async fn refresh(&mut self) -> Result<()> {
         self.coordinator.refresh().await?;
-        recover_schema_state_files(
+        let schema_state_recovery = recover_schema_state_files(
             &self.root_uri,
             Arc::clone(&self.storage),
             &self.coordinator.snapshot(),
@@ -420,18 +422,20 @@ impl Omnigraph {
             Arc::clone(&self.storage),
             &mut self.coordinator,
             crate::db::manifest::RecoveryMode::RollForwardOnly,
+            schema_state_recovery,
         )
         .await?;
-        // Re-read the schema source / catalog from disk: schema-state
-        // recovery above may have renamed staging files into place
-        // (completing an in-flight schema_apply), so the on-disk
-        // `_schema.pg` and IR contract may now reflect a NEWER schema
-        // than the in-memory `self.catalog` / `self.schema_source`.
-        // Without this reload subsequent ops on the handle would use
-        // stale catalog metadata against post-migration data on disk.
-        // Mirrors `open_with_storage_and_mode`'s schema-load sequence.
+        self.reload_schema_if_source_changed().await?;
+        self.runtime_cache.invalidate_all().await;
+        Ok(())
+    }
+
+    async fn reload_schema_if_source_changed(&mut self) -> Result<()> {
         let schema_path = schema_source_uri(&self.root_uri);
         let schema_source = self.storage.read_text(&schema_path).await?;
+        if schema_source == self.schema_source {
+            return Ok(());
+        }
         let current_source_ir = read_schema_ir_from_source(&schema_source)?;
         let branches = self.coordinator.branch_list().await?;
         let (accepted_ir, _) = load_or_bootstrap_schema_contract(
@@ -445,7 +449,6 @@ impl Omnigraph {
         fixup_blob_schemas(&mut catalog);
         self.schema_source = schema_source;
         self.catalog = catalog;
-        self.runtime_cache.invalidate_all().await;
         Ok(())
     }
 
@@ -609,6 +612,23 @@ impl Omnigraph {
 
     pub async fn ensure_indices_on(&mut self, branch: &str) -> Result<()> {
         table_ops::ensure_indices_on(self, branch).await
+    }
+
+    #[cfg(feature = "failpoints")]
+    #[doc(hidden)]
+    pub async fn failpoint_publish_table_head_without_index_rebuild_for_test(
+        &mut self,
+        branch: &str,
+        table_key: &str,
+        table_branch: Option<&str>,
+    ) -> Result<u64> {
+        table_ops::failpoint_publish_table_head_without_index_rebuild_for_test(
+            self,
+            branch,
+            table_key,
+            table_branch,
+        )
+        .await
     }
 
     /// Compact small Lance fragments into fewer larger ones across every
@@ -989,7 +1009,6 @@ impl Omnigraph {
     pub(crate) async fn invalidate_graph_index(&self) {
         table_ops::invalidate_graph_index(self).await
     }
-
 }
 
 pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {

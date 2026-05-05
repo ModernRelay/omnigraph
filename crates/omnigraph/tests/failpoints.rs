@@ -6,11 +6,49 @@ use fail::FailScenario;
 use omnigraph::db::Omnigraph;
 use omnigraph::failpoints::ScopedFailPoint;
 
+use helpers::recovery::{
+    FollowUpMutation, RecoveryExpectation, TableExpectation, assert_post_recovery_invariants,
+    branch_head_commit_id, single_sidecar_operation_id,
+};
 use helpers::{MUTATION_QUERIES, mixed_params, mutate_main, version_main};
 
 const SCHEMA_V1: &str = "node Person { name: String @key }\n";
 const SCHEMA_V2_ADDED_TYPE: &str =
     "node Person { name: String @key }\nnode Company { name: String @key }\n";
+
+fn node_table_uri(root: &str, type_name: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in type_name.as_bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("{}/nodes/{hash:016x}", root.trim_end_matches('/'))
+}
+
+fn person_batch(rows: &[(&str, &str, Option<i32>)]) -> arrow_array::RecordBatch {
+    use std::sync::Arc;
+
+    use arrow_array::{Int32Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, true),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let ids: Vec<&str> = rows.iter().map(|(id, _, _)| *id).collect();
+    let names: Vec<&str> = rows.iter().map(|(_, name, _)| *name).collect();
+    let ages: Vec<Option<i32>> = rows.iter().map(|(_, _, age)| *age).collect();
+    arrow_array::RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(ids)),
+            Arc::new(Int32Array::from(ages)),
+            Arc::new(StringArray::from(names)),
+        ],
+    )
+    .unwrap()
+}
 
 #[tokio::test]
 async fn branch_create_failpoint_triggers() {
@@ -174,12 +212,12 @@ async fn recovery_rolls_forward_after_finalize_publisher_failure() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
+    let operation_id;
 
     // Phase A: trigger the residual.
     {
         let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
-        let _failpoint =
-            ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+        let _failpoint = ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
 
         // The mutation's finalize completes (commit_staged advances Lance
         // HEAD on node:Person AND writes a `__recovery/{ulid}.json`
@@ -195,9 +233,8 @@ async fn recovery_rolls_forward_after_finalize_publisher_failure() {
         .await
         .unwrap_err();
         assert!(
-            err.to_string().contains(
-                "injected failpoint triggered: mutation.post_finalize_pre_publisher"
-            ),
+            err.to_string()
+                .contains("injected failpoint triggered: mutation.post_finalize_pre_publisher"),
             "unexpected error: {err}"
         );
 
@@ -212,6 +249,7 @@ async fn recovery_rolls_forward_after_finalize_publisher_failure() {
             1,
             "exactly one sidecar should persist after the finalize failure"
         );
+        operation_id = single_sidecar_operation_id(dir.path());
 
         // Drop the failpoint scope and the engine handle.
     }
@@ -220,21 +258,7 @@ async fn recovery_rolls_forward_after_finalize_publisher_failure() {
     // sidecar, classifies node:Person as RolledPastExpected, decides
     // RollForward, publishes the manifest update, records the audit
     // row, deletes the sidecar.
-    let mut db = Omnigraph::open(&uri).await.unwrap();
-
-    // Sidecar gone — sweep completed end to end.
-    let recovery_dir = dir.path().join("__recovery");
-    if recovery_dir.exists() {
-        let remaining: Vec<_> = std::fs::read_dir(&recovery_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
-        assert!(
-            remaining.is_empty(),
-            "sidecar must be deleted after successful roll-forward; remaining: {:?}",
-            remaining,
-        );
-    }
+    let db = Omnigraph::open(&uri).await.unwrap();
 
     // The originally-attempted "Eve" insert is now visible — the recovery
     // sweep extended the manifest pin to include the staged commit.
@@ -243,27 +267,258 @@ async fn recovery_rolls_forward_after_finalize_publisher_failure() {
         person_count, 1,
         "exactly one person (Eve) must be visible after roll-forward"
     );
+    drop(db);
 
-    // The next mutation on the same table succeeds — no ExpectedVersionMismatch.
-    mutate_main(
-        &mut db,
-        MUTATION_QUERIES,
-        "insert_person",
-        &mixed_params(&[("$name", "Frank")], &[("$age", 33)]),
+    assert_post_recovery_invariants(
+        dir.path(),
+        &operation_id,
+        RecoveryExpectation::RolledForward {
+            tables: vec![TableExpectation::main("node:Person").follow_up_mutation(
+                FollowUpMutation::new(
+                    "main",
+                    MUTATION_QUERIES,
+                    "insert_person",
+                    mixed_params(&[("$name", "Frank")], &[("$age", 33)]),
+                ),
+            )],
+        },
     )
     .await
-    .expect("next mutation must succeed after recovery rolled forward");
+    .unwrap();
+
+    let db = Omnigraph::open(&uri).await.unwrap();
     let person_count = helpers::count_rows(&db, "node:Person").await;
     assert_eq!(
         person_count, 2,
         "Frank's insert must land normally after recovery"
     );
+}
 
-    // Audit row recorded.
-    let audit_dir = dir.path().join("_graph_commit_recoveries.lance");
-    assert!(
-        audit_dir.exists(),
-        "_graph_commit_recoveries.lance must exist after a successful recovery"
+#[tokio::test]
+async fn recovery_rolls_forward_load_on_feature_branch() {
+    use omnigraph::loader::LoadMode;
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let operation_id;
+    let main_person_pin;
+    let feature_parent_commit_id;
+
+    {
+        let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+        db.branch_create("feature").await.unwrap();
+        db.mutate(
+            "feature",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "BeforeLoad")], &[("$age", 40)]),
+        )
+        .await
+        .unwrap();
+        main_person_pin = db
+            .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .entry("node:Person")
+            .expect("main must have Person")
+            .table_version;
+        feature_parent_commit_id = branch_head_commit_id(dir.path(), "feature").await.unwrap();
+
+        let _failpoint = ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+        let err = db
+            .load(
+                "feature",
+                r#"{"type":"Person","data":{"name":"FeatureLoad","age":41}}
+"#,
+                LoadMode::Append,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("injected failpoint triggered: mutation.post_finalize_pre_publisher"),
+            "unexpected error: {err}"
+        );
+        operation_id = single_sidecar_operation_id(dir.path());
+    }
+
+    let db = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(
+        helpers::count_rows_branch(&db, "feature", "node:Person").await,
+        2,
+        "feature branch load row must be visible after recovery"
+    );
+    assert_eq!(
+        helpers::count_rows(&db, "node:Person").await,
+        0,
+        "feature branch load recovery must not publish the row to main"
+    );
+    drop(db);
+
+    assert_post_recovery_invariants(
+        dir.path(),
+        &operation_id,
+        RecoveryExpectation::RolledForward {
+            tables: vec![
+                TableExpectation::branch("node:Person", "feature")
+                    .expected_main_manifest_pin(main_person_pin)
+                    .expected_recovery_parent_commit_id(feature_parent_commit_id)
+                    .follow_up_mutation(FollowUpMutation::new(
+                        "feature",
+                        MUTATION_QUERIES,
+                        "insert_person",
+                        mixed_params(&[("$name", "AfterLoad")], &[("$age", 42)]),
+                    )),
+            ],
+        },
+    )
+    .await
+    .unwrap();
+
+    let db = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(
+        helpers::count_rows_branch(&db, "feature", "node:Person").await,
+        3,
+        "follow-up feature mutation must succeed after load recovery"
+    );
+    assert_eq!(
+        helpers::count_rows(&db, "node:Person").await,
+        0,
+        "follow-up feature mutation must not move main"
+    );
+}
+
+#[tokio::test]
+async fn recovery_rolls_forward_ensure_indices_on_feature_branch() {
+    use lance_index::DatasetIndexExt;
+    use omnigraph::loader::{LoadMode, load_jsonl};
+    use omnigraph::table_store::TableStore;
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let operation_id;
+    let feature_parent_commit_id;
+    let main_person_pin;
+
+    let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Person","data":{"name":"alice","age":30}}
+"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    db.branch_create("feature").await.unwrap();
+    db.mutate(
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "BeforeEnsure")], &[("$age", 42)]),
+    )
+    .await
+    .unwrap();
+
+    main_person_pin = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entry("node:Person")
+        .expect("main must have Person")
+        .table_version;
+
+    // Make the feature branch's Person table genuinely need index work
+    // while keeping the manifest internally consistent. The test-only
+    // publisher deliberately skips the normal index-rebuild preparation;
+    // the failed writer below is still the real `ensure_indices_on`.
+    let person_uri = node_table_uri(&uri, "Person");
+    let store = TableStore::new(&uri);
+    let mut ds = store
+        .open_dataset_head(&person_uri, Some("feature"))
+        .await
+        .unwrap();
+    ds.drop_index("id_idx").await.unwrap();
+    let dropped_index_head = ds.version().version;
+    db.failpoint_publish_table_head_without_index_rebuild_for_test(
+        "feature",
+        "node:Person",
+        Some("feature"),
+    )
+    .await
+    .unwrap();
+    let feature_snapshot = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("feature"))
+        .await
+        .unwrap();
+    assert_eq!(
+        feature_snapshot
+            .entry("node:Person")
+            .expect("feature must have Person")
+            .table_version,
+        dropped_index_head,
+        "test setup must publish the dropped-index table head before ensure_indices runs",
+    );
+    feature_parent_commit_id = branch_head_commit_id(dir.path(), "feature").await.unwrap();
+
+    {
+        let _failpoint =
+            ScopedFailPoint::new("ensure_indices.post_phase_b_pre_manifest_commit", "return");
+        let err = db.ensure_indices_on("feature").await.unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "injected failpoint triggered: ensure_indices.post_phase_b_pre_manifest_commit"
+            ),
+            "unexpected error: {err}"
+        );
+        operation_id = single_sidecar_operation_id(dir.path());
+    }
+    drop(db);
+
+    let db = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(
+        helpers::count_rows_branch(&db, "feature", "node:Person").await,
+        2,
+        "feature should see inherited alice plus recovered branch-local row"
+    );
+    assert_eq!(
+        helpers::count_rows(&db, "node:Person").await,
+        1,
+        "ensure_indices branch recovery must not move main"
+    );
+    drop(db);
+
+    assert_post_recovery_invariants(
+        dir.path(),
+        &operation_id,
+        RecoveryExpectation::RolledForward {
+            tables: vec![
+                TableExpectation::branch("node:Person", "feature")
+                    .expected_main_manifest_pin(main_person_pin)
+                    .expected_recovery_parent_commit_id(feature_parent_commit_id)
+                    .follow_up_mutation(FollowUpMutation::new(
+                        "feature",
+                        MUTATION_QUERIES,
+                        "insert_person",
+                        mixed_params(&[("$name", "AfterEnsure")], &[("$age", 44)]),
+                    )),
+            ],
+        },
+    )
+    .await
+    .unwrap();
+
+    let db = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(
+        helpers::count_rows_branch(&db, "feature", "node:Person").await,
+        3,
+        "follow-up feature mutation must succeed after ensure_indices recovery"
+    );
+    assert_eq!(
+        helpers::count_rows(&db, "node:Person").await,
+        1,
+        "follow-up feature mutation must not move main"
     );
 }
 
@@ -286,8 +541,7 @@ async fn refresh_runs_roll_forward_recovery_in_process() {
 
     // Phase A: trigger the residual (sidecar persists; manifest unchanged).
     {
-        let _failpoint =
-            ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+        let _failpoint = ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
         let err = mutate_main(
             &mut db,
             MUTATION_QUERIES,
@@ -297,9 +551,8 @@ async fn refresh_runs_roll_forward_recovery_in_process() {
         .await
         .unwrap_err();
         assert!(
-            err.to_string().contains(
-                "injected failpoint triggered: mutation.post_finalize_pre_publisher"
-            ),
+            err.to_string()
+                .contains("injected failpoint triggered: mutation.post_finalize_pre_publisher"),
             "unexpected error: {err}"
         );
         let recovery_dir = dir.path().join("__recovery");
@@ -447,7 +700,9 @@ async fn refresh_defers_rollback_eligible_sidecar_to_next_open() {
     // Trigger refresh-time recovery directly. Sidecar is rollback-
     // eligible (UnexpectedAtP1); RollForwardOnly mode defers it,
     // leaving the sidecar on disk and Lance HEAD unchanged on Person.
-    db.refresh().await.expect("refresh must succeed (deferring rollback)");
+    db.refresh()
+        .await
+        .expect("refresh must succeed (deferring rollback)");
 
     // Sidecar still on disk.
     assert_eq!(
@@ -509,8 +764,7 @@ async fn finalize_publisher_residual_does_not_drift_untouched_tables() {
         .unwrap();
 
     {
-        let _failpoint =
-            ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+        let _failpoint = ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
         let _ = mutate_main(
             &mut db,
             MUTATION_QUERIES,
@@ -570,13 +824,14 @@ async fn ensure_indices_phase_a_btree_failure_leaves_existing_tables_writable() 
     // node:Project table's btree-on-id build. (TEST_SCHEMA already
     // has Person + Company + Knows + WorksAt — pick a name that isn't
     // already declared.)
-    let extended_schema = format!("{}\nnode Project {{ name: String @key }}\n", helpers::TEST_SCHEMA);
+    let extended_schema = format!(
+        "{}\nnode Project {{ name: String @key }}\n",
+        helpers::TEST_SCHEMA
+    );
 
     {
-        let _failpoint = ScopedFailPoint::new(
-            "ensure_indices.post_stage_pre_commit_btree",
-            "return",
-        );
+        let _failpoint =
+            ScopedFailPoint::new("ensure_indices.post_stage_pre_commit_btree", "return");
         let err = db.apply_schema(&extended_schema).await.unwrap_err();
         assert!(
             err.to_string()
@@ -630,12 +885,105 @@ fn assert_no_staging_files(repo: &std::path::Path) {
 // ExpectedVersionMismatch.
 
 #[tokio::test]
+async fn schema_apply_without_schema_staging_rolls_back_on_next_open() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let operation_id;
+
+    {
+        let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+        load_jsonl(
+            &mut db,
+            r#"{"type":"Person","data":{"name":"alice","age":30}}
+"#,
+            LoadMode::Append,
+        )
+        .await
+        .unwrap();
+    }
+
+    let pre_failure_version = {
+        let db = Omnigraph::open(&uri).await.unwrap();
+        version_main(&db).await.unwrap()
+    };
+
+    {
+        let mut db = Omnigraph::open(&uri).await.unwrap();
+        let _failpoint = ScopedFailPoint::new("schema_apply.before_staging_write", "return");
+        let v2_schema = r#"node Person {
+    name: String @key
+    age: I32?
+    city: String?
+}
+
+node Company {
+    name: String @key
+}
+
+node Tag {
+    label: String @key
+}
+
+edge Knows: Person -> Person {
+    since: Date?
+}
+
+edge WorksAt: Person -> Company
+"#;
+        let err = db.apply_schema(v2_schema).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("injected failpoint triggered: schema_apply.before_staging_write"),
+            "unexpected error: {err}"
+        );
+        operation_id = single_sidecar_operation_id(dir.path());
+    }
+
+    let db = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(
+        version_main(&db).await.unwrap(),
+        pre_failure_version,
+        "manifest must remain on the old schema when no schema staging files existed"
+    );
+    assert_eq!(
+        helpers::count_rows(&db, "node:Person").await,
+        1,
+        "old-schema data must remain readable after rollback"
+    );
+    drop(db);
+
+    assert_post_recovery_invariants(
+        dir.path(),
+        &operation_id,
+        RecoveryExpectation::RolledBack {
+            tables: vec![TableExpectation::main("node:Person")],
+        },
+    )
+    .await
+    .unwrap();
+
+    let live_schema = std::fs::read_to_string(dir.path().join("_schema.pg")).unwrap();
+    assert!(
+        !live_schema.contains("city: String?"),
+        "_schema.pg must keep the OLD schema when staging files never existed; got:\n{live_schema}",
+    );
+    assert!(
+        !live_schema.contains("node Tag"),
+        "_schema.pg must keep the OLD schema when staging files never existed; got:\n{live_schema}",
+    );
+}
+
+#[tokio::test]
 async fn schema_apply_phase_b_failure_recovered_on_next_open() {
     use omnigraph::loader::{LoadMode, load_jsonl};
 
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
+    let operation_id;
 
     // Seed: a Person table with one row so the schema-apply rewritten_tables
     // loop has actual work to do.
@@ -710,6 +1058,7 @@ edge WorksAt: Person -> Company
             1,
             "exactly one sidecar must persist after schema_apply failure"
         );
+        operation_id = single_sidecar_operation_id(dir.path());
     }
 
     // Phase B: reopen runs the recovery sweep. Sidecar's writer_kind is
@@ -717,25 +1066,6 @@ edge WorksAt: Person -> Company
     // drift on Person, decision is RollForward, manifest extends to the
     // current Lance HEAD.
     let db = Omnigraph::open(&uri).await.unwrap();
-
-    // Sidecar gone, audit row recorded.
-    let recovery_dir = dir.path().join("__recovery");
-    if recovery_dir.exists() {
-        let remaining: Vec<_> = std::fs::read_dir(&recovery_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
-        assert!(
-            remaining.is_empty(),
-            "sidecar must be deleted; remaining: {:?}",
-            remaining,
-        );
-    }
-    let audit_dir = dir.path().join("_graph_commit_recoveries.lance");
-    assert!(
-        audit_dir.exists(),
-        "_graph_commit_recoveries.lance must exist after schema_apply recovery"
-    );
 
     // Recovery sweep must have advanced the manifest pin on the rewritten
     // table: roll-forward published the post-failure Lance HEAD.
@@ -745,6 +1075,17 @@ edge WorksAt: Person -> Company
         "manifest version must advance post-recovery; pre={pre_failure_version}, \
          post={post_recovery_version}",
     );
+    drop(db);
+
+    assert_post_recovery_invariants(
+        dir.path(),
+        &operation_id,
+        RecoveryExpectation::RolledForward {
+            tables: vec![TableExpectation::main("node:Person")],
+        },
+    )
+    .await
+    .unwrap();
 
     // Schema-apply atomicity: the live `_schema.pg` must reflect the
     // NEW schema (city column on Person, Tag node type) — not the old.
@@ -761,7 +1102,6 @@ edge WorksAt: Person -> Company
         live_schema.contains("node Tag"),
         "_schema.pg must reflect the NEW schema (Tag type added); got:\n{live_schema}",
     );
-    drop(db);
 }
 
 #[tokio::test]
@@ -939,6 +1279,8 @@ async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
+    let operation_id;
+    let target_parent_commit_id;
 
     // Setup:
     //   main: alice
@@ -975,41 +1317,18 @@ async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
         .unwrap();
     }
 
-    // Capture target_branch's commit-graph head BEFORE the failed merge.
-    // This is the commit the recovery's merge commit must claim as its
-    // `parent_commit_id` (D2 — without the per-branch CommitGraph fix,
-    // recovery would record the GLOBAL head as parent instead).
-    let target_branch_head_before_failure = {
-        let commits_dir = dir.path().join("_graph_commits.lance");
-        let ds = lance::Dataset::open(commits_dir.to_str().unwrap())
+    let main_person_pin = {
+        let db = Omnigraph::open(&uri).await.unwrap();
+        db.snapshot_of(omnigraph::db::ReadTarget::branch("main"))
             .await
             .unwrap()
-            .checkout_branch("target_branch")
-            .await
-            .unwrap();
-        use arrow_array::{Array, StringArray};
-        use futures::TryStreamExt;
-        let batches: Vec<arrow_array::RecordBatch> =
-            ds.scan().try_into_stream().await.unwrap().try_collect().await.unwrap();
-        // Grab the latest commit_id by created_at order (the per-branch
-        // checkout ensures we only see target_branch's commits).
-        let mut latest: Option<(i64, String)> = None;
-        for batch in batches {
-            let ids = batch
-                .column_by_name("graph_commit_id").unwrap()
-                .as_any().downcast_ref::<StringArray>().unwrap();
-            let created = batch
-                .column_by_name("created_at").unwrap()
-                .as_any().downcast_ref::<arrow_array::TimestampMicrosecondArray>().unwrap();
-            for i in 0..ids.len() {
-                let ts = created.value(i);
-                if latest.as_ref().is_none_or(|(t, _)| ts > *t) {
-                    latest = Some((ts, ids.value(i).to_string()));
-                }
-            }
-        }
-        latest.expect("target_branch must have at least one commit (the insert-Bob mutate)").1
+            .entry("node:Person")
+            .expect("main must have Person")
+            .table_version
     };
+    target_parent_commit_id = branch_head_commit_id(dir.path(), "target_branch")
+        .await
+        .unwrap();
 
     // Phase A: failpoint fires after the per-table publish loop completes
     // but before commit_manifest_updates. Sidecar persists with
@@ -1031,105 +1350,31 @@ async fn branch_merge_phase_b_failure_recovered_on_non_main_target() {
         let recovery_dir = dir.path().join("__recovery");
         let sidecar_count = std::fs::read_dir(&recovery_dir).unwrap().count();
         assert_eq!(
-            sidecar_count,
-            1,
+            sidecar_count, 1,
             "exactly one sidecar must persist after non-main branch_merge failure"
         );
+        operation_id = single_sidecar_operation_id(dir.path());
     }
 
     // Phase B: reopen runs full sweep. The BranchMerge sidecar's branch
     // = Some("target_branch"); D2 fix opens a per-branch CommitGraph
     // for the audit append so the merge-parent linkage is correct.
-    let _db = Omnigraph::open(&uri).await.unwrap();
+    let db = Omnigraph::open(&uri).await.unwrap();
+    drop(db);
 
-    let recovery_dir = dir.path().join("__recovery");
-    if recovery_dir.exists() {
-        let remaining: Vec<_> = std::fs::read_dir(&recovery_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
-        assert!(
-            remaining.is_empty(),
-            "sidecar must be deleted; remaining: {:?}",
-            remaining,
-        );
-    }
-
-    // Find the recovery commit on target_branch's commit graph and
-    // assert its `parent_commit_id` matches the head we captured BEFORE
-    // the failed merge. This is what catches D2: without the
-    // per-branch CommitGraph fix, recovery records the GLOBAL head as
-    // parent, which on this test setup is the source_branch's
-    // insert-Carol commit (a different ULID), and the assertion fails.
-    //
-    // `merged_parent_commit_id` alone is insufficient — it's
-    // independently populated from sidecar.merge_source_commit_id, so
-    // it would be set correctly even with D2's bug.
-    use arrow_array::{Array, StringArray};
-    use futures::TryStreamExt;
-    let commits_dir = dir.path().join("_graph_commits.lance");
-    let ds = lance::Dataset::open(commits_dir.to_str().unwrap())
-        .await
-        .unwrap()
-        .checkout_branch("target_branch")
-        .await
-        .unwrap();
-    let batches: Vec<arrow_array::RecordBatch> = ds
-        .scan()
-        .try_into_stream()
-        .await
-        .unwrap()
-        .try_collect()
-        .await
-        .unwrap();
-    let mut recovery_merge_parent: Option<String> = None;
-    let mut recovery_merge_merged_parent: Option<String> = None;
-    for batch in batches {
-        let merged = batch
-            .column_by_name("merged_parent_commit_id")
-            .expect("merged_parent_commit_id column present")
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("merged_parent_commit_id is Utf8");
-        let parents = batch
-            .column_by_name("parent_commit_id")
-            .expect("parent_commit_id column present")
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("parent_commit_id is Utf8");
-        for i in 0..merged.len() {
-            if !merged.is_null(i) {
-                // First (and only — single recovery, single merge commit)
-                // commit with a merged parent IS the recovery commit.
-                recovery_merge_parent = if parents.is_null(i) {
-                    None
-                } else {
-                    Some(parents.value(i).to_string())
-                };
-                recovery_merge_merged_parent = Some(merged.value(i).to_string());
-                break;
-            }
-        }
-        if recovery_merge_parent.is_some() {
-            break;
-        }
-    }
-    let recovery_parent = recovery_merge_parent
-        .expect("non-main branch_merge recovery must record a merge commit with parent_commit_id");
-    assert_eq!(
-        recovery_parent, target_branch_head_before_failure,
-        "recovery merge commit's parent_commit_id must == target_branch's pre-failure head; \
-         expected {}, got {} — this would regress to the GLOBAL head if D2's per-branch \
-         CommitGraph::open_at_branch fix were removed",
-        target_branch_head_before_failure, recovery_parent,
-    );
-    // Sanity: merged_parent is set from the source branch (independent
-    // of D2; would be correct even with the bug, but we still verify
-    // it's non-null so the row is a true merge commit).
-    assert!(
-        recovery_merge_merged_parent.is_some(),
-        "recovery merge commit must have non-null merged_parent_commit_id"
-    );
+    assert_post_recovery_invariants(
+        dir.path(),
+        &operation_id,
+        RecoveryExpectation::RolledForward {
+            tables: vec![
+                TableExpectation::branch("node:Person", "target_branch")
+                    .expected_main_manifest_pin(main_person_pin)
+                    .expected_recovery_parent_commit_id(target_parent_commit_id),
+            ],
+        },
+    )
+    .await
+    .unwrap();
 }
 
 /// `ensure_indices` only writes a sidecar when at least one table
@@ -1180,10 +1425,8 @@ async fn ensure_indices_phase_b_failure_does_not_leak_sidecar_when_no_work_neede
     // still fires, surfacing the Err.
     {
         let mut db = Omnigraph::open(&uri).await.unwrap();
-        let _failpoint = ScopedFailPoint::new(
-            "ensure_indices.post_phase_b_pre_manifest_commit",
-            "return",
-        );
+        let _failpoint =
+            ScopedFailPoint::new("ensure_indices.post_phase_b_pre_manifest_commit", "return");
         let err = db.ensure_indices().await.unwrap_err();
         assert!(
             err.to_string().contains(

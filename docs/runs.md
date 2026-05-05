@@ -176,10 +176,13 @@ recovery sweep in `crates/omnigraph/src/db/manifest/recovery.rs`:
   sidecar on disk for operator review.
 - Otherwise, if every table is `RolledPastExpected`, **roll forward**:
   a single `ManifestBatchPublisher::publish` call extends every pin
-  atomically.
+  atomically. `SchemaApply` sidecars are eligible only when schema-state
+  recovery promoted the matching staging files in the same recovery pass;
+  otherwise full open-time recovery rolls them back and refresh-time
+  recovery leaves them for the next read-write open.
 - Otherwise **roll back**: per-table `Dataset::restore` to the
-  expected_version (with a fragment-set short-circuit so repeated
-  mid-sweep crashes don't pile up versions).
+  manifest-pinned table version for that branch. Rollback records the
+  actual restore target in the audit row's `to_version`.
 - After a successful roll-forward or roll-back, an audit row is
   recorded — `_graph_commits.lance` carries
   a commit tagged `actor_id = "omnigraph:recovery"`, and a sibling

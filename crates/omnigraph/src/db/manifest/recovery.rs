@@ -15,7 +15,7 @@
 //!    `OpenMode::ReadWrite`) classifies each table in each sidecar and
 //!    either rolls forward all tables (if every table is at
 //!    `post_commit_pin` AND matches the sidecar) or rolls back all
-//!    `RolledPastExpected` tables to `expected_version`.
+//!    drifted tables to the manifest-pinned version.
 //!
 //! ## Verified Lance behavior the rollback path depends on
 //!
@@ -42,8 +42,9 @@ use tracing::warn;
 use crate::db::commit_graph::CommitGraph;
 use crate::db::graph_coordinator::GraphCoordinator;
 use crate::db::recovery_audit::{
-    now_micros, RecoveryAudit, RecoveryAuditRecord, RecoveryKind, TableOutcome,
+    RecoveryAudit, RecoveryAuditRecord, RecoveryKind, TableOutcome, now_micros,
 };
+use crate::db::schema_state::SchemaStateRecovery;
 use crate::error::{OmniError, Result};
 use crate::storage::StorageAdapter;
 
@@ -209,12 +210,11 @@ pub(crate) enum TableClassification {
     RolledPastExpected,
     /// `lance_head == manifest_pinned + 1` but the sidecar's
     /// `expected_version`/`post_commit_pin` don't match. Some other writer
-    /// or recovery action moved this table. Roll back to
-    /// `sidecar.expected_version`.
+    /// or recovery action moved this table. Roll back to the manifest pin.
     UnexpectedAtP1,
     /// `lance_head > manifest_pinned + 1`. Multi-step orphan from a
     /// previous restore attempt or an external mutation. Roll back to
-    /// `sidecar.expected_version`.
+    /// the manifest pin.
     UnexpectedMultistep,
     /// `lance_head < manifest_pinned`. Should be impossible: the manifest
     /// pin can only advance after a successful Lance commit. Surface
@@ -231,7 +231,7 @@ pub(crate) enum TableClassification {
 ///
 /// - Any `InvariantViolation` → `Abort` (operator action required).
 /// - Any `UnexpectedAtP1` / `UnexpectedMultistep` / `NoMovement` →
-///   `RollBack` all `RolledPastExpected` tables to `expected_version`.
+///   `RollBack` all drifted tables to the manifest pin.
 /// - All `RolledPastExpected` → `RollForward` every table in one
 ///   manifest publish.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -419,7 +419,10 @@ pub(crate) fn classify_table(
 pub(crate) fn decide(classifications: &[TableClassification]) -> SidecarDecision {
     use SidecarDecision::*;
     use TableClassification::*;
-    if classifications.iter().any(|c| matches!(c, InvariantViolation { .. })) {
+    if classifications
+        .iter()
+        .any(|c| matches!(c, InvariantViolation { .. }))
+    {
         return Abort;
     }
     if classifications
@@ -432,8 +435,8 @@ pub(crate) fn decide(classifications: &[TableClassification]) -> SidecarDecision
     RollForward
 }
 
-/// Restore a single table's Lance HEAD to `expected_version`, producing a
-/// new commit at HEAD+1 with content == content-at-`expected_version`.
+/// Restore a single table's Lance HEAD to `target_version`, producing a
+/// new commit at HEAD+1 with content == content-at-`target_version`.
 ///
 /// Always runs the actual `Dataset::restore` — there is NO fragment-set
 /// short-circuit because equal fragment IDs do NOT imply equal content:
@@ -448,7 +451,7 @@ pub(crate) fn decide(classifications: &[TableClassification]) -> SidecarDecision
 pub(crate) async fn restore_table_to_version(
     table_path: &str,
     branch: Option<&str>,
-    expected_version: u64,
+    target_version: u64,
 ) -> Result<()> {
     let head = Dataset::open(table_path)
         .await
@@ -461,7 +464,7 @@ pub(crate) async fn restore_table_to_version(
         _ => head,
     };
     let mut to_restore = head
-        .checkout_version(expected_version)
+        .checkout_version(target_version)
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
     to_restore
@@ -494,6 +497,7 @@ pub(crate) async fn recover_manifest_drift(
     storage: std::sync::Arc<dyn StorageAdapter>,
     coordinator: &mut GraphCoordinator,
     mode: RecoveryMode,
+    schema_state_recovery: SchemaStateRecovery,
 ) -> Result<()> {
     let sidecars = list_sidecars(root_uri, storage.as_ref()).await?;
     if sidecars.is_empty() {
@@ -514,12 +518,9 @@ pub(crate) async fn recover_manifest_drift(
     for sidecar in sidecars {
         let branch_snapshot = match sidecar.branch.as_deref() {
             Some(b) => {
-                let mut branch_coord = GraphCoordinator::open_branch(
-                    root_uri,
-                    b,
-                    std::sync::Arc::clone(&storage),
-                )
-                .await?;
+                let mut branch_coord =
+                    GraphCoordinator::open_branch(root_uri, b, std::sync::Arc::clone(&storage))
+                        .await?;
                 branch_coord.refresh().await?;
                 branch_coord.snapshot()
             }
@@ -528,8 +529,15 @@ pub(crate) async fn recover_manifest_drift(
                 coordinator.snapshot()
             }
         };
-        process_sidecar(root_uri, storage.as_ref(), &branch_snapshot, &sidecar, mode)
-            .await?;
+        process_sidecar(
+            root_uri,
+            storage.as_ref(),
+            &branch_snapshot,
+            &sidecar,
+            mode,
+            schema_state_recovery,
+        )
+        .await?;
     }
     // Final refresh so the caller sees the post-sweep state.
     coordinator.refresh().await?;
@@ -542,22 +550,24 @@ async fn process_sidecar(
     snapshot: &Snapshot,
     sidecar: &RecoverySidecar,
     mode: RecoveryMode,
+    schema_state_recovery: SchemaStateRecovery,
 ) -> Result<()> {
-    let mut classifications = Vec::with_capacity(sidecar.tables.len());
+    let mut states = Vec::with_capacity(sidecar.tables.len());
     for pin in &sidecar.tables {
-        let lance_head =
-            open_lance_head(&pin.table_path, pin.table_branch.as_deref()).await?;
+        let lance_head = open_lance_head(&pin.table_path, pin.table_branch.as_deref()).await?;
         let manifest_pinned = snapshot
             .entry(&pin.table_key)
             .map(|e| e.table_version)
             .unwrap_or(0);
-        classifications.push(classify_table(
-            pin,
-            lance_head,
+        states.push(ClassifiedTable {
+            classification: classify_table(pin, lance_head, manifest_pinned, sidecar.writer_kind),
             manifest_pinned,
-            sidecar.writer_kind,
-        ));
+        });
     }
+    let classifications = states
+        .iter()
+        .map(|state| state.classification)
+        .collect::<Vec<_>>();
 
     match decide(&classifications) {
         SidecarDecision::Abort => match mode {
@@ -605,51 +615,31 @@ async fn process_sidecar(
                 writer_kind = ?sidecar.writer_kind,
                 "recovery: rolling back sidecar (mixed or unexpected state)"
             );
-            // Restore every table whose Lance HEAD has drifted from the
-            // manifest pin (RolledPastExpected, UnexpectedAtP1,
-            // UnexpectedMultistep). NoMovement tables are already at
-            // expected_version — no action. Restore is unconditional;
-            // repeated mid-rollback crashes accumulate a few extra
-            // Lance commits that `omnigraph cleanup` reclaims.
-            let mut outcomes = Vec::with_capacity(sidecar.tables.len());
-            for (pin, cls) in sidecar.tables.iter().zip(classifications.iter()) {
-                if matches!(
-                    cls,
-                    TableClassification::RolledPastExpected
-                        | TableClassification::UnexpectedAtP1
-                        | TableClassification::UnexpectedMultistep
-                ) {
-                    restore_table_to_version(
-                        &pin.table_path,
-                        pin.table_branch.as_deref(),
-                        pin.expected_version,
-                    )
-                    .await?;
-                    outcomes.push(TableOutcome {
-                        table_key: pin.table_key.clone(),
-                        from_version: snapshot
-                            .entry(&pin.table_key)
-                            .map(|e| e.table_version)
-                            .unwrap_or(0),
-                        to_version: pin.expected_version,
-                    });
-                }
-            }
-            // Manifest pin doesn't move on rollback; record an audit-only
-            // commit at the existing version so operators can correlate via
-            // `omnigraph commit list --filter actor=omnigraph:recovery`.
-            record_audit(
-                root_uri,
-                sidecar,
-                snapshot.version(),
-                RecoveryKind::RolledBack,
-                outcomes,
-            )
-            .await?;
-            delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
-            Ok(())
+            roll_back_sidecar(root_uri, storage, snapshot, sidecar, &states).await
         }
         SidecarDecision::RollForward => {
+            if matches!(sidecar.writer_kind, SidecarKind::SchemaApply)
+                && !schema_state_recovery.completed_schema_apply_sidecar_rename()
+            {
+                return match mode {
+                    RecoveryMode::Full => {
+                        warn!(
+                            operation_id = sidecar.operation_id.as_str(),
+                            "recovery: rolling back SchemaApply sidecar because schema staging \
+                             files were not promoted in this recovery pass"
+                        );
+                        roll_back_sidecar(root_uri, storage, snapshot, sidecar, &states).await
+                    }
+                    RecoveryMode::RollForwardOnly => {
+                        warn!(
+                            operation_id = sidecar.operation_id.as_str(),
+                            "recovery: deferring SchemaApply sidecar because schema staging files \
+                             were not promoted in this recovery pass"
+                        );
+                        Ok(())
+                    }
+                };
+            }
             warn!(
                 operation_id = sidecar.operation_id.as_str(),
                 writer_kind = ?sidecar.writer_kind,
@@ -688,6 +678,64 @@ async fn process_sidecar(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ClassifiedTable {
+    classification: TableClassification,
+    manifest_pinned: u64,
+}
+
+async fn roll_back_sidecar(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    snapshot: &Snapshot,
+    sidecar: &RecoverySidecar,
+    states: &[ClassifiedTable],
+) -> Result<()> {
+    // Restore every table whose Lance HEAD has drifted from the
+    // manifest pin (RolledPastExpected, UnexpectedAtP1,
+    // UnexpectedMultistep). NoMovement tables are already at the
+    // manifest pin — no action. Restore is unconditional; repeated
+    // mid-rollback crashes accumulate a few extra Lance commits that
+    // `omnigraph cleanup` reclaims.
+    let mut outcomes = Vec::with_capacity(sidecar.tables.len());
+    for (pin, state) in sidecar.tables.iter().zip(states.iter()) {
+        if matches!(
+            state.classification,
+            TableClassification::RolledPastExpected
+                | TableClassification::UnexpectedAtP1
+                | TableClassification::UnexpectedMultistep
+        ) {
+            restore_table_to_version(
+                &pin.table_path,
+                pin.table_branch.as_deref(),
+                state.manifest_pinned,
+            )
+            .await?;
+            outcomes.push(TableOutcome {
+                table_key: pin.table_key.clone(),
+                from_version: snapshot
+                    .entry(&pin.table_key)
+                    .map(|e| e.table_version)
+                    .unwrap_or(0),
+                to_version: state.manifest_pinned,
+            });
+        }
+    }
+    // Manifest pin doesn't move on rollback; record an audit-only
+    // commit at the existing version so operators can correlate via
+    // `omnigraph commit list --filter actor=omnigraph:recovery`.
+    record_audit(
+        root_uri,
+        sidecar,
+        snapshot.version(),
+        RecoveryKind::RolledBack,
+        outcomes,
+    )
+    .await?;
+    delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
+    Ok(())
+}
+
 /// Atomically extend every table's manifest pin from `expected_version` to
 /// `post_commit_pin` via a single `ManifestBatchPublisher::publish` call.
 /// Returns the new manifest version produced by the publish.
@@ -710,8 +758,7 @@ async fn roll_forward_all(
 ) -> Result<(u64, HashMap<String, u64>)> {
     let mut updates: Vec<ManifestChange> = Vec::with_capacity(sidecar.tables.len());
     let mut expected: HashMap<String, u64> = HashMap::with_capacity(sidecar.tables.len());
-    let mut published_versions: HashMap<String, u64> =
-        HashMap::with_capacity(sidecar.tables.len());
+    let mut published_versions: HashMap<String, u64> = HashMap::with_capacity(sidecar.tables.len());
 
     for pin in &sidecar.tables {
         // Open the dataset at its CURRENT Lance HEAD on the pin's branch
@@ -738,12 +785,11 @@ async fn roll_forward_all(
             .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
 
         let table_relative_path = super::table_path_for_table_key(&pin.table_key)?;
-        let version_metadata =
-            super::metadata::TableVersionMetadata::from_dataset(
-                root_uri,
-                &table_relative_path,
-                &head_ds,
-            )?;
+        let version_metadata = super::metadata::TableVersionMetadata::from_dataset(
+            root_uri,
+            &table_relative_path,
+            &head_ds,
+        )?;
 
         updates.push(ManifestChange::Update(SubTableUpdate {
             table_key: pin.table_key.clone(),
@@ -779,33 +825,26 @@ async fn record_audit(
     kind: RecoveryKind,
     outcomes: Vec<TableOutcome>,
 ) -> Result<()> {
-    // BranchMerge sidecars carry the source branch's HEAD commit id so
-    // recovery can record this as a MERGE commit (with parent linkage)
-    // instead of a plain commit. Without the merge parent, future
-    // `branch_merge feature → main` between the same pair would not
-    // recognize "already up-to-date" and merge-base computations break.
-    //
-    // For BranchMerge on a non-main target, the parent commit id is the
-    // TARGET BRANCH's tip — `CommitGraph::open()` returns the global
-    // commit graph whose `head_commit_id()` is the global head and would
-    // record the wrong parent. Open the per-branch instance instead.
+    // Non-main recovery commits must be appended on the sidecar branch's
+    // commit graph, otherwise parent_commit_id comes from the global
+    // main head. BranchMerge additionally records the source branch's
+    // HEAD as merged_parent_commit_id so future merges between the same
+    // pair recognize "already up-to-date".
+    let target_branch = sidecar.branch.as_deref();
+    let mut graph = match target_branch {
+        Some(branch) => CommitGraph::open_at_branch(root_uri, branch).await?,
+        None => CommitGraph::open(root_uri).await?,
+    };
     let graph_commit_id = match (
         sidecar.writer_kind,
         sidecar.merge_source_commit_id.as_deref(),
         kind,
     ) {
         (SidecarKind::BranchMerge, Some(source_id), RecoveryKind::RolledForward) => {
-            let mut branch_graph = match sidecar.branch.as_deref() {
-                Some(target_branch) => {
-                    CommitGraph::open_at_branch(root_uri, target_branch).await?
-                }
-                None => CommitGraph::open(root_uri).await?,
-            };
-            let parent_commit_id =
-                branch_graph.head_commit_id().await?.unwrap_or_default();
-            branch_graph
+            let parent_commit_id = graph.head_commit_id().await?.unwrap_or_default();
+            graph
                 .append_merge_commit(
-                    sidecar.branch.as_deref(),
+                    target_branch,
                     manifest_version,
                     &parent_commit_id,
                     source_id,
@@ -814,13 +853,8 @@ async fn record_audit(
                 .await?
         }
         _ => {
-            let mut graph = CommitGraph::open(root_uri).await?;
             graph
-                .append_commit(
-                    sidecar.branch.as_deref(),
-                    manifest_version,
-                    Some(RECOVERY_ACTOR),
-                )
+                .append_commit(target_branch, manifest_version, Some(RECOVERY_ACTOR))
                 .await?
         }
     };
@@ -915,11 +949,11 @@ pub(crate) fn new_sidecar(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use arrow_array::{Int32Array, RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
     use crate::storage::LocalStorageAdapter;
     use crate::table_store::TableStore;
+    use arrow_array::{Int32Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
 
     fn person_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -1183,11 +1217,10 @@ mod tests {
         assert_eq!(post.version().version, head_before + 1);
         // Content matches v1 (just alice).
         let scanner = post.scan();
-        let batches: Vec<RecordBatch> = futures::TryStreamExt::try_collect(
-            scanner.try_into_stream().await.unwrap(),
-        )
-        .await
-        .unwrap();
+        let batches: Vec<RecordBatch> =
+            futures::TryStreamExt::try_collect(scanner.try_into_stream().await.unwrap())
+                .await
+                .unwrap();
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 1);
     }
@@ -1295,7 +1328,11 @@ mod tests {
         // Write sidecars in REVERSE chronological order (newest first).
         // The classifier shouldn't care, but the sweep needs deterministic
         // processing for reproducibility.
-        let ids = ["01H000000000000000000000ZZ", "01H000000000000000000000MM", "01H000000000000000000000AA"];
+        let ids = [
+            "01H000000000000000000000ZZ",
+            "01H000000000000000000000MM",
+            "01H000000000000000000000AA",
+        ];
         for id in &ids {
             let sc = new_sidecar(
                 SidecarKind::Mutation,

@@ -1,0 +1,559 @@
+use std::path::{Path, PathBuf};
+
+use arrow_array::{Array, RecordBatch, StringArray};
+use futures::TryStreamExt;
+use lance::Dataset;
+use omnigraph::db::commit_graph::CommitGraph;
+use omnigraph::db::{GraphCommit, Omnigraph, ReadTarget, SubTableEntry};
+use omnigraph::error::{OmniError, Result};
+use omnigraph_compiler::ir::ParamMap;
+use serde::Deserialize;
+
+const RECOVERY_ACTOR: &str = "omnigraph:recovery";
+
+#[derive(Debug)]
+pub enum RecoveryExpectation {
+    RolledForward { tables: Vec<TableExpectation> },
+    RolledBack { tables: Vec<TableExpectation> },
+    Deferred,
+    NoOp,
+}
+
+#[derive(Debug)]
+pub struct TableExpectation {
+    pub table_key: String,
+    pub branch: Option<String>,
+    pub expected_lance_head: Option<u64>,
+    pub expected_main_manifest_pin: Option<u64>,
+    pub expected_recovery_parent_commit_id: Option<String>,
+    pub follow_up_mutation: Option<FollowUpMutation>,
+}
+
+#[derive(Debug)]
+pub struct FollowUpMutation {
+    pub branch: String,
+    pub query_source: String,
+    pub query_name: String,
+    pub params: ParamMap,
+}
+
+#[derive(Debug, Clone)]
+struct RecoveryAuditRow {
+    graph_commit_id: String,
+    recovery_kind: String,
+    operation_id: String,
+    sidecar_writer_kind: String,
+    per_table_outcomes: Vec<TableOutcome>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TableOutcome {
+    table_key: String,
+    to_version: u64,
+}
+
+impl TableExpectation {
+    pub fn main(table_key: impl Into<String>) -> Self {
+        Self::new(table_key, None::<String>)
+    }
+
+    pub fn branch(table_key: impl Into<String>, branch: impl Into<String>) -> Self {
+        Self::new(table_key, Some(branch))
+    }
+
+    pub fn new(table_key: impl Into<String>, branch: Option<impl Into<String>>) -> Self {
+        Self {
+            table_key: table_key.into(),
+            branch: branch.map(Into::into),
+            expected_lance_head: None,
+            expected_main_manifest_pin: None,
+            expected_recovery_parent_commit_id: None,
+            follow_up_mutation: None,
+        }
+    }
+
+    pub fn expected_lance_head(mut self, version: u64) -> Self {
+        self.expected_lance_head = Some(version);
+        self
+    }
+
+    pub fn expected_main_manifest_pin(mut self, version: u64) -> Self {
+        self.expected_main_manifest_pin = Some(version);
+        self
+    }
+
+    pub fn expected_recovery_parent_commit_id(mut self, commit_id: impl Into<String>) -> Self {
+        self.expected_recovery_parent_commit_id = Some(commit_id.into());
+        self
+    }
+
+    pub fn follow_up_mutation(mut self, mutation: FollowUpMutation) -> Self {
+        self.follow_up_mutation = Some(mutation);
+        self
+    }
+}
+
+impl FollowUpMutation {
+    pub fn new(
+        branch: impl Into<String>,
+        query_source: impl Into<String>,
+        query_name: impl Into<String>,
+        params: ParamMap,
+    ) -> Self {
+        Self {
+            branch: branch.into(),
+            query_source: query_source.into(),
+            query_name: query_name.into(),
+            params,
+        }
+    }
+}
+
+pub fn single_sidecar_operation_id(repo_root: &Path) -> String {
+    let ids = sidecar_operation_ids(repo_root);
+    assert_eq!(
+        ids.len(),
+        1,
+        "expected exactly one recovery sidecar under __recovery/, got {:?}",
+        ids,
+    );
+    ids.into_iter().next().unwrap()
+}
+
+pub fn sidecar_operation_ids(repo_root: &Path) -> Vec<String> {
+    let dir = repo_root.join("__recovery");
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let mut ids = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                return None;
+            }
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids
+}
+
+pub async fn branch_head_commit_id(repo_root: &Path, branch: &str) -> Result<String> {
+    let graph = match branch {
+        "main" => CommitGraph::open(&repo_uri(repo_root)).await?,
+        branch => CommitGraph::open_at_branch(&repo_uri(repo_root), branch).await?,
+    };
+    graph.head_commit_id().await?.ok_or_else(|| {
+        OmniError::manifest_internal(format!("commit graph for branch {branch} has no head"))
+    })
+}
+
+pub async fn assert_post_recovery_invariants(
+    repo_root: &Path,
+    operation_id: &str,
+    expectation: RecoveryExpectation,
+) -> Result<()> {
+    match expectation {
+        RecoveryExpectation::RolledForward { tables } => {
+            assert_sidecar_absent(repo_root, operation_id);
+            let audit = read_audit_row(repo_root, operation_id).await?;
+            assert_eq!(
+                audit.recovery_kind, "RolledForward",
+                "audit row for {operation_id} recorded the wrong recovery_kind",
+            );
+            assert_manifest_pins_match_lance_heads(repo_root, &tables).await?;
+            assert_audit_to_versions_match_lance_heads(repo_root, &audit, &tables).await?;
+            assert_recovery_commit_shape(repo_root, &audit, &tables).await?;
+            assert_non_main_did_not_move_main(repo_root, &tables).await?;
+            assert_idempotent_reopen(repo_root, operation_id).await?;
+            run_follow_up_mutations(repo_root, tables).await?;
+        }
+        RecoveryExpectation::RolledBack { tables } => {
+            assert_sidecar_absent(repo_root, operation_id);
+            let audit = read_audit_row(repo_root, operation_id).await?;
+            assert_eq!(
+                audit.recovery_kind, "RolledBack",
+                "audit row for {operation_id} recorded the wrong recovery_kind",
+            );
+            assert_recovery_commit_shape(repo_root, &audit, &tables).await?;
+            assert_non_main_did_not_move_main(repo_root, &tables).await?;
+            assert_idempotent_reopen(repo_root, operation_id).await?;
+            run_follow_up_mutations(repo_root, tables).await?;
+        }
+        RecoveryExpectation::Deferred => {
+            assert!(
+                sidecar_path(repo_root, operation_id).exists(),
+                "deferred recovery must leave sidecar {operation_id} on disk",
+            );
+            assert!(
+                read_audit_row(repo_root, operation_id).await.is_err(),
+                "deferred recovery must not record an audit row for {operation_id}",
+            );
+        }
+        RecoveryExpectation::NoOp => {
+            assert_sidecar_absent(repo_root, operation_id);
+            assert!(
+                read_audit_row(repo_root, operation_id).await.is_err(),
+                "no-op recovery must not record an audit row for {operation_id}",
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn branch_context(tables: &[TableExpectation]) -> Option<String> {
+    tables
+        .iter()
+        .filter_map(|table| table.branch.as_deref())
+        .find(|branch| *branch != "main")
+        .map(str::to_string)
+}
+
+fn sidecar_path(repo_root: &Path, operation_id: &str) -> PathBuf {
+    repo_root
+        .join("__recovery")
+        .join(format!("{operation_id}.json"))
+}
+
+fn assert_sidecar_absent(repo_root: &Path, operation_id: &str) {
+    assert!(
+        !sidecar_path(repo_root, operation_id).exists(),
+        "recovery sidecar {operation_id} must be deleted after successful recovery",
+    );
+}
+
+async fn assert_manifest_pins_match_lance_heads(
+    repo_root: &Path,
+    tables: &[TableExpectation],
+) -> Result<()> {
+    let uri = repo_uri(repo_root);
+    let db = Omnigraph::open(&uri).await?;
+    for table in tables {
+        let (entry, lance_head) = entry_and_lance_head(&db, &uri, table).await?;
+        assert_eq!(
+            entry.table_version, lance_head,
+            "manifest pin for {} on {:?} must match Lance HEAD after roll-forward",
+            table.table_key, table.branch,
+        );
+        if let Some(expected) = table.expected_lance_head {
+            assert_eq!(
+                lance_head, expected,
+                "Lance HEAD for {} on {:?} did not match the test's expected value",
+                table.table_key, table.branch,
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn assert_audit_to_versions_match_lance_heads(
+    repo_root: &Path,
+    audit: &RecoveryAuditRow,
+    tables: &[TableExpectation],
+) -> Result<()> {
+    let uri = repo_uri(repo_root);
+    let db = Omnigraph::open(&uri).await?;
+    for table in tables {
+        let (_, lance_head) = entry_and_lance_head(&db, &uri, table).await?;
+        let outcome = audit
+            .per_table_outcomes
+            .iter()
+            .find(|outcome| outcome.table_key == table.table_key)
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "audit row for {} has no outcome for {}",
+                    audit.operation_id, table.table_key,
+                ))
+            })?;
+        assert_eq!(
+            outcome.to_version, lance_head,
+            "audit to_version for {} must match the published Lance HEAD",
+            table.table_key,
+        );
+    }
+    Ok(())
+}
+
+async fn assert_non_main_did_not_move_main(
+    repo_root: &Path,
+    tables: &[TableExpectation],
+) -> Result<()> {
+    let uri = repo_uri(repo_root);
+    let db = Omnigraph::open(&uri).await?;
+    let main = db.snapshot_of(ReadTarget::branch("main")).await?;
+    for table in tables {
+        let Some(expected) = table.expected_main_manifest_pin else {
+            continue;
+        };
+        let entry = main.entry(&table.table_key).ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "main snapshot has no entry for {}",
+                table.table_key,
+            ))
+        })?;
+        assert_eq!(
+            entry.table_version, expected,
+            "non-main recovery for {} on {:?} must not move main's manifest pin",
+            table.table_key, table.branch,
+        );
+    }
+    Ok(())
+}
+
+async fn assert_recovery_commit_shape(
+    repo_root: &Path,
+    audit: &RecoveryAuditRow,
+    tables: &[TableExpectation],
+) -> Result<()> {
+    let branch = branch_context(tables);
+    let expected_parent = expected_recovery_parent(tables)?;
+    let branch = branch.as_deref();
+    let commit = read_recovery_commit(repo_root, audit, branch).await?;
+
+    assert_eq!(
+        commit.actor_id.as_deref(),
+        Some(RECOVERY_ACTOR),
+        "recovery commit {} for operation {} must use actor {}",
+        commit.graph_commit_id,
+        audit.operation_id,
+        RECOVERY_ACTOR,
+    );
+
+    if let Some(expected_parent) = expected_parent {
+        assert_eq!(
+            commit.parent_commit_id.as_deref(),
+            Some(expected_parent.as_str()),
+            "recovery commit {} for operation {} recorded the wrong parent",
+            commit.graph_commit_id,
+            audit.operation_id,
+        );
+    }
+
+    if audit.sidecar_writer_kind == "BranchMerge" {
+        assert!(
+            commit.merged_parent_commit_id.is_some(),
+            "recovered BranchMerge must record merged_parent_commit_id",
+        );
+
+        if let Some(branch) = branch {
+            let graph = CommitGraph::open_at_branch(&repo_uri(repo_root), branch).await?;
+            let commits = graph.load_commits().await?;
+            let parent = commit.parent_commit_id.as_deref().ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "recovered BranchMerge commit {} has no parent_commit_id",
+                    commit.graph_commit_id,
+                ))
+            })?;
+            assert!(
+                commits
+                    .iter()
+                    .any(|candidate| candidate.graph_commit_id == parent),
+                "recovered BranchMerge parent_commit_id {} is not on target branch {}",
+                parent,
+                branch,
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn expected_recovery_parent(tables: &[TableExpectation]) -> Result<Option<String>> {
+    let mut expected = None;
+    for table in tables {
+        let Some(candidate) = &table.expected_recovery_parent_commit_id else {
+            continue;
+        };
+        match &expected {
+            None => expected = Some(candidate.clone()),
+            Some(existing) if existing == candidate => {}
+            Some(existing) => {
+                return Err(OmniError::manifest_internal(format!(
+                    "conflicting expected recovery parents in table expectations: {existing} vs {candidate}",
+                )));
+            }
+        }
+    }
+    Ok(expected)
+}
+
+async fn assert_idempotent_reopen(repo_root: &Path, operation_id: &str) -> Result<()> {
+    let before = matching_audit_rows(repo_root, operation_id).await?;
+    let uri = repo_uri(repo_root);
+    let _db = Omnigraph::open(&uri).await?;
+    assert_sidecar_absent(repo_root, operation_id);
+    let after = matching_audit_rows(repo_root, operation_id).await?;
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "immediate reopen after recovery must be a clean no-op for {operation_id}",
+    );
+    Ok(())
+}
+
+async fn run_follow_up_mutations(repo_root: &Path, tables: Vec<TableExpectation>) -> Result<()> {
+    let mut db: Option<Omnigraph> = None;
+    for table in tables {
+        let Some(mutation) = table.follow_up_mutation else {
+            continue;
+        };
+        if db.is_none() {
+            db = Some(Omnigraph::open(&repo_uri(repo_root)).await?);
+        }
+        let db = db.as_mut().unwrap();
+        db.mutate(
+            &mutation.branch,
+            &mutation.query_source,
+            &mutation.query_name,
+            &mutation.params,
+        )
+        .await
+        .map_err(|err| {
+            OmniError::manifest_internal(format!(
+                "follow-up mutation {} on {} after recovery failed: {}",
+                mutation.query_name, table.table_key, err,
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+async fn entry_and_lance_head(
+    db: &Omnigraph,
+    root_uri: &str,
+    table: &TableExpectation,
+) -> Result<(SubTableEntry, u64)> {
+    let branch = table.branch.as_deref().unwrap_or("main");
+    let snapshot = db.snapshot_of(ReadTarget::branch(branch)).await?;
+    let entry = snapshot
+        .entry(&table.table_key)
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "snapshot for branch {branch} has no entry for {}",
+                table.table_key,
+            ))
+        })?
+        .clone();
+    let lance_head = lance_head_for_entry(root_uri, &entry).await?;
+    Ok((entry, lance_head))
+}
+
+async fn lance_head_for_entry(root_uri: &str, entry: &SubTableEntry) -> Result<u64> {
+    let table_uri = format!("{}/{}", root_uri.trim_end_matches('/'), entry.table_path);
+    let ds = Dataset::open(&table_uri)
+        .await
+        .map_err(|err| OmniError::Lance(err.to_string()))?;
+    let ds = match entry.table_branch.as_deref() {
+        Some(branch) if branch != "main" => ds
+            .checkout_branch(branch)
+            .await
+            .map_err(|err| OmniError::Lance(err.to_string()))?,
+        _ => ds,
+    };
+    Ok(ds.version().version)
+}
+
+async fn read_recovery_commit(
+    repo_root: &Path,
+    audit: &RecoveryAuditRow,
+    branch: Option<&str>,
+) -> Result<GraphCommit> {
+    let uri = repo_uri(repo_root);
+    let graph = match branch {
+        Some(branch) => CommitGraph::open_at_branch(&uri, branch).await?,
+        None => CommitGraph::open(&uri).await?,
+    };
+    graph
+        .load_commits()
+        .await?
+        .into_iter()
+        .find(|commit| commit.graph_commit_id == audit.graph_commit_id)
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "recovery commit {} for operation {} was not found",
+                audit.graph_commit_id, audit.operation_id,
+            ))
+        })
+}
+
+async fn read_audit_row(repo_root: &Path, operation_id: &str) -> Result<RecoveryAuditRow> {
+    let mut rows = matching_audit_rows(repo_root, operation_id).await?;
+    if rows.len() != 1 {
+        return Err(OmniError::manifest_internal(format!(
+            "expected exactly one recovery audit row for {operation_id}, got {}",
+            rows.len(),
+        )));
+    }
+    Ok(rows.remove(0))
+}
+
+async fn matching_audit_rows(
+    repo_root: &Path,
+    operation_id: &str,
+) -> Result<Vec<RecoveryAuditRow>> {
+    let recoveries_dir = repo_root.join("_graph_commit_recoveries.lance");
+    if !recoveries_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let ds = Dataset::open(recoveries_dir.to_str().unwrap())
+        .await
+        .map_err(|err| OmniError::Lance(err.to_string()))?;
+    let batches: Vec<RecordBatch> = ds
+        .scan()
+        .try_into_stream()
+        .await
+        .map_err(|err| OmniError::Lance(err.to_string()))?
+        .try_collect()
+        .await
+        .map_err(|err| OmniError::Lance(err.to_string()))?;
+
+    let mut rows = Vec::new();
+    for batch in batches {
+        let graph_commit_ids = string_column(&batch, "graph_commit_id")?;
+        let kinds = string_column(&batch, "recovery_kind")?;
+        let ops = string_column(&batch, "operation_id")?;
+        let writers = string_column(&batch, "sidecar_writer_kind")?;
+        let outcomes_json = string_column(&batch, "per_table_outcomes_json")?;
+        for row in 0..batch.num_rows() {
+            if ops.value(row) != operation_id {
+                continue;
+            }
+            let per_table_outcomes =
+                serde_json::from_str(outcomes_json.value(row)).map_err(|err| {
+                    OmniError::manifest_internal(format!(
+                        "failed to parse recovery audit outcomes for {operation_id}: {err}",
+                    ))
+                })?;
+            rows.push(RecoveryAuditRow {
+                graph_commit_id: graph_commit_ids.value(row).to_string(),
+                recovery_kind: kinds.value(row).to_string(),
+                operation_id: ops.value(row).to_string(),
+                sidecar_writer_kind: writers.value(row).to_string(),
+                per_table_outcomes,
+            });
+        }
+    }
+    Ok(rows)
+}
+
+fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!("recovery audit batch missing '{name}'"))
+        })?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!("recovery audit column '{name}' is not Utf8"))
+        })
+}
+
+fn repo_uri(repo_root: &Path) -> String {
+    repo_root.to_str().unwrap().to_string()
+}

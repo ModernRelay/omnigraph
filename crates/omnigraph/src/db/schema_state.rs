@@ -285,6 +285,24 @@ fn schema_lock_conflict(detail: impl Into<String>) -> OmniError {
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SchemaStateRecovery {
+    Noop,
+    CleanedStaging,
+    CompletedStagingRename { schema_apply_sidecar: bool },
+}
+
+impl SchemaStateRecovery {
+    pub(crate) fn completed_schema_apply_sidecar_rename(self) -> bool {
+        matches!(
+            self,
+            Self::CompletedStagingRename {
+                schema_apply_sidecar: true,
+            }
+        )
+    }
+}
+
 /// Reconcile leftover schema staging files (`_schema.pg.staging`,
 /// `_schema.ir.json.staging`, `__schema_state.json.staging`) against the
 /// manifest snapshot.
@@ -306,7 +324,7 @@ pub(crate) async fn recover_schema_state_files(
     root_uri: &str,
     storage: Arc<dyn StorageAdapter>,
     snapshot: &Snapshot,
-) -> Result<()> {
+) -> Result<SchemaStateRecovery> {
     let pg_staging = schema_source_staging_uri(root_uri);
     let ir_staging = schema_ir_staging_uri(root_uri);
     let state_staging = schema_state_staging_uri(root_uri);
@@ -316,7 +334,7 @@ pub(crate) async fn recover_schema_state_files(
     let state_exists = storage.exists(&state_staging).await?;
 
     if !pg_exists && !ir_exists && !state_exists {
-        return Ok(());
+        return Ok(SchemaStateRecovery::Noop);
     }
 
     // Schema-apply atomicity: when a SchemaApply sidecar is present,
@@ -335,7 +353,9 @@ pub(crate) async fn recover_schema_state_files(
             snapshot.version()
         );
         complete_staging_rename(root_uri, storage.as_ref()).await?;
-        return Ok(());
+        return Ok(SchemaStateRecovery::CompletedStagingRename {
+            schema_apply_sidecar: true,
+        });
     }
 
     if !pg_exists {
@@ -365,7 +385,9 @@ pub(crate) async fn recover_schema_state_files(
             snapshot.version()
         );
         complete_staging_rename(root_uri, storage.as_ref()).await?;
-        return Ok(());
+        return Ok(SchemaStateRecovery::CompletedStagingRename {
+            schema_apply_sidecar: false,
+        });
     }
 
     let staging_source = storage.read_text(&pg_staging).await?;
@@ -384,7 +406,7 @@ pub(crate) async fn recover_schema_state_files(
             "removing leftover schema staging files matching the live schema (no-op apply that crashed)"
         );
         cleanup_staging_files(root_uri, storage.as_ref()).await?;
-        return Ok(());
+        return Ok(SchemaStateRecovery::CleanedStaging);
     }
 
     let live_keys = expected_table_keys(&live_ir);
@@ -407,14 +429,16 @@ pub(crate) async fn recover_schema_state_files(
             snapshot.version()
         );
         cleanup_staging_files(root_uri, storage.as_ref()).await?;
-        Ok(())
+        Ok(SchemaStateRecovery::CleanedStaging)
     } else if actual_keys == staging_keys {
         warn!(
             "schema apply crashed after manifest commit; completing schema-file rename (manifest v{})",
             snapshot.version()
         );
         complete_staging_rename(root_uri, storage.as_ref()).await?;
-        Ok(())
+        Ok(SchemaStateRecovery::CompletedStagingRename {
+            schema_apply_sidecar: false,
+        })
     } else {
         Err(schema_lock_conflict(format!(
             "found schema staging files but the manifest's table set ({:?}) matches neither the live schema ({:?}) nor the staging schema ({:?}); manual operator action required",
@@ -426,9 +450,7 @@ pub(crate) async fn recover_schema_state_files(
 async fn cleanup_staging_files(root_uri: &str, storage: &dyn StorageAdapter) -> Result<()> {
     storage.delete(&schema_source_staging_uri(root_uri)).await?;
     storage.delete(&schema_ir_staging_uri(root_uri)).await?;
-    storage
-        .delete(&schema_state_staging_uri(root_uri))
-        .await?;
+    storage.delete(&schema_state_staging_uri(root_uri)).await?;
     Ok(())
 }
 

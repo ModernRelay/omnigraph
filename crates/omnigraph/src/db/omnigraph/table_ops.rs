@@ -31,6 +31,37 @@ pub(super) async fn ensure_indices_on(db: &mut Omnigraph, branch: &str) -> Resul
     ensure_indices_for_branch(db, branch.as_deref()).await
 }
 
+#[cfg(feature = "failpoints")]
+pub(super) async fn failpoint_publish_table_head_without_index_rebuild_for_test(
+    db: &mut Omnigraph,
+    branch: &str,
+    table_key: &str,
+    table_branch: Option<&str>,
+) -> Result<u64> {
+    let branch = normalize_branch_name(branch)?;
+    let snapshot = db.snapshot_for_branch(branch.as_deref()).await?;
+    let entry = snapshot
+        .entry(table_key)
+        .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
+    let full_path = format!("{}/{}", db.root_uri, entry.table_path);
+    let ds = db
+        .table_store
+        .open_dataset_head_for_write(table_key, &full_path, table_branch)
+        .await?;
+    let state = db.table_store.table_state(&full_path, &ds).await?;
+    let update = crate::db::SubTableUpdate {
+        table_key: table_key.to_string(),
+        table_version: state.version,
+        table_branch: table_branch.map(str::to_string),
+        row_count: state.row_count,
+        version_metadata: state.version_metadata,
+    };
+    let mut expected = std::collections::HashMap::new();
+    expected.insert(table_key.to_string(), entry.table_version);
+    commit_prepared_updates_on_branch_with_expected(db, branch.as_deref(), &[update], &expected)
+        .await
+}
+
 pub(super) async fn ensure_indices_for_branch(
     db: &mut Omnigraph,
     branch: Option<&str>,
@@ -100,9 +131,7 @@ pub(super) async fn ensure_indices_for_branch(
             continue;
         }
         let full_path = format!("{}/{}", db.root_uri, entry.table_path);
-        if needs_index_work_edge(db, &table_key, &full_path, entry.table_branch.as_deref())
-            .await?
-        {
+        if needs_index_work_edge(db, &table_key, &full_path, entry.table_branch.as_deref()).await? {
             recovery_pins.push(crate::db::manifest::SidecarTablePin {
                 table_key,
                 table_path: full_path,
@@ -243,9 +272,7 @@ pub(super) async fn ensure_indices_for_branch(
     // per-table commit window regardless). Best-effort cleanup; failing
     // the user here would error a call that already succeeded.
     if let Some(handle) = recovery_handle {
-        if let Err(err) =
-            crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await
-        {
+        if let Err(err) = crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await {
             tracing::warn!(
                 error = %err,
                 operation_id = handle.operation_id.as_str(),

@@ -18,6 +18,7 @@ use lance::Dataset;
 use omnigraph::db::Omnigraph;
 
 mod helpers;
+use helpers::recovery::{RecoveryExpectation, TableExpectation, assert_post_recovery_invariants};
 
 const TEST_SCHEMA: &str = include_str!("fixtures/test.pg");
 
@@ -185,7 +186,9 @@ async fn recovery_rolls_back_synthetic_drift_on_open() {
     let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
 {"type":"Person","data":{"name":"bob","age":25}}
 "#;
-    load_jsonl(&mut db, test_data, LoadMode::Append).await.unwrap();
+    load_jsonl(&mut db, test_data, LoadMode::Append)
+        .await
+        .unwrap();
     drop(db);
 
     // Synthetic drift: advance Person's Lance HEAD WITHOUT updating the
@@ -289,8 +292,14 @@ async fn count_recovery_audit_rows(repo_root: &Path) -> usize {
         .await
         .expect("recoveries dataset opens");
     use futures::TryStreamExt;
-    let batches: Vec<arrow_array::RecordBatch> =
-        ds.scan().try_into_stream().await.unwrap().try_collect().await.unwrap();
+    let batches: Vec<arrow_array::RecordBatch> = ds
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
     batches.iter().map(|b| b.num_rows()).sum()
 }
 
@@ -303,13 +312,17 @@ async fn read_latest_recovery_audit(
     if !recoveries_dir.exists() {
         return None;
     }
-    let ds = Dataset::open(recoveries_dir.to_str().unwrap())
-        .await
-        .ok()?;
+    let ds = Dataset::open(recoveries_dir.to_str().unwrap()).await.ok()?;
     use arrow_array::{Array, StringArray};
     use futures::TryStreamExt;
-    let batches: Vec<arrow_array::RecordBatch> =
-        ds.scan().try_into_stream().await.ok()?.try_collect().await.ok()?;
+    let batches: Vec<arrow_array::RecordBatch> = ds
+        .scan()
+        .try_into_stream()
+        .await
+        .ok()?
+        .try_collect()
+        .await
+        .ok()?;
     let last_batch = batches.iter().filter(|b| b.num_rows() > 0).last()?;
     let row = last_batch.num_rows() - 1;
     let kinds = last_batch
@@ -349,11 +362,19 @@ async fn list_recovery_audit_kinds(repo_root: &Path) -> Vec<String> {
     if !recoveries_dir.exists() {
         return Vec::new();
     }
-    let ds = Dataset::open(recoveries_dir.to_str().unwrap()).await.unwrap();
+    let ds = Dataset::open(recoveries_dir.to_str().unwrap())
+        .await
+        .unwrap();
     use arrow_array::{Array, StringArray};
     use futures::TryStreamExt;
-    let batches: Vec<arrow_array::RecordBatch> =
-        ds.scan().try_into_stream().await.unwrap().try_collect().await.unwrap();
+    let batches: Vec<arrow_array::RecordBatch> = ds
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
     let mut out = Vec::new();
     for batch in batches {
         let kinds = batch
@@ -378,8 +399,14 @@ async fn count_recovery_actor_commits(repo_root: &Path) -> usize {
     let ds = Dataset::open(actors_dir.to_str().unwrap()).await.unwrap();
     use arrow_array::{Array, StringArray};
     use futures::TryStreamExt;
-    let batches: Vec<arrow_array::RecordBatch> =
-        ds.scan().try_into_stream().await.unwrap().try_collect().await.unwrap();
+    let batches: Vec<arrow_array::RecordBatch> = ds
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
     let mut count = 0;
     for batch in &batches {
         let actors = batch
@@ -411,7 +438,9 @@ async fn recovery_rolls_forward_after_phase_b_completes() {
     let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
 {"type":"Person","data":{"name":"bob","age":25}}
 "#;
-    load_jsonl(&mut db, test_data, LoadMode::Append).await.unwrap();
+    load_jsonl(&mut db, test_data, LoadMode::Append)
+        .await
+        .unwrap();
     drop(db);
 
     let person_uri = node_table_uri(uri, "Person");
@@ -454,48 +483,18 @@ async fn recovery_rolls_forward_after_phase_b_completes() {
 
     // Reopen — sweep must roll forward, advancing the manifest pin to
     // head_after via a single ManifestBatchPublisher::publish call.
-    let _db = Omnigraph::open(uri).await.unwrap();
+    let db = Omnigraph::open(uri).await.unwrap();
+    drop(db);
 
-    // Sidecar deleted (sweep completed end-to-end).
-    assert!(
-        !list_recovery_dir(dir.path()).contains(&"01H00000000000000000000RF.json".to_string()),
-        "sidecar must be deleted after successful roll-forward"
-    );
-
-    // Audit row recorded.
-    assert_eq!(
-        count_recovery_audit_rows(dir.path()).await,
-        1,
-        "roll-forward must record exactly one audit row"
-    );
-    assert_eq!(
-        count_recovery_actor_commits(dir.path()).await,
-        1,
-        "roll-forward must record exactly one commit-graph row tagged with omnigraph:recovery"
-    );
-    let audit = read_latest_recovery_audit(dir.path()).await;
-    assert_eq!(
-        audit,
-        Some((
-            "RolledForward".to_string(),
-            Some("act-alice".to_string()),
-            "01H00000000000000000000RF".to_string(),
-            "Mutation".to_string(),
-        )),
-        "audit row content mismatch"
-    );
-
-    // Idempotency: reopen is a no-op.
-    let _db2 = Omnigraph::open(uri).await.unwrap();
-    assert!(
-        list_recovery_dir(dir.path()).is_empty(),
-        "second open must be a clean no-op"
-    );
-    assert_eq!(
-        count_recovery_audit_rows(dir.path()).await,
-        1,
-        "second open must NOT record a new audit row"
-    );
+    assert_post_recovery_invariants(
+        dir.path(),
+        "01H00000000000000000000RF",
+        RecoveryExpectation::RolledForward {
+            tables: vec![TableExpectation::main("node:Person").expected_lance_head(head_after)],
+        },
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -509,7 +508,9 @@ async fn recovery_rolls_back_records_audit_row_with_recovery_actor() {
     let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
 "#;
-    load_jsonl(&mut db, test_data, LoadMode::Append).await.unwrap();
+    load_jsonl(&mut db, test_data, LoadMode::Append)
+        .await
+        .unwrap();
     drop(db);
 
     let person_uri = node_table_uri(uri, "Person");
@@ -574,7 +575,9 @@ async fn recovery_rolls_forward_with_null_actor() {
     let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
 "#;
-    load_jsonl(&mut db, test_data, LoadMode::Append).await.unwrap();
+    load_jsonl(&mut db, test_data, LoadMode::Append)
+        .await
+        .unwrap();
     drop(db);
 
     let person_uri = node_table_uri(uri, "Person");
@@ -650,7 +653,9 @@ async fn recovery_processes_multiple_sidecars_with_fresh_snapshot_per_iter() {
     let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
 {"type":"Company","data":{"name":"acme"}}
 "#;
-    load_jsonl(&mut db, test_data, LoadMode::Append).await.unwrap();
+    load_jsonl(&mut db, test_data, LoadMode::Append)
+        .await
+        .unwrap();
     drop(db);
 
     // Synthesize drift on both tables independently.
@@ -745,7 +750,9 @@ async fn recovery_ensure_indices_steady_state_no_sidecar() {
     let test_data = r#"{"type":"Person","data":{"name":"alice","age":30}}
 {"type":"Company","data":{"name":"acme"}}
 "#;
-    load_jsonl(&mut db, test_data, LoadMode::Append).await.unwrap();
+    load_jsonl(&mut db, test_data, LoadMode::Append)
+        .await
+        .unwrap();
     db.ensure_indices().await.unwrap();
     drop(db);
 
@@ -1045,6 +1052,13 @@ async fn recovery_classifies_feature_branch_sidecar_against_feature_branch() {
         .expect("feature snapshot must have Person entry");
     let v_pin = feature_entry.table_version;
     let feature_branch_name = feature_entry.table_branch.clone();
+    let main_pin = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entry("node:Person")
+        .expect("main snapshot must have Person entry")
+        .table_version;
     drop(db);
 
     // Bypass the manifest: append directly to Person's Lance HEAD on the
@@ -1100,37 +1114,21 @@ async fn recovery_classifies_feature_branch_sidecar_against_feature_branch() {
     // against feature's snapshot, not main's. With the fix, feature's
     // manifest pin advances v_pin → v_head.
     let db = Omnigraph::open(uri).await.unwrap();
-    assert!(
-        list_recovery_dir(dir.path()).is_empty(),
-        "feature-branch sidecar must be processed (deleted) after recovery"
-    );
+    drop(db);
 
-    // The post-recovery feature snapshot must show Person pinned at v_head.
-    let post_feature_snapshot = db
-        .snapshot_of(omnigraph::db::ReadTarget::branch("feature"))
-        .await
-        .unwrap();
-    let post_entry = post_feature_snapshot
-        .entry("node:Person")
-        .expect("Person must still be pinned on feature");
-    assert_eq!(
-        post_entry.table_version, v_head,
-        "feature manifest pin must advance v_pin={} → v_head={}; got {} \
-         — without branch-aware recovery, classification would have \
-         compared against main and rolled back / no-op'd",
-        v_pin, v_head, post_entry.table_version,
-    );
-
-    // Audit row recorded for the recovery action — and the row's
-    // recovery_kind == RolledForward (proves the branch-aware classifier
-    // got us through the eligible path; without it, the snapshot lookup
-    // against main's pin would have produced NoMovement → RollBack).
-    let kinds = list_recovery_audit_kinds(dir.path()).await;
-    assert_eq!(
-        kinds, vec!["RolledForward".to_string()],
-        "feature-branch sidecar recovery must record exactly one RolledForward audit row; got {:?}",
-        kinds,
-    );
+    assert_post_recovery_invariants(
+        dir.path(),
+        "01H0000000000000000000FEAT",
+        RecoveryExpectation::RolledForward {
+            tables: vec![
+                TableExpectation::branch("node:Person", "feature")
+                    .expected_lance_head(v_head)
+                    .expected_main_manifest_pin(main_pin),
+            ],
+        },
+    )
+    .await
+    .unwrap();
 }
 
 /// Companion to the roll-forward feature-branch test: branch-axis
@@ -1176,6 +1174,13 @@ async fn recovery_rolls_back_feature_branch_sidecar_against_feature_branch() {
         .expect("feature snapshot must have Person entry");
     let v_pin = feature_entry.table_version;
     let feature_branch_name = feature_entry.table_branch.clone();
+    let main_pin = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entry("node:Person")
+        .expect("main snapshot must have Person entry")
+        .table_version;
     drop(db);
 
     // Bypass the manifest: append on the feature ref to advance HEAD past
@@ -1230,21 +1235,21 @@ async fn recovery_rolls_back_feature_branch_sidecar_against_feature_branch() {
     write_sidecar_file(dir.path(), "01H0000000000000000000FRB1", &sidecar_json);
 
     // Reopen with full sweep — RollBack is allowed at open time.
-    let _db = Omnigraph::open(uri).await.unwrap();
-    assert!(
-        list_recovery_dir(dir.path()).is_empty(),
-        "feature-branch rollback sidecar must be deleted after recovery"
-    );
+    let db = Omnigraph::open(uri).await.unwrap();
+    drop(db);
 
-    // Audit kind == RolledBack (proves classifier saw feature's HEAD,
-    // not main's; main's view of Person would be NoMovement → no audit
-    // row attribution).
-    let kinds = list_recovery_audit_kinds(dir.path()).await;
-    assert_eq!(
-        kinds, vec!["RolledBack".to_string()],
-        "feature-branch rollback must record one RolledBack audit row; got {:?}",
-        kinds,
-    );
+    assert_post_recovery_invariants(
+        dir.path(),
+        "01H0000000000000000000FRB1",
+        RecoveryExpectation::RolledBack {
+            tables: vec![
+                TableExpectation::branch("node:Person", "feature")
+                    .expected_main_manifest_pin(main_pin),
+            ],
+        },
+    )
+    .await
+    .unwrap();
 
     // Lance HEAD on the feature ref must have advanced (real restore ran).
     let post = store
@@ -1256,6 +1261,18 @@ async fn recovery_rolls_back_feature_branch_sidecar_against_feature_branch() {
         "real restore must have appended a commit on feature; v_head={}, post={}",
         v_head,
         post.version().version,
+    );
+
+    let db = Omnigraph::open(uri).await.unwrap();
+    assert_eq!(
+        helpers::count_rows_branch(&db, "feature", "node:Person").await,
+        2,
+        "feature branch must still expose the manifest-pinned rows after rollback"
+    );
+    assert_eq!(
+        helpers::count_rows(&db, "node:Person").await,
+        1,
+        "feature rollback must not move main"
     );
 }
 

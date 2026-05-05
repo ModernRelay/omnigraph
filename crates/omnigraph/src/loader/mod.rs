@@ -540,6 +540,11 @@ async fn load_jsonl_reader<R: BufRead>(
         let (updates, expected_versions, sidecar_handle) = staging
             .finalize(db, branch, crate::db::manifest::SidecarKind::Load)
             .await?;
+        // Same finalize → publisher residual as mutations: per-table
+        // staged commits have advanced Lance HEAD, but the manifest
+        // publish has not run yet. Reuse the mutation failpoint name so
+        // one failpoint pins the shared `MutationStaging` boundary.
+        crate::failpoints::maybe_fail("mutation.post_finalize_pre_publisher")?;
         db.commit_updates_on_branch_with_expected(branch, &updates, &expected_versions)
             .await?;
         // The recovery sidecar protects the per-table commit_staged →

@@ -302,11 +302,7 @@ pub(super) async fn apply_schema_with_lock(
             // open the wrong HEAD here.
             let existing = db
                 .table_store
-                .open_dataset_head_for_write(
-                    table_key,
-                    &dataset_uri,
-                    entry.table_branch.as_deref(),
-                )
+                .open_dataset_head_for_write(table_key, &dataset_uri, entry.table_branch.as_deref())
                 .await?;
             let staged = db.table_store.stage_overwrite(&existing, batch).await?;
             db.table_store
@@ -398,6 +394,8 @@ pub(super) async fn apply_schema_with_lock(
     // `recover_schema_state_files`:
     //   - crash before commit  → manifest unchanged; staging deleted on open
     //   - crash after commit   → manifest advanced; staging renamed on open
+    crate::failpoints::maybe_fail("schema_apply.before_staging_write")?;
+
     let staging_pg_uri = schema_source_staging_uri(&db.root_uri);
     db.storage
         .write_text(&staging_pg_uri, desired_schema_source)
@@ -449,9 +447,7 @@ pub(super) async fn apply_schema_with_lock(
     // Failing the schema_apply call would report failure for a migration
     // that already succeeded.
     if let Some(handle) = recovery_handle {
-        if let Err(err) =
-            crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await
-        {
+        if let Err(err) = crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await {
             tracing::warn!(
                 error = %err,
                 operation_id = handle.operation_id.as_str(),

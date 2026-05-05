@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub mod recovery;
+
 use arrow_array::{Array, RecordBatch, StringArray};
 use futures::TryStreamExt;
 
