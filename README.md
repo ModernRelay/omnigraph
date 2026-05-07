@@ -11,6 +11,8 @@ Branch, commit, and merge typed graph data like source code. Multi-modal, self-h
 
 Backed by the Lance open-table format.
 
+Join the [Omnigraph Slack community](https://join.slack.com/t/omnigraphworkspace/shared_invite/zt-3wfpglyxj-lHvJGhuySPfqLtN35uJZNw)
+
 ## Use Cases
 
 - On-prem & hybrid context graphs
