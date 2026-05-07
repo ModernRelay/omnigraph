@@ -2,6 +2,7 @@ pub mod api;
 pub mod auth;
 pub mod config;
 pub mod policy;
+pub mod workload;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
