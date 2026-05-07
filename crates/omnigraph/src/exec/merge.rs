@@ -1018,17 +1018,14 @@ impl Omnigraph {
         actor_id: Option<&str>,
     ) -> Result<MergeOutcome> {
         self.ensure_schema_apply_idle("branch_merge").await?;
-        let previous_actor = self.audit_actor_id.clone();
-        self.audit_actor_id = actor_id.map(str::to_string);
-        let result = self.branch_merge_impl(source, target).await;
-        self.audit_actor_id = previous_actor;
-        result
+        self.branch_merge_impl(source, target, actor_id).await
     }
 
     async fn branch_merge_impl(
         &mut self,
         source: &str,
         target: &str,
+        actor_id: Option<&str>,
     ) -> Result<MergeOutcome> {
         if is_internal_run_branch(source) || is_internal_run_branch(target) {
             return Err(OmniError::manifest(format!(
@@ -1090,6 +1087,7 @@ impl Omnigraph {
                 &target_head_commit_id,
                 &source_head_commit_id,
                 is_fast_forward,
+                actor_id,
             )
             .await;
         self.restore_coordinator(previous);
@@ -1108,6 +1106,7 @@ impl Omnigraph {
         target_head_commit_id: &str,
         source_head_commit_id: &str,
         is_fast_forward: bool,
+        actor_id: Option<&str>,
     ) -> Result<MergeOutcome> {
         self.ensure_commit_graph_initialized().await?;
         let target_snapshot = self.snapshot();
@@ -1146,7 +1145,7 @@ impl Omnigraph {
 
             if let Some(staged) = stage_streaming_table_merge(
                 table_key,
-                self.catalog(),
+                &self.catalog(),
                 base_snapshot,
                 source_snapshot,
                 &target_snapshot,
@@ -1193,6 +1192,29 @@ impl Omnigraph {
         // requires pre-computing source deltas during candidate
         // classification (a structural change to `CandidateTableState`)
         // and is left as follow-up work.
+        // Acquire per-(table_key, target_branch) queues for every table
+        // touched by the merge plan. Sorted-order acquisition prevents
+        // lock-order inversion against concurrent multi-table writers.
+        // The active branch (set by the caller's `swap_coordinator_for_branch`)
+        // is the merge target; queue keys are scoped to it because a
+        // branch_merge writes only to the target branch.
+        //
+        // Held across the per-table publish loop and the manifest
+        // commit + record_merge_commit calls below. Under PR 1b's
+        // intermediate state (global server RwLock still in place),
+        // this acquisition is uncontended.
+        let merge_queue_keys: Vec<(String, Option<String>)> = ordered_table_keys
+            .iter()
+            .filter(|table_key| {
+                matches!(
+                    candidates.get(*table_key),
+                    Some(CandidateTableState::RewriteMerged(_)) | Some(CandidateTableState::AdoptSourceState)
+                )
+            })
+            .map(|table_key| (table_key.clone(), self.active_branch().map(str::to_string)))
+            .collect();
+        let _merge_queue_guards = self.write_queue().acquire_many(&merge_queue_keys).await;
+
         let recovery_pins: Vec<crate::db::manifest::SidecarTablePin> = ordered_table_keys
             .iter()
             .filter_map(|table_key| {
@@ -1238,7 +1260,7 @@ impl Omnigraph {
             let mut sidecar = crate::db::manifest::new_sidecar(
                 crate::db::manifest::SidecarKind::BranchMerge,
                 target_branch,
-                self.audit_actor_id.clone(),
+                actor_id.map(str::to_string),
                 recovery_pins,
             );
             // Carry the source branch's HEAD commit id so the recovery
@@ -1267,7 +1289,7 @@ impl Omnigraph {
                 CandidateTableState::AdoptSourceState => {
                     publish_adopted_source_state(
                         self,
-                        self.catalog(),
+                        &self.catalog(),
                         base_snapshot,
                         source_snapshot,
                         &target_snapshot,
@@ -1315,6 +1337,7 @@ impl Omnigraph {
             manifest_version,
             target_head_commit_id,
             source_head_commit_id,
+            actor_id,
         )
         .await?;
 

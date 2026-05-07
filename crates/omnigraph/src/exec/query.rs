@@ -13,11 +13,12 @@ impl Omnigraph {
     ) -> Result<QueryResult> {
         self.ensure_schema_state_valid().await?;
         let resolved = self.resolved_target(target).await?;
+        let catalog = self.catalog();
 
         let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
             .map_err(|e| OmniError::manifest(e.to_string()))?;
-        let type_ctx = typecheck_query(self.catalog(), &query_decl)?;
-        let ir = lower_query(self.catalog(), &query_decl, &type_ctx)?;
+        let type_ctx = typecheck_query(&catalog, &query_decl)?;
+        let ir = lower_query(&catalog, &query_decl, &type_ctx)?;
 
         let needs_graph = ir
             .pipeline
@@ -34,7 +35,7 @@ impl Omnigraph {
             params,
             &resolved.snapshot,
             graph_index.as_deref(),
-            self.catalog(),
+            &catalog,
         )
         .await
     }
@@ -52,19 +53,19 @@ impl Omnigraph {
     ) -> Result<QueryResult> {
         self.ensure_schema_state_valid().await?;
         let snapshot = self.snapshot_at_version(version).await?;
+        let catalog = self.catalog();
 
         let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
             .map_err(|e| OmniError::manifest(e.to_string()))?;
-        let type_ctx = typecheck_query(self.catalog(), &query_decl)?;
-        let ir = lower_query(self.catalog(), &query_decl, &type_ctx)?;
+        let type_ctx = typecheck_query(&catalog, &query_decl)?;
+        let ir = lower_query(&catalog, &query_decl, &type_ctx)?;
 
         let needs_graph = ir
             .pipeline
             .iter()
             .any(|op| matches!(op, IROp::Expand { .. } | IROp::AntiJoin { .. }));
         let graph_index = if needs_graph {
-            let edge_types = self
-                .catalog()
+            let edge_types = catalog
                 .edge_types
                 .iter()
                 .map(|(name, et)| (name.clone(), (et.from_type.clone(), et.to_type.clone())))
@@ -79,7 +80,7 @@ impl Omnigraph {
             params,
             &snapshot,
             graph_index.as_deref(),
-            self.catalog(),
+            &catalog,
         )
         .await
     }

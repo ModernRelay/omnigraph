@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use arrow_array::{
     Array, BinaryArray, BooleanArray, Date32Array, FixedSizeListArray, Float32Array, Float64Array,
     Int32Array, Int64Array, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray,
@@ -76,9 +77,19 @@ pub struct Omnigraph {
     coordinator: GraphCoordinator,
     table_store: TableStore,
     runtime_cache: RuntimeCache,
-    catalog: Catalog,
-    schema_source: String,
-    pub(crate) audit_actor_id: Option<String>,
+    /// Read-heavy on every query, written only by `apply_schema`. ArcSwap
+    /// gives atomic pointer swap with zero-cost reads (`load()` returns a
+    /// `Guard<Arc<Catalog>>`), so concurrent queries on different actors
+    /// don't contend on a lock to read the catalog.
+    catalog: Arc<ArcSwap<Catalog>>,
+    /// Read-heavy on schema introspection paths, written only by
+    /// `apply_schema`. Same ArcSwap rationale as `catalog`.
+    schema_source: Arc<ArcSwap<String>>,
+    /// Per-`(table_key, branch)` writer queues. Reachable from engine
+    /// internals (mutation finalize, schema_apply, branch_merge,
+    /// ensure_indices, delete_where) and from future MR-870 recovery
+    /// reconciler. PR 1b adds the field; callers acquire in commits 4+.
+    write_queue: Arc<crate::db::write_queue::WriteQueueManager>,
 }
 
 /// Whether [`Omnigraph::open`] runs the open-time recovery sweep.
@@ -131,9 +142,9 @@ impl Omnigraph {
             coordinator,
             table_store: TableStore::new(&root),
             runtime_cache: RuntimeCache::default(),
-            catalog,
-            schema_source: schema_source.to_string(),
-            audit_actor_id: None,
+            catalog: Arc::new(ArcSwap::from_pointee(catalog)),
+            schema_source: Arc::new(ArcSwap::from_pointee(schema_source.to_string())),
+            write_queue: Arc::new(crate::db::write_queue::WriteQueueManager::new()),
         })
     }
 
@@ -217,18 +228,35 @@ impl Omnigraph {
             coordinator,
             table_store: TableStore::new(&root),
             runtime_cache: RuntimeCache::default(),
-            catalog,
-            schema_source,
-            audit_actor_id: None,
+            catalog: Arc::new(ArcSwap::from_pointee(catalog)),
+            schema_source: Arc::new(ArcSwap::from_pointee(schema_source)),
+            write_queue: Arc::new(crate::db::write_queue::WriteQueueManager::new()),
         })
     }
 
-    pub fn catalog(&self) -> &Catalog {
-        &self.catalog
+    /// Returns an `Arc<Catalog>` snapshot. Cheap clone of the current
+    /// catalog pointer; callers can hold the returned `Arc` across awaits
+    /// without blocking concurrent `apply_schema`.
+    pub fn catalog(&self) -> Arc<Catalog> {
+        self.catalog.load_full()
     }
 
-    pub fn schema_source(&self) -> &str {
-        &self.schema_source
+    /// Returns an `Arc<String>` snapshot of the schema source.
+    pub fn schema_source(&self) -> Arc<String> {
+        self.schema_source.load_full()
+    }
+
+    /// Atomically swap the in-memory catalog. Concurrent readers see
+    /// either the old or the new pointer; never a torn state. Used by
+    /// `apply_schema` and `reload_schema_if_source_changed`.
+    pub(crate) fn store_catalog(&self, catalog: Catalog) {
+        self.catalog.store(Arc::new(catalog));
+    }
+
+    /// Atomically swap the in-memory schema source. Same rationale as
+    /// [`store_catalog`](Self::store_catalog).
+    pub(crate) fn store_schema_source(&self, schema_source: String) {
+        self.schema_source.store(Arc::new(schema_source));
     }
 
     pub fn uri(&self) -> &str {
@@ -276,6 +304,17 @@ impl Omnigraph {
     /// call this to write/delete sidecars at `__recovery/{ulid}.json`.
     pub(crate) fn storage_adapter(&self) -> &dyn crate::storage::StorageAdapter {
         self.storage.as_ref()
+    }
+
+    /// Per-`(table_key, branch)` writer queues.
+    ///
+    /// Engine-internal writers (mutation finalize, schema_apply,
+    /// branch_merge, ensure_indices, delete_where) and the future MR-870
+    /// recovery reconciler reach the queue manager via this accessor.
+    /// Returns an `Arc` clone so callers can hold the manager across
+    /// `&mut self` engine API boundaries.
+    pub(crate) fn write_queue(&self) -> Arc<crate::db::write_queue::WriteQueueManager> {
+        Arc::clone(&self.write_queue)
     }
 
     /// Engine-level access to the repo's normalized root URI. Used by
@@ -433,7 +472,7 @@ impl Omnigraph {
     async fn reload_schema_if_source_changed(&mut self) -> Result<()> {
         let schema_path = schema_source_uri(&self.root_uri);
         let schema_source = self.storage.read_text(&schema_path).await?;
-        if schema_source == self.schema_source {
+        if schema_source == *self.schema_source.load_full() {
             return Ok(());
         }
         let current_source_ir = read_schema_ir_from_source(&schema_source)?;
@@ -447,8 +486,8 @@ impl Omnigraph {
         .await?;
         let mut catalog = build_catalog_from_ir(&accepted_ir)?;
         fixup_blob_schemas(&mut catalog);
-        self.schema_source = schema_source;
-        self.catalog = catalog;
+        self.store_schema_source(schema_source);
+        self.store_catalog(catalog);
         Ok(())
     }
 
@@ -658,8 +697,8 @@ impl Omnigraph {
     /// ```
     pub async fn read_blob(&self, type_name: &str, id: &str, property: &str) -> Result<BlobFile> {
         self.ensure_schema_state_valid().await?;
-        let node_type = self
-            .catalog
+        let catalog = self.catalog();
+        let node_type = catalog
             .node_types
             .get(type_name)
             .ok_or_else(|| OmniError::manifest(format!("unknown node type '{}'", type_name)))?;
@@ -799,10 +838,6 @@ impl Omnigraph {
         self.ensure_schema_apply_idle("branch_create").await?;
         ensure_public_branch_ref(name, "branch_create")?;
         self.coordinator.branch_create(name).await
-    }
-
-    pub(crate) fn current_audit_actor(&self) -> Option<&str> {
-        self.audit_actor_id.as_deref()
     }
 
     pub async fn branch_create_from(
@@ -976,12 +1011,14 @@ impl Omnigraph {
         manifest_version: u64,
         parent_commit_id: &str,
         merged_parent_commit_id: &str,
+        actor_id: Option<&str>,
     ) -> Result<String> {
         table_ops::record_merge_commit(
             self,
             manifest_version,
             parent_commit_id,
             merged_parent_commit_id,
+            actor_id,
         )
         .await
     }
@@ -991,12 +1028,14 @@ impl Omnigraph {
         branch: Option<&str>,
         updates: &[crate::db::SubTableUpdate],
         expected_table_versions: &std::collections::HashMap<String, u64>,
+        actor_id: Option<&str>,
     ) -> Result<u64> {
         table_ops::commit_updates_on_branch_with_expected(
             self,
             branch,
             updates,
             expected_table_versions,
+            actor_id,
         )
         .await
     }

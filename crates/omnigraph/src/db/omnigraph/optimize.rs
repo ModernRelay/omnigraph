@@ -81,7 +81,7 @@ pub async fn optimize_all_tables(db: &mut Omnigraph) -> Result<Vec<TableOptimize
     let resolved = db.resolved_branch_target(None).await?;
     let snapshot = resolved.snapshot;
 
-    let table_tasks: Vec<_> = all_table_keys(&db.catalog)
+    let table_tasks: Vec<_> = all_table_keys(&db.catalog())
         .into_iter()
         .filter_map(|table_key| {
             let entry = snapshot.entry(&table_key)?;
@@ -144,7 +144,7 @@ pub async fn cleanup_all_tables(
     let resolved = db.resolved_branch_target(None).await?;
     let snapshot = resolved.snapshot;
 
-    let table_tasks: Vec<_> = all_table_keys(&db.catalog)
+    let table_tasks: Vec<_> = all_table_keys(&db.catalog())
         .into_iter()
         .filter_map(|table_key| {
             let entry = snapshot.entry(&table_key)?;

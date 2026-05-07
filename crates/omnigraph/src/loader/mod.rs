@@ -90,13 +90,8 @@ impl Omnigraph {
         mode: LoadMode,
         actor_id: Option<&str>,
     ) -> Result<IngestResult> {
-        let previous_actor = self.audit_actor_id.clone();
-        self.audit_actor_id = actor_id.map(str::to_string);
-        let result = self
-            .ingest_with_current_actor(branch, from, data, mode)
-            .await;
-        self.audit_actor_id = previous_actor;
-        result
+        self.ingest_with_current_actor(branch, from, data, mode, actor_id)
+            .await
     }
 
     pub async fn ingest_file(
@@ -127,6 +122,7 @@ impl Omnigraph {
         from: Option<&str>,
         data: &str,
         mode: LoadMode,
+        actor_id: Option<&str>,
     ) -> Result<IngestResult> {
         self.ensure_schema_state_valid().await?;
         let target_branch =
@@ -143,7 +139,7 @@ impl Omnigraph {
                 .await?;
         }
 
-        let result = self.load(&target_branch, data, mode).await?;
+        let result = self.load_as(&target_branch, data, mode, actor_id).await?;
         Ok(IngestResult {
             branch: target_branch,
             base_branch,
@@ -154,6 +150,16 @@ impl Omnigraph {
     }
 
     pub async fn load(&mut self, branch: &str, data: &str, mode: LoadMode) -> Result<LoadResult> {
+        self.load_as(branch, data, mode, None).await
+    }
+
+    pub async fn load_as(
+        &mut self,
+        branch: &str,
+        data: &str,
+        mode: LoadMode,
+        actor_id: Option<&str>,
+    ) -> Result<LoadResult> {
         self.ensure_schema_state_valid().await?;
         // Reject internal `__run__*` / system-prefixed branches at the
         // public write boundary. Direct-publish paths assert this
@@ -169,7 +175,7 @@ impl Omnigraph {
         // Direct-to-target writes: no Run state machine, no `__run__` staging
         // branch. Cross-table OCC is enforced by the publisher's
         // `expected_table_versions` CAS inside `load_jsonl_reader`.
-        self.load_direct_on_branch(requested.as_deref(), data, mode)
+        self.load_direct_on_branch(requested.as_deref(), data, mode, actor_id)
             .await
     }
 
@@ -188,9 +194,10 @@ impl Omnigraph {
         branch: Option<&str>,
         data: &str,
         mode: LoadMode,
+        actor_id: Option<&str>,
     ) -> Result<LoadResult> {
         let reader = BufReader::new(Cursor::new(data.as_bytes()));
-        load_jsonl_reader(self, branch, reader, mode).await
+        load_jsonl_reader(self, branch, reader, mode, actor_id).await
     }
 }
 
@@ -232,6 +239,7 @@ async fn load_jsonl_reader<R: BufRead>(
     branch: Option<&str>,
     reader: R,
     mode: LoadMode,
+    actor_id: Option<&str>,
 ) -> Result<LoadResult> {
     let catalog = db.catalog().clone();
 
@@ -537,15 +545,19 @@ async fn load_jsonl_reader<R: BufRead>(
 
     // Phase 4: Atomic manifest commit with publisher-level OCC.
     if use_staging {
-        let (updates, expected_versions, sidecar_handle) = staging
-            .finalize(db, branch, crate::db::manifest::SidecarKind::Load)
+        let staged = staging.stage_all(db, branch).await?;
+        // `_queue_guards` holds per-(table_key, branch) write queues
+        // across the manifest publish below — see exec/mutation.rs for
+        // the rationale (interleaving prevention).
+        let (updates, expected_versions, sidecar_handle, _queue_guards) = staged
+            .commit_all(db, branch, crate::db::manifest::SidecarKind::Load, actor_id)
             .await?;
         // Same finalize → publisher residual as mutations: per-table
         // staged commits have advanced Lance HEAD, but the manifest
         // publish has not run yet. Reuse the mutation failpoint name so
         // one failpoint pins the shared `MutationStaging` boundary.
         crate::failpoints::maybe_fail("mutation.post_finalize_pre_publisher")?;
-        db.commit_updates_on_branch_with_expected(branch, &updates, &expected_versions)
+        db.commit_updates_on_branch_with_expected(branch, &updates, &expected_versions, actor_id)
             .await?;
         // The recovery sidecar protects the per-table commit_staged →
         // manifest publish window. Phase C succeeded — clean up
@@ -574,6 +586,7 @@ async fn load_jsonl_reader<R: BufRead>(
             branch,
             &overwrite_updates,
             &overwrite_expected,
+            actor_id,
         )
         .await?;
     }

@@ -345,8 +345,8 @@ async fn validate_edge_insert_endpoints(
     edge_name: &str,
     assignments: &HashMap<String, Literal>,
 ) -> Result<()> {
-    let edge_type = db
-        .catalog()
+    let catalog = db.catalog();
+    let edge_type = catalog
         .edge_types
         .get(edge_name)
         .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{}'", edge_name)))?;
@@ -688,13 +688,8 @@ impl Omnigraph {
         params: &ParamMap,
         actor_id: Option<&str>,
     ) -> Result<MutationResult> {
-        let previous_actor = self.audit_actor_id.clone();
-        self.audit_actor_id = actor_id.map(str::to_string);
-        let result = self
-            .mutate_with_current_actor(branch, query_source, query_name, params)
-            .await;
-        self.audit_actor_id = previous_actor;
-        result
+        self.mutate_with_current_actor(branch, query_source, query_name, params, actor_id)
+            .await
     }
 
     async fn mutate_with_current_actor(
@@ -703,6 +698,7 @@ impl Omnigraph {
         query_source: &str,
         query_name: &str,
         params: &ParamMap,
+        actor_id: Option<&str>,
     ) -> Result<MutationResult> {
         self.ensure_schema_state_valid().await?;
         let requested = Self::normalize_branch_name(branch)?;
@@ -737,11 +733,19 @@ impl Omnigraph {
             Err(e) => Err(e),
             Ok(total) if staging.is_empty() => Ok(total),
             Ok(total) => {
-                let (updates, expected_versions, sidecar_handle) = staging
-                    .finalize(
+                let staged = staging.stage_all(self, requested.as_deref()).await?;
+                // `_queue_guards` holds per-(table_key, branch) write
+                // queues acquired inside `commit_all`. Held across the
+                // manifest publish below so no concurrent writer can
+                // interleave between our commit_staged and our publish
+                // (which would correctly fail our CAS but leave Lance
+                // HEAD advanced — the residual class MR-870 recovers).
+                let (updates, expected_versions, sidecar_handle, _queue_guards) = staged
+                    .commit_all(
                         self,
                         requested.as_deref(),
                         crate::db::manifest::SidecarKind::Mutation,
+                        actor_id,
                     )
                     .await?;
                 // Failpoint that wedges the documented finalize→publisher
@@ -759,6 +763,7 @@ impl Omnigraph {
                     requested.as_deref(),
                     &updates,
                     &expected_versions,
+                    actor_id,
                 )
                 .await?;
                 // Phase C succeeded — sidecar can be deleted. If this
@@ -804,7 +809,7 @@ impl Omnigraph {
         let query_decl = omnigraph_compiler::find_named_query(query_source, query_name)
             .map_err(|e| OmniError::manifest(e.to_string()))?;
 
-        let checked = typecheck_query_decl(self.catalog(), &query_decl)?;
+        let checked = typecheck_query_decl(&self.catalog(), &query_decl)?;
         match checked {
             CheckedQuery::Mutation(_) => {}
             CheckedQuery::Read(_) => {

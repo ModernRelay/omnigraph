@@ -236,5 +236,6 @@ Rules:
 4. **Re-verify before recommending.** If you cite a flag, env var, endpoint, or constant to the user or in code, grep for it in source first. Memory and docs go stale; the code is authoritative.
 5. **Keep AGENTS.md a map, not an encyclopedia.** New deep content goes into `docs/`. Add an entry to "Where to find each topic" instead of pasting prose into this file. The "Always-on rules" section is the exception — it's for invariants that should always be in scope.
 6. **Re-read on schema/query/IR changes.** Edits to `schema.pest`, `query.pest`, `ir/lower.rs`, `query/typecheck.rs`, or `query/lint.rs` should trigger a re-read of [docs/schema-language.md](docs/schema-language.md), [docs/query-language.md](docs/query-language.md), and [docs/execution.md](docs/execution.md) to confirm they still describe reality.
+7. **Always make smaller commits.** Each commit does one thing, compiles, and passes tests; mechanical refactors land separately from the behavior changes they enable.
 
 CI check: `scripts/check-agents-md.sh` verifies that every `docs/*.md` link in this file resolves and that every doc in the canonical set is linked. Run it locally before opening a PR if you've moved or renamed docs.

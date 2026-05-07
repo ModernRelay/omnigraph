@@ -5,6 +5,7 @@ mod omnigraph;
 mod recovery_audit;
 mod run_registry;
 mod schema_state;
+pub(crate) mod write_queue;
 
 pub use commit_graph::GraphCommit;
 pub use graph_coordinator::{GraphCoordinator, ReadTarget, ResolvedTarget, SnapshotId};

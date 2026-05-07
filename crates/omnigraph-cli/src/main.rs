@@ -1425,7 +1425,7 @@ async fn execute_query_lint(
     let uri = resolve_local_uri(config, cli_uri, cli_target, "query lint")?;
     let db = Omnigraph::open(&uri).await?;
     Ok(lint_query_file(
-        db.catalog(),
+        &db.catalog(),
         &query_source,
         query_path,
         QueryLintSchemaSource::repo(uri),
