@@ -435,26 +435,42 @@ impl StagedMutation {
         }
         let guards = db.write_queue().acquire_many(&queue_keys).await;
 
-        // Revalidate manifest pins. Read fresh per-branch snapshot —
-        // in-memory `db.snapshot()` may be stale if another writer
-        // committed since our stage. If any pin moved past our
-        // expected_version, fail-fast before commit_staged moves
-        // Lance HEAD.
+        // Revalidate manifest pins (PR 2 perf optimization).
         //
-        // Both staged and inline-committed tables are revalidated.
-        // Inline-committed tables (delete-only path) had their Lance
-        // HEAD advanced before this point, but the *manifest pin*
-        // shouldn't have moved if no other writer interleaved. If it
-        // has, return manifest_conflict — the sidecar emitted below
-        // captures (expected, post) so the next open's recovery sweep
-        // can resolve the Lance-HEAD-vs-manifest divergence.
+        // Single-table mutations skip revalidation entirely: once the
+        // per-(table, branch) queue is held, no concurrent writer can
+        // move our table's pin (queue exclusivity); if revalidation
+        // were to fail, the publisher's `expected_table_versions` CAS
+        // catches the same drift. The cost on conflict is one orphan
+        // Lance HEAD advance, recovered via the sidecar protocol on
+        // the next ReadWrite open.
         //
-        // Note: under PR 1b's intermediate state (global server RwLock
-        // in place), this revalidation is a no-op because no concurrent
-        // writer can run. Becomes load-bearing once PR 2 removes the
-        // global lock — see `.context/pr-1b-plan.md` Risk 3.
-        if !staged.is_empty() || !inline_committed.is_empty() {
-            let snapshot = db.snapshot_for_branch(branch).await?;
+        // Multi-table mutations use the in-memory `db.snapshot()`
+        // (zero I/O) instead of `db.snapshot_for_branch(...)` (fresh
+        // manifest read). This is correct under MR-686's single-process
+        // scope: all in-process tenants share one `Arc<Omnigraph>` and
+        // therefore one coordinator; publishes update the shared
+        // coordinator BEFORE releasing queue guards (see
+        // `commit_all` -> caller's publisher -> caller drops guards),
+        // so any tenant 2 acquiring queue keys after tenant 1 reads a
+        // fresh in-memory view. The within-mutation race (mutation A
+        // captures expected_versions[T2]=V0, tenant B publishes T2 to
+        // V1 during A's stage I/O, A then acquires T2's queue) is
+        // caught here via the in-memory check (B's publish updated the
+        // shared coordinator, so snapshot.entry(T2) returns V1 != V0).
+        //
+        // Multi-coordinator deployments (§VI.27 aspirational) would
+        // require force-refresh under the queue here. That trade-off
+        // is documented in §VI's "Explicit non-commitments" subsection.
+        //
+        // SAFETY: relies on (1) the per-(table, branch) WriteQueueManager
+        // using exclusive `tokio::sync::Mutex<()>` (not `RwLock`), and
+        // (2) the single-coordinator invariant (one Omnigraph engine
+        // per process). Migrating either premise breaks this skip; see
+        // master plan risk #2.
+        let total_tables = staged.len() + inline_committed.len();
+        if total_tables > 1 {
+            let snapshot = db.snapshot().await;
             for entry in &staged {
                 let current = snapshot.entry(&entry.table_key).map(|e| e.table_version);
                 match current {
@@ -498,6 +514,9 @@ impl StagedMutation {
                 }
             }
         }
+        // Avoid an unused-variable warning when `branch` is not consumed
+        // above (single-table fast path skips revalidation).
+        let _ = branch;
 
         // Sidecar protocol: build the per-table pin list and write the
         // sidecar BEFORE any Lance commit_staged runs, so a crash
