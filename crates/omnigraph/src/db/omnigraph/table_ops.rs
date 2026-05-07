@@ -2,15 +2,13 @@ use super::*;
 
 pub(super) async fn graph_index(db: &Omnigraph) -> Result<Arc<crate::graph_index::GraphIndex>> {
     db.ensure_schema_state_valid().await?;
-    let resolved = db
-        .coordinator
+    let coord = db.coordinator.lock().await;
+    let resolved = coord
         .resolve_target(&ReadTarget::Branch(
-            db.coordinator
-                .current_branch()
-                .unwrap_or("main")
-                .to_string(),
+            coord.current_branch().unwrap_or("main").to_string(),
         ))
         .await?;
+    drop(coord);
     let catalog = db.catalog();
     db.runtime_cache.graph_index(&resolved, &catalog).await
 }
@@ -24,7 +22,7 @@ pub(super) async fn graph_index_for_resolved(
 }
 
 pub(super) async fn ensure_indices(db: &mut Omnigraph) -> Result<()> {
-    let current_branch = db.coordinator.current_branch().map(str::to_string);
+    let current_branch = db.coordinator.lock().await.current_branch().map(str::to_string);
     ensure_indices_for_branch(db, current_branch.as_deref()).await
 }
 
@@ -402,7 +400,7 @@ pub(super) async fn open_for_mutation(
     db: &Omnigraph,
     table_key: &str,
 ) -> Result<(Dataset, String, Option<String>)> {
-    let current_branch = db.coordinator.current_branch().map(str::to_string);
+    let current_branch = db.coordinator.lock().await.current_branch().map(str::to_string);
     open_for_mutation_on_branch(db, current_branch.as_deref(), table_key).await
 }
 
@@ -737,6 +735,8 @@ async fn commit_prepared_updates(
         _snapshot_id: _,
     } = db
         .coordinator
+        .lock()
+        .await
         .commit_updates_with_actor(updates, actor_id)
         .await?;
     Ok(manifest_version)
@@ -753,6 +753,8 @@ async fn commit_prepared_updates_with_expected(
         _snapshot_id: _,
     } = db
         .coordinator
+        .lock()
+        .await
         .commit_updates_with_actor_with_expected(updates, expected_table_versions, actor_id)
         .await?;
     Ok(manifest_version)
@@ -764,7 +766,7 @@ pub(super) async fn commit_prepared_updates_on_branch(
     updates: &[crate::db::SubTableUpdate],
     actor_id: Option<&str>,
 ) -> Result<u64> {
-    let current_branch = db.coordinator.current_branch().map(str::to_string);
+    let current_branch = db.coordinator.lock().await.current_branch().map(str::to_string);
     let requested_branch = branch.map(str::to_string);
     if requested_branch == current_branch {
         return commit_prepared_updates(db, updates, actor_id).await;
@@ -792,7 +794,7 @@ pub(super) async fn commit_prepared_updates_on_branch_with_expected(
     expected_table_versions: &std::collections::HashMap<String, u64>,
     actor_id: Option<&str>,
 ) -> Result<u64> {
-    let current_branch = db.coordinator.current_branch().map(str::to_string);
+    let current_branch = db.coordinator.lock().await.current_branch().map(str::to_string);
     let requested_branch = branch.map(str::to_string);
     if requested_branch == current_branch {
         return commit_prepared_updates_with_expected(
@@ -827,7 +829,7 @@ pub(super) async fn commit_updates(
     updates: &[crate::db::SubTableUpdate],
 ) -> Result<u64> {
     db.ensure_schema_apply_not_locked("write commit").await?;
-    let current_branch = db.coordinator.current_branch().map(str::to_string);
+    let current_branch = db.coordinator.lock().await.current_branch().map(str::to_string);
     let prepared = prepare_updates_for_commit(db, current_branch.as_deref(), updates).await?;
     commit_prepared_updates(db, &prepared, None).await
 }
@@ -836,7 +838,7 @@ pub(super) async fn commit_manifest_updates(
     db: &mut Omnigraph,
     updates: &[crate::db::SubTableUpdate],
 ) -> Result<u64> {
-    db.coordinator.commit_manifest_updates(updates).await
+    db.coordinator.lock().await.commit_manifest_updates(updates).await
 }
 
 pub(super) async fn record_merge_commit(
@@ -846,7 +848,7 @@ pub(super) async fn record_merge_commit(
     merged_parent_commit_id: &str,
     actor_id: Option<&str>,
 ) -> Result<String> {
-    db.coordinator
+    db.coordinator.lock().await
         .record_merge_commit(
             manifest_version,
             parent_commit_id,
@@ -880,7 +882,7 @@ pub(super) async fn commit_updates_on_branch_with_expected(
 }
 
 pub(super) async fn ensure_commit_graph_initialized(db: &mut Omnigraph) -> Result<()> {
-    db.coordinator.ensure_commit_graph_initialized().await
+    db.coordinator.lock().await.ensure_commit_graph_initialized().await
 }
 
 pub(super) async fn invalidate_graph_index(db: &Omnigraph) {

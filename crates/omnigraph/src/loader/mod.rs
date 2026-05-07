@@ -59,14 +59,14 @@ pub enum LoadMode {
 
 /// Load JSONL data into an Omnigraph database.
 pub async fn load_jsonl(db: &mut Omnigraph, data: &str, mode: LoadMode) -> Result<LoadResult> {
-    let current_branch = db.active_branch().map(str::to_string);
+    let current_branch = db.active_branch().await;
     let branch = current_branch.as_deref().unwrap_or("main");
     db.load(branch, data, mode).await
 }
 
 /// Load JSONL data from a file path.
 pub async fn load_jsonl_file(db: &mut Omnigraph, path: &str, mode: LoadMode) -> Result<LoadResult> {
-    let current_branch = db.active_branch().map(str::to_string);
+    let current_branch = db.active_branch().await;
     let branch = current_branch.as_deref().unwrap_or("main");
     db.load_file(branch, path, mode).await
 }
@@ -1830,7 +1830,7 @@ edge WorksAt: Person -> Company
             .unwrap();
 
         // Read back via snapshot
-        let snap = db.snapshot();
+        let snap = db.snapshot().await;
         let person_ds = snap.open("node:Person").await.unwrap();
 
         assert_eq!(person_ds.count_rows(None).await.unwrap(), 2);
@@ -1867,7 +1867,7 @@ edge WorksAt: Person -> Company
             .await
             .unwrap();
 
-        let snap = db.snapshot();
+        let snap = db.snapshot().await;
         let knows_ds = snap.open("edge:Knows").await.unwrap();
 
         let batches: Vec<RecordBatch> = knows_ds
@@ -1902,13 +1902,13 @@ edge WorksAt: Person -> Company
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-        let v1 = db.version();
+        let v1 = db.version().await;
 
         load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
             .await
             .unwrap();
 
-        assert!(db.version() > v1);
+        assert!(db.version().await > v1);
     }
 
     #[tokio::test]
@@ -1925,7 +1925,7 @@ edge WorksAt: Person -> Company
             .unwrap();
         load_jsonl(&mut db, batch2, LoadMode::Append).await.unwrap();
 
-        let snap = db.snapshot();
+        let snap = db.snapshot().await;
         let person_ds = snap.open("node:Person").await.unwrap();
         assert_eq!(person_ds.count_rows(None).await.unwrap(), 2);
     }

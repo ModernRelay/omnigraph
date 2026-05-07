@@ -74,7 +74,14 @@ pub struct SchemaApplyResult {
 pub struct Omnigraph {
     root_uri: String,
     storage: Arc<dyn StorageAdapter>,
-    coordinator: GraphCoordinator,
+    /// Coordinator state behind a tokio Mutex. PR 2 (MR-686) wraps this
+    /// so engine write APIs can be `&self` (the HTTP server's `AppState`
+    /// then holds `Arc<Omnigraph>` and dispatches concurrent calls
+    /// without a global write lock). Critical sections are short:
+    /// callers acquire, read or refresh, drop. Lock acquisition order:
+    /// always before `runtime_cache` (when both are needed in one
+    /// scope).
+    coordinator: Arc<tokio::sync::Mutex<GraphCoordinator>>,
     table_store: TableStore,
     runtime_cache: RuntimeCache,
     /// Read-heavy on every query, written only by `apply_schema`. ArcSwap
@@ -139,7 +146,7 @@ impl Omnigraph {
         Ok(Self {
             root_uri: root.clone(),
             storage,
-            coordinator,
+            coordinator: Arc::new(tokio::sync::Mutex::new(coordinator)),
             table_store: TableStore::new(&root),
             runtime_cache: RuntimeCache::default(),
             catalog: Arc::new(ArcSwap::from_pointee(catalog)),
@@ -225,7 +232,7 @@ impl Omnigraph {
         Ok(Self {
             root_uri: root.clone(),
             storage,
-            coordinator,
+            coordinator: Arc::new(tokio::sync::Mutex::new(coordinator)),
             table_store: TableStore::new(&root),
             runtime_cache: RuntimeCache::default(),
             catalog: Arc::new(ArcSwap::from_pointee(catalog)),
@@ -275,7 +282,7 @@ impl Omnigraph {
         schema_apply::apply_schema(self, desired_schema_source).await
     }
 
-    pub(crate) async fn ensure_schema_apply_idle(&mut self, operation: &str) -> Result<()> {
+    pub(crate) async fn ensure_schema_apply_idle(&self, operation: &str) -> Result<()> {
         schema_apply::ensure_schema_apply_idle(self, operation).await
     }
 
@@ -336,15 +343,16 @@ impl Omnigraph {
     }
 
     pub(crate) async fn swap_coordinator_for_branch(
-        &mut self,
+        &self,
         branch: Option<&str>,
     ) -> Result<GraphCoordinator> {
         let next = self.open_coordinator_for_branch(branch).await?;
-        Ok(std::mem::replace(&mut self.coordinator, next))
+        let mut coord = self.coordinator.lock().await;
+        Ok(std::mem::replace(&mut *coord, next))
     }
 
-    pub(crate) fn restore_coordinator(&mut self, coordinator: GraphCoordinator) {
-        self.coordinator = coordinator;
+    pub(crate) async fn restore_coordinator(&self, coordinator: GraphCoordinator) {
+        *self.coordinator.lock().await = coordinator;
     }
 
     pub(crate) async fn resolved_branch_target(
@@ -354,21 +362,19 @@ impl Omnigraph {
         self.ensure_schema_state_valid().await?;
         let requested = ReadTarget::Branch(branch.unwrap_or("main").to_string());
         let normalized = normalize_branch_name(branch.unwrap_or("main"))?;
-        if normalized.as_deref() == self.coordinator.current_branch() {
-            let snapshot_id = self.coordinator.head_commit_id().await?.unwrap_or_else(|| {
-                SnapshotId::synthetic(
-                    self.coordinator.current_branch(),
-                    self.coordinator.version(),
-                )
+        let coord = self.coordinator.lock().await;
+        if normalized.as_deref() == coord.current_branch() {
+            let snapshot_id = coord.head_commit_id().await?.unwrap_or_else(|| {
+                SnapshotId::synthetic(coord.current_branch(), coord.version())
             });
             return Ok(ResolvedTarget {
                 requested,
-                branch: self.coordinator.current_branch().map(str::to_string),
+                branch: coord.current_branch().map(str::to_string),
                 snapshot_id,
-                snapshot: self.coordinator.snapshot(),
+                snapshot: coord.snapshot(),
             });
         }
-        self.coordinator.resolve_target(&requested).await
+        coord.resolve_target(&requested).await
     }
 
     pub(crate) async fn snapshot_for_branch(&self, branch: Option<&str>) -> Result<Snapshot> {
@@ -377,13 +383,13 @@ impl Omnigraph {
             .map(|resolved| resolved.snapshot)
     }
 
-    pub(crate) fn version(&self) -> u64 {
-        self.coordinator.version()
+    pub(crate) async fn version(&self) -> u64 {
+        self.coordinator.lock().await.version()
     }
 
     /// Return an immutable Snapshot from the known manifest state. No storage I/O.
-    pub(crate) fn snapshot(&self) -> Snapshot {
-        self.coordinator.snapshot()
+    pub(crate) async fn snapshot(&self) -> Snapshot {
+        self.coordinator.lock().await.snapshot()
     }
 
     pub async fn snapshot_of(&self, target: impl Into<ReadTarget>) -> Result<Snapshot> {
@@ -408,10 +414,11 @@ impl Omnigraph {
     }
 
     /// Synchronize this handle's write base to the latest head of the named branch.
-    pub async fn sync_branch(&mut self, branch: &str) -> Result<()> {
+    pub async fn sync_branch(&self, branch: &str) -> Result<()> {
         self.ensure_schema_state_valid().await?;
         let branch = normalize_branch_name(branch)?;
-        self.coordinator = self.open_coordinator_for_branch(branch.as_deref()).await?;
+        let next = self.open_coordinator_for_branch(branch.as_deref()).await?;
+        *self.coordinator.lock().await = next;
         self.runtime_cache.invalidate_all().await;
         Ok(())
     }
@@ -448,18 +455,19 @@ impl Omnigraph {
     /// (e.g. `schema_apply` mid-write) MUST use
     /// [`refresh_coordinator_only`](Self::refresh_coordinator_only) to
     /// avoid the recovery sweep racing their own sidecar.
-    pub async fn refresh(&mut self) -> Result<()> {
-        self.coordinator.refresh().await?;
+    pub async fn refresh(&self) -> Result<()> {
+        let mut coord = self.coordinator.lock().await;
+        coord.refresh().await?;
         let schema_state_recovery = recover_schema_state_files(
             &self.root_uri,
             Arc::clone(&self.storage),
-            &self.coordinator.snapshot(),
+            &coord.snapshot(),
         )
         .await?;
         crate::db::manifest::recover_manifest_drift(
             &self.root_uri,
             Arc::clone(&self.storage),
-            &mut self.coordinator,
+            &mut *coord,
             crate::db::manifest::RecoveryMode::RollForwardOnly,
             schema_state_recovery,
         )
@@ -469,14 +477,14 @@ impl Omnigraph {
         Ok(())
     }
 
-    async fn reload_schema_if_source_changed(&mut self) -> Result<()> {
+    async fn reload_schema_if_source_changed(&self) -> Result<()> {
         let schema_path = schema_source_uri(&self.root_uri);
         let schema_source = self.storage.read_text(&schema_path).await?;
         if schema_source == *self.schema_source.load_full() {
             return Ok(());
         }
         let current_source_ir = read_schema_ir_from_source(&schema_source)?;
-        let branches = self.coordinator.branch_list().await?;
+        let branches = self.coordinator.lock().await.branch_list().await?;
         let (accepted_ir, _) = load_or_bootstrap_schema_contract(
             &self.root_uri,
             Arc::clone(&self.storage),
@@ -498,15 +506,15 @@ impl Omnigraph {
     /// here would observe the caller's own sidecar, classify it as
     /// RolledPastExpected, and roll it forward — racing the caller's
     /// own publish path.
-    pub(crate) async fn refresh_coordinator_only(&mut self) -> Result<()> {
-        self.coordinator.refresh().await?;
+    pub(crate) async fn refresh_coordinator_only(&self) -> Result<()> {
+        self.coordinator.lock().await.refresh().await?;
         self.runtime_cache.invalidate_all().await;
         Ok(())
     }
 
     pub async fn resolve_snapshot(&self, branch: &str) -> Result<SnapshotId> {
         self.ensure_schema_state_valid().await?;
-        self.coordinator.resolve_snapshot_id(branch).await
+        self.coordinator.lock().await.resolve_snapshot_id(branch).await
     }
 
     pub(crate) async fn resolved_target(
@@ -514,7 +522,7 @@ impl Omnigraph {
         target: impl Into<ReadTarget>,
     ) -> Result<ResolvedTarget> {
         self.ensure_schema_state_valid().await?;
-        self.coordinator.resolve_target(&target.into()).await
+        self.coordinator.lock().await.resolve_target(&target.into()).await
     }
 
     // ─── Change detection ────────────────────────────────────────────────
@@ -545,26 +553,20 @@ impl Omnigraph {
         to_commit_id: &str,
         filter: &crate::changes::ChangeFilter,
     ) -> Result<crate::changes::ChangeSet> {
-        let from_commit = self
-            .coordinator
-            .resolve_commit(&SnapshotId::new(from_commit_id))
-            .await?;
-        let to_commit = self
-            .coordinator
-            .resolve_commit(&SnapshotId::new(to_commit_id))
-            .await?;
-        let from_snap = self
-            .coordinator
+        let coord = self.coordinator.lock().await;
+        let from_commit = coord.resolve_commit(&SnapshotId::new(from_commit_id)).await?;
+        let to_commit = coord.resolve_commit(&SnapshotId::new(to_commit_id)).await?;
+        let from_snap = coord
             .resolve_target(&ReadTarget::Snapshot(SnapshotId::new(
                 from_commit.graph_commit_id.clone(),
             )))
             .await?;
-        let to_snap = self
-            .coordinator
+        let to_snap = coord
             .resolve_target(&ReadTarget::Snapshot(SnapshotId::new(
                 to_commit.graph_commit_id.clone(),
             )))
             .await?;
+        drop(coord);
         crate::changes::diff_snapshots(
             self.uri(),
             &from_snap.snapshot,
@@ -597,7 +599,7 @@ impl Omnigraph {
     /// Create a Snapshot at any historical manifest version.
     pub async fn snapshot_at_version(&self, version: u64) -> Result<Snapshot> {
         self.ensure_schema_state_valid().await?;
-        self.coordinator.snapshot_at_version(version).await
+        self.coordinator.lock().await.snapshot_at_version(version).await
     }
 
     pub async fn export_jsonl(
@@ -709,7 +711,7 @@ impl Omnigraph {
             )));
         }
 
-        let snapshot = self.snapshot();
+        let snapshot = self.snapshot().await;
         let table_key = format!("node:{}", type_name);
         let ds = snapshot.open(&table_key).await?;
 
@@ -737,12 +739,12 @@ impl Omnigraph {
         })
     }
 
-    pub(crate) fn active_branch(&self) -> Option<&str> {
-        self.coordinator.current_branch()
+    pub(crate) async fn active_branch(&self) -> Option<String> {
+        self.coordinator.lock().await.current_branch().map(str::to_string)
     }
 
     async fn ensure_branch_delete_safe(&self, branch: &str, branches: &[String]) -> Result<()> {
-        let descendants = self.coordinator.branch_descendants(branch).await?;
+        let descendants = self.coordinator.lock().await.branch_descendants(branch).await?;
         if let Some(descendant) = descendants.first() {
             return Err(OmniError::manifest_conflict(format!(
                 "cannot delete branch '{}' because descendant branch '{}' still depends on it",
@@ -797,8 +799,9 @@ impl Omnigraph {
         Ok(())
     }
 
-    async fn delete_branch_storage_only(&mut self, branch: &str) -> Result<()> {
-        if self.coordinator.current_branch() == Some(branch) {
+    async fn delete_branch_storage_only(&self, branch: &str) -> Result<()> {
+        let active = self.coordinator.lock().await.current_branch().map(str::to_string);
+        if active.as_deref() == Some(branch) {
             return Err(OmniError::manifest_conflict(format!(
                 "cannot delete currently active branch '{}'",
                 branch
@@ -812,7 +815,7 @@ impl Omnigraph {
             .map(|entry| (entry.table_key.clone(), entry.table_path.clone()))
             .collect::<Vec<_>>();
 
-        self.coordinator.branch_delete(branch).await?;
+        self.coordinator.lock().await.branch_delete(branch).await?;
         self.cleanup_deleted_branch_tables(branch, &owned_tables)
             .await
     }
@@ -833,15 +836,15 @@ impl Omnigraph {
             .map(|id| id.map(|snapshot_id| snapshot_id.as_str().to_string()))
     }
 
-    pub async fn branch_create(&mut self, name: &str) -> Result<()> {
+    pub async fn branch_create(&self, name: &str) -> Result<()> {
         self.ensure_schema_state_valid().await?;
         self.ensure_schema_apply_idle("branch_create").await?;
         ensure_public_branch_ref(name, "branch_create")?;
-        self.coordinator.branch_create(name).await
+        self.coordinator.lock().await.branch_create(name).await
     }
 
     pub async fn branch_create_from(
-        &mut self,
+        &self,
         from: impl Into<ReadTarget>,
         name: &str,
     ) -> Result<()> {
@@ -850,7 +853,7 @@ impl Omnigraph {
     }
 
     async fn branch_create_from_impl(
-        &mut self,
+        &self,
         from: impl Into<ReadTarget>,
         name: &str,
         allow_internal_refs: bool,
@@ -867,24 +870,24 @@ impl Omnigraph {
         }
         let branch = normalize_branch_name(&branch_name)?;
         let previous = self.swap_coordinator_for_branch(branch.as_deref()).await?;
-        let result = self.coordinator.branch_create(name).await;
-        self.restore_coordinator(previous);
+        let result = self.coordinator.lock().await.branch_create(name).await;
+        self.restore_coordinator(previous).await;
         result
     }
 
     pub async fn branch_list(&self) -> Result<Vec<String>> {
         self.ensure_schema_state_valid().await?;
-        self.coordinator.branch_list().await
+        self.coordinator.lock().await.branch_list().await
     }
 
-    pub async fn branch_delete(&mut self, name: &str) -> Result<()> {
+    pub async fn branch_delete(&self, name: &str) -> Result<()> {
         self.ensure_schema_state_valid().await?;
         self.ensure_schema_apply_idle("branch_delete").await?;
         ensure_public_branch_ref(name, "branch_delete")?;
         self.refresh().await?;
         let branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot delete branch 'main'".to_string()))?;
-        let branches = self.coordinator.branch_list().await?;
+        let branches = self.coordinator.lock().await.branch_list().await?;
         if !branches.iter().any(|candidate| candidate == &branch) {
             return Err(OmniError::manifest_not_found(format!(
                 "branch '{}' not found",
@@ -898,7 +901,7 @@ impl Omnigraph {
 
     pub async fn get_commit(&self, commit_id: &str) -> Result<GraphCommit> {
         self.ensure_schema_state_valid().await?;
-        self.coordinator
+        self.coordinator.lock().await
             .resolve_commit(&SnapshotId::new(commit_id))
             .await
     }
@@ -1534,7 +1537,7 @@ edge WorksAt: Person -> Company
     }
 
     async fn table_rows_json(db: &Omnigraph, table_key: &str) -> Vec<Value> {
-        let snapshot = db.snapshot();
+        let snapshot = db.snapshot().await;
         let ds = snapshot.open(table_key).await.unwrap();
         let batches = db.table_store().scan_batches(&ds).await.unwrap();
         batches
@@ -1631,7 +1634,7 @@ edge WorksAt: Person -> Company
         let uri = dir.path().to_str().unwrap();
         let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
         seed_person_row(&mut db, "Alice", Some(30)).await;
-        let before_version = db.snapshot().version();
+        let before_version = db.snapshot().await.version();
 
         let desired = TEST_SCHEMA
             .replace("node Person {\n", "node Human @rename_from(\"Person\") {\n")
@@ -1642,7 +1645,7 @@ edge WorksAt: Person -> Company
             );
         db.apply_schema(&desired).await.unwrap();
 
-        let head = db.snapshot();
+        let head = db.snapshot().await;
         assert!(head.entry("node:Person").is_none());
         assert!(head.entry("node:Human").is_some());
         let historical = ManifestCoordinator::snapshot_at(uri, None, before_version)
@@ -1672,7 +1675,7 @@ edge WorksAt: Person -> Company
         .await
         .unwrap();
 
-        let all_branches = db.coordinator.all_branches().await.unwrap();
+        let all_branches = db.coordinator.lock().await.all_branches().await.unwrap();
         assert!(
             !all_branches.iter().any(|b| is_internal_run_branch(b)),
             "run branch should be deleted after publish, got: {:?}",
@@ -1696,7 +1699,7 @@ edge WorksAt: Person -> Company
         let desired = TEST_SCHEMA.replace("name: String @key", "name: String @key @index");
         db.apply_schema(&desired).await.unwrap();
 
-        let snapshot = db.snapshot();
+        let snapshot = db.snapshot().await;
         let ds = snapshot.open("node:Person").await.unwrap();
         assert!(db.table_store().has_fts_index(&ds, "name").await.unwrap());
     }
@@ -1715,7 +1718,7 @@ edge WorksAt: Person -> Company
         );
         db.apply_schema(&desired).await.unwrap();
 
-        let snapshot = db.snapshot();
+        let snapshot = db.snapshot().await;
         let ds = snapshot.open("node:Person").await.unwrap();
         assert!(db.table_store().has_btree_index(&ds, "id").await.unwrap());
         assert!(db.table_store().has_fts_index(&ds, "name").await.unwrap());
@@ -1728,6 +1731,8 @@ edge WorksAt: Person -> Company
         let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
         let mut db = db;
         db.coordinator
+            .lock()
+            .await
             .branch_create(SCHEMA_APPLY_LOCK_BRANCH)
             .await
             .unwrap();
@@ -1745,6 +1750,8 @@ edge WorksAt: Person -> Company
         let uri = dir.path().to_str().unwrap();
         let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
         db.coordinator
+            .lock()
+            .await
             .branch_create(SCHEMA_APPLY_LOCK_BRANCH)
             .await
             .unwrap();
@@ -1762,6 +1769,8 @@ edge WorksAt: Person -> Company
         let uri = dir.path().to_str().unwrap();
         let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
         db.coordinator
+            .lock()
+            .await
             .branch_create(SCHEMA_APPLY_LOCK_BRANCH)
             .await
             .unwrap();
