@@ -47,6 +47,7 @@ time = { workspace = true }
 async-trait = { workspace = true }
 url = { workspace = true }
 chrono = { workspace = true }
+arc-swap = { workspace = true }
 
 [dev-dependencies]
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.4.1" }

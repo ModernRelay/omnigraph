@@ -4639,6 +4639,7 @@ dependencies = [
 name = "omnigraph-engine"
 version = "0.4.1"
 dependencies = [
+ "arc-swap",
  "arrow-array",
  "arrow-cast",
  "arrow-ord",

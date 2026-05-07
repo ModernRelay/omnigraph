@@ -56,6 +56,7 @@ tower-http = { version = "0.6", features = ["trace"] }
 color-eyre = "0.6"
 tempfile = "3"
 ahash = "0.8"
+arc-swap = "1"
 base64 = "0.22"
 ariadne = "0.4"
 regex = "1"
