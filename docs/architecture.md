@@ -247,7 +247,7 @@ flowchart LR
         manual[called manually<br/>or from optimize]:::now
     end
 
-    subgraph roadmap[Roadmap — invariants §VII.35]
+    subgraph roadmap[Roadmap — invariants §VII.38]
         rec[Reconciler<br/>observes manifest]:::future
         diff[coverage diff<br/>fragments − fragment_bitmap]:::future
         wp[worker pool<br/>builds index segments]:::future
@@ -258,7 +258,7 @@ flowchart LR
     rec --> diff --> wp
 ```
 
-Today, indexes are built explicitly via `ensure_indices`. Reads degrade gracefully when index coverage is partial — Lance's scanner unions indexed and scan paths automatically. The roadmap reconciler (per [`docs/invariants.md`](invariants.md) §VII.35) observes manifest state and converges coverage in the background.
+Today, indexes are built explicitly via `ensure_indices`. Reads degrade gracefully when index coverage is partial — Lance's scanner unions indexed and scan paths automatically. The roadmap reconciler (per [`docs/invariants.md`](invariants.md) §VII.38) observes manifest state and converges coverage in the background.
 
 ### Server / CLI
 
