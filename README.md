@@ -8,6 +8,7 @@
 **Lakehouse-native graph engine with git-style workflows.**
 
 Branch, commit, and merge typed graph data like source code. Multi-modal, self-hosted, open source.
+Backed by the Lance open-table format.
 
 ## Use Cases
 
