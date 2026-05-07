@@ -28,7 +28,7 @@ Only `/export` streams (`application/x-ndjson`, MPSC channel + `Body::from_strea
 
 ## Error model
 
-Uniform `ErrorOutput { error, code?, merge_conflicts[], manifest_conflict? }` with `code ∈ unauthorized | forbidden | bad_request | not_found | conflict | internal`. Merge conflicts attach structured `MergeConflictOutput { table_key, row_id?, kind, message }`.
+Uniform `ErrorOutput { error, code?, merge_conflicts[], manifest_conflict? }` with `code ∈ unauthorized | forbidden | bad_request | not_found | conflict | too_many_requests | service_unavailable | internal`. Merge conflicts attach structured `MergeConflictOutput { table_key, row_id?, kind, message }`.
 
 `manifest_conflict` is set on **publisher CAS rejections** (HTTP 409): the
 caller's pre-write view of one table's manifest version was stale.
@@ -37,7 +37,40 @@ which table to refresh and retry. This is the conflict shape produced by
 concurrent `/change` or `/ingest` calls landing the same `(table, branch)`
 race (MR-771 / MR-766).
 
-HTTP status codes used: 200, 400, 401, 403, 404, 409, 500.
+HTTP status codes used: 200, 400, 401, 403, 404, 409, 429, 500, 503.
+
+## Per-actor admission control (MR-686)
+
+PR 2 (MR-686) removed the global server `RwLock<Omnigraph>`. Disjoint
+`(table, branch)` writes from different actors now run concurrently,
+guarded only by the engine's per-(table, branch) write queue. To keep
+one heavy actor from exhausting shared capacity (Lance I/O, manifest
+churn, network), the server gates mutating handlers through a
+`WorkloadController` configured per-process from environment variables:
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `OMNIGRAPH_PER_ACTOR_INFLIGHT_MAX` | 16 | Concurrent in-flight mutations per actor |
+| `OMNIGRAPH_PER_ACTOR_BYTES_MAX` | 4 GiB | In-flight estimated bytes per actor |
+| `OMNIGRAPH_GLOBAL_REWRITE_MAX` | 4 | Concurrent compaction / index-build slots |
+
+When an actor exceeds its in-flight count or byte budget, the server
+returns **HTTP 429 Too Many Requests** with `code: too_many_requests`
+and a `Retry-After` header (seconds). The actor should back off; other
+actors are unaffected.
+
+When the global rewrite pool is exhausted (compaction, index build),
+the server returns **HTTP 503 Service Unavailable** with
+`code: service_unavailable`. Clients can retry; the rewrite pool
+empties as in-flight rewrites complete.
+
+Cedar policy authorization runs **before** admission accounting so
+denied requests don't consume admission slots.
+
+Today admission gates the `/change` hot path. `/ingest`, `/branches/*`,
+and `/schema/apply` flow through the unlocked engine handle without
+admission gates — wiring those is mechanical follow-up work tracked
+on MR-686.
 
 ## Body limits
 
