@@ -878,10 +878,24 @@ impl Omnigraph {
             ensure_public_branch_ref(name, "branch_create_from")?;
         }
         let branch = normalize_branch_name(&branch_name)?;
-        let previous = self.swap_coordinator_for_branch(branch.as_deref()).await?;
-        let result = self.coordinator.write().await.branch_create(name).await;
-        self.restore_coordinator(previous).await;
-        result
+        // Operate on a freshly-opened source coordinator that's owned locally
+        // — never touch `self.coordinator`. The pre-fix implementation used
+        // `swap_coordinator_for_branch` + operate + `restore_coordinator` as
+        // three separate `coordinator.write().await` acquisitions; under
+        // `&self` concurrency, a second `branch_create_from` could swap
+        // self.coordinator between this caller's swap and operate steps,
+        // making the operate run against the wrong source branch and
+        // forking off the wrong HEAD. Pinned by
+        // `concurrent_branch_create_from_distinct_parents_does_not_corrupt_coordinator`
+        // in `crates/omnigraph-server/tests/server.rs`.
+        //
+        // `branch_create` mutates only the local coord's commit-graph cache;
+        // the manifest write is durable on disk regardless of which
+        // coord-handle issued it. Discarding `source_coord` after the call
+        // is the right shape — the new branch is reachable from any
+        // subsequent open of any coord.
+        let mut source_coord = self.open_coordinator_for_branch(branch.as_deref()).await?;
+        source_coord.branch_create(name).await
     }
 
     pub async fn branch_list(&self) -> Result<Vec<String>> {
