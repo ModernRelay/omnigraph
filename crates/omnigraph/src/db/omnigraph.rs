@@ -465,22 +465,30 @@ impl Omnigraph {
     /// [`refresh_coordinator_only`](Self::refresh_coordinator_only) to
     /// avoid the recovery sweep racing their own sidecar.
     pub async fn refresh(&self) -> Result<()> {
-        let mut coord = self.coordinator.write().await;
-        coord.refresh().await?;
-        let schema_state_recovery = recover_schema_state_files(
-            &self.root_uri,
-            Arc::clone(&self.storage),
-            &coord.snapshot(),
-        )
-        .await?;
-        crate::db::manifest::recover_manifest_drift(
-            &self.root_uri,
-            Arc::clone(&self.storage),
-            &mut *coord,
-            crate::db::manifest::RecoveryMode::RollForwardOnly,
-            schema_state_recovery,
-        )
-        .await?;
+        // Scope the coord write guard to the recovery section only.
+        // `reload_schema_if_source_changed` (below) acquires
+        // `self.coordinator.read().await` when the on-disk schema source
+        // has drifted from the cached `schema_source`. Tokio's RwLock is
+        // not reentrant, so holding the write across that call deadlocks.
+        // Pinned by `composite_flow_schema_apply_then_branch_ops_no_deadlock_in_refresh`.
+        {
+            let mut coord = self.coordinator.write().await;
+            coord.refresh().await?;
+            let schema_state_recovery = recover_schema_state_files(
+                &self.root_uri,
+                Arc::clone(&self.storage),
+                &coord.snapshot(),
+            )
+            .await?;
+            crate::db::manifest::recover_manifest_drift(
+                &self.root_uri,
+                Arc::clone(&self.storage),
+                &mut *coord,
+                crate::db::manifest::RecoveryMode::RollForwardOnly,
+                schema_state_recovery,
+            )
+            .await?;
+        } // ← write guard released before reload's read acquisition
         self.reload_schema_if_source_changed().await?;
         self.runtime_cache.invalidate_all().await;
         Ok(())
