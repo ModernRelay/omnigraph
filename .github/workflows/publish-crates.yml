@@ -1,0 +1,99 @@
+name: Publish to crates.io
+
+# Publishes the four workspace crates to crates.io in dependency order.
+#
+# Triggers:
+#   - push of any v* tag (future releases auto-publish alongside release.yml)
+#   - workflow_dispatch with an explicit tag input (catch-up runs for past tags)
+#
+# Idempotent: each crate's current crates.io version is checked before publish,
+# so a partial failure can be re-run without "crate version already exists" errors.
+#
+# Prerequisite: repo secret CARGO_REGISTRY_TOKEN. The job exits cleanly if absent.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (e.g. v0.4.1). Required for manual dispatches."
+        required: true
+        type: string
+
+jobs:
+  publish_crates:
+    name: Publish crates
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Skip if CARGO_REGISTRY_TOKEN is not configured
+        if: env.CARGO_REGISTRY_TOKEN == ''
+        run: |
+          echo "CARGO_REGISTRY_TOKEN is not set; skipping crates.io publish."
+          echo "CARGO_PUBLISH_SKIP=1" >> "$GITHUB_ENV"
+
+      - name: Resolve ref
+        if: env.CARGO_PUBLISH_SKIP != '1'
+        id: ref
+        run: |
+          ref="${{ inputs.tag || github.ref_name }}"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+          echo "Publishing from ref: ${ref}"
+
+      - name: Checkout source at tag
+        if: env.CARGO_PUBLISH_SKIP != '1'
+        uses: actions/checkout@v5.0.1
+        with:
+          ref: ${{ steps.ref.outputs.ref }}
+
+      - name: Install Linux dependencies
+        if: env.CARGO_PUBLISH_SKIP != '1'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - name: Install Rust stable
+        if: env.CARGO_PUBLISH_SKIP != '1'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust build data
+        if: env.CARGO_PUBLISH_SKIP != '1'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Publish crates in dependency order
+        if: env.CARGO_PUBLISH_SKIP != '1'
+        run: |
+          set -euo pipefail
+
+          publish_if_new() {
+            local crate="$1"
+            local version
+            version=$(cargo metadata --format-version=1 --no-deps \
+              | jq -r --arg c "$crate" '.packages[] | select(.name==$c) | .version')
+
+            local current
+            current=$(curl -fsSL "https://crates.io/api/v1/crates/${crate}" \
+              | jq -r '.crate.max_version' || echo "")
+
+            if [[ "$current" == "$version" ]]; then
+              echo "==> ${crate} ${version} already on crates.io, skipping"
+              return 0
+            fi
+
+            echo "==> publishing ${crate} ${version} (current crates.io: ${current:-none})"
+            cargo publish -p "$crate" --locked
+          }
+
+          publish_if_new omnigraph-compiler
+          publish_if_new omnigraph-engine
+          publish_if_new omnigraph-server
+          publish_if_new omnigraph-cli
