@@ -443,11 +443,11 @@ pub(super) async fn apply_schema_with_lock(
     }
 
     db.refresh_coordinator_only().await?;
-    if db.version().await != base_manifest_version {
+    let current_manifest_version = db.version().await;
+    if current_manifest_version != base_manifest_version {
         return Err(OmniError::manifest_conflict(format!(
             "schema apply lost its write lease: main advanced from v{} to v{} while schema apply was in progress",
-            base_manifest_version,
-            db.version().await
+            base_manifest_version, current_manifest_version,
         )));
     }
 

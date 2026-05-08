@@ -99,6 +99,9 @@ See [deployment.md](deployment.md) for token-source operational details.
 ## Not implemented (by design or "TBD")
 
 - CORS — not configured; add `tower_http::cors` if needed.
-- Rate limiting — none.
+- Rate limiting — per-actor admission control gates `/change`, `/ingest`,
+  `/branches/{create,delete,merge}`, `/schema/apply` (see "Per-actor
+  admission control" above). No global rate limiter is configured;
+  add `tower_http::limit` if a graph-wide cap is needed.
 - Pagination — none (commits/branches return everything; export streams).
 - Multi-tenant routing — one repo per process.
