@@ -3250,7 +3250,6 @@ query insert_c($name: String) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[serial]
 async fn ingest_per_actor_admission_cap_returns_429() {
     // Pin the admission gate on `/ingest`. With per-actor in-flight cap of 1
     // and 8 concurrent requests from the same actor, at least one request
@@ -3269,11 +3268,32 @@ async fn ingest_per_actor_admission_cap_returns_429() {
     // `state.workload.try_admit(&actor_arc, est_bytes)` after Cedar
     // authorization and before the engine call. Cap exhaustion surfaces as
     // 429 with `code: too_many_requests`.
-    let _guard = EnvGuard::set(&[
-        ("OMNIGRAPH_PER_ACTOR_INFLIGHT_MAX", Some("1")),
-        ("OMNIGRAPH_PER_ACTOR_BYTES_MAX", Some("1000000000")),
-    ]);
-    let (_temp, app) = app_for_loaded_repo_with_auth_tokens(&[("act-flooder", "flooder-token")]).await;
+    //
+    // Construct the WorkloadController directly with cap=1 instead of
+    // mutating `OMNIGRAPH_PER_ACTOR_INFLIGHT_MAX` via EnvGuard. Process-wide
+    // env vars are visible to concurrently-running tests; the previous
+    // `EnvGuard + #[serial]` pair leaked the override into any other test
+    // that called `AppState::open` during the guard's window
+    // (matrix CI failure on commit 99b0941). Using the explicit
+    // `AppState::new_with_workload` constructor closes that bug class —
+    // this test no longer mutates global state and no longer needs
+    // `#[serial]`.
+    let temp = init_loaded_repo().await;
+    let repo = repo_path(temp.path());
+    let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let workload = omnigraph_server::workload::WorkloadController::new(
+        1,             // per-actor in-flight cap (the fixture under test)
+        1_000_000_000, // per-actor byte budget — large so it never bottlenecks
+        4,             // global rewrite cap (default-equivalent)
+    );
+    let state = AppState::new_with_workload(
+        repo.to_string_lossy().to_string(),
+        db,
+        vec![("act-flooder".to_string(), "flooder-token".to_string())],
+        workload,
+    );
+    let app = build_app(state);
+    let _temp = temp;
 
     // Eight concurrent ingests, all from act-flooder. Only one fits in a
     // cap=1 in-flight semaphore; the others must 429.
