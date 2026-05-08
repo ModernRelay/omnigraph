@@ -1083,6 +1083,16 @@ impl Omnigraph {
             ))
             .await?
             .snapshot;
+        // Hold the merge-exclusive mutex across the full swap → operate
+        // → restore window. Two concurrent branch_merge calls would
+        // otherwise interleave their three separate `coordinator.write()`
+        // acquisitions, leaving each merge's body running against the
+        // other's swapped coord. Pinned by
+        // `concurrent_branch_merges_distinct_targets_do_not_swap_into_each_other`
+        // in `crates/omnigraph-server/tests/server.rs`.
+        let merge_exclusive = self.merge_exclusive();
+        let _merge_guard = merge_exclusive.lock().await;
+
         let previous_branch = self.active_branch().await;
         let previous = self
             .swap_coordinator_for_branch(target_branch.as_deref())
