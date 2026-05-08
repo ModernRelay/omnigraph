@@ -158,7 +158,10 @@ async fn drive_heavy_actor(
 ) -> (usize, usize, usize) {
     use tokio::sync::Semaphore;
 
-    let limiter = Arc::new(Semaphore::new(concurrency.max(1)));
+    // Asserted at startup in `main()`; check again here for defense in
+    // depth so a future caller can't pass 0 silently.
+    assert!(concurrency > 0, "drive_heavy_actor concurrency must be > 0");
+    let limiter = Arc::new(Semaphore::new(concurrency));
     let mut handles = Vec::with_capacity(batches);
     for b in 0..batches {
         let app = app.clone();
@@ -249,6 +252,13 @@ async fn main() {
     let args = Args::parse();
     if args.light_actors == 0 || args.light_ops_per_actor == 0 || args.heavy_batches == 0 {
         eprintln!("--light-actors, --light-ops-per-actor, --heavy-batches must all be > 0");
+        std::process::exit(2);
+    }
+    if args.heavy_concurrency == 0 {
+        eprintln!(
+            "--heavy-concurrency must be > 0 (zero would prevent the heavy actor from \
+             ever firing a batch; if you want to disable heavy traffic, set --heavy-batches=0)"
+        );
         std::process::exit(2);
     }
 
