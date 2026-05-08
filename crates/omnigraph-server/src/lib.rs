@@ -206,6 +206,29 @@ impl AppState {
         }
     }
 
+    /// Construct with a caller-provided [`workload::WorkloadController`].
+    /// Tests and benches use this to override per-actor caps without
+    /// mutating global env vars (which is unsafe in Rust 2024 once the
+    /// async runtime is up — `setenv` isn't thread-safe).
+    pub fn new_with_workload(
+        uri: String,
+        db: Omnigraph,
+        bearer_tokens: Vec<(String, String)>,
+        workload: workload::WorkloadController,
+    ) -> Self {
+        let bearer_tokens: Vec<(BearerTokenHash, Arc<str>)> = bearer_tokens
+            .into_iter()
+            .map(|(actor, token)| (hash_bearer_token(&token), Arc::<str>::from(actor)))
+            .collect();
+        Self {
+            uri,
+            engine: Arc::new(db),
+            workload: Arc::new(workload),
+            bearer_tokens: Arc::from(bearer_tokens),
+            policy_engine: None,
+        }
+    }
+
     pub async fn open(uri: impl Into<String>) -> Result<Self> {
         Self::open_with_bearer_token(uri, None).await
     }
