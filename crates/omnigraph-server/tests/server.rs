@@ -2436,9 +2436,27 @@ mod matrix {
         pub async fn new() -> Self {
             let temp = init_loaded_repo().await;
             let repo = repo_path(temp.path());
-            let state = AppState::open(repo.to_string_lossy().to_string())
-                .await
-                .unwrap();
+            // Build the WorkloadController explicitly with defaults rather
+            // than letting `AppState::open` call
+            // `WorkloadController::from_env()`. The admission-gate test
+            // (`ingest_per_actor_admission_cap_returns_429`) sets
+            // OMNIGRAPH_PER_ACTOR_INFLIGHT_MAX=1 inside an EnvGuard while
+            // it runs. Process-wide env vars are visible to
+            // concurrently-running tests; if a matrix cell reads env at
+            // AppState construction time during that window it picks up
+            // cap=1 and the second concurrent merge in cell b surfaces
+            // 429 instead of the expected 200. Constructing the
+            // controller here with explicit defaults makes cells
+            // independent of any env mutation other tests perform.
+            let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+            let workload =
+                omnigraph_server::workload::WorkloadController::with_defaults();
+            let state = AppState::new_with_workload(
+                repo.to_string_lossy().to_string(),
+                db,
+                Vec::new(),
+                workload,
+            );
             let app = build_app(state);
             Self {
                 _temp: temp,
