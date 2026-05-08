@@ -467,10 +467,29 @@ fn summarize_merge_conflicts(conflicts: &[api::MergeConflictOutput]) -> String {
     format!("merge conflicts: {}{}", preview.join("; "), suffix)
 }
 
+/// Constant `Retry-After` value (seconds) emitted on 429 / 503 responses.
+/// Matches the doc claim at `ApiError::too_many_requests` and
+/// `ApiError::service_unavailable`. Plumbing per-RejectReason durations
+/// through is a follow-up; the admission rejects we surface today are
+/// uniformly bounded by the in-flight cap recovery time, which is
+/// dominated by request handler duration rather than calendar wait.
+const RETRY_AFTER_SECONDS: &str = "60";
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let mut headers = axum::http::HeaderMap::new();
+        if matches!(
+            self.code,
+            ErrorCode::TooManyRequests | ErrorCode::ServiceUnavailable
+        ) {
+            headers.insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static(RETRY_AFTER_SECONDS),
+            );
+        }
         (
             self.status,
+            headers,
             Json(ErrorOutput {
                 error: self.message,
                 code: Some(self.code),
