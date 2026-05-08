@@ -2193,7 +2193,8 @@ async fn change_concurrent_inserts_same_key_serialize_without_409() {
     //
     // This test spawns N concurrent /change inserts on a single
     // node type and asserts: every request returns 200 (no 409),
-    // and the final row count equals N.
+    // and the final row count equals the seed count + N (every
+    // staged batch actually committed).
     let temp = init_loaded_repo().await;
     let repo = repo_path(temp.path());
     let state = AppState::open(repo.to_string_lossy().to_string())
@@ -2201,6 +2202,8 @@ async fn change_concurrent_inserts_same_key_serialize_without_409() {
         .unwrap();
     let app = build_app(state);
 
+    // test.jsonl seeds 4 Persons (Alice, Bob, Charlie, Diana).
+    const SEED_PERSON_ROWS: u64 = 4;
     const N: usize = 12;
 
     let mut handles = Vec::with_capacity(N);
@@ -2241,11 +2244,37 @@ async fn change_concurrent_inserts_same_key_serialize_without_409() {
         bad
     );
 
-    // The status assertions above are the load-bearing pin: every
-    // concurrent insert succeeded under the per-(table, branch) queue,
-    // serialized by the queue, with publisher CAS at end. None
-    // produced 409 manifest_conflict (which is what `ensure_expected_version`
-    // would have done pre-Phase-2).
+    // Verify the inserts actually landed. The status check above only proves
+    // the publisher CAS didn't reject; the row count proves none of the
+    // concurrent commits silently overwrote a peer.
+    let (snapshot_status, snapshot_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/snapshot?branch=main")
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(snapshot_status, StatusCode::OK);
+    let person_rows = snapshot_body["tables"]
+        .as_array()
+        .and_then(|tables| {
+            tables
+                .iter()
+                .find(|t| t["table_key"].as_str() == Some("node:Person"))
+        })
+        .and_then(|t| t["row_count"].as_u64())
+        .expect("snapshot must include node:Person row_count");
+    assert_eq!(
+        person_rows,
+        SEED_PERSON_ROWS + N as u64,
+        "expected {} seeded + {} concurrent inserts = {} Person rows; got {}",
+        SEED_PERSON_ROWS,
+        N,
+        SEED_PERSON_ROWS + N as u64,
+        person_rows,
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
