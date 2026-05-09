@@ -1,15 +1,18 @@
-use arrow_array::{RecordBatch, UInt64Array};
+use arrow_array::{
+    Array, ArrayRef, RecordBatch, StringArray, StructArray, UInt32Array, UInt64Array,
+};
 use arrow_schema::SchemaRef;
 use arrow_select::concat::concat_batches;
 use futures::TryStreamExt;
 use lance::Dataset;
+use lance::blob::BlobArrayBuilder;
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream, Scanner};
 use lance::dataset::transaction::{Operation, Transaction, TransactionBuilder};
 use lance::dataset::{
     CommitBuilder, InsertBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode,
     WriteParams,
 };
-use lance::datatypes::BlobHandling;
+use lance::datatypes::BlobKind;
 use lance::index::scalar::IndexDetails;
 use lance_file::version::LanceFileVersion;
 use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
@@ -272,15 +275,176 @@ impl TableStore {
             return self.scan_batches(ds).await;
         }
 
-        let mut scanner = ds.scan();
-        scanner.blob_handling(BlobHandling::AllBinary);
-        scanner
-            .try_into_stream()
+        let batches = Self::scan_stream(ds, None, None, None, true)
+            .await?
+            .try_collect::<Vec<RecordBatch>>()
             .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?
-            .try_collect()
-            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let mut materialized = Vec::with_capacity(batches.len());
+        for batch in batches {
+            materialized.push(Self::materialize_blob_batch(ds, batch).await?);
+        }
+        Ok(materialized)
+    }
+
+    pub(crate) async fn materialize_blob_batch(
+        ds: &Dataset,
+        batch: RecordBatch,
+    ) -> Result<RecordBatch> {
+        let has_blob_columns = ds.schema().fields_pre_order().any(|field| field.is_blob());
+        if !has_blob_columns {
+            return Ok(batch);
+        }
+
+        let row_ids = batch
+            .column_by_name("_rowid")
+            .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| {
+                OmniError::Lance("expected _rowid column when materializing blobs".to_string())
+            })?
+            .values()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+
+        let schema: SchemaRef = Arc::new(ds.schema().into());
+        let mut columns = Vec::with_capacity(schema.fields().len());
+        for field in schema.fields() {
+            let lance_field = lance::datatypes::Field::try_from(field.as_ref())
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            let column = batch.column_by_name(field.name()).ok_or_else(|| {
+                OmniError::Lance(format!("batch missing column '{}'", field.name()))
+            })?;
+            if lance_field.is_blob() {
+                let descriptions =
+                    column
+                        .as_any()
+                        .downcast_ref::<StructArray>()
+                        .ok_or_else(|| {
+                            OmniError::Lance(format!(
+                                "expected blob descriptions for '{}'",
+                                field.name()
+                            ))
+                        })?;
+                columns.push(
+                    Self::rebuild_blob_column(ds, field.name(), descriptions, &row_ids).await?,
+                );
+            } else {
+                columns.push(column.clone());
+            }
+        }
+
+        RecordBatch::try_new(schema, columns).map_err(|e| OmniError::Lance(e.to_string()))
+    }
+
+    async fn rebuild_blob_column(
+        ds: &Dataset,
+        column_name: &str,
+        descriptions: &StructArray,
+        row_ids: &[u64],
+    ) -> Result<ArrayRef> {
+        let mut builder = BlobArrayBuilder::new(row_ids.len());
+        let mut non_null_row_ids = Vec::new();
+        let mut row_has_blob = Vec::with_capacity(row_ids.len());
+
+        for row in 0..row_ids.len() {
+            let is_null = Self::blob_description_is_null(descriptions, row)?;
+            row_has_blob.push(!is_null);
+            if !is_null {
+                non_null_row_ids.push(row_ids[row]);
+            }
+        }
+
+        let blob_files = if non_null_row_ids.is_empty() {
+            Vec::new()
+        } else {
+            Arc::new(ds.clone())
+                .take_blobs(&non_null_row_ids, column_name)
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?
+        };
+
+        let mut files = blob_files.into_iter();
+        for has_blob in row_has_blob {
+            if !has_blob {
+                builder
+                    .push_null()
+                    .map_err(|e| OmniError::Lance(e.to_string()))?;
+                continue;
+            }
+
+            let blob = files.next().ok_or_else(|| {
+                OmniError::Lance(format!(
+                    "blob rewrite for '{}' lost alignment with source rows",
+                    column_name
+                ))
+            })?;
+            if let Some(uri) = blob.uri() {
+                builder
+                    .push_uri(uri)
+                    .map_err(|e| OmniError::Lance(e.to_string()))?;
+            } else {
+                builder
+                    .push_bytes(
+                        blob.read()
+                            .await
+                            .map_err(|e| OmniError::Lance(e.to_string()))?,
+                    )
+                    .map_err(|e| OmniError::Lance(e.to_string()))?;
+            }
+        }
+
+        if files.next().is_some() {
+            return Err(OmniError::Lance(format!(
+                "blob rewrite for '{}' produced extra source blobs",
+                column_name
+            )));
+        }
+
+        builder
+            .finish()
             .map_err(|e| OmniError::Lance(e.to_string()))
+    }
+
+    fn blob_description_is_null(descriptions: &StructArray, row: usize) -> Result<bool> {
+        if descriptions.is_null(row) {
+            return Ok(true);
+        }
+
+        let kind = descriptions
+            .column_by_name("kind")
+            .and_then(|col| col.as_any().downcast_ref::<UInt32Array>())
+            .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row) as u8))
+            .or_else(|| {
+                descriptions
+                    .column_by_name("kind")
+                    .and_then(|col| col.as_any().downcast_ref::<arrow_array::UInt8Array>())
+                    .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)))
+            });
+        let position = descriptions
+            .column_by_name("position")
+            .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+            .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)));
+        let size = descriptions
+            .column_by_name("size")
+            .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+            .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)));
+        let blob_uri = descriptions
+            .column_by_name("blob_uri")
+            .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+            .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)));
+
+        let Some(kind) = kind else {
+            return Ok(true);
+        };
+        let kind = BlobKind::try_from(kind).map_err(|e| OmniError::Lance(e.to_string()))?;
+        if kind != BlobKind::Inline {
+            return Ok(false);
+        }
+
+        Ok(position.unwrap_or(0) == 0
+            && size.unwrap_or(0) == 0
+            && blob_uri.unwrap_or("").is_empty())
     }
 
     pub async fn scan_stream(
@@ -772,11 +936,7 @@ impl TableStore {
     ///
     /// MR-793 Phase 2: introduces this for the schema_apply rewrite path.
     /// Lance API verified in `.context/mr-793-design.md` Appendix A.1.
-    pub async fn stage_overwrite(
-        &self,
-        ds: &Dataset,
-        batch: RecordBatch,
-    ) -> Result<StagedWrite> {
+    pub async fn stage_overwrite(&self, ds: &Dataset, batch: RecordBatch) -> Result<StagedWrite> {
         if batch.num_rows() == 0 {
             return Err(OmniError::manifest_internal(
                 "stage_overwrite called with empty batch".to_string(),
@@ -821,8 +981,7 @@ impl TableStore {
         // read-your-writes via scan_with_staged, list every committed
         // fragment in removed_fragment_ids so the post-stage view shows
         // ONLY the staged fragments.
-        let removed_fragment_ids: Vec<u64> =
-            ds.manifest.fragments.iter().map(|f| f.id).collect();
+        let removed_fragment_ids: Vec<u64> = ds.manifest.fragments.iter().map(|f| f.id).collect();
         Ok(StagedWrite {
             transaction,
             new_fragments,
@@ -859,9 +1018,7 @@ impl TableStore {
             .replace(true)
             .execute_uncommitted()
             .await
-            .map_err(|e| {
-                OmniError::Lance(format!("stage_create_btree_index: {}", e))
-            })?;
+            .map_err(|e| OmniError::Lance(format!("stage_create_btree_index: {}", e)))?;
         let removed_indices: Vec<IndexMetadata> = ds
             .load_indices()
             .await
@@ -900,9 +1057,7 @@ impl TableStore {
             .replace(true)
             .execute_uncommitted()
             .await
-            .map_err(|e| {
-                OmniError::Lance(format!("stage_create_inverted_index: {}", e))
-            })?;
+            .map_err(|e| OmniError::Lance(format!("stage_create_inverted_index: {}", e)))?;
         let removed_indices: Vec<IndexMetadata> = ds
             .load_indices()
             .await
@@ -1074,13 +1229,8 @@ impl TableStore {
             None => committed,
         };
 
-        let pending = scan_pending_batches(
-            pending_batches,
-            pending_schema,
-            projection,
-            filter,
-        )
-        .await?;
+        let pending =
+            scan_pending_batches(pending_batches, pending_schema, projection, filter).await?;
 
         let mut out = committed;
         out.extend(pending);
@@ -1438,11 +1588,8 @@ async fn scan_pending_batches(
 ) -> Result<Vec<RecordBatch>> {
     let schema = pending_schema.unwrap_or_else(|| pending_batches[0].schema());
     let ctx = datafusion::execution::context::SessionContext::new();
-    let mem = datafusion::datasource::MemTable::try_new(
-        schema,
-        vec![pending_batches.to_vec()],
-    )
-    .map_err(|e| OmniError::Lance(e.to_string()))?;
+    let mem = datafusion::datasource::MemTable::try_new(schema, vec![pending_batches.to_vec()])
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
     ctx.register_table("pending", Arc::new(mem))
         .map_err(|e| OmniError::Lance(e.to_string()))?;
 
@@ -1454,9 +1601,7 @@ async fn scan_pending_batches(
                 .join(", ")
         })
         .unwrap_or_else(|| "*".to_string());
-    let where_clause = filter
-        .map(|f| format!("WHERE {f}"))
-        .unwrap_or_default();
+    let where_clause = filter.map(|f| format!("WHERE {f}")).unwrap_or_default();
     let sql = format!("SELECT {proj} FROM pending {where_clause}");
     let df = ctx
         .sql(&sql)

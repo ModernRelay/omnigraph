@@ -26,12 +26,14 @@ struct StagedMergeResult {
 struct CursorRow {
     id: String,
     signature: String,
+    dataset: Dataset,
     batch: RecordBatch,
     row_index: usize,
 }
 
 struct OrderedTableCursor {
     stream: Option<std::pin::Pin<Box<DatasetRecordBatchStream>>>,
+    dataset: Option<Dataset>,
     current_batch: Option<RecordBatch>,
     current_row: usize,
     peeked: Option<CursorRow>,
@@ -47,14 +49,15 @@ impl OrderedTableCursor {
     }
 
     async fn from_dataset(dataset: Option<Dataset>) -> Result<Self> {
-        let stream = if let Some(ds) = dataset {
+        let stream = if let Some(ds) = &dataset {
             Some(Box::pin(
-                crate::table_store::TableStore::scan_stream(
-                    &ds,
+                crate::table_store::TableStore::scan_stream_with(
+                    ds,
                     None,
                     None,
                     Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]),
-                    false,
+                    true,
+                    |_| Ok(()),
                 )
                 .await?,
             ))
@@ -64,6 +67,7 @@ impl OrderedTableCursor {
 
         Ok(Self {
             stream,
+            dataset,
             current_batch: None,
             current_row: 0,
             peeked: None,
@@ -90,9 +94,13 @@ impl OrderedTableCursor {
                 if self.current_row < batch.num_rows() {
                     let row_index = self.current_row;
                     self.current_row += 1;
+                    let dataset = self.dataset.clone().ok_or_else(|| {
+                        OmniError::manifest("cursor row missing source dataset".to_string())
+                    })?;
                     return Ok(Some(CursorRow {
                         id: row_id_at(batch, row_index)?,
                         signature: row_signature(batch, row_index)?,
+                        dataset,
                         batch: batch.clone(),
                         row_index,
                     }));
@@ -146,11 +154,36 @@ impl StagedTableWriter {
     async fn push_row(&mut self, row: &CursorRow) -> Result<()> {
         self.row_count += 1;
         self.buffered_rows += 1;
-        self.batches.push(row.batch.slice(row.row_index, 1));
+        self.batches.push(self.row_batch(row).await?);
         if self.buffered_rows >= MERGE_STAGE_BATCH_ROWS {
             self.flush().await?;
         }
         Ok(())
+    }
+
+    async fn row_batch(&self, row: &CursorRow) -> Result<RecordBatch> {
+        let batch = row.batch.slice(row.row_index, 1);
+        let has_blob_columns = row
+            .dataset
+            .schema()
+            .fields_pre_order()
+            .any(|field| field.is_blob());
+        if has_blob_columns {
+            return crate::table_store::TableStore::materialize_blob_batch(&row.dataset, batch)
+                .await;
+        }
+        let columns = self
+            .schema
+            .fields()
+            .iter()
+            .map(|field| {
+                batch.column_by_name(field.name()).cloned().ok_or_else(|| {
+                    OmniError::Lance(format!("batch missing column '{}'", field.name()))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        RecordBatch::try_new(self.schema.clone(), columns)
+            .map_err(|e| OmniError::Lance(e.to_string()))
     }
 
     async fn finish(mut self) -> Result<StagedTable> {
@@ -494,13 +527,20 @@ fn classify_merge_conflict(
 
 fn row_signature(batch: &RecordBatch, row: usize) -> Result<String> {
     let mut values = Vec::with_capacity(batch.num_columns());
-    for column in batch.columns() {
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+        if field.name().starts_with("_row") {
+            continue;
+        }
         values.push(
             array_value_to_string(column.as_ref(), row)
                 .map_err(|e| OmniError::Lance(e.to_string()))?,
         );
     }
     Ok(values.join("\u{1f}"))
+}
+
+async fn scan_validation_stream(ds: &Dataset) -> Result<DatasetRecordBatchStream> {
+    crate::table_store::TableStore::scan_stream_with(ds, None, None, None, false, |_| Ok(())).await
 }
 
 async fn validate_merge_candidates(
@@ -520,8 +560,7 @@ async fn validate_merge_candidates(
         if let Some(ds) =
             candidate_dataset(source_snapshot, target_snapshot, candidates, &table_key).await?
         {
-            let mut stream =
-                crate::table_store::TableStore::scan_stream(&ds, None, None, None, false).await?;
+            let mut stream = scan_validation_stream(&ds).await?;
             while let Some(batch) = stream
                 .try_next()
                 .await
@@ -568,8 +607,7 @@ async fn validate_merge_candidates(
         if let Some(ds) =
             candidate_dataset(source_snapshot, target_snapshot, candidates, &table_key).await?
         {
-            let mut stream =
-                crate::table_store::TableStore::scan_stream(&ds, None, None, None, false).await?;
+            let mut stream = scan_validation_stream(&ds).await?;
             while let Some(batch) = stream
                 .try_next()
                 .await
@@ -922,7 +960,7 @@ async fn publish_rewritten_merge_table(
     if let Some(delta) = &staged.delta_staged {
         let batches: Vec<RecordBatch> = target_db
             .table_store()
-            .scan_batches(&delta.dataset)
+            .scan_batches_for_rewrite(&delta.dataset)
             .await?
             .into_iter()
             .filter(|batch| batch.num_rows() > 0)
@@ -1025,11 +1063,7 @@ impl Omnigraph {
         result
     }
 
-    async fn branch_merge_impl(
-        &mut self,
-        source: &str,
-        target: &str,
-    ) -> Result<MergeOutcome> {
+    async fn branch_merge_impl(&mut self, source: &str, target: &str) -> Result<MergeOutcome> {
         if is_internal_run_branch(source) || is_internal_run_branch(target) {
             return Err(OmniError::manifest(format!(
                 "branch_merge does not allow internal run refs ('{}' -> '{}')",
