@@ -3478,3 +3478,77 @@ async fn oversized_request_body_returns_payload_too_large() {
 
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn cors_default_off_does_not_emit_allow_origin_header() {
+    // Make sure the env is unset when build_app runs.
+    // SAFETY: tests are gated by #[serial], so no concurrent env reads.
+    unsafe {
+        env::remove_var("OMNIGRAPH_SERVER_CORS_ORIGIN");
+    }
+
+    let (_temp, app) = app_for_loaded_repo().await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .method(Method::GET)
+                .header("Origin", "http://localhost:5173")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers().get("access-control-allow-origin").is_none(),
+        "default-off CORS should not advertise allow-origin",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn cors_env_origin_emits_allow_origin_header() {
+    // SAFETY: tests are gated by #[serial], so no concurrent env reads.
+    unsafe {
+        env::set_var(
+            "OMNIGRAPH_SERVER_CORS_ORIGIN",
+            "http://localhost:5173,https://app.example.com",
+        );
+    }
+
+    // Build the app *after* the env var is set so build_cors_layer reads it.
+    let (_temp, app) = app_for_loaded_repo().await;
+
+    // Reset the env immediately to keep other tests clean.
+    unsafe {
+        env::remove_var("OMNIGRAPH_SERVER_CORS_ORIGIN");
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .method(Method::GET)
+                .header("Origin", "http://localhost:5173")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let allow_origin = response
+        .headers()
+        .get("access-control-allow-origin")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert_eq!(
+        allow_origin, "http://localhost:5173",
+        "CORS layer should echo the matching origin",
+    );
+}

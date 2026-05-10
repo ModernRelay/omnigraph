@@ -90,9 +90,22 @@ See [deployment.md](deployment.md) for token-source operational details.
 - Startup logs: token source name, repo URI, bind address
 - Graceful SIGINT shutdown
 
+## CORS
+
+Off by default — production deployments behind a same-origin reverse proxy need no
+configuration. To enable cross-origin requests (e.g. from a browser-based UI on a
+different host/port during development), set:
+
+- `OMNIGRAPH_SERVER_CORS_ORIGIN` — comma-separated list of allowed origins.
+  Example: `OMNIGRAPH_SERVER_CORS_ORIGIN=http://localhost:5173,https://app.example.com`.
+
+When set, the server attaches a `tower_http::cors::CorsLayer` permitting `GET`, `POST`,
+`DELETE`, plus the `Authorization` and `Content-Type` request headers. Requests from
+origins not in the list receive no CORS allow-origin response and the browser blocks
+them. Empty/unset variable → no layer → no CORS headers (default behaviour preserved).
+
 ## Not implemented (by design or "TBD")
 
-- CORS — not configured; add `tower_http::cors` if needed.
 - Rate limiting — per-actor admission control gates `/change`, `/ingest`,
   `/branches/{create,delete,merge}`, `/schema/apply` (see "Per-actor
   admission control" above). No global rate limiter is configured;

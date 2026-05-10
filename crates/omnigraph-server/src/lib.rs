@@ -49,6 +49,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -550,14 +551,47 @@ pub fn build_app(state: AppState) -> Router {
             require_bearer_auth,
         ));
 
-    Router::new()
+    let mut router = Router::new()
         .route("/healthz", get(server_health))
         .route("/openapi.json", get(server_openapi))
         .merge(protected)
         .layer(DefaultBodyLimit::max(DEFAULT_REQUEST_BODY_LIMIT_BYTES))
         .layer(TraceLayer::new_for_http())
-        .with_state(state)
+        .with_state(state);
+
+    if let Some(cors) = build_cors_layer() {
+        router = router.layer(cors);
+    }
+
+    router
 }
+
+/// Build a CORS layer if `OMNIGRAPH_SERVER_CORS_ORIGIN` is set. The value is a
+/// comma-separated list of origins. Default off so production deployments are
+/// unchanged.
+fn build_cors_layer() -> Option<CorsLayer> {
+    let raw = std::env::var(CORS_ORIGIN_ENV).ok()?;
+    let origins: Vec<_> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<axum::http::HeaderValue>().ok())
+        .collect();
+    if origins.is_empty() {
+        return None;
+    }
+    let layer = CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::DELETE,
+        ])
+        .allow_headers([AUTHORIZATION, CONTENT_TYPE]);
+    Some(layer)
+}
+
+pub const CORS_ORIGIN_ENV: &str = "OMNIGRAPH_SERVER_CORS_ORIGIN";
 
 pub async fn serve(config: ServerConfig) -> Result<()> {
     let token_source = resolve_token_source().await?;
