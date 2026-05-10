@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use axum::Router;
 use axum::body::{Body, to_bytes};
@@ -2175,6 +2176,1287 @@ async fn change_conflict_returns_manifest_conflict_409() {
         conflict.actual,
         conflict.expected,
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn change_concurrent_inserts_same_key_serialize_without_409() {
+    // PR 2 Phase 2 (MR-686): pin the design fix for the same-key
+    // concurrency hazard. Pre-fix, in-process concurrent inserts on
+    // the same `(table, branch)` rejected with 409 manifest_conflict
+    // because `ensure_expected_version` fired before the per-table
+    // queue was acquired and saw Lance HEAD already advanced by a
+    // peer writer. Post-fix, Insert/Merge skip the strict pre-stage
+    // check (see `MutationOpKind::strict_pre_stage_version_check`);
+    // the queue serializes commit_staged; Lance's natural rebase
+    // handles the in-flight stage; the publisher's CAS on a fresh
+    // per-branch snapshot under the queue catches genuine cross-
+    // process drift.
+    //
+    // This test spawns N concurrent /change inserts on a single
+    // node type and asserts: every request returns 200 (no 409),
+    // and the final row count equals the seed count + N (every
+    // staged batch actually committed).
+    let temp = init_loaded_repo().await;
+    let repo = repo_path(temp.path());
+    let state = AppState::open(repo.to_string_lossy().to_string())
+        .await
+        .unwrap();
+    let app = build_app(state);
+
+    // test.jsonl seeds 4 Persons (Alice, Bob, Charlie, Diana).
+    const SEED_PERSON_ROWS: u64 = 4;
+    const N: usize = 12;
+
+    let mut handles = Vec::with_capacity(N);
+    for i in 0..N {
+        let app = app.clone();
+        handles.push(tokio::spawn(async move {
+            let body = serde_json::to_vec(&ChangeRequest {
+                query_source: MUTATION_QUERIES.to_string(),
+                query_name: Some("insert_person".to_string()),
+                params: Some(json!({ "name": format!("racer-{i}"), "age": i as i32 })),
+                branch: Some("main".to_string()),
+            })
+            .unwrap();
+            let req = Request::builder()
+                .uri("/change")
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let response = app.oneshot(req).await.unwrap();
+            response.status()
+        }));
+    }
+
+    let mut statuses = Vec::with_capacity(N);
+    for h in handles {
+        statuses.push(h.await.unwrap());
+    }
+
+    let bad: Vec<_> = statuses
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| **s != StatusCode::OK)
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "expected every concurrent insert to return 200, got non-200 for: {:?}",
+        bad
+    );
+
+    // Verify the inserts actually landed. The status check above only proves
+    // the publisher CAS didn't reject; the row count proves none of the
+    // concurrent commits silently overwrote a peer.
+    let (snapshot_status, snapshot_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/snapshot?branch=main")
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(snapshot_status, StatusCode::OK);
+    let person_rows = snapshot_body["tables"]
+        .as_array()
+        .and_then(|tables| {
+            tables
+                .iter()
+                .find(|t| t["table_key"].as_str() == Some("node:Person"))
+        })
+        .and_then(|t| t["row_count"].as_u64())
+        .expect("snapshot must include node:Person row_count");
+    assert_eq!(
+        person_rows,
+        SEED_PERSON_ROWS + N as u64,
+        "expected {} seeded + {} concurrent inserts = {} Person rows; got {}",
+        SEED_PERSON_ROWS,
+        N,
+        SEED_PERSON_ROWS + N as u64,
+        person_rows,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn change_concurrent_updates_same_key_serialize_via_publisher_cas() {
+    // Pin Update RYW semantics under in-process concurrency on the same
+    // `(table, branch)`. With per-table queue serialization and op-kind-aware
+    // drift detection at commit time, exactly one of N concurrent UPDATEs
+    // on the same row commits; the rest are rejected as 409 manifest_conflict.
+    //
+    // Pre-fix bug class: in `MutationStaging::commit_all`, after queue
+    // acquisition, the staged Lance transaction is handed straight to
+    // `commit_staged`. For a writer whose staged dataset is at V0 but
+    // Lance HEAD has advanced to V1 (because the queue's prior winner
+    // already published), Lance's transaction conflict resolver fires
+    // `RetryableCommitConflict` on Update vs Update on the same row.
+    // That error gets wrapped as `OmniError::Lance(<string>)` and the
+    // API surfaces it as **500 internal**, not 409. Users see "internal
+    // server error" instead of a retryable conflict, breaking the
+    // documented 409 contract for in-process drift.
+    //
+    // Post-fix invariant: `commit_all` does an op-kind-aware drift check
+    // before each `commit_staged`. For tables whose tracked op_kind has
+    // `strict_pre_stage_version_check() == true` (Update / Delete /
+    // SchemaRewrite), if the staged dataset's version doesn't match the
+    // fresh manifest pin, return `OmniError::manifest_expected_version_mismatch`
+    // → 409 ExpectedVersionMismatch. The N-1 losers see a clean 409
+    // before Lance's commit_staged ever runs.
+    //
+    // Why correct-by-design: closing the class "Lance internal conflict
+    // surfaces as 500 instead of 409" rather than mapping the specific
+    // Lance error variant. The drift check fires at the right architectural
+    // layer (engine boundary, under the queue) and respects the existing
+    // `MutationOpKind` policy.
+    let temp = init_loaded_repo().await;
+    let repo = repo_path(temp.path());
+    let state = AppState::open(repo.to_string_lossy().to_string())
+        .await
+        .unwrap();
+    let app = build_app(state);
+
+    // Spawn N=8 concurrent UPDATEs on Alice (from test.jsonl, age=30 at V0)
+    // writing distinct ages.
+    const N: usize = 8;
+    let mut handles = Vec::with_capacity(N);
+    for i in 0..N {
+        let app = app.clone();
+        let target_age = 100 + i as i32;
+        handles.push(tokio::spawn(async move {
+            let body = serde_json::to_vec(&ChangeRequest {
+                query_source: MUTATION_QUERIES.to_string(),
+                query_name: Some("set_age".to_string()),
+                params: Some(json!({ "name": "Alice", "age": target_age })),
+                branch: Some("main".to_string()),
+            })
+            .unwrap();
+            let req = Request::builder()
+                .uri("/change")
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let response = app.oneshot(req).await.unwrap();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            (status, body.to_vec())
+        }));
+    }
+
+    let mut results = Vec::with_capacity(N);
+    for h in handles {
+        results.push(h.await.unwrap());
+    }
+    let statuses: Vec<StatusCode> = results.iter().map(|(s, _)| *s).collect();
+
+    let ok_count = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::OK)
+        .count();
+    let conflict_count = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::CONFLICT)
+        .count();
+    let other: Vec<_> = statuses
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| **s != StatusCode::OK && **s != StatusCode::CONFLICT)
+        .collect();
+
+    let other_bodies: Vec<(usize, StatusCode, String)> = other
+        .iter()
+        .map(|(i, s)| {
+            let body_str = String::from_utf8_lossy(&results[*i].1).to_string();
+            (*i, **s, body_str)
+        })
+        .collect();
+    assert!(
+        other.is_empty(),
+        "expected only 200 or 409 statuses, got non-200/409 entries: {:?}",
+        other_bodies
+    );
+    assert_eq!(
+        ok_count + conflict_count,
+        N,
+        "all responses must be 200 or 409 to satisfy the RYW invariant; statuses: {:?}",
+        statuses
+    );
+    assert_eq!(
+        ok_count, 1,
+        "expected exactly one update to commit and N-1 to receive 409 manifest_conflict \
+         (op-kind-aware drift check rejects stale-V0 staged datasets at commit_all entry). \
+         Got {} OK + {} 409 + {} other. \
+         Pre-fix symptom: 1 OK + (N-1) x 500 because Lance's RetryableCommitConflict for \
+         Update vs Update on the same row bubbles up as `OmniError::Lance(<string>)` and \
+         the API maps it to 500 internal, not 409. Statuses: {:?}",
+        ok_count,
+        conflict_count,
+        statuses.len() - ok_count - conflict_count,
+        statuses,
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Branch-ops morphological matrix
+//
+// Table-driven test covering all interesting (op_a, op_b, target_overlap)
+// concurrent-pair cells with the C1-C6 invariants asserted uniformly:
+//
+//   C1 — both complete (no deadlock, no hang)
+//   C2 — status: both 200, or exactly one clean conflict (409/429), no 500
+//   C3 — per-target row count
+//   C4 — per-target row identity (present + absent named persons)
+//   C5 — engine state remains coherent (subsequent /snapshot is consistent)
+//   C6 — post-op /change on main succeeds (engine state isn't poisoned)
+//
+// Cell list (a-k) below. Each cell uses a fresh tempdir + AppState so a
+// failure in one doesn't leak into the next. Within a cell, ops align at
+// a tokio::sync::Barrier so both reach the engine close in time, and the
+// pair is wrapped in tokio::time::timeout(15s) so a deadlock surfaces
+// as a clean panic.
+//
+// Replaces the three narrow concurrent_branch_* tests below; their
+// scenarios are folded into cells f, h, i (branch_create_from race),
+// cell a (merge race with C4 identity assertions), and cell d
+// (concurrent change-during-merge).
+// ─────────────────────────────────────────────────────────────────────────
+
+mod matrix {
+    use super::*;
+    use std::time::Duration;
+    use tokio::sync::Barrier;
+
+    #[derive(Debug)]
+    pub(super) struct OpStatus {
+        pub status: StatusCode,
+        pub body: Vec<u8>,
+    }
+
+    pub(super) struct Harness {
+        pub _temp: tempfile::TempDir,
+        pub app: Router,
+    }
+
+    impl Harness {
+        pub async fn new() -> Self {
+            let temp = init_loaded_repo().await;
+            let repo = repo_path(temp.path());
+            // Build the WorkloadController explicitly with defaults rather
+            // than letting `AppState::open` call
+            // `WorkloadController::from_env()`. The admission-gate test
+            // (`ingest_per_actor_admission_cap_returns_429`) sets
+            // OMNIGRAPH_PER_ACTOR_INFLIGHT_MAX=1 inside an EnvGuard while
+            // it runs. Process-wide env vars are visible to
+            // concurrently-running tests; if a matrix cell reads env at
+            // AppState construction time during that window it picks up
+            // cap=1 and the second concurrent merge in cell b surfaces
+            // 429 instead of the expected 200. Constructing the
+            // controller here with explicit defaults makes cells
+            // independent of any env mutation other tests perform.
+            let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+            let workload =
+                omnigraph_server::workload::WorkloadController::with_defaults();
+            let state = AppState::new_with_workload(
+                repo.to_string_lossy().to_string(),
+                db,
+                Vec::new(),
+                workload,
+            );
+            let app = build_app(state);
+            Self {
+                _temp: temp,
+                app,
+            }
+        }
+
+        pub async fn create_branch(&self, from: &str, name: &str) {
+            let body = serde_json::to_vec(&BranchCreateRequest {
+                from: Some(from.to_string()),
+                name: name.to_string(),
+            })
+            .unwrap();
+            let r = self
+                .app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/branches")
+                        .method(Method::POST)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::OK,
+                "setup create_branch {} from {} failed",
+                name,
+                from
+            );
+        }
+
+        pub async fn insert_person(&self, branch: &str, name: &str, age: i32) {
+            let body = serde_json::to_vec(&ChangeRequest {
+                query_source: MUTATION_QUERIES.to_string(),
+                query_name: Some("insert_person".to_string()),
+                params: Some(json!({ "name": name, "age": age })),
+                branch: Some(branch.to_string()),
+            })
+            .unwrap();
+            let r = self
+                .app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/change")
+                        .method(Method::POST)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::OK,
+                "setup insert {} on {} failed",
+                name,
+                branch
+            );
+        }
+
+        /// Run two ops concurrently with barrier alignment + 15s deadlock
+        /// timeout. Returns `(op_a, op_b)`. Panics on timeout.
+        pub async fn run_pair(
+            &self,
+            op_a: impl FnOnce(Router, Arc<Barrier>) -> tokio::task::JoinHandle<OpStatus>,
+            op_b: impl FnOnce(Router, Arc<Barrier>) -> tokio::task::JoinHandle<OpStatus>,
+        ) -> (OpStatus, OpStatus) {
+            let barrier = Arc::new(Barrier::new(2));
+            let h_a = op_a(self.app.clone(), Arc::clone(&barrier));
+            let h_b = op_b(self.app.clone(), Arc::clone(&barrier));
+            let result = tokio::time::timeout(Duration::from_secs(15), async {
+                let a = h_a.await.unwrap();
+                let b = h_b.await.unwrap();
+                (a, b)
+            })
+            .await;
+            result.expect("concurrent op pair deadlocked (>15s)")
+        }
+
+        pub async fn person_count(&self, branch: &str) -> u64 {
+            let r = self
+                .app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/snapshot?branch={}", branch))
+                        .method(Method::GET)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::OK,
+                "snapshot {} failed",
+                branch
+            );
+            let body = to_bytes(r.into_body(), usize::MAX).await.unwrap();
+            let v: Value = serde_json::from_slice(&body).unwrap();
+            v["tables"]
+                .as_array()
+                .and_then(|tables| {
+                    tables
+                        .iter()
+                        .find(|t| t["table_key"].as_str() == Some("node:Person"))
+                })
+                .and_then(|t| t["row_count"].as_u64())
+                .unwrap_or_else(|| panic!("snapshot {} missing node:Person", branch))
+        }
+
+        /// True iff the named Person exists on `branch`. Uses the
+        /// `get_person` query from `test.gq` for identity rather than
+        /// just count.
+        pub async fn person_exists(&self, branch: &str, name: &str) -> bool {
+            let body = serde_json::to_vec(&ReadRequest {
+                query_source: include_str!(
+                    "../../omnigraph/tests/fixtures/test.gq"
+                )
+                .to_string(),
+                query_name: Some("get_person".to_string()),
+                params: Some(json!({ "name": name })),
+                branch: Some(branch.to_string()),
+                snapshot: None,
+            })
+            .unwrap();
+            let r = self
+                .app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/read")
+                        .method(Method::POST)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::OK,
+                "person_exists query for {} on {} failed",
+                name,
+                branch
+            );
+            let body = to_bytes(r.into_body(), usize::MAX).await.unwrap();
+            let v: Value = serde_json::from_slice(&body).unwrap();
+            v["row_count"].as_u64().unwrap_or(0) > 0
+        }
+
+        /// Asserts each name in `present` exists on `branch` and each in
+        /// `absent` does not. Identity-grade check that catches symmetric
+        /// swap races a row-count assertion would miss.
+        pub async fn assert_persons(
+            &self,
+            branch: &str,
+            cell: &str,
+            present: &[&str],
+            absent: &[&str],
+        ) {
+            for name in present {
+                assert!(
+                    self.person_exists(branch, name).await,
+                    "[{}] expected {} to be present on {}",
+                    cell,
+                    name,
+                    branch
+                );
+            }
+            for name in absent {
+                assert!(
+                    !self.person_exists(branch, name).await,
+                    "[{}] expected {} to be absent from {}",
+                    cell,
+                    name,
+                    branch
+                );
+            }
+        }
+
+        /// C6: insert a uniquely-named sentinel on main and verify it
+        /// landed. Catches engine-state poisoning where a cell's
+        /// concurrent ops left the engine half-broken — subsequent
+        /// /change either deadlocks or returns a non-200.
+        pub async fn assert_post_op_sentinel(&self, cell: &str, sentinel: &str) {
+            let body = serde_json::to_vec(&ChangeRequest {
+                query_source: MUTATION_QUERIES.to_string(),
+                query_name: Some("insert_person".to_string()),
+                params: Some(json!({ "name": sentinel, "age": 99 })),
+                branch: Some("main".to_string()),
+            })
+            .unwrap();
+            let r = self
+                .app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/change")
+                        .method(Method::POST)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::OK,
+                "[{}] post-op sentinel /change on main failed (engine poisoned?)",
+                cell
+            );
+            assert!(
+                self.person_exists("main", sentinel).await,
+                "[{}] sentinel {} did not land on main",
+                cell,
+                sentinel
+            );
+        }
+    }
+
+    // Helpers that build the closures for `run_pair`. Each takes a
+    // Router + Barrier and returns a JoinHandle yielding the status/body.
+
+    pub(super) fn op_merge(
+        source: String,
+        target: String,
+    ) -> impl FnOnce(Router, Arc<Barrier>) -> tokio::task::JoinHandle<OpStatus> {
+        move |app: Router, barrier: Arc<Barrier>| {
+            tokio::spawn(async move {
+                barrier.wait().await;
+                let body = serde_json::to_vec(&BranchMergeRequest {
+                    source,
+                    target: Some(target),
+                })
+                .unwrap();
+                let response = app
+                    .oneshot(
+                    Request::builder()
+                        .uri("/branches/merge")
+                        .method(Method::POST)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                OpStatus {
+                    status,
+                    body: body.to_vec(),
+                }
+            })
+        }
+    }
+
+    pub(super) fn op_change_insert(
+        branch: String,
+        name: String,
+        age: i32,
+    ) -> impl FnOnce(Router, Arc<Barrier>) -> tokio::task::JoinHandle<OpStatus> {
+        move |app: Router, barrier: Arc<Barrier>| {
+            tokio::spawn(async move {
+                barrier.wait().await;
+                let body = serde_json::to_vec(&ChangeRequest {
+                    query_source: MUTATION_QUERIES.to_string(),
+                    query_name: Some("insert_person".to_string()),
+                    params: Some(json!({ "name": name, "age": age })),
+                    branch: Some(branch),
+                })
+                .unwrap();
+                let response = app
+                    .oneshot(
+                    Request::builder()
+                        .uri("/change")
+                        .method(Method::POST)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                OpStatus {
+                    status,
+                    body: body.to_vec(),
+                }
+            })
+        }
+    }
+
+    pub(super) fn op_branch_create(
+        from: String,
+        name: String,
+    ) -> impl FnOnce(Router, Arc<Barrier>) -> tokio::task::JoinHandle<OpStatus> {
+        move |app: Router, barrier: Arc<Barrier>| {
+            tokio::spawn(async move {
+                barrier.wait().await;
+                let body = serde_json::to_vec(&BranchCreateRequest {
+                    from: Some(from),
+                    name,
+                })
+                .unwrap();
+                let response = app
+                    .oneshot(
+                    Request::builder()
+                        .uri("/branches")
+                        .method(Method::POST)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                OpStatus {
+                    status,
+                    body: body.to_vec(),
+                }
+            })
+        }
+    }
+
+    pub(super) fn op_branch_delete(
+        name: String,
+    ) -> impl FnOnce(Router, Arc<Barrier>) -> tokio::task::JoinHandle<OpStatus> {
+        move |app: Router, barrier: Arc<Barrier>| {
+            tokio::spawn(async move {
+                barrier.wait().await;
+                let response = app
+                    .oneshot(
+                    Request::builder()
+                        .uri(format!("/branches/{}", name))
+                        .method(Method::DELETE)
+                        .body(Body::empty())
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                OpStatus {
+                    status,
+                    body: body.to_vec(),
+                }
+            })
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_branch_ops_morphological_matrix() {
+    // Cell a: Merge × Merge, distinct targets.
+    // Pre-fix on b09a097/22d76db: branch_merge_impl's swap-restore race
+    // landed feature_a's content in target_b instead of target_a (and
+    // vice versa — symmetric swap). Identity asserts catch both
+    // asymmetric and symmetric variants.
+    {
+        let cell = "a:merge×merge:distinct-targets";
+        let h = matrix::Harness::new().await;
+        h.create_branch("main", "feature-a-cella").await;
+        h.insert_person("feature-a-cella", "EveA-cella", 22).await;
+        h.create_branch("main", "feature-b-cella").await;
+        h.insert_person("feature-b-cella", "FrankB-cella", 33).await;
+        h.create_branch("main", "target-a-cella").await;
+        h.create_branch("main", "target-b-cella").await;
+
+        let (sa, sb) = h
+            .run_pair(
+                matrix::op_merge(
+                    "feature-a-cella".to_string(),
+                    "target-a-cella".to_string(),
+                ),
+                matrix::op_merge(
+                    "feature-b-cella".to_string(),
+                    "target-b-cella".to_string(),
+                ),
+            )
+            .await;
+        assert_eq!(sa.status, StatusCode::OK, "[{}] merge a", cell);
+        assert_eq!(sb.status, StatusCode::OK, "[{}] merge b", cell);
+        h.assert_persons("target-a-cella", cell, &["EveA-cella"], &["FrankB-cella"])
+            .await;
+        h.assert_persons("target-b-cella", cell, &["FrankB-cella"], &["EveA-cella"])
+            .await;
+        h.assert_post_op_sentinel(cell, "sentinel-cella").await;
+    }
+
+    // Cell b: Merge × Merge, same target / distinct sources.
+    // Both want to land in main. merge_exclusive serializes; both should
+    // succeed and main should contain BOTH sources' contributions.
+    {
+        let cell = "b:merge×merge:same-target-distinct-sources";
+        let h = matrix::Harness::new().await;
+        h.create_branch("main", "src-x-cellb").await;
+        h.insert_person("src-x-cellb", "Xavier-cellb", 41).await;
+        h.create_branch("main", "src-y-cellb").await;
+        h.insert_person("src-y-cellb", "Yvonne-cellb", 42).await;
+
+        let (sa, sb) = h
+            .run_pair(
+                matrix::op_merge("src-x-cellb".to_string(), "main".to_string()),
+                matrix::op_merge("src-y-cellb".to_string(), "main".to_string()),
+            )
+            .await;
+        assert_eq!(sa.status, StatusCode::OK, "[{}] merge x", cell);
+        assert_eq!(sb.status, StatusCode::OK, "[{}] merge y", cell);
+        h.assert_persons("main", cell, &["Xavier-cellb", "Yvonne-cellb"], &[])
+            .await;
+        h.assert_post_op_sentinel(cell, "sentinel-cellb").await;
+    }
+
+    // Cell c: Merge × Merge, same source / distinct targets (fanout).
+    // One source merged into two targets simultaneously. merge_exclusive
+    // serializes; both targets should reflect the source's content.
+    {
+        let cell = "c:merge×merge:same-source-distinct-targets";
+        let h = matrix::Harness::new().await;
+        h.create_branch("main", "src-shared-cellc").await;
+        h.insert_person("src-shared-cellc", "Sharon-cellc", 50).await;
+        h.create_branch("main", "tgt-1-cellc").await;
+        h.create_branch("main", "tgt-2-cellc").await;
+
+        let (sa, sb) = h
+            .run_pair(
+                matrix::op_merge(
+                    "src-shared-cellc".to_string(),
+                    "tgt-1-cellc".to_string(),
+                ),
+                matrix::op_merge(
+                    "src-shared-cellc".to_string(),
+                    "tgt-2-cellc".to_string(),
+                ),
+            )
+            .await;
+        assert_eq!(sa.status, StatusCode::OK, "[{}] merge into tgt-1", cell);
+        assert_eq!(sb.status, StatusCode::OK, "[{}] merge into tgt-2", cell);
+        h.assert_persons("tgt-1-cellc", cell, &["Sharon-cellc"], &[])
+            .await;
+        h.assert_persons("tgt-2-cellc", cell, &["Sharon-cellc"], &[])
+            .await;
+        h.assert_post_op_sentinel(cell, "sentinel-cellc").await;
+    }
+
+    // Cell d: Merge × Change, both touching main. C2 permits both
+    // succeed, or exactly one clean 409 if the merge detects target
+    // movement after planning but before acquiring the queue.
+    {
+        let cell = "d:merge×change:into-target";
+        let h = matrix::Harness::new().await;
+        h.create_branch("main", "feature-celld").await;
+        h.insert_person("feature-celld", "EveD-celld", 22).await;
+
+        let (sa, sb) = h
+            .run_pair(
+                matrix::op_merge("feature-celld".to_string(), "main".to_string()),
+                matrix::op_change_insert("main".to_string(), "FrankD-celld".to_string(), 33),
+            )
+            .await;
+        assert_eq!(sb.status, StatusCode::OK, "[{}] change", cell);
+        assert!(
+            sa.status == StatusCode::OK || sa.status == StatusCode::CONFLICT,
+            "[{}] merge must be 200 or clean 409, got {}",
+            cell,
+            sa.status
+        );
+        if sa.status == StatusCode::OK {
+            h.assert_persons("main", cell, &["EveD-celld", "FrankD-celld"], &[])
+                .await;
+        } else {
+            let error: ErrorOutput = serde_json::from_slice(&sa.body).unwrap();
+            let conflict = error
+                .manifest_conflict
+                .expect("merge 409 must include manifest_conflict");
+            assert_eq!(conflict.table_key, "node:Person", "[{}] conflict table", cell);
+            h.assert_persons("main", cell, &["FrankD-celld"], &["EveD-celld"])
+                .await;
+        }
+        h.assert_post_op_sentinel(cell, "sentinel-celld").await;
+    }
+
+    // Cell e: Merge × BranchCreateFrom-target. Concurrent fork off the
+    // merge target while the merge runs. Both should succeed; the new
+    // branch should have a coherent view (either pre- or post-merge,
+    // both valid). After both, target = main has the merged content.
+    {
+        let cell = "e:merge×branch_create_from:target";
+        let h = matrix::Harness::new().await;
+        h.create_branch("main", "src-celle").await;
+        h.insert_person("src-celle", "Eve-celle", 22).await;
+
+        let (sa, sb) = h
+            .run_pair(
+                matrix::op_merge("src-celle".to_string(), "main".to_string()),
+                matrix::op_branch_create("main".to_string(), "fork-celle".to_string()),
+            )
+            .await;
+        assert_eq!(sa.status, StatusCode::OK, "[{}] merge", cell);
+        assert_eq!(sb.status, StatusCode::OK, "[{}] branch_create_from", cell);
+        // Main definitely has Eve.
+        h.assert_persons("main", cell, &["Eve-celle"], &[]).await;
+        // fork-celle was forked off main at SOME version; main's current
+        // count is 5 (4 seeded + Eve). fork-celle has either 4 (pre-merge
+        // snapshot) or 5 (post-merge snapshot); both are valid timings.
+        let fork_count = h.person_count("fork-celle").await;
+        assert!(
+            fork_count == 4 || fork_count == 5,
+            "[{}] fork-celle row count must be pre- or post-merge view (4 or 5), got {}",
+            cell,
+            fork_count
+        );
+        h.assert_post_op_sentinel(cell, "sentinel-celle").await;
+    }
+
+    // Cell f: BranchCreateFrom × BranchCreateFrom, distinct parents.
+    // Pre-fix on f925ad1: swap-restore race in branch_create_from_impl
+    // forked the new branch off the wrong parent. Identity asserts pin
+    // that fork-from-A inherits A's content, fork-from-B inherits B's.
+    {
+        let cell = "f:branch_create_from×branch_create_from:distinct-parents";
+        let h = matrix::Harness::new().await;
+        h.create_branch("main", "alpha-cellf").await;
+        h.insert_person("alpha-cellf", "Eve-cellf", 22).await;
+        h.create_branch("main", "beta-cellf").await;
+
+        let (sa, sb) = h
+            .run_pair(
+                matrix::op_branch_create(
+                    "alpha-cellf".to_string(),
+                    "gamma-cellf".to_string(),
+                ),
+                matrix::op_branch_create(
+                    "beta-cellf".to_string(),
+                    "delta-cellf".to_string(),
+                ),
+            )
+            .await;
+        assert_eq!(sa.status, StatusCode::OK, "[{}] gamma create", cell);
+        assert_eq!(sb.status, StatusCode::OK, "[{}] delta create", cell);
+        // gamma forks off alpha → must contain Eve.
+        h.assert_persons("gamma-cellf", cell, &["Eve-cellf"], &[]).await;
+        // delta forks off beta → must NOT contain Eve.
+        h.assert_persons("delta-cellf", cell, &[], &["Eve-cellf"]).await;
+        h.assert_post_op_sentinel(cell, "sentinel-cellf").await;
+    }
+
+    // Cell g: BranchCreateFrom × BranchDelete, unrelated branches.
+    // Disjoint branches; both should complete cleanly without
+    // interference.
+    {
+        let cell = "g:branch_create_from×branch_delete:unrelated";
+        let h = matrix::Harness::new().await;
+        h.create_branch("main", "doomed-cellg").await;
+
+        let (sa, sb) = h
+            .run_pair(
+                matrix::op_branch_create("main".to_string(), "newborn-cellg".to_string()),
+                matrix::op_branch_delete("doomed-cellg".to_string()),
+            )
+            .await;
+        assert_eq!(sa.status, StatusCode::OK, "[{}] create newborn", cell);
+        assert_eq!(sb.status, StatusCode::OK, "[{}] delete doomed", cell);
+        // newborn-cellg exists with main's content.
+        h.assert_persons("newborn-cellg", cell, &["Alice"], &[]).await;
+        h.assert_post_op_sentinel(cell, "sentinel-cellg").await;
+    }
+
+    // Cell h: BranchDelete × BranchDelete, distinct branches. Both call
+    // refresh() internally; verify no deadlock and both deletes land.
+    {
+        let cell = "h:branch_delete×branch_delete:distinct";
+        let h = matrix::Harness::new().await;
+        h.create_branch("main", "doomed1-cellh").await;
+        h.create_branch("main", "doomed2-cellh").await;
+
+        let (sa, sb) = h
+            .run_pair(
+                matrix::op_branch_delete("doomed1-cellh".to_string()),
+                matrix::op_branch_delete("doomed2-cellh".to_string()),
+            )
+            .await;
+        assert_eq!(sa.status, StatusCode::OK, "[{}] delete 1", cell);
+        assert_eq!(sb.status, StatusCode::OK, "[{}] delete 2", cell);
+        // Verify both gone via /branches list (snapshot would still work
+        // for a deleted branch via parent fallback in some paths, so we
+        // use the explicit list).
+        let r = h
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/branches")
+                    .method(Method::GET)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let body = to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        let list_body: Value = serde_json::from_slice(&body).unwrap();
+        let branches: Vec<&str> = list_body["branches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            !branches.contains(&"doomed1-cellh"),
+            "[{}] doomed1 still in branch list: {:?}",
+            cell,
+            branches
+        );
+        assert!(
+            !branches.contains(&"doomed2-cellh"),
+            "[{}] doomed2 still in branch list: {:?}",
+            cell,
+            branches
+        );
+        h.assert_post_op_sentinel(cell, "sentinel-cellh").await;
+    }
+
+    // Cell i: BranchDelete × Change, on a different branch. Delete one
+    // branch while a /change runs on main. Both should succeed.
+    {
+        let cell = "i:branch_delete×change:distinct-branch";
+        let h = matrix::Harness::new().await;
+        h.create_branch("main", "doomed-celli").await;
+
+        let (sa, sb) = h
+            .run_pair(
+                matrix::op_branch_delete("doomed-celli".to_string()),
+                matrix::op_change_insert("main".to_string(), "Pat-celli".to_string(), 44),
+            )
+            .await;
+        assert_eq!(sa.status, StatusCode::OK, "[{}] delete", cell);
+        assert_eq!(sb.status, StatusCode::OK, "[{}] change", cell);
+        h.assert_persons("main", cell, &["Pat-celli"], &[]).await;
+        h.assert_post_op_sentinel(cell, "sentinel-celli").await;
+    }
+
+    // Cell j: BranchCreateFrom × Change, both on main. The fork timing
+    // determines whether the new branch sees the change (pre or post).
+    // Both valid. Main must contain the inserted row.
+    {
+        let cell = "j:branch_create_from×change:on-source";
+        let h = matrix::Harness::new().await;
+
+        let (sa, sb) = h
+            .run_pair(
+                matrix::op_branch_create("main".to_string(), "twin-cellj".to_string()),
+                matrix::op_change_insert("main".to_string(), "Quincy-cellj".to_string(), 55),
+            )
+            .await;
+        assert_eq!(sa.status, StatusCode::OK, "[{}] branch_create", cell);
+        assert_eq!(sb.status, StatusCode::OK, "[{}] change", cell);
+        h.assert_persons("main", cell, &["Quincy-cellj"], &[]).await;
+        // twin-cellj has either pre-change view (no Quincy) or
+        // post-change view (with Quincy); either is valid.
+        let twin_has_quincy = h.person_exists("twin-cellj", "Quincy-cellj").await;
+        let _ = twin_has_quincy; // either valid timing — just ensure no panic
+        h.assert_post_op_sentinel(cell, "sentinel-cellj").await;
+    }
+
+    // Cell k: reopen consistency. Run a representative concurrent pair,
+    // drop the engine, reopen on a separate handle, verify state matches.
+    {
+        let cell = "k:reopen-after-pair";
+        let h = matrix::Harness::new().await;
+        h.create_branch("main", "src-cellk").await;
+        h.insert_person("src-cellk", "Rita-cellk", 36).await;
+
+        let (sa, sb) = h
+            .run_pair(
+                matrix::op_merge("src-cellk".to_string(), "main".to_string()),
+                matrix::op_change_insert("main".to_string(), "Steve-cellk".to_string(), 37),
+            )
+            .await;
+        assert_eq!(sb.status, StatusCode::OK, "[{}] change", cell);
+        assert!(
+            sa.status == StatusCode::OK || sa.status == StatusCode::CONFLICT,
+            "[{}] merge must be 200 or clean 409, got {}",
+            cell,
+            sa.status
+        );
+        if sa.status == StatusCode::OK {
+            h.assert_persons("main", cell, &["Rita-cellk", "Steve-cellk"], &[])
+                .await;
+        } else {
+            let error: ErrorOutput = serde_json::from_slice(&sa.body).unwrap();
+            let conflict = error
+                .manifest_conflict
+                .expect("merge 409 must include manifest_conflict");
+            assert_eq!(conflict.table_key, "node:Person", "[{}] conflict table", cell);
+            h.assert_persons("main", cell, &["Steve-cellk"], &["Rita-cellk"])
+                .await;
+        }
+
+        // Reopen via a fresh AppState on the same repo.
+        let repo_uri = format!("{}/server.omni", h._temp.path().display());
+        let reopened = AppState::open(repo_uri.clone()).await.unwrap();
+        let app2 = build_app(reopened);
+        // Sanity: the same identity check via the new app must see
+        // Rita and Steve.
+        let r = app2
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/snapshot?branch=main")
+                    .method(Method::GET)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "[{}] reopen snapshot", cell);
+        let body = to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let person_rows = v["tables"]
+            .as_array()
+            .and_then(|tables| {
+                tables
+                    .iter()
+                    .find(|t| t["table_key"].as_str() == Some("node:Person"))
+            })
+            .and_then(|t| t["row_count"].as_u64())
+            .expect("reopen snapshot must include node:Person row_count");
+        let expected_rows = if sa.status == StatusCode::OK { 6 } else { 5 };
+        assert_eq!(
+            person_rows, expected_rows,
+            "[{}] reopened main should include seed (4) + committed concurrent writes",
+            cell,
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn change_disjoint_table_concurrency_succeeds_at_http_level() {
+    // HTTP-level pin for MR-686's disjoint-table promise: concurrent /change
+    // requests touching different node types must coexist without admission
+    // rejection or publisher-CAS conflict. The bench harness measures
+    // throughput; this test is the regression sentinel that catches a
+    // future change which accidentally re-introduces graph-wide
+    // serialization on the disjoint path.
+    //
+    // Setup: test.jsonl seeds 4 Persons + 2 Companies. Spawn N=4 concurrent
+    // /change inserts on `node:Person` and N=4 concurrent inserts on
+    // `node:Company`. All 8 must return 200, and the post-test row counts
+    // must reflect every insert.
+    const PERSON_QUERY: &str = r#"
+query insert_p($name: String, $age: I32) {
+    insert Person { name: $name, age: $age }
+}
+"#;
+    const COMPANY_QUERY: &str = r#"
+query insert_c($name: String) {
+    insert Company { name: $name }
+}
+"#;
+    const SEED_PERSONS: u64 = 4;
+    const SEED_COMPANIES: u64 = 2;
+    const PER_TYPE: usize = 4;
+
+    let temp = init_loaded_repo().await;
+    let repo = repo_path(temp.path());
+    let state = AppState::open(repo.to_string_lossy().to_string())
+        .await
+        .unwrap();
+    let app = build_app(state);
+
+    let mut handles = Vec::with_capacity(PER_TYPE * 2);
+    for i in 0..PER_TYPE {
+        let app_p = app.clone();
+        handles.push(tokio::spawn(async move {
+            let body = serde_json::to_vec(&ChangeRequest {
+                query_source: PERSON_QUERY.to_string(),
+                query_name: Some("insert_p".to_string()),
+                params: Some(json!({ "name": format!("p-{i}"), "age": i as i32 })),
+                branch: Some("main".to_string()),
+            })
+            .unwrap();
+            let req = Request::builder()
+                .uri("/change")
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            app_p.oneshot(req).await.unwrap().status()
+        }));
+        let app_c = app.clone();
+        handles.push(tokio::spawn(async move {
+            let body = serde_json::to_vec(&ChangeRequest {
+                query_source: COMPANY_QUERY.to_string(),
+                query_name: Some("insert_c".to_string()),
+                params: Some(json!({ "name": format!("c-{i}") })),
+                branch: Some("main".to_string()),
+            })
+            .unwrap();
+            let req = Request::builder()
+                .uri("/change")
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            app_c.oneshot(req).await.unwrap().status()
+        }));
+    }
+
+    let mut statuses = Vec::with_capacity(PER_TYPE * 2);
+    for h in handles {
+        statuses.push(h.await.unwrap());
+    }
+
+    let bad: Vec<_> = statuses
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| **s != StatusCode::OK)
+        .collect();
+    assert!(
+        bad.is_empty(),
+        "expected every disjoint /change insert to return 200, got non-200 for: {:?}",
+        bad,
+    );
+
+    // Verify both tables landed every insert.
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/snapshot?branch=main")
+            .method(Method::GET)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let lookup_count = |table_key: &str| -> u64 {
+        body["tables"]
+            .as_array()
+            .and_then(|tables| tables.iter().find(|t| t["table_key"].as_str() == Some(table_key)))
+            .and_then(|t| t["row_count"].as_u64())
+            .unwrap_or_else(|| panic!("snapshot missing {}", table_key))
+    };
+    assert_eq!(
+        lookup_count("node:Person"),
+        SEED_PERSONS + PER_TYPE as u64,
+        "Person row count after concurrent inserts",
+    );
+    assert_eq!(
+        lookup_count("node:Company"),
+        SEED_COMPANIES + PER_TYPE as u64,
+        "Company row count after concurrent inserts",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ingest_per_actor_admission_cap_returns_429() {
+    // Pin the admission gate on `/ingest`. With per-actor in-flight cap of 1
+    // and 8 concurrent requests from the same actor, at least one request
+    // must be rejected with HTTP 429 and `code: too_many_requests`.
+    //
+    // Pre-fix bug class: the admission pattern at `server_change`
+    // (`crates/omnigraph-server/src/lib.rs:932`) was the only handler
+    // that called `WorkloadController::try_admit`. A heavy actor sending
+    // bulk-ingest traffic would exhaust shared engine capacity (Lance I/O
+    // threads, manifest churn) without ever hitting an admission cap.
+    // Pinned at the HTTP boundary so future refactors that drop the
+    // try_admit call from a mutating handler turn this red.
+    //
+    // Post-fix invariant: `/ingest`, `/branches/create`, `/branches/delete`,
+    // `/branches/merge`, and `/schema/apply` all gate on
+    // `state.workload.try_admit(&actor_arc, est_bytes)` after Cedar
+    // authorization and before the engine call. Cap exhaustion surfaces as
+    // 429 with `code: too_many_requests`.
+    //
+    // Construct the WorkloadController directly with cap=1 instead of
+    // mutating `OMNIGRAPH_PER_ACTOR_INFLIGHT_MAX` via EnvGuard. Process-wide
+    // env vars are visible to concurrently-running tests; the previous
+    // `EnvGuard + #[serial]` pair leaked the override into any other test
+    // that called `AppState::open` during the guard's window
+    // (matrix CI failure on commit 99b0941). Using the explicit
+    // `AppState::new_with_workload` constructor closes that bug class —
+    // this test no longer mutates global state and no longer needs
+    // `#[serial]`.
+    let temp = init_loaded_repo().await;
+    let repo = repo_path(temp.path());
+    let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let workload = omnigraph_server::workload::WorkloadController::new(
+        1,             // per-actor in-flight cap (the fixture under test)
+        1_000_000_000, // per-actor byte budget — large so it never bottlenecks
+    );
+    let state = AppState::new_with_workload(
+        repo.to_string_lossy().to_string(),
+        db,
+        vec![("act-flooder".to_string(), "flooder-token".to_string())],
+        workload,
+    );
+    let app = build_app(state);
+    let _temp = temp;
+
+    // Eight concurrent ingests, all from act-flooder. Only one fits in a
+    // cap=1 in-flight semaphore; the others must 429.
+    const N: usize = 8;
+    let barrier = Arc::new(tokio::sync::Barrier::new(N));
+    let mut handles = Vec::with_capacity(N);
+    for i in 0..N {
+        let app = app.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(tokio::spawn(async move {
+            // Align the 8 tasks at the barrier so they all attempt
+            // try_admit close in time.
+            barrier.wait().await;
+
+            let body = serde_json::to_vec(&IngestRequest {
+                data: format!(
+                    "{{\"type\":\"Person\",\"data\":{{\"name\":\"flooder-{i}\",\"age\":{i}}}}}\n"
+                ),
+                branch: Some("main".to_string()),
+                from: Some("main".to_string()),
+                mode: Some(omnigraph::loader::LoadMode::Merge),
+            })
+            .unwrap();
+            let req = Request::builder()
+                .uri("/ingest")
+                .method(Method::POST)
+                .header("authorization", "Bearer flooder-token")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let response = app.oneshot(req).await.unwrap();
+            let status = response.status();
+            let headers = response.headers().clone();
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            (status, headers, body.to_vec())
+        }));
+    }
+
+    let mut results = Vec::with_capacity(N);
+    for h in handles {
+        results.push(h.await.unwrap());
+    }
+    let statuses: Vec<StatusCode> = results.iter().map(|(s, _, _)| *s).collect();
+
+    let too_many: Vec<usize> = statuses
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| **s == StatusCode::TOO_MANY_REQUESTS)
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        !too_many.is_empty(),
+        "expected at least one /ingest under cap=1 to return 429; got statuses: {:?}",
+        statuses,
+    );
+
+    // Validate the structured error body for each 429 (body must carry
+    // the `too_many_requests` code so clients can distinguish it from
+    // generic conflicts).
+    for i in &too_many {
+        let body_value: Value = serde_json::from_slice(&results[*i].2).unwrap();
+        let error: ErrorOutput = serde_json::from_value(body_value).unwrap();
+        assert_eq!(
+            error.code,
+            Some(omnigraph_server::api::ErrorCode::TooManyRequests),
+            "429 body must carry code=too_many_requests; idx {} got {:?}",
+            i,
+            error.code,
+        );
+    }
+
+    // Validate the `Retry-After` header is set on every 429. Pinned by
+    // the same test so a future refactor that drops the header from
+    // `IntoResponse for ApiError` turns this red. The constant
+    // matches `crates/omnigraph-server/src/lib.rs::ApiError::into_response`.
+    for i in &too_many {
+        let retry_after = results[*i]
+            .1
+            .get(axum::http::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        assert!(
+            retry_after.is_some(),
+            "429 response must include a Retry-After header; idx {} headers were: {:?}",
+            i,
+            results[*i].1,
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

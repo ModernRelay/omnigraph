@@ -339,6 +339,9 @@ pub enum ErrorCode {
     BadRequest,
     NotFound,
     Conflict,
+    /// 429 Too Many Requests — per-actor admission cap exceeded.
+    /// Clients should respect the `Retry-After` header.
+    TooManyRequests,
     Internal,
 }
 

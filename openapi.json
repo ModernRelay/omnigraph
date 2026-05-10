@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.4.1"
+    "version": "0.4.2"
   },
   "paths": {
     "/branches": {
@@ -123,6 +123,16 @@
                 }
               }
             }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -200,6 +210,16 @@
                 }
               }
             }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -261,6 +281,16 @@
           },
           "404": {
             "description": "Branch not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
             "content": {
               "application/json": {
                 "schema": {
@@ -338,6 +368,16 @@
           },
           "409": {
             "description": "Merge conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
             "content": {
               "application/json": {
                 "schema": {
@@ -625,6 +665,16 @@
                 }
               }
             }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -799,6 +849,16 @@
           },
           "403": {
             "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
             "content": {
               "application/json": {
                 "schema": {
@@ -1140,6 +1200,7 @@
           "bad_request",
           "not_found",
           "conflict",
+          "too_many_requests",
           "internal"
         ]
       },

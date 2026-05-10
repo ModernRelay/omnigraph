@@ -26,7 +26,7 @@ use arrow_schema::SchemaRef;
 use lance::Dataset;
 use omnigraph_compiler::catalog::EdgeType;
 
-use crate::db::SubTableUpdate;
+use crate::db::{MutationOpKind, SubTableUpdate};
 use crate::db::manifest::{
     new_sidecar, write_sidecar, RecoverySidecarHandle, SidecarKind, SidecarTablePin,
 };
@@ -94,18 +94,30 @@ pub(crate) struct MutationStaging {
     /// Inline-committed updates from delete-touching ops (D₂ guarantees no
     /// pending batches exist on a delete-touched table).
     pub(crate) inline_committed: HashMap<String, SubTableUpdate>,
+    /// Strictest [`MutationOpKind`] seen per table within this query. Drives
+    /// the op-kind-aware drift check in [`StagedMutation::commit_all`]: for
+    /// tables whose first or any subsequent touch was a strict op
+    /// (Update / Delete / SchemaRewrite), commit_all fails fast with 409
+    /// when the staged dataset version drifts from the fresh manifest pin
+    /// rather than letting Lance's `commit_staged` surface
+    /// `RetryableCommitConflict` as a 500. See
+    /// [`MutationOpKind::strict_pre_stage_version_check`].
+    pub(crate) op_kinds: HashMap<String, MutationOpKind>,
 }
 
 impl MutationStaging {
     /// Capture pre-write metadata on first touch of a table. Subsequent
-    /// touches are no-ops (paths and `expected_version` are stable for the
-    /// lifetime of one query).
+    /// touches preserve the original `paths` and `expected_versions`
+    /// entries; `op_kinds` upgrades to the strictest kind seen so far so
+    /// that mixed insert+update on the same table still fires the strict
+    /// drift check at commit time.
     pub(crate) fn ensure_path(
         &mut self,
         table_key: &str,
         full_path: String,
         table_branch: Option<String>,
         expected_version: u64,
+        op_kind: MutationOpKind,
     ) {
         self.paths.entry(table_key.to_string()).or_insert(StagedTablePath {
             full_path,
@@ -114,6 +126,19 @@ impl MutationStaging {
         self.expected_versions
             .entry(table_key.to_string())
             .or_insert(expected_version);
+        self.op_kinds
+            .entry(table_key.to_string())
+            .and_modify(|existing| {
+                // Upgrade to the stricter kind if a later op needs it.
+                // Insert + later Update → Update wins; Update + later Insert
+                // keeps Update.
+                if op_kind.strict_pre_stage_version_check()
+                    && !existing.strict_pre_stage_version_check()
+                {
+                    *existing = op_kind;
+                }
+            })
+            .or_insert(op_kind);
     }
 
     /// Append a batch to the per-table accumulator.
@@ -210,101 +235,65 @@ impl MutationStaging {
     }
 
     /// End-of-query: for each pending table, concat batches and commit via
-    /// `stage_append` or `stage_merge_insert` followed by `commit_staged`.
-    /// Merge with inline-committed entries. Return `(updates,
-    /// expected_versions)` for `commit_updates_on_branch_with_expected`.
+    /// **Phase A** of the two-phase commit: stage uncommitted fragments
+    /// for every table in `pending`. No Lance HEAD movement, no sidecar,
+    /// no manifest publish. Returns a [`StagedMutation`] carrying the
+    /// staged transactions so a future MR-686 queue acquisition step can
+    /// run between staging (slow S3 PUTs, no queue) and commit (fast,
+    /// under per-`(table_key, branch)` queue).
     ///
-    /// Sequential per-table — no cross-table dependency, but a parallel
-    /// version is a perf optimization for multi-table writes (loader with
-    /// many node + edge types). v1 ships sequential; the fan-out can land
-    /// in a follow-up.
-    pub(crate) async fn finalize(
+    /// Sequential per-table for now — parallelizing across independent
+    /// Lance datasets is a perf follow-up; same loop structure as the
+    /// pre-split `finalize`.
+    pub(crate) async fn stage_all(
         self,
         db: &crate::db::Omnigraph,
-        branch: Option<&str>,
-        sidecar_kind: SidecarKind,
-    ) -> Result<(
-        Vec<SubTableUpdate>,
-        HashMap<String, u64>,
-        Option<RecoverySidecarHandle>,
-    )> {
+        _branch: Option<&str>,
+    ) -> Result<StagedMutation> {
         let MutationStaging {
             expected_versions,
             paths,
             pending,
             inline_committed,
+            op_kinds,
         } = self;
 
-        let mut updates: Vec<SubTableUpdate> =
-            inline_committed.into_values().collect();
-
-        // Sidecar protocol: build the per-table pin list BEFORE any Lance
-        // commit_staged runs, then write the sidecar so a crash between
-        // Phase B (this loop's commit_staged calls) and Phase C (the
-        // manifest publish in the caller) is recoverable on next open.
-        // Skipped when `pending` is empty (delete-only mutation; the D₂
-        // parse-time rule keeps deletes out of this code path so this
-        // branch is reached only for the inline-committed-only case).
-        let pins: Vec<SidecarTablePin> = pending
-            .iter()
-            .map(|(table_key, _)| {
-                let path = paths.get(table_key).ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "MutationStaging::finalize: missing path for table '{}'",
-                        table_key,
-                    ))
-                })?;
-                let expected = *expected_versions.get(table_key).ok_or_else(|| {
-                    OmniError::manifest_internal(format!(
-                        "MutationStaging::finalize: missing expected version for table '{}'",
-                        table_key,
-                    ))
-                })?;
-                Ok::<SidecarTablePin, OmniError>(SidecarTablePin {
-                    table_key: table_key.clone(),
-                    table_path: path.full_path.clone(),
-                    expected_version: expected,
-                    post_commit_pin: expected + 1,
-                    table_branch: path.table_branch.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let sidecar_handle = if pins.is_empty() {
-            None
-        } else {
-            let sidecar = new_sidecar(
-                sidecar_kind,
-                branch.map(|s| s.to_string()),
-                db.audit_actor_id.clone(),
-                pins,
-            );
-            Some(write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar).await?)
-        };
-
+        let mut staged_entries: Vec<StagedTableEntry> = Vec::with_capacity(pending.len());
         for (table_key, table) in pending {
-            let path = paths.get(&table_key).ok_or_else(|| {
+            let path = paths.get(&table_key).cloned().ok_or_else(|| {
                 OmniError::manifest_internal(format!(
-                    "MutationStaging::finalize: missing path for table '{}'",
+                    "MutationStaging::stage_all: missing path for table '{}'",
                     table_key
                 ))
             })?;
             let expected = *expected_versions.get(&table_key).ok_or_else(|| {
                 OmniError::manifest_internal(format!(
-                    "MutationStaging::finalize: missing expected version for table '{}'",
+                    "MutationStaging::stage_all: missing expected version for table '{}'",
                     table_key
                 ))
             })?;
 
-            // Reopen at the pre-write version. Lance HEAD has not advanced
-            // since `ensure_path` captured it — no prior op committed to
-            // this dataset.
+            // Reopen the dataset for staging. The op_kind reflects the
+            // accumulated PendingTable's mode: Append-mode batches are
+            // INSERT-shaped (no key-based dedup at commit_staged); Merge-
+            // mode batches are MERGE-shaped (key-dedup at commit_staged).
+            // Both skip the strict pre-stage version check under the
+            // [`MutationOpKind`] policy: Lance's natural rebase + the
+            // per-(table, branch) queue + the publisher CAS in
+            // `commit_all` handle drift; the strict check would
+            // over-reject in-process concurrent inserts (PR 2 / MR-686
+            // Phase 2).
+            let stage_kind = match table.mode {
+                PendingMode::Append => crate::db::MutationOpKind::Insert,
+                PendingMode::Merge => crate::db::MutationOpKind::Merge,
+            };
             let ds = db
                 .reopen_for_mutation(
                     &table_key,
                     &path.full_path,
                     path.table_branch.as_deref(),
                     expected,
+                    stage_kind,
                 )
                 .await?;
 
@@ -335,8 +324,8 @@ impl MutationStaging {
                 }
             };
 
-            // Commit via Lance's two-phase write: stage produces
-            // uncommitted fragments + transaction; commit advances HEAD.
+            // Stage produces uncommitted fragments + transaction. No
+            // Lance HEAD advance until `commit_all` runs `commit_staged`.
             let staged = match table.mode {
                 PendingMode::Append => {
                     db.table_store().stage_append(&ds, combined, &[]).await?
@@ -353,16 +342,327 @@ impl MutationStaging {
                         .await?
                 }
             };
+            staged_entries.push(StagedTableEntry {
+                table_key,
+                path,
+                expected_version: expected,
+                dataset: ds,
+                staged_write: staged,
+            });
+        }
+
+        Ok(StagedMutation {
+            inline_committed,
+            staged: staged_entries,
+            expected_versions,
+            paths,
+            op_kinds,
+        })
+    }
+}
+
+/// Output of [`MutationStaging::stage_all`]. Carries the staged Lance
+/// transactions (Phase A complete; uncommitted fragments written) plus
+/// the per-table metadata needed to write the recovery sidecar, run
+/// `commit_staged` (Phase B), and produce the publisher's input.
+///
+/// Splitting `stage_all` and `commit_all` is the structural prerequisite
+/// for MR-686: a future commit can drop queue acquisition + manifest-pin
+/// revalidation between Phase A and Phase B without touching staging
+/// logic.
+pub(crate) struct StagedMutation {
+    /// Updates from delete-touching ops (D₂ parse-time rule keeps
+    /// pending and inline_committed disjoint per table). Tables here
+    /// have already advanced Lance HEAD via inline `delete_where`;
+    /// `commit_all` builds sidecar pins for these too so the
+    /// commit→publish residual is recoverable for delete-only paths
+    /// (third-agent Finding 3).
+    inline_committed: HashMap<String, SubTableUpdate>,
+    /// One entry per table that had pending batches successfully staged.
+    staged: Vec<StagedTableEntry>,
+    /// Pre-write manifest version per table — the publisher's CAS fence.
+    expected_versions: HashMap<String, u64>,
+    /// Per-table identifiers from `MutationStaging::paths`. Carried
+    /// through so `commit_all` can build sidecar pins for both staged
+    /// and inline-committed tables.
+    paths: HashMap<String, StagedTablePath>,
+    /// Strictest op_kind per touched table, propagated from
+    /// `MutationStaging::op_kinds` so `commit_all`'s drift check
+    /// fires only on read-modify-write tables.
+    op_kinds: HashMap<String, MutationOpKind>,
+}
+
+/// Per-table state captured during `stage_all` and consumed by
+/// `commit_all`. Holds the opened `Dataset` so `commit_staged` doesn't
+/// re-open, and the `StagedWrite` whose `transaction` `commit_staged`
+/// will execute.
+struct StagedTableEntry {
+    table_key: String,
+    path: StagedTablePath,
+    expected_version: u64,
+    dataset: lance::Dataset,
+    staged_write: crate::table_store::StagedWrite,
+}
+
+impl StagedMutation {
+    /// **Phase B** of the two-phase commit: acquire per-`(table_key,
+    /// branch)` queues, revalidate manifest pins, write the recovery
+    /// sidecar, run `commit_staged` per table to advance Lance HEAD, and
+    /// return the publisher's input plus the queue guards.
+    ///
+    /// **Caller must hold the returned `_guards` Vec across the
+    /// subsequent manifest publish.** Releasing guards before publish
+    /// would let another writer interleave their commit_staged between
+    /// ours and our publish — which would correctly fail our CAS but
+    /// leave Lance HEAD advanced (the residual class MR-870 recovers
+    /// from). Holding the guards across publish keeps the residual
+    /// unreachable for op-execution failures on the happy path.
+    ///
+    /// Revalidation: between `stage_all` and `commit_all`, another
+    /// writer (in the same process or another process sharing the
+    /// repo) may have committed to one of our touched tables, advancing
+    /// the manifest pin past our `expected_version`. We revalidate
+    /// under the queue and fail-fast with `manifest_conflict` before
+    /// any `commit_staged` so the orphaned uncommitted fragments stay
+    /// unreferenced (cleaned by `cleanup_old_versions`'s age sweep)
+    /// rather than being committed and creating a Lance-HEAD-ahead
+    /// residual.
+    pub(crate) async fn commit_all(
+        self,
+        db: &crate::db::Omnigraph,
+        branch: Option<&str>,
+        sidecar_kind: SidecarKind,
+        actor_id: Option<&str>,
+    ) -> Result<(
+        Vec<SubTableUpdate>,
+        HashMap<String, u64>,
+        Option<RecoverySidecarHandle>,
+        Vec<tokio::sync::OwnedMutexGuard<()>>,
+    )> {
+        let StagedMutation {
+            inline_committed,
+            mut staged,
+            mut expected_versions,
+            paths,
+            op_kinds,
+        } = self;
+
+        // Acquire per-(table_key, branch) queues for every touched
+        // table — both staged and inline-committed. Sorted by
+        // `acquire_many` internally so all multi-table writers
+        // (mutation, branch_merge, schema_apply, future MR-870
+        // recovery) agree on acquisition order — prevents lock-order
+        // inversion deadlock.
+        //
+        // For inline-committed tables (delete-only mutations), Lance
+        // HEAD has already advanced inside `delete_where` before
+        // `commit_all` runs. Holding the queue here doesn't prevent
+        // that interleaving (commit 6 will move queue acquisition into
+        // `delete_where`'s call site); it does prevent another writer
+        // from interleaving between our delete and our publish, which
+        // would otherwise leave a Lance-HEAD-ahead residual the
+        // delete-only sidecar (added below) would have to recover.
+        let mut queue_keys: Vec<(String, Option<String>)> = Vec::with_capacity(
+            staged.len() + inline_committed.len(),
+        );
+        for entry in &staged {
+            queue_keys.push((entry.table_key.clone(), entry.path.table_branch.clone()));
+        }
+        for table_key in inline_committed.keys() {
+            let path = paths.get(table_key).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "StagedMutation::commit_all: missing path for inline-committed table '{}'",
+                    table_key
+                ))
+            })?;
+            queue_keys.push((table_key.clone(), path.table_branch.clone()));
+        }
+        let guards = db.write_queue().acquire_many(&queue_keys).await;
+
+        // Re-capture manifest pins under the queue (PR 2 / MR-686).
+        //
+        // expected_versions was captured when the mutation first opened
+        // each table for mutation (the query's read-time pin). For
+        // non-strict inserts / merge-style appends, a writer may advance
+        // the table before we acquire the queue and Lance can still
+        // safely rebase the write, so we refresh expected_versions to
+        // the queued manifest pin.
+        //
+        // Strict read-modify-write ops (update / delete /
+        // schema-rewrite) are different: the staged batch was computed
+        // against the read-time pin, even if stage_all later re-opened
+        // the dataset at HEAD. For those ops, compare read-time
+        // expected_version to the queued manifest pin and fail before
+        // any Lance HEAD movement if the target drifted. This can
+        // over-reject a single mutation that inserts, then upgrades to
+        // update, while another writer advances the table between the
+        // two touches; that is safe-by-default and keeps one invariant
+        // until `ensure_path` learns how to bump expected_version on
+        // op-kind upgrade.
+        //
+        // Why per-branch (and not the bound-branch `db.snapshot()`):
+        // when the caller mutates a branch other than the engine's
+        // bound branch (e.g., feature-branch ingest from a server
+        // handle bound to main), `db.snapshot()` returns the bound
+        // branch's view of each table — which is the wrong pin for
+        // the publisher's CAS on a different branch. Using
+        // `snapshot_for_branch(branch)` resolves the per-branch
+        // entries correctly. The cost is one fresh manifest read per
+        // mutation; PR 1b's regression came from this same read, but
+        // that read is now strictly necessary for cross-branch
+        // correctness. Single-table same-branch mutations could still
+        // skip this read (queue exclusivity makes the publisher CAS a
+        // no-op), but the conditional adds complexity for marginal
+        // gain — left as a follow-up perf optimization.
+        //
+        // Multi-coordinator deployments (§VI.27 aspirational) get
+        // genuine cross-process drift detection from this read for
+        // free.
+        let snapshot = db.snapshot_for_branch(branch).await?;
+        for entry in staged.iter_mut() {
+            let current = snapshot
+                .entry(&entry.table_key)
+                .map(|e| e.table_version)
+                .ok_or_else(|| {
+                    OmniError::manifest_conflict(format!(
+                        "table '{}' missing from manifest at commit time",
+                        entry.table_key,
+                    ))
+                })?;
+
+            // Insert / Merge tables skip this check: concurrent inserts on
+            // disjoint keys legitimately coexist via Lance's auto-rebase, so
+            // the check would over-reject the existing Phase 2 same-key
+            // insert path (`change_concurrent_inserts_same_key_serialize_without_409`).
+            let strict = op_kinds
+                .get(&entry.table_key)
+                .map(|k| k.strict_pre_stage_version_check())
+                .unwrap_or(false);
+            if strict && entry.expected_version != current {
+                return Err(OmniError::manifest_expected_version_mismatch(
+                    entry.table_key.clone(),
+                    entry.expected_version,
+                    current,
+                ));
+            }
+
+            entry.expected_version = current;
+            expected_versions.insert(entry.table_key.clone(), current);
+        }
+        // Sidecar protocol: build the per-table pin list and write the
+        // sidecar BEFORE any later error can return after Lance HEAD has
+        // already moved. For staged tables this still happens before any
+        // Lance commit_staged runs. For inline-committed delete tables,
+        // Lance HEAD moved inside delete_where before commit_all, so the
+        // sidecar must also exist before the inline manifest-version check
+        // below can reject a stale query.
+        //
+        // Pins cover BOTH staged tables (Lance HEAD will advance below
+        // when `commit_staged` runs) AND inline-committed tables
+        // (Lance HEAD already advanced inside `delete_where` — we still
+        // need a sidecar so that an upcoming publish failure is
+        // recoverable on next open). This closes the third-agent
+        // Finding 3 hazard: delete-only mutations would otherwise skip
+        // the sidecar, leaving any commit→publish residual unreachable
+        // by recovery.
+        let mut pins: Vec<SidecarTablePin> = Vec::with_capacity(
+            staged.len() + inline_committed.len(),
+        );
+        for entry in &staged {
+            pins.push(SidecarTablePin {
+                table_key: entry.table_key.clone(),
+                table_path: entry.path.full_path.clone(),
+                expected_version: entry.expected_version,
+                post_commit_pin: entry.expected_version + 1,
+                table_branch: entry.path.table_branch.clone(),
+            });
+        }
+        for (table_key, update) in &inline_committed {
+            let path = paths.get(table_key).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "StagedMutation::commit_all: missing path for inline-committed table '{}'",
+                    table_key
+                ))
+            })?;
+            let expected = *expected_versions.get(table_key).ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "StagedMutation::commit_all: missing expected version for inline-committed table '{}'",
+                    table_key
+                ))
+            })?;
+            pins.push(SidecarTablePin {
+                table_key: table_key.clone(),
+                table_path: path.full_path.clone(),
+                expected_version: expected,
+                // For inline-committed tables, the post-commit pin is
+                // the actual post-delete version recorded by
+                // `record_inline`, NOT `expected + 1` — `delete_where`
+                // can advance HEAD by more than one version (e.g.,
+                // when Lance internally compacts deletion vectors).
+                post_commit_pin: update.table_version,
+                table_branch: path.table_branch.clone(),
+            });
+        }
+
+        let sidecar_handle = if pins.is_empty() {
+            None
+        } else {
+            let sidecar = new_sidecar(
+                sidecar_kind,
+                branch.map(|s| s.to_string()),
+                actor_id.map(str::to_string),
+                pins,
+            );
+            Some(write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar).await?)
+        };
+
+        for (table_key, _update) in inline_committed.iter() {
+            let current = snapshot
+                .entry(table_key)
+                .map(|e| e.table_version)
+                .ok_or_else(|| {
+                    OmniError::manifest_conflict(format!(
+                        "table '{}' missing from manifest at commit time",
+                        table_key,
+                    ))
+                })?;
+            let expected = expected_versions.get(table_key).copied().ok_or_else(|| {
+                OmniError::manifest_internal(format!(
+                    "StagedMutation::commit_all: missing expected version for inline-committed table '{}'",
+                    table_key
+                ))
+            })?;
+            if expected != current {
+                return Err(OmniError::manifest_expected_version_mismatch(
+                    table_key.clone(),
+                    expected,
+                    current,
+                ));
+            }
+            expected_versions.insert(table_key.clone(), current);
+        }
+
+        let mut updates: Vec<SubTableUpdate> = inline_committed.into_values().collect();
+
+        for entry in staged {
+            let StagedTableEntry {
+                table_key,
+                path,
+                expected_version: _,
+                dataset,
+                staged_write,
+            } = entry;
+
             let new_ds = db
                 .table_store()
-                .commit_staged(Arc::new(ds), staged.transaction)
+                .commit_staged(Arc::new(dataset), staged_write.transaction)
                 .await?;
             let state = db
                 .table_store()
                 .table_state(&path.full_path, &new_ds)
                 .await?;
             updates.push(SubTableUpdate {
-                table_key: table_key.clone(),
+                table_key,
                 table_version: state.version,
                 table_branch: path.table_branch.clone(),
                 row_count: state.row_count,
@@ -370,7 +670,7 @@ impl MutationStaging {
             });
         }
 
-        Ok((updates, expected_versions, sidecar_handle))
+        Ok((updates, expected_versions, sidecar_handle, guards))
     }
 }
 

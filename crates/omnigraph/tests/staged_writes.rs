@@ -860,6 +860,13 @@ async fn lance_restore_appends_one_commit_with_checked_out_content() {
 /// tables before invoking restore — otherwise this hazard becomes
 /// reachable during in-flight tenant traffic.
 ///
+/// MR-686 introduces those per-(table_key, branch) writer queues as the
+/// application-layer mechanism that closes this hazard once continuous
+/// in-process recovery (MR-870) lands. Until MR-686's queue is wired into
+/// the recovery path, the open-time-only invocation strategy is the
+/// only thing keeping this hazard out of production. See
+/// `docs/invariants.md` §VI.30, §VI.32, §VI.33.
+///
 /// This test is the load-bearing constraint any future reconciler must
 /// honor.
 #[tokio::test]

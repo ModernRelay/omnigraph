@@ -59,21 +59,21 @@ pub enum LoadMode {
 
 /// Load JSONL data into an Omnigraph database.
 pub async fn load_jsonl(db: &mut Omnigraph, data: &str, mode: LoadMode) -> Result<LoadResult> {
-    let current_branch = db.active_branch().map(str::to_string);
+    let current_branch = db.active_branch().await;
     let branch = current_branch.as_deref().unwrap_or("main");
     db.load(branch, data, mode).await
 }
 
 /// Load JSONL data from a file path.
 pub async fn load_jsonl_file(db: &mut Omnigraph, path: &str, mode: LoadMode) -> Result<LoadResult> {
-    let current_branch = db.active_branch().map(str::to_string);
+    let current_branch = db.active_branch().await;
     let branch = current_branch.as_deref().unwrap_or("main");
     db.load_file(branch, path, mode).await
 }
 
 impl Omnigraph {
     pub async fn ingest(
-        &mut self,
+        &self,
         branch: &str,
         from: Option<&str>,
         data: &str,
@@ -83,24 +83,19 @@ impl Omnigraph {
     }
 
     pub async fn ingest_as(
-        &mut self,
+        &self,
         branch: &str,
         from: Option<&str>,
         data: &str,
         mode: LoadMode,
         actor_id: Option<&str>,
     ) -> Result<IngestResult> {
-        let previous_actor = self.audit_actor_id.clone();
-        self.audit_actor_id = actor_id.map(str::to_string);
-        let result = self
-            .ingest_with_current_actor(branch, from, data, mode)
-            .await;
-        self.audit_actor_id = previous_actor;
-        result
+        self.ingest_with_current_actor(branch, from, data, mode, actor_id)
+            .await
     }
 
     pub async fn ingest_file(
-        &mut self,
+        &self,
         branch: &str,
         from: Option<&str>,
         path: &str,
@@ -110,7 +105,7 @@ impl Omnigraph {
     }
 
     pub async fn ingest_file_as(
-        &mut self,
+        &self,
         branch: &str,
         from: Option<&str>,
         path: &str,
@@ -122,11 +117,12 @@ impl Omnigraph {
     }
 
     async fn ingest_with_current_actor(
-        &mut self,
+        &self,
         branch: &str,
         from: Option<&str>,
         data: &str,
         mode: LoadMode,
+        actor_id: Option<&str>,
     ) -> Result<IngestResult> {
         self.ensure_schema_state_valid().await?;
         let target_branch =
@@ -143,7 +139,7 @@ impl Omnigraph {
                 .await?;
         }
 
-        let result = self.load(&target_branch, data, mode).await?;
+        let result = self.load_as(&target_branch, data, mode, actor_id).await?;
         Ok(IngestResult {
             branch: target_branch,
             base_branch,
@@ -153,7 +149,17 @@ impl Omnigraph {
         })
     }
 
-    pub async fn load(&mut self, branch: &str, data: &str, mode: LoadMode) -> Result<LoadResult> {
+    pub async fn load(&self, branch: &str, data: &str, mode: LoadMode) -> Result<LoadResult> {
+        self.load_as(branch, data, mode, None).await
+    }
+
+    pub async fn load_as(
+        &self,
+        branch: &str,
+        data: &str,
+        mode: LoadMode,
+        actor_id: Option<&str>,
+    ) -> Result<LoadResult> {
         self.ensure_schema_state_valid().await?;
         // Reject internal `__run__*` / system-prefixed branches at the
         // public write boundary. Direct-publish paths assert this
@@ -169,12 +175,12 @@ impl Omnigraph {
         // Direct-to-target writes: no Run state machine, no `__run__` staging
         // branch. Cross-table OCC is enforced by the publisher's
         // `expected_table_versions` CAS inside `load_jsonl_reader`.
-        self.load_direct_on_branch(requested.as_deref(), data, mode)
+        self.load_direct_on_branch(requested.as_deref(), data, mode, actor_id)
             .await
     }
 
     pub async fn load_file(
-        &mut self,
+        &self,
         branch: &str,
         path: &str,
         mode: LoadMode,
@@ -184,13 +190,14 @@ impl Omnigraph {
     }
 
     async fn load_direct_on_branch(
-        &mut self,
+        &self,
         branch: Option<&str>,
         data: &str,
         mode: LoadMode,
+        actor_id: Option<&str>,
     ) -> Result<LoadResult> {
         let reader = BufReader::new(Cursor::new(data.as_bytes()));
-        load_jsonl_reader(self, branch, reader, mode).await
+        load_jsonl_reader(self, branch, reader, mode, actor_id).await
     }
 }
 
@@ -228,10 +235,11 @@ impl LoadResult {
 }
 
 async fn load_jsonl_reader<R: BufRead>(
-    db: &mut Omnigraph,
+    db: &Omnigraph,
     branch: Option<&str>,
     reader: R,
     mode: LoadMode,
+    actor_id: Option<&str>,
 ) -> Result<LoadResult> {
     let catalog = db.catalog().clone();
 
@@ -327,6 +335,16 @@ async fn load_jsonl_reader<R: BufRead>(
         LoadMode::Append => PendingMode::Append,
         LoadMode::Overwrite => PendingMode::Append, // unused
     };
+    // Map LoadMode to MutationOpKind for the version-check policy.
+    // Append/Merge skip the strict pre-stage check (concurrency-safe
+    // under the per-(table, branch) queue + publisher CAS); Overwrite
+    // uses the strict check because it truncates and replaces the
+    // dataset — concurrent advances change what "replace" means.
+    let load_op_kind = match mode {
+        LoadMode::Append => crate::db::MutationOpKind::Insert,
+        LoadMode::Merge => crate::db::MutationOpKind::Merge,
+        LoadMode::Overwrite => crate::db::MutationOpKind::SchemaRewrite,
+    };
 
     // Phase 2a: build and validate every node batch up front. Cheap and
     // synchronous — surfaces validation errors before any S3 traffic.
@@ -357,7 +375,7 @@ async fn load_jsonl_reader<R: BufRead>(
     if use_staging {
         for (type_name, table_key, batch, loaded_count) in prepared_nodes {
             let (ds, full_path, table_branch) = db
-                .open_for_mutation_on_branch(branch, &table_key)
+                .open_for_mutation_on_branch(branch, &table_key, load_op_kind)
                 .await?;
             let expected_version = ds.version().version;
             staging.ensure_path(
@@ -365,6 +383,7 @@ async fn load_jsonl_reader<R: BufRead>(
                 full_path,
                 table_branch,
                 expected_version,
+                load_op_kind,
             );
             let schema = batch.schema();
             staging.append_batch(&table_key, schema, pending_mode, batch)?;
@@ -478,7 +497,7 @@ async fn load_jsonl_reader<R: BufRead>(
     if use_staging {
         for (edge_name, table_key, batch, loaded_count) in prepared_edges {
             let (ds, full_path, table_branch) = db
-                .open_for_mutation_on_branch(branch, &table_key)
+                .open_for_mutation_on_branch(branch, &table_key, load_op_kind)
                 .await?;
             let expected_version = ds.version().version;
             staging.ensure_path(
@@ -486,6 +505,7 @@ async fn load_jsonl_reader<R: BufRead>(
                 full_path,
                 table_branch,
                 expected_version,
+                load_op_kind,
             );
             let schema = batch.schema();
             staging.append_batch(&table_key, schema, pending_mode, batch)?;
@@ -537,15 +557,19 @@ async fn load_jsonl_reader<R: BufRead>(
 
     // Phase 4: Atomic manifest commit with publisher-level OCC.
     if use_staging {
-        let (updates, expected_versions, sidecar_handle) = staging
-            .finalize(db, branch, crate::db::manifest::SidecarKind::Load)
+        let staged = staging.stage_all(db, branch).await?;
+        // `_queue_guards` holds per-(table_key, branch) write queues
+        // across the manifest publish below — see exec/mutation.rs for
+        // the rationale (interleaving prevention).
+        let (updates, expected_versions, sidecar_handle, _queue_guards) = staged
+            .commit_all(db, branch, crate::db::manifest::SidecarKind::Load, actor_id)
             .await?;
         // Same finalize → publisher residual as mutations: per-table
         // staged commits have advanced Lance HEAD, but the manifest
         // publish has not run yet. Reuse the mutation failpoint name so
         // one failpoint pins the shared `MutationStaging` boundary.
         crate::failpoints::maybe_fail("mutation.post_finalize_pre_publisher")?;
-        db.commit_updates_on_branch_with_expected(branch, &updates, &expected_versions)
+        db.commit_updates_on_branch_with_expected(branch, &updates, &expected_versions, actor_id)
             .await?;
         // The recovery sidecar protects the per-table commit_staged →
         // manifest publish window. Phase C succeeded — clean up
@@ -574,6 +598,7 @@ async fn load_jsonl_reader<R: BufRead>(
             branch,
             &overwrite_updates,
             &overwrite_expected,
+            actor_id,
         )
         .await?;
     }
@@ -1151,8 +1176,14 @@ async fn write_batch_to_dataset(
     batch: RecordBatch,
     mode: LoadMode,
 ) -> Result<(crate::table_store::TableState, Option<String>)> {
-    let (mut ds, full_path, table_branch) =
-        db.open_for_mutation_on_branch(branch, table_key).await?;
+    let op_kind = match mode {
+        LoadMode::Append => crate::db::MutationOpKind::Insert,
+        LoadMode::Merge => crate::db::MutationOpKind::Merge,
+        LoadMode::Overwrite => crate::db::MutationOpKind::SchemaRewrite,
+    };
+    let (mut ds, full_path, table_branch) = db
+        .open_for_mutation_on_branch(branch, table_key, op_kind)
+        .await?;
     let table_store = db.table_store();
 
     match mode {
@@ -1817,7 +1848,7 @@ edge WorksAt: Person -> Company
             .unwrap();
 
         // Read back via snapshot
-        let snap = db.snapshot();
+        let snap = db.snapshot().await;
         let person_ds = snap.open("node:Person").await.unwrap();
 
         assert_eq!(person_ds.count_rows(None).await.unwrap(), 2);
@@ -1854,7 +1885,7 @@ edge WorksAt: Person -> Company
             .await
             .unwrap();
 
-        let snap = db.snapshot();
+        let snap = db.snapshot().await;
         let knows_ds = snap.open("edge:Knows").await.unwrap();
 
         let batches: Vec<RecordBatch> = knows_ds
@@ -1889,13 +1920,13 @@ edge WorksAt: Person -> Company
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-        let v1 = db.version();
+        let v1 = db.version().await;
 
         load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
             .await
             .unwrap();
 
-        assert!(db.version() > v1);
+        assert!(db.version().await > v1);
     }
 
     #[tokio::test]
@@ -1912,7 +1943,7 @@ edge WorksAt: Person -> Company
             .unwrap();
         load_jsonl(&mut db, batch2, LoadMode::Append).await.unwrap();
 
-        let snap = db.snapshot();
+        let snap = db.snapshot().await;
         let person_ds = snap.open("node:Person").await.unwrap();
         assert_eq!(person_ds.count_rows(None).await.unwrap(), 2);
     }

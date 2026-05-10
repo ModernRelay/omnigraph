@@ -16,7 +16,7 @@ Tools that support `@`-imports (Claude Code) auto-include all three files via th
 
 `CLAUDE.md` is a symlink to this file — there is exactly one source of truth. Edit `AGENTS.md`.
 
-**Version surveyed:** 0.4.1
+**Version surveyed:** 0.4.2
 **Workspace crates:** `omnigraph-compiler`, `omnigraph` (engine), `omnigraph-cli`, `omnigraph-server`
 **Storage substrate:** Lance 4.x (columnar, versioned, branchable)
 **License:** MIT
@@ -232,9 +232,16 @@ Rules:
 
 1. **Update in the same PR.** New endpoint, query function, CLI flag, env var, constant, schema construct, or invariant: update both the source code and the doc in the same change. Never split documentation drift into a follow-up.
 2. **Bump version on release.** When a release boundary crosses (e.g. v0.3.1 → v0.3.2), update the version line at the top of this file and add a `docs/releases/<version>.md` describing the user-visible delta. Update [docs/architecture.md](docs/architecture.md) only if the architecture itself changed.
-3. **Don't lie.** If a section becomes wrong but you can't rewrite it fully right now, replace the wrong line with `*(stale — needs update after <change>)*` rather than leaving silently incorrect text. Then fix it ASAP.
-4. **Re-verify before recommending.** If you cite a flag, env var, endpoint, or constant to the user or in code, grep for it in source first. Memory and docs go stale; the code is authoritative.
-5. **Keep AGENTS.md a map, not an encyclopedia.** New deep content goes into `docs/`. Add an entry to "Where to find each topic" instead of pasting prose into this file. The "Always-on rules" section is the exception — it's for invariants that should always be in scope.
-6. **Re-read on schema/query/IR changes.** Edits to `schema.pest`, `query.pest`, `ir/lower.rs`, `query/typecheck.rs`, or `query/lint.rs` should trigger a re-read of [docs/schema-language.md](docs/schema-language.md), [docs/query-language.md](docs/query-language.md), and [docs/execution.md](docs/execution.md) to confirm they still describe reality.
+3. **Write OSS-facing release notes.** Release docs are public project history. Describe capabilities, behavior changes, breaking changes, upgrade notes, and user impact; do not reference private ticket systems, internal codenames, or planning shorthand that an outside contributor cannot inspect.
+4. **Keep versioning coherent.** A release bump must update every published crate manifest, local path dependency constraint, `Cargo.lock`, generated API metadata such as `openapi.json`, and this file's surveyed version. Do not leave mixed package versions unless the release plan explicitly calls for them.
+5. **Keep docs audience-neutral.** Prefer stable public identifiers (versions, PR numbers, public issue links, crate names, endpoint names) over organization-specific labels. If internal context is useful for maintainers, translate it into a durable public rationale before committing it.
+6. **Don't lie.** If a section becomes wrong but you can't rewrite it fully right now, replace the wrong line with `*(stale — needs update after <change>)*` rather than leaving silently incorrect text. Then fix it ASAP.
+7. **Re-verify before recommending.** If you cite a flag, env var, endpoint, or constant to the user or in code, grep for it in source first. Memory and docs go stale; the code is authoritative.
+8. **Keep AGENTS.md short.** This file is always loaded into agent context, so every added line has a recurring context-window cost. Prefer pointers and terse invariants here; put detail in `docs/`.
+9. **Keep AGENTS.md a map, not an encyclopedia.** New deep content goes into `docs/`. Add an entry to "Where to find each topic" instead of pasting prose into this file. The "Always-on rules" section is the exception — it's for invariants that should always be in scope.
+10. **Re-read on schema/query/IR changes.** Edits to `schema.pest`, `query.pest`, `ir/lower.rs`, `query/typecheck.rs`, or `query/lint.rs` should trigger a re-read of [docs/schema-language.md](docs/schema-language.md), [docs/query-language.md](docs/query-language.md), and [docs/execution.md](docs/execution.md) to confirm they still describe reality.
+11. **Always make smaller commits.** Each commit does one thing, compiles, and passes tests; mechanical refactors land separately from the behavior changes they enable.
+12. **Test-first for bug fixes.** When fixing an identified bug, write a regression test that reproduces the failure first. Confirm it fails against the current code with the predicted symptom (not an unrelated error). Then land the fix in a separate commit and confirm the test turns green. The test commit lands just before the fix commit so the red → green pair is visible in `git log` and a reviewer can check out the test commit alone and reproduce the failure.
+13. **Correct by design over symptomatic patches.** When a bug surfaces, identify the root cause and make the fix correct by construction. Don't patch the symptom. If the design admits the bug class, the fix is to close the class, not to add a guard around the latest instance. A symptomatic patch is acceptable only as a stop-gap, with an explicit note in the commit message and a follow-up issue tracking the design fix.
 
 CI check: `scripts/check-agents-md.sh` verifies that every `docs/*.md` link in this file resolves and that every doc in the canonical set is linked. Run it locally before opening a PR if you've moved or renamed docs.

@@ -74,14 +74,14 @@ pub struct TableCleanupStats {
 
 /// Run Lance `compact_files` on every node + edge table on `main`.
 /// Tables run in parallel (bounded concurrency).
-pub async fn optimize_all_tables(db: &mut Omnigraph) -> Result<Vec<TableOptimizeStats>> {
+pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStats>> {
     db.ensure_schema_state_valid().await?;
     db.ensure_schema_apply_idle("optimize").await?;
 
     let resolved = db.resolved_branch_target(None).await?;
     let snapshot = resolved.snapshot;
 
-    let table_tasks: Vec<_> = all_table_keys(&db.catalog)
+    let table_tasks: Vec<_> = all_table_keys(&db.catalog())
         .into_iter()
         .filter_map(|table_key| {
             let entry = snapshot.entry(&table_key)?;
@@ -144,7 +144,7 @@ pub async fn cleanup_all_tables(
     let resolved = db.resolved_branch_target(None).await?;
     let snapshot = resolved.snapshot;
 
-    let table_tasks: Vec<_> = all_table_keys(&db.catalog)
+    let table_tasks: Vec<_> = all_table_keys(&db.catalog())
         .into_iter()
         .filter_map(|table_key| {
             let entry = snapshot.entry(&table_key)?;

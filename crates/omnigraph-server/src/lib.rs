@@ -2,6 +2,7 @@ pub mod api;
 pub mod auth;
 pub mod config;
 pub mod policy;
+pub mod workload;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -47,7 +48,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -118,7 +119,14 @@ pub struct ServerConfig {
 #[derive(Clone)]
 pub struct AppState {
     uri: String,
-    db: Arc<RwLock<Omnigraph>>,
+    /// PR 2 (MR-686): the engine is now `Arc<Omnigraph>` — no global
+    /// write lock. Concurrent handlers call `&self` engine APIs
+    /// directly. Per-(table, branch) write queues inside the engine
+    /// serialize same-key writers; per-actor admission control on
+    /// `workload` isolates noisy actors.
+    engine: Arc<Omnigraph>,
+    /// Per-actor admission control. See `workload::WorkloadController`.
+    workload: Arc<workload::WorkloadController>,
     bearer_tokens: Arc<[(BearerTokenHash, Arc<str>)]>,
     policy_engine: Option<Arc<PolicyEngine>>,
 }
@@ -191,9 +199,33 @@ impl AppState {
             .collect();
         Self {
             uri,
-            db: Arc::new(RwLock::new(db)),
+            engine: Arc::new(db),
+            workload: Arc::new(workload::WorkloadController::from_env()),
             bearer_tokens: Arc::from(bearer_tokens),
             policy_engine: policy_engine.map(Arc::new),
+        }
+    }
+
+    /// Construct with a caller-provided [`workload::WorkloadController`].
+    /// Tests and benches use this to override per-actor caps without
+    /// mutating global env vars (which is unsafe in Rust 2024 once the
+    /// async runtime is up — `setenv` isn't thread-safe).
+    pub fn new_with_workload(
+        uri: String,
+        db: Omnigraph,
+        bearer_tokens: Vec<(String, String)>,
+        workload: workload::WorkloadController,
+    ) -> Self {
+        let bearer_tokens: Vec<(BearerTokenHash, Arc<str>)> = bearer_tokens
+            .into_iter()
+            .map(|(actor, token)| (hash_bearer_token(&token), Arc::<str>::from(actor)))
+            .collect();
+        Self {
+            uri,
+            engine: Arc::new(db),
+            workload: Arc::new(workload),
+            bearer_tokens: Arc::from(bearer_tokens),
+            policy_engine: None,
         }
     }
 
@@ -331,6 +363,31 @@ impl ApiError {
         }
     }
 
+    /// HTTP 429 Too Many Requests — actor exceeded their per-actor
+    /// admission cap (count or byte budget). Clients should respect the
+    /// `Retry-After` header. Mapped from `RejectReason::InFlightCountExceeded`
+    /// and `RejectReason::ByteBudgetExceeded`.
+    pub fn too_many_requests(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            code: ErrorCode::TooManyRequests,
+            message: message.into(),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+        }
+    }
+
+    /// Convert a `WorkloadController` rejection into the matching
+    /// `ApiError` variant.
+    pub fn from_workload_reject(reject: workload::RejectReason) -> Self {
+        match reject {
+            workload::RejectReason::InFlightCountExceeded { .. }
+            | workload::RejectReason::ByteBudgetExceeded { .. } => {
+                Self::too_many_requests(reject.to_string())
+            }
+        }
+    }
+
     fn merge_conflict(conflicts: Vec<api::MergeConflictOutput>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
@@ -418,10 +475,21 @@ fn summarize_merge_conflicts(conflicts: &[api::MergeConflictOutput]) -> String {
     format!("merge conflicts: {}{}", preview.join("; "), suffix)
 }
 
+/// Constant `Retry-After` value (seconds) emitted on 429 responses.
+const RETRY_AFTER_SECONDS: &str = "60";
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let mut headers = axum::http::HeaderMap::new();
+        if matches!(self.code, ErrorCode::TooManyRequests) {
+            headers.insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static(RETRY_AFTER_SECONDS),
+            );
+        }
         (
             self.status,
+            headers,
             Json(ErrorOutput {
                 error: self.message,
                 code: Some(self.code),
@@ -674,7 +742,7 @@ async fn server_snapshot(
         },
     )?;
     let snapshot = {
-        let db = Arc::clone(&state.db).read_owned().await;
+        let db = &state.engine;
         db.snapshot_of(ReadTarget::branch(branch.as_str()))
             .await
             .map_err(ApiError::from_omni)?
@@ -718,7 +786,7 @@ async fn server_read(
     let policy_branch = match &target {
         ReadTarget::Branch(branch) => Some(branch.clone()),
         ReadTarget::Snapshot(_) if state.policy_engine().is_some() && actor.is_some() => {
-            let db = Arc::clone(&state.db).read_owned().await;
+            let db = &state.engine;
             db.resolved_branch_of(target.clone())
                 .await
                 .map(|branch| branch.or_else(|| Some("main".to_string())))
@@ -746,7 +814,7 @@ async fn server_read(
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
     let result = {
-        let db = Arc::clone(&state.db).read_owned().await;
+        let db = &state.engine;
         db.query(
             target.clone(),
             &request.query_source,
@@ -798,15 +866,15 @@ async fn server_export(
             target_branch: None,
         },
     )?;
-    let db = Arc::clone(&state.db);
+    let engine = Arc::clone(&state.engine);
     let type_names = request.type_names.clone();
     let table_keys = request.table_keys.clone();
     let (tx, rx) = mpsc::unbounded_channel::<std::result::Result<Bytes, io::Error>>();
     tokio::spawn(async move {
         let result = {
-            let db = db.read().await;
             let mut writer = ExportStreamWriter { sender: tx.clone() };
-            db.export_jsonl_to_writer(&branch, &type_names, &table_keys, &mut writer)
+            engine
+                .export_jsonl_to_writer(&branch, &type_names, &table_keys, &mut writer)
                 .await
         };
         if let Err(err) = result {
@@ -836,6 +904,7 @@ async fn server_export(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Merge conflict", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -851,6 +920,10 @@ async fn server_change(
     Json(request): Json<ChangeRequest>,
 ) -> std::result::Result<Json<ChangeOutput>, ApiError> {
     let branch = request.branch.unwrap_or_else(|| "main".to_string());
+    let actor_arc = actor
+        .as_ref()
+        .map(|Extension(actor)| Arc::clone(&actor.0))
+        .unwrap_or_else(|| Arc::<str>::from("anonymous"));
     let actor_id = actor.as_ref().map(|Extension(actor)| actor.as_str());
     authorize_request(
         &state,
@@ -862,6 +935,20 @@ async fn server_change(
             target_branch: None,
         },
     )?;
+    // Per-actor admission: bound concurrent in-flight mutations and
+    // estimated bytes per actor. Cedar runs FIRST so denied requests
+    // don't consume admission slots. Estimate uses the request body
+    // size as a coarse proxy; engine memory pressure can run higher.
+    let est_bytes = request.query_source.len() as u64
+        + request
+            .params
+            .as_ref()
+            .map(|p| p.to_string().len() as u64)
+            .unwrap_or(0);
+    let _admission = state
+        .workload
+        .try_admit(&actor_arc, est_bytes)
+        .map_err(ApiError::from_workload_reject)?;
     let (selected_name, query_params) =
         select_named_query(&request.query_source, request.query_name.as_deref())
             .map_err(|err| ApiError::bad_request(err.to_string()))?;
@@ -869,7 +956,7 @@ async fn server_change(
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
     let result = {
-        let mut db = Arc::clone(&state.db).write_owned().await;
+        let db = &state.engine;
         db.mutate_as(
             &branch,
             &request.query_source,
@@ -924,7 +1011,7 @@ async fn server_schema_get(
         },
     )?;
     let schema_source = {
-        let db = Arc::clone(&state.db).read_owned().await;
+        let db = &state.engine;
         db.schema_source().to_string()
     };
     Ok(Json(SchemaOutput { schema_source }))
@@ -941,6 +1028,7 @@ async fn server_schema_get(
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -955,6 +1043,10 @@ async fn server_schema_apply(
     actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<SchemaApplyRequest>,
 ) -> std::result::Result<Json<SchemaApplyOutput>, ApiError> {
+    let actor_arc = actor
+        .as_ref()
+        .map(|Extension(actor)| Arc::clone(&actor.0))
+        .unwrap_or_else(|| Arc::<str>::from("anonymous"));
     let actor_id = actor.as_ref().map(|Extension(actor)| actor.as_str());
     authorize_request(
         &state,
@@ -966,8 +1058,13 @@ async fn server_schema_apply(
             target_branch: Some("main".to_string()),
         },
     )?;
+    let est_bytes = request.schema_source.len() as u64;
+    let _admission = state
+        .workload
+        .try_admit(&actor_arc, est_bytes)
+        .map_err(ApiError::from_workload_reject)?;
     let result = {
-        let mut db = Arc::clone(&state.db).write_owned().await;
+        let db = &state.engine;
         db.apply_schema(&request.schema_source)
             .await
             .map_err(ApiError::from_omni)?
@@ -986,6 +1083,7 @@ async fn server_schema_apply(
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -1004,10 +1102,14 @@ async fn server_ingest(
     let branch = request.branch.unwrap_or_else(|| "main".to_string());
     let from = request.from.unwrap_or_else(|| "main".to_string());
     let mode = request.mode.unwrap_or(omnigraph::loader::LoadMode::Merge);
+    let actor_arc = actor
+        .as_ref()
+        .map(|Extension(actor)| Arc::clone(&actor.0))
+        .unwrap_or_else(|| Arc::<str>::from("anonymous"));
     let actor_id = actor.as_ref().map(|Extension(actor)| actor.as_str());
 
     let branch_exists = {
-        let db = Arc::clone(&state.db).read_owned().await;
+        let db = &state.engine;
         db.branch_list()
             .await
             .map_err(ApiError::from_omni)?
@@ -1037,9 +1139,14 @@ async fn server_ingest(
             target_branch: None,
         },
     )?;
+    let est_bytes = request.data.len() as u64;
+    let _admission = state
+        .workload
+        .try_admit(&actor_arc, est_bytes)
+        .map_err(ApiError::from_workload_reject)?;
 
     let result = {
-        let mut db = Arc::clone(&state.db).write_owned().await;
+        let db = &state.engine;
         db.ingest_as(&branch, Some(&from), &request.data, mode, actor_id)
             .await
             .map_err(ApiError::from_omni)?
@@ -1085,7 +1192,7 @@ async fn server_branch_list(
         },
     )?;
     let mut branches = {
-        let db = Arc::clone(&state.db).read_owned().await;
+        let db = &state.engine;
         db.branch_list().await.map_err(ApiError::from_omni)?
     };
     branches.sort();
@@ -1104,6 +1211,7 @@ async fn server_branch_list(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Branch already exists", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -1118,6 +1226,10 @@ async fn server_branch_create(
     Json(request): Json<BranchCreateRequest>,
 ) -> std::result::Result<Json<BranchCreateOutput>, ApiError> {
     let from = request.from.unwrap_or_else(|| "main".to_string());
+    let actor_arc = actor
+        .as_ref()
+        .map(|Extension(actor)| Arc::clone(&actor.0))
+        .unwrap_or_else(|| Arc::<str>::from("anonymous"));
     authorize_request(
         &state,
         actor.as_ref().map(|Extension(actor)| actor),
@@ -1131,8 +1243,15 @@ async fn server_branch_create(
             target_branch: Some(request.name.clone()),
         },
     )?;
+    // Branch metadata only — small constant bytes estimate. The Lance
+    // shallow-clone work is bounded by the parent's manifest size, not
+    // the request body.
+    let _admission = state
+        .workload
+        .try_admit(&actor_arc, 256)
+        .map_err(ApiError::from_workload_reject)?;
     {
-        let mut db = Arc::clone(&state.db).write_owned().await;
+        let db = &state.engine;
         db.branch_create_from(ReadTarget::branch(&from), &request.name)
             .await
             .map_err(ApiError::from_omni)?;
@@ -1158,6 +1277,7 @@ async fn server_branch_create(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 404, description = "Branch not found", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -1171,6 +1291,10 @@ async fn server_branch_delete(
     actor: Option<Extension<AuthenticatedActor>>,
     Path(branch): Path<String>,
 ) -> std::result::Result<Json<BranchDeleteOutput>, ApiError> {
+    let actor_arc = actor
+        .as_ref()
+        .map(|Extension(actor)| Arc::clone(&actor.0))
+        .unwrap_or_else(|| Arc::<str>::from("anonymous"));
     let actor_id = actor.as_ref().map(|Extension(actor)| actor.as_str());
     authorize_request(
         &state,
@@ -1182,8 +1306,13 @@ async fn server_branch_delete(
             target_branch: Some(branch.clone()),
         },
     )?;
+    // Metadata-only manifest tombstone — small constant estimate.
+    let _admission = state
+        .workload
+        .try_admit(&actor_arc, 256)
+        .map_err(ApiError::from_workload_reject)?;
     {
-        let mut db = Arc::clone(&state.db).write_owned().await;
+        let db = &state.engine;
         db.branch_delete(&branch)
             .await
             .map_err(ApiError::from_omni)?;
@@ -1207,6 +1336,7 @@ async fn server_branch_delete(
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
         (status = 409, description = "Merge conflict", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -1222,6 +1352,10 @@ async fn server_branch_merge(
     Json(request): Json<BranchMergeRequest>,
 ) -> std::result::Result<Json<BranchMergeOutput>, ApiError> {
     let target = request.target.unwrap_or_else(|| "main".to_string());
+    let actor_arc = actor
+        .as_ref()
+        .map(|Extension(actor)| Arc::clone(&actor.0))
+        .unwrap_or_else(|| Arc::<str>::from("anonymous"));
     let actor_id = actor.as_ref().map(|Extension(actor)| actor.as_str());
     authorize_request(
         &state,
@@ -1233,8 +1367,15 @@ async fn server_branch_merge(
             target_branch: Some(target.clone()),
         },
     )?;
+    // Merge body is small JSON; the heavy work is in the engine but is
+    // bounded per-(table, branch) by the writer queue. Small constant
+    // estimate suffices for the actor in-flight count.
+    let _admission = state
+        .workload
+        .try_admit(&actor_arc, 256)
+        .map_err(ApiError::from_workload_reject)?;
     let outcome = {
-        let mut db = Arc::clone(&state.db).write_owned().await;
+        let db = &state.engine;
         db.branch_merge_as(&request.source, &target, actor_id)
             .await
             .map_err(ApiError::from_omni)?
@@ -1283,7 +1424,7 @@ async fn server_commit_list(
         },
     )?;
     let commits = {
-        let db = Arc::clone(&state.db).read_owned().await;
+        let db = &state.engine;
         db.list_commits(query.branch.as_deref())
             .await
             .map_err(ApiError::from_omni)?
@@ -1332,7 +1473,7 @@ async fn server_commit_show(
         },
     )?;
     let commit = {
-        let db = Arc::clone(&state.db).read_owned().await;
+        let db = &state.engine;
         db.get_commit(&commit_id)
             .await
             .map_err(ApiError::from_omni)?

@@ -12,7 +12,7 @@ pub(super) async fn plan_schema(
 }
 
 pub(super) async fn apply_schema(
-    db: &mut Omnigraph,
+    db: &Omnigraph,
     desired_schema_source: &str,
 ) -> Result<SchemaApplyResult> {
     acquire_schema_apply_lock(db).await?;
@@ -27,11 +27,11 @@ pub(super) async fn apply_schema(
 }
 
 pub(super) async fn apply_schema_with_lock(
-    db: &mut Omnigraph,
+    db: &Omnigraph,
     desired_schema_source: &str,
 ) -> Result<SchemaApplyResult> {
     db.ensure_schema_state_valid().await?;
-    let branches = db.coordinator.all_branches().await?;
+    let branches = db.coordinator.read().await.all_branches().await?;
     // Skip `main` and internal system branches. The schema-apply lock branch
     // is excluded because it is the cluster-wide schema-apply serializer.
     // `__run__*` branches are no longer created; the filter remains as
@@ -67,7 +67,7 @@ pub(super) async fn apply_schema_with_lock(
         return Ok(SchemaApplyResult {
             supported: true,
             applied: false,
-            manifest_version: db.version(),
+            manifest_version: db.version().await,
             steps: plan.steps,
         });
     }
@@ -75,7 +75,7 @@ pub(super) async fn apply_schema_with_lock(
     let mut desired_catalog = build_catalog_from_ir(&desired_ir)?;
     fixup_blob_schemas(&mut desired_catalog);
 
-    let snapshot = db.snapshot();
+    let snapshot = db.snapshot().await;
     let base_manifest_version = snapshot.version();
     let mut added_tables = BTreeSet::new();
     let mut renamed_tables = HashMap::new();
@@ -209,6 +209,26 @@ pub(super) async fn apply_schema_with_lock(
         });
     }
 
+    // Acquire per-(table_key, branch) queues for every existing table
+    // that schema_apply will rewrite or re-index. New tables (added or
+    // renamed targets) aren't acquired — they have no existing dataset
+    // to race against. Held across the per-table commit loop and the
+    // manifest publish via `commit_changes_with_actor` below.
+    //
+    // Schema-apply already holds the graph-wide `__schema_apply_lock__`
+    // sentinel branch, so under PR 1b's intermediate state these
+    // per-table acquisitions are uncontended. They exist for symmetry
+    // with future MR-870 recovery, which will need queue acquisition
+    // before any `Dataset::restore` it issues for SchemaApply sidecars.
+    let schema_apply_queue_keys: Vec<(String, Option<String>)> = recovery_pins
+        .iter()
+        .map(|pin| (pin.table_key.clone(), pin.table_branch.clone()))
+        .collect();
+    let _schema_apply_queue_guards = db
+        .write_queue()
+        .acquire_many(&schema_apply_queue_keys)
+        .await;
+
     let recovery_handle = if recovery_pins.is_empty()
         && sidecar_registrations.is_empty()
         && sidecar_tombstones.is_empty()
@@ -225,7 +245,10 @@ pub(super) async fn apply_schema_with_lock(
         let mut sidecar = crate::db::manifest::new_sidecar(
             crate::db::manifest::SidecarKind::SchemaApply,
             None,
-            db.audit_actor_id.clone(),
+            // `apply_schema` doesn't currently take an actor (no `apply_schema_as`
+            // public API). The HTTP server's /schema/apply handler can pass actor
+            // context through a follow-up addition. For now, system-attributed.
+            None,
             recovery_pins,
         );
         sidecar.additional_registrations = sidecar_registrations;
@@ -266,11 +289,12 @@ pub(super) async fn apply_schema_with_lock(
         })?;
         ensure_snapshot_entry_head_matches(db, source_entry).await?;
         let source_ds = snapshot.open(source_table_key).await?;
+        let current_catalog = db.catalog();
         let batch = batch_for_schema_apply_rewrite(
             db,
             &source_ds,
             source_table_key,
-            &db.catalog,
+            &current_catalog,
             target_table_key,
             &desired_catalog,
             property_renames.get(target_table_key),
@@ -311,11 +335,12 @@ pub(super) async fn apply_schema_with_lock(
         })?;
         ensure_snapshot_entry_head_matches(db, entry).await?;
         let source_ds = snapshot.open(table_key).await?;
+        let current_catalog = db.catalog();
         let batch = batch_for_schema_apply_rewrite(
             db,
             &source_ds,
             table_key,
-            &db.catalog,
+            &current_catalog,
             table_key,
             &desired_catalog,
             property_renames.get(table_key),
@@ -418,11 +443,11 @@ pub(super) async fn apply_schema_with_lock(
     }
 
     db.refresh_coordinator_only().await?;
-    if db.version() != base_manifest_version {
+    let current_manifest_version = db.version().await;
+    if current_manifest_version != base_manifest_version {
         return Err(OmniError::manifest_conflict(format!(
             "schema apply lost its write lease: main advanced from v{} to v{} while schema apply was in progress",
-            base_manifest_version,
-            db.version()
+            base_manifest_version, current_manifest_version,
         )));
     }
 
@@ -444,13 +469,15 @@ pub(super) async fn apply_schema_with_lock(
 
     crate::failpoints::maybe_fail("schema_apply.after_staging_write")?;
 
-    let actor_id = db.current_audit_actor().map(str::to_string);
+    // `apply_schema` doesn't currently take an actor; system-attributed.
     let PublishedSnapshot {
         manifest_version,
         _snapshot_id: _,
     } = db
         .coordinator
-        .commit_changes_with_actor(&manifest_changes, actor_id.as_deref())
+        .write()
+        .await
+        .commit_changes_with_actor(&manifest_changes, None)
         .await?;
 
     crate::failpoints::maybe_fail("schema_apply.after_manifest_commit")?;
@@ -471,9 +498,9 @@ pub(super) async fn apply_schema_with_lock(
         )
         .await?;
 
-    db.catalog = desired_catalog;
-    db.schema_source = desired_schema_source.to_string();
-    db.coordinator.refresh().await?;
+    db.store_catalog(desired_catalog);
+    db.store_schema_source(desired_schema_source.to_string());
+    db.coordinator.write().await.refresh().await?;
     db.runtime_cache.invalidate_all().await;
     if changed_edge_tables {
         db.invalidate_graph_index().await;
@@ -504,15 +531,15 @@ pub(super) async fn apply_schema_with_lock(
     })
 }
 
-pub(super) async fn ensure_schema_apply_idle(db: &mut Omnigraph, operation: &str) -> Result<()> {
+pub(super) async fn ensure_schema_apply_idle(db: &Omnigraph, operation: &str) -> Result<()> {
     db.refresh_coordinator_only().await?;
     ensure_schema_apply_not_locked(db, operation).await
 }
 
-pub(super) async fn acquire_schema_apply_lock(db: &mut Omnigraph) -> Result<()> {
+pub(super) async fn acquire_schema_apply_lock(db: &Omnigraph) -> Result<()> {
     db.ensure_schema_state_valid().await?;
     db.refresh_coordinator_only().await?;
-    let branches = db.coordinator.all_branches().await?;
+    let branches = db.coordinator.read().await.all_branches().await?;
     if branches
         .iter()
         .any(|branch| is_schema_apply_lock_branch(branch))
@@ -523,12 +550,16 @@ pub(super) async fn acquire_schema_apply_lock(db: &mut Omnigraph) -> Result<()> 
     }
 
     db.coordinator
+        .write()
+        .await
         .branch_create(SCHEMA_APPLY_LOCK_BRANCH)
         .await?;
     db.refresh_coordinator_only().await?;
 
     let blocking_branches = db
         .coordinator
+        .read()
+        .await
         .all_branches()
         .await?
         .into_iter()
@@ -545,8 +576,10 @@ pub(super) async fn acquire_schema_apply_lock(db: &mut Omnigraph) -> Result<()> 
     Ok(())
 }
 
-pub(super) async fn release_schema_apply_lock(db: &mut Omnigraph) -> Result<()> {
+pub(super) async fn release_schema_apply_lock(db: &Omnigraph) -> Result<()> {
     db.coordinator
+        .write()
+        .await
         .branch_delete(SCHEMA_APPLY_LOCK_BRANCH)
         .await?;
     // Use refresh_coordinator_only — the full Omnigraph::refresh would
@@ -560,6 +593,8 @@ pub(super) async fn release_schema_apply_lock(db: &mut Omnigraph) -> Result<()> 
 pub(super) async fn ensure_schema_apply_not_locked(db: &Omnigraph, operation: &str) -> Result<()> {
     if db
         .coordinator
+        .read()
+        .await
         .all_branches()
         .await?
         .iter()

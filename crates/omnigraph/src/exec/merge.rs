@@ -855,8 +855,9 @@ async fn publish_adopted_source_state(
         .ok_or_else(|| OmniError::manifest(format!("missing source entry for {}", table_key)))?;
     let target_entry = target_snapshot.entry(table_key);
 
+    let target_active = target_db.active_branch().await;
     match (
-        target_db.active_branch(),
+        target_active.as_deref(),
         source_entry.table_branch.as_deref(),
     ) {
         // Both on main — pointer switch is safe (same lineage, version columns valid)
@@ -945,7 +946,13 @@ async fn publish_rewritten_merge_table(
     table_key: &str,
     staged: &StagedMergeResult,
 ) -> Result<crate::db::SubTableUpdate> {
-    let (ds, full_path, table_branch) = target_db.open_for_mutation(table_key).await?;
+    // Branch merge's source-rewrite path is Merge-shaped (upsert from
+    // source onto target). The inline `delete_where` later in this
+    // function operates on rows the rewrite chose to remove, not
+    // user-facing predicates, so Merge is the correct policy here.
+    let (ds, full_path, table_branch) = target_db
+        .open_for_mutation(table_key, crate::db::MutationOpKind::Merge)
+        .await?;
     let mut current_ds = ds;
 
     // Phase 1: merge_insert changed/new rows (preserves _row_created_at_version for
@@ -1045,25 +1052,26 @@ async fn publish_rewritten_merge_table(
 }
 
 impl Omnigraph {
-    pub async fn branch_merge(&mut self, source: &str, target: &str) -> Result<MergeOutcome> {
+    pub async fn branch_merge(&self, source: &str, target: &str) -> Result<MergeOutcome> {
         self.branch_merge_as(source, target, None).await
     }
 
     pub async fn branch_merge_as(
-        &mut self,
+        &self,
         source: &str,
         target: &str,
         actor_id: Option<&str>,
     ) -> Result<MergeOutcome> {
         self.ensure_schema_apply_idle("branch_merge").await?;
-        let previous_actor = self.audit_actor_id.clone();
-        self.audit_actor_id = actor_id.map(str::to_string);
-        let result = self.branch_merge_impl(source, target).await;
-        self.audit_actor_id = previous_actor;
-        result
+        self.branch_merge_impl(source, target, actor_id).await
     }
 
-    async fn branch_merge_impl(&mut self, source: &str, target: &str) -> Result<MergeOutcome> {
+    async fn branch_merge_impl(
+        &self,
+        source: &str,
+        target: &str,
+        actor_id: Option<&str>,
+    ) -> Result<MergeOutcome> {
         if is_internal_run_branch(source) || is_internal_run_branch(target) {
             return Err(OmniError::manifest(format!(
                 "branch_merge does not allow internal run refs ('{}' -> '{}')",
@@ -1113,7 +1121,17 @@ impl Omnigraph {
             ))
             .await?
             .snapshot;
-        let previous_branch = self.active_branch().map(str::to_string);
+        // Hold the merge-exclusive mutex across the full swap → operate
+        // → restore window. Two concurrent branch_merge calls would
+        // otherwise interleave their three separate `coordinator.write()`
+        // acquisitions, leaving each merge's body running against the
+        // other's swapped coord. Pinned by
+        // `concurrent_branch_merges_distinct_targets_do_not_swap_into_each_other`
+        // in `crates/omnigraph-server/tests/server.rs`.
+        let merge_exclusive = self.merge_exclusive();
+        let _merge_guard = merge_exclusive.lock().await;
+
+        let previous_branch = self.active_branch().await;
         let previous = self
             .swap_coordinator_for_branch(target_branch.as_deref())
             .await?;
@@ -1124,9 +1142,10 @@ impl Omnigraph {
                 &target_head_commit_id,
                 &source_head_commit_id,
                 is_fast_forward,
+                actor_id,
             )
             .await;
-        self.restore_coordinator(previous);
+        self.restore_coordinator(previous).await;
 
         if merge_result.is_ok() && previous_branch == target_branch {
             self.refresh().await?;
@@ -1136,15 +1155,16 @@ impl Omnigraph {
     }
 
     async fn branch_merge_on_current_target(
-        &mut self,
+        &self,
         base_snapshot: &Snapshot,
         source_snapshot: &Snapshot,
         target_head_commit_id: &str,
         source_head_commit_id: &str,
         is_fast_forward: bool,
+        actor_id: Option<&str>,
     ) -> Result<MergeOutcome> {
         self.ensure_commit_graph_initialized().await?;
-        let target_snapshot = self.snapshot();
+        let target_snapshot = self.snapshot().await;
 
         let mut table_keys = HashSet::new();
         for entry in base_snapshot.entries() {
@@ -1180,7 +1200,7 @@ impl Omnigraph {
 
             if let Some(staged) = stage_streaming_table_merge(
                 table_key,
-                self.catalog(),
+                &self.catalog(),
                 base_snapshot,
                 source_snapshot,
                 &target_snapshot,
@@ -1227,6 +1247,55 @@ impl Omnigraph {
         // requires pre-computing source deltas during candidate
         // classification (a structural change to `CandidateTableState`)
         // and is left as follow-up work.
+        // Acquire per-(table_key, target_branch) queues for every table
+        // touched by the merge plan. Sorted-order acquisition prevents
+        // lock-order inversion against concurrent multi-table writers.
+        // The active branch (set by the caller's `swap_coordinator_for_branch`)
+        // is the merge target; queue keys are scoped to it because a
+        // branch_merge writes only to the target branch.
+        //
+        // Held across the per-table publish loop and the manifest
+        // commit + record_merge_commit calls below. Under PR 1b's
+        // intermediate state (global server RwLock still in place),
+        // this acquisition is uncontended.
+        let active_branch_for_keys = self.active_branch().await;
+        let merge_queue_keys: Vec<(String, Option<String>)> = ordered_table_keys
+            .iter()
+            .filter(|table_key| {
+                matches!(
+                    candidates.get(*table_key),
+                    Some(CandidateTableState::RewriteMerged(_))
+                        | Some(CandidateTableState::AdoptSourceState)
+                )
+            })
+            .map(|table_key| (table_key.clone(), active_branch_for_keys.clone()))
+            .collect();
+        let _merge_queue_guards = self.write_queue().acquire_many(&merge_queue_keys).await;
+
+        let post_queue_snapshot = self.snapshot().await;
+        for table_key in &ordered_table_keys {
+            let Some(candidate) = candidates.get(table_key) else {
+                continue;
+            };
+            if !matches!(
+                candidate,
+                CandidateTableState::RewriteMerged(_) | CandidateTableState::AdoptSourceState
+            ) {
+                continue;
+            }
+            let expected = target_snapshot.entry(table_key).map(|e| e.table_version);
+            let current = post_queue_snapshot
+                .entry(table_key)
+                .map(|e| e.table_version);
+            if expected != current {
+                return Err(OmniError::manifest_expected_version_mismatch(
+                    table_key.clone(),
+                    expected.unwrap_or(0),
+                    current.unwrap_or(0),
+                ));
+            }
+        }
+
         let recovery_pins: Vec<crate::db::manifest::SidecarTablePin> = ordered_table_keys
             .iter()
             .filter_map(|table_key| {
@@ -1252,7 +1321,7 @@ impl Omnigraph {
                     // the orphaned post-Phase-B HEAD on the target ref.
                     // Same rationale as table_ops.rs:115-120 in
                     // ensure_indices_for_branch.
-                    table_branch: self.active_branch().map(str::to_string),
+                    table_branch: active_branch_for_keys.clone(),
                 })
             })
             .collect();
@@ -1268,11 +1337,11 @@ impl Omnigraph {
             // `branch_merge` calls `swap_coordinator_for_branch(target_branch)`
             // before invoking this function, so `self.active_branch()`
             // is the target.
-            let target_branch = self.active_branch().map(str::to_string);
+            let target_branch = active_branch_for_keys.clone();
             let mut sidecar = crate::db::manifest::new_sidecar(
                 crate::db::manifest::SidecarKind::BranchMerge,
                 target_branch,
-                self.audit_actor_id.clone(),
+                actor_id.map(str::to_string),
                 recovery_pins,
             );
             // Carry the source branch's HEAD commit id so the recovery
@@ -1301,7 +1370,7 @@ impl Omnigraph {
                 CandidateTableState::AdoptSourceState => {
                     publish_adopted_source_state(
                         self,
-                        self.catalog(),
+                        &self.catalog(),
                         base_snapshot,
                         source_snapshot,
                         &target_snapshot,
@@ -1326,7 +1395,7 @@ impl Omnigraph {
         crate::failpoints::maybe_fail("branch_merge.post_phase_b_pre_manifest_commit")?;
 
         let manifest_version = if updates.is_empty() {
-            self.version()
+            self.version().await
         } else {
             self.commit_manifest_updates(&updates).await?
         };
@@ -1349,6 +1418,7 @@ impl Omnigraph {
             manifest_version,
             target_head_commit_id,
             source_head_commit_id,
+            actor_id,
         )
         .await?;
 

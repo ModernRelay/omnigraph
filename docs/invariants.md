@@ -105,7 +105,7 @@ These are user-visible commitments. They state what the engine guarantees and wh
 Specific defaults (timeout values, memory caps, TTL windows) are *configuration*, not invariants — see [docs/constants.md](constants.md) and per-deployment configuration. The invariant is that bounds and contracts exist, not their numerical values.
 
 23. **Atomicity is per-query.** Every `.gq` query is atomic — multi-statement mutations are all-or-nothing via the substrate's atomic-commit primitive. No cross-query `BEGIN`/`COMMIT`; branches and merges fill that role for agent workflows.
-    *Status: upheld at the writer-trait surface, across process boundaries, AND in-process for the common case — the sealed `TableStorage` trait routes inserts / updates / scalar-index builds / merge_insert / overwrite through `stage_*` + `commit_staged` (Phase A is drift-free); the open-time recovery sweep in `db/manifest/recovery.rs` (sidecars at `__recovery/{ulid}.json` written by `MutationStaging::finalize`, `schema_apply`, `branch_merge`, `ensure_indices`) closes the per-table commit_staged → manifest publish residual on the next `Omnigraph::open`; and `Omnigraph::refresh` runs roll-forward-only recovery in-process so long-running servers close the common case (mutation/load finalize → publisher failure) without restart. The "Lance HEAD ahead of `__manifest`" drift class is unreachable for op-execution failures, recoverable across process boundaries for all writer kinds, and recoverable in-process for roll-forward-eligible sidecars. Sidecars that would require `Dataset::restore` are deferred to the next ReadWrite open (restore unsafe under concurrency); continuous in-process recovery for that case requires per-(table, branch) writer-queue acquisition and is the goal of a future background reconciler. Two writer paths still inline-commit pending upstream Lance work: `delete_where` (lance-format/lance#6658) and `create_vector_index` (lance-format/lance#6666).*
+    *Status: upheld at the writer-trait surface, across process boundaries, AND in-process for the common case under concurrent writers (PR 2 / MR-686) — the sealed `TableStorage` trait routes inserts / updates / scalar-index builds / merge_insert / overwrite through `stage_*` + `commit_staged` (Phase A is drift-free); the open-time recovery sweep in `db/manifest/recovery.rs` (sidecars at `__recovery/{ulid}.json` written by `MutationStaging::finalize`, `schema_apply`, `branch_merge`, `ensure_indices`) closes the per-table commit_staged → manifest publish residual on the next `Omnigraph::open`; `Omnigraph::refresh` runs roll-forward-only recovery in-process so long-running servers close the common case without restart; and the per-(table, branch) writer-queue (`db/write_queue.rs`) + revalidation under the queue (`MutationStaging::commit_all`) prevents concurrent writers on the same key from corrupting each other once the HTTP server's global `RwLock<Omnigraph>` is removed (PR 2 Step F). The "Lance HEAD ahead of `__manifest`" drift class is unreachable for op-execution failures, recoverable across process boundaries for all writer kinds, and recoverable in-process for roll-forward-eligible sidecars. Sidecars that would require `Dataset::restore` are deferred to the next ReadWrite open (restore unsafe under concurrency); continuous in-process rollback recovery is the goal of a future background reconciler (MR-870). Two writer paths still inline-commit pending upstream Lance work: `delete_where` (lance-format/lance#6658) and `create_vector_index` (lance-format/lance#6666).*
 
 24. **Schema integrity is strict at commit.** Type validation, required-field presence (auto-filled from `@default` if declared), uniqueness across batches and versions, and referential integrity — all enforced before commit succeeds. Per-write softening flags are opt-in, never default.
     *Status: aspirational — referential integrity at scale requires SIP-backed cross-table validation; not yet implemented. Cross-batch / cross-version uniqueness tracked in MR-714.*
@@ -136,47 +136,64 @@ Specific defaults (timeout values, memory caps, TTL windows) are *configuration*
 34. **Strong consistency by default; relaxation is per-query, never per-default.** Strong (read-your-writes, monotonic, snapshot) is the default for every query. Eventual consistency is opt-in per read query for analytical workloads where staleness is acceptable. Never available on writes; always logged for audit.
     *Status: aspirational — eventual-consistency opt-in flag tracked in MR-425.*
 
+35. **Branches are the cross-query coordination primitive.** Branches are cheap to create, fully isolated, per-branch SI, with durable queryable metadata (creator, intent, parent, fork point). Agents use branches for any multi-step coordination that needs atomicity beyond a single query. Lifecycle policies (TTL, auto-cleanup) are deployment configuration; the invariant is that branches *exist* as first-class durable objects with full SI parity to main.
+    *Status: upheld. Lance shallow-clone gives cheap creation; per-branch SI is the same code path as main; metadata in `_refs/branches/{name}.json` already supports a queryable `metadata` map.*
+
+36. **Per-query isolation is adjustable per-query, never per-default.** Default is Snapshot Isolation (§VI.25). Queries can opt **up** to Serializable for cross-table-invariant safety (`USING SERIALIZABLE`) or **down** to eventual consistency for analytical reads (`USING EVENTUAL`). Stricter than Serializable (Strict Serial / linearizable-across-queries) is **not offered**; branches (§VI.35) replace that role for high-stakes coordination. Stronger and weaker are both per-query opt-ins, never per-default.
+    *Status: SI default upheld. Serializable opt-in aspirational — predicate revalidation under MR-686's per-(table, branch) queue is the implementation seam. Eventual-read opt-in aspirational — tracked in MR-425. Subsumes §VI.34 (which only covers the downgrade direction); §VI.34 is preserved for now to keep its MR-425 pointer addressable.*
+
+37. **Merges are type-aware and agent-resolvable.** Branch merge resolution combines two layers. **Structural** (row-level last-write-wins by deterministic tie-break) is exact for sets of independent rows. **Semantic** (per-type policies declared in schema) handles CRDT-shaped operations: grow-only set, monotonic counter, last-writer-wins-with-timestamp, multi-valued register, first-writer-wins. Conflicts no policy resolves pause the merge with structured `MergeConflictKind` rows; agents produce resolution rows and resume. Auto-resolution never silently picks a side when policies are ambiguous.
+    *Status: structural merge upheld via `OrderedTableCursor` + `StagedTableWriter`. Type-declared semantic policies aspirational. Pausable merges aspirational — current code fails on conflict, doesn't pause.*
+
+### Explicit non-commitments
+
+These are *not* part of the OmniGraph contract. Listed so reviewers and downstream users see what is intentionally out of scope.
+
+- **Strict Serializable across queries.** Branches (§VI.35) are the replacement for cross-query strict-serial coordination.
+- **Cross-process linearizable single-object writes** in multi-coordinator deployments without explicit external coordination (Postgres advisory, S3 sentinel, leader election). §VI.27 multi-coordinator stays aspirational with a clear cost model.
+- **Automatic semantic conflict resolution.** §VI.37 is explicit: ambiguous conflicts always pause for agent or human resolution; auto-resolution requires a per-type policy.
+
 ## VII. Current architectural patterns
 
 These are *how* we realize the invariants today. They are committed conventions — until we explicitly revise them, new code follows them. They are not eternal: a future architecture review may replace any of these with a different mechanism that upholds the same invariants. The deny-list (§IX) protects them in the meantime.
 
-35. **Reconciler pattern for derivable state.** Index coverage, statistics, anything derivable from manifest state — reconciled, not job-queued. *Realizes the "don't maintain state parallel to the substrate" invariant.* See MR-737 §5.16.
+38. **Reconciler pattern for derivable state.** Index coverage, statistics, anything derivable from manifest state — reconciled, not job-queued. *Realizes the "don't maintain state parallel to the substrate" invariant.* See MR-737 §5.16.
     *Status: partial after MR-793 PR #70 — scalar index builds (BTree, Inverted) now route through the staged primitives `stage_create_*_index` + `commit_staged` instead of inline `create_*_index`; this is the building block. The reconciler pattern itself (background `IndexReconciler` task driven by manifest commits, removing synchronous index work from the publish path) is tracked in MR-848. Vector indices remain inline-commit until lance-format/lance#6666 ships.*
 
-36. **Polymorphism via Union, not per-feature lowering.** Interfaces / wildcards / alternation on nodes and edges share one IR (`Polymorphism<T>`) and one lowering (Union of per-type concrete plans). *Realizes "shared mechanism for shared shape."* See MR-737 §5.13.
+39. **Polymorphism via Union, not per-feature lowering.** Interfaces / wildcards / alternation on nodes and edges share one IR (`Polymorphism<T>`) and one lowering (Union of per-type concrete plans). *Realizes "shared mechanism for shared shape."* See MR-737 §5.13.
     *Status: aspirational — node interfaces in MR-579; edge wildcards in MR-744.*
 
-37. **Mutations wrap read subplans.** Insert / Update / Delete / Merge are operators that consume read-shaped subplans. Same planner, same cost model, same storage trait. *Realizes "writes share the planner with reads."* See MR-737 §5.12.
+40. **Mutations wrap read subplans.** Insert / Update / Delete / Merge are operators that consume read-shaped subplans. Same planner, same cost model, same storage trait. *Realizes "writes share the planner with reads."* See MR-737 §5.12.
     *Status: aspirational — current mutation path is separate from reads.*
 
-38. **SIP for cross-operator selectivity propagation.** Producers publish ID bitmaps; downstream scans consume them through structured pushdown. *Realizes "downstream operators prune via upstream selectivity."*
+41. **SIP for cross-operator selectivity propagation.** Producers publish ID bitmaps; downstream scans consume them through structured pushdown. *Realizes "downstream operators prune via upstream selectivity."*
     *Status: aspirational — current code uses IN-list flattening in `Expand`.*
 
-39. **Factorize multi-hop, flatten only at projection.** Lists carry multiplicity through intermediate operators. `Flatten` is inserted by the planner where required, not eagerly. *Realizes "intermediate state shouldn't materialize cross-products eagerly."*
+42. **Factorize multi-hop, flatten only at projection.** Lists carry multiplicity through intermediate operators. `Flatten` is inserted by the planner where required, not eagerly. *Realizes "intermediate state shouldn't materialize cross-products eagerly."*
     *Status: aspirational — current code materializes cross-products eagerly.*
 
-40. **Stable row IDs as dense graph IDs.** Don't maintain parallel string→u32 maps. Lance's stable row IDs are the substrate's identity layer; we use them directly. *Realizes "use the substrate's identity layer."*
+43. **Stable row IDs as dense graph IDs.** Don't maintain parallel string→u32 maps. Lance's stable row IDs are the substrate's identity layer; we use them directly. *Realizes "use the substrate's identity layer."*
     *Status: aspirational — current code rebuilds `TypeIndex` per query.*
 
-41. **Rank and score are columns.** Retrieval operators emit `_score`, `_rank`. Fusion operators consume rank-bearing batches. *Realizes "rank/score is data, not metadata."*
+44. **Rank and score are columns.** Retrieval operators emit `_score`, `_rank`. Fusion operators consume rank-bearing batches. *Realizes "rank/score is data, not metadata."*
     *Status: aspirational — current RRF runs the pipeline twice and discards rank.*
 
-42. **Policy as predicates.** Authorization decisions are filter expressions injected into the planner, not enforcement at the API boundary. *Realizes "authorization pushes down with other filters."*
+45. **Policy as predicates.** Authorization decisions are filter expressions injected into the planner, not enforcement at the API boundary. *Realizes "authorization pushes down with other filters."*
     *Status: aspirational — Cedar enforcement currently at HTTP boundary only; tracked in MR-722 / MR-725.*
 
-43. **Imports unify under `Source`; transport is interchangeable.** A single `Source` IR operator with provider variants (File, Flight, Lance, Stream) handles all imports. Lance-to-Lance is a fast-path that bypasses Arrow encode/decode. *Realizes "external data sources share one operator surface."*
+46. **Imports unify under `Source`; transport is interchangeable.** A single `Source` IR operator with provider variants (File, Flight, Lance, Stream) handles all imports. Lance-to-Lance is a fast-path that bypasses Arrow encode/decode. *Realizes "external data sources share one operator surface."*
     *Status: aspirational — current loader is JSONL-only; tracked in MR-765.*
 
 ## VIII. Quality gates — every change passes
 
-44. **Tests at every boundary.** `MemStorage` for engine tests; planner-only tests; executor-only tests with a stub storage. No layer tested only via end-to-end.
+47. **Tests at every boundary.** `MemStorage` for engine tests; planner-only tests; executor-only tests with a stub storage. No layer tested only via end-to-end.
 
-45. **Reference implementation per trait.** Every trait has a primary impl (Lance for storage) and at least a test impl.
+48. **Reference implementation per trait.** Every trait has a primary impl (Lance for storage) and at least a test impl.
     *Status: partial after MR-793 PR #70 — `TableStorage` (the engine-internal staged-write trait, sealed) has its primary impl on `TableStore` (Lance-backed). The trait's signatures use opaque `SnapshotHandle` / `StagedHandle` types so a future test impl (e.g., `MemStorage`) can land without changing call sites. No test impl yet; `tempfile::tempdir()` + Lance is the de-facto test substrate today (see [docs/testing.md](testing.md)).*
 
-46. **Documented capability surface.** New capabilities are documented with what they advertise, who consumes them, how the planner uses them.
+49. **Documented capability surface.** New capabilities are documented with what they advertise, who consumes them, how the planner uses them.
 
-47. **Benchmark before optimization.** New optimizations land with a benchmark that motivates them; if the motivating workload doesn't exist, the feature waits.
+50. **Benchmark before optimization.** New optimizations land with a benchmark that motivates them; if the motivating workload doesn't exist, the feature waits.
 
 ## IX. Anti-patterns — deny-list
 
@@ -203,21 +220,23 @@ If a proposal fits one of these, the burden is on the proposer to justify why th
 - **Hand-rolling something the substrate already does.** Check the spec first (§I.1).
 - **Mutating in place** state that should be immutable (Lance fragments, index segments). New segments instead.
 - **Silent failures.** OOM, timeout, partial result — all surfaced and bounded (§V.20).
+- **Strict-serial coordination expressed as locks held across queries.** Branches are the agent-native primitive for that (§VI.35).
+- **Auto-resolving merge conflicts when the per-type policy is silent or absent.** Pause and surface the conflict; never silently pick a side (§VI.37).
 
 ### Pattern violations (overridable with justification)
 
 These protect the *current* architectural patterns (§VII). A future review may revise them.
 
-- **Synchronous-inline index updates** for indexes expensive to build (vector ANN, FTS). Reconciler pattern instead (§VII.35).
-- **Job queue for state derivable from manifest.** Reconciler pattern instead (§VII.35).
-- **Per-feature lowering for shapes that share a structure** (interfaces, wildcards, alternation). Use one mechanism (§VII.36).
-- **Per-format import code paths** (one path for JSONL, another for Parquet, another for Flight). Use the `Source` IR operator (§VII.43).
-- **Eager materialization of cross-products** in multi-hop. Factorize (§VII.39).
-- **Ad-hoc `IN`-list filtering** when SIP fits (§VII.38).
+- **Synchronous-inline index updates** for indexes expensive to build (vector ANN, FTS). Reconciler pattern instead (§VII.38).
+- **Job queue for state derivable from manifest.** Reconciler pattern instead (§VII.38).
+- **Per-feature lowering for shapes that share a structure** (interfaces, wildcards, alternation). Use one mechanism (§VII.39).
+- **Per-format import code paths** (one path for JSONL, another for Parquet, another for Flight). Use the `Source` IR operator (§VII.46).
+- **Eager materialization of cross-products** in multi-hop. Factorize (§VII.42).
+- **Ad-hoc `IN`-list filtering** when SIP fits (§VII.41).
 - **String-flattened SQL filter generation** when structured pushdown is available.
-- **Discarding rank in retrieval.** Score and rank propagate as columns (§VII.41).
+- **Discarding rank in retrieval.** Score and rank propagate as columns (§VII.44).
 - **Auto-creating placeholder nodes for orphan edges** (silent invention of data). Reject by default; opt-in per write (§VI.24).
-- **Double-encoding data when both endpoints speak the same format** (e.g., Lance → Arrow → Lance when both are Lance). Use a fast-path (§VII.43).
+- **Double-encoding data when both endpoints speak the same format** (e.g., Lance → Arrow → Lance when both are Lance). Use a fast-path (§VII.46).
 - **Per-write durability fast paths** until MemWAL is stable AND a use case justifies the latency vs. risk tradeoff.
 
 ## X. Review checklist (use against any non-trivial change)
@@ -240,10 +259,12 @@ Print this when reviewing an RFC or PR. Each line is **yes / no / N/A**.
 - Determinism preserved (order-stable, plan-deterministic)? (§VI.28)
 - Idempotency: explicit `on_conflict`; idempotency keys honored if used? (§VI.29)
 - Bounded operations: explicit timeout / memory / concurrency limits? (§VI.31)
-- If touching imports / external data, does it go through `Source`? (§VII.43)
+- If proposing cross-query strict-serial coordination, is it expressed via branches rather than long-held locks? (§VI.35)
+- If touching merge resolution, are silent-pick paths explicitly absent? (§VI.37)
+- If touching imports / external data, does it go through `Source`? (§VII.46)
 - If implementing a graph / retrieval feature: reuses an existing pattern (reconciler, Union, mutation-wrap-read, SIP, factorize, Source) where applicable? (§VII)
-- Tests at every boundary, not just end-to-end? (§VIII.44)
-- Reference impl + test impl for any new trait? (§VIII.45)
+- Tests at every boundary, not just end-to-end? (§VIII.47)
+- Reference impl + test impl for any new trait? (§VIII.48)
 - None of the deny-list patterns apply? (§IX)
 
 ## XI. Living document policy
@@ -276,6 +297,7 @@ These invariants and patterns were extracted from the architectural decisions in
 - The polymorphic-bindings framing (**MR-737 §5.13** — one mechanism for eight cells)
 - The Source-operator framing (**MR-737 §5.12** — one mechanism for all imports)
 - The database-guarantees discussion (§VI): ACID dimensions, CAP-style consistency model, scale-system precedents (ClickHouse, Turbopuffer, LanceDB, Postgres). Each invariant in §VI corresponds to a specific named decision; see prior architecture discussions for the option space considered.
+- **MR-686** — Per-table writer queues and per-actor admission. Source for §VI.35–37 and the explicit non-commitments subsection (MR-686's queue is the seam that makes Serializable opt-in implementable, and the reason §VI.27 multi-coordinator stays aspirational).
 
 General precedent: Lance + LanceDB Enterprise architecture; ClickHouse merge subsystem; Kubernetes controllers; Postgres autovacuum; the FDAL stack (Flight + DataFusion + Arrow + Lance).
 

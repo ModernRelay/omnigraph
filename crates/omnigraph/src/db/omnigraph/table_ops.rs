@@ -2,31 +2,31 @@ use super::*;
 
 pub(super) async fn graph_index(db: &Omnigraph) -> Result<Arc<crate::graph_index::GraphIndex>> {
     db.ensure_schema_state_valid().await?;
-    let resolved = db
-        .coordinator
+    let coord = db.coordinator.read().await;
+    let resolved = coord
         .resolve_target(&ReadTarget::Branch(
-            db.coordinator
-                .current_branch()
-                .unwrap_or("main")
-                .to_string(),
+            coord.current_branch().unwrap_or("main").to_string(),
         ))
         .await?;
-    db.runtime_cache.graph_index(&resolved, &db.catalog).await
+    drop(coord);
+    let catalog = db.catalog();
+    db.runtime_cache.graph_index(&resolved, &catalog).await
 }
 
 pub(super) async fn graph_index_for_resolved(
     db: &Omnigraph,
     resolved: &ResolvedTarget,
 ) -> Result<Arc<crate::graph_index::GraphIndex>> {
-    db.runtime_cache.graph_index(resolved, &db.catalog).await
+    let catalog = db.catalog();
+    db.runtime_cache.graph_index(resolved, &catalog).await
 }
 
-pub(super) async fn ensure_indices(db: &mut Omnigraph) -> Result<()> {
-    let current_branch = db.coordinator.current_branch().map(str::to_string);
+pub(super) async fn ensure_indices(db: &Omnigraph) -> Result<()> {
+    let current_branch = db.coordinator.read().await.current_branch().map(str::to_string);
     ensure_indices_for_branch(db, current_branch.as_deref()).await
 }
 
-pub(super) async fn ensure_indices_on(db: &mut Omnigraph, branch: &str) -> Result<()> {
+pub(super) async fn ensure_indices_on(db: &Omnigraph, branch: &str) -> Result<()> {
     let branch = normalize_branch_name(branch)?;
     ensure_indices_for_branch(db, branch.as_deref()).await
 }
@@ -58,12 +58,18 @@ pub(super) async fn failpoint_publish_table_head_without_index_rebuild_for_test(
     };
     let mut expected = std::collections::HashMap::new();
     expected.insert(table_key.to_string(), entry.table_version);
-    commit_prepared_updates_on_branch_with_expected(db, branch.as_deref(), &[update], &expected)
-        .await
+    commit_prepared_updates_on_branch_with_expected(
+        db,
+        branch.as_deref(),
+        &[update],
+        &expected,
+        None,
+    )
+    .await
 }
 
 pub(super) async fn ensure_indices_for_branch(
-    db: &mut Omnigraph,
+    db: &Omnigraph,
     branch: Option<&str>,
 ) -> Result<()> {
     db.ensure_schema_state_valid().await?;
@@ -72,6 +78,7 @@ pub(super) async fn ensure_indices_for_branch(
     let snapshot = resolved.snapshot;
     let mut updates = Vec::new();
     let active_branch = resolved.branch;
+    let catalog = db.catalog();
 
     // Recovery sidecar: protect the per-table commit_staged loop in
     // build_indices_on_dataset (one commit per index built). Only pins
@@ -83,7 +90,7 @@ pub(super) async fn ensure_indices_for_branch(
     // committed work on sibling tables. Steady-state runs (everything
     // already indexed) skip the sidecar entirely.
     let mut recovery_pins: Vec<crate::db::manifest::SidecarTablePin> = Vec::new();
-    for type_name in db.catalog.node_types.keys() {
+    for type_name in catalog.node_types.keys() {
         let table_key = format!("node:{}", type_name);
         let Some(entry) = snapshot.entry(&table_key) else {
             continue;
@@ -122,7 +129,7 @@ pub(super) async fn ensure_indices_for_branch(
             });
         }
     }
-    for edge_name in db.catalog.edge_types.keys() {
+    for edge_name in catalog.edge_types.keys() {
         let table_key = format!("edge:{}", edge_name);
         let Some(entry) = snapshot.entry(&table_key) else {
             continue;
@@ -147,13 +154,28 @@ pub(super) async fn ensure_indices_for_branch(
             });
         }
     }
+    // Acquire per-(table_key, active_branch) queues for every table
+    // that needs index work. Held across the per-table commit loop and
+    // the manifest publish at the end of this function. Sorted-order
+    // acquisition prevents lock-order inversion against concurrent
+    // multi-table writers (mutation finalize, branch_merge, future
+    // MR-870 recovery). Under PR 1b's intermediate state (global server
+    // RwLock still in place), this acquisition is uncontended.
+    let queue_keys: Vec<(String, Option<String>)> = recovery_pins
+        .iter()
+        .map(|pin| (pin.table_key.clone(), pin.table_branch.clone()))
+        .collect();
+    let _queue_guards = db.write_queue().acquire_many(&queue_keys).await;
+
     let recovery_handle = if recovery_pins.is_empty() {
         None
     } else {
         let sidecar = crate::db::manifest::new_sidecar(
             crate::db::manifest::SidecarKind::EnsureIndices,
             active_branch.clone(),
-            db.audit_actor_id.clone(),
+            // `ensure_indices` doesn't currently take an actor; system-attributed.
+            // Future: add `ensure_indices_as` to thread actor context.
+            None,
             recovery_pins,
         );
         Some(
@@ -162,7 +184,7 @@ pub(super) async fn ensure_indices_for_branch(
         )
     };
 
-    for type_name in db.catalog.node_types.keys() {
+    for type_name in catalog.node_types.keys() {
         let table_key = format!("node:{}", type_name);
         let Some(entry) = snapshot.entry(&table_key) else {
             continue;
@@ -179,6 +201,7 @@ pub(super) async fn ensure_indices_for_branch(
                         entry.table_branch.as_deref(),
                         entry.table_version,
                         active_branch,
+                        crate::db::MutationOpKind::SchemaRewrite,
                     )
                     .await?
                 }
@@ -209,7 +232,7 @@ pub(super) async fn ensure_indices_for_branch(
         }
     }
 
-    for edge_name in db.catalog.edge_types.keys() {
+    for edge_name in catalog.edge_types.keys() {
         let table_key = format!("edge:{}", edge_name);
         let Some(entry) = snapshot.entry(&table_key) else {
             continue;
@@ -226,6 +249,7 @@ pub(super) async fn ensure_indices_for_branch(
                         entry.table_branch.as_deref(),
                         entry.table_version,
                         active_branch,
+                        crate::db::MutationOpKind::SchemaRewrite,
                     )
                     .await?
                 }
@@ -264,7 +288,7 @@ pub(super) async fn ensure_indices_for_branch(
     crate::failpoints::maybe_fail("ensure_indices.post_phase_b_pre_manifest_commit")?;
 
     if !updates.is_empty() {
-        commit_prepared_updates_on_branch(db, branch, &updates).await?;
+        commit_prepared_updates_on_branch(db, branch, &updates, None).await?;
     }
 
     // Recovery sidecar lifecycle: delete after the manifest publish (or
@@ -321,7 +345,8 @@ async fn needs_index_work_node(
     if !db.table_store.has_btree_index(&ds, "id").await? {
         return Ok(true);
     }
-    let Some(node_type) = db.catalog.node_types.get(type_name) else {
+    let catalog = db.catalog();
+    let Some(node_type) = catalog.node_types.get(type_name) else {
         return Ok(false);
     };
     for index_cols in &node_type.indices {
@@ -376,15 +401,23 @@ async fn needs_index_work_edge(
 pub(super) async fn open_for_mutation(
     db: &Omnigraph,
     table_key: &str,
+    op_kind: crate::db::MutationOpKind,
 ) -> Result<(Dataset, String, Option<String>)> {
-    let current_branch = db.coordinator.current_branch().map(str::to_string);
-    open_for_mutation_on_branch(db, current_branch.as_deref(), table_key).await
+    let current_branch = db.coordinator.read().await.current_branch().map(str::to_string);
+    open_for_mutation_on_branch(db, current_branch.as_deref(), table_key, op_kind).await
 }
 
+/// Open a sub-table for mutation. The `op_kind` selects the strict-vs-relaxed
+/// pre-stage version-check policy — see [`crate::db::MutationOpKind`] for the
+/// rationale per kind. Insert / Merge skip the strict
+/// `ensure_expected_version` check (Lance's natural conflict resolver +
+/// per-(table, branch) queue + publisher CAS handle drift); Update / Delete /
+/// SchemaRewrite keep it (read-modify-write SI).
 pub(super) async fn open_for_mutation_on_branch(
     db: &Omnigraph,
     branch: Option<&str>,
     table_key: &str,
+    op_kind: crate::db::MutationOpKind,
 ) -> Result<(Dataset, String, Option<String>)> {
     db.ensure_schema_apply_not_locked("write").await?;
     let resolved = db.resolved_branch_target(branch).await?;
@@ -399,8 +432,10 @@ pub(super) async fn open_for_mutation_on_branch(
                 .table_store
                 .open_dataset_head_for_write(table_key, &full_path, None)
                 .await?;
-            db.table_store
-                .ensure_expected_version(&ds, table_key, entry.table_version)?;
+            if op_kind.strict_pre_stage_version_check() {
+                db.table_store
+                    .ensure_expected_version(&ds, table_key, entry.table_version)?;
+            }
             Ok((ds, full_path, None))
         }
         Some(active_branch) => {
@@ -411,6 +446,7 @@ pub(super) async fn open_for_mutation_on_branch(
                 entry.table_branch.as_deref(),
                 entry.table_version,
                 active_branch,
+                op_kind,
             )
             .await?;
             Ok((ds, full_path, table_branch))
@@ -425,6 +461,7 @@ pub(super) async fn open_owned_dataset_for_branch_write(
     entry_branch: Option<&str>,
     entry_version: u64,
     active_branch: &str,
+    op_kind: crate::db::MutationOpKind,
 ) -> Result<(Dataset, Option<String>)> {
     match entry_branch {
         Some(branch) if branch == active_branch => {
@@ -432,8 +469,10 @@ pub(super) async fn open_owned_dataset_for_branch_write(
                 .table_store
                 .open_dataset_head_for_write(table_key, full_path, Some(active_branch))
                 .await?;
-            db.table_store
-                .ensure_expected_version(&ds, table_key, entry_version)?;
+            if op_kind.strict_pre_stage_version_check() {
+                db.table_store
+                    .ensure_expected_version(&ds, table_key, entry_version)?;
+            }
             Ok((ds, Some(active_branch.to_string())))
         }
         source_branch => {
@@ -450,8 +489,10 @@ pub(super) async fn open_owned_dataset_for_branch_write(
                 .table_store
                 .open_dataset_head_for_write(table_key, full_path, Some(active_branch))
                 .await?;
-            db.table_store
-                .ensure_expected_version(&ds, table_key, entry_version)?;
+            if op_kind.strict_pre_stage_version_check() {
+                db.table_store
+                    .ensure_expected_version(&ds, table_key, entry_version)?;
+            }
             Ok((ds, Some(active_branch.to_string())))
         }
     }
@@ -482,11 +523,27 @@ pub(super) async fn reopen_for_mutation(
     full_path: &str,
     table_branch: Option<&str>,
     expected_version: u64,
+    op_kind: crate::db::MutationOpKind,
 ) -> Result<Dataset> {
     db.ensure_schema_apply_not_locked("write").await?;
-    db.table_store
-        .reopen_for_mutation(full_path, table_branch, table_key, expected_version)
-        .await
+    if op_kind.strict_pre_stage_version_check() {
+        db.table_store
+            .reopen_for_mutation(full_path, table_branch, table_key, expected_version)
+            .await
+    } else {
+        // Insert / Merge: skip the strict version check. Open at HEAD —
+        // Lance's natural conflict resolver at commit_staged time
+        // (rebase append, dedupe merge_insert) handles concurrent
+        // writers correctly; the publisher CAS in
+        // `MutationStaging::commit_all` (refreshed under the
+        // per-(table, branch) queue via `snapshot_for_branch`) catches
+        // genuine cross-process drift as 409. See
+        // [`crate::db::MutationOpKind`] for the policy rationale.
+        let _ = expected_version;
+        db.table_store
+            .open_dataset_head_for_write(table_key, full_path, table_branch)
+            .await
+    }
 }
 
 pub(super) async fn open_dataset_at_state(
@@ -505,7 +562,8 @@ pub(super) async fn build_indices_on_dataset(
     table_key: &str,
     ds: &mut Dataset,
 ) -> Result<()> {
-    build_indices_on_dataset_for_catalog(db, &db.catalog, table_key, ds).await
+    let catalog = db.catalog();
+    build_indices_on_dataset_for_catalog(db, &catalog, table_key, ds).await
 }
 
 pub(super) async fn build_indices_on_dataset_for_catalog(
@@ -680,12 +738,19 @@ async fn prepare_updates_for_commit(
         let mut prepared_update = update.clone();
         if prepared_update.row_count > 0 {
             let full_path = format!("{}/{}", db.root_uri, entry.table_path);
+            // Strict version check is correct here: this runs INSIDE
+            // the publisher commit path, after `commit_staged` already
+            // advanced Lance HEAD to `prepared_update.table_version`.
+            // The check is a defense-in-depth assertion that the
+            // dataset state matches what we just committed; not the
+            // pre-stage race the op-kind policy targets.
             let mut ds = reopen_for_mutation(
                 db,
                 &prepared_update.table_key,
                 &full_path,
                 prepared_update.table_branch.as_deref(),
                 prepared_update.table_version,
+                crate::db::MutationOpKind::SchemaRewrite,
             )
             .await?;
             build_indices_on_dataset(db, &prepared_update.table_key, &mut ds).await?;
@@ -702,49 +767,50 @@ async fn prepare_updates_for_commit(
 }
 
 async fn commit_prepared_updates(
-    db: &mut Omnigraph,
+    db: &Omnigraph,
     updates: &[crate::db::SubTableUpdate],
+    actor_id: Option<&str>,
 ) -> Result<u64> {
-    let actor_id = db.current_audit_actor().map(str::to_string);
     let PublishedSnapshot {
         manifest_version,
         _snapshot_id: _,
     } = db
         .coordinator
-        .commit_updates_with_actor(updates, actor_id.as_deref())
+        .write()
+        .await
+        .commit_updates_with_actor(updates, actor_id)
         .await?;
     Ok(manifest_version)
 }
 
 async fn commit_prepared_updates_with_expected(
-    db: &mut Omnigraph,
+    db: &Omnigraph,
     updates: &[crate::db::SubTableUpdate],
     expected_table_versions: &std::collections::HashMap<String, u64>,
+    actor_id: Option<&str>,
 ) -> Result<u64> {
-    let actor_id = db.current_audit_actor().map(str::to_string);
     let PublishedSnapshot {
         manifest_version,
         _snapshot_id: _,
     } = db
         .coordinator
-        .commit_updates_with_actor_with_expected(
-            updates,
-            expected_table_versions,
-            actor_id.as_deref(),
-        )
+        .write()
+        .await
+        .commit_updates_with_actor_with_expected(updates, expected_table_versions, actor_id)
         .await?;
     Ok(manifest_version)
 }
 
 pub(super) async fn commit_prepared_updates_on_branch(
-    db: &mut Omnigraph,
+    db: &Omnigraph,
     branch: Option<&str>,
     updates: &[crate::db::SubTableUpdate],
+    actor_id: Option<&str>,
 ) -> Result<u64> {
-    let current_branch = db.coordinator.current_branch().map(str::to_string);
+    let current_branch = db.coordinator.read().await.current_branch().map(str::to_string);
     let requested_branch = branch.map(str::to_string);
     if requested_branch == current_branch {
-        return commit_prepared_updates(db, updates).await;
+        return commit_prepared_updates(db, updates, actor_id).await;
     }
 
     let mut coordinator = match requested_branch.as_deref() {
@@ -753,26 +819,32 @@ pub(super) async fn commit_prepared_updates_on_branch(
         }
         None => GraphCoordinator::open(db.uri(), Arc::clone(&db.storage)).await?,
     };
-    let actor_id = db.current_audit_actor().map(str::to_string);
     let PublishedSnapshot {
         manifest_version,
         _snapshot_id: _,
     } = coordinator
-        .commit_updates_with_actor(updates, actor_id.as_deref())
+        .commit_updates_with_actor(updates, actor_id)
         .await?;
     Ok(manifest_version)
 }
 
 pub(super) async fn commit_prepared_updates_on_branch_with_expected(
-    db: &mut Omnigraph,
+    db: &Omnigraph,
     branch: Option<&str>,
     updates: &[crate::db::SubTableUpdate],
     expected_table_versions: &std::collections::HashMap<String, u64>,
+    actor_id: Option<&str>,
 ) -> Result<u64> {
-    let current_branch = db.coordinator.current_branch().map(str::to_string);
+    let current_branch = db.coordinator.read().await.current_branch().map(str::to_string);
     let requested_branch = branch.map(str::to_string);
     if requested_branch == current_branch {
-        return commit_prepared_updates_with_expected(db, updates, expected_table_versions).await;
+        return commit_prepared_updates_with_expected(
+            db,
+            updates,
+            expected_table_versions,
+            actor_id,
+        )
+        .await;
     }
 
     let mut coordinator = match requested_branch.as_deref() {
@@ -781,16 +853,11 @@ pub(super) async fn commit_prepared_updates_on_branch_with_expected(
         }
         None => GraphCoordinator::open(db.uri(), Arc::clone(&db.storage)).await?,
     };
-    let actor_id = db.current_audit_actor().map(str::to_string);
     let PublishedSnapshot {
         manifest_version,
         _snapshot_id: _,
     } = coordinator
-        .commit_updates_with_actor_with_expected(
-            updates,
-            expected_table_versions,
-            actor_id.as_deref(),
-        )
+        .commit_updates_with_actor_with_expected(updates, expected_table_versions, actor_id)
         .await?;
     Ok(manifest_version)
 }
@@ -803,31 +870,31 @@ pub(super) async fn commit_updates(
     updates: &[crate::db::SubTableUpdate],
 ) -> Result<u64> {
     db.ensure_schema_apply_not_locked("write commit").await?;
-    let current_branch = db.coordinator.current_branch().map(str::to_string);
+    let current_branch = db.coordinator.read().await.current_branch().map(str::to_string);
     let prepared = prepare_updates_for_commit(db, current_branch.as_deref(), updates).await?;
-    commit_prepared_updates(db, &prepared).await
+    commit_prepared_updates(db, &prepared, None).await
 }
 
 pub(super) async fn commit_manifest_updates(
-    db: &mut Omnigraph,
+    db: &Omnigraph,
     updates: &[crate::db::SubTableUpdate],
 ) -> Result<u64> {
-    db.coordinator.commit_manifest_updates(updates).await
+    db.coordinator.write().await.commit_manifest_updates(updates).await
 }
 
 pub(super) async fn record_merge_commit(
-    db: &mut Omnigraph,
+    db: &Omnigraph,
     manifest_version: u64,
     parent_commit_id: &str,
     merged_parent_commit_id: &str,
+    actor_id: Option<&str>,
 ) -> Result<String> {
-    let actor_id = db.current_audit_actor().map(str::to_string);
-    db.coordinator
+    db.coordinator.write().await
         .record_merge_commit(
             manifest_version,
             parent_commit_id,
             merged_parent_commit_id,
-            actor_id.as_deref(),
+            actor_id,
         )
         .await
         .map(|snapshot_id| snapshot_id.as_str().to_string())
@@ -837,19 +904,26 @@ pub(super) async fn record_merge_commit(
 /// `expected_table_versions` map asserts the manifest's pre-write per-table
 /// versions; mismatches surface as `ManifestConflictDetails::ExpectedVersionMismatch`.
 pub(super) async fn commit_updates_on_branch_with_expected(
-    db: &mut Omnigraph,
+    db: &Omnigraph,
     branch: Option<&str>,
     updates: &[crate::db::SubTableUpdate],
     expected_table_versions: &std::collections::HashMap<String, u64>,
+    actor_id: Option<&str>,
 ) -> Result<u64> {
     db.ensure_schema_apply_not_locked("write commit").await?;
     let prepared = prepare_updates_for_commit(db, branch, updates).await?;
-    commit_prepared_updates_on_branch_with_expected(db, branch, &prepared, expected_table_versions)
-        .await
+    commit_prepared_updates_on_branch_with_expected(
+        db,
+        branch,
+        &prepared,
+        expected_table_versions,
+        actor_id,
+    )
+    .await
 }
 
-pub(super) async fn ensure_commit_graph_initialized(db: &mut Omnigraph) -> Result<()> {
-    db.coordinator.ensure_commit_graph_initialized().await
+pub(super) async fn ensure_commit_graph_initialized(db: &Omnigraph) -> Result<()> {
+    db.coordinator.write().await.ensure_commit_graph_initialized().await
 }
 
 pub(super) async fn invalidate_graph_index(db: &Omnigraph) {

@@ -16,7 +16,7 @@ pub(super) async fn entity_at(
     id: &str,
     version: u64,
 ) -> Result<Option<serde_json::Value>> {
-    let snap = db.coordinator.snapshot_at_version(version).await?;
+    let snap = db.coordinator.read().await.snapshot_at_version(version).await?;
     entity_from_snapshot(db, &snap, table_key, id).await
 }
 
@@ -142,7 +142,8 @@ async fn export_table_to_writer<W: Write>(
         .open_snapshot_table(snapshot, table_key)
         .await?;
     let ordering = Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]);
-    let blob_properties = blob_properties_for_table_key(db.catalog(), table_key)?;
+    let catalog = db.catalog();
+    let blob_properties = blob_properties_for_table_key(&catalog, table_key)?;
 
     if blob_properties.is_empty() {
         for batch in db.table_store.scan(&ds, None, None, ordering).await? {
@@ -207,9 +208,9 @@ fn write_export_rows_from_batch<W: Write>(
     blob_values: Option<&HashMap<String, Vec<Option<String>>>>,
     writer: &mut W,
 ) -> Result<()> {
+    let catalog = db.catalog();
     if let Some(type_name) = table_key.strip_prefix("node:") {
-        let node_type = db
-            .catalog
+        let node_type = catalog
             .node_types
             .get(type_name)
             .ok_or_else(|| OmniError::manifest(format!("unknown node type '{}'", type_name)))?;
@@ -243,8 +244,7 @@ fn write_export_rows_from_batch<W: Write>(
     }
 
     if let Some(edge_name) = table_key.strip_prefix("edge:") {
-        let edge_type = db
-            .catalog
+        let edge_type = catalog
             .edge_types
             .get(edge_name)
             .ok_or_else(|| OmniError::manifest(format!("unknown edge type '{}'", edge_name)))?;
