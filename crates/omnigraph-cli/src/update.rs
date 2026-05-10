@@ -115,7 +115,15 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
         return Ok(());
     }
 
-    if !args.yes && io::stdin().is_terminal() {
+    if !args.yes {
+        // Refuse to silently replace binaries when there is no user at the
+        // terminal — same posture as `gh`, `rustup`, `apt-get`. Scripted /
+        // piped invocations must opt in with `--yes`.
+        if !io::stdin().is_terminal() {
+            bail!(
+                "refusing to update non-interactively; pass --yes to confirm or run from a terminal"
+            );
+        }
         eprint!(
             "Update from v{} to {}? [y/N] ",
             current_version, latest_tag

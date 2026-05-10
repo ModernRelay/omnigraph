@@ -17,7 +17,7 @@
 
 use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -82,30 +82,62 @@ pub fn maybe_notify(current_version: &str, subcommand_skips_check: bool) {
 }
 
 /// Body of the hidden `__refresh-update-cache` subcommand. Performs a single
-/// network call to the GitHub Releases API and writes the cache file. Errors
-/// are surfaced (the caller is the child process; failures only affect that
-/// child's exit code).
+/// network call to the GitHub Releases API and writes the cache file.
+///
+/// On a transient failure (network down, rate-limited, …) we still touch the
+/// cache file with the previously-known `latest_version` (or the running
+/// binary's own version as a fallback) so the 24h cooldown is honored and the
+/// parent process doesn't spawn a fresh refresh on every invocation.
 pub async fn refresh_cache_subcommand() -> Result<()> {
     let cache_path = cache_file_path().ok_or_else(|| {
         color_eyre::eyre::eyre!("could not resolve cache directory (HOME unset?)")
     })?;
+    let previous = read_cache(&cache_path);
     let client = reqwest::Client::builder()
         .user_agent(concat!("omnigraph-cli/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(10))
         .build()
         .context("build reqwest client")?;
-    let tag = fetch_latest_stable_tag(&client).await?;
-    let version = tag.trim().trim_start_matches('v').to_string();
-    if version.is_empty() {
-        bail!("release metadata missing tag_name");
+    match fetch_latest_stable_tag(&client).await {
+        Ok(tag) => {
+            let version = tag.trim().trim_start_matches('v').to_string();
+            if version.is_empty() {
+                touch_cooldown(&cache_path, previous.as_ref());
+                bail!("release metadata missing tag_name");
+            }
+            let entry = CacheEntry {
+                checked_at_unix: unix_now(),
+                latest_version: version,
+                repo_slug: REPO_SLUG.to_string(),
+            };
+            write_cache(&cache_path, &entry)?;
+            Ok(())
+        }
+        Err(err) => {
+            // Persist a fresh `checked_at_unix` even on failure so we honor
+            // the 24h cooldown across transient outages. We keep whatever
+            // `latest_version` we already knew (or fall back to the running
+            // binary's own version, which never produces a false "newer
+            // available" notice).
+            touch_cooldown(&cache_path, previous.as_ref());
+            Err(err)
+        }
     }
+}
+
+/// Write a fresh `checked_at_unix` timestamp to the cache while keeping the
+/// previously-known `latest_version` (or, when there is none, recording the
+/// current binary's version so `version_is_newer` doesn't fire spuriously).
+fn touch_cooldown(cache_path: &Path, previous: Option<&CacheEntry>) {
+    let latest_version = previous
+        .map(|p| p.latest_version.clone())
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
     let entry = CacheEntry {
         checked_at_unix: unix_now(),
-        latest_version: version,
+        latest_version,
         repo_slug: REPO_SLUG.to_string(),
     };
-    write_cache(&cache_path, &entry)?;
-    Ok(())
+    let _ = write_cache(cache_path, &entry);
 }
 
 fn spawn_detached_refresh() {
@@ -146,12 +178,12 @@ fn libc_setsid() -> i64 {
     unsafe { setsid() as i64 }
 }
 
-fn read_cache(path: &PathBuf) -> Option<CacheEntry> {
+fn read_cache(path: &Path) -> Option<CacheEntry> {
     let raw = fs::read_to_string(path).ok()?;
     serde_json::from_str(&raw).ok()
 }
 
-fn write_cache(path: &PathBuf, entry: &CacheEntry) -> Result<()> {
+fn write_cache(path: &Path, entry: &CacheEntry) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create cache dir {}", parent.display()))?;

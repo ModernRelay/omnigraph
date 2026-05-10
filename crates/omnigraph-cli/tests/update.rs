@@ -369,6 +369,10 @@ fn update_fails_loudly_on_checksum_mismatch() {
     let dir = TempDir::new().unwrap();
     install_real_binary(dir.path());
     install_fake_server(dir.path(), b"#!/bin/sh\necho old-server\n");
+    // Snapshot the original bytes so we can assert byte-for-byte preservation
+    // after a failed update, without making OS-specific assumptions about the
+    // executable format (ELF on Linux, Mach-O on macOS, etc.).
+    let original_omnigraph = fs::read(dir.path().join("omnigraph")).unwrap();
 
     let new_omnigraph = b"NEW-OMNIGRAPH-PAYLOAD";
     let (archive, _digest) = build_release_archive(new_omnigraph, None);
@@ -404,9 +408,14 @@ fn update_fails_loudly_on_checksum_mismatch() {
     );
     // The original binary must not be replaced when the checksum fails.
     let preserved = fs::read(dir.path().join("omnigraph")).unwrap();
-    assert!(
-        preserved.starts_with(b"\x7fELF") || preserved.starts_with(b"#!"),
-        "original binary should still be in place"
+    assert_eq!(
+        preserved, original_omnigraph,
+        "original binary should be preserved byte-for-byte when the checksum fails"
+    );
+    assert_ne!(
+        preserved.as_slice(),
+        &new_omnigraph[..],
+        "rejected payload must not have been written"
     );
 }
 
@@ -448,6 +457,53 @@ fn update_does_not_replace_omnigraph_server_when_not_present() {
     let out = run_update(dir.path(), &fixture, &["--yes"]);
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert!(!dir.path().join("omnigraph-server").exists());
+}
+
+#[test]
+fn update_refuses_to_run_non_interactively_without_yes() {
+    let asset = match current_platform_asset() {
+        Some(a) => a,
+        None => return,
+    };
+    let dir = TempDir::new().unwrap();
+    install_real_binary(dir.path());
+    let original_omnigraph = fs::read(dir.path().join("omnigraph")).unwrap();
+
+    let new_omnigraph = b"NEW-OMNIGRAPH-PAYLOAD";
+    let (archive, digest) = build_release_archive(new_omnigraph, None);
+
+    let fixture = Fixture::start();
+    fixture.route(
+        "/repos/ModernRelay/omnigraph/releases/latest",
+        200,
+        "application/json",
+        release_json("v999.0.0"),
+    );
+    fixture.route(
+        &asset_path("v999.0.0", asset),
+        200,
+        "application/octet-stream",
+        archive,
+    );
+    let stem = asset.trim_end_matches(".tar.gz");
+    fixture.route(
+        &asset_path("v999.0.0", &format!("{stem}.sha256")),
+        200,
+        "text/plain",
+        format!("{digest}  {asset}\n").into_bytes(),
+    );
+
+    // No --yes, no TTY (assert_cmd's stdin is not a terminal): must bail out
+    // before any binary is replaced.
+    let out = run_update(dir.path(), &fixture, &[]);
+    assert!(!out.status.success(), "should refuse non-interactive update without --yes");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("non-interactive") || stderr.contains("--yes"),
+        "expected non-interactive refusal; got: {stderr}"
+    );
+    let preserved = fs::read(dir.path().join("omnigraph")).unwrap();
+    assert_eq!(preserved, original_omnigraph);
 }
 
 #[test]
