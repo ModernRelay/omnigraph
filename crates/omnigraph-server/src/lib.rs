@@ -938,9 +938,7 @@ async fn server_change(
     // Per-actor admission: bound concurrent in-flight mutations and
     // estimated bytes per actor. Cedar runs FIRST so denied requests
     // don't consume admission slots. Estimate uses the request body
-    // size as a coarse proxy; engine memory pressure can run higher
-    // (factorize, vector index) but the global rewrite gate covers
-    // the heavy paths.
+    // size as a coarse proxy; engine memory pressure can run higher.
     let est_bytes = request.query_source.len() as u64
         + request
             .params

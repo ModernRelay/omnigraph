@@ -35,13 +35,13 @@ caller's pre-write view of one table's manifest version was stale.
 `ManifestConflictOutput { table_key, expected, actual }` tells the client
 which table to refresh and retry. This is the conflict shape produced by
 concurrent `/change` or `/ingest` calls landing the same `(table, branch)`
-race (MR-771 / MR-766).
+race.
 
 HTTP status codes used: 200, 400, 401, 403, 404, 409, 429, 500.
 
-## Per-actor admission control (MR-686)
+## Per-actor admission control
 
-PR 2 (MR-686) removed the global server `RwLock<Omnigraph>`. Disjoint
+Disjoint
 `(table, branch)` writes from different actors now run concurrently,
 guarded only by the engine's per-(table, branch) write queue. To keep
 one heavy actor from exhausting shared capacity (Lance I/O, manifest
@@ -61,10 +61,10 @@ actors are unaffected.
 Cedar policy authorization runs **before** admission accounting so
 denied requests don't consume admission slots.
 
-Today admission gates the `/change` hot path. `/ingest`, `/branches/*`,
-and `/schema/apply` flow through the unlocked engine handle without
-admission gates — wiring those is mechanical follow-up work tracked
-on MR-686.
+Today admission gates every mutating handler: `/change`, `/ingest`,
+`/branches/{create,delete,merge}`, and `/schema/apply`. Read-only
+endpoints (`/snapshot`, `/read`, `/export`, `/branches` GET, `/commits`,
+`/schema` GET) are not admission-gated.
 
 ## Body limits
 
