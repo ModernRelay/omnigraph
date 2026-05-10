@@ -33,9 +33,12 @@ use serde_json::Value;
 
 mod embed;
 mod read_format;
+mod update;
+mod version_check;
 
 use embed::{EmbedArgs, EmbedOutput, execute_embed};
 use read_format::{ReadRenderOptions, render_read};
+use update::UpdateArgs;
 
 const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
 
@@ -52,6 +55,12 @@ struct Cli {
 enum Command {
     /// Print the CLI version
     Version,
+    /// Update the omnigraph binaries in place from GitHub Releases
+    Update(UpdateArgs),
+    /// Refresh the update-check cache. Internal — used by the detached
+    /// background refresh spawned at startup. Hidden from `--help`.
+    #[command(name = "__refresh-update-cache", hide = true)]
+    RefreshUpdateCache,
     /// Generate, clean, or refresh explicit seed embeddings
     Embed(EmbedArgs),
     /// Initialize a new repo from a schema
@@ -1587,10 +1596,21 @@ async fn main() -> Result<()> {
             .get_matches();
         Cli::from_arg_matches(&matches)?
     };
+    let skip_version_check = matches!(
+        cli.command,
+        Command::Version | Command::Update(_) | Command::RefreshUpdateCache
+    );
+    version_check::maybe_notify(env!("CARGO_PKG_VERSION"), skip_version_check);
     let http_client = build_http_client()?;
     match cli.command {
         Command::Version => {
             println!("omnigraph {}", env!("CARGO_PKG_VERSION"));
+        }
+        Command::Update(args) => {
+            update::run(args).await?;
+        }
+        Command::RefreshUpdateCache => {
+            version_check::refresh_cache_subcommand().await?;
         }
         Command::Embed(args) => {
             let output = execute_embed(&args).await?;

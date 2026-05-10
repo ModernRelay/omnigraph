@@ -70,6 +70,8 @@ url = "2"
 cedar-policy = "4.9"
 sha2 = "0.10"
 subtle = "2"
+flate2 = "1"
+tar = "0.4"
 
 [profile.dev]
 debug = 0

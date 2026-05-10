@@ -98,3 +98,20 @@ The config file can also define:
 
 When policy is enabled, `schema apply` is authorized through the
 `schema_apply` action and is typically limited to admins on protected `main`.
+
+## Updating
+
+Update both binaries in place from the latest GitHub Release:
+
+```bash
+omnigraph update              # default: stable channel, prompts for confirmation
+omnigraph update --check      # only check; do not install
+omnigraph update --yes        # skip prompt
+omnigraph update --channel edge
+```
+
+Homebrew installs are detected and short-circuited with a hint to run
+`brew upgrade ModernRelay/tap/omnigraph` instead. Each invocation of
+`omnigraph` also performs a best-effort cached check (24-hour TTL) for newer
+releases and prints a one-line stderr notice; suppress with
+`OMNIGRAPH_NO_UPDATE_CHECK=1`. Full details: [install.md](install.md).

@@ -24,6 +24,7 @@ A reference for the `omnigraph` binary's command surface and `omnigraph.yaml` sc
 | `cleanup --keep N --older-than 7d --confirm` | destructive version GC |
 | `embed` | offline JSONL embedding pipeline |
 | `policy validate \| test \| explain` | Cedar tooling |
+| `update` | self-update both binaries from GitHub Releases (`--channel stable\|edge`, `--check`, `--yes`) |
 | `version` / `-v` | print `omnigraph 0.3.x` |
 
 ## `omnigraph.yaml` schema

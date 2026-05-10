@@ -92,3 +92,35 @@ Each archive contains both binaries:
 omnigraph version
 omnigraph-server --help
 ```
+
+## Updating
+
+After installing via the script (or a manual binary install) you can update both
+`omnigraph` and `omnigraph-server` in place:
+
+```bash
+omnigraph update            # update from the latest stable release
+omnigraph update --check    # only check for a newer version
+omnigraph update --yes      # skip the confirmation prompt
+omnigraph update --channel edge  # follow the rolling `edge` channel
+```
+
+`omnigraph update`:
+
+- detects the platform automatically (Linux x86_64 / macOS arm64),
+- downloads the matching `omnigraph-<platform>.tar.gz` and `.sha256`,
+- verifies the SHA256 digest before touching anything,
+- replaces both binaries in the install directory atomically (POSIX rename), and
+- detects Homebrew installs and asks you to run `brew upgrade ModernRelay/tap/omnigraph` instead.
+
+Each invocation of `omnigraph` also performs a best-effort, cached check
+(once every 24 hours) for newer stable releases and prints a one-line stderr
+notice if one is available. The notice is suppressed when:
+
+- `OMNIGRAPH_NO_UPDATE_CHECK=1` is set,
+- `CI` is set,
+- stdout is not a TTY (pipes, scripts), or
+- the running subcommand is `version` or `update`.
+
+The cache lives at `$XDG_CACHE_HOME/omnigraph/update-check.json` (default
+`~/.cache/omnigraph/update-check.json`).
