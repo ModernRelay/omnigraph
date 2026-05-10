@@ -128,8 +128,14 @@ pub async fn refresh_cache_subcommand() -> Result<()> {
 /// Write a fresh `checked_at_unix` timestamp to the cache while keeping the
 /// previously-known `latest_version` (or, when there is none, recording the
 /// current binary's version so `version_is_newer` doesn't fire spuriously).
+///
+/// We only reuse the cached `latest_version` when its `repo_slug` matches the
+/// repo this binary was built against — otherwise a cache file left behind by
+/// a fork's binary could relabel its tag as our own and trigger a spurious
+/// upgrade notice.
 fn touch_cooldown(cache_path: &Path, previous: Option<&CacheEntry>) {
     let latest_version = previous
+        .filter(|p| p.repo_slug == REPO_SLUG)
         .map(|p| p.latest_version.clone())
         .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
     let entry = CacheEntry {
@@ -274,6 +280,41 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("missing.json");
         assert!(read_cache(&path).is_none());
+    }
+
+    #[test]
+    fn touch_cooldown_ignores_cache_from_other_repo() {
+        // Cache populated by a binary pointed at a different fork must not
+        // be relabeled as our own — `touch_cooldown` should fall back to the
+        // current binary's version so `version_is_newer` doesn't fire.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("update-check.json");
+        let foreign = CacheEntry {
+            checked_at_unix: 1_700_000_000,
+            latest_version: "99.99.99".to_string(),
+            repo_slug: "someone/fork".to_string(),
+        };
+        touch_cooldown(&path, Some(&foreign));
+        let after = read_cache(&path).expect("cache should be written");
+        assert_eq!(after.repo_slug, REPO_SLUG);
+        assert_eq!(after.latest_version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn touch_cooldown_preserves_version_from_same_repo() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("update-check.json");
+        let previous = CacheEntry {
+            checked_at_unix: 1_600_000_000,
+            latest_version: "0.5.0".to_string(),
+            repo_slug: REPO_SLUG.to_string(),
+        };
+        touch_cooldown(&path, Some(&previous));
+        let after = read_cache(&path).expect("cache should be written");
+        assert_eq!(after.repo_slug, REPO_SLUG);
+        assert_eq!(after.latest_version, "0.5.0");
+        // The cooldown should have advanced the timestamp past the prior value.
+        assert!(after.checked_at_unix >= previous.checked_at_unix);
     }
 
     #[test]
