@@ -1,5 +1,5 @@
 use arrow_array::{
-    Array, ArrayRef, RecordBatch, StringArray, StructArray, UInt32Array, UInt64Array,
+    Array, ArrayRef, RecordBatch, StringArray, StructArray, UInt8Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::SchemaRef;
 use arrow_select::concat::concat_batches;
@@ -411,39 +411,56 @@ impl TableStore {
             return Ok(true);
         }
 
-        let kind = descriptions
-            .column_by_name("kind")
-            .and_then(|col| col.as_any().downcast_ref::<UInt32Array>())
-            .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row) as u8))
-            .or_else(|| {
-                descriptions
-                    .column_by_name("kind")
-                    .and_then(|col| col.as_any().downcast_ref::<arrow_array::UInt8Array>())
-                    .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)))
-            });
         let position = descriptions
             .column_by_name("position")
             .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
-            .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)));
+            .ok_or_else(|| {
+                OmniError::Lance(format!(
+                    "unrecognized blob description schema {:?}: missing UInt64 position field",
+                    descriptions.fields()
+                ))
+            })?;
         let size = descriptions
             .column_by_name("size")
             .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
-            .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)));
+            .ok_or_else(|| {
+                OmniError::Lance(format!(
+                    "unrecognized blob description schema {:?}: missing UInt64 size field",
+                    descriptions.fields()
+                ))
+            })?;
+
+        let Some(kind_column) = descriptions.column_by_name("kind") else {
+            return Ok(position.is_null(row) || size.is_null(row));
+        };
+        let kind = if let Some(kind) = kind_column.as_any().downcast_ref::<UInt8Array>() {
+            if kind.is_null(row) {
+                return Ok(true);
+            }
+            kind.value(row)
+        } else if let Some(kind) = kind_column.as_any().downcast_ref::<UInt32Array>() {
+            if kind.is_null(row) {
+                return Ok(true);
+            }
+            kind.value(row) as u8
+        } else {
+            return Err(OmniError::Lance(format!(
+                "unrecognized blob description schema {:?}: kind field must be UInt8 or UInt32",
+                descriptions.fields()
+            )));
+        };
+
+        let kind = BlobKind::try_from(kind).map_err(|e| OmniError::Lance(e.to_string()))?;
+        if kind != BlobKind::Inline {
+            return Ok(false);
+        }
         let blob_uri = descriptions
             .column_by_name("blob_uri")
             .and_then(|col| col.as_any().downcast_ref::<StringArray>())
             .and_then(|arr| (!arr.is_null(row)).then(|| arr.value(row)));
 
-        let Some(kind) = kind else {
-            return Ok(true);
-        };
-        let kind = BlobKind::try_from(kind).map_err(|e| OmniError::Lance(e.to_string()))?;
-        if kind != BlobKind::Inline {
-            return Ok(false);
-        }
-
-        Ok(position.unwrap_or(0) == 0
-            && size.unwrap_or(0) == 0
+        Ok((position.is_null(row) || position.value(row) == 0)
+            && (size.is_null(row) || size.value(row) == 0)
             && blob_uri.unwrap_or("").is_empty())
     }
 
