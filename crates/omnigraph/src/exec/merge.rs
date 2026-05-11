@@ -1109,23 +1109,35 @@ impl Omnigraph {
             .await;
         self.restore_coordinator(previous).await;
 
-        // Refresh the restored coordinator on both Ok and Err paths.
-        // During the swap window above, `self.coordinator` was a freshly
-        // opened coord for the merge target; any concurrent writer on
-        // that target (e.g. a `/change` on `main` racing a
-        // `merge into=main`) publishes against the swapped coord and
-        // never touches the original. Without this refresh, the
-        // restored coord's cached manifest snapshot would diverge from
-        // disk and seed a stale `expected_versions` into the next op's
-        // publisher CAS fence — a non-retryable
+        // Sync the restored coordinator's cached manifest snapshot with
+        // disk on both Ok and Err paths. During the swap window above,
+        // `self.coordinator` was a freshly opened coord for the merge
+        // target; any concurrent writer on that target (e.g. a `/change`
+        // on `main` racing a `merge into=main`) publishes against the
+        // swapped coord and never touches the original. Without this
+        // sync, the restored coord's cached manifest snapshot would
+        // diverge from disk and seed a stale `expected_versions` into
+        // the next op's publisher CAS fence — a non-retryable
         // `ExpectedVersionMismatch` for a user with no concurrent
         // writer of their own. Pinned by
         // `concurrent_merge_clean_409_does_not_poison_next_change_on_target`
         // in `crates/omnigraph-server/tests/server.rs` and by the
         // `[d:merge×change:into-target]` cell of
         // `concurrent_branch_ops_morphological_matrix`.
+        //
+        // Use `refresh_coordinator_only` rather than `refresh` so the
+        // recovery sweep doesn't race the merge's own in-flight
+        // sidecar: when the merge body returns Err between Phase B
+        // (per-table `commit_staged` + sidecar write) and Phase C
+        // (manifest publish + sidecar delete), the sidecar is still on
+        // disk. `refresh`'s `RollForwardOnly` sweep would observe it
+        // and close it here — masking the failure from the next
+        // `Omnigraph::open` sweep and from the audit row that the open
+        // sweep emits. Pinned by
+        // `branch_merge_phase_b_failure_recovered_on_next_open` in
+        // `crates/omnigraph/tests/failpoints.rs`.
         if previous_branch == target_branch {
-            self.refresh().await?;
+            self.refresh_coordinator_only().await?;
         }
 
         merge_result
