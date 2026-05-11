@@ -1109,8 +1109,51 @@ impl Omnigraph {
             .await;
         self.restore_coordinator(previous).await;
 
-        if merge_result.is_ok() && previous_branch == target_branch {
-            self.refresh().await?;
+        // Sync the restored coordinator's cached manifest snapshot with
+        // disk on both Ok and Err paths. During the swap window above,
+        // `self.coordinator` was a freshly opened coord for the merge
+        // target; any concurrent writer on that target (e.g. a `/change`
+        // on `main` racing a `merge into=main`) publishes against the
+        // swapped coord and never touches the original. Without this
+        // sync, the restored coord's cached manifest snapshot would
+        // diverge from disk and seed a stale `expected_versions` into
+        // the next op's publisher CAS fence — a non-retryable
+        // `ExpectedVersionMismatch` for a user with no concurrent
+        // writer of their own. Pinned by the
+        // `[d:merge×change:into-target]` cell of
+        // `concurrent_branch_ops_morphological_matrix` in
+        // `crates/omnigraph-server/tests/server.rs`, which flakes
+        // pre-fix and stabilises post-fix.
+        //
+        // Use `refresh_coordinator_only` rather than `refresh` so the
+        // recovery sweep doesn't race the merge's own in-flight
+        // sidecar: when the merge body returns Err between Phase B
+        // (per-table `commit_staged` + sidecar write) and Phase C
+        // (manifest publish + sidecar delete), the sidecar is still on
+        // disk. `refresh`'s `RollForwardOnly` sweep would observe it
+        // and close it here — masking the failure from the next
+        // `Omnigraph::open` sweep and from the audit row that the open
+        // sweep emits. Pinned by
+        // `branch_merge_phase_b_failure_recovered_on_next_open` in
+        // `crates/omnigraph/tests/failpoints.rs`.
+        //
+        // Err-path refresh is best-effort: the merge body's error
+        // (typically the structured `manifest_conflict` from the
+        // post_queue_snapshot drift check) is the value the caller
+        // needs to see. A refresh-time storage error would replace
+        // that with a less informative error; the next op or the next
+        // `Omnigraph::open` will re-sync the coord anyway.
+        if previous_branch == target_branch {
+            if let Err(refresh_err) = self.refresh_coordinator_only().await {
+                if merge_result.is_ok() {
+                    return Err(refresh_err);
+                }
+                tracing::warn!(
+                    error = %refresh_err,
+                    "post-merge coordinator refresh failed on the error path; \
+                     the next op or open will re-sync"
+                );
+            }
         }
 
         merge_result
