@@ -1119,11 +1119,11 @@ impl Omnigraph {
         // diverge from disk and seed a stale `expected_versions` into
         // the next op's publisher CAS fence — a non-retryable
         // `ExpectedVersionMismatch` for a user with no concurrent
-        // writer of their own. Pinned by
-        // `concurrent_merge_clean_409_does_not_poison_next_change_on_target`
-        // in `crates/omnigraph-server/tests/server.rs` and by the
+        // writer of their own. Pinned by the
         // `[d:merge×change:into-target]` cell of
-        // `concurrent_branch_ops_morphological_matrix`.
+        // `concurrent_branch_ops_morphological_matrix` in
+        // `crates/omnigraph-server/tests/server.rs`, which flakes
+        // pre-fix and stabilises post-fix.
         //
         // Use `refresh_coordinator_only` rather than `refresh` so the
         // recovery sweep doesn't race the merge's own in-flight
