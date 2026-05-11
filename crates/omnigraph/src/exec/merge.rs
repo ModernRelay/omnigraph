@@ -1136,8 +1136,26 @@ impl Omnigraph {
         // sweep emits. Pinned by
         // `branch_merge_phase_b_failure_recovered_on_next_open` in
         // `crates/omnigraph/tests/failpoints.rs`.
+        //
+        // Err-path refresh is best-effort: the merge body's error
+        // (typically the structured `manifest_conflict` from the
+        // post_queue_snapshot drift check) is the value the caller
+        // needs to see. A refresh-time storage error would replace
+        // that with a less informative error; the next op or the next
+        // `Omnigraph::open` will re-sync the coord anyway.
         if previous_branch == target_branch {
-            self.refresh_coordinator_only().await?;
+            match merge_result {
+                Ok(_) => self.refresh_coordinator_only().await?,
+                Err(_) => {
+                    if let Err(err) = self.refresh_coordinator_only().await {
+                        tracing::warn!(
+                            error = %err,
+                            "post-merge coordinator refresh failed on the error path; \
+                             the next op or open will re-sync"
+                        );
+                    }
+                }
+            }
         }
 
         merge_result

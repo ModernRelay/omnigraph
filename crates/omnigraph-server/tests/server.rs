@@ -3233,7 +3233,16 @@ async fn concurrent_merge_clean_409_does_not_poison_next_change_on_target() {
     // scenario until the clean-409 branch fires, then sharpens the
     // post-condition specifically for that branch: with the fix, the
     // sentinel must succeed.
-    const MAX_ITERATIONS: usize = 20;
+    //
+    // The clean-409 path is timing-dependent (~20% per iteration on
+    // shared-CPU CI per the original MR-923 repro). With 50 iterations
+    // the probability of never hitting it under that rate is < 0.002%.
+    // The test asserts at the end that the named path was actually
+    // exercised at least once; if a future change makes that path
+    // un-reachable in this scenario, the assertion surfaces the
+    // change rather than letting the test silently degrade to
+    // exercising only the 200-merge path.
+    const MAX_ITERATIONS: usize = 50;
     let mut hit_clean_409 = false;
     for iter in 0..MAX_ITERATIONS {
         let h = matrix::Harness::new().await;
@@ -3281,13 +3290,16 @@ async fn concurrent_merge_clean_409_does_not_poison_next_change_on_target() {
             break;
         }
     }
-    // If MAX_ITERATIONS runs never hit the clean-409 path, the timing
-    // window simply didn't open on this hardware. The per-iteration
-    // sentinel assertion above still covered every 200-merge run, and
-    // the matrix cell covers the same scenario from a different angle.
-    // Don't fail the test — that would substitute hardware-timing
-    // sensitivity for the regression signal.
-    let _ = hit_clean_409;
+    assert!(
+        hit_clean_409,
+        "clean-409 path never fired in {} iterations — the named regression \
+         scenario is no longer reachable through the merge×change race. \
+         Either the race window has closed (good — but this test no longer \
+         pins the bug) or something is preventing the merge body's \
+         post_queue_snapshot drift check from firing. Investigate before \
+         dropping this test.",
+        MAX_ITERATIONS,
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
