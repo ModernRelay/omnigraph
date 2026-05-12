@@ -220,6 +220,7 @@ If a proposal fits one of these, the burden is on the proposer to justify why th
 - **Hand-rolling something the substrate already does.** Check the spec first (§I.1).
 - **Mutating in place** state that should be immutable (Lance fragments, index segments). New segments instead.
 - **Silent failures.** OOM, timeout, partial result — all surfaced and bounded (§V.20).
+- **Shipping observable behavior as if it weren't part of the contract.** Output ordering, error-message text, timestamp precision, default-flag values, latency profile, query-result column order — every observable behavior gets depended on once shipped (Hyrum's Law). Don't expose what you don't want to commit to; treat changes to undocumented-but-observable behavior as breaking changes.
 - **Strict-serial coordination expressed as locks held across queries.** Branches are the agent-native primitive for that (§VI.35).
 - **Auto-resolving merge conflicts when the per-type policy is silent or absent.** Pause and surface the conflict; never silently pick a side (§VI.37).
 

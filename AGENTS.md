@@ -97,9 +97,9 @@ Full diagram and concurrency model: [docs/architecture.md](docs/architecture.md)
 
 ---
 
-## First principle: minimize ongoing liability
+## First principle: engineering is programming integrated over time
 
-Every decision — adding code, removing code, picking an abstraction, choosing a layer, writing a doc paragraph — carries an ongoing maintenance cost. Before any change, ask: **which option has the lower ongoing cost over time?** Not "shorter now," not "fastest to ship," but which leaves the codebase narrower in the long run.
+Software engineering is **programming integrated over time** (Winters, *Software Engineering at Google*). A line of code costs you at every future read, refactor, migration, and dependent change — not just at write-time. So the operative question for any change is: **which option has the lower ongoing liability?** Not "shorter now," not "fastest to ship," but which leaves the codebase narrower in the long run. **Complexity should be earned** — by demonstrated correctness, performance, or future-shape cost; never by speculation.
 
 This is a decision lens, not a code-size rule. It cuts both ways. Sometimes the lower-liability option is:
 
@@ -112,6 +112,11 @@ This is a decision lens, not a code-size rule. It cuts both ways. Sometimes the 
 - **A new abstraction**, when the absence forces every consumer to re-derive the same logic. Or **flattening one**, when the abstraction has accumulated more special-cases than the code it replaced.
 
 When evaluating a design, ask: *"what does this look like after 5 more changes like it?"* If the answer is "this converges to one shape", cost is bounded. If it's "this forks every time", the option is mortgaging the future for present convenience — pick differently.
+
+### Tiebreakers when liability alone is silent
+
+- **Correctness > simplicity > performance.** Lexicographic — give up performance for simpler code; give up simplicity for correct code; never give up correctness. The deny-list ("no silent failures," "no acks before durable persistence," "no reads of partial commits") is this rule's hard floor.
+- **Reversibility shapes evidence demand.** Reversible changes wait for evidence: prefer prod metrics over napkin math over RFCs. Irreversible changes (substrate choice, on-disk format, the §VI database guarantees) earn an RFC, because by the time prod tells you they were wrong, you've shipped years of dependent code. Reviewers should spot both failure modes — RFC-ing a one-line config, and measuring-your-way into a substrate decision.
 
 The always-on rules below and the §IX deny-list in [docs/invariants.md](docs/invariants.md) are specific applications of this principle; when the rules are silent, fall back to it.
 
@@ -150,6 +155,7 @@ If a proposal fits one of these, the burden is on the proposer to justify why th
 - Hand-rolling something Lance already does — check the spec first.
 - Mutating in place state that should be immutable (Lance fragments, index segments) — new segments instead.
 - Silent failures — OOM, timeout, partial result must all be surfaced and bounded.
+- Shipping observable behavior as if it weren't part of the contract — output ordering, error-message text, timestamp precision, default-flag values, latency profile. Per Hyrum's Law, every observable behavior gets depended on once shipped; don't expose what you don't want to commit to.
 
 ---
 
