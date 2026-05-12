@@ -15,7 +15,7 @@ Join the [Omnigraph Slack community](https://join.slack.com/t/omnigraphworkspace
 
 ## Use Cases
 
-- Unified company brain
+- Company brains
 - Context graphs
 - Backbone for multi-agent research
 - Incident response graphs
