@@ -562,7 +562,7 @@ fn build_case(left: OpVariant, right: OpVariant) -> MergeCase {
             InsertAliceCarol,
             DeleteKnowsFromBob,
             // Merged result: insert Alice→Carol applied; Bob→Carol removed.
-            // Total edges: 0 (base 1 - 1 deleted + 1 inserted = 1).
+            // Net edges: base 1 - 1 deleted + 1 inserted = 1 (matches base).
             Expected::Merged(GraphAssert::base()),
             "disjoint: insert one edge + delete different edge",
         ),
