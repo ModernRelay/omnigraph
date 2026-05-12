@@ -2,9 +2,20 @@
 
 **Repo:** [`github.com/trinodb/trino`](https://github.com/trinodb/trino)
 (Java, ~10k★).
-**MR-925 §3.6 mapping:** §5.7 (cost-based optimizer at scale), §5.11
-(distributed transaction patterns — informative, NOT prescriptive),
-§5.10 (connector SPI).
+**MR-925 §3.6 mapping:** §5.7 (cost-based optimizer at scale), §5.12
+(distributed transaction patterns — informative, NOT prescriptive; per-table
+branches are §5.12, not §5.11 which is "DataFusion vs custom executor"),
+§5.4 + §5.6 (connector SPI as the plugin/capability surface — corrected on
+re-read of MR-737; §5.10 is rank fusion, *not* connector SPI).
+
+**§-numbering note:** original MR-925 cross-references in this file used
+§5.10 (connector SPI) and §5.11 (per-table txn branches / distributed
+transactions). On a full re-read of MR-737, §5.10 is "First-class scores
+and rank fusion" and §5.11 is "Substrate choice — DataFusion vs. custom
+executor (A)". The correct mapping for the plugin/capability surface is
+§5.4 (Lance index plugin model) + §5.6 (capability-bearing storage trait);
+the correct mapping for per-table txn branches is §5.12 (mutation IR with
+per-table Lance native branches). Section headings below are updated.
 **Date:** 2026-05-12.
 
 ---
@@ -37,7 +48,7 @@ greedy** for larger queries.
   most useful histogram (informs neighbor-expansion cardinality).
   **Add to §5.7 spec.**
 
-### Connector SPI — maps to MR-737 §5.10
+### Connector SPI — maps to MR-737 §5.4 + §5.6
 
 Trino's "Connector SPI" is a Java interface for adding new data
 sources (Postgres, MySQL, Hive, Iceberg, …). The interface is **fully
@@ -55,7 +66,7 @@ public** — connectors are JARs that get registered at server startup.
   `TableProvider` (less stable, breaks ~once per release). Trino is
   the reference for "what a properly-versioned plugin API looks like."
 
-### Distributed transactions — maps to MR-737 §5.11 (informative)
+### Distributed transactions — maps to MR-737 §5.12 + §10 Open Q9 (informative)
 
 Trino is a **stateless query coordinator**: it does NOT manage
 transactions itself. Each connector's underlying system manages its
@@ -64,8 +75,8 @@ identifier that lets multiple queries see the same snapshot of each
 connected system.
 
 **Why this matters:** Trino's approach is the opposite of MR-737
-§5.11 (per-table txn branches with cross-table coordination). Trino
-punts on the cross-system coordination problem; MR-737 doesn't.
+§5.12 (per-table Lance native txn branches with cross-table coordination).
+Trino punts on the cross-system coordination problem; MR-737 doesn't.
 
 **Re-usable pattern:** None directly. Trino is the **anti-reference**
 — what NOT to do if you want cross-table ACID. MR-737's design is
@@ -123,16 +134,17 @@ encoding; we'd be ahead of Trino on this dimension.
   OmniGraph is currently in-process (Phase 0–2). The distributed
   patterns become relevant only at Phase 3+.
 - **The stateless-coordinator approach to transactions.** MR-737
-  §5.11 explicitly wants stateful per-table txn branches.
+  §5.12 explicitly wants stateful per-table txn branches.
 
 ## Decision impact on MR-737
 
 - **§5.7 (cost model):** Add memory cost as third component;
   out-degree histograms as the most-useful additional statistic.
-- **§5.10 (connector SPI / plugin):** Trino is the gold standard for
-  a stable, versioned plugin API. Cite when designing OmniGraph's
-  custom-index-type registration spec.
-- **§5.11 (transactions):** Trino is anti-reference; MR-737 is
+- **§5.4 + §5.6 (connector SPI / plugin / capability surface):** Trino is
+  the gold standard for a stable, versioned plugin API. Cite when designing
+  OmniGraph's custom-index-type registration spec (§5.4) and the storage
+  trait capability surface (§5.6).
+- **§5.12 (transactions):** Trino is anti-reference; MR-737 is
   strictly more ambitious. Document this.
 - **§5.6 (dynamic filters):** Validates the §1.5 design; we'd be
   ahead of Trino with roaring-encoded dynamic filters.

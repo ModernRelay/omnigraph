@@ -1,6 +1,14 @@
 # Experiment 1.2 — Custom Lance index plugin from outside the lance crate
 
-**Ticket:** MR-925 §1.2 (validates MR-737 §5.4, §5.5).
+**Ticket:** MR-925 §1.2 (validates MR-737 §5.4 "Persisted CSR adjacency as
+Lance index plugin" + §5.16 "Index rebuild orchestration — stateless reconciler").
+
+**§-numbering note:** the original MR-925 cross-reference said "§5.4, §5.5".
+On a full re-read of MR-737: §5.4 is correct (this is the plugin section);
+§5.5 is "Stable row IDs as graph IDs" — *not* the reconciler. The reconciler
+is §5.16 ("Index rebuild orchestration"). Section references in the body have
+been corrected; §5.5 is *indirectly* in scope only because the experiment
+leans on stable row IDs.
 **Prototype:** `validation-prototypes/custom-lance-index/` (long-lived branch).
 **Substrate pin:** Lance 4.0.1 (matched by cargo to 4.0.0 spec). Lance 4.0.1 internally pulls roaring 0.11 and prost-types 0.14; the workspace deps were lifted to match.
 **Date:** 2026-05-12.
@@ -128,8 +136,8 @@ is closed to us). Any custom-index reconciler we ship has to:
   - emit `Operation::CreateIndex { new_indices: vec![updated], removed_indices: vec![old] }`
     to re-publish the index with the updated bitmap.
 
-This is *consistent with* the §5.5 reconciler pattern in MR-737, so it's
-not a blocker — but the writeup of §5.5 should explicitly say "the
+This is *consistent with* the §5.16 reconciler pattern in MR-737, so it's
+not a blocker — but the writeup of §5.16 should explicitly say "the
 reconciler also owns fragment coverage diffs, not just file content".
 
 ### F5. Compaction does not move our index. ⚠️
@@ -203,7 +211,7 @@ paths forward:
 both. The current MR-737 wording implies path (1) is available; this
 experiment proves it is not.
 
-§5.5 (reconciler pattern) is unaffected by this finding — but it must
+§5.16 (reconciler pattern) is unaffected by this finding — but it must
 expand to explicitly own `fragment_bitmap` recomputation across all
 mutating operations, since with path (2) or path (3) we are the only
 party that knows the index's row coverage.

@@ -1,6 +1,15 @@
 # Experiment 1.5 — Extending DataFusion dynamic-filter-pushdown to bitmap shape (code-dive)
 
-**Ticket:** MR-925 §1.5 (validates MR-737 §5.6, §5.7 / Open Q3).
+**Ticket:** MR-925 §1.5 (validates MR-737 §5.3 "Sideways Information Passing
+(SIP) — extends DataFusion's dynamic filter pushdown" + §5.6 "Capability-bearing
+storage trait", with implications for §5.7 cost-model).
+
+**§-numbering note:** the original MR-925 cross-reference said "§5.3 / §5.10".
+On a full re-read of MR-737: §5.3 is the SIP design and is the correct primary
+§ for this experiment; §5.10 in current MR-737 is "First-class scores and rank
+fusion" (unrelated). The capability seam that the bitmap pushdown traverses
+on the storage side is §5.6 (`scan_by_key_set` capability), so this writeup
+also produces deltas for §5.6.
 **Type:** Code-dive only (no prototype crate).
 **Substrate pin:** DataFusion 52.5.
 **Date:** 2026-05-12.

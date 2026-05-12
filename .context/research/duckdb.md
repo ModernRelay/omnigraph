@@ -3,8 +3,17 @@
 **Repo:** [`github.com/duckdb/duckdb`](https://github.com/duckdb/duckdb)
 (C++, ~25k★).
 **MR-925 §3.5 mapping:** §5.2 (factorization alternatives — DuckDB
-takes a different approach), §5.6 (vectorized scan), §5.10 (custom
-extensions / index types).
+takes a different approach), §5.6 (vectorized scan), §5.4 (custom
+extensions / index types — corrected on re-read of MR-737; §5.10 is
+rank fusion, *not* index types).
+
+**§-numbering note:** the original MR-925 cross-references in this file said
+§5.10 (custom index types) and §5.11 (multi-statement transactions). On a
+full re-read of MR-737, §5.10 is "First-class scores and rank fusion" and
+§5.11 is "Substrate choice — DataFusion vs. custom executor". The correct
+mapping is §5.4 (custom index plugin model) and §5.12 (mutation IR /
+multi-statement transactions). Section headings below are updated to use the
+corrected numbering.
 **Date:** 2026-05-12.
 
 ---
@@ -51,7 +60,7 @@ For graph workloads with high expansion (per-row neighbor counts >
 workloads vs. a fully-vectorized non-factorized engine. Validates the
 design choice for MR-737.
 
-### Custom extensions / index types — maps to MR-737 §5.10
+### Custom extensions / index types — maps to MR-737 §5.4
 
 DuckDB has a **rich extension API**:
 - `duckdb_extension.h` — public C ABI for loading shared libraries.
@@ -64,13 +73,13 @@ core crate." DuckDB extensions can register completely new index types
 without forking the core. Compare to Lance (§1.2): Lance has the
 necessary trait surface but the registry is `pub(crate)`.
 
-**Decision impact on MR-737 §5.10:** DuckDB demonstrates that the
+**Decision impact on MR-737 §5.4:** DuckDB demonstrates that the
 plugin pattern is workable and prevalent. Our §1.2 blocker (Lance's
 `pub(crate)` registry) is a fixable one — it's not an architectural
 question, just an API-visibility question. Worth a DuckDB-cited
 upstream PR to Lance.
 
-### Multi-statement transactions — maps to MR-737 §5.11
+### Multi-statement transactions — maps to MR-737 §5.12
 
 DuckDB uses MVCC with **per-transaction undo logs** for in-memory
 state. Persistent state is flushed at commit time.
@@ -118,7 +127,7 @@ sink builds and source emits. This is the same shape DataFusion's
 - **§5.6 (scan model):** Pull-based vectorized scan is the right
   shape. DataFusion already gives us this; no new patterns from
   DuckDB.
-- **§5.10 (custom index types):** DuckDB is the proof-of-concept for
+- **§5.4 (custom index plugin model):** DuckDB is the proof-of-concept for
   fully-extensible index plugins. Cite when raising the Lance
   upstream `pub(crate)` issue.
 

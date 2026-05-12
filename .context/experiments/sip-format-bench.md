@@ -1,6 +1,15 @@
 # Experiment 1.4 — Roaring bitmap variant for u64 row IDs (SIP wire format)
 
-**Ticket:** MR-925 §1.4 (validates MR-737 §5.6, §5.8 / Open Q4).
+**Ticket:** MR-925 §1.4 (validates MR-737 §5.3 "Sideways Information Passing
+(SIP)" wire format + §10 Open Q3 "SIP wire format").
+
+**§-numbering note:** the original MR-925 cross-reference said "§5.6, §5.8 /
+Open Q4". On a full re-read of MR-737: §5.3 is SIP (the wire format is named
+in Open Q3); §5.6 is the storage trait that *consumes* SIP via `sip_mask` /
+`key_set` on `ScanRequest`; §5.8 is "Tiering via Lance base paths" (unrelated
+to SIP). Open Q4 is "CSR index format inside Lance" (also unrelated). The
+correct primary mapping is **§5.3 + §10 Open Q3**, with downstream
+implications for §5.6 (the capability advertisement).
 **Prototype:** `validation-prototypes/sip-format-bench/`.
 **Substrate pin:** `roaring = "0.11"` (matched to lance-table dependency).
 **Date:** 2026-05-12.
@@ -10,7 +19,7 @@
 ## Hypothesis
 
 For propagating row-ID side-information predicates (SIPs) between operators —
-the §5.6 dynamic-filter-pushdown wire format — Roaring bitmaps over u64
+the §5.3 dynamic-filter-pushdown wire format — Roaring bitmaps over u64
 (`RoaringTreemap`) are the right encoding when row IDs cluster by Lance
 fragment (which they do). For random u64s, Roaring is *not* the right
 choice.
@@ -148,7 +157,7 @@ At `n=1M` dense, encoding takes **37ms**, decoding takes **0.02ms**.
 For "build once, read many" wire-format use, this is fine. But if the
 SIP is built mid-pipeline (e.g. from a `FilterExec`'s output IDs) and
 intersected immediately with another payload, the build cost dominates.
-The §5.6 RFC should clarify: SIPs are produced at *probe-build time* on
+The §5.3 RFC should clarify: SIPs are produced at *probe-build time* on
 the hash-join build side, where 37ms is amortized across the entire
 probe phase.
 
@@ -176,9 +185,9 @@ construction.
 
 Default fallback (for non-row-ID u64s): **varint-delta**.
 
-## Decision impact on MR-737 §5.6 and §5.8
+## Decision impact on MR-737 §5.3 + §10 Open Q3 (and downstream §5.6)
 
-**§5.6 (SIP wire format) — concrete choice:**
+**§5.3 (SIP wire format) — concrete choice:**
 
 > ROW_ID_SIP wire format := length-prefixed roaring `serialize_into` bytes
 > with a 1-byte format-tag prefix. Tag values: `0x01` = Roaring (u64
@@ -189,7 +198,7 @@ Default fallback (for non-row-ID u64s): **varint-delta**.
 This makes the wire format extensible while picking a default that
 matches the dominant workload.
 
-**§5.8 / Open Q4 — answered:**
+**Open Q3 — answered:**
 
 The RFC's Q4 ("can we share the SIP filter between operator stages by
 serializing roaring bytes?") is **yes for row-ID payloads**.

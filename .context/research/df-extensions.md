@@ -73,7 +73,7 @@ TableProviders live) absorbs most of the churn. **Reinforces the
 
 ## ParadeDB — Postgres + DataFusion for search
 
-**Maps to:** §5.10 custom index types, §5.6 mixing engines.
+**Maps to:** §5.4 custom index types (corrected from §5.10 on re-read of MR-737; §5.10 is rank fusion), §5.6 mixing engines.
 
 ParadeDB embeds DataFusion inside Postgres as a query executor for
 analytics workloads. They have a custom `pg_search` extension that

@@ -1,6 +1,16 @@
 # Experiment 1.3 — Custom UserDefinedLogicalNode + ExecutionPlan e2e
 
-**Ticket:** MR-925 §1.3 (validates MR-737 §5.3, §5.10).
+**Ticket:** MR-925 §1.3 (validates MR-737 §5.1 "Unified IR", §5.2 "Factorized IR",
+§5.11 "Substrate choice — DataFusion vs. custom executor (A)", and §5.12
+"Mutation IR" — all of which rely on `UserDefinedLogicalNode` + `ExecutionPlan`
+surviving the optimizer end-to-end).
+
+**§-numbering note:** the original §1.3 cross-reference in MR-925 cited "§5.3,
+§5.10". On a full re-read of MR-737: §5.10 is "First-class scores and rank
+fusion (open-world over modalities)" (not "operators survive the optimizer"),
+and the custom-operator e2e contract is actually shared across §5.1, §5.2,
+§5.11, and §5.12. §5.3 (SIP) is the *first* operator that consumes the contract
+— valid — but the contract itself is broader than §5.3 alone.
 **Prototype:** `validation-prototypes/custom-operator/`.
 **Substrate pin:** DataFusion 52.5 (matched to omnigraph workspace).
 **Date:** 2026-05-12.
@@ -168,7 +178,7 @@ These are not blockers but should be noted for the §11 RFC-body delta:
    the RFC that graph operators must explicitly choose their output
    partitioning rather than inheriting.
 
-## Decision impact on MR-737 §5.3 and §5.10
+## Decision impact on MR-737 §5.1, §5.2, §5.3, §5.11, §5.12
 
 **§5.3 is achievable on DataFusion 52.5 as written.** The
 `UserDefinedLogicalNode`/`ExecutionPlan` surface is fully sufficient
@@ -183,9 +193,9 @@ NeighborSetIntersect, etc.). The only edits needed in §5.3:
     operators implementing it accurately, not punting to
     `Statistics::new_unknown`.
 
-**§5.10 ("operators survive the optimizer + execute correctly")**:
-The composition test (E4) plus the metrics test (E5) cover this. No
-deltas needed.
+**§5.1 / §5.2 / §5.11 / §5.12 ("custom operators survive the optimizer +
+execute correctly")**: The composition test (E4) plus the metrics test (E5)
+cover this. No deltas needed.
 
 ## Caveats
 

@@ -1,6 +1,25 @@
 # Experiment 1.6 — Lance native per-table txn branches (code-dive, cost model)
 
-**Ticket:** MR-925 §1.6 (validates MR-737 §5.11, §5.12 / Open Q5).
+**Ticket:** MR-925 §1.6 (validates MR-737 §5.12 "Mutation IR, write planner,
+and external sources").
+
+**§-numbering note (added on re-read of MR-737):** MR-925's original §1.6 cross-
+reference cited "§5.11, §5.12 / Open Q5". On a full read of MR-737:
+
+- **§5.11** is "Substrate choice — DataFusion vs. custom executor — RECOMMENDED
+  (A)" — resolved 2026-05-11, not about per-table branches.
+- **§5.12** "Mutation IR, write planner, and external sources" is where the
+  *implementation note* says "writes go to per-table Lance native branches
+  (storage-layer staging invisible above the TableProvider/Dataset boundary),
+  success → fast-forward, failure → drop branches. NOT `restore()`-based rollback"
+  (also called out in §0.5 item 9). This is what §1.6 actually validates.
+- **Open Q5** in the current MR-737 §10 is "What 'extension rate' means under
+  filters" — unrelated. The MR-925 cross-reference is to a pre-2026-05-11
+  numbering where Q5 covered per-table branches; that question is now folded
+  into §5.12 and resolved per Ragnor 2026-04-29.
+
+Corrected mapping for §1.6: **§5.12 (mutation-IR per-table branches)** — cost
+model + recommendation.
 **Type:** Code-dive only — no prototype crate.
 **Substrate pin:** Lance 4.0.1.
 **Date:** 2026-05-12.
@@ -204,11 +223,12 @@ cheaper.
    *branches*, not just zombie *commits*. This is more state to track,
    not less.
 
-## Decision impact on MR-737 §5.11 and §5.12
+## Decision impact on MR-737 §5.12
 
-**§5.11 (per-table txn isolation):** Lance-native branches **can**
-implement this, but the steady-state cost is essentially the same as
-the current lazy-graph-branch model, and the abort-path cost is *higher*.
+**§5.12 (mutation IR with per-table branches):** Lance-native branches **can**
+implement the per-table staging shape that §5.12 prescribes, but the steady-state
+cost is essentially the same as the current lazy-graph-branch model, and the
+abort-path cost is *higher*.
 The conceptual clarity argument is real but not load-bearing — both
 models provide the same isolation guarantee.
 
@@ -236,7 +256,7 @@ Lance-native per-table branches only if:
     "lazy" so most branches don't fork most tables).
 
 For Phase 0, the deliverable is a **clear specification** of which model
-MR-737 §5.11/§5.12 prescribes. The cost analysis above suggests
+MR-737 §5.12 prescribes. The cost analysis above suggests
 specifying the current model.
 
 ## Caveats and follow-ups
@@ -255,4 +275,4 @@ specifying the current model.
 - **Forbidden APIs file** (`crates/omnigraph/tests/forbidden_apis.rs:57`)
   excludes `.delete_branch(` from the over-match check — there's
   intent in the codebase to allow these calls. Worth a follow-up read
-  to see if MR-737 §5.11 has already opened the door.
+  to see if MR-737 §5.12 has already opened the door.

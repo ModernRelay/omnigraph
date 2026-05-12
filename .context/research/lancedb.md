@@ -2,8 +2,9 @@
 
 **Repo:** [`github.com/lancedb/lancedb`](https://github.com/lancedb/lancedb)
 (OSS LanceDB, Rust + Python).
-**MR-925 §3.2 mapping:** §5.6 (TableProvider integration), §5.10
-(custom index types), §5.12 (mutation-as-IR), §5.1 (vector search as
+**MR-925 §3.2 mapping:** §5.6 (TableProvider integration), §5.4 (Lance index
+plugin model — *not* §5.10, which is rank fusion; corrected on re-read of MR-737),
+§5.12 (mutation-as-IR), §5.1 + §5.10 (vector search as
 operator vs UDF).
 **Date:** 2026-05-12.
 
@@ -36,7 +37,10 @@ DataFusion's `TableProvider` trait. Key files (Rust side):
   for predicates Lance can fully handle and `::Inexact`/`::Unsupported`
   for the rest. This is the exact pattern §5.6 prescribes.
 
-### Vector search as a query operator — maps to MR-737 §5.1, §5.10
+### Vector search as a query operator — maps to MR-737 §5.1 + §5.10
+
+(§5.1 = unified IR with `VectorSearch` as `IROp`; §5.10 = first-class scores +
+rank fusion; VectorSearch emits `_score`/`_rank` per §5.10.)
 
 LanceDB's `Table::query(vector)` builds a `VectorQuery` and lowers it
 to a Lance scan with a `nearest` filter. **At the DataFusion level**,
@@ -119,7 +123,7 @@ the rest must be designed fresh.
 - **§5.6 (TableProvider integration):** LanceDB's filter-pushdown
   conversion is directly reusable. Capability advertisement beyond
   filters (partitioning, SIP) is OmniGraph-original.
-- **§5.10 (custom index types):** LanceDB integrates with Lance's
+- **§5.4 (Lance index plugin model):** LanceDB integrates with Lance's
   built-in scalar/vector indices but does **not** add custom index
   types from outside the lance crate. Per Experiment 1.2, the plugin
   registry is `pub(crate)`. LanceDB is not a reference for solving

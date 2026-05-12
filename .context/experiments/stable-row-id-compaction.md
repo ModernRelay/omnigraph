@@ -1,6 +1,17 @@
 # Experiment 1.7 — Stable-row-id-aware indices survive compaction (code-dive + small repro plan)
 
-**Ticket:** MR-925 §1.7 (validates MR-737 §5.4, §5.10 / Open Q6).
+**Ticket:** MR-925 §1.7 (validates MR-737 §5.4 "Persisted CSR adjacency as Lance
+index plugin" + §5.5 "Stable row IDs as graph IDs").
+
+**§-numbering note (added on re-read of MR-737):** MR-925's original §1.7 cross-
+reference cited "§5.8 / Open Q7" / "§5.10". On a full read of MR-737, §5.10 is
+"First-class scores and rank fusion" (NOT custom index types), §5.4 is "Persisted
+CSR adjacency as Lance index plugin" (which contains the custom-index-type seam),
+and §5.5 is "Stable row IDs as graph IDs" (which flags the experimental status of
+"Stable Row ID for Index" in lance-4.0.x). The corrected mapping for §1.7 is
+**§5.4 + §5.5** and the MR-737 §5.5 substrate caveat that "`Stable Row ID for
+Index` is documented as experimental in lance-4.0.x" is the immediate caveat for
+this experiment.
 **Type:** Code-dive plus a planned small repro (not yet built; specified for Phase 0 entry).
 **Substrate pin:** Lance 4.0.1, lance-index 4.0.1.
 **Date:** 2026-05-12.
@@ -9,10 +20,13 @@
 
 ## Question
 
-MR-737 §5.4 (graph topology index) and §5.10 (custom index types for graph
-adjacency) both depend on the assumption that a custom index — i.e. our
-own CSR/CSC adjacency lists keyed by source-table row IDs — **continues
-to point at the right rows after the source table is compacted.**
+MR-737 §5.4 ("Persisted CSR adjacency as Lance index plugin") and §5.5 ("Stable
+row IDs as graph IDs") both depend on the assumption that a custom CSR/CSC
+adjacency index keyed by source-table row IDs **continues to point at the right
+rows after the source table is compacted.** §5.5 explicitly flags the substrate
+caveat: "Stable Row ID for Index" is **experimental** in lance-4.0.x; confirming
+whether our created indices opt into stable-row-id mode is a follow-up worth
+doing before MR-848 (index reconciler) lands.
 
 Lance's compaction (`compact_files`) consolidates fragments, which on the
 non-stable row-ID scheme renumbers row addresses. The question:
@@ -253,19 +267,22 @@ demonstrates end-to-end survival. Specification:
 Estimated effort: 1–2 days. **Defer to Phase 0**; the code-dive
 already justifies §5.4 as feasible without the repro.
 
-## Decision impact on MR-737 §5.4 and §5.10
+## Decision impact on MR-737 §5.4 and §5.5
 
-**§5.4 (graph topology index) is feasible on Lance 4.0.1 with stable
-row IDs (Path B):**
+**§5.4 (persisted CSR adjacency as Lance index plugin) is feasible on Lance
+4.0.1 with stable row IDs (Path B):**
 
 - No Lance plugin-registry dependency; we drive remapping ourselves.
 - The custom topology dataset stores stable row IDs end-to-end; the
   bulk of compaction-induced changes don't require remap.
 - Path A (Lance-managed remapping) is a follow-up improvement
-  contingent on the §1.2 contribution.
+  contingent on the §1.2 plugin-registry contribution.
 
-**§5.10 (custom index types):** No new findings beyond §1.2. The
-`ScalarIndex::remap` contract is sufficient and stable.
+**§5.5 (stable row IDs as graph IDs):** The MR-737 substrate caveat
+("`Stable Row ID for Index` is experimental in lance-4.0.x") still
+stands. The small repro in §5 above is the way to confirm opt-in;
+until it runs, treat §5.5 as substrate-positive but not yet validated
+for index-side stable IDs.
 
 **Open Q6 ("survive compaction"):** Answered yes. The recommendation is
 **Path B for v1, Path A for v2**. RFC §5.4 should specify the
