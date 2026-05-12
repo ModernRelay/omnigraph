@@ -716,15 +716,17 @@ async fn run_direction(
     expected: &Expected,
 ) -> DirectionResult {
     let dir = tempfile::tempdir().unwrap();
-    let uri = dir.path().to_str().unwrap();
-    let mut main = bootstrap(&dir).await;
-    main.branch_create("feature").await.unwrap();
+    let mut db = bootstrap(&dir).await;
+    db.branch_create("feature").await.unwrap();
 
-    let mut feature = Omnigraph::open(uri).await.unwrap();
-    apply(&mut feature, "feature", left_op).await;
-    apply(&mut main, "main", right_op).await;
+    // One handle, two branches — matches the pattern in
+    // `tests/branching.rs`. Using two `Omnigraph::open` handles for one
+    // dataset is unnecessary here and only opens room for cache-coherency
+    // surprises that are out of scope for this test.
+    apply(&mut db, "feature", left_op).await;
+    apply(&mut db, "main", right_op).await;
 
-    let merge_result = feature.branch_merge("feature", "main").await;
+    let merge_result = db.branch_merge("feature", "main").await;
     let outcome = match merge_result {
         Ok(MergeOutcome::AlreadyUpToDate) => ActualOutcome::AlreadyUpToDate,
         Ok(MergeOutcome::FastForward) => ActualOutcome::FastForward,
@@ -744,8 +746,7 @@ async fn run_direction(
             ActualOutcome::Merged | ActualOutcome::FastForward | ActualOutcome::AlreadyUpToDate
         )
     {
-        let mut reopened = Omnigraph::open(uri).await.unwrap();
-        assert_state(&mut reopened, assert, label).await;
+        assert_state(&mut db, assert, label).await;
     }
 
     DirectionResult {
