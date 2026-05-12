@@ -1,0 +1,27 @@
+[package]
+name = "stable-rowid-index"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Experiment 1.7 / MR-927 Phase 1 — validate that built-in Lance scalar indices
+# survive compaction on a stable-row-id dataset, and that `stage_overwrite`
+# preserves the manifest `uses_stable_row_ids` flag across `Operation::Overwrite`.
+# Validates MR-737 §5.4, §5.5.
+
+[dependencies]
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+lance = { workspace = true }
+lance-table = { workspace = true }
+lance-index = { workspace = true }
+lance-core = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }
+tempfile = { workspace = true }
+
+[[bin]]
+name = "stable-rowid-index"
+path = "src/main.rs"

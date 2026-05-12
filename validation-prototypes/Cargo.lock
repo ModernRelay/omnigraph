@@ -5008,6 +5008,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "stable-rowid-index"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "arrow-array",
+ "arrow-schema",
+ "futures",
+ "lance",
+ "lance-core",
+ "lance-index",
+ "lance-table",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

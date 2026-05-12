@@ -5,10 +5,10 @@ members = [
     "custom-lance-index",
     "custom-operator",
     "sip-format-bench",
+    "stable-rowid-index",       # 1.7 / MR-927 Phase 1
     # Additional crates added as each experiment is set up:
     # "bitmap-pushdown",          # 1.5
     # "txn-branches-cost",        # 1.6
-    # "stable-rowid-index",       # 1.7
 ]
 
 # Pre-Phase-0 validation prototypes for MR-925 / MR-737.
