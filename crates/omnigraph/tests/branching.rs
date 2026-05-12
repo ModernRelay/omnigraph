@@ -60,6 +60,24 @@ query add_employment($person: String, $company: String) {
 }
 "#;
 
+const BLOB_SCHEMA: &str = r#"
+node Document {
+    title: String @key
+    content: Blob?
+    note: String?
+}
+"#;
+
+const BLOB_MUTATIONS: &str = r#"
+query insert_doc($title: String, $content: Blob, $note: String) {
+    insert Document { title: $title, content: $content, note: $note }
+}
+
+query update_doc_note($title: String, $note: String) {
+    update Document set { note: $note } where title = $title
+}
+"#;
+
 async fn init_search_db(dir: &tempfile::TempDir) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, SEARCH_SCHEMA).await.unwrap();
@@ -295,6 +313,128 @@ async fn branch_merge_updates_main_traversal() {
     .await
     .unwrap();
     assert_eq!(merged.num_rows(), 3);
+}
+
+#[tokio::test]
+async fn branch_merge_with_blob_columns_preserves_blob_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+    load_jsonl(
+        &mut main,
+        concat!(
+            "{\"type\":\"Document\",\"data\":{\"title\":\"seed\",\"content\":\"base64:U2VlZA==\",\"note\":\"original\"}}\n",
+            "{\"type\":\"Document\",\"data\":{\"title\":\"main-doc\",\"content\":\"base64:TWFpbg==\",\"note\":\"main\"}}",
+        ),
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+    mutate_main(
+        &mut main,
+        BLOB_MUTATIONS,
+        "update_doc_note",
+        &params(&[("$title", "main-doc"), ("$note", "updated on main")]),
+    )
+    .await
+    .unwrap();
+
+    mutate_branch(
+        &mut feature,
+        "feature",
+        BLOB_MUTATIONS,
+        "insert_doc",
+        &params(&[
+            ("$title", "readme"),
+            ("$content", "base64:SGVsbG8="),
+            ("$note", "branch insert"),
+        ]),
+    )
+    .await
+    .unwrap();
+
+    mutate_branch(
+        &mut feature,
+        "feature",
+        BLOB_MUTATIONS,
+        "update_doc_note",
+        &params(&[("$title", "seed"), ("$note", "updated on branch")]),
+    )
+    .await
+    .unwrap();
+
+    let outcome = main.branch_merge("feature", "main").await.unwrap();
+    assert_eq!(outcome, MergeOutcome::Merged);
+
+    let readme = main
+        .read_blob("Document", "readme", "content")
+        .await
+        .unwrap();
+    let readme_bytes = readme.read().await.unwrap();
+    assert_eq!(&readme_bytes[..], b"Hello");
+
+    let seed = main.read_blob("Document", "seed", "content").await.unwrap();
+    let seed_bytes = seed.read().await.unwrap();
+    assert_eq!(&seed_bytes[..], b"Seed");
+
+    let main_doc = main
+        .read_blob("Document", "main-doc", "content")
+        .await
+        .unwrap();
+    let main_doc_bytes = main_doc.read().await.unwrap();
+    assert_eq!(&main_doc_bytes[..], b"Main");
+}
+
+#[tokio::test]
+async fn branch_merge_with_external_blob_uri_materializes_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let external_dir = tempfile::tempdir().unwrap();
+    let external_path = external_dir.path().join("external.txt");
+    fs::write(&external_path, b"External").unwrap();
+    let external_uri = format!("file://{}", external_path.display());
+
+    let mut main = Omnigraph::init(uri, BLOB_SCHEMA).await.unwrap();
+    load_jsonl(&mut main, "", LoadMode::Overwrite)
+        .await
+        .unwrap();
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+    load_jsonl(
+        &mut main,
+        "{\"type\":\"Document\",\"data\":{\"title\":\"main-doc\",\"content\":\"base64:TWFpbg==\",\"note\":\"main\"}}",
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+
+    let external_data = serde_json::json!({
+        "type": "Document",
+        "data": {
+            "title": "external",
+            "content": external_uri,
+            "note": "branch insert",
+        }
+    })
+    .to_string();
+    feature
+        .load("feature", &external_data, LoadMode::Append)
+        .await
+        .unwrap();
+
+    let outcome = main.branch_merge("feature", "main").await.unwrap();
+    assert_eq!(outcome, MergeOutcome::Merged);
+
+    let external = main
+        .read_blob("Document", "external", "content")
+        .await
+        .unwrap();
+    let external_bytes = external.read().await.unwrap();
+    assert_eq!(&external_bytes[..], b"External");
 }
 
 #[tokio::test]
