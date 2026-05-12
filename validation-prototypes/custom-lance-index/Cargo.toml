@@ -1,0 +1,30 @@
+[package]
+name = "custom-lance-index"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Experiment 1.2 (MR-925) — custom Lance index plugin from outside the lance crate.
+# Validates MR-737 §5.4, §5.5.
+
+[dependencies]
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+lance = { workspace = true }
+lance-table = { workspace = true }
+lance-index = { workspace = true }
+lance-core = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+roaring = { workspace = true }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+
+[[bin]]
+name = "custom-lance-index"
+path = "src/main.rs"

@@ -1,0 +1,69 @@
+[workspace]
+resolver = "2"
+members = [
+    "factorized-batches",
+    "custom-lance-index",
+    # Additional crates added as each experiment is set up:
+    # "custom-operator",          # 1.3
+    # "sip-format-bench",         # 1.4
+    # "bitmap-pushdown",          # 1.5
+    # "txn-branches-cost",        # 1.6
+    # "stable-rowid-index",       # 1.7
+]
+
+# Pre-Phase-0 validation prototypes for MR-925 / MR-737.
+# These are THROWAWAY crates that produce go/no-go signals or calibration
+# numbers. Do not merge to main. The findings live in `.context/experiments/`.
+
+[workspace.dependencies]
+# Pin to the omnigraph workspace versions so the experiments exercise the
+# same substrate behavior the engine will see in Phase 0.
+arrow-array = "57"
+arrow-ipc = "57"
+arrow-schema = "57"
+arrow-select = "57"
+arrow-cast = { version = "57", features = ["prettyprint"] }
+arrow-ord = "57"
+arrow = "57"
+
+datafusion = { version = "52", default-features = false }
+datafusion-physical-plan = "52"
+datafusion-physical-expr = "52"
+datafusion-execution = "52"
+datafusion-common = "52"
+datafusion-expr = "52"
+datafusion-functions-aggregate = "52"
+datafusion-physical-optimizer = "52"
+
+lance = { version = "4.0.0", default-features = false, features = ["aws"] }
+lance-datafusion = "4.0.0"
+lance-file = "4.0.0"
+lance-index = "4.0.0"
+lance-table = "4.0.0"
+lance-core = "4.0.0"
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+futures = "0.3"
+async-trait = "0.1"
+tempfile = "3"
+anyhow = "1"
+rand = "0.8"
+roaring = "0.11"
+croaring = "2"
+prost = "0.14"
+prost-types = "0.14"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+serde_json = "1"
+
+[profile.dev]
+debug = 0
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16

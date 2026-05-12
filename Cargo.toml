@@ -6,6 +6,13 @@ members = [
     "crates/omnigraph-cli",
     "crates/omnigraph-server",
 ]
+exclude = [
+    # MR-925 / MR-737 pre-Phase-0 validation prototypes — nested cargo
+    # workspace; never merged to main.
+    "validation-prototypes",
+    # Existing scratch crate kept out of the main workspace.
+    ".context/scratch/merge-insert-cas-repro",
+]
 default-members = [
     "crates/omnigraph",
     "crates/omnigraph-cli",

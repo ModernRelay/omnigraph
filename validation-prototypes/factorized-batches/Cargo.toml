@@ -1,0 +1,34 @@
+[package]
+name = "factorized-batches"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Experiment 1.1 (MR-925) — factorized batches through DataFusion ops.
+# Validates MR-737 §5.2 / Open Q2.
+
+[dependencies]
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-cast = { workspace = true }
+datafusion = { workspace = true, features = [
+    "sql",
+    "nested_expressions",
+    "unicode_expressions",
+    "string_expressions",
+    "math_expressions",
+    "regex_expressions",
+    "datetime_expressions",
+] }
+datafusion-common = { workspace = true }
+datafusion-expr = { workspace = true }
+datafusion-physical-plan = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }
+rand = { workspace = true }
+
+[[bin]]
+name = "factorized-batches"
+path = "src/main.rs"
