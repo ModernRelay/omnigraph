@@ -1,0 +1,35 @@
+[package]
+name = "custom-operator"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Experiment 1.3 (MR-925) — custom UserDefinedLogicalNode + ExecutionPlan e2e.
+# Validates MR-737 §5.3 / §5.10 (custom ops survive optimizer + execute correctly).
+
+[dependencies]
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+datafusion = { workspace = true, features = [
+    "sql",
+    "nested_expressions",
+    "unicode_expressions",
+    "string_expressions",
+    "math_expressions",
+    "regex_expressions",
+    "datetime_expressions",
+] }
+datafusion-common = { workspace = true }
+datafusion-expr = { workspace = true }
+datafusion-physical-plan = { workspace = true }
+datafusion-physical-expr = { workspace = true }
+datafusion-execution = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+
+[[bin]]
+name = "custom-operator"
+path = "src/main.rs"

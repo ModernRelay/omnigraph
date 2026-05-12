@@ -3,8 +3,8 @@ resolver = "2"
 members = [
     "factorized-batches",
     "custom-lance-index",
+    "custom-operator",
     # Additional crates added as each experiment is set up:
-    # "custom-operator",          # 1.3
     # "sip-format-bench",         # 1.4
     # "bitmap-pushdown",          # 1.5
     # "txn-branches-cost",        # 1.6
