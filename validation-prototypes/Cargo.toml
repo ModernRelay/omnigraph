@@ -4,8 +4,8 @@ members = [
     "factorized-batches",
     "custom-lance-index",
     "custom-operator",
+    "sip-format-bench",
     # Additional crates added as each experiment is set up:
-    # "sip-format-bench",         # 1.4
     # "bitmap-pushdown",          # 1.5
     # "txn-branches-cost",        # 1.6
     # "stable-rowid-index",       # 1.7

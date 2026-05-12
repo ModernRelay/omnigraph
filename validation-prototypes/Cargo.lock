@@ -4920,6 +4920,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
+name = "sip-format-bench"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "rand 0.8.6",
+ "roaring",
+]
+
+[[package]]
 name = "siphasher"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

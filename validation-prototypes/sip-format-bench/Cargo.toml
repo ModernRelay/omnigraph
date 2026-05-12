@@ -1,0 +1,18 @@
+[package]
+name = "sip-format-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Experiment 1.4 (MR-925) — roaring vs sorted-Vec<u64> vs croaring for u64
+# row IDs (SIP wire format).
+# Validates MR-737 §5.6, §5.8 / Open Q4.
+
+[dependencies]
+roaring = { workspace = true }
+rand = { workspace = true }
+anyhow = { workspace = true }
+
+[[bin]]
+name = "sip-format-bench"
+path = "src/main.rs"
