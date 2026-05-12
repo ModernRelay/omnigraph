@@ -532,6 +532,54 @@ async fn stage_overwrite_does_not_advance_head_until_commit() {
     assert_eq!(collect_ids(&after), vec!["zoe"]);
 }
 
+/// `stage_overwrite` is used by `schema_apply` to rewrite tables when
+/// an additive migration touches data. The rewrite MUST preserve the
+/// source dataset's `enable_stable_row_ids` flag — otherwise every
+/// schema_apply that triggers a rewrite would silently disable stable
+/// row IDs on the affected tables, and downstream readers depending on
+/// `_rowid` stability (change-feed validators, index reconcilers) would
+/// observe silent corruption.
+///
+/// Pinned invariant — see `docs/storage.md` "Stable row IDs".
+#[tokio::test]
+async fn stage_overwrite_preserves_stable_row_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap());
+
+    // `write_dataset` creates with `enable_stable_row_ids: true` — see
+    // ADR 0001. We verify that as a precondition so a future change to
+    // the bootstrap helper that drops the flag surfaces here rather
+    // than turning this test into a silent no-op.
+    let ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
+        .await
+        .unwrap();
+    assert!(
+        ds.manifest.uses_stable_row_ids(),
+        "precondition: TableStore::write_dataset must create datasets \
+         with stable row IDs enabled — see ADR 0001"
+    );
+
+    let staged = store
+        .stage_overwrite(&ds, person_batch(&[("zoe", Some(99))]))
+        .await
+        .unwrap();
+    let new_ds = store
+        .commit_staged(Arc::new(ds.clone()), staged.transaction)
+        .await
+        .unwrap();
+
+    assert!(
+        new_ds.manifest.uses_stable_row_ids(),
+        "stage_overwrite + commit_staged must preserve \
+         enable_stable_row_ids from the source dataset. If this fails, \
+         schema_apply has been silently disabling stable row IDs on \
+         every additive migration that triggers a table rewrite. Fix \
+         is in WriteParams at table_store.rs::stage_overwrite — see \
+         ADR 0001."
+    );
+}
+
 /// `stage_overwrite` semantically REPLACES every committed fragment.
 /// `removed_fragment_ids` lists every committed fragment so
 /// `scan_with_staged` shows only the staged rows (not committed + staged).
