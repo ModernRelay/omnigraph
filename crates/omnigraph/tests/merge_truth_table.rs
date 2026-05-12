@@ -749,9 +749,35 @@ async fn run_direction(
         assert_state(&mut db, assert, label).await;
     }
 
+    // Post-conflict invariant: `branch_merge` is atomic, so a failed
+    // merge must leave target exactly as `right_op` alone produced it —
+    // none of `left_op`'s mutations leak in. This generalizes the
+    // assertion that lived in `branching.rs::branch_merge_reports_
+    // divergent_update_conflict` (Alice.age stays 31 after the conflict)
+    // to every conflict cell.
+    if matches!(outcome, ActualOutcome::Conflicts(_)) {
+        let expected_target = state_after_apply_only(right_op);
+        assert_state(&mut db, &expected_target, label).await;
+    }
+
     DirectionResult {
         cell: label.to_string(),
         outcome,
+    }
+}
+
+/// Expected state on `main` after `action` alone runs on the base fixture.
+///
+/// Used by the conflict-cell invariant in [`run_direction`] to assert
+/// `branch_merge` left target unchanged on the failure path.
+fn state_after_apply_only(action: Apply) -> GraphAssert {
+    match action {
+        Apply::Skip => GraphAssert::base(),
+        Apply::InsertEve { .. } => GraphAssert::base().with_eve(),
+        Apply::DeleteAlice => GraphAssert::base().without_alice(),
+        Apply::InsertAliceCarol => GraphAssert::base().with_extra_knows_edge(),
+        Apply::DeleteKnowsFromBob => GraphAssert::base().without_bob_carol(),
+        Apply::SetAliceAge { age } => GraphAssert::base().with_alice_age(age),
     }
 }
 
