@@ -814,6 +814,18 @@ fn check_outcome(label: &str, expected: &Expected, actual: &ActualOutcome) {
         | (Expected::FastForward(_), ActualOutcome::FastForward)
         | (Expected::Merged(_), ActualOutcome::Merged) => {}
         (Expected::Conflicts(want), ActualOutcome::Conflicts(got)) => {
+            // The truth table's whole point is a deterministic oracle, so
+            // a regression that produces extra spurious conflicts (e.g.
+            // emitting both `OrphanEdge` and a stray `DivergentInsert`)
+            // must fail this assertion. Hence exact-count equality, not
+            // subset inclusion.
+            assert_eq!(
+                got.len(),
+                want.len(),
+                "[{label}] expected {} conflict(s) but got {}: {got:?}",
+                want.len(),
+                got.len()
+            );
             for w in want {
                 let hit = got.iter().any(|(table, kind, row)| {
                     table == w.table_key
