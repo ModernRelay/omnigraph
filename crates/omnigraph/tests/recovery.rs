@@ -992,7 +992,6 @@ async fn recovery_ensure_indices_handles_empty_tables() {
 #[tokio::test]
 async fn recovery_multi_sidecar_requires_fresh_snapshot_for_correctness() {
     use omnigraph::loader::{LoadMode, load_jsonl};
-    use omnigraph::table_store::TableStore;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -1011,7 +1010,6 @@ async fn recovery_multi_sidecar_requires_fresh_snapshot_for_correctness() {
     drop(db);
 
     let person_uri = node_table_uri(uri, "Person");
-    let store = TableStore::new(uri);
     let mut ds = Dataset::open(&person_uri).await.unwrap();
     let v1 = ds.version().version;
 
@@ -1025,23 +1023,9 @@ async fn recovery_multi_sidecar_requires_fresh_snapshot_for_correctness() {
     // Bypassing __manifest is what `delete_where` and `append_batch`
     // both do (direct on Lance); using append_batch (instead of no-op
     // deletes) is what makes the fragment-set differ across versions.
-    store
-        .append_batch(
-            &person_uri,
-            &mut ds,
-            person_batch(&[("bob-id", "bob", Some(25))]),
-        )
-        .await
-        .unwrap();
+    helpers::lance_append_inline(&mut ds, person_batch(&[("bob-id", "bob", Some(25))])).await;
     let v2 = ds.version().version;
-    store
-        .append_batch(
-            &person_uri,
-            &mut ds,
-            person_batch(&[("carol-id", "carol", Some(40))]),
-        )
-        .await
-        .unwrap();
+    helpers::lance_append_inline(&mut ds, person_batch(&[("carol-id", "carol", Some(40))])).await;
     let v3 = ds.version().version;
     assert_eq!(v2, v1 + 1);
     assert_eq!(v3, v2 + 1);
@@ -1206,14 +1190,7 @@ async fn recovery_classifies_feature_branch_sidecar_against_feature_branch() {
         .open_dataset_head(&person_uri, feature_branch_name.as_deref())
         .await
         .unwrap();
-    store
-        .append_batch(
-            &person_uri,
-            &mut ds,
-            person_batch(&[("carol-id", "carol", Some(40))]),
-        )
-        .await
-        .unwrap();
+    helpers::lance_append_inline(&mut ds, person_batch(&[("carol-id", "carol", Some(40))])).await;
     let v_head = ds.version().version;
     assert_eq!(v_head, v_pin + 1, "append must advance HEAD by 1");
 
@@ -1328,14 +1305,7 @@ async fn recovery_rolls_back_feature_branch_sidecar_against_feature_branch() {
         .open_dataset_head(&person_uri, feature_branch_name.as_deref())
         .await
         .unwrap();
-    store
-        .append_batch(
-            &person_uri,
-            &mut ds,
-            person_batch(&[("dave-id", "dave", Some(50))]),
-        )
-        .await
-        .unwrap();
+    helpers::lance_append_inline(&mut ds, person_batch(&[("dave-id", "dave", Some(50))])).await;
     let v_head = ds.version().version;
     assert_eq!(v_head, v_pin + 1);
 

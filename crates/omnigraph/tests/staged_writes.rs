@@ -34,6 +34,22 @@ fn person_schema() -> Arc<Schema> {
     ]))
 }
 
+/// Test-only helper: raw `Dataset::append` to advance Lance HEAD without
+/// going through the manifest. Mirrors `TableStore::append_batch`'s body
+/// (which is `pub(crate)` after MR-854) — kept local so these
+/// drift-simulation tests don't depend on the demoted crate-internal API.
+async fn lance_append_inline_local(ds: &mut Dataset, batch: RecordBatch) {
+    use lance::dataset::{WriteMode, WriteParams};
+    let schema = batch.schema();
+    let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Append,
+        allow_external_blob_outside_bases: true,
+        ..Default::default()
+    };
+    ds.append(reader, Some(params)).await.unwrap();
+}
+
 fn person_batch(rows: &[(&str, Option<i32>)]) -> RecordBatch {
     let ids: Vec<&str> = rows.iter().map(|(id, _)| *id).collect();
     let ages: Vec<Option<i32>> = rows.iter().map(|(_, age)| *age).collect();
@@ -815,7 +831,6 @@ async fn create_vector_index_advances_head_inline_documents_residual() {
 async fn lance_restore_appends_one_commit_with_checked_out_content() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
 
     // Build version history: v1 = {alice}, v2 = {alice, bob}, v3 = {alice, bob, carol}.
     let mut ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
@@ -823,16 +838,10 @@ async fn lance_restore_appends_one_commit_with_checked_out_content() {
         .unwrap();
     assert_eq!(ds.version().version, 1);
 
-    store
-        .append_batch(&uri, &mut ds, person_batch(&[("bob", Some(25))]))
-        .await
-        .unwrap();
+    lance_append_inline_local(&mut ds, person_batch(&[("bob", Some(25))])).await;
     assert_eq!(ds.version().version, 2);
 
-    store
-        .append_batch(&uri, &mut ds, person_batch(&[("carol", Some(40))]))
-        .await
-        .unwrap();
+    lance_append_inline_local(&mut ds, person_batch(&[("carol", Some(40))])).await;
     assert_eq!(ds.version().version, 3);
 
     let head_before = ds.version().version;
@@ -908,7 +917,6 @@ async fn lance_restore_appends_one_commit_with_checked_out_content() {
 async fn lance_restore_loses_to_concurrent_append_via_orphaning() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
 
     // v1: seed with alice.
     let _ = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
@@ -925,10 +933,7 @@ async fn lance_restore_loses_to_concurrent_append_via_orphaning() {
     // This simulates a per-table-queue model where another tenant wrote
     // between recovery's open and recovery's restore call.
     let mut writer_handle = Dataset::open(&uri).await.unwrap();
-    store
-        .append_batch(&uri, &mut writer_handle, person_batch(&[("bob", Some(25))]))
-        .await
-        .unwrap();
+    lance_append_inline_local(&mut writer_handle, person_batch(&[("bob", Some(25))])).await;
     assert_eq!(writer_handle.version().version, 2);
 
     // Recovery now restores. Because restore's `check_restore_txn` returns
