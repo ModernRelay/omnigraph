@@ -16,6 +16,29 @@ pub enum SchemaTypeKind {
     Edge,
 }
 
+/// How a drop step interacts with data.
+///
+/// - **`Soft`** — catalog tombstone only. The type / property is hidden
+///   from queries but the underlying Lance column / dataset is retained
+///   on disk. Reversible via `omnigraph schema unhide` (forthcoming).
+///   Tier: `safe`.
+/// - **`Hard`** — actual data removal. The Lance column is rewritten
+///   without the property, or the Lance dataset is dropped. Irreversible
+///   short of branch / snapshot restore. Tier: `destructive`; requires
+///   `--allow-data-loss` to apply.
+///
+/// The planner emits `Soft` by default; `--allow-data-loss` on the apply
+/// CLI promotes drops to `Hard`. This is the dimension orthogonal to
+/// `SafetyTier` from the schema-lint chassis (`crate::lint`): tier
+/// describes the rule's class; mode describes the operator's intent for
+/// data treatment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DropMode {
+    Soft,
+    Hard,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SchemaMigrationPlan {
     pub supported: bool,
@@ -61,6 +84,28 @@ pub enum SchemaMigrationStep {
         type_name: String,
         property_name: String,
         annotations: Vec<Annotation>,
+    },
+    /// Remove a node or edge type. Soft mode tombstones in the catalog
+    /// and retains data on disk; Hard mode drops the Lance dataset and
+    /// requires `--allow-data-loss`.
+    ///
+    /// Dormant in this commit — emitted by the planner in a later
+    /// commit (see `docs/schema-lint-v1-plan.md`).
+    DropType {
+        type_kind: SchemaTypeKind,
+        name: String,
+        mode: DropMode,
+    },
+    /// Remove a property from an existing type. Soft mode tombstones
+    /// the property in the catalog and retains the Lance column; Hard
+    /// mode rewrites the column out and requires `--allow-data-loss`.
+    ///
+    /// Dormant in this commit.
+    DropProperty {
+        type_kind: SchemaTypeKind,
+        type_name: String,
+        property_name: String,
+        mode: DropMode,
     },
     UnsupportedChange {
         entity: String,
@@ -952,5 +997,57 @@ node Person @description("new") {
                 value: Some("new".to_string()),
             }],
         }));
+    }
+
+    #[test]
+    fn drop_steps_round_trip_through_serde() {
+        // The DropType / DropProperty variants are dormant in this
+        // commit — the planner doesn't emit them yet — but their
+        // serde shape needs to be stable from day one. A future
+        // SchemaIR JSON containing one of these must deserialize
+        // back to the same value. This test pins the wire format
+        // so a v0 schema-ir consumer never sees a surprise variant
+        // shape after v1 ships.
+        let steps = vec![
+            SchemaMigrationStep::DropType {
+                type_kind: SchemaTypeKind::Node,
+                name: "Person".to_string(),
+                mode: DropMode::Soft,
+            },
+            SchemaMigrationStep::DropType {
+                type_kind: SchemaTypeKind::Edge,
+                name: "Knows".to_string(),
+                mode: DropMode::Hard,
+            },
+            SchemaMigrationStep::DropProperty {
+                type_kind: SchemaTypeKind::Node,
+                type_name: "Person".to_string(),
+                property_name: "age".to_string(),
+                mode: DropMode::Soft,
+            },
+            SchemaMigrationStep::DropProperty {
+                type_kind: SchemaTypeKind::Interface,
+                type_name: "Named".to_string(),
+                property_name: "alias".to_string(),
+                mode: DropMode::Hard,
+            },
+        ];
+
+        for step in steps {
+            let json = serde_json::to_string(&step).expect("serialize");
+            let round_trip: SchemaMigrationStep =
+                serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(step, round_trip, "round-trip mismatch on {json}");
+        }
+    }
+
+    #[test]
+    fn drop_mode_serde_uses_snake_case() {
+        // External tools may write SchemaIR JSON by hand. Pin the
+        // wire form so we don't silently break them later.
+        assert_eq!(serde_json::to_string(&DropMode::Soft).unwrap(), "\"soft\"");
+        assert_eq!(serde_json::to_string(&DropMode::Hard).unwrap(), "\"hard\"");
+        let soft: DropMode = serde_json::from_str("\"soft\"").unwrap();
+        assert_eq!(soft, DropMode::Soft);
     }
 }

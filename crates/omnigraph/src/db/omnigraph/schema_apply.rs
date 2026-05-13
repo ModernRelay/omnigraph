@@ -138,6 +138,17 @@ pub(super) async fn apply_schema_with_lock(
             }
             SchemaMigrationStep::UpdateTypeMetadata { .. }
             | SchemaMigrationStep::UpdatePropertyMetadata { .. } => {}
+            SchemaMigrationStep::DropType { .. } | SchemaMigrationStep::DropProperty { .. } => {
+                // Dormant — variants exist on the IR but the planner
+                // doesn't emit them yet. Implementation lands in a
+                // subsequent commit (see docs/schema-lint-v1-plan.md).
+                // If a SchemaIR JSON containing one of these arrives
+                // (e.g. round-tripped from a future tool), fail
+                // explicitly rather than silently misclassifying.
+                return Err(OmniError::manifest_internal(
+                    "drop-step variant is not yet implemented in apply_schema",
+                ));
+            }
             step @ SchemaMigrationStep::UnsupportedChange { .. } => {
                 return Err(OmniError::manifest(
                     step.unsupported_error_message()

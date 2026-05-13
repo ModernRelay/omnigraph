@@ -1035,6 +1035,29 @@ fn render_schema_plan_step(step: &SchemaMigrationStep) -> String {
             type_name,
             render_annotations(annotations)
         ),
+        SchemaMigrationStep::DropType {
+            type_kind,
+            name,
+            mode,
+        } => format!(
+            "drop {} type '{}' ({} mode)",
+            schema_type_kind_label(*type_kind),
+            name,
+            drop_mode_label(*mode),
+        ),
+        SchemaMigrationStep::DropProperty {
+            type_kind,
+            type_name,
+            property_name,
+            mode,
+        } => format!(
+            "drop property '{}.{}' of {} '{}' ({} mode)",
+            type_name,
+            property_name,
+            schema_type_kind_label(*type_kind),
+            type_name,
+            drop_mode_label(*mode),
+        ),
         SchemaMigrationStep::UnsupportedChange {
             entity, reason, ..
         } => {
@@ -1070,6 +1093,13 @@ fn schema_lint_tier_label(tier: omnigraph_compiler::SafetyTier) -> &'static str 
         omnigraph_compiler::SafetyTier::Safe => "safe",
         omnigraph_compiler::SafetyTier::Validated => "validated",
         omnigraph_compiler::SafetyTier::Destructive => "destructive",
+    }
+}
+
+fn drop_mode_label(mode: omnigraph_compiler::DropMode) -> &'static str {
+    match mode {
+        omnigraph_compiler::DropMode::Soft => "soft",
+        omnigraph_compiler::DropMode::Hard => "hard",
     }
 }
 
