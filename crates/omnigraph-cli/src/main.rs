@@ -1035,9 +1035,14 @@ fn render_schema_plan_step(step: &SchemaMigrationStep) -> String {
             type_name,
             render_annotations(annotations)
         ),
-        SchemaMigrationStep::UnsupportedChange { entity, reason } => {
-            format!("unsupported change on {}: {}", entity, reason)
-        }
+        SchemaMigrationStep::UnsupportedChange {
+            entity,
+            reason,
+            code,
+        } => match code {
+            Some(c) => format!("unsupported change on {} [{}]: {}", entity, c, reason),
+            None => format!("unsupported change on {}: {}", entity, reason),
+        },
     }
 }
 

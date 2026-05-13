@@ -126,9 +126,10 @@ async fn apply_schema_rejects_dropping_a_property_with_data() {
     // the column is nullable — it would silently destroy data.
     let desired = TEST_SCHEMA.replace("    age: I32?\n", "");
     let err = db.apply_schema(&desired).await.unwrap_err();
+    let msg = err.to_string();
     assert!(
-        err.to_string().contains("removing property"),
-        "expected 'removing property' in error, got: {err}"
+        msg.contains("OG-DS-104"),
+        "expected schema-lint code OG-DS-104 in error, got: {msg}"
     );
 
     // Manifest didn't advance and existing rows are untouched.
@@ -166,8 +167,8 @@ edge Knows: Person -> Person {
     let err = db.apply_schema(desired).await.unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("removing node type") || msg.contains("removing edge type"),
-        "expected drop-type error, got: {msg}"
+        msg.contains("OG-DS-102") || msg.contains("OG-DS-103"),
+        "expected schema-lint code OG-DS-102 or OG-DS-103 in error, got: {msg}"
     );
     assert_eq!(
         db.snapshot_of(ReadTarget::branch("main"))
@@ -191,9 +192,10 @@ async fn apply_schema_rejects_dropping_an_edge_type() {
     // Drop only the `WorksAt` edge.
     let desired = TEST_SCHEMA.replace("\nedge WorksAt: Person -> Company", "");
     let err = db.apply_schema(&desired).await.unwrap_err();
+    let msg = err.to_string();
     assert!(
-        err.to_string().contains("removing edge type"),
-        "expected 'removing edge type' error, got: {err}"
+        msg.contains("OG-DS-103"),
+        "expected schema-lint code OG-DS-103 in error, got: {msg}"
     );
     assert_eq!(
         db.snapshot_of(ReadTarget::branch("main"))
@@ -221,9 +223,10 @@ async fn apply_schema_rejects_adding_a_required_property_without_backfill() {
         "    age: I32?\n    email: String\n}",
     );
     let err = db.apply_schema(&desired).await.unwrap_err();
+    let msg = err.to_string();
     assert!(
-        err.to_string().contains("adding required property"),
-        "expected 'adding required property' error, got: {err}"
+        msg.contains("OG-MF-103"),
+        "expected schema-lint code OG-MF-103 in error, got: {msg}"
     );
     assert_eq!(
         db.snapshot_of(ReadTarget::branch("main"))
@@ -253,8 +256,8 @@ async fn plan_schema_for_property_type_narrowing_is_not_supported() {
     assert!(!plan.supported, "narrowing I64 -> I32 must not be supported");
     assert!(plan.steps.iter().any(|step| matches!(
         step,
-        SchemaMigrationStep::UnsupportedChange { reason, .. }
-            if reason.contains("changing property type")
+        SchemaMigrationStep::UnsupportedChange { code, .. }
+            if code.as_deref() == Some("OG-MF-106")
     )));
 }
 
