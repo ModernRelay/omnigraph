@@ -60,12 +60,12 @@ async fn entity_from_snapshot(
     }
 
     let ds = db
-        .table_store
-        .open_snapshot_table(snapshot, table_key)
+        .storage()
+        .open_snapshot_at_table(snapshot, table_key)
         .await?;
     let filter_sql = format!("id = '{}'", id.replace('\'', "''"));
     let batches = db
-        .table_store
+        .storage()
         .scan(&ds, None, Some(&filter_sql), None)
         .await?;
     let Some(batch) = batches.iter().find(|batch| batch.num_rows() > 0) else {

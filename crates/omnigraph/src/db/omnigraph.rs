@@ -1022,19 +1022,24 @@ impl Omnigraph {
 
         let snapshot = self.snapshot().await;
         let table_key = format!("node:{}", type_name);
-        let ds = snapshot.open(&table_key).await?;
+        let handle = self
+            .storage()
+            .open_snapshot_at_table(&snapshot, &table_key)
+            .await?;
 
         let filter_sql = format!("id = '{}'", id.replace('\'', "''"));
         let row_id = self
-            .table_store
-            .first_row_id_for_filter(&ds, &filter_sql)
+            .storage()
+            .first_row_id_for_filter(&handle, &filter_sql)
             .await?
             .ok_or_else(|| {
                 OmniError::manifest(format!("no {} with id '{}' found", type_name, id))
             })?;
 
-        // Use take_blobs to get the BlobFile handle
-        let ds = Arc::new(ds);
+        // `take_blobs` is a Lance-specific blob accessor not surfaced
+        // through the `TableStorage` trait — reach the inner `Arc<Dataset>`
+        // via the `pub(crate)` accessor for this read-only call.
+        let ds = handle.into_arc();
         let mut blobs = ds
             .take_blobs(&[row_id], property)
             .await
