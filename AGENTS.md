@@ -73,6 +73,7 @@ Full diagram and concurrency model: [docs/architecture.md](docs/architecture.md)
 | Architecture, L1/L2 framing, concurrency model | [docs/architecture.md](docs/architecture.md) |
 | Storage layout, `__manifest` schema, URI schemes, S3 env vars | [docs/storage.md](docs/storage.md) |
 | `.pg` schema language, types, constraints, annotations, migration planning | [docs/schema-language.md](docs/schema-language.md) |
+| Schema-lint codes (`OG-XXX-NNN`), families, severity, suppression | [docs/schema-lint.md](docs/schema-lint.md) |
 | `.gq` query language, MATCH/RETURN/ORDER, search funcs, mutations, IR ops, lint codes | [docs/query-language.md](docs/query-language.md) |
 | Indexes (BTREE / inverted / vector / graph topology) | [docs/indexes.md](docs/indexes.md) |
 | Embeddings (compiler + engine clients, env vars, `@embed`) | [docs/embeddings.md](docs/embeddings.md) |

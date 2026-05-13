@@ -3,6 +3,7 @@ pub mod embedding;
 pub mod error;
 pub mod ir;
 pub mod json_output;
+pub mod lint;
 pub mod query;
 pub mod query_input;
 pub mod result;
@@ -17,6 +18,7 @@ pub use catalog::schema_ir::{
 pub use catalog::schema_plan::{
     SchemaMigrationPlan, SchemaMigrationStep, SchemaTypeKind, plan_schema_migration,
 };
+pub use lint::{DiagnosticCode, Family, SafetyTier, Severity};
 pub use ir::ParamMap;
 pub use ir::lower::{lower_mutation_query, lower_query};
 pub use query::ast::Literal;

@@ -53,15 +53,12 @@ pub(super) async fn apply_schema_with_lock(
     let plan = plan_schema_migration(&accepted_ir, &desired_ir)
         .map_err(|err| OmniError::manifest(err.to_string()))?;
     if !plan.supported {
-        let reason = plan
+        let message = plan
             .steps
             .iter()
-            .find_map(|step| match step {
-                SchemaMigrationStep::UnsupportedChange { reason, .. } => Some(reason.as_str()),
-                _ => None,
-            })
-            .unwrap_or("unsupported schema migration plan");
-        return Err(OmniError::manifest(reason.to_string()));
+            .find_map(|step| step.unsupported_error_message())
+            .unwrap_or_else(|| "unsupported schema migration plan".to_string());
+        return Err(OmniError::manifest(message));
     }
     if plan.steps.is_empty() {
         return Ok(SchemaApplyResult {
@@ -141,8 +138,11 @@ pub(super) async fn apply_schema_with_lock(
             }
             SchemaMigrationStep::UpdateTypeMetadata { .. }
             | SchemaMigrationStep::UpdatePropertyMetadata { .. } => {}
-            SchemaMigrationStep::UnsupportedChange { reason, .. } => {
-                return Err(OmniError::manifest(reason.clone()));
+            step @ SchemaMigrationStep::UnsupportedChange { .. } => {
+                return Err(OmniError::manifest(
+                    step.unsupported_error_message()
+                        .unwrap_or_else(|| "unsupported schema migration step".to_string()),
+                ));
             }
         }
     }

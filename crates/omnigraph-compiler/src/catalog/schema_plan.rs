@@ -65,7 +65,34 @@ pub enum SchemaMigrationStep {
     UnsupportedChange {
         entity: String,
         reason: String,
+        /// Stable schema-lint code (`OG-XXX-NNN`) for this rejection,
+        /// or `None` if the path predates the chassis catalog. See
+        /// [`crate::lint::codes`] for the registry. Renderers should
+        /// prefix the message with `[code]` when present so operators
+        /// can suppress, look up docs, or filter on stable identifiers
+        /// rather than free-text prose.
+        ///
+        /// Stored as `String` (not `&'static str`) so the enum stays
+        /// serde-friendly. Emitters pass the catalog constant's
+        /// `.code` (a `&'static str`) and we own a clone here.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
     },
+}
+
+impl SchemaMigrationStep {
+    /// Returns the formatted error message for an `UnsupportedChange`
+    /// step, prefixed with `[code] ` when a schema-lint code is attached.
+    /// Returns `None` for every other variant.
+    pub fn unsupported_error_message(&self) -> Option<String> {
+        match self {
+            Self::UnsupportedChange { reason, code, .. } => Some(match code {
+                Some(c) => format!("[{}] {}", c, reason),
+                None => reason.clone(),
+            }),
+            _ => None,
+        }
+    }
 }
 
 pub fn plan_schema_migration(
@@ -130,6 +157,7 @@ fn plan_interfaces(
                 "removing interface '{}' is not supported in schema migration v1",
                 leftover.name
             ),
+            code: None,
         });
     }
 
@@ -171,6 +199,7 @@ fn plan_nodes(
                         "node '{}' declares @rename_from(\"{}\") but no accepted node with that name exists",
                         node.name, from
                     ),
+                    code: None,
                 });
             } else {
                 steps.push(SchemaMigrationStep::AddType {
@@ -200,6 +229,7 @@ fn plan_nodes(
                     "changing implemented interfaces on node '{}' is not supported in schema migration v1",
                     node.name
                 ),
+                code: None,
             });
         }
 
@@ -237,6 +267,7 @@ fn plan_nodes(
                 "removing node type '{}' is not supported in schema migration v1",
                 leftover.name
             ),
+            code: Some(crate::lint::codes::OG_DS_102.code.to_string()),
         });
     }
 
@@ -277,6 +308,7 @@ fn plan_edges(
                         "edge '{}' declares @rename_from(\"{}\") but no accepted edge with that name exists",
                         edge.name, from
                     ),
+                    code: None,
                 });
             } else {
                 steps.push(SchemaMigrationStep::AddType {
@@ -305,6 +337,7 @@ fn plan_edges(
                     "changing edge endpoints on '{}' is not supported in schema migration v1",
                     edge.name
                 ),
+                code: None,
             });
         }
         if existing.cardinality != edge.cardinality {
@@ -314,6 +347,7 @@ fn plan_edges(
                     "changing cardinality on edge '{}' is not supported in schema migration v1",
                     edge.name
                 ),
+                code: None,
             });
         }
 
@@ -351,6 +385,7 @@ fn plan_edges(
                 "removing edge type '{}' is not supported in schema migration v1",
                 leftover.name
             ),
+            code: Some(crate::lint::codes::OG_DS_103.code.to_string()),
         });
     }
 }
@@ -396,6 +431,7 @@ fn plan_properties(
                         "property '{}.{}' declares @rename_from(\"{}\") but no accepted property with that name exists",
                         type_name, property.name, from
                     ),
+                    code: None,
                 });
             } else if property.prop_type.nullable {
                 steps.push(SchemaMigrationStep::AddProperty {
@@ -416,6 +452,7 @@ fn plan_properties(
                         "adding required property '{}.{}' requires a backfill and is not supported in schema migration v1",
                         type_name, property.name
                     ),
+                    code: Some(crate::lint::codes::OG_MF_103.code.to_string()),
                 });
             }
             continue;
@@ -444,6 +481,7 @@ fn plan_properties(
                     "changing property type for '{}.{}' is not supported in schema migration v1",
                     type_name, property.name
                 ),
+                code: Some(crate::lint::codes::OG_MF_106.code.to_string()),
             });
         }
 
@@ -472,6 +510,7 @@ fn plan_properties(
                 "removing property '{}.{}' is not supported in schema migration v1",
                 type_name, leftover.name
             ),
+            code: Some(crate::lint::codes::OG_DS_104.code.to_string()),
         });
     }
 
@@ -513,6 +552,7 @@ fn plan_constraints(
                 "removing constraints from '{}' is not supported in schema migration v1",
                 type_name
             ),
+            code: None,
         });
     }
 
@@ -532,6 +572,7 @@ fn plan_constraints(
                     "adding constraint '{}' to '{}' is not supported in schema migration v1",
                     key, type_name
                 ),
+                code: None,
             }),
         }
     }
@@ -557,6 +598,7 @@ fn plan_type_metadata(
             steps.push(SchemaMigrationStep::UnsupportedChange {
                 entity: format!("{}:{}", schema_type_kind_key(type_kind), name),
                 reason,
+                code: None,
             });
         }
     }
@@ -589,6 +631,7 @@ fn plan_property_metadata(
                     property_name
                 ),
                 reason,
+                code: None,
             });
         }
     }
@@ -850,9 +893,9 @@ node Person {
         assert!(!plan.supported);
         assert!(plan.steps.iter().any(|step| matches!(
             step,
-            UnsupportedChange { entity, reason }
+            UnsupportedChange { entity, code, .. }
                 if entity.contains("Person.age")
-                    && reason.contains("adding required property")
+                    && code.as_deref() == Some(crate::lint::codes::OG_MF_103.code)
         )));
     }
 
