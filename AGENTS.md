@@ -93,6 +93,7 @@ Full diagram and concurrency model: [docs/architecture.md](docs/architecture.md)
 | Install (binary / Homebrew / source / channels) | [docs/install.md](docs/install.md) |
 | Deployment (binary / container / RustFS bootstrap / auth / build variants) | [docs/deployment.md](docs/deployment.md) |
 | CI / release workflows | [docs/ci.md](docs/ci.md) |
+| Code ownership (CODEOWNERS source of truth, roles, regeneration) | [docs/codeowners.md](docs/codeowners.md) |
 | Constants & tunables cheat sheet | [docs/constants.md](docs/constants.md) |
 | Per-version release notes | [docs/releases/](docs/releases/) |
 

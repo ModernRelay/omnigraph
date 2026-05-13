@@ -1,0 +1,57 @@
+# Source of truth for .github/CODEOWNERS.
+#
+# How to change role membership or path assignments:
+#   1. Edit this file.
+#   2. Run `python3 .github/scripts/render-codeowners.py` to regenerate
+#      .github/CODEOWNERS.
+#   3. Commit both files in the same PR.
+#
+# CI fails on drift between this source and the generated CODEOWNERS
+# (see .github/workflows/codeowners.yml). CI also rejects direct edits
+# to .github/CODEOWNERS that don't accompany a change here.
+#
+# Why a generator instead of editing CODEOWNERS directly?
+# The yml is the audit trail: `git log .github/codeowners-roles.yml`
+# shows every role change with a reviewable diff and a merge commit.
+# The rendered CODEOWNERS is what GitHub reads at PR time.
+
+roles:
+  engineering:
+    description: >
+      All production code under crates/**. Engine, CLI, server,
+      compiler. Single owner; review must come from this person.
+    members:
+      - aaltshuler
+
+  docs:
+    description: >
+      Documentation under docs/**, plus repo-level docs (README.md,
+      AGENTS.md, CLAUDE.md symlink, SECURITY.md). Either named member
+      can approve; both are listed so reviews can route to whoever is
+      available.
+    members:
+      - aaltshuler
+      - ragnorc
+
+# Path → role mapping. GitHub CODEOWNERS uses "last match wins"
+# semantics — when multiple patterns match a file, only the last
+# matching pattern's owners apply. The generator handles this by
+# emitting `default` as the first `*` line and the specific patterns
+# below afterward, so specific paths override the catch-all.
+#
+# Within this list, order matters only between overlapping specific
+# patterns (the later one wins). Today nothing overlaps; future
+# additions should keep more-specific patterns later.
+paths:
+  "crates/**": [engineering]
+  "docs/**": [docs]
+  "README.md": [docs]
+  "AGENTS.md": [docs]
+  "CLAUDE.md": [docs]
+  "SECURITY.md": [docs]
+
+# Catch-all for paths not explicitly mapped (.github/, scripts/,
+# Cargo.toml, Cargo.lock, openapi.json, LICENSE, etc.). Defaults to
+# engineering — every change to repo infrastructure needs the
+# engineering owner's review.
+default: [engineering]

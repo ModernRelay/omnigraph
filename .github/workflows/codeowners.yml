@@ -1,0 +1,66 @@
+name: CODEOWNERS
+
+on:
+  pull_request:
+    paths:
+      - '.github/codeowners-roles.yml'
+      - '.github/CODEOWNERS'
+      - '.github/scripts/render-codeowners.py'
+      - '.github/workflows/codeowners.yml'
+  workflow_dispatch:
+
+# Read-only; we never push from this workflow.
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: CODEOWNERS matches source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5.4.0
+        with:
+          python-version: '3.13'
+
+      - name: Install PyYAML
+        run: pip install pyyaml
+
+      - name: Re-render CODEOWNERS
+        run: python3 .github/scripts/render-codeowners.py
+
+      - name: Reject drift
+        run: |
+          if ! git diff --quiet .github/CODEOWNERS; then
+            echo "::error::.github/CODEOWNERS is out of sync with .github/codeowners-roles.yml."
+            echo "::error::Run \`python3 .github/scripts/render-codeowners.py\` locally and commit the result."
+            echo "--- diff ---"
+            git --no-pager diff .github/CODEOWNERS
+            exit 1
+          fi
+          echo "CODEOWNERS is in sync with its source."
+
+  noedit:
+    name: CODEOWNERS not hand-edited
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5.0.1
+        with:
+          # Need history so we can diff against the PR base.
+          fetch-depth: 0
+
+      - name: Reject hand-edits to generated file
+        run: |
+          base="origin/${{ github.base_ref }}"
+          git fetch origin "${{ github.base_ref }}" --quiet
+          changed=$(git diff --name-only "$base" HEAD)
+          edited_generated=$(echo "$changed" | grep -E '^\.github/CODEOWNERS$' || true)
+          edited_source=$(echo "$changed" | grep -E '^\.github/codeowners-roles\.yml$' || true)
+          if [ -n "$edited_generated" ] && [ -z "$edited_source" ]; then
+            echo "::error::This PR edits .github/CODEOWNERS but not its source .github/codeowners-roles.yml."
+            echo "::error::Edit the yml and regenerate via \`python3 .github/scripts/render-codeowners.py\`."
+            exit 1
+          fi
+          echo "CODEOWNERS edits accompany source edits (or no CODEOWNERS edits in this PR)."
