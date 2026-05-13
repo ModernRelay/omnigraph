@@ -29,15 +29,21 @@
 //!   the cross-table manifest commit. Documented exception.
 //! - `crates/omnigraph/src/storage_layer.rs` — IS the trait module.
 //!
-//! ## Transitional allow-list
+//! ## Allow-list shape
 //!
-//! The migration of writers onto staged primitives is incremental.
-//! Several writers (ensure_indices, branch_merge, schema_apply rewrites)
-//! already route through the staged primitives; others (bulk loader,
-//! exec/mutation, exec/query) still use the legacy inherent
-//! `TableStore` methods — they're not visible at the trait boundary, but
-//! they DO call lance types. The file-level allow-list below reflects
-//! this transitional state and tightens as call sites migrate.
+//! After MR-854 (MR-793 Phase 1b + Phase 9), every engine call site
+//! reaches the storage layer through `db.storage()` (returns
+//! `&dyn TableStorage`). The inherent inline-commit methods on
+//! `TableStore` (`append_batch`, `merge_insert_batch{,es}`,
+//! `overwrite_batch`, `create_{btree,inverted}_index`, `truncate_table`)
+//! are now `pub(crate)`, so the only direct users are
+//! `table_store.rs` itself (which IS the storage layer) and the bulk
+//! loader's `LoadMode::{Append, Overwrite, Merge}` concurrent
+//! fast-paths in `loader::write_batch_to_dataset` (the loader uses the
+//! trait surface for the staged-write path and falls back to the
+//! demoted inherent methods only for the concurrent fast-path, which
+//! has no two-phase shape in Lance 4.0.0). The file-level allow-list
+//! below matches that boundary.
 
 use std::path::{Path, PathBuf};
 

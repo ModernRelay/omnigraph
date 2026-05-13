@@ -111,6 +111,17 @@ impl SnapshotHandle {
         self.inner
     }
 
+    /// Take ownership of the inner `Dataset` by unwrapping the `Arc`
+    /// (or cloning if the snapshot is shared). `pub(crate)` — used
+    /// only by the maintenance path (`optimize`, `cleanup`) which
+    /// must hand `&mut Dataset` to Lance compaction / cleanup APIs
+    /// that the `TableStorage` trait does not (and should not)
+    /// surface. Engine code that participates in the staged-write
+    /// invariant must stay on the trait methods.
+    pub(crate) fn into_dataset(self) -> Dataset {
+        Arc::try_unwrap(self.inner).unwrap_or_else(|arc| (*arc).clone())
+    }
+
     // ── public, lance-free accessors ──
 
     /// Current Lance manifest version of the snapshot.
@@ -207,6 +218,20 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     ) -> Result<SnapshotHandle>;
 
     async fn delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()>;
+
+    /// Idempotent variant of `delete_branch` used by the best-effort fork
+    /// reclaim under branch delete (`db/omnigraph.rs::cleanup_deleted_branch_tables`)
+    /// and by the orphan-fork reconciler in `optimize`. Tolerates an
+    /// already-absent branch (both Lance's `RefNotFound` and the local-store
+    /// `NotFound` quirk on a missing `tree/{branch}/` dir). A still-referenced
+    /// branch (`RefConflict`) still surfaces as `OmniError::Lance`.
+    async fn force_delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()>;
+
+    /// List the named Lance branches present on the dataset at `dataset_uri`.
+    /// The `cleanup` orphan reconciler diffs this against the manifest
+    /// branch set to find orphaned per-table forks. `main`/default is not a
+    /// named branch and never appears here.
+    async fn list_branches(&self, dataset_uri: &str) -> Result<Vec<String>>;
 
     async fn reopen_for_mutation(
         &self,
@@ -494,6 +519,14 @@ impl TableStorage for TableStore {
 
     async fn delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()> {
         TableStore::delete_branch(self, dataset_uri, branch).await
+    }
+
+    async fn force_delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()> {
+        TableStore::force_delete_branch(self, dataset_uri, branch).await
+    }
+
+    async fn list_branches(&self, dataset_uri: &str) -> Result<Vec<String>> {
+        TableStore::list_branches(self, dataset_uri).await
     }
 
     async fn reopen_for_mutation(

@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::SchemaRef;
-use lance::Dataset;
+use crate::storage_layer::{SnapshotHandle, StagedHandle};
 use omnigraph_compiler::catalog::EdgeType;
 
 use crate::db::manifest::{
@@ -325,9 +325,9 @@ impl MutationStaging {
             // Stage produces uncommitted fragments + transaction. No
             // Lance HEAD advance until `commit_all` runs `commit_staged`.
             let staged = match table.mode {
-                PendingMode::Append => db.table_store().stage_append(&ds, combined, &[]).await?,
+                PendingMode::Append => db.storage().stage_append(&ds, combined, &[]).await?,
                 PendingMode::Merge => {
-                    db.table_store()
+                    db.storage()
                         .stage_merge_insert(
                             ds.clone(),
                             combined,
@@ -389,15 +389,17 @@ pub(crate) struct StagedMutation {
 }
 
 /// Per-table state captured during `stage_all` and consumed by
-/// `commit_all`. Holds the opened `Dataset` so `commit_staged` doesn't
-/// re-open, and the `StagedWrite` whose `transaction` `commit_staged`
-/// will execute.
+/// `commit_all`. Holds the opened snapshot (so `commit_staged` doesn't
+/// re-open) plus the staged Lance transaction that `commit_staged`
+/// will execute. Both held as opaque `TableStorage` handles per MR-793
+/// §III.9 — the inner `lance::Dataset` / `StagedWrite` are not visible
+/// to engine code outside the storage layer.
 struct StagedTableEntry {
     table_key: String,
     path: StagedTablePath,
     expected_version: u64,
-    dataset: lance::Dataset,
-    staged_write: crate::table_store::StagedWrite,
+    dataset: SnapshotHandle,
+    staged_write: StagedHandle,
 }
 
 impl StagedMutation {
@@ -648,11 +650,11 @@ impl StagedMutation {
             } = entry;
 
             let new_ds = db
-                .table_store()
-                .commit_staged(Arc::new(dataset), staged_write.transaction)
+                .storage()
+                .commit_staged(dataset, staged_write)
                 .await?;
             let state = db
-                .table_store()
+                .storage()
                 .table_state(&path.full_path, &new_ds)
                 .await?;
             updates.push(SubTableUpdate {
@@ -803,7 +805,7 @@ fn dedupe_merge_batches_by_id(
 ///   `LoadMode::Merge` double-counts.
 pub(crate) async fn count_src_per_edge(
     db: &crate::db::Omnigraph,
-    committed_ds: &Dataset,
+    committed_ds: &SnapshotHandle,
     table_key: &str,
     staging: &MutationStaging,
     dedupe_key_column: Option<&str>,
@@ -841,7 +843,7 @@ pub(crate) async fn count_src_per_edge(
         _ => vec!["src"],
     };
     let committed = db
-        .table_store()
+        .storage()
         .scan(committed_ds, Some(&projection), None, None)
         .await?;
     for batch in &committed {

@@ -418,7 +418,7 @@ async fn load_jsonl_reader<R: BufRead>(
             let (ds, full_path, table_branch) = db
                 .open_for_mutation_on_branch(branch, &table_key, load_op_kind)
                 .await?;
-            let expected_version = ds.version().version;
+            let expected_version = ds.version();
             staging.ensure_path(
                 &table_key,
                 full_path,
@@ -528,7 +528,7 @@ async fn load_jsonl_reader<R: BufRead>(
             let (ds, full_path, table_branch) = db
                 .open_for_mutation_on_branch(branch, &table_key, load_op_kind)
                 .await?;
-            let expected_version = ds.version().version;
+            let expected_version = ds.version();
             staging.ensure_path(
                 &table_key,
                 full_path,
@@ -1205,28 +1205,45 @@ async fn write_batch_to_dataset(
         LoadMode::Merge => crate::db::MutationOpKind::Merge,
         LoadMode::Overwrite => crate::db::MutationOpKind::SchemaRewrite,
     };
-    let (mut ds, full_path, table_branch) = db
+    let (ds, full_path, table_branch) = db
         .open_for_mutation_on_branch(branch, table_key, op_kind)
         .await?;
-    let table_store = db.table_store();
 
     match mode {
         LoadMode::Overwrite => {
-            let state = table_store
-                .overwrite_batch(&full_path, &mut ds, batch)
+            // Inline-commit residual: the Overwrite path here is the
+            // legacy concurrent fast-path used by Phase 2 of the loader
+            // (Append/Merge route through MutationStaging instead).
+            // `overwrite_batch` advances Lance HEAD as a side effect;
+            // there is no public two-phase overwrite that fits this
+            // shape until Lance issues #6658/#6666 close.
+            let (_new_ds, state) = db
+                .storage()
+                .overwrite_batch(&full_path, ds, batch)
                 .await?;
             Ok((state, table_branch))
         }
         LoadMode::Append => {
-            let state = table_store.append_batch(&full_path, &mut ds, batch).await?;
+            // Same residual class as Overwrite above. The staged-write
+            // path is the `use_staging` branch in `load_with_actor`;
+            // this concurrent path is the per-table fast-path retained
+            // for parallelism. MR-793 Phase 9 will demote
+            // `append_batch` to `pub(crate)` once this last consumer
+            // moves to the staged primitive.
+            let (_new_ds, state) = db
+                .storage()
+                .append_batch(&full_path, ds, batch)
+                .await?;
             Ok((state, table_branch))
         }
         LoadMode::Merge => {
-            let state = table_store
-                .merge_insert_batch(
+            // Same residual class as the other two arms.
+            let state = db
+                .storage()
+                .merge_insert_batches(
                     &full_path,
                     ds,
-                    batch,
+                    vec![batch],
                     vec!["id".to_string()],
                     lance::dataset::WhenMatched::UpdateAll,
                     lance::dataset::WhenNotMatched::InsertAll,
@@ -1596,7 +1613,7 @@ pub(crate) async fn validate_edge_cardinality(
 
     // Scan src column, count per source
     let batches = db
-        .table_store()
+        .storage()
         .scan(&ds, Some(&["src"]), None, None)
         .await?;
 
@@ -1725,7 +1742,7 @@ async fn collect_node_ids_with_pending(
         .await?;
 
     let batches = db
-        .table_store()
+        .storage()
         .scan(&ds, Some(&["id"]), None, None)
         .await?;
 
@@ -1794,7 +1811,7 @@ async fn collect_node_ids(
         .await?;
 
     let batches = db
-        .table_store()
+        .storage()
         .scan(&ds, Some(&["id"]), None, None)
         .await?;
 

@@ -50,10 +50,10 @@ pub(super) async fn failpoint_publish_table_head_without_index_rebuild_for_test(
         .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
     let full_path = format!("{}/{}", db.root_uri, entry.table_path);
     let ds = db
-        .table_store
+        .storage()
         .open_dataset_head_for_write(table_key, &full_path, table_branch)
         .await?;
-    let state = db.table_store.table_state(&full_path, &ds).await?;
+    let state = db.storage().table_state(&full_path, &ds).await?;
     let update = crate::db::SubTableUpdate {
         table_key: table_key.to_string(),
         table_version: state.version,
@@ -209,18 +209,18 @@ pub(super) async fn ensure_indices_for_branch(db: &Omnigraph, branch: Option<&st
                 }
             },
             None => (
-                db.table_store
+                db.storage()
                     .open_dataset_head_for_write(&table_key, &full_path, None)
                     .await?,
                 None,
             ),
         };
-        let row_count = db.table_store.count_rows(&ds, None).await.unwrap_or(0);
+        let row_count = db.storage().count_rows(&ds, None).await.unwrap_or(0);
         if row_count > 0 {
             build_indices_on_dataset(db, &table_key, &mut ds).await?;
         }
 
-        let state = db.table_store.table_state(&full_path, &ds).await?;
+        let state = db.storage().table_state(&full_path, &ds).await?;
         if state.version != entry.table_version
             || resolved_branch.as_deref() != entry.table_branch.as_deref()
         {
@@ -257,18 +257,18 @@ pub(super) async fn ensure_indices_for_branch(db: &Omnigraph, branch: Option<&st
                 }
             },
             None => (
-                db.table_store
+                db.storage()
                     .open_dataset_head_for_write(&table_key, &full_path, None)
                     .await?,
                 None,
             ),
         };
-        let row_count = db.table_store.count_rows(&ds, None).await.unwrap_or(0);
+        let row_count = db.storage().count_rows(&ds, None).await.unwrap_or(0);
         if row_count > 0 {
             build_indices_on_dataset(db, &table_key, &mut ds).await?;
         }
 
-        let state = db.table_store.table_state(&full_path, &ds).await?;
+        let state = db.storage().table_state(&full_path, &ds).await?;
         if state.version != entry.table_version
             || resolved_branch.as_deref() != entry.table_branch.as_deref()
         {
@@ -331,7 +331,7 @@ async fn needs_index_work_node(
     table_branch: Option<&str>,
 ) -> Result<bool> {
     let ds = db
-        .table_store
+        .storage()
         .open_dataset_head_for_write(table_key, full_path, table_branch)
         .await?;
     // Empty tables are skipped by the ensure_indices loop, so they must
@@ -341,10 +341,10 @@ async fn needs_index_work_node(
     // Errors from count_rows are propagated: silently treating them as
     // "0 rows" risks skipping a table that is actually about to be
     // modified.
-    if db.table_store.count_rows(&ds, None).await? == 0 {
+    if db.storage().count_rows(&ds, None).await? == 0 {
         return Ok(false);
     }
-    if !db.table_store.has_btree_index(&ds, "id").await? {
+    if !db.storage().has_btree_index(&ds, "id").await? {
         return Ok(true);
     }
     let catalog = db.catalog();
@@ -360,11 +360,11 @@ async fn needs_index_work_node(
             continue;
         };
         if matches!(prop_type.scalar, ScalarType::String) && !prop_type.list {
-            if !db.table_store.has_fts_index(&ds, prop_name).await? {
+            if !db.storage().has_fts_index(&ds, prop_name).await? {
                 return Ok(true);
             }
         } else if matches!(prop_type.scalar, ScalarType::Vector(_)) && !prop_type.list {
-            if !db.table_store.has_vector_index(&ds, prop_name).await? {
+            if !db.storage().has_vector_index(&ds, prop_name).await? {
                 return Ok(true);
             }
         }
@@ -389,22 +389,22 @@ async fn needs_index_work_edge(
     table_branch: Option<&str>,
 ) -> Result<bool> {
     let ds = db
-        .table_store
+        .storage()
         .open_dataset_head_for_write(table_key, full_path, table_branch)
         .await?;
-    if db.table_store.count_rows(&ds, None).await? == 0 {
+    if db.storage().count_rows(&ds, None).await? == 0 {
         return Ok(false);
     }
-    Ok(!db.table_store.has_btree_index(&ds, "id").await?
-        || !db.table_store.has_btree_index(&ds, "src").await?
-        || !db.table_store.has_btree_index(&ds, "dst").await?)
+    Ok(!db.storage().has_btree_index(&ds, "id").await?
+        || !db.storage().has_btree_index(&ds, "src").await?
+        || !db.storage().has_btree_index(&ds, "dst").await?)
 }
 
 pub(super) async fn open_for_mutation(
     db: &Omnigraph,
     table_key: &str,
     op_kind: crate::db::MutationOpKind,
-) -> Result<(Dataset, String, Option<String>)> {
+) -> Result<(SnapshotHandle, String, Option<String>)> {
     let current_branch = db
         .coordinator
         .read()
@@ -425,7 +425,7 @@ pub(super) async fn open_for_mutation_on_branch(
     branch: Option<&str>,
     table_key: &str,
     op_kind: crate::db::MutationOpKind,
-) -> Result<(Dataset, String, Option<String>)> {
+) -> Result<(SnapshotHandle, String, Option<String>)> {
     db.ensure_schema_apply_not_locked("write").await?;
     let resolved = db.resolved_branch_target(branch).await?;
     let entry = resolved
@@ -436,11 +436,11 @@ pub(super) async fn open_for_mutation_on_branch(
     match resolved.branch.as_deref() {
         None => {
             let ds = db
-                .table_store
+                .storage()
                 .open_dataset_head_for_write(table_key, &full_path, None)
                 .await?;
             if op_kind.strict_pre_stage_version_check() {
-                db.table_store
+                db.storage()
                     .ensure_expected_version(&ds, table_key, entry.table_version)?;
             }
             Ok((ds, full_path, None))
@@ -469,15 +469,15 @@ pub(super) async fn open_owned_dataset_for_branch_write(
     entry_version: u64,
     active_branch: &str,
     op_kind: crate::db::MutationOpKind,
-) -> Result<(Dataset, Option<String>)> {
+) -> Result<(SnapshotHandle, Option<String>)> {
     match entry_branch {
         Some(branch) if branch == active_branch => {
             let ds = db
-                .table_store
+                .storage()
                 .open_dataset_head_for_write(table_key, full_path, Some(active_branch))
                 .await?;
             if op_kind.strict_pre_stage_version_check() {
-                db.table_store
+                db.storage()
                     .ensure_expected_version(&ds, table_key, entry_version)?;
             }
             Ok((ds, Some(active_branch.to_string())))
@@ -509,11 +509,11 @@ pub(super) async fn open_owned_dataset_for_branch_write(
             )
             .await?;
             let ds = db
-                .table_store
+                .storage()
                 .open_dataset_head_for_write(table_key, full_path, Some(active_branch))
                 .await?;
             if op_kind.strict_pre_stage_version_check() {
-                db.table_store
+                db.storage()
                     .ensure_expected_version(&ds, table_key, entry_version)?;
             }
             Ok((ds, Some(active_branch.to_string())))
@@ -528,8 +528,8 @@ pub(super) async fn fork_dataset_from_entry_state(
     source_branch: Option<&str>,
     source_version: u64,
     active_branch: &str,
-) -> Result<Dataset> {
-    db.table_store
+) -> Result<SnapshotHandle> {
+    db.storage()
         .fork_branch_from_state(
             full_path,
             source_branch,
@@ -547,10 +547,10 @@ pub(super) async fn reopen_for_mutation(
     table_branch: Option<&str>,
     expected_version: u64,
     op_kind: crate::db::MutationOpKind,
-) -> Result<Dataset> {
+) -> Result<SnapshotHandle> {
     db.ensure_schema_apply_not_locked("write").await?;
     if op_kind.strict_pre_stage_version_check() {
-        db.table_store
+        db.storage()
             .reopen_for_mutation(full_path, table_branch, table_key, expected_version)
             .await
     } else {
@@ -563,7 +563,7 @@ pub(super) async fn reopen_for_mutation(
         // genuine cross-process drift as 409. See
         // [`crate::db::MutationOpKind`] for the policy rationale.
         let _ = expected_version;
-        db.table_store
+        db.storage()
             .open_dataset_head_for_write(table_key, full_path, table_branch)
             .await
     }
@@ -574,8 +574,8 @@ pub(super) async fn open_dataset_at_state(
     table_path: &str,
     table_branch: Option<&str>,
     table_version: u64,
-) -> Result<Dataset> {
-    db.table_store
+) -> Result<SnapshotHandle> {
+    db.storage()
         .open_dataset_at_state(table_path, table_branch, table_version)
         .await
 }
@@ -583,7 +583,7 @@ pub(super) async fn open_dataset_at_state(
 pub(super) async fn build_indices_on_dataset(
     db: &Omnigraph,
     table_key: &str,
-    ds: &mut Dataset,
+    ds: &mut SnapshotHandle,
 ) -> Result<()> {
     let catalog = db.catalog();
     build_indices_on_dataset_for_catalog(db, &catalog, table_key, ds).await
@@ -593,10 +593,10 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
     db: &Omnigraph,
     catalog: &Catalog,
     table_key: &str,
-    ds: &mut Dataset,
+    ds: &mut SnapshotHandle,
 ) -> Result<()> {
     if let Some(type_name) = table_key.strip_prefix("node:") {
-        if !db.table_store.has_btree_index(ds, "id").await? {
+        if !db.storage().has_btree_index(ds, "id").await? {
             stage_and_commit_btree(db, table_key, ds, &["id"]).await?;
         }
 
@@ -616,19 +616,20 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
                 let prop_name = &index_cols[0];
                 if let Some(prop_type) = node_type.properties.get(prop_name) {
                     if matches!(prop_type.scalar, ScalarType::String) && !prop_type.list {
-                        if !db.table_store.has_fts_index(ds, prop_name).await? {
+                        if !db.storage().has_fts_index(ds, prop_name).await? {
                             stage_and_commit_inverted(db, table_key, ds, prop_name.as_str())
                                 .await?;
                         }
                     } else if matches!(prop_type.scalar, ScalarType::Vector(_)) && !prop_type.list {
-                        if !db.table_store.has_vector_index(ds, prop_name).await? {
+                        if !db.storage().has_vector_index(ds, prop_name).await? {
                             // Inline-commit residual: lance-4.0.0 does not
                             // expose `build_index_metadata_from_segments` as
                             // `pub`, so vector indices cannot be staged from
                             // outside the lance crate. Document at the call
                             // site; companion ticket to lance-format/lance#6658.
-                            db.table_store
-                                .create_vector_index(ds, prop_name.as_str())
+                            let new_snap = db
+                                .storage()
+                                .create_vector_index(ds.clone(), prop_name.as_str())
                                 .await
                                 .map_err(|e| {
                                     OmniError::Lance(format!(
@@ -636,6 +637,7 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
                                         table_key, prop_name, e
                                     ))
                                 })?;
+                            *ds = new_snap;
                         }
                     }
                 }
@@ -645,13 +647,13 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
     }
 
     if table_key.starts_with("edge:") {
-        if !db.table_store.has_btree_index(ds, "id").await? {
+        if !db.storage().has_btree_index(ds, "id").await? {
             stage_and_commit_btree(db, table_key, ds, &["id"]).await?;
         }
-        if !db.table_store.has_btree_index(ds, "src").await? {
+        if !db.storage().has_btree_index(ds, "src").await? {
             stage_and_commit_btree(db, table_key, ds, &["src"]).await?;
         }
-        if !db.table_store.has_btree_index(ds, "dst").await? {
+        if !db.storage().has_btree_index(ds, "dst").await? {
             stage_and_commit_btree(db, table_key, ds, &["dst"]).await?;
         }
         return Ok(());
@@ -674,11 +676,11 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
 async fn stage_and_commit_btree(
     db: &Omnigraph,
     table_key: &str,
-    ds: &mut Dataset,
+    ds: &mut SnapshotHandle,
     columns: &[&str],
 ) -> Result<()> {
     let staged = db
-        .table_store
+        .storage()
         .stage_create_btree_index(ds, columns)
         .await
         .map_err(|e| {
@@ -693,8 +695,8 @@ async fn stage_and_commit_btree(
     // yet called) leaves no Lance-HEAD drift on the touched table.
     crate::failpoints::maybe_fail("ensure_indices.post_stage_pre_commit_btree")?;
     let new_ds = db
-        .table_store
-        .commit_staged(Arc::new(ds.clone()), staged.transaction)
+        .storage()
+        .commit_staged(ds.clone(), staged)
         .await
         .map_err(|e| {
             OmniError::Lance(format!(
@@ -711,11 +713,11 @@ async fn stage_and_commit_btree(
 async fn stage_and_commit_inverted(
     db: &Omnigraph,
     table_key: &str,
-    ds: &mut Dataset,
+    ds: &mut SnapshotHandle,
     column: &str,
 ) -> Result<()> {
     let staged = db
-        .table_store
+        .storage()
         .stage_create_inverted_index(ds, column)
         .await
         .map_err(|e| {
@@ -725,8 +727,8 @@ async fn stage_and_commit_inverted(
             ))
         })?;
     let new_ds = db
-        .table_store
-        .commit_staged(Arc::new(ds.clone()), staged.transaction)
+        .storage()
+        .commit_staged(ds.clone(), staged)
         .await
         .map_err(|e| {
             OmniError::Lance(format!(
@@ -777,7 +779,7 @@ async fn prepare_updates_for_commit(
             )
             .await?;
             build_indices_on_dataset(db, &prepared_update.table_key, &mut ds).await?;
-            let state = db.table_store.table_state(&full_path, &ds).await?;
+            let state = db.storage().table_state(&full_path, &ds).await?;
             prepared_update.table_version = state.version;
             prepared_update.row_count = state.row_count;
             prepared_update.version_metadata = state.version_metadata;

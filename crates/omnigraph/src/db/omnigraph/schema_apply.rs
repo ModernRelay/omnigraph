@@ -355,7 +355,7 @@ where
             let entry = snapshot.entry(table_key)?;
             Some(crate::db::manifest::SidecarTablePin {
                 table_key: table_key.clone(),
-                table_path: db.table_store.dataset_uri(&entry.table_path),
+                table_path: db.storage().dataset_uri(&entry.table_path),
                 expected_version: entry.table_version,
                 post_commit_pin: entry.table_version + 1,
                 table_branch: entry.table_branch.clone(),
@@ -469,12 +469,14 @@ where
 
     for table_key in &added_tables {
         let table_path = table_path_for_table_key(table_key)?;
-        let dataset_uri = db.table_store.dataset_uri(&table_path);
+        let dataset_uri = db.storage().dataset_uri(&table_path);
         let schema = schema_for_table_key(&desired_catalog, table_key)?;
-        let mut ds = TableStore::create_empty_dataset(&dataset_uri, &schema).await?;
+        let mut ds = SnapshotHandle::new(
+            TableStore::create_empty_dataset(&dataset_uri, &schema).await?,
+        );
         db.build_indices_on_dataset_for_catalog(&desired_catalog, table_key, &mut ds)
             .await?;
-        let state = db.table_store.table_state(&dataset_uri, &ds).await?;
+        let state = db.storage().table_state(&dataset_uri, &ds).await?;
         table_registrations.insert(table_key.clone(), table_path);
         table_updates.insert(
             table_key.clone(),
@@ -496,7 +498,10 @@ where
             ))
         })?;
         ensure_snapshot_entry_head_matches(db, source_entry).await?;
-        let source_ds = snapshot.open(source_table_key).await?;
+        let source_ds = db
+            .storage()
+            .open_snapshot_at_table(&snapshot, source_table_key)
+            .await?;
         let current_catalog = db.catalog();
         let batch = batch_for_schema_apply_rewrite(
             db,
@@ -509,11 +514,13 @@ where
         )
         .await?;
         let table_path = table_path_for_table_key(target_table_key)?;
-        let dataset_uri = db.table_store.dataset_uri(&table_path);
-        let mut target_ds = TableStore::write_dataset(&dataset_uri, batch).await?;
+        let dataset_uri = db.storage().dataset_uri(&table_path);
+        let mut target_ds = SnapshotHandle::new(
+            TableStore::write_dataset(&dataset_uri, batch).await?,
+        );
         db.build_indices_on_dataset_for_catalog(&desired_catalog, target_table_key, &mut target_ds)
             .await?;
-        let state = db.table_store.table_state(&dataset_uri, &target_ds).await?;
+        let state = db.storage().table_state(&dataset_uri, &target_ds).await?;
         table_registrations.insert(target_table_key.clone(), table_path);
         table_updates.insert(
             target_table_key.clone(),
@@ -542,7 +549,10 @@ where
             ))
         })?;
         ensure_snapshot_entry_head_matches(db, entry).await?;
-        let source_ds = snapshot.open(table_key).await?;
+        let source_ds = db
+            .storage()
+            .open_snapshot_at_table(&snapshot, table_key)
+            .await?;
         let current_catalog = db.catalog();
         let batch = batch_for_schema_apply_rewrite(
             db,
@@ -554,7 +564,7 @@ where
             property_renames.get(table_key),
         )
         .await?;
-        let dataset_uri = db.table_store.dataset_uri(&entry.table_path);
+        let dataset_uri = db.storage().dataset_uri(&entry.table_path);
         // Route through stage_overwrite + commit_staged for non-empty
         // batches. Lance's `InsertBuilder::execute_uncommitted`
         // errors on empty data (lance-4.0.0 `src/dataset/write/insert.rs:144`),
@@ -564,7 +574,7 @@ where
         // — and schema_apply runs under `__schema_apply_lock__` so the
         // narrow inline-commit residual is bounded.
         let mut target_ds = if batch.num_rows() == 0 {
-            TableStore::overwrite_dataset(&dataset_uri, batch).await?
+            SnapshotHandle::new(TableStore::overwrite_dataset(&dataset_uri, batch).await?)
         } else {
             // Pass `entry.table_branch.as_deref()` (not `None`) for
             // consistency with the indexed_tables block below. Schema
@@ -574,17 +584,15 @@ where
             // means a future relaxation of the lock-check can't quietly
             // open the wrong HEAD here.
             let existing = db
-                .table_store
+                .storage()
                 .open_dataset_head_for_write(table_key, &dataset_uri, entry.table_branch.as_deref())
                 .await?;
-            let staged = db.table_store.stage_overwrite(&existing, batch).await?;
-            db.table_store
-                .commit_staged(Arc::new(existing), staged.transaction)
-                .await?
+            let staged = db.storage().stage_overwrite(&existing, batch).await?;
+            db.storage().commit_staged(existing, staged).await?
         };
         db.build_indices_on_dataset_for_catalog(&desired_catalog, table_key, &mut target_ds)
             .await?;
-        let state = db.table_store.table_state(&dataset_uri, &target_ds).await?;
+        let state = db.storage().table_state(&dataset_uri, &target_ds).await?;
         table_updates.insert(
             table_key.clone(),
             crate::db::SubTableUpdate {
@@ -611,16 +619,16 @@ where
             ))
         })?;
         ensure_snapshot_entry_head_matches(db, entry).await?;
-        let dataset_uri = db.table_store.dataset_uri(&entry.table_path);
+        let dataset_uri = db.storage().dataset_uri(&entry.table_path);
         let mut ds = db
-            .table_store
+            .storage()
             .open_dataset_head_for_write(table_key, &dataset_uri, entry.table_branch.as_deref())
             .await?;
-        db.table_store
+        db.storage()
             .ensure_expected_version(&ds, table_key, entry.table_version)?;
         db.build_indices_on_dataset_for_catalog(&desired_catalog, table_key, &mut ds)
             .await?;
-        let state = db.table_store.table_state(&dataset_uri, &ds).await?;
+        let state = db.storage().table_state(&dataset_uri, &ds).await?;
         table_updates.insert(
             table_key.clone(),
             crate::db::SubTableUpdate {
@@ -869,22 +877,22 @@ pub(super) async fn ensure_snapshot_entry_head_matches(
     db: &Omnigraph,
     entry: &SubTableEntry,
 ) -> Result<()> {
-    let dataset_uri = db.table_store.dataset_uri(&entry.table_path);
+    let dataset_uri = db.storage().dataset_uri(&entry.table_path);
     let ds = db
-        .table_store
+        .storage()
         .open_dataset_head_for_write(
             &entry.table_key,
             &dataset_uri,
             entry.table_branch.as_deref(),
         )
         .await?;
-    db.table_store
+    db.storage()
         .ensure_expected_version(&ds, &entry.table_key, entry.table_version)
 }
 
 pub(super) async fn batch_for_schema_apply_rewrite(
     db: &Omnigraph,
-    source_ds: &Dataset,
+    source_ds: &SnapshotHandle,
     source_table_key: &str,
     source_catalog: &Catalog,
     target_table_key: &str,
@@ -896,11 +904,11 @@ pub(super) async fn batch_for_schema_apply_rewrite(
     let target_blob_properties = blob_properties_for_table_key(target_catalog, target_table_key)?;
     let needs_row_ids = !source_blob_properties.is_empty() || !target_blob_properties.is_empty();
     let batches = if needs_row_ids {
-        db.table_store()
-            .scan_with(source_ds, None, None, None, true, |_| Ok(()))
+        db.storage()
+            .scan_with_row_id(source_ds, None, None, None, true)
             .await?
     } else {
-        db.table_store().scan_batches(source_ds).await?
+        db.storage().scan_batches(source_ds).await?
     };
     if batches.is_empty() {
         return Ok(RecordBatch::new_empty(target_schema));
@@ -970,7 +978,7 @@ pub(super) async fn batch_for_schema_apply_rewrite(
 
 async fn rebuild_blob_column(
     _db: &Omnigraph,
-    source_ds: &Dataset,
+    source_ds: &SnapshotHandle,
     column_name: &str,
     descriptions: &StructArray,
     row_ids: &[u64],
@@ -990,7 +998,7 @@ async fn rebuild_blob_column(
     let blob_files = if non_null_row_ids.is_empty() {
         Vec::new()
     } else {
-        Arc::new(source_ds.clone())
+        Arc::new(source_ds.dataset().clone())
             .take_blobs(&non_null_row_ids, column_name)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?

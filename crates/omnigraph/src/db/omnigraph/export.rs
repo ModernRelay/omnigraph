@@ -143,23 +143,23 @@ async fn export_table_to_writer<W: Write>(
     writer: &mut W,
 ) -> Result<()> {
     let ds = db
-        .table_store
-        .open_snapshot_table(snapshot, table_key)
+        .storage()
+        .open_snapshot_at_table(snapshot, table_key)
         .await?;
     let ordering = Some(vec![ColumnOrdering::asc_nulls_last("id".to_string())]);
     let catalog = db.catalog();
     let blob_properties = blob_properties_for_table_key(&catalog, table_key)?;
 
     if blob_properties.is_empty() {
-        for batch in db.table_store.scan(&ds, None, None, ordering).await? {
+        for batch in db.storage().scan(&ds, None, None, ordering).await? {
             write_export_rows_from_batch(db, table_key, &batch, None, writer)?;
         }
         return Ok(());
     }
 
     let batches = db
-        .table_store
-        .scan_with(&ds, None, None, ordering, true, |_| Ok(()))
+        .storage()
+        .scan_with_row_id(&ds, None, None, ordering, true)
         .await?;
     for batch in batches {
         let row_ids = batch
@@ -175,7 +175,13 @@ async fn export_table_to_writer<W: Write>(
             .iter()
             .copied()
             .collect::<Vec<_>>();
-        let blob_values = export_blob_values(&ds, &batch, &row_ids, blob_properties).await?;
+        // Blob materialization reaches through to the inner Lance
+        // `Dataset` because `take_blobs` is a Lance-only API not lifted
+        // onto the `TableStorage` trait surface (the trait covers
+        // staged-write and snapshot-scan primitives; blob descriptor
+        // materialization sits outside that surface).
+        let blob_values =
+            export_blob_values(ds.dataset(), &batch, &row_ids, blob_properties).await?;
         write_export_rows_from_batch(db, table_key, &batch, Some(&blob_values), writer)?;
     }
     Ok(())

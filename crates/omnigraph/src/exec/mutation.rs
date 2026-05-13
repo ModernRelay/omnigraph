@@ -428,12 +428,11 @@ async fn ensure_node_id_exists(
 
     let filter = format!("id = '{}'", id.replace('\'', "''"));
     let snapshot = db.snapshot_for_branch(branch).await?;
-    let ds = snapshot.open(&table_key).await?;
-    let exists = ds
-        .count_rows(Some(filter))
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?
-        > 0;
+    let ds = db
+        .storage()
+        .open_snapshot_at_table(&snapshot, &table_key)
+        .await?;
+    let exists = db.storage().count_rows(&ds, Some(filter)).await? > 0;
 
     if exists {
         Ok(())
@@ -601,7 +600,7 @@ async fn open_table_for_mutation(
     branch: Option<&str>,
     table_key: &str,
     op_kind: crate::db::MutationOpKind,
-) -> Result<(Dataset, String, Option<String>)> {
+) -> Result<(SnapshotHandle, String, Option<String>)> {
     if let Some(prior) = staging.inline_committed.get(table_key) {
         let path = staging.paths.get(table_key).ok_or_else(|| {
             OmniError::manifest_internal(format!(
@@ -623,7 +622,7 @@ async fn open_table_for_mutation(
     let (ds, full_path, table_branch) = db
         .open_for_mutation_on_branch(branch, table_key, op_kind)
         .await?;
-    let expected_version = ds.version().version;
+    let expected_version = ds.version();
     staging.ensure_path(
         table_key,
         full_path.clone(),
@@ -1055,7 +1054,7 @@ impl Omnigraph {
         // and a chained `update where <pred>` can match a row whose
         // pending value no longer satisfies <pred>.
         let batches = self
-            .table_store()
+            .storage()
             .scan_with_pending(
                 &ds,
                 pending_batches,
@@ -1153,13 +1152,13 @@ impl Omnigraph {
             crate::db::MutationOpKind::Delete,
         )
         .await?;
-        let initial_version = ds.version().version;
+        let initial_version = ds.version();
 
         // Scan matching IDs for cascade. Per D₂ this never overlaps with
         // staged inserts (mixed insert/delete in one query is rejected at
         // parse time), so we scan committed only.
         let batches = self
-            .table_store()
+            .storage()
             .scan(&ds, Some(&["id"]), Some(&pred_sql), None)
             .await?;
 
@@ -1191,7 +1190,7 @@ impl Omnigraph {
         // deletes from coexisting in one query, so this advance of Lance
         // HEAD is the only HEAD movement during the query and the
         // publisher's CAS captures it intact.
-        let mut ds = self
+        let ds = self
             .reopen_for_mutation(
                 &table_key,
                 &full_path,
@@ -1201,9 +1200,9 @@ impl Omnigraph {
             )
             .await?;
         crate::failpoints::maybe_fail("mutation.delete_node_pre_primary_delete")?;
-        let delete_state = self
-            .table_store()
-            .delete_where(&full_path, &mut ds, &pred_sql)
+        let (_new_ds, delete_state) = self
+            .storage()
+            .delete_where(&full_path, ds, &pred_sql)
             .await?;
 
         staging.record_inline(crate::db::SubTableUpdate {
@@ -1242,7 +1241,7 @@ impl Omnigraph {
 
             let edge_table_key = format!("edge:{}", edge_name);
             let cascade_filter = cascade_filters.join(" OR ");
-            let (mut edge_ds, edge_full_path, edge_table_branch) = open_table_for_mutation(
+            let (edge_ds, edge_full_path, edge_table_branch) = open_table_for_mutation(
                 self,
                 staging,
                 branch,
@@ -1251,9 +1250,9 @@ impl Omnigraph {
             )
             .await?;
 
-            let edge_delete = self
-                .table_store()
-                .delete_where(&edge_full_path, &mut edge_ds, &cascade_filter)
+            let (_new_edge_ds, edge_delete) = self
+                .storage()
+                .delete_where(&edge_full_path, edge_ds, &cascade_filter)
                 .await?;
 
             affected_edges += edge_delete.deleted_rows;
@@ -1290,7 +1289,7 @@ impl Omnigraph {
         let pred_sql = predicate_to_sql(predicate, params, true)?;
 
         let table_key = format!("edge:{}", type_name);
-        let (mut ds, full_path, table_branch) = open_table_for_mutation(
+        let (ds, full_path, table_branch) = open_table_for_mutation(
             self,
             staging,
             branch,
@@ -1299,9 +1298,9 @@ impl Omnigraph {
         )
         .await?;
 
-        let delete_state = self
-            .table_store()
-            .delete_where(&full_path, &mut ds, &pred_sql)
+        let (_new_ds, delete_state) = self
+            .storage()
+            .delete_where(&full_path, ds, &pred_sql)
             .await?;
         let affected = delete_state.deleted_rows;
 
@@ -1355,7 +1354,7 @@ fn concat_match_batches_to_schema(
 /// dedup needed (`dedupe_key_column = None`).
 async fn validate_edge_cardinality_with_pending(
     db: &Omnigraph,
-    committed_ds: &Dataset,
+    committed_ds: &SnapshotHandle,
     staging: &MutationStaging,
     table_key: &str,
     edge_type: &omnigraph_compiler::catalog::EdgeType,

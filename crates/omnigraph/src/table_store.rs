@@ -601,7 +601,16 @@ impl TableStore {
         })
     }
 
-    pub async fn append_batch(
+    /// Legacy inline-commit append: writes fragments AND commits in one
+    /// call, advancing Lance HEAD as a side effect. Demoted to
+    /// `pub(crate)` by MR-793 Phase 9 — the staged primitive
+    /// `stage_append` + `commit_staged` is the public engine surface;
+    /// this one survives only as a residual called by
+    /// `loader::write_batch_to_dataset` (LoadMode::Append concurrent
+    /// fast-path) and the deprecated `merge_insert_batch` chain. Do not
+    /// add new call sites — they re-introduce the multi-phase commit
+    /// drift the trait surface was designed to eliminate.
+    pub(crate) async fn append_batch(
         &self,
         dataset_uri: &str,
         ds: &mut Dataset,
@@ -656,7 +665,14 @@ impl TableStore {
         }
     }
 
-    pub async fn overwrite_batch(
+    /// Legacy inline-commit overwrite: truncates then
+    /// `append_batch`-commits, advancing Lance HEAD as a side effect.
+    /// Demoted to `pub(crate)` by MR-793 Phase 9 — the staged primitive
+    /// `stage_overwrite` + `commit_staged` is the public engine surface;
+    /// this one survives only as the LoadMode::Overwrite concurrent
+    /// fast-path inside `loader::write_batch_to_dataset`. Do not add new
+    /// call sites.
+    pub(crate) async fn overwrite_batch(
         &self,
         dataset_uri: &str,
         ds: &mut Dataset,
@@ -682,7 +698,14 @@ impl TableStore {
             .map_err(|e| OmniError::Lance(e.to_string()))
     }
 
-    pub async fn merge_insert_batch(
+    /// Legacy inline-commit merge-insert (single batch). Demoted to
+    /// `pub(crate)` by MR-793 Phase 9 — the staged primitive
+    /// `stage_merge_insert` + `commit_staged` is the public engine
+    /// surface; this one survives only as the body of
+    /// `merge_insert_batches` (which is itself the loader's
+    /// LoadMode::Merge concurrent fast-path). Do not add new call
+    /// sites.
+    pub(crate) async fn merge_insert_batch(
         &self,
         dataset_uri: &str,
         ds: Dataset,
@@ -759,7 +782,14 @@ impl TableStore {
         self.table_state(dataset_uri, &new_ds).await
     }
 
-    pub async fn merge_insert_batches(
+    /// Legacy inline-commit merge-insert (multiple batches concatenated
+    /// into one merge). Demoted to `pub(crate)` by MR-793 Phase 9 — the
+    /// staged primitive `stage_merge_insert` + `commit_staged` is the
+    /// public engine surface; this one survives only via the
+    /// `TableStorage::merge_insert_batches` trait method, called by
+    /// `loader::write_batch_to_dataset` (LoadMode::Merge concurrent
+    /// fast-path). Do not add new call sites.
+    pub(crate) async fn merge_insert_batches(
         &self,
         dataset_uri: &str,
         ds: Dataset,
@@ -1448,7 +1478,17 @@ impl TableStore {
         }))
     }
 
-    pub async fn create_btree_index(&self, ds: &mut Dataset, columns: &[&str]) -> Result<()> {
+    /// Legacy inline-commit BTREE scalar index build. Demoted to
+    /// `pub(crate)` by MR-793 Phase 9 — the staged primitive
+    /// `stage_create_btree_index` + `commit_staged` is the public engine
+    /// surface; this one survives only as the body of the trait's
+    /// inline-commit method (used by no engine call site today). Do not
+    /// add new call sites.
+    pub(crate) async fn create_btree_index(
+        &self,
+        ds: &mut Dataset,
+        columns: &[&str],
+    ) -> Result<()> {
         let params = ScalarIndexParams::default();
         ds.create_index_builder(columns, IndexType::BTree, &params)
             .replace(true)
@@ -1457,7 +1497,17 @@ impl TableStore {
             .map_err(|e| OmniError::Lance(e.to_string()))
     }
 
-    pub async fn create_inverted_index(&self, ds: &mut Dataset, column: &str) -> Result<()> {
+    /// Legacy inline-commit INVERTED (FTS) scalar index build. Demoted
+    /// to `pub(crate)` by MR-793 Phase 9 — the staged primitive
+    /// `stage_create_inverted_index` + `commit_staged` is the public
+    /// engine surface; this one survives only as the body of the
+    /// trait's inline-commit method (used by no engine call site today).
+    /// Do not add new call sites.
+    pub(crate) async fn create_inverted_index(
+        &self,
+        ds: &mut Dataset,
+        column: &str,
+    ) -> Result<()> {
         let params = InvertedIndexParams::default();
         ds.create_index_builder(&[column], IndexType::Inverted, &params)
             .replace(true)

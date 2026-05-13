@@ -7,6 +7,7 @@ use lance::dataset::scanner::ColumnOrdering;
 use crate::db::SubTableEntry;
 use crate::db::manifest::Snapshot;
 use crate::error::Result;
+use crate::storage_layer::{SnapshotHandle, TableStorage};
 use crate::table_store::TableStore;
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -229,7 +230,8 @@ async fn diff_table_same_lineage(
 ) -> Result<Vec<EntityChange>> {
     let vf = from_entry.table_version;
     let vt = to_entry.table_version;
-    let to_ds = table_store.open_at_entry(to_entry).await?;
+    let storage: &dyn TableStorage = table_store;
+    let to_ds = storage.open_snapshot_at_entry(to_entry).await?;
 
     let cols: Vec<&str> = if is_edge {
         vec!["id", "src", "dst", "_row_last_updated_at_version"]
@@ -257,12 +259,12 @@ async fn diff_table_same_lineage(
             "_row_last_updated_at_version > {} AND _row_last_updated_at_version <= {}",
             vf, vt
         );
-        let changed_rows = scan_with_filter(table_store, &to_ds, &cols, &filter_sql).await?;
+        let changed_rows = scan_with_filter(storage, &to_ds, &cols, &filter_sql).await?;
 
         if !changed_rows.is_empty() {
             // Build the set of IDs that existed at the from version
-            let from_ds = table_store.open_at_entry(from_entry).await?;
-            let from_ids: HashSet<String> = scan_id_set(table_store, &from_ds, &["id"])
+            let from_ds = storage.open_snapshot_at_entry(from_entry).await?;
+            let from_ids: HashSet<String> = scan_id_set(storage, &from_ds, &["id"])
                 .await?
                 .into_iter()
                 .map(|r| r.id)
@@ -282,8 +284,8 @@ async fn diff_table_same_lineage(
 
     // Deletes: ID set-difference
     if wants_deletes {
-        let from_ds = table_store.open_at_entry(from_entry).await?;
-        let deleted = deleted_ids_by_set_diff(table_store, &from_ds, &to_ds, is_edge).await?;
+        let from_ds = storage.open_snapshot_at_entry(from_entry).await?;
+        let deleted = deleted_ids_by_set_diff(storage, &from_ds, &to_ds, is_edge).await?;
         changes.extend(deleted);
     }
 
@@ -300,13 +302,14 @@ async fn diff_table_cross_branch(
     is_edge: bool,
     filter: &ChangeFilter,
 ) -> Result<Vec<EntityChange>> {
-    let from_ds = table_store
-        .open_snapshot_table(from_snap, table_key)
+    let storage: &dyn TableStorage = table_store;
+    let from_ds = storage
+        .open_snapshot_at_table(from_snap, table_key)
         .await?;
-    let to_ds = table_store.open_snapshot_table(to_snap, table_key).await?;
+    let to_ds = storage.open_snapshot_at_table(to_snap, table_key).await?;
 
-    let from_rows = scan_all_rows_ordered(table_store, &from_ds, is_edge).await?;
-    let to_rows = scan_all_rows_ordered(table_store, &to_ds, is_edge).await?;
+    let from_rows = scan_all_rows_ordered(storage, &from_ds, is_edge).await?;
+    let to_rows = scan_all_rows_ordered(storage, &to_ds, is_edge).await?;
 
     let mut changes = Vec::new();
     let mut fi = 0;
@@ -392,8 +395,9 @@ async fn diff_table_added(
     if !filter.wants_op(ChangeOp::Insert) {
         return Ok(Vec::new());
     }
-    let ds = table_store.open_snapshot_table(to_snap, table_key).await?;
-    let rows = scan_all_rows_ordered(table_store, &ds, is_edge).await?;
+    let storage: &dyn TableStorage = table_store;
+    let ds = storage.open_snapshot_at_table(to_snap, table_key).await?;
+    let rows = scan_all_rows_ordered(storage, &ds, is_edge).await?;
     Ok(rows
         .into_iter()
         .map(|r| entity_change_from_row(&r, ChangeOp::Insert, is_edge))
@@ -410,10 +414,11 @@ async fn diff_table_removed(
     if !filter.wants_op(ChangeOp::Delete) {
         return Ok(Vec::new());
     }
-    let ds = table_store
-        .open_snapshot_table(from_snap, table_key)
+    let storage: &dyn TableStorage = table_store;
+    let ds = storage
+        .open_snapshot_at_table(from_snap, table_key)
         .await?;
-    let rows = scan_all_rows_ordered(table_store, &ds, is_edge).await?;
+    let rows = scan_all_rows_ordered(storage, &ds, is_edge).await?;
     Ok(rows
         .into_iter()
         .map(|r| entity_change_from_row(&r, ChangeOp::Delete, is_edge))
@@ -424,12 +429,12 @@ async fn diff_table_removed(
 
 /// Scan with a SQL filter, projecting specific columns.
 async fn scan_with_filter(
-    table_store: &TableStore,
-    ds: &lance::Dataset,
+    storage: &dyn TableStorage,
+    ds: &SnapshotHandle,
     cols: &[&str],
     filter_sql: &str,
 ) -> Result<Vec<ScannedRow>> {
-    let batches = table_store
+    let batches = storage
         .scan(ds, Some(cols), Some(filter_sql), None)
         .await?;
     Ok(extract_rows(&batches))
@@ -437,11 +442,11 @@ async fn scan_with_filter(
 
 /// Scan all rows ordered by id, projecting id (+ src/dst for edges) + all columns for signature.
 async fn scan_all_rows_ordered(
-    table_store: &TableStore,
-    ds: &lance::Dataset,
+    storage: &dyn TableStorage,
+    ds: &SnapshotHandle,
     is_edge: bool,
 ) -> Result<Vec<ScannedRow>> {
-    let batches = table_store
+    let batches = storage
         .scan(
             ds,
             None,
@@ -454,9 +459,9 @@ async fn scan_all_rows_ordered(
 
 /// Compute deleted IDs: scan id at from and to, set-difference.
 async fn deleted_ids_by_set_diff(
-    table_store: &TableStore,
-    from_ds: &lance::Dataset,
-    to_ds: &lance::Dataset,
+    storage: &dyn TableStorage,
+    from_ds: &SnapshotHandle,
+    to_ds: &SnapshotHandle,
     is_edge: bool,
 ) -> Result<Vec<EntityChange>> {
     let cols: Vec<&str> = if is_edge {
@@ -465,8 +470,8 @@ async fn deleted_ids_by_set_diff(
         vec!["id"]
     };
 
-    let from_rows = scan_id_set(table_store, from_ds, &cols).await?;
-    let to_ids: HashSet<String> = scan_id_set(table_store, to_ds, &["id"])
+    let from_rows = scan_id_set(storage, from_ds, &cols).await?;
+    let to_ids: HashSet<String> = scan_id_set(storage, to_ds, &["id"])
         .await?
         .into_iter()
         .map(|r| r.id)
@@ -480,11 +485,11 @@ async fn deleted_ids_by_set_diff(
 }
 
 async fn scan_id_set(
-    table_store: &TableStore,
-    ds: &lance::Dataset,
+    storage: &dyn TableStorage,
+    ds: &SnapshotHandle,
     cols: &[&str],
 ) -> Result<Vec<ScannedRow>> {
-    let batches = table_store.scan(ds, Some(cols), None, None).await?;
+    let batches = storage.scan(ds, Some(cols), None, None).await?;
     Ok(extract_rows(&batches))
 }
 

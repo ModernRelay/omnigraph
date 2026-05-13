@@ -928,7 +928,7 @@ async fn publish_adopted_source_state(
                         target_branch,
                     )
                     .await?;
-                let state = target_db.table_store().table_state(&full_path, &ds).await?;
+                let state = target_db.storage().table_state(&full_path, &ds).await?;
                 Ok(crate::db::SubTableUpdate {
                     table_key: table_key.to_string(),
                     table_version: state.version,
@@ -965,9 +965,13 @@ async fn publish_rewritten_merge_table(
     // commit point, narrowed from the previous "merge_insert + delete +
     // index" multi-step inline-commit chain.
     if let Some(delta) = &staged.delta_staged {
+        // The staged delta dataset is a temp-dir Lance dataset used only
+        // to collect the rewrite batches; wrap it in a `SnapshotHandle`
+        // so we can route through the trait's `scan_batches_for_rewrite`.
+        let delta_snapshot = SnapshotHandle::new(delta.dataset.clone());
         let batches: Vec<RecordBatch> = target_db
-            .table_store()
-            .scan_batches_for_rewrite(&delta.dataset)
+            .storage()
+            .scan_batches_for_rewrite(&delta_snapshot)
             .await?
             .into_iter()
             .filter(|batch| batch.num_rows() > 0)
@@ -982,7 +986,7 @@ async fn publish_rewritten_merge_table(
                     .map_err(|e| OmniError::Lance(e.to_string()))?
             };
             let staged_merge = target_db
-                .table_store()
+                .storage()
                 .stage_merge_insert(
                     current_ds.clone(),
                     combined,
@@ -992,8 +996,8 @@ async fn publish_rewritten_merge_table(
                 )
                 .await?;
             current_ds = target_db
-                .table_store()
-                .commit_staged(Arc::new(current_ds), staged_merge.transaction)
+                .storage()
+                .commit_staged(current_ds, staged_merge)
                 .await?;
         }
     }
@@ -1014,10 +1018,11 @@ async fn publish_rewritten_merge_table(
             .map(|id| format!("'{}'", id.replace('\'', "''")))
             .collect();
         let filter = format!("id IN ({})", escaped.join(", "));
-        target_db
-            .table_store()
-            .delete_where(&full_path, &mut current_ds, &filter)
+        let (new_ds, _) = target_db
+            .storage()
+            .delete_where(&full_path, current_ds, &filter)
             .await?;
+        current_ds = new_ds;
     }
 
     // Phase 3: rebuild indices.
@@ -1028,7 +1033,7 @@ async fn publish_rewritten_merge_table(
     // (`build_index_metadata_from_segments` is `pub(crate)` in lance-
     // 4.0.0 — companion ticket to lance-format/lance#6658).
     let row_count = target_db
-        .table_store()
+        .storage()
         .table_state(&full_path, &current_ds)
         .await?
         .row_count;
@@ -1038,7 +1043,7 @@ async fn publish_rewritten_merge_table(
             .await?;
     }
     let final_state = target_db
-        .table_store()
+        .storage()
         .table_state(&full_path, &current_ds)
         .await?;
 
@@ -1364,7 +1369,7 @@ impl Omnigraph {
                 let entry = target_snapshot.entry(table_key)?;
                 Some(crate::db::manifest::SidecarTablePin {
                     table_key: table_key.clone(),
-                    table_path: self.table_store().dataset_uri(&entry.table_path),
+                    table_path: self.storage().dataset_uri(&entry.table_path),
                     expected_version: entry.table_version,
                     post_commit_pin: entry.table_version + 1,
                     // Use the merge target branch (where commits actually

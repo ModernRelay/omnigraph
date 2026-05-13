@@ -26,6 +26,7 @@ use crate::db::graph_coordinator::{GraphCoordinator, PublishedSnapshot};
 use crate::error::{OmniError, Result};
 use crate::runtime_cache::RuntimeCache;
 use crate::storage::{StorageAdapter, join_uri, normalize_root_uri, storage_for_uri};
+use crate::storage_layer::SnapshotHandle;
 use crate::table_store::TableStore;
 
 mod export;
@@ -569,18 +570,15 @@ impl Omnigraph {
         schema_apply::ensure_schema_apply_not_locked(self, operation).await
     }
 
-    pub(crate) fn table_store(&self) -> &TableStore {
-        &self.table_store
-    }
-
     /// Engine-facing trait surface around `TableStore`.
     ///
-    /// This is the canonical accessor for newly-written engine code. The
-    /// trait's signatures use opaque `SnapshotHandle` / `StagedHandle`
-    /// instead of leaking `lance::Dataset` /
-    /// `lance::dataset::transaction::Transaction`. Existing call sites
-    /// that still use `db.table_store.X(...)` (the inherent struct
-    /// methods) are migrated incrementally.
+    /// This is the **only** accessor for engine code reaching into the
+    /// storage layer. The trait's signatures use opaque `SnapshotHandle`
+    /// / `StagedHandle` instead of leaking `lance::Dataset` /
+    /// `lance::dataset::transaction::Transaction`, so newly-added engine
+    /// call sites cannot drift the staged-write invariant by mistake
+    /// (the trait's `stage_*` + `commit_staged` pair is the only way to
+    /// land a write).
     pub(crate) fn storage(&self) -> &dyn crate::storage_layer::TableStorage {
         &self.table_store
     }
@@ -1110,10 +1108,10 @@ impl Omnigraph {
         cleanup_targets.sort_by(|left, right| left.0.cmp(&right.0));
 
         for (table_key, table_path) in cleanup_targets {
-            let dataset_uri = self.table_store.dataset_uri(&table_path);
+            let dataset_uri = self.storage().dataset_uri(&table_path);
             let outcome = match crate::failpoints::maybe_fail("branch_delete.before_table_cleanup")
             {
-                Ok(()) => self.table_store.force_delete_branch(&dataset_uri, branch).await,
+                Ok(()) => self.storage().force_delete_branch(&dataset_uri, branch).await,
                 Err(injected) => Err(injected),
             };
             if let Err(err) = outcome {
@@ -1339,7 +1337,7 @@ impl Omnigraph {
         &self,
         table_key: &str,
         op_kind: crate::db::MutationOpKind,
-    ) -> Result<(Dataset, String, Option<String>)> {
+    ) -> Result<(SnapshotHandle, String, Option<String>)> {
         table_ops::open_for_mutation(self, table_key, op_kind).await
     }
 
@@ -1348,7 +1346,7 @@ impl Omnigraph {
         branch: Option<&str>,
         table_key: &str,
         op_kind: crate::db::MutationOpKind,
-    ) -> Result<(Dataset, String, Option<String>)> {
+    ) -> Result<(SnapshotHandle, String, Option<String>)> {
         table_ops::open_for_mutation_on_branch(self, branch, table_key, op_kind).await
     }
 
@@ -1359,7 +1357,7 @@ impl Omnigraph {
         source_branch: Option<&str>,
         source_version: u64,
         active_branch: &str,
-    ) -> Result<Dataset> {
+    ) -> Result<SnapshotHandle> {
         table_ops::fork_dataset_from_entry_state(
             self,
             table_key,
@@ -1378,7 +1376,7 @@ impl Omnigraph {
         table_branch: Option<&str>,
         expected_version: u64,
         op_kind: crate::db::MutationOpKind,
-    ) -> Result<Dataset> {
+    ) -> Result<SnapshotHandle> {
         table_ops::reopen_for_mutation(
             self,
             table_key,
@@ -1395,14 +1393,14 @@ impl Omnigraph {
         table_path: &str,
         table_branch: Option<&str>,
         table_version: u64,
-    ) -> Result<Dataset> {
+    ) -> Result<SnapshotHandle> {
         table_ops::open_dataset_at_state(self, table_path, table_branch, table_version).await
     }
 
     pub(crate) async fn build_indices_on_dataset(
         &self,
         table_key: &str,
-        ds: &mut Dataset,
+        ds: &mut SnapshotHandle,
     ) -> Result<()> {
         table_ops::build_indices_on_dataset(self, table_key, ds).await
     }
@@ -1411,7 +1409,7 @@ impl Omnigraph {
         &self,
         catalog: &Catalog,
         table_key: &str,
-        ds: &mut Dataset,
+        ds: &mut SnapshotHandle,
     ) -> Result<()> {
         table_ops::build_indices_on_dataset_for_catalog(self, catalog, table_key, ds).await
     }
@@ -2115,8 +2113,12 @@ edge WorksAt: Person -> Company
 
     async fn table_rows_json(db: &Omnigraph, table_key: &str) -> Vec<Value> {
         let snapshot = db.snapshot().await;
-        let ds = snapshot.open(table_key).await.unwrap();
-        let batches = db.table_store().scan_batches(&ds).await.unwrap();
+        let ds = db
+            .storage()
+            .open_snapshot_at_table(&snapshot, table_key)
+            .await
+            .unwrap();
+        let batches = db.storage().scan_batches(&ds).await.unwrap();
         batches
             .into_iter()
             .flat_map(|batch| {
@@ -2128,11 +2130,11 @@ edge WorksAt: Person -> Company
     }
 
     async fn seed_person_row(db: &mut Omnigraph, name: &str, age: Option<i32>) {
-        let (mut ds, full_path, table_branch) = db
+        let (ds, full_path, table_branch) = db
             .open_for_mutation("node:Person", crate::db::MutationOpKind::Insert)
             .await
             .unwrap();
-        let schema: Arc<Schema> = Arc::new(ds.schema().into());
+        let schema: Arc<Schema> = Arc::new(ds.dataset().schema().into());
         let columns: Vec<Arc<dyn Array>> = schema
             .fields()
             .iter()
@@ -2144,9 +2146,9 @@ edge WorksAt: Person -> Company
             })
             .collect();
         let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
-        let state = db
-            .table_store()
-            .append_batch(&full_path, &mut ds, batch)
+        let (_new_ds, state) = db
+            .storage()
+            .append_batch(&full_path, ds, batch)
             .await
             .unwrap();
         db.commit_updates(&[crate::db::SubTableUpdate {
@@ -2280,8 +2282,12 @@ edge WorksAt: Person -> Company
         db.apply_schema(&desired).await.unwrap();
 
         let snapshot = db.snapshot().await;
-        let ds = snapshot.open("node:Person").await.unwrap();
-        assert!(db.table_store().has_fts_index(&ds, "name").await.unwrap());
+        let ds = db
+            .storage()
+            .open_snapshot_at_table(&snapshot, "node:Person")
+            .await
+            .unwrap();
+        assert!(db.storage().has_fts_index(&ds, "name").await.unwrap());
     }
 
     #[tokio::test]
@@ -2299,9 +2305,13 @@ edge WorksAt: Person -> Company
         db.apply_schema(&desired).await.unwrap();
 
         let snapshot = db.snapshot().await;
-        let ds = snapshot.open("node:Person").await.unwrap();
-        assert!(db.table_store().has_btree_index(&ds, "id").await.unwrap());
-        assert!(db.table_store().has_fts_index(&ds, "name").await.unwrap());
+        let ds = db
+            .storage()
+            .open_snapshot_at_table(&snapshot, "node:Person")
+            .await
+            .unwrap();
+        assert!(db.storage().has_btree_index(&ds, "id").await.unwrap());
+        assert!(db.storage().has_fts_index(&ds, "name").await.unwrap());
     }
 
     #[tokio::test]
