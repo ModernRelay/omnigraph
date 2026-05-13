@@ -93,6 +93,24 @@ impl SchemaMigrationStep {
             _ => None,
         }
     }
+
+    /// If this step carries a schema-lint code, return the full
+    /// catalog entry — including family, safety tier, and default
+    /// severity. Used by renderers that want to display richer
+    /// context than just the code string (e.g. `omnigraph schema
+    /// plan` annotating each line with its tier).
+    ///
+    /// Returns `None` for steps that carry no code (the 12 of 17
+    /// `UnsupportedChange` paths still untagged in v0, plus every
+    /// non-`UnsupportedChange` variant).
+    pub fn diagnostic(&self) -> Option<&'static crate::lint::DiagnosticCode> {
+        match self {
+            Self::UnsupportedChange {
+                code: Some(c), ..
+            } => crate::lint::lookup(c),
+            _ => None,
+        }
+    }
 }
 
 pub fn plan_schema_migration(
