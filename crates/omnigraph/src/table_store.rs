@@ -953,8 +953,19 @@ impl TableStore {
                 "stage_overwrite called with empty batch".to_string(),
             ));
         }
+        // `enable_stable_row_ids: true` is defensive — empirically Lance 4.0.0
+        // preserves the source dataset's flag through `Operation::Overwrite`
+        // when WriteParams omits it (pinned by
+        // `stage_overwrite_preserves_stable_row_ids` in tests/staged_writes.rs),
+        // but setting it explicitly matches the public `overwrite_dataset`
+        // path and keeps the invariant documented at every Overwrite site
+        // (see docs/storage.md "Stable row IDs"). Setting it on an existing
+        // dataset that was created without stable row IDs is a no-op per
+        // Lance's row-id-lineage spec, so this stays correct for legacy
+        // datasets.
         let params = WriteParams {
             mode: WriteMode::Overwrite,
+            enable_stable_row_ids: true,
             allow_external_blob_outside_bases: true,
             ..Default::default()
         };
