@@ -33,9 +33,15 @@ roles:
       - aaltshuler
       - ragnorc
 
-# Path → role mapping. Order matters: earlier patterns are overridden
-# by later ones, matching CODEOWNERS's "last match wins" semantics.
-# Keep more-specific paths after broader patterns.
+# Path → role mapping. GitHub CODEOWNERS uses "last match wins"
+# semantics — when multiple patterns match a file, only the last
+# matching pattern's owners apply. The generator handles this by
+# emitting `default` as the first `*` line and the specific patterns
+# below afterward, so specific paths override the catch-all.
+#
+# Within this list, order matters only between overlapping specific
+# patterns (the later one wins). Today nothing overlaps; future
+# additions should keep more-specific patterns later.
 paths:
   "crates/**": [engineering]
   "docs/**": [docs]

@@ -94,18 +94,38 @@ def main() -> int:
     # plus a small margin.
     width = max(len(p) for p in paths) + 2
 
+    # GitHub CODEOWNERS uses "last match wins" semantics. Emit the
+    # default catch-all `*` FIRST so specific patterns below override
+    # it for the paths they cover. If we emitted `*` last, every file
+    # would resolve to the default owners regardless of more-specific
+    # rules — which would silently nullify any role distinction.
+    if "default" in spec:
+        default_owners = owners_for(spec["default"], roles)
+        lines.append(f"{'*':<{width}} {' '.join(default_owners)}")
+        lines.append("")
+
     for pattern, role_names in paths.items():
         owners = owners_for(role_names, roles)
         lines.append(f"{pattern:<{width}} {' '.join(owners)}")
 
-    if "default" in spec:
-        default_owners = owners_for(spec["default"], roles)
-        lines.append("")
-        lines.append(f"{'*':<{width}} {' '.join(default_owners)}")
-
     lines.append("")  # trailing newline so the file ends cleanly
 
-    OUTPUT.write_text("\n".join(lines))
+    rendered = "\n".join(lines)
+
+    # Regression check: the catch-all `*` line (if any) must precede
+    # every specific-path line. Failure here means the generator is
+    # silently nullifying specific rules.
+    if "default" in spec:
+        non_comment = [ln for ln in rendered.splitlines() if ln and not ln.startswith("#")]
+        first_pattern = non_comment[0].split()[0] if non_comment else None
+        if first_pattern != "*":
+            sys.exit(
+                f"error: generator invariant violated — first emitted pattern is "
+                f"{first_pattern!r}, expected '*'. CODEOWNERS uses last-match-wins; "
+                f"the catch-all must come first."
+            )
+
+    OUTPUT.write_text(rendered)
     print(f"wrote {OUTPUT.relative_to(REPO_ROOT)}")
     return 0
 
