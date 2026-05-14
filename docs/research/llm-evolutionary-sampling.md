@@ -186,15 +186,30 @@ The first harness committed against this research is **not** surface 1 above. It
 
 Six candidates worth queueing once the PQ L2 harness produces a signal (positive or negative). Grouped by control-loop shape — the unit of harness reuse is the loop, not the target. Within each cluster, candidates share most of the scaffolding and differ in the kernel / patch dialect / oracle.
 
-### Cluster A — reuses the `lance-autoresearch` harness almost as-is
+### Cluster A — pure autoresearch on Lance kernel hot paths
 
-Autoresearch loop, bit-exact correctness oracle, seconds-scale per-trial eval. Each candidate is "swap `kernels.rs` + add a new `ScalarReference` + maybe one more shape to `inputs::SHAPES`."
+Karpathy single-agent loop, bit-exact (or near-bit-exact) oracle against a scalar reference, seconds-scale per-trial eval, self-contained code (one or a few files the agent edits). Same blueprint as `lance-autoresearch`; per-target a fresh `kernels.rs` / `reference.rs` / `inputs.rs` set in a sister project, or a single multi-target harness with one binary per kernel. The unifying constraint is that the kernel has a clean scalar reference and a deterministic comparison — that's what makes the loop converge in hours rather than days.
 
-**A1. Adjacent distance kernels in `lance-linalg`** — cosine and dot product first, hamming as a stretch. Most production embedding models use cosine, not L2. Lance has separate code paths per metric and the cosine path historically has less SIMD coverage than L2. Harness work: one new `inputs::DataDistribution` for unit-normalized vectors (cosine needs them), one new `ScalarReference` per metric, one new `PqKernel` impl. Probably the lowest-effort next experiment.
+Three sub-groups, ordered by leverage. The decode group is **the single largest hot-cycle pile in Lance** for analytical workloads (every column read decodes), even though distance kernels get more attention because vector search is what users notice.
 
-**A2. IVF partition-selection kernel** — the dist-to-centroids step that runs *before* PQ probing on every `IvfPq` / `IvfHnswPq` query. Different scale than PQ probing: hundreds-to-thousands of centroids per query, full-precision f32 (not PQ-encoded), no LUT. Tests whether autoresearch wins transfer across kernel scales — if a kernel-loop optimization wins on millions of 16-byte PQ codes but loses on thousands of 128-d f32 centroids, the autoresearch shape may not generalize within "kernel-shape" surfaces and that's worth knowing.
+**Distance kernels (`lance-linalg`)** — same loop, same scaffolding as the landed harness; near-zero new code per target.
 
-**A3. FTS BM25 scoring kernel** — once a posting list is fetched, scoring is `Σ idf × tf_norm` per matching document. Bit-exact oracle still applies (it's deterministic math). Lance's FTS is younger than its vector path → more headroom. The harness needs FTS-shaped fixtures (inverted-index posting lists, IDF tables) instead of PQ codebooks, but the loop structure is identical to the PQ harness.
+- **A1. Adjacent distance kernels** — cosine and dot product first, hamming as a stretch. Most production embedding models use cosine, not L2. Lance has separate code paths per metric and the cosine path historically has less SIMD coverage than L2. Harness work: one new `inputs::DataDistribution` for unit-normalized vectors, one new `ScalarReference` per metric, one new `PqKernel` impl. Lowest-effort next experiment.
+- **A2. IVF partition-selection kernel** — the dist-to-centroids step that runs *before* PQ probing on every `IvfPq` / `IvfHnswPq` query. Different scale: hundreds-to-thousands of centroids per query, full-precision f32, no LUT. Tests whether autoresearch wins transfer across kernel scales.
+- **A3. FTS BM25 scoring kernel** — once a posting list is fetched, scoring is `Σ idf × tf_norm` per matching document. Lance's FTS is younger than its vector path → more headroom. Fixture shape differs (inverted-index posting lists, IDF tables), loop structure identical.
+
+**Decode kernels (`lance-encoding`)** — these run on every read of an encoded column. Probably the highest absolute cycle pile in Lance for analytical workloads, well-studied in the literature, and Lance is younger than the comparable code in arrow-rs / parquet-rs. Sister harness per kernel; fixtures are Arrow `IntArray` / `StringArray` / `BooleanArray` built deterministically from seeds.
+
+- **A4. Bitpack integer decode** — Lance heavily uses bitpacked integer columns (`u32` packed at 5–17 bits per value, etc.). Decode = unpack packed bits into an Arrow `IntArray`. Hot on every integer column read; runs billions of values per analytical query. Known SIMD literature (BP128, simdcomp, Lemire's bitpacking variants). Bit-exact oracle trivial: same bits in, same Arrow array out. Single highest-cycle autoresearch target on this list.
+- **A5. Dictionary decode** — dictionary-encoded columns are common for low-cardinality strings. Decode is a `gather` from a dictionary by index. SIMD `vpgatherdq` (AVX2) and prefetch-the-next-N tricks are documented wins; Lance's path may not yet exploit them fully. Bit-exact oracle trivial. Hot on string-heavy analytical workloads (date/category columns).
+- **A6. FSST string decode** — Lance ships FSST (Tableau's Fast Static Symbol Table compression) for high-cardinality strings. Decoder is a tight loop over compressed bytes consulting a 256-entry symbol table. The original FSST paper showed ~2× on Intel via SIMD; Lance's decoder is straightforward Rust. Bit-exact oracle.
+
+**Scan / merge kernels** — called per row scanned or per result merged. Less concentrated than decode but each is on the hot path of a major query shape.
+
+- **A7. Take / gather kernel** — random-access reads of N rows by row ID. Hot for ANN post-retrieval lookup (after a vector probe returns top-K row IDs, fetching the actual columns is a `take`). Also hot for point lookups and join-side fetches. SIMD gather + prefetch are documented wins. Bit-exact oracle.
+- **A8. Predicate / filter evaluation kernels** — scalar comparisons over a column producing a boolean mask. DataFusion provides reference impls per type (`gt_scalar`, `eq_scalar`, etc.); Lance dispatches through them and also has zone-map / bloom pre-filter paths above. The leaf kernels are small, tight, branch-light loops — ideal autoresearch shape. Bit-exact oracle.
+- **A9. Posting list intersection** (FTS `AND` queries) — boolean queries like `term_a AND term_b AND term_c` intersect sorted `u32` posting lists pairwise. Lemire's SIMD intersection algorithms ("SIMD-based decoding of posting lists", `v_simdgalloping`) show 2–5× wins regularly. Bit-exact oracle (output is set equality up to order).
+- **A10. Top-K k-way merge** — when a query plan scans fragments in parallel and merges top-K results into the global top-K. Inner loop is heap insert + tie-break. Hot on every `LIMIT` query and every ANN query. Bit-exact oracle modulo deterministic tie-break.
 
 ### Cluster B — needs a new harness (BauplanLabs control loop)
 
@@ -210,13 +225,15 @@ Tournament sampling, recall + latency oracle, minutes-to-hours per-trial eval. T
 
 ### Cross-cluster prioritization
 
-If the goal is **shortest path to a Lance upstream PR**, run A1 next (cosine + dot kernels). Same harness, two-day extension, immediately upstreamable as a `lance-format/lance` PR if it wins.
+If the goal is **shortest path to a Lance upstream PR**, run A1 next (cosine + dot kernels). Same harness, two-day extension, immediately upstreamable.
 
-If the goal is **most user-facing impact**, run B1 next (IVF_PQ build tuning). Bigger harness but the recommendation engine output is the kind of thing Lance users want and ask for explicitly.
+If the goal is **largest absolute speedup on a real workload**, run A4 next (bitpack integer decode). Every analytical column read goes through it; a win there shows up on every query, not just vector-search queries. Sister harness, but well-defined fixtures (deterministic Arrow `IntArray`s at varied bit widths).
+
+If the goal is **most user-facing impact at the parameter surface**, run B1 next (IVF_PQ build tuning). Bigger harness but the recommendation-engine output is the kind of thing Lance users ask for explicitly.
 
 If the goal is **paper-publishable replication of the BauplanLabs result**, C1 is the only option. Higher cost, higher ceiling, longer timeline.
 
-If A1 wins and B1 doesn't, the conclusion is "Lance kernels have headroom but Lance defaults are well-tuned" — sunsets the parameter-tuning direction cheaply. If A1 fails and B1 wins, the conclusion is "kernels are at-optimum, parameter surface is the real lever." If both win, the natural composition is B2 + a kernel pre-PR pipeline. Run the cheap experiment first.
+If A1 wins and B1 doesn't, the conclusion is "Lance kernels have headroom but Lance defaults are well-tuned" — sunsets the parameter-tuning direction cheaply. If A1 / A4 fail and B1 wins, the conclusion is "kernels are at-optimum, parameter surface is the real lever." If both win, the natural composition is B2 + a kernel pre-PR pipeline. Cheapest experiments first; A1 and A4 share the autoresearch shape and can run in parallel by separate agents.
 
 ## Footnote: OmniGraph-IR as an alternative target
 
