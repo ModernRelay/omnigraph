@@ -77,7 +77,7 @@ The branch-protection policy is the foundation. Future hardening adds:
 
 - **Required signed commits** (`required_signatures: true`) — once maintainers enroll GPG/SSH signing.
 - **Tag protection** for `v*` tags via `repos/.../tags/protection`.
-- **Required reviewers from specific teams** for high-leverage paths (e.g., `docs/invariants.md`) via CODEOWNERS tier expansion + the N-unique-approvers CI workaround.
+- **Required reviewers from specific teams** for high-leverage paths (e.g., `docs/dev/invariants.md`) via CODEOWNERS tier expansion + the N-unique-approvers CI workaround.
 - **More required CI checks**: `cargo deny`, `cargo audit`, `cargo fmt --check`, `cargo clippy -D warnings`, CodeQL, secret scanning, schema-lint (MR-946).
 
 See the hardening playbook for the full plan.

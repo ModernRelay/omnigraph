@@ -4,15 +4,15 @@ This file is the always-on map for AI coding agents (Claude Code, Codex, Cursor,
 
 **Required reading every session, every change:**
 
-1. **[docs/invariants.md](docs/invariants.md)** — the architectural invariants and §IX deny-list. Apply to every PR, not only architecture work.
-2. **[docs/lance.md](docs/lance.md)** — the curated index of upstream Lance docs. **Consult it before every task** to identify which Lance pages are relevant. **Then fetch every page in the matching domain section, plus every page that is even slightly relevant** — not just the page whose title most obviously matches the task. Behavior is interlocked across pages (transactions reference index lifecycle; index lifecycle references compaction; compaction references row-id lineage), and skipping a "slightly relevant" page is how alignment misses happen. The index itself is not a substitute for reading the pages — never act on the index alone. **Always fetch the FULL page content, not summaries** — use `npx mdrip <url>` (or `npx mdrip --max-chars 200000 <url>` for very long pages). Tools that summarize pages (like Claude's `WebFetch`) drop load-bearing details — we have caught alignment misses (default flags, `pub(crate)` blockers, three-page sub-specs hidden behind navigation hubs) only after dumping the full markdown. If `npx mdrip` is unavailable, fall back to `curl <url> | pandoc -f html -t markdown` or paste the rendered page text manually; never act on a summarized fetch alone.
-3. **[docs/testing.md](docs/testing.md)** — the test-coverage map. **Always check what already covers your change before writing a new test.** Extending an existing test (an assertion, a fixture row, a parameterization) is preferred over a duplicated `init_and_load()` block. Walk the before-every-task checklist to identify existing coverage, run those tests as a clean baseline, and only add a new test fn or file when no existing one owns the area.
+1. **[docs/dev/invariants.md](docs/dev/invariants.md)** — the architectural invariants and deny-list. Apply to every PR, not only architecture work.
+2. **[docs/dev/lance.md](docs/dev/lance.md)** — the curated index of upstream Lance docs. **Consult it before every task** to identify which Lance pages are relevant. **Then fetch every page in the matching domain section, plus every page that is even slightly relevant** — not just the page whose title most obviously matches the task. Behavior is interlocked across pages (transactions reference index lifecycle; index lifecycle references compaction; compaction references row-id lineage), and skipping a "slightly relevant" page is how alignment misses happen. The index itself is not a substitute for reading the pages — never act on the index alone. **Always fetch the FULL page content, not summaries** — use `npx mdrip <url>` (or `npx mdrip --max-chars 200000 <url>` for very long pages). Tools that summarize pages (like Claude's `WebFetch`) drop load-bearing details — we have caught alignment misses (default flags, `pub(crate)` blockers, three-page sub-specs hidden behind navigation hubs) only after dumping the full markdown. If `npx mdrip` is unavailable, fall back to `curl <url> | pandoc -f html -t markdown` or paste the rendered page text manually; never act on a summarized fetch alone.
+3. **[docs/dev/testing.md](docs/dev/testing.md)** — the test-coverage map. **Always check what already covers your change before writing a new test.** Extending an existing test (an assertion, a fixture row, a parameterization) is preferred over a duplicated `init_and_load()` block. Walk the before-every-task checklist to identify existing coverage, run those tests as a clean baseline, and only add a new test fn or file when no existing one owns the area.
 
 Tools that support `@`-imports (Claude Code) auto-include all three files via the imports below — note these must sit at column 0 (not inside a blockquote) for the parser to recognize them. Other agents (Codex, Cursor, Cline, …) must open them explicitly at the start of each session.
 
-@docs/invariants.md
-@docs/lance.md
-@docs/testing.md
+@docs/dev/invariants.md
+@docs/dev/lance.md
+@docs/dev/testing.md
 
 `CLAUDE.md` is a symlink to this file — there is exactly one source of truth. Edit `AGENTS.md`.
 
@@ -59,7 +59,7 @@ CLI (omnigraph)        HTTP Server (omnigraph-server, Axum)
         Object store (file / s3 / RustFS / MinIO / S3-compat)
 ```
 
-Full diagram and concurrency model: [docs/architecture.md](docs/architecture.md).
+Full diagram and concurrency model: [docs/dev/architecture.md](docs/dev/architecture.md).
 
 ---
 
@@ -67,35 +67,37 @@ Full diagram and concurrency model: [docs/architecture.md](docs/architecture.md)
 
 | Area | Read |
 |---|---|
-| **Architectural invariants & deny-list (read before any non-trivial proposal or review)** | **[docs/invariants.md](docs/invariants.md)** |
-| **Lance docs index — fetch upstream Lance docs by problem domain** | **[docs/lance.md](docs/lance.md)** |
-| **Test coverage map — what's covered, what helpers to reuse, before-every-task checklist** | **[docs/testing.md](docs/testing.md)** |
-| Architecture, L1/L2 framing, concurrency model | [docs/architecture.md](docs/architecture.md) |
-| Storage layout, `__manifest` schema, URI schemes, S3 env vars | [docs/storage.md](docs/storage.md) |
-| `.pg` schema language, types, constraints, annotations, migration planning | [docs/schema-language.md](docs/schema-language.md) |
-| Schema-lint codes (`OG-XXX-NNN`), families, severity, suppression | [docs/schema-lint.md](docs/schema-lint.md) |
-| `.gq` query language, MATCH/RETURN/ORDER, search funcs, mutations, IR ops, lint codes | [docs/query-language.md](docs/query-language.md) |
-| Indexes (BTREE / inverted / vector / graph topology) | [docs/indexes.md](docs/indexes.md) |
-| Embeddings (compiler + engine clients, env vars, `@embed`) | [docs/embeddings.md](docs/embeddings.md) |
-| Branches, commit graph, snapshots, system branches | [docs/branches-commits.md](docs/branches-commits.md) |
-| Transactions and atomicity (per-query atomic; branches as multi-query transactions) | [docs/transactions.md](docs/transactions.md) |
-| Direct-publish writes (the former Run state machine, now demoted to publisher CAS) | [docs/runs.md](docs/runs.md) |
-| Three-way merge and conflict kinds | [docs/merge.md](docs/merge.md) |
-| Diff / change feed (`diff_between`, `diff_commits`) | [docs/changes.md](docs/changes.md) |
-| Query execution, mutation execution, bulk loader, `load` vs `ingest` | [docs/execution.md](docs/execution.md) |
-| `optimize` (compaction) and `cleanup` (version GC) | [docs/maintenance.md](docs/maintenance.md) |
-| Cedar policy actions, scopes, CLI | [docs/policy.md](docs/policy.md) |
-| HTTP server endpoints, auth, error model, body limits | [docs/server.md](docs/server.md) |
-| CLI quick-start | [docs/cli.md](docs/cli.md) |
-| CLI command surface and `omnigraph.yaml` schema | [docs/cli-reference.md](docs/cli-reference.md) |
-| Audit / actor tracking | [docs/audit.md](docs/audit.md) |
-| Error taxonomy and result serialization | [docs/errors.md](docs/errors.md) |
-| Install (binary / Homebrew / source / channels) | [docs/install.md](docs/install.md) |
-| Deployment (binary / container / RustFS bootstrap / auth / build variants) | [docs/deployment.md](docs/deployment.md) |
-| CI / release workflows | [docs/ci.md](docs/ci.md) |
-| Code ownership (CODEOWNERS source of truth, roles, regeneration) | [docs/codeowners.md](docs/codeowners.md) |
-| Branch protection policy (declarative, applied via `scripts/apply-branch-protection.sh`) | [docs/branch-protection.md](docs/branch-protection.md) |
-| Constants & tunables cheat sheet | [docs/constants.md](docs/constants.md) |
+| **User docs entry point (public CLI/API/operator docs)** | **[docs/user/index.md](docs/user/index.md)** |
+| **Developer docs entry point (architecture, invariants, testing, internals)** | **[docs/dev/index.md](docs/dev/index.md)** |
+| **Architectural invariants & deny-list (read before any non-trivial proposal or review)** | **[docs/dev/invariants.md](docs/dev/invariants.md)** |
+| **Lance docs index — fetch upstream Lance docs by problem domain** | **[docs/dev/lance.md](docs/dev/lance.md)** |
+| **Test coverage map — what's covered, what helpers to reuse, before-every-task checklist** | **[docs/dev/testing.md](docs/dev/testing.md)** |
+| Architecture, L1/L2 framing, concurrency model | [docs/dev/architecture.md](docs/dev/architecture.md) |
+| Storage layout, `__manifest` schema, URI schemes, S3 env vars | [docs/user/storage.md](docs/user/storage.md) |
+| `.pg` schema language, types, constraints, annotations, migration planning | [docs/user/schema-language.md](docs/user/schema-language.md) |
+| Schema-lint codes (`OG-XXX-NNN`), families, severity, suppression | [docs/user/schema-lint.md](docs/user/schema-lint.md) |
+| `.gq` query language, MATCH/RETURN/ORDER, search funcs, mutations, IR ops, lint codes | [docs/user/query-language.md](docs/user/query-language.md) |
+| Indexes (BTREE / inverted / vector / graph topology) | [docs/user/indexes.md](docs/user/indexes.md) |
+| Embeddings (compiler + engine clients, env vars, `@embed`) | [docs/user/embeddings.md](docs/user/embeddings.md) |
+| Branches, commit graph, snapshots, system branches | [docs/user/branches-commits.md](docs/user/branches-commits.md) |
+| Transactions and atomicity (per-query atomic; branches as multi-query transactions) | [docs/user/transactions.md](docs/user/transactions.md) |
+| Direct-publish writes (the former Run state machine, now demoted to publisher CAS) | [docs/dev/runs.md](docs/dev/runs.md) |
+| Three-way merge and conflict kinds | [docs/dev/merge.md](docs/dev/merge.md) |
+| Diff / change feed (`diff_between`, `diff_commits`) | [docs/user/changes.md](docs/user/changes.md) |
+| Query execution, mutation execution, bulk loader, `load` vs `ingest` | [docs/dev/execution.md](docs/dev/execution.md) |
+| `optimize` (compaction) and `cleanup` (version GC) | [docs/user/maintenance.md](docs/user/maintenance.md) |
+| Cedar policy actions, scopes, CLI | [docs/user/policy.md](docs/user/policy.md) |
+| HTTP server endpoints, auth, error model, body limits | [docs/user/server.md](docs/user/server.md) |
+| CLI quick-start | [docs/user/cli.md](docs/user/cli.md) |
+| CLI command surface and `omnigraph.yaml` schema | [docs/user/cli-reference.md](docs/user/cli-reference.md) |
+| Audit / actor tracking | [docs/user/audit.md](docs/user/audit.md) |
+| Error taxonomy and result serialization | [docs/user/errors.md](docs/user/errors.md) |
+| Install (binary / Homebrew / source / channels) | [docs/user/install.md](docs/user/install.md) |
+| Deployment (binary / container / RustFS bootstrap / auth / build variants) | [docs/user/deployment.md](docs/user/deployment.md) |
+| CI / release workflows | [docs/dev/ci.md](docs/dev/ci.md) |
+| Code ownership (CODEOWNERS source of truth, roles, regeneration) | [docs/dev/codeowners.md](docs/dev/codeowners.md) |
+| Branch protection policy (declarative, applied via `scripts/apply-branch-protection.sh`) | [docs/dev/branch-protection.md](docs/dev/branch-protection.md) |
+| Constants & tunables cheat sheet | [docs/user/constants.md](docs/user/constants.md) |
 | Per-version release notes | [docs/releases/](docs/releases/) |
 
 ---
@@ -119,15 +121,15 @@ When evaluating a design, ask: *"what does this look like after 5 more changes l
 ### Tiebreakers when liability alone is silent
 
 - **Correctness > simplicity > performance.** Lexicographic — give up performance for simpler code; give up simplicity for correct code; never give up correctness. The deny-list ("no silent failures," "no acks before durable persistence," "no reads of partial commits") is this rule's hard floor.
-- **Reversibility shapes evidence demand.** Reversible changes wait for evidence: prefer prod metrics over napkin math over RFCs. Irreversible changes (substrate choice, on-disk format, the §VI database guarantees) earn an RFC, because by the time prod tells you they were wrong, you've shipped years of dependent code. Reviewers should spot both failure modes — RFC-ing a one-line config, and measuring-your-way into a substrate decision.
+- **Reversibility shapes evidence demand.** Reversible changes wait for evidence: prefer prod metrics over napkin math over RFCs. Irreversible changes (substrate choice, on-disk format, database guarantees) earn an RFC, because by the time prod tells you they were wrong, you've shipped years of dependent code. Reviewers should spot both failure modes — RFC-ing a one-line config, and measuring-your-way into a substrate decision.
 
-The always-on rules below and the §IX deny-list in [docs/invariants.md](docs/invariants.md) are specific applications of this principle; when the rules are silent, fall back to it.
+The always-on rules below and the deny-list in [docs/dev/invariants.md](docs/dev/invariants.md) are specific applications of this principle; when the rules are silent, fall back to it.
 
 ---
 
 ## Always-on rules (load these into your working memory)
 
-These are architectural rules that need to be in scope on every change. They're framed at the level that survives renames and refactors — the deeper implementation specifics (function names, lock names, branch-prefix conventions, enforcement points) live in the per-area docs and may evolve. The full architectural invariants and deny-list are in [docs/invariants.md](docs/invariants.md); §IX (deny-list) is the fastest first-pass when reviewing any change.
+These are architectural rules that need to be in scope on every change. They're framed at the level that survives renames and refactors — the deeper implementation specifics (function names, lock names, branch-prefix conventions, enforcement points) live in the per-area docs and may evolve. The full architectural invariants and deny-list are in [docs/dev/invariants.md](docs/dev/invariants.md); the deny-list is the fastest first-pass when reviewing any change.
 
 1. **Multi-dataset publish is atomic across the whole graph.** A graph commit flips every relevant sub-table version visible together, in one manifest write. Don't introduce code paths that publish per sub-table outside the unified publish path — that loses cross-table snapshot isolation.
 2. **Snapshot isolation per query.** A query holds one snapshot for its lifetime. Don't re-read the current head mid-query.
@@ -136,7 +138,7 @@ These are architectural rules that need to be in scope on every change. They're 
 5. **Reads always see the current index state for the branch they're reading.** Indexes track the branch head, not historical snapshots. If you change index lifecycle, preserve this guarantee.
 6. **Stable type IDs survive renames.** Schema migration relies on identity that's stable across rename — don't mint new IDs on rename.
 
-### Deny-list (fast-pass review filter — full reasoning in [docs/invariants.md §IX](docs/invariants.md))
+### Deny-list (fast-pass review filter — full reasoning in [docs/dev/invariants.md](docs/dev/invariants.md))
 
 If a proposal fits one of these, the burden is on the proposer to justify why this case is the exception:
 
@@ -234,14 +236,14 @@ omnigraph policy explain --actor act-alice --action change --branch main
 
 ## Maintenance contract for agents
 
-When you change something user-visible, **update the relevant `docs/<area>.md` in the same change**. Pointers from this file to that doc must keep working — CI enforces cross-link integrity via `scripts/check-agents-md.sh`.
+When you change something user-visible, **update the relevant `docs/user/<area>.md` in the same change**. Use [docs/user/index.md](docs/user/index.md) for public behavior and [docs/dev/index.md](docs/dev/index.md) for contributor/internal mechanics. Pointers from this file to those docs must keep working — CI enforces cross-link integrity via `scripts/check-agents-md.sh`.
 
-When proposing or reviewing a non-trivial change, walk [docs/invariants.md](docs/invariants.md) — at minimum the §IX deny-list and §X review checklist. Add to the deny-list when a new anti-pattern surfaces; relaxing an invariant requires the same review process as code.
+When proposing or reviewing a non-trivial change, walk [docs/dev/invariants.md](docs/dev/invariants.md) — at minimum the deny-list and review checklist. Add to the deny-list when a new anti-pattern surfaces; relaxing an invariant requires the same review process as code.
 
 Rules:
 
 1. **Update in the same PR.** New endpoint, query function, CLI flag, env var, constant, schema construct, or invariant: update both the source code and the doc in the same change. Never split documentation drift into a follow-up.
-2. **Bump version on release.** When a release boundary crosses (e.g. v0.3.1 → v0.3.2), update the version line at the top of this file and add a `docs/releases/<version>.md` describing the user-visible delta. Update [docs/architecture.md](docs/architecture.md) only if the architecture itself changed.
+2. **Bump version on release.** When a release boundary crosses (e.g. v0.3.1 → v0.3.2), update the version line at the top of this file and add a `docs/releases/<version>.md` describing the user-visible delta. Update [docs/dev/architecture.md](docs/dev/architecture.md) only if the architecture itself changed.
 3. **Write OSS-facing release notes.** Release docs are public project history. Describe capabilities, behavior changes, breaking changes, upgrade notes, and user impact; do not reference private ticket systems, internal codenames, or planning shorthand that an outside contributor cannot inspect.
 4. **Keep versioning coherent.** A release bump must update every published crate manifest, local path dependency constraint, `Cargo.lock`, generated API metadata such as `openapi.json`, and this file's surveyed version. Do not leave mixed package versions unless the release plan explicitly calls for them.
 5. **Keep docs audience-neutral.** Prefer stable public identifiers (versions, PR numbers, public issue links, crate names, endpoint names) over organization-specific labels. If internal context is useful for maintainers, translate it into a durable public rationale before committing it.
@@ -249,9 +251,9 @@ Rules:
 7. **Re-verify before recommending.** If you cite a flag, env var, endpoint, or constant to the user or in code, grep for it in source first. Memory and docs go stale; the code is authoritative.
 8. **Keep AGENTS.md short.** This file is always loaded into agent context, so every added line has a recurring context-window cost. Prefer pointers and terse invariants here; put detail in `docs/`.
 9. **Keep AGENTS.md a map, not an encyclopedia.** New deep content goes into `docs/`. Add an entry to "Where to find each topic" instead of pasting prose into this file. The "Always-on rules" section is the exception — it's for invariants that should always be in scope.
-10. **Re-read on schema/query/IR changes.** Edits to `schema.pest`, `query.pest`, `ir/lower.rs`, `query/typecheck.rs`, or `query/lint.rs` should trigger a re-read of [docs/schema-language.md](docs/schema-language.md), [docs/query-language.md](docs/query-language.md), and [docs/execution.md](docs/execution.md) to confirm they still describe reality.
+10. **Re-read on schema/query/IR changes.** Edits to `schema.pest`, `query.pest`, `ir/lower.rs`, `query/typecheck.rs`, or `query/lint.rs` should trigger a re-read of [docs/user/schema-language.md](docs/user/schema-language.md), [docs/user/query-language.md](docs/user/query-language.md), and [docs/dev/execution.md](docs/dev/execution.md) to confirm they still describe reality.
 11. **Always make smaller commits.** Each commit does one thing, compiles, and passes tests; mechanical refactors land separately from the behavior changes they enable.
 12. **Test-first for bug fixes.** When fixing an identified bug, write a regression test that reproduces the failure first. Confirm it fails against the current code with the predicted symptom (not an unrelated error). Then land the fix in a separate commit and confirm the test turns green. The test commit lands just before the fix commit so the red → green pair is visible in `git log` and a reviewer can check out the test commit alone and reproduce the failure.
 13. **Correct by design over symptomatic patches.** When a bug surfaces, identify the root cause and make the fix correct by construction. Don't patch the symptom. If the design admits the bug class, the fix is to close the class, not to add a guard around the latest instance. A symptomatic patch is acceptable only as a stop-gap, with an explicit note in the commit message and a follow-up issue tracking the design fix.
 
-CI check: `scripts/check-agents-md.sh` verifies that every `docs/*.md` link in this file resolves and that every doc in the canonical set is linked. Run it locally before opening a PR if you've moved or renamed docs.
+CI check: `scripts/check-agents-md.sh` verifies that docs links in this file and the audience indexes resolve, and that every canonical doc is linked from either [docs/user/index.md](docs/user/index.md) or [docs/dev/index.md](docs/dev/index.md). Run it locally before opening a PR if you've moved or renamed docs.

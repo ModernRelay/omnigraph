@@ -2,7 +2,7 @@
 //!
 //! This module implements the building blocks of the per-sidecar recovery
 //! sweep that closes the documented Phase B → Phase C residual (see
-//! `docs/runs.md` "Open-time recovery sweep"). The high-level shape:
+//! `docs/dev/runs.md` "Open-time recovery sweep"). The high-level shape:
 //!
 //! 1. Each writer that performs a multi-table commit writes a small JSON
 //!    sidecar at `__recovery/{ulid}.json` BEFORE its per-table
@@ -274,8 +274,9 @@ pub(crate) enum TableClassification {
 ///
 /// **All-or-nothing**: the writer that produced the sidecar intended an
 /// atomic publish across every table it listed. Rolling forward only some
-/// of them would publish a partial commit and violate `docs/invariants.md`
-/// §VI.23. The decision is based on the worst classification:
+/// of them would publish a partial commit and violate the manifest-atomic
+/// graph visibility invariant in `docs/dev/invariants.md`. The decision is
+/// based on the worst classification:
 ///
 /// - Any `InvariantViolation` → `Abort` (operator action required).
 /// - Any `UnexpectedAtP1` / `UnexpectedMultistep` / `NoMovement` →
@@ -463,7 +464,7 @@ pub(crate) fn classify_table(
 
 /// Compute the per-sidecar decision from a slice of table classifications.
 ///
-/// All-or-nothing per `docs/invariants.md` §VI.23 — see [`SidecarDecision`].
+/// All-or-nothing per `docs/dev/invariants.md` -- see [`SidecarDecision`].
 pub(crate) fn decide(classifications: &[TableClassification]) -> SidecarDecision {
     use SidecarDecision::*;
     use TableClassification::*;

@@ -33,8 +33,8 @@
 //! `SnapshotHandle` and `StagedHandle` wrap `lance::Dataset` and
 //! `StagedWrite` respectively. Their inner Lance types are
 //! `pub(crate)` — engine code outside `table_store` cannot reach
-//! through. This is the §III.9 alignment: `lance::Dataset` does not
-//! appear in trait signatures.
+//! through. This aligns with the storage-boundary invariant:
+//! `lance::Dataset` does not appear in trait signatures.
 //!
 //! ## Migration status (MR-793 PR #70)
 //!

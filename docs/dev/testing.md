@@ -1,6 +1,6 @@
 # Testing
 
-This file is the always-on map of the test surface. **Consult it before every task** so you know what tests already cover the area you're about to change, what helpers to reuse, and where a new test belongs. The architectural invariant *"tests at every boundary, not just end-to-end"* lives in [docs/invariants.md §VIII.47](invariants.md).
+This file is the always-on map of the test surface. **Consult it before every task** so you know what tests already cover the area you're about to change, what helpers to reuse, and where a new test belongs. The architectural invariant for boundary-matched tests lives in [docs/dev/invariants.md](invariants.md).
 
 ## Where tests live, per crate
 
@@ -49,7 +49,7 @@ The engine's `tests/` is the principal coverage surface; most graph-shaped behav
 - **CLI** — `crates/omnigraph-cli/tests/support/mod.rs`: `Command`-style wrapper for invoking `omnigraph`, server-process spawning, fixture resolution, output assertion helpers.
 - **Server** — no shared helpers; server tests call the `Omnigraph` engine API directly and exercise endpoints over the wire.
 
-> Note: there is **no `MemStorage` or in-memory backend** today. Tests use `tempfile::tempdir()` for local FS. If you find yourself needing one for layer isolation, that's an architectural ask — see [docs/invariants.md §VIII.48](invariants.md) (reference impl + test impl per trait).
+> Note: there is **no `MemStorage` or in-memory backend** today. Tests use `tempfile::tempdir()` for local FS. If you find yourself needing one for layer isolation, that's an architectural ask — keep it explicit in [docs/dev/invariants.md](invariants.md) under known gaps.
 
 ## Failpoints (fault injection)
 
@@ -75,7 +75,7 @@ Locally, set `OMNIGRAPH_S3_TEST_BUCKET` (and the usual `AWS_*` vars including `A
 ## Examples & benches
 
 - `crates/omnigraph/examples/bench_expand.rs` — runnable example (not part of CI).
-- No `benches/` directories. The architectural rule [docs/invariants.md §VIII.50](invariants.md) requires benchmark motivation before optimization, so add `benches/` per crate when you ship a perf-driven change.
+- No `benches/` directories. Add `benches/` per crate when you ship a perf-driven change, and include the motivating workload with the optimization.
 
 ## Coverage tooling — what's missing
 
@@ -107,9 +107,9 @@ When you pick up any change, walk through this:
 2. **Run those tests locally before editing.** `cargo test --workspace --locked` for the broad pass; `-p <crate> --test <file>` for a focused loop. Confirm a clean baseline.
 3. **Decide extend-vs-new** explicitly. If you can extend an existing test (assertion, fixture row, parameterization), do that. Only add a new test fn or new file if no existing one owns the area.
 4. **Reuse the helpers.** `init_and_load()`, fixture files, the CLI `support` harness — re-use them. Don't bootstrap a fresh repo by hand if a helper exists.
-5. **Mind the boundary.** Per [docs/invariants.md §VIII.47](invariants.md), test at the layer the change lives at — planner-level changes deserve planner-level tests, not just end-to-end.
+5. **Mind the boundary.** Per [docs/dev/invariants.md](invariants.md), test at the layer the change lives at — planner-level changes deserve planner-level tests, not just end-to-end.
 6. **For substrate-touching changes** (Lance behavior), reach for `failpoints` or fixture-driven scenarios, not stubbed-out mocks.
 7. **For server / API changes**, confirm the OpenAPI regeneration happens in `openapi.rs` and that the diff lands in `openapi.json`.
 8. **Verify your change makes an existing test fail before it makes the new one pass.** If you can break the code without breaking a test, your coverage gap is the problem to fix first.
 
-When in doubt, re-read [docs/invariants.md §VIII](invariants.md) — quality gates apply to every change.
+When in doubt, re-read [docs/dev/invariants.md](invariants.md) — quality gates apply to every change.
