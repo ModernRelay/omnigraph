@@ -1,7 +1,7 @@
 # LLM Evolutionary Sampling — applicability to Lance directly
 
 **Type:** Research note (exploratory, not a committed plan)
-**Status:** Draft for discussion — revision 2
+**Status:** Draft for discussion — revision 3 (first harness landed; see "First implementation landed" below)
 **Date:** 2026-05-14
 **Author:** assigned via `claude/llm-evolutionary-sampling-research-UgKX8`
 
@@ -169,6 +169,18 @@ Pick **surface 1 (workload-conditioned vector index build)** for the first cut. 
 If the winning tuple beats Lance defaults by ≥1.3× in latency at equal recall on the test dataset, surface 2 (scan tuning) is the next experiment. If it only beats by ≤1.1×, the conclusion is "Lance defaults are close to per-workload optimum for the tested workloads," which is itself publishable and sunsets the project cheaply.
 
 **Out of scope for the first experiment:** Surface 6 (plan-patching) entirely. Surface 4 (compaction) because the per-trial cost is too high to learn fast. OmniGraph integration — make it a generic Lance tool first; an OmniGraph wrapper is a one-day port if the tool works.
+
+## First implementation landed: PQ kernel autoresearch harness
+
+The first harness committed against this research is **not** surface 1 above. It targets a related-but-different surface and adopts a different control loop. The harness lives at [`research/lance-autoresearch/`](../../research/lance-autoresearch/) (its own README + `program.md` document the contract).
+
+**Target shifted from index-build tuning (surface 1) to PQ kernel optimization.** The kernels in `lance-linalg`'s `distance/pq` module — `compute_distance_table_l2` + `probe_pq_l2_top_k` — sit one layer below the parameter surface and are exercised on every ANN query. They're self-contained Rust (no DataFusion plumbing), the per-trial eval is seconds not minutes, and a winning kernel ports directly upstream as a `lance-format/lance` PR. Index-parameter tuning remains a valid surface; it's just a slower iteration loop and a longer upstream path.
+
+**Control loop shifted from BauplanLabs evolutionary sampling (`bol_evol`, `n_samples_per_step`, tournament selection) to Karpathy's single-agent autoresearch contract.** With seconds-scale evaluation, parallel-sample tournaments don't pay for themselves; a single agent editing one file in a tight loop is more sample-efficient. The paper's tournament shape is the right answer when the eval is minutes-to-hours (its TPC-DS regime); when eval is seconds, the autoresearch shape wins. If we move to a slower surface later (index-build tuning, compaction tuning), the BauplanLabs control loop becomes the right choice again.
+
+**Oracle shifted from recall@K vs. SIFT1M to bit-exact equivalence + multi-distribution speed.** The doc's surface 1 oracle is `recall@K ≥ floor, minimize p95_latency` on one fixed dataset. That conflates "kernel is mathematically correct" with "kernel preserves recall on this distribution"; it also gives the agent incentive to overfit lossy approximations to SIFT-shaped clusters. The harness instead requires `max_abs_err ≤ 1e-4` against a scalar reference kernel on a 5-distribution input battery × 3 PQ shapes (correctness phase), then measures geomean ns/query across 3 shapes × 3 distributions with a worst-case guard (speed phase). Any "improvement" generalizes across distributions and PQ shapes by construction. There is no fixed dataset; the harness is fully self-contained.
+
+**What remains to validate against the paper's findings.** Whether autoresearch-shape LLM-driven kernel work actually produces meaningful Lance-upstreamable speedups is the open question; the harness exists to answer it empirically. If the answer is "yes, ≥10% geomean speedup with worst-case guard intact," the obvious next step is to spin the loop on surface 1 (index parameter tuning) with the BauplanLabs control shape, where the per-trial cost justifies parallel sampling. If the answer is "no meaningful win after a hundred trials," that's also a publishable conclusion — autoresearch-shape kernel optimization may already be at substrate-defaults optimum.
 
 ## Footnote: OmniGraph-IR as an alternative target
 
