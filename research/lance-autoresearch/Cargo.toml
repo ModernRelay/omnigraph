@@ -1,3 +1,9 @@
+# Empty `[workspace]` section so cargo treats this directory as its own
+# workspace root and does NOT walk up to the parent omnigraph workspace.
+# Without this, cargo from inside `research/lance-autoresearch/` will try to
+# resolve omnigraph's dependencies even though we're excluded as a member.
+[workspace]
+
 [package]
 name = "lance-autoresearch"
 version = "0.1.0"
