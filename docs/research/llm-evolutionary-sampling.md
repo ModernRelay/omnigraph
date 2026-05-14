@@ -182,6 +182,42 @@ The first harness committed against this research is **not** surface 1 above. It
 
 **What remains to validate against the paper's findings.** Whether autoresearch-shape LLM-driven kernel work actually produces meaningful Lance-upstreamable speedups is the open question; the harness exists to answer it empirically. If the answer is "yes, ≥10% geomean speedup with worst-case guard intact," the obvious next step is to spin the loop on surface 1 (index parameter tuning) with the BauplanLabs control shape, where the per-trial cost justifies parallel sampling. If the answer is "no meaningful win after a hundred trials," that's also a publishable conclusion — autoresearch-shape kernel optimization may already be at substrate-defaults optimum.
 
+## Next experiment candidates (ranked by ROI × readiness)
+
+Six candidates worth queueing once the PQ L2 harness produces a signal (positive or negative). Grouped by control-loop shape — the unit of harness reuse is the loop, not the target. Within each cluster, candidates share most of the scaffolding and differ in the kernel / patch dialect / oracle.
+
+### Cluster A — reuses the `lance-autoresearch` harness almost as-is
+
+Autoresearch loop, bit-exact correctness oracle, seconds-scale per-trial eval. Each candidate is "swap `kernels.rs` + add a new `ScalarReference` + maybe one more shape to `inputs::SHAPES`."
+
+**A1. Adjacent distance kernels in `lance-linalg`** — cosine and dot product first, hamming as a stretch. Most production embedding models use cosine, not L2. Lance has separate code paths per metric and the cosine path historically has less SIMD coverage than L2. Harness work: one new `inputs::DataDistribution` for unit-normalized vectors (cosine needs them), one new `ScalarReference` per metric, one new `PqKernel` impl. Probably the lowest-effort next experiment.
+
+**A2. IVF partition-selection kernel** — the dist-to-centroids step that runs *before* PQ probing on every `IvfPq` / `IvfHnswPq` query. Different scale than PQ probing: hundreds-to-thousands of centroids per query, full-precision f32 (not PQ-encoded), no LUT. Tests whether autoresearch wins transfer across kernel scales — if a kernel-loop optimization wins on millions of 16-byte PQ codes but loses on thousands of 128-d f32 centroids, the autoresearch shape may not generalize within "kernel-shape" surfaces and that's worth knowing.
+
+**A3. FTS BM25 scoring kernel** — once a posting list is fetched, scoring is `Σ idf × tf_norm` per matching document. Bit-exact oracle still applies (it's deterministic math). Lance's FTS is younger than its vector path → more headroom. The harness needs FTS-shaped fixtures (inverted-index posting lists, IDF tables) instead of PQ codebooks, but the loop structure is identical to the PQ harness.
+
+### Cluster B — needs a new harness (BauplanLabs control loop)
+
+Tournament sampling, recall + latency oracle, minutes-to-hours per-trial eval. The autoresearch loop stops paying when eval crosses ~30s — single-agent serial iteration is too slow, and the per-trial cost justifies parallel sampling + tournament selection. This is where the literal BauplanLabs `bol_evol` shape earns its keep.
+
+**B1. IVF_PQ index-build parameter tuning** — the original "surface 1" from the section above. Patch dialect: JSON Patch over `(quantizer, num_partitions, num_sub_vectors, nbits, sample_rate, metric_type)`. Per-trial cost: one index build + 1000-query recall eval, typically minutes. Fitness: `recall@10 ≥ 0.95` floor + minimize `p95_latency`. Highest absolute user-facing ROI of anything on this list — Lance defaults are known to be far from per-workload optima for some workloads (e.g., the right `num_partitions` for a 100k-vector store is very different from a 10M-vector store), and current guidance is "tune by hand or read the docs." A winning harness produces a per-workload recommendation engine.
+
+**B2. Auto-index-type selection** — given a dataset signature (cardinality, dimensionality, value distribution, expected query shape), pick `IvfFlat` vs `IvfPq` vs `Hnsw` vs `IvfHnswPq`, *then* tune sub-parameters. Categorical choice over an inner parameter space; the LLM is well-suited to the top-level pick (which has strong qualitative priors per workload shape) and a B1-style loop handles the inner. Solves a real "which index do I pick?" pain that today requires reading three doc pages. Depends on B1 landing first because the inner parameter search reuses B1's harness.
+
+### Cluster C — highest ceiling, hardest harness
+
+**C1. Physical-plan JSON patching for Lance-backed DataFusion** — the literal BauplanLabs paper replicated with Lance as the storage substrate underneath DataFusion. Serialize the DataFusion physical plan to JSON, LLM emits RFC 6902 patches (hash-join build/probe swaps, multi-join reorders, projection pushdowns toward Lance scans), benchmark each candidate end-to-end on a TPC-DS-style workload. Surface 6 from the section above. Hardest harness on this list — plan serializer + patch validator + plan-instantiation + benchmark plumbing — but the ceiling is the highest absolute speedup of any candidate (BauplanLabs hit 4.78× on TPC-DS). The DataFusion integration in the [Lance docs](https://lance.org/integrations/datafusion/) (`LanceTableProvider`) is the substrate; the harness has to live above it. Probably a separate repo at the scale of `lance-tuner`; this isn't a one-week extension.
+
+### Cross-cluster prioritization
+
+If the goal is **shortest path to a Lance upstream PR**, run A1 next (cosine + dot kernels). Same harness, two-day extension, immediately upstreamable as a `lance-format/lance` PR if it wins.
+
+If the goal is **most user-facing impact**, run B1 next (IVF_PQ build tuning). Bigger harness but the recommendation engine output is the kind of thing Lance users want and ask for explicitly.
+
+If the goal is **paper-publishable replication of the BauplanLabs result**, C1 is the only option. Higher cost, higher ceiling, longer timeline.
+
+If A1 wins and B1 doesn't, the conclusion is "Lance kernels have headroom but Lance defaults are well-tuned" — sunsets the parameter-tuning direction cheaply. If A1 fails and B1 wins, the conclusion is "kernels are at-optimum, parameter surface is the real lever." If both win, the natural composition is B2 + a kernel pre-PR pipeline. Run the cheap experiment first.
+
 ## Footnote: OmniGraph-IR as an alternative target
 
 The previous revision of this note focused on patching OmniGraph's own `QueryIR` (`crates/omnigraph-compiler/src/ir/mod.rs:9`) — multi-hop `Expand` ordering and direction, hybrid retrieval (`rrf`) leg tuning, filter pushdown shape. That surface is real and the [§IX](../invariants.md) deny-list already calls out the gap ("cost-blind plan choice — lowering-order execution is not a planner").
