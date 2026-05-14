@@ -1,0 +1,30 @@
+[package]
+name = "lance-autoresearch"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Autoresearch-style harness for evolving Lance PQ L2 distance kernels via LLM agents."
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "run_experiment"
+path = "src/bin/run_experiment.rs"
+
+[[bench]]
+name = "pq_l2"
+harness = false
+
+[dependencies]
+anyhow = "1"
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1

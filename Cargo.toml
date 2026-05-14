@@ -6,6 +6,11 @@ members = [
     "crates/omnigraph-cli",
     "crates/omnigraph-server",
 ]
+exclude = [
+    # `research/` holds standalone experimental projects with their own
+    # workspaces. They must not be picked up by the omnigraph workspace build.
+    "research",
+]
 default-members = [
     "crates/omnigraph",
     "crates/omnigraph-cli",

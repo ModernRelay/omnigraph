@@ -1,0 +1,7 @@
+target/
+Cargo.lock
+results.tsv
+run.log
+.DS_Store
+*.swp
+data/
