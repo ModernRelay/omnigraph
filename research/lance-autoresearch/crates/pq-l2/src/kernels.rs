@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: MIT OR Apache-2.0
 //
 // AGENT'S PLAYGROUND. This is the file you (the agent) modify.
 //
@@ -14,7 +14,6 @@
 // PUBLIC API CONTRACT (must remain stable so the bench keeps building):
 //   - `pub struct PqKernel`
 //   - `PqKernel::new(shape: PqShape, codebook: &[f32]) -> Self`
-//   - `PqKernel::shape(&self) -> &PqShape`
 //   - `PqKernel::distance_table(&self, query: &[f32]) -> Vec<f32>`
 //   - `PqKernel::probe_top_k(&self, table: &[f32], codes: &[u8], num_vectors: usize, k: usize) -> Vec<(u32, f32)>`
 //
@@ -57,10 +56,6 @@ impl PqKernel {
             shape,
             codebook: codebook.to_vec(),
         }
-    }
-
-    pub fn shape(&self) -> &PqShape {
-        &self.shape
     }
 
     /// Asymmetric L2 distance table for one query.

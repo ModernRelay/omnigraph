@@ -6,7 +6,11 @@ in the style of Andrej Karpathy's
 [`nanochat-research`](https://x.com/karpathy/status/1855651423497650238)
 single-agent autoresearch loop.
 
-Each target is an independent Rust crate under `crates/`:
+Each landed target is an independent Rust crate under `crates/`. The
+candidates below are listed as a roadmap — they have no code yet, only the
+research-note rationale and a `docs/targets/<name>.md` capsule (when one
+exists). Spinning up a candidate is the
+[`docs/adding-a-target.md`](docs/adding-a-target.md) workflow.
 
 | Target | Status | Lance source area | What's optimized |
 |---|---|---|---|

@@ -1,4 +1,9 @@
 //! Peak resident-set-size readback (Linux only; non-Linux returns 0).
+//!
+//! Reads `VmHWM` from `/proc/self/status` — the high-water-mark of resident
+//! memory pages, not the high-water-mark of virtual address space. `VmPeak`
+//! (virtual peak) would include mmap'd files, guard pages, and untouched
+//! allocations; `VmHWM` is what users mean by "peak memory".
 
 #[cfg(target_os = "linux")]
 pub fn peak_rss_mb() -> f64 {
@@ -6,7 +11,7 @@ pub fn peak_rss_mb() -> f64 {
         return 0.0;
     };
     for line in s.lines() {
-        if let Some(rest) = line.strip_prefix("VmPeak:") {
+        if let Some(rest) = line.strip_prefix("VmHWM:") {
             let kb: f64 = rest
                 .split_whitespace()
                 .next()

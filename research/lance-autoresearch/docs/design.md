@@ -11,9 +11,13 @@ A multi-target harness for LLM-driven optimization of Lance hot-path kernels.
 right harness shape is identical across them: bit-exact correctness oracle,
 geomean-across-distributions speed metric, single-agent autoresearch loop.
 
-The original [research note](../../docs/research/llm-evolutionary-sampling.md)
-enumerates ten such candidates (A1–A10) clustered by Lance crate. The first
-landed (`pq-l2`) proves the harness shape; the rest follow the same template.
+The original research note that motivated this repo enumerates ten such
+candidates (A1–A10) clustered by Lance crate. The first landed (`pq-l2`) proves
+the harness shape; the rest follow the same template. When this repo lives
+inside the parent OmniGraph workspace, the note is at
+`omnigraph/docs/research/llm-evolutionary-sampling.md`; if the repo is ever
+extracted as a standalone OSS project, the note is part of OmniGraph's
+private design history and won't ship with the extracted repo.
 
 ## Decision: workspace, not single crate
 

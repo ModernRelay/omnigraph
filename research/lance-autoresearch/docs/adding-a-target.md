@@ -1,13 +1,19 @@
 # Adding a new target
 
 Walk through this when spinning up a new optimization target (A1 cosine, A4
-bitpack, etc.). It's a `cp -r` plus surgical edits — no architectural
-decisions to make per target if the kernel fits the autoresearch shape.
+bitpack, etc.). The workflow is: copy an existing target as scaffolding,
+then rewrite the four source files (`lib.rs`, `kernels.rs`, `reference.rs`,
+`inputs.rs`), the entry point (`bin/run_experiment.rs`), the per-target
+`program.md`, and add a capsule under `docs/targets/`. The Cargo manifest,
+workspace registration, license headers, file-layout conventions, gitignore,
+and shared utilities (`harness-common`) are inherited from the template —
+that's the part you don't rewrite.
 
-If your target's per-trial eval is more than ~30 seconds, or the correctness
-oracle can't be a deterministic comparison against a scalar reference, this
-harness is the wrong fit — see [`design.md`](design.md) "When to revisit"
-for the boundary.
+No architectural decisions are required per target if the kernel fits the
+autoresearch shape. If your target's per-trial eval is more than ~30 seconds,
+or the correctness oracle can't be a deterministic comparison against a
+scalar reference, this harness is the wrong fit — see [`design.md`](design.md)
+"When to revisit" for the boundary.
 
 ## Steps
 

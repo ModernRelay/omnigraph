@@ -38,7 +38,6 @@ pub struct PqKernel { /* agent's private fields */ }
 
 impl PqKernel {
     pub fn new(shape: PqShape, codebook: &[f32]) -> Self;
-    pub fn shape(&self) -> &PqShape;
     pub fn distance_table(&self, query: &[f32]) -> Vec<f32>;
     pub fn probe_top_k(&self, table: &[f32], codes: &[u8], num_vectors: usize, k: usize) -> Vec<(u32, f32)>;
 }

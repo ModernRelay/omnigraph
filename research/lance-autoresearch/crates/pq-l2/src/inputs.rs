@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! IMMUTABLE. Diverse test-data + workload generators.
 //!
 //! Two surfaces. `correctness_battery(seed)` yields several
@@ -90,7 +92,7 @@ pub fn correctness_battery(seed: u64) -> Vec<CorrectnessCase> {
     ];
     for &shape in SHAPES {
         for (kind, label) in kinds {
-            let mut rng = SplitMix64::new(seed ^ shape_hash(shape) ^ kind_hash(*kind));
+            let mut rng = SplitMix64::new(mix_seeds(&[seed, shape_hash(shape), kind_hash(*kind)]));
             let num_vectors = 4096;
             let codebook = build_codebook(shape, *kind, CODEBOOK_TRAIN_SIZE, &mut rng);
             let base = gen_vectors(num_vectors, shape.dim, *kind, &mut rng);
@@ -114,7 +116,7 @@ pub fn speed_workloads(seed: u64) -> Vec<SpeedWorkload> {
     let mut out = Vec::new();
     for &shape in SHAPES {
         for &dist in DISTRIBUTIONS {
-            let mut rng = SplitMix64::new(seed ^ shape_hash(shape) ^ dist_hash(dist));
+            let mut rng = SplitMix64::new(mix_seeds(&[seed, shape_hash(shape), dist_hash(dist)]));
             let kind = match dist {
                 DataDistribution::Clustered => InputKind::Clustered,
                 DataDistribution::Uniform => InputKind::Uniform,
@@ -294,6 +296,21 @@ fn encode(shape: PqShape, n: usize, base: &[f32], codebook: &[f32]) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Combine seed components without XOR-collision. Iterates the SplitMix64
+/// finalizer once per part, so distinct part vectors produce distinct seeds
+/// with vanishingly small collision probability (vs. raw XOR, where
+/// `a ^ b ^ c == a ^ c ^ b` and small constants can cancel each other).
+fn mix_seeds(parts: &[u64]) -> u64 {
+    let mut mixed: u64 = 0;
+    for &p in parts {
+        mixed = mixed.wrapping_add(p).wrapping_add(0x9E37_79B9_7F4A_7C15);
+        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        mixed ^= mixed >> 31;
+    }
+    mixed
 }
 
 fn shape_hash(s: PqShape) -> u64 {

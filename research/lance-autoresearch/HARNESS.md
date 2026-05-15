@@ -70,6 +70,11 @@ A kernel is **kept** iff:
 5. Build clean: `cargo build --release` and
    `cargo clippy --release --all-targets -- -D warnings` both succeed.
 
+Exit codes summary for `run_experiment`: `0` on success, `1` on internal
+error (panic, fixture load failure), `2` on correctness failure, `3` on
+time-budget breach. The agent's loop should treat anything non-zero as
+"revert; do not log as a measurement."
+
 Ties break toward simpler code: same speed within ~3% noise → fewer lines /
 less `unsafe` wins.
 
