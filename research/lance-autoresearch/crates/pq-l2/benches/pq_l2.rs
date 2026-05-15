@@ -16,7 +16,8 @@ fn bench_pq_l2(c: &mut Criterion) {
     for wl in &workloads {
         let kernel = PqKernel::new(wl.shape, &wl.codebook);
         let q = &wl.queries[..wl.shape.dim];
-        let table0 = kernel.distance_table(q);
+        let mut table0 = vec![0.0f32; wl.shape.distance_table_len()];
+        kernel.distance_table(q, &mut table0);
 
         let label_shape = format!(
             "{}x{}x{}",
@@ -26,9 +27,10 @@ fn bench_pq_l2(c: &mut Criterion) {
         let id = format!("{label_shape}/{label_dist}");
 
         c.bench_function(&format!("distance_table/{id}"), |b| {
+            let mut scratch = vec![0.0f32; wl.shape.distance_table_len()];
             b.iter(|| {
-                let t = kernel.distance_table(black_box(q));
-                black_box(t);
+                kernel.distance_table(black_box(q), black_box(&mut scratch));
+                black_box(&scratch);
             });
         });
         c.bench_function(&format!("probe_top_k/{id}"), |b| {

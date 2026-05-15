@@ -25,12 +25,12 @@ impl ScalarReference {
     }
 
     #[allow(clippy::needless_range_loop)]
-    pub fn distance_table(&self, query: &[f32]) -> Vec<f32> {
+    pub fn distance_table(&self, query: &[f32], out: &mut [f32]) {
         let s = &self.shape;
         let svd = s.sub_vector_dim();
         assert_eq!(query.len(), s.dim);
+        assert_eq!(out.len(), s.distance_table_len());
 
-        let mut table = vec![0.0f32; s.distance_table_len()];
         for m in 0..s.num_sub_vectors {
             let q_sub = &query[m * svd..(m + 1) * svd];
             let cb_off = m * s.num_centroids * svd;
@@ -42,10 +42,9 @@ impl ScalarReference {
                     let diff = q_sub[d] - self.codebook[base + d];
                     acc += diff * diff;
                 }
-                table[tbl_off + k] = acc;
+                out[tbl_off + k] = acc;
             }
         }
-        table
     }
 
     pub fn probe_top_k(

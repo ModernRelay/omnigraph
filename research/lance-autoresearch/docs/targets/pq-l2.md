@@ -12,9 +12,12 @@ generalizable speedups against it.
 
 Two functions in `crates/pq-l2/src/kernels.rs`:
 
-- `PqKernel::distance_table(query)` — builds the asymmetric distance table
-  (`[num_sub_vectors][num_centroids]`) for one query against the codebook.
-  Cost: `num_sub_vectors × num_centroids × sub_vector_dim` MAC ops per query.
+- `PqKernel::distance_table(query, &mut out)` — writes the asymmetric
+  distance table (`[num_sub_vectors][num_centroids]`) for one query against
+  the codebook into a caller-provided `&mut [f32]` buffer (the bench
+  pre-allocates and reuses one buffer per workload so allocator cost stays
+  out of the per-query timing). Cost:
+  `num_sub_vectors × num_centroids × sub_vector_dim` MAC ops per query.
 - `PqKernel::probe_top_k(table, codes, num_vectors, k)` — probes
   `num_vectors` PQ-encoded vectors, accumulates per-vector distance via
   `num_sub_vectors` table lookups, returns top-K. Cost:

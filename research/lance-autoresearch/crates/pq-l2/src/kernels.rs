@@ -14,7 +14,7 @@
 // PUBLIC API CONTRACT (must remain stable so the bench keeps building):
 //   - `pub struct PqKernel`
 //   - `PqKernel::new(shape: PqShape, codebook: &[f32]) -> Self`
-//   - `PqKernel::distance_table(&self, query: &[f32]) -> Vec<f32>`
+//   - `PqKernel::distance_table(&self, query: &[f32], out: &mut [f32])`
 //   - `PqKernel::probe_top_k(&self, table: &[f32], codes: &[u8], num_vectors: usize, k: usize) -> Vec<(u32, f32)>`
 //
 // What you CAN do:
@@ -58,17 +58,19 @@ impl PqKernel {
         }
     }
 
-    /// Asymmetric L2 distance table for one query.
+    /// Write the asymmetric L2 distance table for one query into `out`.
     ///
-    /// Layout of returned `Vec<f32>`: `[num_sub_vectors][num_centroids]` flat
-    /// (`table[m * num_centroids + k]`).
+    /// `out` layout: `[num_sub_vectors][num_centroids]` flat
+    /// (`out[m * num_centroids + k]`). Caller pre-allocates `out` with length
+    /// `shape.distance_table_len()`; the bench reuses one buffer across all
+    /// queries so allocator cost stays out of the per-query timing.
     #[allow(clippy::needless_range_loop)]
-    pub fn distance_table(&self, query: &[f32]) -> Vec<f32> {
+    pub fn distance_table(&self, query: &[f32], out: &mut [f32]) {
         let s = &self.shape;
         let svd = s.sub_vector_dim();
         debug_assert_eq!(query.len(), s.dim);
+        debug_assert_eq!(out.len(), s.distance_table_len());
 
-        let mut table = vec![0.0f32; s.distance_table_len()];
         for m in 0..s.num_sub_vectors {
             let q_sub = &query[m * svd..(m + 1) * svd];
             let cb_off = m * s.num_centroids * svd;
@@ -80,10 +82,9 @@ impl PqKernel {
                     let diff = q_sub[d] - self.codebook[base + d];
                     acc += diff * diff;
                 }
-                table[tbl_off + k] = acc;
+                out[tbl_off + k] = acc;
             }
         }
-        table
     }
 
     /// Probe `num_vectors` PQ-encoded vectors and return top-K by ascending

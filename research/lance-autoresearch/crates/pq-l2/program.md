@@ -38,7 +38,7 @@ pub struct PqKernel { /* agent's private fields */ }
 
 impl PqKernel {
     pub fn new(shape: PqShape, codebook: &[f32]) -> Self;
-    pub fn distance_table(&self, query: &[f32]) -> Vec<f32>;
+    pub fn distance_table(&self, query: &[f32], out: &mut [f32]);
     pub fn probe_top_k(&self, table: &[f32], codes: &[u8], num_vectors: usize, k: usize) -> Vec<(u32, f32)>;
 }
 ```
@@ -91,7 +91,11 @@ to combine multiple ideas at once.
 - **FMA chains for table build.** The diff–square–sum maps cleanly to FMA
   on AVX2/NEON. Even without intrinsics, structuring the inner loop so
   `rustc` emits FMA helps.
-- **Avoid the `Vec` allocation in the hot path.** `distance_table` allocates
-  a fresh `Vec<f32>` per call. The public API is fixed (returns `Vec<f32>`),
-  but you can reuse a thread-local scratch buffer internally and copy to a
-  `Vec` at the boundary if it speeds the build.
+- **Reduce `probe_top_k`'s `Vec<(u32, f32)>` allocation.** `distance_table`'s
+  output buffer is already pre-allocated by the caller (the bench reuses
+  one `&mut [f32]` per workload), so allocation isn't on that hot path.
+  `probe_top_k` still allocates a `Vec<(u32, f32)>` for the result. K is
+  small (10–100) so this is a single small alloc per query, but on the
+  SIMD'd kernel it can be a measurable fraction. A heap that uses a
+  fixed-size `[(u32, f32); MAX_K]` internally and only allocates the
+  result `Vec` at the boundary is one option.

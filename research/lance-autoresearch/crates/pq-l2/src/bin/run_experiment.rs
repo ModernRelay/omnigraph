@@ -125,8 +125,10 @@ fn run_correctness() -> Result<(), String> {
         let agent = PqKernel::new(case.shape, &case.codebook);
         let reference = ScalarReference::new(case.shape, &case.codebook);
 
-        let agent_table = agent.distance_table(&case.query);
-        let ref_table = reference.distance_table(&case.query);
+        let mut agent_table = vec![0.0f32; case.shape.distance_table_len()];
+        let mut ref_table = vec![0.0f32; case.shape.distance_table_len()];
+        agent.distance_table(&case.query, &mut agent_table);
+        reference.distance_table(&case.query, &mut ref_table);
         let table_err = max_abs_err(&agent_table, &ref_table);
         if table_err > MAX_ABS_ERR {
             return Err(format!(
@@ -175,13 +177,32 @@ fn run_speed(workloads: &[SpeedWorkload]) -> SpeedReport {
 
     for wl in workloads {
         let kernel = PqKernel::new(wl.shape, &wl.codebook);
+        // Distance-table buffer reused across queries — the alloc must stay
+        // out of the per-query timing so allocator-pressure improvements
+        // don't masquerade as kernel improvements.
+        let mut table = vec![0.0f32; wl.shape.distance_table_len()];
+
+        // Warmup: one untimed query primes caches (codes, codebook) and the
+        // CPU branch predictor before measurement starts. The first query
+        // otherwise pays cold-cache cost on the codes array, which for
+        // (768, 96, 256) is ~1.9 MB and exceeds L2 on many laptops.
+        {
+            let q = &wl.queries[..wl.shape.dim];
+            kernel.distance_table(q, &mut table);
+            let hits = kernel.probe_top_k(&table, &wl.codes, wl.num_vectors, wl.k);
+            std::hint::black_box(hits);
+        }
+
         let mut combo_timings: Vec<u64> = Vec::with_capacity(wl.num_queries);
         for qi in 0..wl.num_queries {
             let q = &wl.queries[qi * wl.shape.dim..(qi + 1) * wl.shape.dim];
             let t0 = Instant::now();
-            let table = kernel.distance_table(q);
-            let _hits = kernel.probe_top_k(&table, &wl.codes, wl.num_vectors, wl.k);
+            kernel.distance_table(q, &mut table);
+            let hits = kernel.probe_top_k(&table, &wl.codes, wl.num_vectors, wl.k);
             combo_timings.push(t0.elapsed().as_nanos() as u64);
+            // black_box prevents LTO from DCE-ing the heap maintenance work
+            // when the binary is the only consumer of `hits`.
+            std::hint::black_box(hits);
         }
         let combo_geo = geomean(&combo_timings);
         per_combo.push(ComboReport {
