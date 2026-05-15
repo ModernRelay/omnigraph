@@ -15,7 +15,7 @@ Join the [Omnigraph Slack community](https://join.slack.com/t/omnigraphworkspace
 
 ## Use Cases
 
-- Company brains
+- Company brains / [Second brains](https://github.com/ModernRelay/omnigraph-cookbooks/tree/main/second-brain)
 - Context graphs
 - Backbone for multi-agent research
 - Incident response graphs
