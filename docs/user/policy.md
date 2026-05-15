@@ -13,13 +13,16 @@ OmniGraph integrates AWS Cedar (`cedar-policy = 4.9`) for ABAC.
 7. `branch_merge`
 8. `run_publish`
 9. `run_abort`
-10. `admin` — reserved
+10. `query_read` — list/get saved queries (`GET /queries`, `GET /queries/{name}`)
+11. `query_write` — create/overwrite/delete saved queries (`PUT /queries/{name}`, `DELETE /queries/{name}`)
+12. `admin` — reserved
 
 ## Scope kinds
 
 - `branch_scope` — applied to source branch (`read`, `export`, `change`)
 - `target_branch_scope` — applied to destination (`schema_apply`, branch ops, run ops)
 - `protected_branches` — named list with special rules; rule scopes are `any | protected | unprotected`
+- Saved-query actions (`query_read`, `query_write`) have no branch scope — saved queries are global metadata, not per-branch.
 
 ## Configuration
 

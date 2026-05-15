@@ -21,6 +21,10 @@ Axum 0.8 + tokio + utoipa-generated OpenAPI. Single repo per process; deploy mul
 | POST | `/branches/merge` | bearer + `branch_merge` | merge `source → target` | `server_branch_merge` |
 | GET | `/commits?branch=` | bearer + `read` | list | `server_commit_list` |
 | GET | `/commits/{commit_id}` | bearer + `read` | show | `server_commit_show` |
+| GET | `/queries` | bearer + `query_read` | list saved queries with their declared params | `server_query_list` |
+| GET | `/queries/{name}` | bearer + `query_read` | get one saved query | `server_query_get` |
+| PUT | `/queries/{name}` | bearer + `query_write` | save (insert or overwrite); source must declare exactly one `query <name>(...)` block whose name matches `{name}` | `server_query_save` |
+| DELETE | `/queries/{name}` | bearer + `query_write` | delete (idempotent) | `server_query_delete` |
 
 ## Streaming
 
@@ -61,10 +65,13 @@ actors are unaffected.
 Cedar policy authorization runs **before** admission accounting so
 denied requests don't consume admission slots.
 
-Today admission gates every mutating handler: `/change`, `/ingest`,
+Today admission gates the data-path mutating handlers: `/change`, `/ingest`,
 `/branches/{create,delete,merge}`, and `/schema/apply`. Read-only
 endpoints (`/snapshot`, `/read`, `/export`, `/branches` GET, `/commits`,
-`/schema` GET) are not admission-gated.
+`/schema` GET, `/queries`) are not admission-gated. `/queries/{name}`
+PUT/DELETE are also not admission-gated — they write a single small
+JSON file outside the manifest and impose negligible Lance / manifest
+pressure compared with the data-path writers.
 
 ## Body limits
 
@@ -89,6 +96,20 @@ See [deployment.md](deployment.md) for token-source operational details.
 - Policy decisions logged at INFO level with actor, action, branch, decision, matched rule
 - Startup logs: token source name, repo URI, bind address
 - Graceful SIGINT shutdown
+
+## Saved queries
+
+`/queries` is a thin CRUD over named `.gq` query sources persisted at
+`<root>/queries/<name>.json` via the existing `StorageAdapter` — same
+substrate as schema source, not a Lance dataset or manifest entry. On
+save the server parses the source via `omnigraph-compiler` and stores
+the declared parameter signature alongside it; clients use that
+signature to render typed inputs (e.g. one MCP tool per saved query
+under the `q_<name>` prefix). Names are constrained to
+`^[a-z][a-z0-9_]{0,63}$` and a small reserved list rejects names that
+would shadow built-in MCP tools (`read`, `change`, ...). Saved queries
+are global (not per-branch); execution still goes through `/read` with
+the saved source as input.
 
 ## Not implemented (by design or "TBD")
 

@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use omnigraph_compiler::query::parser::parse_query;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::error::{OmniError, Result};
 use crate::storage::{StorageAdapter, join_uri};
@@ -73,13 +74,25 @@ pub(crate) async fn list(
     let entries = storage.list_dir(&dir).await?;
     let mut out = Vec::with_capacity(entries.len());
     for uri in entries {
-        if !uri.ends_with(QUERY_FILE_SUFFIX) {
+        let Some(filename_stem) = filename_stem_for_query_file(&uri) else {
+            continue;
+        };
+        let text = storage.read_text(&uri).await?;
+        let parsed: SavedQuery = match serde_json::from_str::<SavedQuery>(&text) {
+            Ok(p) => p,
+            Err(err) => {
+                warn!(uri = %uri, error = %err, "skipping saved query: JSON parse failed");
+                continue;
+            }
+        };
+        // Guard against operator tampering with the on-disk file (rename,
+        // hand-edit, format version bump). Skipping rather than erroring keeps
+        // one bad file from poisoning the entire list — the warn() log makes
+        // the omission loud for the operator to investigate.
+        if let Err(err) = check_record_invariants(&parsed, filename_stem) {
+            warn!(uri = %uri, error = %err, "skipping saved query: failed invariant check");
             continue;
         }
-        let text = storage.read_text(&uri).await?;
-        let parsed: SavedQuery = serde_json::from_str(&text).map_err(|err| {
-            OmniError::manifest_internal(format!("failed to parse saved query at {}: {}", uri, err))
-        })?;
         out.push(parsed);
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -103,7 +116,37 @@ pub(crate) async fn get(
     let parsed: SavedQuery = serde_json::from_str(&text).map_err(|err| {
         OmniError::manifest_internal(format!("failed to parse saved query '{}': {}", name, err))
     })?;
+    // get() is loud (single-record fetch with a known name from the caller);
+    // a failed invariant check is a hard error rather than a silent skip.
+    check_record_invariants(&parsed, name).map_err(OmniError::manifest_internal)?;
     Ok(parsed)
+}
+
+/// Validate that an on-disk record matches the contract we wrote: name is
+/// well-formed, name matches the filename it came from, and format_version
+/// is one we understand.
+fn check_record_invariants(record: &SavedQuery, expected_name: &str) -> std::result::Result<(), String> {
+    if record.format_version != SAVED_QUERY_FORMAT_VERSION {
+        return Err(format!(
+            "format_version {} is not supported (this build understands {})",
+            record.format_version, SAVED_QUERY_FORMAT_VERSION
+        ));
+    }
+    if record.name != expected_name {
+        return Err(format!(
+            "record name '{}' does not match filename '{}'",
+            record.name, expected_name
+        ));
+    }
+    validate_name(&record.name).map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+/// Pull the `<name>` out of a `.../queries/<name>.json` URI. Returns None for
+/// any entry that does not match — non-JSON files, hidden files, etc.
+fn filename_stem_for_query_file(uri: &str) -> Option<&str> {
+    let stem = uri.strip_suffix(QUERY_FILE_SUFFIX)?;
+    stem.rsplit('/').next()
 }
 
 pub(crate) async fn save(
@@ -332,6 +375,103 @@ mod tests {
         match err {
             OmniError::Manifest(m) => assert_eq!(m.kind, crate::error::ManifestErrorKind::NotFound),
             other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_skips_records_with_invariant_violations() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let storage = local();
+
+        // Save one valid record so the queries/ dir exists.
+        let src =
+            "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.name } }";
+        save(root, storage.as_ref(), "find_person", src, None).await.unwrap();
+
+        // 1) Filename / record-name mismatch: write a renamed copy.
+        let renamed = serde_json::to_string(&SavedQuery {
+            format_version: SAVED_QUERY_FORMAT_VERSION,
+            name: "different_name".to_string(),
+            description: None,
+            source: src.to_string(),
+            params: vec![],
+            updated_at_us: "0".to_string(),
+        })
+        .unwrap();
+        storage
+            .write_text(&query_file_uri(root, "renamed_on_disk"), &renamed)
+            .await
+            .unwrap();
+
+        // 2) Future format_version we don't understand.
+        let future = serde_json::to_string(&SavedQuery {
+            format_version: SAVED_QUERY_FORMAT_VERSION + 1,
+            name: "future".to_string(),
+            description: None,
+            source: src.to_string(),
+            params: vec![],
+            updated_at_us: "0".to_string(),
+        })
+        .unwrap();
+        storage
+            .write_text(&query_file_uri(root, "future"), &future)
+            .await
+            .unwrap();
+
+        // 3) Malformed JSON entirely.
+        storage
+            .write_text(&query_file_uri(root, "broken"), "{not json}")
+            .await
+            .unwrap();
+
+        // 4) A name that wouldn't pass validate_name (e.g. uppercase). The
+        //    filename + record name agree, so the mismatch check passes —
+        //    but validate_name should reject it.
+        let bad_name = serde_json::to_string(&SavedQuery {
+            format_version: SAVED_QUERY_FORMAT_VERSION,
+            name: "Bad_Name".to_string(),
+            description: None,
+            source: src.to_string(),
+            params: vec![],
+            updated_at_us: "0".to_string(),
+        })
+        .unwrap();
+        storage
+            .write_text(&query_file_uri(root, "Bad_Name"), &bad_name)
+            .await
+            .unwrap();
+
+        let listed = list(root, Arc::clone(&storage)).await.unwrap();
+        // Only the valid `find_person` should survive the invariant checks.
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "find_person");
+    }
+
+    #[tokio::test]
+    async fn get_rejects_records_with_invariant_violations() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let storage = local();
+
+        let renamed = serde_json::to_string(&SavedQuery {
+            format_version: SAVED_QUERY_FORMAT_VERSION,
+            name: "different_name".to_string(),
+            description: None,
+            source: "query different_name() { match { $p: Person } return { $p.name } }".to_string(),
+            params: vec![],
+            updated_at_us: "0".to_string(),
+        })
+        .unwrap();
+        storage
+            .write_text(&query_file_uri(root, "find_person"), &renamed)
+            .await
+            .unwrap();
+
+        let err = get(root, storage.as_ref(), "find_person").await.unwrap_err();
+        match err {
+            OmniError::Manifest(m) => assert_eq!(m.kind, crate::error::ManifestErrorKind::Internal),
+            other => panic!("expected Internal, got {:?}", other),
         }
     }
 }
