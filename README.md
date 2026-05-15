@@ -85,13 +85,13 @@ omnigraph branch create --from main feature-x ./repo.omni
 omnigraph branch merge  feature-x --into main ./repo.omni
 ```
 
-See [docs/cli.md](docs/cli.md) for schema apply, snapshots, ingest, runs, and policy commands.
+See [docs/user/cli.md](docs/user/cli.md) for schema apply, snapshots, ingest, runs, and policy commands.
 
 ## Docs
 
-- [Install guide](docs/install.md)
-- [CLI guide](docs/cli.md)
-- [Deployment guide](docs/deployment.md)
+- [Install guide](docs/user/install.md)
+- [CLI guide](docs/user/cli.md)
+- [Deployment guide](docs/user/deployment.md)
 
 ## Build And Test
 

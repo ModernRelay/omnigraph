@@ -2,9 +2,11 @@
 
 OmniGraph does not have `BEGIN` / `COMMIT` / `ROLLBACK`. Branches do that job. This page explains the model, when to use which primitive, and shows worked examples for the patterns that come up most.
 
-The architectural rule lives in [`docs/invariants.md`](invariants.md) §VI.23:
+The architectural rule lives in [`docs/dev/invariants.md`](../dev/invariants.md):
 
-> **Atomicity is per-query.** Every `.gq` query is atomic via the substrate's atomic-commit primitive. **No cross-query `BEGIN`/`COMMIT`; branches and merges fill that role for agent workflows.**
+> **Mutations publish at one boundary.** A `mutate_as` or `load` operation
+> accumulates constructive writes, commits each touched table at the end, then
+> publishes one manifest update.
 
 If you need to coordinate multiple queries atomically, you fork a branch, run mutations on it, and merge when you're satisfied. If something goes wrong, you delete the branch.
 
@@ -159,8 +161,8 @@ This is the workflow MR-797 / agentic loops are designed around: **branches are 
 
 ## See also
 
-- [`docs/branches-commits.md`](branches-commits.md) — branch and commit-graph mechanics.
-- [`docs/merge.md`](merge.md) — three-way merge details and conflict kinds.
-- [`docs/query-language.md`](query-language.md) — `.gq` syntax for the multi-statement queries used above.
-- [`docs/runs.md`](runs.md) — the per-query commit pipeline that gives single-query atomicity.
-- [`docs/invariants.md`](invariants.md) §VI.23 — the architectural rule.
+- [`docs/user/branches-commits.md`](branches-commits.md) — branch and commit-graph mechanics.
+- [`docs/dev/merge.md`](../dev/merge.md) — three-way merge details and conflict kinds.
+- [`docs/user/query-language.md`](query-language.md) — `.gq` syntax for the multi-statement queries used above.
+- [`docs/dev/runs.md`](../dev/runs.md) — the per-query commit pipeline that gives single-query atomicity.
+- [`docs/dev/invariants.md`](../dev/invariants.md) — the architectural rule.

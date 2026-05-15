@@ -6,7 +6,7 @@ This file is the curated entry point. **When you hit a Lance-shaped problem, fin
 
 Base URL: `https://lance.org`. **Fetch the FULL page content, not summaries** — use `npx mdrip <url>` (or `npx mdrip --max-chars 200000 <url>` for very long pages). Tools that summarize pages (like Claude's `WebFetch`) routinely drop load-bearing details — defaults, `pub(crate)` blockers, sub-specs hidden behind navigation hubs. If `npx mdrip` is unavailable, fall back to `curl <url> | pandoc -f html -t markdown` or paste the rendered page text manually; **never act on a summarized fetch alone**. Keep this index curated to relevant material — the upstream sitemap has hundreds of URLs (notably the Namespace REST API model surface, Spark/Trino/Databricks integrations) that we don't use.
 
-> **Substrate boundary check.** Before fetching, recall [docs/invariants.md §I](invariants.md): if Lance already does the thing, we don't reimplement it. The most common reason to read these docs is to confirm a substrate behavior, not to learn what to clone.
+> **Substrate boundary check.** Before fetching, recall [docs/dev/invariants.md](invariants.md): if Lance already does the thing, we don't reimplement it. The most common reason to read these docs is to confirm a substrate behavior, not to learn what to clone.
 
 ## Quick-start (read these once per project)
 
@@ -129,7 +129,7 @@ Touching `omnigraph optimize` / `cleanup`, the underlying `compact_files` / `cle
 
 ### DataFusion integration
 
-The runtime substrate that may carry our query execution. See [docs/invariants.md §I.4](invariants.md): we don't rebuild relational machinery.
+The runtime substrate that may carry our query execution. See [docs/dev/invariants.md](invariants.md): we don't rebuild relational machinery.
 
 | Topic | URL |
 |---|---|
