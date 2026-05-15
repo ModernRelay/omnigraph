@@ -660,6 +660,20 @@ impl TableStore {
             .map_err(|e| OmniError::Lance(e.to_string()))?
             .when_matched(when_matched)
             .when_not_matched(when_not_matched)
+            // Force the full-table-scan join path. Our load/mutation path
+            // builds a BTREE on `id` in `prepare_updates_for_commit`, and
+            // that index goes stale across merge_insert calls — its
+            // entries still address tombstoned rows in the fragments that
+            // merge_insert rewrites. Lance's indexed-scan path
+            // (`create_indexed_scan_joined_stream` in
+            // `lance-4.0.0/src/dataset/write/merge_insert.rs`) UNIONs the
+            // index lookup with a full scan of unindexed fragments and
+            // does not filter by deletion vector, so the same stable
+            // `_rowid` appears on both sides, tripping the source-dedup
+            // check ("multiple source rows match the same target row").
+            // The full-scan path is selected by `use_index=false` and
+            // correctly respects deletion vectors.
+            .use_index(false)
             .try_build()
             .map_err(|e| OmniError::Lance(e.to_string()))?;
 
@@ -875,6 +889,15 @@ impl TableStore {
             .map_err(|e| OmniError::Lance(e.to_string()))?
             .when_matched(when_matched)
             .when_not_matched(when_not_matched)
+            // See `merge_insert_batch` for why we disable the indexed
+            // join path: the BTREE on `id` built by
+            // `prepare_updates_for_commit` becomes stale across
+            // merge_insert calls and tips Lance's
+            // `create_indexed_scan_joined_stream` into emitting the same
+            // target `_rowid` twice (indexed scan of the tombstoned
+            // fragment UNION full scan of the unindexed rewrite
+            // fragment).
+            .use_index(false)
             .try_build()
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         let schema = batch.schema();
