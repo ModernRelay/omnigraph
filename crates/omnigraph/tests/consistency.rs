@@ -119,6 +119,67 @@ async fn load_merge_upserts_existing_and_inserts_new() {
     }
 }
 
+/// Regression: two sequential `LoadMode::Merge` invocations against the
+/// same set of keys must both succeed. Pre-fix, the second one failed
+/// with `Ambiguous merge inserts are prohibited: multiple source rows
+/// match the same target row on (id = "TEST-1")` even though every
+/// source batch had one row per key.
+///
+/// Root cause was the BTREE index that the load commit path builds on
+/// `id` (via `prepare_updates_for_commit` → `build_indices_on_dataset`):
+/// after the first merge the index entries still addressed the
+/// tombstoned-by-DV rows in the rewritten fragment, and Lance's
+/// indexed-scan merge path UNIONs the index lookup with a full scan of
+/// the unindexed rewrite fragment, so the same target `_rowid` appeared
+/// twice in the join output and tripped Lance's source-dedupe check.
+/// Fixed by forcing `use_index(false)` on `MergeInsertBuilder` (see
+/// `table_store::TableStore::stage_merge_insert`).
+#[tokio::test]
+async fn load_merge_repeated_against_overlapping_keys_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema = r#"
+node Thing {
+    key: String @key
+    required_val: String
+    optional_val: String?
+}
+"#;
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+
+    // Seed with 50 fully-populated rows (id + required + optional).
+    let mut seed = String::new();
+    for i in 1..=50 {
+        seed.push_str(&format!(
+            r#"{{"type":"Thing","data":{{"key":"TEST-{i}","required_val":"required {i}","optional_val":"optional {i}"}}}}
+"#,
+        ));
+    }
+    load_jsonl(&mut db, &seed, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    // Partial-schema delta — mirrors the bug report exactly: omits
+    // `optional_val`. 25 existing keys + 5 new keys, one row per key.
+    let mut delta = String::new();
+    for i in (1..=25).chain(51..=55) {
+        delta.push_str(&format!(
+            r#"{{"type":"Thing","data":{{"key":"TEST-{i}","required_val":"required {i} UPDATED"}}}}
+"#,
+        ));
+    }
+
+    load_jsonl(&mut db, &delta, LoadMode::Merge)
+        .await
+        .expect("first merge must succeed");
+    assert_eq!(count_rows(&db, "node:Thing").await, 55);
+
+    load_jsonl(&mut db, &delta, LoadMode::Merge)
+        .await
+        .expect("second merge against same keys must succeed");
+    assert_eq!(count_rows(&db, "node:Thing").await, 55);
+}
+
 #[tokio::test]
 async fn cross_type_traversal_deduplicates_duplicate_edges() {
     let dir = tempfile::tempdir().unwrap();
