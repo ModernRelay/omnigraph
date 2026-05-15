@@ -35,18 +35,18 @@
 
 use std::time::Instant;
 
-use lance_autoresearch::inputs::{
+use harness_common::{MAX_ABS_ERR, TIME_BUDGET_SECS, TOPK_DIST_TOL, geomean, peak_rss_mb};
+use pq_l2::inputs::{
     DISTRIBUTIONS, DataDistribution, SHAPES, SpeedWorkload, correctness_battery, speed_workloads,
 };
-use lance_autoresearch::kernels::PqKernel;
-use lance_autoresearch::reference::{ScalarReference, max_abs_err, topk_consistent};
-use lance_autoresearch::{MAX_ABS_ERR, PqShape, TOPK_DIST_TOL};
+use pq_l2::kernels::PqKernel;
+use pq_l2::reference::{ScalarReference, max_abs_err, topk_consistent};
+use pq_l2::PqShape;
 
 // Any constants; the only requirement is that they're pinned across trials so
 // the inputs and the timings are reproducible.
 const CORRECTNESS_SEED: u64 = 0xC0FF_EEC0_DEBE_EFFE;
 const SPEED_SEED: u64 = 0x5EED_F1AC_BABE_FACE;
-const TIME_BUDGET_SECS: u64 = 600;
 
 fn main() {
     let start = Instant::now();
@@ -210,17 +210,6 @@ fn run_speed(workloads: &[SpeedWorkload]) -> SpeedReport {
     }
 }
 
-fn geomean(xs: &[u64]) -> u64 {
-    if xs.is_empty() {
-        return 0;
-    }
-    let mut sum_ln = 0.0f64;
-    for &x in xs {
-        sum_ln += (x.max(1) as f64).ln();
-    }
-    (sum_ln / xs.len() as f64).exp() as u64
-}
-
 fn format_shape(s: &PqShape) -> String {
     format!("({},{},{})", s.dim, s.num_sub_vectors, s.num_centroids)
 }
@@ -232,27 +221,4 @@ fn format_dist(d: &DataDistribution) -> String {
         DataDistribution::Sparse => "sparse",
     }
     .to_string()
-}
-
-#[cfg(target_os = "linux")]
-fn peak_rss_mb() -> f64 {
-    let Ok(s) = std::fs::read_to_string("/proc/self/status") else {
-        return 0.0;
-    };
-    for line in s.lines() {
-        if let Some(rest) = line.strip_prefix("VmPeak:") {
-            let kb: f64 = rest
-                .split_whitespace()
-                .next()
-                .and_then(|t| t.parse().ok())
-                .unwrap_or(0.0);
-            return kb / 1024.0;
-        }
-    }
-    0.0
-}
-
-#[cfg(not(target_os = "linux"))]
-fn peak_rss_mb() -> f64 {
-    0.0
 }

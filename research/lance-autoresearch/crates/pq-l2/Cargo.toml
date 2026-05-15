@@ -1,0 +1,24 @@
+[package]
+name = "pq-l2"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Autoresearch target: Lance PQ L2 distance kernel optimization."
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "run_experiment"
+path = "src/bin/run_experiment.rs"
+
+[[bench]]
+name = "pq_l2"
+harness = false
+
+[dependencies]
+harness-common = { path = "../harness-common" }
+
+[dev-dependencies]
+criterion = { workspace = true }

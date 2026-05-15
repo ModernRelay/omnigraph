@@ -7,8 +7,8 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use lance_autoresearch::inputs::{SHAPES, SPEED_TOP_K, speed_workloads};
-use lance_autoresearch::kernels::PqKernel;
+use pq_l2::inputs::{SHAPES, SPEED_TOP_K, speed_workloads};
+use pq_l2::kernels::PqKernel;
 
 fn bench_pq_l2(c: &mut Criterion) {
     let workloads = speed_workloads(0xBE3C_C0DE_F1AC_BABE);

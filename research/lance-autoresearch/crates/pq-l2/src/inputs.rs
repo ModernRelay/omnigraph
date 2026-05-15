@@ -16,6 +16,7 @@
 //! the codebook is shape-appropriate, not random.
 
 use crate::PqShape;
+use harness_common::SplitMix64;
 
 /// PQ shapes the bench evaluates. The agent's kernel must produce correct
 /// output and competitive speed on every one.
@@ -293,36 +294,6 @@ fn encode(shape: PqShape, n: usize, base: &[f32], codebook: &[f32]) -> Vec<u8> {
         }
     }
     out
-}
-
-/// SplitMix64 — small, deterministic; bit-for-bit reproducible across machines.
-struct SplitMix64 {
-    state: u64,
-}
-
-impl SplitMix64 {
-    fn new(seed: u64) -> Self {
-        Self { state: seed }
-    }
-    fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-    fn next_f32(&mut self) -> f32 {
-        let bits = (self.next_u64() >> 40) as u32;
-        bits as f32 / ((1u32 << 24) as f32)
-    }
-    fn next_normal(&mut self) -> f32 {
-        let mut u1 = self.next_f32();
-        if u1 < 1e-7 {
-            u1 = 1e-7;
-        }
-        let u2 = self.next_f32();
-        (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
-    }
 }
 
 fn shape_hash(s: PqShape) -> u64 {

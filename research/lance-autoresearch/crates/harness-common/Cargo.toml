@@ -1,0 +1,10 @@
+[package]
+name = "harness-common"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Shared utilities for lance-autoresearch per-target harnesses (PRNG, geomean, peak RSS, tolerance constants, time budget)."
+publish = false
+
+[lib]
+path = "src/lib.rs"

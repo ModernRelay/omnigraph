@@ -1,17 +1,20 @@
-//! Lance autoresearch harness — public API for the bench binary, benchmarks, and tests.
+//! Autoresearch target: Lance PQ L2 distance kernel optimization.
 //!
-//! Contract (Karpathy-style three files):
+//! Karpathy-style three-file contract:
 //!
 //! - `kernels` — the AGENT'S PLAYGROUND. Modify freely.
 //! - `reference` — IMMUTABLE. Scalar reference kernel. Defines the math.
 //! - `inputs` — IMMUTABLE. Diverse test-data + workload generators,
 //!   deterministic per fixed seed, varied across the input battery.
 //!
-//! The optimization target is dataset-independent: the agent's kernel must match
-//! the scalar reference within `MAX_ABS_ERR` on every input the bench generates,
-//! and minimize geomean ns/query across multiple PQ shapes and data
-//! distributions. There is no fixed dataset; an "improvement" by construction
-//! generalizes across distributions and shapes.
+//! The optimization target is dataset-independent: the agent's kernel must
+//! match the scalar reference within `harness_common::MAX_ABS_ERR` on every
+//! input the bench generates, and minimize geomean ns/query across multiple
+//! PQ shapes and data distributions. There is no fixed dataset.
+//!
+//! Shared utilities (deterministic PRNG, geomean, peak RSS, tolerance
+//! constants, time budget) come from the `harness-common` workspace crate.
+//! See `../HARNESS.md` for the harness conventions every target follows.
 
 pub mod inputs;
 pub mod kernels;
@@ -45,12 +48,3 @@ impl PqShape {
         self.num_sub_vectors * self.num_centroids * self.sub_vector_dim()
     }
 }
-
-/// Tolerance for the agent kernel's distance values vs. the scalar reference.
-/// Loose enough to permit legal SIMD-accumulator reordering; tight enough to
-/// catch real arithmetic bugs.
-pub const MAX_ABS_ERR: f32 = 1e-4;
-
-/// Tolerance for top-K *distances* (id sets are compared with tie-tolerance —
-/// see `reference::topk_consistent`).
-pub const TOPK_DIST_TOL: f32 = 1e-4;

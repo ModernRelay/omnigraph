@@ -1,32 +1,14 @@
-# Empty `[workspace]` section so cargo treats this directory as its own
-# workspace root and does NOT walk up to the parent omnigraph workspace.
-# Without this, cargo from inside `research/lance-autoresearch/` will try to
-# resolve omnigraph's dependencies even though we're excluded as a member.
 [workspace]
+resolver = "2"
+members = [
+    "crates/harness-common",
+    "crates/pq-l2",
+]
 
-[package]
-name = "lance-autoresearch"
-version = "0.1.0"
-edition = "2024"
-license = "MIT OR Apache-2.0"
-description = "Autoresearch-style harness for evolving Lance PQ L2 distance kernels via LLM agents."
-publish = false
-
-[lib]
-path = "src/lib.rs"
-
-[[bin]]
-name = "run_experiment"
-path = "src/bin/run_experiment.rs"
-
-[[bench]]
-name = "pq_l2"
-harness = false
-
-[dependencies]
+# Each per-target crate sets its own deps. Shared deps below pin versions
+# uniformly across targets so the workspace lockfile stays clean.
+[workspace.dependencies]
 anyhow = "1"
-
-[dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
 
 [profile.release]
