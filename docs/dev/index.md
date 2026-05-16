@@ -51,6 +51,14 @@ constraints. User-facing behavior should still be documented through
 | Install and deployment packaging | [install.md](../user/install.md), [deployment.md](../user/deployment.md) |
 | Release history | [releases/](../releases/) |
 
+## Active Implementation Plans
+
+Working documents for in-flight feature work. Removed when the work lands.
+
+| Area | Read |
+|---|---|
+| Schema-lint chassis v1 (MR-694) — `--allow-data-loss`, soft/hard drops | [schema-lint-v1-plan.md](schema-lint-v1-plan.md) |
+
 ## Boundary
 
 Developer docs may mention implementation details, stale gaps, upstream Lance
