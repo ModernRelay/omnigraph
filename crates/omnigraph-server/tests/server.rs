@@ -975,6 +975,132 @@ rules:
     assert_eq!(bad_status, StatusCode::UNAUTHORIZED);
 }
 
+/// Regression test for MR-731: actor identity comes from the matched
+/// bearer token, never from a client-supplied request header. A future
+/// "convenience" PR that lets clients override `actor_id` to spoof
+/// another identity must break this test. The principle is named in
+/// `docs/dev/invariants.md` Hard Invariant 11 and at the actor-resolution
+/// site in `omnigraph-server/src/lib.rs::authorize_request`.
+///
+/// Two assertions in one fixture:
+/// 1. Spoof-up: bearer for a *denied* actor + X-Actor-Id naming an
+///    *allowed* actor — policy still denies (proves the spoof header
+///    doesn't promote the request).
+/// 2. Spoof-down: bearer for an *allowed* actor + X-Actor-Id naming a
+///    *denied* actor — policy still allows (proves the server-resolved
+///    identity wins; the spoof can't trick the request into a denial
+///    either, which would otherwise be a confusing UX trap).
+///
+/// Cross-reference: MR-777 covers boundary cases like actor-id
+/// *collision* (two distinct tokens minting the same actor_id) and
+/// malformed bearer header parsing. See `auth_boundary_case_coverage`
+/// suite when it lands; the two tests together pin the full bearer-token
+/// → actor identity contract.
+#[tokio::test(flavor = "multi_thread")]
+async fn actor_id_resolves_from_bearer_token_ignoring_client_supplied_headers() {
+    let temp = init_loaded_repo().await;
+    let repo = repo_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    // Same readers/writers split as
+    // `bearer_token_resolves_to_correct_actor_for_policy_decisions` —
+    // `act-a` can read main, `act-b` cannot. The asymmetry is what
+    // makes the spoof-up/spoof-down distinction observable.
+    fs::write(
+        &policy_path,
+        r#"
+version: 1
+groups:
+  readers: [act-a]
+  writers: [act-b]
+protected_branches: [main]
+rules:
+  - id: readers-only
+    allow:
+      actors: { group: readers }
+      actions: [read]
+      branch_scope: any
+"#,
+    )
+    .unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        repo.to_string_lossy().to_string(),
+        vec![
+            ("act-a".to_string(), "token-a".to_string()),
+            ("act-b".to_string(), "token-b".to_string()),
+        ],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap();
+    let app = build_app(state);
+
+    // (1) Spoof-up: bearer for act-b (denied) + X-Actor-Id: act-a (allowed).
+    // If the server were trusting the header, this would succeed as
+    // act-a. The contract is: the bearer wins. Expect 403 because
+    // act-b can't read.
+    let (spoof_up_status, spoof_up_body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/snapshot?branch=main")
+            .method(Method::GET)
+            .header("authorization", "Bearer token-b")
+            .header("x-actor-id", "act-a")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let spoof_up_error: ErrorOutput = serde_json::from_value(spoof_up_body).unwrap();
+    assert_eq!(
+        spoof_up_status,
+        StatusCode::FORBIDDEN,
+        "X-Actor-Id must not promote a denied bearer to an allowed actor",
+    );
+    assert_eq!(
+        spoof_up_error.code,
+        Some(omnigraph_server::api::ErrorCode::Forbidden),
+    );
+
+    // (2) Spoof-down: bearer for act-a (allowed) + X-Actor-Id: act-b (denied).
+    // If the server were trusting the header, this would fail as act-b.
+    // The contract is: the bearer wins. Expect 200 because act-a can read.
+    let (spoof_down_status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri("/snapshot?branch=main")
+            .method(Method::GET)
+            .header("authorization", "Bearer token-a")
+            .header("x-actor-id", "act-b")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        spoof_down_status,
+        StatusCode::OK,
+        "X-Actor-Id must not demote an allowed bearer to a denied actor",
+    );
+
+    // (3) Empty-string spoof attempt: an X-Actor-Id of "" must not
+    // leak through as the policy subject. Same expectation as (1):
+    // bearer for act-b is denied regardless of what the header tries.
+    let (empty_spoof_status, _) = json_response(
+        &app,
+        Request::builder()
+            .uri("/snapshot?branch=main")
+            .method(Method::GET)
+            .header("authorization", "Bearer token-b")
+            .header("x-actor-id", "")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        empty_spoof_status,
+        StatusCode::FORBIDDEN,
+        "empty X-Actor-Id must not clear the resolved actor",
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn policy_allows_read_but_distinguishes_401_from_403() {
     let (_temp, app) = app_for_loaded_repo_with_auth_tokens_and_policy(
