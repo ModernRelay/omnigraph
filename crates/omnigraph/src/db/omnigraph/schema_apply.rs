@@ -138,15 +138,39 @@ pub(super) async fn apply_schema_with_lock(
             }
             SchemaMigrationStep::UpdateTypeMetadata { .. }
             | SchemaMigrationStep::UpdatePropertyMetadata { .. } => {}
-            SchemaMigrationStep::DropType { .. } | SchemaMigrationStep::DropProperty { .. } => {
-                // Dormant — variants exist on the IR but the planner
-                // doesn't emit them yet. Implementation lands in a
-                // subsequent commit (see docs/schema-lint-v1-plan.md).
-                // If a SchemaIR JSON containing one of these arrives
-                // (e.g. round-tripped from a future tool), fail
-                // explicitly rather than silently misclassifying.
+            SchemaMigrationStep::DropProperty {
+                type_kind,
+                type_name,
+                mode,
+                ..
+            } => {
+                // Soft = reuse the existing stage_overwrite rewrite
+                // path. batch_for_schema_apply_rewrite iterates the
+                // *target* schema fields, so a property absent from
+                // desired_catalog is naturally projected away. The
+                // prior Lance version retains the dropped column,
+                // so reads at the previous snapshot still see it
+                // (time-travel reversibility). Hard mode (immediate
+                // compact_files + cleanup_old_versions for actual
+                // data deletion) lands in commit #5 gated by
+                // --allow-data-loss.
+                if !matches!(mode, DropMode::Soft) {
+                    return Err(OmniError::manifest_internal(
+                        "DropProperty { Hard } not yet implemented (commit #5)",
+                    ));
+                }
+                let table_key = schema_table_key(*type_kind, type_name);
+                if table_key.starts_with("edge:") {
+                    changed_edge_tables = true;
+                }
+                rewritten_tables.insert(table_key);
+            }
+            SchemaMigrationStep::DropType { .. } => {
+                // DropType (whole-table drop via __manifest entry
+                // removal) lands in commit #4 — different mechanics
+                // from DropProperty.
                 return Err(OmniError::manifest_internal(
-                    "drop-step variant is not yet implemented in apply_schema",
+                    "DropType not yet implemented (commit #4)",
                 ));
             }
             step @ SchemaMigrationStep::UnsupportedChange { .. } => {

@@ -562,18 +562,22 @@ fn plan_properties(
         .iter()
         .filter(|property| !consumed.contains(&property.name))
     {
-        steps.push(SchemaMigrationStep::UnsupportedChange {
-            entity: format!(
-                "{}:{}.{}",
-                schema_type_kind_key(type_kind),
-                type_name,
-                leftover.name
-            ),
-            reason: format!(
-                "removing property '{}.{}' is not supported in schema migration v1",
-                type_name, leftover.name
-            ),
-            code: Some(crate::lint::codes::OG_DS_104.code.to_string()),
+        // Property removed from the desired schema: emit
+        // DropProperty { Soft } per docs/schema-lint-v1-plan.md
+        // commit #3. The Soft mode reuses the existing
+        // stage_overwrite rewrite path — batch_for_schema_apply_rewrite
+        // iterates target_schema.fields(), so the dropped column is
+        // naturally projected away. The prior Lance version retains
+        // the column until cleanup_old_versions runs, matching the
+        // OG-DS-104 destructive-tier expectation that data remains
+        // recoverable via time travel until cleanup. Hard mode (with
+        // immediate compact_files + cleanup_old_versions) lands in
+        // commit #5, gated by --allow-data-loss.
+        steps.push(SchemaMigrationStep::DropProperty {
+            type_kind,
+            type_name: type_name.to_string(),
+            property_name: leftover.name.clone(),
+            mode: DropMode::Soft,
         });
     }
 
@@ -924,6 +928,67 @@ node Account @rename_from("User") {
             from: "name".to_string(),
             to: "full_name".to_string(),
         }));
+    }
+
+    #[test]
+    fn plan_emits_soft_drop_for_removed_nullable_property() {
+        // Removing a property from the desired schema emits
+        // DropProperty { Soft } (schema-lint v1 chassis commit #3,
+        // MR-694). The plan is `supported = true` — the apply path
+        // handles soft drop via the existing stage_overwrite rewrite
+        // projection. Verified at the integration level by
+        // `apply_schema_drops_a_nullable_property_softly_preserves_prior_version`
+        // in `crates/omnigraph/tests/schema_apply.rs`.
+        let accepted = build_schema_ir(
+            &parse_schema(
+                r#"
+node Person {
+    name: String @key
+    age: I32?
+}
+"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let desired = build_schema_ir(
+            &parse_schema(
+                r#"
+node Person {
+    name: String @key
+}
+"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(
+            plan.supported,
+            "drop-property plan must be supported: {plan:?}"
+        );
+        assert!(
+            plan.steps.iter().any(|step| matches!(
+                step,
+                SchemaMigrationStep::DropProperty {
+                    type_kind: SchemaTypeKind::Node,
+                    type_name,
+                    property_name,
+                    mode: DropMode::Soft,
+                    ..
+                } if type_name == "Person" && property_name == "age"
+            )),
+            "expected DropProperty {{ Soft }} step in plan: {plan:?}",
+        );
+        // Negative: no UnsupportedChange anywhere in the plan.
+        assert!(
+            !plan
+                .steps
+                .iter()
+                .any(|step| matches!(step, UnsupportedChange { .. })),
+            "soft drop must not emit UnsupportedChange: {plan:?}",
+        );
     }
 
     #[test]

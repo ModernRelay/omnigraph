@@ -18,8 +18,8 @@ use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::types::ScalarType;
 use omnigraph_compiler::{
-    SchemaIR, SchemaMigrationPlan, SchemaMigrationStep, SchemaTypeKind, build_catalog_from_ir,
-    build_schema_ir, plan_schema_migration,
+    DropMode, SchemaIR, SchemaMigrationPlan, SchemaMigrationStep, SchemaTypeKind,
+    build_catalog_from_ir, build_schema_ir, plan_schema_migration,
 };
 
 use crate::db::graph_coordinator::{GraphCoordinator, PublishedSnapshot};
