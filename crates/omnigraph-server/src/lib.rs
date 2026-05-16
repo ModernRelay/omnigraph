@@ -689,8 +689,20 @@ fn authorize_request(
     let Some(actor) = actor else {
         return Err(ApiError::unauthorized("missing bearer token"));
     };
-    // Authoritative actor_id is the authenticated session, not whatever the
-    // handler put in the request. Prevents an empty-string default at any
+    // SECURITY INVARIANT (MR-731): actor identity comes from the matched
+    // bearer token, never from a client-supplied request header, query
+    // parameter, or body field. This line is the single chokepoint where
+    // the authoritative actor (resolved from the bearer match by
+    // `require_bearer_auth`) overwrites whatever the handler put in the
+    // PolicyRequest. Removing or weakening it lets clients spoof identity —
+    // exactly the Supabase RLS footgun ("trusting raw_user_meta_data is
+    // asking the attacker if they're an admin"). The principle is codified
+    // in `docs/dev/invariants.md` Hard Invariant 11 ("clients cannot set
+    // actor identity directly") and pinned by the regression test
+    // `actor_id_resolves_from_bearer_token_ignoring_client_supplied_headers`
+    // in `crates/omnigraph-server/tests/server.rs`.
+    //
+    // Side effect: also prevents an empty-string default at any handler
     // call site from ever reaching the engine as a policy subject.
     request.actor_id = actor.as_str().to_string();
     let decision = engine
