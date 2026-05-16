@@ -221,7 +221,7 @@ async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version()
 }
 
 #[tokio::test]
-async fn apply_schema_rejects_dropping_a_node_type() {
+async fn apply_schema_drops_node_and_referencing_edge_softly() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
     let before_version = db
@@ -230,7 +230,11 @@ async fn apply_schema_rejects_dropping_a_node_type() {
         .unwrap()
         .version();
 
-    // Drop the `Company` node type and its outgoing edge that references it.
+    // Drop the `Company` node type and the `WorksAt` edge that references it.
+    // Per schema-lint v1 chassis commit #4 (MR-694), this emits two
+    // `DropType { Soft }` steps; apply tombstones both manifest entries.
+    // Lance dataset files are retained, so time-travel back to the
+    // pre-drop manifest version still resolves both tables.
     let desired = r#"
 node Person {
     name: String @key
@@ -241,23 +245,96 @@ edge Knows: Person -> Person {
     since: Date?
 }
 "#;
-    let err = db.apply_schema(desired).await.unwrap_err();
-    let msg = err.to_string();
+
+    // Confirm the plan emits both DropType { Soft } steps.
+    let plan = db.plan_schema(desired).await.unwrap();
+    assert!(plan.supported, "drop-type plan must be supported");
     assert!(
-        msg.contains("OG-DS-102") || msg.contains("OG-DS-103"),
-        "expected schema-lint code OG-DS-102 or OG-DS-103 in error, got: {msg}"
+        plan.steps.iter().any(|step| matches!(
+            step,
+            SchemaMigrationStep::DropType {
+                type_kind: SchemaTypeKind::Node,
+                name,
+                mode: omnigraph_compiler::DropMode::Soft,
+            } if name == "Company"
+        )),
+        "expected DropType {{ Node, Company, Soft }} in plan: {plan:?}",
     );
-    assert_eq!(
-        db.snapshot_of(ReadTarget::branch("main"))
-            .await
-            .unwrap()
-            .version(),
-        before_version
+    assert!(
+        plan.steps.iter().any(|step| matches!(
+            step,
+            SchemaMigrationStep::DropType {
+                type_kind: SchemaTypeKind::Edge,
+                name,
+                mode: omnigraph_compiler::DropMode::Soft,
+            } if name == "WorksAt"
+        )),
+        "expected DropType {{ Edge, WorksAt, Soft }} in plan: {plan:?}",
+    );
+
+    let result = db.apply_schema(desired).await.unwrap();
+    assert!(result.supported);
+    assert!(result.applied);
+
+    let after_version = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+    assert!(
+        after_version > before_version,
+        "manifest version should advance after soft type drop; before={before_version}, after={after_version}",
+    );
+
+    // (a) Current snapshot: both manifest entries are gone.
+    let current_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert!(
+        current_snapshot.entry("node:Company").is_none(),
+        "current manifest must not list node:Company after soft drop",
+    );
+    assert!(
+        current_snapshot.entry("edge:WorksAt").is_none(),
+        "current manifest must not list edge:WorksAt after soft drop",
+    );
+    // Person + Knows still present (Person wasn't dropped; Knows is in desired).
+    assert!(
+        current_snapshot.entry("node:Person").is_some(),
+        "node:Person must remain in the manifest",
+    );
+
+    // (b) Time travel: at the pre-drop manifest version, both dropped
+    // tables are still listed. Soft drop is reversible via Lance's
+    // version graph until `omnigraph cleanup` runs.
+    let pre_drop_snapshot = db.snapshot_at_version(before_version).await.unwrap();
+    assert!(
+        pre_drop_snapshot.entry("node:Company").is_some(),
+        "pre-drop manifest must still list node:Company (time-travel reversibility)",
+    );
+    assert!(
+        pre_drop_snapshot.entry("edge:WorksAt").is_some(),
+        "pre-drop manifest must still list edge:WorksAt (time-travel reversibility)",
+    );
+
+    // (c) Reopen consistency: drop is preserved across engine restart.
+    let uri = dir.path().to_str().unwrap().to_string();
+    drop(db);
+    let reopened = Omnigraph::open(&uri).await.unwrap();
+    let reopened_snapshot = reopened
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    assert!(
+        reopened_snapshot.entry("node:Company").is_none(),
+        "after reopen, node:Company must still be absent from the current manifest",
+    );
+    assert!(
+        reopened_snapshot.entry("edge:WorksAt").is_none(),
+        "after reopen, edge:WorksAt must still be absent from the current manifest",
     );
 }
 
 #[tokio::test]
-async fn apply_schema_rejects_dropping_an_edge_type() {
+async fn apply_schema_drops_an_edge_type_softly() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
     let before_version = db
@@ -266,20 +343,50 @@ async fn apply_schema_rejects_dropping_an_edge_type() {
         .unwrap()
         .version();
 
-    // Drop only the `WorksAt` edge.
+    // Drop only the `WorksAt` edge. Per chassis v1 commit #4, this
+    // emits `DropType { Edge, WorksAt, Soft }`; apply tombstones the
+    // edge:WorksAt manifest entry. The Company node and Person node
+    // remain intact.
     let desired = TEST_SCHEMA.replace("\nedge WorksAt: Person -> Company", "");
-    let err = db.apply_schema(&desired).await.unwrap_err();
-    let msg = err.to_string();
+
+    let plan = db.plan_schema(&desired).await.unwrap();
+    assert!(plan.supported);
     assert!(
-        msg.contains("OG-DS-103"),
-        "expected schema-lint code OG-DS-103 in error, got: {msg}"
+        plan.steps.iter().any(|step| matches!(
+            step,
+            SchemaMigrationStep::DropType {
+                type_kind: SchemaTypeKind::Edge,
+                name,
+                mode: omnigraph_compiler::DropMode::Soft,
+            } if name == "WorksAt"
+        )),
+        "expected DropType {{ Edge, WorksAt, Soft }} in plan: {plan:?}",
     );
-    assert_eq!(
-        db.snapshot_of(ReadTarget::branch("main"))
-            .await
-            .unwrap()
-            .version(),
-        before_version
+
+    let result = db.apply_schema(&desired).await.unwrap();
+    assert!(result.applied);
+
+    let after_version = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+    assert!(after_version > before_version);
+
+    let current_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert!(
+        current_snapshot.entry("edge:WorksAt").is_none(),
+        "current manifest must not list edge:WorksAt",
+    );
+    // Other tables untouched.
+    assert!(current_snapshot.entry("node:Person").is_some());
+    assert!(current_snapshot.entry("node:Company").is_some());
+    assert!(current_snapshot.entry("edge:Knows").is_some());
+
+    let pre_drop_snapshot = db.snapshot_at_version(before_version).await.unwrap();
+    assert!(
+        pre_drop_snapshot.entry("edge:WorksAt").is_some(),
+        "pre-drop manifest must still list edge:WorksAt",
     );
 }
 

@@ -78,6 +78,7 @@ pub(super) async fn apply_schema_with_lock(
     let mut renamed_tables = HashMap::new();
     let mut rewritten_tables = BTreeSet::new();
     let mut indexed_tables = BTreeSet::new();
+    let mut dropped_tables = BTreeSet::new();
     let mut property_renames = HashMap::<String, HashMap<String, String>>::new();
     let mut changed_edge_tables = false;
 
@@ -165,13 +166,31 @@ pub(super) async fn apply_schema_with_lock(
                 }
                 rewritten_tables.insert(table_key);
             }
-            SchemaMigrationStep::DropType { .. } => {
-                // DropType (whole-table drop via __manifest entry
-                // removal) lands in commit #4 — different mechanics
-                // from DropProperty.
-                return Err(OmniError::manifest_internal(
-                    "DropType not yet implemented (commit #4)",
-                ));
+            SchemaMigrationStep::DropType {
+                type_kind,
+                name,
+                mode,
+            } => {
+                // Soft = remove the table's entry from the current
+                // __manifest version via a tombstone. The Lance
+                // dataset files are retained — prior __manifest
+                // versions still reference them, so Lance time
+                // travel + branch-from-snapshot can read the dropped
+                // table until `omnigraph cleanup` ages out the older
+                // manifest versions. No per-table write happens here;
+                // the tombstone is the entire change. Hard mode
+                // (immediate dataset deletion via cleanup) lands in
+                // commit #5 gated by --allow-data-loss.
+                if !matches!(mode, DropMode::Soft) {
+                    return Err(OmniError::manifest_internal(
+                        "DropType { Hard } not yet implemented (commit #5)",
+                    ));
+                }
+                let table_key = schema_table_key(*type_kind, name);
+                if table_key.starts_with("edge:") {
+                    changed_edge_tables = true;
+                }
+                dropped_tables.insert(table_key);
             }
             step @ SchemaMigrationStep::UnsupportedChange { .. } => {
                 return Err(OmniError::manifest(
@@ -242,6 +261,26 @@ pub(super) async fn apply_schema_with_lock(
             table_key: source_table_key.clone(),
             tombstone_version: source_entry.table_version.saturating_add(1),
         });
+    }
+    // Soft DropType: mark each dropped table for tombstoning in the
+    // recovery sidecar AND in the live table_tombstones map. The
+    // mechanism mirrors rename's source-table tombstone — manifest
+    // entry removed at version+1, dataset files retained, time-travel
+    // reachable until cleanup. No Phase B write happens for these
+    // tables; the recovery sidecar is purely the manifest delta.
+    for dropped_table_key in &dropped_tables {
+        let entry = snapshot.entry(dropped_table_key).ok_or_else(|| {
+            OmniError::manifest(format!(
+                "missing table '{}' for soft drop when building recovery sidecar",
+                dropped_table_key
+            ))
+        })?;
+        let tombstone_version = entry.table_version.saturating_add(1);
+        sidecar_tombstones.push(crate::db::manifest::SidecarTombstone {
+            table_key: dropped_table_key.clone(),
+            tombstone_version,
+        });
+        table_tombstones.insert(dropped_table_key.clone(), tombstone_version);
     }
 
     // Acquire per-(table_key, branch) queues for every existing table

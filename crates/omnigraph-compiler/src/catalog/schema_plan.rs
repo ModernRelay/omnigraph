@@ -324,13 +324,18 @@ fn plan_nodes(
         .iter()
         .filter(|node| !consumed.contains(&node.name))
     {
-        steps.push(SchemaMigrationStep::UnsupportedChange {
-            entity: format!("node:{}", leftover.name),
-            reason: format!(
-                "removing node type '{}' is not supported in schema migration v1",
-                leftover.name
-            ),
-            code: Some(crate::lint::codes::OG_DS_102.code.to_string()),
+        // Node type removed from the desired schema: emit
+        // DropType { Node, Soft } per docs/dev/schema-lint-v1-plan.md
+        // commit #4. Soft = remove the table's entry from the current
+        // __manifest version; data files retained; previous manifest
+        // versions still reference the table, so Lance time travel
+        // restores it until cleanup_old_versions ages out the older
+        // __manifest entries. Hard mode (immediate dataset deletion)
+        // lands in commit #5 gated by --allow-data-loss.
+        steps.push(SchemaMigrationStep::DropType {
+            type_kind: SchemaTypeKind::Node,
+            name: leftover.name.clone(),
+            mode: DropMode::Soft,
         });
     }
 
@@ -442,13 +447,15 @@ fn plan_edges(
         .iter()
         .filter(|edge| !consumed.contains(&edge.name))
     {
-        steps.push(SchemaMigrationStep::UnsupportedChange {
-            entity: format!("edge:{}", leftover.name),
-            reason: format!(
-                "removing edge type '{}' is not supported in schema migration v1",
-                leftover.name
-            ),
-            code: Some(crate::lint::codes::OG_DS_103.code.to_string()),
+        // Edge type removed from the desired schema: emit
+        // DropType { Edge, Soft } per docs/dev/schema-lint-v1-plan.md
+        // commit #4. Same Soft mechanics as node-type drops — manifest
+        // entry tombstoned, data files retained, reversible via Lance
+        // time travel until cleanup.
+        steps.push(SchemaMigrationStep::DropType {
+            type_kind: SchemaTypeKind::Edge,
+            name: leftover.name.clone(),
+            mode: DropMode::Soft,
         });
     }
 }
@@ -988,6 +995,81 @@ node Person {
                 .iter()
                 .any(|step| matches!(step, UnsupportedChange { .. })),
             "soft drop must not emit UnsupportedChange: {plan:?}",
+        );
+    }
+
+    #[test]
+    fn plan_emits_soft_drop_for_removed_node_and_edge_types() {
+        // Removing a node type + the edge type that references it
+        // emits two DropType { Soft } steps (chassis v1 commit #4,
+        // MR-694). The plan is `supported = true` — apply tombstones
+        // both manifest entries. Time-travel reversibility is verified
+        // at the integration level by
+        // `apply_schema_drops_node_and_referencing_edge_softly`
+        // in `crates/omnigraph/tests/schema_apply.rs`.
+        let accepted = build_schema_ir(
+            &parse_schema(
+                r#"
+node Person {
+    name: String @key
+}
+
+node Company {
+    name: String @key
+}
+
+edge WorksAt: Person -> Company
+"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let desired = build_schema_ir(
+            &parse_schema(
+                r#"
+node Person {
+    name: String @key
+}
+"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let plan = plan_schema_migration(&accepted, &desired).unwrap();
+        assert!(
+            plan.supported,
+            "drop-type plan must be supported: {plan:?}"
+        );
+        assert!(
+            plan.steps.iter().any(|step| matches!(
+                step,
+                SchemaMigrationStep::DropType {
+                    type_kind: SchemaTypeKind::Node,
+                    name,
+                    mode: DropMode::Soft,
+                } if name == "Company"
+            )),
+            "expected DropType {{ Node, Company, Soft }} in plan: {plan:?}",
+        );
+        assert!(
+            plan.steps.iter().any(|step| matches!(
+                step,
+                SchemaMigrationStep::DropType {
+                    type_kind: SchemaTypeKind::Edge,
+                    name,
+                    mode: DropMode::Soft,
+                } if name == "WorksAt"
+            )),
+            "expected DropType {{ Edge, WorksAt, Soft }} in plan: {plan:?}",
+        );
+        // Negative: no UnsupportedChange anywhere in the plan.
+        assert!(
+            !plan
+                .steps
+                .iter()
+                .any(|step| matches!(step, UnsupportedChange { .. })),
+            "soft type drop must not emit UnsupportedChange: {plan:?}",
         );
     }
 
