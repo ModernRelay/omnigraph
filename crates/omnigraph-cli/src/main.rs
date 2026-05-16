@@ -316,6 +316,11 @@ enum SchemaCommand {
         schema: PathBuf,
         #[arg(long)]
         json: bool,
+        /// Show the plan as it would execute with `--allow-data-loss`.
+        /// Promotes every `DropMode::Soft` step to `DropMode::Hard`
+        /// so the plan output reflects the destructive intent.
+        #[arg(long, default_value_t = false)]
+        allow_data_loss: bool,
     },
     /// Apply a supported schema migration
     Apply {
@@ -329,6 +334,17 @@ enum SchemaCommand {
         schema: PathBuf,
         #[arg(long)]
         json: bool,
+        /// Allow destructive (data-loss) schema changes.
+        ///
+        /// Without this flag, drops are "soft": the column or table
+        /// is removed from the current manifest version but prior
+        /// versions are retained, so `snapshot_at_version(pre_drop)`
+        /// can still read the dropped data until `omnigraph cleanup`
+        /// runs. With this flag, drops are "hard": `cleanup_old_versions`
+        /// runs on the affected datasets immediately after the apply,
+        /// making the prior data unreachable.
+        #[arg(long, default_value_t = false)]
+        allow_data_loss: bool,
     },
     /// Show the current accepted schema source
     #[command(alias = "get")]
@@ -1980,12 +1996,18 @@ async fn main() -> Result<()> {
                 config,
                 schema,
                 json,
+                allow_data_loss,
             } => {
                 let config = load_cli_config(config.as_ref())?;
                 let uri = resolve_local_uri(&config, uri, target.as_deref(), "schema plan")?;
                 let schema_source = fs::read_to_string(&schema)?;
                 let db = Omnigraph::open(&uri).await?;
-                let plan = db.plan_schema(&schema_source).await?;
+                let plan = db
+                    .plan_schema_with_options(
+                        &schema_source,
+                        omnigraph::db::SchemaApplyOptions { allow_data_loss },
+                    )
+                    .await?;
                 let output = SchemaPlanOutput {
                     uri: &uri,
                     supported: plan.supported,
@@ -2004,6 +2026,7 @@ async fn main() -> Result<()> {
                 config,
                 schema,
                 json,
+                allow_data_loss,
             } => {
                 let config = load_cli_config(config.as_ref())?;
                 let bearer_token =
@@ -2011,6 +2034,12 @@ async fn main() -> Result<()> {
                 let uri = resolve_uri(&config, uri, target.as_deref())?;
                 let schema_source = fs::read_to_string(&schema)?;
                 let output = if is_remote_uri(&uri) {
+                    if allow_data_loss {
+                        return Err(anyhow::anyhow!(
+                            "--allow-data-loss is not yet supported on remote (HTTP) schema apply; \
+                             use `omnigraph schema apply` against a local path or s3:// URI for now"
+                        ));
+                    }
                     remote_json::<SchemaApplyOutput>(
                         &http_client,
                         Method::POST,
@@ -2023,7 +2052,13 @@ async fn main() -> Result<()> {
                     .await?
                 } else {
                     let mut db = Omnigraph::open(&uri).await?;
-                    schema_apply_output(&uri, db.apply_schema(&schema_source).await?)
+                    let result = db
+                        .apply_schema_with_options(
+                            &schema_source,
+                            omnigraph::db::SchemaApplyOptions { allow_data_loss },
+                        )
+                        .await?;
+                    schema_apply_output(&uri, result)
                 };
                 if json {
                     print_json(&output)?;

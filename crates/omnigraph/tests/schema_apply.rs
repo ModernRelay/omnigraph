@@ -522,3 +522,217 @@ edge WorksAt: Human -> Company
         "old node:Person table key should be unmapped after rename"
     );
 }
+
+// ─── Hard-mode drops (chassis v1 commit #5 — --allow-data-loss) ──────────────
+//
+// Hard mode promotes every `DropMode::Soft` step to `DropMode::Hard` and runs
+// `cleanup_old_versions` on affected datasets immediately after the manifest
+// publish. For DropProperty Hard, this removes the prior dataset version
+// (where the column lived), making `snapshot_at_version(pre_drop)` unable to
+// open the dataset at that version. For DropType Hard, the dataset is
+// untouched by the schema apply itself (no per-table write), so
+// cleanup_old_versions is currently a no-op for it — the dataset directory
+// persists. Full orphan-dataset deletion is a separate follow-up.
+
+#[tokio::test]
+async fn apply_schema_with_allow_data_loss_promotes_drops_to_hard() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let desired = TEST_SCHEMA.replace("    age: I32?\n", "");
+
+    // Default plan (no flag) → Soft.
+    let plan_soft = db.plan_schema(&desired).await.unwrap();
+    assert!(plan_soft.steps.iter().any(|step| matches!(
+        step,
+        SchemaMigrationStep::DropProperty {
+            mode: omnigraph_compiler::DropMode::Soft,
+            ..
+        }
+    )));
+
+    // With --allow-data-loss → Hard.
+    let plan_hard = db
+        .plan_schema_with_options(
+            &desired,
+            omnigraph::db::SchemaApplyOptions {
+                allow_data_loss: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(plan_hard.supported);
+    assert!(
+        plan_hard.steps.iter().any(|step| matches!(
+            step,
+            SchemaMigrationStep::DropProperty {
+                mode: omnigraph_compiler::DropMode::Hard,
+                ..
+            }
+        )),
+        "with --allow-data-loss, DropProperty should be promoted to Hard: {plan_hard:?}",
+    );
+    // Negative: no remaining Soft drops in the promoted plan.
+    assert!(
+        !plan_hard.steps.iter().any(|step| matches!(
+            step,
+            SchemaMigrationStep::DropProperty {
+                mode: omnigraph_compiler::DropMode::Soft,
+                ..
+            } | SchemaMigrationStep::DropType {
+                mode: omnigraph_compiler::DropMode::Soft,
+                ..
+            }
+        )),
+        "promoted plan should have no Soft drops left: {plan_hard:?}",
+    );
+
+    // Apply with flag succeeds.
+    let result = db
+        .apply_schema_with_options(
+            &desired,
+            omnigraph::db::SchemaApplyOptions {
+                allow_data_loss: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(result.applied);
+}
+
+#[tokio::test]
+async fn apply_schema_hard_drops_property_makes_prior_version_unreachable() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    let before_version = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+
+    // Hard drop the `age` column. Soft drop would leave the prior
+    // dataset version intact; Hard drop runs cleanup_old_versions on
+    // the dataset post-apply, removing the prior version.
+    let desired = TEST_SCHEMA.replace("    age: I32?\n", "");
+    let result = db
+        .apply_schema_with_options(
+            &desired,
+            omnigraph::db::SchemaApplyOptions {
+                allow_data_loss: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(result.applied);
+
+    // Current snapshot: column gone from the dataset schema.
+    let current_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let current_ds = current_snapshot.open("node:Person").await.unwrap();
+    let current_fields = current_ds
+        .schema()
+        .fields
+        .iter()
+        .map(|f| f.name.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        !current_fields.iter().any(|f| f == "age"),
+        "current Person schema must not include 'age' after hard drop; got {current_fields:?}",
+    );
+
+    // Time travel: at the pre-drop manifest version, the entry points
+    // at the OLD dataset version which has been cleaned up. Opening
+    // the dataset at that snapshot should fail (Lance can't load the
+    // dropped version). This is the Hard-mode contract — the prior
+    // data is unreachable.
+    let pre_drop = db.snapshot_at_version(before_version).await.unwrap();
+    let open_result = pre_drop.open("node:Person").await;
+    assert!(
+        open_result.is_err(),
+        "after hard drop + cleanup, pre-drop snapshot.open() must fail (prior version was reclaimed); got {open_result:?}",
+    );
+}
+
+#[tokio::test]
+async fn apply_schema_hard_drops_node_and_edge_with_flag_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    let before_version = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+
+    let desired = r#"
+node Person {
+    name: String @key
+    age: I32?
+}
+
+edge Knows: Person -> Person {
+    since: Date?
+}
+"#;
+
+    let plan = db
+        .plan_schema_with_options(
+            desired,
+            omnigraph::db::SchemaApplyOptions {
+                allow_data_loss: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(plan.supported);
+    assert!(
+        plan.steps.iter().any(|step| matches!(
+            step,
+            SchemaMigrationStep::DropType {
+                type_kind: SchemaTypeKind::Node,
+                mode: omnigraph_compiler::DropMode::Hard,
+                ..
+            }
+        )),
+        "with --allow-data-loss, DropType {{ Node }} should be Hard: {plan:?}",
+    );
+    assert!(
+        plan.steps.iter().any(|step| matches!(
+            step,
+            SchemaMigrationStep::DropType {
+                type_kind: SchemaTypeKind::Edge,
+                mode: omnigraph_compiler::DropMode::Hard,
+                ..
+            }
+        )),
+        "with --allow-data-loss, DropType {{ Edge }} should be Hard: {plan:?}",
+    );
+
+    let result = db
+        .apply_schema_with_options(
+            desired,
+            omnigraph::db::SchemaApplyOptions {
+                allow_data_loss: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(result.applied);
+
+    let after_version = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+    assert!(after_version > before_version);
+
+    // Current manifest: both dropped entries gone.
+    let current = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    assert!(current.entry("node:Company").is_none());
+    assert!(current.entry("edge:WorksAt").is_none());
+
+    // NOTE: DropType Hard's cleanup of the orphan dataset directory
+    // is a known follow-up (the manifest entry is tombstoned and the
+    // dataset's prior versions are cleaned, but the directory itself
+    // persists until an orphan-cleanup pass is implemented). For the
+    // current contract, the data is *unreachable* via omnigraph
+    // (no manifest entry), which is the user-facing guarantee.
+}

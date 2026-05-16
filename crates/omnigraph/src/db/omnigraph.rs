@@ -34,6 +34,7 @@ mod schema_apply;
 mod table_ops;
 
 pub use optimize::{CleanupPolicyOptions, TableCleanupStats, TableOptimizeStats};
+pub use schema_apply::SchemaApplyOptions;
 
 use super::commit_graph::GraphCommit;
 use super::manifest::{
@@ -308,11 +309,29 @@ impl Omnigraph {
     }
 
     pub async fn plan_schema(&self, desired_schema_source: &str) -> Result<SchemaMigrationPlan> {
-        schema_apply::plan_schema(self, desired_schema_source).await
+        self.plan_schema_with_options(desired_schema_source, SchemaApplyOptions::default())
+            .await
+    }
+
+    pub async fn plan_schema_with_options(
+        &self,
+        desired_schema_source: &str,
+        options: SchemaApplyOptions,
+    ) -> Result<SchemaMigrationPlan> {
+        schema_apply::plan_schema(self, desired_schema_source, options).await
     }
 
     pub async fn apply_schema(&self, desired_schema_source: &str) -> Result<SchemaApplyResult> {
-        schema_apply::apply_schema(self, desired_schema_source).await
+        self.apply_schema_with_options(desired_schema_source, SchemaApplyOptions::default())
+            .await
+    }
+
+    pub async fn apply_schema_with_options(
+        &self,
+        desired_schema_source: &str,
+        options: SchemaApplyOptions,
+    ) -> Result<SchemaApplyResult> {
+        schema_apply::apply_schema(self, desired_schema_source, options).await
     }
 
     pub(crate) async fn ensure_schema_apply_idle(&self, operation: &str) -> Result<()> {
