@@ -16,7 +16,7 @@ pub use catalog::schema_ir::{
     schema_ir_pretty_json,
 };
 pub use catalog::schema_plan::{
-    SchemaMigrationPlan, SchemaMigrationStep, SchemaTypeKind, plan_schema_migration,
+    DropMode, SchemaMigrationPlan, SchemaMigrationStep, SchemaTypeKind, plan_schema_migration,
 };
 pub use lint::{DiagnosticCode, Family, SafetyTier, Severity};
 pub use ir::ParamMap;

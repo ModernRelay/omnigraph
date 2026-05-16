@@ -101,17 +101,23 @@ async fn apply_schema_unsupported_plan_does_not_advance_manifest() {
     );
 }
 
-// ─── Destructive / safety-tier rejections ────────────────────────────────────
+// ─── Destructive / safety-tier behavior ──────────────────────────────────────
 //
-// Schema migration v1 only accepts additive change: add type, add nullable
-// property, add index, rename. Every other shape returns an
-// `UnsupportedChange` step that surfaces as an error from `apply_schema`,
-// without advancing the manifest. These tests pin that contract for the
-// destructive shapes (drop type, drop property, narrow type, add required,
-// remove constraint) so a regression in the planner can't silently allow them.
+// Schema migration v1 accepts:
+// - Additive change: add type, add nullable property, add index, rename.
+// - DropProperty { Soft } via the schema-lint v1 chassis (commit #3 of MR-694)
+//   — the dropped column is removed from the current manifest version but
+//   remains reachable via Lance time travel at the prior version, until
+//   `omnigraph cleanup` runs. Hard mode (immediate data cleanup) lands in
+//   commit #5 gated by `--allow-data-loss`.
+//
+// Every other destructive shape (drop type, narrow type, add required without
+// backfill, remove constraint) still returns an `UnsupportedChange` step that
+// surfaces as an error from `apply_schema`. These tests pin the current
+// contract so a regression in the planner can't silently change behavior.
 
 #[tokio::test]
-async fn apply_schema_rejects_dropping_a_property_with_data() {
+async fn apply_schema_drops_a_nullable_property_softly_preserves_prior_version() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
 
@@ -122,25 +128,96 @@ async fn apply_schema_rejects_dropping_a_property_with_data() {
         .unwrap()
         .version();
 
-    // Drop `age` from Person. v1 doesn't support property removal even when
-    // the column is nullable — it would silently destroy data.
+    // Drop `age` from Person. v1 + chassis commit #3 emit
+    // `DropProperty { Soft }`; the rewrite path projects to the
+    // target schema (no `age`), commits via stage_overwrite. Row
+    // counts are unchanged — only the column is dropped from the
+    // current schema view.
     let desired = TEST_SCHEMA.replace("    age: I32?\n", "");
-    let err = db.apply_schema(&desired).await.unwrap_err();
-    let msg = err.to_string();
+
+    // Confirm the plan emits DropProperty { Soft } (not UnsupportedChange).
+    let plan = db.plan_schema(&desired).await.unwrap();
+    assert!(plan.supported, "drop-property plan must be supported");
     assert!(
-        msg.contains("OG-DS-104"),
-        "expected schema-lint code OG-DS-104 in error, got: {msg}"
+        plan.steps.iter().any(|step| matches!(
+            step,
+            SchemaMigrationStep::DropProperty {
+                type_kind: SchemaTypeKind::Node,
+                type_name,
+                property_name,
+                mode: omnigraph_compiler::DropMode::Soft,
+                ..
+            } if type_name == "Person" && property_name == "age"
+        )),
+        "expected DropProperty {{ type=Person, property=age, mode=Soft }} in plan; got {plan:?}",
     );
 
-    // Manifest didn't advance and existing rows are untouched.
-    assert_eq!(
-        db.snapshot_of(ReadTarget::branch("main"))
-            .await
-            .unwrap()
-            .version(),
-        before_version
+    let result = db.apply_schema(&desired).await.unwrap();
+    assert!(result.supported);
+    assert!(result.applied);
+
+    // Manifest advanced; row count unchanged.
+    let after_version = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .version();
+    assert!(
+        after_version > before_version,
+        "manifest version should advance after soft drop; before={before_version}, after={after_version}",
     );
     assert_eq!(count_rows(&db, "node:Person").await, people_before);
+
+    // (a) Current snapshot: `age` is gone from the dataset schema.
+    let current_snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let current_ds = current_snapshot.open("node:Person").await.unwrap();
+    let current_fields = current_ds
+        .schema()
+        .fields
+        .iter()
+        .map(|f| f.name.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        !current_fields.iter().any(|f| f == "age"),
+        "current Person dataset schema must not include 'age' after soft drop; got fields {current_fields:?}",
+    );
+
+    // (b) Time travel: at the pre-drop manifest version, the prior
+    // Person dataset version still has `age`. Soft drop is reversible
+    // via Lance's version graph until `omnigraph cleanup` runs.
+    let pre_drop_snapshot = db.snapshot_at_version(before_version).await.unwrap();
+    let pre_drop_ds = pre_drop_snapshot.open("node:Person").await.unwrap();
+    let pre_drop_fields = pre_drop_ds
+        .schema()
+        .fields
+        .iter()
+        .map(|f| f.name.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        pre_drop_fields.iter().any(|f| f == "age"),
+        "pre-drop Person dataset schema must still include 'age' (time-travel reversibility); got fields {pre_drop_fields:?}",
+    );
+
+    // (c) Reopen consistency: close the engine, reopen, verify the
+    // drop is preserved (column still absent from current schema).
+    let uri = dir.path().to_str().unwrap().to_string();
+    drop(db);
+    let reopened = Omnigraph::open(&uri).await.unwrap();
+    let reopened_snapshot = reopened
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let reopened_ds = reopened_snapshot.open("node:Person").await.unwrap();
+    let reopened_fields = reopened_ds
+        .schema()
+        .fields
+        .iter()
+        .map(|f| f.name.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        !reopened_fields.iter().any(|f| f == "age"),
+        "after reopen, Person dataset schema must still lack 'age'; got fields {reopened_fields:?}",
+    );
 }
 
 #[tokio::test]
