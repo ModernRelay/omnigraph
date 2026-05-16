@@ -2035,10 +2035,10 @@ async fn main() -> Result<()> {
                 let schema_source = fs::read_to_string(&schema)?;
                 let output = if is_remote_uri(&uri) {
                     if allow_data_loss {
-                        return Err(anyhow::anyhow!(
+                        bail!(
                             "--allow-data-loss is not yet supported on remote (HTTP) schema apply; \
                              use `omnigraph schema apply` against a local path or s3:// URI for now"
-                        ));
+                        );
                     }
                     remote_json::<SchemaApplyOutput>(
                         &http_client,
