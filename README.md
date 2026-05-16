@@ -5,7 +5,7 @@
 [![Crates.io](https://img.shields.io/crates/v/omnigraph-cli.svg)](https://crates.io/crates/omnigraph-cli)
 [![CI](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml/badge.svg)](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml)
 
-**Object-storage native graph engine with git-style workflows.**
+**Object-storage native graph engine with git-style workflows. Designed for agents as first-class operators.**
 
 Branch, commit, and merge typed graph data like source code. Multi-modal, self-hosted, open source.
 
