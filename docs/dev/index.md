@@ -43,6 +43,15 @@ constraints. User-facing behavior should still be documented through
 | Constants and tunables | [constants.md](../user/constants.md) |
 | Transaction model public contract | [transactions.md](../user/transactions.md) |
 
+## Design Proposals (RFCs)
+
+RFCs are proposals under review, not current truth. The authoritative
+description of shipped behavior always lives in the area docs above.
+
+| RFC | Status | Topic |
+|---|---|---|
+| [0001-federated-authentication.md](rfcs/0001-federated-authentication.md) | draft | OIDC auth with a cloud control plane plus VPC/on-prem deployment |
+
 ## Project Operations
 
 | Area | Read |
