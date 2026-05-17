@@ -52,7 +52,30 @@ pub(super) async fn apply_schema(
     db: &Omnigraph,
     desired_schema_source: &str,
     options: SchemaApplyOptions,
+    actor: Option<&str>,
 ) -> Result<SchemaApplyResult> {
+    // Engine-layer policy gate (MR-722 chassis core).
+    //
+    // Fires BEFORE acquiring the schema-apply lock or doing any other
+    // work. When no PolicyChecker is installed this is a no-op and
+    // the apply path behaves exactly as it did before MR-722. When
+    // a PolicyChecker IS installed and the actor is None, this is a
+    // hard error — see Omnigraph::enforce's docstring for the
+    // forget-the-actor-footgun reasoning.
+    //
+    // Scope is TargetBranch("main") to match the HTTP-layer convention
+    // for SchemaApply: branch=None, target_branch=Some("main"). Cedar
+    // policies in the wild use `target_branch_scope: protected` to
+    // gate schema applies, so the engine-layer call has to set the
+    // target_branch shape that activates that predicate. Wrong scope
+    // here = silent policy mismatch with HTTP. See
+    // `omnigraph_policy::ResourceScope::to_branch_pair` for the mapping.
+    db.enforce(
+        omnigraph_policy::PolicyAction::SchemaApply,
+        &omnigraph_policy::ResourceScope::TargetBranch("main".to_string()),
+        actor,
+    )?;
+
     acquire_schema_apply_lock(db).await?;
     let result = apply_schema_with_lock(db, desired_schema_source, options).await;
     let release_result = release_schema_apply_lock(db).await;

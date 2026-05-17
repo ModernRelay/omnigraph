@@ -4661,6 +4661,7 @@ dependencies = [
  "lance-table",
  "object_store",
  "omnigraph-compiler",
+ "omnigraph-policy",
  "regex",
  "reqwest",
  "serde",
@@ -4676,6 +4677,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnigraph-policy"
+version = "0.4.2"
+dependencies = [
+ "cedar-policy",
+ "clap",
+ "color-eyre",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+]
+
+[[package]]
 name = "omnigraph-server"
 version = "0.4.2"
 dependencies = [
@@ -4683,7 +4697,6 @@ dependencies = [
  "aws-config",
  "aws-sdk-secretsmanager",
  "axum",
- "cedar-policy",
  "clap",
  "color-eyre",
  "dashmap",
@@ -4691,6 +4704,7 @@ dependencies = [
  "lance-index",
  "omnigraph-compiler",
  "omnigraph-engine",
+ "omnigraph-policy",
  "serde",
  "serde_json",
  "serde_yaml",

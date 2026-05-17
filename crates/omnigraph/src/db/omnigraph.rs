@@ -129,6 +129,22 @@ pub struct Omnigraph {
     /// every `self.snapshot()` and `self.ensure_commit_graph_initialized()`
     /// call inside the merge body.
     merge_exclusive: Arc<tokio::sync::Mutex<()>>,
+    /// Optional policy checker for engine-layer enforcement (MR-722).
+    /// `None` = no enforcement; mutating methods are unconditionally
+    /// allowed (this is the embedded/dev default). `Some` = every
+    /// mutating method calls `self.enforce(action, scope, actor)` at
+    /// entry; denial returns `OmniError::Policy`.
+    ///
+    /// Per chassis design (see `omnigraph_policy::PolicyChecker`), the
+    /// trait surface is deliberately coarse — action × scope × actor.
+    /// Per-row / per-type / per-column scope lives at the query layer
+    /// (MR-725), which extends the same trait with a different method.
+    /// Don't be tempted to add per-row enforcement here.
+    ///
+    /// Set via `with_policy(checker)` after construction. Today only
+    /// `apply_schema_as` consults this field (PR #2 proof-of-concept);
+    /// PR #3 fans the `enforce()` call out to the remaining writers.
+    policy: Option<Arc<dyn omnigraph_policy::PolicyChecker>>,
 }
 
 /// Whether [`Omnigraph::open`] runs the open-time recovery sweep.
@@ -185,6 +201,7 @@ impl Omnigraph {
             schema_source: Arc::new(ArcSwap::from_pointee(schema_source.to_string())),
             write_queue: Arc::new(crate::db::write_queue::WriteQueueManager::new()),
             merge_exclusive: Arc::new(tokio::sync::Mutex::new(())),
+            policy: None,
         })
     }
 
@@ -272,6 +289,7 @@ impl Omnigraph {
             schema_source: Arc::new(ArcSwap::from_pointee(schema_source)),
             write_queue: Arc::new(crate::db::write_queue::WriteQueueManager::new()),
             merge_exclusive: Arc::new(tokio::sync::Mutex::new(())),
+            policy: None,
         })
     }
 
@@ -304,6 +322,54 @@ impl Omnigraph {
         &self.root_uri
     }
 
+    /// Install a policy checker for engine-layer enforcement (MR-722).
+    /// Builder-style setter — consumes `self`, returns `Self`. Calling
+    /// this on a `Omnigraph` previously without policy enables
+    /// `enforce()` to fire at every mutating engine method that's been
+    /// wired to call it (currently `apply_schema_as`; PR #3 fans out to
+    /// the remaining writers).
+    ///
+    /// Embedded callers that don't care about authorization should
+    /// just not call this. Server / CLI callers that have loaded a
+    /// `PolicyEngine` from `policy.yaml` pass it here.
+    pub fn with_policy(mut self, checker: Arc<dyn omnigraph_policy::PolicyChecker>) -> Self {
+        self.policy = Some(checker);
+        self
+    }
+
+    /// Engine-layer policy enforcement gate (MR-722 chassis core).
+    ///
+    /// * If no policy is installed → no-op (returns `Ok(())`).
+    /// * If policy is installed AND actor is None → denial with a
+    ///   clear "no actor for engine-layer policy check" message.
+    ///   Forces server / CLI / SDK callers to thread an actor through
+    ///   when policy is configured — silent bypass via "I forgot the
+    ///   actor" is exactly the footgun this gate is here to prevent.
+    /// * If policy is installed AND actor is Some → call
+    ///   `PolicyChecker::check(action, scope, actor)`; map denial /
+    ///   internal failure to `OmniError::Policy(...)`.
+    pub(crate) fn enforce(
+        &self,
+        action: omnigraph_policy::PolicyAction,
+        scope: &omnigraph_policy::ResourceScope,
+        actor: Option<&str>,
+    ) -> Result<()> {
+        let Some(checker) = self.policy.as_ref() else {
+            return Ok(());
+        };
+        let Some(actor) = actor else {
+            return Err(OmniError::Policy(
+                "no actor for engine-layer policy check (policy is configured but the call site \
+                 didn't thread an actor through — this is almost certainly a bug, not an \
+                 intended bypass)"
+                    .to_string(),
+            ));
+        };
+        checker
+            .check(action, scope, actor)
+            .map_err(|err| OmniError::Policy(err.to_string()))
+    }
+
     pub(crate) async fn ensure_schema_state_valid(&self) -> Result<()> {
         validate_schema_contract(self.uri(), Arc::clone(&self.storage)).await
     }
@@ -322,7 +388,7 @@ impl Omnigraph {
     }
 
     pub async fn apply_schema(&self, desired_schema_source: &str) -> Result<SchemaApplyResult> {
-        self.apply_schema_with_options(desired_schema_source, SchemaApplyOptions::default())
+        self.apply_schema_as(desired_schema_source, SchemaApplyOptions::default(), None)
             .await
     }
 
@@ -331,7 +397,26 @@ impl Omnigraph {
         desired_schema_source: &str,
         options: SchemaApplyOptions,
     ) -> Result<SchemaApplyResult> {
-        schema_apply::apply_schema(self, desired_schema_source, options).await
+        self.apply_schema_as(desired_schema_source, options, None).await
+    }
+
+    /// Apply a schema migration with an explicit actor for engine-layer
+    /// policy enforcement (MR-722). When a `PolicyChecker` is installed
+    /// via [`Self::with_policy`], this method calls `enforce(SchemaApply,
+    /// Branch("main"), actor)` before any apply work happens. Denial
+    /// returns `OmniError::Policy` and leaves the manifest untouched.
+    ///
+    /// The no-actor variants (`apply_schema`, `apply_schema_with_options`)
+    /// pass `None` here. They work fine without a policy; if a policy IS
+    /// installed and actor is None, enforcement intentionally fails to
+    /// prevent silent-bypass-via-forgetting-the-actor footguns.
+    pub async fn apply_schema_as(
+        &self,
+        desired_schema_source: &str,
+        options: SchemaApplyOptions,
+        actor: Option<&str>,
+    ) -> Result<SchemaApplyResult> {
+        schema_apply::apply_schema(self, desired_schema_source, options, actor).await
     }
 
     pub(crate) async fn ensure_schema_apply_idle(&self, operation: &str) -> Result<()> {
