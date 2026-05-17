@@ -5,7 +5,7 @@
 [![Crates.io](https://img.shields.io/crates/v/omnigraph-cli.svg)](https://crates.io/crates/omnigraph-cli)
 [![CI](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml/badge.svg)](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml)
 
-**Lakehouse-native graph engine with git-style workflows.**
+**Object-storage native graph engine with git-style workflows. Designed for agents as first-class operators.**
 
 Branch, commit, and merge typed graph data like source code. Multi-modal, self-hosted, open source.
 
@@ -15,7 +15,7 @@ Join the [Omnigraph Slack community](https://join.slack.com/t/omnigraphworkspace
 
 ## Use Cases
 
-- Company brains
+- Company brains / [Second brains](https://github.com/ModernRelay/omnigraph-cookbooks/tree/main/second-brain)
 - Context graphs
 - Backbone for multi-agent research
 - Incident response graphs
@@ -25,6 +25,7 @@ Join the [Omnigraph Slack community](https://join.slack.com/t/omnigraphworkspace
 ## Capabilities
 
 - Typed schema, typed queries, and typed mutations
+- Native blob-as-data support (docs, images, videos, etc)
 - Schema-as-code, query validation and linting
 - Git-style graph workflows: branches, commits, merges, and transactional runs
 - Local, on-prem & cloud S3-native storage with snapshot-pinned reads

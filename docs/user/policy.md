@@ -42,3 +42,11 @@ Each rule must use exactly one of `branch_scope` or `target_branch_scope`.
 ## Server enforcement
 
 Every mutating endpoint calls `authorize_request()` *before* the handler runs; decisions are logged with actor / action / branch / outcome / matched rule.
+
+## Actor identity (signed-claim-only)
+
+The actor identity used for every policy decision comes from the matched bearer token — never from a client-supplied request header, query parameter, or body field. The server resolves the token at the auth middleware boundary, looks up the actor it was minted for, and overwrites whatever the handler may have placed in the policy request. Clients cannot set `actor_id` directly.
+
+This is intentional. Trusting client-supplied identity for authorization is "asking the attacker if they're an admin" — Supabase's RLS history names the same footgun. The chokepoint lives in `authorize_request` in `crates/omnigraph-server/src/lib.rs` and is named in `docs/dev/invariants.md` Hard Invariant 11. A regression test asserts the contract: a request with `Authorization: Bearer <token-for-actor-A>` plus `X-Actor-Id: actor-B` always evaluates as actor A, never as actor B.
+
+If you find yourself wanting to let clients override `actor_id` for impersonation, delegation, or service-account flows — that's a feature, but it needs explicit design (e.g., signed delegation claims, an `On-Behalf-Of` audit trail). It is not a convenience knob.
