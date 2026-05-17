@@ -991,6 +991,22 @@ impl Omnigraph {
     }
 
     pub async fn branch_create(&self, name: &str) -> Result<()> {
+        self.branch_create_as(name, None).await
+    }
+
+    /// Create a branch from the coordinator's currently-open snapshot,
+    /// with an explicit actor for engine-layer policy enforcement
+    /// (MR-722 fan-out). Scope is `TargetBranch(name)` — symmetric with
+    /// `branch_delete_as`: the branch being acted upon is the target.
+    /// Cedar rules using `target_branch_scope: protected` therefore see
+    /// the new-branch name and can deny e.g. creating any branch named
+    /// `main` from a non-privileged actor.
+    pub async fn branch_create_as(&self, name: &str, actor: Option<&str>) -> Result<()> {
+        self.enforce(
+            omnigraph_policy::PolicyAction::BranchCreate,
+            &omnigraph_policy::ResourceScope::TargetBranch(name.to_string()),
+            actor,
+        )?;
         self.ensure_schema_state_valid().await?;
         self.ensure_schema_apply_idle("branch_create").await?;
         ensure_public_branch_ref(name, "branch_create")?;
@@ -1002,8 +1018,41 @@ impl Omnigraph {
         from: impl Into<ReadTarget>,
         name: &str,
     ) -> Result<()> {
+        self.branch_create_from_as(from, name, None).await
+    }
+
+    /// Create a branch from a specific source branch with an explicit
+    /// actor for engine-layer policy enforcement (MR-722 fan-out).
+    ///
+    /// Scope is `BranchTransition { source, target }` — matches the
+    /// HTTP-layer convention at `server_branch_create`
+    /// (branch=Some(from), target_branch=Some(name)), so engine and
+    /// HTTP fire the same Cedar decision. Pinned-snapshot sources
+    /// (which aren't a branch ref) materialize as the sentinel
+    /// `<snapshot>` for the policy check; Cedar rules using
+    /// `branch_scope: any` still match, rules pinning a specific
+    /// source branch correctly do not.
+    pub async fn branch_create_from_as(
+        &self,
+        from: impl Into<ReadTarget>,
+        name: &str,
+        actor: Option<&str>,
+    ) -> Result<()> {
+        let target = from.into();
+        let source_branch = match &target {
+            ReadTarget::Branch(b) => b.clone(),
+            _ => "<snapshot>".to_string(),
+        };
+        self.enforce(
+            omnigraph_policy::PolicyAction::BranchCreate,
+            &omnigraph_policy::ResourceScope::BranchTransition {
+                source: source_branch,
+                target: name.to_string(),
+            },
+            actor,
+        )?;
         self.ensure_schema_apply_idle("branch_create_from").await?;
-        self.branch_create_from_impl(from, name, false).await
+        self.branch_create_from_impl(target, name, false).await
     }
 
     async fn branch_create_from_impl(
@@ -1049,6 +1098,22 @@ impl Omnigraph {
     }
 
     pub async fn branch_delete(&self, name: &str) -> Result<()> {
+        self.branch_delete_as(name, None).await
+    }
+
+    /// Delete a branch with an explicit actor for engine-layer policy
+    /// enforcement (MR-722 fan-out). Scope is `TargetBranch(name)` —
+    /// matches the HTTP-layer convention at `server_branch_delete`
+    /// (branch=None, target_branch=Some(name)). Cedar rules using
+    /// `target_branch_scope: protected` therefore correctly gate
+    /// deletion of protected branches (e.g. deny BranchDelete against
+    /// `main`).
+    pub async fn branch_delete_as(&self, name: &str, actor: Option<&str>) -> Result<()> {
+        self.enforce(
+            omnigraph_policy::PolicyAction::BranchDelete,
+            &omnigraph_policy::ResourceScope::TargetBranch(name.to_string()),
+            actor,
+        )?;
         self.ensure_schema_state_valid().await?;
         self.ensure_schema_apply_idle("branch_delete").await?;
         ensure_public_branch_ref(name, "branch_delete")?;

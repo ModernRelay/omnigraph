@@ -1298,9 +1298,13 @@ async fn server_branch_create(
         .map_err(ApiError::from_workload_reject)?;
     {
         let db = &state.engine;
-        db.branch_create_from(ReadTarget::branch(&from), &request.name)
-            .await
-            .map_err(ApiError::from_omni)?;
+        db.branch_create_from_as(
+            ReadTarget::branch(&from),
+            &request.name,
+            actor.as_ref().map(|Extension(a)| a.as_str()),
+        )
+        .await
+        .map_err(ApiError::from_omni)?;
     }
     Ok(Json(BranchCreateOutput {
         uri: state.uri().to_string(),
@@ -1359,7 +1363,7 @@ async fn server_branch_delete(
         .map_err(ApiError::from_workload_reject)?;
     {
         let db = &state.engine;
-        db.branch_delete(&branch)
+        db.branch_delete_as(&branch, actor_id)
             .await
             .map_err(ApiError::from_omni)?;
     }
