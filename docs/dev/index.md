@@ -51,6 +51,7 @@ description of shipped behavior always lives in the area docs above.
 | RFC | Status | Topic |
 |---|---|---|
 | [0001-federated-authentication.md](rfcs/0001-federated-authentication.md) | draft | OIDC auth with a cloud control plane plus VPC/on-prem deployment |
+| [0002-cloud-deployment-architecture.md](rfcs/0002-cloud-deployment-architecture.md) | draft | Staged cloud deployment — managed, elastic, then BYOC/VPC |
 
 ## Project Operations
 
