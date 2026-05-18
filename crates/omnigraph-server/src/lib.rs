@@ -197,12 +197,29 @@ impl AppState {
             .into_iter()
             .map(|(actor, token)| (hash_bearer_token(&token), Arc::<str>::from(actor)))
             .collect();
+        let policy_engine: Option<Arc<PolicyEngine>> = policy_engine.map(Arc::new);
+        // MR-722 chassis: inject the policy checker into the engine so
+        // `Omnigraph::apply_schema_as` (and PR #3's fan-out of the
+        // remaining writers) gates at engine-layer too. HTTP-layer
+        // `authorize_request` still fires first; the engine-layer gate
+        // is the redundant-but-correct backstop, plus the only path
+        // that protects SDK / embedded callers. PR #3 removes the HTTP
+        // redundancy once we're confident the engine gate covers it.
+        let db = if let Some(engine) = policy_engine.as_ref() {
+            // Unsizing coercion: Arc<PolicyEngine> → Arc<dyn PolicyChecker>.
+            // Needs the explicit `as` cast — Rust 2024 doesn't infer it through
+            // `Arc::clone`.
+            let checker = Arc::clone(engine) as Arc<dyn omnigraph_policy::PolicyChecker>;
+            db.with_policy(checker)
+        } else {
+            db
+        };
         Self {
             uri,
             engine: Arc::new(db),
             workload: Arc::new(workload::WorkloadController::from_env()),
             bearer_tokens: Arc::from(bearer_tokens),
-            policy_engine: policy_engine.map(Arc::new),
+            policy_engine,
         }
     }
 
@@ -443,6 +460,13 @@ impl ApiError {
             ),
             OmniError::Lance(message) => Self::internal(format!("storage: {message}")),
             OmniError::Io(err) => Self::internal(format!("io: {err}")),
+            // Engine-layer policy enforcement (MR-722). All denials and
+            // evaluation failures surface here as 403. The HTTP-layer
+            // `authorize_request` already distinguishes 401 (missing
+            // bearer) from 403 (policy denial), so by the time the
+            // engine gate fires, the bearer is valid — any failure from
+            // the engine is a policy outcome, not an auth one.
+            OmniError::Policy(message) => Self::forbidden(message),
         }
     }
 }
@@ -1077,9 +1101,19 @@ async fn server_schema_apply(
         .map_err(ApiError::from_workload_reject)?;
     let result = {
         let db = &state.engine;
-        db.apply_schema(&request.schema_source)
-            .await
-            .map_err(ApiError::from_omni)?
+        // Engine-layer policy enforcement (MR-722): pass the resolved
+        // actor through so apply_schema_as can call enforce() with the
+        // authoritative identity. With a policy installed in AppState,
+        // engine-side enforcement re-checks the same decision the
+        // HTTP-layer authorize_request just made above. PR #3 collapses
+        // the redundancy.
+        db.apply_schema_as(
+            &request.schema_source,
+            omnigraph::db::SchemaApplyOptions::default(),
+            actor_id,
+        )
+        .await
+        .map_err(ApiError::from_omni)?
     };
     Ok(Json(schema_apply_output(state.uri(), result)))
 }
@@ -1264,9 +1298,13 @@ async fn server_branch_create(
         .map_err(ApiError::from_workload_reject)?;
     {
         let db = &state.engine;
-        db.branch_create_from(ReadTarget::branch(&from), &request.name)
-            .await
-            .map_err(ApiError::from_omni)?;
+        db.branch_create_from_as(
+            ReadTarget::branch(&from),
+            &request.name,
+            actor.as_ref().map(|Extension(a)| a.as_str()),
+        )
+        .await
+        .map_err(ApiError::from_omni)?;
     }
     Ok(Json(BranchCreateOutput {
         uri: state.uri().to_string(),
@@ -1325,7 +1363,7 @@ async fn server_branch_delete(
         .map_err(ApiError::from_workload_reject)?;
     {
         let db = &state.engine;
-        db.branch_delete(&branch)
+        db.branch_delete_as(&branch, actor_id)
             .await
             .map_err(ApiError::from_omni)?;
     }

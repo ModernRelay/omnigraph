@@ -1062,6 +1062,21 @@ impl Omnigraph {
         target: &str,
         actor_id: Option<&str>,
     ) -> Result<MergeOutcome> {
+        // Engine-layer policy gate (MR-722 fan-out / PR #3). Scope is
+        // `BranchTransition { source, target }` — matches the HTTP-layer
+        // convention at `server_branch_merge` (branch=Some(source),
+        // target_branch=Some(target)). Cedar rules using
+        // `target_branch_scope: protected` therefore correctly gate
+        // merges INTO protected branches without forbidding the
+        // (symmetric) source-side reference.
+        self.enforce(
+            omnigraph_policy::PolicyAction::BranchMerge,
+            &omnigraph_policy::ResourceScope::BranchTransition {
+                source: source.to_string(),
+                target: target.to_string(),
+            },
+            actor_id,
+        )?;
         self.ensure_schema_apply_idle("branch_merge").await?;
         self.branch_merge_impl(source, target, actor_id).await
     }

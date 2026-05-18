@@ -85,6 +85,13 @@ pub enum OmniError {
     Manifest(ManifestError),
     #[error("merge conflicts: {0:?}")]
     MergeConflicts(Vec<MergeConflict>),
+    /// Engine-layer policy enforcement (MR-722). Wraps either a policy
+    /// denial ("you can't do that") or a policy-evaluation failure
+    /// ("the policy engine itself blew up"). The HTTP layer maps
+    /// denials to 403 and evaluation failures to 500; CLI and embedded
+    /// callers can match on this variant directly.
+    #[error("policy: {0}")]
+    Policy(String),
 }
 
 impl OmniError {

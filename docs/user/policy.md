@@ -11,9 +11,7 @@ OmniGraph integrates AWS Cedar (`cedar-policy = 4.9`) for ABAC.
 5. `branch_create`
 6. `branch_delete`
 7. `branch_merge`
-8. `run_publish`
-9. `run_abort`
-10. `admin` — reserved
+8. `admin` — reserved for policy-management surfaces (hot reload, audit log, approvals). No call site today; see MR-724 for the reservation rationale.
 
 ## Scope kinds
 
@@ -29,19 +27,66 @@ OmniGraph integrates AWS Cedar (`cedar-policy = 4.9`) for ABAC.
 policy:
   file: ./policy.yaml          # Cedar rules + groups
   tests: ./policy.tests.yaml   # declarative test cases
+
+cli:
+  actor: act-andrew            # default actor for CLI direct-engine writes
 ```
 
 Each rule must use exactly one of `branch_scope` or `target_branch_scope`.
+
+`cli.actor` is the default actor identity for CLI direct-engine writes
+when `policy.file` is configured. Override per-invocation with `--as
+<ACTOR>` (top-level flag) — `--as` wins, otherwise `cli.actor` is used,
+otherwise no actor. With policy configured and neither set, the
+engine-layer footgun guard intentionally denies the write (silent bypass
+via "I forgot the actor" is exactly what the guard prevents). Remote
+HTTP writes ignore both — they resolve their actor server-side from the
+bearer token.
 
 ## CLI
 
 - `omnigraph policy validate` — parse + count actors, exit 1 on parse error.
 - `omnigraph policy test` — run cases in `policy.tests.yaml`, exit 1 on any expectation mismatch.
 - `omnigraph policy explain --actor … --action … [--branch …] [--target-branch …]` — show decision and matched rule.
+- `omnigraph --as <ACTOR> <subcommand>` — set the actor for the duration of one invocation. Effective for `change`, `load`, `ingest`, `branch create|delete|merge`, and `schema apply` against local URIs. No-op against remote HTTP URIs (actor is bearer-token-resolved server-side).
 
-## Server enforcement
+## Enforcement
 
-Every mutating endpoint calls `authorize_request()` *before* the handler runs; decisions are logged with actor / action / branch / outcome / matched rule.
+Policy is a property of the **engine**, not the transport. Every mutating
+write — `mutate_as`, `load_as`, `ingest_as`, `apply_schema_as`,
+`branch_create_as`, `branch_create_from_as`, `branch_delete_as`,
+`branch_merge_as` — calls `Omnigraph::enforce(action, scope, actor)` at
+the head of the method. The gate fires identically whether the call
+originates from the HTTP server, the CLI, or an embedded SDK consumer.
+When no `PolicyChecker` is installed (the dev/embedded default) the gate
+is a strict no-op; when one is installed and the call site forgets to
+thread an actor through, the gate fails closed rather than silently
+bypassing.
+
+Server-side, `authorize_request()` still runs at the HTTP boundary —
+that's where actor identity is resolved from the bearer token and where
+admission control / per-actor rate limits live. Engine-layer enforcement
+is the **defense in depth** layer: it catches CLI direct-engine writes,
+embedded SDK consumers, and any future transport that hasn't (or won't)
+re-implement HTTP's authorize_request. Both layers consult the same
+Cedar policy via the same `PolicyChecker` trait, so decisions cannot
+disagree.
+
+## Coarse vs. fine enforcement
+
+There are two enforcement points, each with non-overlapping
+responsibilities:
+
+| Layer | Question it answers | Where it fires |
+|---|---|---|
+| **Engine-layer (coarse)** | Can this actor invoke this action against this branch / branch-transition? | `Omnigraph::enforce(action, scope, actor)` at the head of every `_as` writer; one Cedar decision per call. |
+| **Query-layer (fine)** | For the rows / types this action actually touches, which can the actor see or modify? | Per-row predicates pushed into DataFusion at plan time. **Not yet implemented — see MR-725.** |
+
+The engine-layer gate keeps `ResourceScope` deliberately at branch
+granularity (`Graph`, `Branch`, `TargetBranch`, `BranchTransition`).
+Per-type and per-row authority is the query-layer's job; conflating them
+in `ResourceScope` would create two places per-type policy could be
+evaluated and a drift surface between them.
 
 ## Actor identity (signed-claim-only)
 

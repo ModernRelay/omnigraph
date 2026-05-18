@@ -46,6 +46,12 @@ pub struct CliDefaults {
     pub output_format: Option<ReadOutputFormat>,
     pub table_max_column_width: Option<usize>,
     pub table_cell_layout: Option<TableCellLayout>,
+    /// Default actor identity for CLI direct-engine writes (MR-722).
+    /// Used when `policy.file` is configured and the operator hasn't
+    /// passed `--as <actor>` on the command line. With policy configured
+    /// and neither this nor `--as` set, the engine-layer footgun guard
+    /// fires (no silent bypass).
+    pub actor: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

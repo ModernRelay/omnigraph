@@ -90,6 +90,18 @@ impl Omnigraph {
         mode: LoadMode,
         actor_id: Option<&str>,
     ) -> Result<IngestResult> {
+        // Engine-layer policy gate (MR-722 fan-out / PR #3). Scope is
+        // `Branch(branch)` for the data-write portion. If ingest creates
+        // a new branch as a side-effect (target branch doesn't exist),
+        // the inner `branch_create_from_as` call below additionally
+        // checks `BranchCreate` — both authorities are genuinely needed
+        // for "ingest into a fresh branch", so the layered check is
+        // correct, not redundant.
+        self.enforce(
+            omnigraph_policy::PolicyAction::Change,
+            &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
+            actor_id,
+        )?;
         self.ingest_with_current_actor(branch, from, data, mode, actor_id)
             .await
     }
@@ -135,8 +147,18 @@ impl Omnigraph {
             .iter()
             .any(|name| name == &target_branch);
         if branch_created {
-            self.branch_create_from(crate::db::ReadTarget::branch(&base_branch), &target_branch)
-                .await?;
+            // Thread the actor through to the implicit BranchCreate so
+            // policy decisions match what an explicit `branch_create_from_as`
+            // call would see. Calling the no-actor variant here would
+            // bypass BranchCreate enforcement when policy is installed —
+            // the footgun guard catches that case too, but threading is
+            // the correct fix.
+            self.branch_create_from_as(
+                crate::db::ReadTarget::branch(&base_branch),
+                &target_branch,
+                actor_id,
+            )
+            .await?;
         }
 
         let result = self.load_as(&target_branch, data, mode, actor_id).await?;
@@ -160,6 +182,17 @@ impl Omnigraph {
         mode: LoadMode,
         actor_id: Option<&str>,
     ) -> Result<LoadResult> {
+        // Engine-layer policy gate (MR-722 fan-out / PR #3). Scope is
+        // `Branch(branch)` to match the HTTP-layer Change convention.
+        // `ingest_as` also calls `load_as` after enforcing its own
+        // Change gate — that double-check is fine because both gates
+        // resolve to identical Cedar decisions for the same actor +
+        // branch (the second check is a structurally-correct no-op).
+        self.enforce(
+            omnigraph_policy::PolicyAction::Change,
+            &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
+            actor_id,
+        )?;
         self.ensure_schema_state_valid().await?;
         // Reject internal `__run__*` / system-prefixed branches at the
         // public write boundary. Direct-publish paths assert this
@@ -185,8 +218,21 @@ impl Omnigraph {
         path: &str,
         mode: LoadMode,
     ) -> Result<LoadResult> {
+        self.load_file_as(branch, path, mode, None).await
+    }
+
+    /// Read a file into memory and delegate to `load_as`. Used by the
+    /// CLI's `omnigraph load` so file-path-based writes flow through
+    /// the same engine-layer policy gate as in-memory `load_as` calls.
+    pub async fn load_file_as(
+        &self,
+        branch: &str,
+        path: &str,
+        mode: LoadMode,
+        actor_id: Option<&str>,
+    ) -> Result<LoadResult> {
         let data = std::fs::read_to_string(path).map_err(|e| OmniError::Io(e))?;
-        self.load(branch, &data, mode).await
+        self.load_as(branch, &data, mode, actor_id).await
     }
 
     async fn load_direct_on_branch(

@@ -692,6 +692,16 @@ impl Omnigraph {
         params: &ParamMap,
         actor_id: Option<&str>,
     ) -> Result<MutationResult> {
+        // Engine-layer policy gate (MR-722 fan-out / PR #3). Scope is
+        // `Branch(branch)` to match the HTTP-layer convention at
+        // `server_change` (branch=Some(branch), target_branch=None). When no
+        // PolicyChecker is installed this is a no-op; with policy installed
+        // and actor=None this fails hard (forget-the-actor footgun guard).
+        self.enforce(
+            omnigraph_policy::PolicyAction::Change,
+            &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
+            actor_id,
+        )?;
         self.mutate_with_current_actor(branch, query_source, query_name, params, actor_id)
             .await
     }
