@@ -78,3 +78,11 @@ Edge bodies only allow `@unique` and `@index`.
 - `UnsupportedChange { entity, reason }` (forces `supported=false`)
 
 `apply_schema()` returns `SchemaApplyResult { supported, applied, manifest_version, steps }` and is gated by an internal `__schema_apply_lock__` system branch so concurrent schema applies serialize.
+
+## Destructive drops — `--allow-data-loss`
+
+`DropProperty` and `DropType` steps default to `Soft` mode: the catalog tombstones the entry but the prior column / dataset remains time-travel-reachable via `snapshot_at_version(prev)` until `omnigraph cleanup` runs. Soft drops are reversible.
+
+Pass `--allow-data-loss` (CLI) or `allow_data_loss: true` (HTTP `POST /schema/apply` body, SDK `SchemaApplyOptions`) to promote every drop in the plan to `Hard` mode. Hard drops run `cleanup_old_versions` on the affected dataset immediately after the manifest publish, making the prior column / dataset unreachable. **Irreversible.**
+
+The flag is honored uniformly across transports — `omnigraph schema apply --allow-data-loss`, `POST /schema/apply { schema_source, allow_data_loss: true }`, and `apply_schema_with_options(.., SchemaApplyOptions { allow_data_loss: true })` produce identical plans and identical effects.

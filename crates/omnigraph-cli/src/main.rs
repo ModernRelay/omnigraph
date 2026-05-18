@@ -2091,18 +2091,18 @@ async fn main() -> Result<()> {
                 let uri = resolve_uri(&config, uri, target.as_deref())?;
                 let schema_source = fs::read_to_string(&schema)?;
                 let output = if is_remote_uri(&uri) {
-                    if allow_data_loss {
-                        bail!(
-                            "--allow-data-loss is not yet supported on remote (HTTP) schema apply; \
-                             use `omnigraph schema apply` against a local path or s3:// URI for now"
-                        );
-                    }
+                    // MR-694 PR B: SchemaApplyRequest gained an
+                    // allow_data_loss field so Hard-mode drops are no
+                    // longer CLI-only. The previous bail is gone; the
+                    // field is forwarded into the JSON payload, and
+                    // the server's `server_schema_apply` honors it.
                     remote_json::<SchemaApplyOutput>(
                         &http_client,
                         Method::POST,
                         remote_url(&uri, "/schema/apply"),
                         Some(serde_json::to_value(SchemaApplyRequest {
                             schema_source: schema_source.clone(),
+                            allow_data_loss,
                         })?),
                         bearer_token.as_deref(),
                     )

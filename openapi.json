@@ -1576,6 +1576,10 @@
           "schema_source"
         ],
         "properties": {
+          "allow_data_loss": {
+            "type": "boolean",
+            "description": "When true, promote every `DropMode::Soft` step in the plan to\n`DropMode::Hard`, making the prior column data unreachable\nafter the apply. Matches the CLI's `--allow-data-loss` flag.\nDefaults to `false` (drops remain reversible via time travel)."
+          },
           "schema_source": {
             "type": "string",
             "description": "Project schema in `.pg` source form. The diff against the current\nschema produces the migration steps that will be applied.",

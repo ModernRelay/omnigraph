@@ -1909,3 +1909,134 @@ fn cli_fails_for_invalid_merge_requests() {
 // alongside the run state machine. Direct-to-target writes leave nothing
 // for these CLIs to manage. Audit history is now visible via
 // `omnigraph commit list` reading the commit graph.
+
+// ─── MR-694 PR B: --allow-data-loss flag end-to-end ──────────────────────
+//
+// The schema-lint chassis v1.2 (PR #100) shipped the `--allow-data-loss`
+// flag at the CLI layer; the SDK suite verifies promotion to Hard mode
+// via `apply_schema_with_options(.., SchemaApplyOptions { allow_data_loss })`.
+// These CLI tests close the integration gap so a future change that
+// drops the flag wiring in `main.rs` turns red.
+
+#[test]
+fn schema_apply_allow_data_loss_flag_promotes_drops_to_hard() {
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    let schema_path = temp.path().join("drop-age.pg");
+    init_repo(&repo);
+
+    // Drop the nullable `age` column.
+    let next_schema = fs::read_to_string(fixture("test.pg"))
+        .unwrap()
+        .replace("    age: I32?\n", "");
+    fs::write(&schema_path, next_schema).unwrap();
+
+    let output = output_success(
+        cli()
+            .arg("schema")
+            .arg("apply")
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--allow-data-loss")
+            .arg("--json")
+            .arg(&repo),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["applied"], true);
+
+    let drop_step = payload["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["kind"] == "drop_property")
+        .expect("plan should include a drop_property step");
+    assert_eq!(
+        drop_step["mode"], "hard",
+        "--allow-data-loss should promote Soft → Hard; full step: {drop_step}",
+    );
+}
+
+#[test]
+fn schema_apply_without_allow_data_loss_keeps_soft_drops() {
+    // Symmetric to the above: same schema change without the flag →
+    // drops stay Soft. Pins default semantics against accidental Hard
+    // promotion if a future refactor changes the option threading.
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    let schema_path = temp.path().join("drop-age-soft.pg");
+    init_repo(&repo);
+
+    let next_schema = fs::read_to_string(fixture("test.pg"))
+        .unwrap()
+        .replace("    age: I32?\n", "");
+    fs::write(&schema_path, next_schema).unwrap();
+
+    let output = output_success(
+        cli()
+            .arg("schema")
+            .arg("apply")
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json")
+            .arg(&repo),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["applied"], true);
+
+    let drop_step = payload["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["kind"] == "drop_property")
+        .expect("plan should include a drop_property step");
+    assert_eq!(
+        drop_step["mode"], "soft",
+        "no flag should leave drops Soft; full step: {drop_step}",
+    );
+}
+
+#[test]
+fn schema_plan_parity_cli_and_sdk() {
+    // Same .pg through `Omnigraph::plan_schema_with_options` (SDK) and
+    // `omnigraph schema plan --json` (CLI). Asserts the steps array is
+    // byte-identical after JSON round-trip. HTTP doesn't expose a
+    // separate /schema/plan route — that side of parity is covered by
+    // the HTTP soft/hard drop tests, which exercise apply with
+    // identical fixtures.
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    init_repo(&repo);
+    let schema_path = temp.path().join("plan-parity.pg");
+    let next_schema = fs::read_to_string(fixture("test.pg")).unwrap().replace(
+        "    age: I32?\n}",
+        "    age: I32?\n    nickname: String?\n}",
+    );
+    fs::write(&schema_path, &next_schema).unwrap();
+
+    // CLI side.
+    let cli_output = output_success(
+        cli()
+            .arg("schema")
+            .arg("plan")
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json")
+            .arg(&repo),
+    );
+    let cli_payload: Value = serde_json::from_slice(&cli_output.stdout).unwrap();
+
+    // SDK side: open repo, call plan_schema.
+    let plan = tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let db = Omnigraph::open(repo.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        db.plan_schema(&next_schema).await.unwrap()
+    });
+    let sdk_steps = serde_json::to_value(&plan.steps).unwrap();
+
+    assert_eq!(
+        cli_payload["steps"], sdk_steps,
+        "CLI plan steps must match SDK plan steps for identical input",
+    );
+    assert_eq!(cli_payload["supported"], plan.supported);
+}

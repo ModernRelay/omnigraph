@@ -325,6 +325,31 @@ fn additive_schema_with_nickname() -> String {
     )
 }
 
+fn schema_without_age() -> String {
+    // Drop the nullable `age` column from the test schema. Used by the
+    // HTTP soft/hard drop tests below.
+    fs::read_to_string(fixture("test.pg"))
+        .unwrap()
+        .replace("    age: I32?\n", "")
+}
+
+fn schema_without_company() -> String {
+    // Drop the `Company` node type and the edge referencing it. Used
+    // by the HTTP DropType test below. Hand-crafted (no template
+    // string replace) because the fixture interleaves the type and
+    // its edge.
+    r#"node Person {
+    name: String @key
+    age: I32?
+}
+
+edge Knows: Person -> Person {
+    since: Date?
+}
+"#
+    .to_string()
+}
+
 fn renamed_person_schema() -> String {
     fs::read_to_string(fixture("test.pg"))
         .unwrap()
@@ -380,6 +405,7 @@ async fn schema_apply_route_updates_repo_for_authorized_admin() {
         .body(Body::from(
             serde_json::to_vec(&SchemaApplyRequest {
                 schema_source: schema,
+                ..Default::default()
             })
             .unwrap(),
         ))
@@ -414,6 +440,7 @@ async fn schema_apply_route_requires_schema_apply_policy_permission() {
         .body(Body::from(
             serde_json::to_vec(&SchemaApplyRequest {
                 schema_source: additive_schema_with_nickname(),
+                ..Default::default()
             })
             .unwrap(),
         ))
@@ -443,6 +470,7 @@ async fn schema_apply_route_requires_bearer_token_when_policy_enabled() {
         .body(Body::from(
             serde_json::to_vec(&SchemaApplyRequest {
                 schema_source: additive_schema_with_nickname(),
+                ..Default::default()
             })
             .unwrap(),
         ))
@@ -473,6 +501,7 @@ async fn schema_apply_route_can_rename_type() {
         .body(Body::from(
             serde_json::to_vec(&SchemaApplyRequest {
                 schema_source: renamed_person_schema(),
+                ..Default::default()
             })
             .unwrap(),
         ))
@@ -508,6 +537,7 @@ async fn schema_apply_route_can_rename_property() {
         .body(Body::from(
             serde_json::to_vec(&SchemaApplyRequest {
                 schema_source: renamed_age_schema(),
+                ..Default::default()
             })
             .unwrap(),
         ))
@@ -547,6 +577,7 @@ async fn schema_apply_route_can_add_index() {
         .body(Body::from(
             serde_json::to_vec(&SchemaApplyRequest {
                 schema_source: indexed_name_schema(),
+                ..Default::default()
             })
             .unwrap(),
         ))
@@ -582,6 +613,7 @@ async fn schema_apply_route_rejects_unsupported_plan() {
         .body(Body::from(
             serde_json::to_vec(&SchemaApplyRequest {
                 schema_source: unsupported_schema_change(),
+                ..Default::default()
             })
             .unwrap(),
         ))
@@ -622,6 +654,7 @@ async fn schema_apply_route_rejects_when_non_main_branch_exists() {
         .body(Body::from(
             serde_json::to_vec(&SchemaApplyRequest {
                 schema_source: additive_schema_with_nickname(),
+                ..Default::default()
             })
             .unwrap(),
         ))
@@ -3769,6 +3802,7 @@ async fn default_deny_mode_rejects_schema_apply_with_forbidden() {
 
     let req = SchemaApplyRequest {
         schema_source: additive_schema_with_nickname(),
+                ..Default::default()
     };
     let (status, body) = json_response(
         &app,
@@ -4018,5 +4052,290 @@ async fn policy_decision_parity_branch_merge_team_denied() {
     assert!(
         matches!(sdk, ParityDecision::Deny) && matches!(http, ParityDecision::Deny),
         "SDK={sdk:?} HTTP={http:?} — should both Deny",
+    );
+}
+
+// ─── MR-694 PR B: HTTP soft + hard drop semantics + data preservation ────
+//
+// SDK-level drop semantics are pinned in `crates/omnigraph/tests/schema_apply.rs`.
+// These HTTP-side tests mirror the assertions through POST /schema/apply
+// and exercise the new `allow_data_loss` field (closes the gap where
+// the schema-lint chassis v1.2 shipped Hard mode on the CLI but the
+// HTTP request struct had no equivalent field).
+
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_apply_route_soft_drops_property_via_http() {
+    let (temp, app) = app_for_repo_with_auth_tokens_and_policy(
+        &fs::read_to_string(fixture("test.pg")).unwrap(),
+        &[("act-ragnor", "admin-token")],
+        SCHEMA_APPLY_POLICY_YAML,
+    )
+    .await;
+    // Load a row that has the column we're about to drop.
+    let repo = repo_path(temp.path());
+    {
+        let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+        db.load(
+            "main",
+            r#"{"type":"Person","data":{"name":"PreDrop","age":42}}"#,
+            LoadMode::Append,
+        )
+        .await
+        .unwrap();
+    }
+    let pre_version = manifest_dataset_version(&repo).await;
+
+    let (status, payload) = json_response(
+        &app,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/schema/apply")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer admin-token")
+            .body(Body::from(
+                serde_json::to_vec(&SchemaApplyRequest {
+                    schema_source: schema_without_age(),
+                    ..Default::default()
+                })
+                .unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["applied"], true);
+
+    // Catalog reflects the drop: `age` is gone from the live schema.
+    let reopened = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    assert!(
+        !reopened.catalog().node_types["Person"]
+            .properties
+            .contains_key("age"),
+        "catalog should not contain `age` after drop"
+    );
+
+    // Soft drop preserves the prior version — `age` is still readable
+    // via time travel to the pre-drop manifest version. Mirrors the
+    // SDK-side assertion in `apply_schema_drops_a_nullable_property_softly_preserves_prior_version`.
+    let pre_drop_snapshot = reopened.snapshot_at_version(pre_version).await.unwrap();
+    let pre_drop_ds = pre_drop_snapshot.open("node:Person").await.unwrap();
+    let pre_drop_fields = pre_drop_ds
+        .schema()
+        .fields
+        .iter()
+        .map(|f| f.name.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        pre_drop_fields.iter().any(|f| f == "age"),
+        "soft drop should leave the pre-drop dataset's `age` column \
+         time-travel-reachable; got fields {pre_drop_fields:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_apply_route_soft_drops_node_type_via_http() {
+    let (temp, app) = app_for_repo_with_auth_tokens_and_policy(
+        &fs::read_to_string(fixture("test.pg")).unwrap(),
+        &[("act-ragnor", "admin-token")],
+        SCHEMA_APPLY_POLICY_YAML,
+    )
+    .await;
+    let repo = repo_path(temp.path());
+
+    let (status, payload) = json_response(
+        &app,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/schema/apply")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer admin-token")
+            .body(Body::from(
+                serde_json::to_vec(&SchemaApplyRequest {
+                    schema_source: schema_without_company(),
+                    ..Default::default()
+                })
+                .unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["applied"], true);
+
+    let reopened = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    assert!(
+        !reopened.catalog().node_types.contains_key("Company"),
+        "catalog should not contain `Company` after drop"
+    );
+    assert!(
+        !reopened.catalog().edge_types.contains_key("WorksAt"),
+        "catalog should not contain `WorksAt` after cascade"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_apply_route_hard_drops_property_with_allow_data_loss() {
+    let (temp, app) = app_for_repo_with_auth_tokens_and_policy(
+        &fs::read_to_string(fixture("test.pg")).unwrap(),
+        &[("act-ragnor", "admin-token")],
+        SCHEMA_APPLY_POLICY_YAML,
+    )
+    .await;
+    let repo = repo_path(temp.path());
+    {
+        let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+        db.load(
+            "main",
+            r#"{"type":"Person","data":{"name":"PreDropHard","age":50}}"#,
+            LoadMode::Append,
+        )
+        .await
+        .unwrap();
+    }
+
+    // Apply with allow_data_loss=true → Hard mode promotion.
+    let (status, payload) = json_response(
+        &app,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/schema/apply")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer admin-token")
+            .body(Body::from(
+                serde_json::to_vec(&SchemaApplyRequest {
+                    schema_source: schema_without_age(),
+                    allow_data_loss: true,
+                })
+                .unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["applied"], true);
+
+    // Catalog reflects the drop.
+    let reopened = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    assert!(
+        !reopened.catalog().node_types["Person"]
+            .properties
+            .contains_key("age"),
+        "catalog should not contain `age` after Hard drop"
+    );
+    // Plan steps should show DropMode::Hard for property drops.
+    let steps = payload["steps"].as_array().expect("steps array");
+    let drop_step = steps
+        .iter()
+        .find(|s| s["kind"] == "drop_property")
+        .expect("plan should include drop_property step");
+    let mode = &drop_step["mode"];
+    assert_eq!(mode, "hard", "expected hard mode under allow_data_loss=true");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_apply_route_keeps_drops_soft_without_flag() {
+    // Symmetric to the Hard test: same schema change, but no
+    // allow_data_loss flag → drops stay Soft (prior column data
+    // remains time-travel-reachable). Pins the default semantics
+    // against accidental Hard promotion.
+    let (temp, app) = app_for_repo_with_auth_tokens_and_policy(
+        &fs::read_to_string(fixture("test.pg")).unwrap(),
+        &[("act-ragnor", "admin-token")],
+        SCHEMA_APPLY_POLICY_YAML,
+    )
+    .await;
+    let repo = repo_path(temp.path());
+
+    let (status, payload) = json_response(
+        &app,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/schema/apply")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer admin-token")
+            .body(Body::from(
+                serde_json::to_vec(&SchemaApplyRequest {
+                    schema_source: schema_without_age(),
+                    allow_data_loss: false,
+                })
+                .unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["applied"], true);
+
+    let steps = payload["steps"].as_array().expect("steps array");
+    let drop_step = steps
+        .iter()
+        .find(|s| s["kind"] == "drop_property")
+        .expect("plan should include drop_property step");
+    let mode = &drop_step["mode"];
+    assert_eq!(mode, "soft", "expected soft mode without allow_data_loss");
+    let _ = repo;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_apply_route_additive_property_preserves_existing_rows() {
+    // SDK suite covers rename and drop data preservation. Additive
+    // AddProperty wasn't pinned with a row-count check anywhere.
+    // Load N rows, apply schema adding nullable property, verify
+    // every row is still readable and the new column is null.
+    let (temp, app) = app_for_repo_with_auth_tokens_and_policy(
+        &fs::read_to_string(fixture("test.pg")).unwrap(),
+        &[("act-ragnor", "admin-token")],
+        SCHEMA_APPLY_POLICY_YAML,
+    )
+    .await;
+    let repo = repo_path(temp.path());
+
+    // Standard fixture data: 4 Persons + 1 Company. Load it.
+    let pre_count = {
+        let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+        db.load(
+            "main",
+            &fs::read_to_string(fixture("test.jsonl")).unwrap(),
+            LoadMode::Append,
+        )
+        .await
+        .unwrap();
+        let snap = db
+            .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+            .await
+            .unwrap();
+        snap.entry("node:Person").expect("Person").row_count
+    };
+    assert!(pre_count > 0, "fixture should have loaded Person rows");
+
+    let (status, payload) = json_response(
+        &app,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/schema/apply")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer admin-token")
+            .body(Body::from(
+                serde_json::to_vec(&SchemaApplyRequest {
+                    schema_source: additive_schema_with_nickname(),
+                    ..Default::default()
+                })
+                .unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["applied"], true);
+
+    // Row count preserved.
+    let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let snap = db.snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let post_count = snap.entry("node:Person").expect("Person").row_count;
+    assert_eq!(
+        post_count, pre_count,
+        "AddProperty should preserve row count",
     );
 }
