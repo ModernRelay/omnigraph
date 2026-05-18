@@ -63,6 +63,25 @@ is a strict no-op; when one is installed and the call site forgets to
 thread an actor through, the gate fails closed rather than silently
 bypassing.
 
+## Server runtime states (MR-723)
+
+The HTTP server classifies its startup configuration into one of three
+states based on whether bearer tokens are configured and whether a
+policy file is set. The state determines what happens to a request that
+reaches `authorize_request()` without a matching policy permit.
+
+| State | Tokens | Policy file | Behavior |
+|---|---|---|---|
+| **Open** | no | no | Every request is permitted. Refuses to start unless `--unauthenticated` or `OMNIGRAPH_UNAUTHENTICATED=1` is set — the operator must explicitly opt in. |
+| **DefaultDeny** | yes | no | Every authenticated request for an action other than `read` is rejected with HTTP 403. Closes the "tokens but forgot the policy file" trap — an operator who sets up auth and forgot to point at a policy file used to ship the illusion of protection. |
+| **PolicyEnabled** | any | yes | Every request is evaluated by Cedar against the configured policy. |
+
+The classifier is `classify_server_runtime_state` in
+`crates/omnigraph-server/src/lib.rs`; it returns `Err` for the "no
+tokens, no policy, no flag" cell so the server refuses to start instead
+of silently shipping an open instance. Tests pin every cell of the
+matrix and the State-2 deny path.
+
 Server-side, `authorize_request()` still runs at the HTTP boundary —
 that's where actor identity is resolved from the bearer token and where
 admission control / per-actor rate limits live. Engine-layer enforcement

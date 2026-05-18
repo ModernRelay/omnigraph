@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::{Body, to_bytes};
+use axum::http::header::AUTHORIZATION;
 use axum::http::{Method, Request, StatusCode};
 use lance_index::traits::DatasetIndexExt;
 use omnigraph::db::{Omnigraph, ReadTarget};
@@ -176,15 +177,55 @@ async fn app_for_loaded_repo() -> (tempfile::TempDir, Router) {
     (temp, build_app(state))
 }
 
+/// Build a permit-all policy YAML that grants every action used by the
+/// HTTP-layer tests to the listed actor names. MR-723 default-deny
+/// closed the "tokens but no policy" loophole; helpers that used to
+/// represent "auth without policy" now install this permit-all policy
+/// so test cases retain their pre-MR-723 semantics ("auth required,
+/// every action permitted") without conflicting with the new state
+/// matrix. Tests that specifically need the State-2 deny path use
+/// `app_for_repo_with_auth_tokens_only` instead.
+fn permit_all_policy_yaml(actors: &[&str]) -> String {
+    let members = actors
+        .iter()
+        .map(|a| format!("\"{a}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        r#"
+version: 1
+groups:
+  permitted: [{members}]
+protected_branches: [main]
+rules:
+  - id: permit-data
+    allow:
+      actors: {{ group: permitted }}
+      actions: [read, change, export]
+      branch_scope: any
+  - id: permit-protected-target-actions
+    allow:
+      actors: {{ group: permitted }}
+      actions: [schema_apply, branch_create, branch_delete, branch_merge]
+      target_branch_scope: any
+"#
+    )
+}
+
 async fn app_for_loaded_repo_with_auth(token: &str) -> (tempfile::TempDir, Router) {
+    // `AppState::new_with_bearer_token(token)` maps the token to actor "default";
+    // permit-all policy needs to include that actor.
     let temp = init_loaded_repo().await;
     let repo = repo_path(temp.path());
-    let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
-    let state = AppState::new_with_bearer_token(
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, permit_all_policy_yaml(&["default"])).unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
         repo.to_string_lossy().to_string(),
-        db,
-        Some(token.to_string()),
-    );
+        vec![("default".to_string(), token.to_string())],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap();
     (temp, build_app(state))
 }
 
@@ -193,15 +234,19 @@ async fn app_for_loaded_repo_with_auth_tokens(
 ) -> (tempfile::TempDir, Router) {
     let temp = init_loaded_repo().await;
     let repo = repo_path(temp.path());
-    let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
-    let state = AppState::new_with_bearer_tokens(
+    let policy_path = temp.path().join("policy.yaml");
+    let actors: Vec<&str> = tokens.iter().map(|(actor, _)| *actor).collect();
+    fs::write(&policy_path, permit_all_policy_yaml(&actors)).unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
         repo.to_string_lossy().to_string(),
-        db,
         tokens
             .iter()
             .map(|(actor, token)| ((*actor).to_string(), (*token).to_string()))
             .collect(),
-    );
+        Some(&policy_path),
+    )
+    .await
+    .unwrap();
     (temp, build_app(state))
 }
 
@@ -242,6 +287,29 @@ async fn app_for_repo_with_auth_tokens_and_policy(
             .map(|(actor, token)| ((*actor).to_string(), (*token).to_string()))
             .collect(),
         Some(&policy_path),
+    )
+    .await
+    .unwrap();
+    (temp, build_app(state))
+}
+
+/// MR-723 default-deny mode: bearer tokens configured, no policy file.
+/// Exercises ServerRuntimeState::DefaultDeny — authenticated requests
+/// for Read succeed, every other action is rejected with 403 from
+/// `authorize_request`'s state-2 branch.
+async fn app_for_repo_with_auth_tokens_only(
+    schema: &str,
+    tokens: &[(&str, &str)],
+) -> (tempfile::TempDir, Router) {
+    let temp = init_repo_with_schema(schema).await;
+    let repo = repo_path(temp.path());
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        repo.to_string_lossy().to_string(),
+        tokens
+            .iter()
+            .map(|(actor, token)| ((*actor).to_string(), (*token).to_string()))
+            .collect(),
+        None,
     )
     .await
     .unwrap();
@@ -831,11 +899,20 @@ async fn export_route_returns_jsonl_for_branch_snapshot() {
         .unwrap();
     drop(db);
 
-    let state = AppState::new_with_bearer_token(
+    // MR-723: tokens-without-policy is now default-deny. Install a
+    // permit-all policy alongside the bearer token so /export
+    // (action=Export) passes Cedar evaluation. The test is exercising
+    // export semantics, not policy — the policy is just enough to clear
+    // the State 3 path.
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, permit_all_policy_yaml(&["default"])).unwrap();
+    let state = AppState::open_with_bearer_tokens_and_policy(
         repo.to_string_lossy().to_string(),
-        Omnigraph::open(repo.to_str().unwrap()).await.unwrap(),
-        Some(token.to_string()),
-    );
+        vec![("default".to_string(), token.to_string())],
+        Some(&policy_path),
+    )
+    .await
+    .unwrap();
     let app = build_app(state);
 
     let response = app
@@ -3487,12 +3564,24 @@ async fn ingest_per_actor_admission_cap_returns_429() {
         1,             // per-actor in-flight cap (the fixture under test)
         1_000_000_000, // per-actor byte budget — large so it never bottlenecks
     );
+    // MR-723: install a permit-all policy alongside the bearer token so
+    // /ingest (action=Change) passes Cedar evaluation. The test is
+    // exercising the admission cap, not policy — the policy is just
+    // enough to clear the State 3 path so the test reaches workload.
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, permit_all_policy_yaml(&["act-flooder"])).unwrap();
+    let policy_engine = omnigraph_server::PolicyEngine::load(
+        &policy_path,
+        repo.to_string_lossy().as_ref(),
+    )
+    .unwrap();
     let state = AppState::new_with_workload(
         repo.to_string_lossy().to_string(),
         db,
         vec![("act-flooder".to_string(), "flooder-token".to_string())],
         workload,
-    );
+    )
+    .with_policy_engine(policy_engine);
     let app = build_app(state);
     let _temp = temp;
 
@@ -3603,4 +3692,98 @@ async fn oversized_request_body_returns_payload_too_large() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+// ─── MR-723 default-deny mode (State 2: tokens without policy) ──────────
+//
+// `authorize_request` returns 403 for every action except `Read` when a
+// PolicyEngine is not installed but bearer tokens are configured. Pinned
+// by the three tests below — Read allowed, Change/SchemaApply denied —
+// to prevent regressing back to the pre-MR-723 "tokens configured but
+// no policy = fully open" trap.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn default_deny_mode_allows_read_for_authenticated_actor() {
+    let (_temp, app) = app_for_repo_with_auth_tokens_only(
+        &fs::read_to_string(fixture("test.pg")).unwrap(),
+        &[("act-andrew", "demo-token")],
+    )
+    .await;
+
+    let (status, _body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/snapshot")
+            .method(Method::GET)
+            .header(AUTHORIZATION, "Bearer demo-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn default_deny_mode_rejects_change_with_forbidden() {
+    let (_temp, app) = app_for_repo_with_auth_tokens_only(
+        &fs::read_to_string(fixture("test.pg")).unwrap(),
+        &[("act-andrew", "demo-token")],
+    )
+    .await;
+
+    let change = ChangeRequest {
+        query_source: MUTATION_QUERIES.to_string(),
+        query_name: Some("insert_person".to_string()),
+        params: Some(json!({ "name": "DefaultDeny", "age": 1 })),
+        branch: Some("main".to_string()),
+    };
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/change")
+            .method(Method::POST)
+            .header(AUTHORIZATION, "Bearer demo-token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&change).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let error: ErrorOutput = serde_json::from_value(body).unwrap();
+    assert!(
+        error.error.contains("default-deny"),
+        "expected default-deny in error message, got: {}",
+        error.error
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn default_deny_mode_rejects_schema_apply_with_forbidden() {
+    let (_temp, app) = app_for_repo_with_auth_tokens_only(
+        &fs::read_to_string(fixture("test.pg")).unwrap(),
+        &[("act-andrew", "demo-token")],
+    )
+    .await;
+
+    let req = SchemaApplyRequest {
+        schema_source: additive_schema_with_nickname(),
+    };
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/schema/apply")
+            .method(Method::POST)
+            .header(AUTHORIZATION, "Bearer demo-token")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&req).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let error: ErrorOutput = serde_json::from_value(body).unwrap();
+    assert!(
+        error.error.contains("default-deny"),
+        "expected default-deny in error message, got: {}",
+        error.error
+    );
 }
