@@ -27,15 +27,28 @@ OmniGraph integrates AWS Cedar (`cedar-policy = 4.9`) for ABAC.
 policy:
   file: ./policy.yaml          # Cedar rules + groups
   tests: ./policy.tests.yaml   # declarative test cases
+
+cli:
+  actor: act-andrew            # default actor for CLI direct-engine writes
 ```
 
 Each rule must use exactly one of `branch_scope` or `target_branch_scope`.
+
+`cli.actor` is the default actor identity for CLI direct-engine writes
+when `policy.file` is configured. Override per-invocation with `--as
+<ACTOR>` (top-level flag) — `--as` wins, otherwise `cli.actor` is used,
+otherwise no actor. With policy configured and neither set, the
+engine-layer footgun guard intentionally denies the write (silent bypass
+via "I forgot the actor" is exactly what the guard prevents). Remote
+HTTP writes ignore both — they resolve their actor server-side from the
+bearer token.
 
 ## CLI
 
 - `omnigraph policy validate` — parse + count actors, exit 1 on parse error.
 - `omnigraph policy test` — run cases in `policy.tests.yaml`, exit 1 on any expectation mismatch.
 - `omnigraph policy explain --actor … --action … [--branch …] [--target-branch …]` — show decision and matched rule.
+- `omnigraph --as <ACTOR> <subcommand>` — set the actor for the duration of one invocation. Effective for `change`, `load`, `ingest`, `branch create|delete|merge`, and `schema apply` against local URIs. No-op against remote HTTP URIs (actor is bearer-token-resolved server-side).
 
 ## Enforcement
 
