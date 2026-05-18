@@ -1226,7 +1226,9 @@ async fn server_schema_apply(
         // the redundancy.
         db.apply_schema_as(
             &request.schema_source,
-            omnigraph::db::SchemaApplyOptions::default(),
+            omnigraph::db::SchemaApplyOptions {
+                allow_data_loss: request.allow_data_loss,
+            },
             actor_id,
         )
         .await

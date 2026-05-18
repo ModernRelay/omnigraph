@@ -262,12 +262,18 @@ pub struct ChangeRequest {
     pub branch: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct SchemaApplyRequest {
     /// Project schema in `.pg` source form. The diff against the current
     /// schema produces the migration steps that will be applied.
     #[schema(example = "node Person {\n    name: String @key\n    age: I32?\n}\n\nedge Knows: Person -> Person")]
     pub schema_source: String,
+    /// When true, promote every `DropMode::Soft` step in the plan to
+    /// `DropMode::Hard`, making the prior column data unreachable
+    /// after the apply. Matches the CLI's `--allow-data-loss` flag.
+    /// Defaults to `false` (drops remain reversible via time travel).
+    #[serde(default)]
+    pub allow_data_loss: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
