@@ -1954,6 +1954,7 @@ server:
     }
 
     #[test]
+    #[serial]
     fn unauthenticated_env_var_classification() {
         // MR-723 PR A: closes the gap where the env-var read path inside
         // `load_server_settings` was structurally implemented but not
@@ -2095,6 +2096,7 @@ server:
     }
 
     #[test]
+    #[serial]
     fn server_bearer_tokens_from_env_reads_legacy_token_and_token_file() {
         let temp = tempdir().unwrap();
         let tokens_path = temp.path().join("tokens.json");
