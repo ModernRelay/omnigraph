@@ -1758,9 +1758,11 @@ fn server_bearer_tokens_from_env() -> Result<Vec<(String, String)>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ServerRuntimeState, classify_server_runtime_state, hash_bearer_token, load_server_settings,
-        normalize_bearer_token, parse_bearer_tokens_json, server_bearer_tokens_from_env,
+        ServerConfig, ServerRuntimeState, classify_server_runtime_state, hash_bearer_token,
+        load_server_settings, normalize_bearer_token, parse_bearer_tokens_json, serve,
+        server_bearer_tokens_from_env,
     };
+    use serial_test::serial;
     use std::env;
     use std::fs;
     use tempfile::tempdir;
@@ -1909,6 +1911,117 @@ server:
         );
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn serve_refuses_to_start_in_state_1_without_unauthenticated() {
+        // MR-723 PR A: pin the integration boundary that the classifier
+        // is actually called by `serve()` before any side-effecting
+        // work (Lance dataset open, TcpListener::bind). The classifier
+        // itself is unit-tested above; this test guards the propagation
+        // path from `classify_server_runtime_state` through serve's
+        // `?` so a future refactor that drops the call returns red.
+        //
+        // Marked `#[serial]` because we have to clear all bearer-token
+        // env vars, and another test in this module setting any of them
+        // concurrently would corrupt the read inside `resolve_token_source`.
+        let _guard = EnvGuard::set(&[
+            ("OMNIGRAPH_SERVER_BEARER_TOKEN", None),
+            ("OMNIGRAPH_SERVER_BEARER_TOKENS_FILE", None),
+            ("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", None),
+            ("OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET", None),
+            ("OMNIGRAPH_UNAUTHENTICATED", None),
+        ]);
+        let temp = tempdir().unwrap();
+        // Repo path doesn't need to exist — classifier fires before
+        // `AppState::open_with_bearer_tokens_and_policy`.
+        let config = ServerConfig {
+            uri: temp
+                .path()
+                .join("repo.omni")
+                .to_string_lossy()
+                .into_owned(),
+            bind: "127.0.0.1:0".to_string(),
+            policy_file: None,
+            allow_unauthenticated: false,
+        };
+        let result = serve(config).await;
+        let err = result.expect_err("serve should refuse to start in State 1 without --unauthenticated");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("no bearer tokens") || msg.contains("policy file"),
+            "expected refusal message naming the misconfiguration, got: {msg}",
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn unauthenticated_env_var_classification() {
+        // MR-723 PR A: closes the gap where the env-var read path inside
+        // `load_server_settings` was structurally implemented but not
+        // exercised by any test. Three properties to pin, all in one
+        // sequential test because `cargo test` runs the mod test suite
+        // in parallel and `OMNIGRAPH_UNAUTHENTICATED` is process-global
+        // — interleaving with another test that sets the same env var
+        // (concurrent classifier tests, even the bearer-token suite
+        // sharing `EnvGuard`) corrupts the read. Sequential within one
+        // test fn is the simplest race-free shape.
+        let temp = tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            r#"
+graphs:
+  local:
+    uri: /tmp/demo-unauth.omni
+server:
+  graph: local
+"#,
+        )
+        .unwrap();
+
+        // Truthy values flip Open mode on, even with CLI flag off.
+        for value in ["1", "true", "yes", "TRUE", "anything"] {
+            let _guard = EnvGuard::set(&[("OMNIGRAPH_UNAUTHENTICATED", Some(value))]);
+            let settings = load_server_settings(Some(&config_path), None, None, None, false)
+                .expect("settings load should succeed");
+            assert!(
+                settings.allow_unauthenticated,
+                "OMNIGRAPH_UNAUTHENTICATED={value:?} should enable Open mode",
+            );
+        }
+
+        // Falsy values keep refusal behavior, even with CLI flag off.
+        for value in ["0", "false", "FALSE", ""] {
+            let _guard = EnvGuard::set(&[("OMNIGRAPH_UNAUTHENTICATED", Some(value))]);
+            let settings = load_server_settings(Some(&config_path), None, None, None, false)
+                .expect("settings load should succeed");
+            assert!(
+                !settings.allow_unauthenticated,
+                "OMNIGRAPH_UNAUTHENTICATED={value:?} should NOT enable Open mode",
+            );
+        }
+
+        // Unset env var: also false.
+        let _guard = EnvGuard::set(&[("OMNIGRAPH_UNAUTHENTICATED", None)]);
+        let settings = load_server_settings(Some(&config_path), None, None, None, false)
+            .expect("settings load should succeed");
+        assert!(
+            !settings.allow_unauthenticated,
+            "OMNIGRAPH_UNAUTHENTICATED unset should NOT enable Open mode",
+        );
+        drop(_guard);
+
+        // CLI flag wins even when env is falsy — `serve()` honors the
+        // OR of both inputs.
+        let _guard = EnvGuard::set(&[("OMNIGRAPH_UNAUTHENTICATED", Some("0"))]);
+        let settings = load_server_settings(Some(&config_path), None, None, None, true)
+            .expect("settings load should succeed");
+        assert!(
+            settings.allow_unauthenticated,
+            "--unauthenticated CLI flag should win even when env is falsy",
+        );
+    }
+
     #[test]
     fn classify_policy_enabled_always_wins() {
         // State 3: any setup with a policy file → PolicyEnabled. The
@@ -1983,6 +2096,7 @@ server:
     }
 
     #[test]
+    #[serial]
     fn server_bearer_tokens_from_env_reads_legacy_token_and_token_file() {
         let temp = tempdir().unwrap();
         let tokens_path = temp.path().join("tokens.json");

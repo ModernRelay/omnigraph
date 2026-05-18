@@ -259,6 +259,46 @@ async fn load_as_allows_when_policy_permits_actor() {
 }
 
 #[tokio::test]
+async fn load_file_as_denies_when_policy_rejects_actor() {
+    // `load_file_as` was added in PR #104 as the actor-aware mirror of
+    // `load_file`, used by the CLI's `omnigraph load`. Tested
+    // indirectly via CLI integration; this test closes the direct-SDK
+    // gap so a regression in the file-read path doesn't ride through
+    // unnoticed.
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _engine) = init_with_policy(&dir).await;
+    let data_path = dir.path().join("one-person.jsonl");
+    fs::write(&data_path, ONE_PERSON_JSONL).unwrap();
+
+    let result = db
+        .load_file_as(
+            "main",
+            data_path.to_str().unwrap(),
+            LoadMode::Merge,
+            Some("act-denied"),
+        )
+        .await;
+    assert_denied(result, "load_file_as");
+}
+
+#[tokio::test]
+async fn load_file_as_allows_when_policy_permits_actor() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _engine) = init_with_policy(&dir).await;
+    let data_path = dir.path().join("one-person.jsonl");
+    fs::write(&data_path, ONE_PERSON_JSONL).unwrap();
+
+    db.load_file_as(
+        "main",
+        data_path.to_str().unwrap(),
+        LoadMode::Merge,
+        Some("act-allowed"),
+    )
+    .await
+    .expect("act-allowed should be able to load_file_as on main");
+}
+
+#[tokio::test]
 async fn ingest_as_denies_when_policy_rejects_actor() {
     let dir = tempfile::tempdir().unwrap();
     let (db, _engine) = init_with_policy(&dir).await;
