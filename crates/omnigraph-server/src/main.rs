@@ -16,6 +16,12 @@ struct Cli {
     config: Option<PathBuf>,
     #[arg(long)]
     bind: Option<String>,
+    /// Run without bearer tokens and without a policy file (MR-723).
+    /// Required when neither is configured — otherwise the server
+    /// refuses to start to prevent shipping the illusion of protection.
+    /// Equivalent to setting `OMNIGRAPH_UNAUTHENTICATED=1`.
+    #[arg(long)]
+    unauthenticated: bool,
 }
 
 #[tokio::main]
@@ -24,7 +30,12 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
-    let settings: ServerConfig =
-        load_server_settings(cli.config.as_ref(), cli.uri, cli.target, cli.bind)?;
+    let settings: ServerConfig = load_server_settings(
+        cli.config.as_ref(),
+        cli.uri,
+        cli.target,
+        cli.bind,
+        cli.unauthenticated,
+    )?;
     serve(settings).await
 }

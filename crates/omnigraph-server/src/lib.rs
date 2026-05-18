@@ -50,7 +50,7 @@ use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use utoipa::OpenApi;
 use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
@@ -114,6 +114,15 @@ pub struct ServerConfig {
     pub uri: String,
     pub bind: String,
     pub policy_file: Option<PathBuf>,
+    /// Operator opt-in for fully-unauthenticated dev mode (MR-723).
+    /// When neither bearer tokens nor a policy file are configured,
+    /// `serve()` refuses to start unless this is true (set via
+    /// `--unauthenticated` or `OMNIGRAPH_UNAUTHENTICATED=1`). The
+    /// motivation is that "no tokens + no policy" looks like protection
+    /// (no Cedar errors at boot) but is actually fully open — operators
+    /// who set up auth and forgot the policy file would otherwise ship
+    /// the illusion of protection.
+    pub allow_unauthenticated: bool,
 }
 
 #[derive(Clone)]
@@ -244,6 +253,17 @@ impl AppState {
             bearer_tokens: Arc::from(bearer_tokens),
             policy_engine: None,
         }
+    }
+
+    /// Install a `PolicyEngine` post-construction (MR-723). Used by
+    /// integration tests that need to thread custom workload limits
+    /// alongside a permit-all policy — the existing `new_with_*` and
+    /// `new_with_workload` constructors don't compose. Production
+    /// callers should use `open_with_bearer_tokens_and_policy` which
+    /// installs the policy on both the HTTP state and the engine.
+    pub fn with_policy_engine(mut self, engine: PolicyEngine) -> Self {
+        self.policy_engine = Some(Arc::new(engine));
+        self
     }
 
     pub async fn open(uri: impl Into<String>) -> Result<Self> {
@@ -535,18 +555,75 @@ pub fn load_server_settings(
     cli_uri: Option<String>,
     cli_target: Option<String>,
     cli_bind: Option<String>,
+    cli_allow_unauthenticated: bool,
 ) -> Result<ServerConfig> {
     let config = load_config(config_path)?;
     let uri =
         config.resolve_target_uri(cli_uri, cli_target.as_deref(), config.server_graph_name())?;
     let bind = cli_bind.unwrap_or_else(|| config.server_bind().to_string());
     let policy_file = config.resolve_policy_file();
+    // Either `--unauthenticated` or `OMNIGRAPH_UNAUTHENTICATED=1` flips
+    // this. Treat any non-empty, non-"0"/"false" string as truthy —
+    // standard 12-factor "any value is true" reading of the env var.
+    let env_unauth = std::env::var("OMNIGRAPH_UNAUTHENTICATED")
+        .ok()
+        .map(|v| {
+            let trimmed = v.trim();
+            !trimmed.is_empty() && trimmed != "0" && !trimmed.eq_ignore_ascii_case("false")
+        })
+        .unwrap_or(false);
+    let allow_unauthenticated = cli_allow_unauthenticated || env_unauth;
 
     Ok(ServerConfig {
         uri,
         bind,
         policy_file,
+        allow_unauthenticated,
     })
+}
+
+/// MR-723 server runtime state, classified from the three-state matrix
+/// of (bearer tokens configured) × (policy file configured) at startup.
+///
+/// * **Open** — neither tokens nor policy; requires explicit
+///   `allow_unauthenticated`. Effectively a "trust the network" dev
+///   mode. `serve()` refuses to start in this shape without the flag,
+///   so the only way to reach this state at runtime is via deliberate
+///   operator opt-in.
+/// * **DefaultDeny** — tokens configured but no policy file. The
+///   server requires a valid bearer token; once authenticated, every
+///   action except `Read` is denied with 403. Closes the "tokens but
+///   forgot the policy file" trap.
+/// * **PolicyEnabled** — policy file configured. Cedar evaluates every
+///   authenticated request. Tokens may also be configured (typical) or
+///   not (unusual but valid — every request fails 401 without a
+///   bearer, which is effectively "locked").
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ServerRuntimeState {
+    Open,
+    DefaultDeny,
+    PolicyEnabled,
+}
+
+/// Compute the [`ServerRuntimeState`] from the configured inputs.
+/// Pulled out as a pure function so the 3-state matrix is unit-testable
+/// without standing up the full server.
+pub fn classify_server_runtime_state(
+    has_tokens: bool,
+    has_policy: bool,
+    allow_unauthenticated: bool,
+) -> Result<ServerRuntimeState> {
+    match (has_tokens, has_policy, allow_unauthenticated) {
+        (false, false, false) => bail!(
+            "server has no bearer tokens and no policy file configured. This is a fully \
+             open server — pass `--unauthenticated` (or set OMNIGRAPH_UNAUTHENTICATED=1) \
+             if you actually want that, otherwise configure bearer tokens (see \
+             docs/user/server.md) and/or `policy.file` in omnigraph.yaml."
+        ),
+        (false, false, true) => Ok(ServerRuntimeState::Open),
+        (true, false, _) => Ok(ServerRuntimeState::DefaultDeny),
+        (_, true, _) => Ok(ServerRuntimeState::PolicyEnabled),
+    }
 }
 
 pub fn build_app(state: AppState) -> Router {
@@ -586,9 +663,28 @@ pub fn build_app(state: AppState) -> Router {
 pub async fn serve(config: ServerConfig) -> Result<()> {
     let token_source = resolve_token_source().await?;
     info!(source = token_source.name(), "loaded bearer token source");
+    let tokens = token_source.load().await?;
+    let runtime_state = classify_server_runtime_state(
+        !tokens.is_empty(),
+        config.policy_file.is_some(),
+        config.allow_unauthenticated,
+    )?;
+    match runtime_state {
+        ServerRuntimeState::Open => warn!(
+            "running with --unauthenticated: no bearer tokens, no policy file, all \
+             requests permitted. This is for local dev only — do not expose to a \
+             network you don't fully trust."
+        ),
+        ServerRuntimeState::DefaultDeny => warn!(
+            "bearer tokens are configured but no policy file is set — running in \
+             default-deny mode (only `read` actions are permitted for authenticated \
+             actors). Configure `policy.file` in omnigraph.yaml to enable Cedar rules."
+        ),
+        ServerRuntimeState::PolicyEnabled => {}
+    }
     let state = AppState::open_with_bearer_tokens_and_policy(
         config.uri.clone(),
-        token_source.load().await?,
+        tokens,
         config.policy_file.as_ref(),
     )
     .await?;
@@ -708,6 +804,27 @@ fn authorize_request(
     mut request: PolicyRequest,
 ) -> std::result::Result<(), ApiError> {
     let Some(engine) = state.policy_engine() else {
+        // MR-723 default-deny path. We're here when no PolicyEngine is
+        // installed. Two startup-validated shapes can reach this:
+        //
+        // * **Open mode** (`--unauthenticated`): no tokens, no policy.
+        //   `require_bearer_auth` short-circuits before this is called,
+        //   but defense in depth — if a future change makes the
+        //   middleware call here for an unauthenticated request, we
+        //   want every action to remain Ok rather than 403. The
+        //   operator opted in.
+        // * **DefaultDeny mode**: tokens configured but no policy. The
+        //   request went through bearer auth, so `actor` is Some and
+        //   identifies a known actor. Only `Read` is permitted; every
+        //   other action returns 403. This closes the "configured auth
+        //   but forgot the policy file" trap from MR-723.
+        if actor.is_some() && request.action != PolicyAction::Read {
+            return Err(ApiError::forbidden(
+                "server runs in default-deny mode (bearer tokens configured but no \
+                 policy file). Only `read` actions are permitted; configure \
+                 `policy.file` in omnigraph.yaml to enable other actions.",
+            ));
+        }
         return Ok(());
     };
     let Some(actor) = actor else {
@@ -1641,8 +1758,8 @@ fn server_bearer_tokens_from_env() -> Result<Vec<(String, String)>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        hash_bearer_token, load_server_settings, normalize_bearer_token, parse_bearer_tokens_json,
-        server_bearer_tokens_from_env,
+        ServerRuntimeState, classify_server_runtime_state, hash_bearer_token, load_server_settings,
+        normalize_bearer_token, parse_bearer_tokens_json, server_bearer_tokens_from_env,
     };
     use std::env;
     use std::fs;
@@ -1695,7 +1812,7 @@ server:
         )
         .unwrap();
 
-        let settings = load_server_settings(Some(&config), None, None, None).unwrap();
+        let settings = load_server_settings(Some(&config), None, None, None, false).unwrap();
         assert_eq!(settings.uri, "/tmp/demo.omni");
         assert_eq!(settings.bind, "0.0.0.0:9090");
     }
@@ -1722,6 +1839,7 @@ server:
             Some("/tmp/override.omni".to_string()),
             None,
             Some("0.0.0.0:9999".to_string()),
+            false,
         )
         .unwrap();
         assert_eq!(settings.uri, "/tmp/override.omni");
@@ -1748,14 +1866,67 @@ server:
         .unwrap();
 
         let settings =
-            load_server_settings(Some(&config), None, Some("dev".to_string()), None).unwrap();
+            load_server_settings(Some(&config), None, Some("dev".to_string()), None, false)
+                .unwrap();
         assert_eq!(settings.uri, "http://127.0.0.1:8080");
     }
 
     #[test]
     fn server_settings_require_uri_from_cli_or_config() {
-        let error = load_server_settings(None, None, None, None).unwrap_err();
+        let error = load_server_settings(None, None, None, None, false).unwrap_err();
         assert!(error.to_string().contains("URI must be provided"));
+    }
+
+    #[test]
+    fn classify_open_requires_explicit_unauthenticated_flag() {
+        // State 1: no tokens, no policy, no flag → refuse to start.
+        let error = classify_server_runtime_state(false, false, false).unwrap_err();
+        let msg = error.to_string();
+        assert!(
+            msg.contains("--unauthenticated"),
+            "expected refusal message mentioning --unauthenticated, got: {msg}"
+        );
+
+        // Same matrix cell but with the flag set → Open mode permitted.
+        assert_eq!(
+            classify_server_runtime_state(false, false, true).unwrap(),
+            ServerRuntimeState::Open
+        );
+    }
+
+    #[test]
+    fn classify_tokens_without_policy_is_default_deny() {
+        // State 2: tokens configured, no policy → DefaultDeny regardless
+        // of the flag (the flag opts into the fully-open dev mode; it
+        // doesn't downgrade default-deny back to open).
+        assert_eq!(
+            classify_server_runtime_state(true, false, false).unwrap(),
+            ServerRuntimeState::DefaultDeny
+        );
+        assert_eq!(
+            classify_server_runtime_state(true, false, true).unwrap(),
+            ServerRuntimeState::DefaultDeny
+        );
+    }
+
+    #[test]
+    fn classify_policy_enabled_always_wins() {
+        // State 3: any setup with a policy file → PolicyEnabled. The
+        // flag doesn't matter and tokens-or-not doesn't matter (no
+        // tokens + policy is unusual but valid — every request fails
+        // 401 without a bearer, which is effectively "locked").
+        assert_eq!(
+            classify_server_runtime_state(true, true, false).unwrap(),
+            ServerRuntimeState::PolicyEnabled
+        );
+        assert_eq!(
+            classify_server_runtime_state(false, true, false).unwrap(),
+            ServerRuntimeState::PolicyEnabled
+        );
+        assert_eq!(
+            classify_server_runtime_state(true, true, true).unwrap(),
+            ServerRuntimeState::PolicyEnabled
+        );
     }
 
     #[test]
