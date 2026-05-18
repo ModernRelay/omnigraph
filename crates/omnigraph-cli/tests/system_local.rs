@@ -30,6 +30,11 @@ rules:
       actors: { group: admins }
       actions: [branch_merge]
       target_branch_scope: protected
+  - id: admins-write
+    allow:
+      actors: { group: admins }
+      actions: [change]
+      branch_scope: any
 "#;
 
 const POLICY_E2E_TESTS_YAML: &str = r#"
@@ -949,12 +954,14 @@ query vector_search($q: String) {
 // surface is the same engine path the unit test already covers.
 
 #[test]
-fn local_cli_policy_tooling_is_end_to_end_while_local_writes_stay_unenforced() {
+fn local_cli_policy_tooling_is_end_to_end() {
+    // Sanity check for the read-only policy CLI surfaces. These don't
+    // mutate the graph — they just parse and evaluate the policy file —
+    // so they don't depend on PR #4's engine-side enforcement.
     let repo = SystemRepo::loaded();
     let config = repo.write_config("omnigraph-policy.yaml", &local_policy_config(&repo));
     repo.write_config("policy.yaml", POLICY_E2E_YAML);
     repo.write_config("policy.tests.yaml", POLICY_E2E_TESTS_YAML);
-    let mutation_file = insert_person_query(&repo, "system-local-policy-change.gq");
 
     let validate = output_success(
         cli()
@@ -984,8 +991,34 @@ fn local_cli_policy_tooling_is_end_to_end_while_local_writes_stay_unenforced() {
     let explain_stdout = stdout_string(&explain);
     assert!(explain_stdout.contains("decision: deny"));
     assert!(explain_stdout.contains("branch: main"));
+}
 
-    let local_change = parse_stdout_json(&output_success(
+#[test]
+fn local_cli_change_enforces_engine_layer_policy() {
+    // Asserts MR-722 PR #4: when `policy.file` is configured in
+    // `omnigraph.yaml`, the CLI loads PolicyEngine into Omnigraph and
+    // every direct-engine write hits `enforce(action, scope, actor)` —
+    // identical to what the HTTP server gets, regardless of transport.
+    //
+    // Three cases, each discriminating:
+    //
+    // 1. Policy installed, no actor source (no `cli.actor` in config,
+    //    no `--as` flag) → engine-layer footgun guard fires; CLI exits
+    //    non-zero with a "no actor" message. Silent bypass is the bug
+    //    PR #4 prevents.
+    // 2. Policy installed, `--as act-bruno`, change on main → Cedar
+    //    denies (bruno can change unprotected branches; main is
+    //    protected). CLI exits non-zero with a "denied" message.
+    // 3. Policy installed, `--as act-ragnor`, change on main →
+    //    Cedar permits (admins-write rule). Write succeeds and the
+    //    inserted row is readable.
+    let repo = SystemRepo::loaded();
+    let config = repo.write_config("omnigraph-policy.yaml", &local_policy_config(&repo));
+    repo.write_config("policy.yaml", POLICY_E2E_YAML);
+    let mutation_file = insert_person_query(&repo, "system-local-policy-change.gq");
+
+    // Case 1: policy configured, no actor threaded → footgun guard.
+    let no_actor = output_failure(
         cli()
             .arg("change")
             .arg("--config")
@@ -993,12 +1026,55 @@ fn local_cli_policy_tooling_is_end_to_end_while_local_writes_stay_unenforced() {
             .arg("--query")
             .arg(&mutation_file)
             .arg("--params")
-            .arg(r#"{"name":"PolicyLocal","age":44}"#)
+            .arg(r#"{"name":"NoActorPerson","age":1}"#)
+            .arg("--json"),
+    );
+    let no_actor_stderr = String::from_utf8_lossy(&no_actor.stderr);
+    assert!(
+        no_actor_stderr.contains("no actor"),
+        "expected 'no actor' footgun message, got stderr: {no_actor_stderr}"
+    );
+
+    // Case 2: `--as act-bruno` against protected main → denied.
+    let denied = output_failure(
+        cli()
+            .arg("--as")
+            .arg("act-bruno")
+            .arg("change")
+            .arg("--config")
+            .arg(&config)
+            .arg("--query")
+            .arg(&mutation_file)
+            .arg("--params")
+            .arg(r#"{"name":"BrunoOnMain","age":2}"#)
+            .arg("--json"),
+    );
+    let denied_stderr = String::from_utf8_lossy(&denied.stderr);
+    assert!(
+        denied_stderr.contains("denied"),
+        "expected 'denied' message for bruno/main, got stderr: {denied_stderr}"
+    );
+
+    // Case 3: `--as act-ragnor` against main → permitted by admins-write.
+    let allowed = parse_stdout_json(&output_success(
+        cli()
+            .arg("--as")
+            .arg("act-ragnor")
+            .arg("change")
+            .arg("--config")
+            .arg(&config)
+            .arg("--query")
+            .arg(&mutation_file)
+            .arg("--params")
+            .arg(r#"{"name":"RagnorOnMain","age":3}"#)
             .arg("--json"),
     ));
-    assert_eq!(local_change["branch"], "main");
-    assert_eq!(local_change["affected_nodes"], 1);
+    assert_eq!(allowed["branch"], "main");
+    assert_eq!(allowed["affected_nodes"], 1);
+    assert_eq!(allowed["actor_id"], "act-ragnor");
 
+    // Verify the row landed — proves the write actually committed, not
+    // just that enforce returned Ok and silently dropped the work.
     let verify = parse_stdout_json(&output_success(
         cli()
             .arg("read")
@@ -1008,9 +1084,9 @@ fn local_cli_policy_tooling_is_end_to_end_while_local_writes_stay_unenforced() {
             .arg("--name")
             .arg("get_person")
             .arg("--params")
-            .arg(r#"{"name":"PolicyLocal"}"#)
+            .arg(r#"{"name":"RagnorOnMain"}"#)
             .arg("--json"),
     ));
     assert_eq!(verify["row_count"], 1);
-    assert_eq!(verify["rows"][0]["p.name"], "PolicyLocal");
+    assert_eq!(verify["rows"][0]["p.name"], "RagnorOnMain");
 }

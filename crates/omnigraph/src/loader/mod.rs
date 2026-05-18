@@ -218,8 +218,21 @@ impl Omnigraph {
         path: &str,
         mode: LoadMode,
     ) -> Result<LoadResult> {
+        self.load_file_as(branch, path, mode, None).await
+    }
+
+    /// Read a file into memory and delegate to `load_as`. Used by the
+    /// CLI's `omnigraph load` so file-path-based writes flow through
+    /// the same engine-layer policy gate as in-memory `load_as` calls.
+    pub async fn load_file_as(
+        &self,
+        branch: &str,
+        path: &str,
+        mode: LoadMode,
+        actor_id: Option<&str>,
+    ) -> Result<LoadResult> {
         let data = std::fs::read_to_string(path).map_err(|e| OmniError::Io(e))?;
-        self.load(branch, &data, mode).await
+        self.load_as(branch, &data, mode, actor_id).await
     }
 
     async fn load_direct_on_branch(

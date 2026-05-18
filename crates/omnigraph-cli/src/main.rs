@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::{Arg, ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use color_eyre::eyre::{Result, bail};
@@ -44,6 +45,17 @@ const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
 #[command(about = "Omnigraph graph database CLI")]
 #[command(version = env!("CARGO_PKG_VERSION"), disable_version_flag = true)]
 struct Cli {
+    /// Actor identity for direct-engine writes (MR-722). Overrides
+    /// `cli.actor` from `omnigraph.yaml`. When the configured policy
+    /// is in effect, Cedar evaluates this actor against the requested
+    /// action and scope; with policy configured but neither this flag
+    /// nor `cli.actor` set, the engine-layer footgun guard fires and
+    /// the write is denied (no silent bypass). Has no effect on remote
+    /// HTTP writes — those resolve their actor server-side from the
+    /// bearer token.
+    #[arg(long = "as", global = true, value_name = "ACTOR")]
+    as_actor: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -683,6 +695,37 @@ fn resolve_policy_engine(config: &OmnigraphConfig) -> Result<PolicyEngine> {
         .resolve_policy_file()
         .ok_or_else(|| color_eyre::eyre::eyre!("policy.file must be set in omnigraph.yaml"))?;
     PolicyEngine::load(&policy_file, &policy_repo_id(config))
+}
+
+/// Open a local-URI repo and, when `policy.file` is configured in
+/// `omnigraph.yaml`, install the resolved `PolicyEngine` on the engine
+/// handle so every direct-engine write goes through
+/// `Omnigraph::enforce(...)` (MR-722). Without a configured policy this
+/// is identical to a bare `Omnigraph::open`.
+///
+/// Returns owned `Omnigraph`; chained on top of `Omnigraph::open(...)`'s
+/// existing future to keep call sites narrow.
+async fn open_local_db_with_policy(uri: &str, config: &OmnigraphConfig) -> Result<Omnigraph> {
+    let db = Omnigraph::open(uri).await?;
+    if config.resolve_policy_file().is_some() {
+        let engine = Arc::new(resolve_policy_engine(config)?);
+        Ok(db.with_policy(engine as Arc<dyn omnigraph_policy::PolicyChecker>))
+    } else {
+        Ok(db)
+    }
+}
+
+/// Resolve the CLI's effective actor identity for engine-layer policy
+/// (MR-722). Precedence: `--as <ACTOR>` (top-level flag) overrides
+/// `cli.actor` from `omnigraph.yaml`; both unset returns `None`. When
+/// policy is configured and this returns `None`, the engine-layer
+/// footgun guard intentionally denies — silent bypass via "I forgot the
+/// actor" is what the guard prevents.
+fn resolve_cli_actor<'a>(
+    cli_as: Option<&'a str>,
+    config: &'a OmnigraphConfig,
+) -> Option<&'a str> {
+    cli_as.or(config.cli.actor.as_deref())
 }
 
 fn resolve_policy_tests_path(config: &OmnigraphConfig) -> Result<PathBuf> {
@@ -1553,19 +1596,22 @@ async fn execute_change(
     query_name: Option<&str>,
     branch: &str,
     params_json: Option<&Value>,
+    config: &OmnigraphConfig,
+    cli_as_actor: Option<&str>,
 ) -> Result<ChangeOutput> {
     let (selected_name, query_params) = select_named_query(query_source, query_name)?;
     let params = query_params_from_json(&query_params, params_json)?;
-    let mut db = Omnigraph::open(uri).await?;
+    let db = open_local_db_with_policy(uri, config).await?;
+    let actor = resolve_cli_actor(cli_as_actor, config);
     let result = db
-        .mutate(branch, query_source, &selected_name, &params)
+        .mutate_as(branch, query_source, &selected_name, &params, actor)
         .await?;
     Ok(ChangeOutput {
         branch: branch.to_string(),
         query_name: selected_name,
         affected_nodes: result.affected_nodes,
         affected_edges: result.affected_edges,
-        actor_id: None,
+        actor_id: actor.map(String::from),
     })
 }
 
@@ -1689,9 +1735,10 @@ async fn main() -> Result<()> {
             let config = load_cli_config(config.as_ref())?;
             let uri = resolve_local_uri(&config, uri, target.as_deref(), "load")?;
             let branch = resolve_branch(&config, branch, None, "main");
-            let mut db = Omnigraph::open(&uri).await?;
+            let db = open_local_db_with_policy(&uri, &config).await?;
+            let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
             let result = db
-                .load_file(&branch, &data.to_string_lossy(), mode.into())
+                .load_file_as(&branch, &data.to_string_lossy(), mode.into(), actor)
                 .await?;
             let payload = LoadOutput {
                 uri: &uri,
@@ -1748,9 +1795,16 @@ async fn main() -> Result<()> {
                 )
                 .await?
             } else {
-                let mut db = Omnigraph::open(&uri).await?;
+                let db = open_local_db_with_policy(&uri, &config).await?;
+                let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
                 let result = db
-                    .ingest_file(&branch, Some(&from), &data.to_string_lossy(), mode.into())
+                    .ingest_file_as(
+                        &branch,
+                        Some(&from),
+                        &data.to_string_lossy(),
+                        mode.into(),
+                        actor,
+                    )
                     .await?;
                 ingest_output(&uri, &result, None)
             };
@@ -1787,14 +1841,15 @@ async fn main() -> Result<()> {
                     )
                     .await?
                 } else {
-                    let mut db = Omnigraph::open(&uri).await?;
-                    db.branch_create_from(ReadTarget::branch(&from), &name)
+                    let db = open_local_db_with_policy(&uri, &config).await?;
+                    let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
+                    db.branch_create_from_as(ReadTarget::branch(&from), &name, actor)
                         .await?;
                     BranchCreateOutput {
                         uri: uri.clone(),
                         from: from.clone(),
                         name: name.clone(),
-                        actor_id: None,
+                        actor_id: actor.map(String::from),
                     }
                 };
                 if json {
@@ -1857,12 +1912,13 @@ async fn main() -> Result<()> {
                     )
                     .await?
                 } else {
-                    let mut db = Omnigraph::open(&uri).await?;
-                    db.branch_delete(&name).await?;
+                    let db = open_local_db_with_policy(&uri, &config).await?;
+                    let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
+                    db.branch_delete_as(&name, actor).await?;
                     BranchDeleteOutput {
                         uri: uri.clone(),
                         name: name.clone(),
-                        actor_id: None,
+                        actor_id: actor.map(String::from),
                     }
                 };
                 if json {
@@ -1897,13 +1953,14 @@ async fn main() -> Result<()> {
                     )
                     .await?
                 } else {
-                    let mut db = Omnigraph::open(&uri).await?;
-                    let outcome = db.branch_merge(&source, &into).await?;
+                    let db = open_local_db_with_policy(&uri, &config).await?;
+                    let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
+                    let outcome = db.branch_merge_as(&source, &into, actor).await?;
                     BranchMergeOutput {
                         source: source.clone(),
                         target: into.clone(),
                         outcome: outcome.into(),
-                        actor_id: None,
+                        actor_id: actor.map(String::from),
                     }
                 };
                 if json {
@@ -2051,11 +2108,13 @@ async fn main() -> Result<()> {
                     )
                     .await?
                 } else {
-                    let mut db = Omnigraph::open(&uri).await?;
+                    let db = open_local_db_with_policy(&uri, &config).await?;
+                    let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
                     let result = db
-                        .apply_schema_with_options(
+                        .apply_schema_as(
                             &schema_source,
                             omnigraph::db::SchemaApplyOptions { allow_data_loss },
+                            actor,
                         )
                         .await?;
                     schema_apply_output(&uri, result)
@@ -2340,6 +2399,8 @@ async fn main() -> Result<()> {
                     query_name.as_deref(),
                     &branch,
                     params_json.as_ref(),
+                    &config,
+                    cli.as_actor.as_deref(),
                 )
                 .await?
             };
@@ -2397,7 +2458,7 @@ async fn main() -> Result<()> {
         } => {
             let config = load_cli_config(config.as_ref())?;
             let uri = resolve_uri(&config, uri, target.as_deref())?;
-            let mut db = Omnigraph::open(&uri).await?;
+            let db = Omnigraph::open(&uri).await?;
             let stats = db.optimize().await?;
             if json {
                 let value = serde_json::json!({

@@ -4604,6 +4604,7 @@ dependencies = [
  "lance-index",
  "omnigraph-compiler",
  "omnigraph-engine",
+ "omnigraph-policy",
  "omnigraph-server",
  "predicates",
  "reqwest",
