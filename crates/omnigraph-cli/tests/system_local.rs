@@ -35,6 +35,16 @@ rules:
       actors: { group: admins }
       actions: [change]
       branch_scope: any
+  - id: admins-branch-ops
+    allow:
+      actors: { group: admins }
+      actions: [branch_create, branch_delete]
+      target_branch_scope: any
+  - id: admins-schema-apply
+    allow:
+      actors: { group: admins }
+      actions: [schema_apply]
+      target_branch_scope: any
 "#;
 
 const POLICY_E2E_TESTS_YAML: &str = r#"
@@ -1089,4 +1099,390 @@ fn local_cli_change_enforces_engine_layer_policy() {
     ));
     assert_eq!(verify["row_count"], 1);
     assert_eq!(verify["rows"][0]["p.name"], "RagnorOnMain");
+}
+
+// ─── MR-722 PR A: CLI×writer matrix ───────────────────────────────────────
+//
+// The change writer is covered above by `local_cli_change_enforces_engine_layer_policy`.
+// These tests extend the engine-layer-policy assertion to the other 6
+// writers, asserting each `omnigraph <writer> --as <actor>` invocation
+// reaches the corresponding `_as` method and Cedar evaluates correctly.
+// One denied case (`--as act-bruno`) + one allowed case (`--as act-ragnor`
+// via the `admins-*` rules) per writer; the no-actor footgun is already
+// proved by the change-writer test and applies identically to every
+// other `_as` variant.
+
+#[test]
+fn local_cli_load_enforces_engine_layer_policy() {
+    let repo = SystemRepo::loaded();
+    let config = repo.write_config("omnigraph-policy.yaml", &local_policy_config(&repo));
+    repo.write_config("policy.yaml", POLICY_E2E_YAML);
+    let data = repo.write_jsonl(
+        "system-local-policy-load.jsonl",
+        r#"{"type":"Person","data":{"name":"LoadPolicy","age":11}}"#,
+    );
+
+    // act-bruno: change-on-protected is denied (team-write-unprotected only).
+    let denied = output_failure(
+        cli()
+            .arg("--as")
+            .arg("act-bruno")
+            .arg("load")
+            .arg("--config")
+            .arg(&config)
+            .arg("--data")
+            .arg(&data)
+            .arg("--json"),
+    );
+    let stderr = String::from_utf8_lossy(&denied.stderr);
+    assert!(
+        stderr.contains("denied"),
+        "expected 'denied' for bruno/main load, got: {stderr}"
+    );
+
+    // act-ragnor: admins-write rule permits change anywhere.
+    let allowed = parse_stdout_json(&output_success(
+        cli()
+            .arg("--as")
+            .arg("act-ragnor")
+            .arg("load")
+            .arg("--config")
+            .arg(&config)
+            .arg("--data")
+            .arg(&data)
+            .arg("--json"),
+    ));
+    assert_eq!(allowed["branch"], "main");
+    assert!(allowed["nodes_loaded"].as_u64().unwrap() >= 1);
+}
+
+#[test]
+fn local_cli_ingest_enforces_engine_layer_policy() {
+    let repo = SystemRepo::loaded();
+    let config = repo.write_config("omnigraph-policy.yaml", &local_policy_config(&repo));
+    repo.write_config("policy.yaml", POLICY_E2E_YAML);
+    let data = repo.write_jsonl(
+        "system-local-policy-ingest.jsonl",
+        r#"{"type":"Person","data":{"name":"IngestPolicy","age":12}}"#,
+    );
+
+    // act-bruno: ingest into a new branch requires both BranchCreate and
+    // Change. Bruno has change-unprotected only, and the implicit
+    // branch_create fires first when the target branch doesn't exist.
+    // Either gate is enough to deny — assert denial without pinning
+    // which one fires first.
+    let denied = output_failure(
+        cli()
+            .arg("--as")
+            .arg("act-bruno")
+            .arg("ingest")
+            .arg("--config")
+            .arg(&config)
+            .arg("--data")
+            .arg(&data)
+            .arg("--branch")
+            .arg("policy-ingest-feature")
+            .arg("--json"),
+    );
+    let stderr = String::from_utf8_lossy(&denied.stderr);
+    assert!(
+        stderr.contains("denied"),
+        "expected 'denied' for bruno ingest, got: {stderr}"
+    );
+
+    // act-ragnor: admins-write covers Change, admins-branch-ops covers
+    // BranchCreate. Both fire as ingest creates the branch + loads.
+    let allowed = parse_stdout_json(&output_success(
+        cli()
+            .arg("--as")
+            .arg("act-ragnor")
+            .arg("ingest")
+            .arg("--config")
+            .arg(&config)
+            .arg("--data")
+            .arg(&data)
+            .arg("--branch")
+            .arg("policy-ingest-feature")
+            .arg("--json"),
+    ));
+    assert_eq!(allowed["branch"], "policy-ingest-feature");
+    assert_eq!(allowed["branch_created"], true);
+}
+
+#[test]
+fn local_cli_schema_apply_enforces_engine_layer_policy() {
+    let repo = SystemRepo::loaded();
+    let config = repo.write_config("omnigraph-policy.yaml", &local_policy_config(&repo));
+    repo.write_config("policy.yaml", POLICY_E2E_YAML);
+
+    // Additive: add a nullable property; SDK-compatible with the fixture
+    // schema. Uses the schema-apply scope (TargetBranch("main")).
+    let new_schema = std::fs::read_to_string(fixture("test.pg"))
+        .unwrap()
+        .replace("    age: I32?\n}", "    age: I32?\n    nickname: String?\n}");
+    let schema_path = repo.path().join("policy-additive.pg");
+    std::fs::write(&schema_path, &new_schema).unwrap();
+
+    let denied = output_failure(
+        cli()
+            .arg("--as")
+            .arg("act-bruno")
+            .arg("schema")
+            .arg("apply")
+            .arg("--config")
+            .arg(&config)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json"),
+    );
+    let stderr = String::from_utf8_lossy(&denied.stderr);
+    assert!(
+        stderr.contains("denied"),
+        "expected 'denied' for bruno schema apply, got: {stderr}"
+    );
+
+    let allowed = parse_stdout_json(&output_success(
+        cli()
+            .arg("--as")
+            .arg("act-ragnor")
+            .arg("schema")
+            .arg("apply")
+            .arg("--config")
+            .arg(&config)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json"),
+    ));
+    assert_eq!(allowed["applied"], true);
+}
+
+#[test]
+fn local_cli_branch_create_enforces_engine_layer_policy() {
+    let repo = SystemRepo::loaded();
+    let config = repo.write_config("omnigraph-policy.yaml", &local_policy_config(&repo));
+    repo.write_config("policy.yaml", POLICY_E2E_YAML);
+
+    let denied = output_failure(
+        cli()
+            .arg("--as")
+            .arg("act-bruno")
+            .arg("branch")
+            .arg("create")
+            .arg("--config")
+            .arg(&config)
+            .arg("--from")
+            .arg("main")
+            .arg("bruno-feature"),
+    );
+    let stderr = String::from_utf8_lossy(&denied.stderr);
+    assert!(
+        stderr.contains("denied"),
+        "expected 'denied' for bruno branch create, got: {stderr}"
+    );
+
+    output_success(
+        cli()
+            .arg("--as")
+            .arg("act-ragnor")
+            .arg("branch")
+            .arg("create")
+            .arg("--config")
+            .arg(&config)
+            .arg("--from")
+            .arg("main")
+            .arg("ragnor-feature"),
+    );
+}
+
+#[test]
+fn local_cli_branch_delete_enforces_engine_layer_policy() {
+    let repo = SystemRepo::loaded();
+    let config = repo.write_config("omnigraph-policy.yaml", &local_policy_config(&repo));
+    repo.write_config("policy.yaml", POLICY_E2E_YAML);
+
+    // Pre-create the branch as ragnor so there's something to delete.
+    output_success(
+        cli()
+            .arg("--as")
+            .arg("act-ragnor")
+            .arg("branch")
+            .arg("create")
+            .arg("--config")
+            .arg(&config)
+            .arg("--from")
+            .arg("main")
+            .arg("doomed"),
+    );
+
+    let denied = output_failure(
+        cli()
+            .arg("--as")
+            .arg("act-bruno")
+            .arg("branch")
+            .arg("delete")
+            .arg("--config")
+            .arg(&config)
+            .arg("doomed"),
+    );
+    let stderr = String::from_utf8_lossy(&denied.stderr);
+    assert!(
+        stderr.contains("denied"),
+        "expected 'denied' for bruno branch delete, got: {stderr}"
+    );
+
+    output_success(
+        cli()
+            .arg("--as")
+            .arg("act-ragnor")
+            .arg("branch")
+            .arg("delete")
+            .arg("--config")
+            .arg(&config)
+            .arg("doomed"),
+    );
+}
+
+#[test]
+fn local_cli_branch_merge_enforces_engine_layer_policy() {
+    let repo = SystemRepo::loaded();
+    let config = repo.write_config("omnigraph-policy.yaml", &local_policy_config(&repo));
+    repo.write_config("policy.yaml", POLICY_E2E_YAML);
+
+    // Pre-create a feature branch as ragnor (admins-branch-ops covers it).
+    output_success(
+        cli()
+            .arg("--as")
+            .arg("act-ragnor")
+            .arg("branch")
+            .arg("create")
+            .arg("--config")
+            .arg(&config)
+            .arg("--from")
+            .arg("main")
+            .arg("merge-feature"),
+    );
+
+    let denied = output_failure(
+        cli()
+            .arg("--as")
+            .arg("act-bruno")
+            .arg("branch")
+            .arg("merge")
+            .arg("--config")
+            .arg(&config)
+            .arg("merge-feature")
+            .arg("--into")
+            .arg("main"),
+    );
+    let stderr = String::from_utf8_lossy(&denied.stderr);
+    assert!(
+        stderr.contains("denied"),
+        "expected 'denied' for bruno branch merge, got: {stderr}"
+    );
+
+    output_success(
+        cli()
+            .arg("--as")
+            .arg("act-ragnor")
+            .arg("branch")
+            .arg("merge")
+            .arg("--config")
+            .arg(&config)
+            .arg("merge-feature")
+            .arg("--into")
+            .arg("main"),
+    );
+}
+
+// ─── MR-722 PR A: cli.actor config-only precedence ────────────────────────
+//
+// The change-writer test above uses `--as` directly. These two tests
+// pin the precedence rule that `main.rs::resolve_cli_actor` implements:
+// `--as` flag > `cli.actor` from `omnigraph.yaml` > None.
+
+fn local_policy_config_with_actor(repo: &SystemRepo, actor: &str) -> String {
+    // Mirrors `local_policy_config` but adds `cli.actor` so the
+    // config-only precedence path is exercised. The `cli:` block
+    // already has `graph` and `branch`; appending `actor` here.
+    format!(
+        "\
+project:
+  name: policy-e2e-local
+graphs:
+  local:
+    uri: {}
+cli:
+  graph: local
+  branch: main
+  actor: {}
+query:
+  roots:
+    - .
+policy:
+  file: ./policy.yaml
+",
+        yaml_string(&repo.path().to_string_lossy()),
+        actor,
+    )
+}
+
+#[test]
+fn local_cli_actor_from_config_used_when_no_flag() {
+    // cli.actor: act-ragnor in omnigraph.yaml, no --as flag → change
+    // permitted via admins-write rule. Proves the config-only path
+    // works; previously the only proof was structural.
+    let repo = SystemRepo::loaded();
+    let config = repo.write_config(
+        "omnigraph-policy.yaml",
+        &local_policy_config_with_actor(&repo, "act-ragnor"),
+    );
+    repo.write_config("policy.yaml", POLICY_E2E_YAML);
+    let mutation_file = insert_person_query(&repo, "system-local-cli-actor.gq");
+
+    let allowed = parse_stdout_json(&output_success(
+        cli()
+            .arg("change")
+            .arg("--config")
+            .arg(&config)
+            .arg("--query")
+            .arg(&mutation_file)
+            .arg("--params")
+            .arg(r#"{"name":"ConfigActorEve","age":18}"#)
+            .arg("--json"),
+    ));
+    assert_eq!(allowed["affected_nodes"], 1);
+    assert_eq!(allowed["actor_id"], "act-ragnor");
+}
+
+#[test]
+fn local_cli_actor_flag_overrides_config_actor() {
+    // cli.actor: act-ragnor in config + --as act-bruno on CLI → change
+    // denied. Flag wins per the precedence rule. Without this test, a
+    // future change that reverses precedence would ride through silently.
+    let repo = SystemRepo::loaded();
+    let config = repo.write_config(
+        "omnigraph-policy.yaml",
+        &local_policy_config_with_actor(&repo, "act-ragnor"),
+    );
+    repo.write_config("policy.yaml", POLICY_E2E_YAML);
+    let mutation_file = insert_person_query(&repo, "system-local-cli-actor-override.gq");
+
+    let denied = output_failure(
+        cli()
+            .arg("--as")
+            .arg("act-bruno")
+            .arg("change")
+            .arg("--config")
+            .arg(&config)
+            .arg("--query")
+            .arg(&mutation_file)
+            .arg("--params")
+            .arg(r#"{"name":"OverrideEve","age":19}"#)
+            .arg("--json"),
+    );
+    let stderr = String::from_utf8_lossy(&denied.stderr);
+    assert!(
+        stderr.contains("denied"),
+        "expected 'denied' when --as overrides config to bruno, got: {stderr}"
+    );
 }

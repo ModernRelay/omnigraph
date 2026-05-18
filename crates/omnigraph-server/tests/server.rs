@@ -8,8 +8,10 @@ use axum::body::{Body, to_bytes};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{Method, Request, StatusCode};
 use lance_index::traits::DatasetIndexExt;
-use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::db::{Omnigraph, ReadTarget, SchemaApplyOptions};
+use omnigraph::error::OmniError;
 use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph_policy::{PolicyChecker, PolicyEngine};
 use omnigraph_server::api::{
     BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorOutput, ExportRequest,
     IngestRequest, ReadRequest, SchemaApplyRequest, SchemaOutput,
@@ -3785,5 +3787,236 @@ async fn default_deny_mode_rejects_schema_apply_with_forbidden() {
         error.error.contains("default-deny"),
         "expected default-deny in error message, got: {}",
         error.error
+    );
+}
+
+// ─── SDK ↔ HTTP decision parity (MR-722 PR A) ─────────────────────────────
+//
+// Engine and HTTP both consult Cedar via `PolicyChecker::check()`; by
+// construction they cannot disagree on a decision. These tests pin that
+// property explicitly so a future refactor that introduces a separate
+// auth path (or copy-pastes Cedar evaluation logic) turns red.
+//
+// Four cases cover the per-action scope shapes:
+// * Change on a protected branch via `mutate_as` / POST /change
+// * Change with an actor that has no permit
+// * BranchMerge to a protected target via `branch_merge_as` / POST /branches/merge
+// * BranchMerge with an actor that has no permit
+
+const PARITY_POLICY_YAML: &str = r#"
+version: 1
+groups:
+  team: [act-bruno]
+  admins: [act-ragnor]
+protected_branches: [main]
+rules:
+  - id: admins-change-anywhere
+    allow:
+      actors: { group: admins }
+      actions: [change]
+      branch_scope: any
+  - id: admins-merge-to-protected
+    allow:
+      actors: { group: admins }
+      actions: [branch_merge]
+      target_branch_scope: protected
+"#;
+
+#[derive(Clone, Copy, Debug)]
+enum ParityDecision {
+    Allow,
+    Deny,
+}
+
+async fn build_parity_repo() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    // Build a repo with `main` loaded and a `feature` branch ready for
+    // merge. Returns the repo path and a written policy.yaml path.
+    let temp = init_loaded_repo().await;
+    let repo = repo_path(temp.path());
+    {
+        let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+        db.branch_create_from(ReadTarget::branch("main"), "feature")
+            .await
+            .unwrap();
+        db.load_as(
+            "feature",
+            r#"{"type":"Person","data":{"name":"ParityEve","age":29}}"#,
+            LoadMode::Append,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, PARITY_POLICY_YAML).unwrap();
+    (temp, repo, policy_path)
+}
+
+async fn sdk_change_decision(repo: &Path, policy_path: &Path, actor: &str) -> ParityDecision {
+    let policy = PolicyEngine::load(policy_path, repo.to_string_lossy().as_ref()).unwrap();
+    let db = Omnigraph::open(repo.to_str().unwrap())
+        .await
+        .unwrap()
+        .with_policy(Arc::new(policy) as Arc<dyn PolicyChecker>);
+    let mut params: omnigraph_compiler::ParamMap = Default::default();
+    // Parameter keys are bare names (no `$` prefix); the runtime resolves
+    // `$name` references in the query body to `params["name"]`.
+    params.insert(
+        "name".to_string(),
+        omnigraph_compiler::Literal::String("ParityCharlie".to_string()),
+    );
+    params.insert("age".to_string(), omnigraph_compiler::Literal::Integer(30));
+    let result = db
+        .mutate_as("main", MUTATION_QUERIES, "insert_person", &params, Some(actor))
+        .await;
+    match result {
+        Ok(_) => ParityDecision::Allow,
+        Err(OmniError::Policy(_)) => ParityDecision::Deny,
+        Err(other) => panic!("unexpected SDK error for change: {other:?}"),
+    }
+}
+
+async fn http_change_decision(
+    repo: &Path,
+    policy_path: &PathBuf,
+    actor: &str,
+    token: &str,
+) -> ParityDecision {
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        repo.to_string_lossy().to_string(),
+        vec![(actor.to_string(), token.to_string())],
+        Some(policy_path),
+    )
+    .await
+    .unwrap();
+    let app = build_app(state);
+    let req = ChangeRequest {
+        query_source: MUTATION_QUERIES.to_string(),
+        query_name: Some("insert_person".to_string()),
+        params: Some(json!({ "name": "ParityCharlie", "age": 30 })),
+        branch: Some("main".to_string()),
+    };
+    let (status, _body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/change")
+            .method(Method::POST)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&req).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    match status {
+        StatusCode::OK => ParityDecision::Allow,
+        StatusCode::FORBIDDEN => ParityDecision::Deny,
+        other => panic!("unexpected HTTP status for change: {other}"),
+    }
+}
+
+async fn sdk_merge_decision(repo: &Path, policy_path: &Path, actor: &str) -> ParityDecision {
+    let policy = PolicyEngine::load(policy_path, repo.to_string_lossy().as_ref()).unwrap();
+    let db = Omnigraph::open(repo.to_str().unwrap())
+        .await
+        .unwrap()
+        .with_policy(Arc::new(policy) as Arc<dyn PolicyChecker>);
+    let result = db.branch_merge_as("feature", "main", Some(actor)).await;
+    match result {
+        Ok(_) => ParityDecision::Allow,
+        Err(OmniError::Policy(_)) => ParityDecision::Deny,
+        Err(other) => panic!("unexpected SDK error for branch_merge: {other:?}"),
+    }
+}
+
+async fn http_merge_decision(
+    repo: &Path,
+    policy_path: &PathBuf,
+    actor: &str,
+    token: &str,
+) -> ParityDecision {
+    let state = AppState::open_with_bearer_tokens_and_policy(
+        repo.to_string_lossy().to_string(),
+        vec![(actor.to_string(), token.to_string())],
+        Some(policy_path),
+    )
+    .await
+    .unwrap();
+    let app = build_app(state);
+    let req = BranchMergeRequest {
+        source: "feature".to_string(),
+        target: Some("main".to_string()),
+    };
+    let (status, _body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/branches/merge")
+            .method(Method::POST)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&req).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    match status {
+        StatusCode::OK => ParityDecision::Allow,
+        StatusCode::FORBIDDEN => ParityDecision::Deny,
+        other => panic!("unexpected HTTP status for branch_merge: {other}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_decision_parity_change_admin_on_main_allowed() {
+    // (act-ragnor, change, main) — admins-change-anywhere rule applies.
+    // Both SDK and HTTP must allow. Each path uses its own fresh repo
+    // because allow→side-effects.
+    let (_t1, repo1, policy1) = build_parity_repo().await;
+    let sdk = sdk_change_decision(&repo1, &policy1, "act-ragnor").await;
+    let (_t2, repo2, policy2) = build_parity_repo().await;
+    let http = http_change_decision(&repo2, &policy2, "act-ragnor", "ragnor-token").await;
+    assert!(
+        matches!(sdk, ParityDecision::Allow) && matches!(http, ParityDecision::Allow),
+        "SDK={sdk:?} HTTP={http:?} — should both Allow",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_decision_parity_change_team_on_main_denied() {
+    // (act-bruno, change, main) — no rule grants bruno change on
+    // protected. Both SDK and HTTP must deny. Same repo is reusable
+    // because deny→no side-effects.
+    let (_temp, repo, policy) = build_parity_repo().await;
+    let sdk = sdk_change_decision(&repo, &policy, "act-bruno").await;
+    let http = http_change_decision(&repo, &policy, "act-bruno", "bruno-token").await;
+    assert!(
+        matches!(sdk, ParityDecision::Deny) && matches!(http, ParityDecision::Deny),
+        "SDK={sdk:?} HTTP={http:?} — should both Deny",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_decision_parity_branch_merge_admin_allowed() {
+    // (act-ragnor, branch_merge, feature→main) — admins-merge-to-protected
+    // rule applies. Both Allow. Each path uses its own fresh repo —
+    // a successful merge consumes the feature branch's commit on main.
+    let (_t1, repo1, policy1) = build_parity_repo().await;
+    let sdk = sdk_merge_decision(&repo1, &policy1, "act-ragnor").await;
+    let (_t2, repo2, policy2) = build_parity_repo().await;
+    let http = http_merge_decision(&repo2, &policy2, "act-ragnor", "ragnor-token").await;
+    assert!(
+        matches!(sdk, ParityDecision::Allow) && matches!(http, ParityDecision::Allow),
+        "SDK={sdk:?} HTTP={http:?} — should both Allow",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_decision_parity_branch_merge_team_denied() {
+    // (act-bruno, branch_merge, feature→main) — no rule grants bruno
+    // branch_merge. Both Deny.
+    let (_temp, repo, policy) = build_parity_repo().await;
+    let sdk = sdk_merge_decision(&repo, &policy, "act-bruno").await;
+    let http = http_merge_decision(&repo, &policy, "act-bruno", "bruno-token").await;
+    assert!(
+        matches!(sdk, ParityDecision::Deny) && matches!(http, ParityDecision::Deny),
+        "SDK={sdk:?} HTTP={http:?} — should both Deny",
     );
 }
