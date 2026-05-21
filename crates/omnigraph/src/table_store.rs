@@ -8,6 +8,7 @@ use lance::Dataset;
 use lance::blob::BlobArrayBuilder;
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream, Scanner};
 use lance::dataset::transaction::{Operation, Transaction, TransactionBuilder};
+use lance::dataset::write::merge_insert::SourceDedupeBehavior;
 use lance::dataset::{
     CommitBuilder, InsertBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode,
     WriteParams,
@@ -656,10 +657,39 @@ impl TableStore {
         // blobs via merge_insert (LoadMode::Merge, mutations) are unsupported
         // until Lance exposes WriteParams on MergeInsertBuilder.
         let ds = Arc::new(ds);
-        let job = MergeInsertBuilder::try_new(ds, key_columns)
-            .map_err(|e| OmniError::Lance(e.to_string()))?
-            .when_matched(when_matched)
-            .when_not_matched(when_not_matched)
+        let mut builder = MergeInsertBuilder::try_new(ds, key_columns)
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        builder.when_matched(when_matched);
+        builder.when_not_matched(when_not_matched);
+        // Workaround for a Lance 4.0.x bug class where sequential
+        // merge_insert calls against rows previously rewritten by
+        // merge_insert produce a spurious "Ambiguous merge inserts:
+        // multiple source rows match the same target row on (id = ...)"
+        // error. Lance's `processed_row_ids: Mutex<HashSet<u64>>`
+        // (lance-4.0.0 `src/dataset/write/merge_insert.rs:2099`)
+        // double-processes the same source/target match against
+        // datasets previously rewritten by merge_insert, and the default
+        // `SourceDedupeBehavior::Fail` errors on the second insertion.
+        // `FirstSeen` makes Lance skip the duplicate match instead.
+        //
+        // Covers both observed surfaces:
+        // - PR #98 (sequential `load --mode merge` against same keys).
+        // - MR-920 (sequential `update T set {f} where x=y` on same row).
+        //
+        // Correctness-preserving for OmniGraph because source-side
+        // duplicates are already rejected upstream of this call:
+        // - Load path: `enforce_unique_constraints_intra_batch`
+        //   (`loader/mod.rs:1453`) errors on any duplicate `@key` value.
+        // - Mutate path: `MutationStaging::finalize` (`exec/staging.rs`)
+        //   accumulates and dedupes by `id`.
+        // So FirstSeen only suppresses the spurious Lance behavior, never
+        // user data. Pinned by `loader_rejects_intra_batch_duplicate_keys`
+        // in `tests/consistency.rs`.
+        //
+        // Retire when upstream Lance fixes the bug class. Tracked at
+        // MR-957; upstream: lance-format/lance#6877.
+        builder.source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
+        let job = builder
             .try_build()
             .map_err(|e| OmniError::Lance(e.to_string()))?;
 
@@ -871,10 +901,17 @@ impl TableStore {
             ));
         }
         let ds = Arc::new(ds);
-        let job = MergeInsertBuilder::try_new(ds, key_columns)
-            .map_err(|e| OmniError::Lance(e.to_string()))?
-            .when_matched(when_matched)
-            .when_not_matched(when_not_matched)
+        let mut builder = MergeInsertBuilder::try_new(ds, key_columns)
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        builder.when_matched(when_matched);
+        builder.when_not_matched(when_not_matched);
+        // See `merge_insert_batch` for the FirstSeen rationale. Workaround
+        // for the Lance 4.0.x bug class where sequential merge_insert /
+        // update against rows previously rewritten by merge_insert trips
+        // Lance's `processed_row_ids` HashSet and errors under the default
+        // `SourceDedupeBehavior::Fail`. Retire when upstream Lance is fixed.
+        builder.source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
+        let job = builder
             .try_build()
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         let schema = batch.schema();
