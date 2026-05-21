@@ -186,12 +186,18 @@ node Thing {
 /// batch reaches Lance — otherwise FirstSeen could silently drop user
 /// data.
 ///
-/// The loader's `enforce_unique_constraints_intra_batch`
-/// (`loader/mod.rs:1453`), invoked unconditionally on any node type
-/// with a `@key`, is the layer that provides this guarantee. This test
-/// pins it: a JSONL batch with two rows sharing the same `@key` value
-/// must error at intake under every `LoadMode`, never reach the merge
-/// builder, and never silently succeed via FirstSeen.
+/// Defense in depth:
+/// 1. The loader's `enforce_unique_constraints_intra_batch`
+///    (`loader/mod.rs:1453`), invoked unconditionally on any node type
+///    with a `@key`, errors on intra-batch duplicate `@key` values at
+///    intake — pinned by this test across every `LoadMode`.
+/// 2. The `check_batch_unique_by_keys` precondition at the top of
+///    `merge_insert_batch` and `stage_merge_insert` is the final
+///    fail-fast guard: even if a future caller bypasses the loader path
+///    (e.g. branch-merge's `publish_rewritten_merge_table` builds its
+///    own source batch directly), a real duplicate id reaches Lance
+///    only after surfacing as an `OmniError::Manifest`, never silently
+///    via FirstSeen. Pinned by the unit tests in `table_store::tests`.
 #[tokio::test]
 async fn loader_rejects_intra_batch_duplicate_keys() {
     let dir = tempfile::tempdir().unwrap();
