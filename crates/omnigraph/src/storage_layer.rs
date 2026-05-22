@@ -10,11 +10,12 @@
 //! ## Transitional residuals on the trait
 //!
 //! Several inline-commit methods remain on the trait surface as
-//! documented residuals: `delete_where` (the public
-//! `DeleteBuilder::execute_uncommitted` API shipped with Lance 6.0.1 —
-//! [#6658](https://github.com/lance-format/lance/issues/6658) closed
-//! 2026-05-14; migration to staged two-phase delete tracked as MR-A, the
-//! next follow-up after the v6 bump),
+//! documented residuals: `delete_where`
+//! ([#6658](https://github.com/lance-format/lance/issues/6658) closed
+//! 2026-05-14, but the public `DeleteBuilder::execute_uncommitted` API
+//! did not backport to the 6.x release line — it first ships in
+//! `v7.0.0-beta.10`. Migration to staged two-phase delete is tracked as
+//! MR-A and is gated on the Lance v7.x bump, not the current v6.0.1 pin),
 //! `create_vector_index` (segment-commit-path requires
 //! `build_index_metadata_from_segments` which is `pub(crate)` — see
 //! [#6666](https://github.com/lance-format/lance/issues/6666), still open), and the
