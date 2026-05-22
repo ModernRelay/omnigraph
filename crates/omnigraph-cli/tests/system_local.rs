@@ -246,6 +246,37 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
     ));
     assert_eq!(read_after["row_count"], 1);
     assert_eq!(read_after["rows"][0]["p.name"], "Eve");
+
+    // Inline-source variants of the same read/change flow (CLI `-e` /
+    // `--query-string`). Confirms that file-less invocations reach the
+    // engine identically, including param binding and `branch=main` defaults.
+    let inline_change = parse_stdout_json(&output_success(
+        cli()
+            .arg("change")
+            .arg(repo.path())
+            .arg("-e")
+            .arg("query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }")
+            .arg("--params")
+            .arg(r#"{"name":"Inline","age":42}"#)
+            .arg("--json"),
+    ));
+    assert_eq!(inline_change["branch"], "main");
+    assert_eq!(inline_change["query_name"], "add");
+    assert_eq!(inline_change["affected_nodes"], 1);
+
+    let inline_read = parse_stdout_json(&output_success(
+        cli()
+            .arg("read")
+            .arg(repo.path())
+            .arg("--query-string")
+            .arg("query find($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.age } }")
+            .arg("--params")
+            .arg(r#"{"name":"Inline"}"#)
+            .arg("--json"),
+    ));
+    assert_eq!(inline_read["row_count"], 1);
+    assert_eq!(inline_read["rows"][0]["p.name"], "Inline");
+    assert_eq!(inline_read["rows"][0]["p.age"], 42);
 }
 
 #[test]

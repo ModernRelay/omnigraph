@@ -15,8 +15,8 @@ use api::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
     CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, HealthOutput, IngestOutput,
-    IngestRequest, ReadOutput, ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput,
-    SnapshotQuery, ingest_output, schema_apply_output, snapshot_payload,
+    IngestRequest, QueryRequest, ReadOutput, ReadRequest, SchemaApplyOutput, SchemaApplyRequest,
+    SchemaOutput, SnapshotQuery, ingest_output, schema_apply_output, snapshot_payload,
 };
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
@@ -74,6 +74,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         server_health,
         server_snapshot,
         server_read,
+        server_query,
         server_export,
         server_change,
         server_schema_apply,
@@ -631,6 +632,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/snapshot", get(server_snapshot))
         .route("/export", post(server_export))
         .route("/read", post(server_read))
+        .route("/query", post(server_query))
         .route("/change", post(server_change))
         .route("/schema", get(server_schema_get))
         .route("/schema/apply", post(server_schema_apply))
@@ -982,6 +984,85 @@ async fn server_read(
 
 #[utoipa::path(
     post,
+    path = "/query",
+    tag = "queries",
+    operation_id = "query",
+    request_body = QueryRequest,
+    responses(
+        (status = 200, description = "Query results", body = ReadOutput),
+        (status = 400, description = "Bad request - also returned when the query body contains mutations; use POST /change for write queries", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Execute an inline read query (friendlier-named alternative to `POST /read`).
+///
+/// Designed for ad-hoc exploration and AI-agent tool-use: short field
+/// names (`query`, `name`) match the CLI `-e` flag and the GQ `query`
+/// keyword. Mutations (`insert`/`update`/`delete`) are rejected with 400
+/// -- use `POST /change` for write queries. Otherwise behaves
+/// identically to `POST /read`: same target semantics (branch xor
+/// snapshot), same Cedar action (Read), same response shape.
+async fn server_query(
+    State(state): State<AppState>,
+    actor: Option<Extension<AuthenticatedActor>>,
+    Json(request): Json<QueryRequest>,
+) -> std::result::Result<Json<ReadOutput>, ApiError> {
+    if request.branch.is_some() && request.snapshot.is_some() {
+        return Err(ApiError::bad_request(
+            "query request may specify branch or snapshot, not both",
+        ));
+    }
+
+    let target = read_target_from_request(request.branch, request.snapshot);
+    let policy_branch = match &target {
+        ReadTarget::Branch(branch) => Some(branch.clone()),
+        ReadTarget::Snapshot(_) if state.policy_engine().is_some() && actor.is_some() => {
+            let db = &state.engine;
+            db.resolved_branch_of(target.clone())
+                .await
+                .map(|branch| branch.or_else(|| Some("main".to_string())))
+                .map_err(ApiError::from_omni)?
+        }
+        ReadTarget::Snapshot(_) => None,
+    };
+    authorize_request(
+        &state,
+        actor.as_ref().map(|Extension(actor)| actor),
+        PolicyRequest {
+            actor_id: actor
+                .as_ref()
+                .map(|Extension(actor)| actor.as_str().to_string())
+                .unwrap_or_default(),
+            action: PolicyAction::Read,
+            branch: policy_branch,
+            target_branch: None,
+        },
+    )?;
+    let query_decl = select_named_query_decl(&request.query, request.name.as_deref())
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    if !query_decl.mutations.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "query '{}' contains mutations (insert/update/delete); use POST /change for write queries",
+            query_decl.name
+        )));
+    }
+    let selected_name = query_decl.name.clone();
+    let params = query_params_from_json(&query_decl.params, request.params.as_ref())
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+
+    let result = {
+        let db = &state.engine;
+        db.query(target.clone(), &request.query, &selected_name, &params)
+            .await
+            .map_err(ApiError::from_omni)?
+    };
+    Ok(Json(api::read_output(selected_name, &target, result)))
+}
+
+#[utoipa::path(
+    post,
     path = "/export",
     tag = "queries",
     operation_id = "export",
@@ -1092,7 +1173,7 @@ async fn server_change(
     // estimated bytes per actor. Cedar runs FIRST so denied requests
     // don't consume admission slots. Estimate uses the request body
     // size as a coarse proxy; engine memory pressure can run higher.
-    let est_bytes = request.query_source.len() as u64
+    let est_bytes = request.query.len() as u64
         + request
             .params
             .as_ref()
@@ -1103,7 +1184,7 @@ async fn server_change(
         .try_admit(&actor_arc, est_bytes)
         .map_err(ApiError::from_workload_reject)?;
     let (selected_name, query_params) =
-        select_named_query(&request.query_source, request.query_name.as_deref())
+        select_named_query(&request.query, request.name.as_deref())
             .map_err(|err| ApiError::bad_request(err.to_string()))?;
     let params = query_params_from_json(&query_params, request.params.as_ref())
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
@@ -1112,7 +1193,7 @@ async fn server_change(
         let db = &state.engine;
         db.mutate_as(
             &branch,
-            &request.query_source,
+            &request.query,
             &selected_name,
             &params,
             actor_id,
@@ -1658,10 +1739,10 @@ fn read_target_from_request(branch: Option<String>, snapshot: Option<String>) ->
     }
 }
 
-fn select_named_query(
+fn select_named_query_decl(
     query_source: &str,
     requested_name: Option<&str>,
-) -> Result<(String, Vec<omnigraph_compiler::query::ast::Param>)> {
+) -> Result<omnigraph_compiler::query::ast::QueryDecl> {
     let parsed = parse_query(query_source)?;
     let query = if let Some(name) = requested_name {
         parsed
@@ -1674,7 +1755,14 @@ fn select_named_query(
     } else {
         bail!("query file contains multiple queries; pass --name");
     };
+    Ok(query)
+}
 
+fn select_named_query(
+    query_source: &str,
+    requested_name: Option<&str>,
+) -> Result<(String, Vec<omnigraph_compiler::query::ast::Param>)> {
+    let query = select_named_query_decl(query_source, requested_name)?;
     Ok((query.name, query.params))
 }
 

@@ -684,6 +684,73 @@
         ]
       }
     },
+    "/query": {
+      "post": {
+        "tags": [
+          "queries"
+        ],
+        "summary": "Execute an inline read query (friendlier-named alternative to `POST /read`).",
+        "description": "Designed for ad-hoc exploration and AI-agent tool-use: short field\nnames (`query`, `name`) match the CLI `-e` flag and the GQ `query`\nkeyword. Mutations (`insert`/`update`/`delete`) are rejected with 400\n-- use `POST /change` for write queries. Otherwise behaves\nidentically to `POST /read`: same target semantics (branch xor\nsnapshot), same Cedar action (Read), same response shape.",
+        "operationId": "query",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QueryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Query results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request - also returned when the query body contains mutations; use POST /change for write queries",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/read": {
       "post": {
         "tags": [
@@ -1103,7 +1170,7 @@
       "ChangeRequest": {
         "type": "object",
         "required": [
-          "query_source"
+          "query"
         ],
         "properties": {
           "branch": {
@@ -1113,19 +1180,19 @@
             ],
             "description": "Target branch. Defaults to `main`."
           },
-          "params": {
-            "description": "JSON object whose keys match the mutation's declared parameters."
-          },
-          "query_name": {
+          "name": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Name of the mutation to run when `query_source` declares multiple."
+            "description": "Name of the mutation to run when `query` declares multiple.\n\nAccepts the legacy field name `query_name` as a deserialization alias."
           },
-          "query_source": {
+          "params": {
+            "description": "JSON object whose keys match the mutation's declared parameters."
+          },
+          "query": {
             "type": "string",
-            "description": "GQ mutation source containing `insert`, `update`, or `delete` statements.\nMay declare multiple named mutations; pick one with `query_name`.",
+            "description": "GQ mutation source containing `insert`, `update`, or `delete` statements.\nMay declare multiple named mutations; pick one with `name`.\n\nAccepts the legacy field name `query_source` as a deserialization alias.",
             "example": "query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}"
           }
         }
@@ -1450,6 +1517,44 @@
           },
           "table_key": {
             "type": "string"
+          }
+        }
+      },
+      "QueryRequest": {
+        "type": "object",
+        "description": "Inline read-query request for `POST /query`.\n\nFriendlier-named alternative to [`ReadRequest`] for ad-hoc reads and\nAI-agent integration. Mutations are rejected with 400 — use `POST\n/change` for write queries. Field names are deliberately short\n(`query`, `name`) to match the GQ keyword and the CLI `-e` flag.",
+        "required": [
+          "query"
+        ],
+        "properties": {
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Branch to read from. Mutually exclusive with `snapshot`. Defaults to `main`."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Name of the query to run when `query` declares multiple. Optional when\nonly one query is declared."
+          },
+          "params": {
+            "description": "JSON object whose keys match the query's declared parameters."
+          },
+          "query": {
+            "type": "string",
+            "description": "GQ read-query source. May declare one or more named queries; pick one\nwith `name` when more than one is declared. Mutations\n(`insert`/`update`/`delete`) get 400 — use `POST /change` instead.",
+            "example": "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
+          },
+          "snapshot": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Snapshot id to read from. Mutually exclusive with `branch`."
           }
         }
       },

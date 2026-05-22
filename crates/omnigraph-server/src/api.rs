@@ -248,17 +248,49 @@ pub struct ReadRequest {
     pub snapshot: Option<String>,
 }
 
+/// Inline read-query request for `POST /query`.
+///
+/// Friendlier-named alternative to [`ReadRequest`] for ad-hoc reads and
+/// AI-agent integration. Mutations are rejected with 400 — use `POST
+/// /change` for write queries. Field names are deliberately short
+/// (`query`, `name`) to match the GQ keyword and the CLI `-e` flag.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct QueryRequest {
+    /// GQ read-query source. May declare one or more named queries; pick one
+    /// with `name` when more than one is declared. Mutations
+    /// (`insert`/`update`/`delete`) get 400 — use `POST /change` instead.
+    #[schema(example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}")]
+    pub query: String,
+    /// Name of the query to run when `query` declares multiple. Optional when
+    /// only one query is declared.
+    pub name: Option<String>,
+    /// JSON object whose keys match the query's declared parameters.
+    pub params: Option<Value>,
+    /// Branch to read from. Mutually exclusive with `snapshot`. Defaults to `main`.
+    pub branch: Option<String>,
+    /// Snapshot id to read from. Mutually exclusive with `branch`.
+    pub snapshot: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChangeRequest {
     /// GQ mutation source containing `insert`, `update`, or `delete` statements.
-    /// May declare multiple named mutations; pick one with `query_name`.
+    /// May declare multiple named mutations; pick one with `name`.
+    ///
+    /// Accepts the legacy field name `query_source` as a deserialization alias.
     #[schema(example = "query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}")]
-    pub query_source: String,
-    /// Name of the mutation to run when `query_source` declares multiple.
-    pub query_name: Option<String>,
+    #[serde(alias = "query_source")]
+    pub query: String,
+    /// Name of the mutation to run when `query` declares multiple.
+    ///
+    /// Accepts the legacy field name `query_name` as a deserialization alias.
+    #[serde(default, alias = "query_name")]
+    pub name: Option<String>,
     /// JSON object whose keys match the mutation's declared parameters.
+    #[serde(default)]
     pub params: Option<Value>,
     /// Target branch. Defaults to `main`.
+    #[serde(default)]
     pub branch: Option<String>,
 }
 

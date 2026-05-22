@@ -9,9 +9,10 @@ Axum 0.8 + tokio + utoipa-generated OpenAPI. Single repo per process; deploy mul
 | GET | `/healthz` | none | — | `server_health` |
 | GET | `/openapi.json` | none | — | `server_openapi` (strips security if auth disabled) |
 | GET | `/snapshot?branch=` | bearer + `read` | snapshot of branch | `server_snapshot` |
-| POST | `/read` | bearer + `read` | run named query | `server_read` |
+| POST | `/read` | bearer + `read` | run named query (legacy field names `query_source`/`query_name`) | `server_read` |
+| POST | `/query` | bearer + `read` | run inline read query (clean field names `query`/`name`; mutations → 400) | `server_query` |
 | POST | `/export` | bearer + `export` | NDJSON stream | `server_export` |
-| POST | `/change` | bearer + `change` | mutation | `server_change` |
+| POST | `/change` | bearer + `change` | mutation (`query`/`name`; accepts legacy `query_source`/`query_name` as serde aliases) | `server_change` |
 | GET | `/schema` | bearer + `read` | get current `.pg` source | `server_schema_get` |
 | POST | `/schema/apply` | bearer + `schema_apply` (target=`main`) | migrate | `server_schema_apply` |
 | POST | `/ingest` | bearer + `branch_create` (if new) + `change` | bulk load | `server_ingest` (32 MB body limit) |
@@ -21,6 +22,32 @@ Axum 0.8 + tokio + utoipa-generated OpenAPI. Single repo per process; deploy mul
 | POST | `/branches/merge` | bearer + `branch_merge` | merge `source → target` | `server_branch_merge` |
 | GET | `/commits?branch=` | bearer + `read` | list | `server_commit_list` |
 | GET | `/commits/{commit_id}` | bearer + `read` | show | `server_commit_show` |
+
+## Inline read queries (`POST /query`)
+
+`POST /query` is the read-only, agent-friendly twin of `POST /read`. The
+request body uses clean field names that match the CLI `-e` flag and the GQ
+`query` keyword:
+
+```json
+{
+  "query":    "query find($n: String) { match { $p: Person { name: $n } } return { $p.name } }",
+  "name":     "find",
+  "params":   { "n": "Alice" },
+  "branch":   "main",
+  "snapshot": null
+}
+```
+
+Response shape is identical to `/read` (`ReadOutput`). If the inline source
+contains mutations (`insert` / `update` / `delete`), the request is rejected
+with HTTP 400 and an error pointing the caller at `POST /change` — the
+read-only contract is enforced at the URL.
+
+`POST /change` accepts the same clean field names (`query`, `name`); the
+legacy field names `query_source` and `query_name` continue to deserialize as
+serde aliases so existing clients keep working without changes. `POST /read`
+is byte-stable and unchanged.
 
 ## Streaming
 

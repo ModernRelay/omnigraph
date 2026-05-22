@@ -1423,6 +1423,102 @@ fn read_requires_name_for_multi_query_files() {
 }
 
 #[test]
+fn read_supports_inline_query_string() {
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    init_repo(&repo);
+    load_fixture(&repo);
+
+    let output = output_success(
+        cli()
+            .arg("read")
+            .arg(&repo)
+            .arg("-e")
+            .arg("query find($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.age } }")
+            .arg("--params")
+            .arg(r#"{"name":"Alice"}"#)
+            .arg("--json"),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["query_name"], "find");
+    assert_eq!(payload["row_count"], 1);
+    assert_eq!(payload["rows"][0]["p.name"], "Alice");
+}
+
+#[test]
+fn change_supports_inline_query_string() {
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    init_repo(&repo);
+    load_fixture(&repo);
+
+    let output = output_success(
+        cli()
+            .arg("change")
+            .arg(&repo)
+            .arg("--query-string")
+            .arg("query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }")
+            .arg("--params")
+            .arg(r#"{"name":"Inline","age":42}"#)
+            .arg("--json"),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["query_name"], "add");
+    assert_eq!(payload["affected_nodes"], 1);
+
+    let verify = output_success(
+        cli()
+            .arg("read")
+            .arg(&repo)
+            .arg("-e")
+            .arg("query find($name: String) { match { $p: Person { name: $name } } return { $p.name } }")
+            .arg("--params")
+            .arg(r#"{"name":"Inline"}"#)
+            .arg("--json"),
+    );
+    let verify_payload: Value = serde_json::from_slice(&verify.stdout).unwrap();
+    assert_eq!(verify_payload["row_count"], 1);
+}
+
+#[test]
+fn read_rejects_query_string_combined_with_query() {
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    init_repo(&repo);
+    load_fixture(&repo);
+
+    let output = output_failure(
+        cli()
+            .arg("read")
+            .arg(&repo)
+            .arg("--query")
+            .arg(fixture("test.gq"))
+            .arg("-e")
+            .arg("query whatever() { match { $p: Person } return { $p.name } }"),
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("cannot be used") || stderr.contains("conflict"),
+        "expected clap conflict error, got: {stderr}"
+    );
+}
+
+#[test]
+fn read_rejects_empty_query_string() {
+    let temp = tempdir().unwrap();
+    let repo = repo_path(temp.path());
+    init_repo(&repo);
+    load_fixture(&repo);
+
+    let output = output_failure(cli().arg("read").arg(&repo).arg("-e").arg(""));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("must not be empty"),
+        "expected empty-string rejection, got: {stderr}"
+    );
+}
+
+#[test]
 fn branch_create_json_outputs_source_and_name() {
     let temp = tempdir().unwrap();
     let repo = repo_path(temp.path());

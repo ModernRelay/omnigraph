@@ -159,6 +159,7 @@ const EXPECTED_PATHS: &[&str] = &[
     "/healthz",
     "/snapshot",
     "/read",
+    "/query",
     "/export",
     "/change",
     "/schema",
@@ -278,6 +279,7 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "BranchMergeRequest",
     "ChangeOutput",
     "ChangeRequest",
+    "QueryRequest",
     "CommitListOutput",
     "CommitOutput",
     "ErrorCode",
@@ -368,13 +370,65 @@ fn read_output_schema_has_expected_fields() {
 
 #[test]
 fn change_request_schema_has_expected_fields() {
+    // Canonical field names on the wire are now `query` and `name`. The
+    // schema descriptions document `query_source` and `query_name` as
+    // legacy deserialization aliases for backward compatibility.
     let doc = openapi_json();
     let schema = &doc["components"]["schemas"]["ChangeRequest"];
     let props = schema["properties"].as_object().unwrap();
-    assert!(props.contains_key("query_source"));
-    assert!(props.contains_key("query_name"));
+    assert!(props.contains_key("query"));
+    assert!(props.contains_key("name"));
     assert!(props.contains_key("params"));
     assert!(props.contains_key("branch"));
+    let query_desc = schema["properties"]["query"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        query_desc.contains("query_source"),
+        "expected `query` description to mention the legacy `query_source` alias, got: {query_desc}"
+    );
+}
+
+#[test]
+fn query_request_schema_has_expected_fields() {
+    let doc = openapi_json();
+    let schema = &doc["components"]["schemas"]["QueryRequest"];
+    let props = schema["properties"].as_object().unwrap();
+    assert!(props.contains_key("query"));
+    assert!(props.contains_key("name"));
+    assert!(props.contains_key("params"));
+    assert!(props.contains_key("branch"));
+    assert!(props.contains_key("snapshot"));
+}
+
+#[test]
+fn query_request_query_is_required() {
+    let doc = openapi_json();
+    let schema = &doc["components"]["schemas"]["QueryRequest"];
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(required.contains(&"query"));
+}
+
+#[test]
+fn openapi_query_is_post() {
+    let doc = openapi_json();
+    assert!(doc["paths"]["/query"]["post"].is_object());
+}
+
+#[test]
+fn query_endpoint_documents_mutation_400() {
+    let doc = openapi_json();
+    let four_hundred = &doc["paths"]["/query"]["post"]["responses"]["400"];
+    let description = four_hundred["description"].as_str().unwrap_or_default();
+    assert!(
+        description.contains("mutations") || description.contains("POST /change"),
+        "expected /query 400 response to mention mutation rejection, got: {description}"
+    );
 }
 
 #[test]

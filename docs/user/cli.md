@@ -10,6 +10,24 @@ omnigraph read --uri ./repo.omni --query ./queries.gq --name get_person --params
 omnigraph change --uri ./repo.omni --query ./queries.gq --name insert_person --params '{"name":"Mina","age":28}'
 ```
 
+For ad-hoc reads and mutations (REPLs, AI agents, one-off scripts), pass the
+GQ source inline with `-e` / `--query-string` instead of a file path:
+
+```bash
+omnigraph read --uri ./repo.omni \
+  -e 'query find($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.age } }' \
+  --params '{"name":"Alice"}'
+
+omnigraph change --uri ./repo.omni \
+  -e 'query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }' \
+  --params '{"name":"Inline","age":42}'
+```
+
+`-e` is mutually exclusive with `--query <path>` and `--alias <name>`; exactly
+one of the three must be provided. The inline source travels through the same
+parser, lint, params binding, and commit machinery as a file-based query —
+only the source loader changes.
+
 ## Branching And Reviewable Data Flows
 
 ```bash

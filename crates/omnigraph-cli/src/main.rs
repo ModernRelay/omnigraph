@@ -170,10 +170,13 @@ enum Command {
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["query", "query_string"])]
         alias: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["alias", "query_string"])]
         query: Option<PathBuf>,
+        /// Inline GQ source — alternative to `--query <path>` and `--alias <name>`.
+        #[arg(short = 'e', long = "query-string", value_name = "GQ", conflicts_with_all = ["query", "alias"])]
+        query_string: Option<String>,
         #[arg(long)]
         name: Option<String>,
         #[command(flatten)]
@@ -200,10 +203,13 @@ enum Command {
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["query", "query_string"])]
         alias: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["alias", "query_string"])]
         query: Option<PathBuf>,
+        /// Inline GQ source — alternative to `--query <path>` and `--alias <name>`.
+        #[arg(short = 'e', long = "query-string", value_name = "GQ", conflicts_with_all = ["query", "alias"])]
+        query_string: Option<String>,
         #[arg(long)]
         name: Option<String>,
         #[command(flatten)]
@@ -906,7 +912,9 @@ fn resolve_query_path(
         .map(PathBuf::from)
         .or_else(|| alias_query.map(PathBuf::from))
         .ok_or_else(|| {
-            color_eyre::eyre::eyre!("exactly one of --query or --alias must be provided")
+            color_eyre::eyre::eyre!(
+                "exactly one of --query, --query-string, or --alias must be provided"
+            )
         })
         .and_then(|query_path| config.resolve_query_path(&query_path))
 }
@@ -914,8 +922,15 @@ fn resolve_query_path(
 fn resolve_query_source(
     config: &OmnigraphConfig,
     explicit_query: Option<&PathBuf>,
+    inline_query: Option<&str>,
     alias_query: Option<&str>,
 ) -> Result<String> {
+    if let Some(inline) = inline_query {
+        if inline.trim().is_empty() {
+            bail!("--query-string must not be empty");
+        }
+        return Ok(inline.to_string());
+    }
     Ok(fs::read_to_string(resolve_query_path(
         config,
         explicit_query,
@@ -1629,8 +1644,8 @@ async fn execute_change_remote(
         Method::POST,
         remote_url(uri, "/change"),
         Some(serde_json::to_value(ChangeRequest {
-            query_source: query_source.to_string(),
-            query_name: query_name.map(ToOwned::to_owned),
+            query: query_source.to_string(),
+            name: query_name.map(ToOwned::to_owned),
             params: params_json.cloned(),
             branch: Some(branch.to_string()),
         })?),
@@ -2249,6 +2264,7 @@ async fn main() -> Result<()> {
             config,
             alias,
             query,
+            query_string,
             name,
             params,
             branch,
@@ -2257,8 +2273,8 @@ async fn main() -> Result<()> {
             json,
             alias_args,
         } => {
-            if alias.is_some() == query.is_some() {
-                bail!("exactly one of --alias or --query must be provided");
+            if alias.is_none() && query.is_none() && query_string.is_none() {
+                bail!("exactly one of --query, --query-string, or --alias must be provided");
             }
 
             let config = load_cli_config(config.as_ref())?;
@@ -2281,6 +2297,7 @@ async fn main() -> Result<()> {
             let query_source = resolve_query_source(
                 &config,
                 query.as_ref(),
+                query_string.as_deref(),
                 alias_config.map(|a| a.query.as_str()),
             )?;
             let params_json = merged_params_json(
@@ -2334,14 +2351,15 @@ async fn main() -> Result<()> {
             config,
             alias,
             query,
+            query_string,
             name,
             params,
             branch,
             json,
             alias_args,
         } => {
-            if alias.is_some() == query.is_some() {
-                bail!("exactly one of --alias or --query must be provided");
+            if alias.is_none() && query.is_none() && query_string.is_none() {
+                bail!("exactly one of --query, --query-string, or --alias must be provided");
             }
 
             let config = load_cli_config(config.as_ref())?;
@@ -2364,6 +2382,7 @@ async fn main() -> Result<()> {
             let query_source = resolve_query_source(
                 &config,
                 query.as_ref(),
+                query_string.as_deref(),
                 alias_config.map(|a| a.query.as_str()),
             )?;
             let params_json = merged_params_json(

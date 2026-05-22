@@ -11,8 +11,8 @@ A reference for the `omnigraph` binary's command surface and `omnigraph.yaml` sc
 | `init` | `--schema <pg>` → initialize a repo (also scaffolds `omnigraph.yaml` if missing) |
 | `load` | bulk load a branch (`--mode overwrite\|append\|merge`) |
 | `ingest` | branch-creating transactional load (`--from <base>`) |
-| `read` | run named query (params via `--params`, `--params-file`, or alias args) |
-| `change` | run mutation query |
+| `read` | run named query; source via `--query <path>`, `-e`/`--query-string <GQ>`, or `--alias <name>` (exactly one) |
+| `change` | run mutation query; same `--query` / `-e` / `--alias` mutual-exclusion as `read` |
 | `snapshot` | print current snapshot (per-table version + row count) |
 | `export` | dump to JSONL on stdout (`--type T`, `--table K` filters) |
 | `branch create \| list \| delete \| merge` | branching ops |

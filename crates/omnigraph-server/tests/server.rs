@@ -14,7 +14,7 @@ use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_policy::{PolicyChecker, PolicyEngine};
 use omnigraph_server::api::{
     BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorOutput, ExportRequest,
-    IngestRequest, ReadRequest, SchemaApplyRequest, SchemaOutput,
+    IngestRequest, QueryRequest, ReadRequest, SchemaApplyRequest, SchemaOutput,
 };
 use omnigraph_server::{AppState, build_app};
 use serde_json::{Value, json};
@@ -831,8 +831,8 @@ async fn schema_drift_returns_conflict_for_snapshot_read_and_change() {
     );
 
     let change = ChangeRequest {
-        query_source: MUTATION_QUERIES.to_string(),
-        query_name: Some("insert_person".to_string()),
+        query: MUTATION_QUERIES.to_string(),
+        name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "Mina", "age": 28 })),
         branch: Some("main".to_string()),
     };
@@ -1470,8 +1470,8 @@ async fn policy_blocks_change_on_protected_main_but_allows_unprotected_branch() 
     let app = build_app(state);
 
     let main_change = ChangeRequest {
-        query_source: MUTATION_QUERIES.to_string(),
-        query_name: Some("insert_person".to_string()),
+        query: MUTATION_QUERIES.to_string(),
+        name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "Mina", "age": 28 })),
         branch: Some("main".to_string()),
     };
@@ -1494,8 +1494,8 @@ async fn policy_blocks_change_on_protected_main_but_allows_unprotected_branch() 
     );
 
     let feature_change = ChangeRequest {
-        query_source: MUTATION_QUERIES.to_string(),
-        query_name: Some("insert_person".to_string()),
+        query: MUTATION_QUERIES.to_string(),
+        name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "Mina", "age": 28 })),
         branch: Some("feature".to_string()),
     };
@@ -1590,8 +1590,8 @@ async fn authenticated_change_stamps_actor_on_commits() {
     let (_temp, app) = app_for_loaded_repo_with_auth_tokens(&[("act-andrew", "token-one")]).await;
 
     let change = ChangeRequest {
-        query_source: MUTATION_QUERIES.to_string(),
-        query_name: Some("insert_person".to_string()),
+        query: MUTATION_QUERIES.to_string(),
+        name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "Mina", "age": 28 })),
         branch: Some("main".to_string()),
     };
@@ -1839,8 +1839,8 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
     assert_eq!(create_status, StatusCode::OK);
 
     let change = ChangeRequest {
-        query_source: MUTATION_QUERIES.to_string(),
-        query_name: Some("insert_person".to_string()),
+        query: MUTATION_QUERIES.to_string(),
+        name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "Zoe", "age": 33 })),
         branch: Some("feature".to_string()),
     };
@@ -1969,8 +1969,8 @@ async fn repeated_read_after_change_sees_updated_state_from_same_app() {
     let (_temp, app) = app_for_loaded_repo().await;
 
     let change = ChangeRequest {
-        query_source: MUTATION_QUERIES.to_string(),
-        query_name: Some("insert_person".to_string()),
+        query: MUTATION_QUERIES.to_string(),
+        name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "Mina", "age": 28 })),
         branch: Some("main".to_string()),
     };
@@ -2007,6 +2007,108 @@ async fn repeated_read_after_change_sees_updated_state_from_same_app() {
     assert_eq!(read_status, StatusCode::OK);
     assert_eq!(read_body["row_count"], 1);
     assert_eq!(read_body["rows"][0]["p.name"], "Mina");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_endpoint_runs_inline_read() {
+    let (_temp, app) = app_for_loaded_repo().await;
+
+    let query = QueryRequest {
+        query: fs::read_to_string(fixture("test.gq")).unwrap(),
+        name: Some("get_person".to_string()),
+        params: Some(json!({ "name": "Alice" })),
+        branch: Some("main".to_string()),
+        snapshot: None,
+    };
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/query")
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&query).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["query_name"], "get_person");
+    assert_eq!(body["row_count"], 1);
+    assert_eq!(body["rows"][0]["p.name"], "Alice");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_endpoint_rejects_mutation_with_400() {
+    let (_temp, app) = app_for_loaded_repo().await;
+
+    let query = QueryRequest {
+        query: MUTATION_QUERIES.to_string(),
+        name: Some("insert_person".to_string()),
+        params: Some(json!({ "name": "Should", "age": 1 })),
+        branch: Some("main".to_string()),
+        snapshot: None,
+    };
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/query")
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&query).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let err = body["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("contains mutations") && err.contains("POST /change"),
+        "expected mutation-rejection message, got: {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn change_endpoint_accepts_legacy_field_names() {
+    // The canonical wire field names on /change are `query` and `name`, but
+    // serde aliases keep the legacy `query_source`/`query_name` payload
+    // shape working for clients that haven't migrated yet. Pin both shapes.
+    let (_temp, app) = app_for_loaded_repo().await;
+
+    let legacy_body = json!({
+        "query_source": MUTATION_QUERIES,
+        "query_name": "insert_person",
+        "params": { "name": "Legacy", "age": 21 },
+        "branch": "main",
+    });
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/change")
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&legacy_body).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["affected_nodes"], 1);
+
+    let canonical_body = json!({
+        "query": MUTATION_QUERIES,
+        "name": "insert_person",
+        "params": { "name": "Canonical", "age": 22 },
+        "branch": "main",
+    });
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/change")
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&canonical_body).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["affected_nodes"], 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2056,8 +2158,8 @@ async fn remote_branch_list_create_merge_flow_works() {
     assert_eq!(list_body["branches"], json!(["feature", "main"]));
 
     let change = ChangeRequest {
-        query_source: MUTATION_QUERIES.to_string(),
-        query_name: Some("insert_person".to_string()),
+        query: MUTATION_QUERIES.to_string(),
+        name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "Zoe", "age": 33 })),
         branch: Some("feature".to_string()),
     };
@@ -2390,8 +2492,8 @@ async fn change_conflict_returns_manifest_conflict_409() {
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::to_vec(&ChangeRequest {
-                    query_source: MUTATION_QUERIES.to_string(),
-                    query_name: Some("set_age".to_string()),
+                    query: MUTATION_QUERIES.to_string(),
+                    name: Some("set_age".to_string()),
                     params: Some(json!({ "name": "Alice", "age": 33 })),
                     branch: Some("main".to_string()),
                 })
@@ -2450,8 +2552,8 @@ async fn change_concurrent_inserts_same_key_serialize_without_409() {
         let app = app.clone();
         handles.push(tokio::spawn(async move {
             let body = serde_json::to_vec(&ChangeRequest {
-                query_source: MUTATION_QUERIES.to_string(),
-                query_name: Some("insert_person".to_string()),
+                query: MUTATION_QUERIES.to_string(),
+                name: Some("insert_person".to_string()),
                 params: Some(json!({ "name": format!("racer-{i}"), "age": i as i32 })),
                 branch: Some("main".to_string()),
             })
@@ -2563,8 +2665,8 @@ async fn change_concurrent_updates_same_key_serialize_via_publisher_cas() {
         let target_age = 100 + i as i32;
         handles.push(tokio::spawn(async move {
             let body = serde_json::to_vec(&ChangeRequest {
-                query_source: MUTATION_QUERIES.to_string(),
-                query_name: Some("set_age".to_string()),
+                query: MUTATION_QUERIES.to_string(),
+                name: Some("set_age".to_string()),
                 params: Some(json!({ "name": "Alice", "age": target_age })),
                 branch: Some("main".to_string()),
             })
@@ -2738,8 +2840,8 @@ mod matrix {
 
         pub async fn insert_person(&self, branch: &str, name: &str, age: i32) {
             let body = serde_json::to_vec(&ChangeRequest {
-                query_source: MUTATION_QUERIES.to_string(),
-                query_name: Some("insert_person".to_string()),
+                query: MUTATION_QUERIES.to_string(),
+                name: Some("insert_person".to_string()),
                 params: Some(json!({ "name": name, "age": age })),
                 branch: Some(branch.to_string()),
             })
@@ -2893,8 +2995,8 @@ mod matrix {
         /// /change either deadlocks or returns a non-200.
         pub async fn assert_post_op_sentinel(&self, cell: &str, sentinel: &str) {
             let body = serde_json::to_vec(&ChangeRequest {
-                query_source: MUTATION_QUERIES.to_string(),
-                query_name: Some("insert_person".to_string()),
+                query: MUTATION_QUERIES.to_string(),
+                name: Some("insert_person".to_string()),
                 params: Some(json!({ "name": sentinel, "age": 99 })),
                 branch: Some("main".to_string()),
             })
@@ -2972,8 +3074,8 @@ mod matrix {
             tokio::spawn(async move {
                 barrier.wait().await;
                 let body = serde_json::to_vec(&ChangeRequest {
-                    query_source: MUTATION_QUERIES.to_string(),
-                    query_name: Some("insert_person".to_string()),
+                    query: MUTATION_QUERIES.to_string(),
+                    name: Some("insert_person".to_string()),
                     params: Some(json!({ "name": name, "age": age })),
                     branch: Some(branch),
                 })
@@ -3484,8 +3586,8 @@ query insert_c($name: String) {
         let app_p = app.clone();
         handles.push(tokio::spawn(async move {
             let body = serde_json::to_vec(&ChangeRequest {
-                query_source: PERSON_QUERY.to_string(),
-                query_name: Some("insert_p".to_string()),
+                query: PERSON_QUERY.to_string(),
+                name: Some("insert_p".to_string()),
                 params: Some(json!({ "name": format!("p-{i}"), "age": i as i32 })),
                 branch: Some("main".to_string()),
             })
@@ -3501,8 +3603,8 @@ query insert_c($name: String) {
         let app_c = app.clone();
         handles.push(tokio::spawn(async move {
             let body = serde_json::to_vec(&ChangeRequest {
-                query_source: COMPANY_QUERY.to_string(),
-                query_name: Some("insert_c".to_string()),
+                query: COMPANY_QUERY.to_string(),
+                name: Some("insert_c".to_string()),
                 params: Some(json!({ "name": format!("c-{i}") })),
                 branch: Some("main".to_string()),
             })
@@ -3767,8 +3869,8 @@ async fn default_deny_mode_rejects_change_with_forbidden() {
     .await;
 
     let change = ChangeRequest {
-        query_source: MUTATION_QUERIES.to_string(),
-        query_name: Some("insert_person".to_string()),
+        query: MUTATION_QUERIES.to_string(),
+        name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "DefaultDeny", "age": 1 })),
         branch: Some("main".to_string()),
     };
@@ -3925,8 +4027,8 @@ async fn http_change_decision(
     .unwrap();
     let app = build_app(state);
     let req = ChangeRequest {
-        query_source: MUTATION_QUERIES.to_string(),
-        query_name: Some("insert_person".to_string()),
+        query: MUTATION_QUERIES.to_string(),
+        name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "ParityCharlie", "age": 30 })),
         branch: Some("main".to_string()),
     };
