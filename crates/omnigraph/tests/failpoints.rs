@@ -464,7 +464,7 @@ async fn recovery_rolls_forward_load_on_feature_branch() {
 
 #[tokio::test]
 async fn recovery_rolls_forward_ensure_indices_on_feature_branch() {
-    use lance_index::DatasetIndexExt;
+    use lance::index::DatasetIndexExt;
     use omnigraph::loader::{LoadMode, load_jsonl};
     use omnigraph::table_store::TableStore;
 

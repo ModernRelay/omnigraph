@@ -230,6 +230,11 @@ impl LanceNamespace for BranchManifestNamespace {
             metadata: None,
             properties: None,
             managed_versioning: Some(true),
+            // Every table we return from describe_table is physically
+            // materialized (open_manifest_dataset succeeds), never just
+            // "declared." See lance-namespace 6.0.1 DescribeTableResponse
+            // field docs.
+            is_only_declared: Some(false),
         })
     }
 
@@ -373,6 +378,11 @@ impl LanceNamespace for StagedTableNamespace {
             metadata: None,
             properties: None,
             managed_versioning: Some(true),
+            // Every table we return from describe_table is physically
+            // materialized (open_manifest_dataset succeeds), never just
+            // "declared." See lance-namespace 6.0.1 DescribeTableResponse
+            // field docs.
+            is_only_declared: Some(false),
         })
     }
 
