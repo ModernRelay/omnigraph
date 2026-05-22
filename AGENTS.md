@@ -18,7 +18,7 @@ Tools that support `@`-imports (Claude Code) auto-include all three files via th
 
 **Version surveyed:** 0.4.2
 **Workspace crates:** `omnigraph-compiler`, `omnigraph` (engine), `omnigraph-cli`, `omnigraph-server`
-**Storage substrate:** Lance 4.x (columnar, versioned, branchable)
+**Storage substrate:** Lance 6.x (columnar, versioned, branchable)
 **License:** MIT
 **Toolchain:** Rust stable, edition 2024
 
@@ -53,7 +53,7 @@ CLI (omnigraph)        HTTP Server (omnigraph-server, Axum)
            omnigraph (engine)  ── ManifestRepo, CommitGraph, RunRegistry, GraphIndex (CSR/CSC), exec
                       │
                       ▼
-              Lance 4.x         ── columnar Arrow, fragments, per-dataset versions/branches, indexes
+              Lance 6.x         ── columnar Arrow, fragments, per-dataset versions/branches, indexes
                       │
                       ▼
         Object store (file / s3 / RustFS / MinIO / S3-compat)

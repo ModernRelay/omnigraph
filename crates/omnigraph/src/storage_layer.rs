@@ -10,11 +10,14 @@
 //! ## Transitional residuals on the trait
 //!
 //! Several inline-commit methods remain on the trait surface as
-//! documented residuals: `delete_where` (Lance 4.0.0's `DeleteJob` is
-//! `pub(crate)` — see [#6658](https://github.com/lance-format/lance/issues/6658)),
+//! documented residuals: `delete_where` (the public
+//! `DeleteBuilder::execute_uncommitted` API shipped with Lance 6.0.1 —
+//! [#6658](https://github.com/lance-format/lance/issues/6658) closed
+//! 2026-05-14; migration to staged two-phase delete tracked as MR-A, the
+//! next follow-up after the v6 bump),
 //! `create_vector_index` (segment-commit-path requires
 //! `build_index_metadata_from_segments` which is `pub(crate)` — see
-//! [#6666](https://github.com/lance-format/lance/issues/6666)), and the
+//! [#6666](https://github.com/lance-format/lance/issues/6666), still open), and the
 //! legacy `append_batch` / `merge_insert_batches` / `overwrite_batch` /
 //! `create_btree_index` / `create_inverted_index` paths kept while
 //! engine call sites finish migrating off of them (Phase 1b / Phase 9
