@@ -45,4 +45,5 @@ aws-sdk-secretsmanager = { version = "1", optional = true, default-features = fa
 tempfile = { workspace = true }
 tower = { workspace = true }
 serial_test = "3"
+lance = { workspace = true }
 lance-index = { workspace = true }
