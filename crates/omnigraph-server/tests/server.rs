@@ -7,7 +7,7 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{Method, Request, StatusCode};
-use lance_index::traits::DatasetIndexExt;
+use lance::index::DatasetIndexExt;
 use omnigraph::db::{Omnigraph, ReadTarget, SchemaApplyOptions};
 use omnigraph::error::OmniError;
 use omnigraph::loader::{LoadMode, load_jsonl};

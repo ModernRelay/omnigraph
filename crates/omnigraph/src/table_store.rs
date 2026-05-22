@@ -14,10 +14,11 @@ use lance::dataset::{
     WriteParams,
 };
 use lance::datatypes::BlobKind;
+use lance::index::DatasetIndexExt;
 use lance::index::scalar::IndexDetails;
 use lance_file::version::LanceFileVersion;
 use lance_index::scalar::{InvertedIndexParams, ScalarIndexParams};
-use lance_index::{DatasetIndexExt, IndexType, is_system_index};
+use lance_index::{IndexType, is_system_index};
 use lance_linalg::distance::MetricType;
 use lance_table::format::{Fragment, IndexMetadata, RowIdMeta};
 use lance_table::rowids::{RowIdSequence, write_row_ids};
