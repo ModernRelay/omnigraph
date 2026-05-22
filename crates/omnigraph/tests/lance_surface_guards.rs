@@ -13,7 +13,7 @@
 //!
 //! ## Compile-only guards
 //!
-//! Functions prefixed with `_compile_` are gated `#[allow(dead_code, unreachable_code, unused_variables, unused_mut)]`
+//! Functions prefixed with `_compile_` are gated with a broad `#[allow(...)]`
 //! and never called. They exist to make `cargo build -p omnigraph-engine --tests`
 //! enforce the API shape. Using `unimplemented!()` as a placeholder lets type
 //! inference proceed without running anything.
@@ -109,7 +109,13 @@ async fn manifest_location_field_shape() {
 // .checkout_version(N).await?.restore().await?` as the recovery rollback
 // hammer. Compile-only — never runs.
 
-#[allow(dead_code, unreachable_code, unused_variables, unused_mut)]
+#[allow(
+    dead_code,
+    unreachable_code,
+    unused_variables,
+    unused_mut,
+    clippy::diverging_sub_expression
+)]
 async fn _compile_checkout_version_then_restore_signature() -> lance::Result<()> {
     let ds: Dataset = unimplemented!();
     let mut ds: Dataset = ds.checkout_version(1u64).await?;
@@ -126,7 +132,13 @@ async fn _compile_checkout_version_then_restore_signature() -> lance::Result<()>
 // `DatasetBuilder::from_namespace(ns, vec![id]).await?.with_branch(...).with_version(...).load().await?`.
 // Compile-only.
 
-#[allow(dead_code, unreachable_code, unused_variables, unused_mut)]
+#[allow(
+    dead_code,
+    unreachable_code,
+    unused_variables,
+    unused_mut,
+    clippy::diverging_sub_expression
+)]
 async fn _compile_dataset_builder_from_namespace_signature(
     ns: Arc<dyn LanceNamespace>,
 ) -> lance::Result<()> {
@@ -144,7 +156,13 @@ async fn _compile_dataset_builder_from_namespace_signature(
 // the builder renames or changes signature, the publisher silently breaks.
 // Compile-only.
 
-#[allow(dead_code, unreachable_code, unused_variables, unused_mut)]
+#[allow(
+    dead_code,
+    unreachable_code,
+    unused_variables,
+    unused_mut,
+    clippy::diverging_sub_expression
+)]
 async fn _compile_merge_insert_builder_method_chain() -> lance::Result<()> {
     use lance::dataset::MergeStats;
 
@@ -190,7 +208,13 @@ fn write_params_default_does_not_set_storage_version() {
 // `db/omnigraph/optimize.rs:107` calls `compact_files(&mut ds, options, None)`.
 // Compile-only.
 
-#[allow(dead_code, unreachable_code, unused_variables, unused_mut)]
+#[allow(
+    dead_code,
+    unreachable_code,
+    unused_variables,
+    unused_mut,
+    clippy::diverging_sub_expression
+)]
 async fn _compile_compact_files_signature() -> lance::Result<()> {
     let mut ds: Dataset = unimplemented!();
     let options: CompactionOptions = CompactionOptions::default();
@@ -204,7 +228,13 @@ async fn _compile_compact_files_signature() -> lance::Result<()> {
 // `delete_where` to two-phase via `DeleteBuilder::execute_uncommitted`, this
 // guard updates to pin the staged path. Compile-only.
 
-#[allow(dead_code, unreachable_code, unused_variables, unused_mut)]
+#[allow(
+    dead_code,
+    unreachable_code,
+    unused_variables,
+    unused_mut,
+    clippy::diverging_sub_expression
+)]
 async fn _compile_delete_result_field_shape() -> lance::Result<()> {
     let mut ds: Dataset = unimplemented!();
     let result: DeleteResult = ds.delete("x = 1").await?;
