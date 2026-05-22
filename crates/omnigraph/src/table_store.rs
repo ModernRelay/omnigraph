@@ -8,6 +8,7 @@ use lance::Dataset;
 use lance::blob::BlobArrayBuilder;
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream, Scanner};
 use lance::dataset::transaction::{Operation, Transaction, TransactionBuilder};
+use lance::dataset::write::merge_insert::SourceDedupeBehavior;
 use lance::dataset::{
     CommitBuilder, InsertBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode,
     WriteParams,
@@ -651,15 +652,58 @@ impl TableStore {
             return self.table_state(dataset_uri, &ds).await;
         }
 
+        // Precondition for the FirstSeen workaround below: every caller of
+        // this primitive must hand in a source batch that is unique by
+        // `key_columns`. Without this check, `SourceDedupeBehavior::FirstSeen`
+        // would silently collapse genuine duplicates instead of erroring.
+        check_batch_unique_by_keys(&batch, &key_columns, "merge_insert_batch")?;
+
         // TODO(lance-upstream): MergeInsertBuilder does not accept WriteParams,
         // so allow_external_blob_outside_bases cannot be set here. External URI
         // blobs via merge_insert (LoadMode::Merge, mutations) are unsupported
         // until Lance exposes WriteParams on MergeInsertBuilder.
         let ds = Arc::new(ds);
-        let job = MergeInsertBuilder::try_new(ds, key_columns)
-            .map_err(|e| OmniError::Lance(e.to_string()))?
-            .when_matched(when_matched)
-            .when_not_matched(when_not_matched)
+        let mut builder = MergeInsertBuilder::try_new(ds, key_columns)
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        builder.when_matched(when_matched);
+        builder.when_not_matched(when_not_matched);
+        // Workaround for a Lance 4.0.x bug class where sequential
+        // merge_insert calls against rows previously rewritten by
+        // merge_insert produce a spurious "Ambiguous merge inserts:
+        // multiple source rows match the same target row on (id = ...)"
+        // error. Lance's `processed_row_ids: Mutex<HashSet<u64>>`
+        // (lance-4.0.0 `src/dataset/write/merge_insert.rs:2099`)
+        // double-processes the same source/target match against
+        // datasets previously rewritten by merge_insert, and the default
+        // `SourceDedupeBehavior::Fail` errors on the second insertion.
+        // `FirstSeen` makes Lance skip the duplicate match instead.
+        //
+        // Covers both observed surfaces:
+        // - PR #98 (sequential `load --mode merge` against same keys).
+        // - MR-920 (sequential `update T set {f} where x=y` on same row).
+        //
+        // Correctness-preserving for OmniGraph because every call path
+        // that reaches this primitive either pre-dedupes the source batch
+        // by id, or surfaces a real source dup via the
+        // `check_batch_unique_by_keys` precondition above (which fires
+        // before the FirstSeen setter has a chance to silently collapse
+        // anything):
+        // - Load path: `enforce_unique_constraints_intra_batch`
+        //   (`loader/mod.rs:1453`) errors on intra-batch `@key` dups.
+        // - Mutate path: `MutationStaging::finalize` (`exec/staging.rs`)
+        //   accumulates and dedupes by `id`.
+        // - Branch-merge path: `compute_source_delta` /
+        //   `compute_three_way_delta` (`exec/merge.rs`) walk via
+        //   `OrderedTableCursor` and `push_row` each id at most once.
+        // So FirstSeen only suppresses the spurious Lance behavior, never
+        // user data. Pinned by `loader_rejects_intra_batch_duplicate_keys`
+        // in `tests/consistency.rs` plus the
+        // `check_batch_unique_by_keys` precondition.
+        //
+        // Retire when upstream Lance fixes the bug class. Tracked at
+        // MR-957; upstream: lance-format/lance#6877.
+        builder.source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
+        let job = builder
             .try_build()
             .map_err(|e| OmniError::Lance(e.to_string()))?;
 
@@ -870,11 +914,26 @@ impl TableStore {
                 "stage_merge_insert called with empty batch".to_string(),
             ));
         }
+
+        // Precondition for FirstSeen below. See the comment on
+        // `merge_insert_batch` for why this check is here, not on the caller:
+        // every call path that reaches stage_merge_insert (load,
+        // MutationStaging::finalize, branch_merge::publish_rewritten_merge_table)
+        // must hand in a source batch that is unique by `key_columns`.
+        check_batch_unique_by_keys(&batch, &key_columns, "stage_merge_insert")?;
+
         let ds = Arc::new(ds);
-        let job = MergeInsertBuilder::try_new(ds, key_columns)
-            .map_err(|e| OmniError::Lance(e.to_string()))?
-            .when_matched(when_matched)
-            .when_not_matched(when_not_matched)
+        let mut builder = MergeInsertBuilder::try_new(ds, key_columns)
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        builder.when_matched(when_matched);
+        builder.when_not_matched(when_not_matched);
+        // See `merge_insert_batch` for the FirstSeen rationale. Workaround
+        // for the Lance 4.0.x bug class where sequential merge_insert /
+        // update against rows previously rewritten by merge_insert trips
+        // Lance's `processed_row_ids` HashSet and errors under the default
+        // `SourceDedupeBehavior::Fail`. Retire when upstream Lance is fixed.
+        builder.source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
+        let job = builder
             .try_build()
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         let schema = batch.schema();
@@ -1650,4 +1709,108 @@ fn combine_committed_with_staged(ds: &Dataset, staged: &[StagedWrite]) -> Vec<Fr
         combined.extend(write.new_fragments.iter().cloned());
     }
     combined
+}
+
+/// Precondition guard for `merge_insert_batch` and `stage_merge_insert`.
+/// Both opt into `SourceDedupeBehavior::FirstSeen` to suppress the Lance
+/// `processed_row_ids` bug (MR-957). FirstSeen would *also* silently
+/// collapse genuine duplicate source keys; this check restores fail-fast
+/// behavior on real dups by erroring before the builder gets a chance to
+/// silently skip them.
+///
+/// Today only single-column string keys are used at the call sites
+/// (`vec!["id".to_string()]`). The check restricts itself to that shape
+/// and surfaces an internal error if a future caller passes anything
+/// else — keeping the assumption explicit instead of silently degrading.
+fn check_batch_unique_by_keys(
+    batch: &RecordBatch,
+    key_columns: &[String],
+    context: &'static str,
+) -> Result<()> {
+    if key_columns.len() != 1 {
+        return Err(OmniError::manifest_internal(format!(
+            "{}: check_batch_unique_by_keys currently supports single-column keys only, got {:?}",
+            context, key_columns
+        )));
+    }
+    let key_col_name = &key_columns[0];
+    let column = batch.column_by_name(key_col_name).ok_or_else(|| {
+        OmniError::manifest_internal(format!(
+            "{}: source batch missing key column '{}'",
+            context, key_col_name
+        ))
+    })?;
+    let strs = column
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            OmniError::manifest_internal(format!(
+                "{}: key column '{}' is not a StringArray (got {:?})",
+                context,
+                key_col_name,
+                column.data_type()
+            ))
+        })?;
+
+    let mut seen: std::collections::HashSet<&str> =
+        std::collections::HashSet::with_capacity(batch.num_rows());
+    for i in 0..strs.len() {
+        if !strs.is_valid(i) {
+            continue;
+        }
+        let v = strs.value(i);
+        if !seen.insert(v) {
+            return Err(OmniError::manifest(format!(
+                "{}: duplicate source row for key '{}' (column '{}'); \
+                 callers must hand in a batch unique by `key_columns` \
+                 — see MR-957",
+                context, v, key_col_name
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::StringArray;
+    use arrow_schema::{DataType, Field, Schema};
+
+    fn batch_with_ids(ids: &[&str]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let col = Arc::new(StringArray::from(ids.to_vec())) as ArrayRef;
+        RecordBatch::try_new(schema, vec![col]).unwrap()
+    }
+
+    #[test]
+    fn check_batch_unique_by_keys_passes_when_all_unique() {
+        let batch = batch_with_ids(&["a", "b", "c"]);
+        check_batch_unique_by_keys(&batch, &["id".to_string()], "test").unwrap();
+    }
+
+    #[test]
+    fn check_batch_unique_by_keys_errors_on_duplicate_id() {
+        let batch = batch_with_ids(&["a", "b", "a"]);
+        let err =
+            check_batch_unique_by_keys(&batch, &["id".to_string()], "test").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate source row for key 'a'"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("MR-957"), "error should reference MR-957: {msg}");
+    }
+
+    #[test]
+    fn check_batch_unique_by_keys_rejects_multi_column_keys() {
+        let batch = batch_with_ids(&["a"]);
+        let err = check_batch_unique_by_keys(
+            &batch,
+            &["id".to_string(), "other".to_string()],
+            "test",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("single-column keys only"));
+    }
 }
