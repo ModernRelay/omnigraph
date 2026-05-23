@@ -6,19 +6,26 @@
 omnigraph init --schema ./schema.pg ./repo.omni
 omnigraph load --data ./data.jsonl --mode overwrite ./repo.omni
 omnigraph snapshot ./repo.omni --branch main --json
-omnigraph read --uri ./repo.omni --query ./queries.gq --name get_person --params '{"name":"Alice"}'
-omnigraph change --uri ./repo.omni --query ./queries.gq --name insert_person --params '{"name":"Mina","age":28}'
+omnigraph query  --uri ./repo.omni --query ./queries.gq --name get_person --params '{"name":"Alice"}'
+omnigraph mutate --uri ./repo.omni --query ./queries.gq --name insert_person --params '{"name":"Mina","age":28}'
 ```
+
+`omnigraph query` is the canonical read command (pairs with `POST /query`);
+`omnigraph mutate` is the canonical write command (pairs with `POST /mutate`).
+The previous names `omnigraph read` and `omnigraph change` keep working as
+visible aliases — invocations emit a one-line deprecation warning to stderr
+and otherwise behave identically. See [Deprecated names](#deprecated-names)
+for the migration table.
 
 For ad-hoc reads and mutations (REPLs, AI agents, one-off scripts), pass the
 GQ source inline with `-e` / `--query-string` instead of a file path:
 
 ```bash
-omnigraph read --uri ./repo.omni \
+omnigraph query --uri ./repo.omni \
   -e 'query find($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.age } }' \
   --params '{"name":"Alice"}'
 
-omnigraph change --uri ./repo.omni \
+omnigraph mutate --uri ./repo.omni \
   -e 'query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }' \
   --params '{"name":"Inline","age":42}'
 ```
@@ -52,7 +59,7 @@ omnigraph-server ./repo.omni --bind 127.0.0.1:8080
 Read through the HTTP API:
 
 ```bash
-omnigraph read \
+omnigraph query \
   --target http://127.0.0.1:8080 \
   --query ./queries.gq \
   --name get_person \
@@ -65,8 +72,8 @@ and configure the matching `bearer_token_env` in `omnigraph.yaml`.
 ## Runs, Policy, And Diagnostics
 
 ```bash
-omnigraph query lint --query ./queries.gq --schema ./schema.pg --json
-omnigraph query check --query ./queries.gq ./repo.omni --json
+omnigraph lint  --query ./queries.gq --schema ./schema.pg --json
+omnigraph check --query ./queries.gq ./repo.omni --json
 
 omnigraph schema plan --schema ./next.pg ./repo.omni --json
 omnigraph schema apply --schema ./next.pg ./repo.omni --json
@@ -116,3 +123,21 @@ The config file can also define:
 
 When policy is enabled, `schema apply` is authorized through the
 `schema_apply` action and is typically limited to admins on protected `main`.
+
+## Deprecated names
+
+The CLI was renamed to align with the HTTP server's canonical endpoint
+names (`POST /query`, `POST /mutate`) and the `query` keyword in the GQ
+language. The previous spellings keep working forever; invocations emit a
+one-line warning to stderr and otherwise behave identically.
+
+| Old (deprecated)         | New (canonical)     | Migration                                                |
+|--------------------------|---------------------|----------------------------------------------------------|
+| `omnigraph read`         | `omnigraph query`   | Same flags and behavior. `read` is a visible clap alias. |
+| `omnigraph change`       | `omnigraph mutate`  | Same flags and behavior. `change` is a visible clap alias. |
+| `omnigraph query lint`   | `omnigraph lint`    | Same flags. The argv-level shim rewrites `query lint` to `lint`. |
+| `omnigraph query check`  | `omnigraph check`   | `check` is a visible alias of `omnigraph lint`. |
+
+The `command:` field in `aliases.<name>` in `omnigraph.yaml` accepts both
+`read` / `change` (legacy) and `query` / `mutate` (canonical); the two
+spellings are interchangeable on the wire via serde aliases.

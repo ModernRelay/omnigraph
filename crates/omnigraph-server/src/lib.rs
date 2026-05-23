@@ -22,7 +22,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::{Extension, Path, Query, Request, State};
 use axum::http::StatusCode;
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, HeaderName, HeaderValue};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -73,10 +73,13 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
     paths(
         server_health,
         server_snapshot,
-        server_read,
+        // deprecated; the #[deprecated] attribute on the handler
+        // surfaces as `deprecated: true` on the OpenAPI operation.
+        #[allow(deprecated)] server_read,
         server_query,
         server_export,
-        server_change,
+        #[allow(deprecated)] server_change,
+        server_mutate,
         server_schema_apply,
         server_schema_get,
         server_ingest,
@@ -631,9 +634,21 @@ pub fn build_app(state: AppState) -> Router {
     let protected = Router::new()
         .route("/snapshot", get(server_snapshot))
         .route("/export", post(server_export))
-        .route("/read", post(server_read))
+        // /read and /change are kept indefinitely for back-compat;
+        // their handlers carry #[deprecated] so the OpenAPI operation is
+        // flagged and their responses include RFC 9745 Deprecation +
+        // RFC 8288 Link headers. Suppress the call-site warning for the
+        // route registration itself.
+        .route("/read", post({
+            #[allow(deprecated)]
+            server_read
+        }))
         .route("/query", post(server_query))
-        .route("/change", post(server_change))
+        .route("/change", post({
+            #[allow(deprecated)]
+            server_change
+        }))
+        .route("/mutate", post(server_mutate))
         .route("/schema", get(server_schema_get))
         .route("/schema/apply", post(server_schema_apply))
         .route(
@@ -905,6 +920,21 @@ async fn server_snapshot(
     Ok(Json(snapshot_payload(&branch, &snapshot)))
 }
 
+/// Header values that flag a response as coming from a deprecated route
+/// (RFC 9745 / RFC 8288) and point at the canonical successor.
+fn deprecation_headers(successor_link: &'static str) -> [(HeaderName, HeaderValue); 2] {
+    [
+        (
+            HeaderName::from_static("deprecation"),
+            HeaderValue::from_static("true"),
+        ),
+        (
+            HeaderName::from_static("link"),
+            HeaderValue::from_static(successor_link),
+        ),
+    ]
+}
+
 #[utoipa::path(
     post,
     path = "/read",
@@ -912,25 +942,28 @@ async fn server_snapshot(
     operation_id = "read",
     request_body = ReadRequest,
     responses(
-        (status = 200, description = "Query results", body = ReadOutput),
+        (status = 200, description = "Query results (response includes `Deprecation: true` + `Link: </query>; rel=\"successor-version\"`)", body = ReadOutput),
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
-/// Execute a GQ read query.
+#[deprecated(note = "use POST /query instead; /read is kept indefinitely for byte-stable back-compat")]
+/// **Deprecated** — use [`POST /query`](#tag/queries/operation/query) instead.
 ///
-/// Runs the query in `query_source` against either a branch or a frozen
-/// snapshot (mutually exclusive). When `query_source` defines multiple named
-/// queries, pick one with `query_name`. `params` is a JSON object whose keys
-/// match the parameters declared by the query. Returns rows as a JSON array
-/// plus a `columns` list. Read-only.
+/// Execute a GQ read query. Behavior is unchanged from prior releases; the
+/// route is kept indefinitely for byte-stable back-compat. New integrations
+/// should target `POST /query`, which has clean field names (`query` /
+/// `name`) and a 400-on-mutation guard. Responses from this route include
+/// `Deprecation: true` and `Link: </query>; rel="successor-version"`
+/// headers per RFC 9745 / RFC 8288 so SDKs and proxies can surface the
+/// signal.
 async fn server_read(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
     Json(request): Json<ReadRequest>,
-) -> std::result::Result<Json<ReadOutput>, ApiError> {
+) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<ReadOutput>), ApiError> {
     if request.branch.is_some() && request.snapshot.is_some() {
         return Err(ApiError::bad_request(
             "read request may specify branch or snapshot, not both",
@@ -979,7 +1012,10 @@ async fn server_read(
         .await
         .map_err(ApiError::from_omni)?
     };
-    Ok(Json(api::read_output(selected_name, &target, result)))
+    Ok((
+        deprecation_headers("</query>; rel=\"successor-version\""),
+        Json(api::read_output(selected_name, &target, result)),
+    ))
 }
 
 #[utoipa::path(
@@ -1126,33 +1162,15 @@ async fn server_export(
         .into_response())
 }
 
-#[utoipa::path(
-    post,
-    path = "/change",
-    tag = "mutations",
-    operation_id = "change",
-    request_body = ChangeRequest,
-    responses(
-        (status = 200, description = "Mutation results", body = ChangeOutput),
-        (status = 400, description = "Bad request", body = ErrorOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "Merge conflict", body = ErrorOutput),
-        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// Apply a GQ mutation to a branch.
-///
-/// Writes to the named `branch` (defaults to `main`). Mutations are atomic
-/// per call and produce a new commit. Returns counts of nodes and edges
-/// affected. **Destructive**: on success the branch is updated; rejected
-/// mutations may still acquire locks briefly. Returns 409 on merge conflict.
-async fn server_change(
-    State(state): State<AppState>,
+/// Shared implementation behind `POST /mutate` (canonical) and
+/// `POST /change` (deprecated alias). Returns the bare `ChangeOutput`;
+/// each route handler wraps it (the alias also attaches Deprecation
+/// headers).
+async fn run_mutate(
+    state: AppState,
     actor: Option<Extension<AuthenticatedActor>>,
-    Json(request): Json<ChangeRequest>,
-) -> std::result::Result<Json<ChangeOutput>, ApiError> {
+    request: ChangeRequest,
+) -> std::result::Result<ChangeOutput, ApiError> {
     let branch = request.branch.unwrap_or_else(|| "main".to_string());
     let actor_arc = actor
         .as_ref()
@@ -1201,13 +1219,84 @@ async fn server_change(
         .await
         .map_err(ApiError::from_omni)?
     };
-    Ok(Json(ChangeOutput {
+    Ok(ChangeOutput {
         branch,
         query_name: selected_name,
         affected_nodes: result.affected_nodes,
         affected_edges: result.affected_edges,
         actor_id: actor_id.map(str::to_string),
-    }))
+    })
+}
+
+#[utoipa::path(
+    post,
+    path = "/change",
+    tag = "mutations",
+    operation_id = "change",
+    request_body = ChangeRequest,
+    responses(
+        (status = 200, description = "Mutation results (response includes `Deprecation: true` + `Link: </mutate>; rel=\"successor-version\"`)", body = ChangeOutput),
+        (status = 400, description = "Bad request", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 409, description = "Merge conflict", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+#[deprecated(note = "use POST /mutate instead; /change is kept indefinitely for back-compat")]
+/// **Deprecated** — use [`POST /mutate`](#tag/mutations/operation/mutate) instead.
+///
+/// Apply a GQ mutation to a branch. Behavior is unchanged; the route is
+/// kept indefinitely for back-compat. New integrations should target
+/// `POST /mutate`, which has identical semantics and a name that pairs
+/// cleanly with `POST /query`. Responses from this route include
+/// `Deprecation: true` and `Link: </mutate>; rel="successor-version"`
+/// headers per RFC 9745 / RFC 8288 so SDKs and proxies can surface the
+/// signal.
+async fn server_change(
+    State(state): State<AppState>,
+    actor: Option<Extension<AuthenticatedActor>>,
+    Json(request): Json<ChangeRequest>,
+) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<ChangeOutput>), ApiError> {
+    let output = run_mutate(state, actor, request).await?;
+    Ok((
+        deprecation_headers("</mutate>; rel=\"successor-version\""),
+        Json(output),
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/mutate",
+    tag = "mutations",
+    operation_id = "mutate",
+    request_body = ChangeRequest,
+    responses(
+        (status = 200, description = "Mutation results", body = ChangeOutput),
+        (status = 400, description = "Bad request", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 409, description = "Merge conflict", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Apply a GQ mutation to a branch (canonical mutation endpoint).
+///
+/// Writes to the named `branch` (defaults to `main`). Mutations are atomic
+/// per call and produce a new commit. Returns counts of nodes and edges
+/// affected. **Destructive**: on success the branch is updated; rejected
+/// mutations may still acquire locks briefly. Returns 409 on merge conflict.
+///
+/// Pairs with `POST /query` (read-only). The legacy `POST /change` route
+/// has identical semantics and is kept as a deprecated alias.
+async fn server_mutate(
+    State(state): State<AppState>,
+    actor: Option<Extension<AuthenticatedActor>>,
+    Json(request): Json<ChangeRequest>,
+) -> std::result::Result<Json<ChangeOutput>, ApiError> {
+    Ok(Json(run_mutate(state, actor, request).await?))
 }
 
 #[utoipa::path(

@@ -631,6 +631,131 @@ query list_people() {
     assert_eq!(stdout_string(&lint_output), stdout_string(&check_output));
 }
 
+/// `omnigraph lint` is the canonical top-level lint command after the
+/// query/mutate rename. `omnigraph query lint` and `omnigraph query check`
+/// are kept as deprecated argv shims (warning + rewrite). All three must
+/// produce identical stdout output.
+#[test]
+fn lint_top_level_matches_deprecated_query_lint_output() {
+    let temp = tempdir().unwrap();
+    let schema_path = temp.path().join("schema.pg");
+    let query_path = temp.path().join("queries.gq");
+    write_file(
+        &schema_path,
+        r#"
+node Person {
+    name: String
+}
+"#,
+    );
+    write_query_file(
+        &query_path,
+        r#"
+query list_people() {
+    match { $p: Person }
+    return { $p.name }
+}
+"#,
+    );
+
+    let canonical = output_success(
+        cli()
+            .arg("lint")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json"),
+    );
+    let deprecated_lint = output_success(
+        cli()
+            .arg("query")
+            .arg("lint")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json"),
+    );
+    let deprecated_check = output_success(
+        cli()
+            .arg("query")
+            .arg("check")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json"),
+    );
+
+    assert_eq!(stdout_string(&canonical), stdout_string(&deprecated_lint));
+    assert_eq!(stdout_string(&canonical), stdout_string(&deprecated_check));
+
+    // Canonical form must NOT emit the deprecation warning.
+    let canonical_stderr = String::from_utf8(canonical.stderr).unwrap();
+    assert!(
+        !canonical_stderr.contains("deprecated"),
+        "`omnigraph lint` is canonical and must not warn; got stderr: {canonical_stderr}"
+    );
+
+    // Deprecated forms MUST emit the one-line warning, pointing at the
+    // new top-level `omnigraph lint`.
+    let lint_stderr = String::from_utf8(deprecated_lint.stderr).unwrap();
+    assert!(
+        lint_stderr.contains("`omnigraph query lint` is deprecated")
+            && lint_stderr.contains("`omnigraph lint`"),
+        "expected deprecation warning pointing at `omnigraph lint`; got: {lint_stderr}"
+    );
+    let check_stderr = String::from_utf8(deprecated_check.stderr).unwrap();
+    assert!(
+        check_stderr.contains("`omnigraph query check` is deprecated")
+            && check_stderr.contains("`omnigraph lint`"),
+        "expected deprecation warning pointing at `omnigraph lint`; got: {check_stderr}"
+    );
+}
+
+/// `omnigraph read` and `omnigraph change` are kept as visible clap
+/// aliases for the new canonical `query` / `mutate` subcommands, plus an
+/// argv-level deprecation warning. The warning is emitted to stderr; the
+/// command otherwise behaves identically to the canonical form.
+#[test]
+fn deprecated_read_and_change_subcommands_emit_warnings() {
+    // Both subcommands require `--query`/`--query-string`/`--alias`, so
+    // invoking them with no args will exit non-zero. That's fine --
+    // we only care that the deprecation warning is printed before the
+    // argument-required error.
+    let output = cli().arg("read").output().unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("`omnigraph read` is deprecated")
+            && stderr.contains("`omnigraph query`"),
+        "expected `omnigraph read` deprecation warning; got: {stderr}"
+    );
+
+    let output = cli().arg("change").output().unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("`omnigraph change` is deprecated")
+            && stderr.contains("`omnigraph mutate`"),
+        "expected `omnigraph change` deprecation warning; got: {stderr}"
+    );
+
+    // Sanity check the inverse: the canonical names must NOT print the
+    // deprecation banner.
+    let output = cli().arg("query").arg("--help").output().unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("deprecated"),
+        "`omnigraph query` is canonical and must not warn; got: {stderr}"
+    );
+    let output = cli().arg("mutate").arg("--help").output().unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("deprecated"),
+        "`omnigraph mutate` is canonical and must not warn; got: {stderr}"
+    );
+}
+
 #[test]
 fn query_lint_can_use_local_repo_via_positional_uri() {
     let temp = tempdir().unwrap();

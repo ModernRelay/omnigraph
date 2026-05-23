@@ -312,8 +312,8 @@
         "tags": [
           "mutations"
         ],
-        "summary": "Apply a GQ mutation to a branch.",
-        "description": "Writes to the named `branch` (defaults to `main`). Mutations are atomic\nper call and produce a new commit. Returns counts of nodes and edges\naffected. **Destructive**: on success the branch is updated; rejected\nmutations may still acquire locks briefly. Returns 409 on merge conflict.",
+        "summary": "**Deprecated** — use [`POST /mutate`](#tag/mutations/operation/mutate) instead.",
+        "description": "Apply a GQ mutation to a branch. Behavior is unchanged; the route is\nkept indefinitely for back-compat. New integrations should target\n`POST /mutate`, which has identical semantics and a name that pairs\ncleanly with `POST /query`. Responses from this route include\n`Deprecation: true` and `Link: </mutate>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the\nsignal.",
         "operationId": "change",
         "requestBody": {
           "content": {
@@ -327,7 +327,7 @@
         },
         "responses": {
           "200": {
-            "description": "Mutation results",
+            "description": "Mutation results (response includes `Deprecation: true` + `Link: </mutate>; rel=\"successor-version\"`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -387,6 +387,7 @@
             }
           }
         },
+        "deprecated": true,
         "security": [
           {
             "bearer_token": []
@@ -684,6 +685,93 @@
         ]
       }
     },
+    "/mutate": {
+      "post": {
+        "tags": [
+          "mutations"
+        ],
+        "summary": "Apply a GQ mutation to a branch (canonical mutation endpoint).",
+        "description": "Writes to the named `branch` (defaults to `main`). Mutations are atomic\nper call and produce a new commit. Returns counts of nodes and edges\naffected. **Destructive**: on success the branch is updated; rejected\nmutations may still acquire locks briefly. Returns 409 on merge conflict.\n\nPairs with `POST /query` (read-only). The legacy `POST /change` route\nhas identical semantics and is kept as a deprecated alias.",
+        "operationId": "mutate",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Mutation results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Merge conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/query": {
       "post": {
         "tags": [
@@ -756,8 +844,8 @@
         "tags": [
           "queries"
         ],
-        "summary": "Execute a GQ read query.",
-        "description": "Runs the query in `query_source` against either a branch or a frozen\nsnapshot (mutually exclusive). When `query_source` defines multiple named\nqueries, pick one with `query_name`. `params` is a JSON object whose keys\nmatch the parameters declared by the query. Returns rows as a JSON array\nplus a `columns` list. Read-only.",
+        "summary": "**Deprecated** — use [`POST /query`](#tag/queries/operation/query) instead.",
+        "description": "Execute a GQ read query. Behavior is unchanged from prior releases; the\nroute is kept indefinitely for byte-stable back-compat. New integrations\nshould target `POST /query`, which has clean field names (`query` /\n`name`) and a 400-on-mutation guard. Responses from this route include\n`Deprecation: true` and `Link: </query>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the\nsignal.",
         "operationId": "read",
         "requestBody": {
           "content": {
@@ -771,7 +859,7 @@
         },
         "responses": {
           "200": {
-            "description": "Query results",
+            "description": "Query results (response includes `Deprecation: true` + `Link: </query>; rel=\"successor-version\"`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -811,6 +899,7 @@
             }
           }
         },
+        "deprecated": true,
         "security": [
           {
             "bearer_token": []

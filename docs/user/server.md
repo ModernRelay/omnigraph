@@ -9,10 +9,11 @@ Axum 0.8 + tokio + utoipa-generated OpenAPI. Single repo per process; deploy mul
 | GET | `/healthz` | none | — | `server_health` |
 | GET | `/openapi.json` | none | — | `server_openapi` (strips security if auth disabled) |
 | GET | `/snapshot?branch=` | bearer + `read` | snapshot of branch | `server_snapshot` |
-| POST | `/read` | bearer + `read` | run named query (legacy field names `query_source`/`query_name`) | `server_read` |
-| POST | `/query` | bearer + `read` | run inline read query (clean field names `query`/`name`; mutations → 400) | `server_query` |
+| POST | `/query` | bearer + `read` | run inline read query (canonical; clean field names `query`/`name`; mutations → 400) | `server_query` |
+| POST | `/read` | bearer + `read` | **deprecated** alias of `/query` for legacy clients (legacy field names `query_source`/`query_name`, byte-stable response); response carries `Deprecation: true` + `Link: </query>; rel="successor-version"` | `server_read` |
 | POST | `/export` | bearer + `export` | NDJSON stream | `server_export` |
-| POST | `/change` | bearer + `change` | mutation (`query`/`name`; accepts legacy `query_source`/`query_name` as serde aliases) | `server_change` |
+| POST | `/mutate` | bearer + `change` | mutation query (canonical; `query`/`name`; accepts legacy `query_source`/`query_name` as serde aliases) | `server_mutate` |
+| POST | `/change` | bearer + `change` | **deprecated** alias of `/mutate` for legacy clients; response carries `Deprecation: true` + `Link: </mutate>; rel="successor-version"` | `server_change` |
 | GET | `/schema` | bearer + `read` | get current `.pg` source | `server_schema_get` |
 | POST | `/schema/apply` | bearer + `schema_apply` (target=`main`) | migrate | `server_schema_apply` |
 | POST | `/ingest` | bearer + `branch_create` (if new) + `change` | bulk load | `server_ingest` (32 MB body limit) |
@@ -41,13 +42,33 @@ request body uses clean field names that match the CLI `-e` flag and the GQ
 
 Response shape is identical to `/read` (`ReadOutput`). If the inline source
 contains mutations (`insert` / `update` / `delete`), the request is rejected
-with HTTP 400 and an error pointing the caller at `POST /change` — the
+with HTTP 400 and an error pointing the caller at `POST /mutate` — the
 read-only contract is enforced at the URL.
 
-`POST /change` accepts the same clean field names (`query`, `name`); the
-legacy field names `query_source` and `query_name` continue to deserialize as
-serde aliases so existing clients keep working without changes. `POST /read`
-is byte-stable and unchanged.
+`POST /mutate` is the canonical mutation endpoint. It accepts the same clean
+field names (`query`, `name`); the legacy field names `query_source` and
+`query_name` continue to deserialize as serde aliases so existing clients keep
+working without changes.
+
+## Deprecated names (`/read`, `/change`)
+
+`POST /read` and `POST /change` are kept for back-compat indefinitely — they
+are byte-stable on the request side and otherwise behave identically to
+`/query` / `/mutate`. They are flagged as deprecated through three independent
+channels:
+
+- **OpenAPI**: the operations carry `deprecated: true` in `openapi.json`, so
+  every OpenAPI codegen (typescript-fetch, openapi-generator, oapi-codegen,
+  …) emits a `@deprecated` marker on the generated SDK method.
+- **Response headers (RFC 9745)**: every response carries `Deprecation: true`.
+- **Response headers (RFC 8288)**: every response carries a `Link` header
+  pointing at the canonical successor:
+  `Link: </query>; rel="successor-version"` for `/read`, and
+  `Link: </mutate>; rel="successor-version"` for `/change`. SDKs and HTTP
+  proxies can pick the successor up automatically.
+
+Migration is purely cosmetic on the client side — swap the URL path, leave
+the request body and response handling alone.
 
 ## Streaming
 
@@ -61,8 +82,8 @@ Uniform `ErrorOutput { error, code?, merge_conflicts[], manifest_conflict? }` wi
 caller's pre-write view of one table's manifest version was stale.
 `ManifestConflictOutput { table_key, expected, actual }` tells the client
 which table to refresh and retry. This is the conflict shape produced by
-concurrent `/change` or `/ingest` calls landing the same `(table, branch)`
-race.
+concurrent `/mutate` (or its `/change` alias) or `/ingest` calls landing
+the same `(table, branch)` race.
 
 HTTP status codes used: 200, 400, 401, 403, 404, 409, 429, 500.
 
@@ -88,10 +109,11 @@ actors are unaffected.
 Cedar policy authorization runs **before** admission accounting so
 denied requests don't consume admission slots.
 
-Today admission gates every mutating handler: `/change`, `/ingest`,
-`/branches/{create,delete,merge}`, and `/schema/apply`. Read-only
-endpoints (`/snapshot`, `/read`, `/export`, `/branches` GET, `/commits`,
-`/schema` GET) are not admission-gated.
+Today admission gates every mutating handler: `/mutate` (and its
+deprecated alias `/change`), `/ingest`, `/branches/{create,delete,merge}`,
+and `/schema/apply`. Read-only endpoints (`/snapshot`, `/query`, `/read`,
+`/export`, `/branches` GET, `/commits`, `/schema` GET) are not
+admission-gated.
 
 ## Body limits
 
@@ -120,8 +142,9 @@ See [deployment.md](deployment.md) for token-source operational details.
 ## Not implemented (by design or "TBD")
 
 - CORS — not configured; add `tower_http::cors` if needed.
-- Rate limiting — per-actor admission control gates `/change`, `/ingest`,
-  `/branches/{create,delete,merge}`, `/schema/apply` (see "Per-actor
+- Rate limiting — per-actor admission control gates `/mutate` (alias
+  `/change`), `/ingest`, `/branches/{create,delete,merge}`,
+  `/schema/apply` (see "Per-actor
   admission control" above). No global rate limiter is configured;
   add `tower_http::limit` if a graph-wide cap is needed.
 - Pagination — none (commits/branches return everything; export streams).

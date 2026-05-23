@@ -80,7 +80,16 @@ pub struct PolicySettings {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AliasCommand {
+    /// Read alias (canonical: `query`). The legacy spelling `read` is
+    /// kept as the variant name for back-compat with serialized configs
+    /// and external SDK callers; `query` is accepted on the wire via the
+    /// serde alias.
+    #[serde(alias = "query")]
     Read,
+    /// Mutation alias (canonical: `mutate`). The legacy spelling `change`
+    /// is kept as the variant name for back-compat; `mutate` is accepted
+    /// on the wire via the serde alias.
+    #[serde(alias = "mutate")]
     Change,
 }
 

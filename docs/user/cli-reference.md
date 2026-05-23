@@ -11,15 +11,15 @@ A reference for the `omnigraph` binary's command surface and `omnigraph.yaml` sc
 | `init` | `--schema <pg>` → initialize a repo (also scaffolds `omnigraph.yaml` if missing) |
 | `load` | bulk load a branch (`--mode overwrite\|append\|merge`) |
 | `ingest` | branch-creating transactional load (`--from <base>`) |
-| `read` | run named query; source via `--query <path>`, `-e`/`--query-string <GQ>`, or `--alias <name>` (exactly one) |
-| `change` | run mutation query; same `--query` / `-e` / `--alias` mutual-exclusion as `read` |
+| `query` (alias: `read`) | run named read query; source via `--query <path>`, `-e`/`--query-string <GQ>`, or `--alias <name>` (exactly one). `read` is the deprecated previous name and prints a one-line warning to stderr |
+| `mutate` (alias: `change`) | run mutation query; same `--query` / `-e` / `--alias` mutual-exclusion as `query`. `change` is the deprecated previous name and prints a one-line warning to stderr |
 | `snapshot` | print current snapshot (per-table version + row count) |
 | `export` | dump to JSONL on stdout (`--type T`, `--table K` filters) |
 | `branch create \| list \| delete \| merge` | branching ops |
 | `commit list \| show` | inspect commit graph |
 | `run list \| show \| publish \| abort` | transactional run ops |
 | `schema plan \| apply \| show (alias: get)` | migrations |
-| `query lint \| check` | offline / repo-backed validation |
+| `lint` (alias: `check`) | offline / repo-backed query validation. Replaces `query lint` / `query check`, which are kept as deprecated argv-level shims that print a one-line warning and rewrite to `omnigraph lint` |
 | `optimize` | non-destructive Lance compaction |
 | `cleanup --keep N --older-than 7d --confirm` | destructive version GC |
 | `embed` | offline JSONL embedding pipeline |
@@ -49,7 +49,10 @@ auth:
   env_file: ./.env.omni
 aliases:
   <alias>:
-    command: read|change
+    # accepted values: `read` / `query` (read alias), `change` / `mutate`
+    # (write alias). `query` and `mutate` are recommended; `read` and
+    # `change` remain accepted forever for back-compat.
+    command: read|change|query|mutate
     query: <path-to-.gq>
     name: <query-name>
     args: [<positional-name>, …]
@@ -60,7 +63,7 @@ policy:
   file: ./policy.yaml
 ```
 
-## Output formats (read command)
+## Output formats (`query` command, alias: `read`)
 
 - `json` — pretty-printed object with metadata + rows
 - `jsonl` — one metadata line then one JSON object per row

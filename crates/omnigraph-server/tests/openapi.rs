@@ -162,6 +162,7 @@ const EXPECTED_PATHS: &[&str] = &[
     "/query",
     "/export",
     "/change",
+    "/mutate",
     "/schema",
     "/schema/apply",
     "/ingest",
@@ -226,6 +227,64 @@ fn openapi_export_is_post() {
 fn openapi_change_is_post() {
     let doc = openapi_json();
     assert!(doc["paths"]["/change"]["post"].is_object());
+}
+
+#[test]
+fn openapi_mutate_is_post() {
+    let doc = openapi_json();
+    assert!(doc["paths"]["/mutate"]["post"].is_object());
+}
+
+// Deprecation flagging — `/read` and `/change` are kept indefinitely for
+// back-compat but are flagged so OpenAPI codegens (typescript-fetch,
+// openapi-generator, oapi-codegen, etc.) emit @deprecated on the generated
+// SDK methods. The canonical successors `/query` and `/mutate` are not
+// flagged. See `deprecation_headers` in `omnigraph-server/src/lib.rs` for
+// the matching runtime signal (RFC 9745 + RFC 8288 headers).
+#[test]
+fn openapi_read_is_deprecated() {
+    let doc = openapi_json();
+    assert_eq!(
+        doc["paths"]["/read"]["post"]["deprecated"],
+        serde_json::Value::Bool(true),
+        "/read must be flagged deprecated in OpenAPI; use /query instead"
+    );
+}
+
+#[test]
+fn openapi_change_is_deprecated() {
+    let doc = openapi_json();
+    assert_eq!(
+        doc["paths"]["/change"]["post"]["deprecated"],
+        serde_json::Value::Bool(true),
+        "/change must be flagged deprecated in OpenAPI; use /mutate instead"
+    );
+}
+
+#[test]
+fn openapi_query_is_not_deprecated() {
+    let doc = openapi_json();
+    let deprecated = doc["paths"]["/query"]["post"]
+        .get("deprecated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    assert!(
+        !deprecated,
+        "/query is the canonical read endpoint and must not be deprecated"
+    );
+}
+
+#[test]
+fn openapi_mutate_is_not_deprecated() {
+    let doc = openapi_json();
+    let deprecated = doc["paths"]["/mutate"]["post"]
+        .get("deprecated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    assert!(
+        !deprecated,
+        "/mutate is the canonical mutation endpoint and must not be deprecated"
+    );
 }
 
 #[test]

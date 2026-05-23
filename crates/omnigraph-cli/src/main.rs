@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
@@ -119,10 +120,25 @@ enum Command {
         #[command(subcommand)]
         command: SchemaCommand,
     },
-    /// Query validation and linting
-    Query {
-        #[command(subcommand)]
-        command: QueryCommand,
+    /// Validate queries against a schema (offline) or repo (repo-backed).
+    ///
+    /// Replaces `omnigraph query lint` / `omnigraph query check`, which
+    /// are kept as deprecated argv-level shims (a one-line warning is
+    /// printed and the invocation is rewritten to `omnigraph lint`).
+    #[command(visible_alias = "check")]
+    Lint {
+        /// Repo URI
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        query: PathBuf,
+        #[arg(long)]
+        schema: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
     },
     /// Show repo snapshot
     Snapshot {
@@ -159,8 +175,13 @@ enum Command {
         #[command(subcommand)]
         command: CommitCommand,
     },
-    /// Execute a read query against a branch or snapshot
-    Read {
+    /// Execute a read query against a branch or snapshot.
+    ///
+    /// Canonical read endpoint. The previous name `omnigraph read` is
+    /// kept as a visible alias and prints a one-line deprecation warning
+    /// when used. Pairs with `omnigraph mutate` on the write side.
+    #[command(visible_alias = "read")]
+    Query {
         /// Repo URI
         #[arg(long)]
         uri: Option<String>,
@@ -192,8 +213,13 @@ enum Command {
         #[arg()]
         alias_args: Vec<String>,
     },
-    /// Execute a graph change query against a branch
-    Change {
+    /// Execute a graph mutation query against a branch.
+    ///
+    /// Canonical mutation endpoint. The previous name `omnigraph change`
+    /// is kept as a visible alias and prints a one-line deprecation
+    /// warning when used. Pairs with `omnigraph query` on the read side.
+    #[command(visible_alias = "change")]
+    Mutate {
         /// Repo URI
         #[arg(long)]
         uri: Option<String>,
@@ -373,26 +399,6 @@ enum SchemaCommand {
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum QueryCommand {
-    /// Validate queries and report higher-level drift warnings
-    #[command(visible_alias = "check")]
-    Lint {
-        /// Repo URI
-        uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
-        query: PathBuf,
-        #[arg(long)]
-        schema: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
@@ -1703,10 +1709,50 @@ async fn execute_export_remote_to_writer<W: Write>(
     Ok(())
 }
 
+/// Rewrite deprecated CLI invocations into their canonical form.
+///
+/// The current rename pass moves three subcommands:
+///   - `omnigraph read`        -> `omnigraph query`  (visible_alias handles parsing; we just warn)
+///   - `omnigraph change`      -> `omnigraph mutate` (visible_alias handles parsing; we just warn)
+///   - `omnigraph query lint`  -> `omnigraph lint`   (rewrite required; `query` is now the read-runner)
+///   - `omnigraph query check` -> `omnigraph lint`   (`check` is still a visible alias on `lint`)
+///
+/// Returns the (possibly rewritten) argv that clap should parse.
+fn rewrite_deprecated_argv(args: Vec<OsString>) -> Vec<OsString> {
+    if args.len() >= 3 {
+        let sub = args[1].to_str();
+        let sub2 = args[2].to_str();
+        if sub == Some("query") && matches!(sub2, Some("lint") | Some("check")) {
+            let suffix = sub2.unwrap();
+            eprintln!(
+                "warning: `omnigraph query {suffix}` is deprecated; use `omnigraph lint` (alias: `omnigraph check`) instead"
+            );
+            // Drop the leading `query` token, leaving e.g. `lint --query ./foo.gq`.
+            let mut out = Vec::with_capacity(args.len() - 1);
+            out.push(args[0].clone());
+            out.extend(args[2..].iter().cloned());
+            return out;
+        }
+    }
+    if let Some(sub) = args.get(1).and_then(|s| s.to_str()) {
+        match sub {
+            "read" => eprintln!(
+                "warning: `omnigraph read` is deprecated; use `omnigraph query` instead"
+            ),
+            "change" => eprintln!(
+                "warning: `omnigraph change` is deprecated; use `omnigraph mutate` instead"
+            ),
+            _ => {}
+        }
+    }
+    args
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
     let cli = {
+        let raw_args = rewrite_deprecated_argv(std::env::args_os().collect());
         let matches = Cli::command()
             .arg(
                 Arg::new("version")
@@ -1715,7 +1761,7 @@ async fn main() -> Result<()> {
                     .action(ArgAction::Version)
                     .help("Print version"),
             )
-            .get_matches();
+            .get_matches_from(raw_args);
         Cli::from_arg_matches(&matches)?
     };
     let http_client = build_http_client()?;
@@ -2172,22 +2218,20 @@ async fn main() -> Result<()> {
                 }
             }
         },
-        Command::Query { command } => match command {
-            QueryCommand::Lint {
-                uri,
-                target,
-                config,
-                query,
-                schema,
-                json,
-            } => {
-                let config = load_cli_config(config.as_ref())?;
-                let output =
-                    execute_query_lint(&config, uri, target.as_deref(), schema.as_ref(), &query)
-                        .await?;
-                finish_query_lint(&output, json)?;
-            }
-        },
+        Command::Lint {
+            uri,
+            target,
+            config,
+            query,
+            schema,
+            json,
+        } => {
+            let config = load_cli_config(config.as_ref())?;
+            let output =
+                execute_query_lint(&config, uri, target.as_deref(), schema.as_ref(), &query)
+                    .await?;
+            finish_query_lint(&output, json)?;
+        }
         Command::Snapshot {
             uri,
             target,
@@ -2257,7 +2301,7 @@ async fn main() -> Result<()> {
                     .await?;
             }
         }
-        Command::Read {
+        Command::Query {
             uri,
             legacy_uri,
             target,
@@ -2344,7 +2388,7 @@ async fn main() -> Result<()> {
             );
             print_read_output(&output, format, &config)?;
         }
-        Command::Change {
+        Command::Mutate {
             uri,
             legacy_uri,
             target,

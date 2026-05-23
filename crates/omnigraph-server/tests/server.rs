@@ -2066,6 +2066,163 @@ async fn query_endpoint_rejects_mutation_with_400() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn mutate_endpoint_runs_inline_mutation() {
+    // Canonical mutation endpoint. Pairs with `/query` on the read side.
+    // Same wire shape as `/change`, no deprecation signal.
+    let (_temp, app) = app_for_loaded_repo().await;
+
+    let request = json!({
+        "query": MUTATION_QUERIES,
+        "name": "insert_person",
+        "params": { "name": "Mutie", "age": 30 },
+        "branch": "main",
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/mutate")
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // Canonical route is NOT deprecated; no Deprecation header expected.
+    assert!(
+        response.headers().get("deprecation").is_none(),
+        "POST /mutate must not advertise itself as deprecated"
+    );
+    let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(body["affected_nodes"], 1);
+    assert_eq!(body["query_name"], "insert_person");
+    assert_eq!(body["branch"], "main");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn change_endpoint_emits_deprecation_headers() {
+    // `/change` is kept indefinitely for back-compat but flagged at runtime
+    // per RFC 9745 (`Deprecation: true`) + RFC 8288 (`Link: </mutate>;
+    // rel="successor-version"`). The OpenAPI side is covered by
+    // `openapi_change_is_deprecated` in tests/openapi.rs.
+    let (_temp, app) = app_for_loaded_repo().await;
+
+    let request = json!({
+        "query": MUTATION_QUERIES,
+        "name": "insert_person",
+        "params": { "name": "Legacyer", "age": 33 },
+        "branch": "main",
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/change")
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("deprecation")
+            .and_then(|v| v.to_str().ok()),
+        Some("true"),
+        "POST /change must advertise `Deprecation: true` (RFC 9745)"
+    );
+    assert_eq!(
+        response.headers().get("link").and_then(|v| v.to_str().ok()),
+        Some("</mutate>; rel=\"successor-version\""),
+        "POST /change must point at /mutate via `Link` rel=successor-version (RFC 8288)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn read_endpoint_emits_deprecation_headers() {
+    // `/read` is kept indefinitely for byte-stable back-compat but flagged
+    // at runtime per RFC 9745 + RFC 8288. Successor is `/query`.
+    let (_temp, app) = app_for_loaded_repo().await;
+
+    let request = ReadRequest {
+        query_source: fs::read_to_string(fixture("test.gq")).unwrap(),
+        query_name: Some("get_person".to_string()),
+        params: Some(json!({ "name": "Alice" })),
+        branch: Some("main".to_string()),
+        snapshot: None,
+    };
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/read")
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("deprecation")
+            .and_then(|v| v.to_str().ok()),
+        Some("true"),
+        "POST /read must advertise `Deprecation: true` (RFC 9745)"
+    );
+    assert_eq!(
+        response.headers().get("link").and_then(|v| v.to_str().ok()),
+        Some("</query>; rel=\"successor-version\""),
+        "POST /read must point at /query via `Link` rel=successor-version (RFC 8288)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_endpoint_does_not_emit_deprecation_headers() {
+    // Sanity check the inverse: the canonical `/query` endpoint must not
+    // carry deprecation signaling, so SDK codegens don't propagate a
+    // bogus `@deprecated` marker.
+    let (_temp, app) = app_for_loaded_repo().await;
+
+    let request = QueryRequest {
+        query: fs::read_to_string(fixture("test.gq")).unwrap(),
+        name: Some("get_person".to_string()),
+        params: Some(json!({ "name": "Alice" })),
+        branch: Some("main".to_string()),
+        snapshot: None,
+    };
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/query")
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers().get("deprecation").is_none(),
+        "POST /query is canonical and must not advertise itself as deprecated"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn change_endpoint_accepts_legacy_field_names() {
     // The canonical wire field names on /change are `query` and `name`, but
     // serde aliases keep the legacy `query_source`/`query_name` payload
