@@ -93,7 +93,12 @@ jobs:
             cargo publish -p "$crate" --locked
           }
 
+          # Order matters: each crate must precede anything that depends on it.
+          # omnigraph-compiler and omnigraph-policy have no internal deps;
+          # omnigraph-engine depends on both; server depends on engine + the
+          # two leaf crates; cli depends on everything.
           publish_if_new omnigraph-compiler
+          publish_if_new omnigraph-policy
           publish_if_new omnigraph-engine
           publish_if_new omnigraph-server
           publish_if_new omnigraph-cli
