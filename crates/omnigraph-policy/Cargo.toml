@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-policy"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2024"
 description = "Policy / authorization layer for Omnigraph — Cedar-backed PolicyEngine, PolicyChecker trait, ResourceScope enum."
 license = "MIT"
