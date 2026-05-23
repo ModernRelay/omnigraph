@@ -34,7 +34,7 @@ PY
 canonical=()
 while IFS= read -r line; do
   canonical+=("$line")
-done < <(find docs -type f -name '*.md' ! -path 'docs/releases/*' | sort)
+done < <(find docs -type f -name '*.md' ! -path 'docs/releases/*' ! -path 'docs/internal/*' | sort)
 if [[ -d docs/releases ]]; then
   canonical+=("docs/releases/")
 fi
