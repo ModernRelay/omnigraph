@@ -18,7 +18,7 @@ use omnigraph_compiler::{
 };
 use omnigraph_server::api::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
-    BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
+    BranchMergeOutput, BranchMergeRequest, ChangeOutput, CommitListOutput,
     CommitOutput, ErrorOutput, ExportRequest, IngestOutput, IngestRequest, ReadOutput, ReadRequest,
     SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput, SnapshotTableOutput,
     commit_output, ingest_output, read_output, schema_apply_output, snapshot_payload,
@@ -1636,6 +1636,33 @@ async fn execute_change(
     })
 }
 
+/// Build the JSON body for `POST /change` using the legacy wire shape.
+///
+/// `ChangeRequest`'s Rust field names are now `query` / `name` (the canonical
+/// wire shape going forward), but old `omnigraph-server` builds still require
+/// the legacy `query_source` / `query_name` keys on `/change`. Hand-rolling
+/// the JSON with the legacy names keeps a newer CLI talking to an older
+/// server intact -- the same byte-stability contract we apply to
+/// `execute_read_remote` against `/read`.
+fn legacy_change_request_body(
+    query_source: &str,
+    query_name: Option<&str>,
+    branch: &str,
+    params_json: Option<&Value>,
+) -> Value {
+    let mut body = serde_json::json!({
+        "query_source": query_source,
+        "branch": branch,
+    });
+    if let Some(name) = query_name {
+        body["query_name"] = Value::String(name.to_string());
+    }
+    if let Some(params) = params_json {
+        body["params"] = params.clone();
+    }
+    body
+}
+
 async fn execute_change_remote(
     client: &reqwest::Client,
     uri: &str,
@@ -1649,12 +1676,12 @@ async fn execute_change_remote(
         client,
         Method::POST,
         remote_url(uri, "/change"),
-        Some(serde_json::to_value(ChangeRequest {
-            query: query_source.to_string(),
-            name: query_name.map(ToOwned::to_owned),
-            params: params_json.cloned(),
-            branch: Some(branch.to_string()),
-        })?),
+        Some(legacy_change_request_body(
+            query_source,
+            query_name,
+            branch,
+            params_json,
+        )),
         bearer_token,
     )
     .await
@@ -2627,13 +2654,61 @@ mod tests {
     use std::fs;
 
     use super::{
-        DEFAULT_BEARER_TOKEN_ENV, apply_bearer_token, bearer_token_from_env_file, load_cli_config,
-        load_env_file_into_process, normalize_bearer_token, parse_env_assignment,
-        resolve_remote_bearer_token,
+        DEFAULT_BEARER_TOKEN_ENV, apply_bearer_token, bearer_token_from_env_file,
+        legacy_change_request_body, load_cli_config, load_env_file_into_process,
+        normalize_bearer_token, parse_env_assignment, resolve_remote_bearer_token,
     };
     use omnigraph_server::load_config;
     use reqwest::header::AUTHORIZATION;
+    use serde_json::json;
     use tempfile::tempdir;
+
+    #[test]
+    fn legacy_change_request_body_uses_legacy_field_names() {
+        // `execute_change_remote` hits `POST /change`, which old
+        // `omnigraph-server` builds deserialize as `ChangeRequest` with
+        // **required** `query_source` and optional `query_name` keys.
+        // Newer servers accept both spellings via serde alias, but a
+        // newer CLI must still emit the legacy keys on the wire so it
+        // can talk to an old server during a rolling upgrade.
+        let body = legacy_change_request_body(
+            "query insert_person($n: String) { insert Person { name: $n } }",
+            Some("insert_person"),
+            "main",
+            Some(&json!({ "n": "Alice" })),
+        );
+        assert_eq!(
+            body["query_source"].as_str(),
+            Some("query insert_person($n: String) { insert Person { name: $n } }"),
+        );
+        assert_eq!(body["query_name"].as_str(), Some("insert_person"));
+        assert_eq!(body["branch"].as_str(), Some("main"));
+        assert_eq!(body["params"]["n"].as_str(), Some("Alice"));
+        // Crucially, the **new** field names must NOT appear -- old
+        // servers would silently treat them as unknown fields and then
+        // fail on missing required `query_source`.
+        assert!(
+            body.get("query").is_none(),
+            "legacy /change body must not carry the renamed `query` key; got {body}"
+        );
+        assert!(
+            body.get("name").is_none(),
+            "legacy /change body must not carry the renamed `name` key; got {body}"
+        );
+    }
+
+    #[test]
+    fn legacy_change_request_body_omits_optional_fields_when_unset() {
+        let body = legacy_change_request_body(
+            "query find() { match { $p: Person } return { $p.name } }",
+            None,
+            "main",
+            None,
+        );
+        assert_eq!(body["branch"].as_str(), Some("main"));
+        assert!(body.get("query_name").is_none());
+        assert!(body.get("params").is_none());
+    }
 
     #[test]
     fn apply_bearer_token_adds_header_when_configured() {

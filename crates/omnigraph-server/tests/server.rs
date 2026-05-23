@@ -2060,8 +2060,8 @@ async fn query_endpoint_rejects_mutation_with_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let err = body["error"].as_str().unwrap_or_default();
     assert!(
-        err.contains("contains mutations") && err.contains("POST /change"),
-        "expected mutation-rejection message, got: {err}"
+        err.contains("contains mutations") && err.contains("POST /mutate"),
+        "expected mutation-rejection message pointing at canonical /mutate, got: {err}"
     );
 }
 

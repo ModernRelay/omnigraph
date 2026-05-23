@@ -1026,7 +1026,7 @@ async fn server_read(
     request_body = QueryRequest,
     responses(
         (status = 200, description = "Query results", body = ReadOutput),
-        (status = 400, description = "Bad request - also returned when the query body contains mutations; use POST /change for write queries", body = ErrorOutput),
+        (status = 400, description = "Bad request - also returned when the query body contains mutations; use POST /mutate (or its deprecated alias POST /change) for write queries", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
     ),
@@ -1037,9 +1037,10 @@ async fn server_read(
 /// Designed for ad-hoc exploration and AI-agent tool-use: short field
 /// names (`query`, `name`) match the CLI `-e` flag and the GQ `query`
 /// keyword. Mutations (`insert`/`update`/`delete`) are rejected with 400
-/// -- use `POST /change` for write queries. Otherwise behaves
-/// identically to `POST /read`: same target semantics (branch xor
-/// snapshot), same Cedar action (Read), same response shape.
+/// -- use `POST /mutate` (or its deprecated alias `POST /change`) for
+/// write queries. Otherwise behaves identically to `POST /read`: same
+/// target semantics (branch xor snapshot), same Cedar action (Read),
+/// same response shape.
 async fn server_query(
     State(state): State<AppState>,
     actor: Option<Extension<AuthenticatedActor>>,
@@ -1080,7 +1081,7 @@ async fn server_query(
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
     if !query_decl.mutations.is_empty() {
         return Err(ApiError::bad_request(format!(
-            "query '{}' contains mutations (insert/update/delete); use POST /change for write queries",
+            "query '{}' contains mutations (insert/update/delete); use POST /mutate for write queries",
             query_decl.name
         )));
     }

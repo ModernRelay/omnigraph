@@ -252,13 +252,15 @@ pub struct ReadRequest {
 ///
 /// Friendlier-named alternative to [`ReadRequest`] for ad-hoc reads and
 /// AI-agent integration. Mutations are rejected with 400 — use `POST
-/// /change` for write queries. Field names are deliberately short
-/// (`query`, `name`) to match the GQ keyword and the CLI `-e` flag.
+/// /mutate` (or its deprecated alias `POST /change`) for write queries.
+/// Field names are deliberately short (`query`, `name`) to match the GQ
+/// keyword and the CLI `-e` flag.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct QueryRequest {
     /// GQ read-query source. May declare one or more named queries; pick one
     /// with `name` when more than one is declared. Mutations
-    /// (`insert`/`update`/`delete`) get 400 — use `POST /change` instead.
+    /// (`insert`/`update`/`delete`) get 400 — use `POST /mutate` (or its
+    /// deprecated alias `POST /change`) instead.
     #[schema(example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}")]
     pub query: String,
     /// Name of the query to run when `query` declares multiple. Optional when

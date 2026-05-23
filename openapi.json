@@ -778,7 +778,7 @@
           "queries"
         ],
         "summary": "Execute an inline read query (friendlier-named alternative to `POST /read`).",
-        "description": "Designed for ad-hoc exploration and AI-agent tool-use: short field\nnames (`query`, `name`) match the CLI `-e` flag and the GQ `query`\nkeyword. Mutations (`insert`/`update`/`delete`) are rejected with 400\n-- use `POST /change` for write queries. Otherwise behaves\nidentically to `POST /read`: same target semantics (branch xor\nsnapshot), same Cedar action (Read), same response shape.",
+        "description": "Designed for ad-hoc exploration and AI-agent tool-use: short field\nnames (`query`, `name`) match the CLI `-e` flag and the GQ `query`\nkeyword. Mutations (`insert`/`update`/`delete`) are rejected with 400\n-- use `POST /mutate` (or its deprecated alias `POST /change`) for\nwrite queries. Otherwise behaves identically to `POST /read`: same\ntarget semantics (branch xor snapshot), same Cedar action (Read),\nsame response shape.",
         "operationId": "query",
         "requestBody": {
           "content": {
@@ -802,7 +802,7 @@
             }
           },
           "400": {
-            "description": "Bad request - also returned when the query body contains mutations; use POST /change for write queries",
+            "description": "Bad request - also returned when the query body contains mutations; use POST /mutate (or its deprecated alias POST /change) for write queries",
             "content": {
               "application/json": {
                 "schema": {
@@ -1611,7 +1611,7 @@
       },
       "QueryRequest": {
         "type": "object",
-        "description": "Inline read-query request for `POST /query`.\n\nFriendlier-named alternative to [`ReadRequest`] for ad-hoc reads and\nAI-agent integration. Mutations are rejected with 400 — use `POST\n/change` for write queries. Field names are deliberately short\n(`query`, `name`) to match the GQ keyword and the CLI `-e` flag.",
+        "description": "Inline read-query request for `POST /query`.\n\nFriendlier-named alternative to [`ReadRequest`] for ad-hoc reads and\nAI-agent integration. Mutations are rejected with 400 — use `POST\n/mutate` (or its deprecated alias `POST /change`) for write queries.\nField names are deliberately short (`query`, `name`) to match the GQ\nkeyword and the CLI `-e` flag.",
         "required": [
           "query"
         ],
@@ -1635,7 +1635,7 @@
           },
           "query": {
             "type": "string",
-            "description": "GQ read-query source. May declare one or more named queries; pick one\nwith `name` when more than one is declared. Mutations\n(`insert`/`update`/`delete`) get 400 — use `POST /change` instead.",
+            "description": "GQ read-query source. May declare one or more named queries; pick one\nwith `name` when more than one is declared. Mutations\n(`insert`/`update`/`delete`) get 400 — use `POST /mutate` (or its\ndeprecated alias `POST /change`) instead.",
             "example": "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
           },
           "snapshot": {

@@ -485,7 +485,7 @@ fn query_endpoint_documents_mutation_400() {
     let four_hundred = &doc["paths"]["/query"]["post"]["responses"]["400"];
     let description = four_hundred["description"].as_str().unwrap_or_default();
     assert!(
-        description.contains("mutations") || description.contains("POST /change"),
+        description.contains("mutations") || description.contains("POST /mutate"),
         "expected /query 400 response to mention mutation rejection, got: {description}"
     );
 }
