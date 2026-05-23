@@ -23,6 +23,7 @@ constraints. User-facing behavior should still be documented through
 | On-disk layout, manifest schema, URI behavior | [storage.md](../user/storage.md) |
 | Direct-publish writes, D2, staged writes, recovery sidecars | [runs.md](runs.md) |
 | Query execution, mutation execution, loader flow | [execution.md](execution.md) |
+| DataFusion: current state, passive wins, future improvements | [datafusion-future-improvements.md](datafusion-future-improvements.md) |
 | Index lifecycle and graph topology indexes | [indexes.md](../user/indexes.md) |
 | Branch and commit internals | [branches-commits.md](../user/branches-commits.md) |
 | Three-way merge implementation and conflicts | [merge.md](merge.md) |
