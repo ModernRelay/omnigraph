@@ -3,13 +3,13 @@ mod helpers;
 use std::fs;
 
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph_compiler::{build_schema_ir, schema_ir_pretty_json};
 use omnigraph_compiler::schema::parser::parse_schema;
+use omnigraph_compiler::{build_schema_ir, schema_ir_pretty_json};
 
 use helpers::*;
 
 #[tokio::test]
-async fn init_creates_repo() {
+async fn init_creates_graph() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
@@ -34,7 +34,7 @@ async fn init_creates_repo() {
 }
 
 #[tokio::test]
-async fn open_reads_existing_repo() {
+async fn open_reads_existing_graph() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
 
@@ -49,7 +49,7 @@ async fn open_reads_existing_repo() {
 }
 
 #[tokio::test]
-async fn open_bootstraps_legacy_schema_state_for_main_only_repo() {
+async fn open_bootstraps_legacy_schema_state_for_main_only_graph() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
@@ -64,7 +64,7 @@ async fn open_bootstraps_legacy_schema_state_for_main_only_repo() {
 }
 
 #[tokio::test]
-async fn open_rejects_legacy_repo_with_public_branch() {
+async fn open_rejects_legacy_graph_with_public_branch() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
@@ -74,7 +74,7 @@ async fn open_rejects_legacy_repo_with_public_branch() {
     fs::remove_file(dir.path().join("__schema_state.json")).unwrap();
 
     let err = match Omnigraph::open(uri).await {
-        Ok(_) => panic!("expected legacy repo with public branch to fail schema bootstrap"),
+        Ok(_) => panic!("expected legacy graph with public branch to fail schema bootstrap"),
         Err(err) => err,
     };
     assert!(

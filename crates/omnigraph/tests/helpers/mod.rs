@@ -44,7 +44,7 @@ query insert_person_and_friend($name: String, $age: I32, $friend: String) {
 }
 "#;
 
-/// Init a repo and load the standard test data.
+/// Init a graph and load the standard test data.
 pub async fn init_and_load(dir: &tempfile::TempDir) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
@@ -249,7 +249,7 @@ pub fn vector_and_string_params(
     map
 }
 
-pub fn s3_test_repo_uri(suite: &str) -> Option<String> {
+pub fn s3_test_graph_uri(suite: &str) -> Option<String> {
     let bucket = std::env::var("OMNIGRAPH_S3_TEST_BUCKET").ok()?;
     let prefix = std::env::var("OMNIGRAPH_S3_TEST_PREFIX")
         .ok()

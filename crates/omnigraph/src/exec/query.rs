@@ -1037,8 +1037,16 @@ async fn execute_node_scan(
     let table_key = format!("node:{}", type_name);
     let ds = snapshot.open(&table_key).await?;
 
-    // Build Lance SQL filter string from non-search IR filters
-    let filter_sql = build_lance_filter(filters, params);
+    // Lower the IR filters to a DataFusion `Expr` and apply via
+    // `Scanner::filter_expr` inside the configure closure. The string
+    // pushdown path (`build_lance_filter` → `scanner.filter(&str)`) is
+    // gone for node scans — structured Expr unlocks `CompOp::Contains`
+    // pushdown (via `array_has`) and lets DF 53's optimizer rules
+    // (vectorized IN-list, PhysicalExprSimplifier, CASE-NULL shortcut)
+    // reach our predicates. Other call sites that still take string SQL
+    // (hydrate_nodes for the Expand pushdown, count_rows, the mutation
+    // delete path) migrate in follow-up MRs.
+    let filter_expr = build_lance_filter_expr(filters, params);
 
     // Blob columns must be excluded from scan when a filter is present
     // (Lance bug: BlobsDescriptions + filter triggers a projection assertion).
@@ -1056,10 +1064,15 @@ async fn execute_node_scan(
     let batches = crate::table_store::TableStore::scan_stream_with(
         &ds,
         projection,
-        filter_sql.as_deref(),
+        None,
         None,
         false,
         |scanner| {
+            // Apply the structured IR filter via Lance's Expr pushdown.
+            if let Some(ref expr) = filter_expr {
+                scanner.filter_expr(expr.clone());
+            }
+
             // Apply FTS queries from hoisted search filters (search/fuzzy/match_text in match clause)
             for filter in filters {
                 if is_search_filter(filter) {
@@ -1286,6 +1299,125 @@ pub(super) fn literal_to_sql(lit: &Literal) -> String {
         Literal::DateTime(s) => format!("'{}'", s.replace('\'', "''")),
         Literal::List(_) => "NULL".to_string(), // Not supported in SQL pushdown
     }
+}
+
+// ---------------------------------------------------------------------------
+// Structured DataFusion-Expr pushdown
+//
+// Parallel to the `ir_*_to_sql` family above, these helpers lower the same
+// IR filter shapes to `datafusion::prelude::Expr` so we can call
+// `Scanner::filter_expr(Expr)` instead of `Scanner::filter(&str)`. The
+// structured form unlocks two things the string path could not express:
+//
+//   1. `CompOp::Contains` against list-typed columns (lowered to
+//      `array_has(col, value)` — requires the `nested_expressions`
+//      feature on the `datafusion` crate, enabled in the workspace).
+//   2. Optimizer rules in DataFusion 53 that act on `Expr` shapes
+//      (vectorized `IN`-list eq kernel, `PhysicalExprSimplifier`, the
+//      `CASE WHEN x THEN y ELSE NULL` shortcut, etc.).
+//
+// Search predicates (`is_search_filter`) are still handled separately via
+// `scanner.full_text_search(...)`, not via filter_expr — they stay None
+// here just like in `ir_filter_to_sql`. The `literal_to_sql` path remains
+// because the mutation/update layer (`exec/mutation.rs`) still produces
+// SQL strings for `Dataset::delete(&str)`; that migration is MR-A's
+// territory (Lance #6658 + delete two-phase).
+
+/// Convert IR filters to a single DataFusion `Expr` (AND-joined), or
+/// `None` if no filter is pushable.
+pub(super) fn build_lance_filter_expr(
+    filters: &[IRFilter],
+    params: &ParamMap,
+) -> Option<datafusion::prelude::Expr> {
+    use datafusion::logical_expr::Operator;
+    use datafusion::prelude::Expr;
+
+    let mut acc: Option<Expr> = None;
+    for f in filters {
+        let Some(e) = ir_filter_to_expr(f, params) else {
+            continue;
+        };
+        acc = Some(match acc {
+            None => e,
+            Some(prev) => Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr::new(
+                Box::new(prev),
+                Operator::And,
+                Box::new(e),
+            )),
+        });
+    }
+    acc
+}
+
+/// Convert a single IR filter to a DataFusion `Expr`. Returns `None` for
+/// search-mode filters (handled via `scanner.full_text_search`) or any
+/// expression shape we can't pushdown.
+pub(super) fn ir_filter_to_expr(
+    filter: &IRFilter,
+    params: &ParamMap,
+) -> Option<datafusion::prelude::Expr> {
+    use datafusion::functions_nested::expr_fn::array_has;
+
+    if is_search_filter(filter) {
+        return None;
+    }
+
+    // List-contains: `prop CONTAINS value` lowers to `array_has(prop, value)`.
+    // This is the case `ir_filter_to_sql` had to return None for ("Can't
+    // pushdown list contains"); with structured Expr it pushes down fine.
+    if matches!(filter.op, CompOp::Contains) {
+        let left = ir_expr_to_expr(&filter.left, params)?;
+        let right = ir_expr_to_expr(&filter.right, params)?;
+        return Some(array_has(left, right));
+    }
+
+    let left = ir_expr_to_expr(&filter.left, params)?;
+    let right = ir_expr_to_expr(&filter.right, params)?;
+    Some(match filter.op {
+        CompOp::Eq => left.eq(right),
+        CompOp::Ne => left.not_eq(right),
+        CompOp::Gt => left.gt(right),
+        CompOp::Lt => left.lt(right),
+        CompOp::Ge => left.gt_eq(right),
+        CompOp::Le => left.lt_eq(right),
+        CompOp::Contains => unreachable!("handled above"),
+    })
+}
+
+/// Convert an IR expression to a DataFusion `Expr`. Returns `None` for
+/// shapes we don't support in pushdown (search funcs, RRF, aggregates,
+/// variable refs that aren't a property access).
+pub(super) fn ir_expr_to_expr(
+    expr: &IRExpr,
+    params: &ParamMap,
+) -> Option<datafusion::prelude::Expr> {
+    use datafusion::prelude::{col, lit};
+    match expr {
+        IRExpr::PropAccess { property, .. } => Some(col(property)),
+        IRExpr::Literal(l) => literal_to_expr(l),
+        IRExpr::Param(name) => params.get(name).and_then(literal_to_expr),
+        _ => None,
+    }
+}
+
+/// Convert a Literal to a DataFusion `Expr`. Returns `None` for List
+/// (which the existing SQL path also can't pushdown — falls through to
+/// post-scan in-memory application).
+fn literal_to_expr(lit: &Literal) -> Option<datafusion::prelude::Expr> {
+    use datafusion::prelude::lit as df_lit;
+    Some(match lit {
+        Literal::Null => df_lit(datafusion::scalar::ScalarValue::Null),
+        Literal::String(s) => df_lit(s.clone()),
+        Literal::Integer(n) => df_lit(*n),
+        Literal::Float(f) => df_lit(*f),
+        Literal::Bool(b) => df_lit(*b),
+        // Date/DateTime stored as strings; pass through as string literals
+        // — Lance/DataFusion handles the comparison against typed columns
+        // via implicit cast, matching the existing string-SQL behavior.
+        Literal::Date(s) => df_lit(s.clone()),
+        Literal::DateTime(s) => df_lit(s.clone()),
+        Literal::List(_) => return None,
+    })
 }
 
 fn prefix_batch(batch: &RecordBatch, variable: &str) -> Result<RecordBatch> {

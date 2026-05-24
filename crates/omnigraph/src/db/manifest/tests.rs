@@ -1393,7 +1393,10 @@ async fn test_concurrent_publish_with_overlapping_expected_versions_one_succeeds
     // version (no duplicate version rows).
     let mc = ManifestCoordinator::open(uri).await.unwrap();
     let entry = mc.snapshot().entry("node:Person").unwrap().clone();
-    assert!(entry.table_version > 1, "Person should have advanced past v=1");
+    assert!(
+        entry.table_version > 1,
+        "Person should have advanced past v=1"
+    );
 }
 
 #[tokio::test]
@@ -1418,7 +1421,7 @@ async fn test_publish_migrates_pre_stamp_manifest_to_current_version() {
     let catalog = build_test_catalog();
     let mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
 
-    // Simulate a v1 (pre-stamp) repo by removing the schema-level stamp on disk.
+    // Simulate a v1 (pre-stamp) graph by removing the schema-level stamp on disk.
     {
         let mut ds = open_manifest_dataset(uri, None).await.unwrap();
         ds.update_schema_metadata([(
@@ -1449,7 +1452,7 @@ async fn test_publish_migrates_pre_stamp_manifest_to_current_version() {
     assert_eq!(
         super::migrations::read_stamp(&post),
         super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION,
-        "publish on a v1 repo should leave the manifest stamped at the current version",
+        "publish on a v1 graph should leave the manifest stamped at the current version",
     );
 
     // Manifest should still serve correctly post-migration.

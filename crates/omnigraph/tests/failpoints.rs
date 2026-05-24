@@ -66,7 +66,7 @@ async fn graph_publish_failpoint_triggers_before_commit_append() {
 
 // Atomic schema apply: schema apply writes staging files first, then commits
 // the manifest, then renames staging → final. Tests below inject crashes at
-// the two boundaries and assert that reopening the repo yields a consistent
+// the two boundaries and assert that reopening the graph yields a consistent
 // state.
 
 #[tokio::test]
@@ -303,14 +303,10 @@ async fn inline_delete_conflict_writes_sidecar_before_rejecting() {
     let person_uri = node_table_uri(&uri, "Person");
 
     {
-        let _pause_delete = ScopedFailPoint::new("mutation.delete_node_pre_primary_delete", "pause");
+        let _pause_delete =
+            ScopedFailPoint::new("mutation.delete_node_pre_primary_delete", "pause");
         let delete_params = helpers::params(&[("$name", "Alice")]);
-        let delete = db.mutate(
-            "main",
-            MUTATION_QUERIES,
-            "remove_person",
-            &delete_params,
-        );
+        let delete = db.mutate("main", MUTATION_QUERIES, "remove_person", &delete_params);
         tokio::pin!(delete);
 
         let mut concurrent_update_succeeded = false;
@@ -325,15 +321,18 @@ async fn inline_delete_conflict_writes_sidecar_before_rejecting() {
                 "set_age",
                 &mixed_params(&[("$name", "Bob")], &[("$age", 26)]),
             )
-                .await
-                .is_ok()
+            .await
+            .is_ok()
             {
                 concurrent_update_succeeded = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert!(concurrent_update_succeeded, "concurrent update must land while delete is paused");
+        assert!(
+            concurrent_update_succeeded,
+            "concurrent update must land while delete is paused"
+        );
         fail::remove("mutation.delete_node_pre_primary_delete");
 
         let err = delete.await.unwrap_err();
@@ -464,7 +463,7 @@ async fn recovery_rolls_forward_load_on_feature_branch() {
 
 #[tokio::test]
 async fn recovery_rolls_forward_ensure_indices_on_feature_branch() {
-    use lance_index::DatasetIndexExt;
+    use lance::index::DatasetIndexExt;
     use omnigraph::loader::{LoadMode, load_jsonl};
     use omnigraph::table_store::TableStore;
 
@@ -925,13 +924,13 @@ async fn ensure_indices_stage_btree_failure_leaves_existing_tables_writable() {
     .expect("Person mutation must succeed after the failed schema apply — existing tables are not drifted");
 }
 
-fn assert_no_staging_files(repo: &std::path::Path) {
+fn assert_no_staging_files(graph: &std::path::Path) {
     for name in [
         "_schema.pg.staging",
         "_schema.ir.json.staging",
         "__schema_state.json.staging",
     ] {
-        let path = repo.join(name);
+        let path = graph.join(name);
         assert!(
             !path.exists(),
             "staging file {} still exists after recovery",
@@ -1164,7 +1163,7 @@ edge WorksAt: Person -> Company
     // NEW schema (city column on Person, Tag node type) — not the old.
     // Without the schema-staging coordination, the schema-state
     // recovery would have deleted the staging files (because manifest
-    // hadn't advanced when it ran), leaving a corrupt repo with new-
+    // hadn't advanced when it ran), leaving a corrupt graph with new-
     // schema data on disk but old-schema catalog.
     let live_schema = std::fs::read_to_string(dir.path().join("_schema.pg")).unwrap();
     assert!(

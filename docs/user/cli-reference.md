@@ -8,7 +8,7 @@ A reference for the `omnigraph` binary's command surface and `omnigraph.yaml` sc
 
 | Command | Purpose |
 |---|---|
-| `init` | `--schema <pg>` → initialize a repo (also scaffolds `omnigraph.yaml` if missing) |
+| `init` | `--schema <pg>` → initialize a graph (also scaffolds `omnigraph.yaml` if missing) |
 | `load` | bulk load a branch (`--mode overwrite\|append\|merge`) |
 | `ingest` | branch-creating transactional load (`--from <base>`) |
 | `query` (alias: `read`) | run named read query; source via `--query <path>`, `-e`/`--query-string <GQ>`, or `--alias <name>` (exactly one). `read` is the deprecated previous name and prints a one-line warning to stderr |
@@ -19,7 +19,7 @@ A reference for the `omnigraph` binary's command surface and `omnigraph.yaml` sc
 | `commit list \| show` | inspect commit graph |
 | `run list \| show \| publish \| abort` | transactional run ops |
 | `schema plan \| apply \| show (alias: get)` | migrations |
-| `lint` (alias: `check`) | offline / repo-backed query validation. Replaces `query lint` / `query check`, which are kept as deprecated argv-level shims that print a one-line warning and rewrite to `omnigraph lint` |
+| `lint` (alias: `check`) | offline / graph-backed query validation. Replaces `query lint` / `query check`, which are kept as deprecated argv-level shims that print a one-line warning and rewrite to `omnigraph lint` |
 | `optimize` | non-destructive Lance compaction |
 | `cleanup --keep N --older-than 7d --confirm` | destructive version GC |
 | `embed` | offline JSONL embedding pipeline |

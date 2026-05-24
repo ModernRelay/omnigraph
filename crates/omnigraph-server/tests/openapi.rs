@@ -19,42 +19,42 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn repo_path(root: &Path) -> PathBuf {
+fn graph_path(root: &Path) -> PathBuf {
     root.join("openapi_test.omni")
 }
 
-async fn init_loaded_repo() -> tempfile::TempDir {
+async fn init_loaded_graph() -> tempfile::TempDir {
     let temp = tempfile::tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    fs::create_dir_all(&repo).unwrap();
+    let graph = graph_path(temp.path());
+    fs::create_dir_all(&graph).unwrap();
     let schema = fs::read_to_string(fixture("test.pg")).unwrap();
     let data = fs::read_to_string(fixture("test.jsonl")).unwrap();
-    Omnigraph::init(repo.to_str().unwrap(), &schema)
+    Omnigraph::init(graph.to_str().unwrap(), &schema)
         .await
         .unwrap();
-    let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let mut db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     load_jsonl(&mut db, &data, LoadMode::Overwrite)
         .await
         .unwrap();
     temp
 }
 
-async fn app_for_loaded_repo() -> (tempfile::TempDir, Router) {
-    let temp = init_loaded_repo().await;
-    let repo = repo_path(temp.path());
-    let state = AppState::open(repo.to_string_lossy().to_string())
+async fn app_for_loaded_graph() -> (tempfile::TempDir, Router) {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let state = AppState::open(graph.to_string_lossy().to_string())
         .await
         .unwrap();
     let app = build_app(state);
     (temp, app)
 }
 
-async fn app_for_loaded_repo_with_auth(token: &str) -> (tempfile::TempDir, Router) {
-    let temp = init_loaded_repo().await;
-    let repo = repo_path(temp.path());
-    let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+async fn app_for_loaded_graph_with_auth(token: &str) -> (tempfile::TempDir, Router) {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     let state = AppState::new_with_bearer_token(
-        repo.to_string_lossy().to_string(),
+        graph.to_string_lossy().to_string(),
         db,
         Some(token.to_string()),
     );
@@ -84,7 +84,7 @@ fn openapi_json() -> Value {
 
 #[tokio::test]
 async fn openapi_endpoint_returns_200_with_valid_json() {
-    let (_temp, app) = app_for_loaded_repo().await;
+    let (_temp, app) = app_for_loaded_graph().await;
     let request = Request::builder()
         .method(Method::GET)
         .uri("/openapi.json")
@@ -97,7 +97,7 @@ async fn openapi_endpoint_returns_200_with_valid_json() {
 
 #[tokio::test]
 async fn openapi_endpoint_returns_openapi_31_version() {
-    let (_temp, app) = app_for_loaded_repo().await;
+    let (_temp, app) = app_for_loaded_graph().await;
     let request = Request::builder()
         .method(Method::GET)
         .uri("/openapi.json")
@@ -113,11 +113,11 @@ async fn openapi_endpoint_returns_openapi_31_version() {
 
 #[tokio::test]
 async fn openapi_endpoint_does_not_require_auth() {
-    let temp = init_loaded_repo().await;
-    let repo = repo_path(temp.path());
-    let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     let state = AppState::new_with_bearer_token(
-        repo.to_string_lossy().to_string(),
+        graph.to_string_lossy().to_string(),
         db,
         Some("secret-token".to_string()),
     );
@@ -129,7 +129,11 @@ async fn openapi_endpoint_does_not_require_auth() {
         .body(Body::empty())
         .unwrap();
     let (status, _) = json_response(&app, request).await;
-    assert_eq!(status, StatusCode::OK, "/openapi.json should not require auth");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "/openapi.json should not require auth"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -739,10 +743,13 @@ fn branch_delete_has_branch_path_parameter() {
     let params = doc["paths"]["/branches/{branch}"]["delete"]["parameters"]
         .as_array()
         .unwrap();
-    let has_branch = params.iter().any(|p| {
-        p["name"].as_str() == Some("branch") && p["in"].as_str() == Some("path")
-    });
-    assert!(has_branch, "DELETE /branches/{{branch}} must have 'branch' path parameter");
+    let has_branch = params
+        .iter()
+        .any(|p| p["name"].as_str() == Some("branch") && p["in"].as_str() == Some("path"));
+    assert!(
+        has_branch,
+        "DELETE /branches/{{branch}} must have 'branch' path parameter"
+    );
 }
 
 #[test]
@@ -751,10 +758,13 @@ fn commit_show_has_commit_id_path_parameter() {
     let params = doc["paths"]["/commits/{commit_id}"]["get"]["parameters"]
         .as_array()
         .unwrap();
-    let has_commit_id = params.iter().any(|p| {
-        p["name"].as_str() == Some("commit_id") && p["in"].as_str() == Some("path")
-    });
-    assert!(has_commit_id, "GET /commits/{{commit_id}} must have 'commit_id' path parameter");
+    let has_commit_id = params
+        .iter()
+        .any(|p| p["name"].as_str() == Some("commit_id") && p["in"].as_str() == Some("path"));
+    assert!(
+        has_commit_id,
+        "GET /commits/{{commit_id}} must have 'commit_id' path parameter"
+    );
 }
 
 #[test]
@@ -763,10 +773,13 @@ fn snapshot_has_branch_query_parameter() {
     let params = doc["paths"]["/snapshot"]["get"]["parameters"]
         .as_array()
         .unwrap();
-    let has_branch = params.iter().any(|p| {
-        p["name"].as_str() == Some("branch") && p["in"].as_str() == Some("query")
-    });
-    assert!(has_branch, "GET /snapshot must have 'branch' query parameter");
+    let has_branch = params
+        .iter()
+        .any(|p| p["name"].as_str() == Some("branch") && p["in"].as_str() == Some("query"));
+    assert!(
+        has_branch,
+        "GET /snapshot must have 'branch' query parameter"
+    );
 }
 
 #[test]
@@ -775,10 +788,13 @@ fn commits_has_branch_query_parameter() {
     let params = doc["paths"]["/commits"]["get"]["parameters"]
         .as_array()
         .unwrap();
-    let has_branch = params.iter().any(|p| {
-        p["name"].as_str() == Some("branch") && p["in"].as_str() == Some("query")
-    });
-    assert!(has_branch, "GET /commits must have 'branch' query parameter");
+    let has_branch = params
+        .iter()
+        .any(|p| p["name"].as_str() == Some("branch") && p["in"].as_str() == Some("query"));
+    assert!(
+        has_branch,
+        "GET /commits must have 'branch' query parameter"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -854,8 +870,7 @@ fn error_responses_reference_error_output_schema() {
     ];
 
     for (path, method, status) in paths_with_errors {
-        let content =
-            &doc["paths"][path][method]["responses"][status]["content"];
+        let content = &doc["paths"][path][method]["responses"][status]["content"];
         let schema = &content["application/json"]["schema"];
         let ref_path = schema["$ref"].as_str().unwrap();
         assert!(
@@ -917,7 +932,7 @@ fn openapi_spec_round_trips_through_json() {
 
 #[tokio::test]
 async fn open_mode_spec_has_no_security_schemes() {
-    let (_temp, app) = app_for_loaded_repo().await;
+    let (_temp, app) = app_for_loaded_graph().await;
     let request = Request::builder()
         .method(Method::GET)
         .uri("/openapi.json")
@@ -933,7 +948,7 @@ async fn open_mode_spec_has_no_security_schemes() {
 
 #[tokio::test]
 async fn open_mode_spec_has_no_operation_security() {
-    let (_temp, app) = app_for_loaded_repo().await;
+    let (_temp, app) = app_for_loaded_graph().await;
     let request = Request::builder()
         .method(Method::GET)
         .uri("/openapi.json")
@@ -954,7 +969,7 @@ async fn open_mode_spec_has_no_operation_security() {
 
 #[tokio::test]
 async fn auth_mode_spec_includes_bearer_token_security_scheme() {
-    let (_temp, app) = app_for_loaded_repo_with_auth("secret").await;
+    let (_temp, app) = app_for_loaded_graph_with_auth("secret").await;
     let request = Request::builder()
         .method(Method::GET)
         .uri("/openapi.json")
@@ -968,7 +983,7 @@ async fn auth_mode_spec_includes_bearer_token_security_scheme() {
 
 #[tokio::test]
 async fn auth_mode_spec_has_security_on_protected_operations() {
-    let (_temp, app) = app_for_loaded_repo_with_auth("secret").await;
+    let (_temp, app) = app_for_loaded_graph_with_auth("secret").await;
     let request = Request::builder()
         .method(Method::GET)
         .uri("/openapi.json")
@@ -999,7 +1014,7 @@ async fn auth_mode_spec_has_security_on_protected_operations() {
 
 #[tokio::test]
 async fn auth_mode_spec_matches_static_generation() {
-    let (_temp, app) = app_for_loaded_repo_with_auth("secret").await;
+    let (_temp, app) = app_for_loaded_graph_with_auth("secret").await;
     let request = Request::builder()
         .method(Method::GET)
         .uri("/openapi.json")
@@ -1015,7 +1030,7 @@ async fn auth_mode_spec_matches_static_generation() {
 
 #[tokio::test]
 async fn auth_mode_healthz_still_has_no_security() {
-    let (_temp, app) = app_for_loaded_repo_with_auth("secret").await;
+    let (_temp, app) = app_for_loaded_graph_with_auth("secret").await;
     let request = Request::builder()
         .method(Method::GET)
         .uri("/openapi.json")
@@ -1031,8 +1046,7 @@ async fn auth_mode_healthz_still_has_no_security() {
 
 #[test]
 fn openapi_spec_is_up_to_date() {
-    let spec_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../openapi.json");
+    let spec_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../openapi.json");
 
     let generated = serde_json::to_string_pretty(&openapi_doc()).unwrap() + "\n";
 

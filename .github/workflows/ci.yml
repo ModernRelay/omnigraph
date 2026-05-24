@@ -291,6 +291,14 @@ jobs:
             . -> target
 
       - name: Start RustFS
+        # Pinned to 1.0.0-beta.3 (2026-05-14) — the last known-good tag.
+        # `rustfs/rustfs:latest` (1.0.0-beta.4, 2026-05-21) added a
+        # credentials-policy check that refuses to start when
+        # AWS_ACCESS_KEY_ID/SECRET_ACCESS_KEY are values it considers
+        # "default" (rustfsadmin/rustfsadmin in our case). Bumping to
+        # beta.4+ requires either rotating those creds to less-default
+        # values or setting RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS=true
+        # — deliberate work, not an emergency. Pin first; upgrade later.
         run: |
           docker rm -f rustfs >/dev/null 2>&1 || true
           docker run -d \
@@ -299,7 +307,7 @@ jobs:
             -p 9001:9001 \
             -e RUSTFS_ACCESS_KEY="${AWS_ACCESS_KEY_ID}" \
             -e RUSTFS_SECRET_KEY="${AWS_SECRET_ACCESS_KEY}" \
-            rustfs/rustfs:latest \
+            rustfs/rustfs:1.0.0-beta.3 \
             /data
 
       - name: Install AWS CLI

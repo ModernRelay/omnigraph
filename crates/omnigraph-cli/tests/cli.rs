@@ -1,6 +1,6 @@
 use std::fs;
 
-use lance_index::traits::DatasetIndexExt;
+use lance::index::DatasetIndexExt;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use serde_json::Value;
 use tempfile::tempdir;
@@ -48,9 +48,9 @@ cases:
     expect: deny
 "#;
 
-fn manifest_dataset_version(repo: &std::path::Path) -> u64 {
+fn manifest_dataset_version(graph: &std::path::Path) -> u64 {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
-        Omnigraph::open(repo.to_string_lossy().as_ref())
+        Omnigraph::open(graph.to_string_lossy().as_ref())
             .await
             .unwrap()
             .snapshot_of(ReadTarget::branch("main"))
@@ -67,7 +67,7 @@ fn write_policy_config_fixture(root: &std::path::Path) -> (std::path::PathBuf, s
         &config,
         r#"
 project:
-  name: policy-test-repo
+  name: policy-test-graph
 policy:
   file: ./policy.yaml
 "#,
@@ -221,26 +221,26 @@ fn embed_seed_preserves_non_entity_rows() {
 }
 
 #[test]
-fn init_creates_repo_successfully_on_missing_local_directory() {
+fn init_creates_graph_successfully_on_missing_local_directory() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let schema = fixture("test.pg");
 
-    let output = output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&repo));
+    let output = output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&graph));
     let stdout = stdout_string(&output);
 
     assert!(stdout.contains("initialized"));
-    assert!(repo.join("_schema.pg").exists());
-    assert!(repo.join("__manifest").exists());
+    assert!(graph.join("_schema.pg").exists());
+    assert!(graph.join("__manifest").exists());
     assert!(temp.path().join("omnigraph.yaml").exists());
 }
 
 #[test]
 fn schema_plan_json_reports_supported_additive_change() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let schema_path = temp.path().join("next.pg");
-    init_repo(&repo);
+    init_graph(&graph);
 
     let next_schema = fs::read_to_string(fixture("test.pg")).unwrap().replace(
         "    age: I32?\n}",
@@ -255,7 +255,7 @@ fn schema_plan_json_reports_supported_additive_change() {
             .arg("--schema")
             .arg(&schema_path)
             .arg("--json")
-            .arg(&repo),
+            .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
 
@@ -270,9 +270,9 @@ fn schema_plan_json_reports_supported_additive_change() {
 #[test]
 fn schema_plan_json_reports_unsupported_type_change() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let schema_path = temp.path().join("breaking.pg");
-    init_repo(&repo);
+    init_graph(&graph);
 
     let breaking_schema = fs::read_to_string(fixture("test.pg"))
         .unwrap()
@@ -286,7 +286,7 @@ fn schema_plan_json_reports_unsupported_type_change() {
             .arg("--schema")
             .arg(&schema_path)
             .arg("--json")
-            .arg(&repo),
+            .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
 
@@ -303,9 +303,9 @@ fn schema_plan_json_reports_unsupported_type_change() {
 #[test]
 fn schema_apply_json_applies_supported_migration() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let schema_path = temp.path().join("next.pg");
-    init_repo(&repo);
+    init_graph(&graph);
 
     let next_schema = fs::read_to_string(fixture("test.pg")).unwrap().replace(
         "    age: I32?\n}",
@@ -320,7 +320,7 @@ fn schema_apply_json_applies_supported_migration() {
             .arg("--schema")
             .arg(&schema_path)
             .arg("--json")
-            .arg(&repo),
+            .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
 
@@ -330,7 +330,7 @@ fn schema_apply_json_applies_supported_migration() {
 
     let db = tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(Omnigraph::open(repo.to_string_lossy().as_ref()))
+        .block_on(Omnigraph::open(graph.to_string_lossy().as_ref()))
         .unwrap();
     assert!(
         db.catalog().node_types["Person"]
@@ -342,9 +342,9 @@ fn schema_apply_json_applies_supported_migration() {
 #[test]
 fn schema_apply_human_reports_noop() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let schema_path = fixture("test.pg");
-    init_repo(&repo);
+    init_graph(&graph);
 
     let output = output_success(
         cli()
@@ -352,7 +352,7 @@ fn schema_apply_human_reports_noop() {
             .arg("apply")
             .arg("--schema")
             .arg(&schema_path)
-            .arg(&repo),
+            .arg(&graph),
     );
     let stdout = stdout_string(&output);
 
@@ -363,9 +363,9 @@ fn schema_apply_human_reports_noop() {
 #[test]
 fn schema_apply_json_renames_type_and_updates_snapshot() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let schema_path = temp.path().join("rename.pg");
-    init_repo(&repo);
+    init_graph(&graph);
 
     let renamed_schema = fs::read_to_string(fixture("test.pg"))
         .unwrap()
@@ -384,14 +384,14 @@ fn schema_apply_json_renames_type_and_updates_snapshot() {
             .arg("--schema")
             .arg(&schema_path)
             .arg("--json")
-            .arg(&repo),
+            .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["applied"], true);
 
     let db = tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(Omnigraph::open(repo.to_string_lossy().as_ref()))
+        .block_on(Omnigraph::open(graph.to_string_lossy().as_ref()))
         .unwrap();
     let snapshot = tokio::runtime::Runtime::new()
         .unwrap()
@@ -404,9 +404,9 @@ fn schema_apply_json_renames_type_and_updates_snapshot() {
 #[test]
 fn schema_apply_json_renames_property_and_updates_catalog() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let schema_path = temp.path().join("rename-property.pg");
-    init_repo(&repo);
+    init_graph(&graph);
 
     let renamed_schema = fs::read_to_string(fixture("test.pg"))
         .unwrap()
@@ -420,14 +420,14 @@ fn schema_apply_json_renames_property_and_updates_catalog() {
             .arg("--schema")
             .arg(&schema_path)
             .arg("--json")
-            .arg(&repo),
+            .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["applied"], true);
 
     let db = tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(Omnigraph::open(repo.to_string_lossy().as_ref()))
+        .block_on(Omnigraph::open(graph.to_string_lossy().as_ref()))
         .unwrap();
     let person = &db.catalog().node_types["Person"];
     assert!(person.properties.contains_key("years"));
@@ -437,12 +437,12 @@ fn schema_apply_json_renames_property_and_updates_catalog() {
 #[test]
 fn schema_apply_json_adds_index_for_existing_property() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let schema_path = temp.path().join("index.pg");
-    init_repo(&repo);
+    init_graph(&graph);
 
     let before_index_count = tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let db = Omnigraph::open(repo.to_string_lossy().as_ref())
+        let db = Omnigraph::open(graph.to_string_lossy().as_ref())
             .await
             .unwrap();
         let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
@@ -462,13 +462,13 @@ fn schema_apply_json_adds_index_for_existing_property() {
             .arg("--schema")
             .arg(&schema_path)
             .arg("--json")
-            .arg(&repo),
+            .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["applied"], true);
 
     let after_index_count = tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let db = Omnigraph::open(repo.to_string_lossy().as_ref())
+        let db = Omnigraph::open(graph.to_string_lossy().as_ref())
             .await
             .unwrap();
         let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
@@ -481,9 +481,9 @@ fn schema_apply_json_adds_index_for_existing_property() {
 #[test]
 fn schema_apply_rejects_unsupported_plan() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let schema_path = temp.path().join("breaking.pg");
-    init_repo(&repo);
+    init_graph(&graph);
 
     let breaking_schema = fs::read_to_string(fixture("test.pg"))
         .unwrap()
@@ -496,7 +496,7 @@ fn schema_apply_rejects_unsupported_plan() {
             .arg("apply")
             .arg("--schema")
             .arg(&schema_path)
-            .arg(&repo),
+            .arg(&graph),
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("changing property type"));
@@ -505,9 +505,9 @@ fn schema_apply_rejects_unsupported_plan() {
 #[test]
 fn schema_apply_rejects_when_non_main_branch_exists() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let schema_path = temp.path().join("next.pg");
-    init_repo(&repo);
+    init_graph(&graph);
     output_success(
         cli()
             .arg("branch")
@@ -515,7 +515,7 @@ fn schema_apply_rejects_when_non_main_branch_exists() {
             .arg("--from")
             .arg("main")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("feature"),
     );
 
@@ -531,10 +531,10 @@ fn schema_apply_rejects_when_non_main_branch_exists() {
             .arg("apply")
             .arg("--schema")
             .arg(&schema_path)
-            .arg(&repo),
+            .arg(&graph),
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("schema apply requires a repo with only main"));
+    assert!(stderr.contains("schema apply requires a graph with only main"));
 }
 
 #[test]
@@ -757,11 +757,11 @@ fn deprecated_read_and_change_subcommands_emit_warnings() {
 }
 
 #[test]
-fn query_lint_can_use_local_repo_via_positional_uri() {
+fn query_lint_can_use_local_graph_via_positional_uri() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let query_path = temp.path().join("queries.gq");
-    init_repo(&repo);
+    init_graph(&graph);
     write_query_file(
         &query_path,
         r#"
@@ -779,24 +779,24 @@ query list_people() {
             .arg("--query")
             .arg(&query_path)
             .arg("--json")
-            .arg(&repo),
+            .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
 
     assert_eq!(payload["status"], "ok");
-    assert_eq!(payload["schema_source"]["kind"], "repo");
+    assert_eq!(payload["schema_source"]["kind"], "graph");
     assert_eq!(
         payload["schema_source"]["uri"].as_str(),
-        Some(repo.to_string_lossy().as_ref())
+        Some(graph.to_string_lossy().as_ref())
     );
 }
 
 #[test]
-fn query_lint_can_resolve_repo_and_query_from_config() {
+fn query_lint_can_resolve_graph_and_query_from_config() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let config_path = temp.path().join("omnigraph.yaml");
-    init_repo(&repo);
+    init_graph(&graph);
     write_query_file(
         &temp.path().join("queries.gq"),
         r#"
@@ -806,7 +806,7 @@ query list_people() {
 }
 "#,
     );
-    write_config(&config_path, &local_yaml_config(&repo));
+    write_config(&config_path, &local_yaml_config(&graph));
 
     let output = output_success(
         cli()
@@ -821,10 +821,10 @@ query list_people() {
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
 
     assert_eq!(payload["status"], "ok");
-    assert_eq!(payload["schema_source"]["kind"], "repo");
+    assert_eq!(payload["schema_source"]["kind"], "graph");
     assert_eq!(
         payload["schema_source"]["uri"].as_str(),
-        Some(repo.to_string_lossy().as_ref())
+        Some(graph.to_string_lossy().as_ref())
     );
 }
 
@@ -852,12 +852,12 @@ query list_people() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("query lint is only supported against local repo URIs in this milestone")
+        stderr.contains("query lint is only supported against local graph URIs in this milestone")
     );
 }
 
 #[test]
-fn query_lint_requires_schema_or_resolvable_repo_target() {
+fn query_lint_requires_schema_or_resolvable_graph_target() {
     let temp = tempdir().unwrap();
     let query_path = temp.path().join("queries.gq");
     write_query_file(
@@ -879,7 +879,7 @@ query list_people() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("query lint requires --schema <schema.pg> or a resolvable repo target")
+        stderr.contains("query lint requires --schema <schema.pg> or a resolvable graph target")
     );
 }
 
@@ -971,8 +971,8 @@ query bad_update($slug: String) {
 #[test]
 fn load_json_outputs_summary_for_main_branch() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
     let data = fixture("test.jsonl");
 
     let output = output_success(
@@ -981,7 +981,7 @@ fn load_json_outputs_summary_for_main_branch() {
             .arg("--data")
             .arg(&data)
             .arg("--json")
-            .arg(&repo),
+            .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
 
@@ -996,16 +996,16 @@ fn load_json_outputs_summary_for_main_branch() {
 #[test]
 fn load_into_feature_branch_with_merge_mode_succeeds() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
 
     output_success(
         cli()
             .arg("branch")
             .arg("create")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--from")
             .arg("main")
             .arg("feature"),
@@ -1026,7 +1026,7 @@ fn load_into_feature_branch_with_merge_mode_succeeds() {
             .arg("feature")
             .arg("--mode")
             .arg("merge")
-            .arg(&repo),
+            .arg(&graph),
     );
     let stdout = stdout_string(&output);
 
@@ -1038,15 +1038,15 @@ fn load_into_feature_branch_with_merge_mode_succeeds() {
 #[test]
 fn read_json_outputs_rows_for_named_query() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
     let queries = fixture("test.gq");
 
     let output = output_success(
         cli()
             .arg("read")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--query")
             .arg(&queries)
             .arg("--name")
@@ -1066,16 +1066,16 @@ fn read_json_outputs_rows_for_named_query() {
 #[test]
 fn export_jsonl_outputs_source_rows_for_selected_branch_and_type() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
 
     output_success(
         cli()
             .arg("branch")
             .arg("create")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--from")
             .arg("main")
             .arg("feature"),
@@ -1095,13 +1095,13 @@ fn export_jsonl_outputs_source_rows_for_selected_branch_and_type() {
             .arg("feature")
             .arg("--mode")
             .arg("append")
-            .arg(&repo),
+            .arg(&graph),
     );
 
     let output = output_success(
         cli()
             .arg("export")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--branch")
             .arg("feature")
             .arg("--type")
@@ -1150,7 +1150,7 @@ fn policy_validate_fails_for_invalid_policy_file() {
         &config,
         r#"
 project:
-  name: policy-test-repo
+  name: policy-test-graph
 policy:
   file: ./policy.yaml
 "#,
@@ -1242,11 +1242,11 @@ fn policy_explain_reports_decision_and_matched_rule() {
 #[test]
 fn read_can_resolve_uri_from_config() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let config = temp.path().join("omnigraph.yaml");
-    init_repo(&repo);
-    load_fixture(&repo);
-    write_config(&config, &local_yaml_config(&repo));
+    init_graph(&graph);
+    load_fixture(&graph);
+    write_config(&config, &local_yaml_config(&graph));
 
     let output = output_success(
         cli()
@@ -1268,11 +1268,11 @@ fn read_can_resolve_uri_from_config() {
 #[test]
 fn read_alias_from_yaml_config_runs_with_kv_output() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let config = temp.path().join("omnigraph.yaml");
     let query = temp.path().join("aliases.gq");
-    init_repo(&repo);
-    load_fixture(&repo);
+    init_graph(&graph);
+    load_fixture(&graph);
     write_query_file(
         &query,
         &std::fs::read_to_string(fixture("test.gq")).unwrap(),
@@ -1281,7 +1281,7 @@ fn read_alias_from_yaml_config_runs_with_kv_output() {
         &config,
         &format!(
             "{}aliases:\n  owner:\n    command: read\n    query: aliases.gq\n    name: get_person\n    args: [name]\n    format: kv\n",
-            local_yaml_config(&repo)
+            local_yaml_config(&graph)
         ),
     );
 
@@ -1303,16 +1303,16 @@ fn read_alias_from_yaml_config_runs_with_kv_output() {
 #[test]
 fn read_alias_uses_alias_target_without_cli_default_and_accepts_url_like_arg() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let config = temp.path().join("omnigraph.yaml");
     let query = temp.path().join("aliases.gq");
     let data = temp.path().join("url-like.jsonl");
-    init_repo(&repo);
+    init_graph(&graph);
     write_jsonl(
         &data,
         r#"{"type":"Person","data":{"name":"https://example.com","age":30}}"#,
     );
-    output_success(cli().arg("load").arg("--data").arg(&data).arg(&repo));
+    output_success(cli().arg("load").arg("--data").arg(&data).arg(&graph));
     write_query_file(
         &query,
         &std::fs::read_to_string(fixture("test.gq")).unwrap(),
@@ -1321,7 +1321,7 @@ fn read_alias_uses_alias_target_without_cli_default_and_accepts_url_like_arg() {
         &config,
         &format!(
             "graphs:\n  local:\n    uri: '{}'\nquery:\n  roots:\n    - .\npolicy: {{}}\naliases:\n  owner:\n    command: read\n    query: aliases.gq\n    name: get_person\n    args: [name]\n    graph: local\n    format: kv\n",
-            repo.to_string_lossy()
+            graph.to_string_lossy()
         ),
     );
 
@@ -1343,11 +1343,11 @@ fn read_alias_uses_alias_target_without_cli_default_and_accepts_url_like_arg() {
 #[test]
 fn change_alias_from_yaml_config_persists_changes() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let config = temp.path().join("omnigraph.yaml");
     let query = temp.path().join("mutations.gq");
-    init_repo(&repo);
-    load_fixture(&repo);
+    init_graph(&graph);
+    load_fixture(&graph);
     write_query_file(
         &query,
         r#"
@@ -1360,7 +1360,7 @@ query insert_person($name: String, $age: I32) {
         &config,
         &format!(
             "{}aliases:\n  add_person:\n    command: change\n    query: mutations.gq\n    name: insert_person\n    args: [name, age]\n",
-            local_yaml_config(&repo)
+            local_yaml_config(&graph)
         ),
     );
 
@@ -1381,7 +1381,7 @@ query insert_person($name: String, $age: I32) {
     let verify = output_success(
         cli()
             .arg("read")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--query")
             .arg(fixture("test.gq"))
             .arg("--name")
@@ -1397,14 +1397,14 @@ query insert_person($name: String, $age: I32) {
 #[test]
 fn read_csv_format_outputs_header_and_row_values() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
 
     let output = output_success(
         cli()
             .arg("read")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--query")
             .arg(fixture("test.gq"))
             .arg("--name")
@@ -1423,14 +1423,14 @@ fn read_csv_format_outputs_header_and_row_values() {
 #[test]
 fn read_jsonl_format_outputs_metadata_header_first() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
 
     let output = output_success(
         cli()
             .arg("read")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--query")
             .arg(fixture("test.gq"))
             .arg("--name")
@@ -1449,9 +1449,9 @@ fn read_jsonl_format_outputs_metadata_header_first() {
 #[test]
 fn change_json_outputs_affected_counts_and_persists() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
     let mutation_file = temp.path().join("mutations.gq");
     write_query_file(
         &mutation_file,
@@ -1465,7 +1465,7 @@ query insert_person($name: String, $age: I32) {
     let output = output_success(
         cli()
             .arg("change")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--query")
             .arg(&mutation_file)
             .arg("--params")
@@ -1481,7 +1481,7 @@ query insert_person($name: String, $age: I32) {
     let verify = output_success(
         cli()
             .arg("read")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--query")
             .arg(fixture("test.gq"))
             .arg("--name")
@@ -1498,11 +1498,11 @@ query insert_person($name: String, $age: I32) {
 #[test]
 fn change_can_resolve_uri_and_branch_from_config() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let config = temp.path().join("omnigraph.yaml");
-    init_repo(&repo);
-    load_fixture(&repo);
-    write_config(&config, &local_yaml_config(&repo));
+    init_graph(&graph);
+    load_fixture(&graph);
+    write_config(&config, &local_yaml_config(&graph));
     let mutation_file = temp.path().join("config-mutations.gq");
     write_query_file(
         &mutation_file,
@@ -1532,14 +1532,14 @@ query insert_person($name: String, $age: I32) {
 #[test]
 fn read_requires_name_for_multi_query_files() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
 
     let output = output_failure(
         cli()
             .arg("read")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--query")
             .arg(fixture("test.gq")),
     );
@@ -1550,8 +1550,8 @@ fn read_requires_name_for_multi_query_files() {
 #[test]
 fn read_supports_inline_query_string() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
+    let repo = graph_path(temp.path());
+    init_graph(&repo);
     load_fixture(&repo);
 
     let output = output_success(
@@ -1573,8 +1573,8 @@ fn read_supports_inline_query_string() {
 #[test]
 fn change_supports_inline_query_string() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
+    let repo = graph_path(temp.path());
+    init_graph(&repo);
     load_fixture(&repo);
 
     let output = output_success(
@@ -1608,8 +1608,8 @@ fn change_supports_inline_query_string() {
 #[test]
 fn read_rejects_query_string_combined_with_query() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
+    let repo = graph_path(temp.path());
+    init_graph(&repo);
     load_fixture(&repo);
 
     let output = output_failure(
@@ -1631,8 +1631,8 @@ fn read_rejects_query_string_combined_with_query() {
 #[test]
 fn read_rejects_empty_query_string() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
+    let repo = graph_path(temp.path());
+    init_graph(&repo);
     load_fixture(&repo);
 
     let output = output_failure(cli().arg("read").arg(&repo).arg("-e").arg(""));
@@ -1646,15 +1646,15 @@ fn read_rejects_empty_query_string() {
 #[test]
 fn branch_create_json_outputs_source_and_name() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
 
     let output = output_success(
         cli()
             .arg("branch")
             .arg("create")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--from")
             .arg("main")
             .arg("feature")
@@ -1664,21 +1664,21 @@ fn branch_create_json_outputs_source_and_name() {
 
     assert_eq!(payload["from"], "main");
     assert_eq!(payload["name"], "feature");
-    assert_eq!(payload["uri"], repo.to_string_lossy().as_ref());
+    assert_eq!(payload["uri"], graph.to_string_lossy().as_ref());
 }
 
 #[test]
 fn branch_list_outputs_sorted_branches() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
 
     output_success(
         cli()
             .arg("branch")
             .arg("create")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--from")
             .arg("main")
             .arg("zeta"),
@@ -1688,13 +1688,13 @@ fn branch_list_outputs_sorted_branches() {
             .arg("branch")
             .arg("create")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--from")
             .arg("main")
             .arg("alpha"),
     );
 
-    let output = output_success(cli().arg("branch").arg("list").arg("--uri").arg(&repo));
+    let output = output_success(cli().arg("branch").arg("list").arg("--uri").arg(&graph));
     let stdout = stdout_string(&output);
     let lines = stdout
         .lines()
@@ -1708,15 +1708,15 @@ fn branch_list_outputs_sorted_branches() {
 #[test]
 fn branch_delete_json_outputs_name_and_removes_branch() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
 
     output_success(
         cli()
             .arg("branch")
             .arg("create")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--from")
             .arg("main")
             .arg("feature"),
@@ -1727,15 +1727,15 @@ fn branch_delete_json_outputs_name_and_removes_branch() {
             .arg("branch")
             .arg("delete")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("feature")
             .arg("--json"),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["name"], "feature");
-    assert_eq!(payload["uri"], repo.to_string_lossy().as_ref());
+    assert_eq!(payload["uri"], graph.to_string_lossy().as_ref());
 
-    let listed = output_success(cli().arg("branch").arg("list").arg("--uri").arg(&repo));
+    let listed = output_success(cli().arg("branch").arg("list").arg("--uri").arg(&graph));
     let stdout = stdout_string(&listed);
     let lines = stdout
         .lines()
@@ -1748,15 +1748,15 @@ fn branch_delete_json_outputs_name_and_removes_branch() {
 #[test]
 fn branch_delete_rejects_main() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
 
     let output = output_failure(
         cli()
             .arg("branch")
             .arg("delete")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("main"),
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
@@ -1766,16 +1766,16 @@ fn branch_delete_rejects_main() {
 #[test]
 fn branch_merge_defaults_target_to_main() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
 
     output_success(
         cli()
             .arg("branch")
             .arg("create")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--from")
             .arg("main")
             .arg("feature"),
@@ -1795,7 +1795,7 @@ fn branch_merge_defaults_target_to_main() {
             .arg("feature")
             .arg("--mode")
             .arg("append")
-            .arg(&repo),
+            .arg(&graph),
     );
 
     let merge_output = output_success(
@@ -1803,7 +1803,7 @@ fn branch_merge_defaults_target_to_main() {
             .arg("branch")
             .arg("merge")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("feature")
             .arg("--json"),
     );
@@ -1815,7 +1815,7 @@ fn branch_merge_defaults_target_to_main() {
     let snapshot_output = output_success(
         cli()
             .arg("snapshot")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--branch")
             .arg("main")
             .arg("--json"),
@@ -1835,16 +1835,16 @@ fn branch_merge_defaults_target_to_main() {
 #[test]
 fn branch_merge_supports_explicit_target() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
 
     output_success(
         cli()
             .arg("branch")
             .arg("create")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--from")
             .arg("main")
             .arg("feature"),
@@ -1854,7 +1854,7 @@ fn branch_merge_supports_explicit_target() {
             .arg("branch")
             .arg("create")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--from")
             .arg("main")
             .arg("experiment"),
@@ -1874,7 +1874,7 @@ fn branch_merge_supports_explicit_target() {
             .arg("feature")
             .arg("--mode")
             .arg("append")
-            .arg(&repo),
+            .arg(&graph),
     );
 
     let merge_output = output_success(
@@ -1882,7 +1882,7 @@ fn branch_merge_supports_explicit_target() {
             .arg("branch")
             .arg("merge")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("feature")
             .arg("--into")
             .arg("experiment")
@@ -1896,17 +1896,17 @@ fn branch_merge_supports_explicit_target() {
 #[test]
 fn snapshot_json_returns_manifest_version_and_tables() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
 
-    let output = output_success(cli().arg("snapshot").arg(&repo).arg("--json"));
+    let output = output_success(cli().arg("snapshot").arg(&graph).arg("--json"));
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
 
     assert_eq!(payload["branch"], "main");
     assert_eq!(
         payload["manifest_version"].as_u64().unwrap(),
-        manifest_dataset_version(&repo)
+        manifest_dataset_version(&graph)
     );
     assert!(payload["tables"].as_array().unwrap().len() >= 4);
 }
@@ -1976,11 +1976,11 @@ fn read_embedded_rows(path: std::path::PathBuf) -> Vec<Value> {
 #[test]
 fn snapshot_can_resolve_uri_from_config() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let config = temp.path().join("omnigraph.yaml");
-    init_repo(&repo);
-    load_fixture(&repo);
-    write_config(&config, &local_yaml_config(&repo));
+    init_graph(&graph);
+    load_fixture(&graph);
+    write_config(&config, &local_yaml_config(&graph));
 
     let output = output_success(
         cli()
@@ -1996,11 +1996,11 @@ fn snapshot_can_resolve_uri_from_config() {
 #[test]
 fn snapshot_human_output_includes_branch_and_table_summaries() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
 
-    let output = output_success(cli().arg("snapshot").arg(&repo));
+    let output = output_success(cli().arg("snapshot").arg(&graph));
     let stdout = stdout_string(&output);
 
     assert!(stdout.contains("branch: main"));
@@ -2012,11 +2012,11 @@ fn snapshot_human_output_includes_branch_and_table_summaries() {
 #[test]
 fn commit_show_accepts_long_uri_flag() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
 
-    let list = output_success(cli().arg("commit").arg("list").arg(&repo).arg("--json"));
+    let list = output_success(cli().arg("commit").arg("list").arg(&graph).arg("--json"));
     let list_payload: Value = serde_json::from_slice(&list.stdout).unwrap();
     let commit_id = list_payload["commits"][0]["graph_commit_id"]
         .as_str()
@@ -2028,7 +2028,7 @@ fn commit_show_accepts_long_uri_flag() {
             .arg("commit")
             .arg("show")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg(&commit_id)
             .arg("--json"),
     );
@@ -2039,11 +2039,11 @@ fn commit_show_accepts_long_uri_flag() {
 }
 
 #[test]
-fn cli_fails_for_missing_repo() {
+fn cli_fails_for_missing_graph() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
 
-    let output = output_failure(cli().arg("snapshot").arg(&repo));
+    let output = output_failure(cli().arg("snapshot").arg(&graph));
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
         stderr.contains("_schema.pg")
@@ -2055,7 +2055,7 @@ fn cli_fails_for_missing_repo() {
 #[test]
 fn cli_fails_for_missing_schema_or_data_file() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let missing_schema = temp.path().join("missing.pg");
     let missing_data = temp.path().join("missing.jsonl");
 
@@ -2064,7 +2064,7 @@ fn cli_fails_for_missing_schema_or_data_file() {
             .arg("init")
             .arg("--schema")
             .arg(&missing_schema)
-            .arg(&repo),
+            .arg(&graph),
     );
     assert!(
         String::from_utf8(init_output.stderr)
@@ -2072,13 +2072,13 @@ fn cli_fails_for_missing_schema_or_data_file() {
             .contains("No such file")
     );
 
-    init_repo(&repo);
+    init_graph(&graph);
     let load_output = output_failure(
         cli()
             .arg("load")
             .arg("--data")
             .arg(&missing_data)
-            .arg(&repo),
+            .arg(&graph),
     );
     assert!(
         String::from_utf8(load_output.stderr)
@@ -2090,16 +2090,16 @@ fn cli_fails_for_missing_schema_or_data_file() {
 #[test]
 fn cli_fails_for_invalid_merge_requests() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
 
     let missing_branch = output_failure(
         cli()
             .arg("branch")
             .arg("merge")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("missing"),
     );
     let missing_branch_stderr = String::from_utf8(missing_branch.stderr).unwrap();
@@ -2114,7 +2114,7 @@ fn cli_fails_for_invalid_merge_requests() {
             .arg("branch")
             .arg("merge")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("main")
             .arg("--into")
             .arg("main"),
@@ -2142,9 +2142,9 @@ fn cli_fails_for_invalid_merge_requests() {
 #[test]
 fn schema_apply_allow_data_loss_flag_promotes_drops_to_hard() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let schema_path = temp.path().join("drop-age.pg");
-    init_repo(&repo);
+    init_graph(&graph);
 
     // Drop the nullable `age` column.
     let next_schema = fs::read_to_string(fixture("test.pg"))
@@ -2160,7 +2160,7 @@ fn schema_apply_allow_data_loss_flag_promotes_drops_to_hard() {
             .arg(&schema_path)
             .arg("--allow-data-loss")
             .arg("--json")
-            .arg(&repo),
+            .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["applied"], true);
@@ -2183,9 +2183,9 @@ fn schema_apply_without_allow_data_loss_keeps_soft_drops() {
     // drops stay Soft. Pins default semantics against accidental Hard
     // promotion if a future refactor changes the option threading.
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let schema_path = temp.path().join("drop-age-soft.pg");
-    init_repo(&repo);
+    init_graph(&graph);
 
     let next_schema = fs::read_to_string(fixture("test.pg"))
         .unwrap()
@@ -2199,7 +2199,7 @@ fn schema_apply_without_allow_data_loss_keeps_soft_drops() {
             .arg("--schema")
             .arg(&schema_path)
             .arg("--json")
-            .arg(&repo),
+            .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["applied"], true);
@@ -2225,8 +2225,8 @@ fn schema_plan_parity_cli_and_sdk() {
     // the HTTP soft/hard drop tests, which exercise apply with
     // identical fixtures.
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
     let schema_path = temp.path().join("plan-parity.pg");
     let next_schema = fs::read_to_string(fixture("test.pg")).unwrap().replace(
         "    age: I32?\n}",
@@ -2242,13 +2242,13 @@ fn schema_plan_parity_cli_and_sdk() {
             .arg("--schema")
             .arg(&schema_path)
             .arg("--json")
-            .arg(&repo),
+            .arg(&graph),
     );
     let cli_payload: Value = serde_json::from_slice(&cli_output.stdout).unwrap();
 
-    // SDK side: open repo, call plan_schema.
+    // SDK side: open graph, call plan_schema.
     let plan = tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let db = Omnigraph::open(repo.to_string_lossy().as_ref())
+        let db = Omnigraph::open(graph.to_string_lossy().as_ref())
             .await
             .unwrap();
         db.plan_schema(&next_schema).await.unwrap()

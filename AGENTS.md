@@ -1,6 +1,6 @@
 # OmniGraph — Agent Guide
 
-This file is the always-on map for AI coding agents (Claude Code, Codex, Cursor, Cline) working in this repo. It is loaded into context on every turn, so it stays as a **map plus the rules and invariants that need to be in scope at all times** — the encyclopedia content lives under [`docs/`](docs/). When you need depth, follow a pointer.
+This file is the always-on map for AI coding agents (Claude Code, Codex, Cursor, Cline) working in this codebase. It is loaded into context on every turn, so it stays as a **map plus the rules and invariants that need to be in scope at all times** — the encyclopedia content lives under [`docs/`](docs/). When you need depth, follow a pointer.
 
 **Required reading every session, every change:**
 
@@ -16,9 +16,9 @@ Tools that support `@`-imports (Claude Code) auto-include all three files via th
 
 `CLAUDE.md` is a symlink to this file — there is exactly one source of truth. Edit `AGENTS.md`.
 
-**Version surveyed:** 0.4.2
+**Version surveyed:** 0.6.0
 **Workspace crates:** `omnigraph-compiler`, `omnigraph` (engine), `omnigraph-cli`, `omnigraph-server`
-**Storage substrate:** Lance 4.x (columnar, versioned, branchable)
+**Storage substrate:** Lance 6.x (columnar, versioned, branchable)
 **License:** MIT
 **Toolchain:** Rust stable, edition 2024
 
@@ -50,10 +50,10 @@ CLI (omnigraph)        HTTP Server (omnigraph-server, Axum)
            omnigraph-compiler  ── Pest grammars, catalog, IR, lowering, lint, migration plan
                       │
                       ▼
-           omnigraph (engine)  ── ManifestRepo, CommitGraph, RunRegistry, GraphIndex (CSR/CSC), exec
+           omnigraph (engine)  ── ManifestCoordinator, CommitGraph, RunRegistry, GraphIndex (CSR/CSC), exec
                       │
                       ▼
-              Lance 4.x         ── columnar Arrow, fragments, per-dataset versions/branches, indexes
+              Lance 6.x         ── columnar Arrow, fragments, per-dataset versions/branches, indexes
                       │
                       ▼
         Object store (file / s3 / RustFS / MinIO / S3-compat)
@@ -167,35 +167,35 @@ If a proposal fits one of these, the burden is on the proposer to justify why th
 ## Quick-reference flows
 
 ```bash
-# Initialize an S3-backed repo
-omnigraph init --schema ./schema.pg s3://my-bucket/repo.omni
+# Initialize an S3-backed graph
+omnigraph init --schema ./schema.pg s3://my-bucket/graph.omni
 
 # Bulk load
-omnigraph load --data ./seed.jsonl --mode overwrite s3://my-bucket/repo.omni
+omnigraph load --data ./seed.jsonl --mode overwrite s3://my-bucket/graph.omni
 
 # Branch + ingest a review batch
-omnigraph branch create --from main review/2026-04-25 s3://my-bucket/repo.omni
-omnigraph ingest --branch review/2026-04-25 --data ./batch.jsonl s3://my-bucket/repo.omni
+omnigraph branch create --from main review/2026-04-25 s3://my-bucket/graph.omni
+omnigraph ingest --branch review/2026-04-25 --data ./batch.jsonl s3://my-bucket/graph.omni
 
 # Run a hybrid (vector + BM25) query
 omnigraph read --query ./queries.gq --name find_similar \
-  --params '{"q":"trends in AI safety"}' --format table s3://my-bucket/repo.omni
+  --params '{"q":"trends in AI safety"}' --format table s3://my-bucket/graph.omni
 
 # Plan + apply schema migration
-omnigraph schema plan  --schema ./next.pg s3://my-bucket/repo.omni
-omnigraph schema apply --schema ./next.pg s3://my-bucket/repo.omni --json
+omnigraph schema plan  --schema ./next.pg s3://my-bucket/graph.omni
+omnigraph schema apply --schema ./next.pg s3://my-bucket/graph.omni --json
 
 # Merge review branch back
-omnigraph branch merge review/2026-04-25 --into main s3://my-bucket/repo.omni
+omnigraph branch merge review/2026-04-25 --into main s3://my-bucket/graph.omni
 
 # Compact + GC (preview, then confirm)
-omnigraph optimize s3://my-bucket/repo.omni
-omnigraph cleanup  --keep 10 --older-than 7d s3://my-bucket/repo.omni
-omnigraph cleanup  --keep 10 --older-than 7d --confirm s3://my-bucket/repo.omni
+omnigraph optimize s3://my-bucket/graph.omni
+omnigraph cleanup  --keep 10 --older-than 7d s3://my-bucket/graph.omni
+omnigraph cleanup  --keep 10 --older-than 7d --confirm s3://my-bucket/graph.omni
 
 # Stand up the HTTP server (token from env)
 OMNIGRAPH_SERVER_BEARER_TOKEN=xxxx \
-  omnigraph-server s3://my-bucket/repo.omni --bind 0.0.0.0:8080
+  omnigraph-server s3://my-bucket/graph.omni --bind 0.0.0.0:8080
 
 # Cedar policy explain
 omnigraph policy explain --actor act-alice --action change --branch main
@@ -222,7 +222,7 @@ omnigraph policy explain --actor act-alice --action change --branch main
 | Schema language | — | `.pg` + Pest grammar + catalog + interfaces + constraints + annotations |
 | Query language | — | `.gq` + Pest grammar + IR + lowering + linter |
 | Schema migration planning | — | `plan_schema_migration` + `apply_schema` step types + `__schema_apply_lock__` |
-| Commit graph (DAG) across whole repo | — | `_graph_commits.lance` with linear + merge parents, ULID ids, actor map |
+| Commit graph (DAG) across whole graph | — | `_graph_commits.lance` with linear + merge parents, ULID ids, actor map |
 | Per-query atomic writes | — | In-memory `MutationStaging.pending` accumulator + `stage_*` / `commit_staged` per touched table at end-of-query + publisher CAS via `commit_with_expected` (single manifest commit per `mutate_as` / `load`); D₂ parse-time rule keeps inserts/updates and deletes from mixing |
 | Three-way row-level merge | — | `OrderedTableCursor` + `StagedTableWriter`, structured `MergeConflictKind` |
 | Change feeds | — | `diff_between` / `diff_commits` with manifest fast path + ID streaming |

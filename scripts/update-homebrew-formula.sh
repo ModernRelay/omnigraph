@@ -6,7 +6,7 @@ usage() {
 Usage: update-homebrew-formula.sh <tag> [formula_path]
 
 Environment:
-  REPO_SLUG     GitHub repo that owns the Omnigraph release
+  REPO_SLUG     GitHub repository that owns the Omnigraph release
                 default: ModernRelay/omnigraph
 EOF
 }

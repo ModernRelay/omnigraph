@@ -172,7 +172,7 @@ pub struct PolicyCompiler;
 
 #[derive(Clone)]
 pub struct PolicyEngine {
-    repo_id: String,
+    graph_id: String,
     protected_branches: BTreeSet<String>,
     known_actors: BTreeSet<String>,
     schema: Schema,
@@ -291,7 +291,7 @@ impl PolicyTestConfig {
 }
 
 impl PolicyCompiler {
-    pub fn compile(config: &PolicyConfig, repo_id: &str) -> Result<PolicyEngine> {
+    pub fn compile(config: &PolicyConfig, graph_id: &str) -> Result<PolicyEngine> {
         config.validate()?;
         let (schema, schema_warnings) = Schema::from_cedarschema_str(policy_schema_source())?;
         let schema_warnings = schema_warnings
@@ -300,8 +300,8 @@ impl PolicyCompiler {
         if !schema_warnings.is_empty() {
             bail!("policy schema warnings:\n{}", schema_warnings.join("\n"));
         }
-        let entities = compile_entities(config, repo_id, &schema)?;
-        let (policies, policy_to_rule) = compile_policies(config, repo_id)?;
+        let entities = compile_entities(config, graph_id, &schema)?;
+        let (policies, policy_to_rule) = compile_policies(config, graph_id)?;
         let validator = Validator::new(schema.clone());
         let validation = validator.validate(&policies, ValidationMode::Strict);
         let errors = validation
@@ -318,7 +318,7 @@ impl PolicyCompiler {
             .flat_map(|members| members.iter().cloned())
             .collect();
         Ok(PolicyEngine {
-            repo_id: repo_id.to_string(),
+            graph_id: graph_id.to_string(),
             protected_branches: config.protected_branches.iter().cloned().collect(),
             known_actors,
             schema,
@@ -330,9 +330,9 @@ impl PolicyCompiler {
 }
 
 impl PolicyEngine {
-    pub fn load(path: &Path, repo_id: &str) -> Result<Self> {
+    pub fn load(path: &Path, graph_id: &str) -> Result<Self> {
         let config = PolicyConfig::load(path)?;
-        PolicyCompiler::compile(&config, repo_id)
+        PolicyCompiler::compile(&config, graph_id)
     }
 
     pub fn authorize(&self, request: &PolicyRequest) -> Result<PolicyDecision> {
@@ -349,7 +349,7 @@ impl PolicyEngine {
 
         let principal = entity_uid("Actor", &request.actor_id)?;
         let action = entity_uid("Action", request.action.as_str())?;
-        let resource = entity_uid("Repo", &self.repo_id)?;
+        let resource = entity_uid("Graph", &self.graph_id)?;
         let context_value = json!({
             "has_branch": request.branch.is_some(),
             "branch": request.branch.clone().unwrap_or_default(),
@@ -462,7 +462,7 @@ impl PolicyEngine {
     }
 }
 
-fn compile_entities(config: &PolicyConfig, repo_id: &str, schema: &Schema) -> Result<Entities> {
+fn compile_entities(config: &PolicyConfig, graph_id: &str, schema: &Schema) -> Result<Entities> {
     let mut group_entities = Vec::new();
     for group in config.groups.keys() {
         group_entities.push(Entity::new(
@@ -495,8 +495,8 @@ fn compile_entities(config: &PolicyConfig, repo_id: &str, schema: &Schema) -> Re
         )?);
     }
 
-    let repo_entity = Entity::new(
-        entity_uid("Repo", repo_id)?,
+    let graph_entity = Entity::new(
+        entity_uid("Graph", graph_id)?,
         HashMap::new(),
         HashSet::<EntityUid>::new(),
     )?;
@@ -504,13 +504,13 @@ fn compile_entities(config: &PolicyConfig, repo_id: &str, schema: &Schema) -> Re
     let mut entities = Vec::new();
     entities.extend(group_entities);
     entities.extend(actor_entities);
-    entities.push(repo_entity);
+    entities.push(graph_entity);
     Ok(Entities::from_entities(entities, Some(schema))?)
 }
 
 fn compile_policies(
     config: &PolicyConfig,
-    repo_id: &str,
+    graph_id: &str,
 ) -> Result<(PolicySet, HashMap<String, String>)> {
     let mut policies = Vec::new();
     let mut policy_to_rule = HashMap::new();
@@ -518,7 +518,7 @@ fn compile_policies(
     for rule in &config.rules {
         for action in &rule.allow.actions {
             let policy_id = PolicyId::new(format!("{}:{}", rule.id, action.as_str()));
-            let source = compile_policy_source(rule, action, repo_id);
+            let source = compile_policy_source(rule, action, graph_id);
             let policy = Policy::parse(Some(policy_id.clone()), source.as_str())?;
             policy_to_rule.insert(policy_id.to_string(), rule.id.clone());
             policies.push(policy);
@@ -528,7 +528,7 @@ fn compile_policies(
     Ok((PolicySet::from_policies(policies)?, policy_to_rule))
 }
 
-fn compile_policy_source(rule: &PolicyRule, action: &PolicyAction, repo_id: &str) -> String {
+fn compile_policy_source(rule: &PolicyRule, action: &PolicyAction, graph_id: &str) -> String {
     let mut conditions = Vec::new();
     if let Some(scope) = rule.allow.branch_scope {
         conditions.push(branch_scope_condition(scope));
@@ -547,11 +547,11 @@ fn compile_policy_source(rule: &PolicyRule, action: &PolicyAction, repo_id: &str
         r#"permit (
     principal in Omnigraph::Group::{group},
     action == Omnigraph::Action::{action},
-    resource == Omnigraph::Repo::{repo}
+    resource == Omnigraph::Graph::{graph}
 ){when};"#,
         group = cedar_literal(&rule.allow.actors.group),
         action = cedar_literal(action.as_str()),
-        repo = cedar_literal(repo_id),
+        graph = cedar_literal(graph_id),
         when = when,
     )
 }
@@ -594,16 +594,16 @@ namespace Omnigraph {
 
     entity Actor in [Group];
     entity Group;
-    entity Repo;
+    entity Graph;
 
-    action "read" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
-    action "export" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
-    action "change" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
-    action "schema_apply" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
-    action "branch_create" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
-    action "branch_delete" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
-    action "branch_merge" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
-    action "admin" appliesTo { principal: Actor, resource: Repo, context: RequestContext };
+    action "read" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
+    action "export" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
+    action "change" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
+    action "schema_apply" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
+    action "branch_create" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
+    action "branch_delete" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
+    action "branch_merge" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
+    action "admin" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
 }
 "#
 }
@@ -881,7 +881,7 @@ rules:
         )
         .unwrap();
 
-        let engine = PolicyCompiler::compile(&policy, "repo").unwrap();
+        let engine = PolicyCompiler::compile(&policy, "graph").unwrap();
         let allow = engine
             .authorize(&PolicyRequest {
                 actor_id: "act-bruno".to_string(),
@@ -932,7 +932,7 @@ rules:
 "#,
         )
         .unwrap();
-        let engine = PolicyCompiler::compile(&policy, "repo").unwrap();
+        let engine = PolicyCompiler::compile(&policy, "graph").unwrap();
         let tests = PolicyTestConfig {
             version: 1,
             cases: vec![
@@ -976,7 +976,7 @@ rules:
         )
         .unwrap();
 
-        let engine = PolicyCompiler::compile(&policy, "repo").unwrap();
+        let engine = PolicyCompiler::compile(&policy, "graph").unwrap();
         let allow = engine
             .authorize(&PolicyRequest {
                 actor_id: "act-ragnor".to_string(),

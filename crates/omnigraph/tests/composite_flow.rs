@@ -56,7 +56,7 @@ async fn composite_flow_canonical_lifecycle() {
     let uri = dir.path().to_str().unwrap();
 
     // ─────────────────────────────────────────────────────────────────
-    // Step 1: init a fresh repo with the standard test schema.
+    // Step 1: init a fresh graph with the standard test schema.
     // ─────────────────────────────────────────────────────────────────
     let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
     let v_init = version_branch(&db, "main").await.unwrap();
@@ -70,7 +70,9 @@ async fn composite_flow_canonical_lifecycle() {
     // Step 2: load JSONL seed data (Person + Company nodes,
     // Knows + WorksAt edges).
     // ─────────────────────────────────────────────────────────────────
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Append).await.unwrap();
+    load_jsonl(&mut db, TEST_DATA, LoadMode::Append)
+        .await
+        .unwrap();
     let v_after_load = version_branch(&db, "main").await.unwrap();
     assert!(
         v_after_load > v_init,
@@ -119,19 +121,13 @@ async fn composite_flow_canonical_lifecycle() {
         "feature",
         MUTATION_QUERIES,
         "insert_person_and_friend",
-        &mixed_params(
-            &[("$name", "Frank"), ("$friend", "Eve")],
-            &[("$age", 33)],
-        ),
+        &mixed_params(&[("$name", "Frank"), ("$friend", "Eve")], &[("$age", 33)]),
     )
     .await
     .expect("multi-statement insert+edge on feature");
 
     // After: feature has 4 + Eve + Frank = 6 Persons.
-    let snap = db
-        .snapshot_of(ReadTarget::branch("feature"))
-        .await
-        .unwrap();
+    let snap = db.snapshot_of(ReadTarget::branch("feature")).await.unwrap();
     let person_ds = snap.open("node:Person").await.unwrap();
     assert_eq!(
         person_ds.count_rows(None).await.unwrap(),
@@ -321,14 +317,10 @@ async fn composite_flow_canonical_lifecycle() {
     );
 
     // Re-run a query to verify post-optimize correctness.
-    let post_optimize_total = query_main(
-        &mut db,
-        TEST_QUERIES,
-        "total_people",
-        &ParamMap::default(),
-    )
-    .await
-    .unwrap();
+    let post_optimize_total =
+        query_main(&mut db, TEST_QUERIES, "total_people", &ParamMap::default())
+            .await
+            .unwrap();
     assert!(
         !post_optimize_total.batches().is_empty(),
         "queries must still work after optimize"
@@ -385,14 +377,9 @@ async fn composite_flow_canonical_lifecycle() {
     // post-cleanup. Post-cleanup mutation is omitted here pending
     // resolution of the optimize-vs-manifest-pin interaction documented
     // in Step 10.
-    let final_total = query_main(
-        &mut db,
-        TEST_QUERIES,
-        "total_people",
-        &ParamMap::default(),
-    )
-    .await
-    .unwrap();
+    let final_total = query_main(&mut db, TEST_QUERIES, "total_people", &ParamMap::default())
+        .await
+        .unwrap();
     assert!(!final_total.batches().is_empty());
 }
 
@@ -431,10 +418,12 @@ async fn composite_flow_schema_apply_then_branch_ops_no_deadlock_in_refresh() {
 
     // Step 1: init + load on handle A.
     let mut db_a = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db_a, TEST_DATA, LoadMode::Append).await.unwrap();
+    load_jsonl(&mut db_a, TEST_DATA, LoadMode::Append)
+        .await
+        .unwrap();
     assert_eq!(count_rows(&db_a, "node:Person").await, 4);
 
-    // Step 2: open handle B on the same repo. B's in-memory schema_source
+    // Step 2: open handle B on the same graph. B's in-memory schema_source
     // cache is now a snapshot of `_schema.pg` at open time.
     let db_b = Omnigraph::open(uri).await.unwrap();
 
@@ -444,7 +433,7 @@ async fn composite_flow_schema_apply_then_branch_ops_no_deadlock_in_refresh() {
     // to disk.
     const TEST_SCHEMA_V2: &str = "node Person {\n    name: String @key\n    age: I32?\n    nickname: String?\n}\n\nnode Company {\n    name: String @key\n}\n\nedge Knows: Person -> Person {\n    since: Date?\n}\n\nedge WorksAt: Person -> Company\n";
     let plan = db_a.apply_schema(TEST_SCHEMA_V2).await.unwrap();
-    assert!(plan.applied, "apply_schema must succeed on a clean repo");
+    assert!(plan.applied, "apply_schema must succeed on a clean graph");
     assert!(
         !plan.steps.is_empty(),
         "apply_schema must record the AddProperty step"
@@ -561,7 +550,9 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // edges from test.jsonl).
     // ─────────────────────────────────────────────────────────────────
     let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
-    load_jsonl(&mut db, TEST_DATA, LoadMode::Append).await.unwrap();
+    load_jsonl(&mut db, TEST_DATA, LoadMode::Append)
+        .await
+        .unwrap();
     assert_eq!(count_rows(&db, "node:Person").await, 4);
     assert_eq!(count_rows(&db, "edge:Knows").await, 3);
 
@@ -687,10 +678,7 @@ async fn composite_flow_multi_branch_sequential_merges() {
         "feat-a",
         MUTATION_QUERIES,
         "insert_person_and_friend",
-        &mixed_params(
-            &[("$name", "Grace"), ("$friend", "Eve")],
-            &[("$age", 28)],
-        ),
+        &mixed_params(&[("$name", "Grace"), ("$friend", "Eve")], &[("$age", 28)]),
     )
     .await
     .expect("insert Grace + Knows(Grace → Eve) on feat-a");
@@ -821,15 +809,14 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // `total_people` returns count(Person) = 10. Catches regressions in
     // group-by/count execution against a multi-fragment table whose
     // current shape was produced by two sequential merges.
-    let total_post_merges = query_main(
-        &mut db,
-        TEST_QUERIES,
-        "total_people",
-        &ParamMap::default(),
-    )
-    .await
-    .unwrap();
-    assert_total(&total_post_merges, 10, "post both merges, main must total 10 Persons");
+    let total_post_merges = query_main(&mut db, TEST_QUERIES, "total_people", &ParamMap::default())
+        .await
+        .unwrap();
+    assert_total(
+        &total_post_merges,
+        10,
+        "post both merges, main must total 10 Persons",
+    );
 
     // ─────────────────────────────────────────────────────────────────
     // Step 14: time-travel to pre-merge-a-version. Reads must return
@@ -1021,14 +1008,9 @@ async fn composite_flow_multi_branch_sequential_merges() {
     // correctly to disk but the reopened catalog can't bind them.
     // ─────────────────────────────────────────────────────────────────
     let mut db = db;
-    let post_reopen_total = query_main(
-        &mut db,
-        TEST_QUERIES,
-        "total_people",
-        &ParamMap::default(),
-    )
-    .await
-    .unwrap();
+    let post_reopen_total = query_main(&mut db, TEST_QUERIES, "total_people", &ParamMap::default())
+        .await
+        .unwrap();
     assert_total(
         &post_reopen_total,
         10,

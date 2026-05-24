@@ -41,7 +41,7 @@ fn yaml_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn remote_policy_server_config(repo: &SystemRepo) -> String {
+fn remote_policy_server_config(graph: &SystemGraph) -> String {
     format!(
         "\
 project:
@@ -54,7 +54,7 @@ server:
 policy:
   file: ./policy.yaml
 ",
-        yaml_string(&repo.path().to_string_lossy())
+        yaml_string(&graph.path().to_string_lossy())
     )
 }
 
@@ -81,10 +81,10 @@ auth:
 #[test]
 #[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn remote_server_and_cli_end_to_end_flow() {
-    let repo = SystemRepo::loaded();
-    let server = repo.spawn_server();
-    let config = repo.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
-    let mutation_file = repo.write_query(
+    let graph = SystemGraph::loaded();
+    let server = graph.spawn_server();
+    let config = graph.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
+    let mutation_file = graph.write_query(
         "system-remote-change.gq",
         r#"
 query insert_person($name: String, $age: I32) {
@@ -105,7 +105,7 @@ query insert_person($name: String, $age: I32) {
     assert_eq!(health["status"], "ok");
 
     let local_snapshot = parse_stdout_json(&output_success(
-        cli().arg("snapshot").arg(repo.path()).arg("--json"),
+        cli().arg("snapshot").arg(graph.path()).arg("--json"),
     ));
     let snapshot = parse_stdout_json(&output_success(
         cli()
@@ -120,7 +120,7 @@ query insert_person($name: String, $age: I32) {
     let local_read = parse_stdout_json(&output_success(
         cli()
             .arg("read")
-            .arg(repo.path())
+            .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
             .arg("--name")
@@ -180,7 +180,7 @@ query insert_person($name: String, $age: I32) {
     let local_verify = parse_stdout_json(&output_success(
         cli()
             .arg("read")
-            .arg(repo.path())
+            .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
             .arg("--name")
@@ -260,11 +260,11 @@ query insert_person($name: String, $age: I32) {
 
 #[test]
 #[ignore = "requires loopback socket permissions in sandboxed runners"]
-fn remote_schema_apply_via_cli_updates_repo() {
-    let repo = SystemRepo::initialized();
-    let server = repo.spawn_server();
-    let config = repo.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
-    let next_schema = repo.write_file(
+fn remote_schema_apply_via_cli_updates_graph() {
+    let graph = SystemGraph::initialized();
+    let server = graph.spawn_server();
+    let config = graph.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
+    let next_schema = graph.write_file(
         "next.pg",
         &fs::read_to_string(fixture("test.pg")).unwrap().replace(
             "    age: I32?\n}",
@@ -286,7 +286,7 @@ fn remote_schema_apply_via_cli_updates_repo() {
 
     let db = tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(Omnigraph::open(repo.path().to_string_lossy().as_ref()))
+        .block_on(Omnigraph::open(graph.path().to_string_lossy().as_ref()))
         .unwrap();
     assert!(
         db.catalog().node_types["Person"]
@@ -298,10 +298,10 @@ fn remote_schema_apply_via_cli_updates_repo() {
 #[test]
 #[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn remote_schema_apply_rejects_unsupported_plan() {
-    let repo = SystemRepo::initialized();
-    let server = repo.spawn_server();
-    let config = repo.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
-    let breaking_schema = repo.write_file(
+    let graph = SystemGraph::initialized();
+    let server = graph.spawn_server();
+    let config = graph.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
+    let breaking_schema = graph.write_file(
         "breaking.pg",
         &fs::read_to_string(fixture("test.pg"))
             .unwrap()
@@ -324,7 +324,7 @@ fn remote_schema_apply_rejects_unsupported_plan() {
 #[test]
 #[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn remote_schema_apply_rejects_when_non_main_branch_exists() {
-    let repo = SystemRepo::initialized();
+    let graph = SystemGraph::initialized();
     output_success(
         cli()
             .arg("branch")
@@ -332,12 +332,12 @@ fn remote_schema_apply_rejects_when_non_main_branch_exists() {
             .arg("--from")
             .arg("main")
             .arg("--uri")
-            .arg(repo.path())
+            .arg(graph.path())
             .arg("feature"),
     );
-    let server = repo.spawn_server();
-    let config = repo.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
-    let next_schema = repo.write_file(
+    let server = graph.spawn_server();
+    let config = graph.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
+    let next_schema = graph.write_file(
         "next.pg",
         &fs::read_to_string(fixture("test.pg")).unwrap().replace(
             "    age: I32?\n}",
@@ -355,16 +355,16 @@ fn remote_schema_apply_rejects_when_non_main_branch_exists() {
             .arg(&next_schema),
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("schema apply requires a repo with only main"));
+    assert!(stderr.contains("schema apply requires a graph with only main"));
 }
 
 #[test]
 #[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn remote_read_preserves_projection_order_in_json_and_csv() {
-    let repo = SystemRepo::loaded();
-    let server = repo.spawn_server();
-    let config = repo.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
-    let ordered_query = repo.write_query(
+    let graph = SystemGraph::loaded();
+    let server = graph.spawn_server();
+    let config = graph.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
+    let ordered_query = graph.write_query(
         "ordered-remote.gq",
         r#"
 query ordered_person($name: String) {
@@ -419,10 +419,10 @@ query ordered_person($name: String) {
 #[test]
 #[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn remote_branch_create_list_merge_flow() {
-    let repo = SystemRepo::loaded();
-    let server = repo.spawn_server();
-    let config = repo.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
-    let mutation_file = repo.write_query(
+    let graph = SystemGraph::loaded();
+    let server = graph.spawn_server();
+    let config = graph.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
+    let mutation_file = graph.write_query(
         "system-remote-branch-change.gq",
         r#"
 query insert_person($name: String, $age: I32) {
@@ -516,9 +516,9 @@ query insert_person($name: String, $age: I32) {
 #[test]
 #[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn remote_branch_delete_removes_branch() {
-    let repo = SystemRepo::loaded();
-    let server = repo.spawn_server();
-    let config = repo.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
+    let graph = SystemGraph::loaded();
+    let server = graph.spawn_server();
+    let config = graph.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
 
     parse_stdout_json(&output_success(
         cli()
@@ -557,10 +557,10 @@ fn remote_branch_delete_removes_branch() {
 #[test]
 #[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn remote_export_round_trips_full_branch_graph() {
-    let repo = SystemRepo::loaded();
-    let server = repo.spawn_server();
-    let config = repo.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
-    let mutation_file = repo.write_query(
+    let graph = SystemGraph::loaded();
+    let server = graph.spawn_server();
+    let config = graph.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
+    let mutation_file = graph.write_query(
         "system-remote-export-change.gq",
         r#"
 query insert_person($name: String, $age: I32) {
@@ -624,8 +624,8 @@ query add_friend($from: String, $to: String) {
             .arg("feature")
             .arg("--jsonl"),
     ));
-    let export_path = repo.write_jsonl("system-remote-exported.jsonl", &exported);
-    let imported_repo = repo
+    let export_path = graph.write_jsonl("system-remote-exported.jsonl", &exported);
+    let imported_graph = graph
         .path()
         .parent()
         .unwrap()
@@ -636,18 +636,18 @@ query add_friend($from: String, $to: String) {
             .arg("init")
             .arg("--schema")
             .arg(fixture("test.pg"))
-            .arg(&imported_repo),
+            .arg(&imported_graph),
     );
     output_success(
         cli()
             .arg("load")
             .arg("--data")
             .arg(&export_path)
-            .arg(&imported_repo),
+            .arg(&imported_graph),
     );
 
     let snapshot = parse_stdout_json(&output_success(
-        cli().arg("snapshot").arg(&imported_repo).arg("--json"),
+        cli().arg("snapshot").arg(&imported_graph).arg("--json"),
     ));
     assert_eq!(
         snapshot["tables"]
@@ -671,7 +671,7 @@ query add_friend($from: String, $to: String) {
     let eve = parse_stdout_json(&output_success(
         cli()
             .arg("read")
-            .arg(&imported_repo)
+            .arg(&imported_graph)
             .arg("--query")
             .arg(fixture("test.gq"))
             .arg("--name")
@@ -687,10 +687,10 @@ query add_friend($from: String, $to: String) {
 #[test]
 #[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
-    let repo = SystemRepo::loaded();
-    let server = repo.spawn_server();
-    let config = repo.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
-    let ingest_data = repo.write_jsonl(
+    let graph = SystemGraph::loaded();
+    let server = graph.spawn_server();
+    let config = graph.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
+    let ingest_data = graph.write_jsonl(
         "system-remote-ingest.jsonl",
         r#"{"type":"Person","data":{"name":"Zoe","age":33}}
 {"type":"Person","data":{"name":"Bob","age":26}}"#,
@@ -747,9 +747,9 @@ fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
 #[test]
 #[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn remote_ingest_reuses_existing_branch_and_merges_updates() {
-    let repo = SystemRepo::loaded();
-    let server = repo.spawn_server();
-    let config = repo.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
+    let graph = SystemGraph::loaded();
+    let server = graph.spawn_server();
+    let config = graph.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
 
     output_success(
         cli()
@@ -762,7 +762,7 @@ fn remote_ingest_reuses_existing_branch_and_merges_updates() {
             .arg("feature-ingest"),
     );
 
-    let ingest_data = repo.write_jsonl(
+    let ingest_data = graph.write_jsonl(
         "system-remote-ingest-merge.jsonl",
         r#"{"type":"Person","data":{"name":"Bob","age":26}}
 {"type":"Person","data":{"name":"Zoe","age":33}}"#,
@@ -828,23 +828,23 @@ fn remote_ingest_reuses_existing_branch_and_merges_updates() {
 #[test]
 #[ignore = "requires loopback socket permissions in sandboxed runners"]
 fn remote_policy_enforces_branch_first_cli_workflow() {
-    let repo = SystemRepo::loaded();
+    let graph = SystemGraph::loaded();
     let server_config =
-        repo.write_config("server-policy.yaml", &remote_policy_server_config(&repo));
-    repo.write_config("policy.yaml", REMOTE_POLICY_E2E_YAML);
-    let server = repo.spawn_server_with_config_env(
+        graph.write_config("server-policy.yaml", &remote_policy_server_config(&graph));
+    graph.write_config("policy.yaml", REMOTE_POLICY_E2E_YAML);
+    let server = graph.spawn_server_with_config_env(
         &server_config,
         &[(
             "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
             r#"{"act-bruno":"team-token","act-ragnor":"admin-token"}"#,
         )],
     );
-    let client_config = repo.write_config(
+    let client_config = graph.write_config(
         "omnigraph-policy.yaml",
         &remote_policy_client_config(&server.base_url),
     );
-    repo.write_config(".env.omni", "POLICY_TEST_TOKEN=team-token\n");
-    let mutation_file = repo.write_query(
+    graph.write_config(".env.omni", "POLICY_TEST_TOKEN=team-token\n");
+    let mutation_file = graph.write_query(
         "system-remote-policy-change.gq",
         r#"
 query insert_person($name: String, $age: I32) {

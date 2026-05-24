@@ -52,7 +52,7 @@ pub fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-pub fn repo_path(root: &Path) -> PathBuf {
+pub fn graph_path(root: &Path) -> PathBuf {
     root.join("demo.omni")
 }
 
@@ -86,14 +86,14 @@ pub fn parse_stdout_json(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-pub fn init_repo(repo: &Path) {
+pub fn init_graph(graph: &Path) {
     let schema = fixture("test.pg");
-    output_success(cli().arg("init").arg("--schema").arg(&schema).arg(repo));
+    output_success(cli().arg("init").arg("--schema").arg(&schema).arg(graph));
 }
 
-pub fn load_fixture(repo: &Path) {
+pub fn load_fixture(graph: &Path) {
     let data = fixture("test.jsonl");
-    output_success(cli().arg("load").arg("--data").arg(&data).arg(repo));
+    output_success(cli().arg("load").arg("--data").arg(&data).arg(graph));
 }
 
 pub fn write_jsonl(path: &Path, rows: &str) {
@@ -116,7 +116,7 @@ fn yaml_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-pub fn local_yaml_config(repo: &Path) -> String {
+pub fn local_yaml_config(graph: &Path) -> String {
     format!(
         "\
 graphs:
@@ -130,7 +130,7 @@ query:
     - .
 policy: {{}}
 ",
-        yaml_string(&repo.to_string_lossy())
+        yaml_string(&graph.to_string_lossy())
     )
 }
 
@@ -200,9 +200,9 @@ fn spawn_server_process(mut command: StdCommand) -> TestServer {
     panic!("server did not become healthy");
 }
 
-pub fn spawn_server(repo: &Path) -> TestServer {
+pub fn spawn_server(graph: &Path) -> TestServer {
     let mut command = server_process();
-    command.arg(repo);
+    command.arg(graph);
     spawn_server_process(command)
 }
 
@@ -221,58 +221,57 @@ pub fn spawn_server_with_config_env(config: &Path, envs: &[(&str, &str)]) -> Tes
     spawn_server_process(command)
 }
 
-
-pub struct SystemRepo {
+pub struct SystemGraph {
     _temp: TempDir,
-    repo: PathBuf,
+    graph: PathBuf,
 }
 
-impl SystemRepo {
+impl SystemGraph {
     pub fn initialized() -> Self {
         let temp = tempdir().unwrap();
-        let repo = repo_path(temp.path());
-        init_repo(&repo);
-        Self { _temp: temp, repo }
+        let graph = graph_path(temp.path());
+        init_graph(&graph);
+        Self { _temp: temp, graph }
     }
 
     pub fn loaded() -> Self {
         let temp = tempdir().unwrap();
-        let repo = repo_path(temp.path());
-        init_repo(&repo);
-        load_fixture(&repo);
-        Self { _temp: temp, repo }
+        let graph = graph_path(temp.path());
+        init_graph(&graph);
+        load_fixture(&graph);
+        Self { _temp: temp, graph }
     }
 
     pub fn path(&self) -> &Path {
-        &self.repo
+        &self.graph
     }
 
     pub fn write_query(&self, name: &str, source: &str) -> PathBuf {
-        let path = self.repo.parent().unwrap().join(name);
+        let path = self.graph.parent().unwrap().join(name);
         write_query_file(&path, source);
         path
     }
 
     pub fn write_jsonl(&self, name: &str, rows: &str) -> PathBuf {
-        let path = self.repo.parent().unwrap().join(name);
+        let path = self.graph.parent().unwrap().join(name);
         write_jsonl(&path, rows);
         path
     }
 
     pub fn write_config(&self, name: &str, source: &str) -> PathBuf {
-        let path = self.repo.parent().unwrap().join(name);
+        let path = self.graph.parent().unwrap().join(name);
         write_config(&path, source);
         path
     }
 
     pub fn write_file(&self, name: &str, source: &str) -> PathBuf {
-        let path = self.repo.parent().unwrap().join(name);
+        let path = self.graph.parent().unwrap().join(name);
         write_file(&path, source);
         path
     }
 
     pub fn spawn_server(&self) -> TestServer {
-        spawn_server(&self.repo)
+        spawn_server(&self.graph)
     }
 
     pub fn spawn_server_with_config(&self, config: &Path) -> TestServer {

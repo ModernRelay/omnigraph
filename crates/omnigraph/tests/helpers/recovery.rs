@@ -110,8 +110,8 @@ impl FollowUpMutation {
     }
 }
 
-pub fn single_sidecar_operation_id(repo_root: &Path) -> String {
-    let ids = sidecar_operation_ids(repo_root);
+pub fn single_sidecar_operation_id(graph_root: &Path) -> String {
+    let ids = sidecar_operation_ids(graph_root);
     assert_eq!(
         ids.len(),
         1,
@@ -121,8 +121,8 @@ pub fn single_sidecar_operation_id(repo_root: &Path) -> String {
     ids.into_iter().next().unwrap()
 }
 
-pub fn sidecar_operation_ids(repo_root: &Path) -> Vec<String> {
-    let dir = repo_root.join("__recovery");
+pub fn sidecar_operation_ids(graph_root: &Path) -> Vec<String> {
+    let dir = graph_root.join("__recovery");
     if !dir.exists() {
         return Vec::new();
     }
@@ -143,10 +143,10 @@ pub fn sidecar_operation_ids(repo_root: &Path) -> Vec<String> {
     ids
 }
 
-pub async fn branch_head_commit_id(repo_root: &Path, branch: &str) -> Result<String> {
+pub async fn branch_head_commit_id(graph_root: &Path, branch: &str) -> Result<String> {
     let graph = match branch {
-        "main" => CommitGraph::open(&repo_uri(repo_root)).await?,
-        branch => CommitGraph::open_at_branch(&repo_uri(repo_root), branch).await?,
+        "main" => CommitGraph::open(&graph_uri(graph_root)).await?,
+        branch => CommitGraph::open_at_branch(&graph_uri(graph_root), branch).await?,
     };
     graph.head_commit_id().await?.ok_or_else(|| {
         OmniError::manifest_internal(format!("commit graph for branch {branch} has no head"))
@@ -154,52 +154,52 @@ pub async fn branch_head_commit_id(repo_root: &Path, branch: &str) -> Result<Str
 }
 
 pub async fn assert_post_recovery_invariants(
-    repo_root: &Path,
+    graph_root: &Path,
     operation_id: &str,
     expectation: RecoveryExpectation,
 ) -> Result<()> {
     match expectation {
         RecoveryExpectation::RolledForward { tables } => {
-            assert_sidecar_absent(repo_root, operation_id);
-            let audit = read_audit_row(repo_root, operation_id).await?;
+            assert_sidecar_absent(graph_root, operation_id);
+            let audit = read_audit_row(graph_root, operation_id).await?;
             assert_eq!(
                 audit.recovery_kind, "RolledForward",
                 "audit row for {operation_id} recorded the wrong recovery_kind",
             );
-            assert_manifest_pins_match_lance_heads(repo_root, &tables).await?;
-            assert_audit_to_versions_match_lance_heads(repo_root, &audit, &tables).await?;
-            assert_recovery_commit_shape(repo_root, &audit, &tables).await?;
-            assert_non_main_did_not_move_main(repo_root, &tables).await?;
-            assert_idempotent_reopen(repo_root, operation_id).await?;
-            run_follow_up_mutations(repo_root, tables).await?;
+            assert_manifest_pins_match_lance_heads(graph_root, &tables).await?;
+            assert_audit_to_versions_match_lance_heads(graph_root, &audit, &tables).await?;
+            assert_recovery_commit_shape(graph_root, &audit, &tables).await?;
+            assert_non_main_did_not_move_main(graph_root, &tables).await?;
+            assert_idempotent_reopen(graph_root, operation_id).await?;
+            run_follow_up_mutations(graph_root, tables).await?;
         }
         RecoveryExpectation::RolledBack { tables } => {
-            assert_sidecar_absent(repo_root, operation_id);
-            let audit = read_audit_row(repo_root, operation_id).await?;
+            assert_sidecar_absent(graph_root, operation_id);
+            let audit = read_audit_row(graph_root, operation_id).await?;
             assert_eq!(
                 audit.recovery_kind, "RolledBack",
                 "audit row for {operation_id} recorded the wrong recovery_kind",
             );
             assert_rollback_outcomes_record_drift(&audit);
-            assert_recovery_commit_shape(repo_root, &audit, &tables).await?;
-            assert_non_main_did_not_move_main(repo_root, &tables).await?;
-            assert_idempotent_reopen(repo_root, operation_id).await?;
-            run_follow_up_mutations(repo_root, tables).await?;
+            assert_recovery_commit_shape(graph_root, &audit, &tables).await?;
+            assert_non_main_did_not_move_main(graph_root, &tables).await?;
+            assert_idempotent_reopen(graph_root, operation_id).await?;
+            run_follow_up_mutations(graph_root, tables).await?;
         }
         RecoveryExpectation::Deferred => {
             assert!(
-                sidecar_path(repo_root, operation_id).exists(),
+                sidecar_path(graph_root, operation_id).exists(),
                 "deferred recovery must leave sidecar {operation_id} on disk",
             );
             assert!(
-                read_audit_row(repo_root, operation_id).await.is_err(),
+                read_audit_row(graph_root, operation_id).await.is_err(),
                 "deferred recovery must not record an audit row for {operation_id}",
             );
         }
         RecoveryExpectation::NoOp => {
-            assert_sidecar_absent(repo_root, operation_id);
+            assert_sidecar_absent(graph_root, operation_id);
             assert!(
-                read_audit_row(repo_root, operation_id).await.is_err(),
+                read_audit_row(graph_root, operation_id).await.is_err(),
                 "no-op recovery must not record an audit row for {operation_id}",
             );
         }
@@ -216,24 +216,24 @@ fn branch_context(tables: &[TableExpectation]) -> Option<String> {
         .map(str::to_string)
 }
 
-fn sidecar_path(repo_root: &Path, operation_id: &str) -> PathBuf {
-    repo_root
+fn sidecar_path(graph_root: &Path, operation_id: &str) -> PathBuf {
+    graph_root
         .join("__recovery")
         .join(format!("{operation_id}.json"))
 }
 
-fn assert_sidecar_absent(repo_root: &Path, operation_id: &str) {
+fn assert_sidecar_absent(graph_root: &Path, operation_id: &str) {
     assert!(
-        !sidecar_path(repo_root, operation_id).exists(),
+        !sidecar_path(graph_root, operation_id).exists(),
         "recovery sidecar {operation_id} must be deleted after successful recovery",
     );
 }
 
 async fn assert_manifest_pins_match_lance_heads(
-    repo_root: &Path,
+    graph_root: &Path,
     tables: &[TableExpectation],
 ) -> Result<()> {
-    let uri = repo_uri(repo_root);
+    let uri = graph_uri(graph_root);
     let db = Omnigraph::open(&uri).await?;
     for table in tables {
         let (entry, lance_head) = entry_and_lance_head(&db, &uri, table).await?;
@@ -254,11 +254,11 @@ async fn assert_manifest_pins_match_lance_heads(
 }
 
 async fn assert_audit_to_versions_match_lance_heads(
-    repo_root: &Path,
+    graph_root: &Path,
     audit: &RecoveryAuditRow,
     tables: &[TableExpectation],
 ) -> Result<()> {
-    let uri = repo_uri(repo_root);
+    let uri = graph_uri(graph_root);
     let db = Omnigraph::open(&uri).await?;
     for table in tables {
         let (_, lance_head) = entry_and_lance_head(&db, &uri, table).await?;
@@ -301,10 +301,10 @@ fn assert_rollback_outcomes_record_drift(audit: &RecoveryAuditRow) {
 }
 
 async fn assert_non_main_did_not_move_main(
-    repo_root: &Path,
+    graph_root: &Path,
     tables: &[TableExpectation],
 ) -> Result<()> {
-    let uri = repo_uri(repo_root);
+    let uri = graph_uri(graph_root);
     let db = Omnigraph::open(&uri).await?;
     let main = db.snapshot_of(ReadTarget::branch("main")).await?;
     for table in tables {
@@ -327,14 +327,14 @@ async fn assert_non_main_did_not_move_main(
 }
 
 async fn assert_recovery_commit_shape(
-    repo_root: &Path,
+    graph_root: &Path,
     audit: &RecoveryAuditRow,
     tables: &[TableExpectation],
 ) -> Result<()> {
     let branch = branch_context(tables);
     let expected_parent = expected_recovery_parent(tables)?;
     let branch = branch.as_deref();
-    let commit = read_recovery_commit(repo_root, audit, branch).await?;
+    let commit = read_recovery_commit(graph_root, audit, branch).await?;
 
     assert_eq!(
         commit.actor_id.as_deref(),
@@ -362,7 +362,7 @@ async fn assert_recovery_commit_shape(
         );
 
         if let Some(branch) = branch {
-            let graph = CommitGraph::open_at_branch(&repo_uri(repo_root), branch).await?;
+            let graph = CommitGraph::open_at_branch(&graph_uri(graph_root), branch).await?;
             let commits = graph.load_commits().await?;
             let parent = commit.parent_commit_id.as_deref().ok_or_else(|| {
                 OmniError::manifest_internal(format!(
@@ -403,12 +403,12 @@ fn expected_recovery_parent(tables: &[TableExpectation]) -> Result<Option<String
     Ok(expected)
 }
 
-async fn assert_idempotent_reopen(repo_root: &Path, operation_id: &str) -> Result<()> {
-    let before = matching_audit_rows(repo_root, operation_id).await?;
-    let uri = repo_uri(repo_root);
+async fn assert_idempotent_reopen(graph_root: &Path, operation_id: &str) -> Result<()> {
+    let before = matching_audit_rows(graph_root, operation_id).await?;
+    let uri = graph_uri(graph_root);
     let _db = Omnigraph::open(&uri).await?;
-    assert_sidecar_absent(repo_root, operation_id);
-    let after = matching_audit_rows(repo_root, operation_id).await?;
+    assert_sidecar_absent(graph_root, operation_id);
+    let after = matching_audit_rows(graph_root, operation_id).await?;
     assert_eq!(
         after.len(),
         before.len(),
@@ -417,14 +417,14 @@ async fn assert_idempotent_reopen(repo_root: &Path, operation_id: &str) -> Resul
     Ok(())
 }
 
-async fn run_follow_up_mutations(repo_root: &Path, tables: Vec<TableExpectation>) -> Result<()> {
+async fn run_follow_up_mutations(graph_root: &Path, tables: Vec<TableExpectation>) -> Result<()> {
     let mut db: Option<Omnigraph> = None;
     for table in tables {
         let Some(mutation) = table.follow_up_mutation else {
             continue;
         };
         if db.is_none() {
-            db = Some(Omnigraph::open(&repo_uri(repo_root)).await?);
+            db = Some(Omnigraph::open(&graph_uri(graph_root)).await?);
         }
         let db = db.as_mut().unwrap();
         db.mutate(
@@ -480,11 +480,11 @@ async fn lance_head_for_entry(root_uri: &str, entry: &SubTableEntry) -> Result<u
 }
 
 async fn read_recovery_commit(
-    repo_root: &Path,
+    graph_root: &Path,
     audit: &RecoveryAuditRow,
     branch: Option<&str>,
 ) -> Result<GraphCommit> {
-    let uri = repo_uri(repo_root);
+    let uri = graph_uri(graph_root);
     let graph = match branch {
         Some(branch) => CommitGraph::open_at_branch(&uri, branch).await?,
         None => CommitGraph::open(&uri).await?,
@@ -502,8 +502,8 @@ async fn read_recovery_commit(
         })
 }
 
-async fn read_audit_row(repo_root: &Path, operation_id: &str) -> Result<RecoveryAuditRow> {
-    let mut rows = matching_audit_rows(repo_root, operation_id).await?;
+async fn read_audit_row(graph_root: &Path, operation_id: &str) -> Result<RecoveryAuditRow> {
+    let mut rows = matching_audit_rows(graph_root, operation_id).await?;
     if rows.len() != 1 {
         return Err(OmniError::manifest_internal(format!(
             "expected exactly one recovery audit row for {operation_id}, got {}",
@@ -514,10 +514,10 @@ async fn read_audit_row(repo_root: &Path, operation_id: &str) -> Result<Recovery
 }
 
 async fn matching_audit_rows(
-    repo_root: &Path,
+    graph_root: &Path,
     operation_id: &str,
 ) -> Result<Vec<RecoveryAuditRow>> {
-    let recoveries_dir = repo_root.join("_graph_commit_recoveries.lance");
+    let recoveries_dir = graph_root.join("_graph_commit_recoveries.lance");
     if !recoveries_dir.exists() {
         return Ok(Vec::new());
     }
@@ -575,6 +575,6 @@ fn string_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArr
         })
 }
 
-fn repo_uri(repo_root: &Path) -> String {
-    repo_root.to_str().unwrap().to_string()
+fn graph_uri(graph_root: &Path) -> String {
+    graph_root.to_str().unwrap().to_string()
 }

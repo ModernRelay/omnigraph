@@ -66,7 +66,7 @@ impl StorageAdapter for LocalStorageAdapter {
         // Ensure parent directory exists. S3 has no equivalent (PutObject
         // is path-agnostic). For local fs, callers like the recovery
         // sidecar protocol expect transparent directory creation under
-        // the repo root (the `__recovery/` directory doesn't pre-exist;
+        // the graph root (the `__recovery/` directory doesn't pre-exist;
         // first sidecar write creates it).
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -398,10 +398,13 @@ mod tests {
 
     #[test]
     fn storage_backend_selection_is_scheme_aware() {
-        assert_eq!(storage_kind_for_uri("/tmp/repo"), StorageKind::Local);
-        assert_eq!(storage_kind_for_uri("file:///tmp/repo"), StorageKind::Local);
+        assert_eq!(storage_kind_for_uri("/tmp/graph"), StorageKind::Local);
         assert_eq!(
-            storage_kind_for_uri("s3://omnigraph-preview/repo"),
+            storage_kind_for_uri("file:///tmp/graph"),
+            StorageKind::Local
+        );
+        assert_eq!(
+            storage_kind_for_uri("s3://omnigraph-preview/graph"),
             StorageKind::S3
         );
     }
@@ -440,8 +443,8 @@ mod tests {
 
     #[test]
     fn parse_s3_uri_splits_bucket_and_key() {
-        let location = parse_s3_uri("s3://bucket/repo/_schema.pg").unwrap();
+        let location = parse_s3_uri("s3://bucket/graph/_schema.pg").unwrap();
         assert_eq!(location.bucket, "bucket");
-        assert_eq!(location.key, "repo/_schema.pg");
+        assert_eq!(location.key, "graph/_schema.pg");
     }
 }
