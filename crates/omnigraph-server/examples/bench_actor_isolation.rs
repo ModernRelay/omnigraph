@@ -259,10 +259,10 @@ async fn main() {
     }
 
     let temp = tempfile::tempdir().expect("tempdir");
-    let repo = temp.path().join("bench.omni");
-    Omnigraph::init(repo.to_str().unwrap(), SCHEMA)
+    let graph = temp.path().join("bench.omni");
+    Omnigraph::init(graph.to_str().unwrap(), SCHEMA)
         .await
-        .expect("init repo");
+        .expect("init graph");
 
     // Build bearer tokens: one for the heavy actor + one per light actor.
     let mut tokens: Vec<(String, String)> =
@@ -270,21 +270,17 @@ async fn main() {
     for i in 0..args.light_actors {
         tokens.push((format!("act-light-{i}"), format!("light-token-{i}")));
     }
-    let db = Omnigraph::open(repo.to_str().unwrap())
+    let db = Omnigraph::open(graph.to_str().unwrap())
         .await
-        .expect("open repo");
+        .expect("open graph");
     // Construct a custom WorkloadController with the requested caps and
     // pass it through `AppState::new_with_workload`. Avoids the
     // `unsafe { std::env::set_var(...) }` antipattern that violates
     // `setenv`'s thread-safety precondition once the multi-thread tokio
     // runtime is up.
     let workload = WorkloadController::new(args.inflight_cap, args.byte_cap);
-    let state = AppState::new_with_workload(
-        repo.to_string_lossy().to_string(),
-        db,
-        tokens,
-        workload,
-    );
+    let state =
+        AppState::new_with_workload(graph.to_string_lossy().to_string(), db, tokens, workload);
     let app = build_app(state);
 
     eprintln!(

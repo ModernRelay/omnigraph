@@ -74,7 +74,7 @@ async fn apply_schema_rejects_when_non_main_branch_exists() {
     let err = db.apply_schema(&desired).await.unwrap_err();
     assert!(
         err.to_string()
-            .contains("schema apply requires a repo with only main")
+            .contains("schema apply requires a graph with only main")
     );
 }
 
@@ -402,10 +402,7 @@ async fn apply_schema_rejects_adding_a_required_property_without_backfill() {
 
     // Add `email: String` (required, non-nullable, no @rename_from). Existing
     // rows have no value to fill in, so this is unsupported in v1.
-    let desired = TEST_SCHEMA.replace(
-        "    age: I32?\n}",
-        "    age: I32?\n    email: String\n}",
-    );
+    let desired = TEST_SCHEMA.replace("    age: I32?\n}", "    age: I32?\n    email: String\n}");
     let err = db.apply_schema(&desired).await.unwrap_err();
     let msg = err.to_string();
     assert!(
@@ -437,7 +434,10 @@ async fn plan_schema_for_property_type_narrowing_is_not_supported() {
         .unwrap();
 
     let plan = db.plan_schema(TEST_SCHEMA).await.unwrap();
-    assert!(!plan.supported, "narrowing I64 -> I32 must not be supported");
+    assert!(
+        !plan.supported,
+        "narrowing I64 -> I32 must not be supported"
+    );
     assert!(plan.steps.iter().any(|step| matches!(
         step,
         SchemaMigrationStep::UnsupportedChange { code, .. }

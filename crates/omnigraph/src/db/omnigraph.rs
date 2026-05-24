@@ -166,7 +166,7 @@ pub enum OpenMode {
 }
 
 impl Omnigraph {
-    /// Create a new repo at `uri` from schema source.
+    /// Create a new graph at `uri` from schema source.
     ///
     /// Creates `_schema.pg`, per-type Lance datasets, and `__manifest`.
     pub async fn init(uri: &str, schema_source: &str) -> Result<Self> {
@@ -205,7 +205,7 @@ impl Omnigraph {
         })
     }
 
-    /// Open an existing repo (read-write).
+    /// Open an existing graph (read-write).
     ///
     /// Reads `_schema.pg`, parses it, builds the catalog, and opens `__manifest`.
     /// Runs the open-time recovery sweep before returning — see [`OpenMode`].
@@ -213,7 +213,7 @@ impl Omnigraph {
         Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadWrite).await
     }
 
-    /// Open an existing repo for read-only consumers (NDJSON export,
+    /// Open an existing graph for read-only consumers (NDJSON export,
     /// `commit list`, etc.). Skips the recovery sweep — see [`OpenMode`].
     pub async fn open_read_only(uri: &str) -> Result<Self> {
         Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadOnly).await
@@ -397,7 +397,8 @@ impl Omnigraph {
         desired_schema_source: &str,
         options: SchemaApplyOptions,
     ) -> Result<SchemaApplyResult> {
-        self.apply_schema_as(desired_schema_source, options, None).await
+        self.apply_schema_as(desired_schema_source, options, None)
+            .await
     }
 
     /// Apply a schema migration with an explicit actor for engine-layer
@@ -470,7 +471,7 @@ impl Omnigraph {
         Arc::clone(&self.merge_exclusive)
     }
 
-    /// Engine-level access to the repo's normalized root URI. Used by
+    /// Engine-level access to the graph's normalized root URI. Used by
     /// the recovery sidecar protocol to compute `__recovery/` paths.
     pub(crate) fn root_uri(&self) -> &str {
         &self.root_uri
@@ -510,9 +511,10 @@ impl Omnigraph {
         let normalized = normalize_branch_name(branch.unwrap_or("main"))?;
         let coord = self.coordinator.read().await;
         if normalized.as_deref() == coord.current_branch() {
-            let snapshot_id = coord.head_commit_id().await?.unwrap_or_else(|| {
-                SnapshotId::synthetic(coord.current_branch(), coord.version())
-            });
+            let snapshot_id = coord
+                .head_commit_id()
+                .await?
+                .unwrap_or_else(|| SnapshotId::synthetic(coord.current_branch(), coord.version()));
             return Ok(ResolvedTarget {
                 requested,
                 branch: coord.current_branch().map(str::to_string),
@@ -587,7 +589,7 @@ impl Omnigraph {
     ///    exist. Required BEFORE manifest-drift recovery so a
     ///    SchemaApply roll-forward doesn't publish the manifest while
     ///    the staging files remain unrenamed (which would corrupt the
-    ///    repo: data on new schema, catalog on old).
+    ///    graph: data on new schema, catalog on old).
     /// 3. `recover_manifest_drift(... RollForwardOnly)` — close the
     ///    finalize→publisher residual via roll-forward; defer rollback
     ///    work to next ReadWrite open.
@@ -668,7 +670,11 @@ impl Omnigraph {
 
     pub async fn resolve_snapshot(&self, branch: &str) -> Result<SnapshotId> {
         self.ensure_schema_state_valid().await?;
-        self.coordinator.read().await.resolve_snapshot_id(branch).await
+        self.coordinator
+            .read()
+            .await
+            .resolve_snapshot_id(branch)
+            .await
     }
 
     pub(crate) async fn resolved_target(
@@ -676,7 +682,11 @@ impl Omnigraph {
         target: impl Into<ReadTarget>,
     ) -> Result<ResolvedTarget> {
         self.ensure_schema_state_valid().await?;
-        self.coordinator.read().await.resolve_target(&target.into()).await
+        self.coordinator
+            .read()
+            .await
+            .resolve_target(&target.into())
+            .await
     }
 
     // ─── Change detection ────────────────────────────────────────────────
@@ -708,7 +718,9 @@ impl Omnigraph {
         filter: &crate::changes::ChangeFilter,
     ) -> Result<crate::changes::ChangeSet> {
         let coord = self.coordinator.read().await;
-        let from_commit = coord.resolve_commit(&SnapshotId::new(from_commit_id)).await?;
+        let from_commit = coord
+            .resolve_commit(&SnapshotId::new(from_commit_id))
+            .await?;
         let to_commit = coord.resolve_commit(&SnapshotId::new(to_commit_id)).await?;
         let from_snap = coord
             .resolve_target(&ReadTarget::Snapshot(SnapshotId::new(
@@ -753,7 +765,11 @@ impl Omnigraph {
     /// Create a Snapshot at any historical manifest version.
     pub async fn snapshot_at_version(&self, version: u64) -> Result<Snapshot> {
         self.ensure_schema_state_valid().await?;
-        self.coordinator.read().await.snapshot_at_version(version).await
+        self.coordinator
+            .read()
+            .await
+            .snapshot_at_version(version)
+            .await
     }
 
     pub async fn export_jsonl(
@@ -894,11 +910,20 @@ impl Omnigraph {
     }
 
     pub(crate) async fn active_branch(&self) -> Option<String> {
-        self.coordinator.read().await.current_branch().map(str::to_string)
+        self.coordinator
+            .read()
+            .await
+            .current_branch()
+            .map(str::to_string)
     }
 
     async fn ensure_branch_delete_safe(&self, branch: &str, branches: &[String]) -> Result<()> {
-        let descendants = self.coordinator.read().await.branch_descendants(branch).await?;
+        let descendants = self
+            .coordinator
+            .read()
+            .await
+            .branch_descendants(branch)
+            .await?;
         if let Some(descendant) = descendants.first() {
             return Err(OmniError::manifest_conflict(format!(
                 "cannot delete branch '{}' because descendant branch '{}' still depends on it",
@@ -954,7 +979,12 @@ impl Omnigraph {
     }
 
     async fn delete_branch_storage_only(&self, branch: &str) -> Result<()> {
-        let active = self.coordinator.read().await.current_branch().map(str::to_string);
+        let active = self
+            .coordinator
+            .read()
+            .await
+            .current_branch()
+            .map(str::to_string);
         if active.as_deref() == Some(branch) {
             return Err(OmniError::manifest_conflict(format!(
                 "cannot delete currently active branch '{}'",
@@ -1013,11 +1043,7 @@ impl Omnigraph {
         self.coordinator.write().await.branch_create(name).await
     }
 
-    pub async fn branch_create_from(
-        &self,
-        from: impl Into<ReadTarget>,
-        name: &str,
-    ) -> Result<()> {
+    pub async fn branch_create_from(&self, from: impl Into<ReadTarget>, name: &str) -> Result<()> {
         self.branch_create_from_as(from, name, None).await
     }
 
@@ -1134,7 +1160,9 @@ impl Omnigraph {
 
     pub async fn get_commit(&self, commit_id: &str) -> Result<GraphCommit> {
         self.ensure_schema_state_valid().await?;
-        self.coordinator.read().await
+        self.coordinator
+            .read()
+            .await
             .resolve_commit(&SnapshotId::new(commit_id))
             .await
     }

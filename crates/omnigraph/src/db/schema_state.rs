@@ -61,7 +61,7 @@ pub(crate) async fn load_or_bootstrap_schema_contract(
                 .collect::<Vec<_>>();
             if !public_non_main.is_empty() {
                 return Err(schema_lock_conflict(format!(
-                    "repo is missing persisted schema state and has public branches ({}); public branches block schema evolution entirely",
+                    "graph is missing persisted schema state and has public branches ({}); public branches block schema evolution entirely",
                     public_non_main.join(", ")
                 )));
             }
@@ -70,7 +70,7 @@ pub(crate) async fn load_or_bootstrap_schema_contract(
             Ok((current_source_ir.clone(), state))
         }
         SchemaContractRead::PartialMissing => Err(schema_lock_conflict(
-            "repo schema state is incomplete (_schema.ir.json and __schema_state.json must either both exist or both be absent)",
+            "graph schema state is incomplete (_schema.ir.json and __schema_state.json must either both exist or both be absent)",
         )),
     }
 }
@@ -84,7 +84,7 @@ pub(crate) async fn validate_schema_contract(
         SchemaContractRead::Present { ir, state } => (ir, state),
         SchemaContractRead::MissingAll | SchemaContractRead::PartialMissing => {
             return Err(schema_lock_conflict(
-                "repo is missing persisted schema state; manual coordination is required before schema changes are allowed",
+                "graph is missing persisted schema state; manual coordination is required before schema changes are allowed",
             ));
         }
     };
@@ -163,7 +163,7 @@ pub(crate) async fn read_accepted_schema_ir(
         }
         SchemaContractRead::MissingAll | SchemaContractRead::PartialMissing => {
             Err(schema_lock_conflict(
-                "repo is missing persisted schema state; manual coordination is required before schema changes are allowed",
+                "graph is missing persisted schema state; manual coordination is required before schema changes are allowed",
             ))
         }
     }
@@ -221,7 +221,7 @@ async fn read_schema_contract(
             })?;
             let state = serde_json::from_str::<SchemaState>(&state_json).map_err(|err| {
                 schema_lock_conflict(format!(
-                    "repo schema state in {} is invalid: {}",
+                    "graph schema state in {} is invalid: {}",
                     SCHEMA_STATE_FILENAME, err
                 ))
             })?;
@@ -234,7 +234,7 @@ async fn read_schema_contract(
 fn validate_persisted_schema_contract(ir: &SchemaIR, state: &SchemaState) -> Result<()> {
     if state.format_version != SCHEMA_STATE_FORMAT_VERSION {
         return Err(schema_lock_conflict(format!(
-            "repo schema state format {} is unsupported",
+            "graph schema state format {} is unsupported",
             state.format_version
         )));
     }
@@ -344,7 +344,7 @@ pub(crate) async fn recover_schema_state_files(
     // to the new Lance HEADs; we MUST also rename the staging files
     // forward so the catalog matches. Without this, the disambiguation
     // logic below sees actual_keys == live_keys (manifest didn't move)
-    // and deletes the staging files, leaving the repo with new-schema
+    // and deletes the staging files, leaving the graph with new-schema
     // data on disk but the old `_schema.pg` live — corruption.
     if crate::db::manifest::has_schema_apply_sidecar(root_uri, storage.as_ref()).await? {
         warn!(

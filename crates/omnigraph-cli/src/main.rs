@@ -66,16 +66,16 @@ enum Command {
     Version,
     /// Generate, clean, or refresh explicit seed embeddings
     Embed(EmbedArgs),
-    /// Initialize a new repo from a schema
+    /// Initialize a new graph from a schema
     Init {
         #[arg(long)]
         schema: PathBuf,
-        /// Repo URI (local path or s3://)
+        /// Graph URI (local path or s3://)
         uri: String,
     },
-    /// Load data into a repo
+    /// Load data into a graph
     Load {
-        /// Repo URI
+        /// Graph URI
         uri: Option<String>,
         #[arg(long)]
         target: Option<String>,
@@ -92,7 +92,7 @@ enum Command {
     },
     /// Ingest data into a reviewable named branch
     Ingest {
-        /// Repo URI
+        /// Graph URI
         uri: Option<String>,
         #[arg(long)]
         target: Option<String>,
@@ -124,9 +124,9 @@ enum Command {
         #[command(subcommand)]
         command: QueryCommand,
     },
-    /// Show repo snapshot
+    /// Show graph snapshot
     Snapshot {
-        /// Repo URI
+        /// Graph URI
         uri: Option<String>,
         #[arg(long)]
         target: Option<String>,
@@ -139,7 +139,7 @@ enum Command {
     },
     /// Export a full graph snapshot as JSONL
     Export {
-        /// Repo URI
+        /// Graph URI
         uri: Option<String>,
         #[arg(long)]
         target: Option<String>,
@@ -161,7 +161,7 @@ enum Command {
     },
     /// Execute a read query against a branch or snapshot
     Read {
-        /// Repo URI
+        /// Graph URI
         #[arg(long)]
         uri: Option<String>,
         #[arg(hide = true)]
@@ -191,7 +191,7 @@ enum Command {
     },
     /// Execute a graph change query against a branch
     Change {
-        /// Repo URI
+        /// Graph URI
         #[arg(long)]
         uri: Option<String>,
         #[arg(hide = true)]
@@ -220,9 +220,9 @@ enum Command {
         #[command(subcommand)]
         command: PolicyCommand,
     },
-    /// Compact small Lance fragments in every table of the repo
+    /// Compact small Lance fragments in every table of the graph
     Optimize {
-        /// Repo URI
+        /// Graph URI
         uri: Option<String>,
         #[arg(long)]
         target: Option<String>,
@@ -231,9 +231,9 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Remove old Lance versions from every table of the repo (destructive)
+    /// Remove old Lance versions from every table of the graph (destructive)
     Cleanup {
-        /// Repo URI
+        /// Graph URI
         uri: Option<String>,
         #[arg(long)]
         target: Option<String>,
@@ -259,7 +259,7 @@ enum Command {
 enum BranchCommand {
     /// Create a new branch
     Create {
-        /// Repo URI
+        /// Graph URI
         #[arg(long)]
         uri: Option<String>,
         #[arg(long)]
@@ -274,7 +274,7 @@ enum BranchCommand {
     },
     /// List branches
     List {
-        /// Repo URI
+        /// Graph URI
         #[arg(long)]
         uri: Option<String>,
         #[arg(long)]
@@ -286,7 +286,7 @@ enum BranchCommand {
     },
     /// Delete a branch
     Delete {
-        /// Repo URI
+        /// Graph URI
         #[arg(long)]
         uri: Option<String>,
         #[arg(long)]
@@ -299,7 +299,7 @@ enum BranchCommand {
     },
     /// Merge a source branch into a target branch
     Merge {
-        /// Repo URI
+        /// Graph URI
         #[arg(long)]
         uri: Option<String>,
         #[arg(long)]
@@ -318,7 +318,7 @@ enum BranchCommand {
 enum SchemaCommand {
     /// Plan a schema migration against the accepted persisted schema
     Plan {
-        /// Repo URI
+        /// Graph URI
         uri: Option<String>,
         #[arg(long)]
         target: Option<String>,
@@ -336,7 +336,7 @@ enum SchemaCommand {
     },
     /// Apply a supported schema migration
     Apply {
-        /// Repo URI
+        /// Graph URI
         uri: Option<String>,
         #[arg(long)]
         target: Option<String>,
@@ -361,7 +361,7 @@ enum SchemaCommand {
     /// Show the current accepted schema source
     #[command(alias = "get")]
     Show {
-        /// Repo URI
+        /// Graph URI
         uri: Option<String>,
         #[arg(long)]
         target: Option<String>,
@@ -377,7 +377,7 @@ enum QueryCommand {
     /// Validate queries and report higher-level drift warnings
     #[command(visible_alias = "check")]
     Lint {
-        /// Repo URI
+        /// Graph URI
         uri: Option<String>,
         #[arg(long)]
         target: Option<String>,
@@ -396,7 +396,7 @@ enum QueryCommand {
 enum CommitCommand {
     /// List graph commits
     List {
-        /// Repo URI
+        /// Graph URI
         uri: Option<String>,
         #[arg(long)]
         target: Option<String>,
@@ -409,7 +409,7 @@ enum CommitCommand {
     },
     /// Show a graph commit
     Show {
-        /// Repo URI
+        /// Graph URI
         #[arg(long)]
         uri: Option<String>,
         #[arg(long)]
@@ -582,7 +582,7 @@ fn finish_query_lint(output: &QueryLintOutput, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn ensure_local_repo_parent(uri: &str) -> Result<()> {
+fn ensure_local_graph_parent(uri: &str) -> Result<()> {
     if !uri.contains("://") {
         fs::create_dir_all(uri)?;
     }
@@ -694,10 +694,10 @@ fn resolve_policy_engine(config: &OmnigraphConfig) -> Result<PolicyEngine> {
     let policy_file = config
         .resolve_policy_file()
         .ok_or_else(|| color_eyre::eyre::eyre!("policy.file must be set in omnigraph.yaml"))?;
-    PolicyEngine::load(&policy_file, &policy_repo_id(config))
+    PolicyEngine::load(&policy_file, &policy_graph_id(config))
 }
 
-/// Open a local-URI repo and, when `policy.file` is configured in
+/// Open a local-URI graph and, when `policy.file` is configured in
 /// `omnigraph.yaml`, install the resolved `PolicyEngine` on the engine
 /// handle so every direct-engine write goes through
 /// `Omnigraph::enforce(...)` (MR-722). Without a configured policy this
@@ -721,10 +721,7 @@ async fn open_local_db_with_policy(uri: &str, config: &OmnigraphConfig) -> Resul
 /// policy is configured and this returns `None`, the engine-layer
 /// footgun guard intentionally denies — silent bypass via "I forgot the
 /// actor" is what the guard prevents.
-fn resolve_cli_actor<'a>(
-    cli_as: Option<&'a str>,
-    config: &'a OmnigraphConfig,
-) -> Option<&'a str> {
+fn resolve_cli_actor<'a>(cli_as: Option<&'a str>, config: &'a OmnigraphConfig) -> Option<&'a str> {
     cli_as.or(config.cli.actor.as_deref())
 }
 
@@ -736,7 +733,7 @@ fn resolve_policy_tests_path(config: &OmnigraphConfig) -> Result<PathBuf> {
     })
 }
 
-fn policy_repo_id(config: &OmnigraphConfig) -> String {
+fn policy_graph_id(config: &OmnigraphConfig) -> String {
     if let Some(name) = &config.project.name {
         return name.clone();
     }
@@ -834,8 +831,15 @@ fn parse_duration_arg(s: &str) -> Result<std::time::Duration> {
     if s.is_empty() {
         bail!("duration is empty");
     }
-    let (num_part, unit) = match s.char_indices().rev().find(|(_, c)| c.is_ascii_alphabetic()) {
-        Some((i, _)) => (&s[..i + 1 - s[i..].chars().next().unwrap().len_utf8()], &s[i..]),
+    let (num_part, unit) = match s
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_ascii_alphabetic())
+    {
+        Some((i, _)) => (
+            &s[..i + 1 - s[i..].chars().next().unwrap().len_utf8()],
+            &s[i..],
+        ),
         None => (s, ""),
     };
     let n: u64 = num_part
@@ -861,7 +865,7 @@ fn resolve_local_uri(
     let uri = resolve_uri(config, cli_uri, cli_target)?;
     if is_remote_uri(&uri) {
         bail!(
-            "{} is only supported against local repo URIs in this milestone",
+            "{} is only supported against local graph URIs in this milestone",
             operation
         );
     }
@@ -1117,9 +1121,7 @@ fn render_schema_plan_step(step: &SchemaMigrationStep) -> String {
             type_name,
             drop_mode_label(*mode),
         ),
-        SchemaMigrationStep::UnsupportedChange {
-            entity, reason, ..
-        } => {
+        SchemaMigrationStep::UnsupportedChange { entity, reason, .. } => {
             // When a schema-lint code is attached, render code + tier
             // so operators see at-a-glance the kind of risk (destructive
             // / validated / safe) — not just the rule identifier.
@@ -1529,10 +1531,10 @@ async fn execute_query_lint(
         ));
     }
 
-    let has_repo_target =
+    let has_graph_target =
         cli_uri.is_some() || cli_target.is_some() || config.cli_graph_name().is_some();
-    if !has_repo_target {
-        bail!("query lint requires --schema <schema.pg> or a resolvable repo target");
+    if !has_graph_target {
+        bail!("query lint requires --schema <schema.pg> or a resolvable graph target");
     }
 
     let uri = resolve_local_uri(config, cli_uri, cli_target, "query lint")?;
@@ -1541,7 +1543,7 @@ async fn execute_query_lint(
         &db.catalog(),
         &query_source,
         query_path,
-        QueryLintSchemaSource::repo(uri),
+        QueryLintSchemaSource::graph(uri),
     ))
 }
 
@@ -1718,7 +1720,7 @@ async fn main() -> Result<()> {
         }
         Command::Init { schema, uri } => {
             let schema_source = fs::read_to_string(&schema)?;
-            ensure_local_repo_parent(&uri)?;
+            ensure_local_graph_parent(&uri)?;
             Omnigraph::init(&uri, &schema_source).await?;
             scaffold_config_if_missing(&uri)?;
             println!("initialized {}", uri);
@@ -2499,17 +2501,16 @@ async fn main() -> Result<()> {
             let config = load_cli_config(config.as_ref())?;
             let uri = resolve_uri(&config, uri, target.as_deref())?;
 
-            let older_than_dur = older_than
-                .as_deref()
-                .map(parse_duration_arg)
-                .transpose()?;
+            let older_than_dur = older_than.as_deref().map(parse_duration_arg).transpose()?;
 
             if keep.is_none() && older_than_dur.is_none() {
                 bail!("cleanup requires at least one of --keep or --older-than");
             }
 
             let policy_desc = match (keep, older_than_dur) {
-                (Some(k), Some(d)) => format!("keep {} versions, remove anything older than {:?}", k, d),
+                (Some(k), Some(d)) => {
+                    format!("keep {} versions, remove anything older than {:?}", k, d)
+                }
                 (Some(k), None) => format!("keep {} versions", k),
                 (None, Some(d)) => format!("remove anything older than {:?}", d),
                 _ => unreachable!(),

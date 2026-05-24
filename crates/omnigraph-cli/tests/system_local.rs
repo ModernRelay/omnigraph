@@ -66,7 +66,7 @@ fn yaml_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn local_policy_config(repo: &SystemRepo) -> String {
+fn local_policy_config(graph: &SystemGraph) -> String {
     format!(
         "\
 project:
@@ -83,12 +83,12 @@ query:
 policy:
   file: ./policy.yaml
 ",
-        yaml_string(&repo.path().to_string_lossy())
+        yaml_string(&graph.path().to_string_lossy())
     )
 }
 
-fn insert_person_query(repo: &SystemRepo, name: &str) -> std::path::PathBuf {
-    repo.write_query(
+fn insert_person_query(graph: &SystemGraph, name: &str) -> std::path::PathBuf {
+    graph.write_query(
         name,
         r#"
 query insert_person($name: String, $age: I32) {
@@ -98,8 +98,8 @@ query insert_person($name: String, $age: I32) {
     )
 }
 
-fn add_friend_query(repo: &SystemRepo, name: &str) -> std::path::PathBuf {
-    repo.write_query(
+fn add_friend_query(graph: &SystemGraph, name: &str) -> std::path::PathBuf {
+    graph.write_query(
         name,
         r#"
 query add_friend($from: String, $to: String) {
@@ -109,13 +109,13 @@ query add_friend($from: String, $to: String) {
     )
 }
 
-fn snapshot_table_row_count(repo: &SystemRepo, table_key: &str) -> u64 {
-    snapshot_table_row_count_at(repo.path(), table_key)
+fn snapshot_table_row_count(graph: &SystemGraph, table_key: &str) -> u64 {
+    snapshot_table_row_count_at(graph.path(), table_key)
 }
 
-fn snapshot_table_row_count_at(repo: &std::path::Path, table_key: &str) -> u64 {
+fn snapshot_table_row_count_at(graph: &std::path::Path, table_key: &str) -> u64 {
     let payload = parse_stdout_json(&output_success(
-        cli().arg("snapshot").arg(repo).arg("--json"),
+        cli().arg("snapshot").arg(graph).arg("--json"),
     ));
     payload["tables"]
         .as_array()
@@ -178,7 +178,7 @@ fn format_vector(values: &[f32]) -> String {
         .join(", ")
 }
 
-fn s3_test_repo_uri(suite: &str) -> Option<String> {
+fn s3_test_graph_uri(suite: &str) -> Option<String> {
     let bucket = env::var("OMNIGRAPH_S3_TEST_BUCKET").ok()?;
     let prefix = env::var("OMNIGRAPH_S3_TEST_PREFIX")
         .ok()
@@ -193,21 +193,21 @@ fn s3_test_repo_uri(suite: &str) -> Option<String> {
 
 #[test]
 fn local_cli_end_to_end_init_load_read_change_read_flow() {
-    let repo = SystemRepo::initialized();
-    let mutation_file = insert_person_query(&repo, "system-local-init-change.gq");
+    let graph = SystemGraph::initialized();
+    let mutation_file = insert_person_query(&graph, "system-local-init-change.gq");
 
     output_success(
         cli()
             .arg("load")
             .arg("--data")
             .arg(fixture("test.jsonl"))
-            .arg(repo.path()),
+            .arg(graph.path()),
     );
 
     let read_before = parse_stdout_json(&output_success(
         cli()
             .arg("read")
-            .arg(repo.path())
+            .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
             .arg("--name")
@@ -222,7 +222,7 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
     let change_payload = parse_stdout_json(&output_success(
         cli()
             .arg("change")
-            .arg(repo.path())
+            .arg(graph.path())
             .arg("--query")
             .arg(&mutation_file)
             .arg("--params")
@@ -235,7 +235,7 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
     let read_after = parse_stdout_json(&output_success(
         cli()
             .arg("read")
-            .arg(repo.path())
+            .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
             .arg("--name")
@@ -250,15 +250,15 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
 
 #[test]
 fn local_cli_end_to_end_branch_change_merge_flow() {
-    let repo = SystemRepo::loaded();
-    let mutation_file = insert_person_query(&repo, "system-local-change.gq");
+    let graph = SystemGraph::loaded();
+    let mutation_file = insert_person_query(&graph, "system-local-change.gq");
 
     output_success(
         cli()
             .arg("branch")
             .arg("create")
             .arg("--uri")
-            .arg(repo.path())
+            .arg(graph.path())
             .arg("--from")
             .arg("main")
             .arg("feature"),
@@ -267,7 +267,7 @@ fn local_cli_end_to_end_branch_change_merge_flow() {
     let change_payload = parse_stdout_json(&output_success(
         cli()
             .arg("change")
-            .arg(repo.path())
+            .arg(graph.path())
             .arg("--query")
             .arg(&mutation_file)
             .arg("--branch")
@@ -282,7 +282,7 @@ fn local_cli_end_to_end_branch_change_merge_flow() {
     let feature_read = parse_stdout_json(&output_success(
         cli()
             .arg("read")
-            .arg(repo.path())
+            .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
             .arg("--name")
@@ -301,7 +301,7 @@ fn local_cli_end_to_end_branch_change_merge_flow() {
             .arg("branch")
             .arg("merge")
             .arg("--uri")
-            .arg(repo.path())
+            .arg(graph.path())
             .arg("feature")
             .arg("--json"),
     ));
@@ -310,7 +310,7 @@ fn local_cli_end_to_end_branch_change_merge_flow() {
     let main_read = parse_stdout_json(&output_success(
         cli()
             .arg("read")
-            .arg(repo.path())
+            .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
             .arg("--name")
@@ -327,7 +327,7 @@ fn local_cli_end_to_end_branch_change_merge_flow() {
         cli()
             .arg("commit")
             .arg("list")
-            .arg(repo.path())
+            .arg(graph.path())
             .arg("--branch")
             .arg("main")
             .arg("--json"),
@@ -337,8 +337,8 @@ fn local_cli_end_to_end_branch_change_merge_flow() {
 
 #[test]
 fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
-    let repo = SystemRepo::loaded();
-    let ingest_data = repo.write_jsonl(
+    let graph = SystemGraph::loaded();
+    let ingest_data = graph.write_jsonl(
         "system-local-ingest.jsonl",
         r#"{"type":"Person","data":{"name":"Zoe","age":33}}
 {"type":"Person","data":{"name":"Bob","age":26}}"#,
@@ -351,7 +351,7 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
             .arg(&ingest_data)
             .arg("--branch")
             .arg("feature-ingest")
-            .arg(repo.path())
+            .arg(graph.path())
             .arg("--json"),
     ));
     assert_eq!(ingest_payload["branch"], "feature-ingest");
@@ -364,7 +364,7 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
     let feature_snapshot = parse_stdout_json(&output_success(
         cli()
             .arg("snapshot")
-            .arg(repo.path())
+            .arg(graph.path())
             .arg("--branch")
             .arg("feature-ingest")
             .arg("--json"),
@@ -374,7 +374,7 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
     let zoe = parse_stdout_json(&output_success(
         cli()
             .arg("read")
-            .arg(repo.path())
+            .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
             .arg("--name")
@@ -391,7 +391,7 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
     let bob = parse_stdout_json(&output_success(
         cli()
             .arg("read")
-            .arg(repo.path())
+            .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
             .arg("--name")
@@ -408,20 +408,20 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
 
 #[test]
 fn local_cli_export_round_trips_full_branch_graph() {
-    let repo = SystemRepo::loaded();
+    let graph = SystemGraph::loaded();
 
     output_success(
         cli()
             .arg("branch")
             .arg("create")
             .arg("--uri")
-            .arg(repo.path())
+            .arg(graph.path())
             .arg("--from")
             .arg("main")
             .arg("feature"),
     );
 
-    let feature_data = repo.write_jsonl(
+    let feature_data = graph.write_jsonl(
         "system-local-export-feature.jsonl",
         r#"{"type":"Person","data":{"name":"Eve","age":29}}
 {"edge":"Knows","from":"Alice","to":"Eve"}"#,
@@ -435,53 +435,56 @@ fn local_cli_export_round_trips_full_branch_graph() {
             .arg("feature")
             .arg("--mode")
             .arg("append")
-            .arg(repo.path()),
+            .arg(graph.path()),
     );
 
     let exported = stdout_string(&output_success(
         cli()
             .arg("export")
-            .arg(repo.path())
+            .arg(graph.path())
             .arg("--branch")
             .arg("feature")
             .arg("--jsonl"),
     ));
-    let export_path = repo.write_jsonl("system-local-exported.jsonl", &exported);
-    let imported_repo = repo.path().parent().unwrap().join("imported-export.omni");
+    let export_path = graph.write_jsonl("system-local-exported.jsonl", &exported);
+    let imported_graph = graph.path().parent().unwrap().join("imported-export.omni");
 
     output_success(
         cli()
             .arg("init")
             .arg("--schema")
             .arg(fixture("test.pg"))
-            .arg(&imported_repo),
+            .arg(&imported_graph),
     );
     output_success(
         cli()
             .arg("load")
             .arg("--data")
             .arg(&export_path)
-            .arg(&imported_repo),
+            .arg(&imported_graph),
     );
 
     assert_eq!(
-        snapshot_table_row_count_at(&imported_repo, "node:Person"),
+        snapshot_table_row_count_at(&imported_graph, "node:Person"),
         5
     );
     assert_eq!(
-        snapshot_table_row_count_at(&imported_repo, "node:Company"),
+        snapshot_table_row_count_at(&imported_graph, "node:Company"),
         2
     );
-    assert_eq!(snapshot_table_row_count_at(&imported_repo, "edge:Knows"), 4);
     assert_eq!(
-        snapshot_table_row_count_at(&imported_repo, "edge:WorksAt"),
+        snapshot_table_row_count_at(&imported_graph, "edge:Knows"),
+        4
+    );
+    assert_eq!(
+        snapshot_table_row_count_at(&imported_graph, "edge:WorksAt"),
         2
     );
 
     let eve = parse_stdout_json(&output_success(
         cli()
             .arg("read")
-            .arg(&imported_repo)
+            .arg(&imported_graph)
             .arg("--query")
             .arg(fixture("test.gq"))
             .arg("--name")
@@ -496,7 +499,7 @@ fn local_cli_export_round_trips_full_branch_graph() {
     let friends = parse_stdout_json(&output_success(
         cli()
             .arg("read")
-            .arg(&imported_repo)
+            .arg(&imported_graph)
             .arg("--query")
             .arg(fixture("test.gq"))
             .arg("--name")
@@ -510,7 +513,7 @@ fn local_cli_export_round_trips_full_branch_graph() {
 
 #[test]
 fn local_cli_s3_end_to_end_init_load_read_flow() {
-    let Some(repo_uri) = s3_test_repo_uri("cli-local") else {
+    let Some(graph_uri) = s3_test_graph_uri("cli-local") else {
         eprintln!("skipping s3 cli test: OMNIGRAPH_S3_TEST_BUCKET is not set");
         return;
     };
@@ -535,7 +538,7 @@ query:
     - .
 policy: {{}}
 ",
-            repo_uri
+            graph_uri
         ),
     );
 
@@ -544,14 +547,14 @@ policy: {{}}
             .arg("init")
             .arg("--schema")
             .arg(fixture("test.pg"))
-            .arg(&repo_uri),
+            .arg(&graph_uri),
     );
     output_success(
         cli()
             .arg("load")
             .arg("--data")
             .arg(fixture("test.jsonl"))
-            .arg(&repo_uri),
+            .arg(&graph_uri),
     );
 
     let read = parse_stdout_json(&output_success(
@@ -584,13 +587,13 @@ policy: {{}}
 
 #[test]
 fn local_cli_failed_load_keeps_target_state_unchanged() {
-    let repo = SystemRepo::loaded();
-    let bad_data = repo.write_jsonl(
+    let graph = SystemGraph::loaded();
+    let bad_data = graph.write_jsonl(
         "system-bad-load.jsonl",
         r#"{"edge":"Knows","from":"Alice","to":"Missing"}"#,
     );
-    let person_rows_before = snapshot_table_row_count(&repo, "node:Person");
-    let knows_rows_before = snapshot_table_row_count(&repo, "edge:Knows");
+    let person_rows_before = snapshot_table_row_count(&graph, "node:Person");
+    let knows_rows_before = snapshot_table_row_count(&graph, "edge:Knows");
 
     let output = output_failure(
         cli()
@@ -599,17 +602,17 @@ fn local_cli_failed_load_keeps_target_state_unchanged() {
             .arg(&bad_data)
             .arg("--mode")
             .arg("append")
-            .arg(repo.path()),
+            .arg(graph.path()),
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("not found") || stderr.contains("Missing"));
 
     assert_eq!(
-        snapshot_table_row_count(&repo, "node:Person"),
+        snapshot_table_row_count(&graph, "node:Person"),
         person_rows_before
     );
     assert_eq!(
-        snapshot_table_row_count(&repo, "edge:Knows"),
+        snapshot_table_row_count(&graph, "edge:Knows"),
         knows_rows_before
     );
     // Failed loads leave no run record (the run lifecycle has been
@@ -618,13 +621,13 @@ fn local_cli_failed_load_keeps_target_state_unchanged() {
 
 #[test]
 fn local_cli_failed_change_keeps_target_state_unchanged() {
-    let repo = SystemRepo::loaded();
-    let mutation_file = add_friend_query(&repo, "system-invalid-change.gq");
+    let graph = SystemGraph::loaded();
+    let mutation_file = add_friend_query(&graph, "system-invalid-change.gq");
 
     let output = output_failure(
         cli()
             .arg("change")
-            .arg(repo.path())
+            .arg(graph.path())
             .arg("--query")
             .arg(&mutation_file)
             .arg("--params")
@@ -636,7 +639,7 @@ fn local_cli_failed_change_keeps_target_state_unchanged() {
     let friends_payload = parse_stdout_json(&output_success(
         cli()
             .arg("read")
-            .arg(repo.path())
+            .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
             .arg("--name")
@@ -652,8 +655,8 @@ fn local_cli_failed_change_keeps_target_state_unchanged() {
 
 #[test]
 fn local_cli_resolves_relative_query_against_config_base_dir() {
-    let repo = SystemRepo::loaded();
-    let root = repo.path().parent().unwrap();
+    let graph = SystemGraph::loaded();
+    let root = graph.path().parent().unwrap();
     let config_dir = root.join("config");
     let query_dir = config_dir.join("queries");
     let ambient_dir = root.join("ambient");
@@ -676,7 +679,7 @@ query:
     - queries
 policy: {{}}
 ",
-            repo.path().display()
+            graph.path().display()
         ),
     );
     write_query_file(
@@ -730,7 +733,7 @@ query get_person($name: String) {
 #[test]
 fn local_cli_datetime_and_list_types_round_trip_through_load_read_and_change() {
     let temp = tempfile::tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let schema = temp.path().join("datatypes.pg");
     let data = temp.path().join("datatypes.jsonl");
     let queries = temp.path().join("datatypes.gq");
@@ -805,13 +808,13 @@ query get_task($slug: String) {
 "#,
     );
 
-    output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&repo));
-    output_success(cli().arg("load").arg("--data").arg(&data).arg(&repo));
+    output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&graph));
+    output_success(cli().arg("load").arg("--data").arg(&data).arg(&graph));
 
     let filtered = parse_stdout_json(&output_success(
         cli()
             .arg("read")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--query")
             .arg(&queries)
             .arg("--name")
@@ -836,7 +839,7 @@ query get_task($slug: String) {
     let insert_payload = parse_stdout_json(&output_success(
         cli()
             .arg("change")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--query")
             .arg(&queries)
             .arg("--name")
@@ -852,7 +855,7 @@ query get_task($slug: String) {
     let update_payload = parse_stdout_json(&output_success(
         cli()
             .arg("change")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--query")
             .arg(&queries)
             .arg("--name")
@@ -866,7 +869,7 @@ query get_task($slug: String) {
     let gamma = parse_stdout_json(&output_success(
         cli()
             .arg("read")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--query")
             .arg(&queries)
             .arg("--name")
@@ -893,7 +896,7 @@ query get_task($slug: String) {
 #[ignore = "requires GEMINI_API_KEY and network access"]
 fn local_cli_real_gemini_string_nearest_query_returns_expected_match() {
     let temp = tempfile::tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let schema = temp.path().join("gemini.pg");
     let data = temp.path().join("gemini.jsonl");
     let queries = temp.path().join("gemini.gq");
@@ -935,13 +938,13 @@ query vector_search($q: String) {
 "#,
     );
 
-    output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&repo));
-    output_success(cli().arg("load").arg("--data").arg(&data).arg(&repo));
+    output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&graph));
+    output_success(cli().arg("load").arg("--data").arg(&data).arg(&graph));
 
     let result = parse_stdout_json(&output_success(
         cli()
             .arg("read")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--query")
             .arg(&queries)
             .arg("--name")
@@ -968,10 +971,10 @@ fn local_cli_policy_tooling_is_end_to_end() {
     // Sanity check for the read-only policy CLI surfaces. These don't
     // mutate the graph — they just parse and evaluate the policy file —
     // so they don't depend on PR #4's engine-side enforcement.
-    let repo = SystemRepo::loaded();
-    let config = repo.write_config("omnigraph-policy.yaml", &local_policy_config(&repo));
-    repo.write_config("policy.yaml", POLICY_E2E_YAML);
-    repo.write_config("policy.tests.yaml", POLICY_E2E_TESTS_YAML);
+    let graph = SystemGraph::loaded();
+    let config = graph.write_config("omnigraph-policy.yaml", &local_policy_config(&graph));
+    graph.write_config("policy.yaml", POLICY_E2E_YAML);
+    graph.write_config("policy.tests.yaml", POLICY_E2E_TESTS_YAML);
 
     let validate = output_success(
         cli()
@@ -1022,10 +1025,10 @@ fn local_cli_change_enforces_engine_layer_policy() {
     // 3. Policy installed, `--as act-ragnor`, change on main →
     //    Cedar permits (admins-write rule). Write succeeds and the
     //    inserted row is readable.
-    let repo = SystemRepo::loaded();
-    let config = repo.write_config("omnigraph-policy.yaml", &local_policy_config(&repo));
-    repo.write_config("policy.yaml", POLICY_E2E_YAML);
-    let mutation_file = insert_person_query(&repo, "system-local-policy-change.gq");
+    let graph = SystemGraph::loaded();
+    let config = graph.write_config("omnigraph-policy.yaml", &local_policy_config(&graph));
+    graph.write_config("policy.yaml", POLICY_E2E_YAML);
+    let mutation_file = insert_person_query(&graph, "system-local-policy-change.gq");
 
     // Case 1: policy configured, no actor threaded → footgun guard.
     let no_actor = output_failure(
@@ -1088,7 +1091,7 @@ fn local_cli_change_enforces_engine_layer_policy() {
     let verify = parse_stdout_json(&output_success(
         cli()
             .arg("read")
-            .arg(repo.path())
+            .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
             .arg("--name")
@@ -1114,10 +1117,10 @@ fn local_cli_change_enforces_engine_layer_policy() {
 
 #[test]
 fn local_cli_load_enforces_engine_layer_policy() {
-    let repo = SystemRepo::loaded();
-    let config = repo.write_config("omnigraph-policy.yaml", &local_policy_config(&repo));
-    repo.write_config("policy.yaml", POLICY_E2E_YAML);
-    let data = repo.write_jsonl(
+    let graph = SystemGraph::loaded();
+    let config = graph.write_config("omnigraph-policy.yaml", &local_policy_config(&graph));
+    graph.write_config("policy.yaml", POLICY_E2E_YAML);
+    let data = graph.write_jsonl(
         "system-local-policy-load.jsonl",
         r#"{"type":"Person","data":{"name":"LoadPolicy","age":11}}"#,
     );
@@ -1158,10 +1161,10 @@ fn local_cli_load_enforces_engine_layer_policy() {
 
 #[test]
 fn local_cli_ingest_enforces_engine_layer_policy() {
-    let repo = SystemRepo::loaded();
-    let config = repo.write_config("omnigraph-policy.yaml", &local_policy_config(&repo));
-    repo.write_config("policy.yaml", POLICY_E2E_YAML);
-    let data = repo.write_jsonl(
+    let graph = SystemGraph::loaded();
+    let config = graph.write_config("omnigraph-policy.yaml", &local_policy_config(&graph));
+    graph.write_config("policy.yaml", POLICY_E2E_YAML);
+    let data = graph.write_jsonl(
         "system-local-policy-ingest.jsonl",
         r#"{"type":"Person","data":{"name":"IngestPolicy","age":12}}"#,
     );
@@ -1211,16 +1214,19 @@ fn local_cli_ingest_enforces_engine_layer_policy() {
 
 #[test]
 fn local_cli_schema_apply_enforces_engine_layer_policy() {
-    let repo = SystemRepo::loaded();
-    let config = repo.write_config("omnigraph-policy.yaml", &local_policy_config(&repo));
-    repo.write_config("policy.yaml", POLICY_E2E_YAML);
+    let graph = SystemGraph::loaded();
+    let config = graph.write_config("omnigraph-policy.yaml", &local_policy_config(&graph));
+    graph.write_config("policy.yaml", POLICY_E2E_YAML);
 
     // Additive: add a nullable property; SDK-compatible with the fixture
     // schema. Uses the schema-apply scope (TargetBranch("main")).
     let new_schema = std::fs::read_to_string(fixture("test.pg"))
         .unwrap()
-        .replace("    age: I32?\n}", "    age: I32?\n    nickname: String?\n}");
-    let schema_path = repo.path().join("policy-additive.pg");
+        .replace(
+            "    age: I32?\n}",
+            "    age: I32?\n    nickname: String?\n}",
+        );
+    let schema_path = graph.path().join("policy-additive.pg");
     std::fs::write(&schema_path, &new_schema).unwrap();
 
     let denied = output_failure(
@@ -1258,9 +1264,9 @@ fn local_cli_schema_apply_enforces_engine_layer_policy() {
 
 #[test]
 fn local_cli_branch_create_enforces_engine_layer_policy() {
-    let repo = SystemRepo::loaded();
-    let config = repo.write_config("omnigraph-policy.yaml", &local_policy_config(&repo));
-    repo.write_config("policy.yaml", POLICY_E2E_YAML);
+    let graph = SystemGraph::loaded();
+    let config = graph.write_config("omnigraph-policy.yaml", &local_policy_config(&graph));
+    graph.write_config("policy.yaml", POLICY_E2E_YAML);
 
     let denied = output_failure(
         cli()
@@ -1296,9 +1302,9 @@ fn local_cli_branch_create_enforces_engine_layer_policy() {
 
 #[test]
 fn local_cli_branch_delete_enforces_engine_layer_policy() {
-    let repo = SystemRepo::loaded();
-    let config = repo.write_config("omnigraph-policy.yaml", &local_policy_config(&repo));
-    repo.write_config("policy.yaml", POLICY_E2E_YAML);
+    let graph = SystemGraph::loaded();
+    let config = graph.write_config("omnigraph-policy.yaml", &local_policy_config(&graph));
+    graph.write_config("policy.yaml", POLICY_E2E_YAML);
 
     // Pre-create the branch as ragnor so there's something to delete.
     output_success(
@@ -1344,9 +1350,9 @@ fn local_cli_branch_delete_enforces_engine_layer_policy() {
 
 #[test]
 fn local_cli_branch_merge_enforces_engine_layer_policy() {
-    let repo = SystemRepo::loaded();
-    let config = repo.write_config("omnigraph-policy.yaml", &local_policy_config(&repo));
-    repo.write_config("policy.yaml", POLICY_E2E_YAML);
+    let graph = SystemGraph::loaded();
+    let config = graph.write_config("omnigraph-policy.yaml", &local_policy_config(&graph));
+    graph.write_config("policy.yaml", POLICY_E2E_YAML);
 
     // Pre-create a feature branch as ragnor (admins-branch-ops covers it).
     output_success(
@@ -1400,7 +1406,7 @@ fn local_cli_branch_merge_enforces_engine_layer_policy() {
 // pin the precedence rule that `main.rs::resolve_cli_actor` implements:
 // `--as` flag > `cli.actor` from `omnigraph.yaml` > None.
 
-fn local_policy_config_with_actor(repo: &SystemRepo, actor: &str) -> String {
+fn local_policy_config_with_actor(graph: &SystemGraph, actor: &str) -> String {
     // Mirrors `local_policy_config` but adds `cli.actor` so the
     // config-only precedence path is exercised. The `cli:` block
     // already has `graph` and `branch`; appending `actor` here.
@@ -1421,7 +1427,7 @@ query:
 policy:
   file: ./policy.yaml
 ",
-        yaml_string(&repo.path().to_string_lossy()),
+        yaml_string(&graph.path().to_string_lossy()),
         actor,
     )
 }
@@ -1431,13 +1437,13 @@ fn local_cli_actor_from_config_used_when_no_flag() {
     // cli.actor: act-ragnor in omnigraph.yaml, no --as flag → change
     // permitted via admins-write rule. Proves the config-only path
     // works; previously the only proof was structural.
-    let repo = SystemRepo::loaded();
-    let config = repo.write_config(
+    let graph = SystemGraph::loaded();
+    let config = graph.write_config(
         "omnigraph-policy.yaml",
-        &local_policy_config_with_actor(&repo, "act-ragnor"),
+        &local_policy_config_with_actor(&graph, "act-ragnor"),
     );
-    repo.write_config("policy.yaml", POLICY_E2E_YAML);
-    let mutation_file = insert_person_query(&repo, "system-local-cli-actor.gq");
+    graph.write_config("policy.yaml", POLICY_E2E_YAML);
+    let mutation_file = insert_person_query(&graph, "system-local-cli-actor.gq");
 
     let allowed = parse_stdout_json(&output_success(
         cli()
@@ -1459,13 +1465,13 @@ fn local_cli_actor_flag_overrides_config_actor() {
     // cli.actor: act-ragnor in config + --as act-bruno on CLI → change
     // denied. Flag wins per the precedence rule. Without this test, a
     // future change that reverses precedence would ride through silently.
-    let repo = SystemRepo::loaded();
-    let config = repo.write_config(
+    let graph = SystemGraph::loaded();
+    let config = graph.write_config(
         "omnigraph-policy.yaml",
-        &local_policy_config_with_actor(&repo, "act-ragnor"),
+        &local_policy_config_with_actor(&graph, "act-ragnor"),
     );
-    repo.write_config("policy.yaml", POLICY_E2E_YAML);
-    let mutation_file = insert_person_query(&repo, "system-local-cli-actor-override.gq");
+    graph.write_config("policy.yaml", POLICY_E2E_YAML);
+    let mutation_file = insert_person_query(&graph, "system-local-cli-actor-override.gq");
 
     let denied = output_failure(
         cli()

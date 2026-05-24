@@ -17,7 +17,7 @@ use super::state::{
     ManifestState, SubTableEntry, entries_to_batch, manifest_schema, read_manifest_state,
 };
 
-pub(super) async fn init_manifest_repo(
+pub(super) async fn init_manifest_graph(
     root_uri: &str,
     catalog: &Catalog,
 ) -> Result<(Dataset, ManifestState)> {
@@ -47,7 +47,7 @@ pub(super) async fn init_manifest_repo(
     Ok((dataset, known_state))
 }
 
-pub(super) async fn open_manifest_repo(
+pub(super) async fn open_manifest_graph(
     root_uri: &str,
     branch: Option<&str>,
 ) -> Result<(Dataset, ManifestState)> {

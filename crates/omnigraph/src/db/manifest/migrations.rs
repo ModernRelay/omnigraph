@@ -24,8 +24,8 @@
 //! Only on open-for-write paths (the publisher's `load_publish_state`).
 //! Reads are side-effect-free by contract; an old-shape `__manifest` reads
 //! fine, it just lacks the protections introduced by later versions.
-//! `init_manifest_repo` stamps the current version at creation, so newly
-//! initialized repos never need migration.
+//! `init_manifest_graph` stamps the current version at creation, so newly
+//! initialized graphs never need migration.
 //!
 //! ## Forward-version protection
 //!
@@ -78,7 +78,7 @@ pub(super) async fn migrate_internal_schema(dataset: &mut Dataset) -> Result<()>
     if current > INTERNAL_MANIFEST_SCHEMA_VERSION {
         return Err(OmniError::manifest(format!(
             "__manifest is stamped at internal schema v{} but this binary expects v{} \
-             — upgrade omnigraph before opening this repo for writes",
+             — upgrade omnigraph before opening this graph for writes",
             current, INTERNAL_MANIFEST_SCHEMA_VERSION,
         )));
     }
@@ -112,7 +112,10 @@ pub(super) async fn migrate_internal_schema(dataset: &mut Dataset) -> Result<()>
 async fn migrate_v1_to_v2(dataset: &mut Dataset) -> Result<()> {
     dataset
         .update_field_metadata()
-        .update("object_id", [(OBJECT_ID_PK_KEY.to_string(), "true".to_string())])
+        .update(
+            "object_id",
+            [(OBJECT_ID_PK_KEY.to_string(), "true".to_string())],
+        )
         .map_err(|e| OmniError::Lance(e.to_string()))?
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
@@ -121,10 +124,7 @@ async fn migrate_v1_to_v2(dataset: &mut Dataset) -> Result<()> {
 
 async fn set_stamp(dataset: &mut Dataset, version: u32) -> Result<()> {
     dataset
-        .update_schema_metadata([(
-            INTERNAL_SCHEMA_VERSION_KEY.to_string(),
-            version.to_string(),
-        )])
+        .update_schema_metadata([(INTERNAL_SCHEMA_VERSION_KEY.to_string(), version.to_string())])
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
     Ok(())

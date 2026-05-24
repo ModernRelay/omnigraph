@@ -1,6 +1,6 @@
 # HTTP Server (`omnigraph-server`)
 
-Axum 0.8 + tokio + utoipa-generated OpenAPI. Single repo per process; deploy multiple processes for multi-tenant.
+Axum 0.8 + tokio + utoipa-generated OpenAPI. Single graph per process; deploy multiple processes for multi-tenant.
 
 ## Endpoint inventory
 
@@ -87,7 +87,7 @@ See [deployment.md](deployment.md) for token-source operational details.
 
 - `tower_http::TraceLayer::new_for_http()`
 - Policy decisions logged at INFO level with actor, action, branch, decision, matched rule
-- Startup logs: token source name, repo URI, bind address
+- Startup logs: token source name, graph URI, bind address
 - Graceful SIGINT shutdown
 
 ## Not implemented (by design or "TBD")
@@ -98,4 +98,4 @@ See [deployment.md](deployment.md) for token-source operational details.
   admission control" above). No global rate limiter is configured;
   add `tower_http::limit` if a graph-wide cap is needed.
 - Pagination — none (commits/branches return everything; export streams).
-- Multi-tenant routing — one repo per process.
+- Multi-tenant routing — one graph per process.

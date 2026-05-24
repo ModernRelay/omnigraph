@@ -292,13 +292,11 @@ node Thing {
         .await
         .expect("first merge after ensure_indices must succeed");
     db.ensure_indices().await.unwrap();
-    load_jsonl(&mut db, &delta, LoadMode::Merge)
-        .await
-        .expect(
-            "second merge after ensure_indices must succeed \
+    load_jsonl(&mut db, &delta, LoadMode::Merge).await.expect(
+        "second merge after ensure_indices must succeed \
              (Window 2 canary: drop the FirstSeen setter in table_store.rs \
              only when this stays green WITHOUT it)",
-        );
+    );
     assert_eq!(count_rows(&db, "node:Thing").await, 55);
 }
 
@@ -346,7 +344,7 @@ async fn explicit_target_query_sees_other_writer_commits_without_refresh() {
 
     let uri = dir.path().to_str().unwrap();
 
-    // Two independent handles to the same repo
+    // Two independent handles to the same graph
     let mut db1 = Omnigraph::open(uri).await.unwrap();
     let mut db2 = Omnigraph::open(uri).await.unwrap();
 
