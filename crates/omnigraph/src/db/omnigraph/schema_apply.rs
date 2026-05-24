@@ -97,7 +97,7 @@ pub(super) async fn apply_schema_with_lock(
     // Skip `main` and internal system branches. The schema-apply lock branch
     // is excluded because it is the cluster-wide schema-apply serializer.
     // `__run__*` branches are no longer created; the filter remains as
-    // defense-in-depth for legacy repos with leftover staging branches.
+    // defense-in-depth for legacy graphs with leftover staging branches.
     // A future production sweep will let this guard go.
     let blocking_branches = branches
         .into_iter()
@@ -105,7 +105,7 @@ pub(super) async fn apply_schema_with_lock(
         .collect::<Vec<_>>();
     if !blocking_branches.is_empty() {
         return Err(OmniError::manifest_conflict(format!(
-            "schema apply requires a repo with only main; found non-main branches: {}",
+            "schema apply requires a graph with only main; found non-main branches: {}",
             blocking_branches.join(", ")
         )));
     }
@@ -780,7 +780,7 @@ pub(super) async fn acquire_schema_apply_lock(db: &Omnigraph) -> Result<()> {
     if !blocking_branches.is_empty() {
         let _ = release_schema_apply_lock(db).await;
         return Err(OmniError::manifest_conflict(format!(
-            "schema apply requires a repo with only main; found non-main branches: {}",
+            "schema apply requires a graph with only main; found non-main branches: {}",
             blocking_branches.join(", ")
         )));
     }

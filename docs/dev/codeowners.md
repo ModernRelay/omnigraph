@@ -2,13 +2,13 @@
 
 `.github/CODEOWNERS` is **generated** — not hand-edited. The source of truth is `.github/codeowners-roles.yml`, expanded by `.github/scripts/render-codeowners.py`. CI rejects drift between the two and rejects direct edits to `CODEOWNERS` that don't accompany a yml change.
 
-This setup gives every role change a reviewable PR and a permanent in-repo audit trail (`git log .github/codeowners-roles.yml`).
+This setup gives every role change a reviewable PR and a permanent in-repository audit trail (`git log .github/codeowners-roles.yml`).
 
 ## Current roles
 
 | Role | Members | Scope |
 |---|---|---|
-| `engineering` | `@aaltshuler` | All code under `crates/**`, repo infrastructure, default for unmapped paths |
+| `engineering` | `@aaltshuler` | All code under `crates/**`, repository infrastructure, default for unmapped paths |
 | `docs` | `@aaltshuler`, `@ragnorc` | `docs/**`, README.md, AGENTS.md, CLAUDE.md, SECURITY.md |
 
 GitHub treats multiple owners in a CODEOWNERS line as **"any one of them satisfies the review requirement"**. For docs, either named member can approve. To require N distinct approvers on a specific path, layer a CI check on top (not currently configured).
@@ -34,4 +34,4 @@ CI fails the PR if:
 - **Audit trail**: `git log .github/codeowners-roles.yml` is the canonical record of every role change. The rendered `CODEOWNERS` is a derived artifact.
 - **Roles are first-class**: paths reference roles, not raw handles. Renaming a person or rotating a role updates one place, not every path.
 - **Future extension**: scheduled rotation (weekly on-call, quarterly leads) plugs into the same yml without changing the path mappings. Not enabled today.
-- **Consistency with the product**: omnigraph itself enforces auditable Cedar policy. The repo's code-owner policy follows the same "policy as reviewed code" pattern.
+- **Consistency with the product**: omnigraph itself enforces auditable Cedar policy. The repository's code-owner policy follows the same "policy as reviewed code" pattern.

@@ -22,7 +22,7 @@ Mark a Vector property with `@embed("source_text_property")`. At ingest, the eng
 
 ## CLI `omnigraph embed` (offline file pipeline)
 
-Operates on **JSONL files** (not on a repo). Three modes (mutually exclusive):
+Operates on **JSONL files** (not on a graph). Three modes (mutually exclusive):
 
 - (default) `fill_missing` — only embed rows whose target field is empty
 - `--reembed-all` — overwrite all

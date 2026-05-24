@@ -60,7 +60,7 @@ curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/
 That bootstrap:
 
 - starts RustFS on `127.0.0.1:9000`
-- creates a bucket and S3-backed repo
+- creates a bucket and S3-backed graph
 - loads the checked-in context fixture
 - launches `omnigraph-server` on `127.0.0.1:8080`
 
@@ -69,8 +69,8 @@ Docker must be installed and running first.
 The RustFS bootstrap prefers the rolling `edge` binaries and only falls back to
 source builds when release assets are unavailable.
 
-If a previous run left objects under the same repo prefix but did not finish
-initializing the repo, rerun with `RESET_REPO=1` or set `PREFIX` to a new
+If a previous run left objects under the same graph prefix but did not finish
+initializing the graph, rerun with `RESET_REPO=1` or set `PREFIX` to a new
 value.
 
 ## Common Commands
@@ -78,12 +78,12 @@ value.
 The same URI works for local paths, `s3://…`, or `http://host:port`.
 
 ```bash
-omnigraph init   --schema ./schema.pg ./repo.omni
-omnigraph load   --data   ./data.jsonl ./repo.omni
-omnigraph read   --query  ./queries.gq --name get_person --params '{"name":"Alice"}' ./repo.omni
-omnigraph change --query  ./queries.gq --name insert_person --params '{"name":"Mina"}' ./repo.omni
-omnigraph branch create --from main feature-x ./repo.omni
-omnigraph branch merge  feature-x --into main ./repo.omni
+omnigraph init   --schema ./schema.pg ./graph.omni
+omnigraph load   --data   ./data.jsonl ./graph.omni
+omnigraph read   --query  ./queries.gq --name get_person --params '{"name":"Alice"}' ./graph.omni
+omnigraph change --query  ./queries.gq --name insert_person --params '{"name":"Mina"}' ./graph.omni
+omnigraph branch create --from main feature-x ./graph.omni
+omnigraph branch merge  feature-x --into main ./graph.omni
 ```
 
 See [docs/user/cli.md](docs/user/cli.md) for schema apply, snapshots, ingest, runs, and policy commands.

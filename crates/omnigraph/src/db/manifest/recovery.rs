@@ -58,7 +58,7 @@ use super::{ManifestChange, SubTableUpdate, TableRegistration, TableTombstone};
 /// into the audit row's `recovery_for_actor` field.
 pub(crate) const RECOVERY_ACTOR: &str = "omnigraph:recovery";
 
-/// Subdirectory under the repo root holding sidecar files.
+/// Subdirectory under the graph root holding sidecar files.
 pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
 
 /// Current sidecar JSON shape version. Bumping this is a breaking change:
@@ -142,7 +142,7 @@ pub(crate) struct SidecarTablePin {
 pub(crate) struct SidecarTableRegistration {
     /// Stable identifier (`node:Tag`, `edge:WorksAt`, etc.).
     pub table_key: String,
-    /// Repo-relative path the manifest will register
+    /// Graph-relative path the manifest will register
     /// (e.g. `nodes/{fnv1a64-hex}`); recovery joins this with `root_uri`
     /// to open the dataset Lance HEAD when constructing the
     /// accompanying `Update`.
@@ -295,7 +295,7 @@ pub(crate) enum SidecarDecision {
     Abort,
 }
 
-/// Build the `__recovery/` directory URI under a repo root.
+/// Build the `__recovery/` directory URI under a graph root.
 pub(crate) fn recovery_dir_uri(root_uri: &str) -> String {
     let trimmed = root_uri.trim_end_matches('/');
     format!("{}/{}", trimmed, RECOVERY_DIR_NAME)
@@ -1122,7 +1122,7 @@ async fn record_audit(
 /// the rename so the recovery sweep's roll-forward step sees the new
 /// catalog. Without this, the disambiguation logic deletes the staging
 /// files (since manifest still pins the old table set) and leaves the
-/// repo with new-schema data on disk but the old `_schema.pg` live —
+/// graph with new-schema data on disk but the old `_schema.pg` live —
 /// real corruption.
 pub(crate) async fn has_schema_apply_sidecar(
     root_uri: &str,

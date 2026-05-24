@@ -18,6 +18,7 @@ use api::{
     IngestRequest, ReadOutput, ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput,
     SnapshotQuery, ingest_output, schema_apply_output, snapshot_payload,
 };
+pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::{Extension, Path, Query, Request, State};
@@ -39,7 +40,6 @@ use omnigraph::error::{ManifestConflictDetails, ManifestErrorKind, OmniError};
 use omnigraph_compiler::json_params_to_param_map;
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::{JsonParamMode, ParamMap};
-pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 pub use policy::{
     PolicyAction, PolicyCompiler, PolicyConfig, PolicyDecision, PolicyEngine, PolicyExpectation,
     PolicyRequest, PolicyTestConfig,
@@ -435,10 +435,7 @@ impl ApiError {
         }
     }
 
-    fn manifest_version_conflict(
-        message: String,
-        details: api::ManifestConflictOutput,
-    ) -> Self {
+    fn manifest_version_conflict(message: String, details: api::ManifestConflictOutput) -> Self {
         Self {
             status: StatusCode::CONFLICT,
             code: ErrorCode::Conflict,
@@ -1934,12 +1931,12 @@ server:
             ("OMNIGRAPH_UNAUTHENTICATED", None),
         ]);
         let temp = tempdir().unwrap();
-        // Repo path doesn't need to exist — classifier fires before
+        // Graph path doesn't need to exist — classifier fires before
         // `AppState::open_with_bearer_tokens_and_policy`.
         let config = ServerConfig {
             uri: temp
                 .path()
-                .join("repo.omni")
+                .join("graph.omni")
                 .to_string_lossy()
                 .into_owned(),
             bind: "127.0.0.1:0".to_string(),
@@ -1947,7 +1944,8 @@ server:
             allow_unauthenticated: false,
         };
         let result = serve(config).await;
-        let err = result.expect_err("serve should refuse to start in State 1 without --unauthenticated");
+        let err =
+            result.expect_err("serve should refuse to start in State 1 without --unauthenticated");
         let msg = format!("{:?}", err);
         assert!(
             msg.contains("no bearer tokens") || msg.contains("policy file"),
