@@ -4360,7 +4360,7 @@ mod multi_graph_startup {
             dirs.push(dir);
         }
         let workload = omnigraph_server::workload::WorkloadController::from_env();
-        let state = AppState::new_multi(handles, Vec::new(), None, workload, None).unwrap();
+        let state = AppState::new_multi(handles, Vec::new(), None, workload, None, None).unwrap();
         let app = build_app(state);
         (dirs, app)
     }
@@ -4741,7 +4741,7 @@ graphs:
         let tokens = vec![("act-andrew".to_string(), "secret-token".to_string())];
         let workload = omnigraph_server::workload::WorkloadController::from_env();
         let state =
-            AppState::new_multi(vec![handle], tokens, None, workload, None).unwrap();
+            AppState::new_multi(vec![handle], tokens, None, workload, None, None).unwrap();
         let app = build_app(state);
 
         // No Authorization header → 401.
@@ -4822,6 +4822,7 @@ rules:
             Some(server_policy),
             workload,
             None,
+            None,
         )
         .unwrap();
         let app = build_app(state);
@@ -4861,6 +4862,333 @@ rules:
             resp_viewer.status(),
             StatusCode::FORBIDDEN,
             "viewer must be denied graph_list (Cedar gate)"
+        );
+    }
+
+    // ─── PR 7 — POST /graphs ──────────────────────────────────────────
+
+    use omnigraph_server::api::{GraphCreateRequest, GraphCreateResponse, GraphPolicySpec, GraphSchemaSpec};
+    use omnigraph_server::config::{OmnigraphConfig, hash_config_file};
+
+    /// Spin up a multi-mode server whose `omnigraph.yaml` we control,
+    /// so PR 7's `POST /graphs` can rewrite it. Returns the config
+    /// directory (to live across the test) and a built `Router`.
+    async fn multi_mode_app_with_real_config(
+        initial_graphs: &[&str],
+    ) -> (tempfile::TempDir, Router) {
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+
+        // Init each starting graph at a real URI inside the config dir.
+        let mut yaml_graphs = String::new();
+        let mut handles = Vec::new();
+        for id in initial_graphs {
+            let graph_uri = cfg_dir.path().join(format!("{id}.omni"));
+            Omnigraph::init(graph_uri.to_str().unwrap(), &schema)
+                .await
+                .unwrap();
+            yaml_graphs.push_str(&format!(
+                "  {id}:\n    uri: {}\n",
+                graph_uri.display()
+            ));
+            // Open in-memory engine for the handle.
+            let engine = Omnigraph::open(graph_uri.to_str().unwrap())
+                .await
+                .unwrap();
+            handles.push(Arc::new(
+                omnigraph_server::GraphHandle {
+                    key: omnigraph_server::GraphKey::cluster(
+                        omnigraph_server::GraphId::try_from(*id).unwrap(),
+                    ),
+                    uri: graph_uri.to_string_lossy().to_string(),
+                    engine: Arc::new(engine),
+                    policy: None,
+                },
+            ));
+        }
+        let config_path = cfg_dir.path().join("omnigraph.yaml");
+        fs::write(&config_path, format!("graphs:\n{yaml_graphs}")).unwrap();
+        let config_hash = hash_config_file(&config_path).unwrap();
+
+        let workload = omnigraph_server::workload::WorkloadController::from_env();
+        let state = AppState::new_multi(
+            handles,
+            Vec::new(),
+            None,
+            workload,
+            Some(config_path.clone()),
+            Some(config_hash),
+        )
+        .unwrap();
+        let app = build_app(state);
+        (cfg_dir, app)
+    }
+
+    async fn post_graph(
+        app: &Router,
+        body: &GraphCreateRequest,
+        auth: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let json_body = serde_json::to_vec(body).unwrap();
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/graphs")
+            .header("content-type", "application/json");
+        if let Some(token) = auth {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let req = request.body(Body::from(json_body)).unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        let status = response.status();
+        let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body_json: Value = if body_bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&body_bytes).unwrap_or(Value::Null)
+        };
+        (status, body_json)
+    }
+
+    /// Happy path: POST creates a new graph, returns 201, the graph is
+    /// queryable via cluster routes, and omnigraph.yaml now includes it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn post_graphs_creates_a_new_graph_end_to_end() {
+        let (cfg_dir, app) = multi_mode_app_with_real_config(&["alpha"]).await;
+        let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+        let new_uri = cfg_dir.path().join("beta.omni");
+        let req = GraphCreateRequest {
+            graph_id: "beta".to_string(),
+            uri: new_uri.to_string_lossy().to_string(),
+            schema: GraphSchemaSpec { source: schema },
+            policy: None,
+        };
+        let (status, body) = post_graph(&app, &req, None).await;
+        assert_eq!(status, StatusCode::CREATED, "got body: {body}");
+        let resp: GraphCreateResponse = serde_json::from_value(body).unwrap();
+        assert_eq!(resp.graph_id, "beta");
+
+        // The new graph is reachable via its cluster route.
+        let snap = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/graphs/beta/snapshot?branch=main")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(snap.status(), StatusCode::OK);
+
+        // The YAML on disk now references the new graph.
+        let yaml = fs::read_to_string(cfg_dir.path().join("omnigraph.yaml")).unwrap();
+        assert!(
+            yaml.contains("beta:"),
+            "rewritten YAML must include 'beta:'; got:\n{yaml}"
+        );
+        assert!(
+            yaml.contains(new_uri.to_str().unwrap()),
+            "rewritten YAML must include the new URI; got:\n{yaml}"
+        );
+    }
+
+    /// Two POSTs in sequence both succeed: the second one's drift
+    /// check passes because the first POST updates the in-memory
+    /// baseline hash to the post-rewrite hash.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn post_graphs_baseline_hash_updates_between_rewrites() {
+        let (cfg_dir, app) = multi_mode_app_with_real_config(&["alpha"]).await;
+        let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+        for name in ["beta", "gamma"] {
+            let new_uri = cfg_dir.path().join(format!("{name}.omni"));
+            let req = GraphCreateRequest {
+                graph_id: name.to_string(),
+                uri: new_uri.to_string_lossy().to_string(),
+                schema: GraphSchemaSpec {
+                    source: schema.clone(),
+                },
+                policy: None,
+            };
+            let (status, body) = post_graph(&app, &req, None).await;
+            assert_eq!(status, StatusCode::CREATED, "create {name}: {body}");
+        }
+        let yaml = fs::read_to_string(cfg_dir.path().join("omnigraph.yaml")).unwrap();
+        assert!(yaml.contains("beta:"));
+        assert!(yaml.contains("gamma:"));
+    }
+
+    /// Duplicate `graph_id` returns 409.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn post_graphs_duplicate_graph_id_returns_409() {
+        let (cfg_dir, app) = multi_mode_app_with_real_config(&["alpha"]).await;
+        let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+        let req = GraphCreateRequest {
+            graph_id: "alpha".to_string(), // already registered
+            uri: cfg_dir
+                .path()
+                .join("alpha-duplicate.omni")
+                .to_string_lossy()
+                .to_string(),
+            schema: GraphSchemaSpec { source: schema },
+            policy: None,
+        };
+        let (status, body) = post_graph(&app, &req, None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "got body: {body}");
+    }
+
+    /// Duplicate `uri` returns 409.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn post_graphs_duplicate_uri_returns_409() {
+        let (cfg_dir, app) = multi_mode_app_with_real_config(&["alpha"]).await;
+        let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+        let alpha_uri = cfg_dir.path().join("alpha.omni");
+        let req = GraphCreateRequest {
+            graph_id: "beta".to_string(),
+            uri: alpha_uri.to_string_lossy().to_string(), // already in use
+            schema: GraphSchemaSpec { source: schema },
+            policy: None,
+        };
+        let (status, _) = post_graph(&app, &req, None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+    }
+
+    /// Invalid `graph_id` (reserved name) returns 400.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn post_graphs_invalid_graph_id_returns_400() {
+        let (cfg_dir, app) = multi_mode_app_with_real_config(&["alpha"]).await;
+        let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+        let req = GraphCreateRequest {
+            graph_id: "policies".to_string(), // reserved
+            uri: cfg_dir
+                .path()
+                .join("policies.omni")
+                .to_string_lossy()
+                .to_string(),
+            schema: GraphSchemaSpec { source: schema },
+            policy: None,
+        };
+        let (status, _) = post_graph(&app, &req, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Empty schema source returns 400 with a clear message.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn post_graphs_empty_schema_source_returns_400() {
+        let (cfg_dir, app) = multi_mode_app_with_real_config(&["alpha"]).await;
+        let req = GraphCreateRequest {
+            graph_id: "beta".to_string(),
+            uri: cfg_dir
+                .path()
+                .join("beta.omni")
+                .to_string_lossy()
+                .to_string(),
+            schema: GraphSchemaSpec {
+                source: "   \n  ".to_string(),
+            },
+            policy: None,
+        };
+        let (status, body) = post_graph(&app, &req, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body.to_string().contains("schema.source"),
+            "expected schema.source rejection in body: {body}"
+        );
+    }
+
+    /// Single mode rejects `POST /graphs` with 405.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn post_graphs_returns_405_in_single_mode() {
+        let temp = init_loaded_graph().await;
+        let graph = graph_path(temp.path());
+        let state = AppState::open(graph.to_string_lossy().to_string())
+            .await
+            .unwrap();
+        let app = build_app(state);
+        let req = GraphCreateRequest {
+            graph_id: "beta".to_string(),
+            uri: "/tmp/beta.omni".to_string(),
+            schema: GraphSchemaSpec {
+                source: "node Person { name: String @key }\n".to_string(),
+            },
+            policy: None,
+        };
+        let (status, _) = post_graph(&app, &req, None).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// YAML drift detection: operator hand-edits the config file
+    /// between server start and the POST → 503 Service Unavailable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn post_graphs_yaml_drift_detection_returns_503() {
+        let (cfg_dir, app) = multi_mode_app_with_real_config(&["alpha"]).await;
+        // Simulate an operator editing the file out from under the
+        // running server. This changes the on-disk hash; the server's
+        // in-memory baseline (computed at startup) no longer matches.
+        let config_path = cfg_dir.path().join("omnigraph.yaml");
+        let mut yaml = fs::read_to_string(&config_path).unwrap();
+        yaml.push_str("\n# operator added a comment after server start\n");
+        fs::write(&config_path, yaml).unwrap();
+
+        let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+        let req = GraphCreateRequest {
+            graph_id: "beta".to_string(),
+            uri: cfg_dir
+                .path()
+                .join("beta.omni")
+                .to_string_lossy()
+                .to_string(),
+            schema: GraphSchemaSpec { source: schema },
+            policy: None,
+        };
+        let (status, body) = post_graph(&app, &req, None).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "expected drift detection, got: {body}"
+        );
+        assert!(
+            body.to_string().contains("drift"),
+            "expected drift message, got: {body}"
+        );
+    }
+
+    /// hash_config_file is deterministic and detects byte-level changes.
+    #[test]
+    fn hash_config_file_is_deterministic_and_detects_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.yaml");
+        fs::write(&path, "graphs:\n  alpha:\n    uri: /tmp/a.omni\n").unwrap();
+        let h1 = hash_config_file(&path).unwrap();
+        let h2 = hash_config_file(&path).unwrap();
+        assert_eq!(h1, h2, "hash must be deterministic");
+        fs::write(&path, "graphs:\n  alpha:\n    uri: /tmp/b.omni\n").unwrap();
+        let h3 = hash_config_file(&path).unwrap();
+        assert_ne!(h1, h3, "hash must change when content changes");
+    }
+
+    /// rewrite_atomic refuses to rewrite when the baseline doesn't match.
+    #[test]
+    fn rewrite_atomic_refuses_when_hash_drifts() {
+        use omnigraph_server::config::{RewriteAtomicError, rewrite_atomic};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.yaml");
+        fs::write(&path, "graphs:\n  alpha:\n    uri: /tmp/a.omni\n").unwrap();
+        // Pass an obviously-wrong baseline hash.
+        let wrong_hash = [0u8; 32];
+        let mut new_config = OmnigraphConfig::default();
+        new_config.graphs.insert(
+            "beta".to_string(),
+            omnigraph_server::config::TargetConfig {
+                uri: "/tmp/b.omni".to_string(),
+                bearer_token_env: None,
+                policy: Default::default(),
+            },
+        );
+        let err = rewrite_atomic(&path, &new_config, &wrong_hash).unwrap_err();
+        assert!(
+            matches!(err, RewriteAtomicError::Drift),
+            "expected Drift, got: {err}"
         );
     }
 

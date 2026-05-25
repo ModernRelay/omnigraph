@@ -1008,7 +1008,7 @@ async fn app_for_multi_mode(graph_ids: &[&str]) -> (Vec<tempfile::TempDir>, Rout
         dirs.push(dir);
     }
     let workload = omnigraph_server::workload::WorkloadController::from_env();
-    let state = AppState::new_multi(handles, Vec::new(), None, workload, None).unwrap();
+    let state = AppState::new_multi(handles, Vec::new(), None, workload, None, None).unwrap();
     let app = build_app(state);
     (dirs, app)
 }
