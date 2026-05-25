@@ -21,9 +21,10 @@ use std::sync::Arc;
 use api::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
-    CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, HealthOutput, IngestOutput,
-    IngestRequest, ReadOutput, ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput,
-    SnapshotQuery, ingest_output, schema_apply_output, snapshot_payload,
+    CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphInfo, GraphListResponse,
+    HealthOutput, IngestOutput, IngestRequest, ReadOutput, ReadRequest, SchemaApplyOutput,
+    SchemaApplyRequest, SchemaOutput, SnapshotQuery, ingest_output, schema_apply_output,
+    snapshot_payload,
 };
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 use axum::body::{Body, Bytes};
@@ -79,6 +80,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
     ),
     paths(
         server_health,
+        server_graphs_list,
         server_snapshot,
         server_read,
         server_export,
@@ -909,13 +911,27 @@ pub fn build_app(state: AppState) -> Router {
             require_bearer_auth,
         ));
 
+    // Management endpoints (`GET /graphs`, future `POST /graphs`)
+    // live alongside the per-graph router. They go through bearer auth
+    // but NOT through `resolve_graph_handle` — they operate on the
+    // registry directly. The endpoint is mounted in both modes; in
+    // single mode the handler returns 405 so clients see "resource
+    // exists, wrong context" rather than 404 "no such resource."
+    let management = Router::new()
+        .route("/graphs", get(server_graphs_list))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer_auth,
+        ));
+
     // Mount the protected routes differently per mode:
     //   * Single → flat routes (legacy: `/snapshot`, `/read`, etc.)
     //   * Multi  → nested under `/graphs/{graph_id}/...`
-    // Mode is inferred at startup; the same router code branches once.
     let protected: Router<AppState> = match state.mode() {
-        ServerMode::Single { .. } => per_graph_protected,
-        ServerMode::Multi { .. } => Router::new().nest("/graphs/{graph_id}", per_graph_protected),
+        ServerMode::Single { .. } => per_graph_protected.merge(management),
+        ServerMode::Multi { .. } => Router::new()
+            .nest("/graphs/{graph_id}", per_graph_protected)
+            .merge(management),
     };
 
     Router::new()
@@ -1106,6 +1122,78 @@ async fn server_health() -> Json<HealthOutput> {
         version: SERVER_VERSION.to_string(),
         source_version: SERVER_SOURCE_VERSION.map(str::to_string),
     })
+}
+
+#[utoipa::path(
+    get,
+    path = "/graphs",
+    tag = "management",
+    operation_id = "listGraphs",
+    responses(
+        (status = 200, description = "List of registered graphs", body = GraphListResponse),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 405, description = "Method not allowed (single-graph mode)", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// List every graph currently registered with this server (MR-668).
+///
+/// Multi-graph mode only. In single mode, the route returns 405 — there's
+/// no registry to enumerate. Cedar-gated by the server-level policy via
+/// the `graph_list` action against `Omnigraph::Server::"root"`.
+///
+/// Order: alphabetical by `graph_id` (server-sorted so clients see
+/// deterministic output across requests).
+async fn server_graphs_list(
+    State(state): State<AppState>,
+    actor: Option<Extension<ResolvedActor>>,
+) -> std::result::Result<Json<GraphListResponse>, ApiError> {
+    // 405 in single mode — there's no registry to enumerate, and the
+    // legacy URL surface didn't expose this endpoint.
+    if matches!(state.mode(), ServerMode::Single { .. }) {
+        return Err(ApiError {
+            status: StatusCode::METHOD_NOT_ALLOWED,
+            code: ErrorCode::BadRequest,
+            message: "GET /graphs is only available in multi-graph mode".to_string(),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+        });
+    }
+
+    // Server-level Cedar gate. `state.server_policy` is loaded from
+    // `server.policy.file` in `omnigraph.yaml` at startup. When no
+    // server policy is configured, `authorize_request_server` falls
+    // through to the MR-723 default-deny semantics (every non-Read
+    // action denied for an authenticated actor). `GraphList` is not
+    // `Read`, so without a server policy the request gets 403 — which
+    // is the right default (don't leak the registry until the operator
+    // explicitly authorizes it).
+    authorize_request(
+        actor.as_ref().map(|Extension(actor)| actor),
+        state.server_policy.as_deref(),
+        PolicyRequest {
+            actor_id: actor
+                .as_ref()
+                .map(|Extension(actor)| actor.actor_id.as_ref().to_string())
+                .unwrap_or_default(),
+            action: PolicyAction::GraphList,
+            branch: None,
+            target_branch: None,
+        },
+    )?;
+
+    let mut graphs: Vec<GraphInfo> = state
+        .registry()
+        .list()
+        .into_iter()
+        .map(|handle| GraphInfo {
+            graph_id: handle.key.graph_id.as_str().to_string(),
+            uri: handle.uri.clone(),
+        })
+        .collect();
+    graphs.sort_by(|a, b| a.graph_id.cmp(&b.graph_id));
+    Ok(Json(GraphListResponse { graphs }))
 }
 
 async fn server_openapi(State(state): State<AppState>) -> Json<utoipa::openapi::OpenApi> {

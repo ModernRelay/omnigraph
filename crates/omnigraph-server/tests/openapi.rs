@@ -161,6 +161,7 @@ fn openapi_info_contains_version() {
 
 const EXPECTED_PATHS: &[&str] = &[
     "/healthz",
+    "/graphs",
     "/snapshot",
     "/read",
     "/export",

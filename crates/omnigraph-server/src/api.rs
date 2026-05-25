@@ -467,3 +467,23 @@ pub fn read_target_output(target: &ReadTarget) -> ReadTargetOutput {
         },
     }
 }
+
+// ─── MR-668 PR 6b — management endpoint shapes ─────────────────────────────
+
+/// One entry in the response from `GET /graphs`. Cluster operators
+/// consume this list to discover which graphs the server is currently
+/// serving. The shape is intentionally minimal — `graph_id` and `uri`
+/// are the only fields a routing client needs.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GraphInfo {
+    pub graph_id: String,
+    pub uri: String,
+}
+
+/// Response from `GET /graphs`. Lists every graph registered with the
+/// server in alphabetical order by `graph_id` (sorted server-side so
+/// clients get deterministic output across requests).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GraphListResponse {
+    pub graphs: Vec<GraphInfo>,
+}

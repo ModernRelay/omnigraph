@@ -4675,6 +4675,195 @@ graphs:
         }
     }
 
+    /// `GET /graphs` lists the registered graphs alphabetically in
+    /// multi mode. No auth or server policy = open mode (allowed).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_graphs_lists_registered_graphs_in_multi_mode() {
+        let (_dirs, app) = build_multi_mode_app(&["beta", "alpha"]).await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/graphs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let graphs = json["graphs"].as_array().unwrap();
+        assert_eq!(graphs.len(), 2);
+        // Server-sorted alphabetically.
+        assert_eq!(graphs[0]["graph_id"].as_str().unwrap(), "alpha");
+        assert_eq!(graphs[1]["graph_id"].as_str().unwrap(), "beta");
+    }
+
+    /// `GET /graphs` returns 405 in single mode (resource exists in the
+    /// API surface, just not operational without a `graphs:` map).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_graphs_returns_405_in_single_mode() {
+        let temp = init_loaded_graph().await;
+        let graph = graph_path(temp.path());
+        let state = AppState::open(graph.to_string_lossy().to_string())
+            .await
+            .unwrap();
+        let app = build_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/graphs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// `GET /graphs` requires bearer auth when tokens are configured.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_graphs_requires_bearer_auth_when_configured() {
+        use omnigraph_server::{GraphHandle, GraphId, GraphKey};
+        // Build a multi-mode app with bearer tokens configured.
+        let dir = tempfile::tempdir().unwrap();
+        let graph_uri = dir.path().join("alpha").to_str().unwrap().to_string();
+        let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+        let engine = Omnigraph::init(&graph_uri, &schema).await.unwrap();
+        let handle = Arc::new(GraphHandle {
+            key: GraphKey::cluster(GraphId::try_from("alpha").unwrap()),
+            uri: graph_uri,
+            engine: Arc::new(engine),
+            policy: None,
+        });
+        let tokens = vec![("act-andrew".to_string(), "secret-token".to_string())];
+        let workload = omnigraph_server::workload::WorkloadController::from_env();
+        let state =
+            AppState::new_multi(vec![handle], tokens, None, workload, None).unwrap();
+        let app = build_app(state);
+
+        // No Authorization header → 401.
+        let resp_no_auth = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/graphs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_no_auth.status(), StatusCode::UNAUTHORIZED);
+
+        // With auth but no server policy → 403 (default-deny, since
+        // GraphList is not Read).
+        let resp_authed = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/graphs")
+                    .header("authorization", "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_authed.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// `GET /graphs` with a server policy that allows `graph_list` → 200.
+    /// `GET /graphs` with a server policy that does NOT allow `graph_list` → 403.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_graphs_with_server_policy_authorizes_per_cedar() {
+        use omnigraph_policy::PolicyEngine;
+        use omnigraph_server::{GraphHandle, GraphId, GraphKey};
+
+        let dir = tempfile::tempdir().unwrap();
+        let graph_uri = dir.path().join("alpha").to_str().unwrap().to_string();
+        let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+        let engine = Omnigraph::init(&graph_uri, &schema).await.unwrap();
+        let handle = Arc::new(GraphHandle {
+            key: GraphKey::cluster(GraphId::try_from("alpha").unwrap()),
+            uri: graph_uri,
+            engine: Arc::new(engine),
+            policy: None,
+        });
+
+        // Server policy: admins can graph_list, viewers cannot.
+        let policy_path = dir.path().join("server-policy.yaml");
+        fs::write(
+            &policy_path,
+            r#"
+version: 1
+groups:
+  admins: [act-andrew]
+  viewers: [act-bruno]
+rules:
+  - id: admins-list-graphs
+    allow:
+      actors: { group: admins }
+      actions: [graph_list]
+"#,
+        )
+        .unwrap();
+        let server_policy = PolicyEngine::load(&policy_path, "server").unwrap();
+
+        let tokens = vec![
+            ("act-andrew".to_string(), "andrew-token".to_string()),
+            ("act-bruno".to_string(), "bruno-token".to_string()),
+        ];
+        let workload = omnigraph_server::workload::WorkloadController::from_env();
+        let state = AppState::new_multi(
+            vec![handle],
+            tokens,
+            Some(server_policy),
+            workload,
+            None,
+        )
+        .unwrap();
+        let app = build_app(state);
+
+        // Admin → 200
+        let resp_admin = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/graphs")
+                    .header("authorization", "Bearer andrew-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp_admin.status(),
+            StatusCode::OK,
+            "admin must be allowed graph_list"
+        );
+
+        // Viewer → 403
+        let resp_viewer = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/graphs")
+                    .header("authorization", "Bearer bruno-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp_viewer.status(),
+            StatusCode::FORBIDDEN,
+            "viewer must be denied graph_list (Cedar gate)"
+        );
+    }
+
     /// End-to-end: load an `omnigraph.yaml` with two graphs and serve
     /// them. Both graphs must be queryable via cluster routes.
     ///
