@@ -5,9 +5,9 @@
 [![Crates.io](https://img.shields.io/crates/v/omnigraph-cli.svg)](https://crates.io/crates/omnigraph-cli)
 [![CI](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml/badge.svg)](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml)
 
-**Object-storage native graph engine with git-style workflows. Designed for agents as first-class operators.**
+**Object-storage native knowledge graph with git-style workflows. Designed for agents and humans to collaborate on shared structured knowledge.**
 
-Branch, commit, and merge typed graph data like source code. Multi-modal, self-hosted, open source.
+Turns fragmented context into a live graph, lets humans and agents coordinate through that graph, and uses branches so agent-generated changes can be reviewed and merged safely. 
 
 Built on Rust, Arrow, DataFusion and Lance.
 
@@ -15,12 +15,13 @@ Join the [Omnigraph Slack community](https://join.slack.com/t/omnigraphworkspace
 
 ## Use Cases
 
-- Company brains / [Second brains](https://github.com/ModernRelay/omnigraph-cookbooks/tree/main/second-brain)
-- Context graphs
-- Backbone for multi-agent research
-- Incident response graphs
-- Compliance & audit graphs
-- Enterprise knowledge systems
+- Company brain / [Second brain](https://github.com/ModernRelay/omnigraph-cookbooks/tree/main/second-brain)
+- Context graph
+- Knowledgebase for multi-agent research
+- Graph RAG
+- Incident response graph
+- Compliance & audit graph
+
 
 ## Capabilities
 
