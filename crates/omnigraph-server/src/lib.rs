@@ -1,8 +1,13 @@
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod graph_id;
+pub mod identity;
 pub mod policy;
 pub mod workload;
+
+pub use graph_id::GraphId;
+pub use identity::{AuthSource, GraphKey, ResolvedActor, Scope, TenantId};
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
