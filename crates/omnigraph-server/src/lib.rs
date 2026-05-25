@@ -889,7 +889,74 @@ async fn server_openapi(State(state): State<AppState>) -> Json<utoipa::openapi::
     if !state.requires_bearer_auth() {
         strip_security(&mut doc);
     }
+    // MR-668 PR 4b: in multi mode, the protected routes live under
+    // `/graphs/{graph_id}/...`. Rewrite the doc so the spec matches
+    // the routes the router actually serves. Public paths (`/healthz`)
+    // stay flat in both modes.
+    if matches!(state.mode(), ServerMode::Multi { .. }) {
+        nest_paths_under_cluster_prefix(&mut doc);
+    }
     Json(doc)
+}
+
+/// Path prefix used to namespace per-graph routes in multi mode.
+/// Kept in sync with the `Router::nest(...)` invocation in `build_app`.
+const CLUSTER_PATH_PREFIX: &str = "/graphs/{graph_id}";
+
+/// Operation-id prefix applied to every cloned cluster operation.
+/// Decision 7 in the implementation plan — keeps operation IDs unique
+/// across the spec when both flat and nested variants ever appear in
+/// the same generation pass.
+const CLUSTER_OPERATION_ID_PREFIX: &str = "cluster_";
+
+/// Paths that stay flat in every server mode (public, no per-graph
+/// dependency). Update this list when adding new always-public endpoints.
+const ALWAYS_FLAT_PATHS: &[&str] = &["/healthz"];
+
+/// In multi-mode `server_openapi`, every protected path-item is
+/// reattached under the cluster prefix. Operation IDs gain the
+/// `cluster_` prefix so SDK generators don't collide if/when both
+/// surfaces are merged. The `{graph_id}` URL placeholder is left
+/// implicit in the path; consuming clients see it as a standard
+/// OpenAPI path parameter.
+///
+/// Removing the flat protected paths matches the runtime router —
+/// in multi mode, requests to `/snapshot` etc. return 404, so the
+/// spec must agree.
+fn nest_paths_under_cluster_prefix(doc: &mut utoipa::openapi::OpenApi) {
+    let original = std::mem::take(&mut doc.paths.paths);
+    let mut rewritten = std::collections::BTreeMap::new();
+    for (path, mut item) in original {
+        if ALWAYS_FLAT_PATHS.contains(&path.as_str()) {
+            rewritten.insert(path, item);
+            continue;
+        }
+        rename_operation_ids(&mut item, CLUSTER_OPERATION_ID_PREFIX);
+        let new_path = format!("{CLUSTER_PATH_PREFIX}{path}");
+        rewritten.insert(new_path, item);
+    }
+    doc.paths.paths = rewritten;
+}
+
+/// Prefix every operation_id in this PathItem with `prefix`.
+fn rename_operation_ids(item: &mut utoipa::openapi::PathItem, prefix: &str) {
+    for op in [
+        item.get.as_mut(),
+        item.post.as_mut(),
+        item.put.as_mut(),
+        item.delete.as_mut(),
+        item.options.as_mut(),
+        item.head.as_mut(),
+        item.patch.as_mut(),
+        item.trace.as_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(id) = op.operation_id.as_deref() {
+            op.operation_id = Some(format!("{prefix}{id}"));
+        }
+    }
 }
 
 fn strip_security(doc: &mut utoipa::openapi::OpenApi) {

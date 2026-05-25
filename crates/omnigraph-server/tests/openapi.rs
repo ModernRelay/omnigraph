@@ -957,3 +957,222 @@ fn openapi_spec_is_up_to_date() {
         "openapi.json is out of date. Run: OMNIGRAPH_UPDATE_OPENAPI=1 cargo test -p omnigraph-server --test openapi openapi_spec_is_up_to_date"
     );
 }
+
+// ---------------------------------------------------------------------------
+// MR-668 PR 4b — multi-mode OpenAPI cluster filter
+// ---------------------------------------------------------------------------
+//
+// In multi-graph mode, `/openapi.json` reports cluster routes
+// (`/graphs/{graph_id}/...`) instead of the legacy flat routes. The
+// only flat path that survives is `/healthz`. Operation IDs gain a
+// `cluster_` prefix so SDK generators have stable, unique ids.
+//
+// These tests exercise the request-time `server_openapi` handler via
+// `oneshot`, not the static `ApiDoc::openapi()` — the rewrite happens
+// only on the served document.
+
+const EXPECTED_CLUSTER_PATHS: &[&str] = &[
+    "/graphs/{graph_id}/snapshot",
+    "/graphs/{graph_id}/read",
+    "/graphs/{graph_id}/export",
+    "/graphs/{graph_id}/change",
+    "/graphs/{graph_id}/schema",
+    "/graphs/{graph_id}/schema/apply",
+    "/graphs/{graph_id}/ingest",
+    "/graphs/{graph_id}/branches",
+    "/graphs/{graph_id}/branches/{branch}",
+    "/graphs/{graph_id}/branches/merge",
+    "/graphs/{graph_id}/commits",
+    "/graphs/{graph_id}/commits/{commit_id}",
+];
+
+async fn app_for_multi_mode(graph_ids: &[&str]) -> (Vec<tempfile::TempDir>, Router) {
+    use std::sync::Arc;
+
+    use omnigraph_server::{GraphHandle, GraphId, GraphKey};
+
+    let mut dirs = Vec::with_capacity(graph_ids.len());
+    let mut handles = Vec::with_capacity(graph_ids.len());
+    for id in graph_ids {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_uri = dir.path().join(id).to_str().unwrap().to_string();
+        let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+        let engine = Omnigraph::init(&graph_uri, &schema).await.unwrap();
+        handles.push(Arc::new(GraphHandle {
+            key: GraphKey::cluster(GraphId::try_from(*id).unwrap()),
+            uri: graph_uri,
+            engine: Arc::new(engine),
+            policy: None,
+        }));
+        dirs.push(dir);
+    }
+    let workload = omnigraph_server::workload::WorkloadController::from_env();
+    let state = AppState::new_multi(handles, Vec::new(), None, workload, None).unwrap();
+    let app = build_app(state);
+    (dirs, app)
+}
+
+#[tokio::test]
+async fn multi_mode_openapi_lists_cluster_paths() {
+    let (_dirs, app) = app_for_multi_mode(&["alpha"]).await;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/openapi.json")
+        .body(Body::empty())
+        .unwrap();
+    let (status, json) = json_response(&app, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let paths = json["paths"].as_object().expect("paths must be an object");
+    let path_keys: HashSet<&str> = paths.keys().map(|k| k.as_str()).collect();
+    for expected in EXPECTED_CLUSTER_PATHS {
+        assert!(
+            path_keys.contains(expected),
+            "missing cluster path in multi-mode spec: {expected}. \
+             Found: {path_keys:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn multi_mode_openapi_drops_flat_protected_paths() {
+    let (_dirs, app) = app_for_multi_mode(&["alpha"]).await;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/openapi.json")
+        .body(Body::empty())
+        .unwrap();
+    let (_, json) = json_response(&app, request).await;
+    let paths = json["paths"].as_object().unwrap();
+    // None of the legacy flat protected paths should appear in multi mode.
+    let flat_protected = [
+        "/snapshot",
+        "/read",
+        "/export",
+        "/change",
+        "/schema",
+        "/schema/apply",
+        "/ingest",
+        "/branches",
+        "/branches/{branch}",
+        "/branches/merge",
+        "/commits",
+        "/commits/{commit_id}",
+    ];
+    for flat in flat_protected {
+        assert!(
+            !paths.contains_key(flat),
+            "flat path {flat} must not appear in multi-mode spec; \
+             cluster routes are the only protected surface"
+        );
+    }
+}
+
+#[tokio::test]
+async fn multi_mode_openapi_keeps_healthz_flat() {
+    let (_dirs, app) = app_for_multi_mode(&["alpha"]).await;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/openapi.json")
+        .body(Body::empty())
+        .unwrap();
+    let (_, json) = json_response(&app, request).await;
+    let paths = json["paths"].as_object().unwrap();
+    assert!(
+        paths.contains_key("/healthz"),
+        "/healthz must remain flat in multi mode"
+    );
+    assert!(
+        !paths.contains_key("/graphs/{graph_id}/healthz"),
+        "/healthz must NOT be cluster-prefixed"
+    );
+}
+
+#[tokio::test]
+async fn multi_mode_openapi_prefixes_operation_ids_with_cluster() {
+    let (_dirs, app) = app_for_multi_mode(&["alpha"]).await;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/openapi.json")
+        .body(Body::empty())
+        .unwrap();
+    let (_, json) = json_response(&app, request).await;
+    // Every cluster path operation must have a `cluster_` operation_id.
+    let paths = json["paths"].as_object().unwrap();
+    let mut checked = 0;
+    for (path, item) in paths {
+        if path == "/healthz" {
+            continue;
+        }
+        for method in ["get", "post", "put", "delete", "patch"] {
+            if let Some(op) = item.get(method).filter(|v| v.is_object()) {
+                if let Some(id) = op["operationId"].as_str() {
+                    assert!(
+                        id.starts_with("cluster_"),
+                        "operation_id at {path}.{method} must start with `cluster_`, got `{id}`"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        checked >= EXPECTED_CLUSTER_PATHS.len(),
+        "expected at least {} cluster operation_ids; checked {checked}",
+        EXPECTED_CLUSTER_PATHS.len()
+    );
+}
+
+#[tokio::test]
+async fn multi_mode_operation_ids_are_unique() {
+    // Sanity check: the cluster_ prefix prevents collision with flat ids
+    // (which don't appear in multi mode, but the contract is "unique
+    // across the spec"). Verify every operation_id in the multi-mode
+    // spec is unique.
+    let (_dirs, app) = app_for_multi_mode(&["alpha"]).await;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/openapi.json")
+        .body(Body::empty())
+        .unwrap();
+    let (_, json) = json_response(&app, request).await;
+    let paths = json["paths"].as_object().unwrap();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    for (_, item) in paths {
+        for method in ["get", "post", "put", "delete", "patch"] {
+            if let Some(op) = item.get(method).filter(|v| v.is_object()) {
+                if let Some(id) = op["operationId"].as_str() {
+                    assert!(
+                        seen_ids.insert(id.to_string()),
+                        "duplicate operation_id `{id}` in multi-mode spec"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn single_mode_openapi_unchanged_by_cluster_filter() {
+    // Regression: single mode still emits the legacy flat surface.
+    let (_temp, app) = app_for_loaded_graph().await;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/openapi.json")
+        .body(Body::empty())
+        .unwrap();
+    let (_, json) = json_response(&app, request).await;
+    let paths = json["paths"].as_object().unwrap();
+    let path_keys: HashSet<&str> = paths.keys().map(|k| k.as_str()).collect();
+    for expected in EXPECTED_PATHS {
+        assert!(
+            path_keys.contains(expected),
+            "single mode must still emit flat path: {expected}"
+        );
+    }
+    for cluster in EXPECTED_CLUSTER_PATHS {
+        assert!(
+            !path_keys.contains(cluster),
+            "single mode must NOT emit cluster path: {cluster}"
+        );
+    }
+}
