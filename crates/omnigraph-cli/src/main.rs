@@ -18,9 +18,11 @@ use omnigraph_compiler::{
 use omnigraph_server::api::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
-    CommitOutput, ErrorOutput, ExportRequest, IngestOutput, IngestRequest, ReadOutput, ReadRequest,
-    SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput, SnapshotTableOutput,
-    commit_output, ingest_output, read_output, schema_apply_output, snapshot_payload,
+    CommitOutput, ErrorOutput, ExportRequest, GraphCreateRequest, GraphCreateResponse,
+    GraphListResponse, GraphPolicySpec, GraphSchemaSpec, IngestOutput, IngestRequest, ReadOutput,
+    ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput,
+    SnapshotTableOutput, commit_output, ingest_output, read_output, schema_apply_output,
+    snapshot_payload,
 };
 use omnigraph_server::{
     AliasCommand, OmnigraphConfig, PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest,
@@ -250,6 +252,69 @@ enum Command {
         /// Required to actually run; without it, prints what would be removed
         #[arg(long)]
         confirm: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage graphs on a multi-graph server (MR-668)
+    Graphs {
+        #[command(subcommand)]
+        command: GraphsCommand,
+    },
+}
+
+/// Operations on the graph registry of a multi-graph server (MR-668).
+///
+/// All operations target a remote multi-graph server URL (http:// or
+/// https://). Local-URI invocations return a clear error; for local
+/// graphs operators add/remove entries by editing `omnigraph.yaml`
+/// directly and restarting.
+///
+/// `Delete` is intentionally omitted in v0.7.0 — server-side DELETE
+/// was deferred to bound the release scope. Operators remove graphs
+/// by stopping the server, editing `omnigraph.yaml`, then restarting.
+#[derive(Debug, Subcommand)]
+enum GraphsCommand {
+    /// List every graph registered with the multi-graph server.
+    List {
+        /// Remote server URL (e.g. `https://server.example.com`).
+        #[arg(long)]
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a new graph at runtime via `POST /graphs`.
+    ///
+    /// The schema file is read locally and the bytes are inlined as
+    /// `schema.source` in the request body. The server runs
+    /// `Omnigraph::init` at the supplied `uri` and atomically rewrites
+    /// `omnigraph.yaml` to include the new entry.
+    Create {
+        /// Remote server URL (e.g. `https://server.example.com`).
+        #[arg(long)]
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// New graph identifier. Must satisfy `^[a-zA-Z0-9-]{1,64}$`.
+        #[arg(long)]
+        graph_id: String,
+        /// Storage URI for the new graph (local path or `s3://...`).
+        /// Operator-supplied; the server `Omnigraph::init`s here.
+        #[arg(long = "graph-uri")]
+        graph_uri: String,
+        /// Local path to the schema `.pg` file. CLI reads the file
+        /// and inlines its contents as `schema.source` in the body.
+        #[arg(long)]
+        schema: PathBuf,
+        /// Optional per-graph policy file path. Sent verbatim to the
+        /// server, where it must be readable at request time.
+        #[arg(long)]
+        policy_file: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -2556,6 +2621,94 @@ async fn main() -> Result<()> {
                 );
             }
         }
+        Command::Graphs { command } => match command {
+            GraphsCommand::List {
+                uri,
+                target,
+                config,
+                json,
+            } => {
+                let config = load_cli_config(config.as_ref())?;
+                let bearer_token =
+                    resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
+                let uri = resolve_uri(&config, uri, target.as_deref())?;
+                if !is_remote_uri(&uri) {
+                    bail!(
+                        "`omnigraph graphs list` requires a remote multi-graph server URL \
+                         (http:// or https://). To enumerate local graphs, read `omnigraph.yaml` \
+                         directly."
+                    );
+                }
+                let payload = remote_json::<GraphListResponse>(
+                    &http_client,
+                    Method::GET,
+                    remote_url(&uri, "/graphs"),
+                    None,
+                    bearer_token.as_deref(),
+                )
+                .await?;
+                if json {
+                    print_json(&payload)?;
+                } else {
+                    for entry in payload.graphs {
+                        println!("{}\t{}", entry.graph_id, entry.uri);
+                    }
+                }
+            }
+            GraphsCommand::Create {
+                uri,
+                target,
+                config,
+                graph_id,
+                graph_uri,
+                schema,
+                policy_file,
+                json,
+            } => {
+                let config = load_cli_config(config.as_ref())?;
+                let bearer_token =
+                    resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
+                let uri = resolve_uri(&config, uri, target.as_deref())?;
+                if !is_remote_uri(&uri) {
+                    bail!(
+                        "`omnigraph graphs create` requires a remote multi-graph server URL \
+                         (http:// or https://). To add a graph to a local config, edit \
+                         `omnigraph.yaml` and restart the server."
+                    );
+                }
+                let schema_source = fs::read_to_string(&schema).map_err(|err| {
+                    color_eyre::eyre::eyre!(
+                        "reading schema file '{}': {err}",
+                        schema.display()
+                    )
+                })?;
+                let request_body = GraphCreateRequest {
+                    graph_id: graph_id.clone(),
+                    uri: graph_uri.clone(),
+                    schema: GraphSchemaSpec {
+                        source: schema_source,
+                    },
+                    policy: policy_file
+                        .as_ref()
+                        .map(|file| GraphPolicySpec {
+                            file: Some(file.clone()),
+                        }),
+                };
+                let payload = remote_json::<GraphCreateResponse>(
+                    &http_client,
+                    Method::POST,
+                    remote_url(&uri, "/graphs"),
+                    Some(serde_json::to_value(&request_body)?),
+                    bearer_token.as_deref(),
+                )
+                .await?;
+                if json {
+                    print_json(&payload)?;
+                } else {
+                    println!("created graph {} at {}", payload.graph_id, payload.uri);
+                }
+            }
+        },
     }
     Ok(())
 }
