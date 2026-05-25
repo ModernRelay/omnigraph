@@ -183,13 +183,36 @@ impl Omnigraph {
         let mut catalog = build_catalog_from_ir(&schema_ir)?;
         fixup_blob_schemas(&mut catalog);
 
-        // Write _schema.pg
-        let schema_path = join_uri(&root, SCHEMA_SOURCE_FILENAME);
-        storage.write_text(&schema_path, schema_source).await?;
-        write_schema_contract(&root, storage.as_ref(), &schema_ir).await?;
-
-        // Create manifest + per-type datasets
-        let coordinator = GraphCoordinator::init(&root, &catalog, Arc::clone(&storage)).await?;
+        // Run the I/O phase. On any error, best-effort-clean the schema
+        // artifacts that may have been written to disk before returning
+        // the original error. The cleanup is best-effort: a failure to
+        // delete is logged via `tracing::warn` but does not mask the
+        // original init error.
+        //
+        // Coverage gap: Lance per-type datasets and `__manifest/`
+        // directory created by `GraphCoordinator::init` are NOT cleaned
+        // up here — fully recursive directory deletion requires a
+        // `StorageAdapter::delete_prefix` primitive that's deferred
+        // along with `DELETE /graphs/{id}` (PR 2b in the MR-668 plan
+        // is currently deferred). If `init` fails after coordinator
+        // init succeeds, operators may need to remove the graph
+        // directory manually before retrying `init` on the same URI.
+        // Documented in the PR 2a commit message and `init` rustdoc.
+        let coordinator = match init_storage_phase(
+            &root,
+            schema_source,
+            &schema_ir,
+            &catalog,
+            &storage,
+        )
+        .await
+        {
+            Ok(coordinator) => coordinator,
+            Err(err) => {
+                best_effort_cleanup_init_artifacts(&root, storage.as_ref()).await;
+                return Err(err);
+            }
+        };
 
         Ok(Self {
             root_uri: root.clone(),
@@ -1475,6 +1498,66 @@ fn fixup_blob_schemas(catalog: &mut Catalog) {
 fn read_schema_ir_from_source(schema_source: &str) -> Result<SchemaIR> {
     let schema_ast = parse_schema(schema_source)?;
     build_schema_ir(&schema_ast).map_err(|err| OmniError::manifest(err.to_string()))
+}
+
+/// I/O phase of `Omnigraph::init_with_storage`. Split out so the caller
+/// can pattern-match on the result and run cleanup on error before
+/// returning the original error.
+///
+/// Failpoints fire at the three phase boundaries:
+/// * `init.after_schema_pg_written` — `_schema.pg` is on disk.
+/// * `init.after_schema_contract_written` — `_schema.pg` + `_schema.ir.json`
+///   + `__schema_state.json` are on disk.
+/// * `init.after_coordinator_init` — all schema files plus Lance per-type
+///   datasets and `__manifest/` are on disk. (The cleanup wrapper can only
+///   remove the schema files; Lance directories need `delete_prefix` —
+///   deferred along with `DELETE /graphs/{id}`.)
+async fn init_storage_phase(
+    root: &str,
+    schema_source: &str,
+    schema_ir: &SchemaIR,
+    catalog: &Catalog,
+    storage: &Arc<dyn StorageAdapter>,
+) -> Result<GraphCoordinator> {
+    let schema_path = join_uri(root, SCHEMA_SOURCE_FILENAME);
+    storage.write_text(&schema_path, schema_source).await?;
+    crate::failpoints::maybe_fail("init.after_schema_pg_written")?;
+
+    write_schema_contract(root, storage.as_ref(), schema_ir).await?;
+    crate::failpoints::maybe_fail("init.after_schema_contract_written")?;
+
+    let coordinator = GraphCoordinator::init(root, catalog, Arc::clone(storage)).await?;
+    crate::failpoints::maybe_fail("init.after_coordinator_init")?;
+
+    Ok(coordinator)
+}
+
+/// Best-effort cleanup of init-phase artifacts. Called from
+/// `init_with_storage` on any error returned by `init_storage_phase`.
+///
+/// Removes the three schema files: `_schema.pg`, `_schema.ir.json`,
+/// `__schema_state.json`. Lance datasets and `__manifest/` are not
+/// touched here — recursive directory deletion requires a
+/// `StorageAdapter::delete_prefix` primitive that's deferred along
+/// with `DELETE /graphs/{id}` (MR-668 PR 2b).
+///
+/// Failures to delete are logged via `tracing::warn` and do not mask
+/// the original init error.
+async fn best_effort_cleanup_init_artifacts(root: &str, storage: &dyn StorageAdapter) {
+    for uri in [
+        schema_source_uri(root),
+        schema_ir_uri(root),
+        schema_state_uri(root),
+    ] {
+        if let Err(err) = storage.delete(&uri).await {
+            tracing::warn!(
+                target: "omnigraph::init",
+                uri = %uri,
+                error = %err,
+                "init failed; best-effort cleanup could not delete artifact",
+            );
+        }
+    }
 }
 
 fn schema_table_key(type_kind: SchemaTypeKind, name: &str) -> String {
