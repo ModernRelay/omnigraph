@@ -28,7 +28,7 @@ use api::{
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
-use axum::extract::{Extension, Path, Query, Request, State};
+use axum::extract::{Extension, OriginalUri, Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::middleware::{self, Next};
@@ -118,9 +118,13 @@ const SERVER_SOURCE_VERSION: Option<&str> = option_env!("OMNIGRAPH_SOURCE_VERSIO
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    pub uri: String,
+    /// Server topology + the graphs to open at startup. Single-mode
+    /// invocations (`omnigraph-server <URI>` or `--target <name>`)
+    /// produce `ServerConfigMode::Single`; multi-mode invocations
+    /// (`--config omnigraph.yaml` with a non-empty `graphs:` map and
+    /// no single-mode selector) produce `ServerConfigMode::Multi`.
+    pub mode: ServerConfigMode,
     pub bind: String,
-    pub policy_file: Option<PathBuf>,
     /// Operator opt-in for fully-unauthenticated dev mode (MR-723).
     /// When neither bearer tokens nor a policy file are configured,
     /// `serve()` refuses to start unless this is true (set via
@@ -130,6 +134,47 @@ pub struct ServerConfig {
     /// who set up auth and forgot the policy file would otherwise ship
     /// the illusion of protection.
     pub allow_unauthenticated: bool,
+}
+
+/// What `load_server_settings` produces after applying the four-rule
+/// mode inference matrix (MR-668 decision 2).
+#[derive(Debug, Clone)]
+pub enum ServerConfigMode {
+    /// Legacy invocation — one graph at the given URI. Either:
+    ///   * `omnigraph-server <URI>` (CLI positional), or
+    ///   * `omnigraph-server --target <name> --config omnigraph.yaml`, or
+    ///   * `omnigraph-server --config omnigraph.yaml` with `server.graph`
+    ///     set to a named target.
+    Single {
+        uri: String,
+        /// Top-level `policy.file` (single-graph Cedar policy).
+        policy_file: Option<PathBuf>,
+    },
+    /// Multi-graph invocation — `--config omnigraph.yaml` with a
+    /// non-empty `graphs:` map and no single-mode selector.
+    Multi {
+        /// Per-graph startup configs, sorted by graph id (BTreeMap
+        /// iteration order). PR 5's parallel-open loop iterates this.
+        graphs: Vec<GraphStartupConfig>,
+        /// Path to the config file the server was started from. PR 7's
+        /// `POST /graphs` flow will use this for atomic YAML rewrite
+        /// (DELETE is deferred so the rewrite path is currently unused).
+        config_path: PathBuf,
+        /// `server.policy.file` (server-level Cedar policy for the
+        /// management endpoints). Loaded but currently unused — PR 6b
+        /// wires it into `GET /graphs`.
+        server_policy_file: Option<PathBuf>,
+    },
+}
+
+/// One graph's startup-time configuration: id, opened URI, optional
+/// per-graph policy file path. Constructed by `load_server_settings`
+/// in multi mode; consumed by `serve`'s parallel open loop.
+#[derive(Debug, Clone)]
+pub struct GraphStartupConfig {
+    pub graph_id: String,
+    pub uri: String,
+    pub policy_file: Option<PathBuf>,
 }
 
 /// Server runtime topology. Single mode = legacy `omnigraph-server <URI>`
@@ -696,10 +741,7 @@ pub fn load_server_settings(
     cli_allow_unauthenticated: bool,
 ) -> Result<ServerConfig> {
     let config = load_config(config_path)?;
-    let uri =
-        config.resolve_target_uri(cli_uri, cli_target.as_deref(), config.server_graph_name())?;
     let bind = cli_bind.unwrap_or_else(|| config.server_bind().to_string());
-    let policy_file = config.resolve_policy_file();
     // Either `--unauthenticated` or `OMNIGRAPH_UNAUTHENTICATED=1` flips
     // this. Treat any non-empty, non-"0"/"false" string as truthy —
     // standard 12-factor "any value is true" reading of the env var.
@@ -712,12 +754,79 @@ pub fn load_server_settings(
         .unwrap_or(false);
     let allow_unauthenticated = cli_allow_unauthenticated || env_unauth;
 
+    // MR-668 decision 2 — four-rule mode inference matrix.
+    //
+    //   1. CLI `<URI>` positional        → Single (URI = the value)
+    //   2. CLI `--target <name>`         → Single (URI = graphs.<name>.uri)
+    //   3. `server.graph` in config      → Single (URI = graphs.<server.graph>.uri)
+    //   4. `--config` + non-empty `graphs:` + no single-mode selector
+    //                                    → Multi (every entry in `graphs:`)
+    //   5. otherwise                     → error with migration hint
+    //
+    // Rules 1-3 are mutually compatible (CLI URI wins over `--target`
+    // wins over `server.graph`), reusing the existing
+    // `resolve_target_uri` precedence.
+    let has_cli_uri = cli_uri.is_some();
+    let has_cli_target = cli_target.is_some();
+    let has_server_graph = config.server_graph_name().is_some();
+    let has_graphs_map = !config.graphs.is_empty();
+    let has_explicit_config = config_path.is_some();
+
+    let mode = if has_cli_uri || has_cli_target || has_server_graph {
+        // Rules 1, 2, or 3 → Single mode.
+        let uri = config.resolve_target_uri(
+            cli_uri,
+            cli_target.as_deref(),
+            config.server_graph_name(),
+        )?;
+        let policy_file = config.resolve_policy_file();
+        ServerConfigMode::Single { uri, policy_file }
+    } else if has_explicit_config && has_graphs_map {
+        // Rule 4 → Multi mode. Build a startup config per graph.
+        let mut graphs = Vec::with_capacity(config.graphs.len());
+        for (name, target) in &config.graphs {
+            // Validate the graph id can construct a `GraphId` newtype.
+            // Doing this here (not at registry insert) so a malformed
+            // omnigraph.yaml fails at startup with a clear error.
+            GraphId::try_from(name.clone()).map_err(|err| {
+                color_eyre::eyre::eyre!("invalid graph id '{name}' in omnigraph.yaml: {err}")
+            })?;
+            graphs.push(GraphStartupConfig {
+                graph_id: name.clone(),
+                uri: config.resolve_uri_value(&target.uri),
+                policy_file: config.resolve_target_policy_file(name),
+            });
+        }
+        let config_path = config_path
+            .cloned()
+            .expect("has_explicit_config implies config_path is Some");
+        let server_policy_file = config.resolve_server_policy_file();
+        ServerConfigMode::Multi {
+            graphs,
+            config_path,
+            server_policy_file,
+        }
+    } else {
+        // Rule 5 → error with migration hint.
+        bail!(
+            "no graph to serve: pass a URI (`omnigraph-server <URI>`), select a target \
+             (`--target <name> --config omnigraph.yaml`), set `server.graph: <name>` in \
+             omnigraph.yaml, or for multi-graph mode add a `graphs:` map to the config \
+             file referenced by `--config`."
+        );
+    };
+
     Ok(ServerConfig {
-        uri,
+        mode,
         bind,
-        policy_file,
         allow_unauthenticated,
     })
+}
+
+/// Whether the loaded config will run the server in multi-graph mode.
+/// Useful for the test that constructs `ServerConfig` directly.
+pub fn server_config_is_multi(config: &ServerConfig) -> bool {
+    matches!(config.mode, ServerConfigMode::Multi { .. })
 }
 
 /// MR-723 server runtime state, classified from the three-state matrix
@@ -822,9 +931,22 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     let token_source = resolve_token_source().await?;
     info!(source = token_source.name(), "loaded bearer token source");
     let tokens = token_source.load().await?;
+
+    // For runtime-state classification, "any policy configured" means
+    // either the top-level/single-mode policy file OR a server-level
+    // policy OR any per-graph policy file. Mirrors the
+    // `requires_bearer_auth` semantics on AppState.
+    let has_policy_configured = match &config.mode {
+        ServerConfigMode::Single { policy_file, .. } => policy_file.is_some(),
+        ServerConfigMode::Multi {
+            graphs,
+            server_policy_file,
+            ..
+        } => server_policy_file.is_some() || graphs.iter().any(|g| g.policy_file.is_some()),
+    };
     let runtime_state = classify_server_runtime_state(
         !tokens.is_empty(),
-        config.policy_file.is_some(),
+        has_policy_configured,
         config.allow_unauthenticated,
     )?;
     match runtime_state {
@@ -840,18 +962,120 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         ),
         ServerRuntimeState::PolicyEnabled => {}
     }
-    let state = AppState::open_with_bearer_tokens_and_policy(
-        config.uri.clone(),
-        tokens,
-        config.policy_file.as_ref(),
-    )
-    .await?;
-    let listener = TcpListener::bind(&config.bind).await?;
-    info!(uri = %config.uri, bind = %config.bind, "serving omnigraph");
+
+    let bind = config.bind.clone();
+    let state = match config.mode {
+        ServerConfigMode::Single { uri, policy_file } => {
+            let uri_for_log = uri.clone();
+            info!(uri = %uri_for_log, bind = %bind, mode = "single", "serving omnigraph");
+            AppState::open_with_bearer_tokens_and_policy(uri, tokens, policy_file.as_ref()).await?
+        }
+        ServerConfigMode::Multi {
+            graphs,
+            config_path,
+            server_policy_file,
+        } => {
+            info!(
+                bind = %bind,
+                mode = "multi",
+                graph_count = graphs.len(),
+                config = %config_path.display(),
+                "serving omnigraph"
+            );
+            open_multi_graph_state(
+                graphs,
+                tokens,
+                server_policy_file.as_ref(),
+                config_path,
+            )
+            .await?
+        }
+    };
+
+    let listener = TcpListener::bind(&bind).await?;
     axum::serve(listener, build_app(state))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// Parallel open of every graph in the startup config, with bounded
+/// concurrency (`buffer_unordered(4)`). Fail-fast — the first open error
+/// aborts startup; other in-flight opens are dropped (their `Omnigraph`
+/// instances close cleanly via Arc drop).
+///
+/// The bound 4 is a rule-of-thumb for I/O-bound work. At N ≤ 10 this
+/// trades startup latency for a small amount of concurrent S3 / Lance
+/// open pressure.
+async fn open_multi_graph_state(
+    graphs: Vec<GraphStartupConfig>,
+    tokens: Vec<(String, String)>,
+    server_policy_file: Option<&PathBuf>,
+    config_path: PathBuf,
+) -> Result<AppState> {
+    use futures::StreamExt;
+
+    if graphs.is_empty() {
+        bail!("multi-graph mode requires at least one graph in the `graphs:` map");
+    }
+
+    // Server-level policy (loaded once, applies to management endpoints).
+    // The placeholder graph_id `"server"` matches the PolicyEngine API
+    // shape until the Cedar resource-model refactor (PR 6a) lands.
+    let server_policy = match server_policy_file {
+        Some(path) => Some(PolicyEngine::load(path, "server")?),
+        None => None,
+    };
+
+    let handles: Vec<Arc<GraphHandle>> = futures::stream::iter(graphs.into_iter())
+        .map(|cfg| async move {
+            open_single_graph(cfg).await
+        })
+        .buffer_unordered(4)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+
+    let workload = workload::WorkloadController::from_env();
+    let state = AppState::new_multi(
+        handles,
+        tokens,
+        server_policy,
+        workload,
+        Some(config_path),
+    )
+    .map_err(|err| color_eyre::eyre::eyre!("multi-graph registry: {err}"))?;
+    Ok(state)
+}
+
+/// Open one graph and wrap it in a `GraphHandle`. Used both at startup
+/// (`open_multi_graph_state`) and — once `POST /graphs` lands in PR 7
+/// — for runtime additions.
+async fn open_single_graph(cfg: GraphStartupConfig) -> Result<Arc<GraphHandle>> {
+    let graph_id = GraphId::try_from(cfg.graph_id.clone())
+        .map_err(|err| color_eyre::eyre::eyre!("graph id '{}': {err}", cfg.graph_id))?;
+
+    let db = Omnigraph::open(&cfg.uri)
+        .await
+        .map_err(|err| color_eyre::eyre::eyre!("open graph '{}' at {}: {err}", graph_id, cfg.uri))?;
+
+    let (policy_arc, db) = match &cfg.policy_file {
+        Some(path) => {
+            let policy = PolicyEngine::load(path, graph_id.as_str())?;
+            let policy_arc: Arc<PolicyEngine> = Arc::new(policy);
+            let checker = Arc::clone(&policy_arc) as Arc<dyn omnigraph_policy::PolicyChecker>;
+            (Some(policy_arc), db.with_policy(checker))
+        }
+        None => (None, db),
+    };
+
+    Ok(Arc::new(GraphHandle {
+        key: GraphKey::cluster(graph_id),
+        uri: cfg.uri,
+        engine: Arc::new(db),
+        policy: policy_arc,
+    }))
 }
 
 async fn shutdown_signal() {
@@ -1039,12 +1263,19 @@ async fn resolve_graph_handle(
             )
         })?,
         ServerMode::Multi { .. } => {
-            // Extract the {graph_id} path segment from `/graphs/{graph_id}/...`.
-            // The router only mounts the per-graph nest under that prefix,
-            // so any request reaching this middleware in Multi mode must
-            // have the prefix — but defense in depth still validates.
-            let path = request.uri().path();
-            let graph_id_str = path
+            // `Router::nest("/graphs/{graph_id}", inner)` rewrites
+            // `request.uri().path()` to the inner suffix (e.g. `/snapshot`).
+            // The pre-rewrite URI is preserved in the `OriginalUri`
+            // request extension by axum's router; we read from there to
+            // extract `{graph_id}`. Fall back to the current URI only if
+            // the extension is missing, which shouldn't happen for
+            // nested routes but is safe defensive code.
+            let original_path: String = request
+                .extensions()
+                .get::<OriginalUri>()
+                .map(|OriginalUri(uri)| uri.path().to_string())
+                .unwrap_or_else(|| request.uri().path().to_string());
+            let graph_id_str = original_path
                 .strip_prefix("/graphs/")
                 .and_then(|rest| rest.split('/').next())
                 .filter(|s| !s.is_empty())
@@ -2075,9 +2306,9 @@ fn server_bearer_tokens_from_env() -> Result<Vec<(String, String)>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ServerConfig, ServerRuntimeState, classify_server_runtime_state, hash_bearer_token,
-        load_server_settings, normalize_bearer_token, parse_bearer_tokens_json, serve,
-        server_bearer_tokens_from_env,
+        ServerConfig, ServerConfigMode, ServerRuntimeState, classify_server_runtime_state,
+        hash_bearer_token, load_server_settings, normalize_bearer_token,
+        parse_bearer_tokens_json, serve, server_bearer_tokens_from_env,
     };
     use serial_test::serial;
     use std::env;
@@ -2132,7 +2363,10 @@ server:
         .unwrap();
 
         let settings = load_server_settings(Some(&config), None, None, None, false).unwrap();
-        assert_eq!(settings.uri, "/tmp/demo.omni");
+        match &settings.mode {
+            ServerConfigMode::Single { uri, .. } => assert_eq!(uri, "/tmp/demo.omni"),
+            ServerConfigMode::Multi { .. } => panic!("expected Single mode, got Multi"),
+        }
         assert_eq!(settings.bind, "0.0.0.0:9090");
     }
 
@@ -2161,7 +2395,10 @@ server:
             false,
         )
         .unwrap();
-        assert_eq!(settings.uri, "/tmp/override.omni");
+        match &settings.mode {
+            ServerConfigMode::Single { uri, .. } => assert_eq!(uri, "/tmp/override.omni"),
+            ServerConfigMode::Multi { .. } => panic!("expected Single mode, got Multi"),
+        }
         assert_eq!(settings.bind, "0.0.0.0:9999");
     }
 
@@ -2187,13 +2424,19 @@ server:
         let settings =
             load_server_settings(Some(&config), None, Some("dev".to_string()), None, false)
                 .unwrap();
-        assert_eq!(settings.uri, "http://127.0.0.1:8080");
+        match &settings.mode {
+            ServerConfigMode::Single { uri, .. } => assert_eq!(uri, "http://127.0.0.1:8080"),
+            ServerConfigMode::Multi { .. } => panic!("expected Single mode, got Multi"),
+        }
     }
 
     #[test]
     fn server_settings_require_uri_from_cli_or_config() {
         let error = load_server_settings(None, None, None, None, false).unwrap_err();
-        assert!(error.to_string().contains("URI must be provided"));
+        assert!(
+            error.to_string().contains("no graph to serve"),
+            "expected mode-inference error, got: {error}",
+        );
     }
 
     #[test]
@@ -2252,13 +2495,15 @@ server:
         // Graph path doesn't need to exist — classifier fires before
         // `AppState::open_with_bearer_tokens_and_policy`.
         let config = ServerConfig {
-            uri: temp
-                .path()
-                .join("graph.omni")
-                .to_string_lossy()
-                .into_owned(),
+            mode: ServerConfigMode::Single {
+                uri: temp
+                    .path()
+                    .join("graph.omni")
+                    .to_string_lossy()
+                    .into_owned(),
+                policy_file: None,
+            },
             bind: "127.0.0.1:0".to_string(),
-            policy_file: None,
             allow_unauthenticated: false,
         };
         let result = serve(config).await;

@@ -17,6 +17,12 @@ pub struct ProjectConfig {
 pub struct TargetConfig {
     pub uri: String,
     pub bearer_token_env: Option<String>,
+    /// Per-graph Cedar policy file (MR-668). In single-graph mode this
+    /// field is unused — the top-level `policy.file` applies. In
+    /// multi-graph mode, each `graphs.<id>.policy.file` governs that
+    /// graph's HTTP-layer Cedar enforcement.
+    #[serde(default)]
+    pub policy: PolicySettings,
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
@@ -59,6 +65,12 @@ pub struct ServerDefaults {
     #[serde(rename = "graph")]
     pub graph: Option<String>,
     pub bind: Option<String>,
+    /// Server-level Cedar policy (MR-668). Governs management endpoints
+    /// (`POST /graphs`, `GET /graphs`, `DELETE /graphs/{id}` once they
+    /// land). In single-graph mode this is unused — the top-level
+    /// `policy.file` covers the single graph.
+    #[serde(default)]
+    pub policy: PolicySettings,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -214,6 +226,39 @@ impl OmnigraphConfig {
         } else {
             self.base_dir.join(path)
         })
+    }
+
+    /// Resolve the per-graph policy file path for the named target,
+    /// relative to the config file's `base_dir`. Returns `None` if the
+    /// target is unknown or no per-graph `policy.file` is set.
+    pub fn resolve_target_policy_file(&self, target_name: &str) -> Option<PathBuf> {
+        let target = self.graphs.get(target_name)?;
+        let path = target.policy.file.as_deref()?;
+        let path = Path::new(path);
+        Some(if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.base_dir.join(path)
+        })
+    }
+
+    /// Resolve the server-level policy file path (used by management
+    /// endpoints). Returns `None` if `server.policy.file` is not set.
+    pub fn resolve_server_policy_file(&self) -> Option<PathBuf> {
+        let path = self.server.policy.file.as_deref()?;
+        let path = Path::new(path);
+        Some(if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.base_dir.join(path)
+        })
+    }
+
+    /// Resolve a raw config-supplied URI (which may be relative) to its
+    /// absolute form. URIs containing `://` are passed through as-is;
+    /// relative paths are joined with the config file's `base_dir`.
+    pub fn resolve_uri_value(&self, value: &str) -> String {
+        self.resolve_config_uri(value)
     }
 
     pub fn resolve_policy_tests_file(&self) -> Option<PathBuf> {
