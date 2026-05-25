@@ -1,26 +1,80 @@
 # HTTP Server (`omnigraph-server`)
 
-Axum 0.8 + tokio + utoipa-generated OpenAPI. Single graph per process; deploy multiple processes for multi-tenant.
+Axum 0.8 + tokio + utoipa-generated OpenAPI. **Two modes** (v0.7.0+): single-graph (legacy) and multi-graph (MR-668). Mode is inferred from CLI args + config shape.
+
+## Modes
+
+### Single-graph mode (legacy)
+
+`omnigraph-server <URI>` or `omnigraph-server --target <name> --config omnigraph.yaml`. Routes are flat — `/snapshot`, `/read`, `/branches`, etc. Behavior unchanged from v0.6.0.
+
+### Multi-graph mode (v0.7.0+)
+
+`omnigraph-server --config omnigraph.yaml` with a non-empty `graphs:` map and **no** single-mode selector (no `server.graph`, no `<URI>`, no `--target`). The server opens every configured graph in parallel at startup (bounded concurrency = 4, fail-fast on the first open error). Routes are nested under `/graphs/{graph_id}/...`. Bare flat paths return 404 in multi mode.
+
+Mode inference (four-rule matrix):
+
+1. CLI positional `<URI>` → single
+2. CLI `--target <name>` → single
+3. `server.graph` in config → single
+4. `--config` + non-empty `graphs:` + no single-mode selector → **multi**
+5. otherwise → error with migration hint
 
 ## Endpoint inventory
 
+Per-graph endpoints — same body shape across modes; URLs differ:
+
+| Method | Single-mode path | Multi-mode path | Auth | Action | Handler |
+|---|---|---|---|---|---|
+| GET | `/healthz` | `/healthz` | none | — | `server_health` |
+| GET | `/openapi.json` | `/openapi.json` | none | — | `server_openapi` (strips security if auth disabled; in multi mode emits cluster paths with `cluster_` operation-id prefix) |
+| GET | `/snapshot?branch=` | `/graphs/{id}/snapshot?branch=` | bearer + `read` | snapshot of branch | `server_snapshot` |
+| POST | `/read` | `/graphs/{id}/read` | bearer + `read` | run named query | `server_read` |
+| POST | `/export` | `/graphs/{id}/export` | bearer + `export` | NDJSON stream | `server_export` |
+| POST | `/change` | `/graphs/{id}/change` | bearer + `change` | mutation | `server_change` |
+| GET | `/schema` | `/graphs/{id}/schema` | bearer + `read` | get current `.pg` source | `server_schema_get` |
+| POST | `/schema/apply` | `/graphs/{id}/schema/apply` | bearer + `schema_apply` (target=`main`) | migrate | `server_schema_apply` |
+| POST | `/ingest` | `/graphs/{id}/ingest` | bearer + `branch_create` (if new) + `change` | bulk load | `server_ingest` (32 MB body limit) |
+| GET | `/branches` | `/graphs/{id}/branches` | bearer + `read` | list branches | `server_branch_list` |
+| POST | `/branches` | `/graphs/{id}/branches` | bearer + `branch_create` | create | `server_branch_create` |
+| DELETE | `/branches/{branch}` | `/graphs/{id}/branches/{branch}` | bearer + `branch_delete` | delete | `server_branch_delete` |
+| POST | `/branches/merge` | `/graphs/{id}/branches/merge` | bearer + `branch_merge` | merge `source → target` | `server_branch_merge` |
+| GET | `/commits?branch=` | `/graphs/{id}/commits?branch=` | bearer + `read` | list | `server_commit_list` |
+| GET | `/commits/{commit_id}` | `/graphs/{id}/commits/{commit_id}` | bearer + `read` | show | `server_commit_show` |
+
+Server-level management endpoints (v0.7.0+):
+
 | Method | Path | Auth | Action | Handler |
 |---|---|---|---|---|
-| GET | `/healthz` | none | — | `server_health` |
-| GET | `/openapi.json` | none | — | `server_openapi` (strips security if auth disabled) |
-| GET | `/snapshot?branch=` | bearer + `read` | snapshot of branch | `server_snapshot` |
-| POST | `/read` | bearer + `read` | run named query | `server_read` |
-| POST | `/export` | bearer + `export` | NDJSON stream | `server_export` |
-| POST | `/change` | bearer + `change` | mutation | `server_change` |
-| GET | `/schema` | bearer + `read` | get current `.pg` source | `server_schema_get` |
-| POST | `/schema/apply` | bearer + `schema_apply` (target=`main`) | migrate | `server_schema_apply` |
-| POST | `/ingest` | bearer + `branch_create` (if new) + `change` | bulk load | `server_ingest` (32 MB body limit) |
-| GET | `/branches` | bearer + `read` | list branches | `server_branch_list` |
-| POST | `/branches` | bearer + `branch_create` | create | `server_branch_create` |
-| DELETE | `/branches/{branch}` | bearer + `branch_delete` | delete | `server_branch_delete` |
-| POST | `/branches/merge` | bearer + `branch_merge` | merge `source → target` | `server_branch_merge` |
-| GET | `/commits?branch=` | bearer + `read` | list | `server_commit_list` |
-| GET | `/commits/{commit_id}` | bearer + `read` | show | `server_commit_show` |
+| GET | `/graphs` | bearer + `graph_list` on `Server::"root"` | list registered graphs | `server_graphs_list` (405 in single mode) |
+| POST | `/graphs` | bearer + `graph_create` on `Server::"root"` | create new graph at runtime | `server_graphs_create` (405 in single mode, 32 MB body limit) |
+
+`DELETE /graphs/{id}` is **not** in v0.7.0. Operators remove graphs by stopping the server, editing `omnigraph.yaml`, then restarting.
+
+## `omnigraph.yaml` ownership (multi mode)
+
+The server owns `omnigraph.yaml` while running. `POST /graphs` rewrites the file atomically under an exclusive `fcntl::flock` with SHA-256 drift detection:
+
+- The server hashes the file at startup. `POST /graphs` re-hashes under the flock before rewriting. If the hash doesn't match (operator hand-edited), the rewrite refuses with 503.
+- Comments and blank-line structure are **not** preserved across server-side rewrites — the file is regenerated via `serde_yaml::to_string`.
+- Operators must not edit the file while the server is running. To make offline changes: stop the server, edit, restart.
+
+In **single mode** the server never writes `omnigraph.yaml`.
+
+## `POST /graphs` body shape
+
+```json
+{
+  "graph_id": "alpha",
+  "uri": "s3://tenant-bucket/alpha",
+  "schema": { "source": "<inline .pg source>" },
+  "policy": { "file": "./policies/alpha.yaml" }
+}
+```
+
+- `schema` and `policy` are nested — leaves room for future fields without breaking the shape.
+- `policy` is optional; without it, no per-graph Cedar enforcement.
+- Status codes: 201 Created · 400 invalid body · 401 missing bearer · 403 Cedar denied · 405 single mode · 409 duplicate `graph_id` or `uri` · 413 body >32 MiB · 500 init or rewrite failure · 503 YAML drift.
 
 ## Streaming
 

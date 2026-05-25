@@ -1428,49 +1428,33 @@ async fn server_graphs_create(
     ))
 }
 
-/// Load `omnigraph.yaml` from disk, add the new graph entry, write it
-/// back via `config::rewrite_atomic`, and update the in-memory baseline
-/// hash. Returns an `ApiError` mapped to the appropriate HTTP status
-/// (503 for drift, 500 for IO/serialize failures).
+/// Atomically rewrite `omnigraph.yaml` to add a new graph entry.
+/// Runs inside `tokio::task::spawn_blocking` (the flock is sync).
 ///
-/// Runs inside `tokio::task::spawn_blocking` — `fs2::flock` is sync.
+/// Read-modify-write happens entirely under the flock + baseline
+/// mutex via `config::rewrite_atomic_with_modify` — concurrent
+/// writers serialize without spurious drift errors.
 fn rewrite_yaml_with_new_graph(
     config_path: &std::path::Path,
     config_hash: &Arc<std::sync::Mutex<[u8; 32]>>,
     graph_id: &str,
     new_target: config::TargetConfig,
 ) -> std::result::Result<(), ApiError> {
-    // Re-read the config file to construct the next state.
-    let bytes = std::fs::read(config_path)
-        .map_err(|err| ApiError::internal(format!("read omnigraph.yaml: {err}")))?;
-    let mut updated: config::OmnigraphConfig = serde_yaml::from_slice(&bytes)
-        .map_err(|err| ApiError::internal(format!("parse omnigraph.yaml: {err}")))?;
-    updated.graphs.insert(graph_id.to_string(), new_target);
-
-    // Grab the current baseline hash for the drift check.
-    let expected = *config_hash
-        .lock()
-        .expect("config_hash mutex must not be poisoned");
-    let new_hash = config::rewrite_atomic(config_path, &updated, &expected).map_err(|err| {
-        match err {
-            config::RewriteAtomicError::Drift => ApiError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                code: ErrorCode::Conflict,
-                message: err.to_string(),
-                merge_conflicts: Vec::new(),
-                manifest_conflict: None,
-            },
-            other => ApiError::internal(other.to_string()),
-        }
-    })?;
-
-    // Update the baseline so the next POST sees this as the new "no
-    // drift" reference. If we forgot this, every POST after the first
-    // would 503.
-    *config_hash
-        .lock()
-        .expect("config_hash mutex must not be poisoned") = new_hash;
-    Ok(())
+    let graph_id = graph_id.to_string();
+    config::rewrite_atomic_with_modify(config_path, config_hash, move |mut config| {
+        config.graphs.insert(graph_id, new_target);
+        Ok(config)
+    })
+    .map_err(|err| match err {
+        config::RewriteAtomicError::Drift => ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ErrorCode::Conflict,
+            message: err.to_string(),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+        },
+        other => ApiError::internal(other.to_string()),
+    })
 }
 
 async fn server_openapi(State(state): State<AppState>) -> Json<utoipa::openapi::OpenApi> {

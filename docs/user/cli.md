@@ -44,6 +44,33 @@ omnigraph read \
 If the server requires auth, set `OMNIGRAPH_SERVER_BEARER_TOKEN` on the server
 and configure the matching `bearer_token_env` in `omnigraph.yaml`.
 
+## Multi-graph servers (v0.7.0+)
+
+Against a multi-graph server (started with `--config omnigraph.yaml` referencing a non-empty `graphs:` map), use `omnigraph graphs` to enumerate and create graphs:
+
+```bash
+# List
+omnigraph graphs list --target http://server.example.com --json
+
+# Create
+omnigraph graphs create \
+  --target http://server.example.com \
+  --graph-id beta \
+  --graph-uri /data/beta.omni \
+  --schema schema.pg \
+  --policy-file ./policies/beta.yaml   # optional
+```
+
+The CLI reads `--schema` from the local disk and inlines the contents as `schema.source` in the request body. Both subcommands reject local URI targets — they're for remote multi-graph servers only.
+
+`omnigraph graphs delete` is **not** in v0.7.0. To remove a graph, stop the server, edit `omnigraph.yaml`, restart.
+
+Per-graph URLs: once a graph exists, hit its cluster route from any subcommand by pointing `--uri` at it:
+
+```bash
+omnigraph read --uri http://server.example.com/graphs/beta --query ./q.gq ...
+```
+
 ## Runs, Policy, And Diagnostics
 
 ```bash

@@ -5244,4 +5244,271 @@ graphs:
             _ => unreachable!(),
         }
     }
+
+    // ─── PR 9: composite lifecycle tests ─────────────────────────────────
+    //
+    // These tests exercise PRs 1–8 in combination. Each test composes
+    // multiple primitives (POST a graph, query it, restart, enforce
+    // per-graph policy) into a single scenario. They're the closure
+    // tests for the gaps I flagged in PR 7's coverage assessment —
+    // not redundant with the per-PR tests because they catch
+    // integration regressions that individual unit tests miss.
+
+    /// Post a graph, query it via cluster route, then re-load the
+    /// config from disk and confirm `load_server_settings` sees the
+    /// rewritten YAML (i.e. the server's `POST /graphs` actually
+    /// persists). Validates that on restart, the new graph would be
+    /// opened automatically by `serve()`'s multi-mode startup.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multi_graph_lifecycle_post_query_restart_persistence() {
+        let (cfg_dir, app) = multi_mode_app_with_real_config(&["alpha"]).await;
+        let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+
+        // 1. POST a new graph `beta`.
+        let beta_uri = cfg_dir.path().join("beta.omni");
+        let req = GraphCreateRequest {
+            graph_id: "beta".to_string(),
+            uri: beta_uri.to_string_lossy().to_string(),
+            schema: GraphSchemaSpec {
+                source: schema.clone(),
+            },
+            policy: None,
+        };
+        let (status, _) = post_graph(&app, &req, None).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // 2. Query the new graph via its cluster route.
+        let snap = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/graphs/beta/snapshot?branch=main")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(snap.status(), StatusCode::OK);
+
+        // 3. "Restart": reload the config and confirm the rewritten
+        //    YAML carries the new graph through `load_server_settings`.
+        //    A real restart calls `open_multi_graph_state` next; we
+        //    stop short of opening Lance again (the per-PR tests
+        //    already cover that path) but assert the inferred
+        //    `ServerConfigMode::Multi` lists both graphs.
+        let config_path = cfg_dir.path().join("omnigraph.yaml");
+        let settings: ServerConfig =
+            load_server_settings(Some(&config_path), None, None, None, true).unwrap();
+        match settings.mode {
+            ServerConfigMode::Multi { graphs, .. } => {
+                let ids: Vec<&str> = graphs.iter().map(|g| g.graph_id.as_str()).collect();
+                assert_eq!(
+                    ids,
+                    vec!["alpha", "beta"],
+                    "rewritten YAML must include both graphs in BTreeMap order"
+                );
+            }
+            _ => panic!("expected Multi mode after restart"),
+        }
+    }
+
+    /// Per-graph Cedar policy is enforced for a graph created via POST.
+    /// Closes the gap from PR 7's test coverage — the policy was loaded
+    /// but never exercised end-to-end. This test sends an authenticated
+    /// `change` request against a POST-created graph whose per-graph
+    /// policy denies `change` for that actor.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn per_graph_policy_enforced_on_post_created_graph() {
+        let (cfg_dir, _initial_app) = multi_mode_app_with_real_config(&[]).await;
+        let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+        let config_path = cfg_dir.path().join("omnigraph.yaml");
+        let config_hash = omnigraph_server::config::hash_config_file(&config_path).unwrap();
+        // Server-level policy: act-andrew can create graphs. Required
+        // because requires_bearer_auth fires under MR-723 default-deny
+        // once we configure tokens, and `GraphCreate != Read` would
+        // otherwise 403 without a server policy.
+        let server_policy_path = cfg_dir.path().join("server-policy.yaml");
+        fs::write(
+            &server_policy_path,
+            r#"
+version: 1
+groups:
+  admins: [act-andrew]
+rules:
+  - id: admins-create
+    allow:
+      actors: { group: admins }
+      actions: [graph_create, graph_list]
+"#,
+        )
+        .unwrap();
+        let server_policy = omnigraph_policy::PolicyEngine::load(&server_policy_path, "server")
+            .unwrap();
+        let workload = omnigraph_server::workload::WorkloadController::from_env();
+        let state = AppState::new_multi(
+            vec![],
+            vec![
+                ("act-andrew".to_string(), "andrew-token".to_string()),
+                ("act-bruno".to_string(), "bruno-token".to_string()),
+            ],
+            Some(server_policy),
+            workload,
+            Some(config_path.clone()),
+            Some(config_hash),
+        )
+        .expect("empty multi-mode registry must be constructible");
+        let app = build_app(state);
+
+        // Per-graph policy file: only `act-andrew` may `change`.
+        let beta_policy_path = cfg_dir.path().join("beta-policy.yaml");
+        fs::write(
+            &beta_policy_path,
+            r#"
+version: 1
+groups:
+  writers: [act-andrew]
+  readers: [act-bruno]
+protected_branches: []
+rules:
+  - id: writers-change
+    allow:
+      actors: { group: writers }
+      actions: [read, change]
+      branch_scope: any
+  - id: readers-read
+    allow:
+      actors: { group: readers }
+      actions: [read]
+      branch_scope: any
+"#,
+        )
+        .unwrap();
+
+        // POST `beta` with the per-graph policy attached.
+        let beta_uri = cfg_dir.path().join("beta.omni");
+        let req = GraphCreateRequest {
+            graph_id: "beta".to_string(),
+            uri: beta_uri.to_string_lossy().to_string(),
+            schema: GraphSchemaSpec { source: schema },
+            policy: Some(omnigraph_server::api::GraphPolicySpec {
+                file: Some(beta_policy_path.to_string_lossy().to_string()),
+            }),
+        };
+        let (status, body) = post_graph(&app, &req, Some("andrew-token")).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "POST /graphs failed: {body}"
+        );
+
+        // Authenticated `read` from a reader: 200.
+        let read_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/graphs/beta/snapshot?branch=main")
+                    .header("authorization", "Bearer bruno-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            read_resp.status(),
+            StatusCode::OK,
+            "act-bruno must be allowed read on beta"
+        );
+
+        // Authenticated `change` from the reader (act-bruno) must 403:
+        // beta-policy allows readers only `read`, not `change`.
+        let change_body = serde_json::json!({
+            "query_source": "query foo() { insert Person { name: \"X\" } }",
+            "query_name": "foo",
+            "branch": "main"
+        });
+        let change_resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/graphs/beta/change")
+                    .header("authorization", "Bearer bruno-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&change_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            change_resp.status(),
+            StatusCode::FORBIDDEN,
+            "per-graph Cedar policy must deny `change` for act-bruno on beta"
+        );
+    }
+
+    /// Concurrent POST /graphs for DISTINCT graph_ids all succeed.
+    /// The flock + drift detection serializes the YAML rewrite, but
+    /// all writes are valid and the final YAML lists every graph.
+    /// (Same-graph_id concurrency is already covered by the
+    /// `concurrent_insert_same_key_exactly_one_succeeds` registry
+    /// test plus the YAML drift-detection behavior.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_post_graphs_distinct_ids_all_succeed() {
+        let (cfg_dir, app) = multi_mode_app_with_real_config(&["alpha"]).await;
+        let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+        const N: usize = 4;
+
+        let app = Arc::new(app);
+        let barrier = Arc::new(tokio::sync::Barrier::new(N));
+        let mut tasks = Vec::with_capacity(N);
+        for i in 0..N {
+            let app = Arc::clone(&app);
+            let barrier = Arc::clone(&barrier);
+            let dir = cfg_dir.path().to_path_buf();
+            let schema = schema.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let id = format!("graph-{i}");
+                let uri = dir.join(format!("{id}.omni"));
+                let req = GraphCreateRequest {
+                    graph_id: id.clone(),
+                    uri: uri.to_string_lossy().to_string(),
+                    schema: GraphSchemaSpec { source: schema },
+                    policy: None,
+                };
+                let (status, _) = post_graph(&app, &req, None).await;
+                (id, status)
+            }));
+        }
+
+        let mut succeeded = Vec::new();
+        for t in tasks {
+            let (id, status) = t.await.unwrap();
+            assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "POST {id} must succeed under concurrent distinct-id POSTs"
+            );
+            succeeded.push(id);
+        }
+
+        // Final registry has 1 (alpha) + N (graph-0..N-1) = N+1 graphs.
+        let resp = (*app)
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/graphs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        let graph_count = payload["graphs"].as_array().unwrap().len();
+        assert_eq!(graph_count, N + 1);
+    }
 }
