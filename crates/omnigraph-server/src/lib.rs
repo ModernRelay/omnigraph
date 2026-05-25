@@ -4,10 +4,12 @@ pub mod config;
 pub mod graph_id;
 pub mod identity;
 pub mod policy;
+pub mod registry;
 pub mod workload;
 
 pub use graph_id::GraphId;
 pub use identity::{AuthSource, GraphKey, ResolvedActor, Scope, TenantId};
+pub use registry::{GraphHandle, GraphRegistry, InsertError, RegistryLookup, RegistrySnapshot};
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
