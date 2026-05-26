@@ -17,8 +17,7 @@ Join the [Omnigraph Slack community](https://join.slack.com/t/omnigraphworkspace
 
 - Company brain / [Second brain](https://github.com/ModernRelay/omnigraph-cookbooks/tree/main/second-brain)
 - Context graph
-- Knowledgebase for multi-agent research
-- Graph RAG
+- Knowledge base for multi-agent research
 - Incident response graph
 - Compliance & audit graph
 
