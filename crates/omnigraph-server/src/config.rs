@@ -5,9 +5,8 @@ use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
 use color_eyre::eyre::{Result, bail};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+
 pub const DEFAULT_CONFIG_FILE: &str = "omnigraph.yaml";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -68,9 +67,9 @@ pub struct ServerDefaults {
     pub graph: Option<String>,
     pub bind: Option<String>,
     /// Server-level Cedar policy (MR-668). Governs management endpoints
-    /// (`POST /graphs`, `GET /graphs`, `DELETE /graphs/{id}` once they
-    /// land). In single-graph mode this is unused — the top-level
-    /// `policy.file` covers the single graph.
+    /// — currently `GET /graphs`; future runtime add/remove endpoints
+    /// will plug in here too. In single-graph mode this is unused — the
+    /// top-level `policy.file` covers the single graph.
     #[serde(default)]
     pub policy: PolicySettings,
 }
@@ -371,197 +370,6 @@ fn absolute_base_dir(cwd: &Path, path: &Path) -> Result<PathBuf> {
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| cwd.to_path_buf()))
-}
-
-/// SHA-256 hash of the file at `path`. Used to baseline `omnigraph.yaml`
-/// at server startup; later compared inside `rewrite_atomic` to detect
-/// operator hand-edits ("YAML drift") that would otherwise be clobbered
-/// silently. Read errors propagate so startup fails loudly if the
-/// config file disappears between `load_config` and the hashing.
-pub fn hash_config_file(path: &Path) -> std::io::Result<[u8; 32]> {
-    let bytes = fs::read(path)?;
-    let digest = Sha256::digest(&bytes);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest);
-    Ok(out)
-}
-
-/// Why `rewrite_atomic` refused to rewrite.
-#[derive(Debug, thiserror::Error)]
-pub enum RewriteAtomicError {
-    /// The on-disk file no longer matches the expected hash — an
-    /// operator hand-edited `omnigraph.yaml` between server start
-    /// and now. Rewriting would clobber their changes; instead we
-    /// refuse loudly. Maps to HTTP 503.
-    #[error(
-        "omnigraph.yaml drift detected: on-disk file does not match the server's startup baseline. \
-         Stop the server, reconcile the edits, then restart."
-    )]
-    Drift,
-    /// IO failure during the rewrite — couldn't acquire flock, couldn't
-    /// write the staging file, couldn't rename, etc. The on-disk file
-    /// is unchanged (rename is atomic on POSIX). Maps to HTTP 500.
-    #[error("{0}")]
-    Io(#[from] std::io::Error),
-    /// Failed to serialize the new `OmnigraphConfig` to YAML. Should
-    /// not happen in practice — `OmnigraphConfig` has no infallible
-    /// serde paths in the current types. Maps to HTTP 500.
-    #[error("serialize config: {0}")]
-    Serialize(#[from] serde_yaml::Error),
-}
-
-/// Atomically rewrite `omnigraph.yaml` under an exclusive `fcntl::flock`
-/// with SHA-256 drift detection (MR-668 PR 7).
-///
-/// Returns the new file's hash on success — callers update their
-/// in-memory baseline to this value before releasing other request
-/// handlers.
-///
-/// Sequence (everything inside the flock):
-///   1. Acquire `LOCK_EX` on `path`.
-///   2. Re-read on-disk bytes, hash them.
-///   3. If on-disk hash != `expected_hash` → `RewriteAtomicError::Drift`.
-///   4. Serialize `new_config` to YAML.
-///   5. Write to `path.tmp` and `sync_all` it.
-///   6. `rename(path.tmp, path)` (atomic on POSIX).
-///   7. `sync_all` the parent directory for crash-durability.
-///   8. Release flock (RAII drop on the File).
-///
-/// Sync I/O throughout — callers wrap in `tokio::task::spawn_blocking`
-/// so the async runtime doesn't stall.
-///
-/// **Comments are stripped.** `serde_yaml::to_string` produces canonical
-/// YAML without preserving the operator's comments. Decision Q20 in the
-/// MR-668 plan accepts this tradeoff for v0.7.0; a future split-file
-/// design (`omnigraph.yaml` operator-owned + `omnigraph.runtime.yaml`
-/// server-owned) is the escalation path if operators push back.
-pub fn rewrite_atomic(
-    path: &Path,
-    new_config: &OmnigraphConfig,
-    expected_hash: &[u8; 32],
-) -> std::result::Result<[u8; 32], RewriteAtomicError> {
-    // 1. flock. Open RW so flock works; we re-read via fs::read below.
-    let lock_file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)?;
-    lock_file.lock_exclusive()?;
-    // RAII unlock via `_lock_guard` — the file dropping releases the flock.
-    let _lock_guard = lock_file;
-
-    // 2. Re-read + hash.
-    let current_bytes = fs::read(path)?;
-    let mut current_hash = [0u8; 32];
-    current_hash.copy_from_slice(&Sha256::digest(&current_bytes));
-
-    // 3. Drift check.
-    if current_hash != *expected_hash {
-        return Err(RewriteAtomicError::Drift);
-    }
-
-    // 4. Serialize new config.
-    let serialized = serde_yaml::to_string(new_config)?;
-
-    // 5. Write to .tmp + fsync.
-    let tmp_path = staging_path(path);
-    fs::write(&tmp_path, &serialized)?;
-    let tmp_file = fs::File::open(&tmp_path)?;
-    tmp_file.sync_all()?;
-    drop(tmp_file);
-
-    // 6. Atomic rename.
-    fs::rename(&tmp_path, path)?;
-
-    // 7. fsync parent dir for crash-durability (POSIX rename isn't
-    //    durable until the directory entry is synced).
-    if let Some(parent) = path.parent() {
-        let dir = fs::File::open(parent)?;
-        dir.sync_all()?;
-    }
-
-    // Compute the new file's hash for the caller to update its baseline.
-    let mut new_hash = [0u8; 32];
-    new_hash.copy_from_slice(&Sha256::digest(serialized.as_bytes()));
-    Ok(new_hash)
-}
-
-/// Staging path used during `rewrite_atomic`: `<path>.tmp` to avoid
-/// colliding with any other workflow that might be reading the file.
-fn staging_path(path: &Path) -> PathBuf {
-    let mut s = path.as_os_str().to_owned();
-    s.push(".tmp");
-    PathBuf::from(s)
-}
-
-/// Atomic read-modify-write of `omnigraph.yaml` (MR-668 PR 7 — race-fix
-/// from PR 9). Everything happens **inside** the `fcntl::flock` and the
-/// in-memory baseline mutex:
-///   1. Acquire `LOCK_EX`.
-///   2. Lock the in-memory baseline mutex.
-///   3. Read the on-disk file, hash it.
-///   4. Compare to the in-memory baseline; if mismatch → `Drift`.
-///   5. Parse the on-disk YAML, hand the parsed config to `modify`.
-///   6. Serialize the returned config, write `.tmp`, fsync, rename.
-///   7. Update the in-memory baseline to the new file's hash.
-///   8. Release flock + mutex.
-///
-/// The earlier `rewrite_atomic` captured the baseline OUTSIDE the
-/// flock, which created a race under concurrent writers: a second
-/// writer would see a stale baseline + the first writer's new on-disk
-/// hash, yielding a spurious `Drift` error. The `_with_modify` shape
-/// keeps the entire critical section atomic.
-///
-/// `modify` is a `FnOnce` so the caller can read mutable state into it
-/// (e.g. a `GraphCreateRequest`) without `Sync` requirements.
-pub fn rewrite_atomic_with_modify<F>(
-    path: &Path,
-    baseline: &std::sync::Mutex<[u8; 32]>,
-    modify: F,
-) -> std::result::Result<(), RewriteAtomicError>
-where
-    F: FnOnce(OmnigraphConfig) -> std::result::Result<OmnigraphConfig, RewriteAtomicError>,
-{
-    let lock_file = fs::OpenOptions::new().read(true).write(true).open(path)?;
-    lock_file.lock_exclusive()?;
-    let _lock_guard = lock_file;
-
-    // Lock the in-memory baseline INSIDE the flock so concurrent writers
-    // serialize on both: flock for cross-process safety, mutex for
-    // in-process baseline updates. The mutex guard outlives the modify
-    // step so the baseline can't move under our feet.
-    let mut baseline_guard = baseline
-        .lock()
-        .expect("baseline mutex must not be poisoned");
-
-    let current_bytes = fs::read(path)?;
-    let mut current_hash = [0u8; 32];
-    current_hash.copy_from_slice(&Sha256::digest(&current_bytes));
-    if current_hash != *baseline_guard {
-        return Err(RewriteAtomicError::Drift);
-    }
-
-    // Parse the on-disk config (NOT a stale cached version) and hand
-    // to `modify`. The closure can mutate freely; the result is what
-    // we serialize and write.
-    let current_config: OmnigraphConfig = serde_yaml::from_slice(&current_bytes)?;
-    let new_config = modify(current_config)?;
-    let serialized = serde_yaml::to_string(&new_config)?;
-
-    let tmp_path = staging_path(path);
-    fs::write(&tmp_path, &serialized)?;
-    let tmp_file = fs::File::open(&tmp_path)?;
-    tmp_file.sync_all()?;
-    drop(tmp_file);
-    fs::rename(&tmp_path, path)?;
-    if let Some(parent) = path.parent() {
-        let dir = fs::File::open(parent)?;
-        dir.sync_all()?;
-    }
-
-    let mut new_hash = [0u8; 32];
-    new_hash.copy_from_slice(&Sha256::digest(serialized.as_bytes()));
-    *baseline_guard = new_hash;
-    Ok(())
 }
 
 #[cfg(test)]

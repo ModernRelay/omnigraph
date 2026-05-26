@@ -39,9 +39,9 @@ pub enum PolicyAction {
     /// future shape. Avoid writing such rules until the first consumer
     /// endpoint ships to prevent confusion.
     Admin,
-    /// MR-668: management actions that operate on the server's graph
-    /// registry, not on a single graph's contents. Cedar `appliesTo`
-    /// declarations bind these to `resource: Server` instead of the
+    /// MR-668: management action that operates on the server's graph
+    /// registry, not on a single graph's contents. The Cedar `appliesTo`
+    /// declaration binds it to `resource: Server` instead of the
     /// per-graph `resource: Graph`. Operators authorize a group with:
     /// ```yaml
     /// rules:
@@ -51,12 +51,10 @@ pub enum PolicyAction {
     ///       actions: [graph_list]
     /// ```
     /// `branch_scope` and `target_branch_scope` are NOT supported for
-    /// these actions — there's no branch context at the server level.
-    /// `graph_delete` is intentionally omitted from PR 6a; it lands
-    /// alongside `DELETE /graphs/{id}` in a future release.
-    GraphCreate,
-    /// See `GraphCreate`. Currently the only `Server`-scoped action
-    /// wired into an HTTP endpoint (`GET /graphs`).
+    /// this action — there's no branch context at the server level.
+    /// Runtime `graph_create` / `graph_delete` are intentionally omitted
+    /// from v0.7.0; operators add and remove graphs by editing
+    /// `omnigraph.yaml` and restarting.
     GraphList,
 }
 
@@ -71,7 +69,6 @@ impl PolicyAction {
             Self::BranchDelete => "branch_delete",
             Self::BranchMerge => "branch_merge",
             Self::Admin => "admin",
-            Self::GraphCreate => "graph_create",
             Self::GraphList => "graph_list",
         }
     }
@@ -89,12 +86,12 @@ impl PolicyAction {
 
     /// Which Cedar resource entity governs this action.
     /// Per-graph actions (Read, Change, …) apply to `Omnigraph::Graph::"<id>"`.
-    /// Server-scoped management actions (GraphCreate, GraphList) apply to
+    /// Server-scoped management actions (GraphList) apply to
     /// `Omnigraph::Server::"root"`. `Admin` is reserved without a current
     /// call site; classified as per-graph until MR-724 picks a shape.
     pub fn resource_kind(self) -> PolicyResourceKind {
         match self {
-            Self::GraphCreate | Self::GraphList => PolicyResourceKind::Server,
+            Self::GraphList => PolicyResourceKind::Server,
             Self::Read
             | Self::Export
             | Self::Change
@@ -137,7 +134,6 @@ impl FromStr for PolicyAction {
             "branch_delete" => Ok(Self::BranchDelete),
             "branch_merge" => Ok(Self::BranchMerge),
             "admin" => Ok(Self::Admin),
-            "graph_create" => Ok(Self::GraphCreate),
             "graph_list" => Ok(Self::GraphList),
             other => bail!("unknown policy action '{other}'"),
         }
@@ -329,7 +325,7 @@ impl PolicyConfig {
             }
             if server_scoped && graph_scoped {
                 bail!(
-                    "policy rule '{}' mixes server-scoped actions (graph_create, graph_list) \
+                    "policy rule '{}' mixes the server-scoped action `graph_list` \
                      with per-graph actions; split into separate rules",
                     rule.id
                 );
@@ -432,9 +428,9 @@ impl PolicyEngine {
         let principal = entity_uid("Actor", &request.actor_id)?;
         let action = entity_uid("Action", request.action.as_str())?;
         // MR-668 PR 6a: pick the resource entity based on the action's
-        // `resource_kind`. Server-scoped actions (`graph_create`,
-        // `graph_list`) bind to `Omnigraph::Server::"root"`; per-graph
-        // actions bind to `Omnigraph::Graph::"<graph_label>"`.
+        // `resource_kind`. Server-scoped actions (`graph_list`) bind to
+        // `Omnigraph::Server::"root"`; per-graph actions bind to
+        // `Omnigraph::Graph::"<graph_label>"`.
         let resource = match request.action.resource_kind() {
             PolicyResourceKind::Server => entity_uid("Server", SERVER_RESOURCE_ID)?,
             PolicyResourceKind::Graph => entity_uid("Graph", &self.graph_id)?,
@@ -701,8 +697,8 @@ fn target_branch_scope_condition(scope: PolicyBranchScope) -> String {
 }
 
 fn policy_schema_source() -> &'static str {
-    // MR-668 PR 6a: `entity Server;` plus `graph_create`/`graph_list`
-    // actions that bind to it. Per-graph actions stay bound to `Graph`.
+    // MR-668 PR 6a: `entity Server;` plus the `graph_list` action that
+    // binds to it. Per-graph actions stay bound to `Graph`.
     // The Cedar schema string lives here (not on a fixture file) so any
     // omnigraph-policy build picks up the new vocabulary in lock-step
     // with the Rust code.
@@ -731,7 +727,6 @@ namespace Omnigraph {
     action "branch_merge" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "admin" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
 
-    action "graph_create" appliesTo { principal: Actor, resource: Server, context: RequestContext };
     action "graph_list" appliesTo { principal: Actor, resource: Server, context: RequestContext };
 }
 "#
@@ -1132,7 +1127,7 @@ rules:
         assert!(!deny.allowed);
     }
 
-    // ─── MR-668 PR 6a — server-scoped actions (graph_create, graph_list) ─
+    // ─── MR-668 PR 6a — server-scoped action (graph_list) ─
 
     #[test]
     fn graph_list_action_authorizes_against_server_resource() {
@@ -1178,36 +1173,6 @@ rules:
             })
             .unwrap();
         assert!(!deny.allowed);
-    }
-
-    #[test]
-    fn graph_create_action_authorizes_against_server_resource() {
-        let policy: PolicyConfig = serde_yaml::from_str(
-            r#"
-version: 1
-groups:
-  admins: [act-andrew]
-rules:
-  - id: admins-create-graphs
-    allow:
-      actors: { group: admins }
-      actions: [graph_create, graph_list]
-"#,
-        )
-        .unwrap();
-        let engine = PolicyCompiler::compile(&policy, "ignored").unwrap();
-
-        for action in [PolicyAction::GraphCreate, PolicyAction::GraphList] {
-            let allow = engine
-                .authorize(&PolicyRequest {
-                    actor_id: "act-andrew".to_string(),
-                    action,
-                    branch: None,
-                    target_branch: None,
-                })
-                .unwrap();
-            assert!(allow.allowed, "act-andrew must be allowed {action}");
-        }
     }
 
     #[test]

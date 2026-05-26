@@ -82,7 +82,6 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
     paths(
         server_health,
         server_graphs_list,
-        server_graphs_create,
         server_snapshot,
         server_read,
         server_export,
@@ -160,13 +159,13 @@ pub enum ServerConfigMode {
         /// Per-graph startup configs, sorted by graph id (BTreeMap
         /// iteration order). PR 5's parallel-open loop iterates this.
         graphs: Vec<GraphStartupConfig>,
-        /// Path to the config file the server was started from. PR 7's
-        /// `POST /graphs` flow will use this for atomic YAML rewrite
-        /// (DELETE is deferred so the rewrite path is currently unused).
+        /// Path to the config file the server was started from. Kept on
+        /// the mode so future runtime mutation (deferred — see release
+        /// notes) can locate the source of truth without re-parsing CLI
+        /// args.
         config_path: PathBuf,
         /// `server.policy.file` (server-level Cedar policy for the
-        /// management endpoints). Loaded but currently unused — PR 6b
-        /// wires it into `GET /graphs`.
+        /// management endpoints). Wired into `GET /graphs` authorization.
         server_policy_file: Option<PathBuf>,
     },
 }
@@ -196,10 +195,9 @@ pub enum ServerMode {
     /// Backward compatible with v0.6.0 deployments.
     Single { uri: String },
     /// Multi-graph invocation (MR-668). `config_path` is the
-    /// `omnigraph.yaml` the server reads at startup and (in PR 7,
-    /// deferred) would rewrite on `POST /graphs`. With DELETE deferred,
-    /// the current scope does not rewrite the config file — `POST`
-    /// will (PR 7).
+    /// `omnigraph.yaml` the server reads at startup. The server treats
+    /// the file as operator-owned and never writes it; runtime
+    /// add/remove (deferred) is the only path that would touch it.
     Multi { config_path: Option<PathBuf> },
 }
 
@@ -232,16 +230,6 @@ pub struct AppState {
     /// server policy is configured. Per-graph policies live on each
     /// `GraphHandle.policy`.
     server_policy: Option<Arc<PolicyEngine>>,
-    /// PR 7: SHA-256 hash of `omnigraph.yaml` at server startup, used
-    /// by `POST /graphs` to detect operator hand-edits between server
-    /// start and the rewrite. Wrapped in `Arc<Mutex<...>>` so the POST
-    /// handler can update the baseline after a successful rewrite
-    /// (later POSTs will compare against the post-rewrite hash, not
-    /// the original startup hash).
-    ///
-    /// `None` in single mode (no config file is rewritten there). Some
-    /// in multi mode when the server was started with `--config`.
-    config_hash: Option<Arc<std::sync::Mutex<[u8; 32]>>>,
 }
 
 struct ExportStreamWriter {
@@ -352,7 +340,6 @@ impl AppState {
             workload: self.workload,
             bearer_tokens: self.bearer_tokens,
             server_policy: self.server_policy,
-            config_hash: self.config_hash,
         }
     }
 
@@ -443,7 +430,6 @@ impl AppState {
             workload,
             bearer_tokens,
             server_policy: None,
-            config_hash: None,
         }
     }
 
@@ -453,16 +439,13 @@ impl AppState {
     ///
     /// Caller supplies the already-opened `GraphHandle`s and (optionally)
     /// the path to the source config file. `server_policy` is loaded
-    /// from `server.policy.file` if configured. `config_hash` is the
-    /// SHA-256 of `omnigraph.yaml` at startup; `POST /graphs` compares
-    /// the on-disk file against this baseline before rewriting.
+    /// from `server.policy.file` if configured.
     pub fn new_multi(
         handles: Vec<Arc<GraphHandle>>,
         bearer_tokens: Vec<(String, String)>,
         server_policy: Option<PolicyEngine>,
         workload: workload::WorkloadController,
         config_path: Option<PathBuf>,
-        config_hash: Option<[u8; 32]>,
     ) -> std::result::Result<Self, InsertError> {
         let bearer_tokens = hash_bearer_tokens(bearer_tokens);
         let registry = Arc::new(GraphRegistry::from_handles(handles)?);
@@ -472,7 +455,6 @@ impl AppState {
             workload: Arc::new(workload),
             bearer_tokens,
             server_policy: server_policy.map(Arc::new),
-            config_hash: config_hash.map(|h| Arc::new(std::sync::Mutex::new(h))),
         })
     }
 
@@ -929,20 +911,18 @@ pub fn build_app(state: AppState) -> Router {
             require_bearer_auth,
         ));
 
-    // Management endpoints (`GET /graphs`, future `POST /graphs`)
-    // live alongside the per-graph router. They go through bearer auth
-    // but NOT through `resolve_graph_handle` — they operate on the
-    // registry directly. The endpoint is mounted in both modes; in
-    // single mode the handler returns 405 so clients see "resource
-    // exists, wrong context" rather than 404 "no such resource."
+    // Management endpoints (`GET /graphs`) live alongside the per-graph
+    // router. They go through bearer auth but NOT through
+    // `resolve_graph_handle` — they operate on the registry directly.
+    // The endpoint is mounted in both modes; in single mode the handler
+    // returns 405 so clients see "resource exists, wrong context"
+    // rather than 404 "no such resource."
+    //
+    // Runtime add/remove (`POST /graphs`, `DELETE /graphs/{id}`) is not
+    // exposed in v0.7.0 — operators add graphs by editing
+    // `omnigraph.yaml` and restarting.
     let management = Router::new()
-        .route(
-            "/graphs",
-            get(server_graphs_list).post(
-                server_graphs_create
-                    .layer(DefaultBodyLimit::max(INGEST_REQUEST_BODY_LIMIT_BYTES)),
-            ),
-        )
+        .route("/graphs", get(server_graphs_list))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_bearer_auth,
@@ -1077,11 +1057,6 @@ async fn open_multi_graph_state(
         .into_iter()
         .collect::<Result<Vec<_>>>()?;
 
-    // PR 7: SHA-256 the config file so `POST /graphs` can detect
-    // operator hand-edits later.
-    let config_hash = config::hash_config_file(&config_path)
-        .map_err(|err| color_eyre::eyre::eyre!("hash omnigraph.yaml: {err}"))?;
-
     let workload = workload::WorkloadController::from_env();
     let state = AppState::new_multi(
         handles,
@@ -1089,15 +1064,13 @@ async fn open_multi_graph_state(
         server_policy,
         workload,
         Some(config_path),
-        Some(config_hash),
     )
     .map_err(|err| color_eyre::eyre::eyre!("multi-graph registry: {err}"))?;
     Ok(state)
 }
 
-/// Open one graph and wrap it in a `GraphHandle`. Used both at startup
-/// (`open_multi_graph_state`) and — once `POST /graphs` lands in PR 7
-/// — for runtime additions.
+/// Open one graph and wrap it in a `GraphHandle`. Used at startup by
+/// `open_multi_graph_state`.
 async fn open_single_graph(cfg: GraphStartupConfig) -> Result<Arc<GraphHandle>> {
     let graph_id = GraphId::try_from(cfg.graph_id.clone())
         .map_err(|err| color_eyre::eyre::eyre!("graph id '{}': {err}", cfg.graph_id))?;
@@ -1226,237 +1199,6 @@ async fn server_graphs_list(
     Ok(Json(GraphListResponse { graphs }))
 }
 
-#[utoipa::path(
-    post,
-    path = "/graphs",
-    tag = "management",
-    operation_id = "createGraph",
-    request_body = api::GraphCreateRequest,
-    responses(
-        (status = 201, description = "Graph created", body = api::GraphCreateResponse),
-        (status = 400, description = "Invalid request body (graph_id, schema, policy file)", body = ErrorOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 405, description = "Method not allowed (single-graph mode)", body = ErrorOutput),
-        (status = 409, description = "graph_id or uri already registered", body = ErrorOutput),
-        (status = 413, description = "Request body too large (>32 MiB)", body = ErrorOutput),
-        (status = 500, description = "Init failure or YAML rewrite failure", body = ErrorOutput),
-        (status = 503, description = "omnigraph.yaml drift detected (operator edited the file)", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// Create a new graph at runtime (MR-668 PR 7).
-///
-/// Multi-graph mode only. Operators add a graph to the registry
-/// without restarting the server. The server `Omnigraph::init`s the
-/// new graph at `req.uri`, atomically rewrites `omnigraph.yaml` to
-/// include the new entry, then publishes the handle in the registry.
-///
-/// Cedar-gated by `PolicyAction::GraphCreate` against
-/// `Omnigraph::Server::"root"` (the same server-level policy as
-/// `GET /graphs`).
-///
-/// Failure modes:
-/// * Init fails → orphan storage files at `req.uri` (PR 2a cleans up
-///   schema files but not Lance datasets; operator removes manually).
-/// * Rewrite fails (`fs2::flock` IO error) → orphan storage; YAML
-///   unchanged.
-/// * YAML drift (operator edited the file) → 503; YAML and storage
-///   both unchanged.
-/// * Duplicate `graph_id` or `uri` → 409; storage already in use.
-async fn server_graphs_create(
-    State(state): State<AppState>,
-    actor: Option<Extension<ResolvedActor>>,
-    Json(request): Json<api::GraphCreateRequest>,
-) -> std::result::Result<(StatusCode, Json<api::GraphCreateResponse>), ApiError> {
-    // ─── 1. Mode check: management endpoints don't apply in single mode.
-    let (config_path, config_hash) = match state.mode() {
-        ServerMode::Single { .. } => {
-            return Err(ApiError {
-                status: StatusCode::METHOD_NOT_ALLOWED,
-                code: ErrorCode::BadRequest,
-                message: "POST /graphs is only available in multi-graph mode".to_string(),
-                merge_conflicts: Vec::new(),
-                manifest_conflict: None,
-            });
-        }
-        ServerMode::Multi { config_path } => match (config_path.clone(), state.config_hash.clone()) {
-            (Some(path), Some(hash)) => (path, hash),
-            _ => {
-                return Err(ApiError::internal(
-                    "multi-mode AppState missing config_path or config_hash".to_string(),
-                ));
-            }
-        },
-    };
-
-    // ─── 2. Cedar authorize. Server-level policy gates this.
-    authorize_request(
-        actor.as_ref().map(|Extension(actor)| actor),
-        state.server_policy.as_deref(),
-        PolicyRequest {
-            actor_id: actor
-                .as_ref()
-                .map(|Extension(actor)| actor.actor_id.as_ref().to_string())
-                .unwrap_or_default(),
-            action: PolicyAction::GraphCreate,
-            branch: None,
-            target_branch: None,
-        },
-    )?;
-
-    // ─── 3. Validate request body.
-    let graph_id = GraphId::try_from(request.graph_id.clone())
-        .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    if request.schema.source.trim().is_empty() {
-        return Err(ApiError::bad_request(
-            "schema.source must not be empty".to_string(),
-        ));
-    }
-    if request.uri.trim().is_empty() {
-        return Err(ApiError::bad_request("uri must not be empty".to_string()));
-    }
-
-    // Per-graph policy file (optional). Resolved as caller-supplied path.
-    // Validation: must exist and parse against the Cedar schema. Loading
-    // here surfaces config errors before we init the graph.
-    let policy_file_str = request
-        .policy
-        .as_ref()
-        .and_then(|p| p.file.clone())
-        .filter(|s| !s.trim().is_empty());
-    let policy_engine = if let Some(path) = policy_file_str.as_deref() {
-        Some(
-            PolicyEngine::load(std::path::Path::new(path), graph_id.as_str())
-                .map_err(|err| ApiError::bad_request(format!("policy.file: {err}")))?,
-        )
-    } else {
-        None
-    };
-
-    // ─── 4. Pre-check duplicates (best-effort — registry.insert is the
-    //         authoritative atomic check, but this returns a clearer error
-    //         when the duplicate is obvious).
-    let key = GraphKey::cluster(graph_id.clone());
-    if matches!(state.registry().get(&key), RegistryLookup::Ready(_)) {
-        return Err(ApiError::conflict(format!(
-            "graph '{graph_id}' is already registered"
-        )));
-    }
-    if state
-        .registry()
-        .list()
-        .iter()
-        .any(|h| h.uri == request.uri)
-    {
-        return Err(ApiError::conflict(format!(
-            "uri '{}' is already in use by another graph",
-            request.uri
-        )));
-    }
-
-    // ─── 5. Init the new engine at the requested URI. PR 2a's cleanup
-    //         removes schema files on init failure; Lance directories
-    //         become orphans if `GraphCoordinator::init` partially
-    //         succeeded (documented limitation pending delete_prefix).
-    let engine = Omnigraph::init(&request.uri, &request.schema.source)
-        .await
-        .map_err(|err| ApiError::internal(format!("init: {err}")))?;
-
-    // Apply engine-layer policy enforcement (MR-722). HTTP-layer is the
-    // first gate; this is the redundant-but-correct backstop.
-    let (engine, policy_arc): (Omnigraph, Option<Arc<PolicyEngine>>) = if let Some(p) = policy_engine
-    {
-        let policy_arc: Arc<PolicyEngine> = Arc::new(p);
-        let checker = Arc::clone(&policy_arc) as Arc<dyn omnigraph_policy::PolicyChecker>;
-        (engine.with_policy(checker), Some(policy_arc))
-    } else {
-        (engine, None)
-    };
-
-    let handle = Arc::new(GraphHandle {
-        key: key.clone(),
-        uri: request.uri.clone(),
-        engine: Arc::new(engine),
-        policy: policy_arc,
-    });
-
-    // ─── 6. Rewrite omnigraph.yaml atomically (drift detection inside).
-    //         Done in a blocking task because `fs2::flock` is sync.
-    let new_target = config::TargetConfig {
-        uri: request.uri.clone(),
-        bearer_token_env: None,
-        policy: config::PolicySettings {
-            file: policy_file_str.clone(),
-        },
-    };
-    let graph_id_for_yaml = graph_id.as_str().to_string();
-    let config_path_for_blocking = config_path.clone();
-    let config_hash_for_blocking = Arc::clone(&config_hash);
-    let rewrite_result = tokio::task::spawn_blocking(move || {
-        rewrite_yaml_with_new_graph(
-            &config_path_for_blocking,
-            &config_hash_for_blocking,
-            &graph_id_for_yaml,
-            new_target,
-        )
-    })
-    .await
-    .map_err(|err| ApiError::internal(format!("rewrite join: {err}")))?;
-    rewrite_result?;
-
-    // ─── 7. Publish in the registry. If this fails (race), the YAML
-    //         already has the entry — on restart it gets opened and
-    //         added cleanly. Operator-visible inconsistency is brief
-    //         (just until next restart).
-    state
-        .registry()
-        .insert(Arc::clone(&handle))
-        .await
-        .map_err(|err| match err {
-            registry::InsertError::DuplicateKey(_) | registry::InsertError::DuplicateUri(_) => {
-                ApiError::conflict(err.to_string())
-            }
-        })?;
-
-    Ok((
-        StatusCode::CREATED,
-        Json(api::GraphCreateResponse {
-            graph_id: graph_id.as_str().to_string(),
-            uri: request.uri,
-        }),
-    ))
-}
-
-/// Atomically rewrite `omnigraph.yaml` to add a new graph entry.
-/// Runs inside `tokio::task::spawn_blocking` (the flock is sync).
-///
-/// Read-modify-write happens entirely under the flock + baseline
-/// mutex via `config::rewrite_atomic_with_modify` — concurrent
-/// writers serialize without spurious drift errors.
-fn rewrite_yaml_with_new_graph(
-    config_path: &std::path::Path,
-    config_hash: &Arc<std::sync::Mutex<[u8; 32]>>,
-    graph_id: &str,
-    new_target: config::TargetConfig,
-) -> std::result::Result<(), ApiError> {
-    let graph_id = graph_id.to_string();
-    config::rewrite_atomic_with_modify(config_path, config_hash, move |mut config| {
-        config.graphs.insert(graph_id, new_target);
-        Ok(config)
-    })
-    .map_err(|err| match err {
-        config::RewriteAtomicError::Drift => ApiError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: ErrorCode::Conflict,
-            message: err.to_string(),
-            merge_conflicts: Vec::new(),
-            manifest_conflict: None,
-        },
-        other => ApiError::internal(other.to_string()),
-    })
-}
-
 async fn server_openapi(State(state): State<AppState>) -> Json<utoipa::openapi::OpenApi> {
     let mut doc = ApiDoc::openapi();
     if !state.requires_bearer_auth() {
@@ -1482,9 +1224,12 @@ const CLUSTER_PATH_PREFIX: &str = "/graphs/{graph_id}";
 /// the same generation pass.
 const CLUSTER_OPERATION_ID_PREFIX: &str = "cluster_";
 
-/// Paths that stay flat in every server mode (public, no per-graph
-/// dependency). Update this list when adding new always-public endpoints.
-const ALWAYS_FLAT_PATHS: &[&str] = &["/healthz"];
+/// Paths that stay flat in every server mode (public or server-level,
+/// no per-graph dependency). Update this list when adding new
+/// always-flat endpoints. `/graphs` is the management enumeration —
+/// it lives at the root in both single mode (405) and multi mode, and
+/// must never be rewritten to `/graphs/{graph_id}/graphs`.
+const ALWAYS_FLAT_PATHS: &[&str] = &["/healthz", "/graphs"];
 
 /// In multi-mode `server_openapi`, every protected path-item is
 /// reattached under the cluster prefix. Operation IDs gain the
@@ -1671,9 +1416,10 @@ fn log_policy_decision(actor_id: &str, request: &PolicyRequest, decision: &Polic
 /// HTTP-layer Cedar policy gate. Two sources of the policy engine:
 ///   * Per-graph handler — passes `handle.policy.as_deref()` so the
 ///     graph's Cedar rules govern read/change/branch_*/schema_apply.
-///   * Management handler (PR 6b, deferred for now) — passes
-///     `state.server_policy.as_deref()` so server-level Cedar rules
-///     govern `graph_create`/`graph_list`/`graph_delete`.
+///   * Management handler — passes `state.server_policy.as_deref()` so
+///     server-level Cedar rules govern `graph_list` (the only shipped
+///     server-scoped action; runtime `graph_create` / `graph_delete`
+///     are deferred until a managed cluster catalog lands).
 ///
 /// The MR-731 invariant lives inside this function: actor identity is
 /// overwritten from the resolved bearer match, never trusted from the

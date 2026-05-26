@@ -141,8 +141,11 @@ impl GraphRegistry {
     }
 
     /// Add a new handle. Async because the mutex is `tokio::sync::Mutex`
-    /// (held across `.await` points in PR 7's atomic-YAML-rewrite flow).
-    /// Rejects duplicate `GraphKey` and duplicate `uri`.
+    /// (a future managed-catalog flow may hold it across `.await` points
+    /// during atomic registry mutations). Rejects duplicate `GraphKey`
+    /// and duplicate `uri`. Currently unused at runtime — only construction
+    /// via `from_handles` runs at startup — but kept for the tests that
+    /// pin its concurrency contract.
     ///
     /// Race semantics (pinned by `concurrent_insert_same_key_one_succeeds_one_errors`):
     /// under two concurrent calls with the same key, exactly one returns

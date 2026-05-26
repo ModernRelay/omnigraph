@@ -47,34 +47,18 @@ Server-level management endpoints (v0.7.0+):
 | Method | Path | Auth | Action | Handler |
 |---|---|---|---|---|
 | GET | `/graphs` | bearer + `graph_list` on `Server::"root"` | list registered graphs | `server_graphs_list` (405 in single mode) |
-| POST | `/graphs` | bearer + `graph_create` on `Server::"root"` | create new graph at runtime | `server_graphs_create` (405 in single mode, 32 MB body limit) |
 
-`DELETE /graphs/{id}` is **not** in v0.7.0. Operators remove graphs by stopping the server, editing `omnigraph.yaml`, then restarting.
+## Adding and removing graphs (multi mode)
 
-## `omnigraph.yaml` ownership (multi mode)
+Runtime add/remove via API is **not** exposed in v0.7.0 — neither
+`POST /graphs` nor `DELETE /graphs/{id}` is implemented. Operators add
+or remove graphs by stopping the server, editing the `graphs:` map in
+`omnigraph.yaml`, then restarting. The server treats `omnigraph.yaml`
+as operator-owned configuration and never writes it.
 
-The server owns `omnigraph.yaml` while running. `POST /graphs` rewrites the file atomically under an exclusive `fcntl::flock` with SHA-256 drift detection:
-
-- The server hashes the file at startup. `POST /graphs` re-hashes under the flock before rewriting. If the hash doesn't match (operator hand-edited), the rewrite refuses with 503.
-- Comments and blank-line structure are **not** preserved across server-side rewrites — the file is regenerated via `serde_yaml::to_string`.
-- Operators must not edit the file while the server is running. To make offline changes: stop the server, edit, restart.
-
-In **single mode** the server never writes `omnigraph.yaml`.
-
-## `POST /graphs` body shape
-
-```json
-{
-  "graph_id": "alpha",
-  "uri": "s3://tenant-bucket/alpha",
-  "schema": { "source": "<inline .pg source>" },
-  "policy": { "file": "./policies/alpha.yaml" }
-}
-```
-
-- `schema` and `policy` are nested — leaves room for future fields without breaking the shape.
-- `policy` is optional; without it, no per-graph Cedar enforcement.
-- Status codes: 201 Created · 400 invalid body · 401 missing bearer · 403 Cedar denied · 405 single mode · 409 duplicate `graph_id` or `uri` · 413 body >32 MiB · 500 init or rewrite failure · 503 YAML drift.
+A future release may introduce a managed registry (Lance-backed,
+catalog-style: reserve → init → publish with recovery sidecars) and
+re-expose runtime mutation on top of it.
 
 ## Streaming
 

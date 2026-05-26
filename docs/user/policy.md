@@ -15,12 +15,11 @@ Per-graph actions (bind to `Omnigraph::Graph::"<graph_id>"`):
 7. `branch_merge`
 8. `admin` — reserved for policy-management surfaces (hot reload, audit log, approvals). No call site today; see MR-724 for the reservation rationale.
 
-Server-scoped actions (v0.7.0+; bind to `Omnigraph::Server::"root"`):
+Server-scoped action (v0.7.0+; binds to `Omnigraph::Server::"root"`):
 
-9. `graph_create` — `POST /graphs` runtime graph creation (multi-graph mode)
-10. `graph_list` — `GET /graphs` registry enumeration (multi-graph mode)
+9. `graph_list` — `GET /graphs` registry enumeration (multi-graph mode)
 
-Server-scoped actions cannot use `branch_scope` or `target_branch_scope` — they operate on the registry, not on a graph's branches. A rule cannot mix server-scoped and per-graph actions; split into separate rules. (`graph_delete` is reserved but not shipped in v0.7.0.)
+Server-scoped actions cannot use `branch_scope` or `target_branch_scope` — they operate on the registry, not on a graph's branches. A rule cannot mix server-scoped and per-graph actions; split into separate rules. (Runtime `graph_create` / `graph_delete` are reserved but not shipped in v0.7.0; operators add/remove graphs by editing `omnigraph.yaml` and restarting.)
 
 ## Scope kinds
 
@@ -35,7 +34,7 @@ In multi mode (`omnigraph.yaml` with a non-empty `graphs:` map), policy files at
 ```yaml
 server:
   policy:
-    file: ./server-policy.yaml          # server-level: graph_create, graph_list
+    file: ./server-policy.yaml          # server-level: graph_list
 
 graphs:
   alpha:
@@ -47,7 +46,7 @@ graphs:
     # no per-graph policy → no engine-layer Cedar enforcement on beta
 ```
 
-Each graph's HTTP request flows through its own per-graph policy. Management endpoints (`/graphs`) flow through the server-level policy. When `server.policy.file` is unset and bearer tokens are configured, `GET /graphs` falls through to MR-723 default-deny (only `read`-equivalent actions allowed for authenticated actors — and `graph_list` is not `read`) → 403. So the operator must explicitly authorize via `server-policy.yaml` to expose `/graphs`.
+Each graph's HTTP request flows through its own per-graph policy. The management endpoint (`GET /graphs`) flows through the server-level policy. When `server.policy.file` is unset and bearer tokens are configured, `GET /graphs` falls through to MR-723 default-deny (only `read`-equivalent actions allowed for authenticated actors — and `graph_list` is not `read`) → 403. So the operator must explicitly authorize via `server-policy.yaml` to expose `/graphs`.
 
 Example server-level policy:
 
@@ -56,10 +55,10 @@ version: 1
 groups:
   admins: [act-andrew]
 rules:
-  - id: admins-can-create-and-list-graphs
+  - id: admins-can-list-graphs
     allow:
       actors: { group: admins }
-      actions: [graph_create, graph_list]
+      actions: [graph_list]
 ```
 
 ## Configuration
@@ -75,7 +74,7 @@ cli:
   actor: act-andrew            # default actor for CLI direct-engine writes
 ```
 
-Each rule must use exactly one of `branch_scope` or `target_branch_scope`.
+Each per-graph rule must use exactly one of `branch_scope` or `target_branch_scope`. Server-scoped rules (`graph_list`) take neither — they have no branch context.
 
 `cli.actor` is the default actor identity for CLI direct-engine writes
 when `policy.file` is configured. Override per-invocation with `--as

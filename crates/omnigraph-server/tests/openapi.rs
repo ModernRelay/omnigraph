@@ -1008,7 +1008,7 @@ async fn app_for_multi_mode(graph_ids: &[&str]) -> (Vec<tempfile::TempDir>, Rout
         dirs.push(dir);
     }
     let workload = omnigraph_server::workload::WorkloadController::from_env();
-    let state = AppState::new_multi(handles, Vec::new(), None, workload, None, None).unwrap();
+    let state = AppState::new_multi(handles, Vec::new(), None, workload, None).unwrap();
     let app = build_app(state);
     (dirs, app)
 }
@@ -1069,7 +1069,7 @@ async fn multi_mode_openapi_drops_flat_protected_paths() {
 }
 
 #[tokio::test]
-async fn multi_mode_openapi_keeps_healthz_flat() {
+async fn multi_mode_openapi_keeps_management_paths_flat() {
     let (_dirs, app) = app_for_multi_mode(&["alpha"]).await;
     let request = Request::builder()
         .method(Method::GET)
@@ -1078,14 +1078,17 @@ async fn multi_mode_openapi_keeps_healthz_flat() {
         .unwrap();
     let (_, json) = json_response(&app, request).await;
     let paths = json["paths"].as_object().unwrap();
-    assert!(
-        paths.contains_key("/healthz"),
-        "/healthz must remain flat in multi mode"
-    );
-    assert!(
-        !paths.contains_key("/graphs/{graph_id}/healthz"),
-        "/healthz must NOT be cluster-prefixed"
-    );
+    for flat in ["/healthz", "/graphs"] {
+        assert!(
+            paths.contains_key(flat),
+            "{flat} must remain flat in multi mode"
+        );
+        let nested = format!("/graphs/{{graph_id}}{flat}");
+        assert!(
+            !paths.contains_key(&nested),
+            "{flat} must NOT be cluster-prefixed to {nested}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1098,10 +1101,12 @@ async fn multi_mode_openapi_prefixes_operation_ids_with_cluster() {
         .unwrap();
     let (_, json) = json_response(&app, request).await;
     // Every cluster path operation must have a `cluster_` operation_id.
+    // Flat-mounted paths (healthz, management /graphs) keep their
+    // original operation_ids — they're not per-graph.
     let paths = json["paths"].as_object().unwrap();
     let mut checked = 0;
     for (path, item) in paths {
-        if path == "/healthz" {
+        if path == "/healthz" || path == "/graphs" {
             continue;
         }
         for method in ["get", "post", "put", "delete", "patch"] {

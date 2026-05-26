@@ -889,24 +889,21 @@ query insert_person($name: String, $age: I32) {
     assert_eq!(verify["rows"][0]["p.name"], "PolicyRemote");
 }
 
-// ─── MR-668 PR 8 — omnigraph graphs end-to-end ──────────────────────────────
+// ─── MR-668 PR 8 — omnigraph graphs list end-to-end ────────────────────────
 
-/// Multi-graph server + CLI `omnigraph graphs list` / `create` end-to-end.
+/// Multi-graph server + CLI `omnigraph graphs list` end-to-end.
 ///
 /// Steps:
 ///   1. Init a graph `alpha` on disk and write an `omnigraph.yaml`
 ///      whose `graphs:` map references it.
 ///   2. Spawn the server with `--config <yaml>`.
 ///   3. `omnigraph graphs list` — expect to see `alpha`.
-///   4. `omnigraph graphs create --graph-id beta --schema ...` —
-///      expect 201 and stdout reflecting the new graph.
-///   5. `omnigraph graphs list` again — expect both `alpha` and `beta`.
 ///
 /// Ignored by default — spawning servers needs loopback socket
 /// permissions some sandboxes lack.
 #[test]
 #[ignore = "requires loopback socket permissions in sandboxed runners"]
-fn graphs_list_and_create_against_multi_graph_server() {
+fn graphs_list_against_multi_graph_server() {
     let cfg_dir = tempfile::tempdir().unwrap();
     let schema_path = fixture("test.pg");
 
@@ -956,7 +953,7 @@ cli:
     )
     .unwrap();
 
-    // 1. `graphs list` lists `alpha`.
+    // `graphs list` lists `alpha`.
     let payload = parse_stdout_json(&output_success(
         cli()
             .arg("graphs")
@@ -965,57 +962,13 @@ cli:
             .arg(&client_config_path)
             .arg("--json"),
     ));
-    let initial_ids: Vec<&str> = payload["graphs"]
+    let ids: Vec<&str> = payload["graphs"]
         .as_array()
         .unwrap()
         .iter()
         .map(|g| g["graph_id"].as_str().unwrap())
         .collect();
-    assert_eq!(initial_ids, vec!["alpha"]);
-
-    // 2. `graphs create` adds `beta`.
-    let beta_uri = cfg_dir.path().join("beta.omni");
-    let created = parse_stdout_json(&output_success(
-        cli()
-            .arg("graphs")
-            .arg("create")
-            .arg("--config")
-            .arg(&client_config_path)
-            .arg("--graph-id")
-            .arg("beta")
-            .arg("--graph-uri")
-            .arg(beta_uri.to_str().unwrap())
-            .arg("--schema")
-            .arg(&schema_path)
-            .arg("--json"),
-    ));
-    assert_eq!(created["graph_id"], "beta");
-
-    // 3. `graphs list` now lists both, sorted alphabetically.
-    let payload = parse_stdout_json(&output_success(
-        cli()
-            .arg("graphs")
-            .arg("list")
-            .arg("--config")
-            .arg(&client_config_path)
-            .arg("--json"),
-    ));
-    let final_ids: Vec<&str> = payload["graphs"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|g| g["graph_id"].as_str().unwrap())
-        .collect();
-    assert_eq!(final_ids, vec!["alpha", "beta"]);
-
-    // 4. The new graph is reachable via its cluster snapshot route.
-    let client = Client::new();
-    let snap_status = client
-        .get(format!("{}/graphs/beta/snapshot?branch=main", server.base_url))
-        .send()
-        .unwrap()
-        .status();
-    assert_eq!(snap_status.as_u16(), 200);
+    assert_eq!(ids, vec!["alpha"]);
 
     drop(server);
 }

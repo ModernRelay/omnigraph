@@ -2043,25 +2043,26 @@ fn schema_plan_parity_cli_and_sdk() {
 
 // ─── MR-668 PR 8 — omnigraph graphs subcommand ─────────────────────────────
 
-/// `omnigraph graphs --help` lists the two subcommands shipped in
-/// v0.7.0 (`list`, `create`). `delete` is intentionally NOT in the
-/// help — DELETE was deferred to bound the v0.7.0 scope.
+/// `omnigraph graphs --help` lists only the read-only `list`
+/// subcommand. Runtime add (`create`) and remove (`delete`) are
+/// deferred — operators add/remove graphs by editing `omnigraph.yaml`
+/// and restarting. This test pins the deferral against accidental
+/// re-introduction.
 #[test]
-fn graphs_subcommand_help_lists_list_and_create() {
+fn graphs_subcommand_help_lists_list_only() {
     let output = output_success(cli().arg("graphs").arg("--help"));
     let stdout = stdout_string(&output);
     assert!(
         stdout.contains("list"),
         "expected `list` subcommand in help output:\n{stdout}"
     );
+    let lowered = stdout.to_lowercase();
     assert!(
-        stdout.contains("create"),
-        "expected `create` subcommand in help output:\n{stdout}"
+        !lowered.contains("create a new graph"),
+        "graph create should not be in v0.7.0 help; got:\n{stdout}"
     );
-    // Pin the deferral: `delete` must not appear yet (catches an
-    // accidental scope expansion).
     assert!(
-        !stdout.to_lowercase().contains("delete a graph"),
+        !lowered.contains("delete a graph"),
         "graph delete should not be in v0.7.0 help; got:\n{stdout}"
     );
 }
@@ -2078,53 +2079,3 @@ fn graphs_list_against_local_uri_errors_with_remote_only_message() {
     );
 }
 
-/// `omnigraph graphs create` against a local URI errors the same way.
-#[test]
-fn graphs_create_against_local_uri_errors_with_remote_only_message() {
-    let temp = tempdir().unwrap();
-    let schema = temp.path().join("schema.pg");
-    fs::write(&schema, "node Person { name: String @key }\n").unwrap();
-    let output = output_failure(
-        cli()
-            .arg("graphs")
-            .arg("create")
-            .arg("--uri")
-            .arg("/tmp/local")
-            .arg("--graph-id")
-            .arg("alpha")
-            .arg("--graph-uri")
-            .arg("/tmp/alpha.omni")
-            .arg("--schema")
-            .arg(&schema),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        stderr.contains("remote multi-graph server URL"),
-        "expected 'remote multi-graph server URL' rejection in stderr; got:\n{stderr}"
-    );
-}
-
-/// `omnigraph graphs create` with a missing `--schema` file errors
-/// with the IO context. Catches a regression where the CLI silently
-/// sent an empty body.
-#[test]
-fn graphs_create_with_missing_schema_file_errors() {
-    let output = output_failure(
-        cli()
-            .arg("graphs")
-            .arg("create")
-            .arg("--uri")
-            .arg("http://127.0.0.1:0")
-            .arg("--graph-id")
-            .arg("alpha")
-            .arg("--graph-uri")
-            .arg("/tmp/alpha.omni")
-            .arg("--schema")
-            .arg("/this/path/does/not/exist.pg"),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        stderr.contains("reading schema file"),
-        "expected 'reading schema file' error in stderr; got:\n{stderr}"
-    );
-}
