@@ -52,6 +52,7 @@ pub use policy::{
     PolicyAction, PolicyCompiler, PolicyConfig, PolicyDecision, PolicyEngine, PolicyExpectation,
     PolicyRequest, PolicyTestConfig,
 };
+use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -2035,6 +2036,20 @@ async fn server_branch_create(
     }))
 }
 
+/// Path-param shape for [`server_branch_delete`]. Named-field
+/// deserialization (rather than `Path<String>` or `Path<(String,)>`)
+/// keeps the extractor stable across single-mode flat routes and
+/// multi-mode nested routes: the `{branch}` capture is picked by
+/// name and any other captures in scope (e.g. `{graph_id}` in
+/// multi-mode) are ignored without breaking deserialization.
+///
+/// Closes the "handler path-extractor type is positional and breaks
+/// when route nesting changes" class.
+#[derive(Deserialize)]
+struct BranchPath {
+    branch: String,
+}
+
 #[utoipa::path(
     delete,
     path = "/branches/{branch}",
@@ -2061,7 +2076,7 @@ async fn server_branch_delete(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
-    Path(branch): Path<String>,
+    Path(BranchPath { branch }): Path<BranchPath>,
 ) -> std::result::Result<Json<BranchDeleteOutput>, ApiError> {
     let actor_arc = actor
         .as_ref()
@@ -2201,6 +2216,13 @@ async fn server_commit_list(
     }))
 }
 
+/// Path-param shape for [`server_commit_show`]. See [`BranchPath`]
+/// for the design rationale — same pattern, different field name.
+#[derive(Deserialize)]
+struct CommitPath {
+    commit_id: String,
+}
+
 #[utoipa::path(
     get,
     path = "/commits/{commit_id}",
@@ -2217,6 +2239,7 @@ async fn server_commit_list(
     ),
     security(("bearer_token" = [])),
 )]
+
 /// Get a single commit.
 ///
 /// Returns the commit's manifest version, parent commit(s), and creation
@@ -2224,7 +2247,7 @@ async fn server_commit_list(
 async fn server_commit_show(
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
-    Path(commit_id): Path<String>,
+    Path(CommitPath { commit_id }): Path<CommitPath>,
 ) -> std::result::Result<Json<api::CommitOutput>, ApiError> {
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
