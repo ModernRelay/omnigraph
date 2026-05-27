@@ -4482,6 +4482,97 @@ mod multi_graph_startup {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// Regression for the bot-surfaced path-extractor bug: cluster
+    /// routes whose inner path also captures a parameter
+    /// (`/graphs/{graph_id}/branches/{branch}`,
+    /// `/graphs/{graph_id}/commits/{commit_id}`) must extract the
+    /// inner param cleanly. Axum 0.8 propagates the outer `{graph_id}`
+    /// capture into nested handlers, so a `Path<String>` extractor
+    /// would see two values and fail with "Wrong number of path
+    /// arguments. Expected 1 but got 2." Today both DELETE branch and
+    /// GET commit-by-id break in multi-mode because their handlers
+    /// use bare `Path<String>` — this test pins the fix.
+    ///
+    /// `cluster_routes_dispatch_per_graph_handle` only exercises
+    /// `/snapshot` (no Path extractor), so the regression slipped
+    /// through. This test closes that gap structurally.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cluster_routes_with_inner_path_params_deserialize_correctly() {
+        let (_dirs, app) = build_multi_mode_app(&["alpha"]).await;
+
+        // Create a branch we can then delete — DELETE /graphs/alpha/branches/feature
+        let create_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/graphs/alpha/branches")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"feature"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            create_resp.status(),
+            StatusCode::OK,
+            "branch create on the cluster route must succeed before delete can be tested"
+        );
+
+        // DELETE /graphs/{graph_id}/branches/{branch} — exercises a handler
+        // whose only Path extractor (`branch`) is inside a nested route
+        // that also captures `graph_id`. The handler must pick `branch`
+        // by name, not by position.
+        let delete_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/graphs/alpha/branches/feature")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let delete_status = delete_resp.status();
+        let delete_body = to_bytes(delete_resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            delete_status,
+            StatusCode::OK,
+            "DELETE /graphs/{{id}}/branches/{{branch}} must extract `branch` cleanly. \
+             Body: {}",
+            String::from_utf8_lossy(&delete_body),
+        );
+
+        // GET /graphs/{graph_id}/commits/{commit_id} — same shape: the
+        // handler's only Path extractor is the inner `commit_id`, which
+        // must deserialize by name even though `graph_id` is also in scope.
+        // We don't know a real commit_id, but the failure mode under test
+        // is path extraction, not commit lookup — a 404 from the engine
+        // is fine; a 500 with "Wrong number of path arguments" is the bug.
+        let commit_resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/graphs/alpha/commits/0000000000000000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let commit_status = commit_resp.status();
+        let commit_body = to_bytes(commit_resp.into_body(), usize::MAX).await.unwrap();
+        let body_str = String::from_utf8_lossy(&commit_body);
+        assert!(
+            commit_status != StatusCode::INTERNAL_SERVER_ERROR
+                || !body_str.contains("Wrong number of path arguments"),
+            "GET /graphs/{{id}}/commits/{{commit_id}} must extract `commit_id` cleanly. \
+             Got: {} | {}",
+            commit_status,
+            body_str,
+        );
+    }
+
     /// Flat routes 404 in multi mode — the router only mounts under
     /// `/graphs/{graph_id}/...` so `/snapshot` doesn't resolve.
     #[tokio::test(flavor = "multi_thread")]
