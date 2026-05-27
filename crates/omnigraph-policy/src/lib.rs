@@ -428,8 +428,6 @@ impl PolicyEngine {
     pub fn authorize(&self, actor_id: &str, request: &PolicyRequest) -> Result<PolicyDecision> {
         if !self.known_actors.contains(actor_id) {
             return Ok(self.deny(
-                actor_id,
-                request,
                 None,
                 format!(
                     "policy denied action '{}' for unknown actor '{}'",
@@ -503,14 +501,9 @@ impl PolicyEngine {
                         .unwrap_or_default(),
                     actor_id
                 );
-                self.deny(actor_id, request, matched_rule_id, message)
+                self.deny(matched_rule_id, message)
             }
         })
-    }
-
-    pub fn validate_request(&self, actor_id: &str, request: &PolicyRequest) -> Result<()> {
-        let _ = self.authorize(actor_id, request)?;
-        Ok(())
     }
 
     pub fn run_tests(&self, tests: &PolicyTestConfig) -> Result<()> {
@@ -548,13 +541,7 @@ impl PolicyEngine {
         self.known_actors.len()
     }
 
-    fn deny(
-        &self,
-        _actor_id: &str,
-        _request: &PolicyRequest,
-        matched_rule_id: Option<String>,
-        message: String,
-    ) -> PolicyDecision {
+    fn deny(&self, matched_rule_id: Option<String>, message: String) -> PolicyDecision {
         PolicyDecision {
             allowed: false,
             matched_rule_id,
