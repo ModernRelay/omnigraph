@@ -483,8 +483,10 @@ impl AppState {
             return true;
         }
         // Any per-graph policy also requires auth — otherwise the
-        // policy gate would receive unauthenticated requests.
-        self.registry.list().iter().any(|h| h.policy.is_some())
+        // policy gate would receive unauthenticated requests. The flag
+        // is derived at snapshot construction (`RegistrySnapshot::new`)
+        // so this is an O(1) ArcSwap load — not a per-request walk.
+        self.registry.snapshot_ref().any_per_graph_policy
     }
 
     fn authenticate_bearer_token(&self, provided_token: &str) -> Option<ResolvedActor> {

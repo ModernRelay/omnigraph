@@ -49,9 +49,38 @@ pub struct GraphHandle {
 
 /// Immutable snapshot of the registry's current state. Replaced atomically
 /// via `ArcSwap`; readers see a consistent view of all graphs without locking.
-#[derive(Default)]
+///
+/// Derived state (`any_per_graph_policy`) is computed at snapshot
+/// construction so request-time middleware doesn't have to walk the
+/// graph map every call. Construct only via [`RegistrySnapshot::new`]
+/// (or `Default`) so the field stays in sync with `graphs`.
 pub struct RegistrySnapshot {
     pub graphs: HashMap<GraphKey, Arc<GraphHandle>>,
+    /// `true` iff any registered graph has a per-graph policy installed.
+    /// Used by `AppState::requires_bearer_auth` to decide whether the
+    /// auth middleware should challenge a request — a per-graph policy
+    /// implies bearer auth is required even when no server-level tokens
+    /// or policy are configured.
+    pub any_per_graph_policy: bool,
+}
+
+impl RegistrySnapshot {
+    /// Build a snapshot from a graph map, deriving cached fields.
+    /// The only construction path — direct struct-literal use elsewhere
+    /// would let derived state drift from `graphs`.
+    pub fn new(graphs: HashMap<GraphKey, Arc<GraphHandle>>) -> Self {
+        let any_per_graph_policy = graphs.values().any(|h| h.policy.is_some());
+        Self {
+            graphs,
+            any_per_graph_policy,
+        }
+    }
+}
+
+impl Default for RegistrySnapshot {
+    fn default() -> Self {
+        Self::new(HashMap::new())
+    }
 }
 
 /// Result of a registry lookup. Two-valued — `Tombstoned` deferred with DELETE.
@@ -99,17 +128,24 @@ impl GraphRegistry {
             if graphs.contains_key(&handle.key) {
                 return Err(InsertError::DuplicateKey(handle.key.clone()));
             }
-            if let Some(other) = seen_uris.get(&handle.uri) {
-                let _ = other; // existing key shown in the error message via uri
+            if seen_uris.contains_key(&handle.uri) {
                 return Err(InsertError::DuplicateUri(handle.uri.clone()));
             }
             seen_uris.insert(handle.uri.clone(), handle.key.clone());
             graphs.insert(handle.key.clone(), handle);
         }
         Ok(Self {
-            snapshot: ArcSwap::from_pointee(RegistrySnapshot { graphs }),
+            snapshot: ArcSwap::from_pointee(RegistrySnapshot::new(graphs)),
             mutate: Mutex::new(()),
         })
+    }
+
+    /// Lock-free snapshot read. Callers that need derived state cached
+    /// on the snapshot (e.g. `any_per_graph_policy`) go through here;
+    /// callers that only need values of `graphs` should use [`list`]
+    /// or [`get`].
+    pub fn snapshot_ref(&self) -> arc_swap::Guard<Arc<RegistrySnapshot>> {
+        self.snapshot.load()
     }
 
     /// Lock-free read. Returns `Ready` if the graph is in the current snapshot,
@@ -164,7 +200,7 @@ impl GraphRegistry {
         let mut new_graphs = current.graphs.clone();
         new_graphs.insert(handle.key.clone(), handle);
         self.snapshot
-            .store(Arc::new(RegistrySnapshot { graphs: new_graphs }));
+            .store(Arc::new(RegistrySnapshot::new(new_graphs)));
         Ok(())
     }
 }
