@@ -157,7 +157,7 @@ pub enum ServerConfigMode {
     /// non-empty `graphs:` map and no single-mode selector.
     Multi {
         /// Per-graph startup configs, sorted by graph id (BTreeMap
-        /// iteration order). PR 5's parallel-open loop iterates this.
+        /// iteration order). The parallel-open loop iterates this.
         graphs: Vec<GraphStartupConfig>,
         /// Path to the config file the server was started from. Kept on
         /// the mode so future runtime mutation (deferred — see release
@@ -214,8 +214,8 @@ pub struct AppState {
     /// Topology + (single mode only) the single graph's URI for
     /// startup wiring. The registry below is the runtime source of truth.
     mode: ServerMode,
-    /// PR 2 (MR-686) + PR 4a (MR-668): the engine and per-graph policy
-    /// now live inside `GraphHandle`s in the registry. Reads via
+    /// MR-686 + MR-668: the engine and per-graph policy live inside
+    /// `GraphHandle`s in the registry. Reads via
     /// `ArcSwap` are lock-free; mutations (currently only `insert`)
     /// serialize through the registry's internal mutex.
     registry: Arc<GraphRegistry>,
@@ -433,7 +433,7 @@ impl AppState {
         }
     }
 
-    /// Multi-mode constructor — used by PR 5's startup loop. Operators
+    /// Multi-mode constructor — used by the startup loop. Operators
     /// reach this by invoking `omnigraph-server --config omnigraph.yaml`
     /// with a non-empty `graphs:` map.
     ///
@@ -1204,7 +1204,7 @@ async fn server_openapi(State(state): State<AppState>) -> Json<utoipa::openapi::
     if !state.requires_bearer_auth() {
         strip_security(&mut doc);
     }
-    // MR-668 PR 4b: in multi mode, the protected routes live under
+    // MR-668: in multi mode, the protected routes live under
     // `/graphs/{graph_id}/...`. Rewrite the doc so the spec matches
     // the routes the router actually serves. Public paths (`/healthz`)
     // stay flat in both modes.
@@ -1329,7 +1329,7 @@ async fn require_bearer_auth(
     Ok(next.run(request).await)
 }
 
-/// Routing middleware (MR-668 PR 4a). Resolves the active graph for the
+/// Routing middleware (MR-668). Resolves the active graph for the
 /// request and injects `Arc<GraphHandle>` as an extension so handlers can
 /// extract it via `Extension<Arc<GraphHandle>>`.
 ///

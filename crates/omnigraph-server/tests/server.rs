@@ -4334,7 +4334,7 @@ async fn schema_apply_route_additive_property_preserves_existing_rows() {
     );
 }
 
-// ─── MR-668 PR 5: multi-graph startup ─────────────────────────────────────
+// ─── MR-668: multi-graph startup ──────────────────────────────────────────
 
 mod multi_graph_startup {
     use super::*;

@@ -468,7 +468,7 @@ pub fn read_target_output(target: &ReadTarget) -> ReadTargetOutput {
     }
 }
 
-// ─── MR-668 PR 6b — management endpoint shapes ─────────────────────────────
+// ─── MR-668 — management endpoint shapes ──────────────────────────────────
 
 /// One entry in the response from `GET /graphs`. Cluster operators
 /// consume this list to discover which graphs the server is currently

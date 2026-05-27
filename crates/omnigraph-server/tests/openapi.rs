@@ -960,7 +960,7 @@ fn openapi_spec_is_up_to_date() {
 }
 
 // ---------------------------------------------------------------------------
-// MR-668 PR 4b — multi-mode OpenAPI cluster filter
+// MR-668 — multi-mode OpenAPI cluster filter
 // ---------------------------------------------------------------------------
 //
 // In multi-graph mode, `/openapi.json` reports cluster routes

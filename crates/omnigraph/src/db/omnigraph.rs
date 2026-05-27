@@ -1551,7 +1551,7 @@ async fn best_effort_cleanup_init_artifacts(root: &str, storage: &dyn StorageAda
     ] {
         if let Err(err) = storage.delete(&uri).await {
             tracing::warn!(
-                target: "omnigraph::init",
+                target: "omnigraph::init::cleanup",
                 uri = %uri,
                 error = %err,
                 "init failed; best-effort cleanup could not delete artifact",

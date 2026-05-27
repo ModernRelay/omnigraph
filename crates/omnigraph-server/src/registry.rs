@@ -1,4 +1,4 @@
-//! `GraphRegistry` — the multi-graph routing substrate (MR-668 PR 3).
+//! `GraphRegistry` — the multi-graph routing substrate (MR-668).
 //!
 //! Holds the open `Arc<GraphHandle>` for every graph the server is currently
 //! serving. Lock-free reads via `ArcSwap<RegistrySnapshot>`; mutations

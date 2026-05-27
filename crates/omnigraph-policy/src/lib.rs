@@ -591,7 +591,7 @@ fn compile_entities(config: &PolicyConfig, graph_id: &str, schema: &Schema) -> R
     entities.extend(actor_entities);
     entities.push(graph_entity);
 
-    // MR-668 PR 6a: include the `Omnigraph::Server::"root"` entity
+    // MR-668: include the `Omnigraph::Server::"root"` entity
     // whenever any rule references a server-scoped action. Cedar's
     // schema validator will otherwise reject the policy. Keeping this
     // conditional (rather than always-on) avoids polluting test
@@ -648,7 +648,7 @@ fn compile_policy_source(rule: &PolicyRule, action: &PolicyAction, graph_id: &st
         format!("\nwhen {{ {} }}", conditions.join(" && "))
     };
 
-    // MR-668 PR 6a: emit the resource literal that matches the action's
+    // MR-668: emit the resource literal that matches the action's
     // `resource_kind`. Per-graph actions reference the engine's
     // `Omnigraph::Graph::"<graph_label>"` instance; server-scoped
     // actions reference the singleton `Omnigraph::Server::"root"`.
@@ -669,6 +669,8 @@ fn compile_policy_source(rule: &PolicyRule, action: &PolicyAction, graph_id: &st
 ){when};"#,
         group = cedar_literal(&rule.allow.actors.group),
         action = cedar_literal(action.as_str()),
+        when = when,
+        resource_literal = resource_literal,
     )
 }
 
@@ -697,7 +699,7 @@ fn target_branch_scope_condition(scope: PolicyBranchScope) -> String {
 }
 
 fn policy_schema_source() -> &'static str {
-    // MR-668 PR 6a: `entity Server;` plus the `graph_list` action that
+    // MR-668: `entity Server;` plus the `graph_list` action that
     // binds to it. Per-graph actions stay bound to `Graph`.
     // The Cedar schema string lives here (not on a fixture file) so any
     // omnigraph-policy build picks up the new vocabulary in lock-step
