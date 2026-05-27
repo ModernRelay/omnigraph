@@ -206,18 +206,63 @@ pub enum ServerMode {
 /// value is operator-invisible — it does NOT need to be unique with
 /// any user-facing graph id since single-mode never serves cluster
 /// routes.
+///
+/// **Deprecated in C-1, removed in C-3 of this PR sequence.** The
+/// new `GraphRouting::Single` arm carries `Arc<GraphHandle>` directly,
+/// so there is no longer a need to thread the single-mode handle
+/// through a one-element registry under a magic key.
 pub(crate) const SINGLE_GRAPH_KEY_ID: &str = "default";
+
+/// Runtime routing for the server. Replaces the prior pairing of
+/// `ServerMode` (discriminant + Single's `uri`) with `Arc<GraphRegistry>`
+/// (always populated, even when serving one graph through a sentinel
+/// key). In single-graph mode there is no registry to traverse —
+/// the single handle lives here directly. In multi-graph mode the
+/// registry carries N handles and the middleware dispatches on the
+/// URL's `{graph_id}` segment.
+///
+/// Closes the "single mode is forced through a multi-mode abstraction"
+/// class: `SINGLE_GRAPH_KEY_ID`, the registry-walk-and-assert helper
+/// (`single_mode_handle`), and the 500-class "programmer error"
+/// branch all go away in C-3.
+#[derive(Clone)]
+pub enum GraphRouting {
+    /// Single-graph deployment: one handle, flat routes (`/snapshot`,
+    /// `/read`, …). The `handle.uri` field carries the URI the engine
+    /// was opened from (replaces `ServerMode::Single { uri }`).
+    Single { handle: Arc<GraphHandle> },
+    /// Multi-graph deployment: many handles, cluster routes
+    /// (`/graphs/{graph_id}/...`). `config_path` is the `omnigraph.yaml`
+    /// the server reads at startup; preserved here so future runtime
+    /// mutation (deferred) can find the source of truth without
+    /// re-parsing CLI args (replaces `ServerMode::Multi { config_path }`).
+    Multi {
+        registry: Arc<GraphRegistry>,
+        config_path: Option<PathBuf>,
+    },
+}
 
 #[derive(Clone)]
 pub struct AppState {
     /// Topology + (single mode only) the single graph's URI for
-    /// startup wiring. The registry below is the runtime source of truth.
+    /// startup wiring. The registry below is the runtime source of
+    /// truth in multi mode; the routing field below is the new
+    /// source-of-truth for both modes.
+    ///
+    /// **C-1 transitional**: `mode` and `registry` are kept populated
+    /// in lockstep with `routing` so middleware that reads from either
+    /// shape continues to work. C-2 switches the middleware to
+    /// `routing`; C-3 removes the two legacy fields.
     mode: ServerMode,
-    /// MR-686 + MR-668: the engine and per-graph policy live inside
-    /// `GraphHandle`s in the registry. Reads via
-    /// `ArcSwap` are lock-free; mutations (currently only `insert`)
-    /// serialize through the registry's internal mutex.
+    /// MR-686 + MR-668: legacy multi-graph registry. C-2 stops the
+    /// middleware from reading this in single mode; C-3 removes the
+    /// field entirely (multi mode reads via `routing`).
     registry: Arc<GraphRegistry>,
+    /// New runtime routing source of truth (C-1). Holds the single
+    /// handle directly in single mode (no registry-walk-and-assert)
+    /// and the registry + config_path in multi mode. Middleware
+    /// migration to read from here lands in C-2.
+    routing: GraphRouting,
     /// Per-actor admission control. Process-wide (not per-graph) —
     /// see MR-668 decision Q6.
     workload: Arc<workload::WorkloadController>,
@@ -417,12 +462,16 @@ impl AppState {
             policy: policy_engine,
         });
         let registry = Arc::new(
-            GraphRegistry::from_handles(vec![handle])
+            GraphRegistry::from_handles(vec![Arc::clone(&handle)])
                 .expect("single-mode registry construction is infallible"),
         );
+        let routing = GraphRouting::Single {
+            handle: Arc::clone(&handle),
+        };
         Self {
             mode: ServerMode::Single { uri },
             registry,
+            routing,
             workload,
             bearer_tokens,
             server_policy: None,
@@ -445,9 +494,14 @@ impl AppState {
     ) -> std::result::Result<Self, InsertError> {
         let bearer_tokens = hash_bearer_tokens(bearer_tokens);
         let registry = Arc::new(GraphRegistry::from_handles(handles)?);
+        let routing = GraphRouting::Multi {
+            registry: Arc::clone(&registry),
+            config_path: config_path.clone(),
+        };
         Ok(Self {
             mode: ServerMode::Multi { config_path },
             registry,
+            routing,
             workload: Arc::new(workload),
             bearer_tokens,
             server_policy: server_policy.map(Arc::new),
@@ -482,10 +536,16 @@ impl AppState {
             return true;
         }
         // Any per-graph policy also requires auth — otherwise the
-        // policy gate would receive unauthenticated requests. The flag
-        // is derived at snapshot construction (`RegistrySnapshot::new`)
-        // so this is an O(1) ArcSwap load — not a per-request walk.
-        self.registry.snapshot_ref().any_per_graph_policy
+        // policy gate would receive unauthenticated requests. Reading
+        // from `routing` is O(1) in both arms: single mode is a direct
+        // `handle.policy.is_some()` check, multi mode reads the
+        // cached `any_per_graph_policy` flag on the registry snapshot.
+        match &self.routing {
+            GraphRouting::Single { handle } => handle.policy.is_some(),
+            GraphRouting::Multi { registry, .. } => {
+                registry.snapshot_ref().any_per_graph_policy
+            }
+        }
     }
 
     fn authenticate_bearer_token(&self, provided_token: &str) -> Option<ResolvedActor> {
@@ -513,17 +573,6 @@ fn hash_bearer_tokens(
     Arc::from(tokens)
 }
 
-/// Look up the single-mode handle from the registry. Returns `None`
-/// if the registry is empty or has multiple entries (the latter would
-/// indicate a constructor bug).
-fn single_mode_handle(registry: &GraphRegistry) -> Option<Arc<GraphHandle>> {
-    let list = registry.list();
-    if list.len() == 1 {
-        list.into_iter().next()
-    } else {
-        None
-    }
-}
 
 impl ApiError {
     pub fn unauthorized(message: impl Into<String>) -> Self {
@@ -1344,9 +1393,10 @@ async fn require_bearer_auth(
 /// request and injects `Arc<GraphHandle>` as an extension so handlers can
 /// extract it via `Extension<Arc<GraphHandle>>`.
 ///
-/// **Single mode**: the registry has exactly one handle (keyed by the
-/// `SINGLE_GRAPH_KEY_ID` sentinel). Routes are flat — every request
-/// resolves to that single handle, regardless of the URI path.
+/// **Single mode**: the routing field holds the single handle directly.
+/// Routes are flat; every request resolves to that handle, regardless
+/// of the URI path. No registry walk, no sentinel key, no
+/// programmer-error guard.
 ///
 /// **Multi mode**: routes are nested under `/graphs/{graph_id}/...`. The
 /// middleware extracts `{graph_id}` from the URI path and looks it up in
@@ -1359,15 +1409,9 @@ async fn resolve_graph_handle(
     mut request: Request,
     next: Next,
 ) -> std::result::Result<Response, ApiError> {
-    let handle = match &state.mode {
-        ServerMode::Single { .. } => single_mode_handle(&state.registry).ok_or_else(|| {
-            ApiError::internal(
-                "single-mode registry is empty or has multiple handles \
-                 (programmer error in AppState constructor)"
-                    .to_string(),
-            )
-        })?,
-        ServerMode::Multi { .. } => {
+    let handle = match &state.routing {
+        GraphRouting::Single { handle } => Arc::clone(handle),
+        GraphRouting::Multi { registry, .. } => {
             // `Router::nest("/graphs/{graph_id}", inner)` rewrites
             // `request.uri().path()` to the inner suffix (e.g. `/snapshot`).
             // The pre-rewrite URI is preserved in the `OriginalUri`
@@ -1392,7 +1436,7 @@ async fn resolve_graph_handle(
             let graph_id = GraphId::try_from(graph_id_str.to_string())
                 .map_err(|err| ApiError::bad_request(err.to_string()))?;
             let key = GraphKey::cluster(graph_id.clone());
-            match state.registry.get(&key) {
+            match registry.get(&key) {
                 RegistryLookup::Ready(handle) => handle,
                 RegistryLookup::Gone => {
                     return Err(ApiError::not_found(format!(
@@ -1406,8 +1450,7 @@ async fn resolve_graph_handle(
     // Per-request observability. `Span::current().record` would silently
     // no-op here because no upstream `#[tracing::instrument(...)]` macro
     // declares a `graph_id` field; emit an explicit event instead so the
-    // routing decision actually lands in logs. In single mode the value
-    // is the sentinel `default`.
+    // routing decision actually lands in logs.
     info!(graph_id = %handle.key.graph_id, "graph routed");
 
     request.extensions_mut().insert(handle);
