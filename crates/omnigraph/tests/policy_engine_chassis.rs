@@ -64,7 +64,7 @@ fn additive_schema() -> String {
 fn install_policy(db: Omnigraph, dir_path: &Path) -> (Omnigraph, Arc<PolicyEngine>) {
     let policy_path = dir_path.join("policy.yaml");
     fs::write(&policy_path, POLICY_YAML).unwrap();
-    let engine = PolicyEngine::load(&policy_path, dir_path.to_str().unwrap()).unwrap();
+    let engine = PolicyEngine::load_graph(&policy_path, dir_path.to_str().unwrap()).unwrap();
     let engine = Arc::new(engine);
     let db = db.with_policy(Arc::clone(&engine) as Arc<dyn PolicyChecker>);
     (db, engine)

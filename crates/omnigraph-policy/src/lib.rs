@@ -115,6 +115,26 @@ pub enum PolicyResourceKind {
     Server,
 }
 
+/// Which kind of policy file the caller is loading. Drives the
+/// load-time validation that catches a "wrong action in wrong file"
+/// mistake — a graph policy with `graph_list` rules, or a server
+/// policy with `read` rules, both compile silently as Cedar but
+/// never match any actual request. Typing the loader makes the
+/// mistake a load-time error.
+///
+/// Pairs with [`PolicyAction::resource_kind`]: every action's resource
+/// kind must match the engine kind it's loaded under.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PolicyEngineKind {
+    /// Engine is loaded for a single graph; only actions whose
+    /// `resource_kind()` is `PolicyResourceKind::Graph` are allowed.
+    Graph,
+    /// Engine is loaded for server-level management endpoints; only
+    /// actions whose `resource_kind()` is `PolicyResourceKind::Server`
+    /// are allowed.
+    Server,
+}
+
 impl fmt::Display for PolicyAction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -415,9 +435,33 @@ impl PolicyCompiler {
 }
 
 impl PolicyEngine {
-    pub fn load(path: &Path, graph_id: &str) -> Result<Self> {
+    /// Load a per-graph policy file. Rejects rules whose actions are
+    /// server-scoped (e.g. `graph_list`) — those belong in a server
+    /// policy file, not a per-graph one.
+    ///
+    /// `graph_id` is the label of the graph this engine governs;
+    /// becomes the Cedar `Omnigraph::Graph::"<graph_id>"` resource
+    /// for every per-graph action evaluated against this engine.
+    pub fn load_graph(path: &Path, graph_id: &str) -> Result<Self> {
         let config = PolicyConfig::load(path)?;
+        validate_kind_alignment(&config, PolicyEngineKind::Graph)?;
         PolicyCompiler::compile(&config, graph_id)
+    }
+
+    /// Load a server-level policy file. Rejects rules whose actions
+    /// are per-graph (e.g. `read`, `change`) — those belong in a
+    /// per-graph policy file, not the server one. Takes no `graph_id`:
+    /// server-scoped actions resolve against the singleton
+    /// `Omnigraph::Server::"root"` entity, never a Graph.
+    pub fn load_server(path: &Path) -> Result<Self> {
+        let config = PolicyConfig::load(path)?;
+        validate_kind_alignment(&config, PolicyEngineKind::Server)?;
+        // The Graph entity created by the compiler is never referenced
+        // by a server-scoped rule, so the label below is purely a
+        // placeholder. Use the canonical SERVER_RESOURCE_ID so any
+        // future inspection of an unreachable Graph entity at least
+        // points at the right concept.
+        PolicyCompiler::compile(&config, SERVER_RESOURCE_ID)
     }
 
     /// Evaluate a request. `actor_id` is supplied as a separate
@@ -548,6 +592,38 @@ impl PolicyEngine {
             message,
         }
     }
+}
+
+/// Reject any rule whose actions don't match the engine kind
+/// being loaded. Closes the "wrong action in wrong file silently
+/// no-ops" class — `graph_list` in a per-graph file or `read` in
+/// a server file fails at load time instead of compiling cleanly
+/// and never matching a request.
+fn validate_kind_alignment(config: &PolicyConfig, kind: PolicyEngineKind) -> Result<()> {
+    let required = match kind {
+        PolicyEngineKind::Graph => PolicyResourceKind::Graph,
+        PolicyEngineKind::Server => PolicyResourceKind::Server,
+    };
+    for rule in &config.rules {
+        for action in &rule.allow.actions {
+            if action.resource_kind() != required {
+                let (got, expected_file) = match action.resource_kind() {
+                    PolicyResourceKind::Server => ("server-scoped", "server policy file"),
+                    PolicyResourceKind::Graph => ("per-graph", "per-graph policy file"),
+                };
+                bail!(
+                    "policy rule '{}' uses {} action '{}' in a {:?} policy file; \
+                     move it to a {}",
+                    rule.id,
+                    got,
+                    action,
+                    kind,
+                    expected_file
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn compile_entities(config: &PolicyConfig, graph_id: &str, schema: &Schema) -> Result<Entities> {
@@ -909,8 +985,8 @@ impl PolicyChecker for PolicyEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        PolicyAction, PolicyCompiler, PolicyConfig, PolicyExpectation, PolicyRequest,
-        PolicyTestCase, PolicyTestConfig,
+        PolicyAction, PolicyCompiler, PolicyConfig, PolicyEngine, PolicyExpectation,
+        PolicyRequest, PolicyTestCase, PolicyTestConfig,
     };
 
     #[test]
@@ -1274,5 +1350,144 @@ rules:
             .unwrap();
         assert!(allow.allowed);
         assert_eq!(allow.matched_rule_id.as_deref(), Some("team-read"));
+    }
+
+    // ─── MR-668 follow-up — load_graph / load_server kind alignment ─
+
+    /// A per-graph policy file containing a `graph_list` rule fails
+    /// at load time. Pre-fix, the file compiled cleanly and the rule
+    /// silently never matched (per-graph engine never gets a
+    /// `graph_list` check). Closes the "wrong action, wrong file,
+    /// silent no-op" class.
+    #[test]
+    fn load_graph_rejects_server_scoped_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad-graph-policy.yaml");
+        std::fs::write(
+            &path,
+            r#"
+version: 1
+groups:
+  admins: [act-andrew]
+rules:
+  - id: misplaced-graph-list
+    allow:
+      actors: { group: admins }
+      actions: [graph_list]
+"#,
+        )
+        .unwrap();
+        let err = match PolicyEngine::load_graph(&path, "g1") {
+            Ok(_) => panic!("expected server-scoped action in per-graph file to be rejected"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("server-scoped") && msg.contains("graph_list"),
+            "expected server-scoped-in-graph-file rejection, got: {msg}"
+        );
+    }
+
+    /// A server policy file containing a `read` rule fails at load
+    /// time. Pre-fix, the file compiled cleanly and the rule silently
+    /// never matched (server engine never gets a `read` check).
+    #[test]
+    fn load_server_rejects_per_graph_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad-server-policy.yaml");
+        std::fs::write(
+            &path,
+            r#"
+version: 1
+groups:
+  team: [act-andrew]
+rules:
+  - id: misplaced-read
+    allow:
+      actors: { group: team }
+      actions: [read]
+      branch_scope: any
+"#,
+        )
+        .unwrap();
+        let err = match PolicyEngine::load_server(&path) {
+            Ok(_) => panic!("expected per-graph action in server file to be rejected"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("per-graph") && msg.contains("read"),
+            "expected per-graph-in-server-file rejection, got: {msg}"
+        );
+    }
+
+    /// Positive case: a properly-shaped per-graph policy loads via
+    /// `load_graph` and authorizes as expected. Verifies the
+    /// kind-alignment check is permissive when the file is correct.
+    #[test]
+    fn load_graph_accepts_per_graph_only_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ok-graph-policy.yaml");
+        std::fs::write(
+            &path,
+            r#"
+version: 1
+groups:
+  team: [act-andrew]
+rules:
+  - id: team-read
+    allow:
+      actors: { group: team }
+      actions: [read]
+      branch_scope: any
+"#,
+        )
+        .unwrap();
+        let engine = PolicyEngine::load_graph(&path, "g1").unwrap();
+        let decision = engine
+            .authorize(
+                "act-andrew",
+                &PolicyRequest {
+                    action: PolicyAction::Read,
+                    branch: Some("main".to_string()),
+                    target_branch: None,
+                },
+            )
+            .unwrap();
+        assert!(decision.allowed);
+    }
+
+    /// Positive case: a properly-shaped server policy loads via
+    /// `load_server` and authorizes the `graph_list` action.
+    #[test]
+    fn load_server_accepts_server_only_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ok-server-policy.yaml");
+        std::fs::write(
+            &path,
+            r#"
+version: 1
+groups:
+  admins: [act-andrew]
+rules:
+  - id: admins-list-graphs
+    allow:
+      actors: { group: admins }
+      actions: [graph_list]
+"#,
+        )
+        .unwrap();
+        let engine = PolicyEngine::load_server(&path).unwrap();
+        let decision = engine
+            .authorize(
+                "act-andrew",
+                &PolicyRequest {
+                    action: PolicyAction::GraphList,
+                    branch: None,
+                    target_branch: None,
+                },
+            )
+            .unwrap();
+        assert!(decision.allowed);
     }
 }

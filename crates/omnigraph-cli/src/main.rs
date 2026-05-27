@@ -729,7 +729,7 @@ fn resolve_policy_engine(config: &OmnigraphConfig) -> Result<PolicyEngine> {
     let policy_file = config
         .resolve_policy_file()
         .ok_or_else(|| color_eyre::eyre::eyre!("policy.file must be set in omnigraph.yaml"))?;
-    PolicyEngine::load(&policy_file, &policy_graph_id(config))
+    PolicyEngine::load_graph(&policy_file, &policy_graph_id(config))
 }
 
 /// Open a local-URI graph and, when `policy.file` is configured in

@@ -371,7 +371,7 @@ impl AppState {
         let uri = uri.into();
         let db = Omnigraph::open(&uri).await?;
         let policy_engine = match policy_file {
-            Some(path) => Some(PolicyEngine::load(path, &uri)?),
+            Some(path) => Some(PolicyEngine::load_graph(path, &uri)?),
             None => None,
         };
         if policy_engine.is_some() && bearer_tokens.is_empty() {
@@ -1062,7 +1062,7 @@ async fn open_multi_graph_state(
     // resource-model refactor maps to the singleton
     // `Omnigraph::Server::"root"` entity at evaluation time.
     let server_policy = match server_policy_file {
-        Some(path) => Some(PolicyEngine::load(path, "server")?),
+        Some(path) => Some(PolicyEngine::load_server(path)?),
         None => None,
     };
 
@@ -1100,7 +1100,7 @@ async fn open_single_graph(cfg: GraphStartupConfig) -> Result<Arc<GraphHandle>> 
 
     let (policy_arc, db) = match &cfg.policy_file {
         Some(path) => {
-            let policy = PolicyEngine::load(path, graph_id.as_str())?;
+            let policy = PolicyEngine::load_graph(path, graph_id.as_str())?;
             let policy_arc: Arc<PolicyEngine> = Arc::new(policy);
             let checker = Arc::clone(&policy_arc) as Arc<dyn omnigraph_policy::PolicyChecker>;
             (Some(policy_arc), db.with_policy(checker))

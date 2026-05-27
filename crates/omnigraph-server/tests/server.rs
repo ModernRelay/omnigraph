@@ -3592,7 +3592,7 @@ async fn ingest_per_actor_admission_cap_returns_429() {
     let policy_path = temp.path().join("policy.yaml");
     fs::write(&policy_path, permit_all_policy_yaml(&["act-flooder"])).unwrap();
     let policy_engine =
-        omnigraph_server::PolicyEngine::load(&policy_path, graph.to_string_lossy().as_ref())
+        omnigraph_server::PolicyEngine::load_graph(&policy_path, graph.to_string_lossy().as_ref())
             .unwrap();
     let state = AppState::new_single(
         graph.to_string_lossy().to_string(),
@@ -3716,7 +3716,7 @@ async fn engine_layer_policy_fires_via_direct_arc_omnigraph_from_new_single() {
     let policy_path = temp.path().join("policy.yaml");
     fs::write(&policy_path, permit_all_policy_yaml(&["act-allowed"])).unwrap();
     let policy_engine =
-        omnigraph_server::PolicyEngine::load(&policy_path, graph.to_string_lossy().as_ref())
+        omnigraph_server::PolicyEngine::load_graph(&policy_path, graph.to_string_lossy().as_ref())
             .unwrap();
 
     let workload = omnigraph_server::workload::WorkloadController::new(100, 1_000_000_000);
@@ -3940,7 +3940,7 @@ async fn build_parity_graph() -> (tempfile::TempDir, PathBuf, PathBuf) {
 }
 
 async fn sdk_change_decision(graph: &Path, policy_path: &Path, actor: &str) -> ParityDecision {
-    let policy = PolicyEngine::load(policy_path, graph.to_string_lossy().as_ref()).unwrap();
+    let policy = PolicyEngine::load_graph(policy_path, graph.to_string_lossy().as_ref()).unwrap();
     let db = Omnigraph::open(graph.to_str().unwrap())
         .await
         .unwrap()
@@ -4008,7 +4008,7 @@ async fn http_change_decision(
 }
 
 async fn sdk_merge_decision(graph: &Path, policy_path: &Path, actor: &str) -> ParityDecision {
-    let policy = PolicyEngine::load(policy_path, graph.to_string_lossy().as_ref()).unwrap();
+    let policy = PolicyEngine::load_graph(policy_path, graph.to_string_lossy().as_ref()).unwrap();
     let db = Omnigraph::open(graph.to_str().unwrap())
         .await
         .unwrap()
@@ -4878,7 +4878,7 @@ rules:
 "#,
         )
         .unwrap();
-        let server_policy = PolicyEngine::load(&policy_path, "server").unwrap();
+        let server_policy = PolicyEngine::load_server(&policy_path).unwrap();
 
         let tokens = vec![
             ("act-andrew".to_string(), "andrew-token".to_string()),
