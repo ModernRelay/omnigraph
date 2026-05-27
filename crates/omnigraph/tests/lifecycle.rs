@@ -185,3 +185,69 @@ async fn snapshot_version_is_pinned() {
 
     assert_eq!(snap1.version(), v1);
 }
+
+/// Regression for the `Omnigraph::init` re-init footgun (MR-668
+/// follow-up): a second `init` against a URI that already holds a
+/// graph must NOT modify or destroy the existing graph's schema
+/// artifacts. Today's behavior is destructive either way — the
+/// `write_text(_schema.pg, ...)` call at the top of
+/// `init_storage_phase` overwrites the existing file before any
+/// preflight, and `best_effort_cleanup_init_artifacts` will later
+/// delete all three files if the inner `GraphCoordinator::init`
+/// fails. Both outcomes corrupt an existing graph.
+///
+/// After the fix: strict-mode `init` (no `force` flag) errors out
+/// before touching any file, and the original schema artifacts
+/// match their pre-attempt contents byte-for-byte.
+#[tokio::test]
+async fn init_on_existing_graph_uri_does_not_destroy_existing_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    // Establish the first graph and snapshot its three schema files.
+    Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let original_schema_pg = fs::read_to_string(dir.path().join("_schema.pg")).unwrap();
+    let original_schema_ir = fs::read_to_string(dir.path().join("_schema.ir.json")).unwrap();
+    let original_schema_state = fs::read_to_string(dir.path().join("__schema_state.json")).unwrap();
+
+    // Attempt a re-init with a deliberately different schema so any
+    // overwrite would be observable in the file contents.
+    let different_schema = "node Other { id: String @key }\n";
+    let result = Omnigraph::init(uri, different_schema).await;
+
+    // The new init must report the conflict, not silently mutate.
+    assert!(
+        result.is_err(),
+        "init against an existing graph URI must error, not silently overwrite"
+    );
+
+    // The three schema files must remain present and byte-identical to
+    // their pre-attempt contents.
+    assert!(
+        dir.path().join("_schema.pg").exists(),
+        "_schema.pg must not be deleted by a failed re-init"
+    );
+    assert!(
+        dir.path().join("_schema.ir.json").exists(),
+        "_schema.ir.json must not be deleted by a failed re-init"
+    );
+    assert!(
+        dir.path().join("__schema_state.json").exists(),
+        "__schema_state.json must not be deleted by a failed re-init"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("_schema.pg")).unwrap(),
+        original_schema_pg,
+        "_schema.pg contents must be preserved when re-init is rejected"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("_schema.ir.json")).unwrap(),
+        original_schema_ir,
+        "_schema.ir.json contents must be preserved when re-init is rejected"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("__schema_state.json")).unwrap(),
+        original_schema_state,
+        "__schema_state.json contents must be preserved when re-init is rejected"
+    );
+}
