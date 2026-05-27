@@ -1333,12 +1333,12 @@ fn print_commit_human(commit: &CommitOutput) {
     println!("created_at: {}", commit.created_at);
 }
 
-fn print_policy_explain(decision: &PolicyDecision, request: &PolicyRequest) {
+fn print_policy_explain(decision: &PolicyDecision, actor_id: &str, request: &PolicyRequest) {
     println!(
         "decision: {}",
         if decision.allowed { "allow" } else { "deny" }
     );
-    println!("actor: {}", request.actor_id);
+    println!("actor: {}", actor_id);
     println!("action: {}", request.action);
     if let Some(branch) = &request.branch {
         println!("branch: {}", branch);
@@ -2471,13 +2471,12 @@ async fn main() -> Result<()> {
                 let config = load_cli_config(config.as_ref())?;
                 let engine = resolve_policy_engine(&config)?;
                 let request = PolicyRequest {
-                    actor_id: actor,
                     action,
                     branch,
                     target_branch,
                 };
-                let decision = engine.authorize(&request)?;
-                print_policy_explain(&decision, &request);
+                let decision = engine.authorize(&actor, &request)?;
+                print_policy_explain(&decision, &actor, &request);
             }
         },
         Command::Optimize {

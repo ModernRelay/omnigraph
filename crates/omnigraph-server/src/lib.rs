@@ -1176,10 +1176,6 @@ async fn server_graphs_list(
         actor.as_ref().map(|Extension(actor)| actor),
         state.server_policy.as_deref(),
         PolicyRequest {
-            actor_id: actor
-                .as_ref()
-                .map(|Extension(actor)| actor.actor_id.as_ref().to_string())
-                .unwrap_or_default(),
             action: PolicyAction::GraphList,
             branch: None,
             target_branch: None,
@@ -1422,14 +1418,15 @@ fn log_policy_decision(actor_id: &str, request: &PolicyRequest, decision: &Polic
 ///     are deferred until a managed cluster catalog lands).
 ///
 /// The MR-731 invariant lives inside this function: actor identity is
-/// overwritten from the resolved bearer match, never trusted from the
-/// caller-built `PolicyRequest.actor_id`. See
-/// `actor_id_resolves_from_bearer_token_ignoring_client_supplied_headers`
-/// at `tests/server.rs:1114-1216`.
+/// supplied as a separate argument from the resolved bearer match. The
+/// `PolicyRequest` struct itself does not carry identity (the field was
+/// dropped from the type), so handlers cannot smuggle it through the
+/// request. See `actor_id_resolves_from_bearer_token_ignoring_client_supplied_headers`
+/// at `tests/server.rs`.
 fn authorize_request(
     actor: Option<&ResolvedActor>,
     policy: Option<&PolicyEngine>,
-    mut request: PolicyRequest,
+    request: PolicyRequest,
 ) -> std::result::Result<(), ApiError> {
     let Some(engine) = policy else {
         // MR-723 default-deny path. We're here when no PolicyEngine is
@@ -1458,26 +1455,22 @@ fn authorize_request(
     let Some(actor) = actor else {
         return Err(ApiError::unauthorized("missing bearer token"));
     };
-    // SECURITY INVARIANT (MR-731): actor identity comes from the matched
-    // bearer token, never from a client-supplied request header, query
-    // parameter, or body field. This line is the single chokepoint where
-    // the authoritative actor (resolved from the bearer match by
-    // `require_bearer_auth`) overwrites whatever the handler put in the
-    // PolicyRequest. Removing or weakening it lets clients spoof identity —
-    // exactly the Supabase RLS footgun ("trusting raw_user_meta_data is
-    // asking the attacker if they're an admin"). The principle is codified
-    // in `docs/dev/invariants.md` Hard Invariant 11 ("clients cannot set
+    // SECURITY INVARIANT (MR-731): actor identity is supplied to the
+    // policy engine here as a separate argument, sourced from the
+    // bearer-token match resolved by `require_bearer_auth`. The
+    // `PolicyRequest` struct itself no longer carries `actor_id` (it
+    // was dropped from the type), so handlers cannot smuggle identity
+    // through the request body and there is no overwrite step that
+    // could be skipped. The principle is codified in
+    // `docs/dev/invariants.md` Hard Invariant 11 ("clients cannot set
     // actor identity directly") and pinned by the regression test
     // `actor_id_resolves_from_bearer_token_ignoring_client_supplied_headers`
     // in `crates/omnigraph-server/tests/server.rs`.
-    //
-    // Side effect: also prevents an empty-string default at any handler
-    // call site from ever reaching the engine as a policy subject.
-    request.actor_id = actor.actor_id.as_ref().to_string();
+    let actor_id = actor.actor_id.as_ref();
     let decision = engine
-        .authorize(&request)
+        .authorize(actor_id, &request)
         .map_err(|err| ApiError::internal(format!("policy: {err}")))?;
-    log_policy_decision(actor.actor_id.as_ref(), &request, &decision);
+    log_policy_decision(actor_id, &request, &decision);
     if decision.allowed {
         Ok(())
     } else {
@@ -1514,10 +1507,6 @@ async fn server_snapshot(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
         PolicyRequest {
-            actor_id: actor
-                .as_ref()
-                .map(|Extension(actor)| actor.actor_id.as_ref().to_string())
-                .unwrap_or_default(),
             action: PolicyAction::Read,
             branch: Some(branch.clone()),
             target_branch: None,
@@ -1581,10 +1570,6 @@ async fn server_read(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
         PolicyRequest {
-            actor_id: actor
-                .as_ref()
-                .map(|Extension(actor)| actor.actor_id.as_ref().to_string())
-                .unwrap_or_default(),
             action: PolicyAction::Read,
             branch: policy_branch,
             target_branch: None,
@@ -1641,10 +1626,6 @@ async fn server_export(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
         PolicyRequest {
-            actor_id: actor
-                .as_ref()
-                .map(|Extension(actor)| actor.actor_id.as_ref().to_string())
-                .unwrap_or_default(),
             action: PolicyAction::Export,
             branch: Some(branch.clone()),
             target_branch: None,
@@ -1714,7 +1695,6 @@ async fn server_change(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
         PolicyRequest {
-            actor_id: actor_id.map(str::to_string).unwrap_or_default(),
             action: PolicyAction::Change,
             branch: Some(branch.clone()),
             target_branch: None,
@@ -1787,10 +1767,6 @@ async fn server_schema_get(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
         PolicyRequest {
-            actor_id: actor
-                .as_ref()
-                .map(|Extension(actor)| actor.actor_id.as_ref().to_string())
-                .unwrap_or_default(),
             action: PolicyAction::Read,
             branch: None,
             target_branch: None,
@@ -1839,7 +1815,6 @@ async fn server_schema_apply(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
         PolicyRequest {
-            actor_id: actor_id.map(str::to_string).unwrap_or_default(),
             action: PolicyAction::SchemaApply,
             branch: None,
             target_branch: Some("main".to_string()),
@@ -1922,7 +1897,6 @@ async fn server_ingest(
             actor.as_ref().map(|Extension(actor)| actor),
             handle.policy.as_deref(),
             PolicyRequest {
-                actor_id: actor_id.map(str::to_string).unwrap_or_default(),
                 action: PolicyAction::BranchCreate,
                 branch: Some(from.clone()),
                 target_branch: Some(branch.clone()),
@@ -1933,7 +1907,6 @@ async fn server_ingest(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
         PolicyRequest {
-            actor_id: actor_id.map(str::to_string).unwrap_or_default(),
             action: PolicyAction::Change,
             branch: Some(branch.clone()),
             target_branch: None,
@@ -1983,10 +1956,6 @@ async fn server_branch_list(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
         PolicyRequest {
-            actor_id: actor
-                .as_ref()
-                .map(|Extension(actor)| actor.actor_id.as_ref().to_string())
-                .unwrap_or_default(),
             action: PolicyAction::Read,
             branch: None,
             target_branch: None,
@@ -2036,10 +2005,6 @@ async fn server_branch_create(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
         PolicyRequest {
-            actor_id: actor
-                .as_ref()
-                .map(|Extension(actor)| actor.actor_id.as_ref().to_string())
-                .unwrap_or_default(),
             action: PolicyAction::BranchCreate,
             branch: Some(from.clone()),
             target_branch: Some(request.name.clone()),
@@ -2107,7 +2072,6 @@ async fn server_branch_delete(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
         PolicyRequest {
-            actor_id: actor_id.map(str::to_string).unwrap_or_default(),
             action: PolicyAction::BranchDelete,
             branch: None,
             target_branch: Some(branch.clone()),
@@ -2169,7 +2133,6 @@ async fn server_branch_merge(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
         PolicyRequest {
-            actor_id: actor_id.map(str::to_string).unwrap_or_default(),
             action: PolicyAction::BranchMerge,
             branch: Some(request.source.clone()),
             target_branch: Some(target.clone()),
@@ -2223,10 +2186,6 @@ async fn server_commit_list(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
         PolicyRequest {
-            actor_id: actor
-                .as_ref()
-                .map(|Extension(actor)| actor.actor_id.as_ref().to_string())
-                .unwrap_or_default(),
             action: PolicyAction::Read,
             branch: query.branch.clone(),
             target_branch: None,
@@ -2273,10 +2232,6 @@ async fn server_commit_show(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
         PolicyRequest {
-            actor_id: actor
-                .as_ref()
-                .map(|Extension(actor)| actor.actor_id.as_ref().to_string())
-                .unwrap_or_default(),
             action: PolicyAction::Read,
             branch: None,
             target_branch: None,

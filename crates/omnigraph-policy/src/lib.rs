@@ -202,9 +202,16 @@ pub enum PolicyExpectation {
     Deny,
 }
 
+/// What a caller wants to do, sans identity. Actor identity flows
+/// through a separate `actor_id: &str` parameter on
+/// [`PolicyEngine::authorize`] / [`PolicyChecker::check`] — encoding
+/// the architectural invariant that actor identity is server-authoritative
+/// and must not be supplied by the same code path that supplies the
+/// requested action. In the HTTP layer, the bearer-token middleware
+/// resolves the actor and passes it independently; clients cannot
+/// smuggle identity inside this struct.
 #[derive(Debug, Clone)]
 pub struct PolicyRequest {
-    pub actor_id: String,
     pub action: PolicyAction,
     pub branch: Option<String>,
     pub target_branch: Option<String>,
@@ -413,22 +420,28 @@ impl PolicyEngine {
         PolicyCompiler::compile(&config, graph_id)
     }
 
-    pub fn authorize(&self, request: &PolicyRequest) -> Result<PolicyDecision> {
-        if !self.known_actors.contains(request.actor_id.as_str()) {
+    /// Evaluate a request. `actor_id` is supplied as a separate
+    /// argument (not inside `PolicyRequest`) so the type system enforces
+    /// the "server-authoritative actor identity" invariant — clients
+    /// supplying a `PolicyRequest` cannot smuggle identity through the
+    /// same struct that carries the requested action.
+    pub fn authorize(&self, actor_id: &str, request: &PolicyRequest) -> Result<PolicyDecision> {
+        if !self.known_actors.contains(actor_id) {
             return Ok(self.deny(
+                actor_id,
                 request,
                 None,
                 format!(
                     "policy denied action '{}' for unknown actor '{}'",
-                    request.action, request.actor_id
+                    request.action, actor_id
                 ),
             ));
         }
 
-        let principal = entity_uid("Actor", &request.actor_id)?;
+        let principal = entity_uid("Actor", actor_id)?;
         let action = entity_uid("Action", request.action.as_str())?;
-        // MR-668 PR 6a: pick the resource entity based on the action's
-        // `resource_kind`. Server-scoped actions (`graph_list`) bind to
+        // Pick the resource entity based on the action's `resource_kind`.
+        // Server-scoped actions (`graph_list`) bind to
         // `Omnigraph::Server::"root"`; per-graph actions bind to
         // `Omnigraph::Graph::"<graph_label>"`.
         let resource = match request.action.resource_kind() {
@@ -471,7 +484,7 @@ impl PolicyEngine {
                 matched_rule_id: matched_rule_id.clone(),
                 message: format!(
                     "policy allowed action '{}' for actor '{}'",
-                    request.action, request.actor_id
+                    request.action, actor_id
                 ),
             },
             Decision::Deny => {
@@ -488,15 +501,15 @@ impl PolicyEngine {
                         .as_deref()
                         .map(|branch| format!(" targeting branch '{}'", branch))
                         .unwrap_or_default(),
-                    request.actor_id
+                    actor_id
                 );
-                self.deny(request, matched_rule_id, message)
+                self.deny(actor_id, request, matched_rule_id, message)
             }
         })
     }
 
-    pub fn validate_request(&self, request: &PolicyRequest) -> Result<()> {
-        let _ = self.authorize(request)?;
+    pub fn validate_request(&self, actor_id: &str, request: &PolicyRequest) -> Result<()> {
+        let _ = self.authorize(actor_id, request)?;
         Ok(())
     }
 
@@ -506,12 +519,14 @@ impl PolicyEngine {
         }
         let mut failures = Vec::new();
         for case in &tests.cases {
-            let decision = self.authorize(&PolicyRequest {
-                actor_id: case.actor.clone(),
-                action: case.action,
-                branch: case.branch.clone(),
-                target_branch: case.target_branch.clone(),
-            })?;
+            let decision = self.authorize(
+                &case.actor,
+                &PolicyRequest {
+                    action: case.action,
+                    branch: case.branch.clone(),
+                    target_branch: case.target_branch.clone(),
+                },
+            )?;
             let expected_allowed = matches!(case.expect, PolicyExpectation::Allow);
             if decision.allowed != expected_allowed {
                 failures.push(format!(
@@ -535,6 +550,7 @@ impl PolicyEngine {
 
     fn deny(
         &self,
+        _actor_id: &str,
         _request: &PolicyRequest,
         matched_rule_id: Option<String>,
         message: String,
@@ -750,10 +766,6 @@ fn cedar_literal(value: &str) -> String {
 }
 
 impl PolicyRequest {
-    pub fn actor_id(&self) -> &str {
-        &self.actor_id
-    }
-
     pub fn action(&self) -> PolicyAction {
         self.action
     }
@@ -892,13 +904,12 @@ impl PolicyChecker for PolicyEngine {
     ) -> Result<(), PolicyError> {
         let (branch, target_branch) = scope.to_branch_pair();
         let request = PolicyRequest {
-            actor_id: actor.to_string(),
             action,
             branch: branch.map(|s| s.to_string()),
             target_branch: target_branch.map(|s| s.to_string()),
         };
         let decision = self
-            .authorize(&request)
+            .authorize(actor, &request)
             .map_err(|e| PolicyError::Internal(e.to_string()))?;
         if decision.allowed {
             Ok(())
@@ -1014,33 +1025,39 @@ rules:
 
         let engine = PolicyCompiler::compile(&policy, "graph").unwrap();
         let allow = engine
-            .authorize(&PolicyRequest {
-                actor_id: "act-bruno".to_string(),
-                action: PolicyAction::Change,
-                branch: Some("feature".to_string()),
-                target_branch: None,
-            })
+            .authorize(
+                "act-bruno",
+                &PolicyRequest {
+                    action: PolicyAction::Change,
+                    branch: Some("feature".to_string()),
+                    target_branch: None,
+                },
+            )
             .unwrap();
         assert!(allow.allowed);
         assert_eq!(allow.matched_rule_id.as_deref(), Some("team-write"));
 
         let deny = engine
-            .authorize(&PolicyRequest {
-                actor_id: "act-bruno".to_string(),
-                action: PolicyAction::BranchDelete,
-                branch: None,
-                target_branch: Some("main".to_string()),
-            })
+            .authorize(
+                "act-bruno",
+                &PolicyRequest {
+                    action: PolicyAction::BranchDelete,
+                    branch: None,
+                    target_branch: Some("main".to_string()),
+                },
+            )
             .unwrap();
         assert!(!deny.allowed);
 
         let admin = engine
-            .authorize(&PolicyRequest {
-                actor_id: "act-andrew".to_string(),
-                action: PolicyAction::BranchDelete,
-                branch: None,
-                target_branch: Some("main".to_string()),
-            })
+            .authorize(
+                "act-andrew",
+                &PolicyRequest {
+                    action: PolicyAction::BranchDelete,
+                    branch: None,
+                    target_branch: Some("main".to_string()),
+                },
+            )
             .unwrap();
         assert!(admin.allowed);
         assert_eq!(admin.matched_rule_id.as_deref(), Some("admins-promote"));
@@ -1109,27 +1126,31 @@ rules:
 
         let engine = PolicyCompiler::compile(&policy, "graph").unwrap();
         let allow = engine
-            .authorize(&PolicyRequest {
-                actor_id: "act-ragnor".to_string(),
-                action: PolicyAction::SchemaApply,
-                branch: None,
-                target_branch: Some("main".to_string()),
-            })
+            .authorize(
+                "act-ragnor",
+                &PolicyRequest {
+                    action: PolicyAction::SchemaApply,
+                    branch: None,
+                    target_branch: Some("main".to_string()),
+                },
+            )
             .unwrap();
         assert!(allow.allowed);
 
         let deny = engine
-            .authorize(&PolicyRequest {
-                actor_id: "act-ragnor".to_string(),
-                action: PolicyAction::SchemaApply,
-                branch: None,
-                target_branch: Some("feature".to_string()),
-            })
+            .authorize(
+                "act-ragnor",
+                &PolicyRequest {
+                    action: PolicyAction::SchemaApply,
+                    branch: None,
+                    target_branch: Some("feature".to_string()),
+                },
+            )
             .unwrap();
         assert!(!deny.allowed);
     }
 
-    // ─── MR-668 PR 6a — server-scoped action (graph_list) ─
+    // ─── MR-668 — server-scoped action (graph_list) ─
 
     #[test]
     fn graph_list_action_authorizes_against_server_resource() {
@@ -1155,24 +1176,28 @@ rules:
         let engine = PolicyCompiler::compile(&policy, "ignored").unwrap();
 
         let allow = engine
-            .authorize(&PolicyRequest {
-                actor_id: "act-andrew".to_string(),
-                action: PolicyAction::GraphList,
-                branch: None,
-                target_branch: None,
-            })
+            .authorize(
+                "act-andrew",
+                &PolicyRequest {
+                    action: PolicyAction::GraphList,
+                    branch: None,
+                    target_branch: None,
+                },
+            )
             .unwrap();
         assert!(allow.allowed);
         assert_eq!(allow.matched_rule_id.as_deref(), Some("admins-list-graphs"));
 
         // Different actor, same policy → deny.
         let deny = engine
-            .authorize(&PolicyRequest {
-                actor_id: "act-bruno".to_string(),
-                action: PolicyAction::GraphList,
-                branch: None,
-                target_branch: None,
-            })
+            .authorize(
+                "act-bruno",
+                &PolicyRequest {
+                    action: PolicyAction::GraphList,
+                    branch: None,
+                    target_branch: None,
+                },
+            )
             .unwrap();
         assert!(!deny.allowed);
     }
@@ -1251,12 +1276,14 @@ rules:
         .unwrap();
         let engine = PolicyCompiler::compile(&policy, "graph").unwrap();
         let allow = engine
-            .authorize(&PolicyRequest {
-                actor_id: "act-andrew".to_string(),
-                action: PolicyAction::Read,
-                branch: Some("main".to_string()),
-                target_branch: None,
-            })
+            .authorize(
+                "act-andrew",
+                &PolicyRequest {
+                    action: PolicyAction::Read,
+                    branch: Some("main".to_string()),
+                    target_branch: None,
+                },
+            )
             .unwrap();
         assert!(allow.allowed);
         assert_eq!(allow.matched_rule_id.as_deref(), Some("team-read"));
