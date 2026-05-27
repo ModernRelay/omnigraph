@@ -2,7 +2,7 @@ mod helpers;
 
 use std::fs;
 
-use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::db::{InitOptions, Omnigraph, ReadTarget};
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::{build_schema_ir, schema_ir_pretty_json};
 
@@ -249,5 +249,58 @@ async fn init_on_existing_graph_uri_does_not_destroy_existing_schema() {
         fs::read_to_string(dir.path().join("__schema_state.json")).unwrap(),
         original_schema_state,
         "__schema_state.json contents must be preserved when re-init is rejected"
+    );
+}
+
+/// Happy-path sibling to the strict re-init regression above:
+/// `InitOptions { force: true }` must skip the schema-file preflight
+/// when the operator deliberately wants to recover from orphan
+/// schema artifacts (e.g. files left behind by a failed prior init).
+///
+/// Documented semantics per `InitOptions::force`: skips the preflight
+/// only. Force does NOT purge existing Lance datasets or `__manifest/`
+/// — that needs `StorageAdapter::delete_prefix`, which is tracked
+/// separately. The realistic recovery scenario is "schema files
+/// exist but Lance state doesn't," which this test reproduces.
+///
+/// Without this test, a future refactor could invert the `if !force`
+/// branch and silently break the operator-facing escape hatch.
+#[tokio::test]
+async fn init_with_force_recovers_from_orphan_schema_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    // Simulate orphan schema files: write `_schema.pg` to disk
+    // without running a full init. The preflight will see it and
+    // bail in strict mode.
+    fs::write(dir.path().join("_schema.pg"), TEST_SCHEMA).unwrap();
+
+    // Strict mode refuses because `_schema.pg` exists.
+    let strict_err = match Omnigraph::init(uri, TEST_SCHEMA).await {
+        Ok(_) => panic!("strict init must refuse when orphan _schema.pg exists"),
+        Err(e) => e,
+    };
+    assert!(
+        strict_err.to_string().contains("already initialized"),
+        "strict init must surface AlreadyInitialized (sanity check); got: {strict_err}"
+    );
+
+    // Force init succeeds: it skips the preflight, overwrites the
+    // orphan file, and proceeds to initialize Lance state (which
+    // didn't exist, so `GraphCoordinator::init` is unblocked).
+    let db = Omnigraph::init_with_options(uri, TEST_SCHEMA, InitOptions { force: true })
+        .await
+        .expect("force init must succeed when only orphan schema files block strict init");
+
+    // Confirm the catalog is populated as expected — proves the
+    // graph is functional after force-recovery, not just that the
+    // call returned Ok.
+    assert!(
+        db.catalog().node_types.contains_key("Person"),
+        "force-recovered graph must have the new catalog installed"
+    );
+    assert!(
+        dir.path().join("__schema_state.json").exists(),
+        "force-recovered graph must have full schema state written"
     );
 }

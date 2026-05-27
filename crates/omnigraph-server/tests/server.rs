@@ -4482,6 +4482,81 @@ mod multi_graph_startup {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// Coverage net for cluster-route regressions across every
+    /// protected handler — not just the few that have inner path
+    /// params. Bug-1 surfaced because only `/snapshot` was being
+    /// exercised in cluster mode, leaving the other six protected
+    /// routes implicitly untested. This sweep hits each one and
+    /// asserts the response shows the handler was reached: no 404
+    /// (router didn't match), no 500 with "Wrong number of path
+    /// arguments" (path extractor broke), no 500 with "missing
+    /// extension" (routing middleware didn't inject the handle).
+    ///
+    /// Status codes are negative assertions because each handler's
+    /// happy-path inputs differ — what matters is "the request
+    /// reached the handler," not "the handler returned 200." The
+    /// individual handlers' logic is already tested in single mode.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn all_protected_cluster_routes_resolve_to_their_handler() {
+        let (_dirs, app) = build_multi_mode_app(&["alpha"]).await;
+
+        // (method, path, body) — one minimal request per protected
+        // cluster route. Bodies are valid enough that the router and
+        // extractors succeed; whether the engine ultimately returns
+        // 200 or 4xx is per-handler and not what this test pins.
+        let cases: &[(Method, &str, Option<&str>)] = &[
+            (Method::GET, "/graphs/alpha/snapshot?branch=main", None),
+            (Method::GET, "/graphs/alpha/schema", None),
+            (Method::GET, "/graphs/alpha/branches", None),
+            (Method::GET, "/graphs/alpha/commits", None),
+            (Method::POST, "/graphs/alpha/read", Some(r#"{"query_source":"query q() { return {} }"}"#)),
+            (Method::POST, "/graphs/alpha/change", Some(r#"{"query_source":"query q() { return {} }"}"#)),
+            (Method::POST, "/graphs/alpha/export", Some(r#"{"branch":"main"}"#)),
+            (Method::POST, "/graphs/alpha/schema/apply", Some(r#"{"schema_source":"","allow_data_loss":false}"#)),
+            (Method::POST, "/graphs/alpha/ingest", Some(r#"{"data":""}"#)),
+            (Method::POST, "/graphs/alpha/branches/merge", Some(r#"{"source":"main","target":"main"}"#)),
+        ];
+
+        for (method, path, body) in cases {
+            let req_body = body.map(|s| Body::from(s.to_string())).unwrap_or_else(Body::empty);
+            let req = Request::builder()
+                .method(method.clone())
+                .uri(*path)
+                .header("content-type", "application/json")
+                .body(req_body)
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            let status = resp.status();
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body_str = String::from_utf8_lossy(&bytes);
+
+            assert_ne!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{} {} — router didn't match (cluster-route mounting regression). Body: {}",
+                method,
+                path,
+                body_str,
+            );
+            assert!(
+                !(status == StatusCode::INTERNAL_SERVER_ERROR
+                    && body_str.contains("Wrong number of path arguments")),
+                "{} {} — path extractor broke (Bug-1 class regression). Body: {}",
+                method,
+                path,
+                body_str,
+            );
+            assert!(
+                !(status == StatusCode::INTERNAL_SERVER_ERROR
+                    && body_str.to_lowercase().contains("missing extension")),
+                "{} {} — routing middleware didn't inject GraphHandle. Body: {}",
+                method,
+                path,
+                body_str,
+            );
+        }
+    }
+
     /// Regression for the bot-surfaced path-extractor bug: cluster
     /// routes whose inner path also captures a parameter
     /// (`/graphs/{graph_id}/branches/{branch}`,
@@ -4493,9 +4568,10 @@ mod multi_graph_startup {
     /// GET commit-by-id break in multi-mode because their handlers
     /// use bare `Path<String>` — this test pins the fix.
     ///
-    /// `cluster_routes_dispatch_per_graph_handle` only exercises
-    /// `/snapshot` (no Path extractor), so the regression slipped
-    /// through. This test closes that gap structurally.
+    /// The broader `all_protected_cluster_routes_resolve_to_their_handler`
+    /// test sweeps the full route surface; this one stays narrowly
+    /// targeted at the inner-path-param shape because that's the
+    /// specific regression class.
     #[tokio::test(flavor = "multi_thread")]
     async fn cluster_routes_with_inner_path_params_deserialize_correctly() {
         let (_dirs, app) = build_multi_mode_app(&["alpha"]).await;
