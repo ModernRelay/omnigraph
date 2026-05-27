@@ -3695,11 +3695,11 @@ async fn ingest_per_actor_admission_cap_returns_429() {
 
 /// Regression for B2 (MR-668): when an `AppState` is built with a
 /// per-graph policy and a custom workload, the engine inside the
-/// registry's `GraphHandle` MUST have the same policy applied via
+/// routing's `GraphHandle` MUST have the same policy applied via
 /// `Omnigraph::with_policy`. Pre-fix, `new_with_workload(...).with_policy_engine(p)`
 /// installed the policy only on the HTTP-layer `handle.policy`; the
 /// underlying `Arc<Omnigraph>` was reused without `with_policy`, so any
-/// caller reaching through `state.registry().list()` could bypass Cedar.
+/// caller reaching through `state.routing()` could bypass Cedar.
 ///
 /// This test reaches the engine the same way an embedded SDK consumer
 /// or future routing code path would, and asserts the policy still
@@ -3707,6 +3707,7 @@ async fn ingest_per_actor_admission_cap_returns_429() {
 /// the policy's allowed group" — i.e., authenticated-but-unauthorised.
 #[tokio::test(flavor = "multi_thread")]
 async fn engine_layer_policy_fires_via_direct_arc_omnigraph_from_new_single() {
+    use omnigraph_server::GraphRouting;
     let temp = init_loaded_graph().await;
     let graph = graph_path(temp.path());
     let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
@@ -3728,11 +3729,14 @@ async fn engine_layer_policy_fires_via_direct_arc_omnigraph_from_new_single() {
         workload,
     );
 
-    // Reach into the registry and pull the engine the same way an
+    // Reach into the routing and pull the engine the same way an
     // embedded consumer holding `Arc<Omnigraph>` would. If `new_single`
     // failed to apply `with_policy` to the engine, this `mutate_as`
     // would succeed — the HTTP-layer is bypassed entirely.
-    let handle = state.registry().list().into_iter().next().expect("handle");
+    let handle = match state.routing() {
+        GraphRouting::Single { handle } => Arc::clone(handle),
+        GraphRouting::Multi { .. } => panic!("expected single-mode routing"),
+    };
     let engine = Arc::clone(&handle.engine);
 
     let mut params: omnigraph_compiler::ParamMap = Default::default();

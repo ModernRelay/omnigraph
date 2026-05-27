@@ -179,63 +179,32 @@ pub struct GraphStartupConfig {
     pub policy_file: Option<PathBuf>,
 }
 
-/// Server runtime topology. Single mode = legacy `omnigraph-server <URI>`
-/// invocation, one graph, flat HTTP routes. Multi mode = `--config
-/// omnigraph.yaml` with a `graphs:` map, N graphs, cluster routes
-/// (`/graphs/{graph_id}/...`). Mode is determined at startup by
-/// `load_server_settings`.
+/// Runtime routing for the server. Single mode = legacy
+/// `omnigraph-server <URI>` invocation, one graph, flat HTTP routes.
+/// Multi mode = `--config omnigraph.yaml` with a non-empty `graphs:`
+/// map, N graphs, cluster routes (`/graphs/{graph_id}/...`). Mode is
+/// determined at startup by `load_server_settings`.
 ///
-/// Both modes share the same handler bodies — the routing middleware
-/// (`resolve_graph_handle`) injects `Arc<GraphHandle>` as a request
-/// extension so handlers never see the mode discriminator directly.
-#[derive(Clone, Debug)]
-pub enum ServerMode {
-    /// Single-graph invocation. The `uri` is the only graph's URI.
-    /// Backward compatible with v0.6.0 deployments.
-    Single { uri: String },
-    /// Multi-graph invocation (MR-668). `config_path` is the
-    /// `omnigraph.yaml` the server reads at startup. The server treats
-    /// the file as operator-owned and never writes it; runtime
-    /// add/remove (deferred) is the only path that would touch it.
-    Multi { config_path: Option<PathBuf> },
-}
-
-/// Sentinel `GraphId` for single-graph mode. The single graph is
-/// registered under this key in the registry; the routing middleware
-/// uses it to inject the handle on every flat-route request. The
-/// value is operator-invisible — it does NOT need to be unique with
-/// any user-facing graph id since single-mode never serves cluster
-/// routes.
-///
-/// **Deprecated in C-1, removed in C-3 of this PR sequence.** The
-/// new `GraphRouting::Single` arm carries `Arc<GraphHandle>` directly,
-/// so there is no longer a need to thread the single-mode handle
-/// through a one-element registry under a magic key.
-pub(crate) const SINGLE_GRAPH_KEY_ID: &str = "default";
-
-/// Runtime routing for the server. Replaces the prior pairing of
-/// `ServerMode` (discriminant + Single's `uri`) with `Arc<GraphRegistry>`
-/// (always populated, even when serving one graph through a sentinel
-/// key). In single-graph mode there is no registry to traverse —
-/// the single handle lives here directly. In multi-graph mode the
+/// In single mode the handle lives here directly — there is no
+/// registry, no sentinel key, no walk-and-assert. In multi mode the
 /// registry carries N handles and the middleware dispatches on the
 /// URL's `{graph_id}` segment.
 ///
-/// Closes the "single mode is forced through a multi-mode abstraction"
-/// class: `SINGLE_GRAPH_KEY_ID`, the registry-walk-and-assert helper
-/// (`single_mode_handle`), and the 500-class "programmer error"
-/// branch all go away in C-3.
+/// Both modes share the same handler bodies — the routing middleware
+/// (`resolve_graph_handle`) injects `Arc<GraphHandle>` as a request
+/// extension so handlers never see the routing discriminator.
 #[derive(Clone)]
 pub enum GraphRouting {
     /// Single-graph deployment: one handle, flat routes (`/snapshot`,
     /// `/read`, …). The `handle.uri` field carries the URI the engine
-    /// was opened from (replaces `ServerMode::Single { uri }`).
+    /// was opened from. Backward compatible with v0.6.0 deployments.
     Single { handle: Arc<GraphHandle> },
     /// Multi-graph deployment: many handles, cluster routes
     /// (`/graphs/{graph_id}/...`). `config_path` is the `omnigraph.yaml`
     /// the server reads at startup; preserved here so future runtime
     /// mutation (deferred) can find the source of truth without
-    /// re-parsing CLI args (replaces `ServerMode::Multi { config_path }`).
+    /// re-parsing CLI args. The server treats the file as
+    /// operator-owned and never writes it.
     Multi {
         registry: Arc<GraphRegistry>,
         config_path: Option<PathBuf>,
@@ -244,24 +213,12 @@ pub enum GraphRouting {
 
 #[derive(Clone)]
 pub struct AppState {
-    /// Topology + (single mode only) the single graph's URI for
-    /// startup wiring. The registry below is the runtime source of
-    /// truth in multi mode; the routing field below is the new
-    /// source-of-truth for both modes.
-    ///
-    /// **C-1 transitional**: `mode` and `registry` are kept populated
-    /// in lockstep with `routing` so middleware that reads from either
-    /// shape continues to work. C-2 switches the middleware to
-    /// `routing`; C-3 removes the two legacy fields.
-    mode: ServerMode,
-    /// MR-686 + MR-668: legacy multi-graph registry. C-2 stops the
-    /// middleware from reading this in single mode; C-3 removes the
-    /// field entirely (multi mode reads via `routing`).
-    registry: Arc<GraphRegistry>,
-    /// New runtime routing source of truth (C-1). Holds the single
-    /// handle directly in single mode (no registry-walk-and-assert)
-    /// and the registry + config_path in multi mode. Middleware
-    /// migration to read from here lands in C-2.
+    /// Runtime routing — the single source of truth for where each
+    /// request's graph lives. Single mode holds the handle directly;
+    /// multi mode holds the registry + config path. Both arms are
+    /// the same shape from a handler's perspective: middleware
+    /// extracts an `Arc<GraphHandle>` and injects it as a request
+    /// extension.
     routing: GraphRouting,
     /// Per-actor admission control. Process-wide (not per-graph) —
     /// see MR-668 decision Q6.
@@ -431,9 +388,10 @@ impl AppState {
     }
 
     /// Single-mode shared construction: wraps the bare engine + per-graph
-    /// policy in a `GraphHandle` registered under the sentinel
-    /// `SINGLE_GRAPH_KEY_ID` key. Per-graph policy enforcement on the
-    /// engine (MR-722) is re-applied via `Omnigraph::with_policy`.
+    /// policy in a `GraphHandle` carried directly by `GraphRouting::Single`.
+    /// Per-graph policy enforcement on the engine (MR-722) is re-applied
+    /// via `Omnigraph::with_policy` so HTTP and engine layers can never
+    /// diverge.
     fn build_single_mode(
         uri: String,
         db: Omnigraph,
@@ -451,27 +409,26 @@ impl AppState {
         } else {
             db
         };
+        // `GraphHandle.key` is required by the struct, but in single
+        // mode it is never a registry key (there's no registry) and
+        // never compared against user input (routes are flat, no
+        // `{graph_id}` parameter). The label appears only in tracing
+        // output from `resolve_graph_handle`. The literal below is a
+        // log label, not a routing key — when the future cluster
+        // catalog ships, single mode may carry the catalog-assigned
+        // id here instead.
         let key = GraphKey::cluster(
-            GraphId::try_from(SINGLE_GRAPH_KEY_ID)
-                .expect("single-graph sentinel key must validate"),
+            GraphId::try_from("default")
+                .expect("'default' is a valid GraphId log label"),
         );
         let handle = Arc::new(GraphHandle {
             key,
-            uri: uri.clone(),
+            uri,
             engine: Arc::new(db),
             policy: policy_engine,
         });
-        let registry = Arc::new(
-            GraphRegistry::from_handles(vec![Arc::clone(&handle)])
-                .expect("single-mode registry construction is infallible"),
-        );
-        let routing = GraphRouting::Single {
-            handle: Arc::clone(&handle),
-        };
         Self {
-            mode: ServerMode::Single { uri },
-            registry,
-            routing,
+            routing: GraphRouting::Single { handle },
             workload,
             bearer_tokens,
             server_policy: None,
@@ -494,38 +451,24 @@ impl AppState {
     ) -> std::result::Result<Self, InsertError> {
         let bearer_tokens = hash_bearer_tokens(bearer_tokens);
         let registry = Arc::new(GraphRegistry::from_handles(handles)?);
-        let routing = GraphRouting::Multi {
-            registry: Arc::clone(&registry),
-            config_path: config_path.clone(),
-        };
         Ok(Self {
-            mode: ServerMode::Multi { config_path },
-            registry,
-            routing,
+            routing: GraphRouting::Multi {
+                registry,
+                config_path,
+            },
             workload: Arc::new(workload),
             bearer_tokens,
             server_policy: server_policy.map(Arc::new),
         })
     }
 
-    /// Topology accessor. Handlers don't typically inspect this — they
-    /// extract `Arc<GraphHandle>` via the routing middleware — but
-    /// `build_app` does to decide flat vs nested route mounting.
-    pub fn mode(&self) -> &ServerMode {
-        &self.mode
-    }
-
-    /// The configured URI in single mode. Returns `None` in multi mode —
-    /// each graph has its own URI on `handle.uri` instead.
-    pub fn uri(&self) -> Option<&str> {
-        match &self.mode {
-            ServerMode::Single { uri } => Some(uri.as_str()),
-            ServerMode::Multi { .. } => None,
-        }
-    }
-
-    pub fn registry(&self) -> &Arc<GraphRegistry> {
-        &self.registry
+    /// Runtime routing accessor. Handlers don't typically inspect this —
+    /// they extract `Arc<GraphHandle>` via the routing middleware — but
+    /// `build_app` matches on it to decide flat vs nested route
+    /// mounting, and a handful of management endpoints (`GET /graphs`,
+    /// the OpenAPI cluster rewrite) match on the discriminant.
+    pub fn routing(&self) -> &GraphRouting {
+        &self.routing
     }
 
     fn requires_bearer_auth(&self) -> bool {
@@ -998,9 +941,9 @@ pub fn build_app(state: AppState) -> Router {
     // Mount the protected routes differently per mode:
     //   * Single → flat routes (legacy: `/snapshot`, `/read`, etc.)
     //   * Multi  → nested under `/graphs/{graph_id}/...`
-    let protected: Router<AppState> = match state.mode() {
-        ServerMode::Single { .. } => per_graph_protected.merge(management),
-        ServerMode::Multi { .. } => Router::new()
+    let protected: Router<AppState> = match state.routing() {
+        GraphRouting::Single { .. } => per_graph_protected.merge(management),
+        GraphRouting::Multi { .. } => Router::new()
             .nest("/graphs/{graph_id}", per_graph_protected)
             .merge(management),
     };
@@ -1222,11 +1165,14 @@ async fn server_graphs_list(
 ) -> std::result::Result<Json<GraphListResponse>, ApiError> {
     // 405 in single mode — there's no registry to enumerate, and the
     // legacy URL surface didn't expose this endpoint.
-    if matches!(state.mode(), ServerMode::Single { .. }) {
-        return Err(ApiError::method_not_allowed(
-            "GET /graphs is only available in multi-graph mode",
-        ));
-    }
+    let registry = match state.routing() {
+        GraphRouting::Single { .. } => {
+            return Err(ApiError::method_not_allowed(
+                "GET /graphs is only available in multi-graph mode",
+            ));
+        }
+        GraphRouting::Multi { registry, .. } => registry,
+    };
 
     // Server-level Cedar gate. `state.server_policy` is loaded from
     // `server.policy.file` in `omnigraph.yaml` at startup. When no
@@ -1246,8 +1192,7 @@ async fn server_graphs_list(
         },
     )?;
 
-    let mut graphs: Vec<GraphInfo> = state
-        .registry()
+    let mut graphs: Vec<GraphInfo> = registry
         .list()
         .into_iter()
         .map(|handle| GraphInfo {
@@ -1268,7 +1213,7 @@ async fn server_openapi(State(state): State<AppState>) -> Json<utoipa::openapi::
     // `/graphs/{graph_id}/...`. Rewrite the doc so the spec matches
     // the routes the router actually serves. Public paths (`/healthz`)
     // stay flat in both modes.
-    if matches!(state.mode(), ServerMode::Multi { .. }) {
+    if matches!(state.routing(), GraphRouting::Multi { .. }) {
         nest_paths_under_cluster_prefix(&mut doc);
     }
     Json(doc)
