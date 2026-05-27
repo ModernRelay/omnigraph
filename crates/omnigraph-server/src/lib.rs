@@ -1497,7 +1497,6 @@ fn authorize_request(
 /// count) for every table on the branch. Defaults to `main` when `branch` is
 /// omitted. Read-only.
 async fn server_snapshot(
-    State(_state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
     Query(query): Query<SnapshotQuery>,
@@ -1543,7 +1542,6 @@ async fn server_snapshot(
 /// match the parameters declared by the query. Returns rows as a JSON array
 /// plus a `columns` list. Read-only.
 async fn server_read(
-    State(_state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
     Json(request): Json<ReadRequest>,
@@ -1616,7 +1614,6 @@ async fn server_read(
 /// streams the entire branch. Suitable for large exports — the response is
 /// streamed, not buffered. Read-only.
 async fn server_export(
-    State(_state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
     Json(request): Json<ExportRequest>,
@@ -1759,7 +1756,6 @@ async fn server_change(
 /// Useful for clients that want to introspect available types and tables
 /// before constructing GQ queries. Read-only.
 async fn server_schema_get(
-    State(_state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
 ) -> std::result::Result<Json<SchemaOutput>, ApiError> {
@@ -1948,7 +1944,6 @@ async fn server_ingest(
 ///
 /// Returns branch names sorted alphabetically. Read-only.
 async fn server_branch_list(
-    State(_state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
 ) -> std::result::Result<Json<BranchListOutput>, ApiError> {
@@ -2177,7 +2172,6 @@ async fn server_branch_merge(
 /// Filter by `branch` to get the commits on a single branch (most recent
 /// first); omit to list across all branches. Read-only.
 async fn server_commit_list(
-    State(_state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
     Query(query): Query<CommitListQuery>,
@@ -2223,7 +2217,6 @@ async fn server_commit_list(
 /// Returns the commit's manifest version, parent commit(s), and creation
 /// metadata. Read-only.
 async fn server_commit_show(
-    State(_state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
     Path(commit_id): Path<String>,
