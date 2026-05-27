@@ -1388,10 +1388,12 @@ async fn resolve_graph_handle(
         }
     };
 
-    // Record the graph id on the current tracing span for per-request
-    // observability. Operators correlating logs across requests reach for
-    // this field; in single mode it's the sentinel `default`.
-    tracing::Span::current().record("graph_id", handle.key.graph_id.as_str());
+    // Per-request observability. `Span::current().record` would silently
+    // no-op here because no upstream `#[tracing::instrument(...)]` macro
+    // declares a `graph_id` field; emit an explicit event instead so the
+    // routing decision actually lands in logs. In single mode the value
+    // is the sentinel `default`.
+    info!(graph_id = %handle.key.graph_id, "graph routed");
 
     request.extensions_mut().insert(handle);
     Ok(next.run(request).await)
