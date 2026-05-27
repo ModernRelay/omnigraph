@@ -371,15 +371,17 @@ impl AppState {
         bearer_tokens: Vec<(String, String)>,
         policy_file: Option<&PathBuf>,
     ) -> Result<Self> {
+        // The "policy requires tokens" invariant is enforced once by
+        // `classify_server_runtime_state` in `serve()`, before either
+        // single-mode or multi-mode construction is reached. By the
+        // time we get here, the (policy, no-tokens) combination has
+        // already been rejected — no second bail needed.
         let uri = uri.into();
         let db = Omnigraph::open(&uri).await?;
         let policy_engine = match policy_file {
             Some(path) => Some(PolicyEngine::load_graph(path, &uri)?),
             None => None,
         };
-        if policy_engine.is_some() && bearer_tokens.is_empty() {
-            bail!("policy requires at least one configured bearer token actor");
-        }
         Ok(Self::new_with_bearer_tokens_and_policy(
             uri,
             db,
@@ -854,10 +856,14 @@ pub fn server_config_is_multi(config: &ServerConfig) -> bool {
 ///   server requires a valid bearer token; once authenticated, every
 ///   action except `Read` is denied with 403. Closes the "tokens but
 ///   forgot the policy file" trap.
-/// * **PolicyEnabled** — policy file configured. Cedar evaluates every
-///   authenticated request. Tokens may also be configured (typical) or
-///   not (unusual but valid — every request fails 401 without a
-///   bearer, which is effectively "locked").
+/// * **PolicyEnabled** — policy file configured and at least one
+///   bearer token configured. Cedar evaluates every authenticated
+///   request. Policy without tokens is rejected at startup —
+///   such a server would 401 every request, which is bug-shaped
+///   rather than feature-shaped (operators wanting "deny all
+///   unauthenticated traffic" should configure tokens plus a
+///   deny-all policy to get meaningful 403s with policy-decision
+///   logging instead).
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ServerRuntimeState {
     Open,
@@ -866,8 +872,15 @@ pub enum ServerRuntimeState {
 }
 
 /// Compute the [`ServerRuntimeState`] from the configured inputs.
-/// Pulled out as a pure function so the 3-state matrix is unit-testable
+/// Pulled out as a pure function so the matrix is unit-testable
 /// without standing up the full server.
+///
+/// The classifier is the **single source of truth** for "should we
+/// start?" — both `serve()`'s single-mode and multi-mode branches
+/// call this before constructing their `AppState`. Adding a startup
+/// invariant here means both modes enforce it automatically; the
+/// alternative (per-constructor `bail!`) drifts the moment a third
+/// mode is added.
 pub fn classify_server_runtime_state(
     has_tokens: bool,
     has_policy: bool,
@@ -882,7 +895,14 @@ pub fn classify_server_runtime_state(
         ),
         (false, false, true) => Ok(ServerRuntimeState::Open),
         (true, false, _) => Ok(ServerRuntimeState::DefaultDeny),
-        (_, true, _) => Ok(ServerRuntimeState::PolicyEnabled),
+        (false, true, _) => bail!(
+            "policy file is configured but no bearer tokens — every request would 401 \
+             because no token can ever match. Configure at least one bearer token (see \
+             docs/user/server.md), or remove the policy file. To deny all unauthenticated \
+             traffic deliberately, configure tokens plus a deny-all Cedar rule — that \
+             produces meaningful 403s with policy-decision logging instead of silent 401s."
+        ),
+        (true, true, _) => Ok(ServerRuntimeState::PolicyEnabled),
     }
 }
 
@@ -2377,9 +2397,10 @@ fn server_bearer_tokens_from_env() -> Result<Vec<(String, String)>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ServerConfig, ServerConfigMode, ServerRuntimeState, classify_server_runtime_state,
-        hash_bearer_token, load_server_settings, normalize_bearer_token,
-        parse_bearer_tokens_json, serve, server_bearer_tokens_from_env,
+        GraphStartupConfig, ServerConfig, ServerConfigMode, ServerRuntimeState,
+        classify_server_runtime_state, hash_bearer_token, load_server_settings,
+        normalize_bearer_token, parse_bearer_tokens_json, serve,
+        server_bearer_tokens_from_env,
     };
     use serial_test::serial;
     use std::env;
@@ -2544,6 +2565,57 @@ server:
 
     #[tokio::test]
     #[serial]
+    async fn serve_refuses_to_start_with_policy_but_no_tokens_multi_mode() {
+        // Bug 2 from the bot-review pass: multi-mode startup was missing
+        // the "policy requires tokens" check that single-mode enforces.
+        // After centralizing the check in `classify_server_runtime_state`,
+        // both modes get the same enforcement. This test guards the
+        // multi-mode propagation path.
+        //
+        // Sibling test below pins single mode. Together they pin that
+        // the classifier is called from both branches of `serve()`.
+        let _guard = EnvGuard::set(&[
+            ("OMNIGRAPH_SERVER_BEARER_TOKEN", None),
+            ("OMNIGRAPH_SERVER_BEARER_TOKENS_FILE", None),
+            ("OMNIGRAPH_SERVER_BEARER_TOKENS_JSON", None),
+            ("OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET", None),
+            ("OMNIGRAPH_UNAUTHENTICATED", None),
+        ]);
+        let temp = tempdir().unwrap();
+        // The classifier reads `has_policy_configured` from the config
+        // shape (does the Option contain a path?), not from file
+        // existence, so we can hand it a path without writing a real
+        // policy file — the bail fires before policy load.
+        let policy_path = temp.path().join("server-policy.yaml");
+        let config = ServerConfig {
+            mode: ServerConfigMode::Multi {
+                graphs: vec![GraphStartupConfig {
+                    graph_id: "alpha".to_string(),
+                    uri: temp
+                        .path()
+                        .join("alpha.omni")
+                        .to_string_lossy()
+                        .into_owned(),
+                    policy_file: None,
+                }],
+                config_path: temp.path().join("omnigraph.yaml"),
+                server_policy_file: Some(policy_path),
+            },
+            bind: "127.0.0.1:0".to_string(),
+            allow_unauthenticated: false,
+        };
+        let result = serve(config).await;
+        let err = result
+            .expect_err("serve should refuse to start in multi mode with policy but no tokens");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("policy file is configured but no bearer tokens"),
+            "expected policy-without-tokens rejection in multi mode, got: {msg}",
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn serve_refuses_to_start_in_state_1_without_unauthenticated() {
         // MR-723 PR A: pin the integration boundary that the classifier
         // is actually called by `serve()` before any side-effecting
@@ -2657,23 +2729,41 @@ server:
     }
 
     #[test]
-    fn classify_policy_enabled_always_wins() {
-        // State 3: any setup with a policy file → PolicyEnabled. The
-        // flag doesn't matter and tokens-or-not doesn't matter (no
-        // tokens + policy is unusual but valid — every request fails
-        // 401 without a bearer, which is effectively "locked").
+    fn classify_policy_enabled_requires_tokens() {
+        // State 3: tokens + policy → PolicyEnabled, regardless of the
+        // `allow_unauthenticated` flag (Cedar evaluates the bearer,
+        // the flag is moot once tokens exist).
         assert_eq!(
             classify_server_runtime_state(true, true, false).unwrap(),
-            ServerRuntimeState::PolicyEnabled
-        );
-        assert_eq!(
-            classify_server_runtime_state(false, true, false).unwrap(),
             ServerRuntimeState::PolicyEnabled
         );
         assert_eq!(
             classify_server_runtime_state(true, true, true).unwrap(),
             ServerRuntimeState::PolicyEnabled
         );
+    }
+
+    #[test]
+    fn classify_policy_without_tokens_is_rejected() {
+        // Closes the "policy installed but no tokens → silent 401 on
+        // every request" footgun. The same shape that single-mode
+        // `open_with_bearer_tokens_and_policy` used to bail on
+        // privately is now rejected by the classifier so both single
+        // and multi mode get the same enforcement from one source of
+        // truth.
+        for allow_unauthenticated in [false, true] {
+            let err = classify_server_runtime_state(false, true, allow_unauthenticated)
+                .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("policy file is configured but no bearer tokens"),
+                "expected policy-without-tokens rejection message; got: {msg}"
+            );
+            assert!(
+                msg.contains("every request would 401"),
+                "rejection message must name the failure mode; got: {msg}"
+            );
+        }
     }
 
     #[test]
