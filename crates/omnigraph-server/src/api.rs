@@ -344,6 +344,11 @@ pub enum ErrorCode {
     Forbidden,
     BadRequest,
     NotFound,
+    /// 405 Method Not Allowed — the route exists but the active server
+    /// mode doesn't serve this method (e.g. `GET /graphs` in single-graph
+    /// mode). Distinct from 404 so clients can tell "wrong context" from
+    /// "no such resource."
+    MethodNotAllowed,
     Conflict,
     /// 429 Too Many Requests — per-actor admission cap exceeded.
     /// Clients should respect the `Retry-After` header.

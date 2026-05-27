@@ -567,6 +567,20 @@ impl ApiError {
         }
     }
 
+    /// HTTP 405 Method Not Allowed. Used when the route is mounted but
+    /// the active server mode doesn't serve it (`GET /graphs` in
+    /// single-graph mode returns this instead of 404 so clients can
+    /// distinguish "wrong context" from "no such resource").
+    pub fn method_not_allowed(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::METHOD_NOT_ALLOWED,
+            code: ErrorCode::MethodNotAllowed,
+            message: message.into(),
+            merge_conflicts: Vec::new(),
+            manifest_conflict: None,
+        }
+    }
+
     pub fn conflict(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
@@ -1155,13 +1169,9 @@ async fn server_graphs_list(
     // 405 in single mode — there's no registry to enumerate, and the
     // legacy URL surface didn't expose this endpoint.
     if matches!(state.mode(), ServerMode::Single { .. }) {
-        return Err(ApiError {
-            status: StatusCode::METHOD_NOT_ALLOWED,
-            code: ErrorCode::BadRequest,
-            message: "GET /graphs is only available in multi-graph mode".to_string(),
-            merge_conflicts: Vec::new(),
-            manifest_conflict: None,
-        });
+        return Err(ApiError::method_not_allowed(
+            "GET /graphs is only available in multi-graph mode",
+        ));
     }
 
     // Server-level Cedar gate. `state.server_policy` is loaded from

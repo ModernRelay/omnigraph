@@ -1256,6 +1256,7 @@
           "forbidden",
           "bad_request",
           "not_found",
+          "method_not_allowed",
           "conflict",
           "too_many_requests",
           "internal"
