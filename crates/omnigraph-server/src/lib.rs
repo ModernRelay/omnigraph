@@ -684,6 +684,12 @@ impl ApiError {
             // engine gate fires, the bearer is valid — any failure from
             // the engine is a policy outcome, not an auth one.
             OmniError::Policy(message) => Self::forbidden(message),
+            // `Omnigraph::init` against an existing graph URI in strict
+            // mode. Not currently HTTP-reachable (POST /graphs was
+            // pulled), but mapping is wired so the variant has a
+            // single canonical translation when a future runtime
+            // create endpoint lands.
+            err @ OmniError::AlreadyInitialized { .. } => Self::conflict(err.to_string()),
         }
     }
 }

@@ -165,29 +165,92 @@ pub enum OpenMode {
     ReadOnly,
 }
 
+/// Options for [`Omnigraph::init_with_options`].
+///
+/// `force` controls the safety preflight that prevents an
+/// accidental re-init from overwriting an existing graph's schema
+/// metadata. Default behavior (`force: false`) fails fast with
+/// [`OmniError::AlreadyInitialized`] if any of `_schema.pg`,
+/// `_schema.ir.json`, or `__schema_state.json` already exists at
+/// the target URI. With `force: true` the preflight is skipped —
+/// existing schema files are overwritten in place. Force does NOT
+/// purge old Lance datasets or `__manifest/`; reclaiming those
+/// still requires deleting the graph directory by hand (or via a
+/// future `DELETE /graphs/{id}`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InitOptions {
+    /// Skip the existing-graph preflight. Operators set this when
+    /// they actually mean to overwrite — e.g. `omnigraph init --force`.
+    pub force: bool,
+}
+
 impl Omnigraph {
     /// Create a new graph at `uri` from schema source.
     ///
-    /// Creates `_schema.pg`, per-type Lance datasets, and `__manifest`.
+    /// Strict mode: errors with [`OmniError::AlreadyInitialized`] if
+    /// `uri` already holds any of the three schema artifacts. To
+    /// overwrite an existing graph deliberately, call
+    /// [`Self::init_with_options`] with `InitOptions { force: true }`.
     pub async fn init(uri: &str, schema_source: &str) -> Result<Self> {
-        Self::init_with_storage(uri, schema_source, storage_for_uri(uri)?).await
+        Self::init_with_options(uri, schema_source, InitOptions::default()).await
+    }
+
+    /// Create a new graph at `uri`, with explicit init-time options.
+    ///
+    /// See [`InitOptions`] for the safety contract — by default this
+    /// behaves identically to [`Self::init`].
+    pub async fn init_with_options(
+        uri: &str,
+        schema_source: &str,
+        options: InitOptions,
+    ) -> Result<Self> {
+        Self::init_with_storage(uri, schema_source, storage_for_uri(uri)?, options).await
     }
 
     pub(crate) async fn init_with_storage(
         uri: &str,
         schema_source: &str,
         storage: Arc<dyn StorageAdapter>,
+        options: InitOptions,
     ) -> Result<Self> {
         let root = normalize_root_uri(uri)?;
+
+        // Preflight: refuse to clobber an existing graph unless the
+        // operator passed `force`. This runs BEFORE any parse or
+        // write so a misdirected `init` against an existing graph
+        // URI cannot reach a code path that overwrites or, on a
+        // later cleanup, deletes the schema files.
+        //
+        // Closes the "init is destructive against existing state"
+        // class: there is no longer a code path where strict-mode
+        // `init` can mutate a populated graph root.
+        if !options.force {
+            for candidate in [
+                schema_source_uri(&root),
+                schema_ir_uri(&root),
+                schema_state_uri(&root),
+            ] {
+                if storage.exists(&candidate).await? {
+                    return Err(OmniError::AlreadyInitialized {
+                        uri: root.clone(),
+                    });
+                }
+            }
+        }
+
         let schema_ir = read_schema_ir_from_source(schema_source)?;
         let mut catalog = build_catalog_from_ir(&schema_ir)?;
         fixup_blob_schemas(&mut catalog);
 
         // Run the I/O phase. On any error, best-effort-clean the schema
         // artifacts that may have been written to disk before returning
-        // the original error. The cleanup is best-effort: a failure to
-        // delete is logged via `tracing::warn` but does not mask the
-        // original init error.
+        // the original error. The cleanup is safe in strict mode because
+        // the preflight above guarantees the three schema URIs did NOT
+        // exist before this call, so any file there afterward is ours
+        // to delete. In `force` mode the operator opted in to overwrite
+        // semantics, so cleanup-on-failure of force re-inits may delete
+        // schema files that were present pre-call — that's part of the
+        // force contract.
         //
         // Coverage gap: Lance per-type datasets and `__manifest/`
         // directory created by `GraphCoordinator::init` are NOT cleaned
@@ -1852,7 +1915,7 @@ edge WorksAt: Person -> Company
         let uri = dir.path().to_str().unwrap();
         let adapter = Arc::new(RecordingStorageAdapter::default());
 
-        Omnigraph::init_with_storage(uri, TEST_SCHEMA, adapter.clone())
+        Omnigraph::init_with_storage(uri, TEST_SCHEMA, adapter.clone(), InitOptions::default())
             .await
             .unwrap();
         assert!(adapter.writes().contains(&join_uri(uri, "_schema.pg")));

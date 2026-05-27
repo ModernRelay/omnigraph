@@ -73,6 +73,13 @@ enum Command {
         schema: PathBuf,
         /// Graph URI (local path or s3://)
         uri: String,
+        /// Overwrite existing schema artifacts at the URI. Without
+        /// this flag, init refuses to touch a URI that already holds
+        /// `_schema.pg`, `_schema.ir.json`, or `__schema_state.json`
+        /// — closes the re-init footgun (MR-668 follow-up). With the
+        /// flag, the operator opts in to destructive semantics.
+        #[arg(long)]
+        force: bool,
     },
     /// Load data into a graph
     Load {
@@ -1746,10 +1753,15 @@ async fn main() -> Result<()> {
                 print_embed_human(&output);
             }
         }
-        Command::Init { schema, uri } => {
+        Command::Init { schema, uri, force } => {
             let schema_source = fs::read_to_string(&schema)?;
             ensure_local_graph_parent(&uri)?;
-            Omnigraph::init(&uri, &schema_source).await?;
+            Omnigraph::init_with_options(
+                &uri,
+                &schema_source,
+                omnigraph::db::InitOptions { force },
+            )
+            .await?;
             scaffold_config_if_missing(&uri)?;
             println!("initialized {}", uri);
         }

@@ -11,7 +11,7 @@ pub use commit_graph::GraphCommit;
 pub use graph_coordinator::{GraphCoordinator, ReadTarget, ResolvedTarget, SnapshotId};
 pub use manifest::{Snapshot, SubTableEntry, SubTableUpdate};
 pub use omnigraph::{
-    CleanupPolicyOptions, MergeOutcome, Omnigraph, OpenMode, SchemaApplyOptions,
+    CleanupPolicyOptions, InitOptions, MergeOutcome, Omnigraph, OpenMode, SchemaApplyOptions,
     SchemaApplyResult, TableCleanupStats, TableOptimizeStats,
 };
 pub(crate) use omnigraph::ensure_public_branch_ref;
