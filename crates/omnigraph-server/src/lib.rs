@@ -259,8 +259,34 @@ pub struct ApiError {
 }
 
 impl AppState {
+    /// Canonical single-mode constructor. Every other `new_*` / `open_*`
+    /// helper is a thin convenience wrapper around this one. Builds the
+    /// engine + per-graph policy through `build_single_mode`, which
+    /// applies `Omnigraph::with_policy` so HTTP-layer and engine-layer
+    /// policy can never diverge — there is no "policy installed on HTTP
+    /// but not on engine" representable state (closes the prior
+    /// `with_policy_engine` footgun that reused the engine `Arc`
+    /// without re-applying `with_policy`).
+    pub fn new_single(
+        uri: String,
+        db: Omnigraph,
+        bearer_tokens: Vec<(String, String)>,
+        policy_engine: Option<PolicyEngine>,
+        workload: workload::WorkloadController,
+    ) -> Self {
+        let bearer_tokens = hash_bearer_tokens(bearer_tokens);
+        let per_graph_policy = policy_engine.map(Arc::new);
+        Self::build_single_mode(uri, db, bearer_tokens, per_graph_policy, Arc::new(workload))
+    }
+
     pub fn new(uri: String, db: Omnigraph) -> Self {
-        Self::new_with_bearer_tokens(uri, db, Vec::new())
+        Self::new_single(
+            uri,
+            db,
+            Vec::new(),
+            None,
+            workload::WorkloadController::from_env(),
+        )
     }
 
     pub fn new_with_bearer_token(uri: String, db: Omnigraph, bearer_token: Option<String>) -> Self {
@@ -276,7 +302,13 @@ impl AppState {
         db: Omnigraph,
         bearer_tokens: Vec<(String, String)>,
     ) -> Self {
-        Self::new_with_bearer_tokens_and_policy(uri, db, bearer_tokens, None)
+        Self::new_single(
+            uri,
+            db,
+            bearer_tokens,
+            None,
+            workload::WorkloadController::from_env(),
+        )
     }
 
     pub fn new_with_bearer_tokens_and_policy(
@@ -285,62 +317,27 @@ impl AppState {
         bearer_tokens: Vec<(String, String)>,
         policy_engine: Option<PolicyEngine>,
     ) -> Self {
-        let bearer_tokens = hash_bearer_tokens(bearer_tokens);
-        let per_graph_policy: Option<Arc<PolicyEngine>> = policy_engine.map(Arc::new);
-        let workload = Arc::new(workload::WorkloadController::from_env());
-        Self::build_single_mode(uri, db, bearer_tokens, per_graph_policy, workload)
+        Self::new_single(
+            uri,
+            db,
+            bearer_tokens,
+            policy_engine,
+            workload::WorkloadController::from_env(),
+        )
     }
 
     /// Construct with a caller-provided [`workload::WorkloadController`].
     /// Tests and benches use this to override per-actor caps without
-    /// mutating global env vars (which is unsafe in Rust 2024 once the
-    /// async runtime is up — `setenv` isn't thread-safe).
+    /// mutating global env vars (unsafe in Rust 2024 once the async
+    /// runtime is up — `setenv` isn't thread-safe). For tests that also
+    /// need a custom `PolicyEngine`, use [`new_single`] directly.
     pub fn new_with_workload(
         uri: String,
         db: Omnigraph,
         bearer_tokens: Vec<(String, String)>,
         workload: workload::WorkloadController,
     ) -> Self {
-        let bearer_tokens = hash_bearer_tokens(bearer_tokens);
-        Self::build_single_mode(uri, db, bearer_tokens, None, Arc::new(workload))
-    }
-
-    /// Install a `PolicyEngine` post-construction (MR-723). Used by
-    /// integration tests that need to thread custom workload limits
-    /// alongside a permit-all policy — the existing `new_with_*` and
-    /// `new_with_workload` constructors don't compose. Production
-    /// callers should use `open_with_bearer_tokens_and_policy` which
-    /// also installs the policy on the engine.
-    ///
-    /// PR 4a: rebuilds the single-mode handle with the policy attached
-    /// on the HTTP-layer (`handle.policy`). The engine inside the handle
-    /// is reused as-is — engine-layer policy enforcement is NOT
-    /// reinstalled by this path (the old single-field `policy_engine`
-    /// API had the same semantics — engine-layer enforcement was only
-    /// applied by constructors that took `policy_engine: Option<...>`
-    /// at build time). Tests that depend on engine-layer enforcement
-    /// should use `open_with_bearer_tokens_and_policy` instead.
-    pub fn with_policy_engine(self, engine: PolicyEngine) -> Self {
-        let policy_arc: Arc<PolicyEngine> = Arc::new(engine);
-        let existing = single_mode_handle(&self.registry)
-            .expect("with_policy_engine called on a non-single-mode AppState");
-        let new_handle = Arc::new(GraphHandle {
-            key: existing.key.clone(),
-            uri: existing.uri.clone(),
-            engine: Arc::clone(&existing.engine),
-            policy: Some(policy_arc),
-        });
-        let registry = Arc::new(
-            GraphRegistry::from_handles(vec![new_handle])
-                .expect("rebuilt single-mode registry must accept one handle"),
-        );
-        Self {
-            mode: self.mode,
-            registry,
-            workload: self.workload,
-            bearer_tokens: self.bearer_tokens,
-            server_policy: self.server_policy,
-        }
+        Self::new_single(uri, db, bearer_tokens, None, workload)
     }
 
     pub async fn open(uri: impl Into<String>) -> Result<Self> {

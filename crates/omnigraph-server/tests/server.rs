@@ -3594,13 +3594,13 @@ async fn ingest_per_actor_admission_cap_returns_429() {
     let policy_engine =
         omnigraph_server::PolicyEngine::load(&policy_path, graph.to_string_lossy().as_ref())
             .unwrap();
-    let state = AppState::new_with_workload(
+    let state = AppState::new_single(
         graph.to_string_lossy().to_string(),
         db,
         vec![("act-flooder".to_string(), "flooder-token".to_string())],
+        Some(policy_engine),
         workload,
-    )
-    .with_policy_engine(policy_engine);
+    );
     let app = build_app(state);
     let _temp = temp;
 
@@ -3690,6 +3690,75 @@ async fn ingest_per_actor_admission_cap_returns_429() {
             i,
             results[*i].1,
         );
+    }
+}
+
+/// Regression for B2 (MR-668): when an `AppState` is built with a
+/// per-graph policy and a custom workload, the engine inside the
+/// registry's `GraphHandle` MUST have the same policy applied via
+/// `Omnigraph::with_policy`. Pre-fix, `new_with_workload(...).with_policy_engine(p)`
+/// installed the policy only on the HTTP-layer `handle.policy`; the
+/// underlying `Arc<Omnigraph>` was reused without `with_policy`, so any
+/// caller reaching through `state.registry().list()` could bypass Cedar.
+///
+/// This test reaches the engine the same way an embedded SDK consumer
+/// or future routing code path would, and asserts the policy still
+/// fires. The deny path is "act-blocked has a valid bearer but isn't in
+/// the policy's allowed group" — i.e., authenticated-but-unauthorised.
+#[tokio::test(flavor = "multi_thread")]
+async fn engine_layer_policy_fires_via_direct_arc_omnigraph_from_new_single() {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+
+    // Permit `act-allowed` for change actions; `act-blocked` is not in
+    // any allowed group — every change request from them must deny.
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, permit_all_policy_yaml(&["act-allowed"])).unwrap();
+    let policy_engine =
+        omnigraph_server::PolicyEngine::load(&policy_path, graph.to_string_lossy().as_ref())
+            .unwrap();
+
+    let workload = omnigraph_server::workload::WorkloadController::new(100, 1_000_000_000);
+    let state = AppState::new_single(
+        graph.to_string_lossy().to_string(),
+        db,
+        vec![("act-blocked".to_string(), "block-token".to_string())],
+        Some(policy_engine),
+        workload,
+    );
+
+    // Reach into the registry and pull the engine the same way an
+    // embedded consumer holding `Arc<Omnigraph>` would. If `new_single`
+    // failed to apply `with_policy` to the engine, this `mutate_as`
+    // would succeed — the HTTP-layer is bypassed entirely.
+    let handle = state.registry().list().into_iter().next().expect("handle");
+    let engine = Arc::clone(&handle.engine);
+
+    let mut params: omnigraph_compiler::ParamMap = Default::default();
+    params.insert(
+        "name".to_string(),
+        omnigraph_compiler::Literal::String("EngineLayerBlocked".to_string()),
+    );
+    params.insert("age".to_string(), omnigraph_compiler::Literal::Integer(30));
+    let result = engine
+        .mutate_as(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person",
+            &params,
+            Some("act-blocked"),
+        )
+        .await;
+    match result {
+        Err(OmniError::Policy(_)) => { /* expected — engine-layer gate fired */ }
+        Ok(_) => panic!(
+            "engine-layer policy did NOT fire — act-blocked successfully ran mutate_as via \
+             the engine pulled from the registry handle. AppState::new_single failed to apply \
+             with_policy to the underlying Omnigraph engine. This is the B2 footgun the \
+             with_policy_engine deletion was supposed to close."
+        ),
+        Err(other) => panic!("expected OmniError::Policy, got: {other:?}"),
     }
 }
 
