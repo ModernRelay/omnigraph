@@ -4915,10 +4915,28 @@ graphs:
         }
     }
 
-    /// `GET /graphs` lists the registered graphs alphabetically in
-    /// multi mode. No auth or server policy = open mode (allowed).
+    /// `GET /graphs` must NOT leak the registry in Open mode without
+    /// an explicit server policy. Operators who pass `--unauthenticated`
+    /// opted into trusting the network for graph DATA, not for leaking
+    /// server topology (graph IDs + URIs, which may contain S3 bucket
+    /// paths or internal hostnames). Cedar gating the management
+    /// surface is the documented contract for `server_graphs_list`
+    /// ("don't leak the registry until the operator explicitly
+    /// authorizes it"); enforcing that contract in every runtime
+    /// state — not just `PolicyEnabled` — is the correct-by-design
+    /// closure of the open-mode hole the bot-review pass surfaced.
+    ///
+    /// Today (pre-fix) this returns 200 because `authorize_request`'s
+    /// no-policy fallback only denies when `actor.is_some()`, so Open
+    /// mode (`actor: None`) falls through to `Ok(())`. The fix in the
+    /// next commit tightens the fallback so server-scoped actions
+    /// always require explicit policy.
+    ///
+    /// Sort-order coverage previously lived here; it has moved to
+    /// `get_graphs_with_server_policy_authorizes_per_cedar` where
+    /// the response body is now non-empty and operator-authorized.
     #[tokio::test(flavor = "multi_thread")]
-    async fn get_graphs_lists_registered_graphs_in_multi_mode() {
+    async fn get_graphs_denied_in_open_mode_without_server_policy() {
         let (_dirs, app) = build_multi_mode_app(&["beta", "alpha"]).await;
         let resp = app
             .oneshot(
@@ -4930,14 +4948,16 @@ graphs:
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let status = resp.status();
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: Value = serde_json::from_slice(&body).unwrap();
-        let graphs = json["graphs"].as_array().unwrap();
-        assert_eq!(graphs.len(), 2);
-        // Server-sorted alphabetically.
-        assert_eq!(graphs[0]["graph_id"].as_str().unwrap(), "alpha");
-        assert_eq!(graphs[1]["graph_id"].as_str().unwrap(), "beta");
+        let body_str = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "GET /graphs must require an explicit server policy in every \
+             runtime state; Open-mode bypass would leak server topology. \
+             Body: {body_str}",
+        );
     }
 
     /// `GET /graphs` returns 405 in single mode (resource exists in the
