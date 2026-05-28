@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use omnigraph::db::Omnigraph;
+use omnigraph::storage::normalize_root_uri;
 #[cfg(test)]
 use tokio::sync::Mutex;
 
@@ -104,6 +105,9 @@ pub enum InsertError {
     /// Maps to HTTP 409.
     #[error("URI '{0}' is already registered as another graph")]
     DuplicateUri(String),
+    /// A handle carried an invalid graph URI. Maps to startup failure.
+    #[error("URI '{uri}' is invalid: {message}")]
+    InvalidUri { uri: String, message: String },
 }
 
 pub struct GraphRegistry {
@@ -132,13 +136,14 @@ impl GraphRegistry {
         let mut graphs: HashMap<GraphKey, Arc<GraphHandle>> = HashMap::with_capacity(handles.len());
         let mut seen_uris: HashMap<String, GraphKey> = HashMap::with_capacity(handles.len());
         for handle in handles {
+            let (canonical_uri, handle) = canonicalize_handle_uri(handle)?;
             if graphs.contains_key(&handle.key) {
                 return Err(InsertError::DuplicateKey(handle.key.clone()));
             }
-            if seen_uris.contains_key(&handle.uri) {
+            if seen_uris.contains_key(&canonical_uri) {
                 return Err(InsertError::DuplicateUri(handle.uri.clone()));
             }
-            seen_uris.insert(handle.uri.clone(), handle.key.clone());
+            seen_uris.insert(canonical_uri, handle.key.clone());
             graphs.insert(handle.key.clone(), handle);
         }
         Ok(Self {
@@ -203,11 +208,17 @@ impl GraphRegistry {
     pub async fn insert(&self, handle: Arc<GraphHandle>) -> Result<(), InsertError> {
         let _guard = self.mutate.lock().await;
         let current = self.snapshot.load();
+        let (canonical_uri, handle) = canonicalize_handle_uri(handle)?;
         if current.graphs.contains_key(&handle.key) {
             return Err(InsertError::DuplicateKey(handle.key.clone()));
         }
         for existing in current.graphs.values() {
-            if existing.uri == handle.uri {
+            let existing_uri =
+                normalize_root_uri(&existing.uri).map_err(|err| InsertError::InvalidUri {
+                    uri: existing.uri.clone(),
+                    message: err.to_string(),
+                })?;
+            if existing_uri == canonical_uri {
                 return Err(InsertError::DuplicateUri(handle.uri.clone()));
             }
         }
@@ -217,6 +228,25 @@ impl GraphRegistry {
             .store(Arc::new(RegistrySnapshot::new(new_graphs)));
         Ok(())
     }
+}
+
+fn canonicalize_handle_uri(
+    handle: Arc<GraphHandle>,
+) -> Result<(String, Arc<GraphHandle>), InsertError> {
+    let canonical_uri = normalize_root_uri(&handle.uri).map_err(|err| InsertError::InvalidUri {
+        uri: handle.uri.clone(),
+        message: err.to_string(),
+    })?;
+    if canonical_uri == handle.uri {
+        return Ok((canonical_uri, handle));
+    }
+    let canonical_handle = Arc::new(GraphHandle {
+        key: handle.key.clone(),
+        uri: canonical_uri.clone(),
+        engine: Arc::clone(&handle.engine),
+        policy: handle.policy.clone(),
+    });
+    Ok((canonical_uri, canonical_handle))
 }
 
 impl Default for GraphRegistry {

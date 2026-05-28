@@ -358,8 +358,7 @@ impl PolicyConfig {
                 );
             }
             if server_scoped
-                && (rule.allow.branch_scope.is_some()
-                    || rule.allow.target_branch_scope.is_some())
+                && (rule.allow.branch_scope.is_some() || rule.allow.target_branch_scope.is_some())
             {
                 bail!(
                     "policy rule '{}' uses branch_scope/target_branch_scope with a \
@@ -985,8 +984,8 @@ impl PolicyChecker for PolicyEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        PolicyAction, PolicyCompiler, PolicyConfig, PolicyEngine, PolicyExpectation,
-        PolicyRequest, PolicyTestCase, PolicyTestConfig,
+        PolicyAction, PolicyCompiler, PolicyConfig, PolicyEngine, PolicyExpectation, PolicyRequest,
+        PolicyTestCase, PolicyTestConfig,
     };
 
     #[test]

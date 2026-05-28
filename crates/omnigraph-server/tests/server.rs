@@ -4411,8 +4411,10 @@ async fn schema_apply_route_additive_property_preserves_existing_rows() {
 
 mod multi_graph_startup {
     use super::*;
+    use omnigraph::storage::normalize_root_uri;
     use omnigraph_server::{
-        GraphHandle, GraphId, GraphKey, ServerConfig, ServerConfigMode, load_server_settings,
+        GraphHandle, GraphId, GraphKey, GraphRegistry, InsertError, ServerConfig, ServerConfigMode,
+        load_server_settings,
     };
     use std::sync::Arc;
 
@@ -4509,16 +4511,38 @@ mod multi_graph_startup {
             (Method::GET, "/graphs/alpha/schema", None),
             (Method::GET, "/graphs/alpha/branches", None),
             (Method::GET, "/graphs/alpha/commits", None),
-            (Method::POST, "/graphs/alpha/read", Some(r#"{"query_source":"query q() { return {} }"}"#)),
-            (Method::POST, "/graphs/alpha/change", Some(r#"{"query_source":"query q() { return {} }"}"#)),
-            (Method::POST, "/graphs/alpha/export", Some(r#"{"branch":"main"}"#)),
-            (Method::POST, "/graphs/alpha/schema/apply", Some(r#"{"schema_source":"","allow_data_loss":false}"#)),
+            (
+                Method::POST,
+                "/graphs/alpha/read",
+                Some(r#"{"query_source":"query q() { return {} }"}"#),
+            ),
+            (
+                Method::POST,
+                "/graphs/alpha/change",
+                Some(r#"{"query_source":"query q() { return {} }"}"#),
+            ),
+            (
+                Method::POST,
+                "/graphs/alpha/export",
+                Some(r#"{"branch":"main"}"#),
+            ),
+            (
+                Method::POST,
+                "/graphs/alpha/schema/apply",
+                Some(r#"{"schema_source":"","allow_data_loss":false}"#),
+            ),
             (Method::POST, "/graphs/alpha/ingest", Some(r#"{"data":""}"#)),
-            (Method::POST, "/graphs/alpha/branches/merge", Some(r#"{"source":"main","target":"main"}"#)),
+            (
+                Method::POST,
+                "/graphs/alpha/branches/merge",
+                Some(r#"{"source":"main","target":"main"}"#),
+            ),
         ];
 
         for (method, path, body) in cases {
-            let req_body = body.map(|s| Body::from(s.to_string())).unwrap_or_else(Body::empty);
+            let req_body = body
+                .map(|s| Body::from(s.to_string()))
+                .unwrap_or_else(Body::empty);
             let req = Request::builder()
                 .method(method.clone())
                 .uri(*path)
@@ -4690,6 +4714,57 @@ graphs:
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registry_rejects_duplicate_normalized_graph_uris() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_uri = dir.path().join("same").to_str().unwrap().to_string();
+        let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+        let engine = Arc::new(Omnigraph::init(&graph_uri, &schema).await.unwrap());
+
+        let alpha = Arc::new(GraphHandle {
+            key: GraphKey::cluster(GraphId::try_from("alpha").unwrap()),
+            uri: graph_uri.clone(),
+            engine: Arc::clone(&engine),
+            policy: None,
+        });
+        let beta = Arc::new(GraphHandle {
+            key: GraphKey::cluster(GraphId::try_from("beta").unwrap()),
+            uri: format!("file://{graph_uri}/"),
+            engine,
+            policy: None,
+        });
+
+        match GraphRegistry::from_handles(vec![alpha, beta]) {
+            Err(InsertError::DuplicateUri(uri)) => {
+                assert!(
+                    normalize_root_uri(&uri).is_ok(),
+                    "duplicate URI should still be parseable, got {uri}"
+                );
+            }
+            Err(err) => panic!("expected DuplicateUri for normalized aliases, got {err:?}"),
+            Ok(_) => panic!("expected DuplicateUri for normalized aliases, got Ok"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registry_stores_canonical_graph_uri() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_uri = dir.path().join("canonical").to_str().unwrap().to_string();
+        let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+        let engine = Omnigraph::init(&graph_uri, &schema).await.unwrap();
+        let handle = Arc::new(GraphHandle {
+            key: GraphKey::cluster(GraphId::try_from("alpha").unwrap()),
+            uri: format!("file://{graph_uri}/"),
+            engine: Arc::new(engine),
+            policy: None,
+        });
+
+        let registry = GraphRegistry::from_handles(vec![handle]).unwrap();
+        let listed = registry.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].uri, graph_uri);
+    }
+
     // ── Four-rule mode inference matrix ───────────────────────────────
 
     /// Rule 1: CLI positional URI → Single.
@@ -4752,8 +4827,7 @@ server:
 "#,
         )
         .unwrap();
-        let settings =
-            load_server_settings(Some(&config_path), None, None, None, true).unwrap();
+        let settings = load_server_settings(Some(&config_path), None, None, None, true).unwrap();
         match settings.mode {
             ServerConfigMode::Single { uri, .. } => assert_eq!(uri, "/tmp/beta.omni"),
             ServerConfigMode::Multi { .. } => panic!("expected Single (rule 3), got Multi"),
@@ -4776,8 +4850,7 @@ graphs:
 "#,
         )
         .unwrap();
-        let settings =
-            load_server_settings(Some(&config_path), None, None, None, true).unwrap();
+        let settings = load_server_settings(Some(&config_path), None, None, None, true).unwrap();
         match settings.mode {
             ServerConfigMode::Multi { graphs, .. } => {
                 let ids: Vec<&str> = graphs.iter().map(|g| g.graph_id.as_str()).collect();
@@ -4785,6 +4858,63 @@ graphs:
                 assert_eq!(ids, vec!["alpha", "beta"]);
             }
             ServerConfigMode::Single { .. } => panic!("expected Multi (rule 4), got Single"),
+        }
+    }
+
+    #[test]
+    fn mode_inference_multi_rejects_top_level_policy_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            r#"
+policy:
+  file: ./policy.yaml
+graphs:
+  alpha:
+    uri: /tmp/alpha.omni
+"#,
+        )
+        .unwrap();
+        let err = load_server_settings(Some(&config_path), None, None, None, true).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("top-level `policy.file` is single-graph/CLI-local policy only"),
+            "expected single-graph policy guidance, got: {msg}"
+        );
+        assert!(
+            msg.contains("graphs.<graph_id>.policy.file"),
+            "expected per-graph migration guidance, got: {msg}"
+        );
+        assert!(
+            msg.contains("server.policy.file"),
+            "expected server policy migration guidance, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn mode_inference_normalizes_multi_graph_uris() {
+        let temp = tempfile::tempdir().unwrap();
+        let graph = temp.path().join("alpha.omni");
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+graphs:
+  alpha:
+    uri: file://{}/
+"#,
+                graph.display()
+            ),
+        )
+        .unwrap();
+        let settings = load_server_settings(Some(&config_path), None, None, None, true).unwrap();
+        match settings.mode {
+            ServerConfigMode::Multi { graphs, .. } => {
+                assert_eq!(graphs[0].uri, graph.to_string_lossy());
+            }
+            ServerConfigMode::Single { .. } => panic!("expected Multi"),
         }
     }
 
@@ -4806,8 +4936,7 @@ graphs:
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("omnigraph.yaml");
         fs::write(&config_path, "server:\n  bind: 127.0.0.1:8080\n").unwrap();
-        let err =
-            load_server_settings(Some(&config_path), None, None, None, true).unwrap_err();
+        let err = load_server_settings(Some(&config_path), None, None, None, true).unwrap_err();
         assert!(err.to_string().contains("no graph to serve"));
     }
 
@@ -4865,8 +4994,7 @@ graphs:
 "#,
         )
         .unwrap();
-        let settings =
-            load_server_settings(Some(&config_path), None, None, None, true).unwrap();
+        let settings = load_server_settings(Some(&config_path), None, None, None, true).unwrap();
         let graphs = match settings.mode {
             ServerConfigMode::Multi { graphs, .. } => graphs,
             _ => panic!("expected Multi"),
@@ -4900,8 +5028,7 @@ graphs:
 "#,
         )
         .unwrap();
-        let settings =
-            load_server_settings(Some(&config_path), None, None, None, true).unwrap();
+        let settings = load_server_settings(Some(&config_path), None, None, None, true).unwrap();
         match settings.mode {
             ServerConfigMode::Multi {
                 server_policy_file, ..
@@ -5000,8 +5127,7 @@ graphs:
         });
         let tokens = vec![("act-andrew".to_string(), "secret-token".to_string())];
         let workload = omnigraph_server::workload::WorkloadController::from_env();
-        let state =
-            AppState::new_multi(vec![handle], tokens, None, workload, None).unwrap();
+        let state = AppState::new_multi(vec![handle], tokens, None, workload, None).unwrap();
         let app = build_app(state);
 
         // No Authorization header → 401.
@@ -5092,8 +5218,8 @@ rules:
             ("act-bruno".to_string(), "bruno-token".to_string()),
         ];
         let workload = omnigraph_server::workload::WorkloadController::from_env();
-        let state = AppState::new_multi(handles, tokens, Some(server_policy), workload, None)
-            .unwrap();
+        let state =
+            AppState::new_multi(handles, tokens, Some(server_policy), workload, None).unwrap();
         let app = build_app(state);
 
         // Admin → 200, body returns both graphs alphabetically sorted.

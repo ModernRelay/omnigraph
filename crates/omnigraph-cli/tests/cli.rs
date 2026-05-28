@@ -2071,11 +2071,16 @@ fn graphs_subcommand_help_lists_list_only() {
 /// message — the CLI only operates against remote multi-graph servers.
 #[test]
 fn graphs_list_against_local_uri_errors_with_remote_only_message() {
-    let output = output_failure(cli().arg("graphs").arg("list").arg("--uri").arg("/tmp/local"));
+    let output = output_failure(
+        cli()
+            .arg("graphs")
+            .arg("list")
+            .arg("--uri")
+            .arg("/tmp/local"),
+    );
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
         stderr.contains("remote multi-graph server URL"),
         "expected 'remote multi-graph server URL' rejection in stderr; got:\n{stderr}"
     );
 }
-

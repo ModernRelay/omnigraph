@@ -177,10 +177,7 @@ mod tests {
     #[test]
     fn rejects_path_separators() {
         for bad in ["alpha/beta", "../etc", "..", "alpha\\beta"] {
-            assert!(
-                GraphId::try_from(bad).is_err(),
-                "expected reject: {bad}"
-            );
+            assert!(GraphId::try_from(bad).is_err(), "expected reject: {bad}");
         }
     }
 

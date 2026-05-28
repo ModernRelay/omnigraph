@@ -37,6 +37,17 @@ rules:
       target_branch_scope: protected
 "#;
 
+const GRAPH_LIST_SERVER_POLICY_YAML: &str = r#"
+version: 1
+groups:
+  admins: [act-admin]
+rules:
+  - id: admins-can-list-graphs
+    allow:
+      actors: { group: admins }
+      actions: [graph_list]
+"#;
+
 fn yaml_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -918,13 +929,24 @@ fn graphs_list_against_multi_graph_server() {
         .unwrap();
     });
 
+    fs::write(
+        cfg_dir.path().join("server-policy.yaml"),
+        GRAPH_LIST_SERVER_POLICY_YAML,
+    )
+    .unwrap();
+
     // Server config with `graphs:` map and no `server.graph` selector
-    // — multi mode (rule 4 of the inference matrix).
+    // — multi mode (rule 4 of the inference matrix). `GET /graphs` is a
+    // server-scoped action, so the success path needs an explicit server
+    // policy and bearer token.
     let server_config_path = cfg_dir.path().join("omnigraph.yaml");
     fs::write(
         &server_config_path,
         format!(
             "\
+server:
+  policy:
+    file: ./server-policy.yaml
 graphs:
   alpha:
     uri: {}
@@ -934,7 +956,13 @@ graphs:
     )
     .unwrap();
 
-    let server = spawn_server_with_config(&server_config_path);
+    let server = spawn_server_with_config_env(
+        &server_config_path,
+        &[(
+            "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+            r#"{"act-admin":"admin-token"}"#,
+        )],
+    );
 
     // Client config — the CLI's `--target dev` resolves to `server.base_url`.
     let client_config_path = cfg_dir.path().join("client.yaml");
@@ -945,11 +973,19 @@ graphs:
 graphs:
   dev:
     uri: {}
+    bearer_token_env: GRAPH_LIST_TOKEN
 cli:
   graph: dev
+auth:
+  env_file: ./.env.omni
 ",
             yaml_string(&server.base_url)
         ),
+    )
+    .unwrap();
+    fs::write(
+        cfg_dir.path().join(".env.omni"),
+        "GRAPH_LIST_TOKEN=admin-token\n",
     )
     .unwrap();
 

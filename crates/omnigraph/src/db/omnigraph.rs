@@ -231,9 +231,7 @@ impl Omnigraph {
                 schema_state_uri(&root),
             ] {
                 if storage.exists(&candidate).await? {
-                    return Err(OmniError::AlreadyInitialized {
-                        uri: root.clone(),
-                    });
+                    return Err(OmniError::AlreadyInitialized { uri: root.clone() });
                 }
             }
         }
@@ -242,15 +240,34 @@ impl Omnigraph {
         let mut catalog = build_catalog_from_ir(&schema_ir)?;
         fixup_blob_schemas(&mut catalog);
 
-        // Run the I/O phase. On any error, best-effort-clean the schema
-        // artifacts that may have been written to disk before returning
-        // the original error. The cleanup is safe in strict mode because
-        // the preflight above guarantees the three schema URIs did NOT
-        // exist before this call, so any file there afterward is ours
-        // to delete. In `force` mode the operator opted in to overwrite
-        // semantics, so cleanup-on-failure of force re-inits may delete
-        // schema files that were present pre-call — that's part of the
-        // force contract.
+        // Establish an atomic ownership claim on `_schema.pg` before
+        // writing the remaining init artifacts. A check-then-write preflight
+        // is not enough under concurrent `init` calls: two callers can both
+        // observe an empty root, one can successfully initialize, and the
+        // loser can then fail in Lance `WriteMode::Create`. Only the caller
+        // that atomically created `_schema.pg` may clean up schema artifacts
+        // on later failure.
+        let schema_pg_claimed = if options.force {
+            false
+        } else {
+            let schema_path = join_uri(&root, SCHEMA_SOURCE_FILENAME);
+            if !storage
+                .write_text_if_absent(&schema_path, schema_source)
+                .await?
+            {
+                return Err(OmniError::AlreadyInitialized { uri: root.clone() });
+            }
+            if let Err(err) = crate::failpoints::maybe_fail("init.after_schema_pg_written") {
+                best_effort_cleanup_init_artifacts(&root, storage.as_ref()).await;
+                return Err(err);
+            }
+            true
+        };
+
+        // Run the I/O phase. On any error, best-effort-clean schema
+        // artifacts only when this invocation owns them: strict mode owns
+        // them after the atomic `_schema.pg` claim above; force mode owns
+        // destructive overwrite semantics by explicit operator request.
         //
         // Coverage gap: Lance per-type datasets and `__manifest/`
         // directory created by `GraphCoordinator::init` are NOT cleaned
@@ -267,12 +284,15 @@ impl Omnigraph {
             &schema_ir,
             &catalog,
             &storage,
+            !schema_pg_claimed,
         )
         .await
         {
             Ok(coordinator) => coordinator,
             Err(err) => {
-                best_effort_cleanup_init_artifacts(&root, storage.as_ref()).await;
+                if schema_pg_claimed || options.force {
+                    best_effort_cleanup_init_artifacts(&root, storage.as_ref()).await;
+                }
                 return Err(err);
             }
         };
@@ -1567,8 +1587,10 @@ fn read_schema_ir_from_source(schema_source: &str) -> Result<SchemaIR> {
 /// can pattern-match on the result and run cleanup on error before
 /// returning the original error.
 ///
-/// Failpoints fire at the three phase boundaries:
-/// * `init.after_schema_pg_written` — `_schema.pg` is on disk.
+/// Failpoints fire at the phase boundaries:
+/// * `init.after_schema_pg_written` — `_schema.pg` is on disk. In strict mode
+///   this fires in the caller immediately after the atomic ownership claim; in
+///   force mode it fires here after the explicit overwrite.
 /// * `init.after_schema_contract_written` — `_schema.pg` + `_schema.ir.json`
 ///   + `__schema_state.json` are on disk.
 /// * `init.after_coordinator_init` — all schema files plus Lance per-type
@@ -1581,10 +1603,13 @@ async fn init_storage_phase(
     schema_ir: &SchemaIR,
     catalog: &Catalog,
     storage: &Arc<dyn StorageAdapter>,
+    write_schema_pg: bool,
 ) -> Result<GraphCoordinator> {
-    let schema_path = join_uri(root, SCHEMA_SOURCE_FILENAME);
-    storage.write_text(&schema_path, schema_source).await?;
-    crate::failpoints::maybe_fail("init.after_schema_pg_written")?;
+    if write_schema_pg {
+        let schema_path = join_uri(root, SCHEMA_SOURCE_FILENAME);
+        storage.write_text(&schema_path, schema_source).await?;
+        crate::failpoints::maybe_fail("init.after_schema_pg_written")?;
+    }
 
     write_schema_contract(root, storage.as_ref(), schema_ir).await?;
     crate::failpoints::maybe_fail("init.after_schema_contract_written")?;
@@ -1832,7 +1857,7 @@ mod tests {
     use crate::db::manifest::ManifestCoordinator;
     use async_trait::async_trait;
     use serde_json::Value;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use crate::storage::{LocalStorageAdapter, StorageAdapter, join_uri};
 
@@ -1886,6 +1911,11 @@ edge WorksAt: Person -> Company
             self.inner.write_text(uri, contents).await
         }
 
+        async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool> {
+            self.writes.lock().unwrap().push(uri.to_string());
+            self.inner.write_text_if_absent(uri, contents).await
+        }
+
         async fn exists(&self, uri: &str) -> Result<bool> {
             self.exists_checks.lock().unwrap().push(uri.to_string());
             self.inner.exists(uri).await
@@ -1907,6 +1937,89 @@ edge WorksAt: Person -> Company
         async fn list_dir(&self, dir_uri: &str) -> Result<Vec<String>> {
             self.inner.list_dir(dir_uri).await
         }
+    }
+
+    #[derive(Debug)]
+    struct InitRaceStorageAdapter {
+        inner: LocalStorageAdapter,
+        root: String,
+        barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    #[async_trait]
+    impl StorageAdapter for InitRaceStorageAdapter {
+        async fn read_text(&self, uri: &str) -> Result<String> {
+            self.inner.read_text(uri).await
+        }
+
+        async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
+            self.inner.write_text(uri, contents).await
+        }
+
+        async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool> {
+            self.inner.write_text_if_absent(uri, contents).await
+        }
+
+        async fn exists(&self, uri: &str) -> Result<bool> {
+            let exists = self.inner.exists(uri).await?;
+            if uri == schema_state_uri(&self.root) {
+                self.barrier.wait().await;
+            }
+            Ok(exists)
+        }
+
+        async fn rename_text(&self, from_uri: &str, to_uri: &str) -> Result<()> {
+            self.inner.rename_text(from_uri, to_uri).await
+        }
+
+        async fn delete(&self, uri: &str) -> Result<()> {
+            self.inner.delete(uri).await
+        }
+
+        async fn list_dir(&self, dir_uri: &str) -> Result<Vec<String>> {
+            self.inner.list_dir(dir_uri).await
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_strict_init_does_not_delete_winning_schema_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap().to_string();
+        let root = normalize_root_uri(&uri).unwrap();
+        let storage: Arc<dyn StorageAdapter> = Arc::new(InitRaceStorageAdapter {
+            inner: LocalStorageAdapter,
+            root,
+            barrier: Arc::new(tokio::sync::Barrier::new(2)),
+        });
+
+        let left = Omnigraph::init_with_storage(
+            &uri,
+            TEST_SCHEMA,
+            Arc::clone(&storage),
+            InitOptions::default(),
+        );
+        let right = Omnigraph::init_with_storage(
+            &uri,
+            TEST_SCHEMA,
+            Arc::clone(&storage),
+            InitOptions::default(),
+        );
+        let (left, right) = tokio::join!(left, right);
+        let ok_count = usize::from(left.is_ok()) + usize::from(right.is_ok());
+        assert_eq!(ok_count, 1, "exactly one concurrent init should win");
+
+        assert!(
+            dir.path().join("_schema.pg").exists(),
+            "winning init must leave _schema.pg in place"
+        );
+        assert!(
+            dir.path().join("_schema.ir.json").exists(),
+            "winning init must leave _schema.ir.json in place"
+        );
+        assert!(
+            dir.path().join("__schema_state.json").exists(),
+            "winning init must leave __schema_state.json in place"
+        );
     }
 
     #[tokio::test]

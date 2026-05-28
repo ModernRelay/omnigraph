@@ -46,7 +46,12 @@ graphs:
     # no per-graph policy → no engine-layer Cedar enforcement on beta
 ```
 
-Each graph's HTTP request flows through its own per-graph policy. The management endpoint (`GET /graphs`) flows through the server-level policy. When `server.policy.file` is unset and bearer tokens are configured, `GET /graphs` falls through to MR-723 default-deny (only `read`-equivalent actions allowed for authenticated actors — and `graph_list` is not `read`) → 403. So the operator must explicitly authorize via `server-policy.yaml` to expose `/graphs`.
+Top-level `policy.file` is single-graph / CLI-local policy only. Multi-graph
+server startup rejects it because applying one graph policy to every configured
+graph is ambiguous. Move per-graph rules to `graphs.<graph_id>.policy.file` and
+move `graph_list` rules to `server.policy.file`.
+
+Each graph's HTTP request flows through its own per-graph policy. The management endpoint (`GET /graphs`) flows through the server-level policy. When `server.policy.file` is unset, `GET /graphs` is denied in every runtime state, including `--unauthenticated`; with bearer tokens configured, it returns 403 after admission control because `graph_list` is not a `read`-equivalent action. The operator must explicitly authorize via `server-policy.yaml` to expose `/graphs`.
 
 Example server-level policy:
 
@@ -116,12 +121,13 @@ reaches `authorize_request()` without a matching policy permit.
 |---|---|---|---|
 | **Open** | no | no | Every request is permitted. Refuses to start unless `--unauthenticated` or `OMNIGRAPH_UNAUTHENTICATED=1` is set — the operator must explicitly opt in. |
 | **DefaultDeny** | yes | no | Every authenticated request for an action other than `read` is rejected with HTTP 403. Closes the "tokens but forgot the policy file" trap — an operator who sets up auth and forgot to point at a policy file used to ship the illusion of protection. |
-| **PolicyEnabled** | any | yes | Every request is evaluated by Cedar against the configured policy. |
+| **PolicyEnabled** | yes | yes | Every request is evaluated by Cedar against the configured policy. |
 
 The classifier is `classify_server_runtime_state` in
 `crates/omnigraph-server/src/lib.rs`; it returns `Err` for the "no
-tokens, no policy, no flag" cell so the server refuses to start instead
-of silently shipping an open instance. Tests pin every cell of the
+tokens, no policy, no flag" cell and for "policy file, no tokens" so the
+server refuses to start instead of silently shipping an open instance or
+a policy-protected server that can only 401. Tests pin every cell of the
 matrix and the State-2 deny path.
 
 Server-side, `authorize_request()` still runs at the HTTP boundary —

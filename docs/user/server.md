@@ -117,7 +117,9 @@ endpoints (`/snapshot`, `/read`, `/export`, `/branches` GET, `/commits`,
   1. `OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET` — AWS Secrets Manager (build with `--features aws`)
   2. `OMNIGRAPH_SERVER_BEARER_TOKENS_FILE` or `OMNIGRAPH_SERVER_BEARER_TOKENS_JSON` — JSON `{actor_id: token, …}`
   3. `OMNIGRAPH_SERVER_BEARER_TOKEN` — single legacy token, actor `default`
-- If no tokens configured, server runs unauthenticated (local dev) and `/openapi.json` strips the security scheme.
+- If no tokens and no policy are configured, startup refuses unless
+  `--unauthenticated` or `OMNIGRAPH_UNAUTHENTICATED=1` explicitly opts into
+  open local-dev mode. In that mode `/openapi.json` strips the security scheme.
 
 See [deployment.md](deployment.md) for token-source operational details.
 
@@ -136,4 +138,4 @@ See [deployment.md](deployment.md) for token-source operational details.
   admission control" above). No global rate limiter is configured;
   add `tower_http::limit` if a graph-wide cap is needed.
 - Pagination — none (commits/branches return everything; export streams).
-- Multi-tenant routing — one graph per process.
+- Runtime graph add/remove — edit `omnigraph.yaml` and restart.

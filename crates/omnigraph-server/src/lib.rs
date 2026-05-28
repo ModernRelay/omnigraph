@@ -45,6 +45,7 @@ pub use config::{
 use futures::stream;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::{ManifestConflictDetails, ManifestErrorKind, OmniError};
+use omnigraph::storage::normalize_root_uri;
 use omnigraph_compiler::json_params_to_param_map;
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::{JsonParamMode, ParamMap};
@@ -62,6 +63,8 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use utoipa::OpenApi;
+use utoipa::openapi::path::{Parameter, ParameterIn};
+use utoipa::openapi::schema::{Object, Type};
 use utoipa::openapi::security::{Http, HttpAuthScheme, SecurityScheme};
 
 type BearerTokenHash = [u8; 32];
@@ -361,7 +364,7 @@ impl AppState {
         uri: impl Into<String>,
         bearer_tokens: Vec<(String, String)>,
     ) -> Result<Self> {
-        let uri = uri.into();
+        let uri = normalize_root_uri(&uri.into()).wrap_err("normalize graph URI")?;
         let db = Omnigraph::open(&uri).await?;
         Ok(Self::new_with_bearer_tokens(uri, db, bearer_tokens))
     }
@@ -376,7 +379,7 @@ impl AppState {
         // single-mode or multi-mode construction is reached. By the
         // time we get here, the (policy, no-tokens) combination has
         // already been rejected — no second bail needed.
-        let uri = uri.into();
+        let uri = normalize_root_uri(&uri.into()).wrap_err("normalize graph URI")?;
         let db = Omnigraph::open(&uri).await?;
         let policy_engine = match policy_file {
             Some(path) => Some(PolicyEngine::load_graph(path, &uri)?),
@@ -420,9 +423,9 @@ impl AppState {
         // log label, not a routing key — when the future cluster
         // catalog ships, single mode may carry the catalog-assigned
         // id here instead.
+        let uri = normalize_root_uri(&uri).unwrap_or(uri);
         let key = GraphKey::cluster(
-            GraphId::try_from("default")
-                .expect("'default' is a valid GraphId log label"),
+            GraphId::try_from("default").expect("'default' is a valid GraphId log label"),
         );
         let handle = Arc::new(GraphHandle {
             key,
@@ -488,9 +491,7 @@ impl AppState {
         // cached `any_per_graph_policy` flag on the registry snapshot.
         match &self.routing {
             GraphRouting::Single { handle } => handle.policy.is_some(),
-            GraphRouting::Multi { registry, .. } => {
-                registry.snapshot_ref().any_per_graph_policy
-            }
+            GraphRouting::Multi { registry, .. } => registry.snapshot_ref().any_per_graph_policy,
         }
     }
 
@@ -509,16 +510,13 @@ impl AppState {
     }
 }
 
-fn hash_bearer_tokens(
-    bearer_tokens: Vec<(String, String)>,
-) -> Arc<[(BearerTokenHash, Arc<str>)]> {
+fn hash_bearer_tokens(bearer_tokens: Vec<(String, String)>) -> Arc<[(BearerTokenHash, Arc<str>)]> {
     let tokens: Vec<(BearerTokenHash, Arc<str>)> = bearer_tokens
         .into_iter()
         .map(|(actor, token)| (hash_bearer_token(&token), Arc::<str>::from(actor)))
         .collect();
     Arc::from(tokens)
 }
-
 
 impl ApiError {
     pub fn unauthorized(message: impl Into<String>) -> Self {
@@ -789,14 +787,25 @@ pub fn load_server_settings(
 
     let mode = if has_cli_uri || has_cli_target || has_server_graph {
         // Rules 1, 2, or 3 → Single mode.
-        let uri = config.resolve_target_uri(
+        let raw_uri = config.resolve_target_uri(
             cli_uri,
             cli_target.as_deref(),
             config.server_graph_name(),
         )?;
+        let uri = normalize_root_uri(&raw_uri).wrap_err_with(|| {
+            format!("normalize single-graph URI '{raw_uri}' from server settings")
+        })?;
         let policy_file = config.resolve_policy_file();
         ServerConfigMode::Single { uri, policy_file }
     } else if has_explicit_config && has_graphs_map {
+        if config.resolve_policy_file().is_some() {
+            bail!(
+                "top-level `policy.file` is single-graph/CLI-local policy only; \
+                 in multi-graph mode move per-graph rules to \
+                 `graphs.<graph_id>.policy.file` and move `graph_list` rules to \
+                 `server.policy.file`."
+            );
+        }
         // Rule 4 → Multi mode. Build a startup config per graph.
         let mut graphs = Vec::with_capacity(config.graphs.len());
         for (name, target) in &config.graphs {
@@ -806,9 +815,13 @@ pub fn load_server_settings(
             GraphId::try_from(name.clone()).map_err(|err| {
                 color_eyre::eyre::eyre!("invalid graph id '{name}' in omnigraph.yaml: {err}")
             })?;
+            let raw_uri = config.resolve_uri_value(&target.uri);
+            let uri = normalize_root_uri(&raw_uri).wrap_err_with(|| {
+                format!("normalize URI '{raw_uri}' for graph '{name}' in omnigraph.yaml")
+            })?;
             graphs.push(GraphStartupConfig {
                 graph_id: name.clone(),
-                uri: config.resolve_uri_value(&target.uri),
+                uri,
                 policy_file: config.resolve_target_policy_file(name),
             });
         }
@@ -1033,13 +1046,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
                 config = %config_path.display(),
                 "serving omnigraph"
             );
-            open_multi_graph_state(
-                graphs,
-                tokens,
-                server_policy_file.as_ref(),
-                config_path,
-            )
-            .await?
+            open_multi_graph_state(graphs, tokens, server_policy_file.as_ref(), config_path).await?
         }
     };
 
@@ -1090,14 +1097,8 @@ async fn open_multi_graph_state(
         .await?;
 
     let workload = workload::WorkloadController::from_env();
-    let state = AppState::new_multi(
-        handles,
-        tokens,
-        server_policy,
-        workload,
-        Some(config_path),
-    )
-    .map_err(|err| color_eyre::eyre::eyre!("multi-graph registry: {err}"))?;
+    let state = AppState::new_multi(handles, tokens, server_policy, workload, Some(config_path))
+        .map_err(|err| color_eyre::eyre::eyre!("multi-graph registry: {err}"))?;
     Ok(state)
 }
 
@@ -1106,10 +1107,12 @@ async fn open_multi_graph_state(
 async fn open_single_graph(cfg: GraphStartupConfig) -> Result<Arc<GraphHandle>> {
     let graph_id = GraphId::try_from(cfg.graph_id.clone())
         .map_err(|err| color_eyre::eyre::eyre!("graph id '{}': {err}", cfg.graph_id))?;
+    let uri = normalize_root_uri(&cfg.uri)
+        .wrap_err_with(|| format!("normalize URI for graph '{}'", cfg.graph_id))?;
 
-    let db = Omnigraph::open(&cfg.uri)
+    let db = Omnigraph::open(&uri)
         .await
-        .map_err(|err| color_eyre::eyre::eyre!("open graph '{}' at {}: {err}", graph_id, cfg.uri))?;
+        .map_err(|err| color_eyre::eyre::eyre!("open graph '{}' at {}: {err}", graph_id, uri))?;
 
     let (policy_arc, db) = match &cfg.policy_file {
         Some(path) => {
@@ -1123,7 +1126,7 @@ async fn open_single_graph(cfg: GraphStartupConfig) -> Result<Arc<GraphHandle>> 
 
     Ok(Arc::new(GraphHandle {
         key: GraphKey::cluster(graph_id),
-        uri: cfg.uri,
+        uri,
         engine: Arc::new(db),
         policy: policy_arc,
     }))
@@ -1260,9 +1263,9 @@ const ALWAYS_FLAT_PATHS: &[&str] = &["/healthz", "/graphs"];
 /// In multi-mode `server_openapi`, every protected path-item is
 /// reattached under the cluster prefix. Operation IDs gain the
 /// `cluster_` prefix so SDK generators don't collide if/when both
-/// surfaces are merged. The `{graph_id}` URL placeholder is left
-/// implicit in the path; consuming clients see it as a standard
-/// OpenAPI path parameter.
+/// surfaces are merged. Every rewritten operation also declares the
+/// required `{graph_id}` path parameter so the served OpenAPI document
+/// remains internally valid.
 ///
 /// Removing the flat protected paths matches the runtime router —
 /// in multi mode, requests to `/snapshot` etc. return 404, so the
@@ -1276,15 +1279,46 @@ fn nest_paths_under_cluster_prefix(doc: &mut utoipa::openapi::OpenApi) {
             continue;
         }
         rename_operation_ids(&mut item, CLUSTER_OPERATION_ID_PREFIX);
+        add_cluster_graph_id_parameter(&mut item);
         let new_path = format!("{CLUSTER_PATH_PREFIX}{path}");
         rewritten.insert(new_path, item);
     }
     doc.paths.paths = rewritten;
 }
 
+fn add_cluster_graph_id_parameter(item: &mut utoipa::openapi::PathItem) {
+    for op in path_item_operations_mut(item) {
+        let parameters = op.parameters.get_or_insert_with(Vec::new);
+        let has_graph_id = parameters
+            .iter()
+            .any(|param| param.name == "graph_id" && param.parameter_in == ParameterIn::Path);
+        if !has_graph_id {
+            parameters.insert(0, graph_id_path_parameter());
+        }
+    }
+}
+
+fn graph_id_path_parameter() -> Parameter {
+    let mut parameter = Parameter::new("graph_id");
+    parameter.parameter_in = ParameterIn::Path;
+    parameter.description = Some("Graph id to route the request to.".to_string());
+    parameter.schema = Some(Object::with_type(Type::String).into());
+    parameter
+}
+
 /// Prefix every operation_id in this PathItem with `prefix`.
 fn rename_operation_ids(item: &mut utoipa::openapi::PathItem, prefix: &str) {
-    for op in [
+    for op in path_item_operations_mut(item) {
+        if let Some(id) = op.operation_id.as_deref() {
+            op.operation_id = Some(format!("{prefix}{id}"));
+        }
+    }
+}
+
+fn path_item_operations_mut(
+    item: &mut utoipa::openapi::PathItem,
+) -> impl Iterator<Item = &mut utoipa::openapi::path::Operation> {
+    [
         item.get.as_mut(),
         item.post.as_mut(),
         item.put.as_mut(),
@@ -1296,11 +1330,6 @@ fn rename_operation_ids(item: &mut utoipa::openapi::PathItem, prefix: &str) {
     ]
     .into_iter()
     .flatten()
-    {
-        if let Some(id) = op.operation_id.as_deref() {
-            op.operation_id = Some(format!("{prefix}{id}"));
-        }
-    }
 }
 
 fn strip_security(doc: &mut utoipa::openapi::OpenApi) {
@@ -1405,9 +1434,7 @@ async fn resolve_graph_handle(
             match registry.get(&key) {
                 RegistryLookup::Ready(handle) => handle,
                 RegistryLookup::Gone => {
-                    return Err(ApiError::not_found(format!(
-                        "graph '{graph_id}' not found"
-                    )));
+                    return Err(ApiError::not_found(format!("graph '{graph_id}' not found")));
                 }
             }
         }
@@ -1731,7 +1758,9 @@ async fn server_change(
         .as_ref()
         .map(|Extension(actor)| Arc::clone(&actor.actor_id))
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
-    let actor_id = actor.as_ref().map(|Extension(actor)| actor.actor_id.as_ref());
+    let actor_id = actor
+        .as_ref()
+        .map(|Extension(actor)| actor.actor_id.as_ref());
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
@@ -1850,7 +1879,9 @@ async fn server_schema_apply(
         .as_ref()
         .map(|Extension(actor)| Arc::clone(&actor.actor_id))
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
-    let actor_id = actor.as_ref().map(|Extension(actor)| actor.actor_id.as_ref());
+    let actor_id = actor
+        .as_ref()
+        .map(|Extension(actor)| actor.actor_id.as_ref());
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
@@ -1921,7 +1952,9 @@ async fn server_ingest(
         .as_ref()
         .map(|Extension(actor)| Arc::clone(&actor.actor_id))
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
-    let actor_id = actor.as_ref().map(|Extension(actor)| actor.actor_id.as_ref());
+    let actor_id = actor
+        .as_ref()
+        .map(|Extension(actor)| actor.actor_id.as_ref());
 
     let branch_exists = {
         let db = &handle.engine;
@@ -2120,7 +2153,9 @@ async fn server_branch_delete(
         .as_ref()
         .map(|Extension(actor)| Arc::clone(&actor.actor_id))
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
-    let actor_id = actor.as_ref().map(|Extension(actor)| actor.actor_id.as_ref());
+    let actor_id = actor
+        .as_ref()
+        .map(|Extension(actor)| actor.actor_id.as_ref());
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
@@ -2181,7 +2216,9 @@ async fn server_branch_merge(
         .as_ref()
         .map(|Extension(actor)| Arc::clone(&actor.actor_id))
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
-    let actor_id = actor.as_ref().map(|Extension(actor)| actor.actor_id.as_ref());
+    let actor_id = actor
+        .as_ref()
+        .map(|Extension(actor)| actor.actor_id.as_ref());
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         handle.policy.as_deref(),
@@ -2417,8 +2454,7 @@ mod tests {
     use super::{
         GraphStartupConfig, ServerConfig, ServerConfigMode, ServerRuntimeState,
         classify_server_runtime_state, hash_bearer_token, load_server_settings,
-        normalize_bearer_token, parse_bearer_tokens_json, serve,
-        server_bearer_tokens_from_env,
+        normalize_bearer_token, parse_bearer_tokens_json, serve, server_bearer_tokens_from_env,
     };
     use serial_test::serial;
     use std::env;
@@ -2770,8 +2806,8 @@ server:
         // and multi mode get the same enforcement from one source of
         // truth.
         for allow_unauthenticated in [false, true] {
-            let err = classify_server_runtime_state(false, true, allow_unauthenticated)
-                .unwrap_err();
+            let err =
+                classify_server_runtime_state(false, true, allow_unauthenticated).unwrap_err();
             let msg = err.to_string();
             assert!(
                 msg.contains("policy file is configured but no bearer tokens"),

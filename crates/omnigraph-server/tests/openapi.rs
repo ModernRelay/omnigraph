@@ -1129,6 +1129,68 @@ async fn multi_mode_openapi_prefixes_operation_ids_with_cluster() {
 }
 
 #[tokio::test]
+async fn multi_mode_openapi_declares_graph_id_path_parameter() {
+    let (_dirs, app) = app_for_multi_mode(&["alpha"]).await;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/openapi.json")
+        .body(Body::empty())
+        .unwrap();
+    let (_, json) = json_response(&app, request).await;
+    let paths = json["paths"].as_object().unwrap();
+
+    for expected_path in EXPECTED_CLUSTER_PATHS {
+        let item = paths
+            .get(*expected_path)
+            .unwrap_or_else(|| panic!("missing cluster path {expected_path}"));
+        for method in ["get", "post", "put", "delete", "patch"] {
+            let Some(operation) = item.get(method).filter(|value| value.is_object()) else {
+                continue;
+            };
+            let parameters = operation["parameters"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{expected_path}.{method} missing parameters"));
+            let graph_id = parameters
+                .iter()
+                .find(|param| param["name"] == "graph_id" && param["in"] == "path")
+                .unwrap_or_else(|| {
+                    panic!("{expected_path}.{method} missing graph_id path parameter")
+                });
+            assert_eq!(
+                graph_id["required"].as_bool(),
+                Some(true),
+                "{expected_path}.{method} graph_id parameter must be required"
+            );
+            assert_eq!(
+                graph_id["schema"]["type"].as_str(),
+                Some("string"),
+                "{expected_path}.{method} graph_id parameter must be string typed"
+            );
+        }
+    }
+
+    for flat in ["/healthz", "/graphs"] {
+        let item = paths.get(flat).unwrap();
+        for method in ["get", "post", "put", "delete", "patch"] {
+            if let Some(operation) = item.get(method).filter(|value| value.is_object()) {
+                let has_graph_id = operation["parameters"]
+                    .as_array()
+                    .map(|params| {
+                        params
+                            .iter()
+                            .any(|param| param["name"] == "graph_id" && param["in"] == "path")
+                    })
+                    .unwrap_or(false);
+                assert!(
+                    !has_graph_id,
+                    "{flat}.{method} must not declare graph_id; it remains flat"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn multi_mode_operation_ids_are_unique() {
     // Sanity check: the cluster_ prefix prevents collision with flat ids
     // (which don't appear in multi mode, but the contract is "unique

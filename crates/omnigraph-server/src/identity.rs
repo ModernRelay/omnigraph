@@ -95,10 +95,7 @@ fn validate_tenant_id(value: &str) -> Result<()> {
         );
     }
     if !tenant_id_regex().is_match(value) {
-        bail!(
-            "tenant_id '{}' must match ^[a-zA-Z0-9-]{{1,64}}$",
-            value
-        );
+        bail!("tenant_id '{}' must match ^[a-zA-Z0-9-]{{1,64}}$", value);
     }
     Ok(())
 }
