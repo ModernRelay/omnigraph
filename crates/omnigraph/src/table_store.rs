@@ -1793,25 +1793,24 @@ mod tests {
     #[test]
     fn check_batch_unique_by_keys_errors_on_duplicate_id() {
         let batch = batch_with_ids(&["a", "b", "a"]);
-        let err =
-            check_batch_unique_by_keys(&batch, &["id".to_string()], "test").unwrap_err();
+        let err = check_batch_unique_by_keys(&batch, &["id".to_string()], "test").unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("duplicate source row for key 'a'"),
             "unexpected error: {msg}"
         );
-        assert!(msg.contains("MR-957"), "error should reference MR-957: {msg}");
+        assert!(
+            msg.contains("MR-957"),
+            "error should reference MR-957: {msg}"
+        );
     }
 
     #[test]
     fn check_batch_unique_by_keys_rejects_multi_column_keys() {
         let batch = batch_with_ids(&["a"]);
-        let err = check_batch_unique_by_keys(
-            &batch,
-            &["id".to_string(), "other".to_string()],
-            "test",
-        )
-        .unwrap_err();
+        let err =
+            check_batch_unique_by_keys(&batch, &["id".to_string(), "other".to_string()], "test")
+                .unwrap_err();
         assert!(err.to_string().contains("single-column keys only"));
     }
 }

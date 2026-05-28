@@ -137,12 +137,11 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
                     Rule::mutation_body => {
                         for mutation_pair in body.into_inner() {
                             if let Rule::mutation_stmt = mutation_pair.as_rule() {
-                                let stmt =
-                                    mutation_pair.into_inner().next().ok_or_else(|| {
-                                        NanoError::Parse(
-                                            "mutation statement cannot be empty".to_string(),
-                                        )
-                                    })?;
+                                let stmt = mutation_pair.into_inner().next().ok_or_else(|| {
+                                    NanoError::Parse(
+                                        "mutation statement cannot be empty".to_string(),
+                                    )
+                                })?;
                                 mutations.push(parse_mutation_stmt(stmt)?);
                             }
                         }

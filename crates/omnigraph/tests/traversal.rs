@@ -504,9 +504,21 @@ query fof_chain($name: String) {
 
     let batch = result.concat_batches().unwrap();
     assert_eq!(batch.num_rows(), 1);
-    let col0 = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-    let col1 = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-    let col2 = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+    let col0 = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let col1 = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let col2 = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
     assert_eq!(col0.value(0), "Alice");
     assert_eq!(col1.value(0), "Bob");
     assert_eq!(col2.value(0), "Diana");
@@ -574,8 +586,16 @@ query at_acme_named() {
 
     let batch = result.concat_batches().unwrap();
     assert_eq!(batch.num_rows(), 1);
-    let person = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-    let company = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+    let person = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let company = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
     assert_eq!(person.value(0), "Alice");
     assert_eq!(company.value(0), "Acme");
 }
@@ -608,8 +628,16 @@ query at_company($company: String) {
 
     let batch = result.concat_batches().unwrap();
     assert_eq!(batch.num_rows(), 1);
-    let person = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-    let company = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+    let person = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let company = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
     assert_eq!(person.value(0), "Bob");
     assert_eq!(company.value(0), "Globex");
 }
@@ -633,19 +661,22 @@ query fan_out($name: String) {
 "#;
     // Alice knows Bob and Charlie, works at Acme.
     // Each friend paired with her company → 2 rows.
-    let result = query_main(
-        &mut db,
-        queries,
-        "fan_out",
-        &params(&[("$name", "Alice")]),
-    )
-    .await
-    .unwrap();
+    let result = query_main(&mut db, queries, "fan_out", &params(&[("$name", "Alice")]))
+        .await
+        .unwrap();
 
     let batch = result.concat_batches().unwrap();
     assert_eq!(batch.num_rows(), 2);
-    let friends = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-    let companies = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+    let friends = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let companies = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
 
     let mut pairs: Vec<(&str, &str)> = (0..batch.num_rows())
         .map(|i| (friends.value(i), companies.value(i)))

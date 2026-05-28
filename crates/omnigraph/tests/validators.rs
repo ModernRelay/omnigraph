@@ -76,7 +76,9 @@ async fn init_with(schema: &str, data: &str) -> (tempfile::TempDir, Omnigraph) {
     let uri = dir.path().to_str().unwrap();
     let mut db = Omnigraph::init(uri, schema).await.unwrap();
     if !data.is_empty() {
-        load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+        load_jsonl(&mut db, data, LoadMode::Overwrite)
+            .await
+            .unwrap();
     }
     (dir, db)
 }

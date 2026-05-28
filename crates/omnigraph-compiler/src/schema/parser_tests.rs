@@ -271,9 +271,9 @@ age: I32?
     match &schema.declarations[0] {
         SchemaDecl::Node(n) => {
             assert!(
-                n.constraints.iter().any(
-                    |c| matches!(c, Constraint::Range { property, .. } if property == "age")
-                )
+                n.constraints
+                    .iter()
+                    .any(|c| matches!(c, Constraint::Range { property, .. } if property == "age"))
             );
         }
         _ => panic!("expected Node"),

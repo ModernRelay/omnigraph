@@ -235,7 +235,9 @@ pub struct CommitListOutput {
 pub struct ReadRequest {
     /// GQ query source. May declare one or more named queries; pick one with
     /// `query_name` if there is more than one.
-    #[schema(example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}")]
+    #[schema(
+        example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
+    )]
     pub query_source: String,
     /// Name of the query to run when `query_source` declares multiple. Optional
     /// when only one query is declared.
@@ -252,7 +254,9 @@ pub struct ReadRequest {
 pub struct ChangeRequest {
     /// GQ mutation source containing `insert`, `update`, or `delete` statements.
     /// May declare multiple named mutations; pick one with `query_name`.
-    #[schema(example = "query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}")]
+    #[schema(
+        example = "query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}"
+    )]
     pub query_source: String,
     /// Name of the mutation to run when `query_source` declares multiple.
     pub query_name: Option<String>,
@@ -266,7 +270,9 @@ pub struct ChangeRequest {
 pub struct SchemaApplyRequest {
     /// Project schema in `.pg` source form. The diff against the current
     /// schema produces the migration steps that will be applied.
-    #[schema(example = "node Person {\n    name: String @key\n    age: I32?\n}\n\nedge Knows: Person -> Person")]
+    #[schema(
+        example = "node Person {\n    name: String @key\n    age: I32?\n}\n\nedge Knows: Person -> Person"
+    )]
     pub schema_source: String,
     /// When true, promote every `DropMode::Soft` step in the plan to
     /// `DropMode::Hard`, making the prior column data unreachable
@@ -303,7 +309,9 @@ pub struct IngestRequest {
     pub mode: Option<LoadMode>,
     /// NDJSON payload: one record per line, each shaped
     /// `{"type": "<TypeName>", "data": {...}}`.
-    #[schema(example = "{\"type\": \"Person\", \"data\": {\"name\": \"Alice\", \"age\": 30}}\n{\"type\": \"Person\", \"data\": {\"name\": \"Bob\", \"age\": 25}}")]
+    #[schema(
+        example = "{\"type\": \"Person\", \"data\": {\"name\": \"Alice\", \"age\": 30}}\n{\"type\": \"Person\", \"data\": {\"name\": \"Bob\", \"age\": 25}}"
+    )]
     pub data: String,
 }
 
@@ -344,6 +352,11 @@ pub enum ErrorCode {
     Forbidden,
     BadRequest,
     NotFound,
+    /// 405 Method Not Allowed — the route exists but the active server
+    /// mode doesn't serve this method (e.g. `GET /graphs` in single-graph
+    /// mode). Distinct from 404 so clients can tell "wrong context" from
+    /// "no such resource."
+    MethodNotAllowed,
     Conflict,
     /// 429 Too Many Requests — per-actor admission cap exceeded.
     /// Clients should respect the `Retry-After` header.
@@ -466,4 +479,24 @@ pub fn read_target_output(target: &ReadTarget) -> ReadTargetOutput {
             snapshot: Some(snapshot.as_str().to_string()),
         },
     }
+}
+
+// ─── MR-668 — management endpoint shapes ──────────────────────────────────
+
+/// One entry in the response from `GET /graphs`. Cluster operators
+/// consume this list to discover which graphs the server is currently
+/// serving. The shape is intentionally minimal — `graph_id` and `uri`
+/// are the only fields a routing client needs.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GraphInfo {
+    pub graph_id: String,
+    pub uri: String,
+}
+
+/// Response from `GET /graphs`. Lists every graph registered with the
+/// server in alphabetical order by `graph_id` (sorted server-side so
+/// clients get deterministic output across requests).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GraphListResponse {
+    pub graphs: Vec<GraphInfo>,
 }

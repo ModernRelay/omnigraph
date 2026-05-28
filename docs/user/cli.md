@@ -44,6 +44,27 @@ omnigraph read \
 If the server requires auth, set `OMNIGRAPH_SERVER_BEARER_TOKEN` on the server
 and configure the matching `bearer_token_env` in `omnigraph.yaml`.
 
+## Multi-graph servers (v0.6.0+)
+
+Against a multi-graph server (started with `--config omnigraph.yaml` referencing a non-empty `graphs:` map), use `omnigraph graphs list` to enumerate the registered graphs. The server must configure bearer tokens and `server.policy.file` with a rule that allows `graph_list`; `/graphs` is closed by default even when the server runs with `--unauthenticated`.
+
+```bash
+OMNIGRAPH_BEARER_TOKEN=admin-token \
+  omnigraph graphs list --uri http://server.example.com --json
+```
+
+For config-driven clients, set the remote graph's `bearer_token_env` to an environment variable containing a token whose actor is authorized by `server.policy.file`.
+
+`list` rejects local URI targets — it's for remote multi-graph servers only.
+
+Runtime add/remove is **not** in v0.6.0. To add a graph, stop the server, add a `graphs.<id>` entry to `omnigraph.yaml`, then restart. To remove, stop the server, delete the entry, restart.
+
+Per-graph URLs: hit a graph's cluster route from any subcommand by pointing `--uri` at it:
+
+```bash
+omnigraph read --uri http://server.example.com/graphs/beta --query ./q.gq ...
+```
+
 ## Runs, Policy, And Diagnostics
 
 ```bash

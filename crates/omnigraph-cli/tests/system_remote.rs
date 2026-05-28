@@ -37,6 +37,17 @@ rules:
       target_branch_scope: protected
 "#;
 
+const GRAPH_LIST_SERVER_POLICY_YAML: &str = r#"
+version: 1
+groups:
+  admins: [act-admin]
+rules:
+  - id: admins-can-list-graphs
+    allow:
+      actors: { group: admins }
+      actions: [graph_list]
+"#;
+
 fn yaml_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -887,4 +898,113 @@ query insert_person($name: String, $age: I32) {
     ));
     assert_eq!(verify["row_count"], 1);
     assert_eq!(verify["rows"][0]["p.name"], "PolicyRemote");
+}
+
+// ─── MR-668 PR 8 — omnigraph graphs list end-to-end ────────────────────────
+
+/// Multi-graph server + CLI `omnigraph graphs list` end-to-end.
+///
+/// Steps:
+///   1. Init a graph `alpha` on disk and write an `omnigraph.yaml`
+///      whose `graphs:` map references it.
+///   2. Spawn the server with `--config <yaml>`.
+///   3. `omnigraph graphs list` — expect to see `alpha`.
+///
+/// Ignored by default — spawning servers needs loopback socket
+/// permissions some sandboxes lack.
+#[test]
+#[ignore = "requires loopback socket permissions in sandboxed runners"]
+fn graphs_list_against_multi_graph_server() {
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let schema_path = fixture("test.pg");
+
+    // Init `alpha` on disk.
+    let alpha_uri = cfg_dir.path().join("alpha.omni");
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        Omnigraph::init(
+            alpha_uri.to_str().unwrap(),
+            &fs::read_to_string(&schema_path).unwrap(),
+        )
+        .await
+        .unwrap();
+    });
+
+    fs::write(
+        cfg_dir.path().join("server-policy.yaml"),
+        GRAPH_LIST_SERVER_POLICY_YAML,
+    )
+    .unwrap();
+
+    // Server config with `graphs:` map and no `server.graph` selector
+    // — multi mode (rule 4 of the inference matrix). `GET /graphs` is a
+    // server-scoped action, so the success path needs an explicit server
+    // policy and bearer token.
+    let server_config_path = cfg_dir.path().join("omnigraph.yaml");
+    fs::write(
+        &server_config_path,
+        format!(
+            "\
+server:
+  policy:
+    file: ./server-policy.yaml
+graphs:
+  alpha:
+    uri: {}
+",
+            yaml_string(&alpha_uri.to_string_lossy())
+        ),
+    )
+    .unwrap();
+
+    let server = spawn_server_with_config_env(
+        &server_config_path,
+        &[(
+            "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+            r#"{"act-admin":"admin-token"}"#,
+        )],
+    );
+
+    // Client config — the CLI's `--target dev` resolves to `server.base_url`.
+    let client_config_path = cfg_dir.path().join("client.yaml");
+    fs::write(
+        &client_config_path,
+        format!(
+            "\
+graphs:
+  dev:
+    uri: {}
+    bearer_token_env: GRAPH_LIST_TOKEN
+cli:
+  graph: dev
+auth:
+  env_file: ./.env.omni
+",
+            yaml_string(&server.base_url)
+        ),
+    )
+    .unwrap();
+    fs::write(
+        cfg_dir.path().join(".env.omni"),
+        "GRAPH_LIST_TOKEN=admin-token\n",
+    )
+    .unwrap();
+
+    // `graphs list` lists `alpha`.
+    let payload = parse_stdout_json(&output_success(
+        cli()
+            .arg("graphs")
+            .arg("list")
+            .arg("--config")
+            .arg(&client_config_path)
+            .arg("--json"),
+    ));
+    let ids: Vec<&str> = payload["graphs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["graph_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["alpha"]);
+
+    drop(server);
 }

@@ -150,9 +150,7 @@ impl SchemaMigrationStep {
     /// non-`UnsupportedChange` variant).
     pub fn diagnostic(&self) -> Option<&'static crate::lint::DiagnosticCode> {
         match self {
-            Self::UnsupportedChange {
-                code: Some(c), ..
-            } => crate::lint::lookup(c),
+            Self::UnsupportedChange { code: Some(c), .. } => crate::lint::lookup(c),
             _ => None,
         }
     }
@@ -1037,10 +1035,7 @@ node Person {
         .unwrap();
 
         let plan = plan_schema_migration(&accepted, &desired).unwrap();
-        assert!(
-            plan.supported,
-            "drop-type plan must be supported: {plan:?}"
-        );
+        assert!(plan.supported, "drop-type plan must be supported: {plan:?}");
         assert!(
             plan.steps.iter().any(|step| matches!(
                 step,
@@ -1182,8 +1177,7 @@ node Person @description("new") {
 
         for step in steps {
             let json = serde_json::to_string(&step).expect("serialize");
-            let round_trip: SchemaMigrationStep =
-                serde_json::from_str(&json).expect("deserialize");
+            let round_trip: SchemaMigrationStep = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(step, round_trip, "round-trip mismatch on {json}");
         }
     }

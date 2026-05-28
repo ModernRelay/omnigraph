@@ -585,6 +585,63 @@
         ]
       }
     },
+    "/graphs": {
+      "get": {
+        "tags": [
+          "management"
+        ],
+        "summary": "List every graph currently registered with this server (MR-668).",
+        "description": "Multi-graph mode only. In single mode, the route returns 405 — there's\nno registry to enumerate. Cedar-gated by the server-level policy via\nthe `graph_list` action against `Omnigraph::Server::\"root\"`.\n\nOrder: alphabetical by `graph_id` (server-sorted so clients see\ndeterministic output across requests).",
+        "operationId": "listGraphs",
+        "responses": {
+          "200": {
+            "description": "List of registered graphs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GraphListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "Method not allowed (single-graph mode)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/healthz": {
       "get": {
         "tags": [
@@ -1199,6 +1256,7 @@
           "forbidden",
           "bad_request",
           "not_found",
+          "method_not_allowed",
           "conflict",
           "too_many_requests",
           "internal"
@@ -1265,6 +1323,37 @@
               "type": "string"
             },
             "description": "Restrict the export to these node/edge type names. Empty exports all types."
+          }
+        }
+      },
+      "GraphInfo": {
+        "type": "object",
+        "description": "One entry in the response from `GET /graphs`. Cluster operators\nconsume this list to discover which graphs the server is currently\nserving. The shape is intentionally minimal — `graph_id` and `uri`\nare the only fields a routing client needs.",
+        "required": [
+          "graph_id",
+          "uri"
+        ],
+        "properties": {
+          "graph_id": {
+            "type": "string"
+          },
+          "uri": {
+            "type": "string"
+          }
+        }
+      },
+      "GraphListResponse": {
+        "type": "object",
+        "description": "Response from `GET /graphs`. Lists every graph registered with the\nserver in alphabetical order by `graph_id` (sorted server-side so\nclients get deterministic output across requests).",
+        "required": [
+          "graphs"
+        ],
+        "properties": {
+          "graphs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GraphInfo"
+            }
           }
         }
       },

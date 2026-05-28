@@ -1910,9 +1910,14 @@ query docs_with_tag($tag: String) {
     return { $d.slug }
 }
 "#;
-    let result = query_main(&mut db, queries, "docs_with_tag", &params(&[("$tag", "red")]))
-        .await
-        .unwrap();
+    let result = query_main(
+        &mut db,
+        queries,
+        "docs_with_tag",
+        &params(&[("$tag", "red")]),
+    )
+    .await
+    .unwrap();
 
     let batch = result.concat_batches().unwrap();
     let slugs = batch

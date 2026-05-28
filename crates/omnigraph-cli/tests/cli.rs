@@ -2040,3 +2040,47 @@ fn schema_plan_parity_cli_and_sdk() {
     );
     assert_eq!(cli_payload["supported"], plan.supported);
 }
+
+// ─── MR-668 PR 8 — omnigraph graphs subcommand ─────────────────────────────
+
+/// `omnigraph graphs --help` lists only the read-only `list`
+/// subcommand. Runtime add (`create`) and remove (`delete`) are
+/// deferred — operators add/remove graphs by editing `omnigraph.yaml`
+/// and restarting. This test pins the deferral against accidental
+/// re-introduction.
+#[test]
+fn graphs_subcommand_help_lists_list_only() {
+    let output = output_success(cli().arg("graphs").arg("--help"));
+    let stdout = stdout_string(&output);
+    assert!(
+        stdout.contains("list"),
+        "expected `list` subcommand in help output:\n{stdout}"
+    );
+    let lowered = stdout.to_lowercase();
+    assert!(
+        !lowered.contains("create a new graph"),
+        "graph create should not be in v0.6.0 help; got:\n{stdout}"
+    );
+    assert!(
+        !lowered.contains("delete a graph"),
+        "graph delete should not be in v0.6.0 help; got:\n{stdout}"
+    );
+}
+
+/// `omnigraph graphs list` against a local URI errors with a clear
+/// message — the CLI only operates against remote multi-graph servers.
+#[test]
+fn graphs_list_against_local_uri_errors_with_remote_only_message() {
+    let output = output_failure(
+        cli()
+            .arg("graphs")
+            .arg("list")
+            .arg("--uri")
+            .arg("/tmp/local"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("remote multi-graph server URL"),
+        "expected 'remote multi-graph server URL' rejection in stderr; got:\n{stderr}"
+    );
+}
