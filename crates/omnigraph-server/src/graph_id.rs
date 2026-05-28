@@ -119,13 +119,16 @@ fn regex() -> &'static Regex {
 
 /// Reserved `graph_id` values that the regex alone wouldn't catch.
 /// The leading-underscore rule already excludes every engine-managed
-/// filename pattern (`_schema.pg`, `__manifest`, etc.); this list covers
-/// route-prefix collisions and standard endpoint names.
+/// filename pattern (`_schema.pg`, `__manifest`, etc.); the regex
+/// `^[a-zA-Z0-9-]{1,64}$` (see `regex()`) additionally rejects every
+/// dot-containing name structurally — `openapi.json` and friends
+/// never reach this check.
+///
+/// This list only needs to cover route-prefix collisions and
+/// top-level endpoint names whose spellings DO satisfy the regex
+/// (no dots, no underscores).
 fn is_reserved(value: &str) -> bool {
-    matches!(
-        value,
-        "policies" | "healthz" | "openapi" | "openapi.json" | "graphs"
-    )
+    matches!(value, "policies" | "healthz" | "openapi" | "graphs")
 }
 
 #[cfg(test)]
@@ -205,7 +208,11 @@ mod tests {
 
     #[test]
     fn rejects_reserved_route_names() {
-        for bad in ["policies", "healthz", "openapi", "openapi.json", "graphs"] {
+        // Names that satisfy the regex but are still reserved because
+        // they'd collide with top-level route prefixes / endpoint names.
+        // Dot-containing names (e.g. `openapi.json`) are rejected by the
+        // regex, not this list — `rejects_dots` above covers them.
+        for bad in ["policies", "healthz", "openapi", "graphs"] {
             assert!(
                 GraphId::try_from(bad).is_err(),
                 "expected reject (reserved): {bad}"

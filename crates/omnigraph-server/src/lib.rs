@@ -50,7 +50,7 @@ use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::{JsonParamMode, ParamMap};
 pub use policy::{
     PolicyAction, PolicyCompiler, PolicyConfig, PolicyDecision, PolicyEngine, PolicyExpectation,
-    PolicyRequest, PolicyTestConfig,
+    PolicyRequest, PolicyResourceKind, PolicyTestConfig,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -1455,20 +1455,38 @@ fn authorize_request(
     request: PolicyRequest,
 ) -> std::result::Result<(), ApiError> {
     let Some(engine) = policy else {
-        // MR-723 default-deny path. We're here when no PolicyEngine is
-        // installed. Two startup-validated shapes can reach this:
+        // No PolicyEngine installed. Three runtime states can reach this:
         //
         // * **Open mode** (`--unauthenticated`): no tokens, no policy.
-        //   `require_bearer_auth` short-circuits before this is called,
-        //   but defense in depth — if a future change makes the
-        //   middleware call here for an unauthenticated request, we
-        //   want every action to remain Ok rather than 403. The
-        //   operator opted in.
+        //   Per-graph operations are open by operator opt-in (they
+        //   accepted "trust the network" for graph data).
         // * **DefaultDeny mode**: tokens configured but no policy. The
-        //   request went through bearer auth, so `actor` is Some and
-        //   identifies a known actor. Only `Read` is permitted; every
-        //   other action returns 403. This closes the "configured auth
-        //   but forgot the policy file" trap from MR-723.
+        //   request went through bearer auth, so `actor` is Some. Only
+        //   per-graph `Read` is permitted; other per-graph actions
+        //   return 403. Closes the "configured auth but forgot the
+        //   policy file" trap from MR-723.
+        // * Either of the above with a **server-scoped** action
+        //   (`graph_list`, future `graph_create`/`graph_delete`).
+        //
+        // Server-scoped actions are always denied here, regardless of
+        // mode or actor presence. The management surface leaks server
+        // topology (graph IDs + URIs that may contain S3 bucket paths
+        // or internal hostnames) — operators who opted into Open mode
+        // accepted exposure of graph DATA, not exposure of server
+        // topology. Closing the management surface by default in every
+        // runtime state means the docstring contract on
+        // `server_graphs_list` ("don't leak the registry until the
+        // operator explicitly authorizes it") holds uniformly; the
+        // operator's only path to enabling it is configuring an
+        // explicit `server.policy.file` in omnigraph.yaml.
+        if request.action.resource_kind() == PolicyResourceKind::Server {
+            return Err(ApiError::forbidden(
+                "server-scoped actions require an explicit `server.policy.file` \
+                 configured in omnigraph.yaml — the management surface is closed \
+                 by default in every runtime state, including --unauthenticated, \
+                 so that server topology is never exposed without operator opt-in.",
+            ));
+        }
         if actor.is_some() && request.action != PolicyAction::Read {
             return Err(ApiError::forbidden(
                 "server runs in default-deny mode (bearer tokens configured but no \

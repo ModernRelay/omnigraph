@@ -5034,23 +5034,39 @@ graphs:
         assert_eq!(resp_authed.status(), StatusCode::FORBIDDEN);
     }
 
-    /// `GET /graphs` with a server policy that allows `graph_list` → 200.
-    /// `GET /graphs` with a server policy that does NOT allow `graph_list` → 403.
+    /// `GET /graphs` with a server policy that allows `graph_list` → 200
+    /// and returns the registry sorted alphabetically by `graph_id`.
+    /// `GET /graphs` with a server policy that does NOT allow
+    /// `graph_list` (viewer group) → 403.
+    ///
+    /// This test owns the alphabetical-sort coverage that previously
+    /// lived in `get_graphs_lists_registered_graphs_in_multi_mode`.
+    /// That test now asserts denial in Open mode (server-scoped actions
+    /// require explicit policy in every runtime state), so the positive
+    /// body-shape assertions need a home where the response is
+    /// operator-authorized — here.
     #[tokio::test(flavor = "multi_thread")]
     async fn get_graphs_with_server_policy_authorizes_per_cedar() {
         use omnigraph_policy::PolicyEngine;
         use omnigraph_server::{GraphHandle, GraphId, GraphKey};
 
         let dir = tempfile::tempdir().unwrap();
-        let graph_uri = dir.path().join("alpha").to_str().unwrap().to_string();
+
+        // Two graphs deliberately registered in non-alphabetical order
+        // so the test would fail if the handler relied on insertion
+        // order instead of server-side sorting.
         let schema = fs::read_to_string(fixture("test.pg")).unwrap();
-        let engine = Omnigraph::init(&graph_uri, &schema).await.unwrap();
-        let handle = Arc::new(GraphHandle {
-            key: GraphKey::cluster(GraphId::try_from("alpha").unwrap()),
-            uri: graph_uri,
-            engine: Arc::new(engine),
-            policy: None,
-        });
+        let mut handles = Vec::new();
+        for id in ["beta", "alpha"] {
+            let graph_uri = dir.path().join(id).to_str().unwrap().to_string();
+            let engine = Omnigraph::init(&graph_uri, &schema).await.unwrap();
+            handles.push(Arc::new(GraphHandle {
+                key: GraphKey::cluster(GraphId::try_from(id).unwrap()),
+                uri: graph_uri,
+                engine: Arc::new(engine),
+                policy: None,
+            }));
+        }
 
         // Server policy: admins can graph_list, viewers cannot.
         let policy_path = dir.path().join("server-policy.yaml");
@@ -5076,17 +5092,11 @@ rules:
             ("act-bruno".to_string(), "bruno-token".to_string()),
         ];
         let workload = omnigraph_server::workload::WorkloadController::from_env();
-        let state = AppState::new_multi(
-            vec![handle],
-            tokens,
-            Some(server_policy),
-            workload,
-            None,
-        )
-        .unwrap();
+        let state = AppState::new_multi(handles, tokens, Some(server_policy), workload, None)
+            .unwrap();
         let app = build_app(state);
 
-        // Admin → 200
+        // Admin → 200, body returns both graphs alphabetically sorted.
         let resp_admin = app
             .clone()
             .oneshot(
@@ -5104,6 +5114,16 @@ rules:
             StatusCode::OK,
             "admin must be allowed graph_list"
         );
+        let body = to_bytes(resp_admin.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let graphs = json["graphs"].as_array().unwrap();
+        assert_eq!(graphs.len(), 2, "response must list both registered graphs");
+        assert_eq!(
+            graphs[0]["graph_id"].as_str().unwrap(),
+            "alpha",
+            "server must sort graphs alphabetically by graph_id (insertion order was 'beta', 'alpha')"
+        );
+        assert_eq!(graphs[1]["graph_id"].as_str().unwrap(), "beta");
 
         // Viewer → 403
         let resp_viewer = app
