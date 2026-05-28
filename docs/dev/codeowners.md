@@ -8,10 +8,10 @@ This setup gives every role change a reviewable PR and a permanent in-repository
 
 | Role | Members | Scope |
 |---|---|---|
-| `engineering` | `@aaltshuler`, `@ragnorc` | All code under `crates/**`, repository infrastructure, default for unmapped paths |
-| `docs` | `@aaltshuler`, `@ragnorc` | `docs/**`, README.md, AGENTS.md, CLAUDE.md, SECURITY.md |
+| `engineering` | `@ragnorc` | All code under `crates/**`, repository infrastructure, default for unmapped paths |
+| `docs` | `@ragnorc` | `docs/**`, README.md, AGENTS.md, CLAUDE.md, SECURITY.md |
 
-GitHub treats multiple owners in a CODEOWNERS line as **"any one of them satisfies the review requirement"**. For docs, either named member can approve. To require N distinct approvers on a specific path, layer a CI check on top (not currently configured).
+GitHub treats multiple owners in a CODEOWNERS line as **"any one of them satisfies the review requirement"**. To require N distinct approvers on a specific path, layer a CI check on top (not currently configured).
 
 ## How to change role membership or path mappings
 
