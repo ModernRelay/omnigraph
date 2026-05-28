@@ -5270,12 +5270,11 @@ rules:
         );
     }
 
-    /// End-to-end: load an `omnigraph.yaml` with two graphs and serve
-    /// them. Both graphs must be queryable via cluster routes.
-    ///
-    /// Uses `_` placeholders for tempdirs so they live until end-of-test.
+    /// Loads an `omnigraph.yaml` with two graphs and verifies multi-mode
+    /// inference plus graph entry resolution. Cluster-route dispatch is
+    /// covered by the route tests above.
     #[tokio::test(flavor = "multi_thread")]
-    async fn server_settings_drive_multi_graph_startup_end_to_end() {
+    async fn server_settings_load_multi_graph_config_entries() {
         let cfg_dir = tempfile::tempdir().unwrap();
         // Real graph storage dirs (the URIs in the config must point to
         // a graph init-able location).
@@ -5310,9 +5309,6 @@ graphs:
             load_server_settings(Some(&config_path), None, None, None, true).unwrap();
         assert!(matches!(settings.mode, ServerConfigMode::Multi { .. }));
 
-        // We don't actually call `serve()` (would bind a socket); we
-        // just confirm the settings are well-formed and the inferred
-        // mode lists both graphs.
         match settings.mode {
             ServerConfigMode::Multi { graphs, .. } => {
                 assert_eq!(graphs.len(), 2);

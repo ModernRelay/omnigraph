@@ -79,7 +79,7 @@ cli:
   actor: act-andrew            # default actor for CLI direct-engine writes
 ```
 
-Each per-graph rule must use exactly one of `branch_scope` or `target_branch_scope`. Server-scoped rules (`graph_list`) take neither — they have no branch context.
+Each per-graph rule may use at most one of `branch_scope` or `target_branch_scope`. Server-scoped rules (`graph_list`) take neither — they have no branch context.
 
 `cli.actor` is the default actor identity for CLI direct-engine writes
 when `policy.file` is configured. Override per-invocation with `--as
@@ -121,7 +121,7 @@ reaches `authorize_request()` without a matching policy permit.
 |---|---|---|---|
 | **Open** | no | no | Every request is permitted. Refuses to start unless `--unauthenticated` or `OMNIGRAPH_UNAUTHENTICATED=1` is set — the operator must explicitly opt in. |
 | **DefaultDeny** | yes | no | Every authenticated request for an action other than `read` is rejected with HTTP 403. Closes the "tokens but forgot the policy file" trap — an operator who sets up auth and forgot to point at a policy file used to ship the illusion of protection. |
-| **PolicyEnabled** | yes | yes | Every request is evaluated by Cedar against the configured policy. |
+| **PolicyEnabled** | yes | yes | Authenticated requests that reach a configured policy engine are evaluated by Cedar. Server-scoped actions still require `server.policy.file`. |
 
 The classifier is `classify_server_runtime_state` in
 `crates/omnigraph-server/src/lib.rs`; it returns `Err` for the "no

@@ -210,23 +210,17 @@ impl OmnigraphConfig {
     }
 
     pub fn resolve_auth_env_file(&self) -> Option<PathBuf> {
-        let path = self.auth.env_file.as_deref()?;
-        let path = Path::new(path);
-        Some(if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.base_dir.join(path)
-        })
+        self.auth
+            .env_file
+            .as_deref()
+            .map(|path| self.resolve_config_path(path))
     }
 
     pub fn resolve_policy_file(&self) -> Option<PathBuf> {
-        let path = self.policy.file.as_deref()?;
-        let path = Path::new(path);
-        Some(if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.base_dir.join(path)
-        })
+        self.policy
+            .file
+            .as_deref()
+            .map(|path| self.resolve_config_path(path))
     }
 
     /// Resolve the per-graph policy file path for the named target,
@@ -234,25 +228,21 @@ impl OmnigraphConfig {
     /// target is unknown or no per-graph `policy.file` is set.
     pub fn resolve_target_policy_file(&self, target_name: &str) -> Option<PathBuf> {
         let target = self.graphs.get(target_name)?;
-        let path = target.policy.file.as_deref()?;
-        let path = Path::new(path);
-        Some(if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.base_dir.join(path)
-        })
+        target
+            .policy
+            .file
+            .as_deref()
+            .map(|path| self.resolve_config_path(path))
     }
 
     /// Resolve the server-level policy file path (used by management
     /// endpoints). Returns `None` if `server.policy.file` is not set.
     pub fn resolve_server_policy_file(&self) -> Option<PathBuf> {
-        let path = self.server.policy.file.as_deref()?;
-        let path = Path::new(path);
-        Some(if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.base_dir.join(path)
-        })
+        self.server
+            .policy
+            .file
+            .as_deref()
+            .map(|path| self.resolve_config_path(path))
     }
 
     /// Resolve a raw config-supplied URI (which may be relative) to its
@@ -326,6 +316,15 @@ impl OmnigraphConfig {
             value.to_string()
         } else {
             self.base_dir.join(path).to_string_lossy().to_string()
+        }
+    }
+
+    fn resolve_config_path(&self, value: &str) -> PathBuf {
+        let path = Path::new(value);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.base_dir.join(path)
         }
     }
 }
