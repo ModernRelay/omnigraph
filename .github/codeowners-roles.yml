@@ -19,9 +19,10 @@ roles:
   engineering:
     description: >
       All production code under crates/**. Engine, CLI, server,
-      compiler. Single owner; review must come from this person.
+      compiler. Either named member can approve.
     members:
       - aaltshuler
+      - ragnorc
 
   docs:
     description: >
