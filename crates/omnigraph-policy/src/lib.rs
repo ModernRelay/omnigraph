@@ -53,7 +53,7 @@ pub enum PolicyAction {
     /// `branch_scope` and `target_branch_scope` are NOT supported for
     /// this action — there's no branch context at the server level.
     /// Runtime `graph_create` / `graph_delete` are intentionally omitted
-    /// from v0.7.0; operators add and remove graphs by editing
+    /// from v0.6.0; operators add and remove graphs by editing
     /// `omnigraph.yaml` and restarting.
     GraphList,
 }

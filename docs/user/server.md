@@ -1,6 +1,6 @@
 # HTTP Server (`omnigraph-server`)
 
-Axum 0.8 + tokio + utoipa-generated OpenAPI. **Two modes** (v0.7.0+): single-graph (legacy) and multi-graph (MR-668). Mode is inferred from CLI args + config shape.
+Axum 0.8 + tokio + utoipa-generated OpenAPI. **Two modes** (v0.6.0+): single-graph (legacy) and multi-graph (MR-668). Mode is inferred from CLI args + config shape.
 
 ## Modes
 
@@ -8,7 +8,7 @@ Axum 0.8 + tokio + utoipa-generated OpenAPI. **Two modes** (v0.7.0+): single-gra
 
 `omnigraph-server <URI>` or `omnigraph-server --target <name> --config omnigraph.yaml`. Routes are flat — `/snapshot`, `/read`, `/branches`, etc. Behavior unchanged from v0.6.0.
 
-### Multi-graph mode (v0.7.0+)
+### Multi-graph mode (v0.6.0+)
 
 `omnigraph-server --config omnigraph.yaml` with a non-empty `graphs:` map and **no** single-mode selector (no `server.graph`, no `<URI>`, no `--target`). The server opens every configured graph in parallel at startup (bounded concurrency = 4, fail-fast on the first open error). Routes are nested under `/graphs/{graph_id}/...`. Bare flat paths return 404 in multi mode.
 
@@ -42,7 +42,7 @@ Per-graph endpoints — same body shape across modes; URLs differ:
 | GET | `/commits?branch=` | `/graphs/{id}/commits?branch=` | bearer + `read` | list | `server_commit_list` |
 | GET | `/commits/{commit_id}` | `/graphs/{id}/commits/{commit_id}` | bearer + `read` | show | `server_commit_show` |
 
-Server-level management endpoints (v0.7.0+):
+Server-level management endpoints (v0.6.0+):
 
 | Method | Path | Auth | Action | Handler |
 |---|---|---|---|---|
@@ -50,7 +50,7 @@ Server-level management endpoints (v0.7.0+):
 
 ## Adding and removing graphs (multi mode)
 
-Runtime add/remove via API is **not** exposed in v0.7.0 — neither
+Runtime add/remove via API is **not** exposed in v0.6.0 — neither
 `POST /graphs` nor `DELETE /graphs/{id}` is implemented. Operators add
 or remove graphs by stopping the server, editing the `graphs:` map in
 `omnigraph.yaml`, then restarting. The server treats `omnigraph.yaml`

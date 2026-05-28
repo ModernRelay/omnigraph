@@ -4,7 +4,7 @@
 //! serving. Lock-free reads via `ArcSwap<RegistrySnapshot>`; mutations
 //! serialize through `mutate: Mutex<()>` for read-modify-write atomicity.
 //!
-//! **Deletion is deferred** in v0.7.0 (MR-668 scope cut). The registry has
+//! **Deletion is deferred** in v0.6.0 (MR-668 scope cut). The registry has
 //! no `tombstones` field, no `RegistryLookup::Tombstoned` variant, no
 //! `tombstone()` / `clear_tombstone()` methods. When `DELETE /graphs/{id}`
 //! lands in a follow-up release, those return without breaking caller

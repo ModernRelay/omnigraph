@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-cli"
-version = "0.7.0"
+version = "0.6.0"
 edition = "2024"
 description = "CLI for the Omnigraph graph database."
 license = "MIT"
@@ -13,10 +13,10 @@ name = "omnigraph"
 path = "src/main.rs"
 
 [dependencies]
-omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.7.0" }
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.7.0" }
-omnigraph-policy = { path = "../omnigraph-policy", version = "0.7.0" }
-omnigraph-server = { path = "../omnigraph-server", version = "0.7.0" }
+omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.6.0" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.6.0" }
+omnigraph-policy = { path = "../omnigraph-policy", version = "0.6.0" }
+omnigraph-server = { path = "../omnigraph-server", version = "0.6.0" }
 clap = { workspace = true }
 color-eyre = { workspace = true }
 serde = { workspace = true }

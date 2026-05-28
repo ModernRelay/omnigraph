@@ -2059,11 +2059,11 @@ fn graphs_subcommand_help_lists_list_only() {
     let lowered = stdout.to_lowercase();
     assert!(
         !lowered.contains("create a new graph"),
-        "graph create should not be in v0.7.0 help; got:\n{stdout}"
+        "graph create should not be in v0.6.0 help; got:\n{stdout}"
     );
     assert!(
         !lowered.contains("delete a graph"),
-        "graph delete should not be in v0.7.0 help; got:\n{stdout}"
+        "graph delete should not be in v0.6.0 help; got:\n{stdout}"
     );
 }
 

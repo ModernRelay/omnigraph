@@ -273,7 +273,7 @@ enum Command {
 /// All operations target a remote multi-graph server URL (http:// or
 /// https://). Local-URI invocations return a clear error. To add or
 /// remove graphs, operators edit `omnigraph.yaml` directly and restart
-/// the server — runtime mutation is not exposed in v0.7.0.
+/// the server — runtime mutation is not exposed in v0.6.0.
 #[derive(Debug, Subcommand)]
 enum GraphsCommand {
     /// List every graph registered with the multi-graph server.

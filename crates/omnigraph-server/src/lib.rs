@@ -950,7 +950,7 @@ pub fn build_app(state: AppState) -> Router {
     // rather than 404 "no such resource."
     //
     // Runtime add/remove (`POST /graphs`, `DELETE /graphs/{id}`) is not
-    // exposed in v0.7.0 — operators add graphs by editing
+    // exposed in v0.6.0 — operators add graphs by editing
     // `omnigraph.yaml` and restarting.
     let management = Router::new()
         .route("/graphs", get(server_graphs_list))
