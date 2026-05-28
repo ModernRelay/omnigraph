@@ -19,18 +19,15 @@ roles:
   engineering:
     description: >
       All production code under crates/**. Engine, CLI, server,
-      compiler. Single owner; review must come from this person.
+      compiler.
     members:
-      - aaltshuler
+      - ragnorc
 
   docs:
     description: >
       Documentation under docs/**, plus repo-level docs (README.md,
-      AGENTS.md, CLAUDE.md symlink, SECURITY.md). Either named member
-      can approve; both are listed so reviews can route to whoever is
-      available.
+      AGENTS.md, CLAUDE.md symlink, SECURITY.md).
     members:
-      - aaltshuler
       - ragnorc
 
 # Path → role mapping. GitHub CODEOWNERS uses "last match wins"
