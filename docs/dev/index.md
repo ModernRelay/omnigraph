@@ -58,6 +58,7 @@ Working documents for in-flight feature work. Removed when the work lands.
 | Area | Read |
 |---|---|
 | Schema-lint chassis v1 (MR-694) — `--allow-data-loss`, soft/hard drops | [schema-lint-v1-plan.md](schema-lint-v1-plan.md) |
+| Inline + stored queries, request/response envelope, MCP (MR-656 / MR-976 / MR-969) | [rfc-001-queries-envelope-mcp.md](rfc-001-queries-envelope-mcp.md) |
 
 ## Boundary
 
