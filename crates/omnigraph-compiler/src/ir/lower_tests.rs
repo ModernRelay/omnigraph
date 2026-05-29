@@ -205,12 +205,8 @@ insert Knows { from: $name, to: $friend }
 
     let ir = lower_mutation_query(&qf.queries[0]).unwrap();
     assert_eq!(ir.ops.len(), 2);
-    assert!(
-        matches!(&ir.ops[0], MutationOpIR::Insert { type_name, .. } if type_name == "Person")
-    );
-    assert!(
-        matches!(&ir.ops[1], MutationOpIR::Insert { type_name, .. } if type_name == "Knows")
-    );
+    assert!(matches!(&ir.ops[0], MutationOpIR::Insert { type_name, .. } if type_name == "Person"));
+    assert!(matches!(&ir.ops[1], MutationOpIR::Insert { type_name, .. } if type_name == "Knows"));
 }
 
 /// Destination binding is deferred: NodeScan + Expand + Filter (no cross-join).

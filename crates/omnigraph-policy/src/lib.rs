@@ -39,6 +39,23 @@ pub enum PolicyAction {
     /// future shape. Avoid writing such rules until the first consumer
     /// endpoint ships to prevent confusion.
     Admin,
+    /// MR-668: management action that operates on the server's graph
+    /// registry, not on a single graph's contents. The Cedar `appliesTo`
+    /// declaration binds it to `resource: Server` instead of the
+    /// per-graph `resource: Graph`. Operators authorize a group with:
+    /// ```yaml
+    /// rules:
+    ///   - id: admins-can-list-graphs
+    ///     allow:
+    ///       actors: { group: admins }
+    ///       actions: [graph_list]
+    /// ```
+    /// `branch_scope` and `target_branch_scope` are NOT supported for
+    /// this action — there's no branch context at the server level.
+    /// Runtime `graph_create` / `graph_delete` are intentionally omitted
+    /// from v0.6.0; operators add and remove graphs by editing
+    /// `omnigraph.yaml` and restarting.
+    GraphList,
 }
 
 impl PolicyAction {
@@ -52,6 +69,7 @@ impl PolicyAction {
             Self::BranchDelete => "branch_delete",
             Self::BranchMerge => "branch_merge",
             Self::Admin => "admin",
+            Self::GraphList => "graph_list",
         }
     }
 
@@ -65,6 +83,56 @@ impl PolicyAction {
             Self::BranchCreate | Self::SchemaApply | Self::BranchDelete | Self::BranchMerge
         )
     }
+
+    /// Which Cedar resource entity governs this action.
+    /// Per-graph actions (Read, Change, …) apply to `Omnigraph::Graph::"<id>"`.
+    /// Server-scoped management actions (GraphList) apply to
+    /// `Omnigraph::Server::"root"`. `Admin` is reserved without a current
+    /// call site; classified as per-graph until MR-724 picks a shape.
+    pub fn resource_kind(self) -> PolicyResourceKind {
+        match self {
+            Self::GraphList => PolicyResourceKind::Server,
+            Self::Read
+            | Self::Export
+            | Self::Change
+            | Self::SchemaApply
+            | Self::BranchCreate
+            | Self::BranchDelete
+            | Self::BranchMerge
+            | Self::Admin => PolicyResourceKind::Graph,
+        }
+    }
+}
+
+/// Which Cedar entity an action's policies apply to. Internal to
+/// `omnigraph-policy` — drives the `compile_policy_source` template
+/// and the request-time resource UID construction.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PolicyResourceKind {
+    /// `Omnigraph::Graph::"<graph_label>"` — per-graph actions.
+    Graph,
+    /// `Omnigraph::Server::"root"` — management actions.
+    Server,
+}
+
+/// Which kind of policy file the caller is loading. Drives the
+/// load-time validation that catches a "wrong action in wrong file"
+/// mistake — a graph policy with `graph_list` rules, or a server
+/// policy with `read` rules, both compile silently as Cedar but
+/// never match any actual request. Typing the loader makes the
+/// mistake a load-time error.
+///
+/// Pairs with [`PolicyAction::resource_kind`]: every action's resource
+/// kind must match the engine kind it's loaded under.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PolicyEngineKind {
+    /// Engine is loaded for a single graph; only actions whose
+    /// `resource_kind()` is `PolicyResourceKind::Graph` are allowed.
+    Graph,
+    /// Engine is loaded for server-level management endpoints; only
+    /// actions whose `resource_kind()` is `PolicyResourceKind::Server`
+    /// are allowed.
+    Server,
 }
 
 impl fmt::Display for PolicyAction {
@@ -86,6 +154,7 @@ impl FromStr for PolicyAction {
             "branch_delete" => Ok(Self::BranchDelete),
             "branch_merge" => Ok(Self::BranchMerge),
             "admin" => Ok(Self::Admin),
+            "graph_list" => Ok(Self::GraphList),
             other => bail!("unknown policy action '{other}'"),
         }
     }
@@ -153,9 +222,16 @@ pub enum PolicyExpectation {
     Deny,
 }
 
+/// What a caller wants to do, sans identity. Actor identity flows
+/// through a separate `actor_id: &str` parameter on
+/// [`PolicyEngine::authorize`] / [`PolicyChecker::check`] — encoding
+/// the architectural invariant that actor identity is server-authoritative
+/// and must not be supplied by the same code path that supplies the
+/// requested action. In the HTTP layer, the bearer-token middleware
+/// resolves the actor and passes it independently; clients cannot
+/// smuggle identity inside this struct.
 #[derive(Debug, Clone)]
 pub struct PolicyRequest {
-    pub actor_id: String,
     pub action: PolicyAction,
     pub branch: Option<String>,
     pub target_branch: Option<String>,
@@ -262,6 +338,34 @@ impl PolicyConfig {
                     }
                 }
             }
+            // MR-668: server-scoped actions have no branch context and
+            // must not be mixed with per-graph actions in the same
+            // rule (each rule generates one Cedar `permit` referencing
+            // a specific resource kind).
+            let mut server_scoped = false;
+            let mut graph_scoped = false;
+            for action in &rule.allow.actions {
+                match action.resource_kind() {
+                    PolicyResourceKind::Server => server_scoped = true,
+                    PolicyResourceKind::Graph => graph_scoped = true,
+                }
+            }
+            if server_scoped && graph_scoped {
+                bail!(
+                    "policy rule '{}' mixes the server-scoped action `graph_list` \
+                     with per-graph actions; split into separate rules",
+                    rule.id
+                );
+            }
+            if server_scoped
+                && (rule.allow.branch_scope.is_some() || rule.allow.target_branch_scope.is_some())
+            {
+                bail!(
+                    "policy rule '{}' uses branch_scope/target_branch_scope with a \
+                     server-scoped action; server-scoped actions have no branch context",
+                    rule.id
+                );
+            }
         }
 
         Ok(())
@@ -330,26 +434,61 @@ impl PolicyCompiler {
 }
 
 impl PolicyEngine {
-    pub fn load(path: &Path, graph_id: &str) -> Result<Self> {
+    /// Load a per-graph policy file. Rejects rules whose actions are
+    /// server-scoped (e.g. `graph_list`) — those belong in a server
+    /// policy file, not a per-graph one.
+    ///
+    /// `graph_id` is the label of the graph this engine governs;
+    /// becomes the Cedar `Omnigraph::Graph::"<graph_id>"` resource
+    /// for every per-graph action evaluated against this engine.
+    pub fn load_graph(path: &Path, graph_id: &str) -> Result<Self> {
         let config = PolicyConfig::load(path)?;
+        validate_kind_alignment(&config, PolicyEngineKind::Graph)?;
         PolicyCompiler::compile(&config, graph_id)
     }
 
-    pub fn authorize(&self, request: &PolicyRequest) -> Result<PolicyDecision> {
-        if !self.known_actors.contains(request.actor_id.as_str()) {
+    /// Load a server-level policy file. Rejects rules whose actions
+    /// are per-graph (e.g. `read`, `change`) — those belong in a
+    /// per-graph policy file, not the server one. Takes no `graph_id`:
+    /// server-scoped actions resolve against the singleton
+    /// `Omnigraph::Server::"root"` entity, never a Graph.
+    pub fn load_server(path: &Path) -> Result<Self> {
+        let config = PolicyConfig::load(path)?;
+        validate_kind_alignment(&config, PolicyEngineKind::Server)?;
+        // The Graph entity created by the compiler is never referenced
+        // by a server-scoped rule, so the label below is purely a
+        // placeholder. Use the canonical SERVER_RESOURCE_ID so any
+        // future inspection of an unreachable Graph entity at least
+        // points at the right concept.
+        PolicyCompiler::compile(&config, SERVER_RESOURCE_ID)
+    }
+
+    /// Evaluate a request. `actor_id` is supplied as a separate
+    /// argument (not inside `PolicyRequest`) so the type system enforces
+    /// the "server-authoritative actor identity" invariant — clients
+    /// supplying a `PolicyRequest` cannot smuggle identity through the
+    /// same struct that carries the requested action.
+    pub fn authorize(&self, actor_id: &str, request: &PolicyRequest) -> Result<PolicyDecision> {
+        if !self.known_actors.contains(actor_id) {
             return Ok(self.deny(
-                request,
                 None,
                 format!(
                     "policy denied action '{}' for unknown actor '{}'",
-                    request.action, request.actor_id
+                    request.action, actor_id
                 ),
             ));
         }
 
-        let principal = entity_uid("Actor", &request.actor_id)?;
+        let principal = entity_uid("Actor", actor_id)?;
         let action = entity_uid("Action", request.action.as_str())?;
-        let resource = entity_uid("Graph", &self.graph_id)?;
+        // Pick the resource entity based on the action's `resource_kind`.
+        // Server-scoped actions (`graph_list`) bind to
+        // `Omnigraph::Server::"root"`; per-graph actions bind to
+        // `Omnigraph::Graph::"<graph_label>"`.
+        let resource = match request.action.resource_kind() {
+            PolicyResourceKind::Server => entity_uid("Server", SERVER_RESOURCE_ID)?,
+            PolicyResourceKind::Graph => entity_uid("Graph", &self.graph_id)?,
+        };
         let context_value = json!({
             "has_branch": request.branch.is_some(),
             "branch": request.branch.clone().unwrap_or_default(),
@@ -386,7 +525,7 @@ impl PolicyEngine {
                 matched_rule_id: matched_rule_id.clone(),
                 message: format!(
                     "policy allowed action '{}' for actor '{}'",
-                    request.action, request.actor_id
+                    request.action, actor_id
                 ),
             },
             Decision::Deny => {
@@ -403,16 +542,11 @@ impl PolicyEngine {
                         .as_deref()
                         .map(|branch| format!(" targeting branch '{}'", branch))
                         .unwrap_or_default(),
-                    request.actor_id
+                    actor_id
                 );
-                self.deny(request, matched_rule_id, message)
+                self.deny(matched_rule_id, message)
             }
         })
-    }
-
-    pub fn validate_request(&self, request: &PolicyRequest) -> Result<()> {
-        let _ = self.authorize(request)?;
-        Ok(())
     }
 
     pub fn run_tests(&self, tests: &PolicyTestConfig) -> Result<()> {
@@ -421,12 +555,14 @@ impl PolicyEngine {
         }
         let mut failures = Vec::new();
         for case in &tests.cases {
-            let decision = self.authorize(&PolicyRequest {
-                actor_id: case.actor.clone(),
-                action: case.action,
-                branch: case.branch.clone(),
-                target_branch: case.target_branch.clone(),
-            })?;
+            let decision = self.authorize(
+                &case.actor,
+                &PolicyRequest {
+                    action: case.action,
+                    branch: case.branch.clone(),
+                    target_branch: case.target_branch.clone(),
+                },
+            )?;
             let expected_allowed = matches!(case.expect, PolicyExpectation::Allow);
             if decision.allowed != expected_allowed {
                 failures.push(format!(
@@ -448,18 +584,45 @@ impl PolicyEngine {
         self.known_actors.len()
     }
 
-    fn deny(
-        &self,
-        _request: &PolicyRequest,
-        matched_rule_id: Option<String>,
-        message: String,
-    ) -> PolicyDecision {
+    fn deny(&self, matched_rule_id: Option<String>, message: String) -> PolicyDecision {
         PolicyDecision {
             allowed: false,
             matched_rule_id,
             message,
         }
     }
+}
+
+/// Reject any rule whose actions don't match the engine kind
+/// being loaded. Closes the "wrong action in wrong file silently
+/// no-ops" class — `graph_list` in a per-graph file or `read` in
+/// a server file fails at load time instead of compiling cleanly
+/// and never matching a request.
+fn validate_kind_alignment(config: &PolicyConfig, kind: PolicyEngineKind) -> Result<()> {
+    let required = match kind {
+        PolicyEngineKind::Graph => PolicyResourceKind::Graph,
+        PolicyEngineKind::Server => PolicyResourceKind::Server,
+    };
+    for rule in &config.rules {
+        for action in &rule.allow.actions {
+            if action.resource_kind() != required {
+                let (got, expected_file) = match action.resource_kind() {
+                    PolicyResourceKind::Server => ("server-scoped", "server policy file"),
+                    PolicyResourceKind::Graph => ("per-graph", "per-graph policy file"),
+                };
+                bail!(
+                    "policy rule '{}' uses {} action '{}' in a {:?} policy file; \
+                     move it to a {}",
+                    rule.id,
+                    got,
+                    action,
+                    kind,
+                    expected_file
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn compile_entities(config: &PolicyConfig, graph_id: &str, schema: &Schema) -> Result<Entities> {
@@ -505,6 +668,26 @@ fn compile_entities(config: &PolicyConfig, graph_id: &str, schema: &Schema) -> R
     entities.extend(group_entities);
     entities.extend(actor_entities);
     entities.push(graph_entity);
+
+    // MR-668: include the `Omnigraph::Server::"root"` entity
+    // whenever any rule references a server-scoped action. Cedar's
+    // schema validator will otherwise reject the policy. Keeping this
+    // conditional (rather than always-on) avoids polluting test
+    // assertions for graph-only policies.
+    let any_server_scoped = config.rules.iter().any(|rule| {
+        rule.allow
+            .actions
+            .iter()
+            .any(|action| action.resource_kind() == PolicyResourceKind::Server)
+    });
+    if any_server_scoped {
+        entities.push(Entity::new(
+            entity_uid("Server", SERVER_RESOURCE_ID)?,
+            HashMap::new(),
+            HashSet::<EntityUid>::new(),
+        )?);
+    }
+
     Ok(Entities::from_entities(entities, Some(schema))?)
 }
 
@@ -543,16 +726,29 @@ fn compile_policy_source(rule: &PolicyRule, action: &PolicyAction, graph_id: &st
         format!("\nwhen {{ {} }}", conditions.join(" && "))
     };
 
+    // MR-668: emit the resource literal that matches the action's
+    // `resource_kind`. Per-graph actions reference the engine's
+    // `Omnigraph::Graph::"<graph_label>"` instance; server-scoped
+    // actions reference the singleton `Omnigraph::Server::"root"`.
+    let resource_literal = match action.resource_kind() {
+        PolicyResourceKind::Graph => {
+            format!("Omnigraph::Graph::{}", cedar_literal(graph_id))
+        }
+        PolicyResourceKind::Server => {
+            format!("Omnigraph::Server::{}", cedar_literal(SERVER_RESOURCE_ID))
+        }
+    };
+
     format!(
         r#"permit (
     principal in Omnigraph::Group::{group},
     action == Omnigraph::Action::{action},
-    resource == Omnigraph::Graph::{graph}
+    resource == {resource_literal}
 ){when};"#,
         group = cedar_literal(&rule.allow.actors.group),
         action = cedar_literal(action.as_str()),
-        graph = cedar_literal(graph_id),
         when = when,
+        resource_literal = resource_literal,
     )
 }
 
@@ -581,6 +777,11 @@ fn target_branch_scope_condition(scope: PolicyBranchScope) -> String {
 }
 
 fn policy_schema_source() -> &'static str {
+    // MR-668: `entity Server;` plus the `graph_list` action that
+    // binds to it. Per-graph actions stay bound to `Graph`.
+    // The Cedar schema string lives here (not on a fixture file) so any
+    // omnigraph-policy build picks up the new vocabulary in lock-step
+    // with the Rust code.
     r#"
 namespace Omnigraph {
     type RequestContext = {
@@ -595,6 +796,7 @@ namespace Omnigraph {
     entity Actor in [Group];
     entity Group;
     entity Graph;
+    entity Server;
 
     action "read" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "export" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
@@ -604,9 +806,16 @@ namespace Omnigraph {
     action "branch_delete" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "branch_merge" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "admin" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
+
+    action "graph_list" appliesTo { principal: Actor, resource: Server, context: RequestContext };
 }
 "#
 }
+
+/// Canonical id of the `Omnigraph::Server` Cedar entity. There's only one
+/// (the running server); the id is fixed at `"root"` so Cedar rules can
+/// reference it unambiguously: `resource == Omnigraph::Server::"root"`.
+const SERVER_RESOURCE_ID: &str = "root";
 
 fn entity_uid(entity_type: &str, id: &str) -> Result<EntityUid> {
     let typename = EntityTypeName::from_str(&format!("Omnigraph::{entity_type}"))?;
@@ -619,10 +828,6 @@ fn cedar_literal(value: &str) -> String {
 }
 
 impl PolicyRequest {
-    pub fn actor_id(&self) -> &str {
-        &self.actor_id
-    }
-
     pub fn action(&self) -> PolicyAction {
         self.action
     }
@@ -761,13 +966,12 @@ impl PolicyChecker for PolicyEngine {
     ) -> Result<(), PolicyError> {
         let (branch, target_branch) = scope.to_branch_pair();
         let request = PolicyRequest {
-            actor_id: actor.to_string(),
             action,
             branch: branch.map(|s| s.to_string()),
             target_branch: target_branch.map(|s| s.to_string()),
         };
         let decision = self
-            .authorize(&request)
+            .authorize(actor, &request)
             .map_err(|e| PolicyError::Internal(e.to_string()))?;
         if decision.allowed {
             Ok(())
@@ -780,7 +984,7 @@ impl PolicyChecker for PolicyEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        PolicyAction, PolicyCompiler, PolicyConfig, PolicyExpectation, PolicyRequest,
+        PolicyAction, PolicyCompiler, PolicyConfig, PolicyEngine, PolicyExpectation, PolicyRequest,
         PolicyTestCase, PolicyTestConfig,
     };
 
@@ -883,33 +1087,39 @@ rules:
 
         let engine = PolicyCompiler::compile(&policy, "graph").unwrap();
         let allow = engine
-            .authorize(&PolicyRequest {
-                actor_id: "act-bruno".to_string(),
-                action: PolicyAction::Change,
-                branch: Some("feature".to_string()),
-                target_branch: None,
-            })
+            .authorize(
+                "act-bruno",
+                &PolicyRequest {
+                    action: PolicyAction::Change,
+                    branch: Some("feature".to_string()),
+                    target_branch: None,
+                },
+            )
             .unwrap();
         assert!(allow.allowed);
         assert_eq!(allow.matched_rule_id.as_deref(), Some("team-write"));
 
         let deny = engine
-            .authorize(&PolicyRequest {
-                actor_id: "act-bruno".to_string(),
-                action: PolicyAction::BranchDelete,
-                branch: None,
-                target_branch: Some("main".to_string()),
-            })
+            .authorize(
+                "act-bruno",
+                &PolicyRequest {
+                    action: PolicyAction::BranchDelete,
+                    branch: None,
+                    target_branch: Some("main".to_string()),
+                },
+            )
             .unwrap();
         assert!(!deny.allowed);
 
         let admin = engine
-            .authorize(&PolicyRequest {
-                actor_id: "act-andrew".to_string(),
-                action: PolicyAction::BranchDelete,
-                branch: None,
-                target_branch: Some("main".to_string()),
-            })
+            .authorize(
+                "act-andrew",
+                &PolicyRequest {
+                    action: PolicyAction::BranchDelete,
+                    branch: None,
+                    target_branch: Some("main".to_string()),
+                },
+            )
             .unwrap();
         assert!(admin.allowed);
         assert_eq!(admin.matched_rule_id.as_deref(), Some("admins-promote"));
@@ -978,23 +1188,305 @@ rules:
 
         let engine = PolicyCompiler::compile(&policy, "graph").unwrap();
         let allow = engine
-            .authorize(&PolicyRequest {
-                actor_id: "act-ragnor".to_string(),
-                action: PolicyAction::SchemaApply,
-                branch: None,
-                target_branch: Some("main".to_string()),
-            })
+            .authorize(
+                "act-ragnor",
+                &PolicyRequest {
+                    action: PolicyAction::SchemaApply,
+                    branch: None,
+                    target_branch: Some("main".to_string()),
+                },
+            )
             .unwrap();
         assert!(allow.allowed);
 
         let deny = engine
-            .authorize(&PolicyRequest {
-                actor_id: "act-ragnor".to_string(),
-                action: PolicyAction::SchemaApply,
-                branch: None,
-                target_branch: Some("feature".to_string()),
-            })
+            .authorize(
+                "act-ragnor",
+                &PolicyRequest {
+                    action: PolicyAction::SchemaApply,
+                    branch: None,
+                    target_branch: Some("feature".to_string()),
+                },
+            )
             .unwrap();
         assert!(!deny.allowed);
+    }
+
+    // ─── MR-668 — server-scoped action (graph_list) ─
+
+    #[test]
+    fn graph_list_action_authorizes_against_server_resource() {
+        let policy: PolicyConfig = serde_yaml::from_str(
+            r#"
+version: 1
+groups:
+  admins: [act-andrew]
+  viewers: [act-bruno]
+rules:
+  - id: admins-list-graphs
+    allow:
+      actors: { group: admins }
+      actions: [graph_list]
+"#,
+        )
+        .unwrap();
+
+        // The graph_label passed at compile time is irrelevant for
+        // server-scoped actions — they resolve against
+        // `Omnigraph::Server::"root"` regardless. We pass a sentinel
+        // so it's obvious the value isn't used.
+        let engine = PolicyCompiler::compile(&policy, "ignored").unwrap();
+
+        let allow = engine
+            .authorize(
+                "act-andrew",
+                &PolicyRequest {
+                    action: PolicyAction::GraphList,
+                    branch: None,
+                    target_branch: None,
+                },
+            )
+            .unwrap();
+        assert!(allow.allowed);
+        assert_eq!(allow.matched_rule_id.as_deref(), Some("admins-list-graphs"));
+
+        // Different actor, same policy → deny.
+        let deny = engine
+            .authorize(
+                "act-bruno",
+                &PolicyRequest {
+                    action: PolicyAction::GraphList,
+                    branch: None,
+                    target_branch: None,
+                },
+            )
+            .unwrap();
+        assert!(!deny.allowed);
+    }
+
+    #[test]
+    fn server_scoped_rule_cannot_use_branch_scope() {
+        let policy: PolicyConfig = serde_yaml::from_str(
+            r#"
+version: 1
+groups:
+  admins: [act-andrew]
+rules:
+  - id: bad-branch-scope-on-graph-list
+    allow:
+      actors: { group: admins }
+      actions: [graph_list]
+      branch_scope: any
+"#,
+        )
+        .unwrap();
+        let err = policy.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("branch_scope") || msg.contains("server-scoped"),
+            "expected branch_scope rejection for server-scoped action; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn rule_mixing_server_and_per_graph_actions_is_rejected() {
+        // A single rule must reference exactly one resource kind.
+        // `graph_list` (Server) + `read` (Graph) in one allow block
+        // is invalid — operators must split the rule.
+        let policy: PolicyConfig = serde_yaml::from_str(
+            r#"
+version: 1
+groups:
+  admins: [act-andrew]
+rules:
+  - id: mixed-resource-kinds
+    allow:
+      actors: { group: admins }
+      actions: [graph_list, read]
+"#,
+        )
+        .unwrap();
+        let err = policy.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("server-scoped") || msg.contains("split into separate rules"),
+            "expected mix-resource-kinds rejection; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn per_graph_rules_continue_to_work_alongside_server_rules() {
+        // Decision 6 contract: existing operator policies (which only
+        // reference per-graph actions) keep compiling and authorizing
+        // as before, even when the compiled-in schema now declares
+        // `Server` + `graph_*` actions. This pins the "Cedar refactor
+        // is operator-invisible" promise.
+        let policy: PolicyConfig = serde_yaml::from_str(
+            r#"
+version: 1
+groups:
+  team: [act-andrew]
+protected_branches: [main]
+rules:
+  - id: team-read
+    allow:
+      actors: { group: team }
+      actions: [read, export]
+      branch_scope: any
+"#,
+        )
+        .unwrap();
+        let engine = PolicyCompiler::compile(&policy, "graph").unwrap();
+        let allow = engine
+            .authorize(
+                "act-andrew",
+                &PolicyRequest {
+                    action: PolicyAction::Read,
+                    branch: Some("main".to_string()),
+                    target_branch: None,
+                },
+            )
+            .unwrap();
+        assert!(allow.allowed);
+        assert_eq!(allow.matched_rule_id.as_deref(), Some("team-read"));
+    }
+
+    // ─── MR-668 follow-up — load_graph / load_server kind alignment ─
+
+    /// A per-graph policy file containing a `graph_list` rule fails
+    /// at load time. Pre-fix, the file compiled cleanly and the rule
+    /// silently never matched (per-graph engine never gets a
+    /// `graph_list` check). Closes the "wrong action, wrong file,
+    /// silent no-op" class.
+    #[test]
+    fn load_graph_rejects_server_scoped_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad-graph-policy.yaml");
+        std::fs::write(
+            &path,
+            r#"
+version: 1
+groups:
+  admins: [act-andrew]
+rules:
+  - id: misplaced-graph-list
+    allow:
+      actors: { group: admins }
+      actions: [graph_list]
+"#,
+        )
+        .unwrap();
+        let err = match PolicyEngine::load_graph(&path, "g1") {
+            Ok(_) => panic!("expected server-scoped action in per-graph file to be rejected"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("server-scoped") && msg.contains("graph_list"),
+            "expected server-scoped-in-graph-file rejection, got: {msg}"
+        );
+    }
+
+    /// A server policy file containing a `read` rule fails at load
+    /// time. Pre-fix, the file compiled cleanly and the rule silently
+    /// never matched (server engine never gets a `read` check).
+    #[test]
+    fn load_server_rejects_per_graph_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad-server-policy.yaml");
+        std::fs::write(
+            &path,
+            r#"
+version: 1
+groups:
+  team: [act-andrew]
+rules:
+  - id: misplaced-read
+    allow:
+      actors: { group: team }
+      actions: [read]
+      branch_scope: any
+"#,
+        )
+        .unwrap();
+        let err = match PolicyEngine::load_server(&path) {
+            Ok(_) => panic!("expected per-graph action in server file to be rejected"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("per-graph") && msg.contains("read"),
+            "expected per-graph-in-server-file rejection, got: {msg}"
+        );
+    }
+
+    /// Positive case: a properly-shaped per-graph policy loads via
+    /// `load_graph` and authorizes as expected. Verifies the
+    /// kind-alignment check is permissive when the file is correct.
+    #[test]
+    fn load_graph_accepts_per_graph_only_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ok-graph-policy.yaml");
+        std::fs::write(
+            &path,
+            r#"
+version: 1
+groups:
+  team: [act-andrew]
+rules:
+  - id: team-read
+    allow:
+      actors: { group: team }
+      actions: [read]
+      branch_scope: any
+"#,
+        )
+        .unwrap();
+        let engine = PolicyEngine::load_graph(&path, "g1").unwrap();
+        let decision = engine
+            .authorize(
+                "act-andrew",
+                &PolicyRequest {
+                    action: PolicyAction::Read,
+                    branch: Some("main".to_string()),
+                    target_branch: None,
+                },
+            )
+            .unwrap();
+        assert!(decision.allowed);
+    }
+
+    /// Positive case: a properly-shaped server policy loads via
+    /// `load_server` and authorizes the `graph_list` action.
+    #[test]
+    fn load_server_accepts_server_only_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ok-server-policy.yaml");
+        std::fs::write(
+            &path,
+            r#"
+version: 1
+groups:
+  admins: [act-andrew]
+rules:
+  - id: admins-list-graphs
+    allow:
+      actors: { group: admins }
+      actions: [graph_list]
+"#,
+        )
+        .unwrap();
+        let engine = PolicyEngine::load_server(&path).unwrap();
+        let decision = engine
+            .authorize(
+                "act-andrew",
+                &PolicyRequest {
+                    action: PolicyAction::GraphList,
+                    branch: None,
+                    target_branch: None,
+                },
+            )
+            .unwrap();
+        assert!(decision.allowed);
     }
 }

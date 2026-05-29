@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use futures::TryStreamExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectPath;
-use object_store::{DynObjectStore, ObjectStore, PutPayload};
+use object_store::{DynObjectStore, ObjectStore, PutMode, PutPayload};
+use tokio::io::AsyncWriteExt;
 use url::Url;
 
 use crate::error::{OmniError, Result};
@@ -19,6 +20,13 @@ const S3_SCHEME_PREFIX: &str = "s3://";
 pub trait StorageAdapter: Debug + Send + Sync {
     async fn read_text(&self, uri: &str) -> Result<String>;
     async fn write_text(&self, uri: &str, contents: &str) -> Result<()>;
+    /// Write a text object only if no object exists at `uri`.
+    ///
+    /// Returns `Ok(true)` when this call created the object, `Ok(false)`
+    /// when the object already existed, and propagates every other storage
+    /// error. Callers use this to establish ownership before running
+    /// best-effort cleanup on partial failure.
+    async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool>;
     async fn exists(&self, uri: &str) -> Result<bool>;
     /// Move a file from `from_uri` to `to_uri`, replacing any existing file at
     /// `to_uri`. Atomic on local POSIX; on S3 implemented as copy + delete
@@ -75,6 +83,30 @@ impl StorageAdapter for LocalStorageAdapter {
         }
         tokio::fs::write(&path, contents).await?;
         Ok(())
+    }
+
+    async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool> {
+        let path = local_path_from_uri(uri)?;
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+        }
+        let mut file = match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(err) => return Err(err.into()),
+        };
+        if let Err(err) = file.write_all(contents.as_bytes()).await {
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(err.into());
+        }
+        Ok(true)
     }
 
     async fn exists(&self, uri: &str) -> Result<bool> {
@@ -144,6 +176,24 @@ impl StorageAdapter for S3StorageAdapter {
             .await
             .map_err(|err| storage_backend_error("write", uri, err))?;
         Ok(())
+    }
+
+    async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool> {
+        let location = self.object_path(uri)?;
+        match self
+            .store
+            .put_opts(
+                &location,
+                PutPayload::from(contents.as_bytes().to_vec()),
+                PutMode::Create.into(),
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::AlreadyExists { .. })
+            | Err(object_store::Error::Precondition { .. }) => Ok(false),
+            Err(err) => Err(storage_backend_error("write_if_absent", uri, err)),
+        }
     }
 
     async fn exists(&self, uri: &str) -> Result<bool> {
@@ -446,5 +496,17 @@ mod tests {
         let location = parse_s3_uri("s3://bucket/graph/_schema.pg").unwrap();
         assert_eq!(location.bucket, "bucket");
         assert_eq!(location.key, "graph/_schema.pg");
+    }
+
+    #[tokio::test]
+    async fn local_write_text_if_absent_creates_once_without_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().join("claim.txt");
+        let uri = uri.to_str().unwrap();
+        let storage = LocalStorageAdapter;
+
+        assert!(storage.write_text_if_absent(uri, "first").await.unwrap());
+        assert!(!storage.write_text_if_absent(uri, "second").await.unwrap());
+        assert_eq!(storage.read_text(uri).await.unwrap(), "first");
     }
 }

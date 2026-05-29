@@ -212,12 +212,7 @@ impl Omnigraph {
             .await
     }
 
-    pub async fn load_file(
-        &self,
-        branch: &str,
-        path: &str,
-        mode: LoadMode,
-    ) -> Result<LoadResult> {
+    pub async fn load_file(&self, branch: &str, path: &str, mode: LoadMode) -> Result<LoadResult> {
         self.load_file_as(branch, path, mode, None).await
     }
 
@@ -457,13 +452,7 @@ async fn load_jsonl_reader<R: BufRead>(
     for (edge_name, rows) in &edge_rows {
         let edge_type = &catalog.edge_types[edge_name];
         let from_ids = if use_staging {
-            collect_node_ids_with_pending(
-                db,
-                branch,
-                &edge_type.from_type,
-                &staging,
-            )
-            .await?
+            collect_node_ids_with_pending(db, branch, &edge_type.from_type, &staging).await?
         } else {
             collect_node_ids(
                 db,
@@ -476,13 +465,7 @@ async fn load_jsonl_reader<R: BufRead>(
             .await?
         };
         let to_ids = if use_staging {
-            collect_node_ids_with_pending(
-                db,
-                branch,
-                &edge_type.to_type,
-                &staging,
-            )
-            .await?
+            collect_node_ids_with_pending(db, branch, &edge_type.to_type, &staging).await?
         } else {
             collect_node_ids(
                 db,
@@ -581,12 +564,7 @@ async fn load_jsonl_reader<R: BufRead>(
         let table_key = format!("edge:{}", edge_name);
         if use_staging {
             validate_edge_cardinality_with_pending_loader(
-                db,
-                branch,
-                edge_type,
-                &table_key,
-                &staging,
-                mode,
+                db, branch, edge_type, &table_key, &staging, mode,
             )
             .await?;
         } else if let Some(update) = overwrite_updates.iter().find(|u| u.table_key == table_key) {
@@ -1699,8 +1677,7 @@ async fn validate_edge_cardinality_with_pending_loader(
         LoadMode::Append | LoadMode::Overwrite => None,
     };
     let counts =
-        crate::exec::staging::count_src_per_edge(db, &ds, table_key, staging, dedupe_key)
-            .await?;
+        crate::exec::staging::count_src_per_edge(db, &ds, table_key, staging, dedupe_key).await?;
     crate::exec::staging::enforce_cardinality_bounds(edge_type, &counts)
 }
 

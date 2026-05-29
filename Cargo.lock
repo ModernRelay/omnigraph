@@ -4642,6 +4642,7 @@ dependencies = [
 name = "omnigraph-server"
 version = "0.6.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "aws-config",
  "aws-sdk-secretsmanager",
@@ -4655,6 +4656,7 @@ dependencies = [
  "omnigraph-compiler",
  "omnigraph-engine",
  "omnigraph-policy",
+ "regex",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -4662,6 +4664,7 @@ dependencies = [
  "sha2",
  "subtle",
  "tempfile",
+ "thiserror",
  "tokio",
  "tower",
  "tower-http",

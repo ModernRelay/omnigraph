@@ -37,7 +37,10 @@ futures = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
 async-trait = { workspace = true }
+arc-swap = { workspace = true }
 dashmap = "6"
+regex = { workspace = true }
+thiserror = { workspace = true }
 aws-config = { version = "1", optional = true, default-features = false, features = ["rustls", "rt-tokio", "credentials-process", "sso"] }
 aws-sdk-secretsmanager = { version = "1", optional = true, default-features = false, features = ["rustls", "rt-tokio"] }
 

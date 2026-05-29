@@ -109,7 +109,8 @@ docker run --rm -p 8080:8080 \
 
 ## Auth
 
-The server can run unauthenticated for local development, but any shared or
+The server can run unauthenticated for local development only when explicitly
+started with `--unauthenticated` or `OMNIGRAPH_UNAUTHENTICATED=1`. Any shared or
 internet-facing deployment should set a bearer token source.
 
 ### Token sources

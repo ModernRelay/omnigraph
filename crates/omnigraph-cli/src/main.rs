@@ -18,10 +18,11 @@ use omnigraph_compiler::{
 };
 use omnigraph_server::api::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
-    BranchMergeOutput, BranchMergeRequest, ChangeOutput, CommitListOutput,
-    CommitOutput, ErrorOutput, ExportRequest, IngestOutput, IngestRequest, ReadOutput, ReadRequest,
-    SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput, SnapshotTableOutput,
-    commit_output, ingest_output, read_output, schema_apply_output, snapshot_payload,
+    BranchMergeOutput, BranchMergeRequest, ChangeOutput, CommitListOutput, CommitOutput,
+    ErrorOutput, ExportRequest, GraphListResponse, IngestOutput, IngestRequest, ReadOutput,
+    ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput,
+    SnapshotTableOutput, commit_output, ingest_output, read_output, schema_apply_output,
+    snapshot_payload,
 };
 use omnigraph_server::{
     AliasCommand, OmnigraphConfig, PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest,
@@ -73,6 +74,13 @@ enum Command {
         schema: PathBuf,
         /// Graph URI (local path or s3://)
         uri: String,
+        /// Overwrite existing schema artifacts at the URI. Without
+        /// this flag, init refuses to touch a URI that already holds
+        /// `_schema.pg`, `_schema.ir.json`, or `__schema_state.json`
+        /// — closes the re-init footgun (MR-668 follow-up). With the
+        /// flag, the operator opts in to destructive semantics.
+        #[arg(long)]
+        force: bool,
     },
     /// Load data into a graph
     Load {
@@ -282,6 +290,33 @@ enum Command {
         /// Required to actually run; without it, prints what would be removed
         #[arg(long)]
         confirm: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage graphs on a multi-graph server (MR-668)
+    Graphs {
+        #[command(subcommand)]
+        command: GraphsCommand,
+    },
+}
+
+/// Operations on the graph registry of a multi-graph server (MR-668).
+///
+/// All operations target a remote multi-graph server URL (http:// or
+/// https://). Local-URI invocations return a clear error. To add or
+/// remove graphs, operators edit `omnigraph.yaml` directly and restart
+/// the server — runtime mutation is not exposed in v0.6.0.
+#[derive(Debug, Subcommand)]
+enum GraphsCommand {
+    /// List every graph registered with the multi-graph server.
+    List {
+        /// Remote server URL (e.g. `https://server.example.com`).
+        #[arg(long)]
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
@@ -707,7 +742,7 @@ fn resolve_policy_engine(config: &OmnigraphConfig) -> Result<PolicyEngine> {
     let policy_file = config
         .resolve_policy_file()
         .ok_or_else(|| color_eyre::eyre::eyre!("policy.file must be set in omnigraph.yaml"))?;
-    PolicyEngine::load(&policy_file, &policy_graph_id(config))
+    PolicyEngine::load_graph(&policy_file, &policy_graph_id(config))
 }
 
 /// Open a local-URI graph and, when `policy.file` is configured in
@@ -1327,12 +1362,12 @@ fn print_commit_human(commit: &CommitOutput) {
     println!("created_at: {}", commit.created_at);
 }
 
-fn print_policy_explain(decision: &PolicyDecision, request: &PolicyRequest) {
+fn print_policy_explain(decision: &PolicyDecision, actor_id: &str, request: &PolicyRequest) {
     println!(
         "decision: {}",
         if decision.allowed { "allow" } else { "deny" }
     );
-    println!("actor: {}", request.actor_id);
+    println!("actor: {}", actor_id);
     println!("action: {}", request.action);
     if let Some(branch) = &request.branch {
         println!("branch: {}", branch);
@@ -1807,10 +1842,15 @@ async fn main() -> Result<()> {
                 print_embed_human(&output);
             }
         }
-        Command::Init { schema, uri } => {
+        Command::Init { schema, uri, force } => {
             let schema_source = fs::read_to_string(&schema)?;
             ensure_local_graph_parent(&uri)?;
-            Omnigraph::init(&uri, &schema_source).await?;
+            Omnigraph::init_with_options(
+                &uri,
+                &schema_source,
+                omnigraph::db::InitOptions { force },
+            )
+            .await?;
             scaffold_config_if_missing(&uri)?;
             println!("initialized {}", uri);
         }
@@ -2534,13 +2574,12 @@ async fn main() -> Result<()> {
                 let config = load_cli_config(config.as_ref())?;
                 let engine = resolve_policy_engine(&config)?;
                 let request = PolicyRequest {
-                    actor_id: actor,
                     action,
                     branch,
                     target_branch,
                 };
-                let decision = engine.authorize(&request)?;
-                print_policy_explain(&decision, &request);
+                let decision = engine.authorize(&actor, &request)?;
+                print_policy_explain(&decision, &actor, &request);
             }
         },
         Command::Optimize {
@@ -2647,6 +2686,41 @@ async fn main() -> Result<()> {
                 );
             }
         }
+        Command::Graphs { command } => match command {
+            GraphsCommand::List {
+                uri,
+                target,
+                config,
+                json,
+            } => {
+                let config = load_cli_config(config.as_ref())?;
+                let bearer_token =
+                    resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
+                let uri = resolve_uri(&config, uri, target.as_deref())?;
+                if !is_remote_uri(&uri) {
+                    bail!(
+                        "`omnigraph graphs list` requires a remote multi-graph server URL \
+                         (http:// or https://). To enumerate local graphs, read `omnigraph.yaml` \
+                         directly."
+                    );
+                }
+                let payload = remote_json::<GraphListResponse>(
+                    &http_client,
+                    Method::GET,
+                    remote_url(&uri, "/graphs"),
+                    None,
+                    bearer_token.as_deref(),
+                )
+                .await?;
+                if json {
+                    print_json(&payload)?;
+                } else {
+                    for entry in payload.graphs {
+                        println!("{}\t{}", entry.graph_id, entry.uri);
+                    }
+                }
+            }
+        },
     }
     Ok(())
 }

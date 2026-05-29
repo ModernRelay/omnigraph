@@ -16,7 +16,12 @@ pub(super) async fn entity_at(
     id: &str,
     version: u64,
 ) -> Result<Option<serde_json::Value>> {
-    let snap = db.coordinator.read().await.snapshot_at_version(version).await?;
+    let snap = db
+        .coordinator
+        .read()
+        .await
+        .snapshot_at_version(version)
+        .await?;
     entity_from_snapshot(db, &snap, table_key, id).await
 }
 

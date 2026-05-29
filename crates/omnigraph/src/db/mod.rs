@@ -10,11 +10,11 @@ pub(crate) mod write_queue;
 pub use commit_graph::GraphCommit;
 pub use graph_coordinator::{GraphCoordinator, ReadTarget, ResolvedTarget, SnapshotId};
 pub use manifest::{Snapshot, SubTableEntry, SubTableUpdate};
+pub(crate) use omnigraph::ensure_public_branch_ref;
 pub use omnigraph::{
-    CleanupPolicyOptions, MergeOutcome, Omnigraph, OpenMode, SchemaApplyOptions,
+    CleanupPolicyOptions, InitOptions, MergeOutcome, Omnigraph, OpenMode, SchemaApplyOptions,
     SchemaApplyResult, TableCleanupStats, TableOptimizeStats,
 };
-pub(crate) use omnigraph::ensure_public_branch_ref;
 pub(crate) use run_registry::is_internal_run_branch;
 
 pub(crate) const SCHEMA_APPLY_LOCK_BRANCH: &str = "__schema_apply_lock__";
@@ -59,9 +59,7 @@ impl MutationOpKind {
     pub(crate) fn strict_pre_stage_version_check(self) -> bool {
         match self {
             MutationOpKind::Insert | MutationOpKind::Merge => false,
-            MutationOpKind::Update
-            | MutationOpKind::Delete
-            | MutationOpKind::SchemaRewrite => true,
+            MutationOpKind::Update | MutationOpKind::Delete | MutationOpKind::SchemaRewrite => true,
         }
     }
 }
