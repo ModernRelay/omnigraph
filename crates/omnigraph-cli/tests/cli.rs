@@ -714,6 +714,77 @@ query list_people() {
     );
 }
 
+/// Bare `omnigraph check` is NOT a clap `visible_alias` on `lint` (MR-981 §6:
+/// visible aliases give agents two canonical names to emit interchangeably).
+/// It's an argv-level shim: rewrites to `omnigraph lint`, prints a one-line
+/// stderr deprecation warning, and produces identical stdout to the canonical
+/// invocation. Cargo/Go users typing `check` keep working; help text shows
+/// only `lint`.
+#[test]
+fn deprecated_check_top_level_rewrites_to_lint() {
+    let temp = tempdir().unwrap();
+    let schema_path = temp.path().join("schema.pg");
+    let query_path = temp.path().join("queries.gq");
+    write_file(
+        &schema_path,
+        r#"
+node Person {
+    name: String
+}
+"#,
+    );
+    write_query_file(
+        &query_path,
+        r#"
+query list_people() {
+    match { $p: Person }
+    return { $p.name }
+}
+"#,
+    );
+
+    let canonical = output_success(
+        cli()
+            .arg("lint")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json"),
+    );
+    let deprecated_check = output_success(
+        cli()
+            .arg("check")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json"),
+    );
+
+    assert_eq!(stdout_string(&canonical), stdout_string(&deprecated_check));
+
+    let check_stderr = String::from_utf8(deprecated_check.stderr).unwrap();
+    assert!(
+        check_stderr.contains("`omnigraph check` is deprecated")
+            && check_stderr.contains("`omnigraph lint`"),
+        "expected `omnigraph check` deprecation warning pointing at `omnigraph lint`; got: {check_stderr}"
+    );
+
+    // `check` must NOT appear in the canonical `omnigraph --help` output —
+    // agents copy the surface from help text and would otherwise emit both
+    // names interchangeably.
+    let help = cli().arg("--help").output().unwrap();
+    let stdout = String::from_utf8(help.stdout).unwrap();
+    let check_aliased = stdout
+        .lines()
+        .any(|line| line.trim_start().starts_with("lint") && line.contains("check"));
+    assert!(
+        !check_aliased,
+        "`check` must not be advertised as a visible alias of `lint`; help output: {stdout}"
+    );
+}
+
 /// `omnigraph read` and `omnigraph change` are kept as visible clap
 /// aliases for the new canonical `query` / `mutate` subcommands, plus an
 /// argv-level deprecation warning. The warning is emitted to stderr; the

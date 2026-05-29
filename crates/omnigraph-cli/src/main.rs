@@ -130,10 +130,15 @@ enum Command {
     },
     /// Validate queries against a schema (offline) or repo (repo-backed).
     ///
-    /// Replaces `omnigraph query lint` / `omnigraph query check`, which
-    /// are kept as deprecated argv-level shims (a one-line warning is
-    /// printed and the invocation is rewritten to `omnigraph lint`).
-    #[command(visible_alias = "check")]
+    /// Canonical name is `lint` (matches the `omnigraph_compiler::lint`
+    /// module and the `OG-XXX-NNN` lint-code vocabulary). Replaces the
+    /// deprecated `omnigraph query lint` / `omnigraph query check` /
+    /// `omnigraph check` invocations — each is kept as an argv-level
+    /// shim that prints a one-line stderr warning and rewrites to
+    /// `omnigraph lint`. Aliases are deliberately *not* exposed via
+    /// clap's `visible_alias` because that would advertise two
+    /// equivalent canonical names, which agents emit interchangeably
+    /// (see MR-981).
     Lint {
         /// Graph URI
         uri: Option<String>,
@@ -1776,11 +1781,19 @@ async fn execute_export_remote_to_writer<W: Write>(
 
 /// Rewrite deprecated CLI invocations into their canonical form.
 ///
-/// The current rename pass moves three subcommands:
-///   - `omnigraph read`        -> `omnigraph query`  (visible_alias handles parsing; we just warn)
-///   - `omnigraph change`      -> `omnigraph mutate` (visible_alias handles parsing; we just warn)
+/// The current rename pass moves four subcommands:
+///   - `omnigraph read`        -> `omnigraph query`  (clap `visible_alias` handles parsing; we warn)
+///   - `omnigraph change`      -> `omnigraph mutate` (clap `visible_alias` handles parsing; we warn)
+///   - `omnigraph check`       -> `omnigraph lint`   (rewrite required; no visible_alias by design)
 ///   - `omnigraph query lint`  -> `omnigraph lint`   (rewrite required; `query` is now the read-runner)
-///   - `omnigraph query check` -> `omnigraph lint`   (`check` is still a visible alias on `lint`)
+///   - `omnigraph query check` -> `omnigraph lint`   (rewrite required)
+///
+/// `check` is *not* a clap visible_alias on `lint` even though they're
+/// semantically equivalent. Visible aliases create two canonical names
+/// that agents emit interchangeably depending on training-data drift
+/// (see MR-981 §6 for the policy). The argv-shim + stderr warning
+/// pattern preserves back-compat for human users while pointing every
+/// caller at the single canonical name in `--help`.
 ///
 /// Returns the (possibly rewritten) argv that clap should parse.
 fn rewrite_deprecated_argv(args: Vec<OsString>) -> Vec<OsString> {
@@ -1790,12 +1803,17 @@ fn rewrite_deprecated_argv(args: Vec<OsString>) -> Vec<OsString> {
         if sub == Some("query") && matches!(sub2, Some("lint") | Some("check")) {
             let suffix = sub2.unwrap();
             eprintln!(
-                "warning: `omnigraph query {suffix}` is deprecated; use `omnigraph lint` (alias: `omnigraph check`) instead"
+                "warning: `omnigraph query {suffix}` is deprecated; use `omnigraph lint` instead"
             );
-            // Drop the leading `query` token, leaving e.g. `lint --query ./foo.gq`.
+            // Drop the leading `query` token AND normalize `check` -> `lint`.
+            // `check` is no longer a clap visible_alias (MR-981 §6), so the
+            // rewritten argv must reach the canonical `lint` subcommand
+            // directly. Result for `omnigraph query check --query foo.gq`:
+            //   `omnigraph lint --query foo.gq`.
             let mut out = Vec::with_capacity(args.len() - 1);
             out.push(args[0].clone());
-            out.extend(args[2..].iter().cloned());
+            out.push(OsString::from("lint"));
+            out.extend(args[3..].iter().cloned());
             return out;
         }
     }
@@ -1807,6 +1825,17 @@ fn rewrite_deprecated_argv(args: Vec<OsString>) -> Vec<OsString> {
             "change" => eprintln!(
                 "warning: `omnigraph change` is deprecated; use `omnigraph mutate` instead"
             ),
+            "check" => {
+                eprintln!(
+                    "warning: `omnigraph check` is deprecated; use `omnigraph lint` instead"
+                );
+                // Rewrite the top-level subcommand to `lint`; pass through the rest.
+                let mut out = Vec::with_capacity(args.len());
+                out.push(args[0].clone());
+                out.push(OsString::from("lint"));
+                out.extend(args[2..].iter().cloned());
+                return out;
+            }
             _ => {}
         }
     }
