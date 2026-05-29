@@ -1654,7 +1654,7 @@ async fn server_read(
 ) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<ReadOutput>), ApiError> {
     let (selected_name, target, result) = run_query(
         handle,
-        actor,
+        actor.as_ref().map(|Extension(actor)| actor),
         &request.query_source,
         request.query_name.as_deref(),
         request.params.as_ref(),
@@ -1699,7 +1699,7 @@ async fn server_query(
 ) -> std::result::Result<Json<ReadOutput>, ApiError> {
     let (selected_name, target, result) = run_query(
         handle,
-        actor,
+        actor.as_ref().map(|Extension(actor)| actor),
         &request.query,
         request.name.as_deref(),
         request.params.as_ref(),
@@ -1785,21 +1785,18 @@ async fn server_export(
 async fn run_mutate(
     state: AppState,
     handle: Arc<GraphHandle>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<&ResolvedActor>,
     query: &str,
     name: Option<&str>,
     params_json: Option<&Value>,
     branch: String,
 ) -> std::result::Result<ChangeOutput, ApiError> {
     let actor_arc = actor
-        .as_ref()
-        .map(|Extension(actor)| Arc::clone(&actor.actor_id))
+        .map(|a| Arc::clone(&a.actor_id))
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
-    let actor_id = actor
-        .as_ref()
-        .map(|Extension(actor)| actor.actor_id.as_ref());
+    let actor_id = actor.map(|a| a.actor_id.as_ref());
     authorize_request(
-        actor.as_ref().map(|Extension(actor)| actor),
+        actor,
         handle.policy.as_deref(),
         PolicyRequest {
             action: PolicyAction::Change,
@@ -1853,7 +1850,7 @@ async fn run_mutate(
 /// MR-969 extends per-actor admission to stored-read invocations.
 async fn run_query(
     handle: Arc<GraphHandle>,
-    actor: Option<Extension<ResolvedActor>>,
+    actor: Option<&ResolvedActor>,
     query: &str,
     name: Option<&str>,
     params_json: Option<&Value>,
@@ -1880,7 +1877,7 @@ async fn run_query(
         ReadTarget::Snapshot(_) => None,
     };
     authorize_request(
-        actor.as_ref().map(|Extension(actor)| actor),
+        actor,
         handle.policy.as_deref(),
         PolicyRequest {
             action: PolicyAction::Read,
@@ -1945,7 +1942,7 @@ async fn server_change(
     let output = run_mutate(
         state,
         handle,
-        actor,
+        actor.as_ref().map(|Extension(actor)| actor),
         &request.query,
         request.name.as_deref(),
         request.params.as_ref(),
@@ -1994,7 +1991,7 @@ async fn server_mutate(
         run_mutate(
             state,
             handle,
-            actor,
+            actor.as_ref().map(|Extension(actor)| actor),
             &request.query,
             request.name.as_deref(),
             request.params.as_ref(),
