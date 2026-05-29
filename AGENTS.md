@@ -164,6 +164,32 @@ If a proposal fits one of these, the burden is on the proposer to justify why th
 
 ---
 
+## Build, test, lint
+
+Rust stable workspace (edition 2024). `protoc` is a build dependency (`brew install protobuf` / `apt-get install protobuf-compiler libprotobuf-dev`). **Crate dir ≠ package name** for the engine: the directory is `crates/omnigraph` but its Cargo package is `omnigraph-engine` (use that in `-p`). The CLI binary built from `omnigraph-cli` is named `omnigraph`.
+
+```bash
+cargo build --workspace --locked              # build everything
+cargo test  --workspace --locked              # the canonical CI gate (matches CI exactly)
+cargo run -p omnigraph-cli -- <args>          # run the `omnigraph` CLI from source
+cargo run -p omnigraph-server -- <uri> --bind 0.0.0.0:8080   # run the server from source
+
+# Run one crate / one test file / one test fn
+cargo test -p omnigraph-engine --test traversal           # one integration-test file (see docs/dev/testing.md)
+cargo test -p omnigraph-engine --test runs concurrent     # one test fn by name substring
+cargo test -p omnigraph-engine some_inline_test -- --nocapture   # show stdout
+
+# Feature-gated suites (each is its own job in CI, not part of the default run)
+cargo test -p omnigraph-engine --features failpoints --test failpoints   # fault injection
+cargo build -p omnigraph-server --features aws   # AWS Secrets Manager bearer-token source
+```
+
+S3-backed tests (`s3_storage`, and the S3 paths in server/CLI system tests) **skip** unless `OMNIGRAPH_S3_TEST_BUCKET` + `AWS_*` (incl. `AWS_ENDPOINT_URL_S3` for non-AWS) are set; CI runs them against containerized RustFS. `scripts/local-rustfs-bootstrap.sh` stands up a local S3 environment.
+
+CI does **not** run `clippy` or `rustfmt` as gates — but `cargo test --workspace --locked` is the exact gate, so run it before pushing. Two non-test CI checks: `scripts/check-agents-md.sh` (doc cross-link integrity — run it after moving/renaming docs) and OpenAPI drift (`crates/omnigraph-server/tests/openapi.rs` regenerates `openapi.json`; set `OMNIGRAPH_UPDATE_OPENAPI=1` to update the checked-in copy when a server/API change is intentional).
+
+---
+
 ## Quick-reference flows
 
 ```bash
