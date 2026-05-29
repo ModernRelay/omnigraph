@@ -78,7 +78,6 @@ install -m 0755 target/release/omnigraph-server ~/.local/bin/omnigraph-server
 Tagged releases are expected to publish:
 
 - `omnigraph-linux-x86_64.tar.gz`
-- `omnigraph-macos-x86_64.tar.gz`
 - `omnigraph-macos-arm64.tar.gz`
 
 Each archive contains both binaries:
