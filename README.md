@@ -5,33 +5,29 @@
 [![Crates.io](https://img.shields.io/crates/v/omnigraph-cli.svg)](https://crates.io/crates/omnigraph-cli)
 [![CI](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml/badge.svg)](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml)
 
-**Object-storage native knowledge graph with git-style workflows. Designed for agents and humans to collaborate on shared structured knowledge.**
+**Lakehouse native graph engine built for context assembly**
 
-Turns fragmented context into a live graph, lets humans and agents coordinate through that graph, and uses branches so agent-generated changes can be reviewed and merged safely. 
+Schema AS CODE
+Context AS CODE
+Security AS CODE
+Dashboards AS CODE
 
-Built on Rust, Arrow, DataFusion and Lance.
+Git-style snapshots & branching
+Object storage native (S3, RustFS)
+VPC, On-prem, hybrid deployment
+Lance format as storage layer
 
-Join the [Omnigraph Slack community](https://join.slack.com/t/omnigraphworkspace/shared_invite/zt-3wfpglyxj-lHvJGhuySPfqLtN35uJZNw)
+## Core Use Cases
 
-## Use Cases
-
-- Company brain / [Second brain](https://github.com/ModernRelay/omnigraph-cookbooks/tree/main/second-brain)
+- Company brain
 - Context graph
-- Knowledge base for multi-agent research
-- Incident response graph
-- Compliance & audit graph
+- Agentic memory
+- Code & dev graph
+- R&D data layer
+- ML workflows
+- Karpathy's LLM wiki
 
-
-## Capabilities
-
-- Typed schema, typed queries, and typed mutations
-- Native blob-as-data support (docs, images, videos, etc)
-- Schema-as-code, query validation and linting
-- Git-style graph workflows: branches, commits, merges, and transactional runs
-- Local, on-prem & cloud S3-native storage with snapshot-pinned reads
-- Graph traversal + text, fuzzy, BM25, vector, and RRF search in one runtime
-- Policy-as-code for server-side access control
-- Single CLI for multiple deployments
+Omnigraph acts as operational state & coordination layer for agents
 
 ## Quick Install
 
@@ -86,12 +82,11 @@ omnigraph branch create --from main feature-x ./graph.omni
 omnigraph branch merge  feature-x --into main ./graph.omni
 ```
 
-See [docs/user/cli.md](docs/user/cli.md) for schema apply, snapshots, ingest, runs, and policy commands.
+See [docs/user/cli.md](docs/user/cli.md) for schema apply, snapshots, ingest, commits, and policy commands.
 
 ## Docs
 
 - [Install guide](docs/user/install.md)
-- [CLI guide](docs/user/cli.md)
 - [Deployment guide](docs/user/deployment.md)
 
 ## Build And Test
@@ -113,8 +108,8 @@ Notes:
 
 - `crates/omnigraph-compiler`: shared schema/query parser, typechecker, catalog, and IR lowering
 - `crates/omnigraph`: storage/runtime, branching, merge, change detection, and query execution
-- `crates/omnigraph-cli`: CLI for init/load/ingest/read/change/branch/snapshot/export/policy operations
-- `crates/omnigraph-server`: Axum HTTP server for remote reads, changes, ingest, export, branches, commits, and runs
+- `crates/omnigraph-cli`: CLI for graph lifecycle (init/load/ingest), query/mutate, branch/commit/merge, schema/lint, snapshot/export, policy, and maintenance (optimize/cleanup)
+- `crates/omnigraph-server`: Axum HTTP server for remote reads, changes, ingest, export, branches, and commits
 
 ## Contributing
 
