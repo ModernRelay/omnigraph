@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
@@ -17,9 +18,9 @@ use omnigraph_compiler::{
 };
 use omnigraph_server::api::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
-    BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
-    CommitOutput, ErrorOutput, ExportRequest, GraphListResponse, IngestOutput, IngestRequest,
-    ReadOutput, ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput,
+    BranchMergeOutput, BranchMergeRequest, ChangeOutput, CommitListOutput, CommitOutput,
+    ErrorOutput, ExportRequest, GraphListResponse, IngestOutput, IngestRequest, ReadOutput,
+    ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput,
     SnapshotTableOutput, commit_output, ingest_output, read_output, schema_apply_output,
     snapshot_payload,
 };
@@ -127,10 +128,30 @@ enum Command {
         #[command(subcommand)]
         command: SchemaCommand,
     },
-    /// Query validation and linting
-    Query {
-        #[command(subcommand)]
-        command: QueryCommand,
+    /// Validate queries against a schema (offline) or repo (repo-backed).
+    ///
+    /// Canonical name is `lint` (matches the `omnigraph_compiler::lint`
+    /// module and the `OG-XXX-NNN` lint-code vocabulary). Replaces the
+    /// deprecated `omnigraph query lint` / `omnigraph query check` /
+    /// `omnigraph check` invocations — each is kept as an argv-level
+    /// shim that prints a one-line stderr warning and rewrites to
+    /// `omnigraph lint`. Aliases are deliberately *not* exposed via
+    /// clap's `visible_alias` because that would advertise two
+    /// equivalent canonical names, which agents emit interchangeably
+    /// (see MR-981).
+    Lint {
+        /// Graph URI
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        query: PathBuf,
+        #[arg(long)]
+        schema: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
     },
     /// Show graph snapshot
     Snapshot {
@@ -167,8 +188,13 @@ enum Command {
         #[command(subcommand)]
         command: CommitCommand,
     },
-    /// Execute a read query against a branch or snapshot
-    Read {
+    /// Execute a read query against a branch or snapshot.
+    ///
+    /// Canonical read endpoint. The previous name `omnigraph read` is
+    /// kept as a visible alias and prints a one-line deprecation warning
+    /// when used. Pairs with `omnigraph mutate` on the write side.
+    #[command(visible_alias = "read")]
+    Query {
         /// Graph URI
         #[arg(long)]
         uri: Option<String>,
@@ -178,10 +204,13 @@ enum Command {
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["query", "query_string"])]
         alias: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["alias", "query_string"])]
         query: Option<PathBuf>,
+        /// Inline GQ source — alternative to `--query <path>` and `--alias <name>`.
+        #[arg(short = 'e', long = "query-string", value_name = "GQ", conflicts_with_all = ["query", "alias"])]
+        query_string: Option<String>,
         #[arg(long)]
         name: Option<String>,
         #[command(flatten)]
@@ -197,8 +226,13 @@ enum Command {
         #[arg()]
         alias_args: Vec<String>,
     },
-    /// Execute a graph change query against a branch
-    Change {
+    /// Execute a graph mutation query against a branch.
+    ///
+    /// Canonical mutation endpoint. The previous name `omnigraph change`
+    /// is kept as a visible alias and prints a one-line deprecation
+    /// warning when used. Pairs with `omnigraph query` on the read side.
+    #[command(visible_alias = "change")]
+    Mutate {
         /// Graph URI
         #[arg(long)]
         uri: Option<String>,
@@ -208,10 +242,13 @@ enum Command {
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["query", "query_string"])]
         alias: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["alias", "query_string"])]
         query: Option<PathBuf>,
+        /// Inline GQ source — alternative to `--query <path>` and `--alias <name>`.
+        #[arg(short = 'e', long = "query-string", value_name = "GQ", conflicts_with_all = ["query", "alias"])]
+        query_string: Option<String>,
         #[arg(long)]
         name: Option<String>,
         #[command(flatten)]
@@ -408,26 +445,7 @@ enum SchemaCommand {
 }
 
 #[derive(Debug, Subcommand)]
-enum QueryCommand {
-    /// Validate queries and report higher-level drift warnings
-    #[command(visible_alias = "check")]
-    Lint {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
-        query: PathBuf,
-        #[arg(long)]
-        schema: Option<PathBuf>,
-        #[arg(long)]
-        json: bool,
-    },
-}
 
-#[derive(Debug, Subcommand)]
 enum CommitCommand {
     /// List graph commits
     List {
@@ -945,7 +963,9 @@ fn resolve_query_path(
         .map(PathBuf::from)
         .or_else(|| alias_query.map(PathBuf::from))
         .ok_or_else(|| {
-            color_eyre::eyre::eyre!("exactly one of --query or --alias must be provided")
+            color_eyre::eyre::eyre!(
+                "exactly one of --query, --query-string, or --alias must be provided"
+            )
         })
         .and_then(|query_path| config.resolve_query_path(&query_path))
 }
@@ -953,8 +973,15 @@ fn resolve_query_path(
 fn resolve_query_source(
     config: &OmnigraphConfig,
     explicit_query: Option<&PathBuf>,
+    inline_query: Option<&str>,
     alias_query: Option<&str>,
 ) -> Result<String> {
+    if let Some(inline) = inline_query {
+        if inline.trim().is_empty() {
+            bail!("--query-string must not be empty");
+        }
+        return Ok(inline.to_string());
+    }
     Ok(fs::read_to_string(resolve_query_path(
         config,
         explicit_query,
@@ -1652,6 +1679,33 @@ async fn execute_change(
     })
 }
 
+/// Build the JSON body for `POST /change` using the legacy wire shape.
+///
+/// `ChangeRequest`'s Rust field names are now `query` / `name` (the canonical
+/// wire shape going forward), but old `omnigraph-server` builds still require
+/// the legacy `query_source` / `query_name` keys on `/change`. Hand-rolling
+/// the JSON with the legacy names keeps a newer CLI talking to an older
+/// server intact -- the same byte-stability contract we apply to
+/// `execute_read_remote` against `/read`.
+fn legacy_change_request_body(
+    query_source: &str,
+    query_name: Option<&str>,
+    branch: &str,
+    params_json: Option<&Value>,
+) -> Value {
+    let mut body = serde_json::json!({
+        "query_source": query_source,
+        "branch": branch,
+    });
+    if let Some(name) = query_name {
+        body["query_name"] = Value::String(name.to_string());
+    }
+    if let Some(params) = params_json {
+        body["params"] = params.clone();
+    }
+    body
+}
+
 async fn execute_change_remote(
     client: &reqwest::Client,
     uri: &str,
@@ -1665,12 +1719,12 @@ async fn execute_change_remote(
         client,
         Method::POST,
         remote_url(uri, "/change"),
-        Some(serde_json::to_value(ChangeRequest {
-            query_source: query_source.to_string(),
-            query_name: query_name.map(ToOwned::to_owned),
-            params: params_json.cloned(),
-            branch: Some(branch.to_string()),
-        })?),
+        Some(legacy_change_request_body(
+            query_source,
+            query_name,
+            branch,
+            params_json,
+        )),
         bearer_token,
     )
     .await
@@ -1725,10 +1779,74 @@ async fn execute_export_remote_to_writer<W: Write>(
     Ok(())
 }
 
+/// Rewrite deprecated CLI invocations into their canonical form.
+///
+/// The current rename pass moves four subcommands:
+///   - `omnigraph read`        -> `omnigraph query`  (clap `visible_alias` handles parsing; we warn)
+///   - `omnigraph change`      -> `omnigraph mutate` (clap `visible_alias` handles parsing; we warn)
+///   - `omnigraph check`       -> `omnigraph lint`   (rewrite required; no visible_alias by design)
+///   - `omnigraph query lint`  -> `omnigraph lint`   (rewrite required; `query` is now the read-runner)
+///   - `omnigraph query check` -> `omnigraph lint`   (rewrite required)
+///
+/// `check` is *not* a clap visible_alias on `lint` even though they're
+/// semantically equivalent. Visible aliases create two canonical names
+/// that agents emit interchangeably depending on training-data drift
+/// (see MR-981 §6 for the policy). The argv-shim + stderr warning
+/// pattern preserves back-compat for human users while pointing every
+/// caller at the single canonical name in `--help`.
+///
+/// Returns the (possibly rewritten) argv that clap should parse.
+fn rewrite_deprecated_argv(args: Vec<OsString>) -> Vec<OsString> {
+    if args.len() >= 3 {
+        let sub = args[1].to_str();
+        let sub2 = args[2].to_str();
+        if sub == Some("query") && matches!(sub2, Some("lint") | Some("check")) {
+            let suffix = sub2.unwrap();
+            eprintln!(
+                "warning: `omnigraph query {suffix}` is deprecated; use `omnigraph lint` instead"
+            );
+            // Drop the leading `query` token AND normalize `check` -> `lint`.
+            // `check` is no longer a clap visible_alias (MR-981 §6), so the
+            // rewritten argv must reach the canonical `lint` subcommand
+            // directly. Result for `omnigraph query check --query foo.gq`:
+            //   `omnigraph lint --query foo.gq`.
+            let mut out = Vec::with_capacity(args.len() - 1);
+            out.push(args[0].clone());
+            out.push(OsString::from("lint"));
+            out.extend(args[3..].iter().cloned());
+            return out;
+        }
+    }
+    if let Some(sub) = args.get(1).and_then(|s| s.to_str()) {
+        match sub {
+            "read" => eprintln!(
+                "warning: `omnigraph read` is deprecated; use `omnigraph query` instead"
+            ),
+            "change" => eprintln!(
+                "warning: `omnigraph change` is deprecated; use `omnigraph mutate` instead"
+            ),
+            "check" => {
+                eprintln!(
+                    "warning: `omnigraph check` is deprecated; use `omnigraph lint` instead"
+                );
+                // Rewrite the top-level subcommand to `lint`; pass through the rest.
+                let mut out = Vec::with_capacity(args.len());
+                out.push(args[0].clone());
+                out.push(OsString::from("lint"));
+                out.extend(args[2..].iter().cloned());
+                return out;
+            }
+            _ => {}
+        }
+    }
+    args
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
     let cli = {
+        let raw_args = rewrite_deprecated_argv(std::env::args_os().collect());
         let matches = Cli::command()
             .arg(
                 Arg::new("version")
@@ -1737,7 +1855,7 @@ async fn main() -> Result<()> {
                     .action(ArgAction::Version)
                     .help("Print version"),
             )
-            .get_matches();
+            .get_matches_from(raw_args);
         Cli::from_arg_matches(&matches)?
     };
     let http_client = build_http_client()?;
@@ -2199,22 +2317,20 @@ async fn main() -> Result<()> {
                 }
             }
         },
-        Command::Query { command } => match command {
-            QueryCommand::Lint {
-                uri,
-                target,
-                config,
-                query,
-                schema,
-                json,
-            } => {
-                let config = load_cli_config(config.as_ref())?;
-                let output =
-                    execute_query_lint(&config, uri, target.as_deref(), schema.as_ref(), &query)
-                        .await?;
-                finish_query_lint(&output, json)?;
-            }
-        },
+        Command::Lint {
+            uri,
+            target,
+            config,
+            query,
+            schema,
+            json,
+        } => {
+            let config = load_cli_config(config.as_ref())?;
+            let output =
+                execute_query_lint(&config, uri, target.as_deref(), schema.as_ref(), &query)
+                    .await?;
+            finish_query_lint(&output, json)?;
+        }
         Command::Snapshot {
             uri,
             target,
@@ -2284,13 +2400,14 @@ async fn main() -> Result<()> {
                     .await?;
             }
         }
-        Command::Read {
+        Command::Query {
             uri,
             legacy_uri,
             target,
             config,
             alias,
             query,
+            query_string,
             name,
             params,
             branch,
@@ -2299,8 +2416,8 @@ async fn main() -> Result<()> {
             json,
             alias_args,
         } => {
-            if alias.is_some() == query.is_some() {
-                bail!("exactly one of --alias or --query must be provided");
+            if alias.is_none() && query.is_none() && query_string.is_none() {
+                bail!("exactly one of --query, --query-string, or --alias must be provided");
             }
 
             let config = load_cli_config(config.as_ref())?;
@@ -2323,6 +2440,7 @@ async fn main() -> Result<()> {
             let query_source = resolve_query_source(
                 &config,
                 query.as_ref(),
+                query_string.as_deref(),
                 alias_config.map(|a| a.query.as_str()),
             )?;
             let params_json = merged_params_json(
@@ -2369,21 +2487,22 @@ async fn main() -> Result<()> {
             );
             print_read_output(&output, format, &config)?;
         }
-        Command::Change {
+        Command::Mutate {
             uri,
             legacy_uri,
             target,
             config,
             alias,
             query,
+            query_string,
             name,
             params,
             branch,
             json,
             alias_args,
         } => {
-            if alias.is_some() == query.is_some() {
-                bail!("exactly one of --alias or --query must be provided");
+            if alias.is_none() && query.is_none() && query_string.is_none() {
+                bail!("exactly one of --query, --query-string, or --alias must be provided");
             }
 
             let config = load_cli_config(config.as_ref())?;
@@ -2406,6 +2525,7 @@ async fn main() -> Result<()> {
             let query_source = resolve_query_source(
                 &config,
                 query.as_ref(),
+                query_string.as_deref(),
                 alias_config.map(|a| a.query.as_str()),
             )?;
             let params_json = merged_params_json(
@@ -2639,13 +2759,61 @@ mod tests {
     use std::fs;
 
     use super::{
-        DEFAULT_BEARER_TOKEN_ENV, apply_bearer_token, bearer_token_from_env_file, load_cli_config,
-        load_env_file_into_process, normalize_bearer_token, parse_env_assignment,
-        resolve_remote_bearer_token,
+        DEFAULT_BEARER_TOKEN_ENV, apply_bearer_token, bearer_token_from_env_file,
+        legacy_change_request_body, load_cli_config, load_env_file_into_process,
+        normalize_bearer_token, parse_env_assignment, resolve_remote_bearer_token,
     };
     use omnigraph_server::load_config;
     use reqwest::header::AUTHORIZATION;
+    use serde_json::json;
     use tempfile::tempdir;
+
+    #[test]
+    fn legacy_change_request_body_uses_legacy_field_names() {
+        // `execute_change_remote` hits `POST /change`, which old
+        // `omnigraph-server` builds deserialize as `ChangeRequest` with
+        // **required** `query_source` and optional `query_name` keys.
+        // Newer servers accept both spellings via serde alias, but a
+        // newer CLI must still emit the legacy keys on the wire so it
+        // can talk to an old server during a rolling upgrade.
+        let body = legacy_change_request_body(
+            "query insert_person($n: String) { insert Person { name: $n } }",
+            Some("insert_person"),
+            "main",
+            Some(&json!({ "n": "Alice" })),
+        );
+        assert_eq!(
+            body["query_source"].as_str(),
+            Some("query insert_person($n: String) { insert Person { name: $n } }"),
+        );
+        assert_eq!(body["query_name"].as_str(), Some("insert_person"));
+        assert_eq!(body["branch"].as_str(), Some("main"));
+        assert_eq!(body["params"]["n"].as_str(), Some("Alice"));
+        // Crucially, the **new** field names must NOT appear -- old
+        // servers would silently treat them as unknown fields and then
+        // fail on missing required `query_source`.
+        assert!(
+            body.get("query").is_none(),
+            "legacy /change body must not carry the renamed `query` key; got {body}"
+        );
+        assert!(
+            body.get("name").is_none(),
+            "legacy /change body must not carry the renamed `name` key; got {body}"
+        );
+    }
+
+    #[test]
+    fn legacy_change_request_body_omits_optional_fields_when_unset() {
+        let body = legacy_change_request_body(
+            "query find() { match { $p: Person } return { $p.name } }",
+            None,
+            "main",
+            None,
+        );
+        assert_eq!(body["branch"].as_str(), Some("main"));
+        assert!(body.get("query_name").is_none());
+        assert!(body.get("params").is_none());
+    }
 
     #[test]
     fn apply_bearer_token_adds_header_when_configured() {

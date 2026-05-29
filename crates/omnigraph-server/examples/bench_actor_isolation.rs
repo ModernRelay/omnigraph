@@ -199,8 +199,8 @@ async fn drive_light_actor(
     let mut other = 0usize;
     for op_idx in 0..ops {
         let request_body = ChangeRequest {
-            query_source: "query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}".to_string(),
-            query_name: Some("insert_person".to_string()),
+            query: "query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}".to_string(),
+            name: Some("insert_person".to_string()),
             params: Some(serde_json::json!({
                 "name": format!("light-{actor_idx}-{op_idx}"),
                 "age": op_idx as i32,

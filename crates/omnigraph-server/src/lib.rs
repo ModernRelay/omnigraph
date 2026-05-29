@@ -22,16 +22,16 @@ use api::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
     CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphInfo, GraphListResponse,
-    HealthOutput, IngestOutput, IngestRequest, ReadOutput, ReadRequest, SchemaApplyOutput,
-    SchemaApplyRequest, SchemaOutput, SnapshotQuery, ingest_output, schema_apply_output,
-    snapshot_payload,
+    HealthOutput, IngestOutput, IngestRequest, QueryRequest, ReadOutput, ReadRequest,
+    SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotQuery, ingest_output,
+    schema_apply_output, snapshot_payload,
 };
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 use axum::body::{Body, Bytes};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::{Extension, OriginalUri, Path, Query, Request, State};
 use axum::http::StatusCode;
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, HeaderName, HeaderValue};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -86,9 +86,13 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         server_health,
         server_graphs_list,
         server_snapshot,
-        server_read,
+        // deprecated; the #[deprecated] attribute on the handler
+        // surfaces as `deprecated: true` on the OpenAPI operation.
+        #[allow(deprecated)] server_read,
+        server_query,
         server_export,
-        server_change,
+        #[allow(deprecated)] server_change,
+        server_mutate,
         server_schema_apply,
         server_schema_get,
         server_ingest,
@@ -930,8 +934,21 @@ pub fn build_app(state: AppState) -> Router {
     let per_graph_protected = Router::new()
         .route("/snapshot", get(server_snapshot))
         .route("/export", post(server_export))
-        .route("/read", post(server_read))
-        .route("/change", post(server_change))
+        // /read and /change are kept indefinitely for back-compat;
+        // their handlers carry #[deprecated] so the OpenAPI operation is
+        // flagged and their responses include RFC 9745 Deprecation +
+        // RFC 8288 Link headers. Suppress the call-site warning for the
+        // route registration itself.
+        .route("/read", post({
+            #[allow(deprecated)]
+            server_read
+        }))
+        .route("/query", post(server_query))
+        .route("/change", post({
+            #[allow(deprecated)]
+            server_change
+        }))
+        .route("/mutate", post(server_mutate))
         .route("/schema", get(server_schema_get))
         .route("/schema/apply", post(server_schema_apply))
         .route(
@@ -1591,6 +1608,21 @@ async fn server_snapshot(
     Ok(Json(snapshot_payload(&branch, &snapshot)))
 }
 
+/// Header values that flag a response as coming from a deprecated route
+/// (RFC 9745 / RFC 8288) and point at the canonical successor.
+fn deprecation_headers(successor_link: &'static str) -> [(HeaderName, HeaderValue); 2] {
+    [
+        (
+            HeaderName::from_static("deprecation"),
+            HeaderValue::from_static("true"),
+        ),
+        (
+            HeaderName::from_static("link"),
+            HeaderValue::from_static(successor_link),
+        ),
+    ]
+}
+
 #[utoipa::path(
     post,
     path = "/read",
@@ -1598,69 +1630,84 @@ async fn server_snapshot(
     operation_id = "read",
     request_body = ReadRequest,
     responses(
-        (status = 200, description = "Query results", body = ReadOutput),
+        (status = 200, description = "Query results (response includes `Deprecation: true` + `Link: </query>; rel=\"successor-version\"`)", body = ReadOutput),
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
-/// Execute a GQ read query.
+#[deprecated(note = "use POST /query instead; /read is kept indefinitely for byte-stable back-compat")]
+/// **Deprecated** — use [`POST /query`](#tag/queries/operation/query) instead.
 ///
-/// Runs the query in `query_source` against either a branch or a frozen
-/// snapshot (mutually exclusive). When `query_source` defines multiple named
-/// queries, pick one with `query_name`. `params` is a JSON object whose keys
-/// match the parameters declared by the query. Returns rows as a JSON array
-/// plus a `columns` list. Read-only.
+/// Execute a GQ read query. Behavior is unchanged from prior releases; the
+/// route is kept indefinitely for byte-stable back-compat. New integrations
+/// should target `POST /query`, which has clean field names (`query` /
+/// `name`) and a 400-on-mutation guard. Responses from this route include
+/// `Deprecation: true` and `Link: </query>; rel="successor-version"`
+/// headers per RFC 9745 / RFC 8288 so SDKs and proxies can surface the
+/// signal.
 async fn server_read(
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
     Json(request): Json<ReadRequest>,
-) -> std::result::Result<Json<ReadOutput>, ApiError> {
-    if request.branch.is_some() && request.snapshot.is_some() {
-        return Err(ApiError::bad_request(
-            "read request may specify branch or snapshot, not both",
-        ));
-    }
-
-    let target = read_target_from_request(request.branch, request.snapshot);
-    let policy_branch = match &target {
-        ReadTarget::Branch(branch) => Some(branch.clone()),
-        ReadTarget::Snapshot(_) if handle.policy.is_some() && actor.is_some() => {
-            let db = &handle.engine;
-            db.resolved_branch_of(target.clone())
-                .await
-                .map(|branch| branch.or_else(|| Some("main".to_string())))
-                .map_err(ApiError::from_omni)?
-        }
-        ReadTarget::Snapshot(_) => None,
-    };
-    authorize_request(
+) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<ReadOutput>), ApiError> {
+    let (selected_name, target, result) = run_query(
+        handle,
         actor.as_ref().map(|Extension(actor)| actor),
-        handle.policy.as_deref(),
-        PolicyRequest {
-            action: PolicyAction::Read,
-            branch: policy_branch,
-            target_branch: None,
-        },
-    )?;
-    let (selected_name, query_params) =
-        select_named_query(&request.query_source, request.query_name.as_deref())
-            .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    let params = query_params_from_json(&query_params, request.params.as_ref())
-        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+        &request.query_source,
+        request.query_name.as_deref(),
+        request.params.as_ref(),
+        request.branch,
+        request.snapshot,
+        false, // /read predates the D2 rule; legacy callers may submit mutating queries here
+    )
+    .await?;
+    Ok((
+        deprecation_headers("</query>; rel=\"successor-version\""),
+        Json(api::read_output(selected_name, &target, result)),
+    ))
+}
 
-    let result = {
-        let db = &handle.engine;
-        db.query(
-            target.clone(),
-            &request.query_source,
-            &selected_name,
-            &params,
-        )
-        .await
-        .map_err(ApiError::from_omni)?
-    };
+#[utoipa::path(
+    post,
+    path = "/query",
+    tag = "queries",
+    operation_id = "query",
+    request_body = QueryRequest,
+    responses(
+        (status = 200, description = "Query results", body = ReadOutput),
+        (status = 400, description = "Bad request - also returned when the query body contains mutations; use POST /mutate (or its deprecated alias POST /change) for write queries", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Execute an inline read query (friendlier-named alternative to `POST /read`).
+///
+/// Designed for ad-hoc exploration and AI-agent tool-use: short field
+/// names (`query`, `name`) match the CLI `-e` flag and the GQ `query`
+/// keyword. Mutations (`insert`/`update`/`delete`) are rejected with 400
+/// -- use `POST /mutate` (or its deprecated alias `POST /change`) for
+/// write queries. Otherwise behaves identically to `POST /read`: same
+/// target semantics (branch xor snapshot), same Cedar action (Read),
+/// same response shape.
+async fn server_query(
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    Json(request): Json<QueryRequest>,
+) -> std::result::Result<Json<ReadOutput>, ApiError> {
+    let (selected_name, target, result) = run_query(
+        handle,
+        actor.as_ref().map(|Extension(actor)| actor),
+        &request.query,
+        request.name.as_deref(),
+        request.params.as_ref(),
+        request.branch,
+        request.snapshot,
+        true, // /query is read-only; reject mutations
+    )
+    .await?;
     Ok(Json(api::read_output(selected_name, &target, result)))
 }
 
@@ -1725,44 +1772,31 @@ async fn server_export(
         .into_response())
 }
 
-#[utoipa::path(
-    post,
-    path = "/change",
-    tag = "mutations",
-    operation_id = "change",
-    request_body = ChangeRequest,
-    responses(
-        (status = 200, description = "Mutation results", body = ChangeOutput),
-        (status = 400, description = "Bad request", body = ErrorOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 409, description = "Merge conflict", body = ErrorOutput),
-        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// Apply a GQ mutation to a branch.
+/// Shared implementation behind `POST /mutate` (canonical) and
+/// `POST /change` (deprecated alias). Returns the bare `ChangeOutput`;
+/// each route handler wraps it (the alias also attaches Deprecation
+/// headers).
+/// Shared backend for `/mutate` (canonical) and `/change` (deprecated alias).
 ///
-/// Writes to the named `branch` (defaults to `main`). Mutations are atomic
-/// per call and produce a new commit. Returns counts of nodes and edges
-/// affected. **Destructive**: on success the branch is updated; rejected
-/// mutations may still acquire locks briefly. Returns 409 on merge conflict.
-async fn server_change(
-    State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
-    Json(request): Json<ChangeRequest>,
-) -> std::result::Result<Json<ChangeOutput>, ApiError> {
-    let branch = request.branch.unwrap_or_else(|| "main".to_string());
+/// Decoupled from `ChangeRequest` so MR-969's `/queries/{name}` stored-query
+/// handler can call this directly with registry-supplied fields without
+/// rebuilding the request body. Today's HTTP handlers unpack the request and
+/// call here; the registry would do the same.
+async fn run_mutate(
+    state: AppState,
+    handle: Arc<GraphHandle>,
+    actor: Option<&ResolvedActor>,
+    query: &str,
+    name: Option<&str>,
+    params_json: Option<&Value>,
+    branch: String,
+) -> std::result::Result<ChangeOutput, ApiError> {
     let actor_arc = actor
-        .as_ref()
-        .map(|Extension(actor)| Arc::clone(&actor.actor_id))
+        .map(|a| Arc::clone(&a.actor_id))
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
-    let actor_id = actor
-        .as_ref()
-        .map(|Extension(actor)| actor.actor_id.as_ref());
+    let actor_id = actor.map(|a| a.actor_id.as_ref());
     authorize_request(
-        actor.as_ref().map(|Extension(actor)| actor),
+        actor,
         handle.policy.as_deref(),
         PolicyRequest {
             action: PolicyAction::Change,
@@ -1774,10 +1808,8 @@ async fn server_change(
     // estimated bytes per actor. Cedar runs FIRST so denied requests
     // don't consume admission slots. Estimate uses the request body
     // size as a coarse proxy; engine memory pressure can run higher.
-    let est_bytes = request.query_source.len() as u64
-        + request
-            .params
-            .as_ref()
+    let est_bytes = query.len() as u64
+        + params_json
             .map(|p| p.to_string().len() as u64)
             .unwrap_or(0);
     let _admission = state
@@ -1785,30 +1817,188 @@ async fn server_change(
         .try_admit(&actor_arc, est_bytes)
         .map_err(ApiError::from_workload_reject)?;
     let (selected_name, query_params) =
-        select_named_query(&request.query_source, request.query_name.as_deref())
-            .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    let params = query_params_from_json(&query_params, request.params.as_ref())
+        select_named_query(query, name).map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let params = query_params_from_json(&query_params, params_json)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
     let result = {
         let db = &handle.engine;
-        db.mutate_as(
-            &branch,
-            &request.query_source,
-            &selected_name,
-            &params,
-            actor_id,
-        )
-        .await
-        .map_err(ApiError::from_omni)?
+        db.mutate_as(&branch, query, &selected_name, &params, actor_id)
+            .await
+            .map_err(ApiError::from_omni)?
     };
-    Ok(Json(ChangeOutput {
+    Ok(ChangeOutput {
         branch,
         query_name: selected_name,
         affected_nodes: result.affected_nodes,
         affected_edges: result.affected_edges,
         actor_id: actor_id.map(str::to_string),
-    }))
+    })
+}
+
+/// Shared backend for `/query` (canonical) and `/read` (deprecated alias).
+///
+/// Mirrors [`run_mutate`]'s decoupled shape so MR-969's stored-query handler
+/// can call here with registry-supplied fields. Rejects inline source that
+/// contains mutations (D2 rule); callers wanting writes go through
+/// [`run_mutate`] instead.
+///
+/// Intentionally does **not** take [`AppState`] (unlike [`run_mutate`]):
+/// reads are not admission-gated today, so there is no `state.workload`
+/// consumer. The signature grows the parameter when Phase 1 (MR-976) adds
+/// the request envelope's `expect: { max_rows_scanned: N }` budget, or
+/// MR-969 extends per-actor admission to stored-read invocations.
+async fn run_query(
+    handle: Arc<GraphHandle>,
+    actor: Option<&ResolvedActor>,
+    query: &str,
+    name: Option<&str>,
+    params_json: Option<&Value>,
+    branch: Option<String>,
+    snapshot: Option<String>,
+    reject_mutations: bool,
+) -> std::result::Result<(String, ReadTarget, omnigraph_compiler::result::QueryResult), ApiError> {
+    if branch.is_some() && snapshot.is_some() {
+        return Err(ApiError::bad_request(
+            "request may specify branch or snapshot, not both",
+        ));
+    }
+
+    let target = read_target_from_request(branch, snapshot);
+    let policy_branch = match &target {
+        ReadTarget::Branch(branch) => Some(branch.clone()),
+        ReadTarget::Snapshot(_) if handle.policy.is_some() && actor.is_some() => {
+            let db = &handle.engine;
+            db.resolved_branch_of(target.clone())
+                .await
+                .map(|branch| branch.or_else(|| Some("main".to_string())))
+                .map_err(ApiError::from_omni)?
+        }
+        ReadTarget::Snapshot(_) => None,
+    };
+    authorize_request(
+        actor,
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::Read,
+            branch: policy_branch,
+            target_branch: None,
+        },
+    )?;
+    let query_decl =
+        select_named_query_decl(query, name).map_err(|err| ApiError::bad_request(err.to_string()))?;
+    if reject_mutations && !query_decl.mutations.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "query '{}' contains mutations (insert/update/delete); use POST /mutate for write queries",
+            query_decl.name
+        )));
+    }
+    let selected_name = query_decl.name.clone();
+    let params = query_params_from_json(&query_decl.params, params_json)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+
+    let result = {
+        let db = &handle.engine;
+        db.query(target.clone(), query, &selected_name, &params)
+            .await
+            .map_err(ApiError::from_omni)?
+    };
+    Ok((selected_name, target, result))
+}
+
+#[utoipa::path(
+    post,
+    path = "/change",
+    tag = "mutations",
+    operation_id = "change",
+    request_body = ChangeRequest,
+    responses(
+        (status = 200, description = "Mutation results (response includes `Deprecation: true` + `Link: </mutate>; rel=\"successor-version\"`)", body = ChangeOutput),
+        (status = 400, description = "Bad request", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 409, description = "Merge conflict", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+#[deprecated(note = "use POST /mutate instead; /change is kept indefinitely for back-compat")]
+/// **Deprecated** — use [`POST /mutate`](#tag/mutations/operation/mutate) instead.
+///
+/// Apply a GQ mutation to a branch. Behavior is unchanged; the route is
+/// kept indefinitely for back-compat. New integrations should target
+/// `POST /mutate`, which has identical semantics and a name that pairs
+/// cleanly with `POST /query`. Responses from this route include
+/// `Deprecation: true` and `Link: </mutate>; rel="successor-version"`
+/// headers per RFC 9745 / RFC 8288 so SDKs and proxies can surface the
+/// signal.
+async fn server_change(
+    State(state): State<AppState>,
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    Json(request): Json<ChangeRequest>,
+) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<ChangeOutput>), ApiError> {
+    let branch = request.branch.unwrap_or_else(|| "main".to_string());
+    let output = run_mutate(
+        state,
+        handle,
+        actor.as_ref().map(|Extension(actor)| actor),
+        &request.query,
+        request.name.as_deref(),
+        request.params.as_ref(),
+        branch,
+    )
+    .await?;
+    Ok((
+        deprecation_headers("</mutate>; rel=\"successor-version\""),
+        Json(output),
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/mutate",
+    tag = "mutations",
+    operation_id = "mutate",
+    request_body = ChangeRequest,
+    responses(
+        (status = 200, description = "Mutation results", body = ChangeOutput),
+        (status = 400, description = "Bad request", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 409, description = "Merge conflict", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Apply a GQ mutation to a branch (canonical mutation endpoint).
+///
+/// Writes to the named `branch` (defaults to `main`). Mutations are atomic
+/// per call and produce a new commit. Returns counts of nodes and edges
+/// affected. **Destructive**: on success the branch is updated; rejected
+/// mutations may still acquire locks briefly. Returns 409 on merge conflict.
+///
+/// Pairs with `POST /query` (read-only). The legacy `POST /change` route
+/// has identical semantics and is kept as a deprecated alias.
+async fn server_mutate(
+    State(state): State<AppState>,
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    Json(request): Json<ChangeRequest>,
+) -> std::result::Result<Json<ChangeOutput>, ApiError> {
+    let branch = request.branch.unwrap_or_else(|| "main".to_string());
+    Ok(Json(
+        run_mutate(
+            state,
+            handle,
+            actor.as_ref().map(|Extension(actor)| actor),
+            &request.query,
+            request.name.as_deref(),
+            request.params.as_ref(),
+            branch,
+        )
+        .await?,
+    ))
 }
 
 #[utoipa::path(
@@ -2350,10 +2540,10 @@ fn read_target_from_request(branch: Option<String>, snapshot: Option<String>) ->
     }
 }
 
-fn select_named_query(
+fn select_named_query_decl(
     query_source: &str,
     requested_name: Option<&str>,
-) -> Result<(String, Vec<omnigraph_compiler::query::ast::Param>)> {
+) -> Result<omnigraph_compiler::query::ast::QueryDecl> {
     let parsed = parse_query(query_source)?;
     let query = if let Some(name) = requested_name {
         parsed
@@ -2366,7 +2556,14 @@ fn select_named_query(
     } else {
         bail!("query file contains multiple queries; pass --name");
     };
+    Ok(query)
+}
 
+fn select_named_query(
+    query_source: &str,
+    requested_name: Option<&str>,
+) -> Result<(String, Vec<omnigraph_compiler::query::ast::Param>)> {
+    let query = select_named_query_decl(query_source, requested_name)?;
     Ok((query.name, query.params))
 }
 

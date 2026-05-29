@@ -29,9 +29,11 @@ Per-graph endpoints — same body shape across modes; URLs differ:
 | GET | `/healthz` | `/healthz` | none | — | `server_health` |
 | GET | `/openapi.json` | `/openapi.json` | none | — | `server_openapi` (strips security if auth disabled; in multi mode emits cluster paths with `cluster_` operation-id prefix) |
 | GET | `/snapshot?branch=` | `/graphs/{id}/snapshot?branch=` | bearer + `read` | snapshot of branch | `server_snapshot` |
-| POST | `/read` | `/graphs/{id}/read` | bearer + `read` | run named query | `server_read` |
+| POST | `/query` | `/graphs/{id}/query` | bearer + `read` | inline read query (canonical; clean field names `query`/`name`; mutations → 400) | `server_query` |
+| POST | `/read` | `/graphs/{id}/read` | bearer + `read` | **deprecated** alias of `/query` (legacy field names `query_source`/`query_name`, byte-stable response; carries `Deprecation: true` + `Link: </query>; rel="successor-version"`) | `server_read` |
 | POST | `/export` | `/graphs/{id}/export` | bearer + `export` | NDJSON stream | `server_export` |
-| POST | `/change` | `/graphs/{id}/change` | bearer + `change` | mutation | `server_change` |
+| POST | `/mutate` | `/graphs/{id}/mutate` | bearer + `change` | mutation (canonical; `query`/`name`; accepts legacy `query_source`/`query_name` as serde aliases) | `server_mutate` |
+| POST | `/change` | `/graphs/{id}/change` | bearer + `change` | **deprecated** alias of `/mutate` (carries `Deprecation: true` + `Link: </mutate>; rel="successor-version"`) | `server_change` |
 | GET | `/schema` | `/graphs/{id}/schema` | bearer + `read` | get current `.pg` source | `server_schema_get` |
 | POST | `/schema/apply` | `/graphs/{id}/schema/apply` | bearer + `schema_apply` (target=`main`) | migrate | `server_schema_apply` |
 | POST | `/ingest` | `/graphs/{id}/ingest` | bearer + `branch_create` (if new) + `change` | bulk load | `server_ingest` (32 MB body limit) |
@@ -60,6 +62,52 @@ A future release may introduce a managed registry (Lance-backed,
 catalog-style: reserve → init → publish with recovery sidecars) and
 re-expose runtime mutation on top of it.
 
+## Inline read queries (`POST /query`)
+
+`POST /query` is the read-only, agent-friendly twin of `POST /read`. The
+request body uses clean field names that match the CLI `-e` flag and the GQ
+`query` keyword:
+
+```json
+{
+  "query":    "query find($n: String) { match { $p: Person { name: $n } } return { $p.name } }",
+  "name":     "find",
+  "params":   { "n": "Alice" },
+  "branch":   "main",
+  "snapshot": null
+}
+```
+
+Response shape is identical to `/read` (`ReadOutput`). If the inline source
+contains mutations (`insert` / `update` / `delete`), the request is rejected
+with HTTP 400 and an error pointing the caller at `POST /mutate` — the
+read-only contract is enforced at the URL.
+
+`POST /mutate` is the canonical mutation endpoint. It accepts the same clean
+field names (`query`, `name`); the legacy field names `query_source` and
+`query_name` continue to deserialize as serde aliases so existing clients keep
+working without changes.
+
+## Deprecated names (`/read`, `/change`)
+
+`POST /read` and `POST /change` are kept for back-compat indefinitely — they
+are byte-stable on the request side and otherwise behave identically to
+`/query` / `/mutate`. They are flagged as deprecated through three independent
+channels:
+
+- **OpenAPI**: the operations carry `deprecated: true` in `openapi.json`, so
+  every OpenAPI codegen (typescript-fetch, openapi-generator, oapi-codegen,
+  …) emits a `@deprecated` marker on the generated SDK method.
+- **Response headers (RFC 9745)**: every response carries `Deprecation: true`.
+- **Response headers (RFC 8288)**: every response carries a `Link` header
+  pointing at the canonical successor:
+  `Link: </query>; rel="successor-version"` for `/read`, and
+  `Link: </mutate>; rel="successor-version"` for `/change`. SDKs and HTTP
+  proxies can pick the successor up automatically.
+
+Migration is purely cosmetic on the client side — swap the URL path, leave
+the request body and response handling alone.
+
 ## Streaming
 
 Only `/export` streams (`application/x-ndjson`, MPSC channel + `Body::from_stream`). Everything else is buffered JSON.
@@ -72,8 +120,8 @@ Uniform `ErrorOutput { error, code?, merge_conflicts[], manifest_conflict? }` wi
 caller's pre-write view of one table's manifest version was stale.
 `ManifestConflictOutput { table_key, expected, actual }` tells the client
 which table to refresh and retry. This is the conflict shape produced by
-concurrent `/change` or `/ingest` calls landing the same `(table, branch)`
-race.
+concurrent `/mutate` (or its `/change` alias) or `/ingest` calls landing
+the same `(table, branch)` race.
 
 HTTP status codes used: 200, 400, 401, 403, 404, 409, 429, 500.
 
@@ -99,10 +147,11 @@ actors are unaffected.
 Cedar policy authorization runs **before** admission accounting so
 denied requests don't consume admission slots.
 
-Today admission gates every mutating handler: `/change`, `/ingest`,
-`/branches/{create,delete,merge}`, and `/schema/apply`. Read-only
-endpoints (`/snapshot`, `/read`, `/export`, `/branches` GET, `/commits`,
-`/schema` GET) are not admission-gated.
+Today admission gates every mutating handler: `/mutate` (and its
+deprecated alias `/change`), `/ingest`, `/branches/{create,delete,merge}`,
+and `/schema/apply`. Read-only endpoints (`/snapshot`, `/query`, `/read`,
+`/export`, `/branches` GET, `/commits`, `/schema` GET) are not
+admission-gated.
 
 ## Body limits
 
@@ -134,8 +183,9 @@ See [deployment.md](deployment.md) for token-source operational details.
 ## Not implemented (by design or "TBD")
 
 - CORS — not configured; add `tower_http::cors` if needed.
-- Rate limiting — per-actor admission control gates `/change`, `/ingest`,
-  `/branches/{create,delete,merge}`, `/schema/apply` (see "Per-actor
+- Rate limiting — per-actor admission control gates `/mutate` (alias
+  `/change`), `/ingest`, `/branches/{create,delete,merge}`,
+  `/schema/apply` (see "Per-actor
   admission control" above). No global rate limiter is configured;
   add `tower_http::limit` if a graph-wide cap is needed.
 - Pagination — none (commits/branches return everything; export streams).

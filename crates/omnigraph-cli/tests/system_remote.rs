@@ -203,6 +203,67 @@ query insert_person($name: String, $age: I32) {
     assert_eq!(local_verify["row_count"], 1);
     assert_eq!(local_verify["rows"][0]["p.name"], "Mina");
 
+    // CLI `-e` over the HTTP transport (--config points at remote server).
+    // Confirms inline source survives the remote-execution path identically
+    // to file-based queries, and exercises `POST /query` end-to-end via the
+    // change-then-read round trip we just established.
+    let inline_remote_read = parse_stdout_json(&output_success(
+        cli()
+            .arg("read")
+            .arg("--config")
+            .arg(&config)
+            .arg("-e")
+            .arg("query find($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.age } }")
+            .arg("--params")
+            .arg(r#"{"name":"Mina"}"#)
+            .arg("--json"),
+    ));
+    assert_eq!(inline_remote_read["row_count"], 1);
+    assert_eq!(inline_remote_read["rows"][0]["p.name"], "Mina");
+
+    let inline_remote_change = parse_stdout_json(&output_success(
+        cli()
+            .arg("change")
+            .arg("--config")
+            .arg(&config)
+            .arg("--query-string")
+            .arg("query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }")
+            .arg("--params")
+            .arg(r#"{"name":"Inline","age":42}"#)
+            .arg("--json"),
+    ));
+    assert_eq!(inline_remote_change["affected_nodes"], 1);
+
+    // `POST /query` happy path directly: a hand-rolled HTTP body using the
+    // new clean field names.
+    let http_query = client
+        .post(format!("{}/query", server.base_url))
+        .json(&json!({
+            "branch": "main",
+            "query": "query find($name: String) { match { $p: Person { name: $name } } return { $p.name } }",
+            "params": { "name": "Inline" }
+        }))
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<serde_json::Value>()
+        .unwrap();
+    assert_eq!(http_query["row_count"], 1);
+    assert_eq!(http_query["rows"][0]["p.name"], "Inline");
+
+    // `POST /query` rejects mutations with 400.
+    let http_query_mutation = client
+        .post(format!("{}/query", server.base_url))
+        .json(&json!({
+            "branch": "main",
+            "query": "query bad($name: String, $age: I32) { insert Person { name: $name, age: $age } }",
+            "params": { "name": "Nope", "age": 1 }
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(http_query_mutation.status(), reqwest::StatusCode::BAD_REQUEST);
+
     // `run publish` / `run list` removed. Direct-to-target writes
     // already landed via the change call above; the commit graph is now
     // the audit surface (verified separately by `commit list`).

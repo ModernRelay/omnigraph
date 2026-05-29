@@ -164,8 +164,10 @@ const EXPECTED_PATHS: &[&str] = &[
     "/graphs",
     "/snapshot",
     "/read",
+    "/query",
     "/export",
     "/change",
+    "/mutate",
     "/schema",
     "/schema/apply",
     "/ingest",
@@ -233,6 +235,64 @@ fn openapi_change_is_post() {
 }
 
 #[test]
+fn openapi_mutate_is_post() {
+    let doc = openapi_json();
+    assert!(doc["paths"]["/mutate"]["post"].is_object());
+}
+
+// Deprecation flagging — `/read` and `/change` are kept indefinitely for
+// back-compat but are flagged so OpenAPI codegens (typescript-fetch,
+// openapi-generator, oapi-codegen, etc.) emit @deprecated on the generated
+// SDK methods. The canonical successors `/query` and `/mutate` are not
+// flagged. See `deprecation_headers` in `omnigraph-server/src/lib.rs` for
+// the matching runtime signal (RFC 9745 + RFC 8288 headers).
+#[test]
+fn openapi_read_is_deprecated() {
+    let doc = openapi_json();
+    assert_eq!(
+        doc["paths"]["/read"]["post"]["deprecated"],
+        serde_json::Value::Bool(true),
+        "/read must be flagged deprecated in OpenAPI; use /query instead"
+    );
+}
+
+#[test]
+fn openapi_change_is_deprecated() {
+    let doc = openapi_json();
+    assert_eq!(
+        doc["paths"]["/change"]["post"]["deprecated"],
+        serde_json::Value::Bool(true),
+        "/change must be flagged deprecated in OpenAPI; use /mutate instead"
+    );
+}
+
+#[test]
+fn openapi_query_is_not_deprecated() {
+    let doc = openapi_json();
+    let deprecated = doc["paths"]["/query"]["post"]
+        .get("deprecated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    assert!(
+        !deprecated,
+        "/query is the canonical read endpoint and must not be deprecated"
+    );
+}
+
+#[test]
+fn openapi_mutate_is_not_deprecated() {
+    let doc = openapi_json();
+    let deprecated = doc["paths"]["/mutate"]["post"]
+        .get("deprecated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    assert!(
+        !deprecated,
+        "/mutate is the canonical mutation endpoint and must not be deprecated"
+    );
+}
+
+#[test]
 fn openapi_ingest_is_post() {
     let doc = openapi_json();
     assert!(doc["paths"]["/ingest"]["post"].is_object());
@@ -283,6 +343,7 @@ const EXPECTED_SCHEMAS: &[&str] = &[
     "BranchMergeRequest",
     "ChangeOutput",
     "ChangeRequest",
+    "QueryRequest",
     "CommitListOutput",
     "CommitOutput",
     "ErrorCode",
@@ -373,13 +434,65 @@ fn read_output_schema_has_expected_fields() {
 
 #[test]
 fn change_request_schema_has_expected_fields() {
+    // Canonical field names on the wire are now `query` and `name`. The
+    // schema descriptions document `query_source` and `query_name` as
+    // legacy deserialization aliases for backward compatibility.
     let doc = openapi_json();
     let schema = &doc["components"]["schemas"]["ChangeRequest"];
     let props = schema["properties"].as_object().unwrap();
-    assert!(props.contains_key("query_source"));
-    assert!(props.contains_key("query_name"));
+    assert!(props.contains_key("query"));
+    assert!(props.contains_key("name"));
     assert!(props.contains_key("params"));
     assert!(props.contains_key("branch"));
+    let query_desc = schema["properties"]["query"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        query_desc.contains("query_source"),
+        "expected `query` description to mention the legacy `query_source` alias, got: {query_desc}"
+    );
+}
+
+#[test]
+fn query_request_schema_has_expected_fields() {
+    let doc = openapi_json();
+    let schema = &doc["components"]["schemas"]["QueryRequest"];
+    let props = schema["properties"].as_object().unwrap();
+    assert!(props.contains_key("query"));
+    assert!(props.contains_key("name"));
+    assert!(props.contains_key("params"));
+    assert!(props.contains_key("branch"));
+    assert!(props.contains_key("snapshot"));
+}
+
+#[test]
+fn query_request_query_is_required() {
+    let doc = openapi_json();
+    let schema = &doc["components"]["schemas"]["QueryRequest"];
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(required.contains(&"query"));
+}
+
+#[test]
+fn openapi_query_is_post() {
+    let doc = openapi_json();
+    assert!(doc["paths"]["/query"]["post"].is_object());
+}
+
+#[test]
+fn query_endpoint_documents_mutation_400() {
+    let doc = openapi_json();
+    let four_hundred = &doc["paths"]["/query"]["post"]["responses"]["400"];
+    let description = four_hundred["description"].as_str().unwrap_or_default();
+    assert!(
+        description.contains("mutations") || description.contains("POST /mutate"),
+        "expected /query 400 response to mention mutation rejection, got: {description}"
+    );
 }
 
 #[test]

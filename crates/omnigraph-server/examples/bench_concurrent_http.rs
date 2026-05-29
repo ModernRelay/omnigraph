@@ -121,8 +121,8 @@ async fn drive_actor(
     for op_idx in 0..ops {
         let table_idx = pick_table(actor_idx, op_idx, mode, num_tables);
         let request_body = ChangeRequest {
-            query_source: build_query_source(table_idx),
-            query_name: Some("insert_item".to_string()),
+            query: build_query_source(table_idx),
+            name: Some("insert_item".to_string()),
             params: Some(serde_json::json!({
                 "name": format!("a{actor_idx}_o{op_idx}"),
                 "value": op_idx as i32,

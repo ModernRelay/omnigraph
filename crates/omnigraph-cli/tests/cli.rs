@@ -631,6 +631,202 @@ query list_people() {
     assert_eq!(stdout_string(&lint_output), stdout_string(&check_output));
 }
 
+/// `omnigraph lint` is the canonical top-level lint command after the
+/// query/mutate rename. `omnigraph query lint` and `omnigraph query check`
+/// are kept as deprecated argv shims (warning + rewrite). All three must
+/// produce identical stdout output.
+#[test]
+fn lint_top_level_matches_deprecated_query_lint_output() {
+    let temp = tempdir().unwrap();
+    let schema_path = temp.path().join("schema.pg");
+    let query_path = temp.path().join("queries.gq");
+    write_file(
+        &schema_path,
+        r#"
+node Person {
+    name: String
+}
+"#,
+    );
+    write_query_file(
+        &query_path,
+        r#"
+query list_people() {
+    match { $p: Person }
+    return { $p.name }
+}
+"#,
+    );
+
+    let canonical = output_success(
+        cli()
+            .arg("lint")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json"),
+    );
+    let deprecated_lint = output_success(
+        cli()
+            .arg("query")
+            .arg("lint")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json"),
+    );
+    let deprecated_check = output_success(
+        cli()
+            .arg("query")
+            .arg("check")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json"),
+    );
+
+    assert_eq!(stdout_string(&canonical), stdout_string(&deprecated_lint));
+    assert_eq!(stdout_string(&canonical), stdout_string(&deprecated_check));
+
+    // Canonical form must NOT emit the deprecation warning.
+    let canonical_stderr = String::from_utf8(canonical.stderr).unwrap();
+    assert!(
+        !canonical_stderr.contains("deprecated"),
+        "`omnigraph lint` is canonical and must not warn; got stderr: {canonical_stderr}"
+    );
+
+    // Deprecated forms MUST emit the one-line warning, pointing at the
+    // new top-level `omnigraph lint`.
+    let lint_stderr = String::from_utf8(deprecated_lint.stderr).unwrap();
+    assert!(
+        lint_stderr.contains("`omnigraph query lint` is deprecated")
+            && lint_stderr.contains("`omnigraph lint`"),
+        "expected deprecation warning pointing at `omnigraph lint`; got: {lint_stderr}"
+    );
+    let check_stderr = String::from_utf8(deprecated_check.stderr).unwrap();
+    assert!(
+        check_stderr.contains("`omnigraph query check` is deprecated")
+            && check_stderr.contains("`omnigraph lint`"),
+        "expected deprecation warning pointing at `omnigraph lint`; got: {check_stderr}"
+    );
+}
+
+/// Bare `omnigraph check` is NOT a clap `visible_alias` on `lint` (MR-981 §6:
+/// visible aliases give agents two canonical names to emit interchangeably).
+/// It's an argv-level shim: rewrites to `omnigraph lint`, prints a one-line
+/// stderr deprecation warning, and produces identical stdout to the canonical
+/// invocation. Cargo/Go users typing `check` keep working; help text shows
+/// only `lint`.
+#[test]
+fn deprecated_check_top_level_rewrites_to_lint() {
+    let temp = tempdir().unwrap();
+    let schema_path = temp.path().join("schema.pg");
+    let query_path = temp.path().join("queries.gq");
+    write_file(
+        &schema_path,
+        r#"
+node Person {
+    name: String
+}
+"#,
+    );
+    write_query_file(
+        &query_path,
+        r#"
+query list_people() {
+    match { $p: Person }
+    return { $p.name }
+}
+"#,
+    );
+
+    let canonical = output_success(
+        cli()
+            .arg("lint")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json"),
+    );
+    let deprecated_check = output_success(
+        cli()
+            .arg("check")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json"),
+    );
+
+    assert_eq!(stdout_string(&canonical), stdout_string(&deprecated_check));
+
+    let check_stderr = String::from_utf8(deprecated_check.stderr).unwrap();
+    assert!(
+        check_stderr.contains("`omnigraph check` is deprecated")
+            && check_stderr.contains("`omnigraph lint`"),
+        "expected `omnigraph check` deprecation warning pointing at `omnigraph lint`; got: {check_stderr}"
+    );
+
+    // `check` must NOT appear in the canonical `omnigraph --help` output —
+    // agents copy the surface from help text and would otherwise emit both
+    // names interchangeably.
+    let help = cli().arg("--help").output().unwrap();
+    let stdout = String::from_utf8(help.stdout).unwrap();
+    let check_aliased = stdout
+        .lines()
+        .any(|line| line.trim_start().starts_with("lint") && line.contains("check"));
+    assert!(
+        !check_aliased,
+        "`check` must not be advertised as a visible alias of `lint`; help output: {stdout}"
+    );
+}
+
+/// `omnigraph read` and `omnigraph change` are kept as visible clap
+/// aliases for the new canonical `query` / `mutate` subcommands, plus an
+/// argv-level deprecation warning. The warning is emitted to stderr; the
+/// command otherwise behaves identically to the canonical form.
+#[test]
+fn deprecated_read_and_change_subcommands_emit_warnings() {
+    // Both subcommands require `--query`/`--query-string`/`--alias`, so
+    // invoking them with no args will exit non-zero. That's fine --
+    // we only care that the deprecation warning is printed before the
+    // argument-required error.
+    let output = cli().arg("read").output().unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("`omnigraph read` is deprecated")
+            && stderr.contains("`omnigraph query`"),
+        "expected `omnigraph read` deprecation warning; got: {stderr}"
+    );
+
+    let output = cli().arg("change").output().unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("`omnigraph change` is deprecated")
+            && stderr.contains("`omnigraph mutate`"),
+        "expected `omnigraph change` deprecation warning; got: {stderr}"
+    );
+
+    // Sanity check the inverse: the canonical names must NOT print the
+    // deprecation banner.
+    let output = cli().arg("query").arg("--help").output().unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("deprecated"),
+        "`omnigraph query` is canonical and must not warn; got: {stderr}"
+    );
+    let output = cli().arg("mutate").arg("--help").output().unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("deprecated"),
+        "`omnigraph mutate` is canonical and must not warn; got: {stderr}"
+    );
+}
+
 #[test]
 fn query_lint_can_use_local_graph_via_positional_uri() {
     let temp = tempdir().unwrap();
@@ -1420,6 +1616,102 @@ fn read_requires_name_for_multi_query_files() {
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("multiple queries"));
+}
+
+#[test]
+fn read_supports_inline_query_string() {
+    let temp = tempdir().unwrap();
+    let repo = graph_path(temp.path());
+    init_graph(&repo);
+    load_fixture(&repo);
+
+    let output = output_success(
+        cli()
+            .arg("read")
+            .arg(&repo)
+            .arg("-e")
+            .arg("query find($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.age } }")
+            .arg("--params")
+            .arg(r#"{"name":"Alice"}"#)
+            .arg("--json"),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["query_name"], "find");
+    assert_eq!(payload["row_count"], 1);
+    assert_eq!(payload["rows"][0]["p.name"], "Alice");
+}
+
+#[test]
+fn change_supports_inline_query_string() {
+    let temp = tempdir().unwrap();
+    let repo = graph_path(temp.path());
+    init_graph(&repo);
+    load_fixture(&repo);
+
+    let output = output_success(
+        cli()
+            .arg("change")
+            .arg(&repo)
+            .arg("--query-string")
+            .arg("query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }")
+            .arg("--params")
+            .arg(r#"{"name":"Inline","age":42}"#)
+            .arg("--json"),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["query_name"], "add");
+    assert_eq!(payload["affected_nodes"], 1);
+
+    let verify = output_success(
+        cli()
+            .arg("read")
+            .arg(&repo)
+            .arg("-e")
+            .arg("query find($name: String) { match { $p: Person { name: $name } } return { $p.name } }")
+            .arg("--params")
+            .arg(r#"{"name":"Inline"}"#)
+            .arg("--json"),
+    );
+    let verify_payload: Value = serde_json::from_slice(&verify.stdout).unwrap();
+    assert_eq!(verify_payload["row_count"], 1);
+}
+
+#[test]
+fn read_rejects_query_string_combined_with_query() {
+    let temp = tempdir().unwrap();
+    let repo = graph_path(temp.path());
+    init_graph(&repo);
+    load_fixture(&repo);
+
+    let output = output_failure(
+        cli()
+            .arg("read")
+            .arg(&repo)
+            .arg("--query")
+            .arg(fixture("test.gq"))
+            .arg("-e")
+            .arg("query whatever() { match { $p: Person } return { $p.name } }"),
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("cannot be used") || stderr.contains("conflict"),
+        "expected clap conflict error, got: {stderr}"
+    );
+}
+
+#[test]
+fn read_rejects_empty_query_string() {
+    let temp = tempdir().unwrap();
+    let repo = graph_path(temp.path());
+    init_graph(&repo);
+    load_fixture(&repo);
+
+    let output = output_failure(cli().arg("read").arg(&repo).arg("-e").arg(""));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("must not be empty"),
+        "expected empty-string rejection, got: {stderr}"
+    );
 }
 
 #[test]
