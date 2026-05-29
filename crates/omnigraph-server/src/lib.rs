@@ -1845,6 +1845,12 @@ async fn run_mutate(
 /// can call here with registry-supplied fields. Rejects inline source that
 /// contains mutations (D2 rule); callers wanting writes go through
 /// [`run_mutate`] instead.
+///
+/// Intentionally does **not** take [`AppState`] (unlike [`run_mutate`]):
+/// reads are not admission-gated today, so there is no `state.workload`
+/// consumer. The signature grows the parameter when Phase 1 (MR-976) adds
+/// the request envelope's `expect: { max_rows_scanned: N }` budget, or
+/// MR-969 extends per-actor admission to stored-read invocations.
 async fn run_query(
     handle: Arc<GraphHandle>,
     actor: Option<Extension<ResolvedActor>>,
