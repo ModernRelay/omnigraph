@@ -302,16 +302,105 @@ Select with `--graph <name>` (shipped flag, MR-603).
 - **`aliases:` ⇄ `queries:` convergence.** Out of scope here; tracked separately. One registry with embedded + remote invocation surfaces is the target end state.
 - **Single-file `KUBECONFIG`-style list.** Do we support `OMNIGRAPH_CONFIG` pointing at multiple files (colon-joined), or a single file only? Start single; revisit if demand appears.
 
+## Implementation — breadboard + slices (Shape A)
+
+Shaped via requirements + a fit check (Shape A — global-first layered config + unified `graphs:` entry + three-tier init — selected over a project-first minimal option and a Helix-clone). This section breadboards A and slices it. **Bold** = NEW.
+
+### Places
+
+| # | Place | What |
+|---|---|---|
+| P1 | Disk | `~/.omnigraph/{config.yaml, credentials, cache/, state/}` + project `omnigraph.yaml` + `.env.omni` |
+| P2 | Config resolution | runs on every command: load layers → merge → resolve `--graph` |
+| P3 | Command execution | embedded engine OR remote HTTP client |
+| P4 | Remote `omnigraph-server` | existing HTTP surface (`/query`, `/mutate`, `/queries/{name}`) |
+| P5 | Scaffold | `login` / `init` / `quickstart` |
+
+### Affordances
+
+| # | Place | Affordance | NEW? | Wires |
+|---|---|---|---|---|
+| U1 | P1 | `~/.omnigraph/config.yaml` (operator edits) | **N** | → N1 |
+| U2 | P1 | project `./omnigraph.yaml` | — | → N1 |
+| U3 | P1 | `~/.omnigraph/credentials` / `.env.omni` dotenv (secrets, git-ignored) | — | → N4 |
+| U4 | P3 | `omnigraph <verb> --graph <name>` (any command) | — | → N14 |
+| U5 | P5 | `omnigraph login [<server>]` | **N** | → N11 |
+| U6 | P5 | `omnigraph init` / `quickstart [--template]` | partly | → N12 / N13 |
+| U7 | P2 | `omnigraph config view --resolved --show-origin` | **N** | → N10 |
+| N1 | P2 | `load_layered_config()` — global (N3) + project (cwd), serde each | **N** | → N2 |
+| N2 | P2 | **merge engine** — deep-merge settings; replace named-resource entries; replace lists; **retain provenance** | **N⚠️** | → N5, → S_merged |
+| N3 | P2 | global-dir resolver — `OMNIGRAPH_HOME` else `~/.omnigraph/` | **N** | → N1 |
+| N4 | P2 | `load_env_file_into_process` — dotenv, real-env-wins (existing) | — | → N9 |
+| N5 | P2 | `resolve_graph(name, merged)` → `(locus, graph, sub-state, credential)` | **N⚠️** | → N6 |
+| N6 | P3 | `GraphConn` — `Embedded(engine)` \| `Remote(http)` dispatch | **N⚠️** | → N7, → N8 |
+| N7 | P3 | embedded path — `Omnigraph::open(uri)` (existing) | — | → engine |
+| N8 | P3 | **HTTP-client path** — POST `/query`/`/mutate`/`/queries/{name}` | **N⚠️** | → P4, → N9 |
+| N9 | P2 | `resolve_bearer_token(server)` — env → dotenv → keychain(future); extends `resolve_remote_bearer_token` to `servers.<name>` (MR-971) | **N** | → N8 |
+| N10 | P2 | `config view` handler — merged + per-field origin (needs N2 provenance) | **N** | → U7 |
+| N11 | P5 | `login` handler — interactive auth → write `config.yaml` + `credentials` (0600) + `.gitignore` | **N⚠️** | → S_global |
+| N12 | P5 | `init` handler — `scaffold_config_if_missing` + create graph; refuse-if-exists/`--force` purge (MR-975) | partly | → S_project |
+| N13 | P5 | `quickstart` handler — scaffold + `--template` + seed + `serve start` + agent prompt (MR-973; needs serve MR-970) | **N⚠️** | → S_project |
+| N14 | P3 | agent-mode wrapper — `--machine`/`OMNIGRAPH_AGENT_MODE`: JSON, structured errors, never-prompt, typed exit codes (MR-981) | **N⚠️** | → N1 |
+| S_global | P1 | `~/.omnigraph/config.yaml` + `credentials` | **N** | read by N1/N9 |
+| S_project | P1 | `./omnigraph.yaml` + `.env.omni` | — | read by N1/N4 |
+| S_merged | P2 | in-memory resolved config (per command, with provenance) | **N** | read by N5/N10 |
+| S_cache | P1 | `~/.omnigraph/cache/` (remote catalogs) | **N** | read by N8 |
+
+```mermaid
+flowchart TB
+  subgraph P1["P1: Disk"]
+    U1["U1: ~/.omnigraph/config.yaml"]
+    U2["U2: ./omnigraph.yaml"]
+    U3["U3: credentials dotenv"]
+  end
+  subgraph P2["P2: Config resolution"]
+    N3["N3: global-dir (OMNIGRAPH_HOME)"]
+    N1["N1: load_layered_config"]
+    N2["N2: merge engine (+provenance)"]
+    N4["N4: dotenv loader"]
+    N5["N5: resolve_graph(--graph)"]
+    N9["N9: resolve_bearer_token"]
+    N10["N10: config view"]
+  end
+  subgraph P3["P3: Command execution"]
+    U4["U4: omnigraph <verb> --graph"]
+    N14["N14: agent-mode wrapper"]
+    N6["N6: GraphConn embedded|remote"]
+    N7["N7: embedded Omnigraph::open"]
+    N8["N8: HTTP-client POST"]
+  end
+  subgraph P5["P5: Scaffold"]
+    U5["U5: login"]; U6["U6: init/quickstart"]
+    N11["N11: login handler"]; N12["N12: init"]; N13["N13: quickstart"]
+  end
+  P4["P4: remote omnigraph-server"]
+  U1-->N1; U2-->N1; N3-->N1; N1-->N2-->N5-->N6
+  U3-->N4-->N9-->N8
+  U4-->N14-->N1
+  N6-->N7; N6-->N8-->P4
+  N2-->N10-->U7["U7: config view --resolved"]
+  U5-->N11; U6-->N12; U6-->N13
+  classDef ui fill:#ffb6c1,stroke:#d87093,color:#000
+  classDef n fill:#d3d3d3,stroke:#808080,color:#000
+  class U1,U2,U3,U4,U5,U6,U7 ui
+  class N1,N2,N3,N4,N5,N6,N7,N8,N9,N10,N11,N12,N13,N14 n
+```
+
+### Slices (vertical, each demo-able)
+
+| # | Slice | Parts/affordances | Demo |
+|---|---|---|---|
+| **V1** | **Global layer + merge + `config view`** | A1–A4 · N1,N2,N3,N10 · U1,U7,S_global,S_merged | Put config in `~/.omnigraph/`, run `omnigraph config view --resolved --show-origin` from any dir → merged result with per-field origin; existing embedded commands work global-first with no project file |
+| **V2** | **Remote graphs + HTTP client + creds** | A5–A7 · N5,N6,N8,N9 · S_cache | Define a `server:` graph entry; `omnigraph query --graph prod` hits the remote server (`curl`-free); embedded `--graph dev` still local |
+| **V3** | **`omnigraph login`** | A8 · N11,U5 | `omnigraph login prod` writes `~/.omnigraph/credentials` (0600) + `.gitignore`; V2 remote query now works with no manual env |
+| **V4** | **Thin-init hardening + quickstart + templates** | A9 · N12,N13,U6 (needs serve MR-970) | `omnigraph quickstart --template person-knows` scaffolds + seeds + serves; `init --force` purges (MR-975) |
+| **V5** | **Agent-mode** | A10 · N14,U4 (MR-981) | `OMNIGRAPH_AGENT_MODE=1 omnigraph query …` → JSON + structured errors + typed exit codes; never-prompt |
+
+V1 is the foundation (global-first + merge + view). V2 closes the substantive client→server gap. V3 is credential ergonomics. V4/V5 ride sibling tickets (MR-970/973/981). MR-969 (stored queries) ships independently and is reached by N8's `/queries/{name}` once V2 lands.
+
 ## Rollout
 
-Phased, each independently useful:
-
-1. **Env-var remote tier** — `OMNIGRAPH_SERVER` + `OMNIGRAPH_TOKEN`, plus an HTTP client mode in the CLI. Zero-config remote; unblocks `curl`-free server use. (Smallest; highest leverage.)
-2. **Global `config.yaml` + `servers:`/`targets:` + resolution + `config view`.** Named multi-server targeting, layered with the project file.
-3. **`omnigraph login` writing the `auth.env_file` dotenv (and keychain).** Credential management on top of the existing dotenv resolver.
-4. **`omnigraph use` + branch/snapshot-pinned targets.** Active-context switching; reproducible agent contexts.
-
-Phases 1–2 close the substantive gap; 3–4 are ergonomics. Evaluate after phase 2 against early-adopter and agent-onboarding (MR-973 / MR-974) signal.
+The slices above are the rollout order: **V1 (global layer + merge) → V2 (remote graphs + HTTP client) → V3 (login) → V4 (quickstart/templates, on MR-970) → V5 (agent-mode, MR-981).** V1–V2 close the substantive gap (global-first config + `curl`-free server access); V3–V5 are ergonomics that ride sibling tickets. Evaluate after V2 against early-adopter and agent-onboarding (MR-973 / MR-974) signal. The spikes (X1 HTTP-client, X2 merge engine, X3 resolver+provenance, X4 login) resolve before their owning slice.
 
 ## Prior art
 
