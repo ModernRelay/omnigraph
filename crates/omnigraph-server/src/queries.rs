@@ -16,8 +16,10 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::sync::Arc;
 
+use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::query::ast::QueryDecl;
 use omnigraph_compiler::query::parser::parse_query;
+use omnigraph_compiler::query::typecheck::typecheck_query_decl;
 
 use crate::config::{OmnigraphConfig, QueryEntry};
 
@@ -182,6 +184,88 @@ impl QueryRegistry {
     }
 }
 
+/// A stored query that fails to type-check against the live schema —
+/// e.g. it references a node/edge type or property that was renamed or
+/// removed by a migration. Breakages **block server boot** (same posture
+/// as bad policy YAML), surfacing schema drift at the deploy boundary
+/// rather than silently at invocation time.
+#[derive(Debug, Clone)]
+pub struct Breakage {
+    pub query: String,
+    pub message: String,
+}
+
+/// A non-blocking advisory found during validation. Logged at boot;
+/// never blocks startup. Currently: an MCP-exposed query that declares a
+/// parameter an agent cannot realistically supply.
+#[derive(Debug, Clone)]
+pub struct Warning {
+    pub query: String,
+    pub message: String,
+}
+
+/// Outcome of validating a registry against a schema. Breakages are
+/// fatal (boot refuses); warnings are advisory.
+#[derive(Debug, Clone, Default)]
+pub struct CheckReport {
+    pub breakages: Vec<Breakage>,
+    pub warnings: Vec<Warning>,
+}
+
+impl CheckReport {
+    pub fn has_breakages(&self) -> bool {
+        !self.breakages.is_empty()
+    }
+
+    pub fn is_clean(&self) -> bool {
+        self.breakages.is_empty() && self.warnings.is_empty()
+    }
+}
+
+/// Validate a loaded registry against the live schema.
+///
+/// Pure over `(registry, catalog)` — takes an already-parsed registry and
+/// a catalog, so it is callable both at server boot (with the engine's
+/// `catalog()`) and offline from the CLI (`omnigraph queries check`),
+/// without coupling to server config or an open engine connection.
+///
+/// Every query is type-checked via the same `typecheck_query_decl` the
+/// engine runs for inline queries — no parallel implementation. Failures
+/// are **collected, not fail-fast**, so an operator sees every broken
+/// query in one pass.
+///
+/// Advisory lint (warn, never block): an `mcp.expose: true` query that
+/// declares a `Vector(N)` parameter. An LLM cannot supply a raw embedding
+/// vector; such a query should take a `String` parameter and let the
+/// engine embed it server-side at query time. Service-to-service callers
+/// may legitimately pass vectors, so this warns rather than rejects.
+pub fn check(registry: &QueryRegistry, catalog: &Catalog) -> CheckReport {
+    let mut report = CheckReport::default();
+    for query in registry.iter() {
+        if let Err(err) = typecheck_query_decl(catalog, &query.decl) {
+            report.breakages.push(Breakage {
+                query: query.name.clone(),
+                message: err.to_string(),
+            });
+        }
+        if query.expose {
+            for param in &query.decl.params {
+                if param.type_name.starts_with("Vector(") {
+                    report.warnings.push(Warning {
+                        query: query.name.clone(),
+                        message: format!(
+                            "MCP-exposed query declares a `{}` parameter `${}` that agents \
+                             cannot supply; use a `String` parameter for server-side embedding",
+                            param.type_name, param.name
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,5 +350,108 @@ mod tests {
         )])
         .unwrap();
         assert!(reg.lookup("add_user").unwrap().is_mutation());
+    }
+
+    // --- check(registry, catalog) ---
+
+    use omnigraph_compiler::catalog::build_catalog;
+    use omnigraph_compiler::schema::parser::parse_schema;
+
+    fn test_catalog() -> Catalog {
+        let schema = parse_schema(
+            r#"
+node User {
+name: String
+age: I32?
+embedding: Vector(4)
+}
+"#,
+        )
+        .unwrap();
+        build_catalog(&schema).unwrap()
+    }
+
+    #[test]
+    fn check_passes_for_valid_query() {
+        let reg = QueryRegistry::from_specs(vec![spec(
+            "find_user",
+            "query find_user($name: String) { match { $u: User { name: $name } } return { $u.age } }",
+            false,
+        )])
+        .unwrap();
+        let report = check(&reg, &test_catalog());
+        assert!(report.is_clean(), "unexpected: {:?}", report);
+    }
+
+    #[test]
+    fn check_reports_unknown_type_as_breakage() {
+        let reg = QueryRegistry::from_specs(vec![spec(
+            "ghost",
+            // `Widget` is not in the schema.
+            "query ghost() { match { $w: Widget } return { $w.name } }",
+            false,
+        )])
+        .unwrap();
+        let report = check(&reg, &test_catalog());
+        assert!(report.has_breakages());
+        assert_eq!(report.breakages[0].query, "ghost");
+    }
+
+    #[test]
+    fn check_reports_unknown_property_as_breakage() {
+        let reg = QueryRegistry::from_specs(vec![spec(
+            "bad_prop",
+            // `User` exists but has no `nickname`.
+            "query bad_prop() { match { $u: User } return { $u.nickname } }",
+            false,
+        )])
+        .unwrap();
+        let report = check(&reg, &test_catalog());
+        assert!(report.has_breakages());
+        assert_eq!(report.breakages[0].query, "bad_prop");
+    }
+
+    #[test]
+    fn check_collects_every_breakage_not_fail_fast() {
+        let reg = QueryRegistry::from_specs(vec![
+            spec("a", "query a() { match { $w: Widget } return { $w.x } }", false),
+            spec("b", "query b() { match { $g: Gadget } return { $g.y } }", false),
+            spec(
+                "ok",
+                "query ok() { match { $u: User } return { $u.name } }",
+                false,
+            ),
+        ])
+        .unwrap();
+        let report = check(&reg, &test_catalog());
+        assert_eq!(report.breakages.len(), 2, "both bad queries reported: {:?}", report);
+    }
+
+    #[test]
+    fn vector_param_on_exposed_query_warns() {
+        let reg = QueryRegistry::from_specs(vec![spec(
+            "vec_search",
+            "query vec_search($q: Vector(4)) { match { $u: User } return { $u.name } \
+             order { nearest($u.embedding, $q) } limit 3 }",
+            true, // mcp.expose
+        )])
+        .unwrap();
+        let report = check(&reg, &test_catalog());
+        assert!(!report.has_breakages(), "valid query: {:?}", report);
+        assert_eq!(report.warnings.len(), 1);
+        assert_eq!(report.warnings[0].query, "vec_search");
+    }
+
+    #[test]
+    fn vector_param_on_unexposed_query_is_silent() {
+        let reg = QueryRegistry::from_specs(vec![spec(
+            "vec_search",
+            "query vec_search($q: Vector(4)) { match { $u: User } return { $u.name } \
+             order { nearest($u.embedding, $q) } limit 3 }",
+            false, // not exposed — vector param is fine for service-to-service callers
+        )])
+        .unwrap();
+        let report = check(&reg, &test_catalog());
+        assert!(report.is_clean(), "unexpected: {:?}", report);
     }
 }
