@@ -1462,6 +1462,75 @@ async fn test_publish_migrates_pre_stamp_manifest_to_current_version() {
 }
 
 #[tokio::test]
+async fn test_v2_to_v3_sweeps_legacy_run_branches_on_write_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let catalog = build_test_catalog();
+    let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
+
+    // Synthesize a pre-MR-770 graph: a stale `__run__` staging branch left on
+    // `__manifest`, alongside a real user branch that must survive the sweep.
+    mc.create_branch("__run__01J9LEGACY").await.unwrap();
+    mc.create_branch("feature").await.unwrap();
+    let before = mc.list_branches().await.unwrap();
+    assert!(
+        before.iter().any(|b| b == "__run__01J9LEGACY"),
+        "precondition: legacy run branch exists on __manifest; got {before:?}",
+    );
+
+    // Rewind the internal-schema stamp to v2 so the next write-open runs the
+    // v2 → v3 sweep arm (init stamps at the current version, which is past it).
+    {
+        let mut ds = open_manifest_dataset(uri, None).await.unwrap();
+        ds.update_schema_metadata([(
+            "omnigraph:internal_schema_version".to_string(),
+            Some("2".to_string()),
+        )])
+        .await
+        .unwrap();
+        let post = open_manifest_dataset(uri, None).await.unwrap();
+        assert_eq!(super::migrations::read_stamp(&post), 2, "stamp rewound to v2");
+    }
+
+    // A no-op publish forces the open-for-write path, which runs the migration.
+    let mut expected = HashMap::new();
+    expected.insert("node:Person".to_string(), 1);
+    GraphNamespacePublisher::new(uri, None)
+        .publish(&[], &expected)
+        .await
+        .unwrap();
+
+    // Stamp advanced to current; the legacy run branch is physically gone from
+    // `__manifest` (checked via the raw, unfiltered manifest list — not the
+    // guard-filtered `branch_list`), and the real branch + `main` survive.
+    let post = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(
+        super::migrations::read_stamp(&post),
+        super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION,
+    );
+    let reopened = ManifestCoordinator::open(uri).await.unwrap();
+    let after = reopened.list_branches().await.unwrap();
+    assert!(
+        !after.iter().any(|b| b.starts_with("__run__")),
+        "legacy run branch must be swept; got {after:?}",
+    );
+    assert!(after.iter().any(|b| b == "feature"), "user branch must survive");
+    assert!(after.iter().any(|b| b == "main"), "main must survive");
+
+    // Idempotent: a second write-open finds the stamp at current and does not
+    // re-run the sweep or error.
+    GraphNamespacePublisher::new(uri, None)
+        .publish(&[], &expected)
+        .await
+        .unwrap();
+    let final_ds = open_manifest_dataset(uri, None).await.unwrap();
+    assert_eq!(
+        super::migrations::read_stamp(&final_ds),
+        super::migrations::INTERNAL_MANIFEST_SCHEMA_VERSION,
+    );
+}
+
+#[tokio::test]
 async fn test_publish_rejects_manifest_stamped_at_future_version() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
