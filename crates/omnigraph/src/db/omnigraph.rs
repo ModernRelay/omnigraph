@@ -346,6 +346,16 @@ impl Omnigraph {
         mode: OpenMode,
     ) -> Result<Self> {
         let root = normalize_root_uri(uri)?;
+        // Apply pending internal-schema migrations before the coordinator reads
+        // branch state, so `branch_list` and the schema-apply blocking-branch
+        // checks observe the post-migration graph — notably the v2→v3 sweep of
+        // legacy `__run__*` staging branches (MR-770). ReadWrite only: a
+        // read-only open must not trigger object-store writes, so a read-only
+        // open of an unmigrated legacy graph still lists `__run__*` until its
+        // first read-write open (an accepted, documented limitation).
+        if matches!(mode, OpenMode::ReadWrite) {
+            crate::db::manifest::migrate_on_open(&root).await?;
+        }
         // Open the coordinator first so the schema-staging recovery sweep can
         // compare its snapshot against any leftover staging files.
         let mut coordinator = GraphCoordinator::open(&root, Arc::clone(&storage)).await?;
@@ -2255,6 +2265,56 @@ edge WorksAt: Person -> Company
             all_branches
         );
 
+        let desired = TEST_SCHEMA.replace(
+            "    age: I32?\n}",
+            "    age: I32?\n    nickname: String?\n}",
+        );
+        let result = db.apply_schema(&desired).await.unwrap();
+        assert!(result.applied, "schema apply should have applied");
+    }
+
+    /// Regression (MR-770): a pre-v0.4.0 graph that still carries a stale
+    /// `__run__*` branch on `__manifest` must not block schema apply. The
+    /// v2→v3 sweep runs in `Omnigraph::open(ReadWrite)` — before the
+    /// schema-apply blocking-branch check — so apply succeeds with no
+    /// intervening publish.
+    ///
+    /// Confirmed to fail before the open-time migration landed: the reopened
+    /// graph still listed `__run__legacy`, and `apply_schema` returned
+    /// "found non-main branches: __run__legacy".
+    #[tokio::test]
+    async fn legacy_run_branch_is_swept_on_open_and_does_not_block_schema_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        // Synthesize a legacy graph: a stale `__run__` branch on `__manifest`
+        // plus the manifest stamp rewound to v2 (pre-sweep).
+        db.branch_create("__run__legacy").await.unwrap();
+        drop(db);
+        {
+            let mut ds = lance::Dataset::open(&format!("{}/__manifest", uri))
+                .await
+                .unwrap();
+            ds.update_schema_metadata([(
+                "omnigraph:internal_schema_version".to_string(),
+                Some("2".to_string()),
+            )])
+            .await
+            .unwrap();
+        }
+
+        // Reopen (ReadWrite): the open-time migration must sweep `__run__legacy`
+        // before any branch-observing code runs.
+        let db = Omnigraph::open(uri).await.unwrap();
+        let branches = db.branch_list().await.unwrap();
+        assert!(
+            !branches.iter().any(|b| b.starts_with("__run__")),
+            "open-time migration must sweep legacy __run__ branches; got {branches:?}",
+        );
+
+        // Schema apply must proceed with no intervening publish — the
+        // blocking-branch check no longer sees `__run__legacy`.
         let desired = TEST_SCHEMA.replace(
             "    age: I32?\n}",
             "    age: I32?\n    nickname: String?\n}",

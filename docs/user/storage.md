@@ -47,6 +47,7 @@ Adding a new on-disk shape change is one constant bump (`INTERNAL_MANIFEST_SCHEM
 |---|---|
 | v1 (implicit, pre-stamp) | `__manifest.object_id` had no PK annotation; publisher had no row-level CAS protection. |
 | v2 | `__manifest.object_id` carries `lance-schema:unenforced-primary-key=true`; row-level CAS engaged. Stamped as `omnigraph:internal_schema_version=2`. |
+| v3 | One-time sweep of legacy `__run__*` staging branches (pre-v0.4.0 Run state machine, removed MR-771) off `__manifest`. Runs at `Omnigraph::open(ReadWrite)` and on publish. Stamped as `omnigraph:internal_schema_version=3`. |
 
 ## On-disk layout
 

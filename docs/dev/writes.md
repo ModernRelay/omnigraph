@@ -248,9 +248,14 @@ list`.
 
 ## Migration code
 
-`db/manifest/migrations.rs` does not change. Active deletion of
-`_graph_runs.lance` belongs in MR-770 (the production sweep) — this PR
-stops *creating* run state but does not destroy legacy bytes on disk.
+`db/manifest/migrations.rs` carries the v2→v3 internal-schema step (MR-770):
+a one-time sweep that deletes legacy `__run__*` staging branches off
+`__manifest`. It runs in `Omnigraph::open(ReadWrite)` (via
+`manifest::migrate_on_open`, before the coordinator reads branch state) and
+again on the publisher's write path; both are idempotent once the stamp is at
+v3. Deleting the inert `_graph_runs.lance` / `_graph_run_actors.lance` dataset
+*bytes* is still deferred — it needs a `StorageAdapter::delete_prefix`
+primitive — but those bytes are invisible to graph-level state.
 
 ## Mid-query partial failure: closed by MR-794
 
