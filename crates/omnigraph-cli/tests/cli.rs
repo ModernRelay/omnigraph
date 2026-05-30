@@ -2376,3 +2376,64 @@ fn graphs_list_against_local_uri_errors_with_remote_only_message() {
         "expected 'remote multi-graph server URL' rejection in stderr; got:\n{stderr}"
     );
 }
+
+fn queries_test_config(graph_uri: &str, entry: &str, gq_file: &str) -> String {
+    format!(
+        "graphs:\n  local:\n    uri: '{}'\n    queries:\n      {entry}:\n        file: ./{gq_file}\n\
+         cli:\n  graph: local\npolicy: {{}}\n",
+        graph_uri.replace('\'', "''")
+    )
+}
+
+#[test]
+fn queries_validate_exits_zero_on_clean_registry() {
+    let graph = SystemGraph::loaded();
+    graph.write_query(
+        "find_person.gq",
+        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
+    );
+    let config = graph.write_config(
+        "omnigraph.yaml",
+        &queries_test_config(&graph.path().to_string_lossy(), "find_person", "find_person.gq"),
+    );
+    let output = output_success(cli().arg("queries").arg("validate").arg("--config").arg(&config));
+    let stdout = stdout_string(&output);
+    assert!(stdout.contains("OK"), "stdout:\n{stdout}");
+}
+
+#[test]
+fn queries_validate_exits_nonzero_on_type_broken_query() {
+    let graph = SystemGraph::loaded();
+    // `Widget` is not in the fixture schema.
+    graph.write_query("ghost.gq", "query ghost() { match { $w: Widget } return { $w.name } }");
+    let config = graph.write_config(
+        "omnigraph.yaml",
+        &queries_test_config(&graph.path().to_string_lossy(), "ghost", "ghost.gq"),
+    );
+    let output = output_failure(cli().arg("queries").arg("validate").arg("--config").arg(&config));
+    let stdout = stdout_string(&output);
+    assert!(
+        stdout.contains("ghost"),
+        "validation should name the broken query; stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn queries_list_prints_registered_query() {
+    let graph = SystemGraph::loaded();
+    graph.write_query(
+        "find_person.gq",
+        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
+    );
+    let config = graph.write_config(
+        "omnigraph.yaml",
+        &queries_test_config(&graph.path().to_string_lossy(), "find_person", "find_person.gq"),
+    );
+    let output = output_success(cli().arg("queries").arg("list").arg("--config").arg(&config));
+    let stdout = stdout_string(&output);
+    assert!(stdout.contains("find_person"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("$name: String"),
+        "list should show typed params; stdout:\n{stdout}"
+    );
+}

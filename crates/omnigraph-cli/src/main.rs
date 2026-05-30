@@ -24,6 +24,7 @@ use omnigraph_server::api::{
     SnapshotTableOutput, commit_output, ingest_output, read_output, schema_apply_output,
     snapshot_payload,
 };
+use omnigraph_server::queries::{QueryRegistry, check};
 use omnigraph_server::{
     AliasCommand, OmnigraphConfig, PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest,
     PolicyTestConfig, ReadOutputFormat, load_config,
@@ -152,6 +153,11 @@ enum Command {
         schema: Option<PathBuf>,
         #[arg(long)]
         json: bool,
+    },
+    /// Operate on the server-side stored-query registry (`queries:`).
+    Queries {
+        #[command(subcommand)]
+        command: QueriesCommand,
     },
     /// Show graph snapshot
     Snapshot {
@@ -499,6 +505,35 @@ enum PolicyCommand {
         branch: Option<String>,
         #[arg(long = "target-branch")]
         target_branch: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum QueriesCommand {
+    /// Type-check the stored-query registry against the live schema.
+    ///
+    /// Distinct from `omnigraph lint` (which lints one `.gq` file):
+    /// this validates the whole `queries:` registry — opening the graph
+    /// to read its schema and confirming every stored query still
+    /// type-checks. Exits non-zero on any breakage.
+    Validate {
+        /// Graph URI
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the registered stored queries (name, MCP exposure, params).
+    List {
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1609,6 +1644,187 @@ async fn execute_query_lint(
     ))
 }
 
+#[derive(serde::Serialize)]
+struct QueriesIssue {
+    query: String,
+    message: String,
+}
+
+#[derive(serde::Serialize)]
+struct QueriesValidateOutput {
+    ok: bool,
+    breakages: Vec<QueriesIssue>,
+    warnings: Vec<QueriesIssue>,
+}
+
+#[derive(serde::Serialize)]
+struct QueriesParam {
+    name: String,
+    #[serde(rename = "type")]
+    type_name: String,
+    nullable: bool,
+}
+
+#[derive(serde::Serialize)]
+struct QueriesListItem {
+    name: String,
+    mcp_expose: bool,
+    tool_name: Option<String>,
+    mutation: bool,
+    params: Vec<QueriesParam>,
+}
+
+#[derive(serde::Serialize)]
+struct QueriesListOutput {
+    queries: Vec<QueriesListItem>,
+}
+
+/// Resolve the stored-query registry entries for the selected graph,
+/// mirroring the server: a named graph in `graphs:` uses its per-graph
+/// `queries:`; otherwise the top-level `queries:` (single-graph mode).
+fn registry_entries<'a>(
+    config: &'a OmnigraphConfig,
+    target: Option<&str>,
+) -> &'a std::collections::BTreeMap<String, omnigraph_server::config::QueryEntry> {
+    match target.or_else(|| config.cli_graph_name()) {
+        Some(name) if config.graphs.contains_key(name) => config
+            .target_query_entries(name)
+            .unwrap_or_else(|| config.query_entries()),
+        _ => config.query_entries(),
+    }
+}
+
+fn load_registry_or_report(config: &OmnigraphConfig, target: Option<&str>) -> Result<QueryRegistry> {
+    QueryRegistry::load(config, registry_entries(config, target)).map_err(|errors| {
+        color_eyre::eyre::eyre!(
+            "stored-query registry failed to load:\n  {}",
+            errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        )
+    })
+}
+
+async fn execute_queries_validate(
+    uri: Option<String>,
+    target: Option<String>,
+    config_path: Option<&PathBuf>,
+    json: bool,
+) -> Result<()> {
+    let config = load_cli_config(config_path)?;
+    let registry = load_registry_or_report(&config, target.as_deref())?;
+    let uri = resolve_local_uri(&config, uri, target.as_deref(), "queries validate")?;
+    let db = Omnigraph::open(&uri).await?;
+    let report = check(&registry, &db.catalog());
+
+    let output = QueriesValidateOutput {
+        ok: !report.has_breakages(),
+        breakages: report
+            .breakages
+            .iter()
+            .map(|b| QueriesIssue {
+                query: b.query.clone(),
+                message: b.message.clone(),
+            })
+            .collect(),
+        warnings: report
+            .warnings
+            .iter()
+            .map(|w| QueriesIssue {
+                query: w.query.clone(),
+                message: w.message.clone(),
+            })
+            .collect(),
+    };
+
+    if json {
+        print_json(&output)?;
+    } else {
+        if output.breakages.is_empty() {
+            println!(
+                "OK  {} stored quer{} type-check against the schema",
+                registry.len(),
+                if registry.len() == 1 { "y" } else { "ies" }
+            );
+        }
+        for issue in &output.breakages {
+            println!("ERROR  query '{}': {}", issue.query, issue.message);
+        }
+        for issue in &output.warnings {
+            println!("WARN   query '{}': {}", issue.query, issue.message);
+        }
+    }
+
+    if report.has_breakages() {
+        io::stdout().flush()?;
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn execute_queries_list(
+    target: Option<String>,
+    config_path: Option<&PathBuf>,
+    json: bool,
+) -> Result<()> {
+    let config = load_cli_config(config_path)?;
+    let registry = load_registry_or_report(&config, target.as_deref())?;
+
+    let output = QueriesListOutput {
+        queries: registry
+            .iter()
+            .map(|q| QueriesListItem {
+                name: q.name.clone(),
+                mcp_expose: q.expose,
+                tool_name: q.tool_name.clone(),
+                mutation: q.is_mutation(),
+                params: q
+                    .decl
+                    .params
+                    .iter()
+                    .map(|p| QueriesParam {
+                        name: p.name.clone(),
+                        type_name: p.type_name.clone(),
+                        nullable: p.nullable,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    };
+
+    if json {
+        print_json(&output)?;
+    } else if output.queries.is_empty() {
+        println!("(no stored queries registered)");
+    } else {
+        for q in &output.queries {
+            let kind = if q.mutation { "mutation" } else { "read" };
+            let params = q
+                .params
+                .iter()
+                .map(|p| {
+                    format!(
+                        "${}: {}{}",
+                        p.name,
+                        p.type_name,
+                        if p.nullable { "?" } else { "" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mcp = if q.mcp_expose {
+                format!(" [mcp: {}]", q.tool_name.as_deref().unwrap_or(&q.name))
+            } else {
+                String::new()
+            };
+            println!("{kind}  {}({params}){mcp}", q.name);
+        }
+    }
+    Ok(())
+}
+
 async fn execute_read(
     uri: &str,
     query_source: &str,
@@ -2331,6 +2547,23 @@ async fn main() -> Result<()> {
                     .await?;
             finish_query_lint(&output, json)?;
         }
+        Command::Queries { command } => match command {
+            QueriesCommand::Validate {
+                uri,
+                target,
+                config,
+                json,
+            } => {
+                execute_queries_validate(uri, target, config.as_ref(), json).await?;
+            }
+            QueriesCommand::List {
+                target,
+                config,
+                json,
+            } => {
+                execute_queries_list(target, config.as_ref(), json)?;
+            }
+        },
         Command::Snapshot {
             uri,
             target,
