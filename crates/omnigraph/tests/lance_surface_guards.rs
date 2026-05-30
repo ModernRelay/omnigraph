@@ -242,3 +242,51 @@ async fn _compile_delete_result_field_shape() -> lance::Result<()> {
     let _num_deleted: u64 = result.num_deleted_rows;
     Ok(())
 }
+
+// --- Guard 9: force_delete_branch semantics --------------------------------
+//
+// The branch-delete reconciler (`db/omnigraph/optimize.rs::reconcile_orphaned_branches`)
+// and the eager best-effort reclaim in `cleanup_deleted_branch_tables` call
+// `force_delete_branch` to drop orphaned branch refs. The single-authority
+// design relies on three facts pinned here:
+//   1. plain `delete_branch` errors on a missing ref (so the design uses the
+//      force variant instead);
+//   2. `force_delete_branch` removes an existing (forked) branch — the orphan
+//      case, where a `tree/{branch}/` exists;
+//   3. `force_delete_branch` on a *fully-absent* branch (no tree dir) still
+//      errors on the local store, because `remove_dir_all`'s NotFound is not
+//      caught for Lance's native error variant. `TableStore::force_delete_branch`
+//      wraps this to be fully idempotent. Pin the raw quirk so a future Lance
+//      fix (which would let us simplify the wrapper) is noticed.
+
+#[tokio::test]
+async fn force_delete_branch_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard9.lance");
+    let uri = uri.to_str().unwrap();
+    let mut ds = fresh_dataset(uri).await;
+
+    // (1) Plain delete of a never-created branch errors (RefNotFound).
+    assert!(
+        ds.delete_branch("nope").await.is_err(),
+        "Dataset::delete_branch on a missing ref should error; if this is now \
+         Ok, the reconciler could drop the force variant."
+    );
+
+    // (2) force_delete_branch removes an existing (forked) branch.
+    let base = ds.version().version;
+    ds.create_branch("feature", base, None).await.unwrap();
+    ds.force_delete_branch("feature").await.unwrap();
+    assert!(
+        !ds.list_branches().await.unwrap().contains_key("feature"),
+        "force_delete_branch should remove an existing branch ref"
+    );
+
+    // (3) Quirk: force_delete on a fully-absent branch errors on the local
+    // store (worked around by TableStore::force_delete_branch).
+    assert!(
+        ds.force_delete_branch("never").await.is_err(),
+        "force_delete_branch on a fully-absent branch no longer errors — \
+         TableStore::force_delete_branch's NotFound tolerance can be simplified."
+    );
+}
