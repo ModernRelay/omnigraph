@@ -130,9 +130,12 @@ Principles from the field: **XDG for global** (gh) over legacy `~/.app/` (aws/ku
 | Schema | `./*.pg` (e.g. `schema.pg`) | **Keep.** |
 | Stored queries | `./queries/*.gq` | **Keep.** `.gq` sources referenced by the `queries:` registry. |
 
+**`~/.config/omnigraph/` (XDG) vs `~/.omnigraph/` (legacy) — XDG-first, with `~/.omnigraph/` as a fallback.** The peer group (`~/.aws`, `~/.kube`, `~/.docker`, and the direct competitor `~/.helix`) trains users toward `~/.tool/`, but the decisive factor is **config/cache/state separation**: OmniGraph is a client that will *cache remote catalogs*, keep *session state/logs*, and hold *credentials*. XDG gives each a separate home — `~/.config/omnigraph/` (config + 0600 creds), `~/.cache/omnigraph/` (catalogs, safe to `rm -rf`), `~/.local/state/omnigraph/` (session, logs) — whereas a single `~/.omnigraph/` dir mixes cache with secrets and config (can't clear cache safely, backups sweep up cache, corrupt cache sits next to tokens). `aws`/`kube` use the legacy dir largely because they predate XDG; a new tool should not inherit that. `gh` proves XDG is fine cross-platform (on macOS *neither* path is "native" — native is `~/Library/Application Support`, for GUI apps, so it does not apply to a CLI). Honor `~/.omnigraph/` if it already exists, to meet the peer-group expectation without committing to the mixing.
+
 **Env / override precedence (the `KUBECONFIG` analog):**
 - `OMNIGRAPH_CONFIG=/path` — explicit config file, highest precedence.
-- `$XDG_CONFIG_HOME` → global dir; fall back to `~/.config/omnigraph/`, then legacy `~/.omnigraph/` if present.
+- `$XDG_CONFIG_HOME` → global dir; default `~/.config/omnigraph/`; honor legacy `~/.omnigraph/` if present.
+- `$XDG_CACHE_HOME` → `~/.cache/omnigraph/` (cached remote catalogs); `$XDG_STATE_HOME` → `~/.local/state/omnigraph/` (session, logs).
 - Per-server token resolution: `token_env:` (env var) → `credentials.yaml` entry → OS keychain. Operator-chosen env var names use the `OMNIGRAPH_` / `OG_` prefix by convention.
 
 ### 5. Credentials, connection tiers, and bind portability (12-factor)
