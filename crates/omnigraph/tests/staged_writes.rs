@@ -2,7 +2,7 @@
 //! exercise `stage_append`, `stage_merge_insert`, `scan_with_staged`,
 //! and `count_rows_with_staged` directly against a Lance dataset — no
 //! Omnigraph engine involved. The engine-level use of these primitives
-//! is exercised by `tests/runs.rs`.
+//! is exercised by `tests/writes.rs`.
 //!
 //! Test surface here:
 //! 1. `stage_append` + `scan_with_staged` shows committed + staged data
@@ -709,7 +709,7 @@ async fn stage_create_inverted_index_does_not_advance_head_until_commit() {
 ///
 /// **When Lance #6658 lands**: this test will need to flip — replace
 /// the assertion with a `stage_delete` + `commit_staged` round-trip
-/// and remove the residual line in `docs/runs.md`.
+/// and remove the residual line in `docs/dev/writes.md`.
 #[tokio::test]
 async fn delete_where_advances_head_inline_documents_residual() {
     let dir = tempfile::tempdir().unwrap();

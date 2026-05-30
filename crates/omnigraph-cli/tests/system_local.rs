@@ -991,7 +991,7 @@ query vector_search($q: String) {
 
 // The publisher CAS conflict shape is verified end-to-end at the engine
 // level in
-// `crates/omnigraph/tests/runs.rs::concurrent_writers_one_succeeds_one_gets_expected_version_mismatch`
+// `crates/omnigraph/tests/writes.rs::concurrent_writers_one_succeeds_one_gets_expected_version_mismatch`
 // and at the HTTP boundary in
 // `crates/omnigraph-server/tests/server.rs::change_conflict_returns_manifest_conflict_409`.
 // A CLI-level race would be timing-dependent; with direct-publish the

@@ -81,7 +81,7 @@ Full diagram and concurrency model: [docs/dev/architecture.md](docs/dev/architec
 | Embeddings (compiler + engine clients, env vars, `@embed`) | [docs/user/embeddings.md](docs/user/embeddings.md) |
 | Branches, commit graph, snapshots, system branches | [docs/user/branches-commits.md](docs/user/branches-commits.md) |
 | Transactions and atomicity (per-query atomic; branches as multi-query transactions) | [docs/user/transactions.md](docs/user/transactions.md) |
-| Direct-publish writes (the former Run state machine, now demoted to publisher CAS) | [docs/dev/runs.md](docs/dev/runs.md) |
+| Direct-publish write path (staging, D2, recovery sidecars; the former Run state machine) | [docs/dev/writes.md](docs/dev/writes.md) |
 | Three-way merge and conflict kinds | [docs/dev/merge.md](docs/dev/merge.md) |
 | Diff / change feed (`diff_between`, `diff_commits`) | [docs/user/changes.md](docs/user/changes.md) |
 | Query execution, mutation execution, bulk loader, `load` vs `ingest` | [docs/dev/execution.md](docs/dev/execution.md) |
@@ -176,7 +176,7 @@ cargo run -p omnigraph-server -- <uri> --bind 0.0.0.0:8080   # run the server fr
 
 # Run one crate / one test file / one test fn
 cargo test -p omnigraph-engine --test traversal           # one integration-test file (see docs/dev/testing.md)
-cargo test -p omnigraph-engine --test runs concurrent     # one test fn by name substring
+cargo test -p omnigraph-engine --test writes concurrent   # one test fn by name substring
 cargo test -p omnigraph-engine some_inline_test -- --nocapture   # show stdout
 
 # Feature-gated suites (each is its own job in CI, not part of the default run)
