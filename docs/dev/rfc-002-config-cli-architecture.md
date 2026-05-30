@@ -19,6 +19,18 @@ This RFC defines the config and CLI architecture that closes that gap, derived f
 
 The design optimizes jointly for **DX** (one command surface across embedded and remote; clone-and-go) and **AX** (agent experience: one flat resolved context, secrets structurally unreachable, branch-pinned reproducible reads, and a GitOps'd capability surface).
 
+## Reconciliation with shipped / planned CLI work
+
+This RFC must align with shipped reality. Findings (and the corrections they force):
+
+- **Noun is `graph`/`graphs`, NOT `target`/`targets`.** **MR-603 (done)** renamed the config key `targets:` → `graphs:` and the flag to `--graph`. **This RFC uses `graphs:` and `--graph` throughout**; the "unifying noun" is a **`graphs:` entry** that is *embedded* (`uri:`) XOR *remote* (`server:` + a remote graph name). Earlier drafts said `targets:` — read every `targets:`/`--target` below as `graphs:`/`--graph`.
+- **`~/.omnigraph/` is the right home — with shipped precedent.** **MR-581 (done, `og template pull`)** already quick-starts templates into `~/.omnigraph/`. Confirms the single-dir decision.
+- **Templates already exist.** `og template pull <name>` (MR-581, done) + **MR-531** (templates umbrella). The init/template mechanism is not invented here; this RFC only adds the user-level config + `login`.
+- **The init family is already specced — not redesigned here:** `omnigraph init` (exists, `scaffold_config_if_missing` at `main.rs:1415`), `init --force` purge (**MR-975**) + `omnigraph prune` (**MR-972**), `omnigraph quickstart` fat agent-bootstrap (**MR-973**), `omnigraph serve start/stop/status` (**MR-970**), `omnigraph mcp install` + skills + plugin (**MR-974**), agent-mode CLI hardening (**MR-981**). **This RFC's only init-adjacent contribution is the user route**: the global `~/.omnigraph/config.yaml` + `omnigraph login` (supabase/gh split: `init`=project, `login`=user) — not yet covered by a ticket.
+- **`aliases:` → `operations:` is planned (MR-839).** The aliases/queries reconciliation (§6) should read `aliases:` as the soon-to-be `operations:`.
+- **`bearer_token_env` has a known gap (MR-971: "CLI parity + server-side gap").** This RFC's per-`servers.<name>` extension should land on top of MR-971's audit.
+- **`omnigraph query lint` / `query check` already exist (MR-639, done).** A stored-query *registry* validator must not collide — use a verb that doesn't read as a second `query check`.
+
 ## Motivation
 
 Three problems, in priority order:
@@ -103,10 +115,13 @@ This makes the **zero-project case the default, not an edge case**: a solo user 
 
 **Precedence (low → high):** built-in defaults < global < project < env vars < CLI flags. With no project file it collapses to **built-in < global < env < flags** — the common global-only path.
 
-**Merge semantics (predictable, not magical):**
-- **Maps** (`servers`, `targets`, `queries`, `aliases`) → **key union**; on a key collision the higher layer's entry **replaces** the lower wholesale (no field-level deep-merge within an entry — that is where surprise lives).
-- **Scalars** (`defaults.target`, `output_format`) → higher layer wins.
+**Merge semantics — "closest layer wins, at the smallest meaningful unit"** (the field consensus: git / kubeconfig / cargo / Helm / VS Code):
+- **Settings objects** (`defaults`, `auth`, `server`) → **deep-merge per field**: a project sets `defaults.target` and *inherits* the global `defaults.output_format`. (VS Code / cargo behavior.)
+- **Named-resource maps** (`servers`, `targets`, `queries`, `aliases`) → **union by key; on a collision the higher layer's entry REPLACES the lower wholesale** — *no field-level deep-merge within an entry*. (kubeconfig: union contexts by name.) The footgun this avoids: global `servers.prod = {endpoint, bearer_token_env}`, project `servers.prod = {endpoint: other}` — deep-merge would silently retain the old `bearer_token_env`; replace makes the project's `prod` self-contained and predictable.
+- **Lists/arrays** → **replace, never append** (Helm convention; appending is order-sensitive and surprising).
+- **Scalars** → higher layer wins.
 - **Relative paths carry their origin's base_dir.** A `queries:` entry's `.gq` path, or a `policy.file`, resolves against the directory of the layer it was *defined in* — global entries under `~/.omnigraph/`, project entries under the project dir.
+- **Inspectable (non-negotiable):** `omnigraph config view --resolved --show-origin` prints each final value *and which layer set it* (the `git config --show-origin` / `kubectl config view` rule). A layered config without origin-tracing is a debugging trap.
 
 ### 3. Roles, and the file-naming decision (same name for project = server)
 
@@ -197,20 +212,21 @@ servers:
 auth:
   env_file: ~/.omnigraph/credentials   # git-ignored dotenv holding OG_*_TOKEN values
 defaults:
-  target: dev
+  graph: dev
 ```
 
-**Project** `./omnigraph.yaml` (committed, secret-free, portable — no `server.bind`):
+**Project** `./omnigraph.yaml` (committed, secret-free, portable — no `server.bind`). Note the shipped noun is `graphs:` (MR-603); an entry is embedded (`uri`) XOR remote (`server` + remote graph name):
 ```yaml
-targets:
-  dev:      { uri: s3://team-bucket/dev.omni, branch: main }   # embedded
-  staging:  { server: staging, graph: prod, branch: review }   # remote
+graphs:
+  dev:      { uri: s3://team-bucket/dev.omni, branch: main }    # embedded
+  staging:  { server: staging, graph: prod, branch: review }    # remote → graph `prod` on server `staging`
   prod-us:  { server: prod-us, graph: production }
-  prod-eu:  { server: prod-eu, graph: production }             # multi-server, same graph name
-defaults: { target: dev, output_format: table }
+  prod-eu:  { server: prod-eu, graph: production }              # multi-server, same remote graph name
+defaults: { graph: dev, output_format: table }
 queries:  { find_user: { file: ./queries/find_user.gq, mcp: { expose: true } } }
-aliases:  { ... }
+operations: { ... }   # the soon-to-be-renamed `aliases:` (MR-839)
 ```
+Select with `--graph <name>` (shipped flag, MR-603).
 
 **Credentials** the git-ignored `auth.env_file` dotenv (`~/.omnigraph/credentials`, 0600) holds the `OG_*_TOKEN` values; real env vars override it. No committable secrets.
 
