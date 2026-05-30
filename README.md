@@ -7,14 +7,14 @@
 
 **Lakehouse native graph engine built for context assembly**
 
-Schema AS CODE
-Context AS CODE
-Security AS CODE
+Schema AS CODE<br>
+Context AS CODE<br>
+Security AS CODE<br>
 Dashboards AS CODE
 
-Git-style snapshots & branching
-Object storage native (S3, RustFS)
-VPC, On-prem, hybrid deployment
+Git-style snapshots & branching<br>
+Object storage native (S3, RustFS)<br>
+VPC, On-prem, hybrid deployment<br>
 Lance format as storage layer
 
 ## Core Use Cases
