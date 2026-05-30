@@ -9,10 +9,12 @@
 
 Omnigraph acts as operational state & coordination layer for agents
 
-- Git-style snapshots & branching
+- Git-style versioning & branching
+- Multimodal retrieval (graph+vector/fts+filters) optimized for context assembly
 - Object storage native (S3, RustFS)
+- Native blob-as-data support (docs, images, videos, etc)
 - VPC, On-prem, hybrid deployment
-- Lance format as storage layer
+- [`Lance`](https://github.com/lance-format/lance) format as open storage layer
 
 | AS CODE | What it means |
 |---|---|
@@ -23,9 +25,9 @@ Omnigraph acts as operational state & coordination layer for agents
 
 ## Core Use Cases
 
-| Use case | What it's for |
+| Use case | What it's for
 |---|---|
-| **Company brain** | Org knowledge unified into one queryable graph |
+| **Company brain** | Org knowledge unified into one queryable graph | 
 | **Context graph** | Decision traces and codified tribal knowledge |
 | **Agentic memory** | Durable, versioned memory for long-running agents |
 | **Dev graph** | Issues & dependency model for coding agents |
