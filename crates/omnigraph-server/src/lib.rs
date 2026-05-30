@@ -4,6 +4,7 @@ pub mod config;
 pub mod graph_id;
 pub mod identity;
 pub mod policy;
+pub mod queries;
 pub mod registry;
 pub mod workload;
 
@@ -436,6 +437,9 @@ impl AppState {
             uri,
             engine: Arc::new(db),
             policy: policy_engine,
+            // Stored-query registry is wired in by the boot path;
+            // single-mode construction defaults to "no stored queries".
+            queries: None,
         });
         Self {
             routing: GraphRouting::Single { handle },
@@ -1146,6 +1150,8 @@ async fn open_single_graph(cfg: GraphStartupConfig) -> Result<Arc<GraphHandle>> 
         uri,
         engine: Arc::new(db),
         policy: policy_arc,
+        // Stored-query registry is loaded + checked by the boot path.
+        queries: None,
     }))
 }
 

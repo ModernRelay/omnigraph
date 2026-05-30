@@ -1117,6 +1117,7 @@ async fn app_for_multi_mode(graph_ids: &[&str]) -> (Vec<tempfile::TempDir>, Rout
             uri: graph_uri,
             engine: Arc::new(engine),
             policy: None,
+            queries: None,
         }));
         dirs.push(dir);
     }

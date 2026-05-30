@@ -4690,6 +4690,7 @@ mod multi_graph_startup {
                 uri: graph_uri,
                 engine: Arc::new(engine),
                 policy: None,
+                queries: None,
             }));
             dirs.push(dir);
         }
@@ -4985,12 +4986,14 @@ graphs:
             uri: graph_uri.clone(),
             engine: Arc::clone(&engine),
             policy: None,
+            queries: None,
         });
         let beta = Arc::new(GraphHandle {
             key: GraphKey::cluster(GraphId::try_from("beta").unwrap()),
             uri: format!("file://{graph_uri}/"),
             engine,
             policy: None,
+            queries: None,
         });
 
         match GraphRegistry::from_handles(vec![alpha, beta]) {
@@ -5016,6 +5019,7 @@ graphs:
             uri: format!("file://{graph_uri}/"),
             engine: Arc::new(engine),
             policy: None,
+            queries: None,
         });
 
         let registry = GraphRegistry::from_handles(vec![handle]).unwrap();
@@ -5383,6 +5387,7 @@ graphs:
             uri: graph_uri,
             engine: Arc::new(engine),
             policy: None,
+            queries: None,
         });
         let tokens = vec![("act-andrew".to_string(), "secret-token".to_string())];
         let workload = omnigraph_server::workload::WorkloadController::from_env();
@@ -5450,6 +5455,7 @@ graphs:
                 uri: graph_uri,
                 engine: Arc::new(engine),
                 policy: None,
+                queries: None,
             }));
         }
 
