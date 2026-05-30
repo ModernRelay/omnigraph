@@ -111,6 +111,18 @@ jobs:
       - name: Verify AGENTS.md ↔ docs/ cross-links
         run: bash scripts/check-agents-md.sh
 
+  entrypoint_test:
+    name: Container Entrypoint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5.0.1
+
+      - name: Verify omnigraph-server entrypoint arg composition
+        run: sh docker/entrypoint_test.sh
+
   test:
     name: Test Workspace
     needs: classify_changes
