@@ -100,8 +100,9 @@ pub struct PolicySettings {
 
 /// One stored-query registry entry. The map **key** is the query's
 /// identity — it must equal the `query <name>` symbol declared inside
-/// the referenced `.gq` file (asserted at load, C2). Renaming the key
-/// (or the symbol) is a breaking change to callers, by design.
+/// the referenced `.gq` file (asserted when the registry loads).
+/// Renaming the key (or the symbol) is a breaking change to callers, by
+/// design.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryEntry {
     /// Path to the `.gq` file (relative to the config's `base_dir`). The
@@ -302,8 +303,8 @@ impl OmnigraphConfig {
 
     /// Resolve a stored-query `.gq` file path (from a registry entry),
     /// relative to the config's `base_dir`. Mirrors policy-file
-    /// resolution; the registry loader (C2) calls this to turn each
-    /// entry's `file:` value into an absolute path.
+    /// resolution; the registry loader calls this to turn each entry's
+    /// `file:` value into an absolute path.
     pub fn resolve_query_file(&self, value: &str) -> PathBuf {
         self.resolve_config_path(value)
     }
