@@ -14,7 +14,7 @@ Per-graph actions (bind to `Omnigraph::Graph::"<graph_id>"`):
 6. `branch_delete`
 7. `branch_merge`
 8. `admin` — reserved for policy-management surfaces (hot reload, audit log, approvals). No call site today; see MR-724 for the reservation rationale.
-9. `invoke_query` — gates invoking a server-side stored query (the `queries:` registry). Branch-scoped, like `read` / `change`. Coarse in this release: an `invoke_query` allow rule permits any stored query on the graph; a future, additive refinement adds an optional per-query-name scope without changing rules written against the coarse action. No invocation call site yet — the handler lands in a later change. A stored *mutation* is double-gated: `invoke_query` to reach the tool, plus `change` for the write itself (the engine `_as` writers still enforce per the query body).
+9. `invoke_query` — gates invoking a server-side stored query (the `queries:` registry). Branch-scoped, like `read` / `change`. Coarse in this release: an `invoke_query` allow rule permits any stored query on the graph; a future, additive refinement adds an optional per-query-name scope without changing rules written against the coarse action. Enforced at `POST /queries/{name}` (see [server](server.md)). A stored *mutation* is double-gated: `invoke_query` to reach the tool, plus `change` for the write itself (the engine `_as` writers still enforce per the query body).
 
 Server-scoped action (v0.6.0+; binds to `Omnigraph::Server::"root"`):
 

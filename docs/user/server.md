@@ -22,7 +22,7 @@ Mode inference (four-rule matrix):
 
 ### Stored-query validation at startup
 
-If a graph declares a `queries:` registry (see [cli-reference](cli-reference.md)), the server **loads and type-checks every stored query against that graph's live schema at startup** and **refuses to boot** if any query references a type or property the schema lacks — the same fail-loud posture as a malformed policy file, so schema drift surfaces at the deploy boundary rather than at invocation. Two MCP-exposed queries claiming the same tool name is likewise a boot error. Non-blocking advisories (e.g. an MCP-exposed query with a vector parameter an agent cannot supply) are logged. Validate offline before deploying with `omnigraph queries validate`. *(Stored-query invocation over HTTP/MCP is not yet exposed — this release ships the registry, its boot-time validation, and the `invoke_query` Cedar action ahead of the invocation handler.)*
+If a graph declares a `queries:` registry (see [cli-reference](cli-reference.md)), the server **loads and type-checks every stored query against that graph's live schema at startup** and **refuses to boot** if any query references a type or property the schema lacks — the same fail-loud posture as a malformed policy file, so schema drift surfaces at the deploy boundary rather than at invocation. Two MCP-exposed queries claiming the same tool name is likewise a boot error. Non-blocking advisories (e.g. an MCP-exposed query with a vector parameter an agent cannot supply) are logged. Validate offline before deploying with `omnigraph queries validate`. Invoke a validated query over HTTP with `POST /queries/{name}` (see below). *(The MCP tool catalog — `GET /queries` with `inputSchema` projection and the `mcp.expose` filter — is a later slice.)*
 
 ## Endpoint inventory
 
@@ -38,6 +38,7 @@ Per-graph endpoints — same body shape across modes; URLs differ:
 | POST | `/export` | `/graphs/{id}/export` | bearer + `export` | NDJSON stream | `server_export` |
 | POST | `/mutate` | `/graphs/{id}/mutate` | bearer + `change` | mutation (canonical; `query`/`name`; accepts legacy `query_source`/`query_name` as serde aliases) | `server_mutate` |
 | POST | `/change` | `/graphs/{id}/change` | bearer + `change` | **deprecated** alias of `/mutate` (carries `Deprecation: true` + `Link: </mutate>; rel="successor-version"`) | `server_change` |
+| POST | `/queries/{name}` | `/graphs/{id}/queries/{name}` | bearer + `invoke_query` (+ `change` for a stored mutation) | invoke a named query from the `queries:` registry; deny == 404 | `server_invoke_query` |
 | GET | `/schema` | `/graphs/{id}/schema` | bearer + `read` | get current `.pg` source | `server_schema_get` |
 | POST | `/schema/apply` | `/graphs/{id}/schema/apply` | bearer + `schema_apply` (target=`main`) | migrate | `server_schema_apply` |
 | POST | `/ingest` | `/graphs/{id}/ingest` | bearer + `branch_create` (if new) + `change` | bulk load | `server_ingest` (32 MB body limit) |
@@ -53,6 +54,14 @@ Server-level management endpoints (v0.6.0+):
 | Method | Path | Auth | Action | Handler |
 |---|---|---|---|---|
 | GET | `/graphs` | bearer + `graph_list` on `Server::"root"` | list registered graphs | `server_graphs_list` (405 in single mode) |
+
+### Stored-query invocation (`POST /queries/{name}`)
+
+Invoke a curated, server-side stored query by **name** — the source comes from the graph's `queries:` registry, so the client never sends `.gq`. Body (all fields optional): `{ "params": { … }, "branch": "main", "snapshot": null }`, where `params` keys match the query's declared parameters. The response is the **read envelope** (`ReadOutput`) for a stored read or the **mutation envelope** (`ChangeOutput`) for a stored mutation — serialized untagged, so the wire shape is identical to `/query` / `/mutate`.
+
+- **Gate:** `invoke_query` (per-graph, branch-scoped) at the boundary. A stored *mutation* is **double-gated** — it also passes the engine's `change` gate, so an actor with `invoke_query` but not `change` gets `403`.
+- **Deny == unknown:** an `invoke_query` denial and an unknown query name return the **same `404`** (identical body), so an unauthorized caller cannot probe the catalog.
+- A stored mutation cannot target a `snapshot` (`400`); a parameter type error is a structured `400` naming the parameter.
 
 ## Adding and removing graphs (multi mode)
 
