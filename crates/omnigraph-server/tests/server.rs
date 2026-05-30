@@ -239,12 +239,14 @@ async fn app_with_stored_queries(
 /// - `act-invoke`: invoke_query + read (stored reads, not mutations)
 /// - `act-full`:   invoke_query + read + change (stored mutations)
 /// - `act-noinvoke`: read only, no invoke_query (boundary-denied)
+/// - `act-invokeonly`: invoke_query only, no read (clears the boundary, inner read denies)
 const INVOKE_POLICY_YAML: &str = r#"
 version: 1
 groups:
   invokers: ["act-invoke"]
   full: ["act-full"]
   readers: ["act-noinvoke"]
+  invoke_only: ["act-invokeonly"]
 protected_branches: [main]
 rules:
   - id: invokers-invoke-and-read
@@ -261,6 +263,11 @@ rules:
     allow:
       actors: { group: readers }
       actions: [read]
+      branch_scope: any
+  - id: invoke-only-no-read
+    allow:
+      actors: { group: invoke_only }
+      actions: [invoke_query]
       branch_scope: any
 "#;
 
@@ -378,6 +385,34 @@ async fn invoke_unknown_query_and_denied_actor_return_identical_404() {
         unknown_body, denied_body,
         "deny must be byte-identical to a missing query (no catalog probing)"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_query_holder_without_read_sees_403_not_404() {
+    // The 404-hiding is for callers WITHOUT invoke_query. An actor that
+    // HOLDS invoke_query but lacks `read` clears the boundary gate, then the
+    // inner read gate denies → 403 for an EXISTING read query, vs 404 for an
+    // unknown one. Existence is visible to grant-holders by design (the
+    // documented double-gate); this pins that actual contract.
+    let (_temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, false)],
+        &[("act-invokeonly", "t-invokeonly")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    let (exists_status, _) = json_response(
+        &app,
+        invoke_request("find_person", "t-invokeonly", json!({ "params": { "name": "Alice" } })),
+    )
+    .await;
+    let (absent_status, _) =
+        json_response(&app, invoke_request("does_not_exist", "t-invokeonly", json!({}))).await;
+    assert_eq!(
+        exists_status,
+        StatusCode::FORBIDDEN,
+        "an existing read query the holder can't read → inner-gate 403"
+    );
+    assert_eq!(absent_status, StatusCode::NOT_FOUND, "unknown query still 404s");
 }
 
 fn drifted_test_schema() -> String {

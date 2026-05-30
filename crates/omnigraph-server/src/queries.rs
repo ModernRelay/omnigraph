@@ -52,10 +52,10 @@ impl StoredQuery {
     }
 
     /// The MCP tool name this query is catalogued under: the explicit
-    /// `tool_name` override, else the query `name`. This is the catalog
-    /// key — enforced unique across exposed queries at load — and the one
-    /// definition every consumer (uniqueness check, catalog projection,
-    /// CLI display) reads, so the resolution can't drift between them.
+    /// `tool_name` override, else the query `name`. The catalog key —
+    /// enforced unique across exposed queries at load. Server-side
+    /// consumers (the uniqueness check, the future catalog projection) read
+    /// this; the CLI `queries list` resolves the same rule on its own DTO.
     pub fn effective_tool_name(&self) -> &str {
         self.tool_name.as_deref().unwrap_or(&self.name)
     }
@@ -141,9 +141,11 @@ impl QueryRegistry {
         // Exposed queries are catalogued under their effective tool name;
         // two claiming one name is an MCP-namespace collision. Refuse it at
         // load (collected, not fail-fast), naming the loser and the winner.
-        // Iterating the `BTreeMap` keeps "first declared wins" and the error
-        // order deterministic. Scoped to a block so these borrows of
-        // `by_name` end before it is moved into `Self`.
+        // Iterating the `BTreeMap` makes the winner deterministic (the
+        // lexicographically-first query name; config is a map, so YAML
+        // declaration order isn't preserved anyway) and the error order
+        // stable. Scoped to a block so these borrows of `by_name` end
+        // before it is moved into `Self`.
         {
             let mut claimed: BTreeMap<&str, &str> = BTreeMap::new();
             for query in by_name.values().filter(|q| q.expose) {

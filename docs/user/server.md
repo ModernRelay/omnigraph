@@ -60,7 +60,8 @@ Server-level management endpoints (v0.6.0+):
 Invoke a curated, server-side stored query by **name** — the source comes from the graph's `queries:` registry, so the client never sends `.gq`. Body (all fields optional): `{ "params": { … }, "branch": "main", "snapshot": null }`, where `params` keys match the query's declared parameters. The response is the **read envelope** (`ReadOutput`) for a stored read or the **mutation envelope** (`ChangeOutput`) for a stored mutation — serialized untagged, so the wire shape is identical to `/query` / `/mutate`.
 
 - **Gate:** `invoke_query` (per-graph, branch-scoped) at the boundary. A stored *mutation* is **double-gated** — it also passes the engine's `change` gate, so an actor with `invoke_query` but not `change` gets `403`.
-- **Deny == unknown:** an `invoke_query` denial and an unknown query name return the **same `404`** (identical body), so an unauthorized caller cannot probe the catalog.
+- **Deny == unknown, for callers without `invoke_query`:** for a caller lacking the grant, an `invoke_query` denial and an unknown query name return the **same `404`** (identical body), so the catalog can't be probed. A caller that *holds* `invoke_query` may still get the inner gate's `403` for an existing query it can't `read`/`change` (the double-gate, above) — so existence is visible to grant-holders by design.
+- **Requires an explicit policy grant when auth is on.** In default-deny mode (bearer tokens but no `policy.file`), only `read` is permitted, so *every* `/queries/{name}` call returns `404` until an `invoke_query` rule is configured.
 - A stored mutation cannot target a `snapshot` (`400`); a parameter type error is a structured `400` naming the parameter.
 
 ## Adding and removing graphs (multi mode)

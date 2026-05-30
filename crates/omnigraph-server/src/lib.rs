@@ -2174,7 +2174,7 @@ struct QueryNamePath {
         (status = 400, description = "Bad request (param type error; snapshot on a stored mutation)", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden (the inner `change` gate for a stored mutation)", body = ErrorOutput),
-        (status = 404, description = "Unknown stored query, or `invoke_query` denied (indistinguishable)", body = ErrorOutput),
+        (status = 404, description = "Unknown stored query, or `invoke_query` denied — indistinguishable to a caller without the grant", body = ErrorOutput),
         (status = 409, description = "Merge conflict", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
     ),
@@ -2186,8 +2186,11 @@ struct QueryNamePath {
 /// request body — callers send only runtime inputs (`params`, `branch`,
 /// `snapshot`). Gated by the `invoke_query` Cedar action at the boundary;
 /// a stored *mutation* additionally passes the engine's `change` gate
-/// (double-gated). A denied actor and an unknown query both return the
-/// same 404, so the catalog can't be probed.
+/// (double-gated). An actor **without** `invoke_query` cannot tell a denied
+/// query from a missing one — both return the same 404, so the catalog
+/// can't be probed without the grant. Once `invoke_query` is held, the
+/// inner `read`/`change` gate may surface a 403 for an existing query the
+/// actor can't run (the intended double-gate signal).
 async fn server_invoke_query(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
@@ -2195,8 +2198,10 @@ async fn server_invoke_query(
     Path(QueryNamePath { name }): Path<QueryNamePath>,
     Json(req): Json<InvokeStoredQueryRequest>,
 ) -> std::result::Result<Json<InvokeStoredQueryResponse>, ApiError> {
-    // Deny is indistinguishable from a missing query: both 404 with this
-    // exact message, so an unauthorized caller can't probe the catalog.
+    // A caller without `invoke_query` can't tell a denial from a missing
+    // query: both 404 with this exact message, so the catalog can't be
+    // probed without the grant. (A caller that holds invoke_query may still
+    // see the inner gate's 403 for an existing query it can't run — intended.)
     const NOT_FOUND: &str = "stored query not found";
     let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
 

@@ -835,7 +835,7 @@
           "queries"
         ],
         "summary": "Invoke a curated, server-side stored query by name.",
-        "description": "The query source comes from the graph's `queries:` registry, not the\nrequest body — callers send only runtime inputs (`params`, `branch`,\n`snapshot`). Gated by the `invoke_query` Cedar action at the boundary;\na stored *mutation* additionally passes the engine's `change` gate\n(double-gated). A denied actor and an unknown query both return the\nsame 404, so the catalog can't be probed.",
+        "description": "The query source comes from the graph's `queries:` registry, not the\nrequest body — callers send only runtime inputs (`params`, `branch`,\n`snapshot`). Gated by the `invoke_query` Cedar action at the boundary;\na stored *mutation* additionally passes the engine's `change` gate\n(double-gated). An actor **without** `invoke_query` cannot tell a denied\nquery from a missing one — both return the same 404, so the catalog\ncan't be probed without the grant. Once `invoke_query` is held, the\ninner `read`/`change` gate may surface a 403 for an existing query the\nactor can't run (the intended double-gate signal).",
         "operationId": "invoke_query",
         "parameters": [
           {
@@ -900,7 +900,7 @@
             }
           },
           "404": {
-            "description": "Unknown stored query, or `invoke_query` denied (indistinguishable)",
+            "description": "Unknown stored query, or `invoke_query` denied — indistinguishable to a caller without the grant",
             "content": {
               "application/json": {
                 "schema": {
