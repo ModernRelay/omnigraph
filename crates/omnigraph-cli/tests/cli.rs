@@ -2425,9 +2425,24 @@ fn queries_list_prints_registered_query() {
         "find_person.gq",
         "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
     );
+    // Exposed with an explicit tool name so the list shows the MCP suffix.
     let config = graph.write_config(
         "omnigraph.yaml",
-        &queries_test_config(&graph.path().to_string_lossy(), "find_person", "find_person.gq"),
+        &format!(
+            concat!(
+                "graphs:\n",
+                "  local:\n",
+                "    uri: '{}'\n",
+                "    queries:\n",
+                "      find_person:\n",
+                "        file: ./find_person.gq\n",
+                "        mcp: {{ expose: true, tool_name: lookup_person }}\n",
+                "cli:\n",
+                "  graph: local\n",
+                "policy: {{}}\n",
+            ),
+            graph.path().to_string_lossy().replace('\'', "''")
+        ),
     );
     let output = output_success(cli().arg("queries").arg("list").arg("--config").arg(&config));
     let stdout = stdout_string(&output);
@@ -2435,5 +2450,46 @@ fn queries_list_prints_registered_query() {
     assert!(
         stdout.contains("$name: String"),
         "list should show typed params; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[mcp: lookup_person]"),
+        "list should show the MCP tool name for exposed queries; stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn queries_validate_exits_nonzero_on_duplicate_tool_name() {
+    // Two exposed queries claiming one MCP tool name is a load-time
+    // collision — `queries validate` must fail (offline, before the engine
+    // opens) and name both queries plus the contested tool.
+    let graph = SystemGraph::loaded();
+    graph.write_query("a.gq", "query a() { match { $p: Person } return { $p.name } }");
+    graph.write_query("b.gq", "query b() { match { $p: Person } return { $p.name } }");
+    let config = graph.write_config(
+        "omnigraph.yaml",
+        &format!(
+            concat!(
+                "graphs:\n",
+                "  local:\n",
+                "    uri: '{}'\n",
+                "    queries:\n",
+                "      a:\n",
+                "        file: ./a.gq\n",
+                "        mcp: {{ expose: true, tool_name: dup }}\n",
+                "      b:\n",
+                "        file: ./b.gq\n",
+                "        mcp: {{ expose: true, tool_name: dup }}\n",
+                "cli:\n",
+                "  graph: local\n",
+                "policy: {{}}\n",
+            ),
+            graph.path().to_string_lossy().replace('\'', "''")
+        ),
+    );
+    let output = output_failure(cli().arg("queries").arg("validate").arg("--config").arg(&config));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("dup") && stderr.contains("'a'") && stderr.contains("'b'"),
+        "duplicate tool name should be reported naming both queries; stderr:\n{stderr}"
     );
 }

@@ -50,6 +50,15 @@ impl StoredQuery {
     pub fn is_mutation(&self) -> bool {
         !self.decl.mutations.is_empty()
     }
+
+    /// The MCP tool name this query is catalogued under: the explicit
+    /// `tool_name` override, else the query `name`. This is the catalog
+    /// key — enforced unique across exposed queries at load — and the one
+    /// definition every consumer (uniqueness check, catalog projection,
+    /// CLI display) reads, so the resolution can't drift between them.
+    pub fn effective_tool_name(&self) -> &str {
+        self.tool_name.as_deref().unwrap_or(&self.name)
+    }
 }
 
 /// A loaded, identity-checked stored-query registry for one graph.
@@ -126,6 +135,27 @@ impl QueryRegistry {
                     query: Some(spec.name),
                     message: format!("parse error: {err}"),
                 }),
+            }
+        }
+
+        // Exposed queries are catalogued under their effective tool name;
+        // two claiming one name is an MCP-namespace collision. Refuse it at
+        // load (collected, not fail-fast), naming the loser and the winner.
+        // Iterating the `BTreeMap` keeps "first declared wins" and the error
+        // order deterministic. Scoped to a block so these borrows of
+        // `by_name` end before it is moved into `Self`.
+        {
+            let mut claimed: BTreeMap<&str, &str> = BTreeMap::new();
+            for query in by_name.values().filter(|q| q.expose) {
+                let tool = query.effective_tool_name();
+                if let Some(winner) = claimed.insert(tool, &query.name) {
+                    errors.push(LoadError {
+                        query: Some(query.name.clone()),
+                        message: format!(
+                            "MCP tool name '{tool}' already claimed by exposed query '{winner}'"
+                        ),
+                    });
+                }
             }
         }
 
@@ -286,6 +316,15 @@ mod tests {
         }
     }
 
+    fn spec_tool(name: &str, source: &str, expose: bool, tool_name: &str) -> RegistrySpec {
+        RegistrySpec {
+            name: name.to_string(),
+            source: source.to_string(),
+            expose,
+            tool_name: Some(tool_name.to_string()),
+        }
+    }
+
     #[test]
     fn key_equal_symbol_loads() {
         let reg = QueryRegistry::from_specs(vec![spec(
@@ -299,6 +338,21 @@ mod tests {
         assert!(q.expose);
         assert_eq!(q.decl.params.len(), 1);
         assert!(!q.is_mutation());
+        // No override → the effective tool name is the query name.
+        assert_eq!(q.effective_tool_name(), "find_user");
+
+        // An explicit override is what the catalog keys on.
+        let with_tool = QueryRegistry::from_specs(vec![spec_tool(
+            "find_user",
+            "query find_user($id: String) { match { $u: User } return { $u.name } }",
+            true,
+            "lookup_user",
+        )])
+        .unwrap();
+        assert_eq!(
+            with_tool.lookup("find_user").unwrap().effective_tool_name(),
+            "lookup_user"
+        );
     }
 
     #[test]
@@ -324,6 +378,35 @@ mod tests {
         assert_eq!(q.name, "b");
         assert_eq!(q.decl.params[0].name, "y");
         assert!(reg.lookup("a").is_none(), "only the selected symbol is registered");
+    }
+
+    #[test]
+    fn duplicate_exposed_tool_name_is_a_load_error() {
+        // Two MCP-exposed queries claiming one tool name is an ambiguity in
+        // the catalog key space — refused at load, naming both queries and
+        // the contested tool.
+        let errors = QueryRegistry::from_specs(vec![
+            spec_tool("a", "query a() { match { $u: User } return { $u.name } }", true, "dup"),
+            spec_tool("b", "query b() { match { $u: User } return { $u.name } }", true, "dup"),
+        ])
+        .unwrap_err();
+        assert_eq!(errors.len(), 1);
+        let msg = errors[0].to_string();
+        assert!(msg.contains("'dup'"), "names the contested tool: {msg}");
+        assert!(msg.contains("'a'"), "names the winning query: {msg}");
+        assert!(msg.contains("'b'"), "names the losing query: {msg}");
+    }
+
+    #[test]
+    fn duplicate_tool_name_among_unexposed_is_allowed() {
+        // Unexposed queries have no MCP tool, so a shared effective tool
+        // name is inert — must not error (pins the exposed-only scope).
+        let reg = QueryRegistry::from_specs(vec![
+            spec_tool("a", "query a() { match { $u: User } return { $u.name } }", false, "dup"),
+            spec_tool("b", "query b() { match { $u: User } return { $u.name } }", false, "dup"),
+        ])
+        .unwrap();
+        assert_eq!(reg.len(), 2);
     }
 
     #[test]
