@@ -44,8 +44,8 @@ function Download-ReleaseFiles {
   )
 
   try {
-    Invoke-WebRequest -Uri "$BaseUrl/$assetName" -OutFile $ArchivePath
-    Invoke-WebRequest -Uri "$BaseUrl/$assetStem.sha256" -OutFile $ChecksumPath
+    Invoke-WebRequest -UseBasicParsing -Uri "$BaseUrl/$assetName" -OutFile $ArchivePath
+    Invoke-WebRequest -UseBasicParsing -Uri "$BaseUrl/$assetStem.sha256" -OutFile $ChecksumPath
     return $true
   } catch {
     return $false
