@@ -12,10 +12,10 @@ Context AS CODE<br>
 Security AS CODE<br>
 Dashboards AS CODE
 
-Git-style snapshots & branching<br>
-Object storage native (S3, RustFS)<br>
-VPC, On-prem, hybrid deployment<br>
-Lance format as storage layer
+- Git-style snapshots & branching<br>
+- Object storage native (S3, RustFS)<br>
+- VPC, On-prem, hybrid deployment<br>
+- Lance format as storage layer
 
 ## Core Use Cases
 
