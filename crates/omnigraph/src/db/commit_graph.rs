@@ -376,7 +376,7 @@ impl CommitGraph {
     }
 }
 
-fn graph_commits_uri(root_uri: &str) -> String {
+pub(crate) fn graph_commits_uri(root_uri: &str) -> String {
     format!("{}/{}", root_uri.trim_end_matches('/'), GRAPH_COMMITS_DIR)
 }
 

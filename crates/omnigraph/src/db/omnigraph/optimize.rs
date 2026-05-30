@@ -138,6 +138,19 @@ pub async fn cleanup_all_tables(
     db.ensure_schema_state_valid().await?;
     db.ensure_schema_apply_idle("cleanup").await?;
 
+    // Reclaim orphaned branch forks (from an incomplete prior `branch_delete`)
+    // before version GC. Authority-derived and idempotent; the eager
+    // best-effort reclaim in `branch_delete` covers the common case, this is
+    // the guaranteed backstop. Logged for observability.
+    let reconciled = reconcile_orphaned_branches(db).await?;
+    if !reconciled.reclaimed.is_empty() {
+        tracing::info!(
+            count = reconciled.reclaimed.len(),
+            reclaimed = ?reconciled.reclaimed,
+            "cleanup reconciled orphaned branch forks"
+        );
+    }
+
     let before_timestamp = options.older_than.map(|d| Utc::now() - d);
     let keep_versions = options.keep_versions;
 
@@ -190,6 +203,93 @@ pub async fn cleanup_all_tables(
         .await;
 
     results.into_iter().collect()
+}
+
+/// Outcome of [`reconcile_orphaned_branches`]: the `(owner, branch)` pairs
+/// reclaimed, where `owner` is a table key (e.g. `node:Person`) or
+/// `"_graph_commits"`.
+#[derive(Debug, Clone, Default)]
+pub struct BranchReconcileStats {
+    pub reclaimed: Vec<(String, String)>,
+}
+
+/// Drop every per-table and commit-graph Lance branch that the manifest no
+/// longer references.
+///
+/// Orphaned forks arise when a `branch_delete` flips the manifest authority
+/// (atomic) but a downstream best-effort reclaim does not complete. They are
+/// unreachable through any snapshot — no manifest entry can name them — yet
+/// they pin their `tree/{branch}/` storage and can block reusing the branch
+/// name. This is the guaranteed convergence backstop: it is idempotent and
+/// derived purely from the manifest authority, so it no-ops once everything is
+/// reconciled, and it would harmlessly find nothing if a future Lance atomic
+/// multi-dataset branch op prevented orphans from forming.
+///
+/// The keep-set is the full (unfiltered) manifest branch list, so system
+/// branches' forks are never reclaimed; `main`/default is not a named Lance
+/// branch and so is never a candidate. Referencing children are dropped before
+/// parents (Lance refuses to delete a referenced parent) by ordering longest
+/// branch names first.
+pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconcileStats> {
+    use std::collections::HashSet;
+
+    let keep: HashSet<String> = db
+        .coordinator
+        .read()
+        .await
+        .all_branches()
+        .await?
+        .into_iter()
+        .collect();
+
+    let resolved = db.resolved_branch_target(None).await?;
+    let snapshot = resolved.snapshot;
+    let table_targets: Vec<(String, String)> = all_table_keys(&db.catalog())
+        .into_iter()
+        .filter_map(|table_key| {
+            let entry = snapshot.entry(&table_key)?;
+            let full_path = format!("{}/{}", db.root_uri, entry.table_path);
+            Some((table_key, full_path))
+        })
+        .collect();
+
+    let mut stats = BranchReconcileStats::default();
+
+    for (table_key, full_path) in table_targets {
+        let mut orphans = orphan_branches(db.table_store.list_branches(&full_path).await?, &keep);
+        for branch in orphans.drain(..) {
+            db.table_store
+                .force_delete_branch(&full_path, &branch)
+                .await?;
+            stats.reclaimed.push((table_key.clone(), branch));
+        }
+    }
+
+    // Commit-graph orphans (best-effort: the dataset may not exist on a graph
+    // that has never committed).
+    let commits_uri = crate::db::commit_graph::graph_commits_uri(db.root_uri());
+    if db.storage_adapter().exists(&commits_uri).await? {
+        let mut commit_graph = crate::db::commit_graph::CommitGraph::open(db.root_uri()).await?;
+        let mut orphans = orphan_branches(commit_graph.list_branches().await?, &keep);
+        for branch in orphans.drain(..) {
+            commit_graph.force_delete_branch(&branch).await?;
+            stats.reclaimed.push(("_graph_commits".to_string(), branch));
+        }
+    }
+
+    Ok(stats)
+}
+
+/// Filter `present` Lance branches down to those absent from the manifest
+/// `keep` set, ordered children-before-parents (longest name first) so Lance's
+/// referenced-parent `RefConflict` cannot block reclamation.
+fn orphan_branches(present: Vec<String>, keep: &std::collections::HashSet<String>) -> Vec<String> {
+    let mut orphans: Vec<String> = present
+        .into_iter()
+        .filter(|branch| !keep.contains(branch))
+        .collect();
+    orphans.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    orphans
 }
 
 fn all_table_keys(catalog: &omnigraph_compiler::catalog::Catalog) -> Vec<String> {

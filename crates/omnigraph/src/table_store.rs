@@ -177,6 +177,21 @@ impl TableStore {
             .map_err(|e| OmniError::Lance(e.to_string()))
     }
 
+    /// List the named Lance branches present on the dataset at `dataset_uri`.
+    /// The `cleanup` orphan reconciler diffs this against the manifest branch
+    /// set to find orphaned per-table forks. `main`/default is not a named
+    /// branch and never appears here.
+    pub async fn list_branches(&self, dataset_uri: &str) -> Result<Vec<String>> {
+        let ds = Dataset::open(dataset_uri)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let branches = ds
+            .list_branches()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        Ok(branches.into_keys().collect())
+    }
+
     /// Idempotently drop `branch` from the dataset at `dataset_uri`.
     ///
     /// Unlike [`delete_branch`](Self::delete_branch), this tolerates an
