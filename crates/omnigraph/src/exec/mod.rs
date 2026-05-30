@@ -35,7 +35,7 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::db::commit_graph::CommitGraph;
 use crate::db::manifest::ManifestCoordinator;
-use crate::db::{MergeOutcome, Omnigraph, is_internal_run_branch};
+use crate::db::{MergeOutcome, Omnigraph, is_internal_system_branch};
 use crate::db::{ReadTarget, Snapshot};
 use crate::embedding::EmbeddingClient;
 use crate::error::{MergeConflict, MergeConflictKind, OmniError, Result};

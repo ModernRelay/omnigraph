@@ -1491,12 +1491,6 @@ pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
 }
 
 pub(crate) fn ensure_public_branch_ref(branch: &str, operation: &str) -> Result<()> {
-    if super::is_internal_run_branch(branch) {
-        return Err(OmniError::manifest(format!(
-            "{} does not allow internal run ref '{}'",
-            operation, branch
-        )));
-    }
     if is_internal_system_branch(branch) {
         return Err(OmniError::manifest(format!(
             "{} does not allow internal system ref '{}'",
@@ -1900,7 +1894,6 @@ fn json_value_from_array(array: &dyn Array, row: usize) -> Result<serde_json::Va
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::is_internal_run_branch;
     use crate::db::manifest::ManifestCoordinator;
     use async_trait::async_trait;
     use serde_json::Value;
@@ -2238,11 +2231,11 @@ edge WorksAt: Person -> Company
     #[tokio::test]
     async fn test_apply_schema_succeeds_after_load() {
         // Historical: schema apply used to be blocked by leftover
-        // `__run__` branches. A defense-in-depth filter now skips
-        // internal system branches, and run branches were made
-        // ephemeral on every terminal state — so in practice no
-        // `__run__` branch survives publish. The filter still guards
-        // the invariant.
+        // `__run__` branches. The Run state machine was removed in
+        // MR-771, so a fresh graph never creates a `__run__` branch;
+        // legacy ones are swept by the v2→v3 manifest migration. This
+        // asserts the invariant a current graph upholds: publish leaves
+        // no `__run__` branch behind, so schema apply proceeds.
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
@@ -2257,8 +2250,8 @@ edge WorksAt: Person -> Company
 
         let all_branches = db.coordinator.read().await.all_branches().await.unwrap();
         assert!(
-            !all_branches.iter().any(|b| is_internal_run_branch(b)),
-            "run branch should be deleted after publish, got: {:?}",
+            !all_branches.iter().any(|b| b.starts_with("__run__")),
+            "no __run__ branch should exist after publish, got: {:?}",
             all_branches
         );
 

@@ -14,8 +14,11 @@ publisher's row-level CAS on `__manifest` is the single fence.
 
 - No `RunRecord`, no `_graph_runs.lance`, no `_graph_run_actors.lance`.
 - No `omnigraph run *` CLI subcommands and no `/runs/*` HTTP endpoints.
-- No `__run__<id>` staging branches. (Legacy on-disk artifacts from
-  pre-MR-771 repos are inert; MR-770 sweeps them in production.)
+- No `__run__<id>` staging branches; `__run__*` is no longer a reserved
+  name. The branch-name guard was removed in MR-770, and any stale
+  `__run__*` branch on an upgraded graph is swept off `__manifest` by the
+  v2→v3 internal-schema migration on first read-write open. (The inert
+  `_graph_runs.lance` bytes remain until a `delete_prefix` primitive lands.)
 - Cancelled mutation futures leave **no graph-level state** — only orphaned
   Lance fragments, which the existing `omnigraph cleanup` pipe reclaims.
 
