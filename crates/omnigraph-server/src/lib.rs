@@ -49,6 +49,7 @@ use futures::stream;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::{ManifestConflictDetails, ManifestErrorKind, OmniError};
 use omnigraph::storage::normalize_root_uri;
+use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::json_params_to_param_map;
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::{JsonParamMode, ParamMap};
@@ -443,20 +444,13 @@ impl AppState {
         let uri = normalize_root_uri(&uri.into()).wrap_err("normalize graph URI")?;
         let db = Omnigraph::open(&uri).await?;
 
-        let report = check(&queries, &db.catalog());
-        if report.has_breakages() {
-            bail!("{}", format_registry_breakages(&uri, &report));
-        }
-        log_registry_warnings(&uri, &report);
+        // Validate the registry against the live schema and resolve it to
+        // an attachable handle (refuse boot on breakage).
+        let registry = validate_and_attach(queries, &db.catalog(), &uri)?;
 
         let policy_engine = match policy_file {
             Some(path) => Some(PolicyEngine::load_graph(path, &uri)?),
             None => None,
-        };
-        let registry = if queries.is_empty() {
-            None
-        } else {
-            Some(Arc::new(queries))
         };
         Ok(Self::new_single_with_queries(
             uri,
@@ -844,6 +838,30 @@ fn log_registry_warnings(label: &str, report: &queries::CheckReport) {
     for warning in &report.warnings {
         warn!(graph = label, query = %warning.query, "stored query: {}", warning.message);
     }
+}
+
+/// Validate a loaded stored-query registry against the live schema and
+/// resolve it to an attachable handle. Refuses boot on any breakage
+/// (same posture as bad policy YAML), logs the non-blocking warnings,
+/// and collapses an empty registry to `None` (nothing attached). This is
+/// the single gate every open path funnels through, so no opener can
+/// attach a registry that has not been schema-checked. `label` names the
+/// graph in messages.
+fn validate_and_attach(
+    queries: QueryRegistry,
+    catalog: &Catalog,
+    label: &str,
+) -> Result<Option<Arc<QueryRegistry>>> {
+    let report = check(&queries, catalog);
+    if report.has_breakages() {
+        bail!("{}", format_registry_breakages(label, &report));
+    }
+    log_registry_warnings(label, &report);
+    Ok(if queries.is_empty() {
+        None
+    } else {
+        Some(Arc::new(queries))
+    })
 }
 
 /// Format every load error (parse / identity failure) into a multi-line
@@ -1258,13 +1276,11 @@ async fn open_single_graph(cfg: GraphStartupConfig) -> Result<Arc<GraphHandle>> 
         .await
         .map_err(|err| color_eyre::eyre::eyre!("open graph '{}' at {}: {err}", graph_id, uri))?;
 
-    // Type-check this graph's stored queries against the live schema;
-    // refuse to start on a breakage (same posture as bad policy YAML).
-    let report = check(&cfg.queries, &db.catalog());
-    if report.has_breakages() {
-        bail!("{}", format_registry_breakages(graph_id.as_str(), &report));
-    }
-    log_registry_warnings(graph_id.as_str(), &report);
+    // Validate this graph's stored queries against the live schema and
+    // resolve them to an attachable handle (refuse boot on breakage).
+    // Done before the policy match rebinds `db`; the catalog handle is an
+    // owned `Arc`, so no borrow of `db` survives into the match.
+    let queries = validate_and_attach(cfg.queries, &db.catalog(), graph_id.as_str())?;
 
     let (policy_arc, db) = match &cfg.policy_file {
         Some(path) => {
@@ -1276,11 +1292,6 @@ async fn open_single_graph(cfg: GraphStartupConfig) -> Result<Arc<GraphHandle>> 
         None => (None, db),
     };
 
-    let queries = if cfg.queries.is_empty() {
-        None
-    } else {
-        Some(Arc::new(cfg.queries))
-    };
     Ok(Arc::new(GraphHandle {
         key: GraphKey::cluster(graph_id),
         uri,
@@ -2803,6 +2814,53 @@ mod tests {
     fn hash_bearer_token_produces_32_byte_output() {
         let hash = hash_bearer_token("any-token");
         assert_eq!(hash.len(), 32);
+    }
+
+    /// The single gate both open paths funnel through: it refuses a
+    /// schema breakage (naming the graph label + query), attaches a clean
+    /// registry, and collapses an empty one to `None`. Pure over its args
+    /// (no engine), so it covers the multi-graph path's logic too — the
+    /// only per-path difference is the `label`, asserted here.
+    #[test]
+    fn validate_and_attach_gates_on_schema_and_collapses_empty() {
+        use crate::queries::{QueryRegistry, RegistrySpec};
+        use omnigraph_compiler::catalog::build_catalog;
+        use omnigraph_compiler::schema::parser::parse_schema;
+
+        let schema = parse_schema("node User {\nname: String\n}\n").unwrap();
+        let catalog = build_catalog(&schema).unwrap();
+        let spec = |name: &str, source: &str| RegistrySpec {
+            name: name.to_string(),
+            source: source.to_string(),
+            expose: false,
+            tool_name: None,
+        };
+
+        // Empty registry → nothing attached, no error.
+        let empty =
+            super::validate_and_attach(QueryRegistry::default(), &catalog, "g").unwrap();
+        assert!(empty.is_none());
+
+        // A query that type-checks → attached.
+        let ok = QueryRegistry::from_specs(vec![spec(
+            "find_user",
+            "query find_user() { match { $u: User } return { $u.name } }",
+        )])
+        .unwrap();
+        assert!(super::validate_and_attach(ok, &catalog, "g").unwrap().is_some());
+
+        // A query referencing a type the schema lacks → boot refusal that
+        // names both the graph label and the offending query.
+        let broken = QueryRegistry::from_specs(vec![spec(
+            "ghost",
+            "query ghost() { match { $w: Widget } return { $w.name } }",
+        )])
+        .unwrap();
+        let err = super::validate_and_attach(broken, &catalog, "graph-x").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("graph-x"), "labels the graph: {msg}");
+        assert!(msg.contains("ghost"), "names the query: {msg}");
+        assert!(msg.contains("schema check"), "mentions the schema check: {msg}");
     }
 
     #[test]
