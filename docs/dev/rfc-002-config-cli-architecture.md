@@ -155,6 +155,15 @@ So the client carries *pointers to servers*, not query definitions; it **discove
 
 `queries:` (manifest, server/remote, Cedar-gated, MCP) and `aliases:` (manifest, embedded CLI only) overlap — both are "named `.gq` queries in the manifest." This RFC keeps them siblings (the MR-969 decision); the clean long-term is **one registry, two invocation surfaces** (embedded + remote), with `aliases:` subsumed. Out of scope here.
 
+#### Reconciling `aliases:` with the role model
+
+`aliases:` is the pre-MR-969, **client-role, embedded-only, ungated** ancestor of `queries:`. An alias bundles `command` (read/change), `query` (`.gq` path), `name` (symbol), `args` (positional param names), and `graph`/`branch`/`format` defaults; the CLI runs it embedded. The server never reads it. So:
+
+- **Role:** `aliases:` is **client-role** (CLI behavior) → it may live in **both** the user-global `config.yaml` and the project manifest, layered. `queries:` is **server-role** → it lives **only** in the deployment manifest (the server reads the manifest, not `~`). *Who reads it determines where it can live.*
+- **Difference:** `aliases:` = embedded invocation, no gating, explicit `command`, bundles client defaults + positional args. `queries:` = remote (+future embedded), Cedar + `mcp.expose`, **infers** read/mutate, bundles only MCP settings.
+- **Convergence:** decompose an alias — *definition* (name→.gq+symbol) → `queries:` (the superset: typed, validated, gated, multi-surface, no redundant `command`); *target/branch/format* → client invocation context (`--target`/`--branch`/`--format` or `defaults:`), not baked per-query; *positional `args`* → thin CLI sugar or dropped (agents/services use named JSON params). End-state: one `queries:` registry + the client config model subsumes `aliases:`.
+- **v1:** keep `aliases:` unchanged. Footgun worth a load-time warn: an alias and a query with the same name in one manifest are different namespaces invoked differently (`--alias X` vs `POST /queries/X`).
+
 ### 7. CLI surface
 
 - `omnigraph login <server>` — interactive auth; writes `credentials.yaml` (0600) or the keychain. The `gh auth login` analog.
