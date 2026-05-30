@@ -11,7 +11,7 @@ OmniGraph today has a single config file, `omnigraph.yaml`, read both by the CLI
 
 This RFC defines the config and CLI architecture that closes that gap, derived from first principles — *working backwards from what OmniGraph uniquely enables* rather than copying kubeconfig / `helix.toml`. The result:
 
-1. A **layered config** — user-global (`~/.config/omnigraph/`) + per-project (`./omnigraph.yaml`) — sharing **one uniform schema**, with **both layers optional** (a solo user defines everything in `~`; a repo overrides per-key).
+1. A **global-first layered config** — user-global (`~/.config/omnigraph/`) is the **primary, self-sufficient default**; per-project (`./omnigraph.yaml`) is an *optional* override + deployment manifest. One uniform schema, both layers optional; the CLI works from any directory with **no project file** (the `kubectl`/`aws`/`gh` posture), unlike today's project-anchored behavior.
 2. A single unifying noun — the **target** — that resolves a name to a concrete `(locus, graph, sub-state, credential)` tuple, where the locus is **embedded (storage URI) XOR remote (server endpoint)**.
 3. A **multi-server × multi-graph** client model (OmniGraph hosts N graphs per server and there are M servers — unlike Helix's one-cluster-one-graph).
 4. **Credentials by reference** (env var / keychain), never inlined, with a separate `credentials` file (AWS pattern) so every committed/GitOps'd surface is secret-free.
@@ -86,18 +86,20 @@ targets:
 
 **Two concepts, not kubeconfig's three.** kube splits cluster / user / context; that 3-way split is its most-cursed UX. A target *bundles* server+graph+branch+defaults under one name; the **only** thing split out is `servers`, because endpoints+credentials are shared across many targets and are secret-bearing (different ownership and rate-of-change; see §2). Result: **2 nouns — `servers` and `targets`.** Embedded `targets` (`uri:`) subsume today's `graphs:` entries.
 
-### 2. Layered config — uniform schema, both layers optional
+### 2. Layered config — global-first, uniform schema, project-optional
 
-**Rule: the two layers share ONE schema, and each is fully self-sufficient** (the git model — `~/.gitconfig` and `.git/config` are the same schema; you don't need a repo to have a working config). Do **not** specialize the layers. Anything — `servers`, `targets`, `defaults`, `queries`, `aliases`, `policy` — is expressible at either layer.
+**Posture: global-first, project-optional.** OmniGraph's CLI is primarily a *client* (it operates against graphs and servers, embedded or remote), so it sits on the **global-first** side of the CLI-config axis — like `kubectl` / `aws` / `gh` / `docker`, and unlike *project-first* tools (`git` / `cargo` / `terraform`) whose primary config is per-repo. The **global user config is the primary, self-sufficient default**; the project file is an *optional* repo-scoped override (and, when present, the deployment manifest). `omnigraph query --target prod` must work from **any directory with no project file**, exactly as `kubectl get pods --context prod` works from anywhere. *(This is a deliberate flip from today, where the CLI reads `./omnigraph.yaml` and does not even walk parent dirs — i.e. today it is project-anchored.)*
 
-This makes the **zero-project case first-class**: a solo user defines everything in `~/.config/omnigraph/config.yaml` and never creates a project file. The project layer is a pure **optional override/extension**.
+**Rule: the two layers share ONE schema, and each is fully self-sufficient** (the git-layering mechanism — same schema at both levels; you never need a repo to have a working config). Do **not** specialize the layers. Anything — `servers`, `targets`, `defaults`, `queries`, `aliases`, `policy` — is expressible at either layer.
+
+This makes the **zero-project case the default, not an edge case**: a solo user (or an agent) defines everything in `~/.config/omnigraph/config.yaml` — servers, embedded + remote targets, defaults, even a personal server's `graphs:`/`queries:` — and **never creates a project file**. A team adds `./omnigraph.yaml` only when it wants repo-scoped overrides or a committed, GitOps'd deployment manifest. Global-first does **not** forbid project files; it stops *requiring* them (the kubectl model: `~/.kube/config` is sufficient and default; per-project kubeconfigs are opt-in via `KUBECONFIG`).
 
 | Layer | Required? | Typical use | Path |
 |---|---|---|---|
-| Global | no | solo user's entire config; shared servers+creds for teams | `~/.config/omnigraph/config.yaml` |
-| Project | no | repo-specific targets, defaults, and the stored-query/MCP registry | `./omnigraph.yaml` |
+| Global | no | **the default** — solo/agent's entire config; shared servers+creds for teams; even a personal server's graphs/queries | `~/.config/omnigraph/config.yaml` |
+| Project | no | **opt-in** — repo-scoped overrides + the committed deployment manifest (graphs, queries, policy) | `./omnigraph.yaml` |
 
-**Precedence (low → high):** built-in defaults < global < project < env vars < CLI flags.
+**Precedence (low → high):** built-in defaults < global < project < env vars < CLI flags. With no project file it collapses to **built-in < global < env < flags** — the common global-only path.
 
 **Merge semantics (predictable, not magical):**
 - **Maps** (`servers`, `targets`, `queries`, `aliases`) → **key union**; on a key collision the higher layer's entry **replaces** the lower wholesale (no field-level deep-merge within an entry — that is where surprise lives).
@@ -238,7 +240,7 @@ aliases:  { ... }
 
 - **Additive.** Today's `omnigraph.yaml` (`graphs:`, `cli:`, `server:`, `aliases:`, `policy:`) keeps working unchanged. `graphs:` entries are equivalent to embedded `targets:` with a `uri:`; both resolve.
 - **`targets:` is new** and optional. `servers:` is new and optional. Absent → today's behavior.
-- **Global `~/.config/omnigraph/config.yaml` is new** and optional. Absent → only project + env + flags, exactly as now.
+- **Global `~/.config/omnigraph/config.yaml` is new.** Absent → only project + env + flags, exactly as now. Its addition is the **global-first posture flip**: today the CLI is project-anchored (reads `./omnigraph.yaml`, no parent walk); the global config becomes the new primary discovery path so the CLI works with no project file. Existing project-only workflows are unchanged (project still overrides global); the flip is additive — it adds a fallback layer below the project file, it does not remove the project file.
 - **`graphs:` → `targets:` is an evolution, not a break.** Both can coexist; `targets:` is the superset (adds remote + branch pinning). A future cleanup may alias `graphs:` to embedded `targets:`.
 - **`server.bind` stays supported** but documentation steers operators to `--bind` / `OMNIGRAPH_BIND` for portability; no removal.
 
