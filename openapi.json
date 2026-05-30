@@ -829,6 +829,114 @@
         ]
       }
     },
+    "/queries/{name}": {
+      "post": {
+        "tags": [
+          "queries"
+        ],
+        "summary": "Invoke a curated, server-side stored query by name.",
+        "description": "The query source comes from the graph's `queries:` registry, not the\nrequest body — callers send only runtime inputs (`params`, `branch`,\n`snapshot`). Gated by the `invoke_query` Cedar action at the boundary;\na stored *mutation* additionally passes the engine's `change` gate\n(double-gated). A denied actor and an unknown query both return the\nsame 404, so the catalog can't be probed.",
+        "operationId": "invoke_query",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Stored query name (the registry key)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InvokeStoredQueryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Read envelope (ReadOutput) or mutation envelope (ChangeOutput), serialized untagged",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvokeStoredQueryResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request (param type error; snapshot on a stored mutation)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden (the inner `change` gate for a stored mutation)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown stored query, or `invoke_query` denied (indistinguishable)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Merge conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/query": {
       "post": {
         "tags": [
@@ -1627,6 +1735,40 @@
             "type": "string"
           }
         }
+      },
+      "InvokeStoredQueryRequest": {
+        "type": "object",
+        "description": "Body for `POST /queries/{name}` — invokes the server-side stored query\nnamed in the path. The query source and name come from the registry,\nnever the body; only the runtime inputs are supplied here.",
+        "properties": {
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Branch to run against. Defaults to `main`; for a stored mutation the\nwrite targets this branch."
+          },
+          "params": {
+            "description": "JSON object whose keys match the stored query's declared parameters."
+          },
+          "snapshot": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Snapshot id to read from (read queries only — rejected for a stored\nmutation). Mutually exclusive with `branch`."
+          }
+        }
+      },
+      "InvokeStoredQueryResponse": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ReadOutput"
+          },
+          {
+            "$ref": "#/components/schemas/ChangeOutput"
+          }
+        ],
+        "description": "Response for `POST /queries/{name}`: the read envelope for a stored\nread, or the mutation envelope for a stored mutation. Serialized\n**untagged**, so the wire shape is exactly [`ReadOutput`] or\n[`ChangeOutput`] — classification follows the stored query, not a\nwrapper field."
       },
       "LoadMode": {
         "type": "string",

@@ -300,6 +300,36 @@ pub struct ChangeRequest {
     pub branch: Option<String>,
 }
 
+/// Body for `POST /queries/{name}` — invokes the server-side stored query
+/// named in the path. The query source and name come from the registry,
+/// never the body; only the runtime inputs are supplied here.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct InvokeStoredQueryRequest {
+    /// JSON object whose keys match the stored query's declared parameters.
+    #[serde(default)]
+    pub params: Option<Value>,
+    /// Branch to run against. Defaults to `main`; for a stored mutation the
+    /// write targets this branch.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Snapshot id to read from (read queries only — rejected for a stored
+    /// mutation). Mutually exclusive with `branch`.
+    #[serde(default)]
+    pub snapshot: Option<String>,
+}
+
+/// Response for `POST /queries/{name}`: the read envelope for a stored
+/// read, or the mutation envelope for a stored mutation. Serialized
+/// **untagged**, so the wire shape is exactly [`ReadOutput`] or
+/// [`ChangeOutput`] — classification follows the stored query, not a
+/// wrapper field.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum InvokeStoredQueryResponse {
+    Read(ReadOutput),
+    Change(ChangeOutput),
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct SchemaApplyRequest {
     /// Project schema in `.pg` source form. The diff against the current

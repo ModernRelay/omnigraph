@@ -25,7 +25,8 @@ use api::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
     CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphInfo, GraphListResponse,
-    HealthOutput, IngestOutput, IngestRequest, QueryRequest, ReadOutput, ReadRequest,
+    HealthOutput, IngestOutput, IngestRequest, InvokeStoredQueryRequest,
+    InvokeStoredQueryResponse, QueryRequest, ReadOutput, ReadRequest,
     SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotQuery, ingest_output,
     schema_apply_output, snapshot_payload,
 };
@@ -97,6 +98,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         server_export,
         #[allow(deprecated)] server_change,
         server_mutate,
+        server_invoke_query,
         server_schema_apply,
         server_schema_get,
         server_ingest,
@@ -1090,6 +1092,7 @@ pub fn build_app(state: AppState) -> Router {
             server_change
         }))
         .route("/mutate", post(server_mutate))
+        .route("/queries/{name}", post(server_invoke_query))
         .route("/schema", get(server_schema_get))
         .route("/schema/apply", post(server_schema_apply))
         .route(
@@ -2151,6 +2154,119 @@ async fn server_mutate(
         )
         .await?,
     ))
+}
+
+/// Path parameter for `POST /queries/{name}`.
+#[derive(Deserialize)]
+struct QueryNamePath {
+    name: String,
+}
+
+#[utoipa::path(
+    post,
+    path = "/queries/{name}",
+    tag = "queries",
+    operation_id = "invoke_query",
+    params(("name" = String, Path, description = "Stored query name (the registry key)")),
+    request_body = InvokeStoredQueryRequest,
+    responses(
+        (status = 200, description = "Read envelope (ReadOutput) or mutation envelope (ChangeOutput), serialized untagged", body = InvokeStoredQueryResponse),
+        (status = 400, description = "Bad request (param type error; snapshot on a stored mutation)", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden (the inner `change` gate for a stored mutation)", body = ErrorOutput),
+        (status = 404, description = "Unknown stored query, or `invoke_query` denied (indistinguishable)", body = ErrorOutput),
+        (status = 409, description = "Merge conflict", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Invoke a curated, server-side stored query by name.
+///
+/// The query source comes from the graph's `queries:` registry, not the
+/// request body — callers send only runtime inputs (`params`, `branch`,
+/// `snapshot`). Gated by the `invoke_query` Cedar action at the boundary;
+/// a stored *mutation* additionally passes the engine's `change` gate
+/// (double-gated). A denied actor and an unknown query both return the
+/// same 404, so the catalog can't be probed.
+async fn server_invoke_query(
+    State(state): State<AppState>,
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    Path(QueryNamePath { name }): Path<QueryNamePath>,
+    Json(req): Json<InvokeStoredQueryRequest>,
+) -> std::result::Result<Json<InvokeStoredQueryResponse>, ApiError> {
+    // Deny is indistinguishable from a missing query: both 404 with this
+    // exact message, so an unauthorized caller can't probe the catalog.
+    const NOT_FOUND: &str = "stored query not found";
+    let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
+
+    // Boundary gate (authentication already ran in `require_bearer_auth`).
+    authorize_request(
+        actor_ref,
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::InvokeQuery,
+            branch: req.branch.clone().or_else(|| Some("main".to_string())),
+            target_branch: None,
+        },
+    )
+    .map_err(|_| ApiError::not_found(NOT_FOUND))?;
+
+    // Resolve against the per-graph registry (same 404 on a miss).
+    let stored = handle
+        .queries
+        .as_ref()
+        .and_then(|registry| registry.lookup(&name))
+        .ok_or_else(|| ApiError::not_found(NOT_FOUND))?;
+
+    // Detach what we need before `handle` moves into the runner — the
+    // registry borrow lives inside `handle`.
+    let source = Arc::clone(&stored.source);
+    let query_name = stored.name.clone();
+    let is_mutation = stored.is_mutation();
+
+    info!(
+        graph = %handle.uri,
+        actor = ?actor_ref.map(|a| a.actor_id.as_ref()),
+        query = %query_name,
+        kind = if is_mutation { "mutate" } else { "read" },
+        "stored query invoked"
+    );
+
+    if is_mutation {
+        if req.snapshot.is_some() {
+            return Err(ApiError::bad_request(
+                "stored mutation cannot target a snapshot",
+            ));
+        }
+        let branch = req.branch.unwrap_or_else(|| "main".to_string());
+        let output = run_mutate(
+            state,
+            handle,
+            actor_ref,
+            &source,
+            Some(&query_name),
+            req.params.as_ref(),
+            branch,
+        )
+        .await?;
+        Ok(Json(InvokeStoredQueryResponse::Change(output)))
+    } else {
+        let (selected, target, result) = run_query(
+            handle,
+            actor_ref,
+            &source,
+            Some(&query_name),
+            req.params.as_ref(),
+            req.branch,
+            req.snapshot,
+            true,
+        )
+        .await?;
+        Ok(Json(InvokeStoredQueryResponse::Read(api::read_output(
+            selected, &target, result,
+        ))))
+    }
 }
 
 #[utoipa::path(

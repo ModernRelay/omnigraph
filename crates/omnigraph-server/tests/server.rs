@@ -209,6 +209,177 @@ async fn server_refuses_boot_on_type_broken_stored_query() {
     );
 }
 
+/// Build a single-mode app with a stored-query registry plus a bearer→actor
+/// pairing and a policy, so invoke tests exercise the `invoke_query`
+/// boundary gate and the inner read/change gates together.
+async fn app_with_stored_queries(
+    specs: &[(&str, &str, bool)],
+    tokens: &[(&str, &str)],
+    policy: &str,
+) -> (tempfile::TempDir, Router) {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, policy).unwrap();
+    let registry = stored_query_registry(specs);
+    let state = AppState::open_single_with_queries(
+        graph.to_string_lossy().to_string(),
+        tokens
+            .iter()
+            .map(|(actor, token)| ((*actor).to_string(), (*token).to_string()))
+            .collect(),
+        Some(&policy_path),
+        registry,
+    )
+    .await
+    .unwrap();
+    (temp, build_app(state))
+}
+
+/// - `act-invoke`: invoke_query + read (stored reads, not mutations)
+/// - `act-full`:   invoke_query + read + change (stored mutations)
+/// - `act-noinvoke`: read only, no invoke_query (boundary-denied)
+const INVOKE_POLICY_YAML: &str = r#"
+version: 1
+groups:
+  invokers: ["act-invoke"]
+  full: ["act-full"]
+  readers: ["act-noinvoke"]
+protected_branches: [main]
+rules:
+  - id: invokers-invoke-and-read
+    allow:
+      actors: { group: invokers }
+      actions: [invoke_query, read]
+      branch_scope: any
+  - id: full-invoke-read-change
+    allow:
+      actors: { group: full }
+      actions: [invoke_query, read, change]
+      branch_scope: any
+  - id: readers-read-only
+    allow:
+      actors: { group: readers }
+      actions: [read]
+      branch_scope: any
+"#;
+
+const FIND_PERSON_GQ: &str =
+    "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }";
+
+fn invoke_request(name: &str, token: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .uri(format!("/queries/{name}"))
+        .method(Method::POST)
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_stored_read_returns_rows() {
+    let (_temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, false)],
+        &[("act-invoke", "t-invoke")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    let (status, body) = json_response(
+        &app,
+        invoke_request("find_person", "t-invoke", json!({ "params": { "name": "Alice" } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["query_name"], "find_person");
+    assert_eq!(body["row_count"], 1, "Alice is in the fixture; body: {body}");
+    assert!(body["rows"].is_array(), "read envelope shape; body: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_stored_mutation_double_gates_on_change() {
+    let specs: &[(&str, &str, bool)] = &[(
+        "add_person",
+        "query add_person($name: String) { insert Person { name: $name } }",
+        false,
+    )];
+    let (_temp, app) = app_with_stored_queries(
+        specs,
+        &[("act-invoke", "t-invoke"), ("act-full", "t-full")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+
+    // Has invoke_query but NOT change → the inner change gate denies (403).
+    let (status, body) = json_response(
+        &app,
+        invoke_request("add_person", "t-invoke", json!({ "params": { "name": "Eve" } })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "invoke_query without change must 403; body: {body}"
+    );
+
+    // Has invoke_query + change → applied.
+    let (status, body) = json_response(
+        &app,
+        invoke_request("add_person", "t-full", json!({ "params": { "name": "Eve" } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["affected_nodes"], 1, "body: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_stored_query_bad_param_is_400() {
+    let (_temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, false)],
+        &[("act-invoke", "t-invoke")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    // `name` is declared String; pass a number.
+    let (status, body) = json_response(
+        &app,
+        invoke_request("find_person", "t-invoke", json!({ "params": { "name": 123 } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(
+        body["error"].as_str().unwrap_or_default().contains("name"),
+        "400 should name the offending param; body: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_unknown_query_and_denied_actor_return_identical_404() {
+    let (_temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, false)],
+        &[("act-invoke", "t-invoke"), ("act-noinvoke", "t-noinvoke")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+
+    // Authorized actor, unknown query name → 404.
+    let (unknown_status, unknown_body) =
+        json_response(&app, invoke_request("does_not_exist", "t-invoke", json!({}))).await;
+    // Denied actor (no invoke_query), real query name → 404.
+    let (denied_status, denied_body) = json_response(
+        &app,
+        invoke_request("find_person", "t-noinvoke", json!({ "params": { "name": "Alice" } })),
+    )
+    .await;
+
+    assert_eq!(unknown_status, StatusCode::NOT_FOUND);
+    assert_eq!(denied_status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        unknown_body, denied_body,
+        "deny must be byte-identical to a missing query (no catalog probing)"
+    );
+}
+
 fn drifted_test_schema() -> String {
     fs::read_to_string(fixture("test.pg"))
         .unwrap()
