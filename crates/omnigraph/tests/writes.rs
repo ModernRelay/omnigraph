@@ -1,7 +1,7 @@
-//! Tests for the direct-to-target write path (Run state machine
-//! removed). The Run/`__run__` staging branch / RunRecord state machine no
-//! longer exists; mutations and loads write directly to target tables and
-//! commit once via the publisher's `expected_table_versions` CAS.
+//! Tests for the direct-publish write path: mutations and loads write
+//! directly to target tables and commit once via the publisher's
+//! `expected_table_versions` CAS. (History: this replaced the removed Run
+//! state machine / `__run__` staging branches / RunRecord — MR-771.)
 //!
 //! What this file covers:
 //! - No `__run__*` branches are created by load or mutate.

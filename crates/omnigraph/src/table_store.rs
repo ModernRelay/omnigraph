@@ -49,7 +49,7 @@ pub struct DeleteState {
 /// `exec/mutation.rs`) and the bulk loader (`loader/mod.rs`). The
 /// intent: defer Lance commits to end-of-query so a mid-query failure
 /// leaves the touched table at the pre-mutation HEAD instead of
-/// drifting ahead. See `docs/runs.md` for the publisher-CAS contract
+/// drifting ahead. See `docs/dev/writes.md` for the publisher-CAS contract
 /// this builds on.
 ///
 /// `transaction` is opaque from our side — Lance owns its semantics. We
@@ -901,7 +901,7 @@ impl TableStore {
     /// Lift path: either a Lance API extension that lets
     /// `MergeInsertBuilder` accept additional staged fragments, or an
     /// in-memory pre-merge here that folds prior staged batches into the
-    /// input stream. See `docs/runs.md`.
+    /// input stream. See `docs/dev/writes.md`.
     pub async fn stage_merge_insert(
         &self,
         ds: Dataset,

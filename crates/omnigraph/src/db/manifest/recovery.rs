@@ -2,7 +2,7 @@
 //!
 //! This module implements the building blocks of the per-sidecar recovery
 //! sweep that closes the documented Phase B → Phase C residual (see
-//! `docs/dev/runs.md` "Open-time recovery sweep"). The high-level shape:
+//! `docs/dev/writes.md` "Open-time recovery sweep"). The high-level shape:
 //!
 //! 1. Each writer that performs a multi-table commit writes a small JSON
 //!    sidecar at `__recovery/{ulid}.json` BEFORE its per-table

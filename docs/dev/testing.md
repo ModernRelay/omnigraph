@@ -20,7 +20,7 @@ The engine's `tests/` is the principal coverage surface; most graph-shaped behav
 | `end_to_end.rs` | Full init → load → query/mutate flow |
 | `branching.rs` | Branch create / list / delete, lazy fork |
 | `merge_truth_table.rs` | Merge-pair truth table (MR-786): all 9×9 `(left_op, right_op)` cells from `{noop, addNode, removeNode, addEdge, removeEdge, setProperty, dropProperty, addLabel, removeLabel}`. Adding a new op to `OpVariant` forces a compile error in `build_case` until the new row + column are dispositioned. 36 executable cells run through real `branch_merge` with a structured oracle (`MergeOutcome` / `MergeConflictKind` + graph-state assert); 45 cells involving `dropProperty`/`addLabel`/`removeLabel` are recorded as `Unsupported` until the mutation grammar grows. |
-| `runs.rs` | Direct-publish writes: cancellation, concurrent-writer CAS, multi-statement atomicity, MR-794 staged-write rewire (D₂ rejection, insert+update coalesce, multi-append coalesce, partial-failure recovery, load RI/cardinality recovery) |
+| `writes.rs` | Direct-publish writes: cancellation, concurrent-writer CAS, multi-statement atomicity, MR-794 staged-write rewire (D₂ rejection, insert+update coalesce, multi-append coalesce, partial-failure recovery, load RI/cardinality recovery) |
 | `staged_writes.rs` | TableStore staged-write primitives (`stage_append`, `stage_merge_insert`, `commit_staged`, `scan_with_staged`, `count_rows_with_staged`) — primitive-level only; engine code uses the in-memory `MutationStaging` accumulator instead |
 | `lifecycle.rs` | Graph lifecycle, schema state |
 | `point_in_time.rs` | Snapshots, time travel (`snapshot_at_version`, `entity_at`) |
@@ -89,7 +89,7 @@ If introducing coverage tooling is in scope for your task, the natural first ste
 
 How to check:
 
-1. **Map the change to an area** — use the engine integration-test table above (`branching.rs`, `runs.rs`, `search.rs`, etc.). The filename usually names the area.
+1. **Map the change to an area** — use the engine integration-test table above (`branching.rs`, `writes.rs`, `search.rs`, etc.). The filename usually names the area.
 2. **Open the file and skim every test fn name.** Test fn names are the index — read them all, not just the first few.
 3. **Grep for the symbol or path you're changing.** `rg <FunctionName>` or `rg <enum_variant>` across all `tests/` directories surfaces existing coverage you might miss.
 4. **Decide one of three outcomes**, in this order of preference:

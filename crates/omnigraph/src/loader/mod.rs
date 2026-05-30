@@ -613,7 +613,7 @@ async fn load_jsonl_reader<R: BufRead>(
     } else {
         // LoadMode::Overwrite keeps the legacy inline-commit path —
         // truncate-then-append doesn't fit the staged shape (see
-        // `docs/runs.md` "LoadMode::Overwrite residual"). The recovery
+        // `docs/dev/writes.md` "LoadMode::Overwrite residual"). The recovery
         // sidecar is not applicable here because the writer doesn't go
         // through MutationStaging; per-table inline commits + a final
         // manifest publish handle their own residual via the documented
