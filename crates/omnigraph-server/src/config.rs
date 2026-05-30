@@ -24,6 +24,14 @@ pub struct TargetConfig {
     /// graph's HTTP-layer Cedar enforcement.
     #[serde(default)]
     pub policy: PolicySettings,
+    /// Per-graph stored-query registry: an inline `name -> entry`
+    /// map. Mirrors the per-graph `policy` shape — each
+    /// `graphs.<id>.queries` declares that graph's stored queries. Absent
+    /// (or empty) = no stored queries for the graph. v1 is inline-only;
+    /// an external `queries.yaml` manifest indirection is a deferred
+    /// convenience.
+    #[serde(default)]
+    pub queries: BTreeMap<String, QueryEntry>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
@@ -90,6 +98,33 @@ pub struct PolicySettings {
     pub file: Option<String>,
 }
 
+/// One stored-query registry entry. The map **key** is the query's
+/// identity — it must equal the `query <name>` symbol declared inside
+/// the referenced `.gq` file (asserted at load, C2). Renaming the key
+/// (or the symbol) is a breaking change to callers, by design.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryEntry {
+    /// Path to the `.gq` file (relative to the config's `base_dir`). The
+    /// file may declare several queries; the registry selects the one
+    /// whose symbol matches the map key.
+    pub file: String,
+    #[serde(default)]
+    pub mcp: McpSettings,
+}
+
+/// MCP exposure for a stored query. A *deployment* concern (the same
+/// `.gq` may be exposed in one graph and hidden in another), so it lives
+/// in YAML rather than in the `.gq` source. Default `expose: false` —
+/// a query is HTTP-callable but absent from the MCP tool catalog unless
+/// the operator opts in. The catalog projection lands in a later slice;
+/// v1 round-trips these fields.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct McpSettings {
+    #[serde(default)]
+    pub expose: bool,
+    pub tool_name: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AliasCommand {
@@ -137,6 +172,12 @@ pub struct OmnigraphConfig {
     pub aliases: BTreeMap<String, AliasConfig>,
     #[serde(default)]
     pub policy: PolicySettings,
+    /// Top-level stored-query registry, used in single-graph
+    /// mode — mirrors how the top-level `policy` applies to the single
+    /// graph. In multi-graph mode this is unused; each graph's
+    /// `graphs.<id>.queries` applies instead.
+    #[serde(default)]
+    pub queries: BTreeMap<String, QueryEntry>,
     #[serde(skip)]
     base_dir: PathBuf,
 }
@@ -152,6 +193,7 @@ impl Default for OmnigraphConfig {
             query: QueryDefaults::default(),
             aliases: BTreeMap::new(),
             policy: PolicySettings::default(),
+            queries: BTreeMap::new(),
             base_dir: PathBuf::new(),
         }
     }
@@ -242,6 +284,28 @@ impl OmnigraphConfig {
             .file
             .as_deref()
             .map(|path| self.resolve_config_path(path))
+    }
+
+    /// The top-level stored-query registry entries (single-graph mode).
+    pub fn query_entries(&self) -> &BTreeMap<String, QueryEntry> {
+        &self.queries
+    }
+
+    /// The per-graph stored-query registry entries for a named target
+    /// (multi-graph mode). Returns `None` if the target is unknown.
+    pub fn target_query_entries(
+        &self,
+        target_name: &str,
+    ) -> Option<&BTreeMap<String, QueryEntry>> {
+        self.graphs.get(target_name).map(|target| &target.queries)
+    }
+
+    /// Resolve a stored-query `.gq` file path (from a registry entry),
+    /// relative to the config's `base_dir`. Mirrors policy-file
+    /// resolution; the registry loader (C2) calls this to turn each
+    /// entry's `file:` value into an absolute path.
+    pub fn resolve_query_file(&self, value: &str) -> PathBuf {
+        self.resolve_config_path(value)
     }
 
     /// Resolve the server-level policy file path (used by management
@@ -487,6 +551,74 @@ policy: {}
         let resolved = config.resolve_query_path(Path::new("local.gq")).unwrap();
 
         assert_eq!(resolved, config_dir.join("local.gq"));
+    }
+
+    #[test]
+    fn queries_block_round_trips_inline_and_per_graph() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("omnigraph.yaml"),
+            r#"
+graphs:
+  prod:
+    uri: s3://bucket/prod
+    queries:
+      find_user:
+        file: ./queries/find_user.gq
+        mcp:
+          expose: true
+          tool_name: lookup_user
+      internal_audit:
+        file: ./queries/audit.gq
+queries:
+  single_mode_q:
+    file: ./q.gq
+"#,
+        )
+        .unwrap();
+
+        let config = load_config_in(temp.path(), None).unwrap();
+
+        // Per-graph registry (multi-graph mode).
+        let prod = config.target_query_entries("prod").unwrap();
+        assert_eq!(prod.len(), 2);
+        let find_user = &prod["find_user"];
+        assert_eq!(find_user.file, "./queries/find_user.gq");
+        assert!(find_user.mcp.expose);
+        assert_eq!(find_user.mcp.tool_name.as_deref(), Some("lookup_user"));
+        // Default exposure is false (safe by default) and tool_name absent.
+        let audit = &prod["internal_audit"];
+        assert!(!audit.mcp.expose);
+        assert!(audit.mcp.tool_name.is_none());
+
+        // Top-level registry (single-graph mode).
+        assert_eq!(config.query_entries().len(), 1);
+
+        // Path resolution joins against base_dir, like policy files.
+        assert_eq!(
+            config.resolve_query_file(&find_user.file),
+            temp.path().join("./queries/find_user.gq")
+        );
+    }
+
+    #[test]
+    fn queries_block_absent_yields_empty_registry() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("omnigraph.yaml"),
+            "graphs:\n  local:\n    uri: ./demo.omni\n",
+        )
+        .unwrap();
+
+        let config = load_config_in(temp.path(), None).unwrap();
+        // Additive: no `queries:` anywhere → empty registries everywhere.
+        assert!(config.query_entries().is_empty());
+        assert!(
+            config
+                .target_query_entries("local")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
