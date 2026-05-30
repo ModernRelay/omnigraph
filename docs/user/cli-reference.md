@@ -20,6 +20,7 @@ A reference for the `omnigraph` binary's command surface and `omnigraph.yaml` sc
 | `run list \| show \| publish \| abort` | transactional run ops |
 | `schema plan \| apply \| show (alias: get)` | migrations |
 | `lint` (alias: `check`) | offline / graph-backed query validation. Replaces `query lint` / `query check`, which are kept as deprecated argv-level shims that print a one-line warning and rewrite to `omnigraph lint` |
+| `queries validate \| list` | operate on the server-side stored-query registry (the `queries:` block). `validate` type-checks every stored query against the live schema offline (opens the selected graph; exits non-zero on any breakage), catching schema drift without restarting the server; `list` prints each query's name, MCP exposure, and typed params. Distinct from `lint`, which validates a single `.gq` file |
 | `optimize` | non-destructive Lance compaction |
 | `cleanup --keep N --older-than 7d --confirm` | destructive version GC |
 | `embed` | offline JSONL embedding pipeline |
@@ -34,6 +35,13 @@ graphs:
   <name>:
     uri: <local|s3://|http(s)://>
     bearer_token_env: <ENV_NAME>
+    queries:                      # per-graph stored-query registry (server-role; multi-graph mode)
+      <query-name>:               # key MUST equal the `query <name>` symbol inside the .gq
+        file: <path-to-.gq>       # relative to this config's directory
+        mcp:
+          expose: false           # default false: HTTP-callable but not listed as an MCP tool
+          tool_name: <name>       # optional MCP tool-name override (defaults to <query-name>;
+                                  #   must be unique across exposed queries)
 server:
   graph: <name>
   bind: <ip:port>
@@ -59,6 +67,8 @@ aliases:
     graph: <name>
     branch: <name>
     format: <output-format>
+queries:                          # top-level stored-query registry (single-graph mode); mirrors top-level `policy`
+  <query-name>: { file: <path-to-.gq>, mcp: { expose: false } }
 policy:
   file: ./policy.yaml
 ```

@@ -20,6 +20,10 @@ Mode inference (four-rule matrix):
 4. `--config` + non-empty `graphs:` + no single-mode selector → **multi**
 5. otherwise → error with migration hint
 
+### Stored-query validation at startup
+
+If a graph declares a `queries:` registry (see [cli-reference](cli-reference.md)), the server **loads and type-checks every stored query against that graph's live schema at startup** and **refuses to boot** if any query references a type or property the schema lacks — the same fail-loud posture as a malformed policy file, so schema drift surfaces at the deploy boundary rather than at invocation. Two MCP-exposed queries claiming the same tool name is likewise a boot error. Non-blocking advisories (e.g. an MCP-exposed query with a vector parameter an agent cannot supply) are logged. Validate offline before deploying with `omnigraph queries validate`. *(Stored-query invocation over HTTP/MCP is not yet exposed — this release ships the registry, its boot-time validation, and the `invoke_query` Cedar action ahead of the invocation handler.)*
+
 ## Endpoint inventory
 
 Per-graph endpoints — same body shape across modes; URLs differ:
