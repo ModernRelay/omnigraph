@@ -21,15 +21,15 @@ The design optimizes jointly for **DX** (one command surface across embedded and
 
 ## Reconciliation with shipped / planned CLI work
 
-This RFC must align with shipped reality. Findings (and the corrections they force):
+Verified **against the code**, not ticket statuses (which are unreliable — e.g. MR-581 is marked done but is stale and unbuilt). Findings and the corrections they force:
 
-- **Noun is `graph`/`graphs`, NOT `target`/`targets`.** **MR-603 (done)** renamed the config key `targets:` → `graphs:` and the flag to `--graph`. **This RFC uses `graphs:` and `--graph` throughout**; the "unifying noun" is a **`graphs:` entry** that is *embedded* (`uri:`) XOR *remote* (`server:` + a remote graph name). Earlier drafts said `targets:` — read every `targets:`/`--target` below as `graphs:`/`--graph`.
-- **`~/.omnigraph/` is the right home — with shipped precedent.** **MR-581 (done, `og template pull`)** already quick-starts templates into `~/.omnigraph/`. Confirms the single-dir decision.
-- **Templates already exist.** `og template pull <name>` (MR-581, done) + **MR-531** (templates umbrella). The init/template mechanism is not invented here; this RFC only adds the user-level config + `login`.
-- **The init family is already specced — not redesigned here:** `omnigraph init` (exists, `scaffold_config_if_missing` at `main.rs:1415`), `init --force` purge (**MR-975**) + `omnigraph prune` (**MR-972**), `omnigraph quickstart` fat agent-bootstrap (**MR-973**), `omnigraph serve start/stop/status` (**MR-970**), `omnigraph mcp install` + skills + plugin (**MR-974**), agent-mode CLI hardening (**MR-981**). **This RFC's only init-adjacent contribution is the user route**: the global `~/.omnigraph/config.yaml` + `omnigraph login` (supabase/gh split: `init`=project, `login`=user) — not yet covered by a ticket.
-- **`aliases:` → `operations:` is planned (MR-839).** The aliases/queries reconciliation (§6) should read `aliases:` as the soon-to-be `operations:`.
-- **`bearer_token_env` has a known gap (MR-971: "CLI parity + server-side gap").** This RFC's per-`servers.<name>` extension should land on top of MR-971's audit.
-- **`omnigraph query lint` / `query check` already exist (MR-639, done).** A stored-query *registry* validator must not collide — use a verb that doesn't read as a second `query check`.
+- **Noun is `graph`/`graphs`, NOT `target`/`targets`.** The config key is `graphs:` in `config.rs` and the flag is `--graph`. **This RFC uses `graphs:`/`--graph` throughout**; the unifying noun is a **`graphs:` entry** that is *embedded* (`uri:`) XOR *remote* (`server:` + a remote graph name). Read any lingering `targets:`/`--target` below as `graphs:`/`--graph`.
+- **`~/.omnigraph/` stands on its own merits** (Helix/aws/kube peer convention), **not** on precedent — there is **no `~/.omnigraph/` usage in the code** today. (MR-581 / MR-531 templates-into-`~/.omnigraph/` are *stale tickets, unbuilt*.)
+- **Templates do not exist** in the code (no `template` command). The template mechanism is a *design question for this RFC / the init family*, not an existing foothold.
+- **What actually exists in the CLI** (verified): `init, query(read), mutate(change), load, ingest, branch, schema, lint, snapshot, export, commit, policy, optimize, cleanup, graphs`. **Not built:** `serve, quickstart, template, prune, login`. `omnigraph init` exists (with `scaffold_config_if_missing`, `main.rs:1415`); the rest of the "init family" (`quickstart` MR-973, `serve` MR-970, `prune`/`init --force` MR-972/975, `mcp install`/skills MR-974, agent-mode MR-981) are **unbuilt tickets**, some stale.
+- **Config still uses `aliases:`** (no `operations:` in code; MR-839 unbuilt). §6's reconciliation talks about `aliases:` as-is, noting `operations:` is a *proposed* rename.
+- **`bearer_token_env` exists** (per-graph, `config.rs`); MR-971 flags a CLI-parity / server-side gap. The per-`servers.<name>` extension lands on top of that.
+- **A top-level `omnigraph lint` command exists** (verified). A stored-query *registry* validator must pick a verb that doesn't read as a competing lint/check.
 
 ## Motivation
 
@@ -197,9 +197,27 @@ So the client carries *pointers to servers*, not query definitions; it **discove
 ### 7. CLI surface
 
 - `omnigraph login <server>` — interactive auth; writes the token to the `auth.env_file` dotenv (0600) or the keychain. The `gh auth login` analog.
-- `omnigraph use <target>` — set the active target (writes the appropriate layer). The `kubectl config use-context` analog.
-- `omnigraph config view [--resolved] [<target>]` — print the merged config and, with `--resolved`, the final tuple **plus the origin layer of every field** (the `git config --show-origin` / `kubectl config view` analog). Resolution is never a mystery.
-- All existing verbs (`query`, `mutate`, `load`, `schema`, `branch`, …) gain `--target <name>`; resolution decides embedded vs remote transparently.
+- `omnigraph use <graph>` — set the active graph (writes the appropriate layer). The `kubectl config use-context` analog.
+- `omnigraph config view [--resolved] [--show-origin] [<graph>]` — print the merged config and, with `--resolved`, the final tuple **plus the origin layer of every field** (the `git config --show-origin` / `kubectl config view` analog). Resolution is never a mystery.
+- All existing verbs (`query`, `mutate`, `load`, `schema`, `branch`, …) gain `--graph <name>`; resolution decides embedded vs remote transparently.
+
+### 7.5 Init, login, and bootstrap — three tiers (folds in the Q2 design)
+
+Scaffolding splits into three tiers by *scope* and *fatness*, mirroring the field (supabase `init` vs `login`; HelixDB thin `init` vs fat `chef`). Most of this lives in sibling tickets; this RFC owns only the **user route**.
+
+| Tier | Command | Scope | What it does | Model | Status |
+|---|---|---|---|---|---|
+| **User route** | `omnigraph login [<server>]` | user (`~/.omnigraph/`) | auth + write `~/.omnigraph/config.yaml` / `credentials`; first-run global setup | gh / supabase `login` | **this RFC** (unbuilt) |
+| **Thin project init** | `omnigraph init` | project, in-place | create graph + `scaffold_config_if_missing` (`omnigraph.yaml` + minimal `.pg`/`.gq`); refuse-if-exists or `--force` | `cargo init`, `prisma init` | exists; `--force` purge = MR-975 |
+| **Fat bootstrap** | `omnigraph quickstart [--template <t>] [--auto]` | project, possibly new-dir | scaffold + seed data + `serve start` + agent prompt file | HelixDB `chef`, `create-next-app` | MR-973 (unbuilt) |
+
+**Design positions** (first-principles, since none of the fat tier is built):
+- **Split `init` (project) from `login` (user)** — never one command writing to both `$HOME` and the project (the supabase line, not the dbt line). `init`=project scaffold; `login`=user credential + global config.
+- **`init` is in-place + refuse-if-exists** (cargo/prisma/terraform default): don't clobber; adopt existing files; require `--force` to overwrite (and `--force` purges Lance state per MR-975).
+- **Interactive for humans, `--auto`/agent-mode for automation** (npm `-y`, create-* `--CI`, MR-981 `--machine`). In `OMNIGRAPH_AGENT_MODE` any prompt → fail with a repair hint.
+- **Templates are a `--template <name>` flag on the fat tier** (create-vite model), with the *content* (schema + queries + seed) coming from a template source. Mechanism is a design question (bundled-in vs `og template pull` from a repo vs `npm create-*`-style delegation) — **not** an existing foothold (MR-581 stale). Lean: a small set of bundled templates first (generic `Person→Knows`, plus promote `omnigraph-intel-bootstrap`), `--template <github>` later.
+- **`init`/`quickstart` can scaffold the `graphs:` map with one or more entries**; "init with specific graphs" = the scaffolded `graphs:` block (embedded `uri:` locally; the agent/operator adds remote `server:` entries via `login` + editing).
+- **Secrets-on-scaffold rule** (prisma/dbt/supabase all do this): anything that writes a token or `.env`-shaped file also writes/updates `.gitignore` to exclude it. `init`/`login` must keep the `auth.env_file` git-ignored.
 
 ### 8. Concrete shape
 
