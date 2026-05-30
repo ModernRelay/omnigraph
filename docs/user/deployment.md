@@ -20,6 +20,8 @@ Build or install:
 - `omnigraph`
 - `omnigraph-server`
 
+On Windows, the binaries are `omnigraph.exe` and `omnigraph-server.exe`.
+
 Run against a local graph:
 
 ```bash
@@ -141,8 +143,10 @@ The server binary ships in two flavors:
 | **AWS** | `cargo build --release --features aws` | Adds AWS Secrets Manager backend for bearer tokens |
 
 Tagged release archives contain the default `omnigraph` and
-`omnigraph-server` binaries. AWS-enabled server binaries are built from source
-with `cargo build --release --features aws -p omnigraph-server` when needed.
+`omnigraph-server` binaries on macOS / Linux, and `omnigraph.exe` plus
+`omnigraph-server.exe` on Windows. AWS-enabled server binaries are built from
+source with `cargo build --release --features aws -p omnigraph-server` when
+needed.
 
 The AWS build adds ~150 transitive deps and ~30-60s of first-build compile
 time. Default builds don't pay that cost.
