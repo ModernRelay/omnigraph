@@ -14,7 +14,7 @@ Omnigraph acts as operational state & coordination layer for agents
 - VPC, On-prem, hybrid deployment
 - Lance format as storage layer
 
-| AS CODE | |
+| AS CODE | What it means |
 |---|---|
 | **Schema AS CODE** | Typed `.pg` schemas, planned, applied, enforced |
 | **Context AS CODE** | Linted queries & agentic nudges, versioned and reusable |
@@ -23,7 +23,7 @@ Omnigraph acts as operational state & coordination layer for agents
 
 ## Core Use Cases
 
-| Use case | |
+| Use case | What it's for |
 |---|---|
 | **Company brain** | Org knowledge unified into one queryable graph |
 | **Context graph** | Decision traces and codified tribal knowledge |
