@@ -169,6 +169,37 @@ impl CommitGraph {
         self.refresh().await
     }
 
+    /// Idempotently drop the commit-graph branch `name`, tolerating an
+    /// already-absent branch (see [`TableStore::force_delete_branch`] for the
+    /// same semantics). Used by the best-effort reclaim in `branch_delete` and
+    /// the `cleanup` orphan reconciler. `RefConflict` (referencing descendants)
+    /// is still surfaced.
+    pub async fn force_delete_branch(&mut self, name: &str) -> Result<()> {
+        let mut ds = Dataset::open(&graph_commits_uri(&self.root_uri))
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        match ds.force_delete_branch(name).await {
+            Ok(()) => {}
+            Err(lance::Error::RefNotFound { .. }) | Err(lance::Error::NotFound { .. }) => {}
+            Err(e) => return Err(OmniError::Lance(e.to_string())),
+        }
+        self.refresh().await
+    }
+
+    /// List the named branches present on the commit-graph dataset. The
+    /// `cleanup` reconciler diffs this against the manifest branch set to find
+    /// orphaned commit-graph branches to reclaim.
+    pub async fn list_branches(&self) -> Result<Vec<String>> {
+        let ds = Dataset::open(&graph_commits_uri(&self.root_uri))
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let branches = ds
+            .list_branches()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        Ok(branches.into_keys().collect())
+    }
+
     pub async fn append_commit(
         &mut self,
         manifest_branch: Option<&str>,

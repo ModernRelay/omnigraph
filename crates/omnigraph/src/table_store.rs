@@ -177,6 +177,30 @@ impl TableStore {
             .map_err(|e| OmniError::Lance(e.to_string()))
     }
 
+    /// Idempotently drop `branch` from the dataset at `dataset_uri`.
+    ///
+    /// Unlike [`delete_branch`](Self::delete_branch), this tolerates an
+    /// already-absent branch — both a missing contents ref (Lance's
+    /// `force_delete_branch` handles that) and a missing `tree/{branch}/`
+    /// directory (the local-store `NotFound` quirk pinned by
+    /// `lance_surface_guards::force_delete_branch_semantics`). Safe to call on a
+    /// possibly-orphaned or already-reclaimed fork.
+    ///
+    /// A branch that still has referencing descendants (`RefConflict`) is NOT
+    /// tolerated: that is a real ordering error and surfaces as `OmniError::Lance`.
+    /// Used by the eager best-effort reclaim in `cleanup_deleted_branch_tables`
+    /// and the `cleanup` orphan reconciler.
+    pub async fn force_delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()> {
+        let mut ds = Dataset::open(dataset_uri)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        match ds.force_delete_branch(branch).await {
+            Ok(()) => Ok(()),
+            Err(lance::Error::RefNotFound { .. }) | Err(lance::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(OmniError::Lance(e.to_string())),
+        }
+    }
+
     pub async fn open_dataset_at_state(
         &self,
         table_path: &str,
