@@ -7,27 +7,31 @@
 
 **Lakehouse native graph engine built for context assembly**
 
-Schema AS CODE<br>
-Context AS CODE<br>
-Security AS CODE<br>
-Dashboards AS CODE
+Omnigraph acts as operational state & coordination layer for agents
 
-- Git-style snapshots & branching<br>
-- Object storage native (S3, RustFS)<br>
-- VPC, On-prem, hybrid deployment<br>
+- Git-style snapshots & branching
+- Object storage native (S3, RustFS)
+- VPC, On-prem, hybrid deployment
 - Lance format as storage layer
+
+| AS CODE | |
+|---|---|
+| **Schema AS CODE** | Typed `.pg` schemas, planned, applied, enforced |
+| **Context AS CODE** | Linted queries & agentic nudges, versioned and reusable |
+| **Security AS CODE** | Cedar policies enforced server-side on every mutation |
+| **Dashboards AS CODE** | Declarative views & controls over the graph *(coming)* |
 
 ## Core Use Cases
 
-- Company brain
-- Context graph
-- Agentic memory
-- Code & dev graph
-- R&D data layer
-- ML workflows
-- Karpathy's LLM wiki
-
-Omnigraph acts as operational state & coordination layer for agents
+| Use case | |
+|---|---|
+| **Company brain** | Org knowledge unified into one queryable graph |
+| **Context graph** | Decision traces and codified tribal knowledge |
+| **Agentic memory** | Durable, versioned memory for long-running agents |
+| **Dev graph** | Issues & dependency model for coding agents |
+| **R&D data layer** | Experiments & trials data written into branches |
+| **ML workflows** | Versioned, branchable graphs for training & eval |
+| **Karpathy's LLM wiki** | A living, agent-updatable knowledge base |
 
 ## Quick Install
 
