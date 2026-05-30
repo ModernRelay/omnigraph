@@ -16,6 +16,7 @@ use omnigraph_server::api::{
     BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorOutput, ExportRequest,
     IngestRequest, QueryRequest, ReadRequest, SchemaApplyRequest, SchemaOutput,
 };
+use omnigraph_server::queries::{QueryRegistry, RegistrySpec};
 use omnigraph_server::{AppState, build_app};
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -139,6 +140,73 @@ async fn init_graph_with_schema(schema: &str) -> tempfile::TempDir {
 
 fn graph_path(root: &Path) -> PathBuf {
     root.join("server.omni")
+}
+
+fn stored_query_registry(specs: &[(&str, &str, bool)]) -> QueryRegistry {
+    QueryRegistry::from_specs(
+        specs
+            .iter()
+            .map(|(name, source, expose)| RegistrySpec {
+                name: name.to_string(),
+                source: source.to_string(),
+                expose: *expose,
+                tool_name: None,
+            })
+            .collect(),
+    )
+    .expect("specs parse and key==symbol")
+}
+
+#[tokio::test]
+async fn server_boots_with_a_valid_stored_query_registry() {
+    // A stored query that type-checks against the fixture schema
+    // (`Person { name, age }`) must let the server boot.
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let registry = stored_query_registry(&[(
+        "find_person",
+        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
+        false,
+    )]);
+    let state = AppState::open_single_with_queries(
+        graph.to_string_lossy().to_string(),
+        vec![],
+        None,
+        registry,
+    )
+    .await;
+    assert!(state.is_ok(), "valid registry should boot: {:?}", state.err());
+}
+
+#[tokio::test]
+async fn server_refuses_boot_on_type_broken_stored_query() {
+    // A stored query referencing a type not in the schema (`Widget`)
+    // must abort boot, naming the offending query.
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let registry = stored_query_registry(&[(
+        "ghost",
+        "query ghost() { match { $w: Widget } return { $w.name } }",
+        false,
+    )]);
+    let result = AppState::open_single_with_queries(
+        graph.to_string_lossy().to_string(),
+        vec![],
+        None,
+        registry,
+    )
+    .await;
+    // `AppState` is not `Debug`, so match rather than `expect_err`.
+    let err = match result {
+        Ok(_) => panic!("type-broken stored query must refuse boot"),
+        Err(err) => err,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("ghost"), "error should name the broken query: {msg}");
+    assert!(
+        msg.contains("schema check"),
+        "error should mention the schema check: {msg}"
+    );
 }
 
 fn drifted_test_schema() -> String {
