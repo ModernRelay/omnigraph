@@ -18,8 +18,8 @@ Omnigraph acts as operational state & coordination layer for agents
 |---|---|
 | **Schema AS CODE** | Typed `.pg` schemas, planned, applied, enforced |
 | **Context AS CODE** | Linted queries & agentic nudges, versioned and reusable |
-| **Security** | Cedar policies enforced server-side on every mutation |
-| **Dashboards** | Declarative views & controls over the graph *(coming)* |
+| **Security AS CODE** | Cedar policies enforced server-side on every mutation |
+| **Dashboards AS CODE** | Declarative views & controls over the graph *(coming)* |
 
 ## Core Use Cases
 
