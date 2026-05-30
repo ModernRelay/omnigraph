@@ -910,7 +910,7 @@ pub fn load_server_settings(
         // Single mode uses the top-level `queries:` (mirrors top-level
         // `policy.file`). Load + identity-check now (no engine needed);
         // the schema type-check happens when the engine opens.
-        let queries = QueryRegistry::load(&config, config.query_entries())
+        let queries = QueryRegistry::load(&config, config.query_entries_for(None))
             .map_err(|errs| color_eyre::eyre::eyre!(format_registry_load_errors(&uri, &errs)))?;
         ServerConfigMode::Single {
             uri,
@@ -939,9 +939,11 @@ pub fn load_server_settings(
             let uri = normalize_root_uri(&raw_uri).wrap_err_with(|| {
                 format!("normalize URI '{raw_uri}' for graph '{name}' in omnigraph.yaml")
             })?;
-            // Per-graph `queries:`. Load + identity-check now; the schema
-            // type-check happens when this graph's engine opens.
-            let queries = QueryRegistry::load(&config, &target.queries)
+            // Per-graph `queries:`, selected through the shared
+            // `query_entries_for` so server and CLI resolve identically.
+            // Load + identity-check now; the schema type-check happens
+            // when this graph's engine opens.
+            let queries = QueryRegistry::load(&config, config.query_entries_for(Some(name.as_str())))
                 .map_err(|errs| color_eyre::eyre::eyre!(format_registry_load_errors(name, &errs)))?;
             graphs.push(GraphStartupConfig {
                 graph_id: name.clone(),

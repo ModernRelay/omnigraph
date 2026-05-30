@@ -1679,19 +1679,15 @@ struct QueriesListOutput {
     queries: Vec<QueriesListItem>,
 }
 
-/// Resolve the stored-query registry entries for the selected graph,
-/// mirroring the server: a named graph in `graphs:` uses its per-graph
-/// `queries:`; otherwise the top-level `queries:` (single-graph mode).
+/// Resolve the stored-query registry entries for the selected graph via
+/// the same `query_entries_for` the server boot uses, so the CLI
+/// validates exactly the block the server would load. A `--target`
+/// overrides the configured default graph.
 fn registry_entries<'a>(
     config: &'a OmnigraphConfig,
     target: Option<&str>,
 ) -> &'a std::collections::BTreeMap<String, omnigraph_server::config::QueryEntry> {
-    match target.or_else(|| config.cli_graph_name()) {
-        Some(name) if config.graphs.contains_key(name) => config
-            .target_query_entries(name)
-            .unwrap_or_else(|| config.query_entries()),
-        _ => config.query_entries(),
-    }
+    config.query_entries_for(target.or_else(|| config.cli_graph_name()))
 }
 
 fn load_registry_or_report(config: &OmnigraphConfig, target: Option<&str>) -> Result<QueryRegistry> {

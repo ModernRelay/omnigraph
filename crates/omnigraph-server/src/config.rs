@@ -301,6 +301,20 @@ impl OmnigraphConfig {
         self.graphs.get(target_name).map(|target| &target.queries)
     }
 
+    /// The stored-query registry entries that apply for a graph
+    /// selection — the single definition of "which `queries:` block
+    /// governs graph X", shared by server boot and the CLI so the two
+    /// can't drift. A named graph present in `graphs:` uses its
+    /// per-graph block; everything else (no selection, or a name that is
+    /// not a known graph, e.g. a bare URI) falls back to the top-level
+    /// block (single-graph mode).
+    pub fn query_entries_for(&self, graph: Option<&str>) -> &BTreeMap<String, QueryEntry> {
+        match graph {
+            Some(name) if self.graphs.contains_key(name) => &self.graphs[name].queries,
+            _ => &self.queries,
+        }
+    }
+
     /// Resolve a stored-query `.gq` file path (from a registry entry),
     /// relative to the config's `base_dir`. Mirrors policy-file
     /// resolution; the registry loader calls this to turn each entry's
@@ -594,6 +608,14 @@ queries:
 
         // Top-level registry (single-graph mode).
         assert_eq!(config.query_entries().len(), 1);
+
+        // The shared selector resolves the same blocks the server boot
+        // and the CLI use: a known graph → its per-graph block; no
+        // selection or an unknown name → the top-level block (the latter
+        // pins the behavior of the CLI's now-deleted fallback arm).
+        assert_eq!(config.query_entries_for(Some("prod")).len(), 2);
+        assert_eq!(config.query_entries_for(None).len(), 1);
+        assert_eq!(config.query_entries_for(Some("nonexistent")).len(), 1);
 
         // Path resolution joins against base_dir, like policy files.
         assert_eq!(
