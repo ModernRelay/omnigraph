@@ -16,12 +16,12 @@ This page explains what the policy says and how to change it.
 | **Disallow force pushes** | `true` | No history rewrites on `main`. |
 | **Disallow branch deletions** | `true` | `main` cannot be deleted. |
 | **Required conversation resolution** | `true` | All review comment threads must be resolved before merge. |
-| **Enforce on admins** | `true` | Even repo admins go through the gates. The point is no bypasses. |
+| **Enforce on admins** | `true` | Even repository admins go through the gates. The point is no bypasses. |
 | **Required signed commits** | not yet | Not enabled. Would lock out maintainers until everyone enrolls GPG/SSH commit signing. Tracked as a follow-up. |
 
 ## How to apply
 
-Run from the repo root:
+Run from the repository root:
 
 ```bash
 ./scripts/apply-branch-protection.sh
@@ -29,7 +29,7 @@ Run from the repo root:
 
 The script reads `.github/branch-protection.json`, strips the human-readable `_comment` field (the GitHub API rejects unknown keys), and PUTs to `repos/ModernRelay/omnigraph/branches/main/protection`.
 
-Requires `gh` authenticated with a token that has admin permissions on the repo.
+Requires `gh` authenticated with a token that has admin permissions on the repository.
 
 To preview without applying:
 
@@ -57,7 +57,7 @@ Outputs the live policy. Compare against `.github/branch-protection.json` to det
 
 - **Audit trail**: `git log .github/branch-protection.json` shows every change with a reviewable diff and a merge commit.
 - **Disaster recovery**: if branch protection is accidentally removed or weakened via the UI, the JSON is the canonical recovery point.
-- **Consistency**: pairs with `.github/codeowners-roles.yml` (the CODEOWNERS source of truth). Repo policy lives in the repo.
+- **Consistency**: pairs with `.github/codeowners-roles.yml` (the CODEOWNERS source of truth). Repository policy lives in the repository.
 
 ## What this gates
 
@@ -69,7 +69,7 @@ After branch protection is applied, every PR targeting `main` must:
 4. Have all review conversations resolved.
 5. Be squash- or rebase-merged (no merge commits).
 
-Even repo admins are subject to these rules.
+Even repository admins are subject to these rules.
 
 ## Subsequent hardening (not in this PR)
 
@@ -77,7 +77,7 @@ The branch-protection policy is the foundation. Future hardening adds:
 
 - **Required signed commits** (`required_signatures: true`) — once maintainers enroll GPG/SSH signing.
 - **Tag protection** for `v*` tags via `repos/.../tags/protection`.
-- **Required reviewers from specific teams** for high-leverage paths (e.g., `docs/invariants.md`) via CODEOWNERS tier expansion + the N-unique-approvers CI workaround.
+- **Required reviewers from specific teams** for high-leverage paths (e.g., `docs/dev/invariants.md`) via CODEOWNERS tier expansion + the N-unique-approvers CI workaround.
 - **More required CI checks**: `cargo deny`, `cargo audit`, `cargo fmt --check`, `cargo clippy -D warnings`, CodeQL, secret scanning, schema-lint (MR-946).
 
 See the hardening playbook for the full plan.

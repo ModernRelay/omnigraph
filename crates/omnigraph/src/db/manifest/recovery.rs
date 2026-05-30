@@ -2,7 +2,7 @@
 //!
 //! This module implements the building blocks of the per-sidecar recovery
 //! sweep that closes the documented Phase B → Phase C residual (see
-//! `docs/runs.md` "Open-time recovery sweep"). The high-level shape:
+//! `docs/dev/runs.md` "Open-time recovery sweep"). The high-level shape:
 //!
 //! 1. Each writer that performs a multi-table commit writes a small JSON
 //!    sidecar at `__recovery/{ulid}.json` BEFORE its per-table
@@ -58,7 +58,7 @@ use super::{ManifestChange, SubTableUpdate, TableRegistration, TableTombstone};
 /// into the audit row's `recovery_for_actor` field.
 pub(crate) const RECOVERY_ACTOR: &str = "omnigraph:recovery";
 
-/// Subdirectory under the repo root holding sidecar files.
+/// Subdirectory under the graph root holding sidecar files.
 pub(crate) const RECOVERY_DIR_NAME: &str = "__recovery";
 
 /// Current sidecar JSON shape version. Bumping this is a breaking change:
@@ -142,7 +142,7 @@ pub(crate) struct SidecarTablePin {
 pub(crate) struct SidecarTableRegistration {
     /// Stable identifier (`node:Tag`, `edge:WorksAt`, etc.).
     pub table_key: String,
-    /// Repo-relative path the manifest will register
+    /// Graph-relative path the manifest will register
     /// (e.g. `nodes/{fnv1a64-hex}`); recovery joins this with `root_uri`
     /// to open the dataset Lance HEAD when constructing the
     /// accompanying `Update`.
@@ -274,8 +274,9 @@ pub(crate) enum TableClassification {
 ///
 /// **All-or-nothing**: the writer that produced the sidecar intended an
 /// atomic publish across every table it listed. Rolling forward only some
-/// of them would publish a partial commit and violate `docs/invariants.md`
-/// §VI.23. The decision is based on the worst classification:
+/// of them would publish a partial commit and violate the manifest-atomic
+/// graph visibility invariant in `docs/dev/invariants.md`. The decision is
+/// based on the worst classification:
 ///
 /// - Any `InvariantViolation` → `Abort` (operator action required).
 /// - Any `UnexpectedAtP1` / `UnexpectedMultistep` / `NoMovement` →
@@ -294,7 +295,7 @@ pub(crate) enum SidecarDecision {
     Abort,
 }
 
-/// Build the `__recovery/` directory URI under a repo root.
+/// Build the `__recovery/` directory URI under a graph root.
 pub(crate) fn recovery_dir_uri(root_uri: &str) -> String {
     let trimmed = root_uri.trim_end_matches('/');
     format!("{}/{}", trimmed, RECOVERY_DIR_NAME)
@@ -463,7 +464,7 @@ pub(crate) fn classify_table(
 
 /// Compute the per-sidecar decision from a slice of table classifications.
 ///
-/// All-or-nothing per `docs/invariants.md` §VI.23 — see [`SidecarDecision`].
+/// All-or-nothing per `docs/dev/invariants.md` -- see [`SidecarDecision`].
 pub(crate) fn decide(classifications: &[TableClassification]) -> SidecarDecision {
     use SidecarDecision::*;
     use TableClassification::*;
@@ -1121,7 +1122,7 @@ async fn record_audit(
 /// the rename so the recovery sweep's roll-forward step sees the new
 /// catalog. Without this, the disambiguation logic deletes the staging
 /// files (since manifest still pins the old table set) and leaves the
-/// repo with new-schema data on disk but the old `_schema.pg` live —
+/// graph with new-schema data on disk but the old `_schema.pg` live —
 /// real corruption.
 pub(crate) async fn has_schema_apply_sidecar(
     root_uri: &str,

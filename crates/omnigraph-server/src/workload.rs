@@ -270,12 +270,13 @@ mod tests {
         let err = controller
             .try_admit(&actor, 100)
             .expect_err("third should reject on count");
-        assert!(matches!(err, RejectReason::InFlightCountExceeded { cap: 2 }));
+        assert!(matches!(
+            err,
+            RejectReason::InFlightCountExceeded { cap: 2 }
+        ));
         drop(g1);
         // After drop, a new admit succeeds again.
-        let _g3 = controller
-            .try_admit(&actor, 100)
-            .expect("admit after drop");
+        let _g3 = controller.try_admit(&actor, 100).expect("admit after drop");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -356,7 +357,9 @@ mod tests {
         let bob: Arc<str> = "bob".into();
         let _ga = controller.try_admit(&alice, 100).expect("alice ok");
         // Alice over count cap, Bob unaffected.
-        let err = controller.try_admit(&alice, 100).expect_err("alice rejected");
+        let err = controller
+            .try_admit(&alice, 100)
+            .expect_err("alice rejected");
         assert!(matches!(err, RejectReason::InFlightCountExceeded { .. }));
         let _gb = controller.try_admit(&bob, 100).expect("bob ok");
     }

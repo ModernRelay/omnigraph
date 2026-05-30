@@ -121,8 +121,8 @@ async fn drive_actor(
     for op_idx in 0..ops {
         let table_idx = pick_table(actor_idx, op_idx, mode, num_tables);
         let request_body = ChangeRequest {
-            query_source: build_query_source(table_idx),
-            query_name: Some("insert_item".to_string()),
+            query: build_query_source(table_idx),
+            name: Some("insert_item".to_string()),
             params: Some(serde_json::json!({
                 "name": format!("a{actor_idx}_o{op_idx}"),
                 "value": op_idx as i32,
@@ -152,7 +152,9 @@ async fn drive_actor(
             errors += 1;
             // Drain body for logging on the first few failures.
             if errors <= 3 {
-                let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap_or_default();
+                let body = to_bytes(response.into_body(), 64 * 1024)
+                    .await
+                    .unwrap_or_default();
                 eprintln!(
                     "actor {actor_idx} op {op_idx} status {status} body {}",
                     String::from_utf8_lossy(&body)
@@ -173,13 +175,13 @@ async fn main() {
     }
 
     let temp = tempfile::tempdir().expect("tempdir");
-    let repo = temp.path().join("bench.omni");
+    let graph = temp.path().join("bench.omni");
     let schema = build_schema(args.tables);
-    Omnigraph::init(repo.to_str().unwrap(), &schema)
+    Omnigraph::init(graph.to_str().unwrap(), &schema)
         .await
-        .expect("init repo");
+        .expect("init graph");
 
-    let state = AppState::open(repo.to_string_lossy().to_string())
+    let state = AppState::open(graph.to_string_lossy().to_string())
         .await
         .expect("open AppState");
     let app = build_app(state);

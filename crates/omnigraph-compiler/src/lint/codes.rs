@@ -116,7 +116,13 @@ pub const ALL_CODES: &[DiagnosticCode] = &[
 ];
 
 /// Codes actually emitted by the planner in v0 (i.e. not reserved).
-pub const EMITTED_IN_V0: &[&str] = &["OG-DS-102", "OG-DS-103", "OG-DS-104", "OG-MF-103", "OG-MF-106"];
+pub const EMITTED_IN_V0: &[&str] = &[
+    "OG-DS-102",
+    "OG-DS-103",
+    "OG-DS-104",
+    "OG-MF-103",
+    "OG-MF-106",
+];
 
 /// Look up a code by its string identifier.
 pub fn lookup(code: &str) -> Option<&'static DiagnosticCode> {

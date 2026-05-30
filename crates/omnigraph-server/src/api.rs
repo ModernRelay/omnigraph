@@ -235,7 +235,9 @@ pub struct CommitListOutput {
 pub struct ReadRequest {
     /// GQ query source. May declare one or more named queries; pick one with
     /// `query_name` if there is more than one.
-    #[schema(example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}")]
+    #[schema(
+        example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
+    )]
     pub query_source: String,
     /// Name of the query to run when `query_source` declares multiple. Optional
     /// when only one query is declared.
@@ -248,26 +250,70 @@ pub struct ReadRequest {
     pub snapshot: Option<String>,
 }
 
+/// Inline read-query request for `POST /query`.
+///
+/// Friendlier-named alternative to [`ReadRequest`] for ad-hoc reads and
+/// AI-agent integration. Mutations are rejected with 400 — use `POST
+/// /mutate` (or its deprecated alias `POST /change`) for write queries.
+/// Field names are deliberately short (`query`, `name`) to match the GQ
+/// keyword and the CLI `-e` flag.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ChangeRequest {
-    /// GQ mutation source containing `insert`, `update`, or `delete` statements.
-    /// May declare multiple named mutations; pick one with `query_name`.
-    #[schema(example = "query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}")]
-    pub query_source: String,
-    /// Name of the mutation to run when `query_source` declares multiple.
-    pub query_name: Option<String>,
-    /// JSON object whose keys match the mutation's declared parameters.
+pub struct QueryRequest {
+    /// GQ read-query source. May declare one or more named queries; pick one
+    /// with `name` when more than one is declared. Mutations
+    /// (`insert`/`update`/`delete`) get 400 — use `POST /mutate` (or its
+    /// deprecated alias `POST /change`) instead.
+    #[schema(example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}")]
+    pub query: String,
+    /// Name of the query to run when `query` declares multiple. Optional when
+    /// only one query is declared.
+    pub name: Option<String>,
+    /// JSON object whose keys match the query's declared parameters.
     pub params: Option<Value>,
-    /// Target branch. Defaults to `main`.
+    /// Branch to read from. Mutually exclusive with `snapshot`. Defaults to `main`.
     pub branch: Option<String>,
+    /// Snapshot id to read from. Mutually exclusive with `branch`.
+    pub snapshot: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ChangeRequest {
+    /// GQ mutation source containing `insert`, `update`, or `delete` statements.
+    /// May declare multiple named mutations; pick one with `name`.
+    ///
+    /// Accepts the legacy field name `query_source` as a deserialization alias.
+    #[schema(
+        example = "query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}"
+    )]
+    #[serde(alias = "query_source")]
+    pub query: String,
+    /// Name of the mutation to run when `query` declares multiple.
+    ///
+    /// Accepts the legacy field name `query_name` as a deserialization alias.
+    #[serde(default, alias = "query_name")]
+    pub name: Option<String>,
+    /// JSON object whose keys match the mutation's declared parameters.
+    #[serde(default)]
+    pub params: Option<Value>,
+    /// Target branch. Defaults to `main`.
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct SchemaApplyRequest {
     /// Project schema in `.pg` source form. The diff against the current
     /// schema produces the migration steps that will be applied.
-    #[schema(example = "node Person {\n    name: String @key\n    age: I32?\n}\n\nedge Knows: Person -> Person")]
+    #[schema(
+        example = "node Person {\n    name: String @key\n    age: I32?\n}\n\nedge Knows: Person -> Person"
+    )]
     pub schema_source: String,
+    /// When true, promote every `DropMode::Soft` step in the plan to
+    /// `DropMode::Hard`, making the prior column data unreachable
+    /// after the apply. Matches the CLI's `--allow-data-loss` flag.
+    /// Defaults to `false` (drops remain reversible via time travel).
+    #[serde(default)]
+    pub allow_data_loss: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -297,7 +343,9 @@ pub struct IngestRequest {
     pub mode: Option<LoadMode>,
     /// NDJSON payload: one record per line, each shaped
     /// `{"type": "<TypeName>", "data": {...}}`.
-    #[schema(example = "{\"type\": \"Person\", \"data\": {\"name\": \"Alice\", \"age\": 30}}\n{\"type\": \"Person\", \"data\": {\"name\": \"Bob\", \"age\": 25}}")]
+    #[schema(
+        example = "{\"type\": \"Person\", \"data\": {\"name\": \"Alice\", \"age\": 30}}\n{\"type\": \"Person\", \"data\": {\"name\": \"Bob\", \"age\": 25}}"
+    )]
     pub data: String,
 }
 
@@ -338,6 +386,11 @@ pub enum ErrorCode {
     Forbidden,
     BadRequest,
     NotFound,
+    /// 405 Method Not Allowed — the route exists but the active server
+    /// mode doesn't serve this method (e.g. `GET /graphs` in single-graph
+    /// mode). Distinct from 404 so clients can tell "wrong context" from
+    /// "no such resource."
+    MethodNotAllowed,
     Conflict,
     /// 429 Too Many Requests — per-actor admission cap exceeded.
     /// Clients should respect the `Retry-After` header.
@@ -460,4 +513,24 @@ pub fn read_target_output(target: &ReadTarget) -> ReadTargetOutput {
             snapshot: Some(snapshot.as_str().to_string()),
         },
     }
+}
+
+// ─── MR-668 — management endpoint shapes ──────────────────────────────────
+
+/// One entry in the response from `GET /graphs`. Cluster operators
+/// consume this list to discover which graphs the server is currently
+/// serving. The shape is intentionally minimal — `graph_id` and `uri`
+/// are the only fields a routing client needs.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GraphInfo {
+    pub graph_id: String,
+    pub uri: String,
+}
+
+/// Response from `GET /graphs`. Lists every graph registered with the
+/// server in alphabetical order by `graph_id` (sorted server-side so
+/// clients get deterministic output across requests).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GraphListResponse {
+    pub graphs: Vec<GraphInfo>,
 }

@@ -10,11 +10,15 @@
 //! ## Transitional residuals on the trait
 //!
 //! Several inline-commit methods remain on the trait surface as
-//! documented residuals: `delete_where` (Lance 4.0.0's `DeleteJob` is
-//! `pub(crate)` — see [#6658](https://github.com/lance-format/lance/issues/6658)),
+//! documented residuals: `delete_where`
+//! ([#6658](https://github.com/lance-format/lance/issues/6658) closed
+//! 2026-05-14, but the public `DeleteBuilder::execute_uncommitted` API
+//! did not backport to the 6.x release line — it first ships in
+//! `v7.0.0-beta.10`. Migration to staged two-phase delete is tracked as
+//! MR-A and is gated on the Lance v7.x bump, not the current v6.0.1 pin),
 //! `create_vector_index` (segment-commit-path requires
 //! `build_index_metadata_from_segments` which is `pub(crate)` — see
-//! [#6666](https://github.com/lance-format/lance/issues/6666)), and the
+//! [#6666](https://github.com/lance-format/lance/issues/6666), still open), and the
 //! legacy `append_batch` / `merge_insert_batches` / `overwrite_batch` /
 //! `create_btree_index` / `create_inverted_index` paths kept while
 //! engine call sites finish migrating off of them (Phase 1b / Phase 9
@@ -33,8 +37,8 @@
 //! `SnapshotHandle` and `StagedHandle` wrap `lance::Dataset` and
 //! `StagedWrite` respectively. Their inner Lance types are
 //! `pub(crate)` — engine code outside `table_store` cannot reach
-//! through. This is the §III.9 alignment: `lance::Dataset` does not
-//! appear in trait signatures.
+//! through. This aligns with the storage-boundary invariant:
+//! `lance::Dataset` does not appear in trait signatures.
 //!
 //! ## Migration status (MR-793 PR #70)
 //!
@@ -90,7 +94,9 @@ impl SnapshotHandle {
     /// Construct from a Lance dataset. `pub(crate)` — only
     /// `TableStore` should produce these.
     pub(crate) fn new(ds: Dataset) -> Self {
-        Self { inner: Arc::new(ds) }
+        Self {
+            inner: Arc::new(ds),
+        }
     }
 
     /// Borrow the underlying Lance dataset. `pub(crate)` so only the
@@ -238,16 +244,10 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
 
     async fn scan_batches(&self, snapshot: &SnapshotHandle) -> Result<Vec<RecordBatch>>;
 
-    async fn scan_batches_for_rewrite(
-        &self,
-        snapshot: &SnapshotHandle,
-    ) -> Result<Vec<RecordBatch>>;
+    async fn scan_batches_for_rewrite(&self, snapshot: &SnapshotHandle)
+    -> Result<Vec<RecordBatch>>;
 
-    async fn count_rows(
-        &self,
-        snapshot: &SnapshotHandle,
-        filter: Option<String>,
-    ) -> Result<usize>;
+    async fn count_rows(&self, snapshot: &SnapshotHandle, filter: Option<String>) -> Result<usize>;
 
     async fn count_rows_with_staged(
         &self,
@@ -280,11 +280,8 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         filter: &str,
     ) -> Result<Option<u64>>;
 
-    async fn table_state(
-        &self,
-        dataset_uri: &str,
-        snapshot: &SnapshotHandle,
-    ) -> Result<TableState>;
+    async fn table_state(&self, dataset_uri: &str, snapshot: &SnapshotHandle)
+    -> Result<TableState>;
 
     // ── Staged writes (no HEAD advance) ────────────────────────────────
 
@@ -561,11 +558,7 @@ impl TableStorage for TableStore {
         TableStore::scan_batches_for_rewrite(self, snapshot.dataset()).await
     }
 
-    async fn count_rows(
-        &self,
-        snapshot: &SnapshotHandle,
-        filter: Option<String>,
-    ) -> Result<usize> {
+    async fn count_rows(&self, snapshot: &SnapshotHandle, filter: Option<String>) -> Result<usize> {
         TableStore::count_rows(self, snapshot.dataset(), filter).await
     }
 
@@ -587,14 +580,8 @@ impl TableStorage for TableStore {
         filter: Option<&str>,
     ) -> Result<Vec<RecordBatch>> {
         let staged_writes = staged_handles_as_writes(staged);
-        TableStore::scan_with_staged(
-            self,
-            snapshot.dataset(),
-            &staged_writes,
-            projection,
-            filter,
-        )
-        .await
+        TableStore::scan_with_staged(self, snapshot.dataset(), &staged_writes, projection, filter)
+            .await
     }
 
     async fn scan_with_pending(
@@ -654,18 +641,10 @@ impl TableStorage for TableStore {
         when_matched: WhenMatched,
         when_not_matched: WhenNotMatched,
     ) -> Result<StagedHandle> {
-        let ds = Arc::try_unwrap(snapshot.into_arc())
-            .unwrap_or_else(|arc| (*arc).clone());
-        TableStore::stage_merge_insert(
-            self,
-            ds,
-            batch,
-            key_columns,
-            when_matched,
-            when_not_matched,
-        )
-        .await
-        .map(StagedHandle::new)
+        let ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
+        TableStore::stage_merge_insert(self, ds, batch, key_columns, when_matched, when_not_matched)
+            .await
+            .map(StagedHandle::new)
     }
 
     async fn commit_staged(
@@ -716,8 +695,7 @@ impl TableStorage for TableStore {
         snapshot: SnapshotHandle,
         batch: RecordBatch,
     ) -> Result<(SnapshotHandle, TableState)> {
-        let mut ds = Arc::try_unwrap(snapshot.into_arc())
-            .unwrap_or_else(|arc| (*arc).clone());
+        let mut ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
         let state = TableStore::append_batch(self, dataset_uri, &mut ds, batch).await?;
         Ok((SnapshotHandle::new(ds), state))
     }
@@ -731,8 +709,7 @@ impl TableStorage for TableStore {
         when_matched: WhenMatched,
         when_not_matched: WhenNotMatched,
     ) -> Result<TableState> {
-        let ds = Arc::try_unwrap(snapshot.into_arc())
-            .unwrap_or_else(|arc| (*arc).clone());
+        let ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
         TableStore::merge_insert_batches(
             self,
             dataset_uri,
@@ -751,8 +728,7 @@ impl TableStorage for TableStore {
         snapshot: SnapshotHandle,
         batch: RecordBatch,
     ) -> Result<(SnapshotHandle, TableState)> {
-        let mut ds = Arc::try_unwrap(snapshot.into_arc())
-            .unwrap_or_else(|arc| (*arc).clone());
+        let mut ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
         let state = TableStore::overwrite_batch(self, dataset_uri, &mut ds, batch).await?;
         Ok((SnapshotHandle::new(ds), state))
     }
@@ -763,8 +739,7 @@ impl TableStorage for TableStore {
         snapshot: SnapshotHandle,
         filter: &str,
     ) -> Result<(SnapshotHandle, DeleteState)> {
-        let mut ds = Arc::try_unwrap(snapshot.into_arc())
-            .unwrap_or_else(|arc| (*arc).clone());
+        let mut ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
         let state = TableStore::delete_where(self, dataset_uri, &mut ds, filter).await?;
         Ok((SnapshotHandle::new(ds), state))
     }
@@ -786,8 +761,7 @@ impl TableStorage for TableStore {
         snapshot: SnapshotHandle,
         columns: &[&str],
     ) -> Result<SnapshotHandle> {
-        let mut ds = Arc::try_unwrap(snapshot.into_arc())
-            .unwrap_or_else(|arc| (*arc).clone());
+        let mut ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
         TableStore::create_btree_index(self, &mut ds, columns).await?;
         Ok(SnapshotHandle::new(ds))
     }
@@ -797,8 +771,7 @@ impl TableStorage for TableStore {
         snapshot: SnapshotHandle,
         column: &str,
     ) -> Result<SnapshotHandle> {
-        let mut ds = Arc::try_unwrap(snapshot.into_arc())
-            .unwrap_or_else(|arc| (*arc).clone());
+        let mut ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
         TableStore::create_inverted_index(self, &mut ds, column).await?;
         Ok(SnapshotHandle::new(ds))
     }
@@ -808,8 +781,7 @@ impl TableStorage for TableStore {
         snapshot: SnapshotHandle,
         column: &str,
     ) -> Result<SnapshotHandle> {
-        let mut ds = Arc::try_unwrap(snapshot.into_arc())
-            .unwrap_or_else(|arc| (*arc).clone());
+        let mut ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
         TableStore::create_vector_index(self, &mut ds, column).await?;
         Ok(SnapshotHandle::new(ds))
     }
@@ -833,6 +805,13 @@ impl TableStorage for TableStore {
         // Note: existing TableStore::scan_stream is an associated fn that
         // takes &Dataset, so we delegate via the dataset reference held by
         // the snapshot.
-        TableStore::scan_stream(snapshot.dataset(), projection, filter, order_by, with_row_id).await
+        TableStore::scan_stream(
+            snapshot.dataset(),
+            projection,
+            filter,
+            order_by,
+            with_row_id,
+        )
+        .await
     }
 }

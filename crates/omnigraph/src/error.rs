@@ -85,6 +85,21 @@ pub enum OmniError {
     Manifest(ManifestError),
     #[error("merge conflicts: {0:?}")]
     MergeConflicts(Vec<MergeConflict>),
+    /// Engine-layer policy enforcement (MR-722). Wraps either a policy
+    /// denial ("you can't do that") or a policy-evaluation failure
+    /// ("the policy engine itself blew up"). The HTTP layer maps
+    /// denials to 403 and evaluation failures to 500; CLI and embedded
+    /// callers can match on this variant directly.
+    #[error("policy: {0}")]
+    Policy(String),
+    /// `Omnigraph::init` was called against a URI that already holds
+    /// schema artifacts from a previous init. Strict mode (the default)
+    /// fails fast with this error before touching disk so an existing
+    /// graph's metadata cannot be overwritten or destroyed. Operators
+    /// who actually want to overwrite pass `InitOptions { force: true }`
+    /// (CLI: `omnigraph init --force`).
+    #[error("graph already initialized at '{uri}'; pass --force to overwrite")]
+    AlreadyInitialized { uri: String },
 }
 
 impl OmniError {

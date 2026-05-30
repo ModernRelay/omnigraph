@@ -10,7 +10,7 @@ Three views, increasing zoom:
 2. **Layer view** — the eight-layer stack inside one OmniGraph process.
 3. **Component zoom-ins** — what's inside each layer.
 
-For runtime flows (read query, mutation), see [`docs/execution.md`](execution.md). For the on-disk layout of a repo, see [`docs/storage.md`](storage.md).
+For runtime flows (read query, mutation), see [`docs/dev/execution.md`](execution.md). For the on-disk layout of a graph, see [`docs/user/storage.md`](../user/storage.md).
 
 L1 (orange in the diagrams) is what we inherit from Lance; L2 (blue) is what OmniGraph adds. The L1/L2 framing is also called out in prose at the bottom of this doc.
 
@@ -63,7 +63,7 @@ flowchart TB
     subgraph engine[omnigraph engine]
         plan[exec query and mutation]:::l2
         gi[graph index CSR/CSC<br/>RuntimeCache LRU 8]:::l2
-        coord[coordinator<br/>ManifestRepo · CommitGraph]:::l2
+        coord[coordinator<br/>ManifestCoordinator · CommitGraph]:::l2
     end
 
     subgraph storage[storage trait — wraps Lance]
@@ -86,7 +86,7 @@ flowchart TB
     lance_layer -- bytes --> object_store
 ```
 
-The `storage trait` row is partly aspirational. Today the engine calls `lance::Dataset` methods through `table_store`; a capability-bearing `Dataset` trait per [`docs/invariants.md`](invariants.md) §I.4 is on the roadmap (MR-737). The diagram shows the intended seam.
+The storage seam is partly aspirational. `TableStorage` exists as the sealed staged-write trait, but capability/stat surfaces and full call-site migration are still roadmap. The diagram shows the intended boundary.
 
 ## Component zoom-ins
 
@@ -132,7 +132,7 @@ flowchart TB
 
     subgraph state[graph state]
         coord[GraphCoordinator]:::l2
-        mr[ManifestRepo<br/>db/manifest.rs]:::l2
+        mr[ManifestCoordinator<br/>db/manifest.rs]:::l2
         cg[CommitGraph<br/>_graph_commits.lance]:::l2
         stg[MutationStaging<br/>per-query in-memory accumulator<br/>exec/staging.rs]:::l2
     end
@@ -166,7 +166,7 @@ Code paths:
 
 - Read entry: `Omnigraph::query` at `crates/omnigraph/src/exec/query.rs:7`
 - Mutation entry: `Omnigraph::mutate` at `crates/omnigraph/src/exec/mutation.rs:511`
-- Manifest commit: `ManifestRepo::commit` at `crates/omnigraph/src/db/manifest.rs:280`
+- Manifest commit: `ManifestCoordinator::commit` at `crates/omnigraph/src/db/manifest.rs:280`
 - Graph index: `crates/omnigraph/src/graph_index/`
 - Loader: `Omnigraph::ingest` at `crates/omnigraph/src/loader/mod.rs:74`
 
@@ -174,7 +174,7 @@ Code paths:
 
 Inserts and updates inside `mutate_as` and the bulk loader's
 Append/Merge modes go through `MutationStaging`
-([`crates/omnigraph/src/exec/staging.rs`](../crates/omnigraph/src/exec/staging.rs)),
+([`crates/omnigraph/src/exec/staging.rs`](../../crates/omnigraph/src/exec/staging.rs)),
 a per-query in-memory accumulator. No Lance HEAD advance happens during
 op execution; one `stage_*` + `commit_staged` per touched table runs
 at end-of-query, then the publisher commits the manifest atomically.
@@ -204,11 +204,10 @@ contracts:
   the committed snapshot at the captured `expected_version` and unions
   with a DataFusion `MemTable` over the pending batches.
 
-This pattern realizes [docs/invariants.md §VI.25](invariants.md)
-(read-your-writes within a multi-statement mutation) and §VI.32
-(failure scope bounded) for inserts/updates by construction at the
-writer layer. See [docs/runs.md](runs.md) for the publisher CAS
-contract this builds on.
+This pattern realizes read-your-writes within a multi-statement mutation
+and keeps failure scope bounded for inserts/updates by construction at
+the writer layer. See [docs/dev/invariants.md](invariants.md) and
+[docs/dev/runs.md](runs.md) for the publisher CAS contract this builds on.
 
 ### Storage trait — today vs. roadmap
 
@@ -222,10 +221,10 @@ flowchart LR
         d2[storage.rs<br/>S3 / file URI plumbing]:::now
     end
 
-    subgraph roadmap[Roadmap — invariants §I.4]
+    subgraph roadmap[Roadmap - storage capabilities]
         t[trait Dataset<br/>schema · stats · placement<br/>capabilities · scan · write]:::future
         impl1[LanceStorage]:::future
-        impl2[MemStorage for tests]:::future
+        impl2[future test impl]:::future
     end
 
     today -.-> roadmap
@@ -233,7 +232,7 @@ flowchart LR
     t --> impl2
 ```
 
-The storage layer's trait surface is aspirational. Today the engine calls `lance::Dataset` methods directly. The roadmap (per [`docs/invariants.md`](invariants.md) §I.4 and MR-737) is a `Dataset` trait that surfaces capabilities and statistics so the planner can reason about pushdown opportunities.
+The staged-write trait exists today as `TableStorage`, implemented by `TableStore`. Full engine migration plus capability and statistics surfaces remain roadmap, so the planner cannot yet reason about all pushdown opportunities through a documented trait surface.
 
 ### Index lifecycle — today vs. roadmap
 
@@ -247,7 +246,7 @@ flowchart LR
         manual[called manually<br/>or from optimize]:::now
     end
 
-    subgraph roadmap[Roadmap — invariants §VII.38]
+    subgraph roadmap[Roadmap - manifest reconciler]
         rec[Reconciler<br/>observes manifest]:::future
         diff[coverage diff<br/>fragments − fragment_bitmap]:::future
         wp[worker pool<br/>builds index segments]:::future
@@ -258,7 +257,7 @@ flowchart LR
     rec --> diff --> wp
 ```
 
-Today, indexes are built explicitly via `ensure_indices`. Reads degrade gracefully when index coverage is partial — Lance's scanner unions indexed and scan paths automatically. The roadmap reconciler (per [`docs/invariants.md`](invariants.md) §VII.38) observes manifest state and converges coverage in the background.
+Today, indexes are built explicitly via `ensure_indices`. Reads degrade gracefully when index coverage is partial — Lance's scanner unions indexed and scan paths automatically. The roadmap reconciler observes manifest state and converges coverage in the background.
 
 ### Server / CLI
 
@@ -279,7 +278,7 @@ flowchart LR
     eng --> wq
 ```
 
-The server applies Cedar policy at the HTTP boundary today (per [`docs/invariants.md`](invariants.md) §VII.45, the roadmap is to push policy into the planner as predicates). After Cedar, mutating handlers go through `WorkloadController` (per-actor admission cap + byte budget; PR 2 / MR-686) before reaching the engine. The engine itself holds an `Arc<WriteQueueManager>` so concurrent mutations on the same `(table, branch)` serialize at the queue, while disjoint keys run in parallel — see [server.md](server.md) "Per-actor admission control" and [runs.md](runs.md). The CLI bypasses the HTTP layer (and admission) and calls the engine API directly.
+The server applies Cedar policy at the HTTP boundary today. The roadmap, called out in [docs/dev/invariants.md](invariants.md) as a known gap, is to push policy into the planner as predicates. After Cedar, mutating handlers go through `WorkloadController` (per-actor admission cap + byte budget; PR 2 / MR-686) before reaching the engine. The engine itself holds an `Arc<WriteQueueManager>` so concurrent mutations on the same `(table, branch)` serialize at the queue, while disjoint keys run in parallel — see [docs/user/server.md](../user/server.md) "Per-actor admission control" and [docs/dev/runs.md](runs.md). The CLI bypasses the HTTP layer (and admission) and calls the engine API directly.
 
 Code paths:
 

@@ -24,5 +24,5 @@
 pub mod codes;
 pub mod diagnostic;
 
-pub use codes::{lookup, DiagnosticCode, ALL_CODES};
+pub use codes::{ALL_CODES, DiagnosticCode, lookup};
 pub use diagnostic::{Family, SafetyTier, Severity};

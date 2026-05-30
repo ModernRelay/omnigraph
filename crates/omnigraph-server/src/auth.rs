@@ -119,7 +119,10 @@ pub(crate) fn parse_json_secret_payload(payload: &str) -> Result<Vec<(String, St
             bail!("bearer-token secret contains a blank actor id");
         }
         if token.is_empty() {
-            bail!("bearer-token secret has a blank token for actor '{}'", actor);
+            bail!(
+                "bearer-token secret has a blank token for actor '{}'",
+                actor
+            );
         }
         pairs.push((actor, token));
     }
@@ -151,8 +154,7 @@ pub mod aws {
         /// Construct a new source. Resolves AWS credentials + region via the
         /// default chain — no explicit configuration needed on EC2/ECS/EKS.
         pub async fn new(secret_id: impl Into<String>) -> Result<Self> {
-            let config =
-                aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+            let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
             let client = aws_sdk_secretsmanager::Client::new(&config);
             Ok(Self {
                 client,
@@ -200,8 +202,8 @@ pub use aws::SecretsManagerTokenSource;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
     use serial_test::serial;
+    use std::env;
 
     fn clear_env() {
         unsafe {
@@ -232,7 +234,10 @@ mod tests {
         unsafe {
             env::remove_var("OMNIGRAPH_SERVER_BEARER_TOKEN");
         }
-        assert_eq!(tokens, vec![("default".to_string(), "some-token".to_string())]);
+        assert_eq!(
+            tokens,
+            vec![("default".to_string(), "some-token".to_string())]
+        );
     }
 
     #[tokio::test]

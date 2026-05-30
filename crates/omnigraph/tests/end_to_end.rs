@@ -1866,3 +1866,70 @@ async fn ensure_indices_does_not_error_on_repeated_call() {
     let ds = snap.open("node:Person").await.unwrap();
     assert_eq!(ds.count_rows(None).await.unwrap(), 4);
 }
+
+// ─── DataFusion-Expr filter pushdown (Tier-1 follow-up to the Lance v6 bump) ──
+
+/// Regression for `CompOp::Contains` pushdown via `array_has` in
+/// `ir_filter_to_expr`. Before the Expr-pushdown refactor, the
+/// `ir_filter_to_sql` family returned `None` for list-contains (the
+/// comment said *"Can't pushdown list contains"*) and the predicate was
+/// applied post-scan in memory. With `Scanner::filter_expr(Expr)` and
+/// DF's `array_has` builtin, the contains predicate now pushes down to
+/// Lance — the test confirms results are correct AND the pushdown path
+/// is exercised (a regression on the pushdown would land all rows in
+/// the scan, then be filtered post-hoc; that still produces the right
+/// count so this test pins correctness, while `lance_surface_guards.rs`
+/// is the structural pin for the surface itself).
+#[tokio::test]
+async fn ir_filter_with_list_contains_pushes_down() {
+    let schema = r#"
+node Doc {
+    slug: String @key
+    tags: [String]
+}
+"#;
+    let data = r#"{"type":"Doc","data":{"slug":"alpha","tags":["red","blue"]}}
+{"type":"Doc","data":{"slug":"bravo","tags":["green"]}}
+{"type":"Doc","data":{"slug":"charlie","tags":["red","green"]}}
+{"type":"Doc","data":{"slug":"delta","tags":[]}}"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Omnigraph::init(dir.path().to_str().unwrap(), schema)
+        .await
+        .unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let queries = r#"
+query docs_with_tag($tag: String) {
+    match {
+        $d: Doc
+        $d.tags contains $tag
+    }
+    return { $d.slug }
+}
+"#;
+    let result = query_main(
+        &mut db,
+        queries,
+        "docs_with_tag",
+        &params(&[("$tag", "red")]),
+    )
+    .await
+    .unwrap();
+
+    let batch = result.concat_batches().unwrap();
+    let slugs = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut got: Vec<&str> = (0..slugs.len()).map(|i| slugs.value(i)).collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec!["alpha", "charlie"],
+        "contains-pushdown should return exactly the rows whose tags list contains 'red'"
+    );
+}

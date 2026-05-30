@@ -127,10 +127,7 @@ async fn multi_statement_mutation_is_atomic_with_read_your_writes() {
             "main",
             MUTATION_QUERIES,
             "insert_person_and_friend",
-            &mixed_params(
-                &[("$name", "Eve"), ("$friend", "Alice")],
-                &[("$age", 22)],
-            ),
+            &mixed_params(&[("$name", "Eve"), ("$friend", "Alice")], &[("$age", 22)]),
         )
         .await
         .unwrap();
@@ -187,10 +184,7 @@ async fn partial_failure_leaves_target_queryable_and_unblocks_next_mutation() {
             "main",
             MUTATION_QUERIES,
             "insert_person_and_friend",
-            &mixed_params(
-                &[("$name", "Eve"), ("$friend", "Missing")],
-                &[("$age", 22)],
-            ),
+            &mixed_params(&[("$name", "Eve"), ("$friend", "Missing")], &[("$age", 22)]),
         )
         .await
         .expect_err("op-2 must fail");
@@ -521,6 +515,10 @@ query delete_two_persons($first: String, $second: String) {
     delete Person where name = $first
     delete Person where name = $second
 }
+
+query update_age_by_name($name: String, $age: I32) {
+    update Person set { age: $age } where name = $name
+}
 "#;
 
 /// D₂: a query mixing inserts/updates with deletes is rejected at parse
@@ -539,10 +537,7 @@ async fn mutation_rejects_mixed_insert_and_delete_at_parse_time() {
             "main",
             STAGED_QUERIES,
             "mixed_insert_and_delete",
-            &mixed_params(
-                &[("$name", "Eve"), ("$victim", "Alice")],
-                &[("$age", 22)],
-            ),
+            &mixed_params(&[("$name", "Eve"), ("$victim", "Alice")], &[("$age", 22)]),
         )
         .await
         .expect_err("D₂ must reject mixed insert+delete");
@@ -555,7 +550,9 @@ async fn mutation_rejects_mixed_insert_and_delete_at_parse_time() {
         manifest_err.message,
     );
     assert!(
-        manifest_err.message.contains("split into separate mutations"),
+        manifest_err
+            .message
+            .contains("split into separate mutations"),
         "error message should direct user to split: {}",
         manifest_err.message,
     );
@@ -664,11 +661,7 @@ async fn multiple_appends_to_same_edge_coalesce_to_one_append() {
             "main",
             STAGED_QUERIES,
             "insert_two_friends",
-            &params(&[
-                ("$from", "Alice"),
-                ("$a", "Bob"),
-                ("$b", "Eve"),
-            ]),
+            &params(&[("$from", "Alice"), ("$a", "Bob"), ("$b", "Eve")]),
         )
         .await
         .unwrap();
@@ -778,8 +771,14 @@ async fn load_with_bad_edge_reference_unblocks_next_load() {
     // No write made it to disk: counts unchanged.
     let mid_persons = count_rows(&db, "node:Person").await;
     let mid_edges = count_rows(&db, "edge:Knows").await;
-    assert_eq!(mid_persons, pre_persons, "failed load must not advance Person count");
-    assert_eq!(mid_edges, pre_edges, "failed load must not advance Knows count");
+    assert_eq!(
+        mid_persons, pre_persons,
+        "failed load must not advance Person count"
+    );
+    assert_eq!(
+        mid_edges, pre_edges,
+        "failed load must not advance Knows count"
+    );
 
     // Second load against the same tables — succeeds (no HEAD drift).
     let good = r#"{"type": "Person", "data": {"name": "Pat", "age": 55}}"#;
@@ -820,7 +819,9 @@ edge WorksAt: Person -> Company @card(0..1)
 {"type": "Company", "data": {"name": "Acme"}}
 {"type": "Company", "data": {"name": "Bigco"}}
 "#;
-    load_jsonl(&mut db, seed, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&mut db, seed, LoadMode::Overwrite)
+        .await
+        .unwrap();
 
     let pre_works = count_rows(&db, "edge:WorksAt").await;
 
@@ -1010,7 +1011,10 @@ query cascade_then_explicit($name: String, $other: String) {
     // — Bob→Diana would survive. The exact-count check makes both ops
     // independently observable.
     let pre_knows = count_rows(&db, "edge:Knows").await;
-    assert_eq!(pre_knows, 3, "fixture invariant: TEST_DATA seeds 3 Knows edges");
+    assert_eq!(
+        pre_knows, 3,
+        "fixture invariant: TEST_DATA seeds 3 Knows edges"
+    );
 
     db.mutate(
         "main",
@@ -1062,7 +1066,9 @@ query add_friend($from: String, $to: String) {
     let seed = r#"{"type": "Person", "data": {"name": "Alice"}}
 {"type": "Person", "data": {"name": "Bob"}}
 "#;
-    load_jsonl(&mut db, seed, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&mut db, seed, LoadMode::Overwrite)
+        .await
+        .unwrap();
 
     // Single insert: count=1 < min=2 → reject with clear message.
     let err = db
@@ -1078,8 +1084,7 @@ query add_friend($from: String, $to: String) {
         panic!("expected Manifest error, got {err:?}");
     };
     assert!(
-        manifest_err.message.contains("@card violation")
-            && manifest_err.message.contains("min 2"),
+        manifest_err.message.contains("@card violation") && manifest_err.message.contains("min 2"),
         "unexpected error: {}",
         manifest_err.message,
     );
@@ -1117,7 +1122,9 @@ edge WorksAt: Person -> Company @card(0..1)
 {"type": "Company", "data": {"name": "Bigco"}}
 {"edge": "WorksAt", "from": "Alice", "to": "Acme", "data": {"id": "w1"}}
 "#;
-    load_jsonl(&mut db, seed, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&mut db, seed, LoadMode::Overwrite)
+        .await
+        .unwrap();
 
     // Merge-update the same edge id w1 to point at Bigco. Counted naively
     // as union, Alice has 2 WorksAt (committed Acme + pending Bigco) which
@@ -1163,7 +1170,9 @@ edge WorksAt: Person -> Company @card(0..1)
 {"type": "Company", "data": {"name": "Acme"}}
 {"type": "Company", "data": {"name": "Bigco"}}
 "#;
-    load_jsonl(&mut db, seed, LoadMode::Overwrite).await.unwrap();
+    load_jsonl(&mut db, seed, LoadMode::Overwrite)
+        .await
+        .unwrap();
 
     // Merge load with the SAME edge id twice — the second row supersedes
     // the first in the finalize-time dedupe. If pending-counting doesn't
@@ -1360,5 +1369,95 @@ query insert_then_update_note(
         )
         .await
         .unwrap();
-    assert_eq!(qr.num_rows(), 0, "letter must not be visible after early error");
+    assert_eq!(
+        qr.num_rows(),
+        0,
+        "letter must not be visible after early error"
+    );
+}
+
+/// MR-920 regression: two sequential `update T set {f:v} where x=y`
+/// invocations against the same row must both succeed. Pre-fix, the
+/// second one failed with `Ambiguous merge inserts are prohibited:
+/// multiple source rows match the same target row on (id = "Alice")`
+/// even though the scan returned exactly one row.
+///
+/// Root cause hypothesis (per MR-920): Lance's
+/// `processed_row_ids: Mutex<HashSet<u64>>`
+/// (`src/dataset/write/merge_insert.rs:2099`) double-processes the
+/// same target row_id against datasets previously rewritten by
+/// merge_insert. `SourceDedupeBehavior::FirstSeen` makes Lance skip
+/// rather than error.
+///
+/// Companion to `consistency.rs::load_merge_repeated_against_overlapping_keys_succeeds`
+/// (PR #98 / Window 1 of the bug class via the load surface).
+#[tokio::test]
+async fn second_sequential_update_on_same_row_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    db.mutate(
+        "main",
+        STAGED_QUERIES,
+        "update_age_by_name",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
+    )
+    .await
+    .expect("first sequential update on Alice must succeed");
+
+    let batches = read_table(&db, "node:Person").await;
+    let alice_count: usize = batches
+        .iter()
+        .map(|b| {
+            let names = b
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap();
+            (0..b.num_rows())
+                .filter(|i| names.is_valid(*i) && names.value(*i) == "Alice")
+                .count()
+        })
+        .sum();
+    assert_eq!(
+        alice_count, 1,
+        "after first update, exactly one Alice row should be visible"
+    );
+
+    db.mutate(
+        "main",
+        STAGED_QUERIES,
+        "update_age_by_name",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 42)]),
+    )
+    .await
+    .expect("second sequential update on Alice must succeed");
+
+    let batches = read_table(&db, "node:Person").await;
+    let mut alice_age: Option<i32> = None;
+    for batch in &batches {
+        let names = batch
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        let ages = batch
+            .column_by_name("age")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::Int32Array>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            if names.is_valid(i) && names.value(i) == "Alice" && ages.is_valid(i) {
+                alice_age = Some(ages.value(i));
+            }
+        }
+    }
+    assert_eq!(
+        alice_age,
+        Some(42),
+        "Alice's age must reflect the second update"
+    );
 }

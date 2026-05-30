@@ -22,7 +22,7 @@ A `.gq` query with multiple ops (e.g. `insert Person … insert Knows …`)
 must observe earlier ops' writes when validating later ops (referential
 integrity, edge cardinality). After MR-794 step 2+ this is implemented
 via an in-memory `MutationStaging` accumulator in
-[`crates/omnigraph/src/exec/staging.rs`](../crates/omnigraph/src/exec/staging.rs),
+[`crates/omnigraph/src/exec/staging.rs`](../../crates/omnigraph/src/exec/staging.rs),
 shared by both `mutate_as` and the bulk loader:
 
 - On the first touch of each table, the pre-write manifest version is
@@ -48,9 +48,8 @@ shared by both `mutate_as` and the bulk loader:
   prevents inserts/updates from coexisting with deletes in one query,
   so the inline path is safe for delete-only mutations.
 
-This upholds [docs/invariants.md §VI.23](invariants.md) (atomicity per
-query) and §VI.25 (read-your-writes within a multi-statement mutation,
-upheld).
+This upholds the manifest-atomic mutation and read-your-writes invariants
+tracked in [docs/dev/invariants.md](invariants.md).
 
 ### D₂ — parse-time mixed-mode rejection
 
@@ -233,7 +232,7 @@ success and one failure. The losing writer's error is
 `ManifestConflictDetails::ExpectedVersionMismatch { table_key, expected,
 actual }`. The HTTP server maps this to **409 Conflict** with body
 `{"error": "...", "code": "conflict", "manifest_conflict": { "table_key":
-"...", "expected": N, "actual": M }}` — see [docs/server.md](server.md).
+"...", "expected": N, "actual": M }}` — see [docs/user/server.md](../user/server.md).
 
 ## Audit
 

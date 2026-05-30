@@ -95,11 +95,11 @@ const FORBIDDEN_PATTERNS: &[&str] = &[
 /// provide the staged primitives or to maintain the system tables
 /// (commit graph, manifest).
 const ALLOW_LIST_FILES: &[&str] = &[
-    "table_store.rs",        // The storage layer itself.
-    "storage_layer.rs",      // The trait module.
-    "commit_graph.rs",       // Maintains `_graph_commits.lance` system table.
-    "graph_coordinator.rs",  // Drives the manifest publisher / branch coordinator.
-    "recovery_audit.rs",     // Maintains `_graph_commit_recoveries.lance` (recovery audit trail).
+    "table_store.rs",       // The storage layer itself.
+    "storage_layer.rs",     // The trait module.
+    "commit_graph.rs",      // Maintains `_graph_commits.lance` system table.
+    "graph_coordinator.rs", // Drives the manifest publisher / branch coordinator.
+    "recovery_audit.rs",    // Maintains `_graph_commit_recoveries.lance` (recovery audit trail).
 ];
 
 /// Directories exempt from the guard. Files under these paths may use
@@ -168,10 +168,7 @@ fn engine_code_does_not_call_forbidden_lance_apis() {
             // comments are documentation, not code use. The trait
             // surface (sealed + trait-only) is the actual enforcement;
             // this test only catches code use.
-            if trimmed.starts_with("//")
-                || trimmed.starts_with("/*")
-                || trimmed.starts_with("*")
-            {
+            if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with("*") {
                 continue;
             }
             // Allow lines marked with the sentinel on the SAME line or

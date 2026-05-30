@@ -80,8 +80,15 @@ jobs:
             version=$(cargo metadata --format-version=1 --no-deps \
               | jq -r --arg c "$crate" '.packages[] | select(.name==$c) | .version')
 
+            # crates.io API requires a User-Agent header — without it the
+            # API responds 403 and the skip check below would silently
+            # fall through to a real publish attempt that errors with
+            # "already exists on crates.io index" when re-running after a
+            # partial publish. Send a UA naming the workflow.
             local current
-            current=$(curl -fsSL "https://crates.io/api/v1/crates/${crate}" \
+            current=$(curl -fsSL \
+              -A 'ModernRelay-omnigraph-ci (https://github.com/ModernRelay/omnigraph)' \
+              "https://crates.io/api/v1/crates/${crate}" \
               | jq -r '.crate.max_version' || echo "")
 
             if [[ "$current" == "$version" ]]; then
@@ -90,10 +97,28 @@ jobs:
             fi
 
             echo "==> publishing ${crate} ${version} (current crates.io: ${current:-none})"
-            cargo publish -p "$crate" --locked
+            # Defense in depth: if the skip check missed an existing
+            # version (e.g. crates.io API hiccup), cargo publish errors
+            # with "already exists on crates.io index". Treat that as
+            # success so the workflow can be re-run idempotently.
+            local output
+            if ! output=$(cargo publish -p "$crate" --locked 2>&1); then
+              echo "$output"
+              if echo "$output" | grep -q "already exists on crates.io"; then
+                echo "==> ${crate} ${version} was already published; treating as success"
+                return 0
+              fi
+              return 1
+            fi
+            echo "$output"
           }
 
+          # Order matters: each crate must precede anything that depends on it.
+          # omnigraph-compiler and omnigraph-policy have no internal deps;
+          # omnigraph-engine depends on both; server depends on engine + the
+          # two leaf crates; cli depends on everything.
           publish_if_new omnigraph-compiler
+          publish_if_new omnigraph-policy
           publish_if_new omnigraph-engine
           publish_if_new omnigraph-server
           publish_if_new omnigraph-cli

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use clap::ValueEnum;
 use color_eyre::eyre::{Result, bail};
 use serde::{Deserialize, Serialize};
+
 pub const DEFAULT_CONFIG_FILE: &str = "omnigraph.yaml";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -17,6 +18,12 @@ pub struct ProjectConfig {
 pub struct TargetConfig {
     pub uri: String,
     pub bearer_token_env: Option<String>,
+    /// Per-graph Cedar policy file (MR-668). In single-graph mode this
+    /// field is unused — the top-level `policy.file` applies. In
+    /// multi-graph mode, each `graphs.<id>.policy.file` governs that
+    /// graph's HTTP-layer Cedar enforcement.
+    #[serde(default)]
+    pub policy: PolicySettings,
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
@@ -46,6 +53,12 @@ pub struct CliDefaults {
     pub output_format: Option<ReadOutputFormat>,
     pub table_max_column_width: Option<usize>,
     pub table_cell_layout: Option<TableCellLayout>,
+    /// Default actor identity for CLI direct-engine writes (MR-722).
+    /// Used when `policy.file` is configured and the operator hasn't
+    /// passed `--as <actor>` on the command line. With policy configured
+    /// and neither this nor `--as` set, the engine-layer footgun guard
+    /// fires (no silent bypass).
+    pub actor: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -53,6 +66,12 @@ pub struct ServerDefaults {
     #[serde(rename = "graph")]
     pub graph: Option<String>,
     pub bind: Option<String>,
+    /// Server-level Cedar policy (MR-668). Governs management endpoints
+    /// — currently `GET /graphs`; future runtime add/remove endpoints
+    /// will plug in here too. In single-graph mode this is unused — the
+    /// top-level `policy.file` covers the single graph.
+    #[serde(default)]
+    pub policy: PolicySettings,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -74,7 +93,16 @@ pub struct PolicySettings {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AliasCommand {
+    /// Read alias (canonical: `query`). The legacy spelling `read` is
+    /// kept as the variant name for back-compat with serialized configs
+    /// and external SDK callers; `query` is accepted on the wire via the
+    /// serde alias.
+    #[serde(alias = "query")]
     Read,
+    /// Mutation alias (canonical: `mutate`). The legacy spelling `change`
+    /// is kept as the variant name for back-compat; `mutate` is accepted
+    /// on the wire via the serde alias.
+    #[serde(alias = "mutate")]
     Change,
 }
 
@@ -191,23 +219,46 @@ impl OmnigraphConfig {
     }
 
     pub fn resolve_auth_env_file(&self) -> Option<PathBuf> {
-        let path = self.auth.env_file.as_deref()?;
-        let path = Path::new(path);
-        Some(if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.base_dir.join(path)
-        })
+        self.auth
+            .env_file
+            .as_deref()
+            .map(|path| self.resolve_config_path(path))
     }
 
     pub fn resolve_policy_file(&self) -> Option<PathBuf> {
-        let path = self.policy.file.as_deref()?;
-        let path = Path::new(path);
-        Some(if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.base_dir.join(path)
-        })
+        self.policy
+            .file
+            .as_deref()
+            .map(|path| self.resolve_config_path(path))
+    }
+
+    /// Resolve the per-graph policy file path for the named target,
+    /// relative to the config file's `base_dir`. Returns `None` if the
+    /// target is unknown or no per-graph `policy.file` is set.
+    pub fn resolve_target_policy_file(&self, target_name: &str) -> Option<PathBuf> {
+        let target = self.graphs.get(target_name)?;
+        target
+            .policy
+            .file
+            .as_deref()
+            .map(|path| self.resolve_config_path(path))
+    }
+
+    /// Resolve the server-level policy file path (used by management
+    /// endpoints). Returns `None` if `server.policy.file` is not set.
+    pub fn resolve_server_policy_file(&self) -> Option<PathBuf> {
+        self.server
+            .policy
+            .file
+            .as_deref()
+            .map(|path| self.resolve_config_path(path))
+    }
+
+    /// Resolve a raw config-supplied URI (which may be relative) to its
+    /// absolute form. URIs containing `://` are passed through as-is;
+    /// relative paths are joined with the config file's `base_dir`.
+    pub fn resolve_uri_value(&self, value: &str) -> String {
+        self.resolve_config_uri(value)
     }
 
     pub fn resolve_policy_tests_file(&self) -> Option<PathBuf> {
@@ -274,6 +325,15 @@ impl OmnigraphConfig {
             value.to_string()
         } else {
             self.base_dir.join(path).to_string_lossy().to_string()
+        }
+    }
+
+    fn resolve_config_path(&self, value: &str) -> PathBuf {
+        let path = Path::new(value);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.base_dir.join(path)
         }
     }
 }

@@ -692,6 +692,16 @@ impl Omnigraph {
         params: &ParamMap,
         actor_id: Option<&str>,
     ) -> Result<MutationResult> {
+        // Engine-layer policy gate (MR-722 fan-out / PR #3). Scope is
+        // `Branch(branch)` to match the HTTP-layer convention at
+        // `server_change` (branch=Some(branch), target_branch=None). When no
+        // PolicyChecker is installed this is a no-op; with policy installed
+        // and actor=None this fails hard (forget-the-actor footgun guard).
+        self.enforce(
+            omnigraph_policy::PolicyAction::Change,
+            &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
+            actor_id,
+        )?;
         self.mutate_with_current_actor(branch, query_source, query_name, params, actor_id)
             .await
     }
@@ -784,11 +794,8 @@ impl Omnigraph {
                     // post_commit_pin) and tidies up. Failing the user
                     // here would return an error for a write that
                     // already landed.
-                    if let Err(err) = crate::db::manifest::delete_sidecar(
-                        &handle,
-                        self.storage_adapter(),
-                    )
-                    .await
+                    if let Err(err) =
+                        crate::db::manifest::delete_sidecar(&handle, self.storage_adapter()).await
                     {
                         tracing::warn!(
                             error = %err,
@@ -842,15 +849,8 @@ impl Omnigraph {
                     assignments,
                     predicate,
                 } => {
-                    self.execute_update(
-                        type_name,
-                        assignments,
-                        predicate,
-                        params,
-                        branch,
-                        staging,
-                    )
-                    .await?
+                    self.execute_update(type_name, assignments, predicate, params, branch, staging)
+                        .await?
                 }
                 MutationOpIR::Delete {
                     type_name,
@@ -971,14 +971,8 @@ impl Omnigraph {
             // + iterate pending edges in-memory for the `src` column,
             // group-by-src. The pending side already includes the row
             // we just appended (above).
-            validate_edge_cardinality_with_pending(
-                self,
-                &ds,
-                staging,
-                &table_key,
-                edge_type,
-            )
-            .await?;
+            validate_edge_cardinality_with_pending(self, &ds, staging, &table_key, edge_type)
+                .await?;
 
             self.invalidate_graph_index().await;
 
@@ -1369,14 +1363,8 @@ async fn validate_edge_cardinality_with_pending(
     if edge_type.cardinality.is_default() {
         return Ok(());
     }
-    let counts = super::staging::count_src_per_edge(
-        db,
-        committed_ds,
-        table_key,
-        staging,
-        None,
-    )
-    .await?;
+    let counts =
+        super::staging::count_src_per_edge(db, committed_ds, table_key, staging, None).await?;
     super::staging::enforce_cardinality_bounds(edge_type, &counts)
 }
 

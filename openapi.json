@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.4.2"
+    "version": "0.6.0"
   },
   "paths": {
     "/branches": {
@@ -312,8 +312,8 @@
         "tags": [
           "mutations"
         ],
-        "summary": "Apply a GQ mutation to a branch.",
-        "description": "Writes to the named `branch` (defaults to `main`). Mutations are atomic\nper call and produce a new commit. Returns counts of nodes and edges\naffected. **Destructive**: on success the branch is updated; rejected\nmutations may still acquire locks briefly. Returns 409 on merge conflict.",
+        "summary": "**Deprecated** — use [`POST /mutate`](#tag/mutations/operation/mutate) instead.",
+        "description": "Apply a GQ mutation to a branch. Behavior is unchanged; the route is\nkept indefinitely for back-compat. New integrations should target\n`POST /mutate`, which has identical semantics and a name that pairs\ncleanly with `POST /query`. Responses from this route include\n`Deprecation: true` and `Link: </mutate>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the\nsignal.",
         "operationId": "change",
         "requestBody": {
           "content": {
@@ -327,7 +327,7 @@
         },
         "responses": {
           "200": {
-            "description": "Mutation results",
+            "description": "Mutation results (response includes `Deprecation: true` + `Link: </mutate>; rel=\"successor-version\"`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -387,6 +387,7 @@
             }
           }
         },
+        "deprecated": true,
         "security": [
           {
             "bearer_token": []
@@ -585,6 +586,63 @@
         ]
       }
     },
+    "/graphs": {
+      "get": {
+        "tags": [
+          "management"
+        ],
+        "summary": "List every graph currently registered with this server (MR-668).",
+        "description": "Multi-graph mode only. In single mode, the route returns 405 — there's\nno registry to enumerate. Cedar-gated by the server-level policy via\nthe `graph_list` action against `Omnigraph::Server::\"root\"`.\n\nOrder: alphabetical by `graph_id` (server-sorted so clients see\ndeterministic output across requests).",
+        "operationId": "listGraphs",
+        "responses": {
+          "200": {
+            "description": "List of registered graphs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GraphListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "Method not allowed (single-graph mode)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/healthz": {
       "get": {
         "tags": [
@@ -684,13 +742,167 @@
         ]
       }
     },
+    "/mutate": {
+      "post": {
+        "tags": [
+          "mutations"
+        ],
+        "summary": "Apply a GQ mutation to a branch (canonical mutation endpoint).",
+        "description": "Writes to the named `branch` (defaults to `main`). Mutations are atomic\nper call and produce a new commit. Returns counts of nodes and edges\naffected. **Destructive**: on success the branch is updated; rejected\nmutations may still acquire locks briefly. Returns 409 on merge conflict.\n\nPairs with `POST /query` (read-only). The legacy `POST /change` route\nhas identical semantics and is kept as a deprecated alias.",
+        "operationId": "mutate",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChangeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Mutation results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChangeOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Merge conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/query": {
+      "post": {
+        "tags": [
+          "queries"
+        ],
+        "summary": "Execute an inline read query (friendlier-named alternative to `POST /read`).",
+        "description": "Designed for ad-hoc exploration and AI-agent tool-use: short field\nnames (`query`, `name`) match the CLI `-e` flag and the GQ `query`\nkeyword. Mutations (`insert`/`update`/`delete`) are rejected with 400\n-- use `POST /mutate` (or its deprecated alias `POST /change`) for\nwrite queries. Otherwise behaves identically to `POST /read`: same\ntarget semantics (branch xor snapshot), same Cedar action (Read),\nsame response shape.",
+        "operationId": "query",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QueryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Query results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReadOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request - also returned when the query body contains mutations; use POST /mutate (or its deprecated alias POST /change) for write queries",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/read": {
       "post": {
         "tags": [
           "queries"
         ],
-        "summary": "Execute a GQ read query.",
-        "description": "Runs the query in `query_source` against either a branch or a frozen\nsnapshot (mutually exclusive). When `query_source` defines multiple named\nqueries, pick one with `query_name`. `params` is a JSON object whose keys\nmatch the parameters declared by the query. Returns rows as a JSON array\nplus a `columns` list. Read-only.",
+        "summary": "**Deprecated** — use [`POST /query`](#tag/queries/operation/query) instead.",
+        "description": "Execute a GQ read query. Behavior is unchanged from prior releases; the\nroute is kept indefinitely for byte-stable back-compat. New integrations\nshould target `POST /query`, which has clean field names (`query` /\n`name`) and a 400-on-mutation guard. Responses from this route include\n`Deprecation: true` and `Link: </query>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the\nsignal.",
         "operationId": "read",
         "requestBody": {
           "content": {
@@ -704,7 +916,7 @@
         },
         "responses": {
           "200": {
-            "description": "Query results",
+            "description": "Query results (response includes `Deprecation: true` + `Link: </query>; rel=\"successor-version\"`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -744,6 +956,7 @@
             }
           }
         },
+        "deprecated": true,
         "security": [
           {
             "bearer_token": []
@@ -1103,7 +1316,7 @@
       "ChangeRequest": {
         "type": "object",
         "required": [
-          "query_source"
+          "query"
         ],
         "properties": {
           "branch": {
@@ -1113,19 +1326,19 @@
             ],
             "description": "Target branch. Defaults to `main`."
           },
-          "params": {
-            "description": "JSON object whose keys match the mutation's declared parameters."
-          },
-          "query_name": {
+          "name": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Name of the mutation to run when `query_source` declares multiple."
+            "description": "Name of the mutation to run when `query` declares multiple.\n\nAccepts the legacy field name `query_name` as a deserialization alias."
           },
-          "query_source": {
+          "params": {
+            "description": "JSON object whose keys match the mutation's declared parameters."
+          },
+          "query": {
             "type": "string",
-            "description": "GQ mutation source containing `insert`, `update`, or `delete` statements.\nMay declare multiple named mutations; pick one with `query_name`.",
+            "description": "GQ mutation source containing `insert`, `update`, or `delete` statements.\nMay declare multiple named mutations; pick one with `name`.\n\nAccepts the legacy field name `query_source` as a deserialization alias.",
             "example": "query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}"
           }
         }
@@ -1199,6 +1412,7 @@
           "forbidden",
           "bad_request",
           "not_found",
+          "method_not_allowed",
           "conflict",
           "too_many_requests",
           "internal"
@@ -1265,6 +1479,37 @@
               "type": "string"
             },
             "description": "Restrict the export to these node/edge type names. Empty exports all types."
+          }
+        }
+      },
+      "GraphInfo": {
+        "type": "object",
+        "description": "One entry in the response from `GET /graphs`. Cluster operators\nconsume this list to discover which graphs the server is currently\nserving. The shape is intentionally minimal — `graph_id` and `uri`\nare the only fields a routing client needs.",
+        "required": [
+          "graph_id",
+          "uri"
+        ],
+        "properties": {
+          "graph_id": {
+            "type": "string"
+          },
+          "uri": {
+            "type": "string"
+          }
+        }
+      },
+      "GraphListResponse": {
+        "type": "object",
+        "description": "Response from `GET /graphs`. Lists every graph registered with the\nserver in alphabetical order by `graph_id` (sorted server-side so\nclients get deterministic output across requests).",
+        "required": [
+          "graphs"
+        ],
+        "properties": {
+          "graphs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GraphInfo"
+            }
           }
         }
       },
@@ -1453,6 +1698,44 @@
           }
         }
       },
+      "QueryRequest": {
+        "type": "object",
+        "description": "Inline read-query request for `POST /query`.\n\nFriendlier-named alternative to [`ReadRequest`] for ad-hoc reads and\nAI-agent integration. Mutations are rejected with 400 — use `POST\n/mutate` (or its deprecated alias `POST /change`) for write queries.\nField names are deliberately short (`query`, `name`) to match the GQ\nkeyword and the CLI `-e` flag.",
+        "required": [
+          "query"
+        ],
+        "properties": {
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Branch to read from. Mutually exclusive with `snapshot`. Defaults to `main`."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Name of the query to run when `query` declares multiple. Optional when\nonly one query is declared."
+          },
+          "params": {
+            "description": "JSON object whose keys match the query's declared parameters."
+          },
+          "query": {
+            "type": "string",
+            "description": "GQ read-query source. May declare one or more named queries; pick one\nwith `name` when more than one is declared. Mutations\n(`insert`/`update`/`delete`) get 400 — use `POST /mutate` (or its\ndeprecated alias `POST /change`) instead.",
+            "example": "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
+          },
+          "snapshot": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Snapshot id to read from. Mutually exclusive with `branch`."
+          }
+        }
+      },
       "ReadOutput": {
         "type": "object",
         "required": [
@@ -1576,6 +1859,10 @@
           "schema_source"
         ],
         "properties": {
+          "allow_data_loss": {
+            "type": "boolean",
+            "description": "When true, promote every `DropMode::Soft` step in the plan to\n`DropMode::Hard`, making the prior column data unreachable\nafter the apply. Matches the CLI's `--allow-data-loss` flag.\nDefaults to `false` (drops remain reversible via time travel)."
+          },
           "schema_source": {
             "type": "string",
             "description": "Project schema in `.pg` source form. The diff against the current\nschema produces the migration steps that will be applied.",

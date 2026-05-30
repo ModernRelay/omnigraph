@@ -66,7 +66,7 @@ async fn graph_publish_failpoint_triggers_before_commit_append() {
 
 // Atomic schema apply: schema apply writes staging files first, then commits
 // the manifest, then renames staging → final. Tests below inject crashes at
-// the two boundaries and assert that reopening the repo yields a consistent
+// the two boundaries and assert that reopening the graph yields a consistent
 // state.
 
 #[tokio::test]
@@ -303,14 +303,10 @@ async fn inline_delete_conflict_writes_sidecar_before_rejecting() {
     let person_uri = node_table_uri(&uri, "Person");
 
     {
-        let _pause_delete = ScopedFailPoint::new("mutation.delete_node_pre_primary_delete", "pause");
+        let _pause_delete =
+            ScopedFailPoint::new("mutation.delete_node_pre_primary_delete", "pause");
         let delete_params = helpers::params(&[("$name", "Alice")]);
-        let delete = db.mutate(
-            "main",
-            MUTATION_QUERIES,
-            "remove_person",
-            &delete_params,
-        );
+        let delete = db.mutate("main", MUTATION_QUERIES, "remove_person", &delete_params);
         tokio::pin!(delete);
 
         let mut concurrent_update_succeeded = false;
@@ -325,15 +321,18 @@ async fn inline_delete_conflict_writes_sidecar_before_rejecting() {
                 "set_age",
                 &mixed_params(&[("$name", "Bob")], &[("$age", 26)]),
             )
-                .await
-                .is_ok()
+            .await
+            .is_ok()
             {
                 concurrent_update_succeeded = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        assert!(concurrent_update_succeeded, "concurrent update must land while delete is paused");
+        assert!(
+            concurrent_update_succeeded,
+            "concurrent update must land while delete is paused"
+        );
         fail::remove("mutation.delete_node_pre_primary_delete");
 
         let err = delete.await.unwrap_err();
@@ -464,7 +463,7 @@ async fn recovery_rolls_forward_load_on_feature_branch() {
 
 #[tokio::test]
 async fn recovery_rolls_forward_ensure_indices_on_feature_branch() {
-    use lance_index::DatasetIndexExt;
+    use lance::index::DatasetIndexExt;
     use omnigraph::loader::{LoadMode, load_jsonl};
     use omnigraph::table_store::TableStore;
 
@@ -925,13 +924,13 @@ async fn ensure_indices_stage_btree_failure_leaves_existing_tables_writable() {
     .expect("Person mutation must succeed after the failed schema apply — existing tables are not drifted");
 }
 
-fn assert_no_staging_files(repo: &std::path::Path) {
+fn assert_no_staging_files(graph: &std::path::Path) {
     for name in [
         "_schema.pg.staging",
         "_schema.ir.json.staging",
         "__schema_state.json.staging",
     ] {
-        let path = repo.join(name);
+        let path = graph.join(name);
         assert!(
             !path.exists(),
             "staging file {} still exists after recovery",
@@ -1164,7 +1163,7 @@ edge WorksAt: Person -> Company
     // NEW schema (city column on Person, Tag node type) — not the old.
     // Without the schema-staging coordination, the schema-state
     // recovery would have deleted the staging files (because manifest
-    // hadn't advanced when it ran), leaving a corrupt repo with new-
+    // hadn't advanced when it ran), leaving a corrupt graph with new-
     // schema data on disk but old-schema catalog.
     let live_schema = std::fs::read_to_string(dir.path().join("_schema.pg")).unwrap();
     assert!(
@@ -1665,5 +1664,145 @@ async fn ensure_indices_phase_b_failure_does_not_leak_sidecar_when_no_work_neede
     assert!(
         !audit_dir.exists(),
         "_graph_commit_recoveries.lance must NOT exist when no sidecar was processed"
+    );
+}
+
+// ─── MR-668 PR 2a: Omnigraph::init cleanup on partial failure ──────────────
+//
+// `init_with_storage` writes three schema artifacts before invoking
+// `GraphCoordinator::init`. Without cleanup, a failure between any of those
+// steps left orphan files behind, making the URI unusable for a retry of
+// `init` (it would refuse because `_schema.pg` already exists). The tests
+// below pin: on failpoint trigger at each of the three phase boundaries,
+// the three schema files are removed before the error is returned.
+//
+// Coverage note: the third boundary (`init.after_coordinator_init`) only
+// asserts cleanup of the schema files. Lance per-type directories and
+// `__manifest/` are NOT cleaned up — that requires a recursive
+// `StorageAdapter::delete_prefix` primitive deferred along with
+// `DELETE /graphs/{id}` (MR-668 PR 2b). The orphan Lance directories
+// after a coordinator-init-phase failure are documented as a known
+// limitation.
+
+#[tokio::test]
+async fn init_failpoint_after_schema_pg_written_cleans_up_schema_file() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let _failpoint = ScopedFailPoint::new("init.after_schema_pg_written", "return");
+
+    let err = match Omnigraph::init(uri, helpers::TEST_SCHEMA).await {
+        Ok(_) => panic!("expected Omnigraph::init to fail at the configured failpoint"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string()
+            .contains("injected failpoint triggered: init.after_schema_pg_written"),
+        "got: {err}"
+    );
+
+    // Only `_schema.pg` was written at this phase boundary, but the
+    // cleanup attempts all three — `delete` treats not-found as Ok,
+    // so the other two deletes are no-ops.
+    assert!(
+        !dir.path().join("_schema.pg").exists(),
+        "_schema.pg must be cleaned up after init failure"
+    );
+}
+
+#[tokio::test]
+async fn init_failpoint_after_schema_contract_written_cleans_up_all_schema_files() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let _failpoint = ScopedFailPoint::new("init.after_schema_contract_written", "return");
+
+    let err = match Omnigraph::init(uri, helpers::TEST_SCHEMA).await {
+        Ok(_) => panic!("expected Omnigraph::init to fail at the configured failpoint"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string()
+            .contains("injected failpoint triggered: init.after_schema_contract_written"),
+        "got: {err}"
+    );
+
+    assert!(
+        !dir.path().join("_schema.pg").exists(),
+        "_schema.pg must be cleaned up"
+    );
+    assert!(
+        !dir.path().join("_schema.ir.json").exists(),
+        "_schema.ir.json must be cleaned up"
+    );
+    assert!(
+        !dir.path().join("__schema_state.json").exists(),
+        "__schema_state.json must be cleaned up"
+    );
+}
+
+#[tokio::test]
+async fn init_failpoint_after_coordinator_init_cleans_up_schema_files() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let _failpoint = ScopedFailPoint::new("init.after_coordinator_init", "return");
+
+    let err = match Omnigraph::init(uri, helpers::TEST_SCHEMA).await {
+        Ok(_) => panic!("expected Omnigraph::init to fail at the configured failpoint"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string()
+            .contains("injected failpoint triggered: init.after_coordinator_init"),
+        "got: {err}"
+    );
+
+    // Schema files are cleaned up by `best_effort_cleanup_init_artifacts`.
+    assert!(
+        !dir.path().join("_schema.pg").exists(),
+        "_schema.pg must be cleaned up after late-phase init failure"
+    );
+    assert!(
+        !dir.path().join("_schema.ir.json").exists(),
+        "_schema.ir.json must be cleaned up after late-phase init failure"
+    );
+    assert!(
+        !dir.path().join("__schema_state.json").exists(),
+        "__schema_state.json must be cleaned up after late-phase init failure"
+    );
+
+    // Documented limitation: Lance per-type datasets and `__manifest/`
+    // created by `GraphCoordinator::init` are NOT cleaned up — recursive
+    // deletion requires the deferred `delete_prefix` primitive. This
+    // assertion does NOT check for their absence; it merely documents
+    // the boundary by noting we don't validate orphan directories here.
+    // When PR 2b lands, this test can be tightened to assert the graph
+    // root is fully empty.
+}
+
+#[tokio::test]
+async fn init_failpoint_returns_original_error_not_cleanup_error() {
+    // The cleanup is best-effort. If `storage.delete` fails (e.g. transient
+    // network blip on S3), the original init failpoint error must still
+    // surface — not be masked by a cleanup failure. This test triggers the
+    // failpoint and asserts the returned error references the failpoint,
+    // not the cleanup. (The cleanup currently logs via `tracing::warn`;
+    // we can't easily fault-inject delete failures without another seam,
+    // so this is a smoke test for the precedence contract.)
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let _failpoint = ScopedFailPoint::new("init.after_schema_pg_written", "return");
+
+    let err = match Omnigraph::init(uri, helpers::TEST_SCHEMA).await {
+        Ok(_) => panic!("expected Omnigraph::init to fail at the configured failpoint"),
+        Err(e) => e,
+    };
+    // Failpoint message wins; no "cleanup" substring expected.
+    let msg = err.to_string();
+    assert!(
+        msg.contains("init.after_schema_pg_written"),
+        "init error must surface the failpoint cause, got: {msg}"
     );
 }

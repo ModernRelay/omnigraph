@@ -90,6 +90,18 @@ impl Omnigraph {
         mode: LoadMode,
         actor_id: Option<&str>,
     ) -> Result<IngestResult> {
+        // Engine-layer policy gate (MR-722 fan-out / PR #3). Scope is
+        // `Branch(branch)` for the data-write portion. If ingest creates
+        // a new branch as a side-effect (target branch doesn't exist),
+        // the inner `branch_create_from_as` call below additionally
+        // checks `BranchCreate` — both authorities are genuinely needed
+        // for "ingest into a fresh branch", so the layered check is
+        // correct, not redundant.
+        self.enforce(
+            omnigraph_policy::PolicyAction::Change,
+            &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
+            actor_id,
+        )?;
         self.ingest_with_current_actor(branch, from, data, mode, actor_id)
             .await
     }
@@ -135,8 +147,18 @@ impl Omnigraph {
             .iter()
             .any(|name| name == &target_branch);
         if branch_created {
-            self.branch_create_from(crate::db::ReadTarget::branch(&base_branch), &target_branch)
-                .await?;
+            // Thread the actor through to the implicit BranchCreate so
+            // policy decisions match what an explicit `branch_create_from_as`
+            // call would see. Calling the no-actor variant here would
+            // bypass BranchCreate enforcement when policy is installed —
+            // the footgun guard catches that case too, but threading is
+            // the correct fix.
+            self.branch_create_from_as(
+                crate::db::ReadTarget::branch(&base_branch),
+                &target_branch,
+                actor_id,
+            )
+            .await?;
         }
 
         let result = self.load_as(&target_branch, data, mode, actor_id).await?;
@@ -160,6 +182,17 @@ impl Omnigraph {
         mode: LoadMode,
         actor_id: Option<&str>,
     ) -> Result<LoadResult> {
+        // Engine-layer policy gate (MR-722 fan-out / PR #3). Scope is
+        // `Branch(branch)` to match the HTTP-layer Change convention.
+        // `ingest_as` also calls `load_as` after enforcing its own
+        // Change gate — that double-check is fine because both gates
+        // resolve to identical Cedar decisions for the same actor +
+        // branch (the second check is a structurally-correct no-op).
+        self.enforce(
+            omnigraph_policy::PolicyAction::Change,
+            &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
+            actor_id,
+        )?;
         self.ensure_schema_state_valid().await?;
         // Reject internal `__run__*` / system-prefixed branches at the
         // public write boundary. Direct-publish paths assert this
@@ -179,14 +212,22 @@ impl Omnigraph {
             .await
     }
 
-    pub async fn load_file(
+    pub async fn load_file(&self, branch: &str, path: &str, mode: LoadMode) -> Result<LoadResult> {
+        self.load_file_as(branch, path, mode, None).await
+    }
+
+    /// Read a file into memory and delegate to `load_as`. Used by the
+    /// CLI's `omnigraph load` so file-path-based writes flow through
+    /// the same engine-layer policy gate as in-memory `load_as` calls.
+    pub async fn load_file_as(
         &self,
         branch: &str,
         path: &str,
         mode: LoadMode,
+        actor_id: Option<&str>,
     ) -> Result<LoadResult> {
         let data = std::fs::read_to_string(path).map_err(|e| OmniError::Io(e))?;
-        self.load(branch, &data, mode).await
+        self.load_as(branch, &data, mode, actor_id).await
     }
 
     async fn load_direct_on_branch(
@@ -411,13 +452,7 @@ async fn load_jsonl_reader<R: BufRead>(
     for (edge_name, rows) in &edge_rows {
         let edge_type = &catalog.edge_types[edge_name];
         let from_ids = if use_staging {
-            collect_node_ids_with_pending(
-                db,
-                branch,
-                &edge_type.from_type,
-                &staging,
-            )
-            .await?
+            collect_node_ids_with_pending(db, branch, &edge_type.from_type, &staging).await?
         } else {
             collect_node_ids(
                 db,
@@ -430,13 +465,7 @@ async fn load_jsonl_reader<R: BufRead>(
             .await?
         };
         let to_ids = if use_staging {
-            collect_node_ids_with_pending(
-                db,
-                branch,
-                &edge_type.to_type,
-                &staging,
-            )
-            .await?
+            collect_node_ids_with_pending(db, branch, &edge_type.to_type, &staging).await?
         } else {
             collect_node_ids(
                 db,
@@ -535,12 +564,7 @@ async fn load_jsonl_reader<R: BufRead>(
         let table_key = format!("edge:{}", edge_name);
         if use_staging {
             validate_edge_cardinality_with_pending_loader(
-                db,
-                branch,
-                edge_type,
-                &table_key,
-                &staging,
-                mode,
+                db, branch, edge_type, &table_key, &staging, mode,
             )
             .await?;
         } else if let Some(update) = overwrite_updates.iter().find(|u| u.table_key == table_key) {
@@ -1653,8 +1677,7 @@ async fn validate_edge_cardinality_with_pending_loader(
         LoadMode::Append | LoadMode::Overwrite => None,
     };
     let counts =
-        crate::exec::staging::count_src_per_edge(db, &ds, table_key, staging, dedupe_key)
-            .await?;
+        crate::exec::staging::count_src_per_edge(db, &ds, table_key, staging, dedupe_key).await?;
     crate::exec::staging::enforce_cardinality_bounds(edge_type, &counts)
 }
 

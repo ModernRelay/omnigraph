@@ -1,6 +1,6 @@
 # Testing
 
-This file is the always-on map of the test surface. **Consult it before every task** so you know what tests already cover the area you're about to change, what helpers to reuse, and where a new test belongs. The architectural invariant *"tests at every boundary, not just end-to-end"* lives in [docs/invariants.md §VIII.47](invariants.md).
+This file is the always-on map of the test surface. **Consult it before every task** so you know what tests already cover the area you're about to change, what helpers to reuse, and where a new test belongs. The architectural invariant for boundary-matched tests lives in [docs/dev/invariants.md](invariants.md).
 
 ## Where tests live, per crate
 
@@ -22,7 +22,7 @@ The engine's `tests/` is the principal coverage surface; most graph-shaped behav
 | `merge_truth_table.rs` | Merge-pair truth table (MR-786): all 9×9 `(left_op, right_op)` cells from `{noop, addNode, removeNode, addEdge, removeEdge, setProperty, dropProperty, addLabel, removeLabel}`. Adding a new op to `OpVariant` forces a compile error in `build_case` until the new row + column are dispositioned. 36 executable cells run through real `branch_merge` with a structured oracle (`MergeOutcome` / `MergeConflictKind` + graph-state assert); 45 cells involving `dropProperty`/`addLabel`/`removeLabel` are recorded as `Unsupported` until the mutation grammar grows. |
 | `runs.rs` | Direct-publish writes: cancellation, concurrent-writer CAS, multi-statement atomicity, MR-794 staged-write rewire (D₂ rejection, insert+update coalesce, multi-append coalesce, partial-failure recovery, load RI/cardinality recovery) |
 | `staged_writes.rs` | TableStore staged-write primitives (`stage_append`, `stage_merge_insert`, `commit_staged`, `scan_with_staged`, `count_rows_with_staged`) — primitive-level only; engine code uses the in-memory `MutationStaging` accumulator instead |
-| `lifecycle.rs` | Repo lifecycle, schema state |
+| `lifecycle.rs` | Graph lifecycle, schema state |
 | `point_in_time.rs` | Snapshots, time travel (`snapshot_at_version`, `entity_at`) |
 | `changes.rs` | `diff_between` / `diff_commits` |
 | `consistency.rs` | Cross-table snapshot isolation, atomic publish |
@@ -31,7 +31,7 @@ The engine's `tests/` is the principal coverage surface; most graph-shaped behav
 | `traversal.rs` | `Expand`, variable-length hops, anti-join |
 | `aggregation.rs` | `count`, `sum`, `avg`, `min`, `max` |
 | `export.rs` | NDJSON streaming export filters |
-| `s3_storage.rs` | S3-backed repo (skipped unless `OMNIGRAPH_S3_TEST_BUCKET` is set) |
+| `s3_storage.rs` | S3-backed graph (skipped unless `OMNIGRAPH_S3_TEST_BUCKET` is set) |
 | `lance_version_columns.rs` | Per-row `_row_last_updated_at_version` behavior |
 | `validators.rs` | Schema constraint enforcement (enum, range, unique, cardinality) across JSONL, insert, update paths |
 | `maintenance.rs` | `optimize` (compaction) + `cleanup` (version GC): empty/idempotent/no-op edges, policy validation, head preservation |
@@ -45,11 +45,11 @@ The engine's `tests/` is the principal coverage surface; most graph-shaped behav
 
 ## Test helpers
 
-- **Engine** — `crates/omnigraph/tests/helpers/mod.rs`: `init_and_load()` (bootstrap a temp repo + load standard fixture), `snapshot_main()`, `snapshot_branch()`, query/mutation runners, row collection and counting. Use these instead of hand-rolling.
+- **Engine** — `crates/omnigraph/tests/helpers/mod.rs`: `init_and_load()` (bootstrap a temp graph + load standard fixture), `snapshot_main()`, `snapshot_branch()`, query/mutation runners, row collection and counting. Use these instead of hand-rolling.
 - **CLI** — `crates/omnigraph-cli/tests/support/mod.rs`: `Command`-style wrapper for invoking `omnigraph`, server-process spawning, fixture resolution, output assertion helpers.
 - **Server** — no shared helpers; server tests call the `Omnigraph` engine API directly and exercise endpoints over the wire.
 
-> Note: there is **no `MemStorage` or in-memory backend** today. Tests use `tempfile::tempdir()` for local FS. If you find yourself needing one for layer isolation, that's an architectural ask — see [docs/invariants.md §VIII.48](invariants.md) (reference impl + test impl per trait).
+> Note: there is **no `MemStorage` or in-memory backend** today. Tests use `tempfile::tempdir()` for local FS. If you find yourself needing one for layer isolation, that's an architectural ask — keep it explicit in [docs/dev/invariants.md](invariants.md) under known gaps.
 
 ## Failpoints (fault injection)
 
@@ -63,23 +63,23 @@ The engine's `tests/` is the principal coverage surface; most graph-shaped behav
 CI runs three S3-backed tests against a containerized RustFS server (`.github/workflows/ci.yml` → `rustfs_integration` job):
 
 - `cargo test -p omnigraph-engine --test s3_storage`
-- `cargo test -p omnigraph-server --test server server_opens_s3_repo_directly_and_serves_snapshot_and_read`
+- `cargo test -p omnigraph-server --test server server_opens_s3_graph_directly_and_serves_snapshot_and_read`
 - `cargo test -p omnigraph-cli --test system_local local_cli_s3_end_to_end_init_load_read_flow`
 
 Locally, set `OMNIGRAPH_S3_TEST_BUCKET` (and the usual `AWS_*` vars including `AWS_ENDPOINT_URL_S3` for non-AWS) before running. Without those, S3 tests skip gracefully.
 
 ## OpenAPI drift
 
-`crates/omnigraph-server/tests/openapi.rs` regenerates `openapi.json` and diffs against the checked-in copy. CI auto-commits the regeneration on same-repo PRs and otherwise runs in strict-check mode (env: `OMNIGRAPH_UPDATE_OPENAPI`).
+`crates/omnigraph-server/tests/openapi.rs` regenerates `openapi.json` and diffs against the checked-in copy. CI auto-commits the regeneration on same-repository PRs and otherwise runs in strict-check mode (env: `OMNIGRAPH_UPDATE_OPENAPI`).
 
 ## Examples & benches
 
 - `crates/omnigraph/examples/bench_expand.rs` — runnable example (not part of CI).
-- No `benches/` directories. The architectural rule [docs/invariants.md §VIII.50](invariants.md) requires benchmark motivation before optimization, so add `benches/` per crate when you ship a perf-driven change.
+- No `benches/` directories. Add `benches/` per crate when you ship a perf-driven change, and include the motivating workload with the optimization.
 
 ## Coverage tooling — what's missing
 
-There is **no** coverage tooling in the repo today: no `tarpaulin.toml`, no `codecov.yml`, no coverage CI step. If you want to know whether your change is covered, the answer comes from reading and running the relevant integration tests, not from a tool.
+There is **no** coverage tooling in the repository today: no `tarpaulin.toml`, no `codecov.yml`, no coverage CI step. If you want to know whether your change is covered, the answer comes from reading and running the relevant integration tests, not from a tool.
 
 If introducing coverage tooling is in scope for your task, the natural first step is `cargo-llvm-cov` wired into a separate CI job, and a per-crate threshold rather than a global one.
 
@@ -97,7 +97,7 @@ How to check:
    - *Existing test covers the area but not your case* → **add an assertion or a fixture row to the existing test**, don't write a new function with `init_and_load()` again.
    - *No existing coverage in any test file* → only then write a new test; put it in the file that owns the area, or open a new file only if the area itself is new.
 
-Three duplicated `init_and_load() → run_query → assert_eq` blocks where one parameterized test would do is the most common form of test rot in this repo. Don't add to it.
+Three duplicated `init_and_load() → run_query → assert_eq` blocks where one parameterized test would do is the most common form of test rot in this repository. Don't add to it.
 
 ## Before-every-task checklist
 
@@ -106,10 +106,10 @@ When you pick up any change, walk through this:
 1. **Find existing coverage** (per the principle above). Don't just look at the first test file by name — grep for the symbol you're touching across every crate's `tests/`.
 2. **Run those tests locally before editing.** `cargo test --workspace --locked` for the broad pass; `-p <crate> --test <file>` for a focused loop. Confirm a clean baseline.
 3. **Decide extend-vs-new** explicitly. If you can extend an existing test (assertion, fixture row, parameterization), do that. Only add a new test fn or new file if no existing one owns the area.
-4. **Reuse the helpers.** `init_and_load()`, fixture files, the CLI `support` harness — re-use them. Don't bootstrap a fresh repo by hand if a helper exists.
-5. **Mind the boundary.** Per [docs/invariants.md §VIII.47](invariants.md), test at the layer the change lives at — planner-level changes deserve planner-level tests, not just end-to-end.
+4. **Reuse the helpers.** `init_and_load()`, fixture files, the CLI `support` harness — re-use them. Don't bootstrap a fresh graph by hand if a helper exists.
+5. **Mind the boundary.** Per [docs/dev/invariants.md](invariants.md), test at the layer the change lives at — planner-level changes deserve planner-level tests, not just end-to-end.
 6. **For substrate-touching changes** (Lance behavior), reach for `failpoints` or fixture-driven scenarios, not stubbed-out mocks.
 7. **For server / API changes**, confirm the OpenAPI regeneration happens in `openapi.rs` and that the diff lands in `openapi.json`.
 8. **Verify your change makes an existing test fail before it makes the new one pass.** If you can break the code without breaking a test, your coverage gap is the problem to fix first.
 
-When in doubt, re-read [docs/invariants.md §VIII](invariants.md) — quality gates apply to every change.
+When in doubt, re-read [docs/dev/invariants.md](invariants.md) — quality gates apply to every change.

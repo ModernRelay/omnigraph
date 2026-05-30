@@ -1,0 +1,20 @@
+[package]
+name = "omnigraph-policy"
+version = "0.6.0"
+edition = "2024"
+description = "Policy / authorization layer for Omnigraph — Cedar-backed PolicyEngine, PolicyChecker trait, ResourceScope enum."
+license = "MIT"
+repository = "https://github.com/ModernRelay/omnigraph"
+homepage = "https://github.com/ModernRelay/omnigraph"
+documentation = "https://docs.rs/omnigraph-policy"
+
+[dependencies]
+cedar-policy = { workspace = true }
+clap = { workspace = true }
+color-eyre = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
