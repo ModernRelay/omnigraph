@@ -20,6 +20,7 @@ use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::query::ast::QueryDecl;
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::query::typecheck::typecheck_query_decl;
+use omnigraph_compiler::types::{PropType, ScalarType};
 
 use crate::config::{OmnigraphConfig, QueryEntry};
 
@@ -250,7 +251,13 @@ pub fn check(registry: &QueryRegistry, catalog: &Catalog) -> CheckReport {
         }
         if query.expose {
             for param in &query.decl.params {
-                if param.type_name.starts_with("Vector(") {
+                // Resolve to the structured type via the compiler's own
+                // resolver rather than string-matching `Vector(` — one
+                // canonical definition of "is a vector", so this lint can't
+                // drift from how the parser/type system spells the type.
+                let is_vector = PropType::from_param_type_name(&param.type_name, param.nullable)
+                    .is_some_and(|pt| matches!(pt.scalar, ScalarType::Vector(_)));
+                if is_vector {
                     report.warnings.push(Warning {
                         query: query.name.clone(),
                         message: format!(
@@ -453,5 +460,21 @@ embedding: Vector(4)
         .unwrap();
         let report = check(&reg, &test_catalog());
         assert!(report.is_clean(), "unexpected: {:?}", report);
+    }
+
+    #[test]
+    fn non_vector_param_on_exposed_query_does_not_warn() {
+        // The recommended `String` alternative on an exposed query does not
+        // resolve to a Vector, so the embedding advisory stays silent. Guards
+        // the structured type check against a false positive (and pins that
+        // only `Vector(_)` triggers the warning).
+        let reg = QueryRegistry::from_specs(vec![spec(
+            "search",
+            "query search($name: String) { match { $u: User { name: $name } } return { $u.name } }",
+            true,
+        )])
+        .unwrap();
+        let report = check(&reg, &test_catalog());
+        assert!(report.is_clean(), "no breakage or warning expected: {:?}", report);
     }
 }
