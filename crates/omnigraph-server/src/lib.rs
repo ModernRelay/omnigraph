@@ -26,7 +26,7 @@ use api::{
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
     CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphInfo, GraphListResponse,
     HealthOutput, IngestOutput, IngestRequest, InvokeStoredQueryRequest,
-    InvokeStoredQueryResponse, QueryRequest, ReadOutput, ReadRequest,
+    InvokeStoredQueryResponse, QueriesCatalogOutput, QueryRequest, ReadOutput, ReadRequest,
     SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotQuery, ingest_output,
     schema_apply_output, snapshot_payload,
 };
@@ -98,6 +98,7 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         server_export,
         #[allow(deprecated)] server_change,
         server_mutate,
+        server_list_queries,
         server_invoke_query,
         server_schema_apply,
         server_schema_get,
@@ -1092,6 +1093,7 @@ pub fn build_app(state: AppState) -> Router {
             server_change
         }))
         .route("/mutate", post(server_mutate))
+        .route("/queries", get(server_list_queries))
         .route("/queries/{name}", post(server_invoke_query))
         .route("/schema", get(server_schema_get))
         .route("/schema/apply", post(server_schema_apply))
@@ -2272,6 +2274,51 @@ async fn server_invoke_query(
             selected, &target, result,
         ))))
     }
+}
+
+#[utoipa::path(
+    get,
+    path = "/queries",
+    tag = "queries",
+    operation_id = "list_queries",
+    responses(
+        (status = 200, description = "Stored-query catalog (the mcp.expose subset, with typed params)", body = QueriesCatalogOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// List the graph's exposed stored queries as a typed tool catalog.
+///
+/// Returns the `mcp.expose == true` subset of the `queries:` registry, each
+/// with its MCP tool name, read/mutate flag, description/instruction, and
+/// typed parameters — enough for a client to register them as tools without
+/// fetching `.gq` source. Read-gated; the catalog is graph-wide (branch
+/// independent — `read` is authorized against `main`). **Not** Cedar-filtered
+/// per query yet, so it can list a query whose `invoke_query` the caller
+/// lacks (a known gap until per-query authorization lands).
+async fn server_list_queries(
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+) -> std::result::Result<Json<QueriesCatalogOutput>, ApiError> {
+    authorize_request(
+        actor.as_ref().map(|Extension(actor)| actor),
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::Read,
+            branch: Some("main".to_string()),
+            target_branch: None,
+        },
+    )?;
+    let queries = match handle.queries.as_ref() {
+        Some(registry) => registry
+            .iter()
+            .filter(|q| q.expose)
+            .map(api::query_catalog_entry)
+            .collect(),
+        None => Vec::new(),
+    };
+    Ok(Json(QueriesCatalogOutput { queries }))
 }
 
 #[utoipa::path(

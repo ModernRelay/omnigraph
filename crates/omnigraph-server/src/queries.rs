@@ -563,4 +563,64 @@ embedding: Vector(4)
         let report = check(&reg, &test_catalog());
         assert!(report.is_clean(), "no breakage or warning expected: {:?}", report);
     }
+
+    // --- catalog projection (api::query_catalog_entry) ---
+
+    #[test]
+    fn catalog_entry_projects_every_param_kind() {
+        use crate::api::{self, ParamKind};
+        let reg = QueryRegistry::from_specs(vec![spec_tool(
+            "all_types",
+            "query all_types($s: String, $i: I32, $big: I64, $u: U64, $f: F64, $b: Bool, \
+             $d: Date, $dt: DateTime, $blob: Blob, $opt: String?, $list: [I32], $vec: Vector(4)) \
+             { match { $x: User } return { $x.name } }",
+            true,
+            "all",
+        )])
+        .unwrap();
+        let entry = api::query_catalog_entry(reg.lookup("all_types").unwrap());
+        assert_eq!(entry.name, "all_types");
+        assert_eq!(entry.tool_name, "all");
+        assert!(!entry.mutation);
+
+        let by: std::collections::HashMap<_, _> =
+            entry.params.iter().map(|p| (p.name.as_str(), p)).collect();
+        assert_eq!(by["s"].kind, ParamKind::String);
+        assert_eq!(by["i"].kind, ParamKind::Int);
+        assert_eq!(by["big"].kind, ParamKind::BigInt, "I64 → bigint (string on the wire)");
+        assert_eq!(by["u"].kind, ParamKind::BigInt, "U64 → bigint");
+        assert_eq!(by["f"].kind, ParamKind::Float);
+        assert_eq!(by["b"].kind, ParamKind::Bool);
+        assert_eq!(by["d"].kind, ParamKind::Date);
+        assert_eq!(by["dt"].kind, ParamKind::DateTime);
+        assert_eq!(by["blob"].kind, ParamKind::Blob);
+        assert!(!by["s"].nullable);
+        assert!(by["opt"].nullable, "String? → nullable");
+        assert_eq!(by["list"].kind, ParamKind::List);
+        assert_eq!(by["list"].item_kind, Some(ParamKind::Int), "[I32] → list of int");
+        assert_eq!(by["vec"].kind, ParamKind::Vector);
+        assert_eq!(by["vec"].vector_dim, Some(4));
+    }
+
+    #[test]
+    fn catalog_entry_flags_mutation_and_empty_params() {
+        use crate::api;
+        let reg = QueryRegistry::from_specs(vec![spec(
+            "add_user",
+            "query add_user($name: String) { insert User { name: $name } }",
+            true,
+        )])
+        .unwrap();
+        let entry = api::query_catalog_entry(reg.lookup("add_user").unwrap());
+        assert!(entry.mutation, "insert body → mutation flag");
+
+        let reg2 = QueryRegistry::from_specs(vec![spec(
+            "no_params",
+            "query no_params() { match { $u: User } return { $u.name } }",
+            true,
+        )])
+        .unwrap();
+        let entry2 = api::query_catalog_entry(reg2.lookup("no_params").unwrap());
+        assert!(entry2.params.is_empty(), "no declared params → empty list");
+    }
 }

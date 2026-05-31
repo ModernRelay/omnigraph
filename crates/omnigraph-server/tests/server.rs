@@ -415,6 +415,87 @@ async fn invoke_query_holder_without_read_sees_403_not_404() {
     assert_eq!(absent_status, StatusCode::NOT_FOUND, "unknown query still 404s");
 }
 
+fn get_request(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .method(Method::GET)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_queries_returns_only_exposed_with_typed_params() {
+    let (_temp, app) = app_with_stored_queries(
+        &[
+            ("find_person", FIND_PERSON_GQ, true),
+            (
+                "add_person",
+                "query add_person($name: String) { insert Person { name: $name } }",
+                true,
+            ),
+            ("hidden", "query hidden() { match { $p: Person } return { $p.name } }", false),
+        ],
+        &[("act-invoke", "t-invoke")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    let (status, body) = json_response(&app, get_request("/queries", "t-invoke")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let entries = body["queries"].as_array().unwrap();
+    let names: Vec<&str> = entries.iter().map(|q| q["name"].as_str().unwrap()).collect();
+    assert!(
+        names.contains(&"find_person") && names.contains(&"add_person"),
+        "exposed queries listed: {names:?}"
+    );
+    assert!(!names.contains(&"hidden"), "non-exposed query hidden from the catalog: {names:?}");
+
+    let fp = entries.iter().find(|q| q["name"] == "find_person").unwrap();
+    assert_eq!(fp["mutation"], false);
+    assert_eq!(fp["tool_name"], "find_person");
+    assert_eq!(fp["params"][0]["name"], "name");
+    assert_eq!(fp["params"][0]["kind"], "string");
+    let ap = entries.iter().find(|q| q["name"] == "add_person").unwrap();
+    assert_eq!(ap["mutation"], true, "stored insert → mutation");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_queries_is_read_gated_so_a_non_invoker_can_list() {
+    // The catalog is read-gated (not invoke_query-gated), so a reader who
+    // lacks invoke_query still enumerates the exposed queries — the
+    // documented probe-oracle gap until per-query Cedar filtering lands.
+    let (_temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, true)],
+        &[("act-noinvoke", "t-noinvoke")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    let (status, body) = json_response(&app, get_request("/queries", "t-noinvoke")).await;
+    assert_eq!(status, StatusCode::OK, "read-gated catalog; body: {body}");
+    let names: Vec<&str> = body["queries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|q| q["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"find_person"),
+        "a reader lists the catalog despite lacking invoke_query: {names:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_queries_is_empty_when_no_registry() {
+    let (_temp, app) = app_for_loaded_graph_with_auth("demo-token").await;
+    let (status, body) = json_response(&app, get_request("/queries", "demo-token")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        body["queries"].as_array().unwrap().is_empty(),
+        "no stored-query registry → empty catalog"
+    );
+}
+
 fn drifted_test_schema() -> String {
     fs::read_to_string(fixture("test.pg"))
         .unwrap()
