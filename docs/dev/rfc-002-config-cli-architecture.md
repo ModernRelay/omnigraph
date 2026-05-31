@@ -14,7 +14,7 @@ This RFC defines the config and CLI architecture that closes that gap, derived f
 1. A **global-first layered config** — user-global (`~/.omnigraph/`) is the **primary, self-sufficient default**; per-project (`./omnigraph.yaml`) is an *optional* override + deployment manifest. One uniform schema, both layers optional; the CLI works from any directory with **no project file** (the `kubectl`/`aws`/`gh` posture), unlike today's project-anchored behavior.
 2. A single unifying noun — the **target** — that resolves a name to a concrete `(locus, graph, sub-state, credential)` tuple, where the locus is **embedded (storage URI) XOR remote (server endpoint)**.
 3. A **multi-server × multi-graph** client model (OmniGraph hosts N graphs per server and there are M servers — unlike Helix's one-cluster-one-graph).
-4. **Credentials by reference**, reusing OmniGraph's existing mechanism — `bearer_token_env:` (token resolved by env-var name) + a git-ignored `auth.env_file` dotenv — extended to servers and the global layer; OS keychain as a future resolver. No new `credentials.yaml`; every committed/GitOps'd surface stays secret-free.
+4. **Credentials by reference, keyed by server name** (the AWS/gh/kube model) — OS keychain `omnigraph:<server>` (preferred) → a `[<server>]` profile in `~/.omnigraph/credentials` → `OMNIGRAPH_TOKEN[_<SERVER>]` env (CI). `servers.<name>` is endpoint-only by default but may carry an explicit, secret-free `auth: { token: { env|file|command|keychain } }` source; no `credentials.yaml`; the shipped `bearer_token_env` + dotenv stay as a legacy compat path. Every committed/GitOps'd surface stays secret-free.
 5. A **file-naming** decision: project and server config are **the same artifact, same name** (`omnigraph.yaml`); the only differently-named file is the user-global `config.yaml`, justified by **scope, not role**.
 
 The design optimizes jointly for **DX** (one command surface across embedded and remote; clone-and-go) and **AX** (agent experience: one flat resolved context, secrets structurally unreachable, branch-pinned reproducible reads, and a GitOps'd capability surface).
@@ -117,7 +117,7 @@ This makes the **zero-project case the default, not an edge case**: a solo user 
 
 **Merge semantics — "closest layer wins, at the smallest meaningful unit"** (the field consensus: git / kubeconfig / cargo / Helm / VS Code):
 - **Settings objects** (`defaults`, `auth`, `server`) → **deep-merge per field**: a project sets `defaults.target` and *inherits* the global `defaults.output_format`. (VS Code / cargo behavior.)
-- **Named-resource maps** (`servers`, `targets`, `queries`, `aliases`) → **union by key; on a collision the higher layer's entry REPLACES the lower wholesale** — *no field-level deep-merge within an entry*. (kubeconfig: union contexts by name.) The footgun this avoids: global `servers.prod = {endpoint, bearer_token_env}`, project `servers.prod = {endpoint: other}` — deep-merge would silently retain the old `bearer_token_env`; replace makes the project's `prod` self-contained and predictable.
+- **Named-resource maps** (`servers`, `targets`, `queries`, `aliases`) → **union by key; on a collision the higher layer's entry REPLACES the lower wholesale** — *no field-level deep-merge within an entry*. (kubeconfig: union contexts by name.) The footgun this avoids: global `servers.prod = {endpoint, policy}`, project `servers.prod = {endpoint: other}` — deep-merge would silently retain the old fields; replace makes the project's `prod` self-contained and predictable.
 - **Lists/arrays** → **replace, never append** (Helm convention; appending is order-sensitive and surprising).
 - **Scalars** → higher layer wins.
 - **Relative paths carry their origin's base_dir.** A `queries:` entry's `.gq` path, or a `policy.file`, resolves against the directory of the layer it was *defined in* — global entries under `~/.omnigraph/`, project entries under the project dir.
@@ -136,13 +136,13 @@ This makes the **zero-project case the default, not an edge case**: a solo user 
 
 ### 4. File naming
 
-Principles from the field: **one global dir** `~/.omnigraph/` (like `~/.aws`/`~/.kube`/`~/.helix`), with config/cache/state as **subdirectories** (separation without XDG's three-root scatter); **secrets in a separate, git-ignored file inside that dir** (OmniGraph's existing `auth.env_file` dotenv, not a new `credentials.yaml`); **project-root manifest keeps the app-named file** (`Cargo.toml`, `package.json`); **`.yaml`, not `.yml`**; keep OmniGraph's established names. The only genuinely *new* decision is the **global** dir's existence; credentials reuse the existing `bearer_token_env` + `auth.env_file` mechanism.
+Principles from the field: **one global dir** `~/.omnigraph/` (like `~/.aws`/`~/.kube`/`~/.helix`), with config/cache/state as **subdirectories** (separation without XDG's three-root scatter); **secrets keyed by server name in the OS keychain or a separate git-ignored profile file** (AWS/gh model, not a new `credentials.yaml`); **project-root manifest keeps the app-named file** (`Cargo.toml`, `package.json`); **`.yaml`, not `.yml`**; keep OmniGraph's established names. The genuinely *new* decisions are the **global** dir's existence and keyed-by-name resolution with an explicit `auth.token` override (MR-971); the shipped `bearer_token_env` + `auth.env_file` mechanism remains as legacy compat.
 
 | Artifact | Path / name | Why |
 |---|---|---|
 | Project = server config (one artifact) | `./omnigraph.yaml` | **Keep.** Root manifest like `Cargo.toml` / `compose.yaml` / `helix.toml`. Same name for both roles because it is one file. In prod the server's deploy repo and an app repo each have their own `omnigraph.yaml` — same name, different repos. |
 | Global user config | `~/.omnigraph/config.yaml` | **One dir** (`~/.omnigraph/`, like `~/.aws`/`~/.kube`/`~/.helix`). Named `config.yaml` *not* `omnigraph.yaml` — the name signals scope (and `~/.aws/config`, `~/.kube/config`, `~/.helix/config` all do this). Holds the full schema so a solo user needs nothing else. |
-| Credentials | **Existing** `auth.env_file` dotenv — `./.env.omni` (project), `~/.omnigraph/credentials` (global); `0600`, git-ignored, *inside the one dir*. OS keychain is a future option. | **Reuse what exists** — OmniGraph already loads a git-ignored dotenv (`load_env_file_into_process`, env-vars-win precedence) and resolves a token by env-var name (`bearer_token_env`). Do **not** invent a parallel `credentials.yaml`; the dotenv is the separate, secret-only, uncommittable credential store (matches `~/.helix/credentials`). |
+| Credentials | OS keychain (`omnigraph:<server>`, preferred) → `~/.omnigraph/credentials` profile file (`[<server>]`, `0600`, git-ignored). **Keyed by server name**, inside the one dir. | **Key by name, AWS/gh model** — `~/.aws/credentials [profile]`, `~/.kube/config users:`, `~/.helix/credentials`. *Not* a `credentials.yaml`, and *not* a per-server hand-named env var; the secret lives under the server name (no indirection). Legacy `bearer_token_env` + `.env.omni` dotenv remain as a compat path. See §5. |
 | Cache / state | `~/.omnigraph/cache/`, `~/.omnigraph/state/` | Subdirs of the one dir (like `~/.aws/sso/cache/`, `~/.kube/cache/`) — cache is `rm -rf`-safe and backup-excludable without scattering across XDG roots. |
 | Cedar policy | `./policies/<env>.yaml` + `<env>.tests.yaml` | **Keep.** Referenced by `policy.file`. |
 | Schema | `./*.pg` (e.g. `schema.pg`) | **Keep.** |
@@ -156,16 +156,52 @@ Principles from the field: **one global dir** `~/.omnigraph/` (like `~/.aws`/`~/
 - `OMNIGRAPH_CONFIG=/path` — explicit config file, highest precedence.
 - `OMNIGRAPH_HOME=/path` → the global dir (default `~/.omnigraph/`); `$XDG_CONFIG_HOME` optionally honored if a user has set it, but `~/.omnigraph/` is canonical.
 - Cache and state are subdirs of the one dir: `~/.omnigraph/cache/` (cached remote catalogs), `~/.omnigraph/state/` (session, logs).
-- Per-server/-graph token resolution (**existing mechanism, extended to servers**): `bearer_token_env: <VAR>` names the var → resolved from a real process env var → else the `auth.env_file` dotenv (named lookup) → (future) OS keychain. Operator-chosen var names use the `OMNIGRAPH_` / `OG_` prefix by convention; `DEFAULT_BEARER_TOKEN_ENV` is the fallback name.
+- Per-server token resolution: an explicit `auth: { token: {...} }` source (env/file/command/keychain) wins if set; otherwise **keyed by the server name** — `OMNIGRAPH_TOKEN_<NAME>` (or `OMNIGRAPH_TOKEN` for the active server) → OS keychain `omnigraph:<name>` → the `[<name>]` profile in `~/.omnigraph/credentials`; legacy `bearer_token_env` still honored. See §5.
 
 ### 5. Credentials, connection tiers, and bind portability (12-factor)
 
-**Credentials are by-reference everywhere, never inlined at any layer — and the mechanism already exists.** OmniGraph today resolves a bearer token by **env-var name** (`bearer_token_env:` on a graph) and loads secrets from a git-ignored **dotenv** (`auth.env_file:`, e.g. `.env.omni`) via `load_env_file_into_process` — which sets only vars not already in the environment, so **real env vars win over the file** (standard dotenv precedence). This RFC **extends that mechanism**, it does not replace it:
-- `bearer_token_env: <VAR>` gains a per-**server** form (`servers.<name>.bearer_token_env`) alongside the existing per-graph form.
-- `auth.env_file` gains a **global** location (`~/.omnigraph/credentials`) layered under the project `.env.omni`.
-- Resolution order (existing `resolve_remote_bearer_token`, extended): process env var → `auth.env_file` named lookup → (future) OS keychain.
+**Credentials are by-reference everywhere, never inlined — and keyed by the *server name*, not by a hand-invented env-var name.** This is the one place the design departs from simply reusing the shipped `bearer_token_env` mechanism, because that mechanism is sub-optimal for a multi-server client: it forces the operator to invent and coordinate an env-var name per server (three steps to add a server: pick a var, name it in config, set it in the store). The peer group (AWS profiles, `gh` hosts, kubeconfig users, docker auths) instead keys the secret **by the server's name** — no indirection. OmniGraph should match that.
 
-There is **no new `credentials.yaml`** — the dotenv *is* the separate, secret-only, git-ignored credential store (it already appears in `.gitignore`). The reason secrets gravitate to `~`/the dotenv rather than the committed config is that the project manifest is shareable — not a schema constraint. This keeps the design safe for git (manifest shareable) and for agents (no inline secrets anywhere they can read). The keychain is an additive future resolver, not a replacement for the dotenv default.
+**Resolution for server `<name>` (no config field required):**
+1. **`OMNIGRAPH_TOKEN_<NAME>`** env var (name-derived, upper-snake), else **`OMNIGRAPH_TOKEN`** for the active server — the CI/headless override (12-factor).
+2. **OS keychain** entry `omnigraph:<name>` — the preferred interactive store (no plaintext on disk); written by `omnigraph login <name>`.
+3. **`~/.omnigraph/credentials`** — an AWS-style profile file keyed by server name (mode `0600`, git-ignored), the fallback when no keychain:
+   ```ini
+   [prod-us]
+   token = …
+   [prod-eu]
+   token = …
+   ```
+So a `servers.<name>` with no token field resolves by name — adding a server is one step (`omnigraph login <name>`), and "multiple servers, multiple tokens" falls out for free.
+
+**But implicit must not be the *only* path — explicit sourcing is a first-class option** (the DX/AX lesson). Pure-convention is invisible (you must *know* `OMNIGRAPH_TOKEN_<NAME>`), can't integrate with a secrets-manager's fixed var name, and can't do dynamic/short-lived tokens. So a server may declare an explicit `auth:` block — a **method-agnostic wrapper** (today only `token:` for bearer; `mtls:`/`oidc:` are the future siblings, so the credential model never has to be re-keyed) holding a tagged token *source*. Secrets are *still* never inlined (every source is a reference):
+
+```yaml
+servers:
+  prod-us:
+    endpoint: https://og-us…
+    auth: { token: { env: OG_PROD_US_TOKEN } }     # explicit env var — self-documenting (= legacy bearer_token_env)
+  prod-eu:
+    endpoint: https://og-eu…
+    auth: { token: { command: [vault, read, -field=token, secret/og] } }   # dynamic / short-lived
+  edge:
+    endpoint: https://og-edge…
+    auth: { token: { file: /run/secrets/og-token } }   # k8s/docker mounted secret
+  staging:
+    endpoint: https://og-staging…          # no auth: → implicit chain (below)
+```
+
+| `auth.token:` source | when | DX/AX value |
+|---|---|---|
+| *(auth omitted)* | the common case | zero-config; `omnigraph login` populates keychain `omnigraph:<name>` |
+| `{ env: VAR }` | secrets-manager / CI injects a fixed var | **self-documenting** — config states the source; = the legacy `bearer_token_env` |
+| `{ file: PATH }` | k8s/docker secret mounted as a file | no env plumbing |
+| `{ command: [...] }` | Vault, cloud IAM, `gh auth token` | **dynamic tokens** — first-class exec, the capability pure-env/keychain can't give (kube `exec` / AWS `credential_process`) |
+| `{ keychain: ENTRY }` | pin a non-default keychain entry | explicit override of the name-derived default |
+
+**Resolution per server:** if `auth.token:` is set, use that source (no fallthrough). Else the **implicit chain**: `OMNIGRAPH_TOKEN_<NAME>` (or `OMNIGRAPH_TOKEN` for the active server) → keychain `omnigraph:<name>` → `[<name>]` in `~/.omnigraph/credentials` (`0600`, git-ignored). `omnigraph login <server>` writes/rotates only that server's secret; per-server precedence is independent; sharing is opt-in (same env var or source). The `command` source runs locally with the operator's own privileges and is defined only in operator-owned config (never server-supplied), so it adds no remote-execution surface. The `auth:` wrapper is method-agnostic so adding mTLS/OIDC later is a new sibling key, not a breaking re-key (Hyrum's Law: the field name is a contract once shipped). There is **no `credentials.yaml`** and **no inlined secret**. *Convention for the floor, explicit for control — and explicit is legible to agents and never inlines a secret.*
+
+**Back-compat.** The shipped per-graph `bearer_token_env` + `auth.env_file` dotenv (`resolve_remote_bearer_token`, real-env-wins) keeps working unchanged for existing single-server setups; `bearer_token_env` is just the legacy flat alias for `auth: { token: { env } }`. Resolution tries an explicit `auth.token:` (or legacy `bearer_token_env`) first, then the keyed-by-name chain — so nothing breaks, but the zero-config default is the no-boilerplate keyed-by-name path. (MR-971 — the `bearer_token_env` parity gap — is where this resolver work lands.)
 
 **Three connection tiers** (Supabase/Prisma teach the zero-config floor):
 1. **Env vars** — `OMNIGRAPH_SERVER=https://…` + `OMNIGRAPH_TOKEN=…`: zero-config remote, no file (the `DATABASE_URL` floor).
@@ -196,7 +232,7 @@ So the client carries *pointers to servers*, not query definitions; it **discove
 
 ### 7. CLI surface
 
-- `omnigraph login <server>` — interactive auth; writes the token to the `auth.env_file` dotenv (0600) or the keychain. The `gh auth login` analog.
+- `omnigraph login <server>` — interactive auth; stores the token keyed by server name in the OS keychain (`omnigraph:<server>`) or the `[<server>]` profile of `~/.omnigraph/credentials` (0600). The `gh auth login` analog.
 - `omnigraph use <graph>` — set the active graph (writes the appropriate layer). The `kubectl config use-context` analog.
 - `omnigraph config view [--resolved] [--show-origin] [<graph>]` — print the merged config and, with `--resolved`, the final tuple **plus the origin layer of every field** (the `git config --show-origin` / `kubectl config view` analog). Resolution is never a mystery.
 - All existing verbs (`query`, `mutate`, `load`, `schema`, `branch`, …) gain `--graph <name>`; resolution decides embedded vs remote transparently.
@@ -217,18 +253,16 @@ Scaffolding splits into three tiers by *scope* and *fatness*, mirroring the fiel
 - **Interactive for humans, `--auto`/agent-mode for automation** (npm `-y`, create-* `--CI`, MR-981 `--machine`). In `OMNIGRAPH_AGENT_MODE` any prompt → fail with a repair hint.
 - **Templates are a `--template <name>` flag on the fat tier** (create-vite model), with the *content* (schema + queries + seed) coming from a template source. Mechanism is a design question (bundled-in vs `og template pull` from a repo vs `npm create-*`-style delegation) — **not** an existing foothold (MR-581 stale). Lean: a small set of bundled templates first (generic `Person→Knows`, plus promote `omnigraph-intel-bootstrap`), `--template <github>` later.
 - **`init`/`quickstart` can scaffold the `graphs:` map with one or more entries**; "init with specific graphs" = the scaffolded `graphs:` block (embedded `uri:` locally; the agent/operator adds remote `server:` entries via `login` + editing).
-- **Secrets-on-scaffold rule** (prisma/dbt/supabase all do this): anything that writes a token or `.env`-shaped file also writes/updates `.gitignore` to exclude it. `init`/`login` must keep the `auth.env_file` git-ignored.
+- **Secrets-on-scaffold rule** (prisma/dbt/supabase all do this): anything that writes a token also keeps it out of VCS. `login` prefers the OS keychain (no file); the `~/.omnigraph/credentials` profile fallback is `0600` and git-ignored, and any project-local `.env`-shaped file gets a `.gitignore` entry.
 
 ### 8. Concrete shape
 
 **Global** `~/.omnigraph/config.yaml` (per-user, secret-free):
 ```yaml
-servers:
-  prod-us:  { endpoint: https://og-us.internal:8080,  bearer_token_env: OG_PROD_US_TOKEN }
-  prod-eu:  { endpoint: https://og-eu.internal:8080,  bearer_token_env: OG_PROD_EU_TOKEN }
-  staging:  { endpoint: https://og-staging.internal:8080, bearer_token_env: OG_STAGING_TOKEN }
-auth:
-  env_file: ~/.omnigraph/credentials   # git-ignored dotenv holding OG_*_TOKEN values
+servers:                               # endpoint only — token is keyed by the server name
+  prod-us:  { endpoint: https://og-us.internal:8080 }
+  prod-eu:  { endpoint: https://og-eu.internal:8080 }
+  staging:  { endpoint: https://og-staging.internal:8080 }
 defaults:
   graph: dev
 ```
@@ -246,7 +280,7 @@ operations: { ... }   # the soon-to-be-renamed `aliases:` (MR-839)
 ```
 Select with `--graph <name>` (shipped flag, MR-603).
 
-**Credentials** the git-ignored `auth.env_file` dotenv (`~/.omnigraph/credentials`, 0600) holds the `OG_*_TOKEN` values; real env vars override it. No committable secrets.
+**Credentials** are keyed by server name — `omnigraph login prod-us` writes the OS keychain entry `omnigraph:prod-us` (or a `[prod-us]` profile in `~/.omnigraph/credentials`, 0600, git-ignored); `OMNIGRAPH_TOKEN_PROD_US` overrides for CI. No token fields in any config file; no committable secrets.
 
 ## DX
 
@@ -292,12 +326,12 @@ Select with `--graph <name>` (shipped flag, MR-603).
 - **Global `~/.omnigraph/config.yaml` is new.** Absent → only project + env + flags, exactly as now. Its addition is the **global-first posture flip**: today the CLI is project-anchored (reads `./omnigraph.yaml`, no parent walk); the global config becomes the new primary discovery path so the CLI works with no project file. Existing project-only workflows are unchanged (project still overrides global); the flip is additive — it adds a fallback layer below the project file, it does not remove the project file.
 - **`graphs:` → `targets:` is an evolution, not a break.** Both can coexist; `targets:` is the superset (adds remote + branch pinning). A future cleanup may alias `graphs:` to embedded `targets:`.
 - **`server.bind` stays supported** but documentation steers operators to `--bind` / `OMNIGRAPH_BIND` for portability; no removal.
-- **Credentials reuse existing fields.** `bearer_token_env` and `auth.env_file` are unchanged; the RFC only *extends* them — `bearer_token_env` gains a per-`servers.<name>` form, and `auth.env_file` gains a global location (`~/.omnigraph/credentials`) layered under the project `.env.omni`. No `credentials.yaml`, no `token_env`. Existing dotenv setups keep working.
+- **Credentials: keyed-by-name is new; `bearer_token_env` is the compat path.** The primary design (keychain / `[<server>]` profile / `OMNIGRAPH_TOKEN_<SERVER>`) is new resolver work (lands on MR-971). The shipped `bearer_token_env` + `auth.env_file` dotenv (`resolve_remote_bearer_token`) is **unchanged and still honored** — existing single-server dotenv setups keep working, and the resolver honors an explicit `auth: { token: {...} }` source (env/file/command/keychain) with `bearer_token_env` as its flat legacy alias. No `credentials.yaml`.
 
 ## Open questions
 
 - **`graphs:` vs `targets:` naming churn.** Do we rename `graphs:` → `targets:` (with a deprecation alias) or keep `graphs:` for embedded and add `targets:` for remote? Leaning: keep both, document `targets:` as the superset.
-- **Keychain integration scope.** macOS Keychain first (matches operator practice), with a `0600` file fallback; Linux Secret Service later?
+- **Keychain integration scope.** Keychain is now the *primary* credential store (§5), so this is on the critical path, not optional: macOS Keychain first (matches operator practice) with the `0600` `[<server>]` profile file as fallback; Linux Secret Service / `pass` later. Open: which keyring crate, and the exact `OMNIGRAPH_TOKEN_<SERVER>` name-derivation (upper-snake, non-alnum → `_`).
 - **Project-local `servers:`.** Allowed (e.g. a localhost dev server), merged with global. Confirm creds stay by-reference even for project-local servers (yes).
 - **`aliases:` ⇄ `queries:` convergence.** Out of scope here; tracked separately. One registry with embedded + remote invocation surfaces is the target end state.
 - **Single-file `KUBECONFIG`-style list.** Do we support `OMNIGRAPH_CONFIG` pointing at multiple files (colon-joined), or a single file only? Start single; revisit if demand appears.
@@ -335,7 +369,7 @@ Shaped via requirements + a fit check (Shape A — global-first layered config +
 | N6 | P3 | `GraphConn` — `Embedded(engine)` \| `Remote(http)` dispatch | **N⚠️** | → N7, → N8 |
 | N7 | P3 | embedded path — `Omnigraph::open(uri)` (existing) | — | → engine |
 | N8 | P3 | **HTTP-client path** — POST `/query`/`/mutate`/`/queries/{name}` | **N⚠️** | → P4, → N9 |
-| N9 | P2 | `resolve_bearer_token(server)` — env → dotenv → keychain(future); extends `resolve_remote_bearer_token` to `servers.<name>` (MR-971) | **N** | → N8 |
+| N9 | P2 | `resolve_bearer_token(server)` — explicit `auth.token` source if set, else **keyed by name**: `OMNIGRAPH_TOKEN_<NAME>`/`OMNIGRAPH_TOKEN` → keychain `omnigraph:<name>` → `[<name>]` profile; legacy `bearer_token_env`/dotenv (MR-971) | **N⚠️** | → N8 |
 | N10 | P2 | `config view` handler — merged + per-field origin (needs N2 provenance) | **N** | → U7 |
 | N11 | P5 | `login` handler — interactive auth → write `config.yaml` + `credentials` (0600) + `.gitignore` | **N⚠️** | → S_global |
 | N12 | P5 | `init` handler — `scaffold_config_if_missing` + create graph; refuse-if-exists/`--force` purge (MR-975) | partly | → S_project |
