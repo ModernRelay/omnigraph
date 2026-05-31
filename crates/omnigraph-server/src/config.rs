@@ -331,6 +331,36 @@ impl OmnigraphConfig {
         }
     }
 
+    /// The policy file that applies for a graph selection — the policy
+    /// sibling of [`OmnigraphConfig::query_entries_for`], so policy and
+    /// queries resolve by the same identity rule. A named graph in
+    /// `graphs:` uses its per-graph `policy.file` with **no** top-level
+    /// fallback (a named graph with no per-graph policy has no policy —
+    /// that keeps the boot-time coherence check meaningful); anything else
+    /// (no selection, or a bare URI) uses the top-level `policy.file`.
+    pub fn resolve_policy_file_for(&self, graph: Option<&str>) -> Option<PathBuf> {
+        match graph {
+            Some(name) if self.graphs.contains_key(name) => self.resolve_target_policy_file(name),
+            _ => self.resolve_policy_file(),
+        }
+    }
+
+    /// Names of any top-level config blocks (`policy.file`, `queries:`)
+    /// that are populated. Used by the boot-time coherence check: when a
+    /// **named** graph is served (single-mode by name, or multi-mode),
+    /// the top-level blocks are not honored, so a populated one is a
+    /// configuration error rather than a silent no-op.
+    pub fn populated_top_level_blocks(&self) -> Vec<&'static str> {
+        let mut blocks = Vec::new();
+        if self.policy.file.is_some() {
+            blocks.push("policy.file");
+        }
+        if !self.queries.is_empty() {
+            blocks.push("queries");
+        }
+        blocks
+    }
+
     /// Resolve a stored-query `.gq` file path (from a registry entry),
     /// relative to the config's `base_dir`. Mirrors policy-file
     /// resolution; the registry loader calls this to turn each entry's
@@ -637,6 +667,42 @@ queries:
         assert_eq!(
             config.resolve_query_file(&find_user.file),
             temp.path().join("./queries/find_user.gq")
+        );
+    }
+
+    #[test]
+    fn resolve_policy_file_for_follows_identity() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("omnigraph.yaml"),
+            "policy:\n  file: ./top.yaml\ngraphs:\n  prod:\n    uri: s3://b/prod\n    \
+             policy:\n      file: ./prod.yaml\n  bare:\n    uri: s3://b/bare\n",
+        )
+        .unwrap();
+        let config = load_config_in(temp.path(), None).unwrap();
+
+        // Named graph with its own policy → per-graph (not top-level).
+        assert!(
+            config
+                .resolve_policy_file_for(Some("prod"))
+                .unwrap()
+                .ends_with("prod.yaml")
+        );
+        // Named graph with NO per-graph policy → None (no top-level fallback;
+        // load-bearing for the boot coherence check).
+        assert!(config.resolve_policy_file_for(Some("bare")).is_none());
+        // Anonymous (bare URI) or an unknown name → top-level.
+        assert!(
+            config
+                .resolve_policy_file_for(None)
+                .unwrap()
+                .ends_with("top.yaml")
+        );
+        assert!(
+            config
+                .resolve_policy_file_for(Some("nope"))
+                .unwrap()
+                .ends_with("top.yaml")
         );
     }
 

@@ -67,7 +67,7 @@ aliases:
     graph: <name>
     branch: <name>
     format: <output-format>
-queries:                          # top-level stored-query registry (single-graph mode); mirrors top-level `policy`
+queries:                          # top-level registry — applies only to a bare-URI (anonymous) graph; a graph served by name uses its `graphs.<id>.queries`. Mirrors top-level `policy`.
   <query-name>: { file: <path-to-.gq> }   # mcp.expose defaults to true
 policy:
   file: ./policy.yaml

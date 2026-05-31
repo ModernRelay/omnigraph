@@ -6,7 +6,9 @@ Axum 0.8 + tokio + utoipa-generated OpenAPI. **Two modes** (v0.6.0+): single-gra
 
 ### Single-graph mode (legacy)
 
-`omnigraph-server <URI>` or `omnigraph-server --target <name> --config omnigraph.yaml`. Routes are flat — `/snapshot`, `/read`, `/branches`, etc. Behavior unchanged from v0.6.0.
+`omnigraph-server <URI>` or `omnigraph-server --target <name> --config omnigraph.yaml`. Routes are flat — `/snapshot`, `/read`, `/branches`, etc.
+
+**Config follows graph identity.** A bare `<URI>` is an *anonymous* graph and uses the **top-level** `policy.file` / `queries:`. A graph chosen by **name** (`--target` / `server.graph`) uses its own `graphs.<name>.{policy.file, queries}` — the same block multi-graph mode uses. ⚠️ *Changed from v0.6.0, which always used top-level config in single mode: a named-graph config that puts `policy`/`queries` at top-level now **refuses boot** and points you at `graphs.<name>.…` (move the block there). Bare-`<URI>` single mode is unchanged.*
 
 ### Multi-graph mode (v0.6.0+)
 

@@ -1679,19 +1679,36 @@ struct QueriesListOutput {
     queries: Vec<QueriesListItem>,
 }
 
-/// Resolve the stored-query registry entries for the selected graph via
-/// the same `query_entries_for` the server boot uses, so the CLI
-/// validates exactly the block the server would load. A `--target`
-/// overrides the configured default graph.
-fn registry_entries<'a>(
-    config: &'a OmnigraphConfig,
-    target: Option<&str>,
-) -> &'a std::collections::BTreeMap<String, omnigraph_server::config::QueryEntry> {
-    config.query_entries_for(target.or_else(|| config.cli_graph_name()))
+/// Resolve the selected graph to `(local URI, registry selection)` from one
+/// precedence, so a command's schema and its stored-query registry can never
+/// come from different graphs. A **positional URI is anonymous** (top-level
+/// registry, ignoring the configured default graph); otherwise `--target`
+/// or the configured `cli.graph` names the graph (its per-graph block).
+/// Mirrors the server's single-mode identity rule.
+fn resolve_selected_graph(
+    config: &OmnigraphConfig,
+    cli_uri: Option<String>,
+    cli_target: Option<&str>,
+    operation: &str,
+) -> Result<(String, Option<String>)> {
+    let selected = if cli_uri.is_some() {
+        None
+    } else {
+        cli_target
+            .map(str::to_string)
+            .or_else(|| config.cli_graph_name().map(str::to_string))
+    };
+    let uri = resolve_local_uri(config, cli_uri, cli_target, operation)?;
+    Ok((uri, selected))
 }
 
-fn load_registry_or_report(config: &OmnigraphConfig, target: Option<&str>) -> Result<QueryRegistry> {
-    QueryRegistry::load(config, registry_entries(config, target)).map_err(|errors| {
+/// Load the stored-query registry for an already-resolved graph selection
+/// (`None` = anonymous → top-level; `Some(name)` = that graph's block).
+fn load_registry_or_report(
+    config: &OmnigraphConfig,
+    selected: Option<&str>,
+) -> Result<QueryRegistry> {
+    QueryRegistry::load(config, config.query_entries_for(selected)).map_err(|errors| {
         color_eyre::eyre::eyre!(
             "stored-query registry failed to load:\n  {}",
             errors
@@ -1710,8 +1727,11 @@ async fn execute_queries_validate(
     json: bool,
 ) -> Result<()> {
     let config = load_cli_config(config_path)?;
-    let registry = load_registry_or_report(&config, target.as_deref())?;
-    let uri = resolve_local_uri(&config, uri, target.as_deref(), "queries validate")?;
+    // One selection drives both the schema URI and the registry, so a
+    // positional URI and a `--target` can't validate different graphs.
+    let (uri, selected) =
+        resolve_selected_graph(&config, uri, target.as_deref(), "queries validate")?;
+    let registry = load_registry_or_report(&config, selected.as_deref())?;
     let db = Omnigraph::open(&uri).await?;
     let report = check(&registry, &db.catalog());
 
@@ -1766,7 +1786,10 @@ fn execute_queries_list(
     json: bool,
 ) -> Result<()> {
     let config = load_cli_config(config_path)?;
-    let registry = load_registry_or_report(&config, target.as_deref())?;
+    // `list` takes no URI, so the selection is the target or the configured
+    // default graph (named → its per-graph block; else top-level).
+    let selected = target.as_deref().or_else(|| config.cli_graph_name());
+    let registry = load_registry_or_report(&config, selected)?;
 
     let output = QueriesListOutput {
         queries: registry

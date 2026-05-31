@@ -5506,17 +5506,97 @@ graphs:
         let err = load_server_settings(Some(&config_path), None, None, None, true).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("top-level `policy.file` is single-graph/CLI-local policy only"),
-            "expected single-graph policy guidance, got: {msg}"
+            msg.contains("top-level") && msg.contains("policy.file") && msg.contains("not honored"),
+            "expected top-level-not-honored guidance, got: {msg}"
         );
         assert!(
-            msg.contains("graphs.<graph_id>.policy.file"),
+            msg.contains("graphs.<graph_id>"),
             "expected per-graph migration guidance, got: {msg}"
         );
         assert!(
             msg.contains("server.policy.file"),
             "expected server policy migration guidance, got: {msg}"
         );
+    }
+
+    #[test]
+    fn mode_inference_multi_rejects_top_level_queries() {
+        // Symmetric to the policy guard: a top-level `queries:` block in
+        // multi-graph mode is not honored (each graph uses its own), so it
+        // is a loud error rather than a silent no-op.
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            "queries:\n  q:\n    file: ./q.gq\ngraphs:\n  alpha:\n    uri: /tmp/alpha.omni\n",
+        )
+        .unwrap();
+        let err = load_server_settings(Some(&config_path), None, None, None, true).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("queries") && msg.contains("not honored"),
+            "top-level queries must be rejected in multi-graph mode: {msg}"
+        );
+    }
+
+    #[test]
+    fn single_mode_named_graph_rejects_top_level_blocks() {
+        // Serving a graph by name (`--target`/`server.graph`) uses its
+        // per-graph block; a populated top-level block would be silently
+        // shadowed, so boot refuses and names the per-graph location.
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            "policy:\n  file: ./top.yaml\ngraphs:\n  prod:\n    uri: /tmp/prod.omni\n",
+        )
+        .unwrap();
+        let err =
+            load_server_settings(Some(&config_path), None, Some("prod".to_string()), None, true)
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("prod") && msg.contains("policy.file") && msg.contains("graphs.prod"),
+            "named single-mode + top-level policy must refuse, naming the graph: {msg}"
+        );
+    }
+
+    #[test]
+    fn single_mode_named_graph_uses_per_graph_policy_and_queries() {
+        // The identity rule: `--target prod` attaches `graphs.prod`'s own
+        // policy + queries, not the top-level ones (which are absent here).
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("prod.gq"),
+            "query pq() { match { $u: User } return { $u.name } }",
+        )
+        .unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            "graphs:\n  prod:\n    uri: /tmp/prod.omni\n    policy:\n      file: ./prod-policy.yaml\n    \
+             queries:\n      pq:\n        file: ./prod.gq\n",
+        )
+        .unwrap();
+        let settings =
+            load_server_settings(Some(&config_path), None, Some("prod".to_string()), None, true)
+                .unwrap();
+        match settings.mode {
+            ServerConfigMode::Single {
+                policy_file,
+                queries,
+                ..
+            } => {
+                assert!(
+                    policy_file
+                        .as_ref()
+                        .is_some_and(|p| p.ends_with("prod-policy.yaml")),
+                    "per-graph policy attached: {policy_file:?}"
+                );
+                assert!(queries.lookup("pq").is_some(), "per-graph query attached");
+            }
+            other => panic!("expected Single mode, got {other:?}"),
+        }
     }
 
     #[test]

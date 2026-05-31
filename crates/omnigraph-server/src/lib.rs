@@ -927,11 +927,34 @@ pub fn load_server_settings(
         let uri = normalize_root_uri(&raw_uri).wrap_err_with(|| {
             format!("normalize single-graph URI '{raw_uri}' from server settings")
         })?;
-        let policy_file = config.resolve_policy_file();
-        // Single mode uses the top-level `queries:` (mirrors top-level
-        // `policy.file`). Load + identity-check now (no engine needed);
-        // the schema type-check happens when the engine opens.
-        let queries = QueryRegistry::load(&config, config.query_entries_for(None))
+        // Config follows graph IDENTITY, not mode: a bare URI is anonymous
+        // (top-level config); a graph chosen by name uses its per-graph
+        // `graphs.<name>.{policy,queries}`. `resolve_target_uri` already
+        // errored on an unknown name, so a `Some(name)` here is a known graph.
+        let selected: Option<&str> = if has_cli_uri {
+            None
+        } else {
+            cli_target.as_deref().or_else(|| config.server_graph_name())
+        };
+        // A named selection must not leave a populated top-level block
+        // silently unused — refuse boot and point at the per-graph block.
+        if let Some(name) = selected {
+            let unhonored = config.populated_top_level_blocks();
+            if !unhonored.is_empty() {
+                bail!(
+                    "serving named graph '{name}', but top-level {} {} set — a named graph \
+                     uses its own `graphs.{name}.…` block, so the top-level value is ignored. \
+                     Move it to `graphs.{name}` (e.g. `graphs.{name}.policy.file`, \
+                     `graphs.{name}.queries`).",
+                    unhonored.join(" and "),
+                    if unhonored.len() == 1 { "is" } else { "are" },
+                );
+            }
+        }
+        // Load + identity-check now (no engine needed); the schema
+        // type-check happens when the engine opens.
+        let policy_file = config.resolve_policy_file_for(selected);
+        let queries = QueryRegistry::load(&config, config.query_entries_for(selected))
             .map_err(|errs| color_eyre::eyre::eyre!(format_registry_load_errors(&uri, &errs)))?;
         ServerConfigMode::Single {
             uri,
@@ -939,12 +962,16 @@ pub fn load_server_settings(
             queries,
         }
     } else if has_explicit_config && has_graphs_map {
-        if config.resolve_policy_file().is_some() {
+        // Multi mode: every graph uses its per-graph block; top-level
+        // policy/queries are never honored, so a populated one is an error.
+        let unhonored = config.populated_top_level_blocks();
+        if !unhonored.is_empty() {
             bail!(
-                "top-level `policy.file` is single-graph/CLI-local policy only; \
-                 in multi-graph mode move per-graph rules to \
-                 `graphs.<graph_id>.policy.file` and move `graph_list` rules to \
-                 `server.policy.file`."
+                "multi-graph mode: top-level {} {} not honored — each graph uses its own \
+                 `graphs.<graph_id>.…` block. Move per-graph rules there (and any \
+                 `graph_list` policy to `server.policy.file`).",
+                unhonored.join(" and "),
+                if unhonored.len() == 1 { "is" } else { "are" },
             );
         }
         // Rule 4 → Multi mode. Build a startup config per graph.

@@ -47,10 +47,15 @@ graphs:
     # no per-graph policy → no engine-layer Cedar enforcement on beta
 ```
 
-Top-level `policy.file` is single-graph / CLI-local policy only. Multi-graph
-server startup rejects it because applying one graph policy to every configured
-graph is ambiguous. Move per-graph rules to `graphs.<graph_id>.policy.file` and
-move `graph_list` rules to `server.policy.file`.
+**Config follows graph identity, not server mode.** A graph served by **name**
+(`--target <name>` or `server.graph`) uses its own `graphs.<name>.policy.file`,
+exactly as in multi-graph mode. Top-level `policy.file` applies only to an
+**anonymous** graph — one served by a bare `<URI>` with no `graphs:` entry.
+Serving a **named** graph (single- or multi-graph mode) while top-level
+`policy.file` (or `queries:`) is populated **refuses boot**, naming the block,
+since the top-level value would otherwise be silently shadowed by the per-graph
+block. Move per-graph rules to `graphs.<graph_id>.policy.file` and `graph_list`
+rules to `server.policy.file`.
 
 Each graph's HTTP request flows through its own per-graph policy. The management endpoint (`GET /graphs`) flows through the server-level policy. When `server.policy.file` is unset, `GET /graphs` is denied in every runtime state, including `--unauthenticated`; with bearer tokens configured, it returns 403 after admission control because `graph_list` is not a `read`-equivalent action. The operator must explicitly authorize via `server-policy.yaml` to expose `/graphs`.
 

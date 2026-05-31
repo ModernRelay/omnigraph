@@ -2493,3 +2493,49 @@ fn queries_validate_exits_nonzero_on_duplicate_tool_name() {
         "duplicate tool name should be reported naming both queries; stderr:\n{stderr}"
     );
 }
+
+#[test]
+fn queries_validate_positional_uri_ignores_default_graph() {
+    // A positional URI is anonymous → the schema AND the registry both come
+    // from top-level, even when `cli.graph` names a graph whose per-graph
+    // queries would fail. Pins that the URI and registry can't diverge.
+    let graph = SystemGraph::loaded();
+    graph.write_query(
+        "clean.gq",
+        "query clean($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
+    );
+    // `Widget` is not in the fixture schema — the default graph's per-graph
+    // query would break validate if it were (wrongly) selected.
+    graph.write_query("broken.gq", "query broken() { match { $w: Widget } return { $w.name } }");
+    let config = graph.write_config(
+        "omnigraph.yaml",
+        concat!(
+            "cli:\n  graph: prod\n",
+            "graphs:\n",
+            "  prod:\n",
+            "    uri: /nonexistent-prod.omni\n",
+            "    queries:\n",
+            "      broken:\n",
+            "        file: ./broken.gq\n",
+            "queries:\n",
+            "  clean:\n",
+            "    file: ./clean.gq\n",
+            "policy: {}\n",
+        ),
+    );
+    // Positional URI = the real loaded graph; selection is anonymous, so the
+    // CLEAN top-level registry validates (not prod's broken one).
+    let output = output_success(
+        cli()
+            .arg("queries")
+            .arg("validate")
+            .arg(graph.path())
+            .arg("--config")
+            .arg(&config),
+    );
+    let stdout = stdout_string(&output);
+    assert!(
+        stdout.contains("OK"),
+        "positional URI must validate the top-level registry, not the cli.graph default; stdout:\n{stdout}"
+    );
+}
