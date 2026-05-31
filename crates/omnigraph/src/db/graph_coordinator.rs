@@ -229,20 +229,42 @@ impl GraphCoordinator {
             )));
         }
 
+        // Manifest authority flip — the single atomic op that makes the branch
+        // cease to exist. Must succeed; everything after is derived state
+        // reclaimed best-effort.
         self.manifest.delete_branch(&branch).await?;
 
+        // Commit-graph branch is derived state. Reclaim best-effort with the
+        // idempotent force variant: a failure here (or a missing dataset) is
+        // reconciled by `cleanup` and must not fail the delete after the
+        // authority already flipped.
+        if let Err(err) = self.reclaim_commit_graph_branch(&branch).await {
+            tracing::warn!(
+                target: "omnigraph::branch_delete::cleanup",
+                branch = %branch,
+                error = %err,
+                "best-effort commit-graph branch reclaim failed; cleanup will reconcile",
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Best-effort, idempotent reclaim of the commit-graph branch `branch`.
+    /// Tolerates an absent commit-graph dataset (a graph that never committed).
+    async fn reclaim_commit_graph_branch(&mut self, branch: &str) -> Result<()> {
         if let Some(commit_graph) = &mut self.commit_graph {
-            commit_graph.delete_branch(&branch).await?;
+            commit_graph.force_delete_branch(branch).await
         } else if self
             .storage
             .exists(&graph_commits_uri(self.root_uri()))
             .await?
         {
             let mut commit_graph = CommitGraph::open(self.root_uri()).await?;
-            commit_graph.delete_branch(&branch).await?;
+            commit_graph.force_delete_branch(branch).await
+        } else {
+            Ok(())
         }
-
-        Ok(())
     }
 
     pub async fn snapshot_at_version(&self, version: u64) -> Result<Snapshot> {

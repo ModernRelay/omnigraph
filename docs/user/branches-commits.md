@@ -10,7 +10,7 @@ OmniGraph builds *graph branches* on top by branching every sub-table coherently
 
 - `branch_create(name)` / `branch_create_from(target, name)` — disallowed name `main`; fails if branch exists; ensures the schema-apply lock is idle.
 - `branch_list()` — returns public branches, **filters internal** `__run__…` and `__schema_apply_lock__` prefixes.
-- `branch_delete(name)` — refuses if there are descendants or active runs on the branch; cleans up owned per-branch fragments.
+- `branch_delete(name)` — refuses if there are descendants or active runs on the branch. The manifest is the single authority for branch existence: deletion flips the `__manifest` branch ref first (one atomic op), after which the branch is gone from every snapshot. The owned per-table forks and the commit-graph branch are derived state, reclaimed best-effort with `force_delete_branch` after the flip. A failure during that reclaim (transient object-store error) does not fail the call or block the authority flip; the leftover forks are unreachable orphans that the [`cleanup`](maintenance.md) reconciler converges. One consequence: if a delete's best-effort reclaim fails, reusing that branch name before the next `cleanup` surfaces a clear error pointing at `cleanup` (the stale fork would otherwise collide on first write).
 - **Lazy forking**: a branch only forks a sub-table when that sub-table is first mutated on it. Pure-read branches share fragments with their source.
 - `sync_branch(branch)` — re-binds the in-memory handle to the latest head of the branch.
 

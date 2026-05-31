@@ -1058,11 +1058,14 @@ impl Omnigraph {
         Ok(())
     }
 
-    async fn cleanup_deleted_branch_tables(
-        &self,
-        branch: &str,
-        owned_tables: &[(String, String)],
-    ) -> Result<()> {
+    /// Best-effort reclaim of the per-table Lance forks a just-deleted branch
+    /// owned. Runs AFTER the manifest authority flip, so the branch is already
+    /// gone and these forks are unreachable orphans. A failure here (transient
+    /// object-store error, the `branch_delete.before_table_cleanup` failpoint)
+    /// is logged and swallowed: the `cleanup` reconciler is the guaranteed
+    /// backstop that converges any leftover orphan. Uses `force_delete_branch`
+    /// so a partially-reclaimed retry is idempotent.
+    async fn cleanup_deleted_branch_tables(&self, branch: &str, owned_tables: &[(String, String)]) {
         let mut seen_paths = HashSet::new();
         let mut cleanup_targets = owned_tables
             .iter()
@@ -1072,17 +1075,22 @@ impl Omnigraph {
         cleanup_targets.sort_by(|left, right| left.0.cmp(&right.0));
 
         for (table_key, table_path) in cleanup_targets {
-            crate::failpoints::maybe_fail("branch_delete.before_table_cleanup")?;
             let dataset_uri = self.table_store.dataset_uri(&table_path);
-            if let Err(err) = self.table_store.delete_branch(&dataset_uri, branch).await {
-                return Err(OmniError::manifest_internal(format!(
-                    "branch '{}' was deleted but cleanup failed for {}: {}",
-                    branch, table_key, err
-                )));
+            let outcome = match crate::failpoints::maybe_fail("branch_delete.before_table_cleanup")
+            {
+                Ok(()) => self.table_store.force_delete_branch(&dataset_uri, branch).await,
+                Err(injected) => Err(injected),
+            };
+            if let Err(err) = outcome {
+                tracing::warn!(
+                    target: "omnigraph::branch_delete::cleanup",
+                    branch = %branch,
+                    table = %table_key,
+                    error = %err,
+                    "best-effort fork reclaim failed; cleanup will reconcile the orphan",
+                );
             }
         }
-
-        Ok(())
     }
 
     async fn delete_branch_storage_only(&self, branch: &str) -> Result<()> {
@@ -1106,9 +1114,12 @@ impl Omnigraph {
             .map(|entry| (entry.table_key.clone(), entry.table_path.clone()))
             .collect::<Vec<_>>();
 
+        // Authority flip (+ best-effort commit-graph reclaim) — must succeed.
         self.coordinator.write().await.branch_delete(branch).await?;
+        // Best-effort per-table fork reclaim; cleanup reconciles any leftover.
         self.cleanup_deleted_branch_tables(branch, &owned_tables)
-            .await
+            .await;
+        Ok(())
     }
 
     pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
