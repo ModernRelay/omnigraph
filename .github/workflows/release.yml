@@ -121,6 +121,17 @@ jobs:
         run: |
           ./scripts/update-homebrew-formula.sh "${GITHUB_REF_NAME}" homebrew-tap/Formula/omnigraph.rb
 
+      - name: Audit generated formula
+        if: env.HOMEBREW_TAP_SKIP != '1'
+        run: |
+          # Audit the checked-out tap by name (brew audit rejects bare paths
+          # and needs tap context). Symlink the checkout into Homebrew's Taps
+          # tree so `modernrelay/tap/omnigraph` resolves to it.
+          tap_dir="$(brew --repository)/Library/Taps/modernrelay/homebrew-tap"
+          mkdir -p "$(dirname "$tap_dir")"
+          ln -sfn "$PWD/homebrew-tap" "$tap_dir"
+          brew audit --strict --online modernrelay/tap/omnigraph
+
       - name: Commit and push formula update
         if: env.HOMEBREW_TAP_SKIP != '1'
         working-directory: homebrew-tap
