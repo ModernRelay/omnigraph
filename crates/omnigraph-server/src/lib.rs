@@ -2213,7 +2213,11 @@ async fn server_invoke_query(
         handle.policy.as_deref(),
         PolicyRequest {
             action: PolicyAction::InvokeQuery,
-            branch: req.branch.clone().or_else(|| Some("main".to_string())),
+            // Graph-scoped: no branch dimension. The per-branch/snapshot
+            // access is enforced by the inner read/change gate in the
+            // runner, so the outer gate must not resolve a branch (doing so
+            // was wrong for snapshot reads).
+            branch: None,
             target_branch: None,
         },
     )

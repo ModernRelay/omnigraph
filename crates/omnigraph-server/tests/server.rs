@@ -249,25 +249,34 @@ groups:
   invoke_only: ["act-invokeonly"]
 protected_branches: [main]
 rules:
-  - id: invokers-invoke-and-read
+  # invoke_query is graph-scoped — its own rules, no branch_scope.
+  - id: invokers-can-invoke
     allow:
       actors: { group: invokers }
-      actions: [invoke_query, read]
-      branch_scope: any
-  - id: full-invoke-read-change
+      actions: [invoke_query]
+  - id: full-can-invoke
     allow:
       actors: { group: full }
-      actions: [invoke_query, read, change]
-      branch_scope: any
-  - id: readers-read-only
-    allow:
-      actors: { group: readers }
-      actions: [read]
-      branch_scope: any
-  - id: invoke-only-no-read
+      actions: [invoke_query]
+  - id: invoke-only-can-invoke
     allow:
       actors: { group: invoke_only }
       actions: [invoke_query]
+  # read / change are branch-scoped.
+  - id: invokers-can-read
+    allow:
+      actors: { group: invokers }
+      actions: [read]
+      branch_scope: any
+  - id: full-can-read-change
+    allow:
+      actors: { group: full }
+      actions: [read, change]
+      branch_scope: any
+  - id: readers-can-read
+    allow:
+      actors: { group: readers }
+      actions: [read]
       branch_scope: any
 "#;
 

@@ -57,16 +57,19 @@ pub enum PolicyAction {
     /// `omnigraph.yaml` and restarting.
     GraphList,
     /// Gates invoking a server-side stored query by name. Per-graph and
-    /// branch-scoped, like `Read`/`Change`. In this release it is
-    /// **coarse**: an `invoke_query` allow rule permits *any* stored
-    /// query on the graph (there is no per-query dimension yet). A
-    /// future, additive refinement adds an optional query-name scope to
-    /// rules without changing rules written against the coarse action.
+    /// **graph-scoped** (no branch dimension, like `Admin`): the per-branch
+    /// access of the query body is enforced by the inner `Read`/`Change`
+    /// gate, so branch-scoping this outer gate would be redundant (and was
+    /// wrong for snapshot reads). A rule that sets `branch_scope` on
+    /// `invoke_query` is rejected by `validate()`. In this release it is
+    /// **coarse**: an `invoke_query` allow rule permits *any* stored query
+    /// on the graph (no per-query dimension yet); a future, additive
+    /// refinement adds an optional query-name scope.
     ///
-    /// This gate sits at the HTTP boundary. The underlying engine `_as`
-    /// writers still enforce `Read`/`Change` per the stored query's body,
-    /// so a stored *mutation* is double-gated: `invoke_query` to reach
-    /// the tool, plus `change` for the write itself.
+    /// This gate sits at the HTTP boundary. The engine `_as` writers still
+    /// enforce `Read`/`Change` per the query body, so a stored *mutation*
+    /// is double-gated: `invoke_query` to reach the tool, plus `change` for
+    /// the write itself.
     InvokeQuery,
 }
 
@@ -87,10 +90,7 @@ impl PolicyAction {
     }
 
     fn uses_branch_scope(self) -> bool {
-        matches!(
-            self,
-            Self::Read | Self::Export | Self::Change | Self::InvokeQuery
-        )
+        matches!(self, Self::Read | Self::Export | Self::Change)
     }
 
     fn uses_target_branch_scope(self) -> bool {
@@ -1306,7 +1306,7 @@ rules:
                 "act-alice",
                 &PolicyRequest {
                     action: PolicyAction::InvokeQuery,
-                    branch: Some("main".to_string()),
+                    branch: None,
                     target_branch: None,
                 },
             )
@@ -1323,7 +1323,7 @@ rules:
                 "act-bruno",
                 &PolicyRequest {
                     action: PolicyAction::InvokeQuery,
-                    branch: Some("main".to_string()),
+                    branch: None,
                     target_branch: None,
                 },
             )
@@ -1332,10 +1332,10 @@ rules:
     }
 
     #[test]
-    fn invoke_query_is_branch_scoped() {
-        // Unlike server-scoped actions, invoke_query accepts a
-        // `branch_scope` qualifier — it runs against a branch like
-        // read/change — so validation passes and the rule authorizes.
+    fn invoke_query_rejects_branch_scope() {
+        // invoke_query is graph-scoped (like admin) — per-branch access is
+        // enforced by the inner read/change gate — so a rule that puts a
+        // `branch_scope` qualifier on it is rejected at validate().
         let policy: PolicyConfig = serde_yaml::from_str(
             r#"
 version: 1
@@ -1350,19 +1350,11 @@ rules:
 "#,
         )
         .unwrap();
-        policy.validate().unwrap();
-        let engine = PolicyCompiler::compile(&policy, "graph").unwrap();
-        let allow = engine
-            .authorize(
-                "act-alice",
-                &PolicyRequest {
-                    action: PolicyAction::InvokeQuery,
-                    branch: Some("review".to_string()),
-                    target_branch: None,
-                },
-            )
-            .unwrap();
-        assert!(allow.allowed);
+        let err = policy.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("branch_scope") && err.contains("invoke_query"),
+            "branch_scope on invoke_query must be rejected: {err}"
+        );
     }
 
     #[test]
