@@ -292,8 +292,22 @@ impl TableStore {
                 .await
             {
                 Ok(ds) => {
-                    self.ensure_expected_version(&ds, table_key, source_version)?;
-                    return Ok(ds);
+                    // The target branch ref already exists. Either a legitimate
+                    // concurrent first-write forked it from the same
+                    // `source_version` (its head matches → reuse it), or it is a
+                    // zombie fork left by an incomplete prior `branch_delete`
+                    // (sitting at a different version). For the zombie, surface
+                    // an actionable error pointing at the `cleanup` orphan
+                    // reconciler instead of the opaque ExpectedVersionMismatch.
+                    if ds.version().version == source_version {
+                        return Ok(ds);
+                    }
+                    return Err(OmniError::manifest_conflict(format!(
+                        "branch '{}' has orphaned table state for '{}' from an incomplete \
+                         prior delete; run `omnigraph cleanup` to reclaim it before reusing \
+                         this branch name",
+                        target_branch, table_key
+                    )));
                 }
                 Err(_) => return Err(OmniError::Lance(create_err.to_string())),
             },
