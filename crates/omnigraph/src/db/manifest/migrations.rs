@@ -144,9 +144,10 @@ async fn migrate_v1_to_v2(dataset: &mut Dataset) -> Result<()> {
 /// working after the `run_registry` module (the guard) is deleted, so it does
 /// not depend on it.
 ///
-/// Idempotent under retry: each run re-enumerates `list_branches` fresh, so a
-/// crash before the stamp bump simply re-deletes whatever `__run__*` branches
-/// still remain on the next open.
+/// Idempotent under both sequential retry and concurrent runners: each run
+/// re-enumerates `list_branches` fresh, and `force_delete_branch` tolerates a
+/// branch that is already gone — so a crash before the stamp bump, or a second
+/// process opening the same legacy graph at the same time, never errors out.
 async fn migrate_v2_to_v3(dataset: &mut Dataset) -> Result<()> {
     const LEGACY_RUN_BRANCH_PREFIX: &str = "__run__";
     let branches = dataset
@@ -161,8 +162,13 @@ async fn migrate_v2_to_v3(dataset: &mut Dataset) -> Result<()> {
         })
         .collect();
     for name in run_branches {
+        // `force_delete_branch` deletes even when the `BranchContents` is
+        // already gone. Plain `delete_branch` errors "BranchContents not
+        // found", which would fail a second concurrent open (or a retry that
+        // raced another runner) after the first one swept the branch. Force is
+        // exactly Lance's documented path for cleaning up zombie branches.
         dataset
-            .delete_branch(&name)
+            .force_delete_branch(&name)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
     }
