@@ -1468,14 +1468,19 @@ async fn test_v2_to_v3_sweeps_legacy_run_branches_on_write_open() {
     let catalog = build_test_catalog();
     let mut mc = ManifestCoordinator::init(uri, &catalog).await.unwrap();
 
-    // Synthesize a pre-MR-770 graph: a stale `__run__` staging branch left on
-    // `__manifest`, alongside a real user branch that must survive the sweep.
+    // Synthesize a pre-MR-770 graph: several stale `__run__` staging branches
+    // left on `__manifest` (a real legacy graph accumulates one per run), plus
+    // a real user branch that must survive the sweep. Multiple run branches
+    // exercise the migration's delete loop on a single reused dataset handle.
     mc.create_branch("__run__01J9LEGACY").await.unwrap();
+    mc.create_branch("__run__01J9SECOND").await.unwrap();
+    mc.create_branch("__run__01J9THIRD").await.unwrap();
     mc.create_branch("feature").await.unwrap();
     let before = mc.list_branches().await.unwrap();
-    assert!(
-        before.iter().any(|b| b == "__run__01J9LEGACY"),
-        "precondition: legacy run branch exists on __manifest; got {before:?}",
+    assert_eq!(
+        before.iter().filter(|b| b.starts_with("__run__")).count(),
+        3,
+        "precondition: three legacy run branches exist on __manifest; got {before:?}",
     );
 
     // Rewind the internal-schema stamp to v2 so the next write-open runs the
