@@ -1072,6 +1072,7 @@ impl Omnigraph {
         cleanup_targets.sort_by(|left, right| left.0.cmp(&right.0));
 
         for (table_key, table_path) in cleanup_targets {
+            crate::failpoints::maybe_fail("branch_delete.before_table_cleanup")?;
             let dataset_uri = self.table_store.dataset_uri(&table_path);
             if let Err(err) = self.table_store.delete_branch(&dataset_uri, branch).await {
                 return Err(OmniError::manifest_internal(format!(

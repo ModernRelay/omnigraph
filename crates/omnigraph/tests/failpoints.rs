@@ -41,6 +41,91 @@ async fn branch_create_failpoint_triggers() {
     );
 }
 
+// Branch delete flips the manifest authority first, then reclaims the per-table
+// forks best-effort. A failure during that reclaim (here, the
+// `branch_delete.before_table_cleanup` failpoint, standing in for a transient
+// object-store error) must NOT fail the call: the branch is already gone, and
+// `cleanup` reconciles the stranded fork. The branch name is reusable after.
+#[tokio::test]
+async fn branch_delete_partial_failure_converges_via_cleanup() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut main = helpers::init_and_load(&dir).await;
+
+    main.branch_create("feature").await.unwrap();
+    let mut feature = Omnigraph::open(&uri).await.unwrap();
+    helpers::mutate_branch(
+        &mut feature,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+    drop(feature);
+
+    let person_uri = node_table_uri(&uri, "Person");
+    {
+        let ds = lance::Dataset::open(&person_uri).await.unwrap();
+        assert!(
+            ds.list_branches().await.unwrap().contains_key("feature"),
+            "precondition: the owned table fork exists before delete"
+        );
+    }
+
+    // Inject a failure during per-table cleanup, AFTER the manifest authority
+    // flip. branch_delete must still succeed (best-effort reclaim).
+    {
+        let _fp = ScopedFailPoint::new("branch_delete.before_table_cleanup", "return");
+        main.branch_delete("feature").await.expect(
+            "branch_delete is best-effort after the manifest flip: a cleanup-step \
+             failure must not fail the call",
+        );
+    }
+
+    // Authority flipped: the branch is gone.
+    assert_eq!(main.branch_list().await.unwrap(), vec!["main".to_string()]);
+
+    // The eager reclaim failed, so the orphan is stranded until cleanup.
+    {
+        let ds = lance::Dataset::open(&person_uri).await.unwrap();
+        assert!(
+            ds.list_branches().await.unwrap().contains_key("feature"),
+            "failed eager reclaim should leave the orphan for cleanup to reconcile"
+        );
+    }
+
+    // cleanup converges: the orphan is reclaimed.
+    main.cleanup(omnigraph::db::CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+    {
+        let ds = lance::Dataset::open(&person_uri).await.unwrap();
+        assert!(
+            !ds.list_branches().await.unwrap().contains_key("feature"),
+            "cleanup should reconcile the orphaned fork away"
+        );
+    }
+
+    // The name is reusable after cleanup reclaims the orphan.
+    main.branch_create("feature").await.unwrap();
+    let mut feature2 = Omnigraph::open(&uri).await.unwrap();
+    helpers::mutate_branch(
+        &mut feature2,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Frank")], &[("$age", 41)]),
+    )
+    .await
+    .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn graph_publish_failpoint_triggers_before_commit_append() {
     let _scenario = FailScenario::setup();
