@@ -126,6 +126,63 @@ async fn branch_delete_partial_failure_converges_via_cleanup() {
     .unwrap();
 }
 
+// Reusing a branch name whose delete left an orphaned fork (before `cleanup`
+// reconciles it) must fail with a clear, actionable error pointing at
+// `cleanup`, not the opaque `ExpectedVersionMismatch` that leaks from the fork
+// path. The recreate itself succeeds; the first write to the previously-forked
+// table is where the stale orphan collides.
+#[tokio::test]
+async fn recreate_over_orphaned_fork_before_cleanup_is_actionable() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut main = helpers::init_and_load(&dir).await;
+
+    main.branch_create("feature").await.unwrap();
+    let mut feature = Omnigraph::open(&uri).await.unwrap();
+    helpers::mutate_branch(
+        &mut feature,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+    drop(feature);
+
+    // Partial delete: leaves the Person fork orphaned (cleanup not yet run).
+    {
+        let _fp = ScopedFailPoint::new("branch_delete.before_table_cleanup", "return");
+        main.branch_delete("feature").await.unwrap();
+    }
+
+    // Recreate the name and write to the previously-forked table WITHOUT a
+    // cleanup in between.
+    main.branch_create("feature").await.unwrap();
+    let mut feature2 = Omnigraph::open(&uri).await.unwrap();
+    let err = helpers::mutate_branch(
+        &mut feature2,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Frank")], &[("$age", 41)]),
+    )
+    .await
+    .expect_err("write should collide with the stale orphaned fork");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cleanup")
+            && (msg.contains("orphan") || msg.contains("incomplete prior delete")),
+        "expected an actionable orphaned-fork error pointing at cleanup, got: {msg}"
+    );
+    assert!(
+        !msg.contains("expected manifest table version"),
+        "should not surface the opaque ExpectedVersionMismatch, got: {msg}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn graph_publish_failpoint_triggers_before_commit_append() {
     let _scenario = FailScenario::setup();
