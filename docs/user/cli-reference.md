@@ -39,7 +39,7 @@ graphs:
       <query-name>:               # key MUST equal the `query <name>` symbol inside the .gq
         file: <path-to-.gq>       # relative to this config's directory
         mcp:
-          expose: false           # default false: HTTP-callable but not listed as an MCP tool
+          expose: true            # default true: listed in the MCP catalog (GET /queries); set false to hide (still HTTP-callable)
           tool_name: <name>       # optional MCP tool-name override (defaults to <query-name>;
                                   #   must be unique across exposed queries)
 server:
@@ -68,7 +68,7 @@ aliases:
     branch: <name>
     format: <output-format>
 queries:                          # top-level stored-query registry (single-graph mode); mirrors top-level `policy`
-  <query-name>: { file: <path-to-.gq>, mcp: { expose: false } }
+  <query-name>: { file: <path-to-.gq> }   # mcp.expose defaults to true
 policy:
   file: ./policy.yaml
 ```

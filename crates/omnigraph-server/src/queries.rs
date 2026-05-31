@@ -36,9 +36,10 @@ pub struct StoredQuery {
     pub source: Arc<str>,
     /// Parsed declaration (params, mutations, description, …).
     pub decl: QueryDecl,
-    /// Whether this query is listed in the MCP tool catalog. Default
-    /// `false`: HTTP-callable but not MCP-enumerated until the operator
-    /// opts in. Consulted by the catalog projection (a later slice).
+    /// Whether this query is listed in the MCP tool catalog (`GET /queries`).
+    /// Default `true` (the manifest entry is the opt-in); `expose: false`
+    /// keeps it HTTP/service-callable but hidden from the agent tool list.
+    /// Catalog membership only — not an authorization gate.
     pub expose: bool,
     /// Optional MCP tool-name override; defaults to `name`.
     pub tool_name: Option<String>,

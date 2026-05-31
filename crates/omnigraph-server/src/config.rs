@@ -115,15 +115,31 @@ pub struct QueryEntry {
 
 /// MCP exposure for a stored query. A *deployment* concern (the same
 /// `.gq` may be exposed in one graph and hidden in another), so it lives
-/// in YAML rather than in the `.gq` source. Default `expose: false` —
-/// a query is HTTP-callable but absent from the MCP tool catalog unless
-/// the operator opts in. The catalog projection lands in a later slice;
-/// v1 round-trips these fields.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// in YAML rather than in the `.gq` source. **Default `expose: true`** —
+/// declaring a query in the manifest *is* the opt-in, so it appears in the
+/// MCP tool catalog (`GET /queries`) by default; set `expose: false` to
+/// keep a query HTTP/service-callable but hidden from the agent tool list.
+/// `expose` governs catalog membership only — it is **not** an
+/// authorization gate (invocation is gated by `invoke_query`), so a hidden
+/// query is still invocable by name with the right permission.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpSettings {
-    #[serde(default)]
+    #[serde(default = "mcp_expose_default")]
     pub expose: bool,
     pub tool_name: Option<String>,
+}
+
+fn mcp_expose_default() -> bool {
+    true
+}
+
+impl Default for McpSettings {
+    fn default() -> Self {
+        Self {
+            expose: mcp_expose_default(),
+            tool_name: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -601,9 +617,9 @@ queries:
         assert_eq!(find_user.file, "./queries/find_user.gq");
         assert!(find_user.mcp.expose);
         assert_eq!(find_user.mcp.tool_name.as_deref(), Some("lookup_user"));
-        // Default exposure is false (safe by default) and tool_name absent.
+        // Default exposure is true (the manifest entry is the opt-in); tool_name absent.
         let audit = &prod["internal_audit"];
-        assert!(!audit.mcp.expose);
+        assert!(audit.mcp.expose);
         assert!(audit.mcp.tool_name.is_none());
 
         // Top-level registry (single-graph mode).
