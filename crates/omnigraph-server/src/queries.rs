@@ -195,10 +195,19 @@ impl QueryRegistry {
             }
         }
 
-        if !errors.is_empty() {
-            return Err(errors);
+        // Parse/identity/uniqueness-check the readable specs even when some
+        // files failed to read, so every broken entry (I/O, parse, identity,
+        // tool-name collision) surfaces in one pass rather than one per
+        // restart. I/O errors come first (in `entries` key order), then the
+        // spec errors. A non-empty `errors` always fails the load.
+        match Self::from_specs(specs) {
+            Ok(registry) if errors.is_empty() => Ok(registry),
+            Ok(_) => Err(errors),
+            Err(spec_errors) => {
+                errors.extend(spec_errors);
+                Err(errors)
+            }
         }
-        Self::from_specs(specs)
     }
 
     pub fn lookup(&self, name: &str) -> Option<&StoredQuery> {
@@ -622,5 +631,38 @@ embedding: Vector(4)
         .unwrap();
         let entry2 = api::query_catalog_entry(reg2.lookup("no_params").unwrap());
         assert!(entry2.params.is_empty(), "no declared params → empty list");
+    }
+
+    // --- load() error collection (file I/O + parse in one pass) ---
+
+    #[test]
+    fn load_collects_io_and_parse_errors_in_one_pass() {
+        use crate::config::load_config;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("good.gq"),
+            "query good() { match { $u: User } return { $u.name } }",
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("broken.gq"), "query broken( {{ not valid").unwrap();
+        // `missing.gq` is deliberately not written (an I/O failure).
+        std::fs::write(
+            temp.path().join("omnigraph.yaml"),
+            "queries:\n  good:\n    file: ./good.gq\n  \
+             missing:\n    file: ./missing.gq\n  broken:\n    file: ./broken.gq\n",
+        )
+        .unwrap();
+        let config = load_config(Some(&temp.path().join("omnigraph.yaml"))).unwrap();
+
+        let errors = QueryRegistry::load(&config, config.query_entries()).unwrap_err();
+        let joined = errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n");
+        // Both the missing file AND the parse error surface in one pass —
+        // the I/O failure must not mask the parse failure.
+        assert!(joined.contains("missing"), "I/O error must surface: {joined}");
+        assert!(
+            joined.contains("broken") && joined.contains("parse error"),
+            "the parse error in a readable file must surface in the same pass: {joined}"
+        );
+        assert!(!joined.contains("'good'"), "the valid entry is not an error: {joined}");
     }
 }
