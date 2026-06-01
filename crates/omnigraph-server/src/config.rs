@@ -9,6 +9,13 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_CONFIG_FILE: &str = "omnigraph.yaml";
 
+pub fn graph_resource_id_for_selection(
+    selected_graph: Option<&str>,
+    normalized_uri: &str,
+) -> String {
+    selected_graph.unwrap_or(normalized_uri).to_string()
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectConfig {
     pub name: Option<String>,
@@ -560,7 +567,9 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{ReadOutputFormat, TableCellLayout, load_config_in};
+    use super::{
+        ReadOutputFormat, TableCellLayout, graph_resource_id_for_selection, load_config_in,
+    };
 
     #[test]
     fn load_config_reads_yaml_defaults_from_current_dir() {
@@ -622,6 +631,18 @@ policy: {}
 
         let config = load_config_in(&child, None).unwrap();
         assert!(config.graphs.is_empty());
+    }
+
+    #[test]
+    fn graph_resource_id_for_selection_uses_name_or_anonymous_uri() {
+        assert_eq!(
+            graph_resource_id_for_selection(Some("local"), "/tmp/graph.omni"),
+            "local"
+        );
+        assert_eq!(
+            graph_resource_id_for_selection(None, "/tmp/graph.omni"),
+            "/tmp/graph.omni"
+        );
     }
 
     #[test]

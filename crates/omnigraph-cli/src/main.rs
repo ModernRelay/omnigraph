@@ -9,6 +9,7 @@ use clap::{Arg, ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcomm
 use color_eyre::eyre::{Result, bail};
 use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
+use omnigraph::storage::normalize_root_uri;
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::{
@@ -27,7 +28,7 @@ use omnigraph_server::api::{
 use omnigraph_server::queries::{QueryRegistry, check, format_check_breakages};
 use omnigraph_server::{
     AliasCommand, OmnigraphConfig, PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest,
-    PolicyTestConfig, ReadOutputFormat, load_config,
+    PolicyTestConfig, ReadOutputFormat, graph_resource_id_for_selection, load_config,
 };
 use reqwest::Method;
 use reqwest::header::AUTHORIZATION;
@@ -782,6 +783,7 @@ fn load_cli_config(config_path: Option<&PathBuf>) -> Result<OmnigraphConfig> {
 struct ResolvedCliGraph {
     uri: String,
     selected: Option<String>,
+    graph_id: String,
     policy_file: Option<PathBuf>,
     is_remote: bool,
 }
@@ -807,14 +809,12 @@ fn resolve_policy_context(config: &OmnigraphConfig) -> Result<ResolvedPolicyCont
                 "policy.file or graphs.<name>.policy.file must be set in omnigraph.yaml"
             )
         })?;
-    let graph_id = if let Some(name) = &config.project.name {
-        name.clone()
-    } else if let Some(selected) = selected.as_deref() {
-        config
-            .resolve_target_uri(None, Some(selected), None)
-            .unwrap_or_else(|_| selected.to_string())
-    } else {
-        policy_graph_id_from_uri(config, None)
+    let graph_id = match selected.as_deref() {
+        Some(name) => graph_resource_id_for_selection(Some(name), ""),
+        None => {
+            let anonymous_graph_id = anonymous_policy_graph_id(config)?;
+            graph_resource_id_for_selection(None, &anonymous_graph_id)
+        }
     };
     Ok(ResolvedPolicyContext {
         policy_file,
@@ -826,32 +826,23 @@ fn resolve_policy_engine(context: &ResolvedPolicyContext) -> Result<PolicyEngine
     PolicyEngine::load_graph(&context.policy_file, &context.graph_id)
 }
 
-fn resolve_policy_engine_for_graph(
-    config: &OmnigraphConfig,
-    graph: &ResolvedCliGraph,
-) -> Result<PolicyEngine> {
+fn resolve_policy_engine_for_graph(graph: &ResolvedCliGraph) -> Result<PolicyEngine> {
     let policy_file = graph.policy_file.as_ref().ok_or_else(|| {
         color_eyre::eyre::eyre!(
             "policy.file or graphs.<name>.policy.file must be set in omnigraph.yaml"
         )
     })?;
-    PolicyEngine::load_graph(
-        policy_file,
-        &policy_graph_id_from_uri(config, Some(&graph.uri)),
-    )
+    PolicyEngine::load_graph(policy_file, &graph.graph_id)
 }
 
 /// Open a local graph and install the policy resolved for the same graph
 /// identity that produced the URI. A named graph uses
 /// `graphs.<name>.policy.file`; an explicit positional URI is anonymous and
 /// uses the legacy top-level `policy.file`.
-async fn open_local_db_with_policy(
-    graph: &ResolvedCliGraph,
-    config: &OmnigraphConfig,
-) -> Result<Omnigraph> {
+async fn open_local_db_with_policy(graph: &ResolvedCliGraph) -> Result<Omnigraph> {
     let db = Omnigraph::open(&graph.uri).await?;
     if graph.policy_file.is_some() {
-        let engine = Arc::new(resolve_policy_engine_for_graph(config, graph)?);
+        let engine = Arc::new(resolve_policy_engine_for_graph(graph)?);
         Ok(db.with_policy(engine as Arc<dyn omnigraph_policy::PolicyChecker>))
     } else {
         Ok(db)
@@ -872,17 +863,22 @@ fn resolve_policy_tests_path(context: &ResolvedPolicyContext) -> PathBuf {
     context.policy_file.with_file_name("policy.tests.yaml")
 }
 
-fn policy_graph_id_from_uri(config: &OmnigraphConfig, uri: Option<&str>) -> String {
-    if let Some(name) = &config.project.name {
-        return name.clone();
+fn normalize_policy_graph_uri(uri: &str) -> Result<String> {
+    if is_remote_uri(uri) {
+        Ok(uri.trim_end_matches('/').to_string())
+    } else {
+        Ok(normalize_root_uri(uri)?)
     }
-    if let Some(uri) = uri {
-        return uri.to_string();
-    }
-    config
+}
+
+fn anonymous_policy_graph_id(config: &OmnigraphConfig) -> Result<String> {
+    let raw_uri = config
         .resolve_target_uri(None, None, config.server_graph_name())
-        .or_else(|_| config.resolve_target_uri(None, None, config.cli_graph_name()))
-        .unwrap_or_else(|_| "default".to_string())
+        .or_else(|_| config.resolve_target_uri(None, None, config.cli_graph_name()));
+    match raw_uri {
+        Ok(uri) => normalize_policy_graph_uri(&uri),
+        Err(_) => Ok("default".to_string()),
+    }
 }
 
 fn resolve_remote_bearer_token(
@@ -980,7 +976,10 @@ fn resolve_cli_graph(
     };
     config.resolve_graph_selection(selected.as_deref())?;
     let uri = resolve_uri(config, cli_uri, cli_target)?;
+    let normalized_uri = normalize_policy_graph_uri(&uri)?;
+    let graph_id = graph_resource_id_for_selection(selected.as_deref(), &normalized_uri);
     Ok(ResolvedCliGraph {
+        graph_id,
         is_remote: is_remote_uri(&uri),
         policy_file: config.resolve_policy_file_for(selected.as_deref()),
         selected,
@@ -2027,7 +2026,7 @@ async fn execute_change(
 ) -> Result<ChangeOutput> {
     let (selected_name, query_params) = select_named_query(query_source, query_name)?;
     let params = query_params_from_json(&query_params, params_json)?;
-    let db = open_local_db_with_policy(graph, config).await?;
+    let db = open_local_db_with_policy(graph).await?;
     let actor = resolve_cli_actor(cli_as_actor, config);
     let result = db
         .mutate_as(branch, query_source, &selected_name, &params, actor)
@@ -2258,7 +2257,7 @@ async fn main() -> Result<()> {
             let graph = resolve_local_graph(&config, uri, target.as_deref(), "load")?;
             let uri = graph.uri.clone();
             let branch = resolve_branch(&config, branch, None, "main");
-            let db = open_local_db_with_policy(&graph, &config).await?;
+            let db = open_local_db_with_policy(&graph).await?;
             let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
             let result = db
                 .load_file_as(&branch, &data.to_string_lossy(), mode.into(), actor)
@@ -2319,7 +2318,7 @@ async fn main() -> Result<()> {
                 )
                 .await?
             } else {
-                let db = open_local_db_with_policy(&graph, &config).await?;
+                let db = open_local_db_with_policy(&graph).await?;
                 let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
                 let result = db
                     .ingest_file_as(
@@ -2366,7 +2365,7 @@ async fn main() -> Result<()> {
                     )
                     .await?
                 } else {
-                    let db = open_local_db_with_policy(&graph, &config).await?;
+                    let db = open_local_db_with_policy(&graph).await?;
                     let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
                     db.branch_create_from_as(ReadTarget::branch(&from), &name, actor)
                         .await?;
@@ -2439,7 +2438,7 @@ async fn main() -> Result<()> {
                     )
                     .await?
                 } else {
-                    let db = open_local_db_with_policy(&graph, &config).await?;
+                    let db = open_local_db_with_policy(&graph).await?;
                     let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
                     db.branch_delete_as(&name, actor).await?;
                     BranchDeleteOutput {
@@ -2481,7 +2480,7 @@ async fn main() -> Result<()> {
                     )
                     .await?
                 } else {
-                    let db = open_local_db_with_policy(&graph, &config).await?;
+                    let db = open_local_db_with_policy(&graph).await?;
                     let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
                     let outcome = db.branch_merge_as(&source, &into, actor).await?;
                     BranchMergeOutput {
@@ -2637,7 +2636,7 @@ async fn main() -> Result<()> {
                     )
                     .await?
                 } else {
-                    let db = open_local_db_with_policy(&graph, &config).await?;
+                    let db = open_local_db_with_policy(&graph).await?;
                     let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
                     let registry = load_registry_or_report(&config, graph.selected())?;
                     let registry = (!registry.is_empty()).then_some(registry);
@@ -3171,7 +3170,8 @@ mod tests {
     use super::{
         DEFAULT_BEARER_TOKEN_ENV, apply_bearer_token, bearer_token_from_env_file,
         legacy_change_request_body, load_cli_config, load_env_file_into_process,
-        normalize_bearer_token, parse_env_assignment, resolve_remote_bearer_token,
+        normalize_bearer_token, parse_env_assignment, resolve_policy_context,
+        resolve_cli_graph, resolve_remote_bearer_token,
     };
     use omnigraph_server::load_config;
     use reqwest::header::AUTHORIZATION;
@@ -3430,5 +3430,101 @@ graphs:
                 std::env::remove_var(key);
             }
         }
+    }
+
+    #[test]
+    fn graph_identity_resolve_policy_context_named_cli_graph_uses_graph_key_not_project_name_or_uri() {
+        let temp = tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            r#"
+project:
+  name: misleading-project
+graphs:
+  local:
+    uri: /tmp/local-policy-graph.omni
+    policy:
+      file: ./policy.yaml
+cli:
+  graph: local
+"#,
+        )
+        .unwrap();
+
+        let config = load_config(Some(&config_path)).unwrap();
+        let context = resolve_policy_context(&config).unwrap();
+        assert_eq!(context.graph_id, "local");
+    }
+
+    #[test]
+    fn graph_identity_resolve_cli_graph_named_target_uses_graph_key_not_project_name_or_uri() {
+        let temp = tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            r#"
+project:
+  name: misleading-project
+graphs:
+  prod:
+    uri: s3://bucket/prod-graph/
+    policy:
+      file: ./prod-policy.yaml
+"#,
+        )
+        .unwrap();
+
+        let config = load_config(Some(&config_path)).unwrap();
+        let graph = resolve_cli_graph(&config, None, Some("prod")).unwrap();
+        assert_eq!(graph.selected(), Some("prod"));
+        assert_eq!(graph.graph_id, "prod");
+        assert_eq!(graph.uri, "s3://bucket/prod-graph/");
+    }
+
+    #[test]
+    fn graph_identity_resolve_cli_graph_positional_uri_uses_anonymous_normalized_uri() {
+        let temp = tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            r#"
+project:
+  name: misleading-project
+graphs:
+  local:
+    uri: /tmp/configured-graph.omni
+    policy:
+      file: ./policy.yaml
+cli:
+  graph: local
+"#,
+        )
+        .unwrap();
+
+        let config = load_config(Some(&config_path)).unwrap();
+        let local_graph_path = temp.path().join("explicit-graph.omni");
+        let local_graph = resolve_cli_graph(
+            &config,
+            Some(format!("file://{}", local_graph_path.display())),
+            None,
+        )
+        .unwrap();
+        assert_eq!(local_graph.selected(), None);
+        assert_eq!(
+            local_graph.graph_id,
+            local_graph_path.to_string_lossy().as_ref()
+        );
+        assert_eq!(local_graph.policy_file, None);
+
+        let s3_graph = resolve_cli_graph(
+            &config,
+            Some("s3://bucket/anonymous-graph/".to_string()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(s3_graph.selected(), None);
+        assert_eq!(s3_graph.graph_id, "s3://bucket/anonymous-graph");
+        assert_eq!(s3_graph.policy_file, None);
     }
 }

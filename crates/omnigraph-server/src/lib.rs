@@ -44,7 +44,7 @@ use color_eyre::eyre::{Result, WrapErr, bail};
 pub use config::{
     AliasCommand, AliasConfig, CliDefaults, DEFAULT_CONFIG_FILE, OmnigraphConfig, PolicySettings,
     ProjectConfig, QueryDefaults, ReadOutputFormat, ServerDefaults, TableCellLayout, TargetConfig,
-    load_config,
+    graph_resource_id_for_selection, load_config,
 };
 use futures::stream;
 use omnigraph::db::{Omnigraph, ReadTarget};
@@ -956,7 +956,7 @@ pub fn load_server_settings(
         let policy_file = config.resolve_policy_file_for(selected);
         let queries = QueryRegistry::load(&config, config.query_entries_for(selected))
             .map_err(|errs| color_eyre::eyre::eyre!(format_registry_load_errors(&uri, &errs)))?;
-        let graph_id = selected.unwrap_or(uri.as_str()).to_string();
+        let graph_id = graph_resource_id_for_selection(selected, &uri);
         ServerConfigMode::Single {
             uri,
             graph_id,
