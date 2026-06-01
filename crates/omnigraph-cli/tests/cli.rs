@@ -2458,6 +2458,38 @@ fn queries_list_prints_registered_query() {
 }
 
 #[test]
+fn queries_list_unknown_target_errors() {
+    // `queries list` opens no graph URI, so unknown-graph validation can't ride
+    // along on URI resolution the way it does for every other command. An
+    // unknown `--target` must still error (naming the graph) instead of
+    // silently falling back to the top-level registry and showing the wrong
+    // (or empty) catalog.
+    let graph = SystemGraph::loaded();
+    graph.write_query(
+        "find_person.gq",
+        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
+    );
+    let config = graph.write_config(
+        "omnigraph.yaml",
+        &queries_test_config(&graph.path().to_string_lossy(), "find_person", "find_person.gq"),
+    );
+    let output = output_failure(
+        cli()
+            .arg("queries")
+            .arg("list")
+            .arg("--target")
+            .arg("nonexistent")
+            .arg("--config")
+            .arg(&config),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("nonexistent"),
+        "error must name the unknown graph; stderr:\n{stderr}"
+    );
+}
+
+#[test]
 fn queries_validate_exits_nonzero_on_duplicate_tool_name() {
     // Two exposed queries claiming one MCP tool name is a load-time
     // collision — `queries validate` must fail (offline, before the engine
