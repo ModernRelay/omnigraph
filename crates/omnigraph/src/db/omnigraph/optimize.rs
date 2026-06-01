@@ -64,12 +64,15 @@ pub struct TableOptimizeStats {
     pub committed: bool,
 }
 
-/// Per-table outcome of `cleanup_all_tables`.
+/// Per-table outcome of `cleanup_all_tables`. `error` is `Some` when this
+/// table's version GC failed; cleanup is fault-isolated per table, so a single
+/// table's failure is recorded here rather than aborting the whole sweep.
 #[derive(Debug, Clone)]
 pub struct TableCleanupStats {
     pub table_key: String,
     pub bytes_removed: u64,
     pub old_versions_removed: u64,
+    pub error: Option<String>,
 }
 
 /// Run Lance `compact_files` on every node + edge table on `main`.
@@ -138,6 +141,26 @@ pub async fn cleanup_all_tables(
     db.ensure_schema_state_valid().await?;
     db.ensure_schema_apply_idle("cleanup").await?;
 
+    // Reclaim orphaned branch forks (from an incomplete prior `branch_delete`)
+    // before version GC. Authority-derived and idempotent; the eager
+    // best-effort reclaim in `branch_delete` covers the common case, this is
+    // the guaranteed backstop. Logged for observability.
+    let reconciled = reconcile_orphaned_branches(db).await?;
+    if !reconciled.reclaimed.is_empty() {
+        tracing::info!(
+            count = reconciled.reclaimed.len(),
+            reclaimed = ?reconciled.reclaimed,
+            "cleanup reconciled orphaned branch forks"
+        );
+    }
+    if !reconciled.failures.is_empty() {
+        tracing::warn!(
+            count = reconciled.failures.len(),
+            failures = ?reconciled.failures,
+            "cleanup could not reconcile some orphaned forks; will retry next cleanup"
+        );
+    }
+
     let before_timestamp = options.older_than.map(|d| Utc::now() - d);
     let keep_versions = options.keep_versions;
 
@@ -160,36 +183,205 @@ pub async fn cleanup_all_tables(
     let concurrency = maint_concurrency().min(table_tasks.len()).max(1);
     let table_store = &db.table_store;
 
-    let results: Vec<Result<TableCleanupStats>> = futures::stream::iter(table_tasks.into_iter())
+    // Fault-isolated per table: a single table's GC failure is recorded on its
+    // stats row (`error: Some`) and logged, never aborting the healthy tables.
+    // cleanup is the convergence backstop, so it must do as much as it can and
+    // converge on re-run rather than fail wholesale (invariant 13).
+    let results: Vec<TableCleanupStats> = futures::stream::iter(table_tasks.into_iter())
         .map(|(table_key, full_path)| async move {
-            let ds = table_store
-                .open_dataset_head_for_write(&table_key, &full_path, None)
-                .await?;
-            let before_version = keep_versions
-                .map(|n| ds.version().version.saturating_sub(n as u64))
-                .filter(|v| *v > 0);
-            let policy = CleanupPolicy {
-                before_timestamp,
-                before_version,
-                delete_unverified: false,
-                error_if_tagged_old_versions: false,
-                clean_referenced_branches: false,
-                delete_rate_limit: None,
-            };
-            let removed: RemovalStats = lance::dataset::cleanup::cleanup_old_versions(&ds, policy)
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?;
-            Ok(TableCleanupStats {
-                table_key,
-                bytes_removed: removed.bytes_removed,
-                old_versions_removed: removed.old_versions,
-            })
+            let outcome: Result<RemovalStats> = async {
+                crate::failpoints::maybe_fail("cleanup.table_gc")?;
+                let ds = table_store
+                    .open_dataset_head_for_write(&table_key, &full_path, None)
+                    .await?;
+                let before_version = keep_versions
+                    .map(|n| ds.version().version.saturating_sub(n as u64))
+                    .filter(|v| *v > 0);
+                let policy = CleanupPolicy {
+                    before_timestamp,
+                    before_version,
+                    delete_unverified: false,
+                    error_if_tagged_old_versions: false,
+                    clean_referenced_branches: false,
+                    delete_rate_limit: None,
+                };
+                lance::dataset::cleanup::cleanup_old_versions(&ds, policy)
+                    .await
+                    .map_err(|e| OmniError::Lance(e.to_string()))
+            }
+            .await;
+            match outcome {
+                Ok(removed) => TableCleanupStats {
+                    table_key,
+                    bytes_removed: removed.bytes_removed,
+                    old_versions_removed: removed.old_versions,
+                    error: None,
+                },
+                Err(err) => {
+                    tracing::warn!(
+                        target: "omnigraph::cleanup",
+                        table = %table_key,
+                        error = %err,
+                        "version GC failed for table; other tables unaffected",
+                    );
+                    TableCleanupStats {
+                        table_key,
+                        bytes_removed: 0,
+                        old_versions_removed: 0,
+                        error: Some(err.to_string()),
+                    }
+                }
+            }
         })
         .buffer_unordered(concurrency)
         .collect()
         .await;
 
-    results.into_iter().collect()
+    Ok(results)
+}
+
+/// Outcome of [`reconcile_orphaned_branches`]: the `(owner, branch)` pairs
+/// reclaimed and the `(owner, error)` pairs that failed, where `owner` is a
+/// table key (e.g. `node:Person`) or `"_graph_commits"`. Per-owner failures are
+/// isolated and recorded here, not propagated — the next reconcile converges.
+#[derive(Debug, Clone, Default)]
+pub struct BranchReconcileStats {
+    pub reclaimed: Vec<(String, String)>,
+    pub failures: Vec<(String, String)>,
+}
+
+/// Drop every per-table and commit-graph Lance branch that the manifest no
+/// longer references.
+///
+/// Orphaned forks arise when a `branch_delete` flips the manifest authority
+/// (atomic) but a downstream best-effort reclaim does not complete. They are
+/// unreachable through any snapshot — no manifest entry can name them — yet
+/// they pin their `tree/{branch}/` storage and can block reusing the branch
+/// name. This is the guaranteed convergence backstop: it is idempotent and
+/// derived purely from the manifest authority, so it no-ops once everything is
+/// reconciled, and it would harmlessly find nothing if a future Lance atomic
+/// multi-dataset branch op prevented orphans from forming.
+///
+/// The keep-set is the full (unfiltered) manifest branch list, so system
+/// branches' forks are never reclaimed; `main`/default is not a named Lance
+/// branch and so is never a candidate. Referencing children are dropped before
+/// parents (Lance refuses to delete a referenced parent) by ordering longest
+/// branch names first.
+pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconcileStats> {
+    use std::collections::HashSet;
+
+    let keep: HashSet<String> = db
+        .coordinator
+        .read()
+        .await
+        .all_branches()
+        .await?
+        .into_iter()
+        .collect();
+
+    let resolved = db.resolved_branch_target(None).await?;
+    let snapshot = resolved.snapshot;
+    let table_targets: Vec<(String, String)> = all_table_keys(&db.catalog())
+        .into_iter()
+        .filter_map(|table_key| {
+            let entry = snapshot.entry(&table_key)?;
+            let full_path = format!("{}/{}", db.root_uri, entry.table_path);
+            Some((table_key, full_path))
+        })
+        .collect();
+
+    let mut stats = BranchReconcileStats::default();
+
+    // Per-table fault isolation: one table's transient failure is recorded and
+    // logged, never aborting the rest of the sweep.
+    for (table_key, full_path) in table_targets {
+        let listed = match db.table_store.list_branches(&full_path).await {
+            Ok(listed) => listed,
+            Err(err) => {
+                tracing::warn!(
+                    target: "omnigraph::cleanup",
+                    table = %table_key,
+                    error = %err,
+                    "listing branches failed during reconcile; skipping table",
+                );
+                stats.failures.push((table_key.clone(), err.to_string()));
+                continue;
+            }
+        };
+        for branch in orphan_branches(listed, &keep) {
+            let outcome = match crate::failpoints::maybe_fail("cleanup.reconcile_fork") {
+                Ok(()) => db.table_store.force_delete_branch(&full_path, &branch).await,
+                Err(injected) => Err(injected),
+            };
+            match outcome {
+                Ok(()) => stats.reclaimed.push((table_key.clone(), branch)),
+                Err(err) => {
+                    tracing::warn!(
+                        target: "omnigraph::cleanup",
+                        table = %table_key,
+                        branch = %branch,
+                        error = %err,
+                        "reclaiming orphaned fork failed; will retry next cleanup",
+                    );
+                    stats.failures.push((table_key.clone(), err.to_string()));
+                }
+            }
+        }
+    }
+
+    // Commit-graph orphans (best-effort: the dataset may not exist on a graph
+    // that has never committed; any failure is isolated and retried next time).
+    if let Err(err) = reconcile_commit_graph_orphans(db, &keep, &mut stats).await {
+        tracing::warn!(
+            target: "omnigraph::cleanup",
+            error = %err,
+            "commit-graph orphan reconcile failed; will retry next cleanup",
+        );
+        stats.failures.push(("_graph_commits".to_string(), err.to_string()));
+    }
+
+    Ok(stats)
+}
+
+/// Commit-graph half of [`reconcile_orphaned_branches`], split out so its
+/// errors can be isolated. Returns `Ok` when the commit-graph dataset is absent.
+async fn reconcile_commit_graph_orphans(
+    db: &Omnigraph,
+    keep: &std::collections::HashSet<String>,
+    stats: &mut BranchReconcileStats,
+) -> Result<()> {
+    let commits_uri = crate::db::commit_graph::graph_commits_uri(db.root_uri());
+    if !db.storage_adapter().exists(&commits_uri).await? {
+        return Ok(());
+    }
+    let mut commit_graph = crate::db::commit_graph::CommitGraph::open(db.root_uri()).await?;
+    for branch in orphan_branches(commit_graph.list_branches().await?, keep) {
+        match commit_graph.force_delete_branch(&branch).await {
+            Ok(()) => stats.reclaimed.push(("_graph_commits".to_string(), branch)),
+            Err(err) => {
+                tracing::warn!(
+                    target: "omnigraph::cleanup",
+                    branch = %branch,
+                    error = %err,
+                    "reclaiming orphaned commit-graph branch failed; will retry next cleanup",
+                );
+                stats.failures.push(("_graph_commits".to_string(), err.to_string()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Filter `present` Lance branches down to those absent from the manifest
+/// `keep` set, ordered children-before-parents (longest name first) so Lance's
+/// referenced-parent `RefConflict` cannot block reclamation.
+fn orphan_branches(present: Vec<String>, keep: &std::collections::HashSet<String>) -> Vec<String> {
+    let mut orphans: Vec<String> = present
+        .into_iter()
+        .filter(|branch| !keep.contains(branch))
+        .collect();
+    orphans.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    orphans
 }
 
 fn all_table_keys(catalog: &omnigraph_compiler::catalog::Catalog) -> Vec<String> {
