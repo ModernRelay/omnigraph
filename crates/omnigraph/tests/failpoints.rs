@@ -233,6 +233,103 @@ async fn cleanup_isolates_single_table_failure() {
     }
 }
 
+// Companion to the version-GC isolation test, exercising the OTHER cleanup
+// loop: a force-delete failure while reconciling one orphaned fork must be
+// isolated (logged, not propagated) so the sweep continues, and a later
+// cleanup converges. This is the loop the Devin finding was about.
+#[tokio::test]
+async fn cleanup_isolates_reconcile_failure() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = helpers::init_and_load(&dir).await;
+
+    // Forge an orphaned fork the reconcile pass will try to reclaim.
+    let person_uri = node_table_uri(&uri, "Person");
+    {
+        let mut ds = lance::Dataset::open(&person_uri).await.unwrap();
+        let base = ds.version().version;
+        ds.create_branch("ghost", base, None).await.unwrap();
+    }
+
+    // Inject a one-shot failure into the reconcile force-delete. The sweep must
+    // not abort.
+    {
+        let _fp = ScopedFailPoint::new("cleanup.reconcile_fork", "1*return");
+        db.cleanup(omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        })
+        .await
+        .expect("a reconcile force-delete failure must not abort cleanup");
+    }
+    // The blocked orphan is still present (the failure was isolated, not retried).
+    {
+        let ds = lance::Dataset::open(&person_uri).await.unwrap();
+        assert!(
+            ds.list_branches().await.unwrap().contains_key("ghost"),
+            "the orphan whose reclaim was injected-to-fail should remain"
+        );
+    }
+    // A second cleanup with no injected failure converges.
+    db.cleanup(omnigraph::db::CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+    {
+        let ds = lance::Dataset::open(&person_uri).await.unwrap();
+        assert!(
+            !ds.list_branches().await.unwrap().contains_key("ghost"),
+            "the second cleanup should reconcile the orphan"
+        );
+    }
+}
+
+// The cleanup reconciler must reclaim orphaned commit-graph branches, not just
+// per-table forks. A delete whose best-effort commit-graph reclaim fails leaves
+// a commit-graph orphan; the next cleanup must drop it.
+#[tokio::test]
+async fn cleanup_reclaims_orphaned_commit_graph_branch() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = helpers::init_and_load(&dir).await;
+
+    db.branch_create("feature").await.unwrap();
+    // Delete, failing the commit-graph reclaim → commit-graph "feature" orphan
+    // (manifest branch gone, commit-graph branch left behind).
+    {
+        let _fp = ScopedFailPoint::new("branch_delete.before_commit_graph_reclaim", "return");
+        db.branch_delete("feature").await.unwrap();
+    }
+
+    let commits_uri = format!("{}/_graph_commits.lance", uri.trim_end_matches('/'));
+    {
+        let ds = lance::Dataset::open(&commits_uri).await.unwrap();
+        assert!(
+            ds.list_branches().await.unwrap().contains_key("feature"),
+            "precondition: the commit-graph branch should be orphaned after the failed reclaim"
+        );
+    }
+
+    db.cleanup(omnigraph::db::CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+
+    {
+        let ds = lance::Dataset::open(&commits_uri).await.unwrap();
+        assert!(
+            !ds.list_branches().await.unwrap().contains_key("feature"),
+            "cleanup should reclaim the orphaned commit-graph branch"
+        );
+    }
+}
+
 // A branch_delete whose best-effort commit-graph reclaim fails leaves a
 // commit-graph "zombie" branch. Recreating that name must heal the zombie and
 // succeed (branch_create force-deletes a stale commit-graph ref since the
@@ -295,18 +392,44 @@ async fn branch_create_rolls_back_manifest_on_commit_graph_failure() {
 // branch versions. When a concurrent first-write legitimately wins the fork
 // race, the loser sees a version mismatch — but that is a stale snapshot, not
 // an orphan, so it must be a retryable "refresh and retry", never a misleading
-// "run cleanup". Writer A pauses at the fork point so writer B commits the fork
-// first; A then resumes into the collision.
+// "run cleanup".
+//
+// Ordering is made deterministic (no sleeps) via a callback at the fork point:
+// `compare_exchange` lets only the FIRST arrival (writer A) record readiness and
+// block until released; later arrivals (writer B) fall through. The test waits
+// on the readiness flag, lets B win and commit the fork, then releases A.
+static FORK_A_AT_POINT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FORK_RELEASE_A: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[tokio::test(flavor = "multi_thread")]
 async fn fork_collision_with_live_concurrent_fork_is_retryable() {
+    use std::sync::atomic::Ordering::SeqCst;
+
     let _scenario = FailScenario::setup();
+    FORK_A_AT_POINT.store(false, SeqCst);
+    FORK_RELEASE_A.store(false, SeqCst);
+
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
     let main = helpers::init_and_load(&dir).await;
     main.branch_create("feature").await.unwrap();
 
-    // "1*pause" pauses only the first arrival (A); B's later arrival is a no-op.
-    let _fp = ScopedFailPoint::new("fork.before_classify", "1*pause");
+    // First arrival (A) records readiness and blocks until released; the rest
+    // (B) fall through immediately. Bounded spin so a mistake can't hang forever.
+    fail::cfg_callback("fork.before_classify", || {
+        if FORK_A_AT_POINT
+            .compare_exchange(false, true, SeqCst, SeqCst)
+            .is_ok()
+        {
+            for _ in 0..2000 {
+                if FORK_RELEASE_A.load(SeqCst) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    })
+    .unwrap();
 
     let uri_a = uri.clone();
     let writer_a = tokio::spawn(async move {
@@ -321,8 +444,19 @@ async fn fork_collision_with_live_concurrent_fork_is_retryable() {
         .await
     });
 
-    // Let A reach the pause, then let B win the fork and commit it.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // Wait (bounded) until A is parked at the fork point.
+    for _ in 0..600 {
+        if FORK_A_AT_POINT.load(SeqCst) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        FORK_A_AT_POINT.load(SeqCst),
+        "writer A never reached the fork point"
+    );
+
+    // B wins the fork and commits it.
     let mut b = Omnigraph::open(&uri).await.unwrap();
     helpers::mutate_branch(
         &mut b,
@@ -334,12 +468,14 @@ async fn fork_collision_with_live_concurrent_fork_is_retryable() {
     .await
     .unwrap();
 
-    // Release A; it resumes, sees the manifest now records the fork.
-    fail::cfg("fork.before_classify", "off").unwrap();
+    // Release A; it resumes, re-reads the manifest, and sees the fork is live.
+    FORK_RELEASE_A.store(true, SeqCst);
     let err = writer_a
         .await
         .unwrap()
         .expect_err("A's stale-snapshot fork should be a retryable conflict");
+    fail::remove("fork.before_classify");
+
     let msg = err.to_string();
     assert!(
         !msg.contains("cleanup"),

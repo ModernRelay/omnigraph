@@ -309,7 +309,11 @@ pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconci
             }
         };
         for branch in orphan_branches(listed, &keep) {
-            match db.table_store.force_delete_branch(&full_path, &branch).await {
+            let outcome = match crate::failpoints::maybe_fail("cleanup.reconcile_fork") {
+                Ok(()) => db.table_store.force_delete_branch(&full_path, &branch).await,
+                Err(injected) => Err(injected),
+            };
+            match outcome {
                 Ok(()) => stats.reclaimed.push((table_key.clone(), branch)),
                 Err(err) => {
                     tracing::warn!(
