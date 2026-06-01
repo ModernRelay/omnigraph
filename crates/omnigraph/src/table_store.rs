@@ -282,35 +282,24 @@ impl TableStore {
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         self.ensure_expected_version(&source_ds, table_key, source_version)?;
 
-        match source_ds
+        if source_ds
             .create_branch(target_branch, source_version, None)
             .await
+            .is_err()
         {
-            Ok(_) => {}
-            Err(create_err) => match self
-                .open_dataset_head(dataset_uri, Some(target_branch))
-                .await
-            {
-                Ok(ds) => {
-                    // The target branch ref already exists. Either a legitimate
-                    // concurrent first-write forked it from the same
-                    // `source_version` (its head matches → reuse it), or it is a
-                    // zombie fork left by an incomplete prior `branch_delete`
-                    // (sitting at a different version). For the zombie, surface
-                    // an actionable error pointing at the `cleanup` orphan
-                    // reconciler instead of the opaque ExpectedVersionMismatch.
-                    if ds.version().version == source_version {
-                        return Ok(ds);
-                    }
-                    return Err(OmniError::manifest_conflict(format!(
-                        "branch '{}' has orphaned table state for '{}' from an incomplete \
-                         prior delete; run `omnigraph cleanup` to reclaim it before reusing \
-                         this branch name",
-                        target_branch, table_key
-                    )));
-                }
-                Err(_) => return Err(OmniError::Lance(create_err.to_string())),
-            },
+            // The target branch ref already exists. The caller
+            // (`open_owned_dataset_for_branch_write`) re-reads the live manifest
+            // before forking and returns a retryable error when a concurrent
+            // writer legitimately holds the fork, so reaching here means the
+            // manifest does NOT reference this fork: it is an orphan from an
+            // incomplete prior `branch_delete`. Surface the actionable cleanup
+            // error rather than guessing from Lance branch versions.
+            return Err(OmniError::manifest_conflict(format!(
+                "branch '{}' has orphaned table state for '{}' from an incomplete \
+                 prior delete; run `omnigraph cleanup` to reclaim it before reusing \
+                 this branch name",
+                target_branch, table_key
+            )));
         }
 
         let ds = self
