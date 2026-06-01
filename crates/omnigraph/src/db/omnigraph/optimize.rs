@@ -64,12 +64,15 @@ pub struct TableOptimizeStats {
     pub committed: bool,
 }
 
-/// Per-table outcome of `cleanup_all_tables`.
+/// Per-table outcome of `cleanup_all_tables`. `error` is `Some` when this
+/// table's version GC failed; cleanup is fault-isolated per table, so a single
+/// table's failure is recorded here rather than aborting the whole sweep.
 #[derive(Debug, Clone)]
 pub struct TableCleanupStats {
     pub table_key: String,
     pub bytes_removed: u64,
     pub old_versions_removed: u64,
+    pub error: Option<String>,
 }
 
 /// Run Lance `compact_files` on every node + edge table on `main`.
@@ -175,6 +178,7 @@ pub async fn cleanup_all_tables(
 
     let results: Vec<Result<TableCleanupStats>> = futures::stream::iter(table_tasks.into_iter())
         .map(|(table_key, full_path)| async move {
+            crate::failpoints::maybe_fail("cleanup.table_gc")?;
             let ds = table_store
                 .open_dataset_head_for_write(&table_key, &full_path, None)
                 .await?;
@@ -196,6 +200,7 @@ pub async fn cleanup_all_tables(
                 table_key,
                 bytes_removed: removed.bytes_removed,
                 old_versions_removed: removed.old_versions,
+                error: None,
             })
         })
         .buffer_unordered(concurrency)

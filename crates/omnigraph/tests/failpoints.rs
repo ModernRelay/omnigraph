@@ -183,6 +183,56 @@ async fn recreate_over_orphaned_fork_before_cleanup_is_actionable() {
     );
 }
 
+// cleanup is the guaranteed convergence backstop, so one table's transient
+// failure must not abort the whole sweep. Inject a one-shot version-GC failure
+// for a single table and assert: cleanup still succeeds, the failure is
+// surfaced per-table in the returned stats, and the independent reconcile pass
+// still reclaimed an orphan.
+#[tokio::test]
+async fn cleanup_isolates_single_table_failure() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = helpers::init_and_load(&dir).await;
+
+    // Forge an orphaned fork on the Person table (a reconcile target).
+    let person_uri = node_table_uri(&uri, "Person");
+    {
+        let mut ds = lance::Dataset::open(&person_uri).await.unwrap();
+        let base = ds.version().version;
+        ds.create_branch("ghost", base, None).await.unwrap();
+    }
+
+    // One table's version GC fails once; the sweep must isolate it.
+    let _fp = ScopedFailPoint::new("cleanup.table_gc", "1*return");
+    let stats = db
+        .cleanup(omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        })
+        .await
+        .expect("a single table's GC failure must not abort cleanup");
+
+    let errored = stats.iter().filter(|s| s.error.is_some()).count();
+    assert_eq!(
+        errored, 1,
+        "exactly one table's GC failure should be surfaced in stats, got {errored}"
+    );
+    assert!(
+        stats.len() >= 4,
+        "every node+edge table should still appear in the stats"
+    );
+
+    // The reconcile pass is independent of the GC failure, so the orphan is gone.
+    {
+        let ds = lance::Dataset::open(&person_uri).await.unwrap();
+        assert!(
+            !ds.list_branches().await.unwrap().contains_key("ghost"),
+            "reconcile should reclaim the orphan despite the GC failure"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn graph_publish_failpoint_triggers_before_commit_append() {
     let _scenario = FailScenario::setup();
