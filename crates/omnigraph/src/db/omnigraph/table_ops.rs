@@ -483,6 +483,7 @@ pub(super) async fn open_owned_dataset_for_branch_write(
             Ok((ds, Some(active_branch.to_string())))
         }
         source_branch => {
+            crate::failpoints::maybe_fail("fork.before_classify")?;
             fork_dataset_from_entry_state(
                 db,
                 table_key,

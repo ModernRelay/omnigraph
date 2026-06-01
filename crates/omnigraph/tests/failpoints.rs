@@ -291,6 +291,66 @@ async fn branch_create_rolls_back_manifest_on_commit_graph_failure() {
     );
 }
 
+// A fork collision must be classified by the manifest authority, not by Lance
+// branch versions. When a concurrent first-write legitimately wins the fork
+// race, the loser sees a version mismatch — but that is a stale snapshot, not
+// an orphan, so it must be a retryable "refresh and retry", never a misleading
+// "run cleanup". Writer A pauses at the fork point so writer B commits the fork
+// first; A then resumes into the collision.
+#[tokio::test(flavor = "multi_thread")]
+async fn fork_collision_with_live_concurrent_fork_is_retryable() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let main = helpers::init_and_load(&dir).await;
+    main.branch_create("feature").await.unwrap();
+
+    // "1*pause" pauses only the first arrival (A); B's later arrival is a no-op.
+    let _fp = ScopedFailPoint::new("fork.before_classify", "1*pause");
+
+    let uri_a = uri.clone();
+    let writer_a = tokio::spawn(async move {
+        let mut a = Omnigraph::open(&uri_a).await.unwrap();
+        helpers::mutate_branch(
+            &mut a,
+            "feature",
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        )
+        .await
+    });
+
+    // Let A reach the pause, then let B win the fork and commit it.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let mut b = Omnigraph::open(&uri).await.unwrap();
+    helpers::mutate_branch(
+        &mut b,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Frank")], &[("$age", 41)]),
+    )
+    .await
+    .unwrap();
+
+    // Release A; it resumes, sees the manifest now records the fork.
+    fail::cfg("fork.before_classify", "off").unwrap();
+    let err = writer_a
+        .await
+        .unwrap()
+        .expect_err("A's stale-snapshot fork should be a retryable conflict");
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("cleanup"),
+        "a live concurrent fork must not be misclassified as an orphan, got: {msg}"
+    );
+    assert!(
+        msg.contains("refresh and retry") || msg.contains("expected manifest table version"),
+        "expected a retryable stale-view error, got: {msg}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn graph_publish_failpoint_triggers_before_commit_append() {
     let _scenario = FailScenario::setup();
