@@ -211,12 +211,45 @@ impl GraphCoordinator {
         let branch = normalize_branch_name(name)?
             .ok_or_else(|| OmniError::manifest("cannot create branch 'main'".to_string()))?;
         self.ensure_commit_graph_initialized().await?;
+
+        // Manifest authority flip first.
         self.manifest.create_branch(&branch).await?;
-        failpoints::maybe_fail("branch_create.after_manifest_branch_create")?;
-        if let Some(commit_graph) = &mut self.commit_graph {
-            commit_graph.create_branch(&branch).await?;
+
+        // Derived commit-graph branch. If anything after the authority flip
+        // fails, roll back the manifest branch so the branch never half-exists
+        // (a manifest branch with no commit-graph branch breaks the next write).
+        if let Err(err) = self.create_commit_graph_branch(&branch).await {
+            if let Err(rollback_err) = self.manifest.delete_branch(&branch).await {
+                tracing::warn!(
+                    target: "omnigraph::branch_create",
+                    branch = %branch,
+                    error = %rollback_err,
+                    "rollback of manifest branch failed after commit-graph create failure",
+                );
+            }
+            return Err(err);
         }
         Ok(())
+    }
+
+    /// Create the derived commit-graph branch for `branch`, healing a zombie ref
+    /// left by an incomplete prior delete. The manifest branch was just created
+    /// fresh, so any existing commit-graph branch with this name is provably
+    /// orphaned and is force-dropped before recreating.
+    async fn create_commit_graph_branch(&mut self, branch: &str) -> Result<()> {
+        failpoints::maybe_fail("branch_create.after_manifest_branch_create")?;
+        let Some(commit_graph) = &mut self.commit_graph else {
+            return Ok(());
+        };
+        if commit_graph
+            .list_branches()
+            .await?
+            .iter()
+            .any(|existing| existing == branch)
+        {
+            commit_graph.force_delete_branch(branch).await?;
+        }
+        commit_graph.create_branch(branch).await
     }
 
     pub async fn branch_delete(&mut self, name: &str) -> Result<()> {
