@@ -23,7 +23,7 @@ The design optimizes jointly for **DX** (one command surface across embedded and
 
 Verified **against the code**, not ticket statuses (which are unreliable — e.g. MR-581 is marked done but is stale and unbuilt). Findings and the corrections they force:
 
-- **Noun is `graph`/`graphs`, NOT `target`/`targets`.** The config key is `graphs:` in `config.rs` and the flag is `--graph`. **This RFC uses `graphs:`/`--graph` throughout**; the unifying noun is a **`graphs:` entry** that is *embedded* (`uri:`) XOR *remote* (`server:` + a remote graph name). Read any lingering `targets:`/`--target` below as `graphs:`/`--graph`.
+- **Noun is `graph`/`graphs`, NOT `target`/`targets`.** The config key is `graphs:` in `config.rs` and the flag is `--graph`. **This RFC uses `graphs:`/`--graph` throughout**; the unifying noun is a **`graphs:` entry** that is *embedded* (`storage:`, formerly `uri:`) XOR *remote* (`server:` + `graph_id:` defaulting to the entry key) — a typed locator (§1.1). Read any lingering `targets:`/`--target` below as `graphs:`/`--graph`.
 - **`~/.omnigraph/` stands on its own merits** (Helix/aws/kube peer convention), **not** on precedent — there is **no `~/.omnigraph/` usage in the code** today. (MR-581 / MR-531 templates-into-`~/.omnigraph/` are *stale tickets, unbuilt*.)
 - **Templates do not exist** in the code (no `template` command). The template mechanism is a *design question for this RFC / the init family*, not an existing foothold.
 - **What actually exists in the CLI** (verified): `init, query(read), mutate(change), load, ingest, branch, schema, lint, snapshot, export, commit, policy, optimize, cleanup, graphs`. **Not built:** `serve, quickstart, template, prune, login`. `omnigraph init` exists (with `scaffold_config_if_missing`, `main.rs:1415`); the rest of the "init family" (`quickstart` MR-973, `serve` MR-970, `prune`/`init --force` MR-972/975, `mcp install`/skills MR-974, agent-mode MR-981) are **unbuilt tickets**, some stale.
@@ -88,17 +88,56 @@ The config's only job is **name → this tuple**. Define one noun — a **target
 ```yaml
 targets:
   dev:                       # embedded — substrate-direct (E1)
-    uri: s3://team-bucket/dev.omni
+    storage: s3://team-bucket/dev.omni
     branch: main             # sub-state (E4)
   staging:                   # remote — resolves a server by reference (E2/E3)
     server: staging          # → looked up in `servers`
-    graph: prod              # graph_id on that server
+    graph_id: prod           # the graph's id on that server (defaults to the entry key)
     branch: review
 ```
 
-`--target staging` resolves: project `targets.staging` → `{server: staging, graph: prod, branch: review}` → `servers.staging` → `{endpoint, token-by-ref}` → final `(remote(https://…), prod, review, $TOKEN)`. Embedded targets skip the server hop and use cloud-storage credentials.
+`--target staging` resolves: project `targets.staging` → `{server: staging, graph_id: prod, branch: review}` → `servers.staging` → `{endpoint, token-by-ref}` → final `(remote(https://…), prod, review, $TOKEN)`. Embedded targets skip the server hop and use cloud-storage credentials.
 
-**Two concepts, not kubeconfig's three.** kube splits cluster / user / context; that 3-way split is its most-cursed UX. A target *bundles* server+graph+branch+defaults under one name; the **only** thing split out is `servers`, because endpoints+credentials are shared across many targets and are secret-bearing (different ownership and rate-of-change; see §2). Result: **2 nouns — `servers` and `targets`.** Embedded `targets` (`uri:`) subsume today's `graphs:` entries.
+**Two concepts, not kubeconfig's three.** kube splits cluster / user / context; that 3-way split is its most-cursed UX. A target *bundles* server+graph+branch+defaults under one name; the **only** thing split out is `servers`, because endpoints+credentials are shared across many targets and are secret-bearing (different ownership and rate-of-change; see §2). Result: **2 nouns — `servers` and `targets`.** Embedded `targets` (`storage:`) subsume today's `graphs:` entries.
+
+### 1.1 The resolved address is a typed *locator*, not a `uri` string
+
+The shipped config models a graph as a single `uri: String`, and code branches on `is_remote_uri(uri)`. That conflates two structurally different addresses: an **embedded** graph is a *complete, self-contained* address — one storage URI = one graph, opened directly via the embedded engine; a **remote** graph is a *server endpoint + a `graph_id`* — one server hosts N graphs. A bare server URL **is not a graph**; it lacks the `graph_id`. The cost of the string model, in the code today:
+
+- the CLI re-decides "server or file?" via `is_remote_uri` at ~16 call sites;
+- `TargetConfig` (one `uri` field) **cannot express** multi-server × multi-graph or a multi-homed graph (E2/E3) — "graph `production` on server `prod-eu`" has no representation;
+- the CLI **bails on remote URIs** for most operations, precisely because the string can't carry the `graph_id`;
+- the `omnigraph-ts` SDK had to model `baseUrl` **+** `graphId` *separately* (rewriting `/graphs/{graphId}/…`) — it invented the structure the string lacks.
+
+So the *resolved* address is a **typed locator**, not a string:
+
+```rust
+enum GraphLocator {
+    Embedded { storage: StorageUri },                  // file:// , s3:// — a complete graph
+    Remote   { server: ServerId, graph_id: GraphId },  // which server + which graph (+ bearer creds)
+}
+```
+
+A `graphs:` entry resolves into this **once**; downstream code dispatches on the variant (the breadboard's `GraphConn = Embedded(engine) | Remote(http)`) instead of re-sniffing a scheme at each call site. The `uri` string becomes an *input format* for the embedded variant, never the address itself.
+
+**YAML naming follows the locator — the *key* names the locus**, so neither the value's scheme nor a comment is load-bearing:
+
+| Locus | Key | Value |
+|---|---|---|
+| Embedded | **`storage:`** (shipped `uri:` is a deprecated alias) | a storage URI (`s3://…`, `file://…`) |
+| Remote | **`server:`** | a name in `servers:` (its `endpoint` + creds resolve by name, §5) |
+| Remote graph id | **`graph_id:`** | the id on that server — **defaults to the entry key**; set only when the local alias differs |
+
+An entry has `storage:` **xor** `server:` — the deserializer rejects *both* and *neither* (no silent ambiguity). This removes two prior confusions: `graphs:` (the map) vs `graph:` (the remote id), and `uri:`-might-be-a-server.
+
+```yaml
+servers:
+  prod-eu: { endpoint: https://og-eu.internal:8080 }
+graphs:
+  dev:        { storage: s3://team-bucket/dev.omni }   # embedded
+  production: { server: prod-eu }                       # remote — graph_id = "production" (the key)
+  staging:    { server: prod-eu, graph_id: prod }       # remote — alias ≠ server's id
+```
 
 ### 2. Layered config — global-first, uniform schema, project-optional
 
@@ -252,7 +291,7 @@ Scaffolding splits into three tiers by *scope* and *fatness*, mirroring the fiel
 - **`init` is in-place + refuse-if-exists** (cargo/prisma/terraform default): don't clobber; adopt existing files; require `--force` to overwrite (and `--force` purges Lance state per MR-975).
 - **Interactive for humans, `--auto`/agent-mode for automation** (npm `-y`, create-* `--CI`, MR-981 `--machine`). In `OMNIGRAPH_AGENT_MODE` any prompt → fail with a repair hint.
 - **Templates are a `--template <name>` flag on the fat tier** (create-vite model), with the *content* (schema + queries + seed) coming from a template source. Mechanism is a design question (bundled-in vs `og template pull` from a repo vs `npm create-*`-style delegation) — **not** an existing foothold (MR-581 stale). Lean: a small set of bundled templates first (generic `Person→Knows`, plus promote `omnigraph-intel-bootstrap`), `--template <github>` later.
-- **`init`/`quickstart` can scaffold the `graphs:` map with one or more entries**; "init with specific graphs" = the scaffolded `graphs:` block (embedded `uri:` locally; the agent/operator adds remote `server:` entries via `login` + editing).
+- **`init`/`quickstart` can scaffold the `graphs:` map with one or more entries**; "init with specific graphs" = the scaffolded `graphs:` block (embedded `storage:` locally; the agent/operator adds remote `server:` entries via `login` + editing).
 - **Secrets-on-scaffold rule** (prisma/dbt/supabase all do this): anything that writes a token also keeps it out of VCS. `login` prefers the OS keychain (no file); the `~/.omnigraph/credentials` profile fallback is `0600` and git-ignored, and any project-local `.env`-shaped file gets a `.gitignore` entry.
 
 ### 8. Concrete shape
@@ -267,13 +306,13 @@ defaults:
   graph: dev
 ```
 
-**Project** `./omnigraph.yaml` (committed, secret-free, portable — no `server.bind`). Note the shipped noun is `graphs:` (MR-603); an entry is embedded (`uri`) XOR remote (`server` + remote graph name):
+**Project** `./omnigraph.yaml` (committed, secret-free, portable — no `server.bind`). Note the shipped noun is `graphs:` (MR-603); an entry is embedded (`storage:`) XOR remote (`server:` + `graph_id:`, §1.1):
 ```yaml
 graphs:
-  dev:      { uri: s3://team-bucket/dev.omni, branch: main }    # embedded
-  staging:  { server: staging, graph: prod, branch: review }    # remote → graph `prod` on server `staging`
-  prod-us:  { server: prod-us, graph: production }
-  prod-eu:  { server: prod-eu, graph: production }              # multi-server, same remote graph name
+  dev:      { storage: s3://team-bucket/dev.omni, branch: main }  # embedded
+  staging:  { server: staging, graph_id: prod, branch: review }   # remote → graph `prod` on server `staging`
+  prod-us:  { server: prod-us, graph_id: production }
+  prod-eu:  { server: prod-eu, graph_id: production }             # multi-homed: same graph, another server
 defaults: { graph: dev, output_format: table }
 queries:  { find_user: { file: ./queries/find_user.gq, mcp: { expose: true } } }
 operations: { ... }   # the soon-to-be-renamed `aliases:` (MR-839)
@@ -321,7 +360,7 @@ Select with `--graph <name>` (shipped flag, MR-603).
 
 ## Migration / backwards compatibility
 
-- **Additive.** Today's `omnigraph.yaml` (`graphs:`, `cli:`, `server:`, `aliases:`, `policy:`) keeps working unchanged. `graphs:` entries are equivalent to embedded `targets:` with a `uri:`; both resolve.
+- **Additive.** Today's `omnigraph.yaml` (`graphs:`, `cli:`, `server:`, `aliases:`, `policy:`) keeps working unchanged. `graphs:` entries are equivalent to embedded `targets:` with a `storage:` (shipped `uri:` is a deprecated alias); both resolve.
 - **`targets:` is new** and optional. `servers:` is new and optional. Absent → today's behavior.
 - **Global `~/.omnigraph/config.yaml` is new.** Absent → only project + env + flags, exactly as now. Its addition is the **global-first posture flip**: today the CLI is project-anchored (reads `./omnigraph.yaml`, no parent walk); the global config becomes the new primary discovery path so the CLI works with no project file. Existing project-only workflows are unchanged (project still overrides global); the flip is additive — it adds a fallback layer below the project file, it does not remove the project file.
 - **`graphs:` → `targets:` is an evolution, not a break.** Both can coexist; `targets:` is the superset (adds remote + branch pinning). A future cleanup may alias `graphs:` to embedded `targets:`.
