@@ -164,6 +164,10 @@ pub enum ServerConfigMode {
     ///     set to a named target.
     Single {
         uri: String,
+        /// Cedar graph resource id for the single graph. A named selection
+        /// uses the graph name; an anonymous URI uses the normalized URI to
+        /// preserve legacy single-graph policy identity.
+        graph_id: String,
         /// Top-level `policy.file` (single-graph Cedar policy).
         policy_file: Option<PathBuf>,
         /// Top-level stored-query registry, loaded and identity-checked
@@ -439,20 +443,32 @@ impl AppState {
         policy_file: Option<&PathBuf>,
         queries: QueryRegistry,
     ) -> Result<Self> {
+        Self::open_single_with_queries_for_graph_id(uri, bearer_tokens, policy_file, queries, None)
+            .await
+    }
+
+    async fn open_single_with_queries_for_graph_id(
+        uri: impl Into<String>,
+        bearer_tokens: Vec<(String, String)>,
+        policy_file: Option<&PathBuf>,
+        queries: QueryRegistry,
+        graph_id: Option<String>,
+    ) -> Result<Self> {
         // The "policy requires tokens" invariant is enforced once by
         // `classify_server_runtime_state` in `serve()`, before either
         // single-mode or multi-mode construction is reached. By the
         // time we get here, the (policy, no-tokens) combination has
         // already been rejected — no second bail needed.
         let uri = normalize_root_uri(&uri.into()).wrap_err("normalize graph URI")?;
+        let graph_id = graph_id.unwrap_or_else(|| uri.clone());
         let db = Omnigraph::open(&uri).await?;
 
         // Validate the registry against the live schema and resolve it to
         // an attachable handle (refuse boot on breakage).
-        let registry = validate_and_attach(queries, &db.catalog(), &uri)?;
+        let registry = validate_and_attach(queries, &db.catalog(), &graph_id)?;
 
         let policy_engine = match policy_file {
-            Some(path) => Some(PolicyEngine::load_graph(path, &uri)?),
+            Some(path) => Some(PolicyEngine::load_graph(path, &graph_id)?),
             None => None,
         };
         Ok(Self::new_single_with_queries(
@@ -940,8 +956,10 @@ pub fn load_server_settings(
         let policy_file = config.resolve_policy_file_for(selected);
         let queries = QueryRegistry::load(&config, config.query_entries_for(selected))
             .map_err(|errs| color_eyre::eyre::eyre!(format_registry_load_errors(&uri, &errs)))?;
+        let graph_id = selected.unwrap_or(uri.as_str()).to_string();
         ServerConfigMode::Single {
             uri,
+            graph_id,
             policy_file,
             queries,
         }
@@ -1205,12 +1223,26 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     let state = match config.mode {
         ServerConfigMode::Single {
             uri,
+            graph_id,
             policy_file,
             queries,
         } => {
             let uri_for_log = uri.clone();
-            info!(uri = %uri_for_log, bind = %bind, mode = "single", "serving omnigraph");
-            AppState::open_single_with_queries(uri, tokens, policy_file.as_ref(), queries).await?
+            info!(
+                uri = %uri_for_log,
+                graph_id = %graph_id,
+                bind = %bind,
+                mode = "single",
+                "serving omnigraph"
+            );
+            AppState::open_single_with_queries_for_graph_id(
+                uri,
+                tokens,
+                policy_file.as_ref(),
+                queries,
+                Some(graph_id),
+            )
+            .await?
         }
         ServerConfigMode::Multi {
             graphs,
@@ -3225,7 +3257,10 @@ server:
 
         let settings = load_server_settings(Some(&config), None, None, None, false).unwrap();
         match &settings.mode {
-            ServerConfigMode::Single { uri, .. } => assert_eq!(uri, "/tmp/demo.omni"),
+            ServerConfigMode::Single { uri, graph_id, .. } => {
+                assert_eq!(uri, "/tmp/demo.omni");
+                assert_eq!(graph_id, "local");
+            }
             ServerConfigMode::Multi { .. } => panic!("expected Single mode, got Multi"),
         }
         assert_eq!(settings.bind, "0.0.0.0:9090");
@@ -3257,7 +3292,10 @@ server:
         )
         .unwrap();
         match &settings.mode {
-            ServerConfigMode::Single { uri, .. } => assert_eq!(uri, "/tmp/override.omni"),
+            ServerConfigMode::Single { uri, graph_id, .. } => {
+                assert_eq!(uri, "/tmp/override.omni");
+                assert_eq!(graph_id, "/tmp/override.omni");
+            }
             ServerConfigMode::Multi { .. } => panic!("expected Single mode, got Multi"),
         }
         assert_eq!(settings.bind, "0.0.0.0:9999");
@@ -3286,7 +3324,10 @@ server:
             load_server_settings(Some(&config), None, Some("dev".to_string()), None, false)
                 .unwrap();
         match &settings.mode {
-            ServerConfigMode::Single { uri, .. } => assert_eq!(uri, "http://127.0.0.1:8080"),
+            ServerConfigMode::Single { uri, graph_id, .. } => {
+                assert_eq!(uri, "http://127.0.0.1:8080");
+                assert_eq!(graph_id, "dev");
+            }
             ServerConfigMode::Multi { .. } => panic!("expected Single mode, got Multi"),
         }
     }
@@ -3414,6 +3455,7 @@ server:
                     .join("graph.omni")
                     .to_string_lossy()
                     .into_owned(),
+                graph_id: "default".to_string(),
                 policy_file: None,
                 queries: crate::queries::QueryRegistry::default(),
             },

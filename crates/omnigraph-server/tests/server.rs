@@ -5760,10 +5760,12 @@ graphs:
                 .unwrap();
         match settings.mode {
             ServerConfigMode::Single {
+                graph_id,
                 policy_file,
                 queries,
                 ..
             } => {
+                assert_eq!(graph_id, "prod", "named single-mode keeps graph identity");
                 assert!(
                     policy_file
                         .as_ref()
