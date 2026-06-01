@@ -2490,6 +2490,50 @@ fn queries_list_unknown_target_errors() {
 }
 
 #[test]
+fn queries_commands_reject_named_graph_with_populated_top_level_block() {
+    // A named graph (here via `cli.graph`) uses its own `graphs.<name>` block,
+    // so a populated top-level `queries:` block would be silently ignored — a
+    // config the server REFUSES to boot. `queries validate`/`list` must reject
+    // it too (matching boot) instead of validating/listing the per-graph block
+    // and giving a false green.
+    let graph = SystemGraph::loaded();
+    graph.write_query(
+        "find_person.gq",
+        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
+    );
+    let config = graph.write_config(
+        "omnigraph.yaml",
+        &format!(
+            concat!(
+                "graphs:\n",
+                "  local:\n",
+                "    uri: '{}'\n",
+                "    queries:\n",
+                "      find_person:\n",
+                "        file: ./find_person.gq\n",
+                "cli:\n",
+                "  graph: local\n",
+                "queries:\n",                 // populated top-level block: the coherence violation
+                "  legacy:\n",
+                "    file: ./legacy.gq\n",
+                "policy: {{}}\n",
+            ),
+            graph.path().to_string_lossy().replace('\'', "''")
+        ),
+    );
+    // Both resolve `local` from cli.graph (no positional URI), so both must
+    // error and name the graph + the ignored block — like server boot does.
+    for sub in ["validate", "list"] {
+        let output = output_failure(cli().arg("queries").arg(sub).arg("--config").arg(&config));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("local") && stderr.contains("queries"),
+            "`queries {sub}` must reject a named graph with a populated top-level block; stderr:\n{stderr}"
+        );
+    }
+}
+
+#[test]
 fn queries_validate_exits_nonzero_on_duplicate_tool_name() {
     // Two exposed queries claiming one MCP tool name is a load-time
     // collision — `queries validate` must fail (offline, before the engine
