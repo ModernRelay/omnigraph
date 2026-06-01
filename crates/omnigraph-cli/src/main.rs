@@ -2699,20 +2699,33 @@ async fn main() -> Result<()> {
                         "table_key": s.table_key,
                         "bytes_removed": s.bytes_removed,
                         "old_versions_removed": s.old_versions_removed,
+                        "error": s.error,
                     })).collect::<Vec<_>>(),
                 });
                 print_json(&value)?;
             } else {
                 let total_bytes: u64 = stats.iter().map(|s| s.bytes_removed).sum();
                 let total_versions: u64 = stats.iter().map(|s| s.old_versions_removed).sum();
+                let failed: Vec<&str> = stats
+                    .iter()
+                    .filter(|s| s.error.is_some())
+                    .map(|s| s.table_key.as_str())
+                    .collect();
                 println!(
                     "cleanup {} ({}) — removed {} versions ({} bytes) across {} tables",
                     uri,
                     policy_desc,
                     total_versions,
                     total_bytes,
-                    stats.len()
+                    stats.len() - failed.len()
                 );
+                if !failed.is_empty() {
+                    println!(
+                        "  {} table(s) failed and will be retried on the next cleanup: {}",
+                        failed.len(),
+                        failed.join(", ")
+                    );
+                }
             }
         }
         Command::Graphs { command } => match command {
