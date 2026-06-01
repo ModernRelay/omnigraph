@@ -1663,7 +1663,21 @@ fn log_policy_decision(actor_id: &str, request: &PolicyRequest, decision: &Polic
     );
 }
 
-/// HTTP-layer Cedar policy gate. Two sources of the policy engine:
+/// The allow/deny **decision** an authorization check produces, kept
+/// separate from the operational failures (`Err`) that can occur while
+/// computing it. [`authorize_request`] collapses `Denied` to a 403; a caller
+/// that needs to remap a denial without also remapping operational failures
+/// (the stored-query invoke handler hides a denial as a 404) matches on this
+/// directly, so a real 401 (missing bearer) or 500 (policy-evaluation error)
+/// keeps its true status instead of being masked as the denial's response.
+enum Authz {
+    Allowed,
+    Denied(String),
+}
+
+/// HTTP-layer Cedar policy gate, returning the allow/deny [`Authz`] decision
+/// and reserving `Err` for operational failures (401 missing bearer, 500
+/// policy-evaluation error). Two sources of the policy engine:
 ///   * Per-graph handler — passes `handle.policy.as_deref()` so the
 ///     graph's Cedar rules govern read/change/branch_*/schema_apply.
 ///   * Management handler — passes `state.server_policy.as_deref()` so
@@ -1677,11 +1691,11 @@ fn log_policy_decision(actor_id: &str, request: &PolicyRequest, decision: &Polic
 /// dropped from the type), so handlers cannot smuggle it through the
 /// request. See `actor_id_resolves_from_bearer_token_ignoring_client_supplied_headers`
 /// at `tests/server.rs`.
-fn authorize_request(
+fn authorize(
     actor: Option<&ResolvedActor>,
     policy: Option<&PolicyEngine>,
     request: PolicyRequest,
-) -> std::result::Result<(), ApiError> {
+) -> std::result::Result<Authz, ApiError> {
     let Some(engine) = policy else {
         // No PolicyEngine installed. Three runtime states can reach this:
         //
@@ -1708,21 +1722,23 @@ fn authorize_request(
         // operator's only path to enabling it is configuring an
         // explicit `server.policy.file` in omnigraph.yaml.
         if request.action.resource_kind() == PolicyResourceKind::Server {
-            return Err(ApiError::forbidden(
+            return Ok(Authz::Denied(
                 "server-scoped actions require an explicit `server.policy.file` \
                  configured in omnigraph.yaml — the management surface is closed \
                  by default in every runtime state, including --unauthenticated, \
-                 so that server topology is never exposed without operator opt-in.",
+                 so that server topology is never exposed without operator opt-in."
+                    .to_string(),
             ));
         }
         if actor.is_some() && request.action != PolicyAction::Read {
-            return Err(ApiError::forbidden(
+            return Ok(Authz::Denied(
                 "server runs in default-deny mode (bearer tokens configured but no \
                  policy file). Only `read` actions are permitted; configure \
-                 `policy.file` in omnigraph.yaml to enable other actions.",
+                 `policy.file` in omnigraph.yaml to enable other actions."
+                    .to_string(),
             ));
         }
-        return Ok(());
+        return Ok(Authz::Allowed);
     };
     let Some(actor) = actor else {
         return Err(ApiError::unauthorized("missing bearer token"));
@@ -1744,9 +1760,26 @@ fn authorize_request(
         .map_err(|err| ApiError::internal(format!("policy: {err}")))?;
     log_policy_decision(actor_id, &request, &decision);
     if decision.allowed {
-        Ok(())
+        Ok(Authz::Allowed)
     } else {
-        Err(ApiError::forbidden(decision.message))
+        Ok(Authz::Denied(decision.message))
+    }
+}
+
+/// Thin wrapper over [`authorize`] for the handlers that treat any denial as a
+/// 403: a denial becomes `ApiError::forbidden`, and operational failures
+/// (401 missing bearer, 500 policy-evaluation error) propagate unchanged. The
+/// stored-query invoke handler does **not** use this — it consumes the
+/// [`Authz`] decision directly to hide a denial as a 404 while letting an
+/// operational failure keep its true status.
+fn authorize_request(
+    actor: Option<&ResolvedActor>,
+    policy: Option<&PolicyEngine>,
+    request: PolicyRequest,
+) -> std::result::Result<(), ApiError> {
+    match authorize(actor, policy, request)? {
+        Authz::Allowed => Ok(()),
+        Authz::Denied(message) => Err(ApiError::forbidden(message)),
     }
 }
 
@@ -2206,6 +2239,7 @@ struct QueryNamePath {
         (status = 404, description = "Unknown stored query, or `invoke_query` denied — indistinguishable to a caller without the grant", body = ErrorOutput),
         (status = 409, description = "Merge conflict", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 500, description = "Policy evaluation error (a denial is reported as 404, not 500)", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
@@ -2235,7 +2269,11 @@ async fn server_invoke_query(
     let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
 
     // Boundary gate (authentication already ran in `require_bearer_auth`).
-    authorize_request(
+    // A denial is hidden as 404 (deny == missing, so the catalog can't be
+    // probed without the grant), but operational failures (401 missing bearer,
+    // 500 policy-evaluation error) propagate with their true status via `?`
+    // rather than being masked as a missing query.
+    match authorize(
         actor_ref,
         handle.policy.as_deref(),
         PolicyRequest {
@@ -2247,8 +2285,10 @@ async fn server_invoke_query(
             branch: None,
             target_branch: None,
         },
-    )
-    .map_err(|_| ApiError::not_found(NOT_FOUND))?;
+    )? {
+        Authz::Allowed => {}
+        Authz::Denied(_) => return Err(ApiError::not_found(NOT_FOUND)),
+    }
 
     // Resolve against the per-graph registry (same 404 on a miss).
     let stored = handle
@@ -3008,6 +3048,80 @@ mod tests {
     use std::env;
     use std::fs;
     use tempfile::tempdir;
+
+    /// `authorize` returns the allow/deny **decision** (`Authz`) and reserves
+    /// `Err` for operational failures, so the invoke handler can hide a denial
+    /// as 404 without also masking a 401/500. Pins each outcome.
+    #[test]
+    fn authorize_splits_decision_from_operational_error() {
+        use super::{Authz, PolicyAction, PolicyCompiler, PolicyConfig, PolicyRequest, ResolvedActor, authorize};
+        use std::sync::Arc;
+
+        fn req(action: PolicyAction) -> PolicyRequest {
+            PolicyRequest { action, branch: None, target_branch: None }
+        }
+        let actor = ResolvedActor::cluster_static(Arc::from("act-alice"));
+
+        // --- No policy engine installed (open / default-deny modes) ---
+        // A server-scoped action is denied in every no-policy state.
+        assert!(matches!(
+            authorize(Some(&actor), None, req(PolicyAction::GraphList)).unwrap(),
+            Authz::Denied(_)
+        ));
+        // Authenticated actor + a non-read per-graph action → default-deny.
+        assert!(matches!(
+            authorize(Some(&actor), None, req(PolicyAction::Change)).unwrap(),
+            Authz::Denied(_)
+        ));
+        // `read` is the one per-graph action permitted without a policy.
+        assert!(matches!(
+            authorize(Some(&actor), None, req(PolicyAction::Read)).unwrap(),
+            Authz::Allowed
+        ));
+        // Open mode (no actor, no policy) → allowed.
+        assert!(matches!(
+            authorize(None, None, req(PolicyAction::Read)).unwrap(),
+            Authz::Allowed
+        ));
+
+        // --- Policy engine installed ---
+        let policy: PolicyConfig = serde_yaml::from_str(
+            "version: 1\n\
+             groups:\n  team: [act-alice]\n\
+             rules:\n  - id: team-read\n    allow:\n      actors: { group: team }\n      actions: [read]\n      branch_scope: any\n",
+        )
+        .unwrap();
+        let engine = PolicyCompiler::compile(&policy, "graph").unwrap();
+
+        // A matched allow rule → Allowed.
+        assert!(matches!(
+            authorize(
+                Some(&actor),
+                Some(&engine),
+                PolicyRequest { action: PolicyAction::Read, branch: Some("main".to_string()), target_branch: None },
+            )
+            .unwrap(),
+            Authz::Allowed
+        ));
+        // Known actor, no matching allow rule → Denied, carrying the decision message.
+        match authorize(
+            Some(&actor),
+            Some(&engine),
+            PolicyRequest { action: PolicyAction::Change, branch: Some("main".to_string()), target_branch: None },
+        )
+        .unwrap()
+        {
+            Authz::Denied(message) => assert!(!message.is_empty(), "a deny carries its decision message"),
+            Authz::Allowed => panic!("change must be denied: only read is allowed"),
+        }
+        // Policy installed but no actor → operational failure (`Err`), NOT a
+        // decision. This is the split that keeps a 401/500 from being masked
+        // as the denial's response in the invoke handler.
+        assert!(
+            authorize(None, Some(&engine), req(PolicyAction::Read)).is_err(),
+            "a missing actor with a policy installed is an operational error, not a deny"
+        );
+    }
 
     #[test]
     fn hash_bearer_token_produces_32_byte_output() {

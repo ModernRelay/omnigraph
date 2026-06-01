@@ -975,6 +975,16 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "Policy evaluation error (a denial is reported as 404, not 500)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
           }
         },
         "security": [
