@@ -331,6 +331,21 @@ impl OmnigraphConfig {
         }
     }
 
+    /// Validate a graph selection against `graphs:` — the fallible
+    /// counterpart to the infallible [`OmnigraphConfig::query_entries_for`].
+    /// A known name passes through; an unknown name errors (the **same**
+    /// message [`OmnigraphConfig::resolve_target_uri`] produces, so a command
+    /// that opens no URI rejects an unknown `--target` exactly like the
+    /// URI-resolving commands do); an anonymous selection (`None`) stays
+    /// anonymous, resolving to the top-level registry downstream.
+    pub fn resolve_graph_selection<'a>(&self, graph: Option<&'a str>) -> Result<Option<&'a str>> {
+        match graph {
+            Some(name) if self.graphs.contains_key(name) => Ok(Some(name)),
+            Some(name) => bail!("graph '{}' not found in {}", name, DEFAULT_CONFIG_FILE),
+            None => Ok(None),
+        }
+    }
+
     /// The policy file that applies for a graph selection — the policy
     /// sibling of [`OmnigraphConfig::query_entries_for`], so policy and
     /// queries resolve by the same identity rule. A named graph in
@@ -574,6 +589,28 @@ policy: {}
 
         let config = load_config_in(&child, None).unwrap();
         assert!(config.graphs.is_empty());
+    }
+
+    #[test]
+    fn resolve_graph_selection_validates_membership() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("omnigraph.yaml"),
+            "graphs:\n  local:\n    uri: ./demo.omni\n",
+        )
+        .unwrap();
+        let config = load_config_in(temp.path(), None).unwrap();
+
+        // A known graph passes through unchanged.
+        assert_eq!(config.resolve_graph_selection(Some("local")).unwrap(), Some("local"));
+        // An anonymous selection stays anonymous (→ top-level registry downstream).
+        assert_eq!(config.resolve_graph_selection(None).unwrap(), None);
+        // An unknown name errors, naming the graph (matching resolve_target_uri).
+        let err = config.resolve_graph_selection(Some("ghost")).unwrap_err().to_string();
+        assert!(
+            err.contains("ghost") && err.contains("not found"),
+            "unknown graph must error naming it: {err}"
+        );
     }
 
     #[test]

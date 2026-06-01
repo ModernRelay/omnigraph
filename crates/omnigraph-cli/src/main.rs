@@ -1787,8 +1787,12 @@ fn execute_queries_list(
 ) -> Result<()> {
     let config = load_cli_config(config_path)?;
     // `list` takes no URI, so the selection is the target or the configured
-    // default graph (named → its per-graph block; else top-level).
-    let selected = target.as_deref().or_else(|| config.cli_graph_name());
+    // default graph (named → its per-graph block; else top-level). Validate
+    // membership explicitly — every URI-resolving command rejects an unknown
+    // name as a side effect of `resolve_target_uri`, but `list` opens no URI,
+    // so it would otherwise fall back to the top-level registry silently.
+    let selected =
+        config.resolve_graph_selection(target.as_deref().or_else(|| config.cli_graph_name()))?;
     let registry = load_registry_or_report(&config, selected)?;
 
     let output = QueriesListOutput {
