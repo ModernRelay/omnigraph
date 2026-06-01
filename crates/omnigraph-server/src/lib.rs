@@ -4,12 +4,15 @@ pub mod config;
 pub mod graph_id;
 pub mod identity;
 pub mod policy;
+pub mod queries;
 pub mod registry;
 pub mod workload;
 
 pub use graph_id::GraphId;
 pub use identity::{AuthSource, GraphKey, ResolvedActor, Scope, TenantId};
 pub use registry::{GraphHandle, GraphRegistry, InsertError, RegistryLookup, RegistrySnapshot};
+
+use crate::queries::{QueryRegistry, check, format_check_breakages};
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -22,7 +25,8 @@ use api::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
     CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphInfo, GraphListResponse,
-    HealthOutput, IngestOutput, IngestRequest, QueryRequest, ReadOutput, ReadRequest,
+    HealthOutput, IngestOutput, IngestRequest, InvokeStoredQueryRequest,
+    InvokeStoredQueryResponse, QueriesCatalogOutput, QueryRequest, ReadOutput, ReadRequest,
     SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotQuery, ingest_output,
     schema_apply_output, snapshot_payload,
 };
@@ -40,12 +44,13 @@ use color_eyre::eyre::{Result, WrapErr, bail};
 pub use config::{
     AliasCommand, AliasConfig, CliDefaults, DEFAULT_CONFIG_FILE, OmnigraphConfig, PolicySettings,
     ProjectConfig, QueryDefaults, ReadOutputFormat, ServerDefaults, TableCellLayout, TargetConfig,
-    load_config,
+    graph_resource_id_for_selection, load_config,
 };
 use futures::stream;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::{ManifestConflictDetails, ManifestErrorKind, OmniError};
 use omnigraph::storage::normalize_root_uri;
+use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::json_params_to_param_map;
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::{JsonParamMode, ParamMap};
@@ -93,6 +98,8 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         server_export,
         #[allow(deprecated)] server_change,
         server_mutate,
+        server_list_queries,
+        server_invoke_query,
         server_schema_apply,
         server_schema_get,
         server_ingest,
@@ -157,8 +164,16 @@ pub enum ServerConfigMode {
     ///     set to a named target.
     Single {
         uri: String,
+        /// Cedar graph resource id for the single graph. A named selection
+        /// uses the graph name; an anonymous URI uses the normalized URI to
+        /// preserve legacy single-graph policy identity.
+        graph_id: String,
         /// Top-level `policy.file` (single-graph Cedar policy).
         policy_file: Option<PathBuf>,
+        /// Top-level stored-query registry, loaded and identity-checked
+        /// at settings-build time; type-checked against the schema when
+        /// the engine opens.
+        queries: QueryRegistry,
     },
     /// Multi-graph invocation — `--config omnigraph.yaml` with a
     /// non-empty `graphs:` map and no single-mode selector.
@@ -185,6 +200,10 @@ pub struct GraphStartupConfig {
     pub graph_id: String,
     pub uri: String,
     pub policy_file: Option<PathBuf>,
+    /// Per-graph stored-query registry, loaded and identity-checked at
+    /// settings-build time; type-checked against the schema when this
+    /// graph's engine opens.
+    pub queries: QueryRegistry,
 }
 
 /// Runtime routing for the server. Single mode = legacy
@@ -285,7 +304,31 @@ impl AppState {
     ) -> Self {
         let bearer_tokens = hash_bearer_tokens(bearer_tokens);
         let per_graph_policy = policy_engine.map(Arc::new);
-        Self::build_single_mode(uri, db, bearer_tokens, per_graph_policy, Arc::new(workload))
+        Self::build_single_mode(uri, db, bearer_tokens, per_graph_policy, Arc::new(workload), None)
+    }
+
+    /// Like `new_single`, but attaches a pre-validated stored-query
+    /// registry. Private — the production single-mode boot path
+    /// (`open_single_with_queries`) is the only caller; every public
+    /// `new_*` constructor builds with no stored queries.
+    fn new_single_with_queries(
+        uri: String,
+        db: Omnigraph,
+        bearer_tokens: Vec<(String, String)>,
+        policy_engine: Option<PolicyEngine>,
+        workload: workload::WorkloadController,
+        queries: Option<Arc<QueryRegistry>>,
+    ) -> Self {
+        let bearer_tokens = hash_bearer_tokens(bearer_tokens);
+        let per_graph_policy = policy_engine.map(Arc::new);
+        Self::build_single_mode(
+            uri,
+            db,
+            bearer_tokens,
+            per_graph_policy,
+            Arc::new(workload),
+            queries,
+        )
     }
 
     pub fn new(uri: String, db: Omnigraph) -> Self {
@@ -378,22 +421,63 @@ impl AppState {
         bearer_tokens: Vec<(String, String)>,
         policy_file: Option<&PathBuf>,
     ) -> Result<Self> {
+        Self::open_single_with_queries(
+            uri,
+            bearer_tokens,
+            policy_file,
+            QueryRegistry::default(),
+        )
+        .await
+    }
+
+    /// Single-mode boot with a stored-query registry: open the engine,
+    /// **type-check the registry against the live schema and refuse to
+    /// start on a breakage** (same posture as bad policy YAML), log
+    /// non-blocking warnings, then attach the registry to the handle.
+    /// With an empty registry the check is a no-op and no registry is
+    /// attached — that is the path `open_with_bearer_tokens_and_policy`
+    /// (no stored queries) takes.
+    pub async fn open_single_with_queries(
+        uri: impl Into<String>,
+        bearer_tokens: Vec<(String, String)>,
+        policy_file: Option<&PathBuf>,
+        queries: QueryRegistry,
+    ) -> Result<Self> {
+        Self::open_single_with_queries_for_graph_id(uri, bearer_tokens, policy_file, queries, None)
+            .await
+    }
+
+    async fn open_single_with_queries_for_graph_id(
+        uri: impl Into<String>,
+        bearer_tokens: Vec<(String, String)>,
+        policy_file: Option<&PathBuf>,
+        queries: QueryRegistry,
+        graph_id: Option<String>,
+    ) -> Result<Self> {
         // The "policy requires tokens" invariant is enforced once by
         // `classify_server_runtime_state` in `serve()`, before either
         // single-mode or multi-mode construction is reached. By the
         // time we get here, the (policy, no-tokens) combination has
         // already been rejected — no second bail needed.
         let uri = normalize_root_uri(&uri.into()).wrap_err("normalize graph URI")?;
+        let graph_id = graph_id.unwrap_or_else(|| uri.clone());
         let db = Omnigraph::open(&uri).await?;
+
+        // Validate the registry against the live schema and resolve it to
+        // an attachable handle (refuse boot on breakage).
+        let registry = validate_and_attach(queries, &db.catalog(), &graph_id)?;
+
         let policy_engine = match policy_file {
-            Some(path) => Some(PolicyEngine::load_graph(path, &uri)?),
+            Some(path) => Some(PolicyEngine::load_graph(path, &graph_id)?),
             None => None,
         };
-        Ok(Self::new_with_bearer_tokens_and_policy(
+        Ok(Self::new_single_with_queries(
             uri,
             db,
             bearer_tokens,
             policy_engine,
+            workload::WorkloadController::from_env(),
+            registry,
         ))
     }
 
@@ -408,6 +492,7 @@ impl AppState {
         bearer_tokens: Arc<[(BearerTokenHash, Arc<str>)]>,
         policy_engine: Option<Arc<PolicyEngine>>,
         workload: Arc<workload::WorkloadController>,
+        queries: Option<Arc<QueryRegistry>>,
     ) -> Self {
         // Engine-layer policy gate (MR-722). With a per-graph policy
         // installed, every `_as` writer on `Omnigraph` calls into the
@@ -436,6 +521,7 @@ impl AppState {
             uri,
             engine: Arc::new(db),
             policy: policy_engine,
+            queries,
         });
         Self {
             routing: GraphRouting::Single { handle },
@@ -750,6 +836,58 @@ pub fn init_tracing() {
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
+/// Log each non-blocking advisory from a registry check report.
+fn log_registry_warnings(label: &str, report: &queries::CheckReport) {
+    for warning in &report.warnings {
+        warn!(graph = label, query = %warning.query, "stored query: {}", warning.message);
+    }
+}
+
+fn validate_registry_against_catalog(
+    registry: &QueryRegistry,
+    catalog: &Catalog,
+    label: &str,
+) -> omnigraph::error::Result<()> {
+    let report = check(registry, catalog);
+    if report.has_breakages() {
+        return Err(OmniError::manifest(format_check_breakages(label, &report)));
+    }
+    log_registry_warnings(label, &report);
+    Ok(())
+}
+
+/// Validate a loaded stored-query registry against the live schema and
+/// resolve it to an attachable handle. Refuses boot on any breakage
+/// (same posture as bad policy YAML), logs the non-blocking warnings,
+/// and collapses an empty registry to `None` (nothing attached). This is
+/// the single gate every open path funnels through, so no opener can
+/// attach a registry that has not been schema-checked. `label` names the
+/// graph in messages.
+fn validate_and_attach(
+    queries: QueryRegistry,
+    catalog: &Catalog,
+    label: &str,
+) -> Result<Option<Arc<QueryRegistry>>> {
+    validate_registry_against_catalog(&queries, catalog, label)
+        .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
+    Ok(if queries.is_empty() {
+        None
+    } else {
+        Some(Arc::new(queries))
+    })
+}
+
+/// Format every load error (parse / identity failure) into a multi-line
+/// boot-abort message.
+fn format_registry_load_errors(label: &str, errors: &[queries::LoadError]) -> String {
+    let joined = errors
+        .iter()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join("\n  ");
+    format!("graph '{label}': stored-query registry failed to load:\n  {joined}")
+}
+
 pub fn load_server_settings(
     config_path: Option<&PathBuf>,
     cli_uri: Option<String>,
@@ -799,15 +937,43 @@ pub fn load_server_settings(
         let uri = normalize_root_uri(&raw_uri).wrap_err_with(|| {
             format!("normalize single-graph URI '{raw_uri}' from server settings")
         })?;
-        let policy_file = config.resolve_policy_file();
-        ServerConfigMode::Single { uri, policy_file }
+        // Config follows graph IDENTITY, not mode: a bare URI is anonymous
+        // (top-level config); a graph chosen by name uses its per-graph
+        // `graphs.<name>.{policy,queries}`. `resolve_target_uri` already
+        // errored on an unknown name, so a `Some(name)` here is a known graph.
+        let selected: Option<&str> = if has_cli_uri {
+            None
+        } else {
+            cli_target.as_deref().or_else(|| config.server_graph_name())
+        };
+        // A named selection must not leave a populated top-level block
+        // silently unused — refuse boot and point at the per-graph block. The
+        // same rule the CLI selection gate enforces, shared via one helper so
+        // the boot check and `omnigraph queries validate`/`list` can't drift.
+        config.ensure_top_level_blocks_honored(selected)?;
+        // Load + identity-check now (no engine needed); the schema
+        // type-check happens when the engine opens.
+        let policy_file = config.resolve_policy_file_for(selected);
+        let queries = QueryRegistry::load(&config, config.query_entries_for(selected))
+            .map_err(|errs| color_eyre::eyre::eyre!(format_registry_load_errors(&uri, &errs)))?;
+        let graph_id = graph_resource_id_for_selection(selected, &uri);
+        ServerConfigMode::Single {
+            uri,
+            graph_id,
+            policy_file,
+            queries,
+        }
     } else if has_explicit_config && has_graphs_map {
-        if config.resolve_policy_file().is_some() {
+        // Multi mode: every graph uses its per-graph block; top-level
+        // policy/queries are never honored, so a populated one is an error.
+        let unhonored = config.populated_top_level_blocks();
+        if !unhonored.is_empty() {
             bail!(
-                "top-level `policy.file` is single-graph/CLI-local policy only; \
-                 in multi-graph mode move per-graph rules to \
-                 `graphs.<graph_id>.policy.file` and move `graph_list` rules to \
-                 `server.policy.file`."
+                "multi-graph mode: top-level {} {} not honored — each graph uses its own \
+                 `graphs.<graph_id>.…` block. Move per-graph rules there (and any \
+                 `graph_list` policy to `server.policy.file`).",
+                unhonored.join(" and "),
+                if unhonored.len() == 1 { "is" } else { "are" },
             );
         }
         // Rule 4 → Multi mode. Build a startup config per graph.
@@ -823,10 +989,17 @@ pub fn load_server_settings(
             let uri = normalize_root_uri(&raw_uri).wrap_err_with(|| {
                 format!("normalize URI '{raw_uri}' for graph '{name}' in omnigraph.yaml")
             })?;
+            // Per-graph `queries:`, selected through the shared
+            // `query_entries_for` so server and CLI resolve identically.
+            // Load + identity-check now; the schema type-check happens
+            // when this graph's engine opens.
+            let queries = QueryRegistry::load(&config, config.query_entries_for(Some(name.as_str())))
+                .map_err(|errs| color_eyre::eyre::eyre!(format_registry_load_errors(name, &errs)))?;
             graphs.push(GraphStartupConfig {
                 graph_id: name.clone(),
                 uri,
                 policy_file: config.resolve_target_policy_file(name),
+                queries,
             });
         }
         let config_path = config_path
@@ -949,6 +1122,8 @@ pub fn build_app(state: AppState) -> Router {
             server_change
         }))
         .route("/mutate", post(server_mutate))
+        .route("/queries", get(server_list_queries))
+        .route("/queries/{name}", post(server_invoke_query))
         .route("/schema", get(server_schema_get))
         .route("/schema/apply", post(server_schema_apply))
         .route(
@@ -1046,10 +1221,28 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
 
     let bind = config.bind.clone();
     let state = match config.mode {
-        ServerConfigMode::Single { uri, policy_file } => {
+        ServerConfigMode::Single {
+            uri,
+            graph_id,
+            policy_file,
+            queries,
+        } => {
             let uri_for_log = uri.clone();
-            info!(uri = %uri_for_log, bind = %bind, mode = "single", "serving omnigraph");
-            AppState::open_with_bearer_tokens_and_policy(uri, tokens, policy_file.as_ref()).await?
+            info!(
+                uri = %uri_for_log,
+                graph_id = %graph_id,
+                bind = %bind,
+                mode = "single",
+                "serving omnigraph"
+            );
+            AppState::open_single_with_queries_for_graph_id(
+                uri,
+                tokens,
+                policy_file.as_ref(),
+                queries,
+                Some(graph_id),
+            )
+            .await?
         }
         ServerConfigMode::Multi {
             graphs,
@@ -1131,6 +1324,12 @@ async fn open_single_graph(cfg: GraphStartupConfig) -> Result<Arc<GraphHandle>> 
         .await
         .map_err(|err| color_eyre::eyre::eyre!("open graph '{}' at {}: {err}", graph_id, uri))?;
 
+    // Validate this graph's stored queries against the live schema and
+    // resolve them to an attachable handle (refuse boot on breakage).
+    // Done before the policy match rebinds `db`; the catalog handle is an
+    // owned `Arc`, so no borrow of `db` survives into the match.
+    let queries = validate_and_attach(cfg.queries, &db.catalog(), graph_id.as_str())?;
+
     let (policy_arc, db) = match &cfg.policy_file {
         Some(path) => {
             let policy = PolicyEngine::load_graph(path, graph_id.as_str())?;
@@ -1146,6 +1345,7 @@ async fn open_single_graph(cfg: GraphStartupConfig) -> Result<Arc<GraphHandle>> 
         uri,
         engine: Arc::new(db),
         policy: policy_arc,
+        queries,
     }))
 }
 
@@ -1479,7 +1679,21 @@ fn log_policy_decision(actor_id: &str, request: &PolicyRequest, decision: &Polic
     );
 }
 
-/// HTTP-layer Cedar policy gate. Two sources of the policy engine:
+/// The allow/deny **decision** an authorization check produces, kept
+/// separate from the operational failures (`Err`) that can occur while
+/// computing it. [`authorize_request`] collapses `Denied` to a 403; a caller
+/// that needs to remap a denial without also remapping operational failures
+/// (the stored-query invoke handler hides a denial as a 404) matches on this
+/// directly, so a real 401 (missing bearer) or 500 (policy-evaluation error)
+/// keeps its true status instead of being masked as the denial's response.
+enum Authz {
+    Allowed,
+    Denied(String),
+}
+
+/// HTTP-layer Cedar policy gate, returning the allow/deny [`Authz`] decision
+/// and reserving `Err` for operational failures (401 missing bearer, 500
+/// policy-evaluation error). Two sources of the policy engine:
 ///   * Per-graph handler — passes `handle.policy.as_deref()` so the
 ///     graph's Cedar rules govern read/change/branch_*/schema_apply.
 ///   * Management handler — passes `state.server_policy.as_deref()` so
@@ -1493,11 +1707,11 @@ fn log_policy_decision(actor_id: &str, request: &PolicyRequest, decision: &Polic
 /// dropped from the type), so handlers cannot smuggle it through the
 /// request. See `actor_id_resolves_from_bearer_token_ignoring_client_supplied_headers`
 /// at `tests/server.rs`.
-fn authorize_request(
+fn authorize(
     actor: Option<&ResolvedActor>,
     policy: Option<&PolicyEngine>,
     request: PolicyRequest,
-) -> std::result::Result<(), ApiError> {
+) -> std::result::Result<Authz, ApiError> {
     let Some(engine) = policy else {
         // No PolicyEngine installed. Three runtime states can reach this:
         //
@@ -1524,21 +1738,23 @@ fn authorize_request(
         // operator's only path to enabling it is configuring an
         // explicit `server.policy.file` in omnigraph.yaml.
         if request.action.resource_kind() == PolicyResourceKind::Server {
-            return Err(ApiError::forbidden(
+            return Ok(Authz::Denied(
                 "server-scoped actions require an explicit `server.policy.file` \
                  configured in omnigraph.yaml — the management surface is closed \
                  by default in every runtime state, including --unauthenticated, \
-                 so that server topology is never exposed without operator opt-in.",
+                 so that server topology is never exposed without operator opt-in."
+                    .to_string(),
             ));
         }
         if actor.is_some() && request.action != PolicyAction::Read {
-            return Err(ApiError::forbidden(
+            return Ok(Authz::Denied(
                 "server runs in default-deny mode (bearer tokens configured but no \
                  policy file). Only `read` actions are permitted; configure \
-                 `policy.file` in omnigraph.yaml to enable other actions.",
+                 `policy.file` in omnigraph.yaml to enable other actions."
+                    .to_string(),
             ));
         }
-        return Ok(());
+        return Ok(Authz::Allowed);
     };
     let Some(actor) = actor else {
         return Err(ApiError::unauthorized("missing bearer token"));
@@ -1560,9 +1776,26 @@ fn authorize_request(
         .map_err(|err| ApiError::internal(format!("policy: {err}")))?;
     log_policy_decision(actor_id, &request, &decision);
     if decision.allowed {
-        Ok(())
+        Ok(Authz::Allowed)
     } else {
-        Err(ApiError::forbidden(decision.message))
+        Ok(Authz::Denied(decision.message))
+    }
+}
+
+/// Thin wrapper over [`authorize`] for the handlers that treat any denial as a
+/// 403: a denial becomes `ApiError::forbidden`, and operational failures
+/// (401 missing bearer, 500 policy-evaluation error) propagate unchanged. The
+/// stored-query invoke handler does **not** use this — it consumes the
+/// [`Authz`] decision directly to hide a denial as a 404 while letting an
+/// operational failure keep its true status.
+fn authorize_request(
+    actor: Option<&ResolvedActor>,
+    policy: Option<&PolicyEngine>,
+    request: PolicyRequest,
+) -> std::result::Result<(), ApiError> {
+    match authorize(actor, policy, request)? {
+        Authz::Allowed => Ok(()),
+        Authz::Denied(message) => Err(ApiError::forbidden(message)),
     }
 }
 
@@ -2001,6 +2234,194 @@ async fn server_mutate(
     ))
 }
 
+/// Path parameter for `POST /queries/{name}`.
+#[derive(Deserialize)]
+struct QueryNamePath {
+    name: String,
+}
+
+fn parse_optional_invoke_body(
+    body: Bytes,
+) -> std::result::Result<InvokeStoredQueryRequest, ApiError> {
+    if body.is_empty() {
+        return Ok(InvokeStoredQueryRequest::default());
+    }
+    serde_json::from_slice::<Option<InvokeStoredQueryRequest>>(&body)
+        .map(|request| request.unwrap_or_default())
+        .map_err(|err| {
+            ApiError::bad_request(format!("invalid stored-query invocation body: {err}"))
+        })
+}
+
+#[utoipa::path(
+    post,
+    path = "/queries/{name}",
+    tag = "queries",
+    operation_id = "invoke_query",
+    params(("name" = String, Path, description = "Stored query name (the registry key)")),
+    request_body = Option<InvokeStoredQueryRequest>,
+    responses(
+        (status = 200, description = "Read envelope (ReadOutput) or mutation envelope (ChangeOutput), serialized untagged", body = InvokeStoredQueryResponse),
+        (status = 400, description = "Bad request (param type error; snapshot on a stored mutation)", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden (the inner `change` gate for a stored mutation)", body = ErrorOutput),
+        (status = 404, description = "Unknown stored query, or `invoke_query` denied — indistinguishable to a caller without the grant", body = ErrorOutput),
+        (status = 409, description = "Merge conflict", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+        (status = 500, description = "Policy evaluation error (a denial is reported as 404, not 500)", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Invoke a curated, server-side stored query by name.
+///
+/// The query source comes from the graph's `queries:` registry, not the
+/// request body — callers send only runtime inputs (`params`, `branch`,
+/// `snapshot`). Gated by the `invoke_query` Cedar action at the boundary;
+/// a stored *mutation* additionally passes the engine's `change` gate
+/// (double-gated). An actor **without** `invoke_query` cannot tell a denied
+/// query from a missing one — both return the same 404, so the catalog
+/// can't be probed without the grant. Once `invoke_query` is held, the
+/// inner `read`/`change` gate may surface a 403 for an existing query the
+/// actor can't run (the intended double-gate signal).
+async fn server_invoke_query(
+    State(state): State<AppState>,
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    Path(QueryNamePath { name }): Path<QueryNamePath>,
+    body: Bytes,
+) -> std::result::Result<Json<InvokeStoredQueryResponse>, ApiError> {
+    let req = parse_optional_invoke_body(body)?;
+    // A caller without `invoke_query` can't tell a denial from a missing
+    // query: both 404 with this exact message, so the catalog can't be
+    // probed without the grant. (A caller that holds invoke_query may still
+    // see the inner gate's 403 for an existing query it can't run — intended.)
+    const NOT_FOUND: &str = "stored query not found";
+    let actor_ref = actor.as_ref().map(|Extension(actor)| actor);
+
+    // Boundary gate (authentication already ran in `require_bearer_auth`).
+    // A denial is hidden as 404 (deny == missing, so the catalog can't be
+    // probed without the grant), but operational failures (401 missing bearer,
+    // 500 policy-evaluation error) propagate with their true status via `?`
+    // rather than being masked as a missing query.
+    match authorize(
+        actor_ref,
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::InvokeQuery,
+            // Graph-scoped: no branch dimension. The per-branch/snapshot
+            // access is enforced by the inner read/change gate in the
+            // runner, so the outer gate must not resolve a branch (doing so
+            // was wrong for snapshot reads).
+            branch: None,
+            target_branch: None,
+        },
+    )? {
+        Authz::Allowed => {}
+        Authz::Denied(_) => return Err(ApiError::not_found(NOT_FOUND)),
+    }
+
+    // Resolve against the per-graph registry (same 404 on a miss).
+    let stored = handle
+        .queries
+        .as_ref()
+        .and_then(|registry| registry.lookup(&name))
+        .ok_or_else(|| ApiError::not_found(NOT_FOUND))?;
+
+    // Detach what we need before `handle` moves into the runner — the
+    // registry borrow lives inside `handle`.
+    let source = Arc::clone(&stored.source);
+    let query_name = stored.name.clone();
+    let is_mutation = stored.is_mutation();
+
+    info!(
+        graph = %handle.uri,
+        actor = ?actor_ref.map(|a| a.actor_id.as_ref()),
+        query = %query_name,
+        kind = if is_mutation { "mutate" } else { "read" },
+        "stored query invoked"
+    );
+
+    if is_mutation {
+        if req.snapshot.is_some() {
+            return Err(ApiError::bad_request(
+                "stored mutation cannot target a snapshot",
+            ));
+        }
+        let branch = req.branch.unwrap_or_else(|| "main".to_string());
+        let output = run_mutate(
+            state,
+            handle,
+            actor_ref,
+            &source,
+            Some(&query_name),
+            req.params.as_ref(),
+            branch,
+        )
+        .await?;
+        Ok(Json(InvokeStoredQueryResponse::Change(output)))
+    } else {
+        let (selected, target, result) = run_query(
+            handle,
+            actor_ref,
+            &source,
+            Some(&query_name),
+            req.params.as_ref(),
+            req.branch,
+            req.snapshot,
+            true,
+        )
+        .await?;
+        Ok(Json(InvokeStoredQueryResponse::Read(api::read_output(
+            selected, &target, result,
+        ))))
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/queries",
+    tag = "queries",
+    operation_id = "list_queries",
+    responses(
+        (status = 200, description = "Stored-query catalog (the mcp.expose subset, with typed params)", body = QueriesCatalogOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// List the graph's exposed stored queries as a typed tool catalog.
+///
+/// Returns the `mcp.expose == true` subset of the `queries:` registry, each
+/// with its MCP tool name, read/mutate flag, description/instruction, and
+/// typed parameters — enough for a client to register them as tools without
+/// fetching `.gq` source. Read-gated; the catalog is graph-wide (branch
+/// independent — `read` is authorized against `main`). **Not** Cedar-filtered
+/// per query yet, so it can list a query whose `invoke_query` the caller
+/// lacks (a known gap until per-query authorization lands).
+async fn server_list_queries(
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+) -> std::result::Result<Json<QueriesCatalogOutput>, ApiError> {
+    authorize_request(
+        actor.as_ref().map(|Extension(actor)| actor),
+        handle.policy.as_deref(),
+        PolicyRequest {
+            action: PolicyAction::Read,
+            branch: Some("main".to_string()),
+            target_branch: None,
+        },
+    )?;
+    let queries = match handle.queries.as_ref() {
+        Some(registry) => registry
+            .iter()
+            .filter(|q| q.expose)
+            .map(api::query_catalog_entry)
+            .collect(),
+        None => Vec::new(),
+    };
+    Ok(Json(QueriesCatalogOutput { queries }))
+}
+
 #[utoipa::path(
     get,
     path = "/schema",
@@ -2088,18 +2509,26 @@ async fn server_schema_apply(
         .map_err(ApiError::from_workload_reject)?;
     let result = {
         let db = &handle.engine;
+        let registry = handle.queries.as_deref();
+        let label = handle.key.graph_id.as_str().to_string();
         // Engine-layer policy enforcement (MR-722): pass the resolved
         // actor through so apply_schema_as can call enforce() with the
         // authoritative identity. With a policy installed in AppState,
         // engine-side enforcement re-checks the same decision the
         // HTTP-layer authorize_request just made above. PR #3 collapses
         // the redundancy.
-        db.apply_schema_as(
+        db.apply_schema_as_with_catalog_check(
             &request.schema_source,
             omnigraph::db::SchemaApplyOptions {
                 allow_data_loss: request.allow_data_loss,
             },
             actor_id,
+            |catalog| {
+                if let Some(registry) = registry {
+                    validate_registry_against_catalog(registry, catalog, &label)?;
+                }
+                Ok(())
+            },
         )
         .await
         .map_err(ApiError::from_omni)?
@@ -2658,10 +3087,131 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    /// `authorize` returns the allow/deny **decision** (`Authz`) and reserves
+    /// `Err` for operational failures, so the invoke handler can hide a denial
+    /// as 404 without also masking a 401/500. Pins each outcome.
+    #[test]
+    fn authorize_splits_decision_from_operational_error() {
+        use super::{Authz, PolicyAction, PolicyCompiler, PolicyConfig, PolicyRequest, ResolvedActor, authorize};
+        use std::sync::Arc;
+
+        fn req(action: PolicyAction) -> PolicyRequest {
+            PolicyRequest { action, branch: None, target_branch: None }
+        }
+        let actor = ResolvedActor::cluster_static(Arc::from("act-alice"));
+
+        // --- No policy engine installed (open / default-deny modes) ---
+        // A server-scoped action is denied in every no-policy state.
+        assert!(matches!(
+            authorize(Some(&actor), None, req(PolicyAction::GraphList)).unwrap(),
+            Authz::Denied(_)
+        ));
+        // Authenticated actor + a non-read per-graph action → default-deny.
+        assert!(matches!(
+            authorize(Some(&actor), None, req(PolicyAction::Change)).unwrap(),
+            Authz::Denied(_)
+        ));
+        // `read` is the one per-graph action permitted without a policy.
+        assert!(matches!(
+            authorize(Some(&actor), None, req(PolicyAction::Read)).unwrap(),
+            Authz::Allowed
+        ));
+        // Open mode (no actor, no policy) → allowed.
+        assert!(matches!(
+            authorize(None, None, req(PolicyAction::Read)).unwrap(),
+            Authz::Allowed
+        ));
+
+        // --- Policy engine installed ---
+        let policy: PolicyConfig = serde_yaml::from_str(
+            "version: 1\n\
+             groups:\n  team: [act-alice]\n\
+             rules:\n  - id: team-read\n    allow:\n      actors: { group: team }\n      actions: [read]\n      branch_scope: any\n",
+        )
+        .unwrap();
+        let engine = PolicyCompiler::compile(&policy, "graph").unwrap();
+
+        // A matched allow rule → Allowed.
+        assert!(matches!(
+            authorize(
+                Some(&actor),
+                Some(&engine),
+                PolicyRequest { action: PolicyAction::Read, branch: Some("main".to_string()), target_branch: None },
+            )
+            .unwrap(),
+            Authz::Allowed
+        ));
+        // Known actor, no matching allow rule → Denied, carrying the decision message.
+        match authorize(
+            Some(&actor),
+            Some(&engine),
+            PolicyRequest { action: PolicyAction::Change, branch: Some("main".to_string()), target_branch: None },
+        )
+        .unwrap()
+        {
+            Authz::Denied(message) => assert!(!message.is_empty(), "a deny carries its decision message"),
+            Authz::Allowed => panic!("change must be denied: only read is allowed"),
+        }
+        // Policy installed but no actor → operational failure (`Err`), NOT a
+        // decision. This is the split that keeps a 401/500 from being masked
+        // as the denial's response in the invoke handler.
+        assert!(
+            authorize(None, Some(&engine), req(PolicyAction::Read)).is_err(),
+            "a missing actor with a policy installed is an operational error, not a deny"
+        );
+    }
+
     #[test]
     fn hash_bearer_token_produces_32_byte_output() {
         let hash = hash_bearer_token("any-token");
         assert_eq!(hash.len(), 32);
+    }
+
+    /// The single gate both open paths funnel through: it refuses a
+    /// schema breakage (naming the graph label + query), attaches a clean
+    /// registry, and collapses an empty one to `None`. Pure over its args
+    /// (no engine), so it covers the multi-graph path's logic too — the
+    /// only per-path difference is the `label`, asserted here.
+    #[test]
+    fn validate_and_attach_gates_on_schema_and_collapses_empty() {
+        use crate::queries::{QueryRegistry, RegistrySpec};
+        use omnigraph_compiler::catalog::build_catalog;
+        use omnigraph_compiler::schema::parser::parse_schema;
+
+        let schema = parse_schema("node User {\nname: String\n}\n").unwrap();
+        let catalog = build_catalog(&schema).unwrap();
+        let spec = |name: &str, source: &str| RegistrySpec {
+            name: name.to_string(),
+            source: source.to_string(),
+            expose: false,
+            tool_name: None,
+        };
+
+        // Empty registry → nothing attached, no error.
+        let empty =
+            super::validate_and_attach(QueryRegistry::default(), &catalog, "g").unwrap();
+        assert!(empty.is_none());
+
+        // A query that type-checks → attached.
+        let ok = QueryRegistry::from_specs(vec![spec(
+            "find_user",
+            "query find_user() { match { $u: User } return { $u.name } }",
+        )])
+        .unwrap();
+        assert!(super::validate_and_attach(ok, &catalog, "g").unwrap().is_some());
+
+        // A query referencing a type the schema lacks → boot refusal that
+        // names both the graph label and the offending query.
+        let broken = QueryRegistry::from_specs(vec![spec(
+            "ghost",
+            "query ghost() { match { $w: Widget } return { $w.name } }",
+        )])
+        .unwrap();
+        let err = super::validate_and_attach(broken, &catalog, "graph-x").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("graph-x"), "labels the graph: {msg}");
+        assert!(msg.contains("ghost"), "names the query: {msg}");
+        assert!(msg.contains("schema check"), "mentions the schema check: {msg}");
     }
 
     #[test]
@@ -2707,7 +3257,10 @@ server:
 
         let settings = load_server_settings(Some(&config), None, None, None, false).unwrap();
         match &settings.mode {
-            ServerConfigMode::Single { uri, .. } => assert_eq!(uri, "/tmp/demo.omni"),
+            ServerConfigMode::Single { uri, graph_id, .. } => {
+                assert_eq!(uri, "/tmp/demo.omni");
+                assert_eq!(graph_id, "local");
+            }
             ServerConfigMode::Multi { .. } => panic!("expected Single mode, got Multi"),
         }
         assert_eq!(settings.bind, "0.0.0.0:9090");
@@ -2739,7 +3292,10 @@ server:
         )
         .unwrap();
         match &settings.mode {
-            ServerConfigMode::Single { uri, .. } => assert_eq!(uri, "/tmp/override.omni"),
+            ServerConfigMode::Single { uri, graph_id, .. } => {
+                assert_eq!(uri, "/tmp/override.omni");
+                assert_eq!(graph_id, "/tmp/override.omni");
+            }
             ServerConfigMode::Multi { .. } => panic!("expected Single mode, got Multi"),
         }
         assert_eq!(settings.bind, "0.0.0.0:9999");
@@ -2768,7 +3324,10 @@ server:
             load_server_settings(Some(&config), None, Some("dev".to_string()), None, false)
                 .unwrap();
         match &settings.mode {
-            ServerConfigMode::Single { uri, .. } => assert_eq!(uri, "http://127.0.0.1:8080"),
+            ServerConfigMode::Single { uri, graph_id, .. } => {
+                assert_eq!(uri, "http://127.0.0.1:8080");
+                assert_eq!(graph_id, "dev");
+            }
             ServerConfigMode::Multi { .. } => panic!("expected Single mode, got Multi"),
         }
     }
@@ -2848,6 +3407,7 @@ server:
                         .to_string_lossy()
                         .into_owned(),
                     policy_file: None,
+                    queries: crate::queries::QueryRegistry::default(),
                 }],
                 config_path: temp.path().join("omnigraph.yaml"),
                 server_policy_file: Some(policy_path),
@@ -2895,7 +3455,9 @@ server:
                     .join("graph.omni")
                     .to_string_lossy()
                     .into_owned(),
+                graph_id: "default".to_string(),
                 policy_file: None,
+                queries: crate::queries::QueryRegistry::default(),
             },
             bind: "127.0.0.1:0".to_string(),
             allow_unauthenticated: false,

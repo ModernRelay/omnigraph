@@ -48,50 +48,17 @@ pub(super) async fn plan_schema(
     Ok(plan)
 }
 
-pub(super) async fn apply_schema(
-    db: &Omnigraph,
-    desired_schema_source: &str,
-    options: SchemaApplyOptions,
-    actor: Option<&str>,
-) -> Result<SchemaApplyResult> {
-    // Engine-layer policy gate (MR-722 chassis core).
-    //
-    // Fires BEFORE acquiring the schema-apply lock or doing any other
-    // work. When no PolicyChecker is installed this is a no-op and
-    // the apply path behaves exactly as it did before MR-722. When
-    // a PolicyChecker IS installed and the actor is None, this is a
-    // hard error — see Omnigraph::enforce's docstring for the
-    // forget-the-actor-footgun reasoning.
-    //
-    // Scope is TargetBranch("main") to match the HTTP-layer convention
-    // for SchemaApply: branch=None, target_branch=Some("main"). Cedar
-    // policies in the wild use `target_branch_scope: protected` to
-    // gate schema applies, so the engine-layer call has to set the
-    // target_branch shape that activates that predicate. Wrong scope
-    // here = silent policy mismatch with HTTP. See
-    // `omnigraph_policy::ResourceScope::to_branch_pair` for the mapping.
-    db.enforce(
-        omnigraph_policy::PolicyAction::SchemaApply,
-        &omnigraph_policy::ResourceScope::TargetBranch("main".to_string()),
-        actor,
-    )?;
-
-    acquire_schema_apply_lock(db).await?;
-    let result = apply_schema_with_lock(db, desired_schema_source, options).await;
-    let release_result = release_schema_apply_lock(db).await;
-    match (result, release_result) {
-        (Ok(result), Ok(())) => Ok(result),
-        (Ok(_), Err(err)) => Err(err),
-        (Err(err), Ok(())) => Err(err),
-        (Err(err), Err(_)) => Err(err),
-    }
+struct PlannedSchemaApply {
+    plan: SchemaMigrationPlan,
+    desired_ir: SchemaIR,
+    desired_catalog: Catalog,
 }
 
-pub(super) async fn apply_schema_with_lock(
+async fn plan_schema_for_apply(
     db: &Omnigraph,
     desired_schema_source: &str,
     options: SchemaApplyOptions,
-) -> Result<SchemaApplyResult> {
+) -> Result<PlannedSchemaApply> {
     db.ensure_schema_state_valid().await?;
     let branches = db.coordinator.read().await.all_branches().await?;
     // Skip `main` and internal system branches. The schema-apply lock branch
@@ -123,6 +90,87 @@ pub(super) async fn apply_schema_with_lock(
             .unwrap_or_else(|| "unsupported schema migration plan".to_string());
         return Err(OmniError::manifest(message));
     }
+
+    let mut desired_catalog = build_catalog_from_ir(&desired_ir)?;
+    fixup_blob_schemas(&mut desired_catalog);
+    Ok(PlannedSchemaApply {
+        plan,
+        desired_ir,
+        desired_catalog,
+    })
+}
+
+pub(super) async fn preview_schema_apply(
+    db: &Omnigraph,
+    desired_schema_source: &str,
+    options: SchemaApplyOptions,
+) -> Result<SchemaApplyPreview> {
+    let planned = plan_schema_for_apply(db, desired_schema_source, options).await?;
+    Ok(SchemaApplyPreview {
+        plan: planned.plan,
+        catalog: planned.desired_catalog,
+    })
+}
+
+pub(super) async fn apply_schema<F>(
+    db: &Omnigraph,
+    desired_schema_source: &str,
+    options: SchemaApplyOptions,
+    actor: Option<&str>,
+    validate_catalog: F,
+) -> Result<SchemaApplyResult>
+where
+    F: FnOnce(&Catalog) -> Result<()>,
+{
+    // Engine-layer policy gate (MR-722 chassis core).
+    //
+    // Fires BEFORE acquiring the schema-apply lock or doing any other
+    // work. When no PolicyChecker is installed this is a no-op and
+    // the apply path behaves exactly as it did before MR-722. When
+    // a PolicyChecker IS installed and the actor is None, this is a
+    // hard error — see Omnigraph::enforce's docstring for the
+    // forget-the-actor-footgun reasoning.
+    //
+    // Scope is TargetBranch("main") to match the HTTP-layer convention
+    // for SchemaApply: branch=None, target_branch=Some("main"). Cedar
+    // policies in the wild use `target_branch_scope: protected` to
+    // gate schema applies, so the engine-layer call has to set the
+    // target_branch shape that activates that predicate. Wrong scope
+    // here = silent policy mismatch with HTTP. See
+    // `omnigraph_policy::ResourceScope::to_branch_pair` for the mapping.
+    db.enforce(
+        omnigraph_policy::PolicyAction::SchemaApply,
+        &omnigraph_policy::ResourceScope::TargetBranch("main".to_string()),
+        actor,
+    )?;
+
+    acquire_schema_apply_lock(db).await?;
+    let result = apply_schema_with_lock(db, desired_schema_source, options, validate_catalog).await;
+    let release_result = release_schema_apply_lock(db).await;
+    match (result, release_result) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Ok(_), Err(err)) => Err(err),
+        (Err(err), Ok(())) => Err(err),
+        (Err(err), Err(_)) => Err(err),
+    }
+}
+
+pub(super) async fn apply_schema_with_lock<F>(
+    db: &Omnigraph,
+    desired_schema_source: &str,
+    options: SchemaApplyOptions,
+    validate_catalog: F,
+) -> Result<SchemaApplyResult>
+where
+    F: FnOnce(&Catalog) -> Result<()>,
+{
+    let planned = plan_schema_for_apply(db, desired_schema_source, options).await?;
+    validate_catalog(&planned.desired_catalog)?;
+    let PlannedSchemaApply {
+        plan,
+        desired_ir,
+        desired_catalog,
+    } = planned;
     if plan.steps.is_empty() {
         return Ok(SchemaApplyResult {
             supported: true,
@@ -131,9 +179,6 @@ pub(super) async fn apply_schema_with_lock(
             steps: plan.steps,
         });
     }
-
-    let mut desired_catalog = build_catalog_from_ir(&desired_ir)?;
-    fixup_blob_schemas(&mut desired_catalog);
 
     let snapshot = db.snapshot().await;
     let base_manifest_version = snapshot.version();

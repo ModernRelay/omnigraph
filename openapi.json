@@ -829,6 +829,177 @@
         ]
       }
     },
+    "/queries": {
+      "get": {
+        "tags": [
+          "queries"
+        ],
+        "summary": "List the graph's exposed stored queries as a typed tool catalog.",
+        "description": "Returns the `mcp.expose == true` subset of the `queries:` registry, each\nwith its MCP tool name, read/mutate flag, description/instruction, and\ntyped parameters — enough for a client to register them as tools without\nfetching `.gq` source. Read-gated; the catalog is graph-wide (branch\nindependent — `read` is authorized against `main`). **Not** Cedar-filtered\nper query yet, so it can list a query whose `invoke_query` the caller\nlacks (a known gap until per-query authorization lands).",
+        "operationId": "list_queries",
+        "responses": {
+          "200": {
+            "description": "Stored-query catalog (the mcp.expose subset, with typed params)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueriesCatalogOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/queries/{name}": {
+      "post": {
+        "tags": [
+          "queries"
+        ],
+        "summary": "Invoke a curated, server-side stored query by name.",
+        "description": "The query source comes from the graph's `queries:` registry, not the\nrequest body — callers send only runtime inputs (`params`, `branch`,\n`snapshot`). Gated by the `invoke_query` Cedar action at the boundary;\na stored *mutation* additionally passes the engine's `change` gate\n(double-gated). An actor **without** `invoke_query` cannot tell a denied\nquery from a missing one — both return the same 404, so the catalog\ncan't be probed without the grant. Once `invoke_query` is held, the\ninner `read`/`change` gate may surface a 403 for an existing query the\nactor can't run (the intended double-gate signal).",
+        "operationId": "invoke_query",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Stored query name (the registry key)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/InvokeStoredQueryRequest"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Read envelope (ReadOutput) or mutation envelope (ChangeOutput), serialized untagged",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvokeStoredQueryResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request (param type error; snapshot on a stored mutation)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden (the inner `change` gate for a stored mutation)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Unknown stored query, or `invoke_query` denied — indistinguishable to a caller without the grant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Merge conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Policy evaluation error (a denial is reported as 404, not 500)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
     "/query": {
       "post": {
         "tags": [
@@ -1628,6 +1799,40 @@
           }
         }
       },
+      "InvokeStoredQueryRequest": {
+        "type": "object",
+        "description": "Body for `POST /queries/{name}` — invokes the server-side stored query\nnamed in the path. The query source and name come from the registry,\nnever the body; only the runtime inputs are supplied here.",
+        "properties": {
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Branch to run against. Defaults to `main`; for a stored mutation the\nwrite targets this branch."
+          },
+          "params": {
+            "description": "JSON object whose keys match the stored query's declared parameters."
+          },
+          "snapshot": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Snapshot id to read from (read queries only — rejected for a stored\nmutation). Mutually exclusive with `branch`."
+          }
+        }
+      },
+      "InvokeStoredQueryResponse": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ReadOutput"
+          },
+          {
+            "$ref": "#/components/schemas/ChangeOutput"
+          }
+        ],
+        "description": "Response for `POST /queries/{name}`: the read envelope for a stored\nread, or the mutation envelope for a stored mutation. Serialized\n**untagged**, so the wire shape is exactly [`ReadOutput`] or\n[`ChangeOutput`] — classification follows the stored query, not a\nwrapper field."
+      },
       "LoadMode": {
         "type": "string",
         "description": "Shadow enum for documenting [`LoadMode`] in the OpenAPI schema.",
@@ -1695,6 +1900,120 @@
           },
           "table_key": {
             "type": "string"
+          }
+        }
+      },
+      "ParamDescriptor": {
+        "type": "object",
+        "description": "One declared parameter of a stored query, projected for the catalog.",
+        "required": [
+          "name",
+          "kind",
+          "nullable"
+        ],
+        "properties": {
+          "item_kind": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ParamKind",
+                "description": "Element kind when `kind == list` (always a scalar — the grammar\nforbids lists of vectors or nested lists)."
+              }
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ParamKind"
+          },
+          "name": {
+            "type": "string"
+          },
+          "nullable": {
+            "type": "boolean",
+            "description": "`false` → the caller must supply it; `true` → optional."
+          },
+          "vector_dim": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Dimension when `kind == vector`.",
+            "minimum": 0
+          }
+        }
+      },
+      "ParamKind": {
+        "type": "string",
+        "description": "The kind of a stored-query parameter, decomposed so a client (e.g. an\nMCP server) can build a typed input schema with a closed `match` and\nnever re-parse omnigraph's type spelling. `bigint`/`date`/`datetime`/\n`blob` are carried as JSON strings on the wire: a 64-bit integer past\n2^53 loses precision as a JSON number, and Date/DateTime are ISO\nstrings, Blob a blob-URI string.",
+        "enum": [
+          "string",
+          "bool",
+          "int",
+          "bigint",
+          "float",
+          "date",
+          "datetime",
+          "blob",
+          "vector",
+          "list"
+        ]
+      },
+      "QueriesCatalogOutput": {
+        "type": "object",
+        "description": "Response for `GET /queries`: the `mcp.expose` subset of a graph's\nstored-query registry, each with typed parameters.",
+        "required": [
+          "queries"
+        ],
+        "properties": {
+          "queries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/QueryCatalogEntry"
+            }
+          }
+        }
+      },
+      "QueryCatalogEntry": {
+        "type": "object",
+        "description": "One entry in the stored-query catalog (`GET /queries`).",
+        "required": [
+          "name",
+          "tool_name",
+          "mutation",
+          "params"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "instruction": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mutation": {
+            "type": "boolean",
+            "description": "`true` for a stored mutation → an MCP read-only hint of `false`."
+          },
+          "name": {
+            "type": "string",
+            "description": "Registry key / invoke path segment (`POST /queries/{name}`)."
+          },
+          "params": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ParamDescriptor"
+            }
+          },
+          "tool_name": {
+            "type": "string",
+            "description": "MCP tool id (the `tool_name` override, else `name`)."
           }
         }
       },

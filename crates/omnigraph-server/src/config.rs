@@ -9,6 +9,13 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_CONFIG_FILE: &str = "omnigraph.yaml";
 
+pub fn graph_resource_id_for_selection(
+    selected_graph: Option<&str>,
+    normalized_uri: &str,
+) -> String {
+    selected_graph.unwrap_or(normalized_uri).to_string()
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectConfig {
     pub name: Option<String>,
@@ -24,6 +31,14 @@ pub struct TargetConfig {
     /// graph's HTTP-layer Cedar enforcement.
     #[serde(default)]
     pub policy: PolicySettings,
+    /// Per-graph stored-query registry: an inline `name -> entry`
+    /// map. Mirrors the per-graph `policy` shape — each
+    /// `graphs.<id>.queries` declares that graph's stored queries. Absent
+    /// (or empty) = no stored queries for the graph. v1 is inline-only;
+    /// an external `queries.yaml` manifest indirection is a deferred
+    /// convenience.
+    #[serde(default)]
+    pub queries: BTreeMap<String, QueryEntry>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
@@ -90,6 +105,50 @@ pub struct PolicySettings {
     pub file: Option<String>,
 }
 
+/// One stored-query registry entry. The map **key** is the query's
+/// identity — it must equal the `query <name>` symbol declared inside
+/// the referenced `.gq` file (asserted when the registry loads).
+/// Renaming the key (or the symbol) is a breaking change to callers, by
+/// design.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryEntry {
+    /// Path to the `.gq` file (relative to the config's `base_dir`). The
+    /// file may declare several queries; the registry selects the one
+    /// whose symbol matches the map key.
+    pub file: String,
+    #[serde(default)]
+    pub mcp: McpSettings,
+}
+
+/// MCP exposure for a stored query. A *deployment* concern (the same
+/// `.gq` may be exposed in one graph and hidden in another), so it lives
+/// in YAML rather than in the `.gq` source. **Default `expose: true`** —
+/// declaring a query in the manifest *is* the opt-in, so it appears in the
+/// MCP tool catalog (`GET /queries`) by default; set `expose: false` to
+/// keep a query HTTP/service-callable but hidden from the agent tool list.
+/// `expose` governs catalog membership only — it is **not** an
+/// authorization gate (invocation is gated by `invoke_query`), so a hidden
+/// query is still invocable by name with the right permission.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpSettings {
+    #[serde(default = "mcp_expose_default")]
+    pub expose: bool,
+    pub tool_name: Option<String>,
+}
+
+fn mcp_expose_default() -> bool {
+    true
+}
+
+impl Default for McpSettings {
+    fn default() -> Self {
+        Self {
+            expose: mcp_expose_default(),
+            tool_name: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AliasCommand {
@@ -137,6 +196,12 @@ pub struct OmnigraphConfig {
     pub aliases: BTreeMap<String, AliasConfig>,
     #[serde(default)]
     pub policy: PolicySettings,
+    /// Top-level stored-query registry, used in single-graph
+    /// mode — mirrors how the top-level `policy` applies to the single
+    /// graph. In multi-graph mode this is unused; each graph's
+    /// `graphs.<id>.queries` applies instead.
+    #[serde(default)]
+    pub queries: BTreeMap<String, QueryEntry>,
     #[serde(skip)]
     base_dir: PathBuf,
 }
@@ -152,6 +217,7 @@ impl Default for OmnigraphConfig {
             query: QueryDefaults::default(),
             aliases: BTreeMap::new(),
             policy: PolicySettings::default(),
+            queries: BTreeMap::new(),
             base_dir: PathBuf::new(),
         }
     }
@@ -242,6 +308,124 @@ impl OmnigraphConfig {
             .file
             .as_deref()
             .map(|path| self.resolve_config_path(path))
+    }
+
+    /// The top-level stored-query registry entries (single-graph mode).
+    pub fn query_entries(&self) -> &BTreeMap<String, QueryEntry> {
+        &self.queries
+    }
+
+    /// The per-graph stored-query registry entries for a named target
+    /// (multi-graph mode). Returns `None` if the target is unknown.
+    pub fn target_query_entries(
+        &self,
+        target_name: &str,
+    ) -> Option<&BTreeMap<String, QueryEntry>> {
+        self.graphs.get(target_name).map(|target| &target.queries)
+    }
+
+    /// The stored-query registry entries that apply for a graph
+    /// selection — the single definition of "which `queries:` block
+    /// governs graph X", shared by server boot and the CLI so the two
+    /// can't drift. A named graph present in `graphs:` uses its
+    /// per-graph block; everything else (no selection, or a name that is
+    /// not a known graph, e.g. a bare URI) falls back to the top-level
+    /// block (single-graph mode).
+    pub fn query_entries_for(&self, graph: Option<&str>) -> &BTreeMap<String, QueryEntry> {
+        match graph {
+            Some(name) if self.graphs.contains_key(name) => &self.graphs[name].queries,
+            _ => &self.queries,
+        }
+    }
+
+    /// The single CLI gate that turns a raw graph selection into a *validated*
+    /// one — the fallible counterpart to the infallible
+    /// [`OmnigraphConfig::query_entries_for`]. Both `queries` subcommands route
+    /// their selection through here so neither can skip a check the other (or
+    /// server boot) applies:
+    /// * a known name passes through, but only after the same coherence check
+    ///   server boot enforces
+    ///   ([`OmnigraphConfig::ensure_top_level_blocks_honored`]) — a named graph
+    ///   with a populated top-level block is rejected;
+    /// * an unknown name errors with the **same** message
+    ///   [`OmnigraphConfig::resolve_target_uri`] produces, so a command that
+    ///   opens no URI rejects an unknown `--target` exactly like the
+    ///   URI-resolving commands do;
+    /// * an anonymous selection (`None`, e.g. a bare URI) stays anonymous,
+    ///   resolving to the top-level registry downstream (top-level honored).
+    pub fn resolve_graph_selection<'a>(&self, graph: Option<&'a str>) -> Result<Option<&'a str>> {
+        match graph {
+            Some(name) if self.graphs.contains_key(name) => {
+                self.ensure_top_level_blocks_honored(Some(name))?;
+                Ok(Some(name))
+            }
+            Some(name) => bail!("graph '{}' not found in {}", name, DEFAULT_CONFIG_FILE),
+            None => Ok(None),
+        }
+    }
+
+    pub fn resolve_policy_tooling_graph_selection(&self) -> Result<Option<&str>> {
+        self.resolve_graph_selection(self.cli_graph_name().or_else(|| self.server_graph_name()))
+    }
+
+    /// The policy file that applies for a graph selection — the policy
+    /// sibling of [`OmnigraphConfig::query_entries_for`], so policy and
+    /// queries resolve by the same identity rule. A named graph in
+    /// `graphs:` uses its per-graph `policy.file` with **no** top-level
+    /// fallback (a named graph with no per-graph policy has no policy —
+    /// that keeps the boot-time coherence check meaningful); anything else
+    /// (no selection, or a bare URI) uses the top-level `policy.file`.
+    pub fn resolve_policy_file_for(&self, graph: Option<&str>) -> Option<PathBuf> {
+        match graph {
+            Some(name) if self.graphs.contains_key(name) => self.resolve_target_policy_file(name),
+            _ => self.resolve_policy_file(),
+        }
+    }
+
+    /// Names of any top-level config blocks (`policy.file`, `queries:`)
+    /// that are populated. Used by the boot-time coherence check: when a
+    /// **named** graph is served (single-mode by name, or multi-mode),
+    /// the top-level blocks are not honored, so a populated one is a
+    /// configuration error rather than a silent no-op.
+    pub fn populated_top_level_blocks(&self) -> Vec<&'static str> {
+        let mut blocks = Vec::new();
+        if self.policy.file.is_some() {
+            blocks.push("policy.file");
+        }
+        if !self.queries.is_empty() {
+            blocks.push("queries");
+        }
+        blocks
+    }
+
+    /// A named graph uses its own `graphs.<name>` block, so a populated
+    /// top-level block would be silently ignored — a config error. The single
+    /// definition of that rule, shared by server boot and the CLI selection
+    /// gate ([`OmnigraphConfig::resolve_graph_selection`]) so the two can't
+    /// drift. An anonymous selection (`None`, e.g. a bare URI) legitimately
+    /// honors the top-level blocks, so it is never rejected here.
+    pub fn ensure_top_level_blocks_honored(&self, selected: Option<&str>) -> Result<()> {
+        if let Some(name) = selected {
+            let unhonored = self.populated_top_level_blocks();
+            if !unhonored.is_empty() {
+                bail!(
+                    "named graph '{name}' uses its own `graphs.{name}.…` block, but top-level {} \
+                     {} set and would be ignored. Move it to `graphs.{name}` (e.g. \
+                     `graphs.{name}.policy.file`, `graphs.{name}.queries`).",
+                    unhonored.join(" and "),
+                    if unhonored.len() == 1 { "is" } else { "are" },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve a stored-query `.gq` file path (from a registry entry),
+    /// relative to the config's `base_dir`. Mirrors policy-file
+    /// resolution; the registry loader calls this to turn each entry's
+    /// `file:` value into an absolute path.
+    pub fn resolve_query_file(&self, value: &str) -> PathBuf {
+        self.resolve_config_path(value)
     }
 
     /// Resolve the server-level policy file path (used by management
@@ -387,7 +571,9 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{ReadOutputFormat, TableCellLayout, load_config_in};
+    use super::{
+        ReadOutputFormat, TableCellLayout, graph_resource_id_for_selection, load_config_in,
+    };
 
     #[test]
     fn load_config_reads_yaml_defaults_from_current_dir() {
@@ -452,6 +638,114 @@ policy: {}
     }
 
     #[test]
+    fn graph_resource_id_for_selection_uses_name_or_anonymous_uri() {
+        assert_eq!(
+            graph_resource_id_for_selection(Some("local"), "/tmp/graph.omni"),
+            "local"
+        );
+        assert_eq!(
+            graph_resource_id_for_selection(None, "/tmp/graph.omni"),
+            "/tmp/graph.omni"
+        );
+    }
+
+    #[test]
+    fn resolve_graph_selection_validates_membership_and_coherence() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("omnigraph.yaml"),
+            "graphs:\n  local:\n    uri: ./demo.omni\n",
+        )
+        .unwrap();
+        let config = load_config_in(temp.path(), None).unwrap();
+
+        // A known graph passes through unchanged.
+        assert_eq!(config.resolve_graph_selection(Some("local")).unwrap(), Some("local"));
+        // An anonymous selection stays anonymous (→ top-level registry downstream).
+        assert_eq!(config.resolve_graph_selection(None).unwrap(), None);
+        // An unknown name errors, naming the graph (matching resolve_target_uri).
+        let err = config.resolve_graph_selection(Some("ghost")).unwrap_err().to_string();
+        assert!(
+            err.contains("ghost") && err.contains("not found"),
+            "unknown graph must error naming it: {err}"
+        );
+
+        // Coherence: a named graph plus a populated top-level block is the
+        // config server boot refuses, so the gate rejects it too (shared rule
+        // via ensure_top_level_blocks_honored). An anonymous selection still
+        // passes — top-level is honored when no graph is named.
+        let temp2 = tempdir().unwrap();
+        fs::write(
+            temp2.path().join("omnigraph.yaml"),
+            "graphs:\n  local:\n    uri: ./demo.omni\npolicy:\n  file: ./top.yaml\n",
+        )
+        .unwrap();
+        let incoherent = load_config_in(temp2.path(), None).unwrap();
+        let err = incoherent
+            .resolve_graph_selection(Some("local"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("local") && err.contains("policy.file"),
+            "named graph + populated top-level block must be rejected, naming both: {err}"
+        );
+        assert_eq!(
+            incoherent.resolve_graph_selection(None).unwrap(),
+            None,
+            "anonymous selection still honors top-level"
+        );
+    }
+
+    #[test]
+    fn policy_tooling_graph_selection_prefers_cli_then_server_and_validates() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("omnigraph.yaml"),
+            "graphs:\n  local:\n    uri: ./local.omni\n  prod:\n    uri: ./prod.omni\n\
+             server:\n  graph: local\ncli:\n  graph: prod\n",
+        )
+        .unwrap();
+        let config = load_config_in(temp.path(), None).unwrap();
+        assert_eq!(
+            config.resolve_policy_tooling_graph_selection().unwrap(),
+            Some("prod")
+        );
+
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("omnigraph.yaml"),
+            "graphs:\n  local:\n    uri: ./local.omni\nserver:\n  graph: local\n",
+        )
+        .unwrap();
+        let config = load_config_in(temp.path(), None).unwrap();
+        assert_eq!(
+            config.resolve_policy_tooling_graph_selection().unwrap(),
+            Some("local")
+        );
+
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("omnigraph.yaml"), "policy: {}\n").unwrap();
+        let config = load_config_in(temp.path(), None).unwrap();
+        assert_eq!(config.resolve_policy_tooling_graph_selection().unwrap(), None);
+
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("omnigraph.yaml"),
+            "graphs:\n  local:\n    uri: ./local.omni\nserver:\n  graph: ghost\n",
+        )
+        .unwrap();
+        let config = load_config_in(temp.path(), None).unwrap();
+        let err = config
+            .resolve_policy_tooling_graph_selection()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ghost") && err.contains("not found"),
+            "unknown server.graph must use graph-selection validation: {err}"
+        );
+    }
+
+    #[test]
     fn resolve_query_path_searches_config_roots() {
         let temp = tempdir().unwrap();
         fs::create_dir_all(temp.path().join("queries")).unwrap();
@@ -487,6 +781,118 @@ policy: {}
         let resolved = config.resolve_query_path(Path::new("local.gq")).unwrap();
 
         assert_eq!(resolved, config_dir.join("local.gq"));
+    }
+
+    #[test]
+    fn queries_block_round_trips_inline_and_per_graph() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("omnigraph.yaml"),
+            r#"
+graphs:
+  prod:
+    uri: s3://bucket/prod
+    queries:
+      find_user:
+        file: ./queries/find_user.gq
+        mcp:
+          expose: true
+          tool_name: lookup_user
+      internal_audit:
+        file: ./queries/audit.gq
+queries:
+  single_mode_q:
+    file: ./q.gq
+"#,
+        )
+        .unwrap();
+
+        let config = load_config_in(temp.path(), None).unwrap();
+
+        // Per-graph registry (multi-graph mode).
+        let prod = config.target_query_entries("prod").unwrap();
+        assert_eq!(prod.len(), 2);
+        let find_user = &prod["find_user"];
+        assert_eq!(find_user.file, "./queries/find_user.gq");
+        assert!(find_user.mcp.expose);
+        assert_eq!(find_user.mcp.tool_name.as_deref(), Some("lookup_user"));
+        // Default exposure is true (the manifest entry is the opt-in); tool_name absent.
+        let audit = &prod["internal_audit"];
+        assert!(audit.mcp.expose);
+        assert!(audit.mcp.tool_name.is_none());
+
+        // Top-level registry (single-graph mode).
+        assert_eq!(config.query_entries().len(), 1);
+
+        // The shared selector resolves the same blocks the server boot
+        // and the CLI use: a known graph → its per-graph block; no
+        // selection or an unknown name → the top-level block (the latter
+        // pins the behavior of the CLI's now-deleted fallback arm).
+        assert_eq!(config.query_entries_for(Some("prod")).len(), 2);
+        assert_eq!(config.query_entries_for(None).len(), 1);
+        assert_eq!(config.query_entries_for(Some("nonexistent")).len(), 1);
+
+        // Path resolution joins against base_dir, like policy files.
+        assert_eq!(
+            config.resolve_query_file(&find_user.file),
+            temp.path().join("./queries/find_user.gq")
+        );
+    }
+
+    #[test]
+    fn resolve_policy_file_for_follows_identity() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("omnigraph.yaml"),
+            "policy:\n  file: ./top.yaml\ngraphs:\n  prod:\n    uri: s3://b/prod\n    \
+             policy:\n      file: ./prod.yaml\n  bare:\n    uri: s3://b/bare\n",
+        )
+        .unwrap();
+        let config = load_config_in(temp.path(), None).unwrap();
+
+        // Named graph with its own policy → per-graph (not top-level).
+        assert!(
+            config
+                .resolve_policy_file_for(Some("prod"))
+                .unwrap()
+                .ends_with("prod.yaml")
+        );
+        // Named graph with NO per-graph policy → None (no top-level fallback;
+        // load-bearing for the boot coherence check).
+        assert!(config.resolve_policy_file_for(Some("bare")).is_none());
+        // Anonymous (bare URI) or an unknown name → top-level.
+        assert!(
+            config
+                .resolve_policy_file_for(None)
+                .unwrap()
+                .ends_with("top.yaml")
+        );
+        assert!(
+            config
+                .resolve_policy_file_for(Some("nope"))
+                .unwrap()
+                .ends_with("top.yaml")
+        );
+    }
+
+    #[test]
+    fn queries_block_absent_yields_empty_registry() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("omnigraph.yaml"),
+            "graphs:\n  local:\n    uri: ./demo.omni\n",
+        )
+        .unwrap();
+
+        let config = load_config_in(temp.path(), None).unwrap();
+        // Additive: no `queries:` anywhere → empty registries everywhere.
+        assert!(config.query_entries().is_empty());
+        assert!(
+            config
+                .target_query_entries("local")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

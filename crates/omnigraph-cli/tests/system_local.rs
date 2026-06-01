@@ -74,14 +74,36 @@ project:
 graphs:
   local:
     uri: {}
+    policy:
+      file: ./policy.yaml
 cli:
   graph: local
   branch: main
 query:
   roots:
     - .
-policy:
-  file: ./policy.yaml
+",
+        yaml_string(&graph.path().to_string_lossy())
+    )
+}
+
+fn local_policy_server_graph_config(graph: &SystemGraph) -> String {
+    format!(
+        "\
+project:
+  name: policy-e2e-local
+graphs:
+  local:
+    uri: {}
+    policy:
+      file: ./policy.yaml
+server:
+  graph: local
+cli:
+  branch: main
+query:
+  roots:
+    - .
 ",
         yaml_string(&graph.path().to_string_lossy())
     )
@@ -1000,49 +1022,55 @@ query vector_search($q: String) {
 #[test]
 fn local_cli_policy_tooling_is_end_to_end() {
     // Sanity check for the read-only policy CLI surfaces. These don't
-    // mutate the graph — they just parse and evaluate the policy file —
-    // so they don't depend on PR #4's engine-side enforcement.
+    // mutate the graph; they parse and evaluate the effective policy for
+    // named graph selections, including per-graph policy files.
     let graph = SystemGraph::loaded();
     let config = graph.write_config("omnigraph-policy.yaml", &local_policy_config(&graph));
+    let server_graph_config = graph.write_config(
+        "omnigraph-policy-server.yaml",
+        &local_policy_server_graph_config(&graph),
+    );
     graph.write_config("policy.yaml", POLICY_E2E_YAML);
     graph.write_config("policy.tests.yaml", POLICY_E2E_TESTS_YAML);
 
-    let validate = output_success(
-        cli()
-            .arg("policy")
-            .arg("validate")
-            .arg("--config")
-            .arg(&config),
-    );
-    assert!(stdout_string(&validate).contains("policy valid:"));
+    for config in [&config, &server_graph_config] {
+        let validate = output_success(
+            cli()
+                .arg("policy")
+                .arg("validate")
+                .arg("--config")
+                .arg(config),
+        );
+        assert!(stdout_string(&validate).contains("policy valid:"));
 
-    let tests = output_success(cli().arg("policy").arg("test").arg("--config").arg(&config));
-    assert!(stdout_string(&tests).contains("policy tests passed: 2 cases"));
+        let tests = output_success(cli().arg("policy").arg("test").arg("--config").arg(config));
+        assert!(stdout_string(&tests).contains("policy tests passed: 2 cases"));
 
-    let explain = output_success(
-        cli()
-            .arg("policy")
-            .arg("explain")
-            .arg("--config")
-            .arg(&config)
-            .arg("--actor")
-            .arg("act-bruno")
-            .arg("--action")
-            .arg("change")
-            .arg("--branch")
-            .arg("main"),
-    );
-    let explain_stdout = stdout_string(&explain);
-    assert!(explain_stdout.contains("decision: deny"));
-    assert!(explain_stdout.contains("branch: main"));
+        let explain = output_success(
+            cli()
+                .arg("policy")
+                .arg("explain")
+                .arg("--config")
+                .arg(config)
+                .arg("--actor")
+                .arg("act-bruno")
+                .arg("--action")
+                .arg("change")
+                .arg("--branch")
+                .arg("main"),
+        );
+        let explain_stdout = stdout_string(&explain);
+        assert!(explain_stdout.contains("decision: deny"));
+        assert!(explain_stdout.contains("branch: main"));
+    }
 }
 
 #[test]
 fn local_cli_change_enforces_engine_layer_policy() {
-    // Asserts MR-722 PR #4: when `policy.file` is configured in
-    // `omnigraph.yaml`, the CLI loads PolicyEngine into Omnigraph and
-    // every direct-engine write hits `enforce(action, scope, actor)` —
-    // identical to what the HTTP server gets, regardless of transport.
+    // Asserts MR-722 PR #4: when the selected graph has a configured
+    // policy file, the CLI loads PolicyEngine into Omnigraph and every
+    // direct-engine write hits `enforce(action, scope, actor)` — identical
+    // to what the HTTP server gets, regardless of transport.
     //
     // Three cases, each discriminating:
     //
@@ -1133,6 +1161,32 @@ fn local_cli_change_enforces_engine_layer_policy() {
     ));
     assert_eq!(verify["row_count"], 1);
     assert_eq!(verify["rows"][0]["p.name"], "RagnorOnMain");
+}
+
+#[test]
+fn local_cli_positional_uri_does_not_inherit_default_graph_policy() {
+    let graph = SystemGraph::loaded();
+    let config = graph.write_config("omnigraph-policy.yaml", &local_policy_config(&graph));
+    graph.write_config("policy.yaml", POLICY_E2E_YAML);
+    let mutation_file = insert_person_query(&graph, "system-local-policy-positional.gq");
+
+    let allowed = parse_stdout_json(&output_success(
+        cli()
+            .arg("--as")
+            .arg("act-bruno")
+            .arg("change")
+            .arg("--config")
+            .arg(&config)
+            .arg("--uri")
+            .arg(graph.path())
+            .arg("--query")
+            .arg(&mutation_file)
+            .arg("--params")
+            .arg(r#"{"name":"PositionalUriBruno","age":4}"#)
+            .arg("--json"),
+    ));
+    assert_eq!(allowed["affected_nodes"], 1);
+    assert_eq!(allowed["actor_id"], "act-bruno");
 }
 
 // ─── MR-722 PR A: CLI×writer matrix ───────────────────────────────────────
@@ -1294,6 +1348,62 @@ fn local_cli_schema_apply_enforces_engine_layer_policy() {
 }
 
 #[test]
+fn local_cli_schema_apply_rejects_stored_query_breakage_before_publish() {
+    let graph = SystemGraph::loaded();
+    graph.write_query(
+        "stored-find-person.gq",
+        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
+    );
+    let config = graph.write_config(
+        "omnigraph-stored-query-schema.yaml",
+        &format!(
+            "\
+graphs:
+  local:
+    uri: {}
+    queries:
+      find_person:
+        file: ./stored-find-person.gq
+cli:
+  graph: local
+  branch: main
+query:
+  roots:
+    - .
+policy: {{}}
+",
+            yaml_string(&graph.path().to_string_lossy())
+        ),
+    );
+    let renamed_schema = std::fs::read_to_string(fixture("test.pg"))
+        .unwrap()
+        .replace("age: I32?", "years: I32? @rename_from(\"age\")");
+    let schema_path = graph.write_file("stored-query-breaks.pg", &renamed_schema);
+
+    let rejected = output_failure(
+        cli()
+            .arg("schema")
+            .arg("apply")
+            .arg("--config")
+            .arg(&config)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json"),
+    );
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(
+        stderr.contains("find_person") && stderr.contains("schema check"),
+        "schema apply should reject the stored-query breakage before publish; stderr: {stderr}"
+    );
+
+    let schema = stdout_string(&output_success(
+        cli().arg("schema").arg("show").arg("--config").arg(&config),
+    ));
+    assert!(schema.contains("age: I32?"));
+    assert!(!schema.contains("years: I32?"));
+}
+
+#[test]
 fn local_cli_branch_create_enforces_engine_layer_policy() {
     let graph = SystemGraph::loaded();
     let config = graph.write_config("omnigraph-policy.yaml", &local_policy_config(&graph));
@@ -1448,6 +1558,8 @@ project:
 graphs:
   local:
     uri: {}
+    policy:
+      file: ./policy.yaml
 cli:
   graph: local
   branch: main
@@ -1455,8 +1567,6 @@ cli:
 query:
   roots:
     - .
-policy:
-  file: ./policy.yaml
 ",
         yaml_string(&graph.path().to_string_lossy()),
         actor,
