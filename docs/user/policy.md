@@ -98,6 +98,10 @@ bearer token.
 
 ## CLI
 
+Policy tooling resolves its graph like server single-mode policy: `cli.graph`
+wins, otherwise `server.graph` is used, otherwise the top-level `policy.file`
+is validated/tested/explained as the anonymous policy.
+
 - `omnigraph policy validate` — parse + count actors, exit 1 on parse error.
 - `omnigraph policy test` — run cases in `policy.tests.yaml`, exit 1 on any expectation mismatch.
 - `omnigraph policy explain --actor … --action … [--branch …] [--target-branch …]` — show decision and matched rule.

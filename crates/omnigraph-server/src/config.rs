@@ -364,6 +364,10 @@ impl OmnigraphConfig {
         }
     }
 
+    pub fn resolve_policy_tooling_graph_selection(&self) -> Result<Option<&str>> {
+        self.resolve_graph_selection(self.cli_graph_name().or_else(|| self.server_graph_name()))
+    }
+
     /// The policy file that applies for a graph selection — the policy
     /// sibling of [`OmnigraphConfig::query_entries_for`], so policy and
     /// queries resolve by the same identity rule. A named graph in
@@ -689,6 +693,55 @@ policy: {}
             incoherent.resolve_graph_selection(None).unwrap(),
             None,
             "anonymous selection still honors top-level"
+        );
+    }
+
+    #[test]
+    fn policy_tooling_graph_selection_prefers_cli_then_server_and_validates() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("omnigraph.yaml"),
+            "graphs:\n  local:\n    uri: ./local.omni\n  prod:\n    uri: ./prod.omni\n\
+             server:\n  graph: local\ncli:\n  graph: prod\n",
+        )
+        .unwrap();
+        let config = load_config_in(temp.path(), None).unwrap();
+        assert_eq!(
+            config.resolve_policy_tooling_graph_selection().unwrap(),
+            Some("prod")
+        );
+
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("omnigraph.yaml"),
+            "graphs:\n  local:\n    uri: ./local.omni\nserver:\n  graph: local\n",
+        )
+        .unwrap();
+        let config = load_config_in(temp.path(), None).unwrap();
+        assert_eq!(
+            config.resolve_policy_tooling_graph_selection().unwrap(),
+            Some("local")
+        );
+
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("omnigraph.yaml"), "policy: {}\n").unwrap();
+        let config = load_config_in(temp.path(), None).unwrap();
+        assert_eq!(config.resolve_policy_tooling_graph_selection().unwrap(), None);
+
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("omnigraph.yaml"),
+            "graphs:\n  local:\n    uri: ./local.omni\nserver:\n  graph: ghost\n",
+        )
+        .unwrap();
+        let config = load_config_in(temp.path(), None).unwrap();
+        let err = config
+            .resolve_policy_tooling_graph_selection()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("ghost") && err.contains("not found"),
+            "unknown server.graph must use graph-selection validation: {err}"
         );
     }
 

@@ -800,21 +800,17 @@ struct ResolvedPolicyContext {
 }
 
 fn resolve_policy_context(config: &OmnigraphConfig) -> Result<ResolvedPolicyContext> {
-    let selected = config.cli_graph_name().map(str::to_string);
-    config.resolve_graph_selection(selected.as_deref())?;
+    let selected = config.resolve_policy_tooling_graph_selection()?;
     let policy_file = config
-        .resolve_policy_file_for(selected.as_deref())
+        .resolve_policy_file_for(selected)
         .ok_or_else(|| {
             color_eyre::eyre::eyre!(
                 "policy.file or graphs.<name>.policy.file must be set in omnigraph.yaml"
             )
         })?;
-    let graph_id = match selected.as_deref() {
+    let graph_id = match selected {
         Some(name) => graph_resource_id_for_selection(Some(name), ""),
-        None => {
-            let anonymous_graph_id = anonymous_policy_graph_id(config)?;
-            graph_resource_id_for_selection(None, &anonymous_graph_id)
-        }
+        None => graph_resource_id_for_selection(None, "default"),
     };
     Ok(ResolvedPolicyContext {
         policy_file,
@@ -868,16 +864,6 @@ fn normalize_policy_graph_uri(uri: &str) -> Result<String> {
         Ok(uri.trim_end_matches('/').to_string())
     } else {
         Ok(normalize_root_uri(uri)?)
-    }
-}
-
-fn anonymous_policy_graph_id(config: &OmnigraphConfig) -> Result<String> {
-    let raw_uri = config
-        .resolve_target_uri(None, None, config.server_graph_name())
-        .or_else(|_| config.resolve_target_uri(None, None, config.cli_graph_name()));
-    match raw_uri {
-        Ok(uri) => normalize_policy_graph_uri(&uri),
-        Err(_) => Ok("default".to_string()),
     }
 }
 
@@ -3481,6 +3467,30 @@ server:
         let context = resolve_policy_context(&config).unwrap();
         assert_eq!(context.graph_id, "local");
         assert!(context.policy_file.ends_with("server-policy.yaml"));
+    }
+
+    #[test]
+    fn graph_identity_resolve_policy_context_anonymous_uses_top_level_default_identity() {
+        let temp = tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            r#"
+project:
+  name: misleading-project
+graphs:
+  local:
+    uri: /tmp/local-policy-graph.omni
+policy:
+  file: ./top-policy.yaml
+"#,
+        )
+        .unwrap();
+
+        let config = load_config(Some(&config_path)).unwrap();
+        let context = resolve_policy_context(&config).unwrap();
+        assert_eq!(context.graph_id, "default");
+        assert!(context.policy_file.ends_with("top-policy.yaml"));
     }
 
     #[test]

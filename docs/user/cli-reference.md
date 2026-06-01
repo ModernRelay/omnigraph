@@ -24,7 +24,7 @@ A reference for the `omnigraph` binary's command surface and `omnigraph.yaml` sc
 | `optimize` | non-destructive Lance compaction |
 | `cleanup --keep N --older-than 7d --confirm` | destructive version GC |
 | `embed` | offline JSONL embedding pipeline |
-| `policy validate \| test \| explain` | Cedar tooling |
+| `policy validate \| test \| explain` | Cedar tooling. Selects `cli.graph`, else `server.graph`, else top-level `policy.file` |
 | `version` / `-v` | print `omnigraph 0.3.x` |
 
 ## `omnigraph.yaml` schema
