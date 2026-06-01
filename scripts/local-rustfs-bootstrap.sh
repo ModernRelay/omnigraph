@@ -6,7 +6,14 @@ SOURCE_REF="${SOURCE_REF:-main}"
 RELEASE_CHANNEL="${RELEASE_CHANNEL:-edge}"
 WORKDIR="${WORKDIR:-$PWD/.omnigraph-rustfs-demo}"
 RUSTFS_CONTAINER_NAME="${RUSTFS_CONTAINER_NAME:-omnigraph-rustfs-demo}"
-RUSTFS_IMAGE="${RUSTFS_IMAGE:-rustfs/rustfs:latest}"
+# Pinned to 1.0.0-beta.3 (2026-05-14) — the last known-good tag, matching CI
+# (.github/workflows/ci.yml). `rustfs/rustfs:latest` (1.0.0-beta.4, 2026-05-21)
+# added a credentials-policy check that refuses to start when the access/secret
+# keys are values it considers "default" (rustfsadmin/rustfsadmin here). This
+# script still works on beta.4+ because it passes
+# RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS=true below — so overriding
+# RUSTFS_IMAGE to a newer tag is safe.
+RUSTFS_IMAGE="${RUSTFS_IMAGE:-rustfs/rustfs:1.0.0-beta.3}"
 RUSTFS_DATA_DIR="${RUSTFS_DATA_DIR:-$WORKDIR/rustfs-data}"
 BUCKET="${BUCKET:-omnigraph-local}"
 PREFIX="${PREFIX:-repos/context}"
@@ -265,6 +272,7 @@ start_rustfs() {
     -v "$RUSTFS_DATA_DIR:/data" \
     -e RUSTFS_ACCESS_KEY="$AWS_ACCESS_KEY_ID" \
     -e RUSTFS_SECRET_KEY="$AWS_SECRET_ACCESS_KEY" \
+    -e RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS=true \
     "$RUSTFS_IMAGE" \
     /data >/dev/null
 }
