@@ -376,6 +376,28 @@ impl OmnigraphConfig {
         blocks
     }
 
+    /// A named graph uses its own `graphs.<name>` block, so a populated
+    /// top-level block would be silently ignored — a config error. The single
+    /// definition of that rule, shared by server boot and the CLI selection
+    /// gate ([`OmnigraphConfig::resolve_graph_selection`]) so the two can't
+    /// drift. An anonymous selection (`None`, e.g. a bare URI) legitimately
+    /// honors the top-level blocks, so it is never rejected here.
+    pub fn ensure_top_level_blocks_honored(&self, selected: Option<&str>) -> Result<()> {
+        if let Some(name) = selected {
+            let unhonored = self.populated_top_level_blocks();
+            if !unhonored.is_empty() {
+                bail!(
+                    "named graph '{name}' uses its own `graphs.{name}.…` block, but top-level {} \
+                     {} set and would be ignored. Move it to `graphs.{name}` (e.g. \
+                     `graphs.{name}.policy.file`, `graphs.{name}.queries`).",
+                    unhonored.join(" and "),
+                    if unhonored.len() == 1 { "is" } else { "are" },
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Resolve a stored-query `.gq` file path (from a registry entry),
     /// relative to the config's `base_dir`. Mirrors policy-file
     /// resolution; the registry loader calls this to turn each entry's

@@ -937,20 +937,10 @@ pub fn load_server_settings(
             cli_target.as_deref().or_else(|| config.server_graph_name())
         };
         // A named selection must not leave a populated top-level block
-        // silently unused — refuse boot and point at the per-graph block.
-        if let Some(name) = selected {
-            let unhonored = config.populated_top_level_blocks();
-            if !unhonored.is_empty() {
-                bail!(
-                    "serving named graph '{name}', but top-level {} {} set — a named graph \
-                     uses its own `graphs.{name}.…` block, so the top-level value is ignored. \
-                     Move it to `graphs.{name}` (e.g. `graphs.{name}.policy.file`, \
-                     `graphs.{name}.queries`).",
-                    unhonored.join(" and "),
-                    if unhonored.len() == 1 { "is" } else { "are" },
-                );
-            }
-        }
+        // silently unused — refuse boot and point at the per-graph block. The
+        // same rule the CLI selection gate enforces, shared via one helper so
+        // the boot check and `omnigraph queries validate`/`list` can't drift.
+        config.ensure_top_level_blocks_honored(selected)?;
         // Load + identity-check now (no engine needed); the schema
         // type-check happens when the engine opens.
         let policy_file = config.resolve_policy_file_for(selected);
