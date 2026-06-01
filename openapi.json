@@ -899,11 +899,17 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/InvokeStoredQueryRequest"
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/InvokeStoredQueryRequest"
+                  }
+                ]
               }
             }
-          },
-          "required": true
+          }
         },
         "responses": {
           "200": {

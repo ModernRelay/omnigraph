@@ -67,6 +67,12 @@ pub struct SchemaApplyResult {
     pub steps: Vec<SchemaMigrationStep>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SchemaApplyPreview {
+    pub plan: SchemaMigrationPlan,
+    pub catalog: Catalog,
+}
+
 /// Top-level handle to an Omnigraph database.
 ///
 /// An Omnigraph is a Lance-native graph database with git-style branching.
@@ -493,6 +499,14 @@ impl Omnigraph {
         schema_apply::plan_schema(self, desired_schema_source, options).await
     }
 
+    pub async fn preview_schema_apply_with_options(
+        &self,
+        desired_schema_source: &str,
+        options: SchemaApplyOptions,
+    ) -> Result<SchemaApplyPreview> {
+        schema_apply::preview_schema_apply(self, desired_schema_source, options).await
+    }
+
     pub async fn apply_schema(&self, desired_schema_source: &str) -> Result<SchemaApplyResult> {
         self.apply_schema_as(desired_schema_source, SchemaApplyOptions::default(), None)
             .await
@@ -523,7 +537,28 @@ impl Omnigraph {
         options: SchemaApplyOptions,
         actor: Option<&str>,
     ) -> Result<SchemaApplyResult> {
-        schema_apply::apply_schema(self, desired_schema_source, options, actor).await
+        self.apply_schema_as_with_catalog_check(desired_schema_source, options, actor, |_| Ok(()))
+            .await
+    }
+
+    pub async fn apply_schema_as_with_catalog_check<F>(
+        &self,
+        desired_schema_source: &str,
+        options: SchemaApplyOptions,
+        actor: Option<&str>,
+        validate_catalog: F,
+    ) -> Result<SchemaApplyResult>
+    where
+        F: FnOnce(&Catalog) -> Result<()>,
+    {
+        schema_apply::apply_schema(
+            self,
+            desired_schema_source,
+            options,
+            actor,
+            validate_catalog,
+        )
+        .await
     }
 
     pub(crate) async fn ensure_schema_apply_idle(&self, operation: &str) -> Result<()> {

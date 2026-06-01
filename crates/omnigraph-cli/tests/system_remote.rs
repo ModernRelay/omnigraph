@@ -60,10 +60,10 @@ project:
 graphs:
   local:
     uri: {}
+    policy:
+      file: ./policy.yaml
 server:
   graph: local
-policy:
-  file: ./policy.yaml
 ",
         yaml_string(&graph.path().to_string_lossy())
     )

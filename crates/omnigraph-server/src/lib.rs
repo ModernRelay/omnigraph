@@ -12,7 +12,7 @@ pub use graph_id::GraphId;
 pub use identity::{AuthSource, GraphKey, ResolvedActor, Scope, TenantId};
 pub use registry::{GraphHandle, GraphRegistry, InsertError, RegistryLookup, RegistrySnapshot};
 
-use crate::queries::{QueryRegistry, check};
+use crate::queries::{QueryRegistry, check, format_check_breakages};
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -820,27 +820,24 @@ pub fn init_tracing() {
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
-/// Format every breakage in a registry check report into a multi-line
-/// boot-abort message, naming each offending query.
-fn format_registry_breakages(label: &str, report: &queries::CheckReport) -> String {
-    let joined = report
-        .breakages
-        .iter()
-        .map(|b| format!("query '{}': {}", b.query, b.message))
-        .collect::<Vec<_>>()
-        .join("\n  ");
-    format!(
-        "graph '{label}': {} stored quer{} failed the schema check:\n  {joined}",
-        report.breakages.len(),
-        if report.breakages.len() == 1 { "y" } else { "ies" }
-    )
-}
-
 /// Log each non-blocking advisory from a registry check report.
 fn log_registry_warnings(label: &str, report: &queries::CheckReport) {
     for warning in &report.warnings {
         warn!(graph = label, query = %warning.query, "stored query: {}", warning.message);
     }
+}
+
+fn validate_registry_against_catalog(
+    registry: &QueryRegistry,
+    catalog: &Catalog,
+    label: &str,
+) -> omnigraph::error::Result<()> {
+    let report = check(registry, catalog);
+    if report.has_breakages() {
+        return Err(OmniError::manifest(format_check_breakages(label, &report)));
+    }
+    log_registry_warnings(label, &report);
+    Ok(())
 }
 
 /// Validate a loaded stored-query registry against the live schema and
@@ -855,11 +852,8 @@ fn validate_and_attach(
     catalog: &Catalog,
     label: &str,
 ) -> Result<Option<Arc<QueryRegistry>>> {
-    let report = check(&queries, catalog);
-    if report.has_breakages() {
-        bail!("{}", format_registry_breakages(label, &report));
-    }
-    log_registry_warnings(label, &report);
+    validate_registry_against_catalog(&queries, catalog, label)
+        .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))?;
     Ok(if queries.is_empty() {
         None
     } else {
@@ -2214,13 +2208,26 @@ struct QueryNamePath {
     name: String,
 }
 
+fn parse_optional_invoke_body(
+    body: Bytes,
+) -> std::result::Result<InvokeStoredQueryRequest, ApiError> {
+    if body.is_empty() {
+        return Ok(InvokeStoredQueryRequest::default());
+    }
+    serde_json::from_slice::<Option<InvokeStoredQueryRequest>>(&body)
+        .map(|request| request.unwrap_or_default())
+        .map_err(|err| {
+            ApiError::bad_request(format!("invalid stored-query invocation body: {err}"))
+        })
+}
+
 #[utoipa::path(
     post,
     path = "/queries/{name}",
     tag = "queries",
     operation_id = "invoke_query",
     params(("name" = String, Path, description = "Stored query name (the registry key)")),
-    request_body = InvokeStoredQueryRequest,
+    request_body = Option<InvokeStoredQueryRequest>,
     responses(
         (status = 200, description = "Read envelope (ReadOutput) or mutation envelope (ChangeOutput), serialized untagged", body = InvokeStoredQueryResponse),
         (status = 400, description = "Bad request (param type error; snapshot on a stored mutation)", body = ErrorOutput),
@@ -2249,8 +2256,9 @@ async fn server_invoke_query(
     Extension(handle): Extension<Arc<GraphHandle>>,
     actor: Option<Extension<ResolvedActor>>,
     Path(QueryNamePath { name }): Path<QueryNamePath>,
-    Json(req): Json<InvokeStoredQueryRequest>,
+    body: Bytes,
 ) -> std::result::Result<Json<InvokeStoredQueryResponse>, ApiError> {
+    let req = parse_optional_invoke_body(body)?;
     // A caller without `invoke_query` can't tell a denial from a missing
     // query: both 404 with this exact message, so the catalog can't be
     // probed without the grant. (A caller that holds invoke_query may still
@@ -2469,18 +2477,26 @@ async fn server_schema_apply(
         .map_err(ApiError::from_workload_reject)?;
     let result = {
         let db = &handle.engine;
+        let registry = handle.queries.as_deref();
+        let label = handle.key.graph_id.as_str().to_string();
         // Engine-layer policy enforcement (MR-722): pass the resolved
         // actor through so apply_schema_as can call enforce() with the
         // authoritative identity. With a policy installed in AppState,
         // engine-side enforcement re-checks the same decision the
         // HTTP-layer authorize_request just made above. PR #3 collapses
         // the redundancy.
-        db.apply_schema_as(
+        db.apply_schema_as_with_catalog_check(
             &request.schema_source,
             omnigraph::db::SchemaApplyOptions {
                 allow_data_loss: request.allow_data_loss,
             },
             actor_id,
+            |catalog| {
+                if let Some(registry) = registry {
+                    validate_registry_against_catalog(registry, catalog, &label)?;
+                }
+                Ok(())
+            },
         )
         .await
         .map_err(ApiError::from_omni)?

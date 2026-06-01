@@ -24,7 +24,7 @@ use omnigraph_server::api::{
     SnapshotTableOutput, commit_output, ingest_output, read_output, schema_apply_output,
     snapshot_payload,
 };
-use omnigraph_server::queries::{QueryRegistry, check};
+use omnigraph_server::queries::{QueryRegistry, check, format_check_breakages};
 use omnigraph_server::{
     AliasCommand, OmnigraphConfig, PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest,
     PolicyTestConfig, ReadOutputFormat, load_config,
@@ -778,25 +778,80 @@ fn load_cli_config(config_path: Option<&PathBuf>) -> Result<OmnigraphConfig> {
     Ok(config)
 }
 
-fn resolve_policy_engine(config: &OmnigraphConfig) -> Result<PolicyEngine> {
-    let policy_file = config
-        .resolve_policy_file()
-        .ok_or_else(|| color_eyre::eyre::eyre!("policy.file must be set in omnigraph.yaml"))?;
-    PolicyEngine::load_graph(&policy_file, &policy_graph_id(config))
+#[derive(Debug, Clone)]
+struct ResolvedCliGraph {
+    uri: String,
+    selected: Option<String>,
+    policy_file: Option<PathBuf>,
+    is_remote: bool,
 }
 
-/// Open a local-URI graph and, when `policy.file` is configured in
-/// `omnigraph.yaml`, install the resolved `PolicyEngine` on the engine
-/// handle so every direct-engine write goes through
-/// `Omnigraph::enforce(...)` (MR-722). Without a configured policy this
-/// is identical to a bare `Omnigraph::open`.
-///
-/// Returns owned `Omnigraph`; chained on top of `Omnigraph::open(...)`'s
-/// existing future to keep call sites narrow.
-async fn open_local_db_with_policy(uri: &str, config: &OmnigraphConfig) -> Result<Omnigraph> {
-    let db = Omnigraph::open(uri).await?;
-    if config.resolve_policy_file().is_some() {
-        let engine = Arc::new(resolve_policy_engine(config)?);
+impl ResolvedCliGraph {
+    fn selected(&self) -> Option<&str> {
+        self.selected.as_deref()
+    }
+}
+
+struct ResolvedPolicyContext {
+    policy_file: PathBuf,
+    graph_id: String,
+}
+
+fn resolve_policy_context(config: &OmnigraphConfig) -> Result<ResolvedPolicyContext> {
+    let selected = config.cli_graph_name().map(str::to_string);
+    config.resolve_graph_selection(selected.as_deref())?;
+    let policy_file = config
+        .resolve_policy_file_for(selected.as_deref())
+        .ok_or_else(|| {
+            color_eyre::eyre::eyre!(
+                "policy.file or graphs.<name>.policy.file must be set in omnigraph.yaml"
+            )
+        })?;
+    let graph_id = if let Some(name) = &config.project.name {
+        name.clone()
+    } else if let Some(selected) = selected.as_deref() {
+        config
+            .resolve_target_uri(None, Some(selected), None)
+            .unwrap_or_else(|_| selected.to_string())
+    } else {
+        policy_graph_id_from_uri(config, None)
+    };
+    Ok(ResolvedPolicyContext {
+        policy_file,
+        graph_id,
+    })
+}
+
+fn resolve_policy_engine(context: &ResolvedPolicyContext) -> Result<PolicyEngine> {
+    PolicyEngine::load_graph(&context.policy_file, &context.graph_id)
+}
+
+fn resolve_policy_engine_for_graph(
+    config: &OmnigraphConfig,
+    graph: &ResolvedCliGraph,
+) -> Result<PolicyEngine> {
+    let policy_file = graph.policy_file.as_ref().ok_or_else(|| {
+        color_eyre::eyre::eyre!(
+            "policy.file or graphs.<name>.policy.file must be set in omnigraph.yaml"
+        )
+    })?;
+    PolicyEngine::load_graph(
+        policy_file,
+        &policy_graph_id_from_uri(config, Some(&graph.uri)),
+    )
+}
+
+/// Open a local graph and install the policy resolved for the same graph
+/// identity that produced the URI. A named graph uses
+/// `graphs.<name>.policy.file`; an explicit positional URI is anonymous and
+/// uses the legacy top-level `policy.file`.
+async fn open_local_db_with_policy(
+    graph: &ResolvedCliGraph,
+    config: &OmnigraphConfig,
+) -> Result<Omnigraph> {
+    let db = Omnigraph::open(&graph.uri).await?;
+    if graph.policy_file.is_some() {
+        let engine = Arc::new(resolve_policy_engine_for_graph(config, graph)?);
         Ok(db.with_policy(engine as Arc<dyn omnigraph_policy::PolicyChecker>))
     } else {
         Ok(db)
@@ -813,17 +868,16 @@ fn resolve_cli_actor<'a>(cli_as: Option<&'a str>, config: &'a OmnigraphConfig) -
     cli_as.or(config.cli.actor.as_deref())
 }
 
-fn resolve_policy_tests_path(config: &OmnigraphConfig) -> Result<PathBuf> {
-    config.resolve_policy_tests_file().ok_or_else(|| {
-        color_eyre::eyre::eyre!(
-            "policy.tests.yaml requires policy.file to be set in omnigraph.yaml"
-        )
-    })
+fn resolve_policy_tests_path(context: &ResolvedPolicyContext) -> PathBuf {
+    context.policy_file.with_file_name("policy.tests.yaml")
 }
 
-fn policy_graph_id(config: &OmnigraphConfig) -> String {
+fn policy_graph_id_from_uri(config: &OmnigraphConfig, uri: Option<&str>) -> String {
     if let Some(name) = &config.project.name {
         return name.clone();
+    }
+    if let Some(uri) = uri {
+        return uri.to_string();
     }
     config
         .resolve_target_uri(None, None, config.server_graph_name())
@@ -912,6 +966,44 @@ fn resolve_uri(
     config.resolve_target_uri(cli_uri, cli_target, config.cli_graph_name())
 }
 
+fn resolve_cli_graph(
+    config: &OmnigraphConfig,
+    cli_uri: Option<String>,
+    cli_target: Option<&str>,
+) -> Result<ResolvedCliGraph> {
+    let selected = if cli_uri.is_some() {
+        None
+    } else {
+        cli_target
+            .map(str::to_string)
+            .or_else(|| config.cli_graph_name().map(str::to_string))
+    };
+    config.resolve_graph_selection(selected.as_deref())?;
+    let uri = resolve_uri(config, cli_uri, cli_target)?;
+    Ok(ResolvedCliGraph {
+        is_remote: is_remote_uri(&uri),
+        policy_file: config.resolve_policy_file_for(selected.as_deref()),
+        selected,
+        uri,
+    })
+}
+
+fn resolve_local_graph(
+    config: &OmnigraphConfig,
+    cli_uri: Option<String>,
+    cli_target: Option<&str>,
+    operation: &str,
+) -> Result<ResolvedCliGraph> {
+    let graph = resolve_cli_graph(config, cli_uri, cli_target)?;
+    if graph.is_remote {
+        bail!(
+            "{} is only supported against local graph URIs in this milestone",
+            operation
+        );
+    }
+    Ok(graph)
+}
+
 /// Parse a Go-style compact duration: `7d`, `24h`, `30m`, `90s`, or a plain
 /// integer as seconds. Used by the `cleanup --older-than` flag.
 fn parse_duration_arg(s: &str) -> Result<std::time::Duration> {
@@ -950,14 +1042,7 @@ fn resolve_local_uri(
     cli_target: Option<&str>,
     operation: &str,
 ) -> Result<String> {
-    let uri = resolve_uri(config, cli_uri, cli_target)?;
-    if is_remote_uri(&uri) {
-        bail!(
-            "{} is only supported against local graph URIs in this milestone",
-            operation
-        );
-    }
-    Ok(uri)
+    Ok(resolve_local_graph(config, cli_uri, cli_target, operation)?.uri)
 }
 
 fn resolve_branch(
@@ -1691,20 +1776,8 @@ fn resolve_selected_graph(
     cli_target: Option<&str>,
     operation: &str,
 ) -> Result<(String, Option<String>)> {
-    let selected = if cli_uri.is_some() {
-        None
-    } else {
-        cli_target
-            .map(str::to_string)
-            .or_else(|| config.cli_graph_name().map(str::to_string))
-    };
-    // Validate the selection through the single gate (membership + coherence),
-    // so a positional URI stays anonymous and a named graph is rejected when a
-    // top-level block would be silently ignored — matching server boot. `list`
-    // already routes through the same gate; this keeps `validate` in step.
-    config.resolve_graph_selection(selected.as_deref())?;
-    let uri = resolve_local_uri(config, cli_uri, cli_target, operation)?;
-    Ok((uri, selected))
+    let graph = resolve_local_graph(config, cli_uri, cli_target, operation)?;
+    Ok((graph.uri, graph.selected))
 }
 
 /// Load the stored-query registry for an already-resolved graph selection
@@ -1723,6 +1796,20 @@ fn load_registry_or_report(
                 .join("\n  ")
         )
     })
+}
+
+fn validate_registry_for_catalog(
+    registry: &QueryRegistry,
+    catalog: &omnigraph_compiler::catalog::Catalog,
+    label: &str,
+) -> omnigraph::error::Result<()> {
+    let report = check(registry, catalog);
+    if report.has_breakages() {
+        return Err(omnigraph::error::OmniError::manifest(
+            format_check_breakages(label, &report),
+        ));
+    }
+    Ok(())
 }
 
 async fn execute_queries_validate(
@@ -1899,7 +1986,7 @@ async fn execute_read_remote(
 }
 
 async fn execute_change(
-    uri: &str,
+    graph: &ResolvedCliGraph,
     query_source: &str,
     query_name: Option<&str>,
     branch: &str,
@@ -1909,7 +1996,7 @@ async fn execute_change(
 ) -> Result<ChangeOutput> {
     let (selected_name, query_params) = select_named_query(query_source, query_name)?;
     let params = query_params_from_json(&query_params, params_json)?;
-    let db = open_local_db_with_policy(uri, config).await?;
+    let db = open_local_db_with_policy(graph, config).await?;
     let actor = resolve_cli_actor(cli_as_actor, config);
     let result = db
         .mutate_as(branch, query_source, &selected_name, &params, actor)
@@ -2137,9 +2224,10 @@ async fn main() -> Result<()> {
             json,
         } => {
             let config = load_cli_config(config.as_ref())?;
-            let uri = resolve_local_uri(&config, uri, target.as_deref(), "load")?;
+            let graph = resolve_local_graph(&config, uri, target.as_deref(), "load")?;
+            let uri = graph.uri.clone();
             let branch = resolve_branch(&config, branch, None, "main");
-            let db = open_local_db_with_policy(&uri, &config).await?;
+            let db = open_local_db_with_policy(&graph, &config).await?;
             let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
             let result = db
                 .load_file_as(&branch, &data.to_string_lossy(), mode.into(), actor)
@@ -2180,10 +2268,11 @@ async fn main() -> Result<()> {
             let config = load_cli_config(config.as_ref())?;
             let bearer_token =
                 resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-            let uri = resolve_uri(&config, uri, target.as_deref())?;
+            let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
+            let uri = graph.uri.clone();
             let branch = resolve_branch(&config, branch, None, "main");
             let from = resolve_branch(&config, from, None, "main");
-            let payload = if is_remote_uri(&uri) {
+            let payload = if graph.is_remote {
                 let data = fs::read_to_string(&data)?;
                 remote_json::<IngestOutput>(
                     &http_client,
@@ -2199,7 +2288,7 @@ async fn main() -> Result<()> {
                 )
                 .await?
             } else {
-                let db = open_local_db_with_policy(&uri, &config).await?;
+                let db = open_local_db_with_policy(&graph, &config).await?;
                 let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
                 let result = db
                     .ingest_file_as(
@@ -2230,9 +2319,10 @@ async fn main() -> Result<()> {
                 let config = load_cli_config(config.as_ref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-                let uri = resolve_uri(&config, uri, target.as_deref())?;
+                let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
+                let uri = graph.uri.clone();
                 let from = resolve_branch(&config, from, None, "main");
-                let payload = if is_remote_uri(&uri) {
+                let payload = if graph.is_remote {
                     remote_json::<BranchCreateOutput>(
                         &http_client,
                         Method::POST,
@@ -2245,7 +2335,7 @@ async fn main() -> Result<()> {
                     )
                     .await?
                 } else {
-                    let db = open_local_db_with_policy(&uri, &config).await?;
+                    let db = open_local_db_with_policy(&graph, &config).await?;
                     let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
                     db.branch_create_from_as(ReadTarget::branch(&from), &name, actor)
                         .await?;
@@ -2271,8 +2361,9 @@ async fn main() -> Result<()> {
                 let config = load_cli_config(config.as_ref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-                let uri = resolve_uri(&config, uri, target.as_deref())?;
-                let payload = if is_remote_uri(&uri) {
+                let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
+                let uri = graph.uri.clone();
+                let payload = if graph.is_remote {
                     remote_json::<BranchListOutput>(
                         &http_client,
                         Method::GET,
@@ -2305,8 +2396,9 @@ async fn main() -> Result<()> {
                 let config = load_cli_config(config.as_ref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-                let uri = resolve_uri(&config, uri, target.as_deref())?;
-                let payload = if is_remote_uri(&uri) {
+                let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
+                let uri = graph.uri.clone();
+                let payload = if graph.is_remote {
                     remote_json::<BranchDeleteOutput>(
                         &http_client,
                         Method::DELETE,
@@ -2316,7 +2408,7 @@ async fn main() -> Result<()> {
                     )
                     .await?
                 } else {
-                    let db = open_local_db_with_policy(&uri, &config).await?;
+                    let db = open_local_db_with_policy(&graph, &config).await?;
                     let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
                     db.branch_delete_as(&name, actor).await?;
                     BranchDeleteOutput {
@@ -2342,9 +2434,10 @@ async fn main() -> Result<()> {
                 let config = load_cli_config(config.as_ref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-                let uri = resolve_uri(&config, uri, target.as_deref())?;
+                let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
+                let uri = graph.uri.clone();
                 let into = resolve_branch(&config, into, None, "main");
-                let payload = if is_remote_uri(&uri) {
+                let payload = if graph.is_remote {
                     remote_json::<BranchMergeOutput>(
                         &http_client,
                         Method::POST,
@@ -2357,7 +2450,7 @@ async fn main() -> Result<()> {
                     )
                     .await?
                 } else {
-                    let db = open_local_db_with_policy(&uri, &config).await?;
+                    let db = open_local_db_with_policy(&graph, &config).await?;
                     let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
                     let outcome = db.branch_merge_as(&source, &into, actor).await?;
                     BranchMergeOutput {
@@ -2492,9 +2585,10 @@ async fn main() -> Result<()> {
                 let config = load_cli_config(config.as_ref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-                let uri = resolve_uri(&config, uri, target.as_deref())?;
+                let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
+                let uri = graph.uri.clone();
                 let schema_source = fs::read_to_string(&schema)?;
-                let output = if is_remote_uri(&uri) {
+                let output = if graph.is_remote {
                     // MR-694 PR B: SchemaApplyRequest gained an
                     // allow_data_loss field so Hard-mode drops are no
                     // longer CLI-only. The previous bail is gone; the
@@ -2512,13 +2606,22 @@ async fn main() -> Result<()> {
                     )
                     .await?
                 } else {
-                    let db = open_local_db_with_policy(&uri, &config).await?;
+                    let db = open_local_db_with_policy(&graph, &config).await?;
                     let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
+                    let registry = load_registry_or_report(&config, graph.selected())?;
+                    let registry = (!registry.is_empty()).then_some(registry);
+                    let label = graph.selected().unwrap_or(&uri).to_string();
                     let result = db
-                        .apply_schema_as(
+                        .apply_schema_as_with_catalog_check(
                             &schema_source,
                             omnigraph::db::SchemaApplyOptions { allow_data_loss },
                             actor,
+                            |catalog| {
+                                if let Some(registry) = registry.as_ref() {
+                                    validate_registry_for_catalog(registry, catalog, &label)?;
+                                }
+                                Ok(())
+                            },
                         )
                         .await?;
                     schema_apply_output(&uri, result)
@@ -2697,7 +2800,8 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .or_else(|| alias_config.and_then(|alias| alias.graph.as_deref()));
             let bearer_token = resolve_remote_bearer_token(&config, uri.as_deref(), target_name)?;
-            let uri = resolve_uri(&config, uri, target_name)?;
+            let graph = resolve_cli_graph(&config, uri, target_name)?;
+            let uri = graph.uri.clone();
             let query_source = resolve_query_source(
                 &config,
                 query.as_ref(),
@@ -2719,7 +2823,7 @@ async fn main() -> Result<()> {
                 alias_config.and_then(|alias| alias.branch.clone()),
             )?;
             let query_name = name.or_else(|| alias_config.and_then(|alias| alias.name.clone()));
-            let output = if is_remote_uri(&uri) {
+            let output = if graph.is_remote {
                 execute_read_remote(
                     &http_client,
                     &uri,
@@ -2782,7 +2886,8 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .or_else(|| alias_config.and_then(|alias| alias.graph.as_deref()));
             let bearer_token = resolve_remote_bearer_token(&config, uri.as_deref(), target_name)?;
-            let uri = resolve_uri(&config, uri, target_name)?;
+            let graph = resolve_cli_graph(&config, uri, target_name)?;
+            let uri = graph.uri.clone();
             let query_source = resolve_query_source(
                 &config,
                 query.as_ref(),
@@ -2804,7 +2909,7 @@ async fn main() -> Result<()> {
                 "main",
             );
             let query_name = name.or_else(|| alias_config.and_then(|alias| alias.name.clone()));
-            let output = if is_remote_uri(&uri) {
+            let output = if graph.is_remote {
                 execute_change_remote(
                     &http_client,
                     &uri,
@@ -2817,7 +2922,7 @@ async fn main() -> Result<()> {
                 .await?
             } else {
                 execute_change(
-                    &uri,
+                    &graph,
                     &query_source,
                     query_name.as_deref(),
                     &branch,
@@ -2836,20 +2941,19 @@ async fn main() -> Result<()> {
         Command::Policy { command } => match command {
             PolicyCommand::Validate { config } => {
                 let config = load_cli_config(config.as_ref())?;
-                let engine = resolve_policy_engine(&config)?;
-                let policy_file = config
-                    .resolve_policy_file()
-                    .expect("policy file should exist after resolve_policy_engine");
+                let context = resolve_policy_context(&config)?;
+                let engine = resolve_policy_engine(&context)?;
                 println!(
                     "policy valid: {} [{} actors]",
-                    policy_file.display(),
+                    context.policy_file.display(),
                     engine.known_actor_count()
                 );
             }
             PolicyCommand::Test { config } => {
                 let config = load_cli_config(config.as_ref())?;
-                let engine = resolve_policy_engine(&config)?;
-                let tests_path = resolve_policy_tests_path(&config)?;
+                let context = resolve_policy_context(&config)?;
+                let engine = resolve_policy_engine(&context)?;
+                let tests_path = resolve_policy_tests_path(&context);
                 let tests = PolicyTestConfig::load(&tests_path)?;
                 engine.run_tests(&tests)?;
                 println!("policy tests passed: {} cases", tests.cases.len());
@@ -2862,7 +2966,8 @@ async fn main() -> Result<()> {
                 target_branch,
             } => {
                 let config = load_cli_config(config.as_ref())?;
-                let engine = resolve_policy_engine(&config)?;
+                let context = resolve_policy_context(&config)?;
+                let engine = resolve_policy_engine(&context)?;
                 let request = PolicyRequest {
                     action,
                     branch,

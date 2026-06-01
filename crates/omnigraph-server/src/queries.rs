@@ -315,6 +315,26 @@ pub fn check(registry: &QueryRegistry, catalog: &Catalog) -> CheckReport {
     report
 }
 
+/// Format every breakage in a registry check report into a multi-line
+/// operator-facing message, naming each offending query.
+pub fn format_check_breakages(label: &str, report: &CheckReport) -> String {
+    let joined = report
+        .breakages
+        .iter()
+        .map(|b| format!("query '{}': {}", b.query, b.message))
+        .collect::<Vec<_>>()
+        .join("\n  ");
+    format!(
+        "graph '{label}': {} stored quer{} failed the schema check:\n  {joined}",
+        report.breakages.len(),
+        if report.breakages.len() == 1 {
+            "y"
+        } else {
+            "ies"
+        }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

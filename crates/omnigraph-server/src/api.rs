@@ -306,7 +306,7 @@ pub struct ChangeRequest {
 /// Body for `POST /queries/{name}` — invokes the server-side stored query
 /// named in the path. The query source and name come from the registry,
 /// never the body; only the runtime inputs are supplied here.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct InvokeStoredQueryRequest {
     /// JSON object whose keys match the stored query's declared parameters.
     #[serde(default)]

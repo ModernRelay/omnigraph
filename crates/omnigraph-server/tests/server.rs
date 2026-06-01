@@ -8,7 +8,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{Method, Request, StatusCode};
 use lance::index::DatasetIndexExt;
-use omnigraph::db::{Omnigraph, ReadTarget, SchemaApplyOptions};
+use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_policy::{PolicyChecker, PolicyEngine};
@@ -280,6 +280,28 @@ rules:
       branch_scope: any
 "#;
 
+const STORED_QUERY_SCHEMA_APPLY_POLICY_YAML: &str = r#"
+version: 1
+groups:
+  admins: [act-ragnor]
+protected_branches: [main]
+rules:
+  - id: admins-can-invoke
+    allow:
+      actors: { group: admins }
+      actions: [invoke_query]
+  - id: admins-can-read
+    allow:
+      actors: { group: admins }
+      actions: [read]
+      branch_scope: any
+  - id: admins-can-schema-apply
+    allow:
+      actors: { group: admins }
+      actions: [schema_apply]
+      target_branch_scope: protected
+"#;
+
 const FIND_PERSON_GQ: &str =
     "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }";
 
@@ -291,6 +313,22 @@ fn invoke_request(name: &str, token: &str, body: Value) -> Request<Body> {
         .header("authorization", format!("Bearer {token}"))
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap()
+}
+
+fn invoke_request_bytes(
+    name: &str,
+    token: &str,
+    body: impl Into<Body>,
+    content_type: Option<&str>,
+) -> Request<Body> {
+    let mut builder = Request::builder()
+        .uri(format!("/queries/{name}"))
+        .method(Method::POST)
+        .header("authorization", format!("Bearer {token}"));
+    if let Some(content_type) = content_type {
+        builder = builder.header("content-type", content_type);
+    }
+    builder.body(body.into()).unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -310,6 +348,68 @@ async fn invoke_stored_read_returns_rows() {
     assert_eq!(body["query_name"], "find_person");
     assert_eq!(body["row_count"], 1, "Alice is in the fixture; body: {body}");
     assert!(body["rows"].is_array(), "read envelope shape; body: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_stored_read_accepts_absent_or_empty_body() {
+    let no_param_query = "query list_people() { match { $p: Person } return { $p.name } }";
+    let (_temp, app) = app_with_stored_queries(
+        &[("list_people", no_param_query, false)],
+        &[("act-invoke", "t-invoke")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+
+    let (status, body) = json_response(
+        &app,
+        invoke_request_bytes("list_people", "t-invoke", Body::empty(), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["query_name"], "list_people");
+
+    let (status, body) = json_response(
+        &app,
+        invoke_request_bytes(
+            "list_people",
+            "t-invoke",
+            Body::empty(),
+            Some("application/json"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let (status, body) = json_response(
+        &app,
+        invoke_request_bytes(
+            "list_people",
+            "t-invoke",
+            Body::from("{}"),
+            Some("application/json"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let (status, body) = json_response(
+        &app,
+        invoke_request_bytes(
+            "list_people",
+            "t-invoke",
+            Body::from("{"),
+            Some("application/json"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("invalid stored-query invocation body"),
+        "malformed JSON should be rejected as bad request; body: {body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -785,6 +885,83 @@ async fn schema_apply_route_updates_graph_for_authorized_admin() {
             .properties
             .contains_key("nickname")
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_apply_route_rejects_stored_query_breakage_before_publish() {
+    let (temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, true)],
+        &[("act-ragnor", "admin-token")],
+        STORED_QUERY_SCHEMA_APPLY_POLICY_YAML,
+    )
+    .await;
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/schema/apply")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer admin-token")
+        .body(Body::from(
+            serde_json::to_vec(&SchemaApplyRequest {
+                schema_source: renamed_age_schema(),
+                ..Default::default()
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+    let (status, payload) = json_response(&app, request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {payload}");
+    let message = payload["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("find_person") && message.contains("schema check"),
+        "registry breakage should name the stored query; body: {payload}"
+    );
+
+    let reopened = Omnigraph::open(graph_path(temp.path()).to_str().unwrap())
+        .await
+        .unwrap();
+    let person = &reopened.catalog().node_types["Person"];
+    assert!(person.properties.contains_key("age"));
+    assert!(!person.properties.contains_key("years"));
+
+    let (invoke_status, invoke_body) = json_response(
+        &app,
+        invoke_request(
+            "find_person",
+            "admin-token",
+            json!({ "params": { "name": "Alice" } }),
+        ),
+    )
+    .await;
+    assert_eq!(invoke_status, StatusCode::OK, "body: {invoke_body}");
+    assert_eq!(invoke_body["row_count"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_apply_route_noop_keeps_valid_stored_query_registry() {
+    let (_temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, true)],
+        &[("act-ragnor", "admin-token")],
+        STORED_QUERY_SCHEMA_APPLY_POLICY_YAML,
+    )
+    .await;
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/schema/apply")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer admin-token")
+        .body(Body::from(
+            serde_json::to_vec(&SchemaApplyRequest {
+                schema_source: fs::read_to_string(fixture("test.pg")).unwrap(),
+                ..Default::default()
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+    let (status, payload) = json_response(&app, request).await;
+    assert_eq!(status, StatusCode::OK, "body: {payload}");
+    assert_eq!(payload["applied"], false);
 }
 
 #[tokio::test]
