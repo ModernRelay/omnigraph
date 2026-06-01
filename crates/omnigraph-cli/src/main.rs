@@ -1798,6 +1798,43 @@ fn load_registry_or_report(
     })
 }
 
+fn graph_query_registry_names(config: &OmnigraphConfig) -> Vec<&str> {
+    config
+        .graphs
+        .iter()
+        .filter_map(|(name, graph)| (!graph.queries.is_empty()).then_some(name.as_str()))
+        .collect()
+}
+
+fn resolve_registry_selection_for_list(
+    config: &OmnigraphConfig,
+    target: Option<&str>,
+) -> Result<Option<String>> {
+    let selected = target
+        .map(str::to_string)
+        .or_else(|| config.cli_graph_name().map(str::to_string));
+    if let Some(name) = selected.as_deref() {
+        config.resolve_graph_selection(Some(name))?;
+        return Ok(selected);
+    }
+
+    if !config.query_entries().is_empty() {
+        return Ok(None);
+    }
+
+    let graph_names = graph_query_registry_names(config);
+    if graph_names.is_empty() {
+        return Ok(None);
+    }
+
+    bail!(
+        "stored-query registries are configured for graph{} {} but no graph was selected. Pass `--target {}` or set `cli.graph`.",
+        if graph_names.len() == 1 { "" } else { "s" },
+        graph_names.join(", "),
+        graph_names[0],
+    )
+}
+
 fn validate_registry_for_catalog(
     registry: &QueryRegistry,
     catalog: &omnigraph_compiler::catalog::Catalog,
@@ -1878,14 +1915,8 @@ fn execute_queries_list(
     json: bool,
 ) -> Result<()> {
     let config = load_cli_config(config_path)?;
-    // `list` takes no URI, so the selection is the target or the configured
-    // default graph (named → its per-graph block; else top-level). Validate
-    // membership explicitly — every URI-resolving command rejects an unknown
-    // name as a side effect of `resolve_target_uri`, but `list` opens no URI,
-    // so it would otherwise fall back to the top-level registry silently.
-    let selected =
-        config.resolve_graph_selection(target.as_deref().or_else(|| config.cli_graph_name()))?;
-    let registry = load_registry_or_report(&config, selected)?;
+    let selected = resolve_registry_selection_for_list(&config, target.as_deref())?;
+    let registry = load_registry_or_report(&config, selected.as_deref())?;
 
     let output = QueriesListOutput {
         queries: registry

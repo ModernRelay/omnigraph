@@ -2458,6 +2458,59 @@ fn queries_list_prints_registered_query() {
 }
 
 #[test]
+fn queries_list_requires_graph_selection_for_per_graph_only_registries() {
+    let graph = SystemGraph::loaded();
+    graph.write_query(
+        "find_person.gq",
+        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
+    );
+    let config = graph.write_config(
+        "omnigraph.yaml",
+        &format!(
+            concat!(
+                "graphs:\n",
+                "  local:\n",
+                "    uri: '{}'\n",
+                "    queries:\n",
+                "      find_person:\n",
+                "        file: ./find_person.gq\n",
+                "policy: {{}}\n",
+            ),
+            graph.path().to_string_lossy().replace('\'', "''")
+        ),
+    );
+
+    let output = output_failure(cli().arg("queries").arg("list").arg("--config").arg(&config));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("local") && stderr.contains("--target local"),
+        "error must name the graph and give a concrete selection hint; stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn queries_list_without_graph_selection_lists_top_level_registry() {
+    let graph = SystemGraph::loaded();
+    graph.write_query(
+        "top_find.gq",
+        "query top_find($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
+    );
+    let config = graph.write_config(
+        "omnigraph.yaml",
+        concat!(
+            "queries:\n",
+            "  top_find:\n",
+            "    file: ./top_find.gq\n",
+            "policy: {}\n",
+        ),
+    );
+
+    let output = output_success(cli().arg("queries").arg("list").arg("--config").arg(&config));
+    let stdout = stdout_string(&output);
+    assert!(stdout.contains("top_find"), "stdout:\n{stdout}");
+}
+
+#[test]
 fn queries_list_unknown_target_errors() {
     // `queries list` opens no graph URI, so unknown-graph validation can't ride
     // along on URI resolution the way it does for every other command. An

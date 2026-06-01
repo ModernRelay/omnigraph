@@ -20,7 +20,7 @@ A reference for the `omnigraph` binary's command surface and `omnigraph.yaml` sc
 | `run list \| show \| publish \| abort` | transactional run ops |
 | `schema plan \| apply \| show (alias: get)` | migrations |
 | `lint` (alias: `check`) | offline / graph-backed query validation. Replaces `query lint` / `query check`, which are kept as deprecated argv-level shims that print a one-line warning and rewrite to `omnigraph lint` |
-| `queries validate \| list` | operate on the server-side stored-query registry (the `queries:` block). `validate` type-checks every stored query against the live schema offline (opens the selected graph; exits non-zero on any breakage), catching schema drift without restarting the server; `list` prints each query's name, MCP exposure, and typed params. Distinct from `lint`, which validates a single `.gq` file |
+| `queries validate \| list` | operate on the server-side stored-query registry (the `queries:` block). `validate` type-checks every stored query against the live schema offline (opens the selected graph; exits non-zero on any breakage), catching schema drift without restarting the server; `list` prints the selected registry's query names, MCP exposure, and typed params. For per-graph registries, pass `--target <graph>` or set `cli.graph`; with no graph selection, `list` shows only top-level `queries:`. Distinct from `lint`, which validates a single `.gq` file |
 | `optimize` | non-destructive Lance compaction |
 | `cleanup --keep N --older-than 7d --confirm` | destructive version GC |
 | `embed` | offline JSONL embedding pipeline |
