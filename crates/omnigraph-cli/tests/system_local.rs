@@ -87,6 +87,28 @@ query:
     )
 }
 
+fn local_policy_server_graph_config(graph: &SystemGraph) -> String {
+    format!(
+        "\
+project:
+  name: policy-e2e-local
+graphs:
+  local:
+    uri: {}
+    policy:
+      file: ./policy.yaml
+server:
+  graph: local
+cli:
+  branch: main
+query:
+  roots:
+    - .
+",
+        yaml_string(&graph.path().to_string_lossy())
+    )
+}
+
 fn insert_person_query(graph: &SystemGraph, name: &str) -> std::path::PathBuf {
     graph.write_query(
         name,
@@ -1001,40 +1023,46 @@ query vector_search($q: String) {
 fn local_cli_policy_tooling_is_end_to_end() {
     // Sanity check for the read-only policy CLI surfaces. These don't
     // mutate the graph; they parse and evaluate the effective policy for
-    // the `cli.graph` selection, including per-graph policy files.
+    // named graph selections, including per-graph policy files.
     let graph = SystemGraph::loaded();
     let config = graph.write_config("omnigraph-policy.yaml", &local_policy_config(&graph));
+    let server_graph_config = graph.write_config(
+        "omnigraph-policy-server.yaml",
+        &local_policy_server_graph_config(&graph),
+    );
     graph.write_config("policy.yaml", POLICY_E2E_YAML);
     graph.write_config("policy.tests.yaml", POLICY_E2E_TESTS_YAML);
 
-    let validate = output_success(
-        cli()
-            .arg("policy")
-            .arg("validate")
-            .arg("--config")
-            .arg(&config),
-    );
-    assert!(stdout_string(&validate).contains("policy valid:"));
+    for config in [&config, &server_graph_config] {
+        let validate = output_success(
+            cli()
+                .arg("policy")
+                .arg("validate")
+                .arg("--config")
+                .arg(config),
+        );
+        assert!(stdout_string(&validate).contains("policy valid:"));
 
-    let tests = output_success(cli().arg("policy").arg("test").arg("--config").arg(&config));
-    assert!(stdout_string(&tests).contains("policy tests passed: 2 cases"));
+        let tests = output_success(cli().arg("policy").arg("test").arg("--config").arg(config));
+        assert!(stdout_string(&tests).contains("policy tests passed: 2 cases"));
 
-    let explain = output_success(
-        cli()
-            .arg("policy")
-            .arg("explain")
-            .arg("--config")
-            .arg(&config)
-            .arg("--actor")
-            .arg("act-bruno")
-            .arg("--action")
-            .arg("change")
-            .arg("--branch")
-            .arg("main"),
-    );
-    let explain_stdout = stdout_string(&explain);
-    assert!(explain_stdout.contains("decision: deny"));
-    assert!(explain_stdout.contains("branch: main"));
+        let explain = output_success(
+            cli()
+                .arg("policy")
+                .arg("explain")
+                .arg("--config")
+                .arg(config)
+                .arg("--actor")
+                .arg("act-bruno")
+                .arg("--action")
+                .arg("change")
+                .arg("--branch")
+                .arg("main"),
+        );
+        let explain_stdout = stdout_string(&explain);
+        assert!(explain_stdout.contains("decision: deny"));
+        assert!(explain_stdout.contains("branch: main"));
+    }
 }
 
 #[test]

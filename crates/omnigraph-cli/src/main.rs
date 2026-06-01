@@ -3458,6 +3458,32 @@ cli:
     }
 
     #[test]
+    fn graph_identity_resolve_policy_context_server_graph_uses_graph_key_when_cli_graph_absent() {
+        let temp = tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            r#"
+project:
+  name: misleading-project
+graphs:
+  local:
+    uri: /tmp/local-policy-graph.omni
+    policy:
+      file: ./server-policy.yaml
+server:
+  graph: local
+"#,
+        )
+        .unwrap();
+
+        let config = load_config(Some(&config_path)).unwrap();
+        let context = resolve_policy_context(&config).unwrap();
+        assert_eq!(context.graph_id, "local");
+        assert!(context.policy_file.ends_with("server-policy.yaml"));
+    }
+
+    #[test]
     fn graph_identity_resolve_cli_graph_named_target_uses_graph_key_not_project_name_or_uri() {
         let temp = tempdir().unwrap();
         let config_path = temp.path().join("omnigraph.yaml");
