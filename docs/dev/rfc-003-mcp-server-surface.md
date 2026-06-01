@@ -233,7 +233,7 @@ Once parity lands, **collapse to one implementation**: the in-server MCP is cano
 - **Cedar filtering (per-query, gated on PR 0b):** actor scoped to `InvokeQuery [find_user]` sees *only* `find_user`; `tools/call list_orders` masks. **This test ships with PR 0b**, not PR 1 — it cannot pass against the coarse action.
 - **Parity per built-in:** each tool round-trips against the same expectations as its HTTP route (reuse route tests); `read`/`change` aliases dispatch identically to `query`/`mutate`.
 - **Double-gating:** a stored mutation requires both `InvokeQuery` and `Change`; `schema_apply` requires `SchemaApply`.
-- **`mcp.expose:false`:** present via `GET /queries` but absent from MCP `tools/list` and not MCP-callable.
+- **`mcp.expose:false`:** absent from `GET /queries` and MCP `tools/list`; still service-callable by name through `POST /queries/{name}` when the actor has `invoke_query`, but not MCP-callable.
 - **Schema generation:** table-driven over every `ParamKind` incl. nullable / list / vector(dim).
 - **Branch-scoped list approximation:** assert the documented R7 caveat — a branch-scoped policy lists `branches_create`, and `tools/call` is the authoritative gate (a denied target still 403s/masks).
 - **Multi-graph isolation:** `/graphs/a/mcp` never lists graph `b`'s tools; server `/mcp` exposes only server tools.
