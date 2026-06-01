@@ -331,16 +331,27 @@ impl OmnigraphConfig {
         }
     }
 
-    /// Validate a graph selection against `graphs:` — the fallible
-    /// counterpart to the infallible [`OmnigraphConfig::query_entries_for`].
-    /// A known name passes through; an unknown name errors (the **same**
-    /// message [`OmnigraphConfig::resolve_target_uri`] produces, so a command
-    /// that opens no URI rejects an unknown `--target` exactly like the
-    /// URI-resolving commands do); an anonymous selection (`None`) stays
-    /// anonymous, resolving to the top-level registry downstream.
+    /// The single CLI gate that turns a raw graph selection into a *validated*
+    /// one — the fallible counterpart to the infallible
+    /// [`OmnigraphConfig::query_entries_for`]. Both `queries` subcommands route
+    /// their selection through here so neither can skip a check the other (or
+    /// server boot) applies:
+    /// * a known name passes through, but only after the same coherence check
+    ///   server boot enforces
+    ///   ([`OmnigraphConfig::ensure_top_level_blocks_honored`]) — a named graph
+    ///   with a populated top-level block is rejected;
+    /// * an unknown name errors with the **same** message
+    ///   [`OmnigraphConfig::resolve_target_uri`] produces, so a command that
+    ///   opens no URI rejects an unknown `--target` exactly like the
+    ///   URI-resolving commands do;
+    /// * an anonymous selection (`None`, e.g. a bare URI) stays anonymous,
+    ///   resolving to the top-level registry downstream (top-level honored).
     pub fn resolve_graph_selection<'a>(&self, graph: Option<&'a str>) -> Result<Option<&'a str>> {
         match graph {
-            Some(name) if self.graphs.contains_key(name) => Ok(Some(name)),
+            Some(name) if self.graphs.contains_key(name) => {
+                self.ensure_top_level_blocks_honored(Some(name))?;
+                Ok(Some(name))
+            }
             Some(name) => bail!("graph '{}' not found in {}", name, DEFAULT_CONFIG_FILE),
             None => Ok(None),
         }
@@ -614,7 +625,7 @@ policy: {}
     }
 
     #[test]
-    fn resolve_graph_selection_validates_membership() {
+    fn resolve_graph_selection_validates_membership_and_coherence() {
         let temp = tempdir().unwrap();
         fs::write(
             temp.path().join("omnigraph.yaml"),
@@ -632,6 +643,31 @@ policy: {}
         assert!(
             err.contains("ghost") && err.contains("not found"),
             "unknown graph must error naming it: {err}"
+        );
+
+        // Coherence: a named graph plus a populated top-level block is the
+        // config server boot refuses, so the gate rejects it too (shared rule
+        // via ensure_top_level_blocks_honored). An anonymous selection still
+        // passes — top-level is honored when no graph is named.
+        let temp2 = tempdir().unwrap();
+        fs::write(
+            temp2.path().join("omnigraph.yaml"),
+            "graphs:\n  local:\n    uri: ./demo.omni\npolicy:\n  file: ./top.yaml\n",
+        )
+        .unwrap();
+        let incoherent = load_config_in(temp2.path(), None).unwrap();
+        let err = incoherent
+            .resolve_graph_selection(Some("local"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("local") && err.contains("policy.file"),
+            "named graph + populated top-level block must be rejected, naming both: {err}"
+        );
+        assert_eq!(
+            incoherent.resolve_graph_selection(None).unwrap(),
+            None,
+            "anonymous selection still honors top-level"
         );
     }
 

@@ -1698,6 +1698,11 @@ fn resolve_selected_graph(
             .map(str::to_string)
             .or_else(|| config.cli_graph_name().map(str::to_string))
     };
+    // Validate the selection through the single gate (membership + coherence),
+    // so a positional URI stays anonymous and a named graph is rejected when a
+    // top-level block would be silently ignored — matching server boot. `list`
+    // already routes through the same gate; this keeps `validate` in step.
+    config.resolve_graph_selection(selected.as_deref())?;
     let uri = resolve_local_uri(config, cli_uri, cli_target, operation)?;
     Ok((uri, selected))
 }
