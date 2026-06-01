@@ -207,7 +207,7 @@ contracts:
 This pattern realizes read-your-writes within a multi-statement mutation
 and keeps failure scope bounded for inserts/updates by construction at
 the writer layer. See [docs/dev/invariants.md](invariants.md) and
-[docs/dev/runs.md](runs.md) for the publisher CAS contract this builds on.
+[docs/dev/writes.md](writes.md) for the publisher CAS contract this builds on.
 
 ### Storage trait — today vs. roadmap
 
@@ -278,7 +278,7 @@ flowchart LR
     eng --> wq
 ```
 
-The server applies Cedar policy at the HTTP boundary today. The roadmap, called out in [docs/dev/invariants.md](invariants.md) as a known gap, is to push policy into the planner as predicates. After Cedar, mutating handlers go through `WorkloadController` (per-actor admission cap + byte budget; PR 2 / MR-686) before reaching the engine. The engine itself holds an `Arc<WriteQueueManager>` so concurrent mutations on the same `(table, branch)` serialize at the queue, while disjoint keys run in parallel — see [docs/user/server.md](../user/server.md) "Per-actor admission control" and [docs/dev/runs.md](runs.md). The CLI bypasses the HTTP layer (and admission) and calls the engine API directly.
+The server applies Cedar policy at the HTTP boundary today. The roadmap, called out in [docs/dev/invariants.md](invariants.md) as a known gap, is to push policy into the planner as predicates. After Cedar, mutating handlers go through `WorkloadController` (per-actor admission cap + byte budget; PR 2 / MR-686) before reaching the engine. The engine itself holds an `Arc<WriteQueueManager>` so concurrent mutations on the same `(table, branch)` serialize at the queue, while disjoint keys run in parallel — see [docs/user/server.md](../user/server.md) "Per-actor admission control" and [docs/dev/writes.md](writes.md). The CLI bypasses the HTTP layer (and admission) and calls the engine API directly.
 
 Code paths:
 

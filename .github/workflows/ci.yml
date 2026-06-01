@@ -111,6 +111,18 @@ jobs:
       - name: Verify AGENTS.md ↔ docs/ cross-links
         run: bash scripts/check-agents-md.sh
 
+  entrypoint_test:
+    name: Container Entrypoint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5.0.1
+
+      - name: Verify omnigraph-server entrypoint arg composition
+        run: sh docker/entrypoint_test.sh
+
   test:
     name: Test Workspace
     needs: classify_changes
@@ -248,6 +260,63 @@ jobs:
       - name: Test omnigraph-server with aws feature
         if: needs.classify_changes.outputs.run_full_ci == 'true'
         run: cargo test --locked -p omnigraph-server --features aws
+
+  test_windows_binaries:
+    name: Test Windows release binaries
+    needs: classify_changes
+    runs-on: windows-latest
+    timeout-minutes: 75
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Skip for text-only changes
+        if: needs.classify_changes.outputs.run_full_ci != 'true'
+        run: Write-Host "Text-only change detected; skipping Windows binary build."
+
+      - name: Checkout source
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        uses: actions/checkout@v5.0.1
+
+      - name: Install system dependencies
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        run: choco install protoc -y
+
+      - name: Install Rust stable
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust build data
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+          key: windows-release-binaries
+
+      - name: Build Windows binaries
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        run: cargo build --release --locked -p omnigraph-cli -p omnigraph-server
+
+      - name: Smoke test Windows binaries
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        run: |
+          & ./target/release/omnigraph.exe version
+          & ./target/release/omnigraph-server.exe --help
+
+      - name: Check PowerShell installer syntax
+        if: needs.classify_changes.outputs.run_full_ci == 'true'
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("scripts/install.ps1", [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | Format-List
+            exit 1
+          }
 
   rustfs_integration:
     name: RustFS S3 Integration

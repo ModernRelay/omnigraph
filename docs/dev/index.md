@@ -21,7 +21,7 @@ constraints. User-facing behavior should still be documented through
 |---|---|
 | System structure, L1/L2 framing, component diagrams | [architecture.md](architecture.md) |
 | On-disk layout, manifest schema, URI behavior | [storage.md](../user/storage.md) |
-| Direct-publish writes, D2, staged writes, recovery sidecars | [runs.md](runs.md) |
+| Direct-publish writes, D2, staged writes, recovery sidecars | [writes.md](writes.md) |
 | Query execution, mutation execution, loader flow | [execution.md](execution.md) |
 | Index lifecycle and graph topology indexes | [indexes.md](../user/indexes.md) |
 | Branch and commit internals | [branches-commits.md](../user/branches-commits.md) |

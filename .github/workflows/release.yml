@@ -20,6 +20,8 @@ jobs:
             asset_name: omnigraph-linux-x86_64
           - runner: macos-14
             asset_name: omnigraph-macos-arm64
+          - runner: windows-latest
+            asset_name: omnigraph-windows-x86_64
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -36,6 +38,10 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install protobuf
 
+      - name: Install Windows dependencies
+        if: runner.os == 'Windows'
+        run: choco install protoc -y
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -50,7 +56,8 @@ jobs:
       - name: Build release binaries
         run: cargo build --release --locked -p omnigraph-cli -p omnigraph-server
 
-      - name: Package release archive
+      - name: Package Unix release archive
+        if: runner.os != 'Windows'
         run: |
           mkdir -p release
           install -m 0755 target/release/omnigraph release/omnigraph
@@ -58,12 +65,27 @@ jobs:
           tar -C release -czf "${{ matrix.asset_name }}.tar.gz" omnigraph omnigraph-server
           shasum -a 256 "${{ matrix.asset_name }}.tar.gz" > "${{ matrix.asset_name }}.sha256"
 
+      - name: Package Windows release archive
+        if: runner.os == 'Windows'
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item target/release/omnigraph.exe release/omnigraph.exe
+          Copy-Item target/release/omnigraph-server.exe release/omnigraph-server.exe
+          Compress-Archive -Path release/omnigraph.exe, release/omnigraph-server.exe -DestinationPath "${{ matrix.asset_name }}.zip" -Force
+          $hash = (Get-FileHash "${{ matrix.asset_name }}.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  ${{ matrix.asset_name }}.zip" | Out-File -FilePath "${{ matrix.asset_name }}.sha256" -Encoding ascii
+          New-Item -ItemType Directory -Force -Path verify | Out-Null
+          Expand-Archive -Path "${{ matrix.asset_name }}.zip" -DestinationPath verify -Force
+          $items = Get-ChildItem -Path verify -File
+          if ($items.Count -ne 2 -or !(Test-Path verify/omnigraph.exe) -or !(Test-Path verify/omnigraph-server.exe)) {
+            throw "Windows release archive is missing expected binaries"
+          }
+
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v2.5.0
         with:
           files: |
-            ${{ matrix.asset_name }}.tar.gz
-            ${{ matrix.asset_name }}.sha256
+            ${{ matrix.asset_name }}.*
 
   update_homebrew_tap:
     name: Update Homebrew tap
@@ -113,3 +135,22 @@ jobs:
           git add Formula/omnigraph.rb
           git commit -m "Update Omnigraph formula to ${GITHUB_REF_NAME}"
           git push origin HEAD:main
+
+  smoke_windows_installer:
+    name: Smoke Windows installer
+    needs: build_release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5.0.1
+
+      - name: Install from tagged release
+        run: ./scripts/install.ps1 -Version "$env:GITHUB_REF_NAME" -InstallDir "$env:RUNNER_TEMP/omnigraph-bin"
+
+      - name: Smoke installed binaries
+        run: |
+          & "$env:RUNNER_TEMP/omnigraph-bin/omnigraph.exe" version
+          & "$env:RUNNER_TEMP/omnigraph-bin/omnigraph-server.exe" --help

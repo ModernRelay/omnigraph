@@ -90,6 +90,24 @@ omnigraph branch merge  feature-x --into main ./graph.omni
 
 See [docs/user/cli.md](docs/user/cli.md) for schema apply, snapshots, ingest, commits, and policy commands.
 
+## Clients
+
+For programmatic access to a running `omnigraph-server`:
+
+- **TypeScript SDK** — [`@modernrelay/omnigraph`](https://www.npmjs.com/package/@modernrelay/omnigraph) ([source](https://github.com/ModernRelay/omnigraph-ts/tree/main/packages/sdk)). Instance-per-client, typed errors, camelCase types, async-iterator streaming export.
+
+  ```bash
+  npm install @modernrelay/omnigraph
+  ```
+
+- **Model Context Protocol server** — [`@modernrelay/omnigraph-mcp`](https://www.npmjs.com/package/@modernrelay/omnigraph-mcp) ([source](https://github.com/ModernRelay/omnigraph-ts/tree/main/packages/mcp)). Bridges Omnigraph to LLM hosts (Claude Desktop, Claude Code, …) over stdio. Exposes tools and resources for schema, branches, queries, mutations, ingest, and bundles curated best-practices guidance from the cookbook.
+
+  ```bash
+  npm install -g @modernrelay/omnigraph-mcp
+  ```
+
+Both packages are versioned in lockstep with `omnigraph-server` on major.minor: `@modernrelay/omnigraph@X.Y.*` targets `omnigraph-server@X.Y.*`. See [`ModernRelay/omnigraph-ts`](https://github.com/ModernRelay/omnigraph-ts) for the monorepo.
+
 ## Docs
 
 - [Install guide](docs/user/install.md)

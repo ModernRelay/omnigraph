@@ -38,7 +38,7 @@ Use it this way:
    publishes one manifest update. Do not commit per statement. Delete-only
    queries are the documented inline residual; the parse-time D2 rule prevents
    mixing deletes with insert/update until Lance exposes two-phase delete.
-   Read [runs.md](runs.md) and [execution.md](execution.md).
+   Read [writes.md](writes.md) and [execution.md](execution.md).
 
 5. **Recovery is part of the commit protocol.** Writers that can advance Lance
    HEAD before manifest publish must write `__recovery/{ulid}.json` sidecars.
@@ -56,7 +56,7 @@ Use it this way:
    branch they read even when index coverage is partial. Expensive index work
    should converge from manifest state instead of extending the critical write
    path. Scalar staged index builds and vector inline residuals are documented
-   in [runs.md](runs.md) and [indexes.md](../user/indexes.md).
+   in [writes.md](writes.md) and [indexes.md](../user/indexes.md).
 
 8. **Schema identity survives renames.** Accepted schema identity must remain
    stable across type and property renames. Rename support belongs in migration
@@ -96,12 +96,12 @@ Use it this way:
 
 | Area | Current state | Source |
 |---|---|---|
-| Multi-table commit | Manifest CAS plus recovery sidecars; not a single Lance primitive | [runs.md](runs.md), [architecture.md](architecture.md) |
-| Constructive mutations | In-memory `MutationStaging`, one end-of-query table commit per touched table, then one manifest publish | [runs.md](runs.md), [execution.md](execution.md) |
-| Deletes | Inline-commit residual; delete-only queries allowed, mixed insert/update/delete rejected by D2 | [query-language.md](../user/query-language.md), [runs.md](runs.md) |
+| Multi-table commit | Manifest CAS plus recovery sidecars; not a single Lance primitive | [writes.md](writes.md), [architecture.md](architecture.md) |
+| Constructive mutations | In-memory `MutationStaging`, one end-of-query table commit per touched table, then one manifest publish | [writes.md](writes.md), [execution.md](execution.md) |
+| Deletes | Inline-commit residual; delete-only queries allowed, mixed insert/update/delete rejected by D2 | [query-language.md](../user/query-language.md), [writes.md](writes.md) |
 | Schema validation | Type checks, required fields, defaults, edge endpoint checks, and edge cardinality are enforced on write paths | [schema-language.md](../user/schema-language.md), [execution.md](execution.md) |
 | Unique constraints | Intra-batch and write-path checks exist; full cross-version uniqueness is still a gap | [schema-language.md](../user/schema-language.md) |
-| Storage trait | `TableStorage` exists as the sealed staged-write surface; full call-site migration and capability/stat surfaces are incomplete | [runs.md](runs.md), [architecture.md](architecture.md) |
+| Storage trait | `TableStorage` exists as the sealed staged-write surface; full call-site migration and capability/stat surfaces are incomplete | [writes.md](writes.md), [architecture.md](architecture.md) |
 | Index lifecycle | `ensure_indices` is explicit today; reconciler-based convergence is roadmap | [indexes.md](../user/indexes.md), [maintenance.md](../user/maintenance.md) |
 | Traversal IDs | Runtime still builds `TypeIndex`; Lance stable row-id based graph IDs are roadmap | [architecture.md](architecture.md), [query-language.md](../user/query-language.md) |
 | Auth | Bearer token hashing and server-side actor resolution are implemented at the HTTP boundary | [server.md](../user/server.md), [policy.md](../user/policy.md) |

@@ -1,7 +1,10 @@
-# Runs — REMOVED (MR-771)
+# Direct-Publish Write Path
 
-The Run state machine and `__run__<id>` staging branches were removed in
-MR-771. `mutate_as` and `load` now write **directly to the target table**
+> History: the Run state machine and `__run__<id>` staging branches were
+> removed in MR-771 (shipped v0.4.0). Writes now go directly to the target
+> table; this document specifies that direct-publish path.
+
+`mutate_as` and `load` write **directly to the target table**
 and call `ManifestBatchPublisher::publish` once at the end with
 `expected_table_versions` (the per-table manifest versions captured before
 the first write). Cross-table OCC is enforced inside the publisher; the
