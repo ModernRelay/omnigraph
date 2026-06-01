@@ -99,6 +99,7 @@ Use it this way:
 | Multi-table commit | Manifest CAS plus recovery sidecars; not a single Lance primitive | [writes.md](writes.md), [architecture.md](architecture.md) |
 | Constructive mutations | In-memory `MutationStaging`, one end-of-query table commit per touched table, then one manifest publish | [writes.md](writes.md), [execution.md](execution.md) |
 | Deletes | Inline-commit residual; delete-only queries allowed, mixed insert/update/delete rejected by D2 | [query-language.md](../user/query-language.md), [writes.md](writes.md) |
+| Branch delete | Manifest is the single authority, flipped atomically first; per-table forks + commit-graph branch are derived state, reclaimed best-effort (`force_delete_branch`) with the `cleanup` reconciler as the guaranteed backstop. Reusing a name whose reclaim failed before `cleanup` surfaces an actionable error | [branches-commits.md](../user/branches-commits.md), [maintenance.md](../user/maintenance.md) |
 | Schema validation | Type checks, required fields, defaults, edge endpoint checks, and edge cardinality are enforced on write paths | [schema-language.md](../user/schema-language.md), [execution.md](execution.md) |
 | Unique constraints | Intra-batch and write-path checks exist; full cross-version uniqueness is still a gap | [schema-language.md](../user/schema-language.md) |
 | Storage trait | `TableStorage` exists as the sealed staged-write surface; full call-site migration and capability/stat surfaces are incomplete | [writes.md](writes.md), [architecture.md](architecture.md) |
@@ -106,6 +107,13 @@ Use it this way:
 | Traversal IDs | Runtime still builds `TypeIndex`; Lance stable row-id based graph IDs are roadmap | [architecture.md](architecture.md), [query-language.md](../user/query-language.md) |
 | Auth | Bearer token hashing and server-side actor resolution are implemented at the HTTP boundary | [server.md](../user/server.md), [policy.md](../user/policy.md) |
 | Tests | Tempdir-backed Lance tests are the current substrate; there is no `MemStorage` test backend | [testing.md](testing.md) |
+
+The branch-delete reconciler is authority-derived: it reclaims orphaned forks
+today and degrades to a no-op if Lance ships an atomic multi-dataset branch
+operation, so the design composes with that future rather than blocking it. This
+is the same shape as invariant 7 (indexes are derived state); prefer it over a
+recovery-sidecar-style approach for any new multi-dataset metadata operation,
+since the sidecar would be scaffolding to remove once the substrate closes the gap.
 
 ## Known Gaps
 

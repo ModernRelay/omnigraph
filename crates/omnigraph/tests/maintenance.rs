@@ -7,10 +7,23 @@ mod helpers;
 
 use std::time::Duration;
 
+use lance::Dataset;
 use omnigraph::db::{CleanupPolicyOptions, Omnigraph};
 use omnigraph::loader::{LoadMode, load_jsonl};
 
 use helpers::{TEST_DATA, TEST_SCHEMA, count_rows, init_and_load};
+
+/// Filesystem URI of a node sub-table, mirroring the engine's layout
+/// (FNV-1a of the type name under `nodes/`). Matches the helper in
+/// `failpoints.rs`; used to inspect/forge Lance branches directly in tests.
+fn node_table_uri(root: &str, type_name: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in type_name.as_bytes() {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("{}/nodes/{hash:016x}", root.trim_end_matches('/'))
+}
 
 #[tokio::test]
 async fn optimize_on_empty_graph_returns_stats_per_table_with_no_changes() {
@@ -157,4 +170,60 @@ async fn cleanup_then_optimize_preserves_rows_and_table_remains_writable() {
         .await
         .unwrap();
     assert_eq!(count_rows(&db, "node:Person").await, people_before);
+}
+
+#[tokio::test]
+async fn cleanup_reconciles_orphaned_branch_forks() {
+    // An incomplete prior `branch_delete` can leave a per-table Lance branch
+    // that the manifest no longer references (a "zombie" fork). It is
+    // unreachable through any snapshot but pins its `tree/{branch}/` storage.
+    // `cleanup` must reconcile it away: drop every Lance branch absent from the
+    // manifest authority, without touching `main`.
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = init_and_load(&dir).await;
+
+    let people_before = count_rows(&db, "node:Person").await;
+    assert!(people_before > 0, "fixture should seed Person rows");
+
+    // Forge an orphaned fork the manifest never knew about.
+    let person_uri = node_table_uri(&uri, "Person");
+    {
+        let mut ds = Dataset::open(&person_uri).await.unwrap();
+        let base = ds.version().version;
+        ds.create_branch("ghost", base, None).await.unwrap();
+        assert!(
+            ds.list_branches().await.unwrap().contains_key("ghost"),
+            "precondition: orphaned fork staged"
+        );
+    }
+
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+
+    // Orphan reclaimed; main untouched.
+    {
+        let ds = Dataset::open(&person_uri).await.unwrap();
+        assert!(
+            !ds.list_branches().await.unwrap().contains_key("ghost"),
+            "cleanup should reconcile the orphaned 'ghost' fork away"
+        );
+    }
+    assert_eq!(
+        count_rows(&db, "node:Person").await,
+        people_before,
+        "cleanup must not disturb main while reconciling orphans"
+    );
+
+    // Idempotent: a second cleanup with the orphan already gone is a no-op.
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
 }
