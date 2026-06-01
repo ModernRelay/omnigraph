@@ -233,6 +233,64 @@ async fn cleanup_isolates_single_table_failure() {
     }
 }
 
+// A branch_delete whose best-effort commit-graph reclaim fails leaves a
+// commit-graph "zombie" branch. Recreating that name must heal the zombie and
+// succeed (branch_create force-deletes a stale commit-graph ref since the
+// manifest branch is created fresh), instead of dying on the leftover ref.
+#[tokio::test]
+async fn branch_create_recreates_over_commit_graph_zombie() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Omnigraph::init(dir.path().to_str().unwrap(), helpers::TEST_SCHEMA)
+        .await
+        .unwrap();
+
+    db.branch_create("feature").await.unwrap();
+    {
+        // Fail the best-effort commit-graph reclaim → commit-graph "feature"
+        // zombie survives the delete (manifest authority still flips).
+        let _fp = ScopedFailPoint::new("branch_delete.before_commit_graph_reclaim", "return");
+        db.branch_delete("feature").await.unwrap();
+    }
+    assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
+
+    db.branch_create("feature")
+        .await
+        .expect("branch_create should heal the zombie commit-graph branch and succeed");
+    assert!(
+        db.branch_list()
+            .await
+            .unwrap()
+            .contains(&"feature".to_string())
+    );
+}
+
+// branch_create is authority-then-derived: if the derived commit-graph branch
+// cannot be created, the manifest branch (the authority) must be rolled back so
+// the branch does not half-exist. The existing failpoint fires right after the
+// manifest create, standing in for any post-authority failure.
+#[tokio::test]
+async fn branch_create_rolls_back_manifest_on_commit_graph_failure() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Omnigraph::init(dir.path().to_str().unwrap(), helpers::TEST_SCHEMA)
+        .await
+        .unwrap();
+
+    let err = {
+        let _fp = ScopedFailPoint::new("branch_create.after_manifest_branch_create", "return");
+        db.branch_create("feature").await.unwrap_err()
+    };
+    assert!(
+        !db.branch_list()
+            .await
+            .unwrap()
+            .contains(&"feature".to_string()),
+        "branch_create must roll back the manifest branch when the derived \
+         commit-graph branch fails, got error: {err}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn graph_publish_failpoint_triggers_before_commit_append() {
     let _scenario = FailScenario::setup();

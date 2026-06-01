@@ -253,6 +253,7 @@ impl GraphCoordinator {
     /// Best-effort, idempotent reclaim of the commit-graph branch `branch`.
     /// Tolerates an absent commit-graph dataset (a graph that never committed).
     async fn reclaim_commit_graph_branch(&mut self, branch: &str) -> Result<()> {
+        failpoints::maybe_fail("branch_delete.before_commit_graph_reclaim")?;
         if let Some(commit_graph) = &mut self.commit_graph {
             commit_graph.force_delete_branch(branch).await
         } else if self
