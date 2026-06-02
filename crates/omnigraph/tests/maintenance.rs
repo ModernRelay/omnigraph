@@ -8,7 +8,7 @@ mod helpers;
 use std::time::Duration;
 
 use lance::Dataset;
-use omnigraph::db::{CleanupPolicyOptions, Omnigraph};
+use omnigraph::db::{CleanupPolicyOptions, Omnigraph, SkipReason};
 use omnigraph::loader::{LoadMode, load_jsonl};
 
 use helpers::{TEST_DATA, TEST_SCHEMA, count_rows, init_and_load};
@@ -70,6 +70,95 @@ async fn optimize_after_load_then_again_is_idempotent() {
             s.table_key
         );
     }
+}
+
+// Regression: `optimize` must not crash on a graph that has a `Blob` table.
+//
+// Lance `compact_files` forces `BlobHandling::AllBinary`, which mis-decodes
+// blob-v2 columns ("more fields in the schema than provided column indices"),
+// failing even a pristine uniform-V2_2 multi-fragment blob table. `optimize`
+// must skip blob-bearing tables (and report the skip) rather than aborting the
+// whole sweep.
+//
+// RED today: `optimize()` returns Err and the `.expect` below panics with the
+// column-index decode message. GREEN after the skip fix lands; the fix commit
+// also strengthens this test to assert `doc.skipped == Some(..)` /
+// `tag.skipped == None` (needs the new `SkipReason` API).
+#[tokio::test]
+async fn optimize_skips_blob_table_and_reports_skip() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    // One Blob node type (`Doc`) + one plain node type (`Tag`): proves the blob
+    // table is skipped while a non-blob table in the same sweep still compacts.
+    let schema = "\
+node Doc {\n    slug: String @key\n    content: Blob\n}\n\
+node Tag {\n    slug: String @key\n}\n";
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+
+    // Multi-fragment blob table: Overwrite creates fragment 1; each Merge of
+    // new keys appends another. A >=2-fragment blob table is exactly what
+    // crashes `compact_files` today (single fragment would no-op and not crash).
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"content\":\"base64:aGVsbG8x\"}}\n{\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"content\":\"base64:aGVsbG8y\"}}",
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d3\",\"content\":\"base64:aGVsbG8z\"}}",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d4\",\"content\":\"base64:aGVsbG80\"}}",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    // Plain table, also multi-fragment so it has something to compact.
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Tag\",\"data\":{\"slug\":\"t1\"}}\n{\"type\":\"Tag\",\"data\":{\"slug\":\"t2\"}}",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Tag\",\"data\":{\"slug\":\"t3\"}}",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    let stats = db
+        .optimize()
+        .await
+        .expect("optimize must not crash on a graph with a Blob table");
+
+    let doc = stats
+        .iter()
+        .find(|s| s.table_key == "node:Doc")
+        .expect("Doc stat present");
+    let tag = stats
+        .iter()
+        .find(|s| s.table_key == "node:Tag")
+        .expect("Tag stat present");
+    // The blob table is skipped (and reported), not compacted.
+    assert_eq!(
+        doc.skipped,
+        Some(SkipReason::BlobColumnsUnsupportedByLance),
+        "blob table must be reported as skipped",
+    );
+    assert!(!doc.committed, "skipped blob table is not compacted");
+    assert_eq!(doc.fragments_removed, 0);
+    assert_eq!(doc.fragments_added, 0);
+    // The plain (non-blob) table is unaffected by the skip.
+    assert_eq!(tag.skipped, None, "non-blob table must not be skipped");
 }
 
 #[tokio::test]
