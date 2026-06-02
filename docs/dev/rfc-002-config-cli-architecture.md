@@ -1,452 +1,471 @@
-# RFC: Config & CLI Architecture — Layered Config, Client Targeting, File Naming
+# RFC: Config & CLI Architecture — Layered Config, Client Targeting, Typed Locators
 
-**Status:** Proposed
-**Date:** 2026-05-30
-**Tickets:** MR-668 (multi-graph server, shipped — the dependency this builds on), MR-969 (stored queries + MCP — supplies the in-repo agent tool surface), MR-973 (quickstart / onboarding), MR-974 (agent setup surface), MR-981 (agent-friendly CLI hardening)
-**Target release:** v0.8.x (tentative; phased — see Rollout)
+**Status:** Proposed (revised 2026-06-02)
+**Supersedes:** the original additive-only draft (2026-05-30). This revision **embraces breaking changes** to remove ambiguity and conflation rather than carrying every legacy shape forward. It is gated behind a config `version:` field and ships compat aliases for the highest-traffic legacy keys, but it does not pretend the end-state is purely additive. Incorporates an implementation-readiness review: endpoint-bound credentials, layer identity trust, route-unification specifics, restored `query.roots`, and right-sized auth scope.
+**Target release:** v0.8.x (phased — see Rollout)
 
 ## Summary
 
-OmniGraph today has a single config file, `omnigraph.yaml`, read both by the CLI (operating the embedded engine) and by `omnigraph-server` (hosting graphs). There is **no client-side configuration that targets a *running server*** — to talk to a deployed `omnigraph-server` you drop to `curl` or the `omnigraph-ts` client. This is the one real gap in an otherwise coherent design (storage-URI addressing, multi-graph routing, per-graph policy).
+OmniGraph today reads one config file, `omnigraph.yaml`, from both the CLI (operating the embedded engine) and `omnigraph-server` (hosting graphs). The CLI **can** already reach a *single-graph* server — point a graph entry's URI at the endpoint and set `bearer_token_env` — but it **cannot address a specific graph on a multi-graph server**, has no named-server credential model, and does not work without a project file in the current directory. Those are the real gaps.
 
-This RFC defines the config and CLI architecture that closes that gap, derived from first principles — *working backwards from what OmniGraph uniquely enables* rather than copying kubeconfig / `helix.toml`. The result:
+This RFC defines the config and CLI architecture that closes them, derived from first principles — *working backward from what OmniGraph uniquely enables* rather than copying kubeconfig. The result:
 
-1. A **global-first layered config** — user-global (`~/.omnigraph/`) is the **primary, self-sufficient default**; per-project (`./omnigraph.yaml`) is an *optional* override + deployment manifest. One uniform schema, both layers optional; the CLI works from any directory with **no project file** (the `kubectl`/`aws`/`gh` posture), unlike today's project-anchored behavior.
-2. A single unifying noun — the **target** — that resolves a name to a concrete `(locus, graph, sub-state, credential)` tuple, where the locus is **embedded (storage URI) XOR remote (server endpoint)**.
-3. A **multi-server × multi-graph** client model (OmniGraph hosts N graphs per server and there are M servers — unlike Helix's one-cluster-one-graph).
-4. **Credentials by reference, keyed by server name** (the AWS/gh/kube model) — OS keychain `omnigraph:<server>` (preferred) → a `[<server>]` profile in `~/.omnigraph/credentials` → `OMNIGRAPH_TOKEN[_<SERVER>]` env (CI). `servers.<name>` is endpoint-only by default but may carry an explicit, secret-free `auth: { token: { env|file|command|keychain } }` source; no `credentials.yaml`; the shipped `bearer_token_env` + dotenv stay as a legacy compat path. Every committed/GitOps'd surface stays secret-free.
-5. A **file-naming** decision: project and server config are **the same artifact, same name** (`omnigraph.yaml`); the only differently-named file is the user-global `config.yaml`, justified by **scope, not role**.
+1. A **typed locator** replacing the conflated `uri: String`. A graph entry is **embedded (`storage:`) XOR remote (`server:` + `graph_id:`)**; the *key* names the locus so neither a URI scheme nor a comment is load-bearing.
+2. **Three-tier server addressing.** A `servers:` entry is self-sufficient — you reach any graph it hosts as `server/graph_id`, because the server enumerates its own graphs. Per-graph `graphs:` entries become *optional aliases* (for a short name, a branch pin, or multi-homing). Below that, env vars (`OMNIGRAPH_SERVER` + token) give a fileless floor.
+3. **Global-first layered config.** The user-global `~/.omnigraph/config.yaml` is the primary, self-sufficient default; `./omnigraph.yaml` is an optional repo-scoped override + deployment manifest. One schema, both layers optional. The CLI works from any directory with no project file (the `kubectl`/`aws`/`gh` posture).
+4. **A method-tagged auth model.** `auth:` is a tagged union over `bearer | oauth | mtls | none`; bearer/mtls reference a *secret source* (`env | file | command | keychain`); OAuth is first-class (`omnigraph login` device flow). Auth is **per-server**, not per-graph. Secrets are never inlined and never live in any `*.yaml` or in the project tree.
+5. **A clean file layout split on the two real boundaries — secrecy and scope, never role.** Global `~/.omnigraph/config.yaml`; project `./omnigraph.yaml` (one artifact, both roles by section); credentials in the OS keychain → `~/.omnigraph/credentials` (INI, `0600`). No `credentials.yaml`.
 
-The design optimizes jointly for **DX** (one command surface across embedded and remote; clone-and-go) and **AX** (agent experience: one flat resolved context, secrets structurally unreachable, branch-pinned reproducible reads, and a GitOps'd capability surface).
+The design optimizes jointly for **DX** (one command surface across embedded and remote; clone-and-go) and **AX** (agent experience: one flat resolved context, secrets structurally unreachable, branch-pinned reproducible reads, a GitOps'd capability surface).
 
-## Reconciliation with shipped / planned CLI work
+## Reconciliation with the code
 
-Verified **against the code**, not ticket statuses (which are unreliable — e.g. MR-581 is marked done but is stale and unbuilt). Findings and the corrections they force:
+Verified **against the code**, not ticket status. Findings, with the corrections they force on the design:
 
-- **Noun is `graph`/`graphs`, NOT `target`/`targets`.** The config key is `graphs:` in `config.rs` and the flag is `--graph`. **This RFC uses `graphs:`/`--graph` throughout**; the unifying noun is a **`graphs:` entry** that is *embedded* (`storage:`, formerly `uri:`) XOR *remote* (`server:` + `graph_id:` defaulting to the entry key) — a typed locator (§1.1). Read any lingering `targets:`/`--target` below as `graphs:`/`--graph`.
-- **`~/.omnigraph/` stands on its own merits** (Helix/aws/kube peer convention), **not** on precedent — there is **no `~/.omnigraph/` usage in the code** today. (MR-581 / MR-531 templates-into-`~/.omnigraph/` are *stale tickets, unbuilt*.)
-- **Templates do not exist** in the code (no `template` command). The template mechanism is a *design question for this RFC / the init family*, not an existing foothold.
-- **What actually exists in the CLI** (verified): `init, query(read), mutate(change), load, ingest, branch, schema, lint, snapshot, export, commit, policy, optimize, cleanup, graphs`. **Not built:** `serve, quickstart, template, prune, login`. `omnigraph init` exists (with `scaffold_config_if_missing`, `main.rs:1415`); the rest of the "init family" (`quickstart` MR-973, `serve` MR-970, `prune`/`init --force` MR-972/975, `mcp install`/skills MR-974, agent-mode MR-981) are **unbuilt tickets**, some stale.
-- **Config still uses `aliases:`** (no `operations:` in code; MR-839 unbuilt). §6's reconciliation talks about `aliases:` as-is, noting `operations:` is a *proposed* rename.
-- **`bearer_token_env` exists** (per-graph, `config.rs`); MR-971 flags a CLI-parity / server-side gap. The per-`servers.<name>` extension lands on top of that.
-- **A top-level `omnigraph lint` command exists** (verified). A stored-query *registry* validator must pick a verb that doesn't read as a competing lint/check.
+- **Config lives in `crates/omnigraph-server/src/config.rs`**, and `omnigraph-cli` depends on the whole `omnigraph-server` crate to use it (`crates/omnigraph-cli/Cargo.toml:19`; the CLI imports `OmnigraphConfig`, `PolicyEngine`, `QueryRegistry`, `load_config` from `omnigraph_server`). The new layered-config stack should land in a **new shared `omnigraph-config` crate**, so the CLI stops pulling Axum/utoipa transitively just to parse YAML (see Implementation).
+- **The config noun is `graphs:` (key) / `cli.graph` (default), but the shipped command-line flag is `--target`** (`main.rs:91,148,…`; field `target`, no `--graph` alias) — the code is itself split between "graph" config terminology and a "target" flag. This RFC unifies on **graph**: `--graph` becomes the canonical flag with `--target` kept as a deprecated alias (Migration).
+- **`TargetConfig` models a graph as a single `uri: String`** with code branching on `is_remote_uri(uri)` (an `http(s)://` prefix check, `main.rs:686`). That string cannot express `{server, graph_id}`; today the only way to address a graph on a multi-graph server is to hand-write the prefix into the URI (`uri: https://host/graphs/prod`) and rely on the flat path append. §2 fixes this with the typed locator.
+- **The CLI already speaks HTTP for many verbs** — `query`, `mutate`, `ingest`, `branch`, `commit`, `schema`, `snapshot`, `export`, `graphs` all have remote paths. But every URL is **flat** (`remote_url(&uri, "/branches")`, `…/commits`, `…/snapshot`, etc.) with **no `/graphs/{graph_id}/` prefix anywhere**, so the entire remote surface targets **single-graph-mode servers only** and 404s against a multi-graph server's nested routes. `query`/`mutate` additionally hit the **deprecated** `/read` (`main.rs:1991`) and `/change` (`main.rs:2068`), not the primary `/query`/`/mutate`. The HTTP client is therefore **extended**, not built from scratch.
+- **Operations that bail on remote**: `load`, `lint`, `schema plan`, `optimize`, `cleanup` via `resolve_local_graph` → *"… is only supported against local graph URIs in this milestone"* (`main.rs:984`).
+- **The CLI does not walk parent directories** — it reads `./omnigraph.yaml` in the cwd only (pinned by a `config.rs` test). Global-first is a deliberate posture flip.
+- **What exists in the CLI** (verified): `init, query (read), mutate (change), load, ingest, branch, schema, lint, queries, snapshot, export, commit, policy, optimize, cleanup, graphs`. Note `queries` already shipped (the stored-query registry, PR #128). **Not built:** `login, use, config view, serve, quickstart`.
+- **`scaffold_config_if_missing` exists** at `main.rs:1547` (invoked by `init`).
+- **The default client bearer env is `OMNIGRAPH_BEARER_TOKEN`** (`main.rs:45`); the server uses `OMNIGRAPH_SERVER_BEARER_TOKEN[_JSON|_FILE|_AWS_SECRET]`. The implicit credential chain in §6 **reuses `OMNIGRAPH_BEARER_TOKEN`** rather than minting a new `OMNIGRAPH_TOKEN`.
+- **The server already exposes the target surface**: `POST /query`, `POST /mutate`, `GET /queries`, `POST /queries/{name}`, `GET /graphs` (405 in single mode, list in multi), and the nested `/graphs/{graph_id}/…` cluster routes. `POST /graphs` and `DELETE /graphs/{id}` are intentionally **not** exposed. The one server-side change this RFC needs is **route unification** (§9).
+- **`project.name` has no consumer** in the code; it is dropped. `server.graph` is purely the single-graph-mode selector (`lib.rs`); it is dropped in favor of structural mode (§9). `cli.actor` is the engine-layer policy actor default (`--as` > `cli.actor` > none, `main.rs:854`); it moves under `defaults:`.
 
 ## Motivation
 
 Three problems, in priority order:
 
-- **No client→server targeting config.** The moment an operator stands up `omnigraph-server` — for bearer auth + Cedar at a network boundary + admission control + multi-graph routing — the CLI can't address it. `curl` is the fallback. There is no named, switchable, credential-carrying way to say "run this against `prod` on the team server."
-- **Multi-server × multi-graph has no first-class expression.** OmniGraph genuinely runs N graphs per server across M servers. The same graph is **multi-homed** — `s3://b/prod` may be `prod` on server A, `production` on server B, and opened directly by the CLI. Today's flat `graphs:` map (name→storage-URI) can't express "graph `production` on server `prod-eu`."
-- **Solo-first and embedded-first are unserved by the remote story.** A solo developer with no projects should define everything in `~`. A developer iterating locally (embedded, no server) and then pointing at staging (remote) should change *one word*, not learn a second command surface.
-
-MR-668 shipped the server side (multiple graphs per server). MR-969 ships the in-repo agent tool surface (stored queries / MCP). This RFC supplies the **client and config layer** that lets humans and agents target that surface coherently — the foundation under MR-973 / MR-974 / MR-981.
+- **No multi-graph client targeting.** OmniGraph runs N graphs per server across M servers, but the CLI's remote path is flat-only and single-graph-only. There is no first-class way to say "graph `production` on server `prod-eu`," and the same graph is **multi-homed** — `s3://b/prod` may be `prod` on server A, `production` on server B, and opened directly by the CLI.
+- **No global, no-project operation.** A solo developer or an agent should be able to define everything in `~` and run from any directory. Today the CLI is project-anchored.
+- **Sub-optimal credentials for a multi-server world.** `bearer_token_env` is per-graph and forces the operator to invent and coordinate an env-var name per server. The peer group keys the secret **by the server's name** and supports interactive login, dynamic tokens, and OAuth. OmniGraph should match that.
 
 ## Non-Goals
 
-- **A control plane / dashboard for config.** Operators edit files and (for servers) restart. No runtime config-mutation API. Matches the MR-668 / MR-969 operational model.
-- **Hot reload.** Restart-only for server-side config, matching MR-668 and MR-969.
-- **Embedding secrets in any config file.** Credentials are by-reference; the git-ignored `auth.env_file` dotenv (or, later, the OS keychain) holds tokens. Never a committable `*.yaml`.
-- **Renaming the project manifest by role.** No `omnigraph.server.yaml` / `omnigraph.client.yaml`. Role lives in sections, not filenames (see Design §3).
-- **Dropping embedded mode.** Embedded-first is load-bearing for the file-naming decision; this RFC assumes it stays.
-- **Cross-graph / cross-server tool listing in MCP.** Clients loop over per-graph catalogs (a MR-969 non-goal, restated).
+- **A control plane / runtime config-mutation API.** Operators edit files and (for servers) restart.
+- **Hot reload.** Restart-only for server-side config.
+- **Embedding secrets in any config file.** Credentials are by-reference; secrets live in the OS keychain or a `0600` profile file, never a committable `*.yaml`, never in the project tree.
+- **Renaming the project manifest by role.** Role lives in sections, not filenames (§5).
+- **Dropping embedded mode.** Embedded-first is load-bearing for the file-layout decision.
+- **Cross-graph / cross-server tool listing in MCP.** Clients loop over per-graph catalogs.
+- **Managing cloud-storage credentials.** Embedded graphs authenticate to object storage via the standard cloud chain (`AWS_*`, instance roles); OmniGraph does not own those (§6).
 
 ## Background
 
-OmniGraph runs on Lance 6.x: typed nodes/edges in per-type Lance datasets, atomic multi-table commits via a `__manifest` table, branchable and time-travelable. The CLI (`omnigraph`) operates the **embedded engine** directly against a storage URI — no HTTP client in its runtime dependencies. `omnigraph-server` (Axum) is a *separate* HTTP front-end over the same engine, with bearer auth + per-graph Cedar (MR-668). The two read the same `omnigraph.yaml` but never connect to each other.
+OmniGraph runs on Lance 6.x: typed nodes/edges in per-type Lance datasets, atomic multi-table commits via a `__manifest` table, branchable and time-travelable. The CLI operates the **embedded engine** directly against a storage URI. `omnigraph-server` (Axum) is a separate HTTP front-end over the same engine, with bearer auth + per-graph Cedar.
 
-OmniGraph **already has a credentials-by-reference mechanism**, which this RFC builds on rather than replacing: `TargetConfig.bearer_token_env` names the env var holding a graph's bearer token, and `auth.env_file` points at a git-ignored dotenv (`.env.omni`) that the CLI auto-loads into the process (`load_env_file_into_process`) with real-env-vars-win precedence; `resolve_remote_bearer_token` resolves a token via env var then dotenv named lookup. `.env.omni` is already in `.gitignore`.
+OmniGraph **already has a credentials-by-reference mechanism** this RFC builds on: `bearer_token_env` names the env var holding a graph's bearer token; `auth.env_file` points at a git-ignored dotenv that the CLI auto-loads (`load_env_file_into_process`, `main.rs:755`, real-env-wins); `resolve_remote_bearer_token` (`main.rs:870`) resolves a token via env then dotenv.
 
-The six **irreducible enablers** that drive the design (referenced as E1–E6 below):
+The six **irreducible enablers** that drive the design (E1–E6):
 
 | # | Enabler | Consequence |
 |---|---|---|
-| E1 | A graph is a **self-contained storage URI**; the substrate (object store + manifest CAS) is the source of truth — no server required to read/write. | A graph is addressable **directly (embedded)**, not only via a server. |
+| E1 | A graph is a **self-contained storage URI**; the substrate is the source of truth — no server required to read/write. | A graph is addressable **directly (embedded)**, not only via a server. |
 | E2 | A server hosts **many graphs**; **many servers** exist. | The remote address space is **`{server} × {graph_id}`**. |
-| E3 | The same graph is **multi-homed** under different per-locus names. | **Name ≠ identity.** Resolution is mandatory. |
+| E3 | The same graph is **multi-homed** under different per-locus names; a server can **enumerate its own graphs** (`GET /graphs`, `graph_list`-gated). | **Name ≠ identity.** Addressing a graph by a *known* `server/graph_id` needs only read/invoke permission on that graph; *discovering* what exists is `graph_list`-gated. Clients need not pre-declare each graph. |
 | E4 | **Branch / commit / snapshot** are first-class addressable sub-state. | An address is *graph @ branch/snapshot*, not just graph. |
-| E5 | Enforcement is **two-layered**: engine-layer Cedar (`_as` writers, works embedded) + HTTP-boundary bearer+Cedar (server only). | *How* you reach a graph determines *which* enforcement applies. |
-| E6 | **Stored queries / MCP tools are a per-graph registry defined in the project config** (MR-969). | The **agent tool surface is version-controlled in the repo**. |
+| E5 | Enforcement is **two-layered**: engine-layer Cedar (`_as` writers, embedded) + HTTP-boundary bearer+Cedar (server only). | *How* you reach a graph determines *which* enforcement applies. |
+| E6 | **Stored queries / MCP tools are a per-graph registry in the deployment config.** | The **agent tool surface is version-controlled in the repo.** |
 
-Competitors collapse dimensions OmniGraph keeps live: **Helix** fuses E2+E3 (one cluster = one graph); **namidb** fuses E1+E3 into the URI (`s3://b?ns=prod`) and serves one namespace per process. OmniGraph has all of E1–E6 at once, so its config resolves a richer space — but the richness is *earned* by capability.
+There are also **two distinct credential domains**, conflated nowhere in this design:
+
+- **Bearer / session credentials** (client → remote server). OmniGraph owns these: keychain / `credentials` / env / OAuth (§6).
+- **Cloud-storage credentials** (embedded engine → object store). The ambient cloud chain owns these; OmniGraph only consumes them.
 
 ## Design
 
-### 1. The address space and the `target` abstraction
+### 1. The address space and resolution
 
 Every OmniGraph address is a tuple:
 
 ```
 (locus, graph, sub-state, credential)
-  locus      = embedded(URI)  XOR  remote(server-endpoint)        # E1, E2
-  graph      = a URI (embedded)  |  a graph_id on a server (remote) # E3
-  sub-state  = branch | snapshot                                   # E4
-  credential = cloud-storage creds (embedded) | bearer token (remote) # E5
+  locus      = embedded(storage URI)  XOR  remote(server endpoint)     # E1, E2
+  graph      = a storage URI (embedded)  |  a graph_id on a server (remote)  # E3
+  sub-state  = branch | snapshot                                       # E4
+  credential = cloud-storage chain (embedded) | server auth (remote)   # E5
 ```
 
-The config's only job is **name → this tuple**. Define one noun — a **target** — that resolves to either shape:
+The config's job is **name → this tuple**. Two nouns express it:
 
-```yaml
-targets:
-  dev:                       # embedded — substrate-direct (E1)
-    storage: s3://team-bucket/dev.omni
-    branch: main             # sub-state (E4)
-  staging:                   # remote — resolves a server by reference (E2/E3)
-    server: staging          # → looked up in `servers`
-    graph_id: prod           # the graph's id on that server (defaults to the entry key)
-    branch: review
+- **`servers:`** — named remote endpoints (+ auth-by-reference). First-class addressable.
+- **`graphs:`** — named graph locators (embedded or remote). For remote graphs these are *optional aliases*; a server alone is addressable without them.
+
+**Resolution of `--graph X`** (the single rule, applied identically everywhere):
+
+```
+1. graphs.X exists?                  → that locator (Embedded or Remote)        # local alias wins
+2. X is "srv/gid" and servers.srv?   → Remote { server: srv, graph_id: gid }    # qualified, no alias needed
+3. defaults.server set?              → Remote { server: defaults.server, graph_id: X }
+4. otherwise                         → error (unknown graph; no default server)
 ```
 
-`--target staging` resolves: project `targets.staging` → `{server: staging, graph_id: prod, branch: review}` → `servers.staging` → `{endpoint, token-by-ref}` → final `(remote(https://…), prod, review, $TOKEN)`. Embedded targets skip the server hop and use cloud-storage credentials.
+`/` is disallowed in a local alias name, so `srv/gid` is unambiguous (the `docker registry/image` pattern). Step 1 may resolve to either variant; steps 2–3 always resolve `Remote`. Snapshot/branch pins from the entry (or `defaults`) attach to the resolved locator and are overridable by `--branch` / `--snapshot`.
 
-**Two concepts, not kubeconfig's three.** kube splits cluster / user / context; that 3-way split is its most-cursed UX. A target *bundles* server+graph+branch+defaults under one name; the **only** thing split out is `servers`, because endpoints+credentials are shared across many targets and are secret-bearing (different ownership and rate-of-change; see §2). Result: **2 nouns — `servers` and `targets`.** Embedded `targets` (`storage:`) subsume today's `graphs:` entries.
+**With no `--graph`:** bare commands use `defaults.graph` (a graph alias). `defaults.server` is **not** a fallback graph — it only supplies the server for step 3 above when an explicit but otherwise-unknown id is passed. So `omnigraph query` → `defaults.graph`; `omnigraph query --graph production` (no alias `production`, no `/`) → `production` on `defaults.server`.
 
-### 1.1 The resolved address is a typed *locator*, not a `uri` string
+This yields **three addressing tiers**, all valid in either config layer:
 
-The shipped config models a graph as a single `uri: String`, and code branches on `is_remote_uri(uri)`. That conflates two structurally different addresses: an **embedded** graph is a *complete, self-contained* address — one storage URI = one graph, opened directly via the embedded engine; a **remote** graph is a *server endpoint + a `graph_id`* — one server hosts N graphs. A bare server URL **is not a graph**; it lacks the `graph_id`. The cost of the string model, in the code today:
+| Tier | You write | You get | Ceremony |
+|---|---|---|---|
+| Env, no file | `OMNIGRAPH_SERVER=https://…` + token | reach any hosted graph by id | zero |
+| `servers:` entry | a named endpoint (+ auth-by-ref) | reach **any** graph it hosts as `server/graph_id` | one entry per *server* |
+| `graphs:` entry | a local alias → `{server, graph_id, branch, snapshot}` | short name, branch pin, multi-homing | one entry per *aliased graph* |
 
-- the CLI re-decides "server or file?" via `is_remote_uri` at ~16 call sites;
-- `TargetConfig` (one `uri` field) **cannot express** multi-server × multi-graph or a multi-homed graph (E2/E3) — "graph `production` on server `prod-eu`" has no representation;
-- the CLI **bails on remote URIs** for most operations, precisely because the string can't carry the `graph_id`;
-- the `omnigraph-ts` SDK had to model `baseUrl` **+** `graphId` *separately* (rewriting `/graphs/{graphId}/…`) — it invented the structure the string lacks.
+### 2. The typed locator (`storage:` vs `server:`)
 
-So the *resolved* address is a **typed locator**, not a string:
+The shipped model is one `uri: String` plus `is_remote_uri` sniffing at ~16 dispatch sites. That conflates two structurally different addresses: an **embedded** graph is a complete self-contained address (one storage URI = one graph), while a **remote** graph is a *server endpoint + a `graph_id`* (one server hosts N graphs). The *resolved* address is therefore a **typed locator**, not a string:
 
 ```rust
 enum GraphLocator {
-    Embedded { storage: StorageUri },                  // file:// , s3:// — a complete graph
-    Remote   { server: ServerId, graph_id: GraphId },  // which server + which graph (+ bearer creds)
+    Embedded { storage: Storage },                     // a complete graph on an object store
+    Remote   { server: ServerId, graph_id: GraphId },  // which server + which graph (+ server auth)
 }
 ```
 
-A `graphs:` entry resolves into this **once**; downstream code dispatches on the variant (the breadboard's `GraphConn = Embedded(engine) | Remote(http)`) instead of re-sniffing a scheme at each call site. The `uri` string becomes an *input format* for the embedded variant, never the address itself.
+A `graphs:` entry resolves into this **once**; downstream code dispatches on the variant instead of re-sniffing a scheme at each call site.
 
-**YAML naming follows the locator — the *key* names the locus**, so neither the value's scheme nor a comment is load-bearing:
+**The key names the locus** — so neither the value's scheme nor a comment is load-bearing:
 
 | Locus | Key | Value |
 |---|---|---|
-| Embedded | **`storage:`** (shipped `uri:` is a deprecated alias) | a storage URI (`s3://…`, `file://…`) |
-| Remote | **`server:`** | a name in `servers:` (its `endpoint` + creds resolve by name, §5) |
-| Remote graph id | **`graph_id:`** | the id on that server — **defaults to the entry key**; set only when the local alias differs |
+| Embedded | **`storage:`** | a storage location (string or block, below) |
+| Remote | **`server:`** | a name in `servers:` (its `endpoint` + auth resolve by name) |
+| Remote graph id | **`graph_id:`** | the id on that server — **defaults to the entry key** |
 
-An entry has `storage:` **xor** `server:` — the deserializer rejects *both* and *neither* (no silent ambiguity). This removes two prior confusions: `graphs:` (the map) vs `graph:` (the remote id), and `uri:`-might-be-a-server.
+An entry has `storage:` **xor** `server:`; the deserializer rejects both and neither.
+
+**`storage:` is a string-or-block.** The bare scalar covers the common case; the block form gives per-graph object-store options a home (region/endpoint/profile) without a future breaking change, and keeps `uri:` as the precise word for "location" exactly where it is now unambiguous (`storage.uri` is always embedded):
 
 ```yaml
-servers:
-  prod-eu: { endpoint: https://og-eu.internal:8080 }
-graphs:
-  dev:        { storage: s3://team-bucket/dev.omni }   # embedded
-  production: { server: prod-eu }                       # remote — graph_id = "production" (the key)
-  staging:    { server: prod-eu, graph_id: prod }       # remote — alias ≠ server's id
+dev:  { storage: s3://team/dev.omni }            # scalar sugar ⇒ storage: { uri: s3://team/dev.omni }
+prod:
+  storage:
+    uri: s3://team/prod.omni
+    region: eu-west-1
+    endpoint: https://minio.local                # S3-compatible override
+    profile: team-deploy                          # named cloud profile
 ```
 
-### 1.2 Invalid configs are rejected by design
+Shipped flat `uri:` becomes a deprecated alias mapped to `storage.uri` with a load-time warning.
 
-The DX rule is: **a config field is either honored or rejected, never silently ignored**. The loader therefore has two phases:
+### 3. Invalid configs are rejected by design
 
-1. Parse YAML into a loose/raw shape that preserves origin (`base_dir`, layer, line/path when available).
-2. Convert once into a typed, role-aware resolved config. Every command receives the resolved form, not the raw YAML structs.
+The DX rule: **a config field is either honored or rejected, never silently ignored.** The loader has two phases:
 
-The typed graph shape is:
+1. Parse YAML into a raw, origin-preserving shape (`base_dir`, layer, path), with **`deny_unknown_fields`** so a typo errors instead of becoming a silent no-op.
+2. Convert once into a typed, role-aware resolved config. Every command receives the resolved form.
 
 ```rust
+struct Config {                  // identical schema at both layers; deny_unknown_fields
+    version:  u32,               // schema version — forward-compat + clean deprecation gate
+    servers:  Map<ServerId, Server>,
+    graphs:   Map<GraphName, GraphEntry>,
+    defaults: Defaults,
+    serve:    Serve,             // host-role serving config (see §5/§9)
+    aliases:  Map<AliasName, Alias>,
+    query:    QueryRoots,        // client-role: search roots for ad-hoc `--query <path>` .gq files
+}
+
 enum GraphEntry {
-    Embedded(EmbeddedGraphEntry),
-    Remote(RemoteGraphEntry),
+    Embedded(EmbeddedGraph),     // storage: present
+    Remote(RemoteGraph),         // server: present
 }
-
-struct EmbeddedGraphEntry {
-    storage: StorageUri,
-    branch: Option<BranchName>,
-    policy: Option<PolicyFile>,
-    queries: QueryRegistrySpec,
-}
-
-struct RemoteGraphEntry {
-    server: ServerId,
-    graph_id: GraphId,
-    branch: Option<BranchName>,
-}
+struct EmbeddedGraph { storage: Storage, branch: Option<Branch>, snapshot: Option<Version>,
+                       policy: Option<PolicyFile>, queries: Map<Name, QueryDef> }
+struct RemoteGraph   { server: ServerId, graph_id: GraphId, branch: Option<Branch>, snapshot: Option<Version> }
 ```
 
-That makes these rules structural rather than advisory:
+This makes the rules structural rather than advisory:
 
-- A graph entry must specify **exactly one** locator: `storage:`/legacy `uri:` xor `server:`.
-- `policy:` and `queries:` are valid only on `Embedded` graph entries, because they define the capability surface of a graph this process opens directly. A `Remote` graph entry points at a server; that server owns policy and stored-query definitions.
-- `omnigraph-server` may serve only `Embedded` graph entries. A server manifest entry with `server:` is rejected: a server should not "host" a graph by proxying another server.
-- A named graph uses its own graph entry. Top-level `policy:` / `queries:` are a legacy anonymous-bare-URI compatibility path only; if a named graph is selected while top-level blocks would be ignored, config validation errors with a migration hint.
-- A client-defined remote graph discovers stored queries from the server (`GET /queries`) and invokes them (`POST /queries/{name}`); it does not define `queries:` locally for that remote graph.
+- A graph entry must specify **exactly one** locator (`storage:` xor `server:`).
+- `policy:` and `queries:` are valid **only** on `Embedded` entries — they define the capability surface of a graph this process opens directly. A `Remote` entry points at a server that owns its own policy and stored queries.
+- `omnigraph-server` may serve only `Embedded` entries; a server manifest entry with `server:` is rejected (a server must not proxy another server).
+- A `Remote` entry discovers stored queries from the server (`GET /queries`) and invokes them (`POST /queries/{name}`); it never defines `queries:` locally.
 
 Examples that must fail fast:
 
 ```yaml
 graphs:
-  prod:
-    storage: s3://team-bucket/prod.omni
-    server: prod-us                         # invalid: storage xor server
+  bad1: { storage: s3://b/prod.omni, server: prod-us }      # invalid: storage xor server
+  bad2: { server: prod-us, graph_id: production,
+          policy: { file: ./p.yaml } }                       # invalid: remote policy lives on the server
 ```
 
-```yaml
-graphs:
-  prod:
-    server: prod-us
-    graph_id: production
-    policy: { file: ./policies/prod.yaml }  # invalid: remote graph policy lives on the server
-    queries:
-      find_user: { file: ./queries/find_user.gq } # invalid: remote graph queries are discovered
-```
+`omnigraph config view --resolved --show-origin` is the user-facing debugger: it prints the final `Embedded`/`Remote` locator and the origin layer of every honored field. Fields that cannot be honored fail validation first; they never appear in the resolved view.
 
-`omnigraph config view --resolved --show-origin` is the user-facing debugger for this boundary: it shows the final `Embedded` or `Remote` graph and where every honored field came from. Fields that cannot be honored never make it into the resolved view; they fail validation first.
+### 4. Layered config — global-first, uniform schema, project-optional
 
-### 2. Layered config — global-first, uniform schema, project-optional
+**Posture: global-first, project-optional.** The CLI is primarily a *client*, so it sits on the global-first side of the axis — like `kubectl`/`aws`/`gh`/`docker`. The **global user config is the primary, self-sufficient default**; the project file is an optional repo-scoped override (and, when present, the deployment manifest). `omnigraph query --graph prod` must work from any directory with no project file.
 
-**Posture: global-first, project-optional.** OmniGraph's CLI is primarily a *client* (it operates against graphs and servers, embedded or remote), so it sits on the **global-first** side of the CLI-config axis — like `kubectl` / `aws` / `gh` / `docker`, and unlike *project-first* tools (`git` / `cargo` / `terraform`) whose primary config is per-repo. The **global user config is the primary, self-sufficient default**; the project file is an *optional* repo-scoped override (and, when present, the deployment manifest). `omnigraph query --target prod` must work from **any directory with no project file**, exactly as `kubectl get pods --context prod` works from anywhere. *(This is a deliberate flip from today, where the CLI reads `./omnigraph.yaml` and does not even walk parent dirs — i.e. today it is project-anchored.)*
-
-**Rule: the two layers share ONE raw schema, and each is fully self-sufficient** (the git-layering mechanism — same schema at both levels; you never need a repo to have a working config). Do **not** specialize the file format by layer. Instead, run the same role-aware validation everywhere (§1.2): the global and project layers may both define graph locators, defaults, servers, and aliases, but fields that are meaningless for a resolved graph variant are rejected rather than ignored. For example, `queries:` is valid for an embedded graph this config opens directly; it is invalid on a remote graph entry because remote stored queries are server-owned and discovered.
-
-This makes the **zero-project case the default, not an edge case**: a solo user (or an agent) defines everything needed for client work in `~/.omnigraph/config.yaml` — servers, embedded + remote graph locators, defaults, aliases, and optionally personal embedded-graph query registries — and **never creates a project file**. A team adds `./omnigraph.yaml` only when it wants repo-scoped overrides or a committed, GitOps'd deployment manifest. Global-first does **not** forbid project files; it stops *requiring* them (the kubectl model: `~/.kube/config` is sufficient and default; per-project kubeconfigs are opt-in via `KUBECONFIG`).
+**One raw schema, both layers, each self-sufficient.** Do not specialize the format by layer. Run the same role-aware validation everywhere (§3): a layer may define graphs, defaults, servers, and aliases, but fields meaningless for a resolved variant are rejected, not ignored.
 
 | Layer | Required? | Typical use | Path |
 |---|---|---|---|
-| Global | no | **the default** — solo/agent's entire config; shared servers+creds for teams; even a personal server's graphs/queries | `~/.omnigraph/config.yaml` |
-| Project | no | **opt-in** — repo-scoped overrides + the committed deployment manifest (graphs, queries, policy) | `./omnigraph.yaml` |
+| Global | no | **the default** — solo/agent's entire config; shared servers+creds for teams | `~/.omnigraph/config.yaml` |
+| Project | no | **opt-in** — repo-scoped overrides + the committed deployment manifest | `./omnigraph.yaml` |
 
-**Precedence (low → high):** built-in defaults < global < project < env vars < CLI flags. With no project file it collapses to **built-in < global < env < flags** — the common global-only path.
+**Precedence (low → high):** built-in defaults < global < active-context state (§5) < project < env vars < CLI flags. With no project file it collapses to built-in < global < state < env < flags.
 
-**Merge semantics — "closest layer wins, at the smallest meaningful unit"** (the field consensus: git / kubeconfig / cargo / Helm / VS Code):
-- **Settings objects** (`defaults`, `auth`, `server`) → **deep-merge per field**: a project sets `defaults.graph` and *inherits* the global `defaults.output_format`. (VS Code / cargo behavior.)
-- **Named-resource maps** (`servers`, `graphs` / compat `targets`, `queries`, `aliases`) → **union by key; on a collision the higher layer's entry REPLACES the lower wholesale** — *no field-level deep-merge within an entry*. (kubeconfig: union contexts by name.) The footgun this avoids: global `servers.prod = {endpoint, policy}`, project `servers.prod = {endpoint: other}` — deep-merge would silently retain the old fields; replace makes the project's `prod` self-contained and predictable.
-- **Lists/arrays** → **replace, never append** (Helm convention; appending is order-sensitive and surprising).
+**Merge semantics — "closest layer wins, at the smallest meaningful unit":**
+- **Settings objects** (`defaults`, `serve`) → deep-merge per field: a project sets `defaults.graph` and inherits the global `defaults.output_format`.
+- **Named-resource maps** (`servers`, `graphs`, `queries`, `aliases`) → union by key; on a collision the higher layer's entry **replaces** the lower wholesale (no field-level deep-merge within an entry — replace makes the higher layer's entry self-contained and predictable).
+- **Server identity is not lower-trust-overridable (security).** A `servers:` entry's `endpoint` and `auth` are its **identity**. A *lower-trust* layer (project < global) may add new servers or override non-identity fields, but may **not** redefine the `endpoint`/`auth` of a server an upper layer already defined — that is rejected (use a distinct name). Without this, a project file (which an agent in the repo can edit, or a cloned repo can ship) could repoint `servers.prod.endpoint` and, because credentials are keyed by name, harvest the user's `prod` token. Composes with credential endpoint-binding (§7) as defense in depth.
+- **Lists** → replace, never append.
 - **Scalars** → higher layer wins.
-- **Relative paths carry their origin's base_dir.** A `queries:` entry's `.gq` path, or a `policy.file`, resolves against the directory of the layer it was *defined in* — global entries under `~/.omnigraph/`, project entries under the project dir.
-- **Inspectable (non-negotiable):** `omnigraph config view --resolved --show-origin` prints each final value *and which layer set it* (the `git config --show-origin` / `kubectl config view` rule). A layered config without origin-tracing is a debugging trap.
+- **Relative paths carry their origin's `base_dir`** — a `queries:` `.gq` path or a `policy.file` resolves against the directory of the layer it was defined in.
+- **Inspectable (non-negotiable):** `config view --resolved --show-origin` prints each final value and the layer that set it.
 
-### 3. Roles, and the file-naming decision (same name for project = server)
+### 5. File layout, naming, and the secrets boundary
 
-`omnigraph.yaml` carries two *roles* that diverge in prod and collapse on a laptop:
+The layout splits on the **two boundaries that are actually irreducible — secrecy and scope — and never on role**:
 
-- **Server role** (read by `omnigraph-server`): `graphs:` entries that are **embedded storage locators**, per-graph `policy.file`, **`queries:` — the stored-query/MCP registry lives here**, plus serving knobs. Remote graph locators are rejected in this role.
-- **Client role** (read by the CLI/agent): `servers:`, embedded or remote `graphs:` locators, `defaults:`, `aliases:`. A remote graph locator points at server-owned capabilities; it cannot define local `policy:` or `queries:`.
-
-**Project config and server config are the same artifact, hence the same name.** The server *serves the project*: the file that says "these graphs exist, with these stored queries and this policy" is simultaneously the project manifest and the server's deploy config. Role is distinguished by which *sections* are populated, never by filename. Readers ignore sections that are not theirs (today's file already does this with `cli:` vs `server:`).
-
-**Why not kube's role-split.** Two coherent models exist: (A) one project file with role-sections (Helix `helix.toml` holds both `[local.dev]` and `[enterprise.production]`; compose; Cargo), and (B) deployment-manifest strictly separate from client config (kubectl — you never put a context in `deployment.yaml`). kube is the sharpest topological analog (multi-server × multi-graph, one client targeting many), so B has a real claim. The tiebreaker is **E1: OmniGraph is embedded-first.** In embedded mode the manifest's `graphs:` *is* the local target list — manifest and local-client-view are the same object, so splitting them (B) fights the grain and forces two files for local work. kube splits because it has **no** embedded mode (client always remote+global). So: take the half kube is right about — *remote* client targeting (`servers:`, endpoints, creds) is a separate concern in a separate **user-global** file (`config.yaml`, like `~/.kube/config`); reject the half it is wrong about for us — do **not** split the *project* layer by role. **The second name (`config.yaml`) is justified by scope (user-global), not role.** *(If OmniGraph ever dropped embedded mode and went pure-remote, model B's strict split would become cleanest.)*
-
-### 4. File naming
-
-Principles from the field: **one global dir** `~/.omnigraph/` (like `~/.aws`/`~/.kube`/`~/.helix`), with config/cache/state as **subdirectories** (separation without XDG's three-root scatter); **secrets keyed by server name in the OS keychain or a separate git-ignored profile file** (AWS/gh model, not a new `credentials.yaml`); **project-root manifest keeps the app-named file** (`Cargo.toml`, `package.json`); **`.yaml`, not `.yml`**; keep OmniGraph's established names. The genuinely *new* decisions are the **global** dir's existence and keyed-by-name resolution with an explicit `auth.token` override (MR-971); the shipped `bearer_token_env` + `auth.env_file` mechanism remains as legacy compat.
-
-| Artifact | Path / name | Why |
+| Axis | Real boundary? | Why |
 |---|---|---|
-| Project = server config (one artifact) | `./omnigraph.yaml` | **Keep.** Root manifest like `Cargo.toml` / `compose.yaml` / `helix.toml`. Same name for both roles because it is one file. In prod the server's deploy repo and an app repo each have their own `omnigraph.yaml` — same name, different repos. |
-| Global user config | `~/.omnigraph/config.yaml` | **One dir** (`~/.omnigraph/`, like `~/.aws`/`~/.kube`/`~/.helix`). Named `config.yaml` *not* `omnigraph.yaml` — the name signals scope (and `~/.aws/config`, `~/.kube/config`, `~/.helix/config` all do this). Holds the full schema so a solo user needs nothing else. |
-| Credentials | OS keychain (`omnigraph:<server>`, preferred) → `~/.omnigraph/credentials` profile file (`[<server>]`, `0600`, git-ignored). **Keyed by server name**, inside the one dir. | **Key by name, AWS/gh model** — `~/.aws/credentials [profile]`, `~/.kube/config users:`, `~/.helix/credentials`. *Not* a `credentials.yaml`, and *not* a per-server hand-named env var; the secret lives under the server name (no indirection). Legacy `bearer_token_env` + `.env.omni` dotenv remain as a compat path. See §5. |
-| Cache / state | `~/.omnigraph/cache/`, `~/.omnigraph/state/` | Subdirs of the one dir (like `~/.aws/sso/cache/`, `~/.kube/cache/`) — cache is `rm -rf`-safe and backup-excludable without scattering across XDG roots. |
-| Cedar policy | `./policies/<env>.yaml` + `<env>.tests.yaml` | **Keep.** Referenced by `policy.file`. |
-| Schema | `./*.pg` (e.g. `schema.pg`) | **Keep.** |
-| Stored queries | `./queries/*.gq` | **Keep.** `.gq` sources referenced by the `queries:` registry. |
+| Secrecy (secret vs secret-free) | **yes, hard** | Security + AX: a secret-bearing file in the repo is exfiltratable by an agent and committable by a human. |
+| Scope (user-global vs project-local) | **yes, hard** | Different lifecycle, owner, and VCS status. |
+| Role (client vs server) | **no, soft** | On a laptop they collapse (E1); in prod they are different *repos* sharing a schema. Role is which sections are filled, not which file. |
 
-**Global dir: `~/.omnigraph/` — one place, with subdirectories.** Everything OmniGraph keeps for a user lives under a single `~/.omnigraph/` directory, matching the peer group (`~/.aws`, `~/.kube`, `~/.docker`) and the direct competitor (`~/.helix`). This is what DB/cloud-CLI users expect and the lowest-cognitive-load shape.
+```
+~/.omnigraph/                       # global, user-scoped, machine-local, NEVER in VCS
+├── config.yaml                     # servers + personal graphs + defaults + aliases   (SECRET-FREE)
+├── credentials                     # INI, [server] → token, 0600, gitignored   (FALLBACK; keychain preferred)
+├── cache/                          # remote catalogs (GET /graphs), OAuth token cache — rm -rf safe
+└── state/                          # active-context (omnigraph use), session logs
 
-*Separation and "one place" are not in conflict* — the decisive realization. The peer tools get config/cache/state separation via **subdirectories inside the one dir**, not via XDG's three scattered roots: `~/.aws/sso/cache/`, `~/.kube/cache/`. So OmniGraph keeps `~/.omnigraph/config.yaml`, `~/.omnigraph/credentials`, `~/.omnigraph/cache/` (catalogs — `rm -rf`-safe, backup-excludable), `~/.omnigraph/state/` (session, logs) — getting cache hygiene **and** a single discoverable location, without the XDG scatter. An earlier draft argued XDG on a false dichotomy (it assumed single-dir ⇒ mixed); subdirs dissolve it. `~/.omnigraph/` is canonical and documented; `$XDG_CONFIG_HOME` may optionally be honored if a user has set it, but XDG is not part of the mental model.
+<repo>/omnigraph.yaml               # project = deployment manifest, committed, portable   (SECRET-FREE)
+<repo>/schema.pg, queries/*.gq, policies/*.yaml
 
-**Env / override precedence (the `KUBECONFIG` analog):**
-- `OMNIGRAPH_CONFIG=/path` — explicit config file, highest precedence.
-- `OMNIGRAPH_HOME=/path` → the global dir (default `~/.omnigraph/`); `$XDG_CONFIG_HOME` optionally honored if a user has set it, but `~/.omnigraph/` is canonical.
-- Cache and state are subdirs of the one dir: `~/.omnigraph/cache/` (cached remote catalogs), `~/.omnigraph/state/` (session, logs).
-- Per-server token resolution: an explicit `auth: { token: {...} }` source (env/file/command/keychain) wins if set; otherwise **keyed by the server name** — `OMNIGRAPH_TOKEN_<NAME>` (or `OMNIGRAPH_TOKEN` for the active server) → OS keychain `omnigraph:<name>` → the `[<name>]` profile in `~/.omnigraph/credentials`; legacy `bearer_token_env` still honored. See §5.
+# secrets at rest:  OS keychain  omnigraph:<server>   (preferred — no plaintext file)
+# secrets in CI:    OMNIGRAPH_BEARER_TOKEN[_<SERVER>] env
+```
 
-### 5. Credentials, connection tiers, and bind portability (12-factor)
+**Naming decisions (best-practice + de-conflicted; breaking where it removes ambiguity):**
 
-**Credentials are by-reference everywhere, never inlined — and keyed by the *server name*, not by a hand-invented env-var name.** This is the one place the design departs from simply reusing the shipped `bearer_token_env` mechanism, because that mechanism is sub-optimal for a multi-server client: it forces the operator to invent and coordinate an env-var name per server (three steps to add a server: pick a var, name it in config, set it in the store). The peer group (AWS profiles, `gh` hosts, kubeconfig users, docker auths) instead keys the secret **by the server's name** — no indirection. OmniGraph should match that.
+| Shipped | This RFC | Why |
+|---|---|---|
+| `server:` (self) vs `servers:` (remote) | **`serve:`** vs `servers:` | Two keys one letter apart with opposite meaning is the worst ambiguity in the current schema. `serve:` = "config when I serve"; `servers:` = "remotes I target." |
+| `uri:` (graph-entry top level) | **`storage:`** (string-or-block; `uri:` nested) | `uri:` conflated embedded/remote (§2). |
+| `cli:` block | folded into **`defaults:`** | "default graph/branch/format/actor" is one concept; no consumer-specific block. |
+| top-level `policy:` / `queries:` | **removed** | per-graph only; deletes the dual-site reconciliation machinery. "Single-graph mode" = a one-entry `graphs:` map. |
+| `bearer_token_env:` (per-graph) | **`servers.<>.auth.bearer.token.env`** | auth is per-server (§6); old field kept as a legacy alias. |
+| `auth.env_file` (project dotenv) | **deprecated (warned)** | no secret-bearing file in the project tree. |
+| `aliases.<>.query: <path>` + `command:` | **`aliases.<>.query: <name>`** (reference) | an alias references a *defined* query; read/mutate inferred (§8). |
+| `project: { name }` | **removed** | no consumer. |
+| *(none)* | **`version: 1`** + `deny_unknown_fields` | forward-compat; typos error rather than no-op. |
+| `query.roots:` | **retained** | resolves ad-hoc `--query <relative>.gq`; orthogonal to the alias/registry model. |
 
-**Resolution for server `<name>` (no config field required):**
-1. **`OMNIGRAPH_TOKEN_<NAME>`** env var (name-derived, upper-snake), else **`OMNIGRAPH_TOKEN`** for the active server — the CI/headless override (12-factor).
-2. **OS keychain** entry `omnigraph:<name>` — the preferred interactive store (no plaintext on disk); written by `omnigraph login <name>`.
-3. **`~/.omnigraph/credentials`** — an AWS-style profile file keyed by server name (mode `0600`, git-ignored), the fallback when no keychain:
+Conventions kept: **snake_case** keys; **plural maps** keyed by name; **`~/.omnigraph/config.yaml`** global (named `config` — the universal convention) + **`./omnigraph.yaml`** project (app-named manifest). `OMNIGRAPH_HOME` overrides the global dir; `OMNIGRAPH_CONFIG` overrides the config file path; `$XDG_CONFIG_HOME` honored if set, but `~/.omnigraph/` is canonical.
+
+**Active context is *state*, not declarative config.** `omnigraph use <graph>` writes `~/.omnigraph/state/active.yaml` (a thin `{server, graph}`), leaving the user-authored `config.yaml` pristine — avoiding kube's comment-stripping rewrite of `~/.kube/config`. It slots into precedence between global and project (§4).
+
+**Four hard rules (promote to invariants):**
+1. **No secret in any `*.yaml`, ever** — global or project. Secrets: keychain → `credentials` (INI, `0600`) → env.
+2. **No secret-bearing file in the project tree.** (Kills project-local `.env.omni`; kept as a warned compat path, removed next major.)
+3. **The project tree carries capability + targeting, never identity.** A project layer may *target* servers and define graphs, but it may not assert a server's identity — redefining a higher-layer server's `endpoint`/`auth` is rejected (§4), and credentials are endpoint-bound (§7). This is the AX guarantee that makes "hand an agent a repo" safe by construction.
+4. **`config.yaml` ⊇ `omnigraph.yaml` schema; scope is the only difference.** Same parser, role-aware validation, `config view --resolved` is the disambiguator.
+
+### 6. Auth — method × source are orthogonal
+
+The shipped code knows only bearer-from-env. Two independent axes must be separated:
+
+- **Method** = *what kind of credential/protocol*: `bearer`, `oauth`, `mtls`, `none`. Exactly one per server.
+- **Source** = *where secret material is read from*: `env`, `file`, `command`, `keychain`. Reusable wherever a secret is needed.
+
+OAuth is **not** "just another token source": it has an interactive flow, endpoints (issuer/client_id/scopes), and refresh semantics, and its tokens are minted by `omnigraph login` and cached in the keychain — never in config. So it is a *method* with its own fields.
+
+```rust
+// servers.<name>.auth — fully optional; absent ⇒ implicit bearer chain keyed by name
+enum Auth {
+    Bearer { token: SecretSource },
+    None,                                   // explicitly unauthenticated (not accidental)
+    // Reserved — shape-stable but not implemented in v1 (own milestone, see Rollout V6):
+    OAuth  { issuer: Url, client_id: String, scopes: Vec<String>, audience: Option<String> },
+    Mtls   { cert: SecretSource, key: SecretSource },
+}
+enum SecretSource {
+    Env(String),           // env:      OMNIGRAPH_BEARER_TOKEN_PROD
+    File(PathBuf),         // file:     /run/secrets/og-token
+    Command(Vec<String>),  // command:  [vault, read, -field=token, secret/og]  (argv list, no shell)
+    Keychain(String),      // keychain: omnigraph:prod
+}
+```
+
+**Externally-tagged** (the key names the method/source), consistent with §2 — a field under `oauth:` cannot leak into `bearer:`.
+
+| Method / source | Use case | YAML |
+|---|---|---|
+| *(omit `auth:`)* | the common case | implicit chain (below) |
+| `bearer.token.env` | CI / secrets-manager fixed var | `auth: { bearer: { token: { env: OG_PROD_TOKEN } } }` |
+| `bearer.token.file` | k8s/docker mounted secret | `auth: { bearer: { token: { file: /run/secrets/og } } }` |
+| `bearer.token.command` | Vault / cloud IAM / `gh auth token` | `auth: { bearer: { token: { command: [vault, read, -field=token, secret/og] } } }` |
+| `bearer.token.keychain` | pin a non-default keychain entry | `auth: { bearer: { token: { keychain: omnigraph:prod } } }` |
+| `oauth` | SaaS / SSO — `omnigraph login` device flow | `auth: { oauth: { issuer: https://auth.og.cloud, client_id: og-cli, scopes: [graph.read, graph.write] } }` |
+| `mtls` | client-cert networks | `auth: { mtls: { cert: { file: ./client.pem }, key: { file: /run/secrets/og-key.pem } } }` (key off the repo tree — hard rule 2) |
+| `none` | open dev server | `auth: { none: {} }` |
+
+**Scope (v1): only `bearer` and `none` are implemented.** `oauth` and `mtls` are **reserved** — the enum shape is fixed (so adding them later is not a breaking re-key, per Hyrum's Law), but a config selecting them errors with "auth method not yet supported." Full OAuth (device flow, token cache, refresh, OIDC server-side validation) and mTLS are a later milestone (Rollout V6).
+
+**Auth is per-server, not per-graph.** One credential authenticates you to a *server*; Cedar then authorizes per graph. The shipped per-graph `bearer_token_env` is the wrong grain for a multi-graph world (it repeats across every graph on a server); it survives as a legacy alias for `servers.<n>.auth.bearer.token.env`.
+
+**The `command` source** runs locally with the operator's own privileges and is defined only in operator-owned config (never server-supplied), so it adds no remote-execution surface. The `auth:` union is method-tagged so adding a method later is a new variant, not a re-key (Hyrum's Law: the field name is a contract once shipped).
+
+**Server-side accept config is separate and secret-free** (it validates incoming credentials; it is not a credential) and lives under `serve:`:
+
+```yaml
+serve:
+  auth:
+    bearer: { enabled: true }                                  # tokens via OMNIGRAPH_SERVER_BEARER_TOKEN* env
+    oauth:  { issuer: https://auth.og.cloud, audience: og-api } # validate OIDC tokens (reserved/future, V6)
+  policy: { file: ./policies/server.yaml }                      # server-level Cedar (management endpoints)
+  # bind/workers are 12-factor: --bind / OMNIGRAPH_BIND, never committed here
+```
+
+### 7. Credential resolution and connection tiers
+
+**Implicit chain for server `<name>`** (when `auth:` is omitted), keyed by name, reusing the shipped env var:
+1. **`OMNIGRAPH_BEARER_TOKEN_<NAME>`** (name-derived, upper-snake), else **`OMNIGRAPH_BEARER_TOKEN`** for the active server — the CI/headless override.
+2. **OS keychain** `omnigraph:<name>` — the preferred interactive store; written by `omnigraph login <name>`.
+3. **`~/.omnigraph/credentials`** — INI profile keyed by server name (`0600`, git-ignored):
    ```ini
    [prod-us]
    token = …
    [prod-eu]
    token = …
    ```
-So a `servers.<name>` with no token field resolves by name — adding a server is one step (`omnigraph login <name>`), and "multiple servers, multiple tokens" falls out for free.
 
-**But implicit must not be the *only* path — explicit sourcing is a first-class option** (the DX/AX lesson). Pure-convention is invisible (you must *know* `OMNIGRAPH_TOKEN_<NAME>`), can't integrate with a secrets-manager's fixed var name, and can't do dynamic/short-lived tokens. So a server may declare an explicit `auth:` block — a **method-agnostic wrapper** (today only `token:` for bearer; `mtls:`/`oidc:` are the future siblings, so the credential model never has to be re-keyed) holding a tagged token *source*. Secrets are *still* never inlined (every source is a reference):
+**Credentials bind to `(server_name, canonical_endpoint)`, not the name alone (security).** `omnigraph login <server>` records the endpoint the credential was issued for; at point-of-use the token is released **only if the resolved endpoint matches**. This check runs regardless of source — including `OMNIGRAPH_BEARER_TOKEN_<NAME>`, since a lower-trust layer can repoint which endpoint `<NAME>` resolves to even when it cannot set the env var. A mismatch withholds the token with an explicit error (`server 'prod' resolved to <endpoint>, which does not match the endpoint this credential was issued for`). Together with the §4 identity rule, this closes the credential-redirection path.
 
-```yaml
-servers:
-  prod-us:
-    endpoint: https://og-us…
-    auth: { token: { env: OG_PROD_US_TOKEN } }     # explicit env var — self-documenting (= legacy bearer_token_env)
-  prod-eu:
-    endpoint: https://og-eu…
-    auth: { token: { command: [vault, read, -field=token, secret/og] } }   # dynamic / short-lived
-  edge:
-    endpoint: https://og-edge…
-    auth: { token: { file: /run/secrets/og-token } }   # k8s/docker mounted secret
-  staging:
-    endpoint: https://og-staging…          # no auth: → implicit chain (below)
-```
+If `auth:` is set, that source is used (no fallthrough). `omnigraph login <server>` writes/rotates only that server's secret (keychain preferred; OAuth, when implemented (V6), runs the device flow and caches tokens in the keychain → `~/.omnigraph/cache/oauth/`). There is **no `credentials.yaml`** and no inlined secret. *Convention for the floor, explicit for control.*
 
-| `auth.token:` source | when | DX/AX value |
-|---|---|---|
-| *(auth omitted)* | the common case | zero-config; `omnigraph login` populates keychain `omnigraph:<name>` |
-| `{ env: VAR }` | secrets-manager / CI injects a fixed var | **self-documenting** — config states the source; = the legacy `bearer_token_env` |
-| `{ file: PATH }` | k8s/docker secret mounted as a file | no env plumbing |
-| `{ command: [...] }` | Vault, cloud IAM, `gh auth token` | **dynamic tokens** — first-class exec, the capability pure-env/keychain can't give (kube `exec` / AWS `credential_process`) |
-| `{ keychain: ENTRY }` | pin a non-default keychain entry | explicit override of the name-derived default |
+**Cloud-storage credentials** for embedded `storage:` graphs come from the ambient cloud chain (`AWS_*`, instance roles, `~/.aws/credentials`), optionally narrowed by `storage.profile`/`storage.region`/`storage.endpoint` (§2). OmniGraph never stores object-store secrets.
 
-**Resolution per server:** if `auth.token:` is set, use that source (no fallthrough). Else the **implicit chain**: `OMNIGRAPH_TOKEN_<NAME>` (or `OMNIGRAPH_TOKEN` for the active server) → keychain `omnigraph:<name>` → `[<name>]` in `~/.omnigraph/credentials` (`0600`, git-ignored). `omnigraph login <server>` writes/rotates only that server's secret; per-server precedence is independent; sharing is opt-in (same env var or source). The `command` source runs locally with the operator's own privileges and is defined only in operator-owned config (never server-supplied), so it adds no remote-execution surface. The `auth:` wrapper is method-agnostic so adding mTLS/OIDC later is a new sibling key, not a breaking re-key (Hyrum's Law: the field name is a contract once shipped). There is **no `credentials.yaml`** and **no inlined secret**. *Convention for the floor, explicit for control — and explicit is legible to agents and never inlines a secret.*
+**Three connection tiers** (the zero-config floor):
+1. **Env vars** — `OMNIGRAPH_SERVER=https://…` + token: fileless remote (the `DATABASE_URL` floor; `OMNIGRAPH_SERVER` is new).
+2. **Global `config.yaml`** — named `servers:` (+ optional graph aliases) for multi-server setups.
+3. **Project `omnigraph.yaml`** — project-pinned graphs/aliases, committed.
 
-**Back-compat.** The shipped per-graph `bearer_token_env` + `auth.env_file` dotenv (`resolve_remote_bearer_token`, real-env-wins) keeps working unchanged for existing single-server setups; `bearer_token_env` is just the legacy flat alias for `auth: { token: { env } }`. Resolution tries an explicit `auth.token:` (or legacy `bearer_token_env`) first, then the keyed-by-name chain — so nothing breaks, but the zero-config default is the no-boilerplate keyed-by-name path. (MR-971 — the `bearer_token_env` parity gap — is where this resolver work lands.)
+### 8. Stored queries (definitions) vs. aliases (invocations)
 
-**Three connection tiers** (Supabase/Prisma teach the zero-config floor):
-1. **Env vars** — `OMNIGRAPH_SERVER=https://…` + `OMNIGRAPH_TOKEN=…`: zero-config remote, no file (the `DATABASE_URL` floor).
-2. **Global `config.yaml`** — named `servers:` + `graphs:` for multi-server setups (the AWS-profiles convenience).
-3. **Project `omnigraph.yaml`** — project-pinned targets/graphs, committed.
+A stored query and a CLI alias are different concepts; do not collapse them, but do remove their overlap:
 
-**Keep `omnigraph.yaml` a *portable* manifest (12-factor).** Deploy-specific runtime that varies per environment — the **bind host/port**, worker counts — should be supplied by **`--bind` / `OMNIGRAPH_BIND` (flags/env)**, *not* a committed `server.bind:` baked into the manifest. A manifest that hardcodes `0.0.0.0:8080` is not portable across deploys and leaks an environment detail into a version-controlled file. The same-named `omnigraph.yaml` stays portable across deploys precisely because the volatile, per-environment knobs live in env/flags (12-factor config), while the stable, portable definition (graphs, queries, policy) lives in the file. This is the one concrete lesson taken from kube's model-B without adopting its file split: portability via env/flags, not via a second file.
-
-### 6. Where stored queries live: defined locally, invoked remotely
-
-A stored query splits across two axes; do not conflate them:
-- **Definition** (`.gq` source + `queries:` entry) lives next to the **embedded graph entry that owns it**. For a hosted remote graph, that is the **deployment manifest** read by `omnigraph-server`; for a personal embedded graph, it may be the user's own config. It never lives on a client-side `Remote` graph entry.
-- **Discovery** ("what tools exist for me?") is fetched from the **server** (Cedar-filtered `GET /queries` / MCP catalog) at connect time.
-- **Invocation** is **remote** (client → server, HTTP/MCP) — or **embedded** (the CLI opens the graph directly and reads the same manifest).
-
-For remote use, the client carries *pointers to servers*, not query definitions; it **discovers and invokes**, never defines. This is the **capability-as-code guarantee for agents**: an agent can only invoke tools the server's *committed, reviewed* config exposes — it **cannot define a new tool at runtime**. Definition is structurally outside the agent's reach.
-
-`queries:` (graph-capability registry, Cedar-gated when served remotely, MCP-visible when exposed) and `aliases:` (client CLI shortcut) overlap — both can name `.gq`-backed operations. This RFC keeps them siblings (the MR-969 decision); the clean long-term is **one registry, two invocation surfaces** (embedded + remote), with `aliases:` subsumed. Out of scope here.
-
-#### Reconciling `aliases:` with the role model
-
-`aliases:` is the pre-MR-969, **client-role, embedded-only, ungated** ancestor of `queries:`. An alias bundles `command` (read/change), `query` (`.gq` path), `name` (symbol), `args` (positional param names), and `graph`/`branch`/`format` defaults; the CLI runs it embedded. The server never reads it. So:
-
-- **Role:** `aliases:` is **client-role** (CLI behavior) → it may live in **both** the user-global `config.yaml` and the project manifest, layered. `queries:` is **graph-capability role** → it lives only on an `Embedded` graph entry, and for remote server graphs that means the server deployment manifest. *Who opens the graph determines where query definitions can live.*
-- **Difference:** `aliases:` = embedded invocation, no gating, explicit `command`, bundles client defaults + positional args. `queries:` = remote (+future embedded), Cedar + `mcp.expose`, **infers** read/mutate, bundles only MCP settings.
-- **Convergence:** decompose an alias — *definition* (name→.gq+symbol) → `queries:` (the superset: typed, validated, gated, multi-surface, no redundant `command`); *target/branch/format* → client invocation context (`--target`/`--branch`/`--format` or `defaults:`), not baked per-query; *positional `args`* → thin CLI sugar or dropped (agents/services use named JSON params). End-state: one `queries:` registry + the client config model subsumes `aliases:`.
-- **Validation:** a file-backed alias (`query: ./foo.gq`) may target only an embedded graph. A remote graph shortcut must be explicit that it invokes a server-owned stored query, e.g. `invoke: find_user`, so the client cannot smuggle a new `.gq` definition into a remote capability surface.
-- **v1:** keep `aliases:` unchanged. Footgun worth a load-time warn: an alias and a query with the same name in one manifest are different namespaces invoked differently (`--alias X` vs `POST /queries/X`).
+- **Definition** (`.gq` source + a `queries:` entry) lives next to the **embedded graph entry that owns it** — for a hosted graph, the deployment manifest read by `omnigraph-server`. It is the capability surface (Cedar-gated when served, MCP-visible when exposed). It never lives on a `Remote` entry.
+- **Discovery** ("what can I call?") is fetched from the server (`GET /queries`, Cedar-filtered) at connect time.
+- **Invocation** is remote (`POST /queries/{name}`) or embedded (open the graph, read the same manifest).
+- **Alias** = a client-side *saved invocation* that **references** a defined query and binds invocation context — it never defines a `.gq`:
 
 ```yaml
+graphs:
+  prod:
+    storage: s3://team/prod.omni
+    queries:
+      find_user: { file: ./queries/find_user.gq, mcp: { expose: true, tool_name: lookup_user } }
+
 aliases:
-  local_owner:
-    command: query
-    query: ./queries/owner.gq
-    name: owner
-    graph: dev          # valid only if `dev` resolves Embedded
-
-  remote_owner:
-    invoke: find_user
-    graph: prod         # valid only if `prod` resolves Remote; source lives on the server
-    args: [name]
+  owner: { graph: prod, query: find_user, branch: review, format: table, args: [name] }
 ```
 
-### 7. CLI surface
+This is the **capability-as-code guarantee for agents**: an agent can only invoke tools the server's committed, reviewed config exposes; it cannot define a new tool at runtime. Making the alias a *reference* (not a second definition site with an inline `.gq` path and an explicit `command`) removes the "alias and query with the same name are different namespaces" footgun and the duplicate-definition drift, while keeping saved-invocation ergonomics. Read vs mutate is inferred from the referenced definition.
 
-- `omnigraph login <server>` — interactive auth; stores the token keyed by server name in the OS keychain (`omnigraph:<server>`) or the `[<server>]` profile of `~/.omnigraph/credentials` (0600). The `gh auth login` analog.
-- `omnigraph use <graph>` — set the active graph (writes the appropriate layer). The `kubectl config use-context` analog.
-- `omnigraph config view [--resolved] [--show-origin] [<graph>]` — print the merged config and, with `--resolved`, the final tuple **plus the origin layer of every field** (the `git config --show-origin` / `kubectl config view` analog). Resolution is never a mystery.
-- All existing verbs (`query`, `mutate`, `load`, `schema`, `branch`, …) gain `--graph <name>`; resolution decides embedded vs remote transparently.
+### 9. Server-mode disambiguation (the V2 prerequisite)
 
-### 7.5 Init, login, and bootstrap — three tiers (folds in the Q2 design)
+**What the server serves.** `serve.graphs: [<name>, …]` selects which embedded `graphs:` entries this process serves (default: **all** embedded entries). It subsumes the removed `server.graph` (a one-element list). Mode is derived from the served count: one ⇒ single, many ⇒ multi.
 
-Scaffolding splits into three tiers by *scope* and *fatness*, mirroring the field (supabase `init` vs `login`; HelixDB thin `init` vs fat `chef`). Most of this lives in sibling tickets; this RFC owns only the **user route**.
+**Canonical wire id.** Every served graph has a canonical `graph_id` — its `serve.graphs` selection name, or `default` for a bare-URI server started with no config. The server **always mounts `/graphs/{graph_id}/…`**. The legacy flat routes (`/query`, `/branches`, …) remain **only when exactly one graph is served**, as a compat alias bound to that graph. `GET /graphs` returns the served set (one entry in single mode — today's single-mode 405 is removed) and stays `graph_list`-gated.
 
-| Tier | Command | Scope | What it does | Model | Status |
-|---|---|---|---|---|---|
-| **User route** | `omnigraph login [<server>]` | user (`~/.omnigraph/`) | auth + write `~/.omnigraph/config.yaml` / `credentials`; first-run global setup | gh / supabase `login` | **this RFC** (unbuilt) |
-| **Thin project init** | `omnigraph init` | project, in-place | create graph + `scaffold_config_if_missing` (`omnigraph.yaml` + minimal `.pg`/`.gq`); refuse-if-exists or `--force` | `cargo init`, `prisma init` | exists; `--force` purge = MR-975 |
-| **Fat bootstrap** | `omnigraph quickstart [--template <t>] [--auto]` | project, possibly new-dir | scaffold + seed data + `serve start` + agent prompt file | HelixDB `chef`, `create-next-app` | MR-973 (unbuilt) |
+**Client.** The client config is **mode-agnostic**: a `Remote` locator always carries `graph_id`, and the client always builds `/graphs/{graph_id}/…`. It never needs to know a server's deploy mode.
 
-**Design positions** (first-principles, since none of the fat tier is built):
-- **Split `init` (project) from `login` (user)** — never one command writing to both `$HOME` and the project (the supabase line, not the dbt line). `init`=project scaffold; `login`=user credential + global config.
-- **`init` is in-place + refuse-if-exists** (cargo/prisma/terraform default): don't clobber; adopt existing files; require `--force` to overwrite (and `--force` purges Lance state per MR-975).
-- **Interactive for humans, `--auto`/agent-mode for automation** (npm `-y`, create-* `--CI`, MR-981 `--machine`). In `OMNIGRAPH_AGENT_MODE` any prompt → fail with a repair hint.
-- **Templates are a `--template <name>` flag on the fat tier** (create-vite model), with the *content* (schema + queries + seed) coming from a template source. Mechanism is a design question (bundled-in vs `og template pull` from a repo vs `npm create-*`-style delegation) — **not** an existing foothold (MR-581 stale). Lean: a small set of bundled templates first (generic `Person→Knows`, plus promote `omnigraph-intel-bootstrap`), `--template <github>` later.
-- **`init`/`quickstart` can scaffold the `graphs:` map with one or more entries**; "init with specific graphs" = the scaffolded `graphs:` block (embedded `storage:` locally; the agent/operator adds remote `server:` entries via `login` + editing).
-- **Secrets-on-scaffold rule** (prisma/dbt/supabase all do this): anything that writes a token also keeps it out of VCS. `login` prefers the OS keychain (no file); the `~/.omnigraph/credentials` profile fallback is `0600` and git-ignored, and any project-local `.env`-shaped file gets a `.gitignore` entry.
+This avoids shipping two URL shapes for the same operation depending on a config mode (a Hyrum's-Law liability) and lets the existing CLI remote paths be rewired once to the prefixed form (and migrated off the deprecated `/read`/`/change`). The fallback, if route unification is deferred, is a cached `GET /graphs` probe in `~/.omnigraph/cache/` (the catalog already returns each `graph_id`); it is strictly worse and not preferred. **V2 is gated on route unification.**
 
-### 8. Concrete shape
+### 10. CLI surface
+
+- `omnigraph login <server>` — interactive auth; stores the token in the keychain (`omnigraph:<server>`) or the `[<server>]` profile (`0600`); runs the OAuth device flow for `oauth` servers. The `gh auth login` analog.
+- `omnigraph use <graph>` — set the active context; writes `~/.omnigraph/state/active.yaml`. The `kubectl config use-context` analog.
+- `omnigraph config view [--resolved] [--show-origin] [<graph>]` — print the merged config and, with `--resolved`, the final locator plus the origin layer of every field.
+- All existing verbs gain `--graph <name>` (the shipped flag is `--target`, kept as a deprecated alias); resolution (§1) decides embedded vs remote transparently.
+
+### 11. Init, login, bootstrap — three tiers
+
+| Tier | Command | Scope | What it does | Status |
+|---|---|---|---|---|
+| **User route** | `omnigraph login [<server>]` | user (`~/.omnigraph/`) | auth + write `config.yaml`/`credentials`; first-run global setup | this RFC (unbuilt) |
+| **Thin project init** | `omnigraph init` | project, in-place | create graph + `scaffold_config_if_missing`; refuse-if-exists or `--force` | exists; `--force` purge unbuilt |
+| **Fat bootstrap** | `omnigraph quickstart [--template <t>] [--auto]` | project | scaffold + seed + serve + agent prompt file | unbuilt (needs `serve`) |
+
+Design positions: **split `init` (project) from `login` (user)** — never one command writing to both `$HOME` and the project; **`init` is in-place + refuse-if-exists** (cargo/prisma default); **interactive for humans, `--auto`/`OMNIGRAPH_AGENT_MODE` for automation** (any prompt → fail with a repair hint); **templates are a `--template` flag** on the fat tier; **secrets-on-scaffold rule** — anything that writes a token keeps it out of VCS (keychain preferred; `credentials` is `0600` and git-ignored).
+
+## Concrete shape
 
 **Global** `~/.omnigraph/config.yaml` (per-user, secret-free):
 ```yaml
-servers:                               # endpoint only — token is keyed by the server name
-  prod-us:  { endpoint: https://og-us.internal:8080 }
-  prod-eu:  { endpoint: https://og-eu.internal:8080 }
-  staging:  { endpoint: https://og-staging.internal:8080 }
+version: 1
+servers:
+  prod:  { endpoint: https://og.internal:8080 }        # auth omitted ⇒ implicit chain keyed by name
+  cloud:
+    endpoint: https://api.og.cloud
+    auth: { oauth: { issuer: https://auth.og.cloud, client_id: og-cli, scopes: [graph.read, graph.write] } }  # reserved/future (V6)
 graphs:
-  personal: { storage: ~/graphs/personal.omni }
-defaults:
-  graph: personal
+  personal: { storage: ~/graphs/personal.omni, branch: main }
+  review:   { server: cloud, graph_id: production, branch: review }   # optional pinned remote alias
+defaults: { server: cloud, graph: personal, output_format: table, actor: ragnor }
 aliases:
-  my_people:
-    command: query
-    query: ~/queries/people.gq
-    name: list_people
-    graph: personal
+  people: { graph: personal, query: list_people }
 ```
 
-**Project client** `./omnigraph.yaml` (committed, secret-free, portable — no `server.bind`). Note the shipped noun is `graphs:` (MR-603); an entry is embedded (`storage:`) XOR remote (`server:` + `graph_id:`, §1.1):
+**Project** `./omnigraph.yaml` (committed, secret-free, portable — read by CLI *and* server):
 ```yaml
+version: 1
 graphs:
-  dev:      { storage: s3://team-bucket/dev.omni, branch: main }  # embedded
-  staging:  { server: staging, graph_id: prod, branch: review }   # remote → graph `prod` on server `staging`
-  prod-us:  { server: prod-us, graph_id: production }
-  prod-eu:  { server: prod-eu, graph_id: production }             # multi-homed: same graph, another server
-defaults: { graph: dev, output_format: table }
-aliases:
-  owner:
-    command: query
-    query: ./queries/owner.gq
-    name: owner
-    args: [name]
-    graph: dev
-```
-Select with `--graph <name>` (shipped flag, MR-603).
-
-**Server deployment** `./omnigraph.yaml` (committed in the deploy repo, read by `omnigraph-server`). Every served graph is an embedded storage locator; server-owned policy and stored-query definitions live here:
-```yaml
-graphs:
-  production:
+  production:                                  # embedded ⇒ served; capability surface lives here
     storage: s3://team-bucket/prod.omni
-    policy:
-      file: ./policies/prod.yaml
+    policy:  { file: ./policies/prod.yaml }
     queries:
-      find_user:
-        file: ./queries/find_user.gq
-        mcp: { expose: true, tool_name: lookup_user }
-
-server:
-  policy:
-    file: ./policies/server.yaml
+      find_user: { file: ./queries/find_user.gq, mcp: { expose: true, tool_name: lookup_user } }
+  staging:                                     # remote ⇒ a target; no policy/queries (server-owned)
+    server: prod
+    graph_id: prod
+    branch: review
+defaults: { graph: production, branch: main, output_format: table }
+serve:
+  graphs: [production]                          # which embedded graphs to serve (default: all)
+  auth:   { bearer: { enabled: true } }         # bind/workers via --bind / OMNIGRAPH_BIND
+  policy: { file: ./policies/server.yaml }
 ```
 
-**Credentials** are keyed by server name — `omnigraph login prod-us` writes the OS keychain entry `omnigraph:prod-us` (or a `[prod-us]` profile in `~/.omnigraph/credentials`, 0600, git-ignored); `OMNIGRAPH_TOKEN_PROD_US` overrides for CI. No token fields in any config file; no committable secrets.
+**Credentials** `~/.omnigraph/credentials` (INI, `0600`, git-ignored — fallback when no keychain):
+```ini
+[prod]
+token = …
+```
+`omnigraph login prod` writes the keychain entry `omnigraph:prod` (preferred) or this profile; `OMNIGRAPH_BEARER_TOKEN_PROD` overrides for CI. No token fields in any YAML; no committable secrets.
 
 ## DX
 
-1. **One command surface, two loci.** `query --graph dev` (embedded) and `--graph staging` (remote) are the same command; only resolution differs. Change one word, not a mental model.
-2. **Clone-and-go.** Project config names servers+graphs; teammate runs `omnigraph login staging` once and every target resolves. The git + `gh auth login` model.
-3. **Multi-server × multi-graph is the default.** Remote graph entries reference `server` by name; `servers` is a global named map; graphs are per-server. `prod-us` and `prod-eu` both serving `production` is two graph entries — Helix cannot express this.
+1. **One command surface, two loci.** `query --graph dev` (embedded) and `--graph staging` (remote) are the same command; only resolution differs.
+2. **Point at a server, use it.** A `servers:` entry reaches every graph the server hosts as `server/graph_id` *if you know the id* — no per-graph declaration. (Listing what exists needs the `graph_list` permission, which the server may default-deny.) `omnigraph login <server>` once, then every target resolves.
+3. **Multi-server × multi-graph is the default.** `prod-us` and `prod-eu` both serving `production` is two `servers:` entries (or two graph aliases) — Helix cannot express this.
 4. **Solo-first.** Everything in `~`, no project required.
-5. **Laptop-to-fleet on one schema.** Local = one `omnigraph.yaml` (both roles); prod = role-split across repos. No second format to learn.
+5. **Laptop-to-fleet on one schema.** Local = one `omnigraph.yaml` (both roles); prod = role-split across repos. No second format.
 
 ## AX (agent experience)
 
-1. **One flat resolved context, never a config to navigate.** target→server→endpoint→token resolves *before* the agent sees anything. The agent reasons about tools, not topology (the LLM-safe-surface principle extended to config).
-2. **Secrets are structurally outside the agent's reach.** The repo it operates in has no tokens; they are in the global layer / keychain, outside its view. An agent *cannot* exfiltrate a prod token from project config because it is not there.
-3. **Branch/snapshot-pinned contexts** (E4) — hand an agent a `branch: review` / `--snapshot v42` target and its reads are reproducible and cannot see uncommitted main-line state. No kubeconfig analog.
-4. **The agent's capabilities are a GitOps'd artifact** (E6) — which graphs exist, which stored-query tools it may call, and which Cedar rules gate them are all in the version-controlled server config. Powers change only via a reviewed PR, deployed by restart. Infrastructure-as-code for what the AI can do.
-5. **Config + policy compose.** Config = "where am I pointed + which token"; Cedar = "what may I do there." Orthogonal; no enforcement logic leaks into config.
+1. **One flat resolved context.** graph→server→endpoint→token resolves before the agent sees anything; `config view --resolved` flattens it. The agent reasons about tools, not topology.
+2. **Secrets are outside the repo and bound to an endpoint.** No secret-bearing file in the repo (hard rule 2); tokens live in the keychain / global layer / env, and are released only to the endpoint they were issued for (§7). A repo-confined agent cannot read a token, and cannot exfiltrate one by repointing a server — the endpoint-binding and §4 identity rule withhold it. See the threat model below for the precise boundary.
+3. **Branch/snapshot-pinned contexts** (E4) — hand an agent a `branch: review` / `--snapshot v42` graph and its reads are reproducible and cannot see uncommitted main-line state.
+4. **Capabilities are a GitOps'd artifact** (E6) — which graphs exist, which stored-query tools it may call, and which Cedar rules gate them are all in version-controlled config. Powers change only via a reviewed PR + restart.
+5. **Config + policy compose.** Config = "where am I pointed + which token"; Cedar = "what may I do there." Orthogonal.
+
+**Threat model & secret boundary.** The agent/repo boundary is a trust boundary, held by three rules: (1) secrets live outside the repo — keychain or `~/.omnigraph/`, never project config or the tree (hard rule 2); (2) a lower-trust layer cannot redefine a server's identity (§4); (3) credentials bind to an endpoint, so a redirected server cannot harvest a token (§7). Caveat — "outside the agent's reach" means the **repo-confined** surface: a shell-capable agent with `$HOME` access can still read `~/.omnigraph/credentials`, so the OS keychain (no plaintext at rest) is the stronger posture and the default `login` target.
 
 ## GitOps — three surfaces, secrets in none
 
 | Surface | Repo | Contents | Deploy | Secrets |
 |---|---|---|---|---|
-| Server deployment config | infra/deploy repo | `graphs:`, policy, **`queries:` + `.gq` files** | commit → CI → **server restart** (no hot reload) | none — by-reference |
+| Server deployment config | infra/deploy repo | `graphs:`, policy, `queries:` + `.gq` | commit → CI → **restart** | none — by-reference |
 | Project client config | app repo | `graphs:` → embedded storage or remote server+graph | committed, read by CLI/agent | none |
-| Global user config | **not GitOps'd** — machine-local `~` | `servers:` + creds-by-ref | `omnigraph login` writes it | refs only (like `~/.kube/config`) |
+| Global user config | machine-local `~` | `servers:` + creds-by-ref | `omnigraph login` writes it | refs only |
 
 ## Comparison
 
@@ -455,42 +474,59 @@ server:
 | Named remote endpoints + creds-by-ref | ✅ | ✅ | partial | partial | ✅ (global `servers`) |
 | Global + project layering, uniform schema | ✗ | ✗ | ✅ | ✗ | ✅ |
 | Embedded OR remote under one name | ✗ | ✗ | n/a | ✗ | ✅ (E1) |
+| Server self-sufficient (no per-graph declare) | ✅ | ✗ | n/a | n/a | ✅ (E3) |
 | Multi-server × multi-graph | ✅ | ✗ | n/a | n/a | ✅ (E2) |
 | Branch/snapshot in the address | ✗ | ✗ | partial | ✗ | ✅ (E4) |
-| Agent tool surface in the repo | ✗ | ✗ (separate bundle) | n/a | n/a | ✅ (E6) |
-| Project manifest renamed by role | — | no | — | no | **no** |
-| Concept count | 3 | 1 | 2 | 1 | **2 (servers/targets)** |
+| Agent tool surface in the repo | ✗ | ✗ | n/a | n/a | ✅ (E6) |
+| Pluggable auth methods (bearer/oauth/mtls) | ✅ (exec) | partial | ✗ | ✗ | ✅ |
+| Concept count | 3 | 1 | 2 | 1 | **2 (servers/graphs)** |
 
-## Migration / backwards compatibility
+## Migration / breaking changes
 
-- **Additive.** Today's `omnigraph.yaml` (`graphs:`, `cli:`, `server:`, `aliases:`, `policy:`) keeps working unchanged. `graphs:` entries are equivalent to embedded `targets:` with a `storage:` (shipped `uri:` is a deprecated alias); both resolve.
-- **`targets:` is new** and optional. `servers:` is new and optional. Absent → today's behavior.
-- **Global `~/.omnigraph/config.yaml` is new.** Absent → only project + env + flags, exactly as now. Its addition is the **global-first posture flip**: today the CLI is project-anchored (reads `./omnigraph.yaml`, no parent walk); the global config becomes the new primary discovery path so the CLI works with no project file. Existing project-only workflows are unchanged (project still overrides global); the flip is additive — it adds a fallback layer below the project file, it does not remove the project file.
-- **`graphs:` → `targets:` is an evolution, not a break.** Both can coexist; `targets:` is the superset (adds remote + branch pinning). A future cleanup may alias `graphs:` to embedded `targets:`.
-- **`server.bind` stays supported** but documentation steers operators to `--bind` / `OMNIGRAPH_BIND` for portability; no removal.
-- **Credentials: keyed-by-name is new; `bearer_token_env` is the compat path.** The primary design (keychain / `[<server>]` profile / `OMNIGRAPH_TOKEN_<SERVER>`) is new resolver work (lands on MR-971). The shipped `bearer_token_env` + `auth.env_file` dotenv (`resolve_remote_bearer_token`) is **unchanged and still honored** — existing single-server dotenv setups keep working, and the resolver honors an explicit `auth: { token: {...} }` source (env/file/command/keychain) with `bearer_token_env` as its flat legacy alias. No `credentials.yaml`.
-- **Validation tightens invalid mixes, not valid legacy use.** Top-level `policy:` / `queries:` remain only for anonymous bare-URI compatibility. Named graphs use per-entry fields. Remote graph entries with local `policy:` / `queries:` and server manifests with `server:` graph locators are rejected because there is no correct way to honor those fields.
+Gated behind `version:`. `version: 1` is this schema; a missing `version:` is read as legacy (the shipped shape) with deprecation warnings.
+
+**Compat aliases (legacy honored, warned):**
+- `--target` flag → `--graph` (deprecated alias).
+- `uri:` → `storage.uri`.
+- `cli:` block fields → `defaults:`.
+- `server:` (self) → `serve:`.
+- `auth.env_file` dotenv → honored but warned (secrets-in-repo); removed next major.
+- `bearer_token_env:` (legacy graph-local) → see "Renamed / migrated" below.
+
+**Removed (hard errors under `version: 1`):**
+- Top-level `policy:` / `queries:` — move to the owning `graphs.<name>` entry.
+- `project.name` — no consumer.
+- A `Remote` graph entry with local `policy:`/`queries:`; a `serve:` manifest with a `server:` graph locator; an alias with an inline `.gq` path.
+
+**Renamed / migrated:**
+- `server.graph` (single-graph selector) → **`serve.graphs: [<name>]`** (a one-element served set; §9). Not a removal — the "define many graphs, serve a subset" capability is preserved.
+- **Legacy credential mapping.** Legacy `{ uri, bearer_token_env }` is a graph-local remote credential with *no named server*, so it cannot map cleanly to `servers.<n>.auth…`. Under `version: 1` the migration **synthesizes a server** — `servers.<graph_name> = { endpoint: <uri>, auth: { bearer: { token: { env: <VAR> } } } }` — and rewrites the graph to `{ server: <graph_name>, graph_id: <graph_name> }`. In legacy mode (no `version:`) the graph-local credential keeps working unchanged.
+
+**Posture flips:**
+- **Global-first.** The CLI gains a global discovery layer below the project file; existing project-only workflows are unchanged (project still overrides global).
+- **Secrets out of the repo.** Project-local `.env.omni` is deprecated; bearer secrets live only in the keychain / `~/.omnigraph/credentials` / env.
+- **Auth keyed by server name** (keychain / `[<server>]` profile / `OMNIGRAPH_BEARER_TOKEN_<SERVER>`), with explicit `auth:` sources for control. `OMNIGRAPH_BEARER_TOKEN` (the shipped name) is reused — **no new `OMNIGRAPH_TOKEN`**.
 
 ## Open questions
 
-- **`graphs:` vs `targets:` naming churn.** Do we rename `graphs:` → `targets:` (with a deprecation alias) or keep `graphs:` for embedded and add `targets:` for remote? Leaning: keep both, document `targets:` as the superset.
-- **Keychain integration scope.** Keychain is now the *primary* credential store (§5), so this is on the critical path, not optional: macOS Keychain first (matches operator practice) with the `0600` `[<server>]` profile file as fallback; Linux Secret Service / `pass` later. Open: which keyring crate, and the exact `OMNIGRAPH_TOKEN_<SERVER>` name-derivation (upper-snake, non-alnum → `_`).
-- **Project-local `servers:`.** Allowed (e.g. a localhost dev server), merged with global. Confirm creds stay by-reference even for project-local servers (yes).
-- **`aliases:` ⇄ `queries:` convergence.** Out of scope here; tracked separately. One registry with embedded + remote invocation surfaces is the target end state.
-- **Single-file `KUBECONFIG`-style list.** Do we support `OMNIGRAPH_CONFIG` pointing at multiple files (colon-joined), or a single file only? Start single; revisit if demand appears.
+- **Keychain crate + name-derivation.** Keychain is the primary credential store, so it is on the critical path: macOS Keychain first, the `0600` profile file as fallback; Linux Secret Service / `pass` later. Open: which keyring crate, and the exact `OMNIGRAPH_BEARER_TOKEN_<SERVER>` derivation (upper-snake, non-alnum → `_`).
+- **OAuth flow specifics (V6, not v1).** Device-authorization vs auth-code+PKCE as the default `login` flow; token-cache location and refresh-failure UX. The enum reserves the shape; implementation is deferred.
+- **`storage:` block scope.** How much object-store config to honor per graph (region/endpoint/profile) vs. delegating entirely to the ambient chain. Start minimal.
+- **Single-file vs `KUBECONFIG`-style list.** `OMNIGRAPH_CONFIG` single path first; colon-joined list later if demand appears.
+- **`config.yaml` vs `omnigraph.yaml` deep convergence.** Out of scope: one registry with embedded + remote invocation surfaces is the long-term end state for `queries:`/`aliases:`.
 
-## Implementation — breadboard + slices (Shape A)
+## Implementation — breadboard + slices
 
-Shaped via requirements + a fit check (Shape A — global-first layered config + unified `graphs:` entry + three-tier init — selected over a project-first minimal option and a Helix-clone). This section breadboards A and slices it. **Bold** = NEW.
+**Bold** = NEW. The new layered-config + resolver + auth code lands in a **new `omnigraph-config` crate** depended on by `omnigraph-cli` and `omnigraph-server`, so neither the CLI nor YAML parsing pulls in the HTTP server stack.
 
 ### Places
 
 | # | Place | What |
 |---|---|---|
-| P1 | Disk | `~/.omnigraph/{config.yaml, credentials, cache/, state/}` + project `omnigraph.yaml` + `.env.omni` |
-| P2 | Config resolution | runs on every command: load layers → merge → resolve `--graph` |
+| P1 | Disk | `~/.omnigraph/{config.yaml, credentials, cache/, state/}` + project `omnigraph.yaml` |
+| P2 | Config resolution | every command: load layers → merge → resolve `--graph` → resolve auth |
 | P3 | Command execution | embedded engine OR remote HTTP client |
-| P4 | Remote `omnigraph-server` | existing HTTP surface (`/query`, `/mutate`, `/queries/{name}`) |
+| P4 | Remote `omnigraph-server` | existing HTTP surface (+ route unification, §9) |
 | P5 | Scaffold | `login` / `init` / `quickstart` |
 
 ### Affordances
@@ -499,92 +535,51 @@ Shaped via requirements + a fit check (Shape A — global-first layered config +
 |---|---|---|---|---|
 | U1 | P1 | `~/.omnigraph/config.yaml` (operator edits) | **N** | → N1 |
 | U2 | P1 | project `./omnigraph.yaml` | — | → N1 |
-| U3 | P1 | `~/.omnigraph/credentials` / `.env.omni` dotenv (secrets, git-ignored) | — | → N4 |
 | U4 | P3 | `omnigraph <verb> --graph <name>` (any command) | — | → N14 |
 | U5 | P5 | `omnigraph login [<server>]` | **N** | → N11 |
-| U6 | P5 | `omnigraph init` / `quickstart [--template]` | partly | → N12 / N13 |
-| U7 | P2 | `omnigraph config view --resolved --show-origin` | **N** | → N10 |
-| N1 | P2 | `load_layered_config()` — global (N3) + project (cwd), serde each | **N** | → N2 |
-| N2 | P2 | **merge engine** — deep-merge settings; replace named-resource entries; replace lists; **retain provenance** and raw field origins | **N⚠️** | → N5, → S_merged |
-| N3 | P2 | global-dir resolver — `OMNIGRAPH_HOME` else `~/.omnigraph/` | **N** | → N1 |
-| N4 | P2 | `load_env_file_into_process` — dotenv, real-env-wins (existing) | — | → N9 |
-| N5 | P2 | `resolve_graph(name, merged)` → typed `Embedded`/`Remote` locator; rejects invalid role/field combinations before execution | **N⚠️** | → N6 |
-| N6 | P3 | `GraphConn` — `Embedded(engine)` \| `Remote(http)` dispatch | **N⚠️** | → N7, → N8 |
-| N7 | P3 | embedded path — `Omnigraph::open(uri)` (existing) | — | → engine |
-| N8 | P3 | **HTTP-client path** — POST `/query`/`/mutate`/`/queries/{name}` | **N⚠️** | → P4, → N9 |
-| N9 | P2 | `resolve_bearer_token(server)` — explicit `auth.token` source if set, else **keyed by name**: `OMNIGRAPH_TOKEN_<NAME>`/`OMNIGRAPH_TOKEN` → keychain `omnigraph:<name>` → `[<name>]` profile; legacy `bearer_token_env`/dotenv (MR-971) | **N⚠️** | → N8 |
-| N10 | P2 | `config view` handler — merged + per-field origin (needs N2 provenance) | **N** | → U7 |
-| N11 | P5 | `login` handler — interactive auth → write `config.yaml` + `credentials` (0600) + `.gitignore` | **N⚠️** | → S_global |
-| N12 | P5 | `init` handler — `scaffold_config_if_missing` + create graph; refuse-if-exists/`--force` purge (MR-975) | partly | → S_project |
-| N13 | P5 | `quickstart` handler — scaffold + `--template` + seed + `serve start` + agent prompt (MR-973; needs serve MR-970) | **N⚠️** | → S_project |
-| N14 | P3 | agent-mode wrapper — `--machine`/`OMNIGRAPH_AGENT_MODE`: JSON, structured errors, never-prompt, typed exit codes (MR-981) | **N⚠️** | → N1 |
-| S_global | P1 | `~/.omnigraph/config.yaml` + `credentials` | **N** | read by N1/N9 |
-| S_project | P1 | `./omnigraph.yaml` + `.env.omni` | — | read by N1/N4 |
-| S_merged | P2 | in-memory resolved config (per command, with provenance) | **N** | read by N5/N10 |
-| S_cache | P1 | `~/.omnigraph/cache/` (remote catalogs) | **N** | read by N8 |
-
-```mermaid
-flowchart TB
-  subgraph P1["P1: Disk"]
-    U1["U1: ~/.omnigraph/config.yaml"]
-    U2["U2: ./omnigraph.yaml"]
-    U3["U3: credentials dotenv"]
-  end
-  subgraph P2["P2: Config resolution"]
-    N3["N3: global-dir (OMNIGRAPH_HOME)"]
-    N1["N1: load_layered_config"]
-    N2["N2: merge engine (+provenance)"]
-    N4["N4: dotenv loader"]
-    N5["N5: resolve_graph(--graph)"]
-    N9["N9: resolve_bearer_token"]
-    N10["N10: config view"]
-  end
-  subgraph P3["P3: Command execution"]
-    U4["U4: omnigraph <verb> --graph"]
-    N14["N14: agent-mode wrapper"]
-    N6["N6: GraphConn embedded|remote"]
-    N7["N7: embedded Omnigraph::open"]
-    N8["N8: HTTP-client POST"]
-  end
-  subgraph P5["P5: Scaffold"]
-    U5["U5: login"]; U6["U6: init/quickstart"]
-    N11["N11: login handler"]; N12["N12: init"]; N13["N13: quickstart"]
-  end
-  P4["P4: remote omnigraph-server"]
-  U1-->N1; U2-->N1; N3-->N1; N1-->N2-->N5-->N6
-  U3-->N4-->N9-->N8
-  U4-->N14-->N1
-  N6-->N7; N6-->N8-->P4
-  N2-->N10-->U7["U7: config view --resolved"]
-  U5-->N11; U6-->N12; U6-->N13
-  classDef ui fill:#ffb6c1,stroke:#d87093,color:#000
-  classDef n fill:#d3d3d3,stroke:#808080,color:#000
-  class U1,U2,U3,U4,U5,U6,U7 ui
-  class N1,N2,N3,N4,N5,N6,N7,N8,N9,N10,N11,N12,N13,N14 n
-```
+| U6 | P5 | `omnigraph init` / `quickstart [--template]` | partly | → N12/N13 |
+| U7 | P2 | `omnigraph use` / `config view --resolved --show-origin` | **N** | → N10 |
+| N0 | P2 | **`omnigraph-config` crate** — shared schema, loader, resolver, auth | **N** | hosts N1–N9 |
+| N1 | P2 | `load_layered_config()` — global (N3) + state (N3b) + project (cwd), `deny_unknown_fields` | **N** | → N2 |
+| N2 | P2 | **merge engine** — deep-merge settings; replace named-resource entries/lists; retain per-field origin | **N⚠️** | → N5, N10 |
+| N3 | P2 | global-dir resolver — `OMNIGRAPH_CONFIG` / `OMNIGRAPH_HOME` else `~/.omnigraph/` | **N** | → N1 |
+| N3b | P2 | active-context state — `~/.omnigraph/state/active.yaml` | **N** | → N1 |
+| N5 | P2 | `resolve_graph(name, merged)` — three-tier (§1) → typed `GraphLocator`; rejects invalid role/field combos | **N⚠️** | → N6 |
+| N6 | P3 | `GraphConn` — `Embedded(engine)` \| `Remote(http)` dispatch | **N⚠️** | → N7, N8 |
+| N7 | P3 | embedded path — `Omnigraph::open(storage)` (existing) | — | → engine |
+| N8 | P3 | HTTP-client path — **rewire existing reqwest calls to `/graphs/{id}/…`; migrate off `/read`,`/change`** | **extend** | → P4, N9 |
+| N9 | P2 | `resolve_auth(server)` — method×source (§6): explicit `auth:` else implicit chain keyed by name (reuses `OMNIGRAPH_BEARER_TOKEN`); **enforces endpoint-binding before releasing a token** (§7) | **N⚠️** | → N8 |
+| N10 | P2 | `config view` handler — merged + per-field origin (needs N2) | **N** | → U7 |
+| N11 | P5 | `login` handler — interactive auth (incl. OAuth device flow) → keychain / `credentials` (0600) + `.gitignore` | **N⚠️** | → S_global |
+| N12 | P5 | `init` handler — `scaffold_config_if_missing`; refuse-if-exists / `--force` | partly | → S_project |
+| N13 | P5 | `quickstart` handler — scaffold + `--template` + seed + serve + agent prompt | **N⚠️** | → S_project |
+| N14 | P3 | agent-mode wrapper — `OMNIGRAPH_AGENT_MODE`: JSON, structured errors, never-prompt, typed exit codes | **N⚠️** | → N1 |
+| N15 | P4 | **server route unification** — `serve.graphs` selects served set; canonical `graph_id` per graph; always mount `/graphs/{id}/…`; flat = compat alias only when one graph served; `GET /graphs` lists served set | **N⚠️** | → P4 |
 
 ### Slices (vertical, each demo-able)
 
-| # | Slice | Parts/affordances | Demo |
-|---|---|---|---|
-| **V1** | **Global layer + merge + `config view`** | A1–A4 · N1,N2,N3,N10 · U1,U7,S_global,S_merged | Put config in `~/.omnigraph/`, run `omnigraph config view --resolved --show-origin` from any dir → merged result with per-field origin; existing embedded commands work global-first with no project file |
-| **V2** | **Remote graphs + HTTP client + creds** | A5–A7 · N5,N6,N8,N9 · S_cache | Define a `server:` graph entry; `omnigraph query --graph prod` hits the remote server (`curl`-free); embedded `--graph dev` still local |
-| **V3** | **`omnigraph login`** | A8 · N11,U5 | `omnigraph login prod` writes `~/.omnigraph/credentials` (0600) + `.gitignore`; V2 remote query now works with no manual env |
-| **V4** | **Thin-init hardening + quickstart + templates** | A9 · N12,N13,U6 (needs serve MR-970) | `omnigraph quickstart --template person-knows` scaffolds + seeds + serves; `init --force` purges (MR-975) |
-| **V5** | **Agent-mode** | A10 · N14,U4 (MR-981) | `OMNIGRAPH_AGENT_MODE=1 omnigraph query …` → JSON + structured errors + typed exit codes; never-prompt |
+| # | Slice | Demo |
+|---|---|---|
+| **V1** | **Global layer + merge + `config view`** | Config in `~/.omnigraph/`; `config view --resolved --show-origin` from any dir → merged result with per-field origin; embedded commands work global-first with no project file |
+| **V2** | **Typed locator + route unification + remote client** | Define a `server:` graph (or `server/graph_id`); `query --graph prod` hits the server `curl`-free against `/graphs/{id}/…`; embedded `--graph dev` still local. *Gated on N15.* |
+| **V3** | **Auth model + `login` + endpoint-bound credentials** | `omnigraph login prod` (bearer) → keychain; per-server resolution with endpoint-binding (§7) + the §4 identity rule (the security model); V2 works with no manual env |
+| **V4** | **Thin-init hardening + quickstart + templates** | `quickstart --template person-knows` scaffolds + seeds + serves; `init --force` purges |
+| **V5** | **Agent-mode** | `OMNIGRAPH_AGENT_MODE=1 omnigraph query …` → JSON + structured errors + typed exit codes; never-prompt |
+| **V6** | **OAuth / mTLS (reserved methods)** | implement the reserved `oauth` (device flow, token cache, refresh, OIDC server-side validation) and `mtls`; the enum shape ships in V3, so this is additive |
 
-V1 is the foundation (global-first + merge + view). V2 closes the substantive client→server gap. V3 is credential ergonomics. V4/V5 ride sibling tickets (MR-970/973/981). MR-969 (stored queries) ships independently and is reached by N8's `/queries/{name}` once V2 lands.
+V1 is the foundation. V2 closes the substantive client→server gap (and depends on the server route unification, N15). V3 is the credential + auth model. V4/V5 are ergonomics.
 
 ## Rollout
 
-The slices above are the rollout order: **V1 (global layer + merge) → V2 (remote graphs + HTTP client) → V3 (login) → V4 (quickstart/templates, on MR-970) → V5 (agent-mode, MR-981).** V1–V2 close the substantive gap (global-first config + `curl`-free server access); V3–V5 are ergonomics that ride sibling tickets. Evaluate after V2 against early-adopter and agent-onboarding (MR-973 / MR-974) signal. The spikes (X1 HTTP-client, X2 merge engine, X3 resolver+provenance, X4 login) resolve before their owning slice.
+**V1 (global layer + merge + view) → V2 (typed locator + route unification + remote client) → V3 (auth + login + endpoint-bound credentials) → V4 (quickstart/templates) → V5 (agent-mode) → V6 (OAuth/mTLS).** V1–V2 close the substantive gap; **V3 lands the auth model and the credential-redirection security fix (a gate, not optional polish)**; V4–V5 are ergonomics; V6 implements the reserved auth methods. Land the schema-`version:` gate and the `omnigraph-config` crate extraction first, since everything else builds on them. Evaluate after V2 against early-adopter and agent-onboarding signal.
 
 ## Prior art
 
-- kubeconfig (clusters / users / contexts; `KUBECONFIG`; `kubectl config view`)
-- Helix CLI v2 (`helix.toml` local+enterprise instance blocks; `~/.helix/config`; `~/.helix/credentials`)
+- kubeconfig (clusters / users / contexts; `KUBECONFIG`; `kubectl config view`; `current-context`)
+- Helix CLI v2 (`helix.toml` local+enterprise blocks; `~/.helix/config`; `~/.helix/credentials`)
 - AWS CLI (`~/.aws/config` + `~/.aws/credentials` split; named profiles; `credential_process`)
+- gh / kubelogin (OAuth device flow; keychain token storage)
 - git (`~/.gitconfig` + `.git/config`; `--show-origin`)
-- Cargo (`Cargo.toml` manifest + `~/.cargo/config.toml`)
+- Cargo (`Cargo.toml` manifest + `~/.cargo/config.toml` + `~/.cargo/credentials.toml`)
 - Supabase / Prisma (one project manifest; connection via `DATABASE_URL` env)
 - 12-factor app (config that varies by deploy lives in the environment)
