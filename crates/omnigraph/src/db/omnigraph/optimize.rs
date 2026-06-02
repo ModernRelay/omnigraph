@@ -70,6 +70,7 @@ pub struct CleanupPolicyOptions {
 /// reason rather than sniffing a string. One variant today, gated by
 /// [`LANCE_SUPPORTS_BLOB_COMPACTION`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SkipReason {
     /// The table has one or more `Blob` columns. Lance `compact_files` forces
     /// `BlobHandling::AllBinary`, which mis-decodes blob-v2 columns; see
@@ -99,8 +100,11 @@ impl std::fmt::Display for SkipReason {
     }
 }
 
-/// Per-table outcome of `optimize_all_tables`.
+/// Per-table outcome of `optimize_all_tables`. This is a returned result type,
+/// not built by callers, so it is `#[non_exhaustive]`: future fields stay
+/// non-breaking and downstream code reads fields rather than constructing it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TableOptimizeStats {
     pub table_key: String,
     /// Number of source fragments that were rewritten by Lance.

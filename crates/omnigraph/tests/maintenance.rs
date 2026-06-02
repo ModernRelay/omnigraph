@@ -80,10 +80,12 @@ async fn optimize_after_load_then_again_is_idempotent() {
 // must skip blob-bearing tables (and report the skip) rather than aborting the
 // whole sweep.
 //
-// RED today: `optimize()` returns Err and the `.expect` below panics with the
-// column-index decode message. GREEN after the skip fix lands; the fix commit
-// also strengthens this test to assert `doc.skipped == Some(..)` /
-// `tag.skipped == None` (needs the new `SkipReason` API).
+// Before the skip fix, `optimize()` returned that Lance error here and aborted
+// the whole sweep; it now skips the blob table (`doc.skipped == Some(..)`)
+// while the sibling non-blob `Tag` table still compacts. The skip is gated by
+// `LANCE_SUPPORTS_BLOB_COMPACTION`; the surface guard
+// `compact_files_still_fails_on_blob_columns` flags when the upstream Lance fix
+// makes the skip (and this test's blob arm) removable.
 #[tokio::test]
 async fn optimize_skips_blob_table_and_reports_skip() {
     let dir = tempfile::tempdir().unwrap();
