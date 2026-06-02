@@ -290,3 +290,88 @@ async fn force_delete_branch_semantics() {
          TableStore::force_delete_branch's NotFound tolerance can be simplified."
     );
 }
+
+// --- Guard 10: blob-column compaction is still broken in this Lance --------
+//
+// `db/omnigraph/optimize.rs` skips tables with blob columns while
+// `LANCE_SUPPORTS_BLOB_COMPACTION = false`: Lance `compact_files` forces
+// `BlobHandling::AllBinary`, and the blob-v2 struct decoder mis-counts columns
+// ("more fields in the schema than provided column indices"), failing even a
+// pristine uniform-V2_2 multi-fragment blob table. Reads are unaffected (they
+// use descriptor handling).
+//
+// WHEN THIS TEST TURNS RED (compact_files no longer errors), the Lance bug is
+// fixed: flip `LANCE_SUPPORTS_BLOB_COMPACTION` to true in optimize.rs, drop the
+// blob-skip branch + the `optimize_skips_blob_table_and_reports_skip`
+// skip assertions in maintenance.rs, and re-pin docs/dev/lance.md.
+
+#[tokio::test]
+async fn compact_files_still_fails_on_blob_columns() {
+    use arrow_array::{LargeBinaryArray, StructArray};
+
+    fn blob_batch(start: i32, n: i32) -> RecordBatch {
+        let ids: Vec<String> = (start..start + n).map(|i| format!("n{i}")).collect();
+        let data =
+            LargeBinaryArray::from_iter_values((start..start + n).map(|i| format!("blob{i}")));
+        let blob_uri = StringArray::from(vec![None::<&str>; n as usize]);
+        let DataType::Struct(fields) = lance::blob::blob_field("content", true).data_type().clone()
+        else {
+            unreachable!("blob_field is always a Struct");
+        };
+        let content = StructArray::new(
+            fields,
+            vec![Arc::new(data) as _, Arc::new(blob_uri) as _],
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            lance::blob::blob_field("content", true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(ids)) as _, Arc::new(content) as _],
+        )
+        .unwrap()
+    }
+
+    async fn write(uri: &str, batch: RecordBatch, mode: WriteMode) {
+        let schema = batch.schema();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        // Blob v2 requires file version >= 2.2; without the pin the *write*
+        // would fail with a different error, masking the guard's intent.
+        let params = WriteParams {
+            mode,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        };
+        Dataset::write(reader, uri, Some(params)).await.unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard10-blob.lance");
+    let uri = uri.to_str().unwrap();
+
+    // Uniform V2_2, two fragments → forces compaction to actually rewrite.
+    write(uri, blob_batch(0, 2), WriteMode::Create).await;
+    write(uri, blob_batch(100, 2), WriteMode::Append).await;
+
+    let mut ds = Dataset::open(uri).await.unwrap();
+    assert!(
+        ds.get_fragments().len() >= 2,
+        "guard needs a multi-fragment table to trigger a real compaction rewrite"
+    );
+
+    let result = compact_files(&mut ds, CompactionOptions::default(), None).await;
+    let err = result.expect_err(
+        "compact_files unexpectedly SUCCEEDED on a blob table — the Lance blob-v2 \
+         compaction bug is fixed. Flip LANCE_SUPPORTS_BLOB_COMPACTION to true in \
+         db/omnigraph/optimize.rs, remove the blob-skip branch, and re-pin docs/dev/lance.md.",
+    );
+    assert!(
+        err.to_string()
+            .contains("more fields in the schema than provided column indices"),
+        "blob compaction failed with an unexpected error (Lance internals may have \
+         shifted): {err}"
+    );
+}

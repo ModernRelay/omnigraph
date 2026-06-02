@@ -7,7 +7,8 @@
 - Lance `compact_files()` on every node + edge table on `main`.
 - Rewrites small fragments into fewer large ones; old fragments remain reachable via older manifests.
 - Bounded by `OMNIGRAPH_MAINTENANCE_CONCURRENCY` (default 8).
-- Returns `[TableOptimizeStats { table_key, fragments_removed, fragments_added, committed }]`.
+- Returns `[TableOptimizeStats { table_key, fragments_removed, fragments_added, committed, skipped }]`.
+- **Blob tables are skipped.** A table that declares any `Blob` property is not compacted: it is reported with `skipped: Some(BlobColumnsUnsupportedByLance)` (and logged via `tracing::warn`) instead of compacted, and the rest of the sweep proceeds normally. The current Lance `compact_files` mis-decodes blob-v2 columns under its forced `BlobHandling::AllBinary` read; **reads and writes are unaffected** — only compaction is. This is gated by `LANCE_SUPPORTS_BLOB_COMPACTION` (`db/omnigraph/optimize.rs`) and removed when the upstream Lance fix lands (see [docs/dev/lance.md](../dev/lance.md)). Consequence: fragment count and deleted-row space on blob tables are not reclaimed until then; query results are never affected.
 
 ## `cleanup_all_tables(db, options)` — destructive
 

@@ -11,6 +11,7 @@
 | Internal manifest schema version | `INTERNAL_MANIFEST_SCHEMA_VERSION = 2` | `db/manifest/migrations.rs` |
 | Merge stage batch | `MERGE_STAGE_BATCH_ROWS = 8192` | `exec/merge.rs` |
 | Maintenance concurrency | `OMNIGRAPH_MAINTENANCE_CONCURRENCY=8` | `db/omnigraph/optimize.rs` |
+| Lance blob compaction support | `LANCE_SUPPORTS_BLOB_COMPACTION = false` | `db/omnigraph/optimize.rs` |
 | Graph index cache size | `8` (LRU) | `runtime_cache.rs` |
 | Default body limit | `1 MB` | `omnigraph-server/lib.rs` |
 | Ingest body limit | `32 MB` | `omnigraph-server/lib.rs` |

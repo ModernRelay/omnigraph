@@ -13,7 +13,7 @@ pub use manifest::{Snapshot, SubTableEntry, SubTableUpdate};
 pub(crate) use omnigraph::ensure_public_branch_ref;
 pub use omnigraph::{
     CleanupPolicyOptions, InitOptions, MergeOutcome, Omnigraph, OpenMode, SchemaApplyOptions,
-    SchemaApplyResult, TableCleanupStats, TableOptimizeStats,
+    SchemaApplyResult, SkipReason, TableCleanupStats, TableOptimizeStats,
 };
 pub(crate) use run_registry::is_internal_run_branch;
 
