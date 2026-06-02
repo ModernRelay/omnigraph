@@ -11,12 +11,12 @@ OmniGraph today reads one config file, `omnigraph.yaml`, from both the CLI (oper
 This RFC defines the config and CLI architecture that closes them, derived from first principles — *working backward from what OmniGraph uniquely enables* rather than copying kubeconfig. The result:
 
 1. A **typed locator** replacing the conflated `uri: String`. A graph entry is **embedded (`storage:`) XOR remote (`server:` + `graph_id:`)**; the *key* names the locus so neither a URI scheme nor a comment is load-bearing.
-2. **Three-tier server addressing.** A `servers:` entry is self-sufficient — you reach any graph it hosts as `server/graph_id`, because the server enumerates its own graphs. Per-graph `graphs:` entries become *optional aliases* (for a short name, a branch pin, or multi-homing). Below that, env vars (`OMNIGRAPH_SERVER` + token) give a fileless floor.
+2. **Three-tier server addressing.** A `servers:` entry is self-sufficient — graph identity is server-owned, so you address a known `server/graph_id` directly with no per-graph entry (listing what exists is `graph_list`-gated, §9). Per-graph `graphs:` entries become *optional aliases* (for a short name, a branch pin, or multi-homing). Below that, env vars (`OMNIGRAPH_SERVER` + token) give a fileless floor.
 3. **Global-first layered config.** The user-global `~/.omnigraph/config.yaml` is the primary, self-sufficient default; `./omnigraph.yaml` is an optional repo-scoped override + deployment manifest. One schema, both layers optional. The CLI works from any directory with no project file (the `kubectl`/`aws`/`gh` posture).
-4. **A method-tagged auth model.** `auth:` is a tagged union over `bearer | oauth | mtls | none`; bearer/mtls reference a *secret source* (`env | file | command | keychain`); OAuth is first-class (`omnigraph login` device flow). Auth is **per-server**, not per-graph. Secrets are never inlined and never live in any `*.yaml` or in the project tree.
+4. **A method-tagged auth model.** `auth:` is a tagged union over `bearer | oauth | mtls | none`; bearer/mtls reference a *secret source* (`env | file | command | keychain`). v1 ships `bearer`/`none`; `oauth`/`mtls` are reserved (the enum shape is fixed, so adding them is non-breaking — V6). Auth is **per-server**, not per-graph, and trusted-origin (§7): a lower-trust layer cannot supply credentials. Secrets are never inlined and never live in any `*.yaml` or in the project tree.
 5. **A clean file layout split on the two real boundaries — secrecy and scope, never role.** Global `~/.omnigraph/config.yaml`; project `./omnigraph.yaml` (one artifact, both roles by section); credentials in the OS keychain → `~/.omnigraph/credentials` (INI, `0600`). No `credentials.yaml`.
 
-The design optimizes jointly for **DX** (one command surface across embedded and remote; clone-and-go) and **AX** (agent experience: one flat resolved context, secrets structurally unreachable, branch-pinned reproducible reads, a GitOps'd capability surface).
+The design optimizes jointly for **DX** (one command surface across embedded and remote; clone-and-go) and **AX** (agent experience: one flat resolved context, secrets out of the repo and endpoint-bound, branch-pinned reproducible reads, a GitOps'd capability surface).
 
 ## Reconciliation with the code
 
@@ -211,8 +211,8 @@ graphs:
 
 **Merge semantics — "closest layer wins, at the smallest meaningful unit":**
 - **Settings objects** (`defaults`, `serve`) → deep-merge per field: a project sets `defaults.graph` and inherits the global `defaults.output_format`.
-- **Named-resource maps** (`servers`, `graphs`, `queries`, `aliases`) → union by key; on a collision the higher layer's entry **replaces** the lower wholesale (no field-level deep-merge within an entry — replace makes the higher layer's entry self-contained and predictable).
-- **Server identity is not lower-trust-overridable (security).** A `servers:` entry's `endpoint` and `auth` are its **identity**. A *lower-trust* layer (project < global) may add new servers or override non-identity fields, but may **not** redefine the `endpoint`/`auth` of a server an upper layer already defined — that is rejected (use a distinct name). Without this, a project file (which an agent in the repo can edit, or a cloned repo can ship) could repoint `servers.prod.endpoint` and, because credentials are keyed by name, harvest the user's `prod` token. Composes with credential endpoint-binding (§7) as defense in depth.
+- **Named-resource maps** (`servers`, `graphs`, `aliases`) → union by key; on a collision the **higher-precedence** layer's entry **replaces** the lower wholesale (no field-level deep-merge within an entry — replace makes the entry self-contained and predictable). Per-graph `queries:` are not a top-level map; they merge as part of their owning `graphs` entry (replaced with it).
+- **Server identity follows trust, not precedence (security).** Precedence and trust run *opposite* for the project layer: project is **higher-precedence** (it wins value merges, above) but **lower-trust** (a repo an agent can edit or a clone can ship). A `servers:` entry's `endpoint` and `auth` are its **identity**, and identity follows trust — a lower-trust layer may add *endpoint-only* servers and graph aliases, but may **not** (a) redefine the `endpoint` of a server a higher-trust layer defined, nor (b) carry an `auth:` block at all (no `command`/`file`/`keychain`/`token` sourcing — `command` would be repo-authored RCE). Both are rejected. Without this, a project file could repoint `servers.prod.endpoint` or inject `auth.command` and, since credentials key by name, harvest or execute against the user's `prod` identity. The credential trust model in §7 enforces the consuming side.
 - **Lists** → replace, never append.
 - **Scalars** → higher layer wins.
 - **Relative paths carry their origin's `base_dir`** — a `queries:` `.gq` path or a `policy.file` resolves against the directory of the layer it was defined in.
@@ -310,7 +310,7 @@ enum SecretSource {
 
 **Auth is per-server, not per-graph.** One credential authenticates you to a *server*; Cedar then authorizes per graph. The shipped per-graph `bearer_token_env` is the wrong grain for a multi-graph world (it repeats across every graph on a server); it survives as a legacy alias for `servers.<n>.auth.bearer.token.env`.
 
-**The `command` source** runs locally with the operator's own privileges and is defined only in operator-owned config (never server-supplied), so it adds no remote-execution surface. The `auth:` union is method-tagged so adding a method later is a new variant, not a re-key (Hyrum's Law: the field name is a contract once shipped).
+**The `command` source** runs locally with the operator's own privileges, so an `auth:` block — `command` especially — is **rejected from a lower-trust (project) layer** (§4): it is honored only from global/trusted config, never from a repo, so it adds no remote-execution surface. The `auth:` union is method-tagged so adding a method later is a new variant, not a re-key (Hyrum's Law: the field name is a contract once shipped).
 
 **Server-side accept config is separate and secret-free** (it validates incoming credentials; it is not a credential) and lives under `serve:`:
 
@@ -320,7 +320,7 @@ serve:
     bearer: { enabled: true }                                  # tokens via OMNIGRAPH_SERVER_BEARER_TOKEN* env
     oauth:  { issuer: https://auth.og.cloud, audience: og-api } # validate OIDC tokens (reserved/future, V6)
   policy: { file: ./policies/server.yaml }                      # server-level Cedar (management endpoints)
-  # bind/workers are 12-factor: --bind / OMNIGRAPH_BIND, never committed here
+  # bind/workers are 12-factor: --bind today (OMNIGRAPH_BIND is proposed, not yet implemented), never committed here
 ```
 
 ### 7. Credential resolution and connection tiers
@@ -336,7 +336,11 @@ serve:
    token = …
    ```
 
-**Credentials bind to `(server_name, canonical_endpoint)`, not the name alone (security).** `omnigraph login <server>` records the endpoint the credential was issued for; at point-of-use the token is released **only if the resolved endpoint matches**. This check runs regardless of source — including `OMNIGRAPH_BEARER_TOKEN_<NAME>`, since a lower-trust layer can repoint which endpoint `<NAME>` resolves to even when it cannot set the env var. A mismatch withholds the token with an explicit error (`server 'prod' resolved to <endpoint>, which does not match the endpoint this credential was issued for`). Together with the §4 identity rule, this closes the credential-redirection path.
+**Credential trust model (security).** Two rules close the credential-redirection path:
+1. *Implicit/ambient credentials apply only to trusted-origin servers.* The implicit chain above (env-by-name, keychain-by-name, profile) is consulted **only when the server's identity — its `endpoint` — came from a trusted layer** (global config, or an explicit operator source). A server whose identity is introduced by a lower-trust (project) layer never auto-consumes an ambient credential; the operator must pass a token explicitly. This is what makes env-by-name safe: a raw `OMNIGRAPH_BEARER_TOKEN_<NAME>` carries no issued-for endpoint, so it is trustworthy only when the *name → endpoint* binding it rides on is itself trusted.
+2. *login-written credentials additionally bind to their endpoint.* `omnigraph login <server>` records `(name, endpoint)`; at use, the keychain/profile token is released only if the resolved endpoint still matches, erroring otherwise (`server 'prod' resolved to <endpoint>, which does not match the endpoint this credential was issued for`). This catches a trusted server whose endpoint later changes.
+
+Together with the §4 identity rule (a lower-trust layer can neither repoint a trusted server nor carry `auth:`), ambient credentials cannot be redirected to an attacker endpoint.
 
 If `auth:` is set, that source is used (no fallthrough). `omnigraph login <server>` writes/rotates only that server's secret (keychain preferred; OAuth, when implemented (V6), runs the device flow and caches tokens in the keychain → `~/.omnigraph/cache/oauth/`). There is **no `credentials.yaml`** and no inlined secret. *Convention for the floor, explicit for control.*
 
@@ -430,7 +434,7 @@ graphs:
 defaults: { graph: production, branch: main, output_format: table }
 serve:
   graphs: [production]                          # which embedded graphs to serve (default: all)
-  auth:   { bearer: { enabled: true } }         # bind/workers via --bind / OMNIGRAPH_BIND
+  auth:   { bearer: { enabled: true } }         # bind via --bind (OMNIGRAPH_BIND proposed; see Rollout)
   policy: { file: ./policies/server.yaml }
 ```
 
@@ -452,7 +456,7 @@ token = …
 ## AX (agent experience)
 
 1. **One flat resolved context.** graph→server→endpoint→token resolves before the agent sees anything; `config view --resolved` flattens it. The agent reasons about tools, not topology.
-2. **Secrets are outside the repo and bound to an endpoint.** No secret-bearing file in the repo (hard rule 2); tokens live in the keychain / global layer / env, and are released only to the endpoint they were issued for (§7). A repo-confined agent cannot read a token, and cannot exfiltrate one by repointing a server — the endpoint-binding and §4 identity rule withhold it. See the threat model below for the precise boundary.
+2. **Secrets are outside the repo and trust-gated.** No secret-bearing file in the repo (hard rule 2); tokens live in the keychain / global layer / env, and ambient credentials apply only to trusted-origin servers (§7). A repo-confined agent cannot read a token, and cannot exfiltrate one by repointing or introducing a server — the §7 trust model and §4 identity rule withhold it. See the threat model below for the precise boundary.
 3. **Branch/snapshot-pinned contexts** (E4) — hand an agent a `branch: review` / `--snapshot v42` graph and its reads are reproducible and cannot see uncommitted main-line state.
 4. **Capabilities are a GitOps'd artifact** (E6) — which graphs exist, which stored-query tools it may call, and which Cedar rules gate them are all in version-controlled config. Powers change only via a reviewed PR + restart.
 5. **Config + policy compose.** Config = "where am I pointed + which token"; Cedar = "what may I do there." Orthogonal.
@@ -500,7 +504,7 @@ Gated behind `version:`. `version: 1` is this schema; a missing `version:` is re
 
 **Renamed / migrated:**
 - `server.graph` (single-graph selector) → **`serve.graphs: [<name>]`** (a one-element served set; §9). Not a removal — the "define many graphs, serve a subset" capability is preserved.
-- **Legacy credential mapping.** Legacy `{ uri, bearer_token_env }` is a graph-local remote credential with *no named server*, so it cannot map cleanly to `servers.<n>.auth…`. Under `version: 1` the migration **synthesizes a server** — `servers.<graph_name> = { endpoint: <uri>, auth: { bearer: { token: { env: <VAR> } } } }` — and rewrites the graph to `{ server: <graph_name>, graph_id: <graph_name> }`. In legacy mode (no `version:`) the graph-local credential keeps working unchanged.
+- **Legacy remote graph + credential mapping.** A legacy remote `{ uri, bearer_token_env }` has *no named server*, and its `uri` may already smuggle the multi-graph hack (`https://host/graphs/{gid}`). Under `version: 1` the migration **splits the URI** and **synthesizes a server**: `https://host[/…]/graphs/{gid}` → `endpoint: https://host`, `graph_id: gid`; a bare `https://host[:port]` → `endpoint: https://host[:port]`, `graph_id: <graph_name>`. It emits `servers.<name> = { endpoint, auth: { bearer: { token: { env: <VAR> } } } }` (treated as trusted on migrate) and rewrites the graph to `{ server: <name>, graph_id }`. Splitting the `/graphs/{gid}` suffix is required — otherwise V2's always-`/graphs/{id}/…` client would build `https://host/graphs/{gid}/graphs/<name>`. In legacy mode (no `version:`) the graph-local credential keeps working unchanged.
 
 **Posture flips:**
 - **Global-first.** The CLI gains a global discovery layer below the project file; existing project-only workflows are unchanged (project still overrides global).
@@ -548,7 +552,7 @@ Gated behind `version:`. `version: 1` is this schema; a missing `version:` is re
 | N6 | P3 | `GraphConn` — `Embedded(engine)` \| `Remote(http)` dispatch | **N⚠️** | → N7, N8 |
 | N7 | P3 | embedded path — `Omnigraph::open(storage)` (existing) | — | → engine |
 | N8 | P3 | HTTP-client path — **rewire existing reqwest calls to `/graphs/{id}/…`; migrate off `/read`,`/change`** | **extend** | → P4, N9 |
-| N9 | P2 | `resolve_auth(server)` — method×source (§6): explicit `auth:` else implicit chain keyed by name (reuses `OMNIGRAPH_BEARER_TOKEN`); **enforces endpoint-binding before releasing a token** (§7) | **N⚠️** | → N8 |
+| N9 | P2 | `resolve_auth(server)` — method×source (§6): explicit `auth:` else implicit chain keyed by name (reuses `OMNIGRAPH_BEARER_TOKEN`); **enforces the §7 credential trust model (trusted-origin + endpoint-binding) before releasing a token** | **N⚠️** | → N8 |
 | N10 | P2 | `config view` handler — merged + per-field origin (needs N2) | **N** | → U7 |
 | N11 | P5 | `login` handler — interactive auth (incl. OAuth device flow) → keychain / `credentials` (0600) + `.gitignore` | **N⚠️** | → S_global |
 | N12 | P5 | `init` handler — `scaffold_config_if_missing`; refuse-if-exists / `--force` | partly | → S_project |
@@ -562,7 +566,7 @@ Gated behind `version:`. `version: 1` is this schema; a missing `version:` is re
 |---|---|---|
 | **V1** | **Global layer + merge + `config view`** | Config in `~/.omnigraph/`; `config view --resolved --show-origin` from any dir → merged result with per-field origin; embedded commands work global-first with no project file |
 | **V2** | **Typed locator + route unification + remote client** | Define a `server:` graph (or `server/graph_id`); `query --graph prod` hits the server `curl`-free against `/graphs/{id}/…`; embedded `--graph dev` still local. *Gated on N15.* |
-| **V3** | **Auth model + `login` + endpoint-bound credentials** | `omnigraph login prod` (bearer) → keychain; per-server resolution with endpoint-binding (§7) + the §4 identity rule (the security model); V2 works with no manual env |
+| **V3** | **Auth model + `login` + credential trust model** | `omnigraph login prod` (bearer) → keychain; per-server resolution with the §7 trust model (trusted-origin + endpoint-binding) + the §4 identity rule (the security model); V2 works with no manual env |
 | **V4** | **Thin-init hardening + quickstart + templates** | `quickstart --template person-knows` scaffolds + seeds + serves; `init --force` purges |
 | **V5** | **Agent-mode** | `OMNIGRAPH_AGENT_MODE=1 omnigraph query …` → JSON + structured errors + typed exit codes; never-prompt |
 | **V6** | **OAuth / mTLS (reserved methods)** | implement the reserved `oauth` (device flow, token cache, refresh, OIDC server-side validation) and `mtls`; the enum shape ships in V3, so this is additive |
@@ -571,7 +575,7 @@ V1 is the foundation. V2 closes the substantive client→server gap (and depends
 
 ## Rollout
 
-**V1 (global layer + merge + view) → V2 (typed locator + route unification + remote client) → V3 (auth + login + endpoint-bound credentials) → V4 (quickstart/templates) → V5 (agent-mode) → V6 (OAuth/mTLS).** V1–V2 close the substantive gap; **V3 lands the auth model and the credential-redirection security fix (a gate, not optional polish)**; V4–V5 are ergonomics; V6 implements the reserved auth methods. Land the schema-`version:` gate and the `omnigraph-config` crate extraction first, since everything else builds on them. Evaluate after V2 against early-adopter and agent-onboarding signal.
+**V1 (global layer + merge + view) → V2 (typed locator + route unification + remote client) → V3 (auth + login + endpoint-bound credentials) → V4 (quickstart/templates) → V5 (agent-mode) → V6 (OAuth/mTLS).** V1–V2 close the substantive gap; **V3 lands the auth model and the credential-redirection security fix (a gate, not optional polish)**; V4–V5 are ergonomics; V6 implements the reserved auth methods. Land the schema-`version:` gate and the `omnigraph-config` crate extraction first, since everything else builds on them. (`OMNIGRAPH_BIND` is a small additive server task — the current binary honors `--bind`/`server.bind` only, `lib.rs:899` — not a prerequisite.) Evaluate after V2 against early-adopter and agent-onboarding signal.
 
 ## Prior art
 
