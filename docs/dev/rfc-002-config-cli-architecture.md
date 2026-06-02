@@ -51,6 +51,7 @@ Three problems, in priority order:
 - **Dropping embedded mode.** Embedded-first is load-bearing for the file-layout decision.
 - **Cross-graph / cross-server tool listing in MCP.** Clients loop over per-graph catalogs.
 - **Managing cloud-storage credentials.** Embedded graphs authenticate to object storage via the standard cloud chain (`AWS_*`, instance roles); OmniGraph does not own those (§6).
+- **Cloud-mode multi-tenancy.** A future multi-tenant Cloud tier (tenant resolved from the OAuth `org_id` claim, per-tenant Cedar bundles, dynamic graph lifecycle, `DELETE /graphs`) is out of scope and lands in the cloud RFC (MR-956 RFC 0003/0004). This RFC only **reserves the shapes** so that work is additive — `serve.auth.oauth` multi-issuer + `tenant_claim` (§6), `serve.policy` as a tagged source (§6), `(server, org)` credential keying (§7), and the `GraphKey { tenant_id, graph_id }` registry seam already shipped in MR-668 (§9). Tenant is **server-resolved from the token** (the MR-731 invariant, `identity.rs:180`) and never appears in the locator, URL path, or request body.
 
 ## Background
 
@@ -308,7 +309,7 @@ enum SecretSource {
 | `mtls` | client-cert networks | `auth: { mtls: { cert: { file: ./client.pem }, key: { file: /run/secrets/og-key.pem } } }` (key off the repo tree — hard rule 2) |
 | `none` | open dev server | `auth: { none: {} }` |
 
-**Scope (v1): only `bearer` and `none` are implemented.** `oauth` and `mtls` are **reserved** — the enum shape is fixed (so adding them later is not a breaking re-key, per Hyrum's Law), but a config selecting them errors with "auth method not yet supported." Full OAuth (device flow, token cache, refresh, OIDC server-side validation) and mTLS are a later milestone (Rollout V6).
+**Scope (v1): only `bearer` and `none` are implemented.** `oauth` and `mtls` are **reserved** — the enum shape is fixed (so adding them later is not a breaking re-key, per Hyrum's Law), but a config selecting them errors with "auth method not yet supported." Client-side OAuth login (device flow, token cache, refresh) is a later milestone (Rollout V6); **server-side OIDC validation is owned by the Federated Auth workstream (MR-956 RFC 0001)** — `serve.auth.oauth` (below) is its YAML home and may land on its own timeline. mTLS is V6.
 
 **Auth is per-server, not per-graph.** One credential authenticates you to a *server*; Cedar then authorizes per graph. The shipped per-graph `bearer_token_env` is the wrong grain for a multi-graph world (it repeats across every graph on a server); it survives as a legacy alias for `servers.<n>.auth.bearer.token.env`.
 
@@ -320,10 +321,17 @@ enum SecretSource {
 serve:
   auth:
     bearer: { enabled: true }                                  # tokens via OMNIGRAPH_SERVER_BEARER_TOKEN* env
-    oauth:  { issuer: https://auth.og.cloud, audience: og-api } # validate OIDC tokens (reserved/future, V6)
+    oauth:                                  # reserved shape; verifier owned by MR-956 RFC 0001
+      issuers:                              # LIST from day one — scalar→list would be a breaking re-key
+        - issuer:  https://auth.og.cloud
+          audience: og-api
+          tenant_claim: org_id              # → ResolvedActor.tenant_id (None in Cluster, Some in Cloud)
+          # actor_claim / scope_claim / jwks_* field schema owned by MR-956 RFC 0001
   policy: { file: ./policies/server.yaml }                      # server-level Cedar (management endpoints)
   # bind/workers are 12-factor: --bind today (OMNIGRAPH_BIND is proposed, not yet implemented), never committed here
 ```
+
+**Reserved for cloud (shape only; see Non-Goals).** Two forward-compat shapes ship in v0.8.x so the multi-tenant Cloud tier is additive, not a breaking re-key: (1) `serve.auth.oauth.issuers` is a **list** carrying `tenant_claim` (→ `ResolvedActor.tenant_id`, already present at `identity.rs:189`) — the verifier and full field schema (`jwks_*`, `clock_skew`, actor/scope claims) are **owned by MR-956 RFC 0001**, which this block is the YAML home for; this RFC reserves only the top-level shape and defers fields there, so there is **one** OIDC schema, not two. (2) `serve.policy` is a **tagged source keyed at the `policy` level** (like `storage:`/`auth:`) — `file` today, `directory`/`manifest` reserved for per-tenant Cedar bundles — so adding variants is additive, with **no `source:` wrapper** (which would be a needless re-key). Both stay parse-but-reject until implemented.
 
 ### 7. Credential resolution and connection tiers
 
@@ -343,6 +351,8 @@ serve:
 2. *login-written credentials additionally bind to their endpoint.* `omnigraph login <server>` records `(name, endpoint)`; at use, the keychain/profile token is released only if the resolved endpoint still matches, erroring otherwise (`server 'prod' resolved to <endpoint>, which does not match the endpoint this credential was issued for`). This catches a trusted server whose endpoint later changes.
 
 Together with the §4 identity rule (a lower-trust layer can neither repoint a trusted server nor carry `servers.<name>.auth`), ambient credentials cannot be redirected to an attacker endpoint.
+
+**Forward-compat (cloud, reserved; see Non-Goals).** Endpoint-binding keys a credential to `(name, endpoint)`, but a multi-org user on **one** cloud endpoint holds many tokens that all bind to that endpoint — so endpoint-binding alone cannot disambiguate them, and the credential identity unit becomes `(server, organization)`. Reserve `omnigraph:<server>[/<org>]` keychain keying and `[<server>/<org>]` profile sections now (additive). The org is server-resolved from the token (never a client-asserted field), so this is a storage-keying concern only.
 
 If `auth:` is set, that source is used (no fallthrough). `omnigraph login <server>` writes/rotates only that server's secret (keychain preferred; OAuth, when implemented (V6), runs the device flow and caches tokens in the keychain → `~/.omnigraph/cache/oauth/`). There is **no `credentials.yaml`** and no inlined secret. *Convention for the floor, explicit for control.*
 
@@ -384,6 +394,8 @@ This is the **capability-as-code guarantee for agents**: an agent can only invok
 **Client.** The client config is **mode-agnostic**: a `Remote` locator always carries `graph_id`, and the client always builds `/graphs/{graph_id}/…`. It never needs to know a server's deploy mode.
 
 This avoids shipping two URL shapes for the same operation depending on a config mode (a Hyrum's-Law liability) and lets the existing CLI remote paths be rewired once to the prefixed form (and migrated off the deprecated `/read`/`/change`). The fallback, if route unification is deferred, is a cached `GET /graphs` probe in `~/.omnigraph/cache/` (the catalog already returns each `graph_id`); it is strictly worse and not preferred. **V2 is gated on route unification.**
+
+**Forward-compat (cloud, reserved; see Non-Goals).** The unified registry stays keyed by **`GraphKey { tenant_id: Option<TenantId>, graph_id }`** — already shipped in MR-668 (`identity.rs:116`, `tenant_id = None` in Cluster/embedded). Folding `Single`/`Multi` into one registry (V2) must **not** flatten it to `graph_id`-only: Cloud mode sets `tenant_id = Some(...)` from the token's `org_id`, two tenants may each own `production`, and `GET /graphs` becomes tenant-scoped (filtered to the resolved tenant; cross-tenant default-deny). Tenant is resolved from the token, never the path.
 
 ### 10. CLI surface
 
@@ -533,6 +545,7 @@ Gated behind `version:`. `version: 1` is this schema; a missing `version:` is re
 
 - **Keychain crate + name-derivation.** Keychain is the primary credential store, so it is on the critical path: macOS Keychain first, the `0600` profile file as fallback; Linux Secret Service / `pass` later. Open: which keyring crate, and the exact `OMNIGRAPH_BEARER_TOKEN_<SERVER>` derivation (upper-snake, non-alnum → `_`).
 - **OAuth flow specifics (V6, not v1).** Device-authorization vs auth-code+PKCE as the default `login` flow; token-cache location and refresh-failure UX. The enum reserves the shape; implementation is deferred.
+- **OIDC ownership / timeline (cloud).** `serve.auth.oauth`'s shape is reserved here; its verifier + field schema are MR-956 RFC 0001's. If Federated Auth lands before V6, server-side OIDC validation ships on its timeline, not this RFC's — the two must converge on one schema (the reserved `issuers:`-list + `tenant_claim`), never a second OIDC config.
 - **`storage:` block scope.** How much object-store config to honor per graph (region/endpoint/profile) vs. delegating entirely to the ambient chain. Start minimal.
 - **Single-file vs `KUBECONFIG`-style list.** `OMNIGRAPH_CONFIG` single path first; colon-joined list later if demand appears.
 - **`config.yaml` vs `omnigraph.yaml` deep convergence.** Out of scope: one registry with embedded + remote invocation surfaces is the long-term end state for `queries:`/`aliases:`.
