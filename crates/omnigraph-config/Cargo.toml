@@ -1,0 +1,18 @@
+[package]
+name = "omnigraph-config"
+version = "0.6.1"
+edition = "2024"
+description = "Configuration schema and loader for the Omnigraph graph database."
+license = "MIT"
+repository = "https://github.com/ModernRelay/omnigraph"
+homepage = "https://github.com/ModernRelay/omnigraph"
+documentation = "https://docs.rs/omnigraph-config"
+
+[dependencies]
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+clap = { workspace = true }
+color-eyre = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

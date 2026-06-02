@@ -6,6 +6,7 @@ members = [
     "crates/omnigraph-cli",
     "crates/omnigraph-policy",
     "crates/omnigraph-server",
+    "crates/omnigraph-config",
 ]
 default-members = [
     "crates/omnigraph",

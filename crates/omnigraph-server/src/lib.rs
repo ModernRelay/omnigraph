@@ -1,6 +1,6 @@
 pub mod api;
 pub mod auth;
-pub mod config;
+pub use omnigraph_config as config;
 pub mod graph_id;
 pub mod identity;
 pub mod policy;
