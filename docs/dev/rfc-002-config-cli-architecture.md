@@ -146,10 +146,12 @@ prod:
     uri: s3://team/prod.omni
     region: eu-west-1
     endpoint: https://minio.local                # S3-compatible override
-    profile: team-deploy                          # named cloud profile
+    profile: team-deploy                          # named cloud profile (env-only — see note)
 ```
 
 Shipped flat `uri:` becomes a deprecated alias mapped to `storage.uri` with a load-time warning.
+
+**Validation (Lance 6.0.1):** `region`/`endpoint` are threadable per-graph today — Lance accepts per-dataset `storage_options` (`builder.rs:165-176,305`) and omnigraph currently hardcodes `storage_options: None` (`namespace.rs:228,376`); wiring them is omnigraph-internal, no Lance change. **`profile` is the exception** — `AWS_PROFILE` is env-only in both Lance and omnigraph's `AmazonS3Builder::from_env()` (`storage.rs:284`), so `storage.profile` is **scoped out of v1** unless omnigraph resolves the profile to concrete credentials itself. `region`/`endpoint` land in V2 (engine threading); `profile` stays a documented Open Question.
 
 ### 3. Invalid configs are rejected by design
 
@@ -377,7 +379,7 @@ This is the **capability-as-code guarantee for agents**: an agent can only invok
 
 **What the server serves.** `serve.graphs: [<name>, …]` selects which embedded `graphs:` entries this process serves (default: **all** embedded entries). It subsumes the removed `server.graph` (a one-element list). Mode is derived from the served count: one ⇒ single, many ⇒ multi.
 
-**Canonical wire id.** Every served graph has a canonical `graph_id` — its `serve.graphs` selection name, or `default` for a bare-URI server started with no config. The server **always mounts `/graphs/{graph_id}/…`**. The legacy flat routes (`/query`, `/branches`, …) remain **only when exactly one graph is served**, as a compat alias bound to that graph. `GET /graphs` returns the served set (one entry in single mode — today's single-mode 405 is removed) and stays `graph_list`-gated.
+**Canonical wire id.** Every served graph has a canonical `graph_id` — its `serve.graphs` selection name, or `default` for a bare-URI server started with no config. The server **always mounts `/graphs/{graph_id}/…`**. The legacy flat routes (`/query`, `/branches`, …) remain **only when exactly one graph is served**, as a compat alias bound to that graph. `GET /graphs` returns the served set (one entry in single mode — today's single-mode 405 is removed) and stays `graph_list`-gated — so with default-deny on server-scoped actions, single-mode `GET /graphs` returns **403 unless a `serve.policy` authorizes `graph_list`** (405→403, not →200). **Open decision (validated):** the wire `graph_id` (`default` for a bare-URI server) and the Cedar *resource* id (today the normalized URI, `graph_resource_id_for_selection`) differ for anonymous graphs; either accept the split or align the anonymous Cedar id to `default` (a policy-identity break for existing single-graph deployments).
 
 **Client.** The client config is **mode-agnostic**: a `Remote` locator always carries `graph_id`, and the client always builds `/graphs/{graph_id}/…`. It never needs to know a server's deploy mode.
 
@@ -486,6 +488,21 @@ token = …
 | Pluggable auth methods (bearer/oauth/mtls) | ✅ (exec) | partial | ✗ | ✗ | ✅ |
 | Concept count | 3 | 1 | 2 | 1 | **2 (servers/graphs)** |
 
+## Divergence & single source of truth
+
+The test (engineering integrated over time): does this design *prevent* divergence between the three surfaces — CLI, config, HTTP routes — by construction, or merely reduce today's instances?
+
+**Structurally prevented:**
+- **config ↔ CLI** — one noun (`graphs:`/`--graph`); a graph address resolves **once** into a typed `GraphLocator` (§2) that downstream dispatches on, instead of re-sniffing `is_remote_uri` at ~17 sites. A new command receives the resolved locator and cannot re-derive "server or file?" wrong. *Enforcement points:* a shared `GraphArgs` (one flag definition) and routing **every** command through the resolver — the current bare-`resolve_uri` re-sniff sites must be converted, not left.
+- **config ↔ HTTP capability surface** — `policy:`/`queries:` live at exactly one site (the owning `Embedded` graph entry), read identically by the embedded CLI and the server; the dual top-level/per-graph reconciliation is deleted.
+
+**Reduced, not prevented — the residual axis:**
+- **CLI ↔ HTTP routes.** Route unification (§9) makes the path *shape* uniform, and *body* types are already shared (the CLI imports `api::*` DTOs, so a DTO change breaks CLI compilation — a compile-time guard). But **path strings stay hand-duplicated**: the server declares routes (`.route("/branches", …)`) and the CLI hand-writes the matching strings (`remote_url(&uri, "/branches")`), and the `omnigraph-ts` SDK is generated from a *vendored* `openapi.json` snapshot. So a new endpoint still forks three ways (server route + CLI client call + SDK re-vendor). Unification removes the *mode* divergence (flat vs nested) and the `/read`-vs-`/query` drift — not the structure that generates path divergence.
+
+**The structural move that would close it (recorded, not in scope):** a shared route/operation table (path+method consts) consumed by both the server router and the CLI client, and/or generating the CLI's HTTP client from the same OpenAPI spec the SDK uses (the CLI is the only hand-maintained parallel client). Given ~17 slowly-growing endpoints and compile-shared bodies, this does not block the RFC — but **V2 is the cheap moment to add the shared path constants**, since it touches every path anyway.
+
+**Net liability:** every duplicate-site count goes down (≈17 sniff sites → 1 locator; 2 route shapes → 1; dual policy/queries → 1; per-graph token → per-server; silent-ignore → honored-or-rejected). The added surface (merge+provenance engine, keychain, layered loader) is centralized — lower ongoing liability *provided* every command routes through the single resolver.
+
 ## Migration / breaking changes
 
 Gated behind `version:`. `version: 1` is this schema; a missing `version:` is read as legacy (the shipped shape) with deprecation warnings.
@@ -522,7 +539,7 @@ Gated behind `version:`. `version: 1` is this schema; a missing `version:` is re
 
 ## Implementation — breadboard + slices
 
-**Bold** = NEW. The new layered-config + resolver + auth code lands in a **new `omnigraph-config` crate** depended on by `omnigraph-cli` and `omnigraph-server`, so neither the CLI nor YAML parsing pulls in the HTTP server stack.
+**Bold** = NEW. The new layered-config + resolver + auth code lands in a **new `omnigraph-config` crate** depended on by `omnigraph-cli` and `omnigraph-server`, so neither the CLI nor YAML parsing pulls in the HTTP server stack. **Caveat (validated):** config extraction alone does *not* shed the dependency — the CLI also imports ~20 `omnigraph_server::api::*` wire DTOs (`main.rs:20-27`). Fully realizing "CLI doesn't pull Axum" needs a companion **`omnigraph-api-types`** crate (the DTOs); otherwise the CLI keeps the server dep for DTOs. `QueryRegistry` stays in `omnigraph-server` (it is `omnigraph-compiler`-coupled, `queries.rs:18-22`) — only the serde types move; `PolicyEngine` is already standalone in `omnigraph-policy`.
 
 ### Places
 
@@ -565,6 +582,7 @@ Gated behind `version:`. `version: 1` is this schema; a missing `version:` is re
 
 | # | Slice | Demo |
 |---|---|---|
+| **V0** | **Foundations (no behavior change)** | extract `omnigraph-config` (+ `omnigraph-api-types`); add `version:` + `deny_unknown_fields`; build the layered-config fixture harness + keychain `SecretStore` seam; relocate the 11 `config.rs` tests. `cargo test --workspace` green, no functional change. |
 | **V1** | **Global layer + merge + `config view`** | Config in `~/.omnigraph/`; `config view --resolved --show-origin` from any dir → merged result with per-field origin; embedded commands work global-first with no project file |
 | **V2** | **Typed locator + route unification + remote client** | Define a `server:` graph (or `server/graph_id`); `query --graph prod` hits the server `curl`-free against `/graphs/{id}/…`; embedded `--graph dev` still local. *Gated on N15.* |
 | **V3** | **Auth model + `login` + credential trust model** | `omnigraph login prod` (bearer) → keychain; per-server resolution with the §7 trust model (trusted-origin + endpoint-binding) + the §4 identity rule (the security model); V2 works with no manual env |
@@ -572,11 +590,63 @@ Gated behind `version:`. `version: 1` is this schema; a missing `version:` is re
 | **V5** | **Agent-mode** | `OMNIGRAPH_AGENT_MODE=1 omnigraph query …` → JSON + structured errors + typed exit codes; never-prompt |
 | **V6** | **OAuth / mTLS (reserved methods)** | implement the reserved `oauth` (device flow, token cache, refresh, OIDC server-side validation) and `mtls`; the enum shape ships in V3, so this is additive |
 
-V1 is the foundation. V2 closes the substantive client→server gap (and depends on the server route unification, N15). V3 is the credential + auth model. V4/V5 are ergonomics.
+### Phase detail (sizing, gates, exit)
+
+Sizes from the 2026-06-02 code audit (six parallel validators). **V0** is a prerequisite the original slices folded into "land first."
+
+**V0 — Foundations** *(M–L; gates everything; no behavior change)*
+- Extract `omnigraph-config` (schema + `load_config` + resolvers — clean, only std/serde/clap deps). Keep `QueryRegistry` in `omnigraph-server` (compiler-coupled); move only serde types; import `PolicyEngine` from `omnigraph-policy` directly. Decide/extract `omnigraph-api-types` (the `api::*` DTOs) to actually shed the CLI's server dep.
+- `version:` + `deny_unknown_fields`, version-gated (no-version = legacy-lenient with compat aliases; `version: 1` = strict).
+- Build the two missing test seams — a layered-config fixture harness (`TempHome` + `OMNIGRAPH_HOME`/XDG env isolation) and a keychain `SecretStore` trait + in-memory fake; relocate the 11 `config.rs` tests (`config.rs:567-948`). Record both in `testing.md`.
+- Exit: `cargo test --workspace --locked` green; no functional change.
+
+**V1 — Layered config + typed locator** *(L; the long pole)*
+- N3 global-dir resolver; N1 layered load; **N2 merge engine + per-field provenance** (replaces the single `base_dir` — the hardest net-new piece; it gates both `config view` *and* the §7 trusted-origin rule); N3b active-context state + `omnigraph use`.
+- Typed `GraphLocator` + `resolve_graph` (§1); rewrite the ~17 dispatch sites; delete `is_remote_uri` (`main.rs:686`).
+- Schema reshape: `cli:`→`defaults:`, `server:`→`serve:`, `uri:`→`storage:` (string-or-block; region/endpoint, **profile scoped out**), remove top-level `policy:`/`queries:` (delete the coherence machinery `config.rs:356-421`), drop `project.name`. Fix `resolve_policy_tooling_graph_selection`.
+- `--graph` canonical + `--target` alias (extract a shared `GraphArgs` first — the flag is duplicated 23×); `config view --resolved --show-origin`; migrate `scaffold_config_if_missing` (`main.rs:1547`) to `version: 1`.
+- Exit: CLI works global-first with no project file; embedded behavior unchanged.
+
+**V2 — Route unification + remote client** *(L; closes the substantive gap; gated on V0 server-side, V1 client-side)*
+- Server: add `serve.graphs`; **unwind the `Single`/`Multi` bifurcation** (`GraphRouting`/`ServerConfigMode` + ~4 branch sites) into one registry; always `.nest("/graphs/{graph_id}",…)` (`lib.rs:1170-1175`); flat = compat alias when one graph served; `GET /graphs` served set (403-by-default without `serve.policy`); resolve the wire-vs-Cedar `graph_id` decision (§9).
+- Client (N8): `remote_url` takes `graph_id` → `/graphs/{id}/…`; `/read`→`/query`, `/change`→`/mutate` (drop `legacy_change_request_body`); locator guards for `load`/`lint`/`schema plan`/`optimize`/`cleanup`.
+- Engine: thread `storage.region`/`endpoint` → `Omnigraph::open` → `namespace.rs:228,376` + `S3StorageAdapter` (`storage.rs:284`).
+- OpenAPI/SDK: regen `openapi.json` (`OMNIGRAPH_UPDATE_OPENAPI=1`), rewrite the exact allow-lists (`openapi.rs:162,1120`), re-vendor `omnigraph-ts` (its `transport.ts` is already prefixed — runtime aligns, op-id names churn).
+- Tests: **make `system_remote.rs` hermetic** (it is entirely `#[ignore]`'d today — the central gap-closer has zero enforced coverage); route-mode matrix; legacy `/graphs/{gid}` URI-split migration.
+
+**V3 — Credential trust model + login** *(L; the security phase; needs V1 provenance)*
+- `servers:` + `Auth` union (`bearer`/`none` impl; `oauth`/`mtls` reserved-error) × `SecretSource`; `resolve_auth` keyed by server name (`rust-ini` reusable from the lock tree); **trusted-origin rule** (unblocked by V1 provenance) + **endpoint-binding**; reject project-layer `servers.auth`/`command`. `omnigraph login` (bearer → keychain via `keyring` 4.0.1, feature-gated, headless graceful-degrade — **check MSRV 1.88** against the toolchain); `serve.auth.bearer.enabled`; `OMNIGRAPH_SERVER` env floor.
+
+**V4 — Init/quickstart** *(S–M)* — `quickstart --template`, `init --force`. **V5 — Agent-mode** *(S–M)* — `OMNIGRAPH_AGENT_MODE`. **V6 — OAuth/mTLS** *(L; deferred)* — client `oauth2`/`openidconnect` + device flow + token cache/refresh; server OIDC/JWKS via `jsonwebtoken` (already in the lock tree); `AuthSource::Oidc` is already reserved (`identity.rs:163`).
+
+### Critical path & parallelization
+
+```
+V0 (crate + api-types + version gate + test seams)
+        ├──────────────► V2-server (serve.graphs + route unwind)   ← needs only serve.graphs; develop alongside V1
+        │                         │
+V1 (N2 provenance + typed locator + schema reshape + config view + --graph)
+        │                         │
+        ├────► V2-client (remote rewire) ── gated on V2-server ────┘
+        ├────► V3 (auth union + trusted-origin[needs N2] + login + keychain)
+        └────► V4, V5 (ride V1)          V6 (rides V3; large, independent)
+```
+
+Long poles: **N2 merge+provenance**, the **typed-locator rewrite**, the **server Single/Multi unwind**. Startable early in parallel: V2-server (server-only), the `storage:` engine threading, and the mechanical `--graph` rename.
+
+### Validation findings (2026-06-02 code audit)
+
+Six parallel validators confirmed the RFC's code claims and surfaced these plan-shaping facts (folded into the phases above):
+1. Config extraction alone does not shed Axum from the CLI — it also imports `api::*` DTOs → V0 adds `omnigraph-api-types`.
+2. N2 merge+provenance gates both `config view` and the trusted-origin rule → it is the V1 linchpin; the auth trust model cannot precede config layering.
+3. Route unification is not green-field — it unwinds the deliberate `Single`/`Multi` split and forces an `openapi.json` regen + `omnigraph-ts` re-vendor (SDK runtime already prefixed; op-ids churn).
+4. `storage.profile` is env-only in Lance and omnigraph → scoped out of v1; `region`/`endpoint` are feasible now (Lance accepts per-dataset `storage_options`).
+5. `system_remote.rs` is entirely `#[ignore]`'d → V2 must make it hermetic or rewrites land green-then-break.
+6. Two test seams (layered-config fixtures, keychain) are missing and on the critical path → built in V0.
 
 ## Rollout
 
-**V1 (global layer + merge + view) → V2 (typed locator + route unification + remote client) → V3 (auth + login + endpoint-bound credentials) → V4 (quickstart/templates) → V5 (agent-mode) → V6 (OAuth/mTLS).** V1–V2 close the substantive gap; **V3 lands the auth model and the credential-redirection security fix (a gate, not optional polish)**; V4–V5 are ergonomics; V6 implements the reserved auth methods. Land the schema-`version:` gate and the `omnigraph-config` crate extraction first, since everything else builds on them. (`OMNIGRAPH_BIND` is a small additive server task — the current binary honors `--bind`/`server.bind` only, `lib.rs:899` — not a prerequisite.) Evaluate after V2 against early-adopter and agent-onboarding signal.
+**V0 → V1 → V2 → V3 → V4 → V5 → V6.** V0–V1 are the foundation; V2 closes the substantive client→server gap (gated on server route unification, N15); **V3 lands the auth model and the credential-redirection security fix (a gate, not optional polish)**; V4–V5 are ergonomics; V6 implements the reserved auth methods. (`OMNIGRAPH_BIND` is a small additive server task — the binary honors `--bind`/`server.bind` only, `lib.rs:899` — not a prerequisite.) Evaluate after V2 against early-adopter and agent-onboarding signal.
 
 ## Prior art
 
