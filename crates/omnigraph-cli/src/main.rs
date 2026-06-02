@@ -3011,18 +3011,19 @@ async fn main() -> Result<()> {
                         "fragments_removed": s.fragments_removed,
                         "fragments_added": s.fragments_added,
                         "committed": s.committed,
+                        "skipped": s.skipped.map(|r| r.as_str()),
                     })).collect::<Vec<_>>(),
                 });
                 print_json(&value)?;
             } else {
                 println!("optimize {} — {} tables", uri, stats.len());
                 for s in &stats {
-                    if s.committed {
+                    if let Some(reason) = s.skipped {
+                        println!("  {:<40} skipped ({reason})", s.table_key);
+                    } else if s.committed {
                         println!(
                             "  {:<40} frags {} → {} ✓",
-                            s.table_key,
-                            s.fragments_removed + s.fragments_added - s.fragments_added,
-                            s.fragments_added
+                            s.table_key, s.fragments_removed, s.fragments_added
                         );
                     } else {
                         println!("  {:<40} no-op", s.table_key);

@@ -130,6 +130,15 @@ them explicit.
 - **Deletes and vector indexes:** `delete_where` and vector index creation still
   advance Lance HEAD inline because the required public Lance APIs are missing.
   Keep D2 and recovery coverage in place until those residuals are removed.
+- **Blob-column compaction:** Lance `compact_files` mis-decodes blob-v2 columns
+  under its forced `BlobHandling::AllBinary` read ("more fields in the schema
+  than provided column indices"), so `optimize` skips any table with a `Blob`
+  property — reporting `SkipReason::BlobColumnsUnsupportedByLance` (loud, not a
+  silent drop) behind the `LANCE_SUPPORTS_BLOB_COMPACTION` gate. Reads and writes
+  are unaffected; only space/fragment reclamation on blob tables is deferred.
+  Remove the skip when the upstream Lance fix lands — the
+  `lance_surface_guards.rs::compact_files_still_fails_on_blob_columns` guard
+  turns red on that bump to force it.
 - **Planner capability/stat surfaces:** cost-aware planning, complete
   capability advertisement, and explain-with-cost are roadmap. Do not describe
   them as implemented.

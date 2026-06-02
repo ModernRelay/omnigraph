@@ -40,6 +40,20 @@ fn maint_concurrency() -> usize {
         .unwrap_or(DEFAULT_MAINT_CONCURRENCY)
 }
 
+/// Whether the installed Lance can compact a dataset that contains blob
+/// columns. `false` today: Lance `compact_files` forces
+/// `BlobHandling::AllBinary` on the read side, and the blob-v2 struct decoder
+/// mis-counts columns ("there were more fields in the schema than provided
+/// column indices"), failing even a pristine uniform-V2_2 multi-fragment blob
+/// table. Reads are unaffected (queries use descriptor handling).
+///
+/// While `false`, [`optimize_all_tables`] skips blob-bearing tables and reports
+/// [`SkipReason::BlobColumnsUnsupportedByLance`] instead of aborting the whole
+/// sweep. Flip to `true` once the upstream Lance fix ships — the
+/// `lance_surface_guards.rs::compact_files_still_fails_on_blob_columns` guard
+/// turns red on that bump and forces this flip. Tracked in `docs/dev/lance.md`.
+const LANCE_SUPPORTS_BLOB_COMPACTION: bool = false;
+
 /// Retention knobs for [`cleanup_all_tables`]. At least one must be set or
 /// nothing is cleaned. If both are set, Lance applies them as AND (a manifest
 /// is kept if it satisfies either — i.e. only manifests older than BOTH the
@@ -52,8 +66,45 @@ pub struct CleanupPolicyOptions {
     pub older_than: Option<Duration>,
 }
 
-/// Per-table outcome of `optimize_all_tables`.
+/// Why `optimize` did not compact a table. Typed so callers branch on the
+/// reason rather than sniffing a string. One variant today, gated by
+/// [`LANCE_SUPPORTS_BLOB_COMPACTION`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SkipReason {
+    /// The table has one or more `Blob` columns. Lance `compact_files` forces
+    /// `BlobHandling::AllBinary`, which mis-decodes blob-v2 columns; see
+    /// [`LANCE_SUPPORTS_BLOB_COMPACTION`] and `docs/dev/lance.md`.
+    BlobColumnsUnsupportedByLance,
+}
+
+impl SkipReason {
+    /// Stable machine-readable token for serialized output (e.g. CLI `--json`).
+    /// Once emitted this is part of the output contract — keep it stable.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SkipReason::BlobColumnsUnsupportedByLance => "blob_columns_unsupported_by_lance",
+        }
+    }
+}
+
+impl std::fmt::Display for SkipReason {
+    /// Human-readable reason for CLI and log output.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let msg = match self {
+            SkipReason::BlobColumnsUnsupportedByLance => {
+                "blob columns — Lance compaction unsupported"
+            }
+        };
+        f.write_str(msg)
+    }
+}
+
+/// Per-table outcome of `optimize_all_tables`. This is a returned result type,
+/// not built by callers, so it is `#[non_exhaustive]`: future fields stay
+/// non-breaking and downstream code reads fields rather than constructing it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TableOptimizeStats {
     pub table_key: String,
     /// Number of source fragments that were rewritten by Lance.
@@ -62,6 +113,33 @@ pub struct TableOptimizeStats {
     pub fragments_added: usize,
     /// Did this table get a new Lance manifest version from the compaction?
     pub committed: bool,
+    /// `Some(reason)` if this table was deliberately not compacted. When set,
+    /// `fragments_removed == 0`, `fragments_added == 0`, and `!committed`.
+    pub skipped: Option<SkipReason>,
+}
+
+impl TableOptimizeStats {
+    /// Stat for a table that Lance actually compacted.
+    fn compacted(table_key: String, metrics: &CompactionMetrics, committed: bool) -> Self {
+        Self {
+            table_key,
+            fragments_removed: metrics.fragments_removed,
+            fragments_added: metrics.fragments_added,
+            committed,
+            skipped: None,
+        }
+    }
+
+    /// Stat for a table that was deliberately skipped (compaction not attempted).
+    fn skipped(table_key: String, reason: SkipReason) -> Self {
+        Self {
+            table_key,
+            fragments_removed: 0,
+            fragments_added: 0,
+            committed: false,
+            skipped: Some(reason),
+        }
+    }
 }
 
 /// Per-table outcome of `cleanup_all_tables`. `error` is `Some` when this
@@ -84,14 +162,21 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
     let resolved = db.resolved_branch_target(None).await?;
     let snapshot = resolved.snapshot;
 
-    let table_tasks: Vec<_> = all_table_keys(&db.catalog())
-        .into_iter()
-        .filter_map(|table_key| {
-            let entry = snapshot.entry(&table_key)?;
+    // Compute per-table state (path + whether it has blob columns) up front, in
+    // a scope that drops the catalog handle before the async stream starts.
+    let table_tasks: Vec<(String, String, bool)> = {
+        let catalog = db.catalog();
+        let mut tasks = Vec::new();
+        for table_key in all_table_keys(&catalog) {
+            let Some(entry) = snapshot.entry(&table_key) else {
+                continue;
+            };
             let full_path = format!("{}/{}", db.root_uri, entry.table_path);
-            Some((table_key, full_path))
-        })
-        .collect();
+            let has_blob = !blob_properties_for_table_key(&catalog, &table_key)?.is_empty();
+            tasks.push((table_key, full_path, has_blob));
+        }
+        tasks
+    };
 
     if table_tasks.is_empty() {
         return Ok(Vec::new());
@@ -101,7 +186,24 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
     let table_store = &db.table_store;
 
     let stats: Vec<Result<TableOptimizeStats>> = futures::stream::iter(table_tasks.into_iter())
-        .map(|(table_key, full_path)| async move {
+        .map(|(table_key, full_path, has_blob)| async move {
+            // Lance `compact_files` mis-decodes blob-v2 columns under the forced
+            // `BlobHandling::AllBinary` read (see LANCE_SUPPORTS_BLOB_COMPACTION).
+            // Skip blob-bearing tables and report it rather than aborting the
+            // whole sweep — the other tables still compact.
+            if has_blob && !LANCE_SUPPORTS_BLOB_COMPACTION {
+                tracing::warn!(
+                    target: "omnigraph::optimize",
+                    table = %table_key,
+                    "skipping compaction: table has blob columns the current Lance \
+                     cannot rewrite (blob-v2 AllBinary decode bug); other tables \
+                     unaffected — rerun after the Lance fix",
+                );
+                return Ok(TableOptimizeStats::skipped(
+                    table_key,
+                    SkipReason::BlobColumnsUnsupportedByLance,
+                ));
+            }
             let mut ds = table_store
                 .open_dataset_head_for_write(&table_key, &full_path, None)
                 .await?;
@@ -111,12 +213,11 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
                     .await
                     .map_err(|e| OmniError::Lance(e.to_string()))?;
             let version_after = ds.version().version;
-            Ok(TableOptimizeStats {
+            Ok(TableOptimizeStats::compacted(
                 table_key,
-                fragments_removed: metrics.fragments_removed,
-                fragments_added: metrics.fragments_added,
-                committed: version_after != version_before,
-            })
+                &metrics,
+                version_after != version_before,
+            ))
         })
         .buffer_unordered(concurrency)
         .collect()

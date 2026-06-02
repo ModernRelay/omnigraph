@@ -33,7 +33,7 @@ mod optimize;
 mod schema_apply;
 mod table_ops;
 
-pub use optimize::{CleanupPolicyOptions, TableCleanupStats, TableOptimizeStats};
+pub use optimize::{CleanupPolicyOptions, SkipReason, TableCleanupStats, TableOptimizeStats};
 pub use schema_apply::SchemaApplyOptions;
 
 use super::commit_graph::GraphCommit;
