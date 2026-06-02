@@ -212,7 +212,7 @@ graphs:
 **Merge semantics — "closest layer wins, at the smallest meaningful unit":**
 - **Settings objects** (`defaults`, `serve`) → deep-merge per field: a project sets `defaults.graph` and inherits the global `defaults.output_format`.
 - **Named-resource maps** (`servers`, `graphs`, `aliases`) → union by key; on a collision the **higher-precedence** layer's entry **replaces** the lower wholesale (no field-level deep-merge within an entry — replace makes the entry self-contained and predictable). Per-graph `queries:` are not a top-level map; they merge as part of their owning `graphs` entry (replaced with it).
-- **Server identity follows trust, not precedence (security).** Precedence and trust run *opposite* for the project layer: project is **higher-precedence** (it wins value merges, above) but **lower-trust** (a repo an agent can edit or a clone can ship). A `servers:` entry's `endpoint` and `auth` are its **identity**, and identity follows trust — a lower-trust layer may add *endpoint-only* servers and graph aliases, but may **not** (a) redefine the `endpoint` of a server a higher-trust layer defined, nor (b) carry an `auth:` block at all (no `command`/`file`/`keychain`/`token` sourcing — `command` would be repo-authored RCE). Both are rejected. Without this, a project file could repoint `servers.prod.endpoint` or inject `auth.command` and, since credentials key by name, harvest or execute against the user's `prod` identity. The credential trust model in §7 enforces the consuming side.
+- **Server identity follows trust, not precedence (security).** Precedence and trust run *opposite* for the project layer: project is **higher-precedence** (it wins value merges, above) but **lower-trust** (a repo an agent can edit or a clone can ship). A `servers:` entry's `endpoint` and `auth` are its **identity**, and identity follows trust — a lower-trust layer may add *endpoint-only* servers and graph aliases, but may **not** (a) redefine the `endpoint` of a server a higher-trust layer defined, nor (b) carry a `servers.<name>.auth` block — *client* credential sourcing — at all (no `command`/`file`/`keychain`/`token` sourcing; `command` would be repo-authored RCE). Both are rejected. (`serve.auth`, the secret-free server-side *accept* config, is unaffected — it is exactly what a committed deployment manifest carries; §6.) Without this, a project file could repoint `servers.prod.endpoint` or inject `auth.command` and, since credentials key by name, harvest or execute against the user's `prod` identity. The credential trust model in §7 enforces the consuming side.
 - **Lists** → replace, never append.
 - **Scalars** → higher layer wins.
 - **Relative paths carry their origin's `base_dir`** — a `queries:` `.gq` path or a `policy.file` resolves against the directory of the layer it was defined in.
@@ -310,7 +310,7 @@ enum SecretSource {
 
 **Auth is per-server, not per-graph.** One credential authenticates you to a *server*; Cedar then authorizes per graph. The shipped per-graph `bearer_token_env` is the wrong grain for a multi-graph world (it repeats across every graph on a server); it survives as a legacy alias for `servers.<n>.auth.bearer.token.env`.
 
-**The `command` source** runs locally with the operator's own privileges, so an `auth:` block — `command` especially — is **rejected from a lower-trust (project) layer** (§4): it is honored only from global/trusted config, never from a repo, so it adds no remote-execution surface. The `auth:` union is method-tagged so adding a method later is a new variant, not a re-key (Hyrum's Law: the field name is a contract once shipped).
+**The `command` source** runs locally with the operator's own privileges, so a `servers.<name>.auth` block — `command` especially — is **rejected from a lower-trust (project) layer** (§4): it is honored only from global/trusted config, never from a repo, so it adds no remote-execution surface. The `auth:` union is method-tagged so adding a method later is a new variant, not a re-key (Hyrum's Law: the field name is a contract once shipped).
 
 **Server-side accept config is separate and secret-free** (it validates incoming credentials; it is not a credential) and lives under `serve:`:
 
@@ -337,10 +337,10 @@ serve:
    ```
 
 **Credential trust model (security).** Two rules close the credential-redirection path:
-1. *Implicit/ambient credentials apply only to trusted-origin servers.* The implicit chain above (env-by-name, keychain-by-name, profile) is consulted **only when the server's identity — its `endpoint` — came from a trusted layer** (global config, or an explicit operator source). A server whose identity is introduced by a lower-trust (project) layer never auto-consumes an ambient credential; the operator must pass a token explicitly. This is what makes env-by-name safe: a raw `OMNIGRAPH_BEARER_TOKEN_<NAME>` carries no issued-for endpoint, so it is trustworthy only when the *name → endpoint* binding it rides on is itself trusted.
+1. *Implicit/ambient credentials apply only to trusted-origin servers.* The implicit chain above (env-by-name, keychain-by-name, profile) is consulted **only when the server's identity — its `endpoint` — came from a trusted layer** (global config, or an explicit operator source). A server whose identity is introduced by a lower-trust (project) layer never auto-consumes an ambient credential: it is **unauthenticated (local-dev) by default**, and authenticated use requires either promoting it to a trusted layer (a global `servers.<name>`) or an operator-supplied credential at invocation — a `--token-from <env|file|command>` flag (operator-trust, not repo-supplied; a future addition, §10). This is what makes env-by-name safe: a raw `OMNIGRAPH_BEARER_TOKEN_<NAME>` carries no issued-for endpoint, so it is trustworthy only when the *name → endpoint* binding it rides on is itself trusted.
 2. *login-written credentials additionally bind to their endpoint.* `omnigraph login <server>` records `(name, endpoint)`; at use, the keychain/profile token is released only if the resolved endpoint still matches, erroring otherwise (`server 'prod' resolved to <endpoint>, which does not match the endpoint this credential was issued for`). This catches a trusted server whose endpoint later changes.
 
-Together with the §4 identity rule (a lower-trust layer can neither repoint a trusted server nor carry `auth:`), ambient credentials cannot be redirected to an attacker endpoint.
+Together with the §4 identity rule (a lower-trust layer can neither repoint a trusted server nor carry `servers.<name>.auth`), ambient credentials cannot be redirected to an attacker endpoint.
 
 If `auth:` is set, that source is used (no fallthrough). `omnigraph login <server>` writes/rotates only that server's secret (keychain preferred; OAuth, when implemented (V6), runs the device flow and caches tokens in the keychain → `~/.omnigraph/cache/oauth/`). There is **no `credentials.yaml`** and no inlined secret. *Convention for the floor, explicit for control.*
 
@@ -385,9 +385,10 @@ This avoids shipping two URL shapes for the same operation depending on a config
 
 ### 10. CLI surface
 
-- `omnigraph login <server>` — interactive auth; stores the token in the keychain (`omnigraph:<server>`) or the `[<server>]` profile (`0600`); runs the OAuth device flow for `oauth` servers. The `gh auth login` analog.
+- `omnigraph login <server>` — interactive auth; stores the token in the keychain (`omnigraph:<server>`) or the `[<server>]` profile (`0600`); runs the OAuth device flow for `oauth` servers (V6). The `gh auth login` analog.
 - `omnigraph use <graph>` — set the active context; writes `~/.omnigraph/state/active.yaml`. The `kubectl config use-context` analog.
 - `omnigraph config view [--resolved] [--show-origin] [<graph>]` — print the merged config and, with `--resolved`, the final locator plus the origin layer of every field.
+- `--token-from <env|file|command>` (future) — an operator-supplied one-shot credential, to authenticate against a server whose identity is *not* in a trusted layer (§7). Operator-trust, never repo-supplied.
 - All existing verbs gain `--graph <name>` (the shipped flag is `--target`, kept as a deprecated alias); resolution (§1) decides embedded vs remote transparently.
 
 ### 11. Init, login, bootstrap — three tiers
@@ -504,7 +505,7 @@ Gated behind `version:`. `version: 1` is this schema; a missing `version:` is re
 
 **Renamed / migrated:**
 - `server.graph` (single-graph selector) → **`serve.graphs: [<name>]`** (a one-element served set; §9). Not a removal — the "define many graphs, serve a subset" capability is preserved.
-- **Legacy remote graph + credential mapping.** A legacy remote `{ uri, bearer_token_env }` has *no named server*, and its `uri` may already smuggle the multi-graph hack (`https://host/graphs/{gid}`). Under `version: 1` the migration **splits the URI** and **synthesizes a server**: `https://host[/…]/graphs/{gid}` → `endpoint: https://host`, `graph_id: gid`; a bare `https://host[:port]` → `endpoint: https://host[:port]`, `graph_id: <graph_name>`. It emits `servers.<name> = { endpoint, auth: { bearer: { token: { env: <VAR> } } } }` (treated as trusted on migrate) and rewrites the graph to `{ server: <name>, graph_id }`. Splitting the `/graphs/{gid}` suffix is required — otherwise V2's always-`/graphs/{id}/…` client would build `https://host/graphs/{gid}/graphs/<name>`. In legacy mode (no `version:`) the graph-local credential keeps working unchanged.
+- **Legacy remote graph + credential mapping.** A legacy remote `{ uri, bearer_token_env }` has *no named server*, and its `uri` may already smuggle the multi-graph hack (`https://host/graphs/{gid}`). Under `version: 1` the migration **strips the trailing `/graphs/{gid}` suffix**: `https://host[/path]/graphs/{gid}` → `endpoint: https://host[/path]` (the full prefix, **including any reverse-proxy path**), `graph_id: gid`; a `uri` with no `/graphs/{gid}` suffix → `endpoint: <uri>`, `graph_id: <graph_name>`. It emits `servers.<name> = { endpoint, auth: { bearer: { token: { env: <VAR> } } } }` (treated as trusted on migrate) and rewrites the graph to `{ server: <name>, graph_id }`. Splitting the `/graphs/{gid}` suffix is required — otherwise V2's always-`/graphs/{id}/…` client would build `https://host/graphs/{gid}/graphs/<name>`. In legacy mode (no `version:`) the graph-local credential keeps working unchanged.
 
 **Posture flips:**
 - **Global-first.** The CLI gains a global discovery layer below the project file; existing project-only workflows are unchanged (project still overrides global).
@@ -554,7 +555,7 @@ Gated behind `version:`. `version: 1` is this schema; a missing `version:` is re
 | N8 | P3 | HTTP-client path — **rewire existing reqwest calls to `/graphs/{id}/…`; migrate off `/read`,`/change`** | **extend** | → P4, N9 |
 | N9 | P2 | `resolve_auth(server)` — method×source (§6): explicit `auth:` else implicit chain keyed by name (reuses `OMNIGRAPH_BEARER_TOKEN`); **enforces the §7 credential trust model (trusted-origin + endpoint-binding) before releasing a token** | **N⚠️** | → N8 |
 | N10 | P2 | `config view` handler — merged + per-field origin (needs N2) | **N** | → U7 |
-| N11 | P5 | `login` handler — interactive auth (incl. OAuth device flow) → keychain / `credentials` (0600) + `.gitignore` | **N⚠️** | → S_global |
+| N11 | P5 | `login` handler — interactive auth (bearer; OAuth device flow in V6) → keychain / `credentials` (0600) + `.gitignore` | **N⚠️** | → S_global |
 | N12 | P5 | `init` handler — `scaffold_config_if_missing`; refuse-if-exists / `--force` | partly | → S_project |
 | N13 | P5 | `quickstart` handler — scaffold + `--template` + seed + serve + agent prompt | **N⚠️** | → S_project |
 | N14 | P3 | agent-mode wrapper — `OMNIGRAPH_AGENT_MODE`: JSON, structured errors, never-prompt, typed exit codes | **N⚠️** | → N1 |
