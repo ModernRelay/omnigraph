@@ -4,7 +4,7 @@ pub use omnigraph_config as config;
 pub mod graph_id;
 pub mod identity;
 pub mod policy;
-pub mod queries;
+pub use omnigraph_queries as queries;
 pub mod registry;
 pub mod workload;
 

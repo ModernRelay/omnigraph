@@ -1,0 +1,16 @@
+[package]
+name = "omnigraph-queries"
+version = "0.6.1"
+edition = "2024"
+description = "Stored-query registry and validation for the Omnigraph graph database."
+license = "MIT"
+repository = "https://github.com/ModernRelay/omnigraph"
+homepage = "https://github.com/ModernRelay/omnigraph"
+documentation = "https://docs.rs/omnigraph-queries"
+
+[dependencies]
+omnigraph-config = { path = "../omnigraph-config", version = "0.6.1" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.6.1" }
+
+[dev-dependencies]
+tempfile = { workspace = true }

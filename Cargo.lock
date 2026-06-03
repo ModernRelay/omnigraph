@@ -4650,6 +4650,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnigraph-queries"
+version = "0.6.1"
+dependencies = [
+ "omnigraph-compiler",
+ "omnigraph-config",
+ "tempfile",
+]
+
+[[package]]
 name = "omnigraph-server"
 version = "0.6.1"
 dependencies = [
@@ -4668,6 +4677,7 @@ dependencies = [
  "omnigraph-config",
  "omnigraph-engine",
  "omnigraph-policy",
+ "omnigraph-queries",
  "regex",
  "serde",
  "serde_json",
