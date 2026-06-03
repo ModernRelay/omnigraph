@@ -1279,6 +1279,22 @@ cli:
         );
     }
 
+    #[test]
+    fn legacy_config_tolerates_unknown_fields() {
+        // No `version:` ⇒ legacy schema: an unrecognized key is tolerated, not
+        // rejected (RFC-002: a missing `version:` is the lenient legacy shape).
+        // Pins the contract that `version` — not an unconditional struct
+        // attribute — gates strictness; a `version: 1` config rejects the same
+        // key (see `version_one_rejects_unknown_nested_field`). A top-level key
+        // is used deliberately: that is the level a struct-wide
+        // `deny_unknown_fields` catches today, so this reproduces the bug.
+        let config = load_yaml(
+            "graphs:\n  local:\n    uri: ./demo.omni\n\
+             future_top_level_key: whatever\ncli:\n  graph: local\n",
+        );
+        assert_eq!(config.cli_graph_name(), Some("local"));
+    }
+
     fn load_yaml(yaml: &str) -> super::OmnigraphConfig {
         let temp = tempdir().unwrap();
         fs::write(temp.path().join("omnigraph.yaml"), yaml).unwrap();
