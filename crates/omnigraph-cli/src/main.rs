@@ -26,7 +26,8 @@ use omnigraph_compiler::{
     json_params_to_param_map, lint_query_file,
 };
 use omnigraph_config::{
-    AliasCommand, OmnigraphConfig, ReadOutputFormat, graph_resource_id_for_selection, load_config,
+    AliasCommand, GraphLocator, OmnigraphConfig, ReadOutputFormat, graph_resource_id_for_selection,
+    load_config,
 };
 use omnigraph_policy::{
     PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest, PolicyTestConfig,
@@ -787,12 +788,25 @@ struct ResolvedCliGraph {
     selected: Option<String>,
     graph_id: String,
     policy_file: Option<PathBuf>,
-    is_remote: bool,
+    /// Typed embedded/remote discriminant (RFC-002 §1/§2). Read ONLY via
+    /// [`ResolvedCliGraph::is_remote`] for now: the locator's
+    /// `uri`/`graph_id`/`endpoint` are V2 fields and currently DIVERGE from the
+    /// engine `uri` and Cedar `graph_id` this struct carries — `resolve_graph`
+    /// base_dir-joins a relative positional and keeps `file://`/trailing slashes,
+    /// whereas the engine URI is the literal positional (`resolve_target_uri`) and
+    /// the Cedar id is engine-normalized (`normalize_root_uri`). `Embedded.graph_id`
+    /// is a Cedar resource id; `Remote.graph_id` is the server wire id — distinct
+    /// concepts consumed only when dispatch moves to the split endpoint/graph_id (V2).
+    locator: GraphLocator,
 }
 
 impl ResolvedCliGraph {
     fn selected(&self) -> Option<&str> {
         self.selected.as_deref()
+    }
+
+    fn is_remote(&self) -> bool {
+        self.locator.is_remote()
     }
 }
 
@@ -961,12 +975,13 @@ fn resolve_cli_graph(
             .or_else(|| config.cli_graph_name().map(str::to_string))
     };
     config.resolve_graph_selection(selected.as_deref())?;
+    let locator = config.resolve_graph(cli_uri.as_deref(), cli_target)?;
     let uri = resolve_uri(config, cli_uri, cli_target)?;
     let normalized_uri = normalize_policy_graph_uri(&uri)?;
     let graph_id = graph_resource_id_for_selection(selected.as_deref(), &normalized_uri);
     Ok(ResolvedCliGraph {
         graph_id,
-        is_remote: is_remote_uri(&uri),
+        locator,
         policy_file: config.resolve_policy_file_for(selected.as_deref()),
         selected,
         uri,
@@ -980,7 +995,7 @@ fn resolve_local_graph(
     operation: &str,
 ) -> Result<ResolvedCliGraph> {
     let graph = resolve_cli_graph(config, cli_uri, cli_target)?;
-    if graph.is_remote {
+    if graph.is_remote() {
         bail!(
             "{} is only supported against local graph URIs in this milestone",
             operation
@@ -2286,7 +2301,7 @@ async fn main() -> Result<()> {
             let uri = graph.uri.clone();
             let branch = resolve_branch(&config, branch, None, "main");
             let from = resolve_branch(&config, from, None, "main");
-            let payload = if graph.is_remote {
+            let payload = if graph.is_remote() {
                 let data = fs::read_to_string(&data)?;
                 remote_json::<IngestOutput>(
                     &http_client,
@@ -2336,7 +2351,7 @@ async fn main() -> Result<()> {
                 let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
                 let uri = graph.uri.clone();
                 let from = resolve_branch(&config, from, None, "main");
-                let payload = if graph.is_remote {
+                let payload = if graph.is_remote() {
                     remote_json::<BranchCreateOutput>(
                         &http_client,
                         Method::POST,
@@ -2377,7 +2392,7 @@ async fn main() -> Result<()> {
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
                 let uri = graph.uri.clone();
-                let payload = if graph.is_remote {
+                let payload = if graph.is_remote() {
                     remote_json::<BranchListOutput>(
                         &http_client,
                         Method::GET,
@@ -2412,7 +2427,7 @@ async fn main() -> Result<()> {
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
                 let uri = graph.uri.clone();
-                let payload = if graph.is_remote {
+                let payload = if graph.is_remote() {
                     remote_json::<BranchDeleteOutput>(
                         &http_client,
                         Method::DELETE,
@@ -2451,7 +2466,7 @@ async fn main() -> Result<()> {
                 let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
                 let uri = graph.uri.clone();
                 let into = resolve_branch(&config, into, None, "main");
-                let payload = if graph.is_remote {
+                let payload = if graph.is_remote() {
                     remote_json::<BranchMergeOutput>(
                         &http_client,
                         Method::POST,
@@ -2602,7 +2617,7 @@ async fn main() -> Result<()> {
                 let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
                 let uri = graph.uri.clone();
                 let schema_source = fs::read_to_string(&schema)?;
-                let output = if graph.is_remote {
+                let output = if graph.is_remote() {
                     // MR-694 PR B: SchemaApplyRequest gained an
                     // allow_data_loss field so Hard-mode drops are no
                     // longer CLI-only. The previous bail is gone; the
@@ -2837,7 +2852,7 @@ async fn main() -> Result<()> {
                 alias_config.and_then(|alias| alias.branch.clone()),
             )?;
             let query_name = name.or_else(|| alias_config.and_then(|alias| alias.name.clone()));
-            let output = if graph.is_remote {
+            let output = if graph.is_remote() {
                 execute_read_remote(
                     &http_client,
                     &uri,
@@ -2923,7 +2938,7 @@ async fn main() -> Result<()> {
                 "main",
             );
             let query_name = name.or_else(|| alias_config.and_then(|alias| alias.name.clone()));
-            let output = if graph.is_remote {
+            let output = if graph.is_remote() {
                 execute_change_remote(
                     &http_client,
                     &uri,
