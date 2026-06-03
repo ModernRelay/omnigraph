@@ -538,7 +538,9 @@ fn load_config_in(cwd: &Path, config_path: Option<&PathBuf>) -> Result<Omnigraph
     });
 
     let mut config = if let Some(path) = &config_path {
-        serde_yaml::from_str::<OmnigraphConfig>(&fs::read_to_string(path)?)?
+        let text = fs::read_to_string(path)?;
+        check_config_version(&text)?;
+        serde_yaml::from_str::<OmnigraphConfig>(&text)?
     } else {
         OmnigraphConfig::default()
     };
@@ -550,6 +552,24 @@ fn load_config_in(cwd: &Path, config_path: Option<&PathBuf>) -> Result<Omnigraph
     };
 
     Ok(config)
+}
+
+/// Read the optional top-level `version:` discriminator and reject versions
+/// this build does not understand. The typed v1 schema (`deny_unknown_fields`,
+/// the `GraphLocator`) lands in a following change; today both no-version
+/// (legacy) and `version: 1` parse via the same lenient struct, so this is the
+/// forward-compat gate that lets v1 tighten without breaking legacy files.
+fn check_config_version(text: &str) -> Result<()> {
+    let value: serde_yaml::Value = serde_yaml::from_str(text)?;
+    if let Some(version) = value.get("version").and_then(serde_yaml::Value::as_u64) {
+        if version != 1 {
+            bail!(
+                "unsupported config version {version}; this build supports version 1 \
+                 (omit `version:` for the legacy schema)"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn absolute_base_dir(cwd: &Path, path: &Path) -> Result<PathBuf> {
@@ -943,6 +963,41 @@ cli:
                 config.cli_graph_name()
             ),
             Some("DEMO_TOKEN")
+        );
+    }
+
+    #[test]
+    fn version_one_parses_like_legacy() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("omnigraph.yaml"),
+            "version: 1\ngraphs:\n  local:\n    uri: ./demo.omni\ncli:\n  graph: local\n",
+        )
+        .unwrap();
+        let config = load_config_in(temp.path(), None).unwrap();
+        assert_eq!(config.cli_graph_name(), Some("local"));
+        assert_eq!(
+            PathBuf::from(
+                config
+                    .resolve_target_uri(None, None, config.cli_graph_name())
+                    .unwrap()
+            ),
+            temp.path().join("./demo.omni")
+        );
+    }
+
+    #[test]
+    fn unsupported_config_version_errors() {
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("omnigraph.yaml"),
+            "version: 2\ngraphs:\n  local:\n    uri: ./demo.omni\n",
+        )
+        .unwrap();
+        let err = load_config_in(temp.path(), None).unwrap_err().to_string();
+        assert!(
+            err.contains("unsupported config version 2"),
+            "config version > 1 must be rejected: {err}"
         );
     }
 }
