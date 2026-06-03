@@ -10,13 +10,6 @@ use color_eyre::eyre::{Result, bail};
 use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
 use omnigraph::storage::normalize_root_uri;
-use omnigraph_compiler::query::parser::parse_query;
-use omnigraph_compiler::schema::parser::parse_schema;
-use omnigraph_compiler::{
-    JsonParamMode, ParamMap, QueryLintOutput, QueryLintQueryKind, QueryLintSchemaSource,
-    QueryLintSeverity, QueryLintStatus, SchemaMigrationPlan, SchemaMigrationStep, build_catalog,
-    json_params_to_param_map, lint_query_file,
-};
 use omnigraph_api_types::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, CommitListOutput, CommitOutput,
@@ -25,13 +18,20 @@ use omnigraph_api_types::{
     SnapshotTableOutput, commit_output, ingest_output, read_output, schema_apply_output,
     snapshot_payload,
 };
-use omnigraph_queries::{QueryRegistry, check, format_check_breakages};
+use omnigraph_compiler::query::parser::parse_query;
+use omnigraph_compiler::schema::parser::parse_schema;
+use omnigraph_compiler::{
+    JsonParamMode, ParamMap, QueryLintOutput, QueryLintQueryKind, QueryLintSchemaSource,
+    QueryLintSeverity, QueryLintStatus, SchemaMigrationPlan, SchemaMigrationStep, build_catalog,
+    json_params_to_param_map, lint_query_file,
+};
 use omnigraph_config::{
     AliasCommand, OmnigraphConfig, ReadOutputFormat, graph_resource_id_for_selection, load_config,
 };
 use omnigraph_policy::{
     PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest, PolicyTestConfig,
 };
+use omnigraph_queries::{QueryRegistry, check, format_check_breakages};
 use reqwest::Method;
 use reqwest::header::AUTHORIZATION;
 use serde::Serialize;
@@ -803,13 +803,11 @@ struct ResolvedPolicyContext {
 
 fn resolve_policy_context(config: &OmnigraphConfig) -> Result<ResolvedPolicyContext> {
     let selected = config.resolve_policy_tooling_graph_selection()?;
-    let policy_file = config
-        .resolve_policy_file_for(selected)
-        .ok_or_else(|| {
-            color_eyre::eyre::eyre!(
-                "policy.file or graphs.<name>.policy.file must be set in omnigraph.yaml"
-            )
-        })?;
+    let policy_file = config.resolve_policy_file_for(selected).ok_or_else(|| {
+        color_eyre::eyre::eyre!(
+            "policy.file or graphs.<name>.policy.file must be set in omnigraph.yaml"
+        )
+    })?;
     let graph_id = match selected {
         Some(name) => graph_resource_id_for_selection(Some(name), ""),
         None => graph_resource_id_for_selection(None, "default"),
@@ -2168,16 +2166,14 @@ fn rewrite_deprecated_argv(args: Vec<OsString>) -> Vec<OsString> {
     }
     if let Some(sub) = args.get(1).and_then(|s| s.to_str()) {
         match sub {
-            "read" => eprintln!(
-                "warning: `omnigraph read` is deprecated; use `omnigraph query` instead"
-            ),
+            "read" => {
+                eprintln!("warning: `omnigraph read` is deprecated; use `omnigraph query` instead")
+            }
             "change" => eprintln!(
                 "warning: `omnigraph change` is deprecated; use `omnigraph mutate` instead"
             ),
             "check" => {
-                eprintln!(
-                    "warning: `omnigraph check` is deprecated; use `omnigraph lint` instead"
-                );
+                eprintln!("warning: `omnigraph check` is deprecated; use `omnigraph lint` instead");
                 // Rewrite the top-level subcommand to `lint`; pass through the rest.
                 let mut out = Vec::with_capacity(args.len());
                 out.push(args[0].clone());
@@ -3159,8 +3155,8 @@ mod tests {
     use super::{
         DEFAULT_BEARER_TOKEN_ENV, apply_bearer_token, bearer_token_from_env_file,
         legacy_change_request_body, load_cli_config, load_env_file_into_process,
-        normalize_bearer_token, parse_env_assignment, resolve_policy_context,
-        resolve_cli_graph, resolve_remote_bearer_token,
+        normalize_bearer_token, parse_env_assignment, resolve_cli_graph, resolve_policy_context,
+        resolve_remote_bearer_token,
     };
     use omnigraph_config::load_config;
     use reqwest::header::AUTHORIZATION;
@@ -3422,7 +3418,8 @@ graphs:
     }
 
     #[test]
-    fn graph_identity_resolve_policy_context_named_cli_graph_uses_graph_key_not_project_name_or_uri() {
+    fn graph_identity_resolve_policy_context_named_cli_graph_uses_graph_key_not_project_name_or_uri()
+     {
         let temp = tempdir().unwrap();
         let config_path = temp.path().join("omnigraph.yaml");
         fs::write(

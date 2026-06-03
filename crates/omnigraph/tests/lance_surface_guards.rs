@@ -329,7 +329,10 @@ async fn compact_files_still_fails_on_blob_columns() {
         ]));
         RecordBatch::try_new(
             schema,
-            vec![Arc::new(StringArray::from(ids)) as _, Arc::new(content) as _],
+            vec![
+                Arc::new(StringArray::from(ids)) as _,
+                Arc::new(content) as _,
+            ],
         )
         .unwrap()
     }

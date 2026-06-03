@@ -411,7 +411,11 @@ pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconci
         };
         for branch in orphan_branches(listed, &keep) {
             let outcome = match crate::failpoints::maybe_fail("cleanup.reconcile_fork") {
-                Ok(()) => db.table_store.force_delete_branch(&full_path, &branch).await,
+                Ok(()) => {
+                    db.table_store
+                        .force_delete_branch(&full_path, &branch)
+                        .await
+                }
                 Err(injected) => Err(injected),
             };
             match outcome {
@@ -438,7 +442,9 @@ pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconci
             error = %err,
             "commit-graph orphan reconcile failed; will retry next cleanup",
         );
-        stats.failures.push(("_graph_commits".to_string(), err.to_string()));
+        stats
+            .failures
+            .push(("_graph_commits".to_string(), err.to_string()));
     }
 
     Ok(stats)
@@ -466,7 +472,9 @@ async fn reconcile_commit_graph_orphans(
                     error = %err,
                     "reclaiming orphaned commit-graph branch failed; will retry next cleanup",
                 );
-                stats.failures.push(("_graph_commits".to_string(), err.to_string()));
+                stats
+                    .failures
+                    .push(("_graph_commits".to_string(), err.to_string()));
             }
         }
     }

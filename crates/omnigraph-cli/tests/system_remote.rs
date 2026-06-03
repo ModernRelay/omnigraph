@@ -262,7 +262,10 @@ query insert_person($name: String, $age: I32) {
         }))
         .send()
         .unwrap();
-    assert_eq!(http_query_mutation.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        http_query_mutation.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
 
     // `run publish` / `run list` removed. Direct-to-target writes
     // already landed via the change call above; the commit graph is now

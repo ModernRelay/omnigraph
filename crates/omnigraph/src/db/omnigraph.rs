@@ -1113,7 +1113,11 @@ impl Omnigraph {
             let dataset_uri = self.table_store.dataset_uri(&table_path);
             let outcome = match crate::failpoints::maybe_fail("branch_delete.before_table_cleanup")
             {
-                Ok(()) => self.table_store.force_delete_branch(&dataset_uri, branch).await,
+                Ok(()) => {
+                    self.table_store
+                        .force_delete_branch(&dataset_uri, branch)
+                        .await
+                }
                 Err(injected) => Err(injected),
             };
             if let Err(err) = outcome {

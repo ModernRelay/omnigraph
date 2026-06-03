@@ -1,11 +1,11 @@
 use omnigraph::db::{GraphCommit, MergeOutcome, ReadTarget, SchemaApplyResult, Snapshot};
 use omnigraph::error::{MergeConflict, MergeConflictKind};
 use omnigraph::loader::{IngestResult, LoadMode};
-use omnigraph_queries::StoredQuery;
 use omnigraph_compiler::SchemaMigrationStep;
 use omnigraph_compiler::query::ast::Param;
 use omnigraph_compiler::result::QueryResult;
 use omnigraph_compiler::types::{PropType, ScalarType};
+use omnigraph_queries::StoredQuery;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utoipa::{IntoParams, ToSchema};
@@ -266,7 +266,9 @@ pub struct QueryRequest {
     /// with `name` when more than one is declared. Mutations
     /// (`insert`/`update`/`delete`) get 400 — use `POST /mutate` (or its
     /// deprecated alias `POST /change`) instead.
-    #[schema(example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}")]
+    #[schema(
+        example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
+    )]
     pub query: String,
     /// Name of the query to run when `query` declares multiple. Optional when
     /// only one query is declared.
@@ -741,7 +743,11 @@ mod tests {
             entry.params.iter().map(|p| (p.name.as_str(), p)).collect();
         assert_eq!(by["s"].kind, ParamKind::String);
         assert_eq!(by["i"].kind, ParamKind::Int);
-        assert_eq!(by["big"].kind, ParamKind::BigInt, "I64 → bigint (string on the wire)");
+        assert_eq!(
+            by["big"].kind,
+            ParamKind::BigInt,
+            "I64 → bigint (string on the wire)"
+        );
         assert_eq!(by["u"].kind, ParamKind::BigInt, "U64 → bigint");
         assert_eq!(by["f"].kind, ParamKind::Float);
         assert_eq!(by["b"].kind, ParamKind::Bool);
@@ -751,7 +757,11 @@ mod tests {
         assert!(!by["s"].nullable);
         assert!(by["opt"].nullable, "String? → nullable");
         assert_eq!(by["list"].kind, ParamKind::List);
-        assert_eq!(by["list"].item_kind, Some(ParamKind::Int), "[I32] → list of int");
+        assert_eq!(
+            by["list"].item_kind,
+            Some(ParamKind::Int),
+            "[I32] → list of int"
+        );
         assert_eq!(by["vec"].kind, ParamKind::Vector);
         assert_eq!(by["vec"].vector_dim, Some(4));
     }

@@ -25,10 +25,10 @@ use api::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
     CommitListQuery, ErrorCode, ErrorOutput, ExportRequest, GraphInfo, GraphListResponse,
-    HealthOutput, IngestOutput, IngestRequest, InvokeStoredQueryRequest,
-    InvokeStoredQueryResponse, QueriesCatalogOutput, QueryRequest, ReadOutput, ReadRequest,
-    SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotQuery, ingest_output,
-    schema_apply_output, snapshot_payload,
+    HealthOutput, IngestOutput, IngestRequest, InvokeStoredQueryRequest, InvokeStoredQueryResponse,
+    QueriesCatalogOutput, QueryRequest, ReadOutput, ReadRequest, SchemaApplyOutput,
+    SchemaApplyRequest, SchemaOutput, SnapshotQuery, ingest_output, schema_apply_output,
+    snapshot_payload,
 };
 pub use auth::{AWS_SECRET_ENV, EnvOrFileTokenSource, TokenSource, resolve_token_source};
 use axum::body::{Body, Bytes};
@@ -304,7 +304,14 @@ impl AppState {
     ) -> Self {
         let bearer_tokens = hash_bearer_tokens(bearer_tokens);
         let per_graph_policy = policy_engine.map(Arc::new);
-        Self::build_single_mode(uri, db, bearer_tokens, per_graph_policy, Arc::new(workload), None)
+        Self::build_single_mode(
+            uri,
+            db,
+            bearer_tokens,
+            per_graph_policy,
+            Arc::new(workload),
+            None,
+        )
     }
 
     /// Like `new_single`, but attaches a pre-validated stored-query
@@ -421,13 +428,8 @@ impl AppState {
         bearer_tokens: Vec<(String, String)>,
         policy_file: Option<&PathBuf>,
     ) -> Result<Self> {
-        Self::open_single_with_queries(
-            uri,
-            bearer_tokens,
-            policy_file,
-            QueryRegistry::default(),
-        )
-        .await
+        Self::open_single_with_queries(uri, bearer_tokens, policy_file, QueryRegistry::default())
+            .await
     }
 
     /// Single-mode boot with a stored-query registry: open the engine,
@@ -993,8 +995,11 @@ pub fn load_server_settings(
             // `query_entries_for` so server and CLI resolve identically.
             // Load + identity-check now; the schema type-check happens
             // when this graph's engine opens.
-            let queries = QueryRegistry::load(&config, config.query_entries_for(Some(name.as_str())))
-                .map_err(|errs| color_eyre::eyre::eyre!(format_registry_load_errors(name, &errs)))?;
+            let queries =
+                QueryRegistry::load(&config, config.query_entries_for(Some(name.as_str())))
+                    .map_err(|errs| {
+                        color_eyre::eyre::eyre!(format_registry_load_errors(name, &errs))
+                    })?;
             graphs.push(GraphStartupConfig {
                 graph_id: name.clone(),
                 uri,
@@ -1112,15 +1117,21 @@ pub fn build_app(state: AppState) -> Router {
         // flagged and their responses include RFC 9745 Deprecation +
         // RFC 8288 Link headers. Suppress the call-site warning for the
         // route registration itself.
-        .route("/read", post({
-            #[allow(deprecated)]
-            server_read
-        }))
+        .route(
+            "/read",
+            post({
+                #[allow(deprecated)]
+                server_read
+            }),
+        )
         .route("/query", post(server_query))
-        .route("/change", post({
-            #[allow(deprecated)]
-            server_change
-        }))
+        .route(
+            "/change",
+            post({
+                #[allow(deprecated)]
+                server_change
+            }),
+        )
         .route("/mutate", post(server_mutate))
         .route("/queries", get(server_list_queries))
         .route("/queries/{name}", post(server_invoke_query))
@@ -1870,7 +1881,9 @@ fn deprecation_headers(successor_link: &'static str) -> [(HeaderName, HeaderValu
     ),
     security(("bearer_token" = [])),
 )]
-#[deprecated(note = "use POST /query instead; /read is kept indefinitely for byte-stable back-compat")]
+#[deprecated(
+    note = "use POST /query instead; /read is kept indefinitely for byte-stable back-compat"
+)]
 /// **Deprecated** — use [`POST /query`](#tag/queries/operation/query) instead.
 ///
 /// Execute a GQ read query. Behavior is unchanged from prior releases; the
@@ -2041,10 +2054,8 @@ async fn run_mutate(
     // estimated bytes per actor. Cedar runs FIRST so denied requests
     // don't consume admission slots. Estimate uses the request body
     // size as a coarse proxy; engine memory pressure can run higher.
-    let est_bytes = query.len() as u64
-        + params_json
-            .map(|p| p.to_string().len() as u64)
-            .unwrap_or(0);
+    let est_bytes =
+        query.len() as u64 + params_json.map(|p| p.to_string().len() as u64).unwrap_or(0);
     let _admission = state
         .workload
         .try_admit(&actor_arc, est_bytes)
@@ -2118,8 +2129,8 @@ async fn run_query(
             target_branch: None,
         },
     )?;
-    let query_decl =
-        select_named_query_decl(query, name).map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let query_decl = select_named_query_decl(query, name)
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
     if reject_mutations && !query_decl.mutations.is_empty() {
         return Err(ApiError::bad_request(format!(
             "query '{}' contains mutations (insert/update/delete); use POST /mutate for write queries",
@@ -3092,11 +3103,18 @@ mod tests {
     /// as 404 without also masking a 401/500. Pins each outcome.
     #[test]
     fn authorize_splits_decision_from_operational_error() {
-        use super::{Authz, PolicyAction, PolicyCompiler, PolicyConfig, PolicyRequest, ResolvedActor, authorize};
+        use super::{
+            Authz, PolicyAction, PolicyCompiler, PolicyConfig, PolicyRequest, ResolvedActor,
+            authorize,
+        };
         use std::sync::Arc;
 
         fn req(action: PolicyAction) -> PolicyRequest {
-            PolicyRequest { action, branch: None, target_branch: None }
+            PolicyRequest {
+                action,
+                branch: None,
+                target_branch: None,
+            }
         }
         let actor = ResolvedActor::cluster_static(Arc::from("act-alice"));
 
@@ -3136,7 +3154,11 @@ mod tests {
             authorize(
                 Some(&actor),
                 Some(&engine),
-                PolicyRequest { action: PolicyAction::Read, branch: Some("main".to_string()), target_branch: None },
+                PolicyRequest {
+                    action: PolicyAction::Read,
+                    branch: Some("main".to_string()),
+                    target_branch: None
+                },
             )
             .unwrap(),
             Authz::Allowed
@@ -3145,11 +3167,17 @@ mod tests {
         match authorize(
             Some(&actor),
             Some(&engine),
-            PolicyRequest { action: PolicyAction::Change, branch: Some("main".to_string()), target_branch: None },
+            PolicyRequest {
+                action: PolicyAction::Change,
+                branch: Some("main".to_string()),
+                target_branch: None,
+            },
         )
         .unwrap()
         {
-            Authz::Denied(message) => assert!(!message.is_empty(), "a deny carries its decision message"),
+            Authz::Denied(message) => {
+                assert!(!message.is_empty(), "a deny carries its decision message")
+            }
             Authz::Allowed => panic!("change must be denied: only read is allowed"),
         }
         // Policy installed but no actor → operational failure (`Err`), NOT a
@@ -3188,8 +3216,7 @@ mod tests {
         };
 
         // Empty registry → nothing attached, no error.
-        let empty =
-            super::validate_and_attach(QueryRegistry::default(), &catalog, "g").unwrap();
+        let empty = super::validate_and_attach(QueryRegistry::default(), &catalog, "g").unwrap();
         assert!(empty.is_none());
 
         // A query that type-checks → attached.
@@ -3198,7 +3225,11 @@ mod tests {
             "query find_user() { match { $u: User } return { $u.name } }",
         )])
         .unwrap();
-        assert!(super::validate_and_attach(ok, &catalog, "g").unwrap().is_some());
+        assert!(
+            super::validate_and_attach(ok, &catalog, "g")
+                .unwrap()
+                .is_some()
+        );
 
         // A query referencing a type the schema lacks → boot refusal that
         // names both the graph label and the offending query.
@@ -3211,7 +3242,10 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("graph-x"), "labels the graph: {msg}");
         assert!(msg.contains("ghost"), "names the query: {msg}");
-        assert!(msg.contains("schema check"), "mentions the schema check: {msg}");
+        assert!(
+            msg.contains("schema check"),
+            "mentions the schema check: {msg}"
+        );
     }
 
     #[test]

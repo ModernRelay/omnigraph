@@ -798,8 +798,7 @@ fn deprecated_read_and_change_subcommands_emit_warnings() {
     let output = cli().arg("read").output().unwrap();
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stderr.contains("`omnigraph read` is deprecated")
-            && stderr.contains("`omnigraph query`"),
+        stderr.contains("`omnigraph read` is deprecated") && stderr.contains("`omnigraph query`"),
         "expected `omnigraph read` deprecation warning; got: {stderr}"
     );
 
@@ -2394,9 +2393,19 @@ fn queries_validate_exits_zero_on_clean_registry() {
     );
     let config = graph.write_config(
         "omnigraph.yaml",
-        &queries_test_config(&graph.path().to_string_lossy(), "find_person", "find_person.gq"),
+        &queries_test_config(
+            &graph.path().to_string_lossy(),
+            "find_person",
+            "find_person.gq",
+        ),
     );
-    let output = output_success(cli().arg("queries").arg("validate").arg("--config").arg(&config));
+    let output = output_success(
+        cli()
+            .arg("queries")
+            .arg("validate")
+            .arg("--config")
+            .arg(&config),
+    );
     let stdout = stdout_string(&output);
     assert!(stdout.contains("OK"), "stdout:\n{stdout}");
 }
@@ -2405,12 +2414,21 @@ fn queries_validate_exits_zero_on_clean_registry() {
 fn queries_validate_exits_nonzero_on_type_broken_query() {
     let graph = SystemGraph::loaded();
     // `Widget` is not in the fixture schema.
-    graph.write_query("ghost.gq", "query ghost() { match { $w: Widget } return { $w.name } }");
+    graph.write_query(
+        "ghost.gq",
+        "query ghost() { match { $w: Widget } return { $w.name } }",
+    );
     let config = graph.write_config(
         "omnigraph.yaml",
         &queries_test_config(&graph.path().to_string_lossy(), "ghost", "ghost.gq"),
     );
-    let output = output_failure(cli().arg("queries").arg("validate").arg("--config").arg(&config));
+    let output = output_failure(
+        cli()
+            .arg("queries")
+            .arg("validate")
+            .arg("--config")
+            .arg(&config),
+    );
     let stdout = stdout_string(&output);
     assert!(
         stdout.contains("ghost"),
@@ -2444,7 +2462,13 @@ fn queries_list_prints_registered_query() {
             graph.path().to_string_lossy().replace('\'', "''")
         ),
     );
-    let output = output_success(cli().arg("queries").arg("list").arg("--config").arg(&config));
+    let output = output_success(
+        cli()
+            .arg("queries")
+            .arg("list")
+            .arg("--config")
+            .arg(&config),
+    );
     let stdout = stdout_string(&output);
     assert!(stdout.contains("find_person"), "stdout:\n{stdout}");
     assert!(
@@ -2480,7 +2504,13 @@ fn queries_list_requires_graph_selection_for_per_graph_only_registries() {
         ),
     );
 
-    let output = output_failure(cli().arg("queries").arg("list").arg("--config").arg(&config));
+    let output = output_failure(
+        cli()
+            .arg("queries")
+            .arg("list")
+            .arg("--config")
+            .arg(&config),
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("local") && stderr.contains("--target local"),
@@ -2505,7 +2535,13 @@ fn queries_list_without_graph_selection_lists_top_level_registry() {
         ),
     );
 
-    let output = output_success(cli().arg("queries").arg("list").arg("--config").arg(&config));
+    let output = output_success(
+        cli()
+            .arg("queries")
+            .arg("list")
+            .arg("--config")
+            .arg(&config),
+    );
     let stdout = stdout_string(&output);
     assert!(stdout.contains("top_find"), "stdout:\n{stdout}");
 }
@@ -2524,7 +2560,11 @@ fn queries_list_unknown_target_errors() {
     );
     let config = graph.write_config(
         "omnigraph.yaml",
-        &queries_test_config(&graph.path().to_string_lossy(), "find_person", "find_person.gq"),
+        &queries_test_config(
+            &graph.path().to_string_lossy(),
+            "find_person",
+            "find_person.gq",
+        ),
     );
     let output = output_failure(
         cli()
@@ -2566,7 +2606,7 @@ fn queries_commands_reject_named_graph_with_populated_top_level_block() {
                 "        file: ./find_person.gq\n",
                 "cli:\n",
                 "  graph: local\n",
-                "queries:\n",                 // populated top-level block: the coherence violation
+                "queries:\n", // populated top-level block: the coherence violation
                 "  legacy:\n",
                 "    file: ./legacy.gq\n",
                 "policy: {{}}\n",
@@ -2592,8 +2632,14 @@ fn queries_validate_exits_nonzero_on_duplicate_tool_name() {
     // collision — `queries validate` must fail (offline, before the engine
     // opens) and name both queries plus the contested tool.
     let graph = SystemGraph::loaded();
-    graph.write_query("a.gq", "query a() { match { $p: Person } return { $p.name } }");
-    graph.write_query("b.gq", "query b() { match { $p: Person } return { $p.name } }");
+    graph.write_query(
+        "a.gq",
+        "query a() { match { $p: Person } return { $p.name } }",
+    );
+    graph.write_query(
+        "b.gq",
+        "query b() { match { $p: Person } return { $p.name } }",
+    );
     let config = graph.write_config(
         "omnigraph.yaml",
         &format!(
@@ -2615,7 +2661,13 @@ fn queries_validate_exits_nonzero_on_duplicate_tool_name() {
             graph.path().to_string_lossy().replace('\'', "''")
         ),
     );
-    let output = output_failure(cli().arg("queries").arg("validate").arg("--config").arg(&config));
+    let output = output_failure(
+        cli()
+            .arg("queries")
+            .arg("validate")
+            .arg("--config")
+            .arg(&config),
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("dup") && stderr.contains("'a'") && stderr.contains("'b'"),
@@ -2635,7 +2687,10 @@ fn queries_validate_positional_uri_ignores_default_graph() {
     );
     // `Widget` is not in the fixture schema — the default graph's per-graph
     // query would break validate if it were (wrongly) selected.
-    graph.write_query("broken.gq", "query broken() { match { $w: Widget } return { $w.name } }");
+    graph.write_query(
+        "broken.gq",
+        "query broken() { match { $w: Widget } return { $w.name } }",
+    );
     let config = graph.write_config(
         "omnigraph.yaml",
         concat!(

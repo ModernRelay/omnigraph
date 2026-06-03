@@ -450,10 +450,7 @@ impl OmnigraphConfig {
 
     /// The per-graph stored-query registry entries for a named target
     /// (multi-graph mode). Returns `None` if the target is unknown.
-    pub fn target_query_entries(
-        &self,
-        target_name: &str,
-    ) -> Option<&BTreeMap<String, QueryEntry>> {
+    pub fn target_query_entries(&self, target_name: &str) -> Option<&BTreeMap<String, QueryEntry>> {
         self.graphs.get(target_name).map(|target| &target.queries)
     }
 
@@ -957,11 +954,17 @@ policy: {}
         let config = load_config_in(temp.path(), None).unwrap();
 
         // A known graph passes through unchanged.
-        assert_eq!(config.resolve_graph_selection(Some("local")).unwrap(), Some("local"));
+        assert_eq!(
+            config.resolve_graph_selection(Some("local")).unwrap(),
+            Some("local")
+        );
         // An anonymous selection stays anonymous (→ top-level registry downstream).
         assert_eq!(config.resolve_graph_selection(None).unwrap(), None);
         // An unknown name errors, naming the graph (matching resolve_target_uri).
-        let err = config.resolve_graph_selection(Some("ghost")).unwrap_err().to_string();
+        let err = config
+            .resolve_graph_selection(Some("ghost"))
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("ghost") && err.contains("not found"),
             "unknown graph must error naming it: {err}"
@@ -1023,7 +1026,10 @@ policy: {}
         let temp = tempdir().unwrap();
         fs::write(temp.path().join("omnigraph.yaml"), "policy: {}\n").unwrap();
         let config = load_config_in(temp.path(), None).unwrap();
-        assert_eq!(config.resolve_policy_tooling_graph_selection().unwrap(), None);
+        assert_eq!(
+            config.resolve_policy_tooling_graph_selection().unwrap(),
+            None
+        );
 
         let temp = tempdir().unwrap();
         fs::write(
@@ -1184,12 +1190,7 @@ queries:
         let config = load_config_in(temp.path(), None).unwrap();
         // Additive: no `queries:` anywhere → empty registries everywhere.
         assert!(config.query_entries().is_empty());
-        assert!(
-            config
-                .target_query_entries("local")
-                .unwrap()
-                .is_empty()
-        );
+        assert!(config.target_query_entries("local").unwrap().is_empty());
     }
 
     #[test]
@@ -1294,7 +1295,12 @@ cli:
     fn storage_bare_resolves_embedded() {
         let config = load_yaml("version: 1\ngraphs:\n  local:\n    storage: ./demo.omni\n");
         match config.resolve_graph(None, Some("local")).unwrap() {
-            GraphLocator::Embedded { uri, selected, graph_id, .. } => {
+            GraphLocator::Embedded {
+                uri,
+                selected,
+                graph_id,
+                ..
+            } => {
                 assert!(uri.ends_with("demo.omni"), "uri: {uri}");
                 assert_eq!(selected.as_deref(), Some("local"));
                 assert_eq!(graph_id, "local");
@@ -1310,7 +1316,12 @@ cli:
              region: eu-west-1\n      endpoint: https://minio.local\n",
         );
         match config.resolve_graph(None, Some("prod")).unwrap() {
-            GraphLocator::Embedded { uri, region, endpoint, .. } => {
+            GraphLocator::Embedded {
+                uri,
+                region,
+                endpoint,
+                ..
+            } => {
                 assert_eq!(uri, "s3://b/prod.omni");
                 assert_eq!(region.as_deref(), Some("eu-west-1"));
                 assert_eq!(endpoint.as_deref(), Some("https://minio.local"));
@@ -1326,7 +1337,12 @@ cli:
              graphs:\n  reports:\n    server: prod\n",
         );
         match config.resolve_graph(None, Some("reports")).unwrap() {
-            GraphLocator::Remote { endpoint, server, graph_id, .. } => {
+            GraphLocator::Remote {
+                endpoint,
+                server,
+                graph_id,
+                ..
+            } => {
                 assert_eq!(endpoint, "https://og.internal:8080");
                 assert_eq!(server, "prod");
                 assert_eq!(graph_id, "reports", "graph_id defaults to the entry key");
@@ -1337,11 +1353,15 @@ cli:
 
     #[test]
     fn qualified_server_slash_graph_resolves_without_an_alias() {
-        let config = load_yaml(
-            "version: 1\nservers:\n  prod:\n    endpoint: https://og.internal:8080\n",
-        );
+        let config =
+            load_yaml("version: 1\nservers:\n  prod:\n    endpoint: https://og.internal:8080\n");
         match config.resolve_graph(None, Some("prod/production")).unwrap() {
-            GraphLocator::Remote { endpoint, server, graph_id, .. } => {
+            GraphLocator::Remote {
+                endpoint,
+                server,
+                graph_id,
+                ..
+            } => {
                 assert_eq!(endpoint, "https://og.internal:8080");
                 assert_eq!(server, "prod");
                 assert_eq!(graph_id, "production");
@@ -1356,13 +1376,19 @@ cli:
             "version: 1\nservers:\n  p:\n    endpoint: https://h\n\
              graphs:\n  bad:\n    storage: s3://b/x\n    server: p\n",
         );
-        assert!(err.contains("exactly one of `storage` or `server`"), "{err}");
+        assert!(
+            err.contains("exactly one of `storage` or `server`"),
+            "{err}"
+        );
     }
 
     #[test]
     fn graph_with_neither_storage_nor_server_is_rejected() {
         let err = load_yaml_err("version: 1\ngraphs:\n  bad:\n    branch: main\n");
-        assert!(err.contains("set `storage:`") && err.contains("bad"), "{err}");
+        assert!(
+            err.contains("set `storage:`") && err.contains("bad"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1386,7 +1412,10 @@ cli:
     #[test]
     fn unknown_graph_name_errors() {
         let config = load_yaml("version: 1\ngraphs:\n  local:\n    storage: ./demo.omni\n");
-        let err = config.resolve_graph(None, Some("ghost")).unwrap_err().to_string();
+        let err = config
+            .resolve_graph(None, Some("ghost"))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("ghost") && err.contains("not found"), "{err}");
     }
 
@@ -1396,7 +1425,10 @@ cli:
         let err = load_yaml_err(
             "version: 1\ngraphs:\n  g:\n    storage:\n      uri: s3://b/x\n      profile: default\n",
         );
-        assert!(err.to_lowercase().contains("profile") || err.contains("unknown field"), "{err}");
+        assert!(
+            err.to_lowercase().contains("profile") || err.contains("unknown field"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1404,7 +1436,9 @@ cli:
         // No `version:` (legacy); a remote uri with the /graphs/{gid} hack splits.
         let config = load_yaml("graphs:\n  prod:\n    uri: https://host:8080/graphs/production\n");
         match config.resolve_graph(None, Some("prod")).unwrap() {
-            GraphLocator::Remote { endpoint, graph_id, .. } => {
+            GraphLocator::Remote {
+                endpoint, graph_id, ..
+            } => {
                 assert_eq!(endpoint, "https://host:8080");
                 assert_eq!(graph_id, "production");
             }
