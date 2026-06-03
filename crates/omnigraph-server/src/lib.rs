@@ -1050,8 +1050,8 @@ pub fn load_server_settings(
     } else {
         // Rule 5 → error with migration hint.
         bail!(
-            "no graph to serve: pass a URI (`omnigraph-server <URI>`), select a target \
-             (`--target <name> --config omnigraph.yaml`), set `server.graph: <name>` in \
+            "no graph to serve: pass a URI (`omnigraph-server <URI>`), select a graph \
+             (`--graph <name> --config omnigraph.yaml`), set `server.graph: <name>` in \
              omnigraph.yaml, or for multi-graph mode add a `graphs:` map to the config \
              file referenced by `--config`."
         );

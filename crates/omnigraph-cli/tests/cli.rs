@@ -2513,7 +2513,7 @@ fn queries_list_requires_graph_selection_for_per_graph_only_registries() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("local") && stderr.contains("--target local"),
+        stderr.contains("local") && stderr.contains("--graph local"),
         "error must name the graph and give a concrete selection hint; stderr:\n{stderr}"
     );
 }
@@ -2550,7 +2550,7 @@ fn queries_list_without_graph_selection_lists_top_level_registry() {
 fn queries_list_unknown_target_errors() {
     // `queries list` opens no graph URI, so unknown-graph validation can't ride
     // along on URI resolution the way it does for every other command. An
-    // unknown `--target` must still error (naming the graph) instead of
+    // unknown `--graph` must still error (naming the graph) instead of
     // silently falling back to the top-level registry and showing the wrong
     // (or empty) catalog.
     let graph = SystemGraph::loaded();
@@ -2570,7 +2570,7 @@ fn queries_list_unknown_target_errors() {
         cli()
             .arg("queries")
             .arg("list")
-            .arg("--target")
+            .arg("--graph")
             .arg("nonexistent")
             .arg("--config")
             .arg(&config),

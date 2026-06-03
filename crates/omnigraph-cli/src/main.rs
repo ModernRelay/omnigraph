@@ -91,7 +91,7 @@ enum Command {
     Load {
         /// Graph URI
         uri: Option<String>,
-        #[arg(long)]
+        #[arg(long = "graph", value_name = "GRAPH")]
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
@@ -108,7 +108,7 @@ enum Command {
     Ingest {
         /// Graph URI
         uri: Option<String>,
-        #[arg(long)]
+        #[arg(long = "graph", value_name = "GRAPH")]
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
@@ -147,7 +147,7 @@ enum Command {
     Lint {
         /// Graph URI
         uri: Option<String>,
-        #[arg(long)]
+        #[arg(long = "graph", value_name = "GRAPH")]
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
@@ -167,7 +167,7 @@ enum Command {
     Snapshot {
         /// Graph URI
         uri: Option<String>,
-        #[arg(long)]
+        #[arg(long = "graph", value_name = "GRAPH")]
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
@@ -180,7 +180,7 @@ enum Command {
     Export {
         /// Graph URI
         uri: Option<String>,
-        #[arg(long)]
+        #[arg(long = "graph", value_name = "GRAPH")]
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
@@ -210,7 +210,7 @@ enum Command {
         uri: Option<String>,
         #[arg(hide = true)]
         legacy_uri: Option<String>,
-        #[arg(long)]
+        #[arg(long = "graph", value_name = "GRAPH")]
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
@@ -248,7 +248,7 @@ enum Command {
         uri: Option<String>,
         #[arg(hide = true)]
         legacy_uri: Option<String>,
-        #[arg(long)]
+        #[arg(long = "graph", value_name = "GRAPH")]
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
@@ -279,7 +279,7 @@ enum Command {
     Optimize {
         /// Graph URI
         uri: Option<String>,
-        #[arg(long)]
+        #[arg(long = "graph", value_name = "GRAPH")]
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
@@ -290,7 +290,7 @@ enum Command {
     Cleanup {
         /// Graph URI
         uri: Option<String>,
-        #[arg(long)]
+        #[arg(long = "graph", value_name = "GRAPH")]
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
@@ -328,7 +328,7 @@ enum GraphsCommand {
         /// Remote server URL (e.g. `https://server.example.com`).
         #[arg(long)]
         uri: Option<String>,
-        #[arg(long)]
+        #[arg(long = "graph", value_name = "GRAPH")]
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
@@ -344,7 +344,7 @@ enum BranchCommand {
         /// Graph URI
         #[arg(long)]
         uri: Option<String>,
-        #[arg(long)]
+        #[arg(long = "graph", value_name = "GRAPH")]
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
@@ -359,7 +359,7 @@ enum BranchCommand {
         /// Graph URI
         #[arg(long)]
         uri: Option<String>,
-        #[arg(long)]
+        #[arg(long = "graph", value_name = "GRAPH")]
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
@@ -371,7 +371,7 @@ enum BranchCommand {
         /// Graph URI
         #[arg(long)]
         uri: Option<String>,
-        #[arg(long)]
+        #[arg(long = "graph", value_name = "GRAPH")]
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
@@ -384,7 +384,7 @@ enum BranchCommand {
         /// Graph URI
         #[arg(long)]
         uri: Option<String>,
-        #[arg(long)]
+        #[arg(long = "graph", value_name = "GRAPH")]
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
@@ -402,7 +402,7 @@ enum SchemaCommand {
     Plan {
         /// Graph URI
         uri: Option<String>,
-        #[arg(long)]
+        #[arg(long = "graph", value_name = "GRAPH")]
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
@@ -420,7 +420,7 @@ enum SchemaCommand {
     Apply {
         /// Graph URI
         uri: Option<String>,
-        #[arg(long)]
+        #[arg(long = "graph", value_name = "GRAPH")]
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
@@ -445,7 +445,7 @@ enum SchemaCommand {
     Show {
         /// Graph URI
         uri: Option<String>,
-        #[arg(long)]
+        #[arg(long = "graph", value_name = "GRAPH")]
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
@@ -461,7 +461,7 @@ enum CommitCommand {
     List {
         /// Graph URI
         uri: Option<String>,
-        #[arg(long)]
+        #[arg(long = "graph", value_name = "GRAPH")]
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
@@ -475,7 +475,7 @@ enum CommitCommand {
         /// Graph URI
         #[arg(long)]
         uri: Option<String>,
-        #[arg(long)]
+        #[arg(long = "graph", value_name = "GRAPH")]
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
@@ -523,7 +523,7 @@ enum QueriesCommand {
     Validate {
         /// Graph URI
         uri: Option<String>,
-        #[arg(long)]
+        #[arg(long = "graph", value_name = "GRAPH")]
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
@@ -532,7 +532,7 @@ enum QueriesCommand {
     },
     /// List the registered stored queries (name, MCP exposure, params).
     List {
-        #[arg(long)]
+        #[arg(long = "graph", value_name = "GRAPH")]
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
@@ -1828,7 +1828,7 @@ fn resolve_registry_selection_for_list(
     }
 
     bail!(
-        "stored-query registries are configured for graph{} {} but no graph was selected. Pass `--target {}` or set `cli.graph`.",
+        "stored-query registries are configured for graph{} {} but no graph was selected. Pass `--graph {}` or set `cli.graph`.",
         if graph_names.len() == 1 { "" } else { "s" },
         graph_names.join(", "),
         graph_names[0],

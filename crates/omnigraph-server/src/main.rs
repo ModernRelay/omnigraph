@@ -10,7 +10,7 @@ use omnigraph_server::{ServerConfig, init_tracing, load_server_settings, serve};
 struct Cli {
     /// Graph URI
     uri: Option<String>,
-    #[arg(long)]
+    #[arg(long = "graph", value_name = "GRAPH")]
     target: Option<String>,
     #[arg(long)]
     config: Option<PathBuf>,
