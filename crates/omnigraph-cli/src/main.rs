@@ -2512,8 +2512,9 @@ async fn main() -> Result<()> {
                 let config = load_cli_config(config.as_ref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-                let uri = resolve_uri(&config, uri, target.as_deref())?;
-                let commits = if is_remote_uri(&uri) {
+                let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
+                let uri = graph.uri.clone();
+                let commits = if graph.is_remote() {
                     remote_json::<CommitListOutput>(
                         &http_client,
                         Method::GET,
@@ -2551,8 +2552,9 @@ async fn main() -> Result<()> {
                 let config = load_cli_config(config.as_ref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-                let uri = resolve_uri(&config, uri, target.as_deref())?;
-                let commit = if is_remote_uri(&uri) {
+                let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
+                let uri = graph.uri.clone();
+                let commit = if graph.is_remote() {
                     remote_json::<CommitOutput>(
                         &http_client,
                         Method::GET,
@@ -2670,8 +2672,9 @@ async fn main() -> Result<()> {
                 let config = load_cli_config(config.as_ref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-                let uri = resolve_uri(&config, uri, target.as_deref())?;
-                let output = if is_remote_uri(&uri) {
+                let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
+                let uri = graph.uri.clone();
+                let output = if graph.is_remote() {
                     remote_json::<SchemaOutput>(
                         &http_client,
                         Method::GET,
@@ -2734,9 +2737,10 @@ async fn main() -> Result<()> {
             let config = load_cli_config(config.as_ref())?;
             let bearer_token =
                 resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-            let uri = resolve_uri(&config, uri, target.as_deref())?;
+            let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
+            let uri = graph.uri.clone();
             let branch = resolve_branch(&config, branch, None, "main");
-            let payload = if is_remote_uri(&uri) {
+            let payload = if graph.is_remote() {
                 remote_json::<SnapshotOutput>(
                     &http_client,
                     Method::GET,
@@ -2769,7 +2773,8 @@ async fn main() -> Result<()> {
             let config = load_cli_config(config.as_ref())?;
             let bearer_token =
                 resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-            let uri = resolve_uri(&config, uri, target.as_deref())?;
+            let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
+            let uri = graph.uri.clone();
             let branch = resolve_branch(&config, branch, None, "main");
             if jsonl {
                 eprintln!("warning: --jsonl is deprecated; `omnigraph export` always emits JSONL");
@@ -2777,7 +2782,7 @@ async fn main() -> Result<()> {
 
             let stdout = io::stdout();
             let mut stdout = stdout.lock();
-            if is_remote_uri(&uri) {
+            if graph.is_remote() {
                 execute_export_remote_to_writer(
                     &http_client,
                     &uri,
@@ -3134,8 +3139,9 @@ async fn main() -> Result<()> {
                 let config = load_cli_config(config.as_ref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-                let uri = resolve_uri(&config, uri, target.as_deref())?;
-                if !is_remote_uri(&uri) {
+                let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
+                let uri = graph.uri.clone();
+                if !graph.is_remote() {
                     bail!(
                         "`omnigraph graphs list` requires a remote multi-graph server URL \
                          (http:// or https://). To enumerate local graphs, read `omnigraph.yaml` \
