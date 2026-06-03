@@ -17,7 +17,7 @@ use omnigraph_compiler::{
     QueryLintSeverity, QueryLintStatus, SchemaMigrationPlan, SchemaMigrationStep, build_catalog,
     json_params_to_param_map, lint_query_file,
 };
-use omnigraph_server::api::{
+use omnigraph_api_types::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, CommitListOutput, CommitOutput,
     ErrorOutput, ExportRequest, GraphListResponse, IngestOutput, IngestRequest, ReadOutput,
@@ -25,10 +25,12 @@ use omnigraph_server::api::{
     SnapshotTableOutput, commit_output, ingest_output, read_output, schema_apply_output,
     snapshot_payload,
 };
-use omnigraph_server::queries::{QueryRegistry, check, format_check_breakages};
-use omnigraph_server::{
-    AliasCommand, OmnigraphConfig, PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest,
-    PolicyTestConfig, ReadOutputFormat, graph_resource_id_for_selection, load_config,
+use omnigraph_queries::{QueryRegistry, check, format_check_breakages};
+use omnigraph_config::{
+    AliasCommand, OmnigraphConfig, ReadOutputFormat, graph_resource_id_for_selection, load_config,
+};
+use omnigraph_policy::{
+    PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest, PolicyTestConfig,
 };
 use reqwest::Method;
 use reqwest::header::AUTHORIZATION;
@@ -1510,7 +1512,7 @@ fn resolve_alias<'a>(
     config: &'a OmnigraphConfig,
     alias_name: Option<&'a str>,
     expected: AliasCommand,
-) -> Result<Option<(&'a str, &'a omnigraph_server::AliasConfig)>> {
+) -> Result<Option<(&'a str, &'a omnigraph_config::AliasConfig)>> {
     let Some(alias_name) = alias_name else {
         return Ok(None);
     };
@@ -1614,7 +1616,7 @@ fn yaml_string(value: &str) -> String {
 
 fn inferred_config_path(uri: &str) -> Result<PathBuf> {
     if uri.contains("://") {
-        return Ok(omnigraph_server::config::default_config_path());
+        return Ok(omnigraph_config::default_config_path());
     }
 
     let path = Path::new(uri);
@@ -1625,7 +1627,7 @@ fn inferred_config_path(uri: &str) -> Result<PathBuf> {
     } else {
         std::env::current_dir()?.join(path.parent().unwrap_or_else(|| Path::new(".")))
     };
-    Ok(base.join(omnigraph_server::config::DEFAULT_CONFIG_FILE))
+    Ok(base.join(omnigraph_config::DEFAULT_CONFIG_FILE))
 }
 
 fn read_target_from_cli(branch: Option<String>, snapshot: Option<String>) -> ReadTarget {
@@ -3160,7 +3162,7 @@ mod tests {
         normalize_bearer_token, parse_env_assignment, resolve_policy_context,
         resolve_cli_graph, resolve_remote_bearer_token,
     };
-    use omnigraph_server::load_config;
+    use omnigraph_config::load_config;
     use reqwest::header::AUTHORIZATION;
     use serde_json::json;
     use tempfile::tempdir;

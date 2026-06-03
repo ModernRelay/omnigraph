@@ -1,7 +1,7 @@
 use color_eyre::eyre::Result;
-use omnigraph_server::ReadOutputFormat;
-use omnigraph_server::api::ReadOutput;
-use omnigraph_server::config::TableCellLayout;
+use omnigraph_api_types::ReadOutput;
+use omnigraph_config::ReadOutputFormat;
+use omnigraph_config::TableCellLayout;
 use serde_json::{Map, Value};
 
 pub struct ReadRenderOptions {
@@ -275,7 +275,7 @@ fn csv_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use omnigraph_server::api::{ReadOutput, ReadTargetOutput};
+    use omnigraph_api_types::{ReadOutput, ReadTargetOutput};
 
     use super::*;
 

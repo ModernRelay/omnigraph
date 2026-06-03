@@ -16,7 +16,9 @@ path = "src/main.rs"
 omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.6.1" }
 omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.6.1" }
 omnigraph-policy = { path = "../omnigraph-policy", version = "0.6.1" }
-omnigraph-server = { path = "../omnigraph-server", version = "0.6.1" }
+omnigraph-config = { path = "../omnigraph-config", version = "0.6.1" }
+omnigraph-queries = { path = "../omnigraph-queries", version = "0.6.1" }
+omnigraph-api-types = { path = "../omnigraph-api-types", version = "0.6.1" }
 clap = { workspace = true }
 color-eyre = { workspace = true }
 serde = { workspace = true }
