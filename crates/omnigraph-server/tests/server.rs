@@ -5890,6 +5890,80 @@ graphs:
         assert!(err.to_string().contains("no graph to serve"));
     }
 
+    // omnigraph-server serves embedded graphs only (RFC-002 §3) — a remote
+    // entry (`server:` set, or a remote `http(s)://` `uri:`) must be refused at
+    // config load, not opened. RED today: `load_server_settings` accepts these
+    // and only fails later at `Omnigraph::open`.
+
+    #[test]
+    fn multi_mode_rejects_server_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            "servers:\n  prod:\n    endpoint: https://og.internal:8080\n\
+             graphs:\n  g:\n    server: prod\n  alpha:\n    uri: /tmp/alpha.omni\n",
+        )
+        .unwrap();
+        let err = load_server_settings(Some(&config_path), None, None, None, true).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'g'") && msg.contains("embedded"),
+            "remote `server:` entry must be rejected, naming the graph: {msg}"
+        );
+    }
+
+    #[test]
+    fn multi_mode_rejects_remote_uri_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            "graphs:\n  g:\n    uri: https://host:8080\n  alpha:\n    uri: /tmp/alpha.omni\n",
+        )
+        .unwrap();
+        let err = load_server_settings(Some(&config_path), None, None, None, true).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'g'") && msg.contains("embedded"),
+            "remote `uri:` entry must be rejected, naming the graph: {msg}"
+        );
+    }
+
+    #[test]
+    fn single_mode_rejects_positional_remote_uri() {
+        let err = load_server_settings(
+            None,
+            Some("https://host:8080".to_string()),
+            None,
+            None,
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("embedded"),
+            "a remote positional URI must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn single_mode_rejects_named_remote_graph() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            "servers:\n  prod:\n    endpoint: https://og.internal:8080\n\
+             graphs:\n  g:\n    server: prod\nserver:\n  graph: g\n",
+        )
+        .unwrap();
+        let err = load_server_settings(Some(&config_path), None, None, None, true).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'g'") && msg.contains("embedded"),
+            "a named remote graph (server.graph) must be rejected: {msg}"
+        );
+    }
+
     /// `--config` + `<URI>` together: URI wins → Single (the CLI URI
     /// takes precedence over the config's graphs map).
     #[test]
