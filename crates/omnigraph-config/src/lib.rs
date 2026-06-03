@@ -21,8 +21,10 @@ pub struct ProjectConfig {
     pub name: Option<String>,
 }
 
+// Spans both schemas (legacy `uri:` and v1 `storage:`/`server:`), so unknown-key
+// strictness is gated on `version` in `load_config_in` rather than pinned here as
+// a struct attribute: legacy tolerates unknown keys, `version: 1` rejects them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TargetConfig {
     /// Embedded base URI. Legacy spelling (`uri:`) for an object-store
     /// location; populated post-load from `storage`/`server` so every existing
@@ -84,6 +86,10 @@ impl<'de> Deserialize<'de> for Storage {
     }
 }
 
+// `storage:` (block form) is v1-only syntax with no legacy form to be lenient
+// about, and the hand-rolled `Storage` deserialize above reaches it through an
+// opaque `from_value` the version-gated loader pass cannot see into — so this
+// block is always strict via its own `deny_unknown_fields`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageBlock {
@@ -103,6 +109,9 @@ impl Storage {
 
 /// A named remote server — an endpoint a client targets. Secret-free: bearer
 /// credentials are resolved out of band (the auth model is a later change).
+// `servers:` is v1-only syntax (no legacy form), so this typed block is always
+// strict — the version gate governs only the legacy-spanning structs
+// (`OmnigraphConfig`, `TargetConfig`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerEntry {
@@ -300,11 +309,15 @@ pub struct AliasConfig {
     pub format: Option<ReadOutputFormat>,
 }
 
+// Top-level schema, spanning legacy and v1 — unknown-key strictness is gated on
+// `version` in `load_config_in` (see the `version` field), not pinned here as a
+// struct attribute.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct OmnigraphConfig {
-    /// Schema version. Absent = legacy (lenient); `1` = the typed schema. The
-    /// loader rejects unsupported versions before parsing (`check_config_version`).
+    /// Schema version — the strictness discriminator. Absent ⇒ legacy schema:
+    /// unknown YAML keys are tolerated (lenient). `Some(1)` ⇒ typed schema:
+    /// unknown keys are rejected at any depth (honored-or-rejected). Decided in
+    /// `load_config_in`, which also rejects unsupported versions.
     #[serde(default)]
     pub version: Option<u32>,
     #[serde(default)]
@@ -810,8 +823,31 @@ fn load_config_in(cwd: &Path, config_path: Option<&PathBuf>) -> Result<Omnigraph
 
     let mut config = if let Some(path) = &config_path {
         let text = fs::read_to_string(path)?;
-        check_config_version(&text)?;
-        serde_yaml::from_str::<OmnigraphConfig>(&text)?
+        let mut unknown: Vec<String> = Vec::new();
+        let de = serde_yaml::Deserializer::from_str(&text);
+        let config: OmnigraphConfig =
+            serde_ignored::deserialize(de, |key| unknown.push(key.to_string()))?;
+        // Strictness is a function of the version, decided here — the one place
+        // the loader holds both the parsed version and the set of ignored fields.
+        // Legacy (no `version:`) tolerates unknown keys; `version: 1` rejects them
+        // at any depth (honored-or-rejected, RFC-002 §3). The v1-only typed blocks
+        // (`storage:`/`servers:`) enforce their own `deny_unknown_fields`.
+        match config.version {
+            Some(v) if v != 1 => bail!(
+                "unsupported config version {v}; this build supports version 1 \
+                 (omit `version:` for the legacy schema)"
+            ),
+            Some(1) if !unknown.is_empty() => {
+                unknown.sort();
+                bail!(
+                    "unknown config field(s) under `version: 1`: {} \
+                     (omit `version:` for the legacy lenient schema)",
+                    unknown.join(", ")
+                )
+            }
+            _ => {}
+        }
+        config
     } else {
         OmnigraphConfig::default()
     };
@@ -825,24 +861,6 @@ fn load_config_in(cwd: &Path, config_path: Option<&PathBuf>) -> Result<Omnigraph
     config.normalize_graphs()?;
 
     Ok(config)
-}
-
-/// Read the optional top-level `version:` discriminator and reject versions
-/// this build does not understand. The typed v1 schema (`deny_unknown_fields`,
-/// the `GraphLocator`) lands in a following change; today both no-version
-/// (legacy) and `version: 1` parse via the same lenient struct, so this is the
-/// forward-compat gate that lets v1 tighten without breaking legacy files.
-fn check_config_version(text: &str) -> Result<()> {
-    let value: serde_yaml::Value = serde_yaml::from_str(text)?;
-    if let Some(version) = value.get("version").and_then(serde_yaml::Value::as_u64) {
-        if version != 1 {
-            bail!(
-                "unsupported config version {version}; this build supports version 1 \
-                 (omit `version:` for the legacy schema)"
-            );
-        }
-    }
-    Ok(())
 }
 
 fn absolute_base_dir(cwd: &Path, path: &Path) -> Result<PathBuf> {
@@ -1293,6 +1311,22 @@ cli:
              future_top_level_key: whatever\ncli:\n  graph: local\n",
         );
         assert_eq!(config.cli_graph_name(), Some("local"));
+    }
+
+    #[test]
+    fn version_one_rejects_unknown_nested_field() {
+        // `version: 1` is strict at ALL depths via serde_ignored, not only at the
+        // structs that carry their own `deny_unknown_fields`: a typo inside a
+        // nested block such as `cli:` must error, naming the offending key
+        // (honored-or-rejected, RFC-002 §3).
+        let err = load_yaml_err(
+            "version: 1\ngraphs:\n  local:\n    uri: ./demo.omni\n\
+             cli:\n  graph: local\n  outout_format: kv\n",
+        );
+        assert!(
+            err.contains("outout_format") || err.contains("unknown config field"),
+            "v1 must reject an unknown nested field, naming it: {err}"
+        );
     }
 
     fn load_yaml(yaml: &str) -> super::OmnigraphConfig {
