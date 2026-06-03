@@ -3168,8 +3168,8 @@ mod tests {
     use std::fs;
 
     use super::{
-        DEFAULT_BEARER_TOKEN_ENV, apply_bearer_token, bearer_token_from_env_file,
-        legacy_change_request_body, load_cli_config, load_env_file_into_process,
+        DEFAULT_BEARER_TOKEN_ENV, ResolvedCliGraph, apply_bearer_token, bearer_token_from_env_file,
+        is_remote_uri, legacy_change_request_body, load_cli_config, load_env_file_into_process,
         normalize_bearer_token, parse_env_assignment, resolve_cli_graph, resolve_policy_context,
         resolve_remote_bearer_token,
     };
@@ -3531,6 +3531,7 @@ graphs:
         assert_eq!(graph.selected(), Some("prod"));
         assert_eq!(graph.graph_id, "prod");
         assert_eq!(graph.uri, "s3://bucket/prod-graph/");
+        assert!(!graph.is_remote());
     }
 
     #[test]
@@ -3567,6 +3568,7 @@ cli:
             local_graph_path.to_string_lossy().as_ref()
         );
         assert_eq!(local_graph.policy_file, None);
+        assert!(!local_graph.is_remote());
 
         let s3_graph = resolve_cli_graph(
             &config,
@@ -3577,5 +3579,72 @@ cli:
         assert_eq!(s3_graph.selected(), None);
         assert_eq!(s3_graph.graph_id, "s3://bucket/anonymous-graph");
         assert_eq!(s3_graph.policy_file, None);
+        assert!(!s3_graph.is_remote());
+    }
+
+    #[test]
+    fn graph_identity_resolve_cli_graph_locator_discriminant_matches_legacy_scheme_sniff() {
+        // L3 behavior-identical guarantee: `GraphLocator::is_remote()` agrees with
+        // the old `is_remote_uri(graph.uri)` for every address shape that flows
+        // through `resolve_cli_graph` today. `srv/gid` is intentionally absent — it
+        // bails at `resolve_graph_selection` (membership) and is unwired until V2.
+        let temp = tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            r#"
+servers:
+  prod:
+    endpoint: https://og.internal:8080
+graphs:
+  remote_via_server:
+    server: prod
+  legacy_remote:
+    uri: https://host:8080/graphs/production
+  local_named:
+    uri: ./demo.omni
+"#,
+        )
+        .unwrap();
+        let config = load_config(Some(&config_path)).unwrap();
+
+        let matches_sniff = |graph: &ResolvedCliGraph, expect_remote: bool, label: &str| {
+            assert_eq!(graph.is_remote(), expect_remote, "{label}: discriminant");
+            assert_eq!(
+                graph.is_remote(),
+                is_remote_uri(&graph.uri),
+                "{label}: is_remote() must equal is_remote_uri(uri)"
+            );
+        };
+
+        // Named entries: server: form, legacy remote uri:, embedded uri:.
+        matches_sniff(
+            &resolve_cli_graph(&config, None, Some("remote_via_server")).unwrap(),
+            true,
+            "server:",
+        );
+        matches_sniff(
+            &resolve_cli_graph(&config, None, Some("legacy_remote")).unwrap(),
+            true,
+            "legacy uri:",
+        );
+        matches_sniff(
+            &resolve_cli_graph(&config, None, Some("local_named")).unwrap(),
+            false,
+            "embedded uri:",
+        );
+
+        // Positional (anonymous) URIs: http(s) -> remote, s3 -> embedded.
+        matches_sniff(
+            &resolve_cli_graph(&config, Some("https://example.com:8080".to_string()), None)
+                .unwrap(),
+            true,
+            "positional http",
+        );
+        matches_sniff(
+            &resolve_cli_graph(&config, Some("s3://bucket/anon/".to_string()), None).unwrap(),
+            false,
+            "positional s3",
+        );
     }
 }
