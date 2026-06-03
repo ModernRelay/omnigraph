@@ -890,6 +890,26 @@ fn format_registry_load_errors(label: &str, errors: &[queries::LoadError]) -> St
     format!("graph '{label}': stored-query registry failed to load:\n  {joined}")
 }
 
+/// omnigraph-server serves embedded graphs only (RFC-002 §3). Reject a graph
+/// whose resolved locator is remote (`server:` set, or a remote `http(s)://`
+/// `uri:`) before any open — a server must not proxy another server. Reuses the
+/// same `resolve_graph` classifier the CLI dispatches on, so the two can't drift.
+fn ensure_embedded(
+    config: &OmnigraphConfig,
+    explicit_uri: Option<&str>,
+    name: Option<&str>,
+    label: &str,
+) -> Result<()> {
+    if config.resolve_graph(explicit_uri, name)?.is_remote() {
+        bail!(
+            "graph '{label}' is remote (it sets `server:` or a remote `http(s)://` URI), but \
+             omnigraph-server serves embedded graphs only and does not proxy another server. \
+             Serve an embedded `storage:` graph, or point a client at the remote server instead."
+        );
+    }
+    Ok(())
+}
+
 pub fn load_server_settings(
     config_path: Option<&PathBuf>,
     cli_uri: Option<String>,
@@ -931,6 +951,23 @@ pub fn load_server_settings(
 
     let mode = if has_cli_uri || has_cli_target || has_server_graph {
         // Rules 1, 2, or 3 → Single mode.
+        // Config follows graph IDENTITY, not mode: a bare URI is anonymous
+        // (top-level config); a graph chosen by name uses its per-graph
+        // `graphs.<name>.{policy,queries}`. Resolved before the URI so the
+        // embedded-only check and `resolve_target_uri` share one selection.
+        let selected: Option<&str> = if has_cli_uri {
+            None
+        } else {
+            cli_target.as_deref().or_else(|| config.server_graph_name())
+        };
+        // omnigraph-server serves embedded graphs only — refuse a remote target
+        // (`server:`/remote `uri:`) before resolving or opening it.
+        ensure_embedded(
+            &config,
+            cli_uri.as_deref(),
+            selected,
+            selected.or(cli_uri.as_deref()).unwrap_or("<graph>"),
+        )?;
         let raw_uri = config.resolve_target_uri(
             cli_uri,
             cli_target.as_deref(),
@@ -939,15 +976,6 @@ pub fn load_server_settings(
         let uri = normalize_root_uri(&raw_uri).wrap_err_with(|| {
             format!("normalize single-graph URI '{raw_uri}' from server settings")
         })?;
-        // Config follows graph IDENTITY, not mode: a bare URI is anonymous
-        // (top-level config); a graph chosen by name uses its per-graph
-        // `graphs.<name>.{policy,queries}`. `resolve_target_uri` already
-        // errored on an unknown name, so a `Some(name)` here is a known graph.
-        let selected: Option<&str> = if has_cli_uri {
-            None
-        } else {
-            cli_target.as_deref().or_else(|| config.server_graph_name())
-        };
         // A named selection must not leave a populated top-level block
         // silently unused — refuse boot and point at the per-graph block. The
         // same rule the CLI selection gate enforces, shared via one helper so
@@ -987,6 +1015,9 @@ pub fn load_server_settings(
             GraphId::try_from(name.clone()).map_err(|err| {
                 color_eyre::eyre::eyre!("invalid graph id '{name}' in omnigraph.yaml: {err}")
             })?;
+            // omnigraph-server serves embedded graphs only — a remote entry
+            // (`server:`/remote `uri:`) cannot be served, only proxied.
+            ensure_embedded(&config, None, Some(name.as_str()), name)?;
             let raw_uri = config.resolve_uri_value(&target.uri);
             let uri = normalize_root_uri(&raw_uri).wrap_err_with(|| {
                 format!("normalize URI '{raw_uri}' for graph '{name}' in omnigraph.yaml")
@@ -3344,9 +3375,9 @@ server:
             r#"
 graphs:
   local:
-    uri: ./demo.omni
+    uri: ./local.omni
   dev:
-    uri: http://127.0.0.1:8080
+    uri: ./dev.omni
 server:
   graph: local
   bind: 127.0.0.1:8080
@@ -3354,12 +3385,15 @@ server:
         )
         .unwrap();
 
+        // `--target dev` overrides `server.graph: local`, resolving the named
+        // embedded graph. (A remote target is now rejected — see
+        // `single_mode_rejects_named_remote_graph` in tests/server.rs.)
         let settings =
             load_server_settings(Some(&config), None, Some("dev".to_string()), None, false)
                 .unwrap();
         match &settings.mode {
             ServerConfigMode::Single { uri, graph_id, .. } => {
-                assert_eq!(uri, "http://127.0.0.1:8080");
+                assert!(uri.ends_with("dev.omni"), "uri: {uri}");
                 assert_eq!(graph_id, "dev");
             }
             ServerConfigMode::Multi { .. } => panic!("expected Single mode, got Multi"),

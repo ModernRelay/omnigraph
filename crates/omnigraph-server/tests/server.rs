@@ -5964,6 +5964,31 @@ graphs:
         );
     }
 
+    #[test]
+    fn multi_mode_accepts_storage_embedded_entry() {
+        // The rejection must NOT over-fire on an embedded `storage:` entry:
+        // `normalize_graphs` fills `.uri` and the server serves it normally.
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            "version: 1\ngraphs:\n  g:\n    storage: ./g.omni\n",
+        )
+        .unwrap();
+        let settings = load_server_settings(Some(&config_path), None, None, None, true).unwrap();
+        match settings.mode {
+            ServerConfigMode::Multi { graphs, .. } => {
+                assert_eq!(graphs.len(), 1);
+                assert!(
+                    graphs[0].uri.ends_with("g.omni"),
+                    "storage entry must resolve to its embedded uri: {}",
+                    graphs[0].uri
+                );
+            }
+            ServerConfigMode::Single { .. } => panic!("expected Multi for a graphs: map"),
+        }
+    }
+
     /// `--config` + `<URI>` together: URI wins → Single (the CLI URI
     /// takes precedence over the config's graphs map).
     #[test]
