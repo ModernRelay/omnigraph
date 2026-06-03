@@ -24,6 +24,7 @@ omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.6.1" }
 omnigraph-policy = { path = "../omnigraph-policy", version = "0.6.1" }
 omnigraph-config = { path = "../omnigraph-config", version = "0.6.1" }
 omnigraph-queries = { path = "../omnigraph-queries", version = "0.6.1" }
+omnigraph-api-types = { path = "../omnigraph-api-types", version = "0.6.1" }
 axum = { workspace = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }

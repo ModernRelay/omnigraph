@@ -1,4 +1,4 @@
-pub mod api;
+pub use omnigraph_api_types as api;
 pub mod auth;
 pub use omnigraph_config as config;
 pub mod graph_id;

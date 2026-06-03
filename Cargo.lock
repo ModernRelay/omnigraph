@@ -4542,6 +4542,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "omnigraph-api-types"
+version = "0.6.1"
+dependencies = [
+ "omnigraph-compiler",
+ "omnigraph-engine",
+ "omnigraph-queries",
+ "serde",
+ "serde_json",
+ "utoipa",
+]
+
+[[package]]
 name = "omnigraph-cli"
 version = "0.6.1"
 dependencies = [
@@ -4673,6 +4685,7 @@ dependencies = [
  "futures",
  "lance",
  "lance-index",
+ "omnigraph-api-types",
  "omnigraph-compiler",
  "omnigraph-config",
  "omnigraph-engine",

@@ -8,6 +8,7 @@ members = [
     "crates/omnigraph-server",
     "crates/omnigraph-config",
     "crates/omnigraph-queries",
+    "crates/omnigraph-api-types",
 ]
 default-members = [
     "crates/omnigraph",

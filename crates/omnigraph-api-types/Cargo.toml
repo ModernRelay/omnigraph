@@ -1,0 +1,17 @@
+[package]
+name = "omnigraph-api-types"
+version = "0.6.1"
+edition = "2024"
+description = "HTTP request/response types (OpenAPI schemas) for the Omnigraph graph database."
+license = "MIT"
+repository = "https://github.com/ModernRelay/omnigraph"
+homepage = "https://github.com/ModernRelay/omnigraph"
+documentation = "https://docs.rs/omnigraph-api-types"
+
+[dependencies]
+omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.6.1" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.6.1" }
+omnigraph-queries = { path = "../omnigraph-queries", version = "0.6.1" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+utoipa = { workspace = true }
