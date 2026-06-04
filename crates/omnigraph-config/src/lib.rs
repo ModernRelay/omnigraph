@@ -332,8 +332,12 @@ pub struct OmnigraphConfig {
     pub server: ServerDefaults,
     #[serde(default)]
     pub auth: AuthDefaults,
-    #[serde(default)]
-    pub cli: CliDefaults,
+    /// CLI/client defaults (`defaults:`) — RFC-002. The legacy spelling `cli:`
+    /// is accepted via a serde alias and honored under the legacy schema; under
+    /// `version: 1` it is rejected at load (see [`legacy_top_level_keys`]). All
+    /// reads go through the `default_*` accessors.
+    #[serde(default, alias = "cli")]
+    pub defaults: CliDefaults,
     #[serde(default)]
     pub query: QueryDefaults,
     #[serde(default)]
@@ -353,6 +357,12 @@ pub struct OmnigraphConfig {
     /// when no `omnigraph.yaml` exists.
     #[serde(skip)]
     loaded_from_file: bool,
+    /// Top-level legacy keys present in the loaded file that v1 renames or
+    /// removes (see [`legacy_top_level_keys`]). Populated by `load_config_in`
+    /// from a raw scan; drives the legacy deprecation warnings. Empty under
+    /// `version: 1` (those keys are rejected at load) and for the built-in default.
+    #[serde(skip)]
+    legacy_keys: Vec<String>,
 }
 
 impl Default for OmnigraphConfig {
@@ -364,13 +374,14 @@ impl Default for OmnigraphConfig {
             graphs: BTreeMap::new(),
             server: ServerDefaults::default(),
             auth: AuthDefaults::default(),
-            cli: CliDefaults::default(),
+            defaults: CliDefaults::default(),
             query: QueryDefaults::default(),
             aliases: BTreeMap::new(),
             policy: PolicySettings::default(),
             queries: BTreeMap::new(),
             base_dir: PathBuf::new(),
             loaded_from_file: false,
+            legacy_keys: Vec::new(),
         }
     }
 }
@@ -380,24 +391,24 @@ impl OmnigraphConfig {
         &self.base_dir
     }
 
-    pub fn cli_branch(&self) -> &str {
-        self.cli.branch.as_deref().unwrap_or("main")
+    pub fn default_branch(&self) -> &str {
+        self.defaults.branch.as_deref().unwrap_or("main")
     }
 
-    pub fn cli_output_format(&self) -> ReadOutputFormat {
-        self.cli.output_format.unwrap_or_default()
+    pub fn default_output_format(&self) -> ReadOutputFormat {
+        self.defaults.output_format.unwrap_or_default()
     }
 
     pub fn table_max_column_width(&self) -> usize {
-        self.cli.table_max_column_width.unwrap_or(80)
+        self.defaults.table_max_column_width.unwrap_or(80)
     }
 
     pub fn table_cell_layout(&self) -> TableCellLayout {
-        self.cli.table_cell_layout.unwrap_or_default()
+        self.defaults.table_cell_layout.unwrap_or_default()
     }
 
-    pub fn cli_graph_name(&self) -> Option<&str> {
-        self.cli.graph.as_deref()
+    pub fn default_graph_name(&self) -> Option<&str> {
+        self.defaults.graph.as_deref()
     }
 
     pub fn server_graph_name(&self) -> Option<&str> {
@@ -514,7 +525,10 @@ impl OmnigraphConfig {
     }
 
     pub fn resolve_policy_tooling_graph_selection(&self) -> Result<Option<&str>> {
-        self.resolve_graph_selection(self.cli_graph_name().or_else(|| self.server_graph_name()))
+        self.resolve_graph_selection(
+            self.default_graph_name()
+                .or_else(|| self.server_graph_name()),
+        )
     }
 
     /// The policy file that applies for a graph selection — the policy
@@ -618,14 +632,13 @@ impl OmnigraphConfig {
                     .to_string(),
             );
         }
-        // Legacy-only notices for keys that `version: 1` rejects at load (so they
-        // can only reach here under the lenient legacy schema). `project:` has no
-        // consumer and is removed in v1.
-        if self.version.is_none() && self.project.name.is_some() {
-            warnings.push(
-                "`project:` has no effect and is removed under `version: 1`; delete it."
-                    .to_string(),
-            );
+        // Legacy-only notices for top-level keys that `version: 1` rejects at
+        // load (so a populated `legacy_keys` only ever occurs under the lenient
+        // legacy schema). Shares the migration hints with the v1 rejection.
+        for key in &self.legacy_keys {
+            if let Some(hint) = legacy_key_migration_hint(key) {
+                warnings.push(format!("`{key}:` — {hint}"));
+            }
         }
         for (name, entry) in &self.graphs {
             if entry.storage.is_none() && entry.server.is_none() && !entry.uri.is_empty() {
@@ -673,7 +686,7 @@ impl OmnigraphConfig {
             });
         }
 
-        let name = name.or_else(|| self.cli_graph_name()).ok_or_else(|| {
+        let name = name.or_else(|| self.default_graph_name()).ok_or_else(|| {
             color_eyre::eyre::eyre!("URI must be provided via <URI>, --graph, or config")
         })?;
 
@@ -865,7 +878,7 @@ fn load_config_in(cwd: &Path, config_path: Option<&PathBuf>) -> Result<Omnigraph
         let text = fs::read_to_string(path)?;
         let mut unknown: Vec<String> = Vec::new();
         let de = serde_yaml::Deserializer::from_str(&text);
-        let config: OmnigraphConfig =
+        let mut config: OmnigraphConfig =
             serde_ignored::deserialize(de, |key| unknown.push(key.to_string()))?;
         // Strictness is a function of the version, decided here — the one place
         // the loader holds both the parsed version and the set of ignored fields.
@@ -887,7 +900,27 @@ fn load_config_in(cwd: &Path, config_path: Option<&PathBuf>) -> Result<Omnigraph
             }
             _ => {}
         }
-        reject_legacy_top_level_keys_under_v1(&text, config.version)?;
+        // Known-but-legacy top-level keys (renamed/removed by v1) are invisible
+        // to `serde_ignored` because they stay parseable for the legacy schema,
+        // so scan the raw text for them: reject under v1, record for the legacy
+        // deprecation warnings otherwise.
+        let legacy_keys = legacy_top_level_keys(&text);
+        if config.version == Some(1) && !legacy_keys.is_empty() {
+            let offenders = legacy_keys
+                .iter()
+                .map(|key| {
+                    format!(
+                        "`{key}:` — {}",
+                        legacy_key_migration_hint(key).unwrap_or("")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n  ");
+            bail!(
+                "invalid key(s) under `version: 1`:\n  {offenders}\n(omit `version:` for the legacy lenient schema)"
+            );
+        }
+        config.legacy_keys = legacy_keys;
         config
     } else {
         OmnigraphConfig::default()
@@ -925,34 +958,29 @@ fn absolute_base_dir(cwd: &Path, path: &Path) -> Result<PathBuf> {
 /// silently ignored). The set grows as each rename/removal lands.
 fn legacy_key_migration_hint(key: &str) -> Option<&'static str> {
     match key {
-        "project" => Some("has no effect and is removed under `version: 1`; delete it"),
+        "project" => Some("remove it; it has no effect under `version: 1`"),
+        "cli" => Some("rename to `defaults:`"),
         _ => None,
     }
 }
 
-/// Reject any v1-illegal top-level key (see [`legacy_key_migration_hint`]) when
-/// `version: 1` is set. Scans the raw top-level mapping rather than the typed
-/// config because the offending keys are known struct fields kept for legacy
-/// parsing — rejection keys on the *presence* of the key (an empty `policy: {}`
-/// under v1 is a silent no-op and must error too), which only a raw scan can see.
-fn reject_legacy_top_level_keys_under_v1(text: &str, version: Option<u32>) -> Result<()> {
-    if version != Some(1) {
-        return Ok(());
-    }
+/// The top-level keys present in the raw config text that v1 renames or removes
+/// (those with a [`legacy_key_migration_hint`]), sorted. Scans the raw mapping
+/// rather than the typed config because these keys are honored under the legacy
+/// schema (so they stay parseable) — detection keys on the *presence* of the
+/// key (an empty `cli: {}`/`policy: {}` under v1 is a silent no-op and must
+/// error too), which only a raw scan can see. Drives both the `version: 1`
+/// rejection and the legacy deprecation warnings.
+fn legacy_top_level_keys(text: &str) -> Vec<String> {
     let mapping: serde_yaml::Mapping = serde_yaml::from_str(text).unwrap_or_default();
-    let mut offenders: Vec<String> = mapping
+    let mut keys: Vec<String> = mapping
         .keys()
         .filter_map(serde_yaml::Value::as_str)
-        .filter_map(|key| legacy_key_migration_hint(key).map(|hint| format!("`{key}:` — {hint}")))
+        .filter(|key| legacy_key_migration_hint(key).is_some())
+        .map(str::to_string)
         .collect();
-    if !offenders.is_empty() {
-        offenders.sort();
-        bail!(
-            "invalid key(s) under `version: 1`:\n  {}\n(omit `version:` for the legacy lenient schema)",
-            offenders.join("\n  ")
-        );
-    }
-    Ok(())
+    keys.sort();
+    keys
 }
 
 #[cfg(test)]
@@ -991,13 +1019,13 @@ policy: {}
         .unwrap();
 
         let config = load_config_in(temp.path(), None).unwrap();
-        assert_eq!(config.cli_graph_name(), Some("local"));
-        assert_eq!(config.cli_branch(), "main");
-        assert_eq!(config.cli_output_format(), ReadOutputFormat::Kv);
+        assert_eq!(config.default_graph_name(), Some("local"));
+        assert_eq!(config.default_branch(), "main");
+        assert_eq!(config.default_output_format(), ReadOutputFormat::Kv);
         assert_eq!(config.table_max_column_width(), 40);
         assert_eq!(config.table_cell_layout(), TableCellLayout::Wrap);
         assert_eq!(
-            config.graph_bearer_token_env(None, None, config.cli_graph_name()),
+            config.graph_bearer_token_env(None, None, config.default_graph_name()),
             Some("DEMO_TOKEN")
         );
         assert_eq!(
@@ -1007,7 +1035,7 @@ policy: {}
         assert_eq!(
             PathBuf::from(
                 config
-                    .resolve_target_uri(None, None, config.cli_graph_name())
+                    .resolve_target_uri(None, None, config.default_graph_name())
                     .unwrap()
             ),
             temp.path().join("./demo.omni")
@@ -1328,7 +1356,7 @@ cli:
             config.graph_bearer_token_env(
                 Some("https://override.example.com"),
                 None,
-                config.cli_graph_name()
+                config.default_graph_name()
             ),
             None
         );
@@ -1336,7 +1364,7 @@ cli:
             config.graph_bearer_token_env(
                 Some("https://override.example.com"),
                 Some("demo"),
-                config.cli_graph_name()
+                config.default_graph_name()
             ),
             Some("DEMO_TOKEN")
         );
@@ -1347,15 +1375,15 @@ cli:
         let temp = tempdir().unwrap();
         fs::write(
             temp.path().join("omnigraph.yaml"),
-            "version: 1\ngraphs:\n  local:\n    uri: ./demo.omni\ncli:\n  graph: local\n",
+            "version: 1\ngraphs:\n  local:\n    uri: ./demo.omni\ndefaults:\n  graph: local\n",
         )
         .unwrap();
         let config = load_config_in(temp.path(), None).unwrap();
-        assert_eq!(config.cli_graph_name(), Some("local"));
+        assert_eq!(config.default_graph_name(), Some("local"));
         assert_eq!(
             PathBuf::from(
                 config
-                    .resolve_target_uri(None, None, config.cli_graph_name())
+                    .resolve_target_uri(None, None, config.default_graph_name())
                     .unwrap()
             ),
             temp.path().join("./demo.omni")
@@ -1390,22 +1418,68 @@ cli:
             "graphs:\n  local:\n    uri: ./demo.omni\n\
              future_top_level_key: whatever\ncli:\n  graph: local\n",
         );
-        assert_eq!(config.cli_graph_name(), Some("local"));
+        assert_eq!(config.default_graph_name(), Some("local"));
     }
 
     #[test]
     fn version_one_rejects_unknown_nested_field() {
         // `version: 1` is strict at ALL depths via serde_ignored, not only at the
         // structs that carry their own `deny_unknown_fields`: a typo inside a
-        // nested block such as `cli:` must error, naming the offending key
+        // nested block such as `defaults:` must error, naming the offending key
         // (honored-or-rejected, RFC-002 §3).
         let err = load_yaml_err(
             "version: 1\ngraphs:\n  local:\n    uri: ./demo.omni\n\
-             cli:\n  graph: local\n  outout_format: kv\n",
+             defaults:\n  graph: local\n  outout_format: kv\n",
         );
         assert!(
             err.contains("outout_format") || err.contains("unknown config field"),
             "v1 must reject an unknown nested field, naming it: {err}"
+        );
+    }
+
+    #[test]
+    fn version_one_rejects_legacy_cli_key() {
+        // `cli:` is renamed to `defaults:` under v1; writing it is a hard error
+        // that points at the new spelling (a known struct field via the `cli`
+        // alias, so only the raw key scan catches it).
+        let err = load_yaml_err(
+            "version: 1\ngraphs:\n  local:\n    storage: ./demo.omni\ncli:\n  graph: local\n",
+        );
+        assert!(
+            err.contains("cli") && err.contains("rename to `defaults:`"),
+            "v1 must reject `cli:` and point at `defaults:`: {err}"
+        );
+    }
+
+    #[test]
+    fn version_one_honors_defaults_block() {
+        let config = load_yaml(
+            "version: 1\ngraphs:\n  local:\n    storage: ./demo.omni\n\
+             defaults:\n  graph: local\n  branch: dev\n  output_format: kv\n",
+        );
+        assert_eq!(config.default_graph_name(), Some("local"));
+        assert_eq!(config.default_branch(), "dev");
+        assert_eq!(config.default_output_format(), ReadOutputFormat::Kv);
+        assert!(
+            config.deprecation_warnings().is_empty(),
+            "clean v1 `defaults:` config must not warn: {:?}",
+            config.deprecation_warnings()
+        );
+    }
+
+    #[test]
+    fn legacy_cli_key_honored_via_alias_and_warned() {
+        // No `version:` ⇒ the legacy `cli:` spelling is accepted (serde alias of
+        // `defaults`) and still honored, but flagged for migration.
+        let config = load_yaml("graphs:\n  local:\n    uri: ./demo.omni\ncli:\n  graph: local\n");
+        assert_eq!(config.default_graph_name(), Some("local"));
+        assert!(
+            config
+                .deprecation_warnings()
+                .iter()
+                .any(|w| w.contains("cli") && w.contains("defaults")),
+            "legacy `cli:` must warn to migrate: {:?}",
+            config.deprecation_warnings()
         );
     }
 

@@ -123,7 +123,7 @@ version: 1
 graphs:
   local:
     storage: {}
-cli:
+defaults:
   graph: local
   branch: main
 query:
@@ -145,7 +145,7 @@ servers:
 graphs:
   dev:
     server: dev
-cli:
+defaults:
   graph: dev
   branch: main
 query:

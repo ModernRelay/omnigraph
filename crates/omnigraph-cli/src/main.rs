@@ -869,7 +869,7 @@ async fn open_local_db_with_policy(graph: &ResolvedCliGraph) -> Result<Omnigraph
 /// footgun guard intentionally denies — silent bypass via "I forgot the
 /// actor" is what the guard prevents.
 fn resolve_cli_actor<'a>(cli_as: Option<&'a str>, config: &'a OmnigraphConfig) -> Option<&'a str> {
-    cli_as.or(config.cli.actor.as_deref())
+    cli_as.or(config.defaults.actor.as_deref())
 }
 
 fn resolve_policy_tests_path(context: &ResolvedPolicyContext) -> PathBuf {
@@ -890,7 +890,7 @@ fn resolve_remote_bearer_token(
     explicit_target: Option<&str>,
 ) -> Result<Option<String>> {
     let scoped_env =
-        config.graph_bearer_token_env(explicit_uri, explicit_target, config.cli_graph_name());
+        config.graph_bearer_token_env(explicit_uri, explicit_target, config.default_graph_name());
     let mut env_names = Vec::new();
     if let Some(name) = scoped_env {
         env_names.push(name.to_string());
@@ -962,7 +962,7 @@ fn resolve_uri(
     cli_uri: Option<String>,
     cli_target: Option<&str>,
 ) -> Result<String> {
-    config.resolve_target_uri(cli_uri, cli_target, config.cli_graph_name())
+    config.resolve_target_uri(cli_uri, cli_target, config.default_graph_name())
 }
 
 fn resolve_cli_graph(
@@ -975,7 +975,7 @@ fn resolve_cli_graph(
     } else {
         cli_target
             .map(str::to_string)
-            .or_else(|| config.cli_graph_name().map(str::to_string))
+            .or_else(|| config.default_graph_name().map(str::to_string))
     };
     config.resolve_graph_selection(selected.as_deref())?;
     let locator = config.resolve_graph(cli_uri.as_deref(), cli_target)?;
@@ -1056,7 +1056,7 @@ fn resolve_branch(
 ) -> String {
     cli_branch
         .or(alias_branch)
-        .or_else(|| config.cli.branch.clone())
+        .or_else(|| config.defaults.branch.clone())
         .unwrap_or_else(|| default_branch.to_string())
 }
 
@@ -1072,7 +1072,7 @@ fn resolve_read_target(
     Ok(read_target_from_cli(
         cli_branch
             .or(alias_branch)
-            .or_else(|| config.cli.branch.clone()),
+            .or_else(|| config.defaults.branch.clone()),
         cli_snapshot,
     ))
 }
@@ -1520,7 +1520,7 @@ fn resolve_read_format(
     } else {
         cli_format
             .or(alias_format)
-            .unwrap_or_else(|| config.cli_output_format())
+            .unwrap_or_else(|| config.default_output_format())
     }
 }
 
@@ -1583,7 +1583,7 @@ server:
   graph: local
   bind: 127.0.0.1:8080
 
-cli:
+defaults:
   graph: local
   branch: main
   output_format: table
@@ -1716,7 +1716,7 @@ async fn execute_query_lint(
     }
 
     let has_graph_target =
-        cli_uri.is_some() || cli_target.is_some() || config.cli_graph_name().is_some();
+        cli_uri.is_some() || cli_target.is_some() || config.default_graph_name().is_some();
     if !has_graph_target {
         bail!("query lint requires --schema <schema.pg> or a resolvable graph target");
     }
@@ -1814,7 +1814,7 @@ fn resolve_registry_selection_for_list(
 ) -> Result<Option<String>> {
     let selected = target
         .map(str::to_string)
-        .or_else(|| config.cli_graph_name().map(str::to_string));
+        .or_else(|| config.default_graph_name().map(str::to_string));
     if let Some(name) = selected.as_deref() {
         config.resolve_graph_selection(Some(name))?;
         return Ok(selected);
@@ -2828,7 +2828,7 @@ async fn main() -> Result<()> {
                 || alias_config
                     .and_then(|alias| alias.graph.as_deref())
                     .is_some()
-                || config.cli_graph_name().is_some();
+                || config.default_graph_name().is_some();
             let (legacy_uri, alias_args) =
                 normalize_legacy_alias_uri(legacy_uri, target_available, alias_name, alias_args);
             let uri = uri.or(legacy_uri);
@@ -2914,7 +2914,7 @@ async fn main() -> Result<()> {
                 || alias_config
                     .and_then(|alias| alias.graph.as_deref())
                     .is_some()
-                || config.cli_graph_name().is_some();
+                || config.default_graph_name().is_some();
             let (legacy_uri, alias_args) =
                 normalize_legacy_alias_uri(legacy_uri, target_available, alias_name, alias_args);
             let uri = uri.or(legacy_uri);
@@ -3517,7 +3517,7 @@ policy:
     }
 
     #[test]
-    fn graph_identity_resolve_cli_graph_named_target_uses_graph_key_not_project_name_or_uri() {
+    fn graph_identity_resolve_default_graph_named_target_uses_graph_key_not_project_name_or_uri() {
         let temp = tempdir().unwrap();
         let config_path = temp.path().join("omnigraph.yaml");
         fs::write(

@@ -11,7 +11,7 @@ graphs:
     server: prod
     bearer_token_env: OMNIGRAPH_BEARER_TOKEN
 
-cli:
+defaults:
   graph: local
   branch: main
 
