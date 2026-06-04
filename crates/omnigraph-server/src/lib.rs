@@ -921,7 +921,7 @@ pub fn load_server_settings(
     for warning in config.deprecation_warnings() {
         warn!("{warning}");
     }
-    let bind = cli_bind.unwrap_or_else(|| config.server_bind().to_string());
+    let bind = cli_bind.unwrap_or_else(|| config.serve_bind().to_string());
     // Either `--unauthenticated` or `OMNIGRAPH_UNAUTHENTICATED=1` flips
     // this. Treat any non-empty, non-"0"/"false" string as truthy —
     // standard 12-factor "any value is true" reading of the env var.
@@ -948,7 +948,7 @@ pub fn load_server_settings(
     // `resolve_target_uri` precedence.
     let has_cli_uri = cli_uri.is_some();
     let has_cli_target = cli_target.is_some();
-    let has_server_graph = config.server_graph_name().is_some();
+    let has_server_graph = config.serve_graph_name().is_some();
     let has_graphs_map = !config.graphs.is_empty();
     let has_explicit_config = config_path.is_some();
 
@@ -961,7 +961,7 @@ pub fn load_server_settings(
         let selected: Option<&str> = if has_cli_uri {
             None
         } else {
-            cli_target.as_deref().or_else(|| config.server_graph_name())
+            cli_target.as_deref().or_else(|| config.serve_graph_name())
         };
         // omnigraph-server serves embedded graphs only — refuse a remote target
         // (`server:`/remote `uri:`) before resolving or opening it.
@@ -971,11 +971,8 @@ pub fn load_server_settings(
             selected,
             selected.or(cli_uri.as_deref()).unwrap_or("<graph>"),
         )?;
-        let raw_uri = config.resolve_target_uri(
-            cli_uri,
-            cli_target.as_deref(),
-            config.server_graph_name(),
-        )?;
+        let raw_uri =
+            config.resolve_target_uri(cli_uri, cli_target.as_deref(), config.serve_graph_name())?;
         let uri = normalize_root_uri(&raw_uri).wrap_err_with(|| {
             format!("normalize single-graph URI '{raw_uri}' from server settings")
         })?;
@@ -1044,7 +1041,7 @@ pub fn load_server_settings(
         let config_path = config_path
             .cloned()
             .expect("has_explicit_config implies config_path is Some");
-        let server_policy_file = config.resolve_server_policy_file();
+        let server_policy_file = config.resolve_serve_policy_file();
         ServerConfigMode::Multi {
             graphs,
             config_path,

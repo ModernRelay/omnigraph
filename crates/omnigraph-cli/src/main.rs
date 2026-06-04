@@ -1579,8 +1579,9 @@ graphs:
     storage: {}
     # bearer_token_env: OMNIGRAPH_BEARER_TOKEN
 
-server:
-  graph: local
+serve:
+  graphs:
+    - local
   bind: 127.0.0.1:8080
 
 defaults:

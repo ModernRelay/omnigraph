@@ -220,6 +220,26 @@ pub struct ServerDefaults {
     pub policy: PolicySettings,
 }
 
+/// Host-role serving config (`serve:`) — RFC-002. Supersedes the legacy
+/// `server:` block (a single `graph:` scalar), which is folded into this at
+/// load under the legacy schema; under `version: 1` `server:` is rejected and
+/// `serve:` is authoritative. `serve:` is v1-only syntax with no legacy spelling,
+/// so it is always strict (`deny_unknown_fields`), like `storage:`/`servers:`.
+///
+/// `graphs` is the served set. Today only 0 or 1 entries are honored — one ⇒
+/// single-graph mode, none ⇒ serve every embedded graph — matching the shipped
+/// behavior of the old `server.graph` selector. Serving a true subset (>1
+/// entry) is rejected until route unification lands.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Serve {
+    #[serde(default)]
+    pub graphs: Vec<String>,
+    pub bind: Option<String>,
+    #[serde(default)]
+    pub policy: PolicySettings,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthDefaults {
     pub env_file: Option<String>,
@@ -328,6 +348,14 @@ pub struct OmnigraphConfig {
     pub servers: BTreeMap<String, ServerEntry>,
     #[serde(default, rename = "graphs")]
     pub graphs: BTreeMap<String, TargetConfig>,
+    /// Host-role serving config (`serve:`) — RFC-002. The legacy `server:` block
+    /// (below) is folded into this under the legacy schema; under `version: 1`
+    /// `server:` is rejected (see [`legacy_top_level_keys`]). Reads go through
+    /// the `serve_*` accessors.
+    #[serde(default)]
+    pub serve: Serve,
+    /// Legacy spelling of `serve:` (no `version:`); rejected under v1, folded
+    /// into `serve` at load. Do not read directly — use the `serve_*` accessors.
     #[serde(default)]
     pub server: ServerDefaults,
     #[serde(default)]
@@ -372,6 +400,7 @@ impl Default for OmnigraphConfig {
             project: ProjectConfig::default(),
             servers: BTreeMap::new(),
             graphs: BTreeMap::new(),
+            serve: Serve::default(),
             server: ServerDefaults::default(),
             auth: AuthDefaults::default(),
             defaults: CliDefaults::default(),
@@ -411,12 +440,12 @@ impl OmnigraphConfig {
         self.defaults.graph.as_deref()
     }
 
-    pub fn server_graph_name(&self) -> Option<&str> {
-        self.server.graph.as_deref()
+    pub fn serve_graph_name(&self) -> Option<&str> {
+        self.serve.graphs.first().map(String::as_str)
     }
 
-    pub fn server_bind(&self) -> &str {
-        self.server.bind.as_deref().unwrap_or("127.0.0.1:8080")
+    pub fn serve_bind(&self) -> &str {
+        self.serve.bind.as_deref().unwrap_or("127.0.0.1:8080")
     }
 
     pub fn resolve_target_name<'a>(
@@ -527,7 +556,7 @@ impl OmnigraphConfig {
     pub fn resolve_policy_tooling_graph_selection(&self) -> Result<Option<&str>> {
         self.resolve_graph_selection(
             self.default_graph_name()
-                .or_else(|| self.server_graph_name()),
+                .or_else(|| self.serve_graph_name()),
         )
     }
 
@@ -592,9 +621,9 @@ impl OmnigraphConfig {
     }
 
     /// Resolve the server-level policy file path (used by management
-    /// endpoints). Returns `None` if `server.policy.file` is not set.
-    pub fn resolve_server_policy_file(&self) -> Option<PathBuf> {
-        self.server
+    /// endpoints). Returns `None` if `serve.policy.file` is not set.
+    pub fn resolve_serve_policy_file(&self) -> Option<PathBuf> {
+        self.serve
             .policy
             .file
             .as_deref()
@@ -744,6 +773,32 @@ impl OmnigraphConfig {
                 selected: Some(name.to_string()),
             })
         }
+    }
+
+    /// Fold the legacy `server:` block into the canonical `serve:` (legacy
+    /// schema only — under `version: 1` `server:` is rejected at load, so the
+    /// fold is a no-op there) and validate the served set. The legacy single
+    /// `graph:` scalar maps to a one-element `graphs:` list. Serving a true
+    /// subset (more than one graph) is rejected until route unification.
+    fn normalize_serve(&mut self) -> Result<()> {
+        if self.version.is_none() {
+            let legacy = std::mem::take(&mut self.server);
+            if legacy.graph.is_some() || legacy.bind.is_some() || legacy.policy.file.is_some() {
+                self.serve = Serve {
+                    graphs: legacy.graph.into_iter().collect(),
+                    bind: legacy.bind,
+                    policy: legacy.policy,
+                };
+            }
+        }
+        if self.serve.graphs.len() > 1 {
+            bail!(
+                "`serve.graphs` lists {} graphs, but serving a subset is not yet \
+                 supported (it lands with route unification); list at most one graph",
+                self.serve.graphs.len()
+            );
+        }
+        Ok(())
     }
 
     /// Fill each graph entry's `uri` from `storage`/`server` and validate the
@@ -934,6 +989,7 @@ fn load_config_in(cwd: &Path, config_path: Option<&PathBuf>) -> Result<Omnigraph
     config.loaded_from_file = loaded_from_file;
 
     config.normalize_graphs()?;
+    config.normalize_serve()?;
 
     Ok(config)
 }
@@ -960,6 +1016,7 @@ fn legacy_key_migration_hint(key: &str) -> Option<&'static str> {
     match key {
         "project" => Some("remove it; it has no effect under `version: 1`"),
         "cli" => Some("rename to `defaults:`"),
+        "server" => Some("rename to `serve:` (note `graph:` becomes the `graphs:` list)"),
         _ => None,
     }
 }
@@ -1479,6 +1536,70 @@ cli:
                 .iter()
                 .any(|w| w.contains("cli") && w.contains("defaults")),
             "legacy `cli:` must warn to migrate: {:?}",
+            config.deprecation_warnings()
+        );
+    }
+
+    #[test]
+    fn version_one_rejects_legacy_server_key() {
+        let err = load_yaml_err(
+            "version: 1\ngraphs:\n  local:\n    storage: ./demo.omni\nserver:\n  graph: local\n",
+        );
+        assert!(
+            err.contains("server") && err.contains("rename to `serve:`"),
+            "v1 must reject `server:` and point at `serve:`: {err}"
+        );
+    }
+
+    #[test]
+    fn version_one_honors_serve_block() {
+        let config = load_yaml(
+            "version: 1\ngraphs:\n  local:\n    storage: ./demo.omni\n\
+             serve:\n  graphs:\n    - local\n  bind: 0.0.0.0:9000\n",
+        );
+        assert_eq!(config.serve_graph_name(), Some("local"));
+        assert_eq!(config.serve_bind(), "0.0.0.0:9000");
+        assert!(config.deprecation_warnings().is_empty());
+    }
+
+    #[test]
+    fn servers_plural_accepted_under_v1() {
+        // `servers:` (the remote endpoint map) is one letter from the rejected
+        // `server:`; the exact-match key scan must not flag it.
+        let config = load_yaml(
+            "version: 1\nservers:\n  prod:\n    endpoint: https://og.example\n\
+             graphs:\n  prod:\n    server: prod\n",
+        );
+        assert!(config.servers.contains_key("prod"));
+    }
+
+    #[test]
+    fn serve_graphs_multi_entry_rejected_until_route_unification() {
+        let err = load_yaml_err(
+            "version: 1\ngraphs:\n  a:\n    storage: ./a.omni\n  b:\n    storage: ./b.omni\n\
+             serve:\n  graphs:\n    - a\n    - b\n",
+        );
+        assert!(
+            err.contains("serve.graphs") && err.contains("subset"),
+            "serving >1 graph must be rejected with a route-unification hint: {err}"
+        );
+    }
+
+    #[test]
+    fn legacy_server_block_folds_into_serve_and_warns() {
+        // No `version:` ⇒ the legacy `server:` block (scalar `graph:`) is folded
+        // into `serve` (one-element `graphs:`), honored, and flagged.
+        let config = load_yaml(
+            "graphs:\n  local:\n    uri: ./demo.omni\nserver:\n  graph: local\n  bind: 0.0.0.0:9000\n",
+        );
+        assert_eq!(config.serve_graph_name(), Some("local"));
+        assert_eq!(config.serve_bind(), "0.0.0.0:9000");
+        assert!(
+            config
+                .deprecation_warnings()
+                .iter()
+                .any(|w| w.contains("server") && w.contains("serve")),
+            "legacy `server:` must warn to migrate: {:?}",
             config.deprecation_warnings()
         );
     }
