@@ -48,7 +48,7 @@ graphs:
 ```
 
 **Config follows graph identity, not server mode.** A graph served by **name**
-(`--target <name>` or `server.graph`) uses its own `graphs.<name>.policy.file`,
+(`--graph <name>` or `server.graph`) uses its own `graphs.<name>.policy.file`,
 exactly as in multi-graph mode. Top-level `policy.file` applies only to an
 **anonymous** graph — one served by a bare `<URI>` with no `graphs:` entry.
 Serving a **named** graph (single- or multi-graph mode) while top-level

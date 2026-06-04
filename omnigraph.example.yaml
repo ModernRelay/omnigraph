@@ -1,8 +1,14 @@
+version: 1
+
+servers:
+  prod:
+    endpoint: http://127.0.0.1:8080
+
 graphs:
   local:
-    uri: ./repo.omni
+    storage: ./repo.omni
   dev:
-    uri: http://127.0.0.1:8080
+    server: prod
     bearer_token_env: OMNIGRAPH_BEARER_TOKEN
 
 cli:

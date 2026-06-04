@@ -4,6 +4,20 @@
 **Supersedes:** the original additive-only draft (2026-05-30). This revision **embraces breaking changes** to remove ambiguity and conflation rather than carrying every legacy shape forward. It is gated behind a config `version:` field and ships compat aliases for the highest-traffic legacy keys, but it does not pretend the end-state is purely additive. Incorporates an implementation-readiness review: endpoint-bound credentials, layer identity trust, route-unification specifics, restored `query.roots`, and right-sized auth scope.
 **Target release:** v0.8.x (phased — see Rollout)
 
+**Implementation status — V1a "locator core" landed.** Shipped: the typed
+`GraphLocator` (`storage:` XOR `server:`+`graph_id:`), a `servers:` map, version-gated
+config strictness (no `version:` = lenient + deprecation-warned; `version: 1` = unknown
+keys rejected at any depth, via `serde_ignored`), `omnigraph-server` rejecting remote
+graph entries (embedded-only), and the `--graph` flag. **Divergences from this proposal as
+built:** `--target` was **removed outright (no deprecated alias)** — a clean rename, not the
+alias proposed below; and `uri:` is honored-but-deprecation-warned (not auto-rewritten to
+`storage.uri`). **Crate-location corrections** (the "Reconciliation"/"Implementation"
+sections below predate V0): the config schema now lives in the extracted `omnigraph-config`
+crate, and `QueryRegistry` was extracted to `omnigraph-queries` (not "kept in
+`omnigraph-server`"). Deferred: layered global-first config + merge/provenance + `config
+view`, the `cli:`→`defaults:` / `server:`→`serve:` renames (V1-remainder), route unification
++ remote client (V2), and the auth model (V3).
+
 ## Summary
 
 OmniGraph today reads one config file, `omnigraph.yaml`, from both the CLI (operating the embedded engine) and `omnigraph-server` (hosting graphs). The CLI **can** already reach a *single-graph* server — point a graph entry's URI at the endpoint and set `bearer_token_env` — but it **cannot address a specific graph on a multi-graph server**, has no named-server credential model, and does not work without a project file in the current directory. Those are the real gaps.

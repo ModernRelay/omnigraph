@@ -2,7 +2,7 @@
 
 A reference for the `omnigraph` binary's command surface and `omnigraph.yaml` schema. For a quick-start guide, see [cli.md](cli.md).
 
-17 top-level command families, 40+ subcommands. All commands accept either a positional `URI`, `--uri`, or a `--target <name>` resolved against `omnigraph.yaml`.
+17 top-level command families, 40+ subcommands. All commands accept either a positional `URI`, `--uri`, or a `--graph <name>` resolved against `omnigraph.yaml`.
 
 ## Top-level commands
 
@@ -20,7 +20,7 @@ A reference for the `omnigraph` binary's command surface and `omnigraph.yaml` sc
 | `run list \| show \| publish \| abort` | transactional run ops |
 | `schema plan \| apply \| show (alias: get)` | migrations |
 | `lint` (alias: `check`) | offline / graph-backed query validation. Replaces `query lint` / `query check`, which are kept as deprecated argv-level shims that print a one-line warning and rewrite to `omnigraph lint` |
-| `queries validate \| list` | operate on the server-side stored-query registry (the `queries:` block). `validate` type-checks every stored query against the live schema offline (opens the selected graph; exits non-zero on any breakage), catching schema drift without restarting the server; `list` prints the selected registry's query names, MCP exposure, and typed params. For per-graph registries, pass `--target <graph>` or set `cli.graph`; with no graph selection, `list` shows only top-level `queries:`. Distinct from `lint`, which validates a single `.gq` file |
+| `queries validate \| list` | operate on the server-side stored-query registry (the `queries:` block). `validate` type-checks every stored query against the live schema offline (opens the selected graph; exits non-zero on any breakage), catching schema drift without restarting the server; `list` prints the selected registry's query names, MCP exposure, and typed params. For per-graph registries, pass `--graph <graph>` or set `cli.graph`; with no graph selection, `list` shows only top-level `queries:`. Distinct from `lint`, which validates a single `.gq` file |
 | `optimize` | non-destructive Lance compaction (skips tables with `Blob` columns; `--json` reports a `skipped` field) |
 | `cleanup --keep N --older-than 7d --confirm` | destructive version GC |
 | `embed` | offline JSONL embedding pipeline |
@@ -30,11 +30,21 @@ A reference for the `omnigraph` binary's command surface and `omnigraph.yaml` sc
 ## `omnigraph.yaml` schema
 
 ```yaml
+version: 1                          # omit for the legacy schema (lenient, deprecation-warned);
+                                    # `1` = strict: unknown/typo'd keys are rejected at any depth
 project: { name }
+servers:                            # named remote endpoints (referenced by graphs.<>.server)
+  <name>: { endpoint: <https://host:port> }
 graphs:
   <name>:
-    uri: <local|s3://|http(s)://>
+    # Embedded XOR remote. Embedded → `storage:`; remote → `server:` (+ optional `graph_id:`).
+    storage: <local|s3://>          # embedded; a bare string, or a block { uri, region, endpoint }
+    # server: <name>                # remote: a `servers:` entry (mutually exclusive with storage)
+    # graph_id: <id>                # the graph's id on that server (defaults to the entry key)
+    # uri: <local|s3://|http(s)://> # DEPRECATED legacy spelling of storage/server; warns at load
     bearer_token_env: <ENV_NAME>
+    branch: <name>                  # optional default branch
+    snapshot: <version>             # optional read-pinned snapshot
     queries:                      # per-graph stored-query registry (server-role; multi-graph mode)
       <query-name>:               # key MUST equal the `query <name>` symbol inside the .gq
         file: <path-to-.gq>       # relative to this config's directory

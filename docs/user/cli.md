@@ -60,7 +60,7 @@ Read through the HTTP API:
 
 ```bash
 omnigraph query \
-  --target http://127.0.0.1:8080 \
+  --graph http://127.0.0.1:8080 \
   --query ./queries.gq \
   --name get_person \
   --params '{"name":"Alice"}'
