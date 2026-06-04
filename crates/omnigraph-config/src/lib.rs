@@ -618,6 +618,15 @@ impl OmnigraphConfig {
                     .to_string(),
             );
         }
+        // Legacy-only notices for keys that `version: 1` rejects at load (so they
+        // can only reach here under the lenient legacy schema). `project:` has no
+        // consumer and is removed in v1.
+        if self.version.is_none() && self.project.name.is_some() {
+            warnings.push(
+                "`project:` has no effect and is removed under `version: 1`; delete it."
+                    .to_string(),
+            );
+        }
         for (name, entry) in &self.graphs {
             if entry.storage.is_none() && entry.server.is_none() && !entry.uri.is_empty() {
                 warnings.push(format!(
@@ -878,6 +887,7 @@ fn load_config_in(cwd: &Path, config_path: Option<&PathBuf>) -> Result<Omnigraph
             }
             _ => {}
         }
+        reject_legacy_top_level_keys_under_v1(&text, config.version)?;
         config
     } else {
         OmnigraphConfig::default()
@@ -905,6 +915,44 @@ fn absolute_base_dir(cwd: &Path, path: &Path) -> Result<PathBuf> {
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| cwd.to_path_buf()))
+}
+
+/// Migration hint for a top-level YAML key that the RFC-002 v1 schema renames or
+/// removes. `Some(hint)` ⇒ the key is invalid under `version: 1`; `None` ⇒ the
+/// key is fine. These keys stay as known struct fields (honored under the legacy
+/// schema), so `serde_ignored` cannot surface them — [`reject_legacy_top_level_keys_under_v1`]
+/// scans for them explicitly instead (RFC-002 §3: honored-or-rejected, never
+/// silently ignored). The set grows as each rename/removal lands.
+fn legacy_key_migration_hint(key: &str) -> Option<&'static str> {
+    match key {
+        "project" => Some("has no effect and is removed under `version: 1`; delete it"),
+        _ => None,
+    }
+}
+
+/// Reject any v1-illegal top-level key (see [`legacy_key_migration_hint`]) when
+/// `version: 1` is set. Scans the raw top-level mapping rather than the typed
+/// config because the offending keys are known struct fields kept for legacy
+/// parsing — rejection keys on the *presence* of the key (an empty `policy: {}`
+/// under v1 is a silent no-op and must error too), which only a raw scan can see.
+fn reject_legacy_top_level_keys_under_v1(text: &str, version: Option<u32>) -> Result<()> {
+    if version != Some(1) {
+        return Ok(());
+    }
+    let mapping: serde_yaml::Mapping = serde_yaml::from_str(text).unwrap_or_default();
+    let mut offenders: Vec<String> = mapping
+        .keys()
+        .filter_map(serde_yaml::Value::as_str)
+        .filter_map(|key| legacy_key_migration_hint(key).map(|hint| format!("`{key}:` — {hint}")))
+        .collect();
+    if !offenders.is_empty() {
+        offenders.sort();
+        bail!(
+            "invalid key(s) under `version: 1`:\n  {}\n(omit `version:` for the legacy lenient schema)",
+            offenders.join("\n  ")
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1359,6 +1407,29 @@ cli:
             err.contains("outout_format") || err.contains("unknown config field"),
             "v1 must reject an unknown nested field, naming it: {err}"
         );
+    }
+
+    #[test]
+    fn version_one_rejects_legacy_project_key() {
+        // `version: 1` removes the `project:` block (no consumer). Writing it
+        // under v1 is a hard error that names the key (honored-or-rejected,
+        // RFC-002 §3) — `serde_ignored` cannot catch it because `project` is a
+        // known struct field kept for legacy parsing.
+        let err = load_yaml_err(
+            "version: 1\nproject:\n  name: x\ngraphs:\n  local:\n    storage: ./demo.omni\n",
+        );
+        assert!(
+            err.contains("project"),
+            "v1 must reject the legacy `project:` key, naming it: {err}"
+        );
+    }
+
+    #[test]
+    fn legacy_project_key_tolerated_without_version() {
+        // No `version:` ⇒ legacy schema: `project:` still parses (it has no
+        // effect, but is not rejected) — only `version: 1` is strict about it.
+        let config = load_yaml("project:\n  name: x\ngraphs:\n  local:\n    uri: ./demo.omni\n");
+        assert!(config.graphs.contains_key("local"));
     }
 
     #[test]

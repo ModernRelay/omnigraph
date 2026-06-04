@@ -1573,8 +1573,6 @@ fn scaffold_config_if_missing(uri: &str) -> Result<()> {
         format!(
             "\
 version: 1
-project:
-  name: Omnigraph Project
 
 graphs:
   local:
