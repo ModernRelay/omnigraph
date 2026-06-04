@@ -1017,6 +1017,8 @@ fn legacy_key_migration_hint(key: &str) -> Option<&'static str> {
         "project" => Some("remove it; it has no effect under `version: 1`"),
         "cli" => Some("rename to `defaults:`"),
         "server" => Some("rename to `serve:` (note `graph:` becomes the `graphs:` list)"),
+        "policy" => Some("move it onto the owning graph (`graphs.<name>.policy`)"),
+        "queries" => Some("move it onto the owning graph (`graphs.<name>.queries`)"),
         _ => None,
     }
 }
@@ -1602,6 +1604,53 @@ cli:
             "legacy `server:` must warn to migrate: {:?}",
             config.deprecation_warnings()
         );
+    }
+
+    #[test]
+    fn version_one_rejects_top_level_policy() {
+        // Top-level `policy:`/`queries:` are removed under v1 — they belong on
+        // the owning graph entry. An empty `policy: {}` must error too (presence,
+        // not contents).
+        let err = load_yaml_err(
+            "version: 1\ngraphs:\n  local:\n    storage: ./demo.omni\npolicy:\n  file: ./p.yaml\n",
+        );
+        assert!(
+            err.contains("policy") && err.contains("graphs.<name>.policy"),
+            "v1 must reject top-level `policy:` and point at the per-graph block: {err}"
+        );
+    }
+
+    #[test]
+    fn version_one_rejects_top_level_queries() {
+        let err = load_yaml_err(
+            "version: 1\ngraphs:\n  local:\n    storage: ./demo.omni\n\
+             queries:\n  q:\n    file: ./q.gq\n",
+        );
+        assert!(
+            err.contains("queries") && err.contains("graphs.<name>.queries"),
+            "v1 must reject top-level `queries:` and point at the per-graph block: {err}"
+        );
+    }
+
+    #[test]
+    fn version_one_honors_per_graph_policy_and_queries() {
+        // The per-graph blocks (`graphs.<name>.policy` / `.queries`) are nested,
+        // not top-level, so the v1 key scan leaves them alone.
+        let config = load_yaml(
+            r#"version: 1
+graphs:
+  prod:
+    storage: s3://b/prod
+    policy:
+      file: ./prod.yaml
+    queries:
+      q:
+        file: ./q.gq
+"#,
+        );
+        assert!(config.resolve_target_policy_file("prod").is_some());
+        assert_eq!(config.target_query_entries("prod").unwrap().len(), 1);
+        assert!(config.deprecation_warnings().is_empty());
     }
 
     #[test]

@@ -129,7 +129,6 @@ defaults:
 query:
   roots:
     - .
-policy: {{}}
 ",
         yaml_string(&graph.to_string_lossy())
     )
@@ -151,7 +150,6 @@ defaults:
 query:
   roots:
     - .
-policy: {{}}
 ",
         yaml_string(url)
     )
