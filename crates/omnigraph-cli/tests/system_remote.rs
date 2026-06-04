@@ -1028,7 +1028,7 @@ graphs:
         )],
     );
 
-    // Client config — the CLI's `--target dev` resolves to `server.base_url`.
+    // Client config — the CLI's `--graph dev` resolves to `server.base_url`.
     let client_config_path = cfg_dir.path().join("client.yaml");
     fs::write(
         &client_config_path,

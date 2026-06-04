@@ -136,7 +136,7 @@ const SERVER_SOURCE_VERSION: Option<&str> = option_env!("OMNIGRAPH_SOURCE_VERSIO
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// Server topology + the graphs to open at startup. Single-mode
-    /// invocations (`omnigraph-server <URI>` or `--target <name>`)
+    /// invocations (`omnigraph-server <URI>` or `--graph <name>`)
     /// produce `ServerConfigMode::Single`; multi-mode invocations
     /// (`--config omnigraph.yaml` with a non-empty `graphs:` map and
     /// no single-mode selector) produce `ServerConfigMode::Multi`.
@@ -159,7 +159,7 @@ pub struct ServerConfig {
 pub enum ServerConfigMode {
     /// Legacy invocation — one graph at the given URI. Either:
     ///   * `omnigraph-server <URI>` (CLI positional), or
-    ///   * `omnigraph-server --target <name> --config omnigraph.yaml`, or
+    ///   * `omnigraph-server --graph <name> --config omnigraph.yaml`, or
     ///   * `omnigraph-server --config omnigraph.yaml` with `server.graph`
     ///     set to a named target.
     Single {
@@ -937,13 +937,13 @@ pub fn load_server_settings(
     // MR-668 decision 2 — four-rule mode inference matrix.
     //
     //   1. CLI `<URI>` positional        → Single (URI = the value)
-    //   2. CLI `--target <name>`         → Single (URI = graphs.<name>.uri)
+    //   2. CLI `--graph <name>`         → Single (URI = graphs.<name>.uri)
     //   3. `server.graph` in config      → Single (URI = graphs.<server.graph>.uri)
     //   4. `--config` + non-empty `graphs:` + no single-mode selector
     //                                    → Multi (every entry in `graphs:`)
     //   5. otherwise                     → error with migration hint
     //
-    // Rules 1-3 are mutually compatible (CLI URI wins over `--target`
+    // Rules 1-3 are mutually compatible (CLI URI wins over `--graph`
     // wins over `server.graph`), reusing the existing
     // `resolve_target_uri` precedence.
     let has_cli_uri = cli_uri.is_some();
@@ -3388,7 +3388,7 @@ server:
         )
         .unwrap();
 
-        // `--target dev` overrides `server.graph: local`, resolving the named
+        // `--graph dev` overrides `server.graph: local`, resolving the named
         // embedded graph. (A remote target is now rejected — see
         // `single_mode_rejects_named_remote_graph` in tests/server.rs.)
         let settings =

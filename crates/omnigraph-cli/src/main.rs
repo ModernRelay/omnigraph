@@ -1771,7 +1771,7 @@ struct QueriesListOutput {
 /// Resolve the selected graph to `(local URI, registry selection)` from one
 /// precedence, so a command's schema and its stored-query registry can never
 /// come from different graphs. A **positional URI is anonymous** (top-level
-/// registry, ignoring the configured default graph); otherwise `--target`
+/// registry, ignoring the configured default graph); otherwise `--graph`
 /// or the configured `cli.graph` names the graph (its per-graph block).
 /// Mirrors the server's single-mode identity rule.
 fn resolve_selected_graph(
@@ -1861,7 +1861,7 @@ async fn execute_queries_validate(
 ) -> Result<()> {
     let config = load_cli_config(config_path)?;
     // One selection drives both the schema URI and the registry, so a
-    // positional URI and a `--target` can't validate different graphs.
+    // positional URI and a `--graph` can't validate different graphs.
     let (uri, selected) =
         resolve_selected_graph(&config, uri, target.as_deref(), "queries validate")?;
     let registry = load_registry_or_report(&config, selected.as_deref())?;

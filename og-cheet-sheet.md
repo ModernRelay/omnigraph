@@ -19,7 +19,7 @@ omnigraph check --query ./queries.gq s3://bucket/repo
 Use `omnigraph.yaml` target resolution:
 
 ```bash
-omnigraph lint --query ./queries.gq --target local --config ./omnigraph.yaml
+omnigraph lint --query ./queries.gq --graph local --config ./omnigraph.yaml
 ```
 
 > The previous `omnigraph query lint` / `omnigraph query check` spellings

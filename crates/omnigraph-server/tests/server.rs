@@ -5642,7 +5642,7 @@ graphs:
         }
     }
 
-    /// Rule 2: --target picks one graph from `graphs:` map → Single.
+    /// Rule 2: --graph picks one graph from `graphs:` map → Single.
     #[test]
     fn mode_inference_cli_target_is_single() {
         let temp = tempfile::tempdir().unwrap();
@@ -5772,7 +5772,7 @@ graphs:
 
     #[test]
     fn single_mode_named_graph_rejects_top_level_blocks() {
-        // Serving a graph by name (`--target`/`server.graph`) uses its
+        // Serving a graph by name (`--graph`/`server.graph`) uses its
         // per-graph block; a populated top-level block would be silently
         // shadowed, so boot refuses and names the per-graph location.
         let temp = tempfile::tempdir().unwrap();
@@ -5799,7 +5799,7 @@ graphs:
 
     #[test]
     fn single_mode_named_graph_uses_per_graph_policy_and_queries() {
-        // The identity rule: `--target prod` attaches `graphs.prod`'s own
+        // The identity rule: `--graph prod` attaches `graphs.prod`'s own
         // policy + queries, not the top-level ones (which are absent here).
         let temp = tempfile::tempdir().unwrap();
         fs::write(

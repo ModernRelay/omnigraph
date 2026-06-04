@@ -21,7 +21,7 @@ fi
 
 if [ -n "${OMNIGRAPH_CONFIG:-}" ]; then
   if [ -n "${OMNIGRAPH_TARGET:-}" ]; then
-    exec "$SERVER_BIN" --config "${OMNIGRAPH_CONFIG}" --target "${OMNIGRAPH_TARGET}" --bind "${bind}"
+    exec "$SERVER_BIN" --config "${OMNIGRAPH_CONFIG}" --graph "${OMNIGRAPH_TARGET}" --bind "${bind}"
   fi
   exec "$SERVER_BIN" --config "${OMNIGRAPH_CONFIG}" --bind "${bind}"
 fi

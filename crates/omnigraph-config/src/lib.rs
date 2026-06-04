@@ -498,7 +498,7 @@ impl OmnigraphConfig {
     ///   with a populated top-level block is rejected;
     /// * an unknown name errors with the **same** message
     ///   [`OmnigraphConfig::resolve_target_uri`] produces, so a command that
-    ///   opens no URI rejects an unknown `--target` exactly like the
+    ///   opens no URI rejects an unknown `--graph` exactly like the
     ///   URI-resolving commands do;
     /// * an anonymous selection (`None`, e.g. a bare URI) stays anonymous,
     ///   resolving to the top-level registry downstream (top-level honored).
@@ -781,7 +781,7 @@ impl OmnigraphConfig {
         }
 
         let target_name = explicit_target.or(default_target).ok_or_else(|| {
-            color_eyre::eyre::eyre!("URI must be provided via <URI>, --target, or config")
+            color_eyre::eyre::eyre!("URI must be provided via <URI>, --graph, or config")
         })?;
         let target = self.graphs.get(target_name).ok_or_else(|| {
             color_eyre::eyre::eyre!(

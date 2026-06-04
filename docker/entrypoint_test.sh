@@ -52,7 +52,7 @@ check "CONFIG only" \
 
 got=$(OMNIGRAPH_CONFIG="/etc/omnigraph/omnigraph.yaml" OMNIGRAPH_TARGET="active" OMNIGRAPH_BIND="0.0.0.0:8080" sh "$ep")
 check "CONFIG + TARGET" \
-  "ARGS: --config /etc/omnigraph/omnigraph.yaml --target active --bind 0.0.0.0:8080" "$got"
+  "ARGS: --config /etc/omnigraph/omnigraph.yaml --graph active --bind 0.0.0.0:8080" "$got"
 
 got=$(sh "$ep" some-uri --bind 1.2.3.4:9 --extra)
 check "explicit args passthrough" \
