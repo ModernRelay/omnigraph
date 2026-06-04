@@ -348,6 +348,11 @@ pub struct OmnigraphConfig {
     pub queries: BTreeMap<String, QueryEntry>,
     #[serde(skip)]
     base_dir: PathBuf,
+    /// Whether a config file was actually loaded (vs the built-in default).
+    /// Gates the no-`version:` deprecation notice — there is nothing to migrate
+    /// when no `omnigraph.yaml` exists.
+    #[serde(skip)]
+    loaded_from_file: bool,
 }
 
 impl Default for OmnigraphConfig {
@@ -365,6 +370,7 @@ impl Default for OmnigraphConfig {
             policy: PolicySettings::default(),
             queries: BTreeMap::new(),
             base_dir: PathBuf::new(),
+            loaded_from_file: false,
         }
     }
 }
@@ -599,6 +605,30 @@ impl OmnigraphConfig {
             .ok_or_else(|| color_eyre::eyre::eyre!("alias '{}' not found", name))
     }
 
+    /// Load-time deprecation notices (RFC-002 §Migration), computed purely so the
+    /// CLI/server can print them — the config crate stays stdio-agnostic. The
+    /// no-`version:` notice is gated on `loaded_from_file` (nothing to migrate when
+    /// no config file exists); the per-graph notice flags a legacy `uri:` entry.
+    pub fn deprecation_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.loaded_from_file && self.version.is_none() {
+            warnings.push(
+                "omnigraph.yaml has no `version:`; the legacy schema is deprecated — add \
+                 `version: 1` so unknown keys error instead of being silently ignored."
+                    .to_string(),
+            );
+        }
+        for (name, entry) in &self.graphs {
+            if entry.storage.is_none() && entry.server.is_none() && !entry.uri.is_empty() {
+                warnings.push(format!(
+                    "graph '{name}' uses the legacy `uri:` key; use `storage:` for an embedded \
+                     graph or `server:` for a remote one."
+                ));
+            }
+        }
+        warnings
+    }
+
     /// Resolve a graph selection to a typed [`GraphLocator`] (RFC-002 §1): an
     /// explicit positional `<URI>` (scheme-sniffed), else a local `graphs:`
     /// alias, else a `server/graph_id` qualified name against `servers:`. A
@@ -820,6 +850,7 @@ fn load_config_in(cwd: &Path, config_path: Option<&PathBuf>) -> Result<Omnigraph
         let default_path = cwd.join(DEFAULT_CONFIG_FILE);
         default_path.exists().then_some(default_path)
     });
+    let loaded_from_file = config_path.is_some();
 
     let mut config = if let Some(path) = &config_path {
         let text = fs::read_to_string(path)?;
@@ -857,6 +888,7 @@ fn load_config_in(cwd: &Path, config_path: Option<&PathBuf>) -> Result<Omnigraph
     } else {
         cwd.to_path_buf()
     };
+    config.loaded_from_file = loaded_from_file;
 
     config.normalize_graphs()?;
 
@@ -1327,6 +1359,50 @@ cli:
             err.contains("outout_format") || err.contains("unknown config field"),
             "v1 must reject an unknown nested field, naming it: {err}"
         );
+    }
+
+    #[test]
+    fn deprecation_warnings_flag_legacy_schema_and_uri() {
+        let config = load_yaml("graphs:\n  local:\n    uri: ./demo.omni\n");
+        let warnings = config.deprecation_warnings();
+        assert!(
+            warnings.iter().any(|w| w.contains("version:")),
+            "expected no-version notice: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("local") && w.contains("uri:")),
+            "expected legacy-uri notice: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn deprecation_warnings_silent_for_clean_v1_config() {
+        let config = load_yaml("version: 1\ngraphs:\n  local:\n    storage: ./demo.omni\n");
+        assert!(
+            config.deprecation_warnings().is_empty(),
+            "clean v1 config must not warn: {:?}",
+            config.deprecation_warnings()
+        );
+    }
+
+    #[test]
+    fn deprecation_warnings_flag_legacy_uri_under_v1() {
+        // `version: 1` but still using `uri:` → only the per-graph notice (no
+        // no-version notice, since `version:` is present).
+        let config = load_yaml("version: 1\ngraphs:\n  local:\n    uri: ./demo.omni\n");
+        let warnings = config.deprecation_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("local") && warnings[0].contains("uri:"));
+    }
+
+    #[test]
+    fn deprecation_warnings_empty_without_config_file() {
+        // No `omnigraph.yaml` → default config → nothing to migrate, no notice.
+        let temp = tempdir().unwrap();
+        let config = load_config_in(temp.path(), None).unwrap();
+        assert!(config.deprecation_warnings().is_empty());
     }
 
     fn load_yaml(yaml: &str) -> super::OmnigraphConfig {
