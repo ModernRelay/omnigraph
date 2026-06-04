@@ -119,9 +119,10 @@ fn yaml_string(value: &str) -> String {
 pub fn local_yaml_config(graph: &Path) -> String {
     format!(
         "\
+version: 1
 graphs:
   local:
-    uri: {}
+    storage: {}
 cli:
   graph: local
   branch: main
@@ -137,9 +138,13 @@ policy: {{}}
 pub fn remote_yaml_config(url: &str) -> String {
     format!(
         "\
+version: 1
+servers:
+  dev:
+    endpoint: {}
 graphs:
   dev:
-    uri: {}
+    server: dev
 cli:
   graph: dev
   branch: main

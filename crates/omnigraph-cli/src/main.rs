@@ -776,6 +776,9 @@ fn load_env_file_into_process(path: &Path) -> Result<()> {
 
 fn load_cli_config(config_path: Option<&PathBuf>) -> Result<OmnigraphConfig> {
     let config = load_config(config_path)?;
+    for warning in config.deprecation_warnings() {
+        eprintln!("warning: {warning}");
+    }
     if let Some(path) = config.resolve_auth_env_file() {
         load_env_file_into_process(&path)?;
     }
@@ -1569,12 +1572,13 @@ fn scaffold_config_if_missing(uri: &str) -> Result<()> {
         path,
         format!(
             "\
+version: 1
 project:
   name: Omnigraph Project
 
 graphs:
   local:
-    uri: {}
+    storage: {}
     # bearer_token_env: OMNIGRAPH_BEARER_TOKEN
 
 server:

@@ -918,6 +918,9 @@ pub fn load_server_settings(
     cli_allow_unauthenticated: bool,
 ) -> Result<ServerConfig> {
     let config = load_config(config_path)?;
+    for warning in config.deprecation_warnings() {
+        warn!("{warning}");
+    }
     let bind = cli_bind.unwrap_or_else(|| config.server_bind().to_string());
     // Either `--unauthenticated` or `OMNIGRAPH_UNAUTHENTICATED=1` flips
     // this. Treat any non-empty, non-"0"/"false" string as truthy —

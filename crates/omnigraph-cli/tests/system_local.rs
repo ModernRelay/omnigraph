@@ -302,6 +302,32 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
 }
 
 #[test]
+fn local_cli_warns_on_legacy_config_without_version() {
+    // A config with no `version:` is the deprecated legacy schema — loading it
+    // emits a migrate-to-`version: 1` warning on stderr (RFC-002 §Migration).
+    let graph = SystemGraph::loaded();
+    let config = graph.write_config(
+        "omnigraph.yaml",
+        &format!(
+            "graphs:\n  local:\n    uri: {}\ncli:\n  graph: local\n",
+            graph.path().display()
+        ),
+    );
+    let output = output_success(
+        cli()
+            .arg("snapshot")
+            .arg("--config")
+            .arg(&config)
+            .arg("--json"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("version: 1"),
+        "legacy config must warn to migrate to `version: 1`; stderr:\n{stderr}"
+    );
+}
+
+#[test]
 fn local_cli_end_to_end_branch_change_merge_flow() {
     let graph = SystemGraph::loaded();
     let mutation_file = insert_person_query(&graph, "system-local-change.gq");

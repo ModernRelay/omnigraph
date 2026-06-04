@@ -232,7 +232,11 @@ fn init_creates_graph_successfully_on_missing_local_directory() {
     assert!(stdout.contains("initialized"));
     assert!(graph.join("_schema.pg").exists());
     assert!(graph.join("__manifest").exists());
-    assert!(temp.path().join("omnigraph.yaml").exists());
+    let scaffold = fs::read_to_string(temp.path().join("omnigraph.yaml")).unwrap();
+    assert!(
+        scaffold.contains("version: 1") && scaffold.contains("storage:"),
+        "init must scaffold a `version: 1` config using `storage:`; got:\n{scaffold}"
+    );
 }
 
 #[test]
