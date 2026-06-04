@@ -20,19 +20,20 @@ A reference for the `omnigraph` binary's command surface and `omnigraph.yaml` sc
 | `run list \| show \| publish \| abort` | transactional run ops |
 | `schema plan \| apply \| show (alias: get)` | migrations |
 | `lint` (alias: `check`) | offline / graph-backed query validation. Replaces `query lint` / `query check`, which are kept as deprecated argv-level shims that print a one-line warning and rewrite to `omnigraph lint` |
-| `queries validate \| list` | operate on the server-side stored-query registry (the `queries:` block). `validate` type-checks every stored query against the live schema offline (opens the selected graph; exits non-zero on any breakage), catching schema drift without restarting the server; `list` prints the selected registry's query names, MCP exposure, and typed params. For per-graph registries, pass `--graph <graph>` or set `cli.graph`; with no graph selection, `list` shows only top-level `queries:`. Distinct from `lint`, which validates a single `.gq` file |
+| `queries validate \| list` | operate on the server-side stored-query registry (the `queries:` block). `validate` type-checks every stored query against the live schema offline (opens the selected graph; exits non-zero on any breakage), catching schema drift without restarting the server; `list` prints the selected registry's query names, MCP exposure, and typed params. For per-graph registries, pass `--graph <graph>` or set `defaults.graph`; with no graph selection, `list` shows only top-level `queries:`. Distinct from `lint`, which validates a single `.gq` file |
 | `optimize` | non-destructive Lance compaction (skips tables with `Blob` columns; `--json` reports a `skipped` field) |
 | `cleanup --keep N --older-than 7d --confirm` | destructive version GC |
 | `embed` | offline JSONL embedding pipeline |
-| `policy validate \| test \| explain` | Cedar tooling. Selects `cli.graph`, else `server.graph`, else top-level `policy.file` |
+| `policy validate \| test \| explain` | Cedar tooling. Selects `defaults.graph`, else `serve.graphs`, else top-level `policy.file` |
 | `version` / `-v` | print `omnigraph 0.3.x` |
 
 ## `omnigraph.yaml` schema
 
 ```yaml
 version: 1                          # omit for the legacy schema (lenient, deprecation-warned);
-                                    # `1` = strict: unknown/typo'd keys are rejected at any depth
-project: { name }
+                                    # `1` = strict: unknown/typo'd keys, and the removed legacy
+                                    #   keys (`project:`, `cli:`, `server:`, top-level
+                                    #   `policy:`/`queries:`), are rejected at any depth
 servers:                            # named remote endpoints (referenced by graphs.<>.server)
   <name>: { endpoint: <https://host:port> }
 graphs:
@@ -45,6 +46,7 @@ graphs:
     bearer_token_env: <ENV_NAME>
     branch: <name>                  # optional default branch
     snapshot: <version>             # optional read-pinned snapshot
+    policy: { file: <policy.yaml> } # per-graph Cedar policy (embedded graphs only)
     queries:                      # per-graph stored-query registry (server-role; multi-graph mode)
       <query-name>:               # key MUST equal the `query <name>` symbol inside the .gq
         file: <path-to-.gq>       # relative to this config's directory
@@ -52,10 +54,11 @@ graphs:
           expose: true            # default true: listed in the MCP catalog (GET /queries); set false to hide (still HTTP-callable)
           tool_name: <name>       # optional MCP tool-name override (defaults to <query-name>;
                                   #   must be unique across exposed queries)
-server:
-  graph: <name>
+serve:                              # host-role serving config (was `server:`)
+  graphs: [<name>]                  # served set; one entry = single-graph mode, omit = serve all
   bind: <ip:port>
-cli:
+  policy: { file: <server-policy.yaml> }   # server-level Cedar (management endpoints)
+defaults:                           # CLI/client defaults (was `cli:`)
   graph: <name>
   branch: <name>
   output_format: json|jsonl|csv|kv|table
@@ -77,11 +80,18 @@ aliases:
     graph: <name>
     branch: <name>
     format: <output-format>
-queries:                          # top-level registry — applies only to a bare-URI (anonymous) graph; a graph served by name uses its `graphs.<id>.queries`. Mirrors top-level `policy`.
-  <query-name>: { file: <path-to-.gq> }   # mcp.expose defaults to true
-policy:
-  file: ./policy.yaml
 ```
+
+**Legacy spellings** (honored only when `version:` is omitted; each emits a load-time deprecation warning, and is rejected under `version: 1`):
+
+| Legacy | v1 |
+|---|---|
+| `cli:` | `defaults:` |
+| `server:` (`graph:` scalar) | `serve:` (`graphs:` list) |
+| top-level `policy:` | `graphs.<name>.policy` |
+| top-level `queries:` | `graphs.<name>.queries` |
+| `project:` | removed (no consumer) |
+| `uri:` | `storage:` (embedded) / `server:` (remote) |
 
 ## Output formats (`query` command, alias: `read`)
 

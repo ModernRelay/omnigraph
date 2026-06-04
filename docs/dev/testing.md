@@ -39,9 +39,12 @@ The engine's `tests/` is the principal coverage surface; most graph-shaped behav
 | `recovery.rs` | Open-time recovery sweep — sidecar I/O, classifier dispatch (NoMovement / RolledPastExpected / UnexpectedAtP1 / UnexpectedMultistep / InvariantViolation), all-or-nothing decision, roll-forward via `ManifestBatchPublisher::publish`, roll-back via `Dataset::restore`, audit row in `_graph_commit_recoveries.lance`, `OpenMode::ReadOnly` skip path |
 | `composite_flow.rs` | Compositional/narrative end-to-end stories — multi-step flows that compose mechanics covered by other test files. Catches integration regressions where individual operations all pass their unit tests but their composition breaks (sequential merges, post-merge main writes, time-travel through merge DAG, reopen consistency over multi-merge histories). |
 
-**Config & CLI (RFC-002 V1a)** — these live outside the engine `tests/` dir: the
-version-gated config-strictness and `deprecation_warnings` tests are inline in
-`omnigraph-config` (`src/lib.rs` test module); the `GraphLocator` discriminant +
+**Config & CLI (RFC-002 V1a + V1-remainder schema reshape)** — these live outside
+the engine `tests/` dir: the version-gated config-strictness, the v1
+legacy-key rejection / legacy-fold renames (`cli:`→`defaults:`, `server:`→`serve:`,
+removed `project:` and top-level `policy:`/`queries:`), and `deprecation_warnings`
+tests are inline in `omnigraph-config` (`src/lib.rs` test module); the
+`GraphLocator` discriminant +
 graph-identity tests are inline in `omnigraph-cli` (`src/main.rs`) plus
 `tests/cli.rs` / `tests/system_local.rs`; the server embedded-only rejection tests
 are in `omnigraph-server/tests/server.rs` (`multi_graph_startup`).

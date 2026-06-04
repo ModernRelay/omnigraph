@@ -8,17 +8,17 @@ Axum 0.8 + tokio + utoipa-generated OpenAPI. **Two modes** (v0.6.0+): single-gra
 
 `omnigraph-server <URI>` or `omnigraph-server --graph <name> --config omnigraph.yaml`. Routes are flat — `/snapshot`, `/read`, `/branches`, etc.
 
-**Config follows graph identity.** A bare `<URI>` is an *anonymous* graph and uses the **top-level** `policy.file` / `queries:`. A graph chosen by **name** (`--graph` / `server.graph`) uses its own `graphs.<name>.{policy.file, queries}` — the same block multi-graph mode uses. ⚠️ *Changed from v0.6.0, which always used top-level config in single mode: a named-graph config that puts `policy`/`queries` at top-level now **refuses boot** and points you at `graphs.<name>.…` (move the block there). Bare-`<URI>` single mode is unchanged.*
+**Config follows graph identity.** A graph chosen by **name** (`--graph` / `serve.graphs`) uses its own `graphs.<name>.{policy.file, queries}` — the same block multi-graph mode uses. A bare `<URI>` is an *anonymous* graph with no per-graph config; under `version: 1` the top-level `policy:` / `queries:` blocks are **removed**, so attach policy or stored queries by giving the graph a named `graphs:` entry. ⚠️ *Under the legacy schema (no `version:`) a bare `<URI>` still falls back to top-level `policy.file` / `queries:`, and a named-graph config that puts `policy`/`queries` at top-level **refuses boot**, pointing you at `graphs.<name>.…`.*
 
 ### Multi-graph mode (v0.6.0+)
 
-`omnigraph-server --config omnigraph.yaml` with a non-empty `graphs:` map and **no** single-mode selector (no `server.graph`, no `<URI>`, no `--graph`). The server opens every configured graph in parallel at startup (bounded concurrency = 4, fail-fast on the first open error). Routes are nested under `/graphs/{graph_id}/...`. Bare flat paths return 404 in multi mode.
+`omnigraph-server --config omnigraph.yaml` with a non-empty `graphs:` map and **no** single-mode selector (no `serve.graphs`, no `<URI>`, no `--graph`). The server opens every configured graph in parallel at startup (bounded concurrency = 4, fail-fast on the first open error). Routes are nested under `/graphs/{graph_id}/...`. Bare flat paths return 404 in multi mode.
 
 Mode inference (four-rule matrix):
 
 1. CLI positional `<URI>` → single
 2. CLI `--graph <name>` → single
-3. `server.graph` in config → single
+3. `serve.graphs` in config → single
 4. `--config` + non-empty `graphs:` + no single-mode selector → **multi**
 5. otherwise → error with migration hint
 

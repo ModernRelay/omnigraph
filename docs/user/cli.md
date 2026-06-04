@@ -71,14 +71,14 @@ and configure the matching `bearer_token_env` in `omnigraph.yaml`.
 
 ## Multi-graph servers (v0.6.0+)
 
-Against a multi-graph server (started with `--config omnigraph.yaml` referencing a non-empty `graphs:` map), use `omnigraph graphs list` to enumerate the registered graphs. The server must configure bearer tokens and `server.policy.file` with a rule that allows `graph_list`; `/graphs` is closed by default even when the server runs with `--unauthenticated`.
+Against a multi-graph server (started with `--config omnigraph.yaml` referencing a non-empty `graphs:` map), use `omnigraph graphs list` to enumerate the registered graphs. The server must configure bearer tokens and `serve.policy.file` with a rule that allows `graph_list`; `/graphs` is closed by default even when the server runs with `--unauthenticated`.
 
 ```bash
 OMNIGRAPH_BEARER_TOKEN=admin-token \
   omnigraph graphs list --uri http://server.example.com --json
 ```
 
-For config-driven clients, set the remote graph's `bearer_token_env` to an environment variable containing a token whose actor is authorized by `server.policy.file`.
+For config-driven clients, set the remote graph's `bearer_token_env` to an environment variable containing a token whose actor is authorized by `serve.policy.file`.
 
 `list` rejects local URI targets — it's for remote multi-graph servers only.
 
@@ -118,14 +118,18 @@ also pass `--schema`.
 query roots:
 
 ```yaml
+version: 1
+servers:
+  dev:
+    endpoint: http://127.0.0.1:8080
 graphs:
   local:
-    uri: ./demo.omni
+    storage: ./demo.omni
   dev:
-    uri: http://127.0.0.1:8080
+    server: dev
     bearer_token_env: OMNIGRAPH_BEARER_TOKEN
 
-cli:
+defaults:
   graph: local
   branch: main
 
@@ -137,10 +141,10 @@ query:
 
 The config file can also define:
 
-- server bind defaults
+- `serve:` bind / served-set / server-level policy defaults
 - auth env files
 - query aliases for common read and change commands
-- `policy.file` for Cedar authorization rules
+- per-graph `policy:` for Cedar authorization rules
 
 When policy is enabled, `schema apply` is authorized through the
 `schema_apply` action and is typically limited to admins on protected `main`.
