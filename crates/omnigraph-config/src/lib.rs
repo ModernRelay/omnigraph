@@ -926,25 +926,71 @@ impl OmnigraphConfig {
     }
 
     fn resolve_config_uri(&self, value: &str) -> String {
-        if value.contains("://") {
-            return value.to_string();
-        }
-
-        let path = Path::new(value);
-        if path.is_absolute() {
-            value.to_string()
-        } else {
-            self.base_dir.join(path).to_string_lossy().to_string()
-        }
+        resolve_uri_against(&self.base_dir, value)
     }
 
     fn resolve_config_path(&self, value: &str) -> PathBuf {
-        let path = Path::new(value);
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.base_dir.join(path)
+        PathBuf::from(resolve_path_against(&self.base_dir, value))
+    }
+
+    /// Rewrite every relative path/URI field to absolute against this layer's
+    /// `base_dir`, so a merged multi-layer config carries only absolute paths and
+    /// the per-field resolvers become no-ops on the result. Mirrors how
+    /// `normalize_graphs` already eagerly fills `entry.uri`; run at the end of a
+    /// single-layer load (RFC-002 §4 — relative paths carry their origin's base_dir).
+    fn resolve_all_paths_in_place(&mut self) {
+        let base = self.base_dir.clone();
+        if let Some(file) = self.policy.file.take() {
+            self.policy.file = Some(resolve_path_against(&base, &file));
         }
+        if let Some(file) = self.serve.policy.file.take() {
+            self.serve.policy.file = Some(resolve_path_against(&base, &file));
+        }
+        if let Some(file) = self.auth.env_file.take() {
+            self.auth.env_file = Some(resolve_path_against(&base, &file));
+        }
+        for entry in self.queries.values_mut() {
+            entry.file = resolve_path_against(&base, &entry.file);
+        }
+        for root in &mut self.query.roots {
+            *root = resolve_path_against(&base, root.as_str());
+        }
+        for graph in self.graphs.values_mut() {
+            if !graph.uri.is_empty() {
+                graph.uri = resolve_uri_against(&base, &graph.uri);
+            }
+            if let Some(file) = graph.policy.file.take() {
+                graph.policy.file = Some(resolve_path_against(&base, &file));
+            }
+            for query in graph.queries.values_mut() {
+                query.file = resolve_path_against(&base, &query.file);
+            }
+        }
+    }
+}
+
+/// Resolve a config-supplied URI against `base_dir`: pass through anything with a
+/// scheme (`://`) or an absolute path; join a relative path onto `base_dir`.
+fn resolve_uri_against(base_dir: &Path, value: &str) -> String {
+    if value.contains("://") {
+        return value.to_string();
+    }
+    let path = Path::new(value);
+    if path.is_absolute() {
+        value.to_string()
+    } else {
+        base_dir.join(path).to_string_lossy().into_owned()
+    }
+}
+
+/// Resolve a config-supplied file path against `base_dir`: pass through an
+/// absolute path; join a relative one onto `base_dir`.
+fn resolve_path_against(base_dir: &Path, value: &str) -> String {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        value.to_string()
+    } else {
+        base_dir.join(path).to_string_lossy().into_owned()
     }
 }
 
@@ -1077,6 +1123,10 @@ fn load_single_layer(cwd: &Path, path: &Path) -> Result<OmnigraphConfig> {
     config.loaded_from_file = true;
     config.normalize_graphs()?;
     config.normalize_serve()?;
+    // After `normalize_graphs` has filled `entry.uri`, resolve every relative
+    // path/URI against this layer's `base_dir` so later layer-merging composes
+    // absolute-only configs.
+    config.resolve_all_paths_in_place();
     Ok(config)
 }
 
@@ -1164,7 +1214,10 @@ mod tests {
             Some(PathBuf::from("/x/c.yaml"))
         );
         assert_eq!(
-            global_config_file_from(|k| (k == "OMNIGRAPH_HOME").then(|| "/h".into()), home.clone()),
+            global_config_file_from(
+                |k| (k == "OMNIGRAPH_HOME").then(|| "/h".into()),
+                home.clone()
+            ),
             Some(PathBuf::from("/h/config.yaml"))
         );
         assert_eq!(
@@ -1179,6 +1232,59 @@ mod tests {
             Some(PathBuf::from("/home/u/.omnigraph/config.yaml"))
         );
         assert_eq!(global_config_file_from(|_| None, None), None);
+    }
+
+    #[test]
+    fn eager_resolution_makes_every_path_field_absolute() {
+        // Every relative path/URI field must be absolute immediately after a
+        // single-layer load, BEFORE any resolver call — so a merged multi-layer
+        // config never mis-resolves a path against the wrong layer's base_dir
+        // (RFC-002 §4). A scheme URI (`https://`) passes through unchanged.
+        let temp = tempdir().unwrap();
+        fs::write(
+            temp.path().join("omnigraph.yaml"),
+            r#"version: 1
+servers:
+  s: { endpoint: https://h }
+graphs:
+  emb:
+    storage: ./emb.omni
+    policy: { file: ./p/emb.yaml }
+    queries:
+      q: { file: ./q/emb.gq }
+  rem:
+    server: s
+serve:
+  graphs: [emb]
+  policy: { file: ./sp.yaml }
+auth:
+  env_file: ./.env.omni
+defaults:
+  graph: emb
+query:
+  roots: [./qr, .]
+"#,
+        )
+        .unwrap();
+        let config = load_config_in(temp.path(), None).unwrap();
+
+        let emb = &config.graphs["emb"];
+        assert!(Path::new(&emb.uri).is_absolute(), "graph uri: {}", emb.uri);
+        assert!(Path::new(emb.policy.file.as_ref().unwrap()).is_absolute());
+        assert!(Path::new(&emb.queries["q"].file).is_absolute());
+        // A remote graph's `uri` is the server endpoint (scheme URL) — passes through.
+        assert!(config.graphs["rem"].uri.contains("://"));
+        assert!(Path::new(config.serve.policy.file.as_ref().unwrap()).is_absolute());
+        assert!(Path::new(config.auth.env_file.as_ref().unwrap()).is_absolute());
+        assert!(
+            config
+                .query
+                .roots
+                .iter()
+                .all(|r| Path::new(r).is_absolute()),
+            "query.roots not absolute: {:?}",
+            config.query.roots
+        );
     }
 
     #[test]
@@ -1428,7 +1534,14 @@ queries:
         let prod = config.target_query_entries("prod").unwrap();
         assert_eq!(prod.len(), 2);
         let find_user = &prod["find_user"];
-        assert_eq!(find_user.file, "./queries/find_user.gq");
+        // Eager path resolution (RFC-002 §4): the stored `file` is now absolute,
+        // resolved against the layer's base_dir.
+        assert!(
+            Path::new(&find_user.file).is_absolute()
+                && find_user.file.ends_with("queries/find_user.gq"),
+            "find_user.file should be eager-resolved absolute: {}",
+            find_user.file
+        );
         assert!(find_user.mcp.expose);
         assert_eq!(find_user.mcp.tool_name.as_deref(), Some("lookup_user"));
         // Default exposure is true (the manifest entry is the opt-in); tool_name absent.
