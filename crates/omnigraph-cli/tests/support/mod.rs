@@ -25,13 +25,19 @@ fn isolated_omnigraph_home() -> &'static Path {
 
 pub fn cli() -> Command {
     let mut command = Command::cargo_bin("omnigraph").unwrap();
-    command.env("OMNIGRAPH_HOME", isolated_omnigraph_home());
+    command
+        .env("OMNIGRAPH_HOME", isolated_omnigraph_home())
+        .env_remove("OMNIGRAPH_CONFIG")
+        .env_remove("XDG_CONFIG_HOME");
     command
 }
 
 pub fn cli_process() -> StdCommand {
     let mut command = StdCommand::new(assert_cmd::cargo::cargo_bin("omnigraph"));
-    command.env("OMNIGRAPH_HOME", isolated_omnigraph_home());
+    command
+        .env("OMNIGRAPH_HOME", isolated_omnigraph_home())
+        .env_remove("OMNIGRAPH_CONFIG")
+        .env_remove("XDG_CONFIG_HOME");
     command
 }
 
