@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -951,6 +952,51 @@ pub fn default_config_path() -> PathBuf {
     PathBuf::from(DEFAULT_CONFIG_FILE)
 }
 
+/// Directory name of the global config under the user's home (`~/.omnigraph`).
+const GLOBAL_CONFIG_DIR_NAME: &str = ".omnigraph";
+/// File name of the global (and project) config.
+pub const GLOBAL_CONFIG_FILE_NAME: &str = "config.yaml";
+
+/// The global config directory — RFC-002 §5. `OMNIGRAPH_HOME` overrides it;
+/// else `$XDG_CONFIG_HOME/omnigraph` if `$XDG_CONFIG_HOME` is set; else
+/// `<home>/.omnigraph` (canonical). Returns `None` only when none resolve (no
+/// home dir and no override). Pure in its inputs so it is hermetically testable.
+fn global_config_dir_from(
+    env: impl Fn(&str) -> Option<OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(dir) = env("OMNIGRAPH_HOME") {
+        return Some(PathBuf::from(dir));
+    }
+    if let Some(xdg) = env("XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(xdg).join("omnigraph"));
+    }
+    home.map(|home| home.join(GLOBAL_CONFIG_DIR_NAME))
+}
+
+/// The global config file — RFC-002 §5. `OMNIGRAPH_CONFIG` (an explicit file
+/// path) wins outright; else `<global_config_dir>/config.yaml`. `None` when no
+/// directory resolves and `OMNIGRAPH_CONFIG` is unset.
+fn global_config_file_from(
+    env: impl Fn(&str) -> Option<OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(file) = env("OMNIGRAPH_CONFIG") {
+        return Some(PathBuf::from(file));
+    }
+    global_config_dir_from(env, home).map(|dir| dir.join(GLOBAL_CONFIG_FILE_NAME))
+}
+
+/// The resolved global config directory for this process.
+pub fn global_config_dir() -> Option<PathBuf> {
+    global_config_dir_from(|key| env::var_os(key), dirs::home_dir())
+}
+
+/// The resolved global config file for this process (see [`global_config_file_from`]).
+pub fn global_config_file() -> Option<PathBuf> {
+    global_config_file_from(|key| env::var_os(key), dirs::home_dir())
+}
+
 pub fn load_config(config_path: Option<&PathBuf>) -> Result<OmnigraphConfig> {
     load_config_in(&env::current_dir()?, config_path)
 }
@@ -1090,8 +1136,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        GraphLocator, Layer, ReadOutputFormat, TableCellLayout, graph_resource_id_for_selection,
-        load_config_in,
+        GraphLocator, Layer, ReadOutputFormat, TableCellLayout, global_config_file_from,
+        graph_resource_id_for_selection, load_config_in,
     };
 
     #[test]
@@ -1102,6 +1148,37 @@ mod tests {
         assert!(Layer::Default < Layer::Global);
         assert!(Layer::Global < Layer::State);
         assert!(Layer::State < Layer::Project);
+    }
+
+    #[test]
+    fn global_config_file_precedence_config_over_home_over_xdg_over_default() {
+        // RFC-002 §5: OMNIGRAPH_CONFIG (file) > OMNIGRAPH_HOME (dir) >
+        // $XDG_CONFIG_HOME/omnigraph > ~/.omnigraph. Driven through the injected
+        // form so no process env is mutated (hermetic, parallel-safe).
+        let home = Some(PathBuf::from("/home/u"));
+        assert_eq!(
+            global_config_file_from(
+                |k| (k == "OMNIGRAPH_CONFIG").then(|| "/x/c.yaml".into()),
+                home.clone(),
+            ),
+            Some(PathBuf::from("/x/c.yaml"))
+        );
+        assert_eq!(
+            global_config_file_from(|k| (k == "OMNIGRAPH_HOME").then(|| "/h".into()), home.clone()),
+            Some(PathBuf::from("/h/config.yaml"))
+        );
+        assert_eq!(
+            global_config_file_from(
+                |k| (k == "XDG_CONFIG_HOME").then(|| "/xdg".into()),
+                home.clone(),
+            ),
+            Some(PathBuf::from("/xdg/omnigraph/config.yaml"))
+        );
+        assert_eq!(
+            global_config_file_from(|_| None, home.clone()),
+            Some(PathBuf::from("/home/u/.omnigraph/config.yaml"))
+        );
+        assert_eq!(global_config_file_from(|_| None, None), None);
     }
 
     #[test]
