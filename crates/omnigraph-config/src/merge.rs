@@ -37,6 +37,12 @@ pub fn merge_layers(layers: Vec<LoadedLayer>) -> (OmnigraphConfig, Provenance) {
     let mut loaded_from_file = false;
 
     for LoadedLayer { layer, config } in layers {
+        // No `..` rest-pattern: every field is bound explicitly so a config field
+        // added later FAILS TO COMPILE here until it is dispositioned (merged or
+        // deliberately ignored). The compiler is the drift-guard. The `_`-bound
+        // fields are intentionally not merged: `project` has no consumer; `server`
+        // is folded into `serve` at load (empty here); `legacy_keys` drives the
+        // per-layer warnings the caller emits before merge.
         let OmnigraphConfig {
             version: layer_version,
             defaults,
@@ -50,10 +56,9 @@ pub fn merge_layers(layers: Vec<LoadedLayer>) -> (OmnigraphConfig, Provenance) {
             queries,
             base_dir: layer_base_dir,
             loaded_from_file: layer_loaded,
-            // Ignored: `project` (no consumer) and `server` (folded into `serve`
-            // at load) are empty here; `legacy_keys` drives per-layer warnings the
-            // caller emits before merge.
-            ..
+            project: _,
+            server: _,
+            legacy_keys: _,
         } = config;
 
         if layer_version.is_some() {
