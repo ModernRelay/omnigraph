@@ -336,7 +336,7 @@ fn config_view_resolved_prints_embedded_and_remote_locators() {
     write_config(
         &config,
         "version: 1\nservers:\n  prod:\n    endpoint: https://prod.example\n\
-         graphs:\n  local:\n    storage: ./l.omni\n  staging:\n    server: prod\n    graph_id: prod\n",
+         graphs:\n  local:\n    storage:\n      uri: ./l.omni\n      region: eu-west-1\n      endpoint: https://minio.local\n  staging:\n    server: prod\n    graph_id: prod\n",
     );
 
     let embedded = parse_stdout_json(&output_success(
@@ -351,6 +351,10 @@ fn config_view_resolved_prints_embedded_and_remote_locators() {
     ));
     assert_eq!(embedded["kind"], "embedded");
     assert!(embedded["uri"].as_str().unwrap().ends_with("l.omni"));
+    // The serialized locator exposes every field — incl. the storage block's
+    // region/endpoint, which the old hand-listed printer dropped.
+    assert_eq!(embedded["region"], "eu-west-1");
+    assert_eq!(embedded["endpoint"], "https://minio.local");
 
     let remote = parse_stdout_json(&output_success(
         cli()

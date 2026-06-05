@@ -169,8 +169,11 @@ pub struct ServerEntry {
 }
 
 /// A resolved graph address (RFC-002 §1.1/§2) — replaces scheme-sniffing on a
-/// `uri` string with a typed embedded-XOR-remote locator.
-#[derive(Debug, Clone)]
+/// `uri` string with a typed embedded-XOR-remote locator. `Serialize` is
+/// internally tagged (`kind: embedded|remote`) so `config view --resolved` dumps
+/// every field without hand-listing — a new field can't be silently omitted.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GraphLocator {
     Embedded {
         /// Object-store URI, resolved against the config `base_dir`.

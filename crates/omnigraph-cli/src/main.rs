@@ -898,68 +898,19 @@ fn print_config_origins(provenance: &Provenance, json: bool) -> Result<()> {
     }
 }
 
-/// Print a resolved [`GraphLocator`] (embedded vs remote) in human or JSON form.
+/// Print a resolved [`GraphLocator`] (embedded vs remote). Serializes the typed
+/// locator (internally tagged `kind:`) and prunes null/empty values, so every
+/// field — including an Embedded graph's `region`/`endpoint`/`policy_file` — is
+/// reported and no field can be forgotten by hand.
 fn print_resolved_locator(locator: &GraphLocator, json: bool) -> Result<()> {
-    match locator {
-        GraphLocator::Embedded {
-            uri,
-            branch,
-            snapshot,
-            graph_id,
-            ..
-        } => {
-            if json {
-                print_json(&serde_json::json!({
-                    "kind": "embedded",
-                    "uri": uri,
-                    "graph_id": graph_id,
-                    "branch": branch,
-                    "snapshot": snapshot,
-                }))
-            } else {
-                println!("embedded");
-                println!("  uri:      {uri}");
-                println!("  graph_id: {graph_id}");
-                if let Some(branch) = branch {
-                    println!("  branch:   {branch}");
-                }
-                if let Some(snapshot) = snapshot {
-                    println!("  snapshot: {snapshot}");
-                }
-                Ok(())
-            }
-        }
-        GraphLocator::Remote {
-            endpoint,
-            server,
-            graph_id,
-            branch,
-            snapshot,
-        } => {
-            if json {
-                print_json(&serde_json::json!({
-                    "kind": "remote",
-                    "endpoint": endpoint,
-                    "server": server,
-                    "graph_id": graph_id,
-                    "branch": branch,
-                    "snapshot": snapshot,
-                }))
-            } else {
-                println!("remote");
-                println!("  endpoint: {endpoint}");
-                println!("  server:   {server}");
-                println!("  graph_id: {graph_id}");
-                if let Some(branch) = branch {
-                    println!("  branch:   {branch}");
-                }
-                if let Some(snapshot) = snapshot {
-                    println!("  snapshot: {snapshot}");
-                }
-                Ok(())
-            }
-        }
+    let mut value = serde_yaml::to_value(locator)?;
+    prune_empty(&mut value);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        print!("{}", serde_yaml::to_string(&value)?);
     }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
