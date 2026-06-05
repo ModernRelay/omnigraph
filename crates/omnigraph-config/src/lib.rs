@@ -8,6 +8,9 @@ use clap::ValueEnum;
 use color_eyre::eyre::{Result, bail};
 use serde::{Deserialize, Serialize};
 
+mod merge;
+pub use merge::{LoadedLayer, merge_layers};
+
 pub const DEFAULT_CONFIG_FILE: &str = "omnigraph.yaml";
 
 pub fn graph_resource_id_for_selection(
