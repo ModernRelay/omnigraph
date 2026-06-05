@@ -154,10 +154,14 @@ are left at `Lance HEAD = manifest_pinned + 1`.
 
 **Recovery protocol** (lifecycle of every staged-write writer —
 `MutationStaging::finalize`, `schema_apply::apply_schema_with_lock`,
-`branch_merge_on_current_target`, `ensure_indices_for_branch`):
+`branch_merge_on_current_target`, `ensure_indices_for_branch`,
+`optimize_all_tables`):
 
 1. **Phase A**: writer writes a sidecar JSON to
-   `__recovery/{ulid}.json` BEFORE its first `commit_staged`. The
+   `__recovery/{ulid}.json` BEFORE its first HEAD-advancing commit
+   (`commit_staged`, or `compact_files` for `optimize_all_tables`,
+   which advances the Lance HEAD via a reserve-fragments + rewrite
+   commit rather than a staged write). The
    sidecar names every `(table_key, table_path, expected_version,
    post_commit_pin)` it intends to commit + the writer kind +
    actor_id.

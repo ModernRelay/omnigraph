@@ -106,6 +106,12 @@ pub(crate) enum SidecarKind {
     BranchMerge,
     /// `ensure_indices_for_branch` — index lifecycle commits.
     EnsureIndices,
+    /// `optimize_all_tables` — Lance `compact_files` (reserve-fragments +
+    /// rewrite commits) followed by a manifest publish of the compacted
+    /// version. Loose-match like the other multi-commit writers; roll-forward
+    /// is always safe because compaction is content-preserving (Lance
+    /// `Operation::Rewrite` "reorganizes data without semantic modification").
+    Optimize,
 }
 
 /// One table's contribution to a sidecar's intended commit. The classifier
@@ -412,11 +418,13 @@ pub(crate) fn parse_sidecar(sidecar_uri: &str, body: &str) -> Result<RecoverySid
 /// - **Strict** (`Mutation`, `Load`): exactly one `commit_staged` per
 ///   table, so `lance_head == manifest_pinned + 1` AND
 ///   `post_commit_pin == lance_head` is required.
-/// - **Loose** (`SchemaApply`, `EnsureIndices`, `BranchMerge`): the
-///   writer may run N ≥ 1 `commit_staged` calls per table (one per
-///   index built + one for the overwrite, etc.; merge tables run
-///   merge_insert + delete_where + index rebuilds) and the exact N
-///   is hard to compute at sidecar-write time. The loose match accepts
+/// - **Loose** (`SchemaApply`, `EnsureIndices`, `BranchMerge`,
+///   `Optimize`): the writer advances the Lance HEAD by N ≥ 1 commits
+///   per table (one per index built + one for the overwrite, etc.;
+///   merge tables run merge_insert + delete_where + index rebuilds;
+///   `Optimize` runs `compact_files`, which commits reserve-fragments +
+///   rewrite) and the exact N is hard to compute at sidecar-write time.
+///   The loose match accepts
 ///   any `lance_head > manifest_pinned` as `RolledPastExpected` when
 ///   `pin.expected_version == manifest_pinned` (the writer's CAS
 ///   target matches what the manifest currently shows). The risk this
