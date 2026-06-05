@@ -980,6 +980,13 @@ impl OmnigraphConfig {
             if !graph.uri.is_empty() {
                 graph.uri = resolve_uri_against(&base, &graph.uri);
             }
+            // Resolve the raw storage URI too (bare and block forms) so it can't
+            // diverge from the derived `entry.uri`.
+            match &mut graph.storage {
+                Some(Storage::Bare(uri)) => *uri = resolve_uri_against(&base, uri),
+                Some(Storage::Block(block)) => block.uri = resolve_uri_against(&base, &block.uri),
+                None => {}
+            }
             if let Some(file) = graph.policy.file.take() {
                 graph.policy.file = Some(resolve_path_against(&base, &file));
             }
@@ -1417,6 +1424,8 @@ graphs:
     policy: { file: ./p/emb.yaml }
     queries:
       q: { file: ./q/emb.gq }
+  emb_block:
+    storage: { uri: ./eb.omni, region: r }
   rem:
     server: s
 serve:
@@ -1437,6 +1446,18 @@ query:
         assert!(Path::new(&emb.uri).is_absolute(), "graph uri: {}", emb.uri);
         assert!(Path::new(emb.policy.file.as_ref().unwrap()).is_absolute());
         assert!(Path::new(&emb.queries["q"].file).is_absolute());
+        // The raw storage URI (bare and block forms) must be resolved too, not
+        // just the derived `entry.uri` — else `storage` diverges from `uri`.
+        let bare_storage = emb.storage.as_ref().unwrap().uri();
+        assert!(
+            Path::new(bare_storage).is_absolute(),
+            "bare storage uri: {bare_storage}"
+        );
+        let block_storage = config.graphs["emb_block"].storage.as_ref().unwrap().uri();
+        assert!(
+            Path::new(block_storage).is_absolute(),
+            "block storage uri: {block_storage}"
+        );
         // A remote graph's `uri` is the server endpoint (scheme URL) — passes through.
         assert!(config.graphs["rem"].uri.contains("://"));
         assert!(Path::new(config.serve.policy.file.as_ref().unwrap()).is_absolute());
