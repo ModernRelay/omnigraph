@@ -1637,6 +1637,100 @@ edge WorksAt: Person -> Company
     );
 }
 
+/// `optimize` Phase B → Phase C residual: `compact_files` advanced the Lance
+/// HEAD but the manifest publish hasn't run. The `Optimize` recovery sidecar
+/// (loose-match, like SchemaApply/EnsureIndices) must roll the compacted version
+/// forward on next open so the manifest tracks the Lance HEAD — and the healed
+/// table must then accept a schema apply (the original bug's victim).
+#[tokio::test]
+async fn optimize_phase_b_failure_recovered_on_next_open() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let operation_id;
+
+    // Seed: several separate Person inserts → multiple fragments, so compaction
+    // has real work and advances the Lance HEAD.
+    {
+        let db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+        for (name, age) in [("alice", 30), ("bob", 31), ("carol", 32), ("dave", 33)] {
+            db.mutate(
+                "main",
+                MUTATION_QUERIES,
+                "insert_person",
+                &mixed_params(&[("$name", name)], &[("$age", age)]),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    let pre_failure_version = {
+        let db = Omnigraph::open(&uri).await.unwrap();
+        version_main(&db).await.unwrap()
+    };
+
+    // Failpoint fires AFTER compact_files advanced the Lance HEAD but BEFORE the
+    // manifest publish. The Optimize sidecar persists (only node:Person has
+    // compactable fragments, so exactly one sidecar is written).
+    {
+        let db = Omnigraph::open(&uri).await.unwrap();
+        let _failpoint =
+            ScopedFailPoint::new("optimize.post_phase_b_pre_manifest_commit", "return");
+        let err = db.optimize().await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("injected failpoint triggered: optimize.post_phase_b_pre_manifest_commit"),
+            "unexpected error: {err}"
+        );
+
+        let recovery_dir = dir.path().join("__recovery");
+        let sidecars: Vec<_> = std::fs::read_dir(&recovery_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(
+            sidecars.len(),
+            1,
+            "exactly one Optimize sidecar must persist after optimize failure"
+        );
+        operation_id = single_sidecar_operation_id(dir.path());
+    }
+
+    // Recovery: reopen runs the sweep. The Optimize sidecar classifies
+    // RolledPastExpected (loose-match) → RollForward → manifest extends to the
+    // compacted Lance HEAD.
+    let db = Omnigraph::open(&uri).await.unwrap();
+    let post_recovery_version = version_main(&db).await.unwrap();
+    assert!(
+        post_recovery_version > pre_failure_version,
+        "manifest version must advance post-recovery (compaction rolled forward); \
+         pre={pre_failure_version}, post={post_recovery_version}",
+    );
+    drop(db);
+
+    assert_post_recovery_invariants(
+        dir.path(),
+        &operation_id,
+        RecoveryExpectation::RolledForward {
+            tables: vec![TableExpectation::main("node:Person")],
+        },
+    )
+    .await
+    .unwrap();
+
+    // The healed table accepts an additive schema apply — its HEAD-vs-manifest
+    // precondition is satisfied because recovery published the compacted version.
+    let db = Omnigraph::open(&uri).await.unwrap();
+    let desired = helpers::TEST_SCHEMA.replace(
+        "    age: I32?\n}",
+        "    age: I32?\n    nickname: String?\n}",
+    );
+    db.apply_schema(&desired)
+        .await
+        .expect("schema apply after optimize recovery must succeed");
+}
+
 #[tokio::test]
 async fn branch_merge_phase_b_failure_recovered_on_next_open() {
     use omnigraph::loader::{LoadMode, load_jsonl};
