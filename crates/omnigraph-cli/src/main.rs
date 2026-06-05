@@ -27,7 +27,7 @@ use omnigraph_compiler::{
 };
 use omnigraph_config::{
     AliasCommand, GraphLocator, OmnigraphConfig, ReadOutputFormat, graph_resource_id_for_selection,
-    load_config,
+    load_layered_config,
 };
 use omnigraph_policy::{
     PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest, PolicyTestConfig,
@@ -775,14 +775,16 @@ fn load_env_file_into_process(path: &Path) -> Result<()> {
 }
 
 fn load_cli_config(config_path: Option<&PathBuf>) -> Result<OmnigraphConfig> {
-    let config = load_config(config_path)?;
-    for warning in config.deprecation_warnings() {
+    // Global-first layered load (global `~/.omnigraph/config.yaml` under the
+    // project `./omnigraph.yaml`); RFC-002 §4. Warnings are collected per layer.
+    let loaded = load_layered_config(config_path)?;
+    for warning in &loaded.warnings {
         eprintln!("warning: {warning}");
     }
-    if let Some(path) = config.resolve_auth_env_file() {
+    if let Some(path) = loaded.config.resolve_auth_env_file() {
         load_env_file_into_process(&path)?;
     }
-    Ok(config)
+    Ok(loaded.config)
 }
 
 #[derive(Debug, Clone)]

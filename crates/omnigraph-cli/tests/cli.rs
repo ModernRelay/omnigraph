@@ -240,6 +240,41 @@ fn init_creates_graph_successfully_on_missing_local_directory() {
 }
 
 #[test]
+fn cli_resolves_graph_from_global_config_with_no_project_file() {
+    // Global-first (RFC-002 §4): a graph defined only in the global config is
+    // usable from a working directory that has no `omnigraph.yaml`.
+    let graph_dir = tempdir().unwrap();
+    let graph = graph_path(graph_dir.path());
+    init_graph(&graph);
+
+    let global_dir = tempdir().unwrap();
+    let global_file = global_dir.path().join("config.yaml");
+    write_config(
+        &global_file,
+        &format!(
+            "version: 1\ngraphs:\n  g:\n    storage: {}\ndefaults:\n  graph: g\n",
+            yaml_string(&graph.to_string_lossy())
+        ),
+    );
+
+    let empty_cwd = tempdir().unwrap();
+    let output = output_success(
+        cli()
+            .current_dir(empty_cwd.path())
+            .env("OMNIGRAPH_CONFIG", &global_file)
+            .arg("snapshot")
+            .arg("--graph")
+            .arg("g")
+            .arg("--json"),
+    );
+    let json = parse_stdout_json(&output);
+    assert!(
+        json.is_object(),
+        "snapshot --json should print an object resolved from the global config: {json}"
+    );
+}
+
+#[test]
 fn schema_plan_json_reports_supported_additive_change() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());

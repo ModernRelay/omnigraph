@@ -4,6 +4,7 @@ use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as StdCommand, Output, Stdio};
+use std::sync::OnceLock;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -12,12 +13,26 @@ use reqwest::blocking::Client;
 use serde_json::Value;
 use tempfile::{TempDir, tempdir};
 
+/// A process-wide empty temp dir used as `OMNIGRAPH_HOME` for every spawned CLI,
+/// so tests never pick up the developer's real `~/.omnigraph/config.yaml` (the
+/// global config layer). Tests exercising global-first set `OMNIGRAPH_CONFIG` /
+/// `OMNIGRAPH_HOME` explicitly to override this isolation.
+fn isolated_omnigraph_home() -> &'static Path {
+    static HOME: OnceLock<TempDir> = OnceLock::new();
+    HOME.get_or_init(|| tempdir().expect("isolated OMNIGRAPH_HOME"))
+        .path()
+}
+
 pub fn cli() -> Command {
-    Command::cargo_bin("omnigraph").unwrap()
+    let mut command = Command::cargo_bin("omnigraph").unwrap();
+    command.env("OMNIGRAPH_HOME", isolated_omnigraph_home());
+    command
 }
 
 pub fn cli_process() -> StdCommand {
-    StdCommand::new(assert_cmd::cargo::cargo_bin("omnigraph"))
+    let mut command = StdCommand::new(assert_cmd::cargo::cargo_bin("omnigraph"));
+    command.env("OMNIGRAPH_HOME", isolated_omnigraph_home());
+    command
 }
 
 fn server_process() -> StdCommand {
@@ -112,7 +127,7 @@ pub fn write_file(path: &Path, source: &str) {
     fs::write(path, source).unwrap();
 }
 
-fn yaml_string(value: &str) -> String {
+pub fn yaml_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 

@@ -35,6 +35,18 @@ pub enum Layer {
     Project,
 }
 
+impl Layer {
+    /// Short human label for messages and `config view --show-origin`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Layer::Default => "default",
+            Layer::Global => "global",
+            Layer::State => "state",
+            Layer::Project => "project",
+        }
+    }
+}
+
 /// Per-field origin of a merged config — a dotted field path (`defaults.graph`,
 /// `graphs.prod`) to the layer that supplied the winning value. Populated by the
 /// merge engine and consumed by `config view --show-origin`; the rest of the
@@ -1069,6 +1081,90 @@ fn load_config_in(cwd: &Path, config_path: Option<&PathBuf>) -> Result<Omnigraph
     }
 }
 
+/// The outcome of a layered config load: the merged config, its per-field
+/// [`Provenance`], and the per-layer deprecation warnings (each labelled with its
+/// layer) collected before merge.
+pub struct LayeredConfig {
+    pub config: OmnigraphConfig,
+    pub provenance: Provenance,
+    pub warnings: Vec<String>,
+}
+
+/// Load and merge the global (`~/.omnigraph/config.yaml`) layer under the project
+/// (`./omnigraph.yaml` or an explicit `--config`) layer — RFC-002 §4 global-first.
+/// The global layer is optional; the project layer follows [`load_config`]'s rules
+/// (an explicit path errors if missing, the cwd default is optional).
+pub fn load_layered_config(project_config_path: Option<&PathBuf>) -> Result<LayeredConfig> {
+    let cwd = env::current_dir()?;
+    let global = global_config_file();
+    load_layered_config_in(
+        &cwd,
+        global.as_deref(),
+        project_config_path.map(PathBuf::as_path),
+    )
+}
+
+/// Hermetic core of [`load_layered_config`]: the caller injects `cwd` and the
+/// global file path. A missing global or cwd-default project file is simply "no
+/// layer"; an explicit project path that is missing still errors via
+/// [`load_single_layer`]. The merged `base_dir` is the highest loaded layer's
+/// config dir (so a relative ad-hoc `--query` still resolves against the config's
+/// directory, as before), falling back to `cwd` only when no config file loaded.
+pub fn load_layered_config_in(
+    cwd: &Path,
+    global_file: Option<&Path>,
+    project_config_path: Option<&Path>,
+) -> Result<LayeredConfig> {
+    let mut layers: Vec<LoadedLayer> = Vec::new();
+
+    if let Some(global) = global_file {
+        if global.exists() {
+            let config = load_single_layer(cwd, global)?;
+            layers.push(LoadedLayer {
+                layer: Layer::Global,
+                config,
+            });
+        }
+    }
+
+    // The active-context State layer (from `omnigraph use`) slots here, between
+    // Global and Project, in a later change.
+
+    let project_path = project_config_path.map(Path::to_path_buf).or_else(|| {
+        let default_path = cwd.join(DEFAULT_CONFIG_FILE);
+        default_path.exists().then_some(default_path)
+    });
+    if let Some(path) = project_path {
+        let config = load_single_layer(cwd, &path)?;
+        layers.push(LoadedLayer {
+            layer: Layer::Project,
+            config,
+        });
+    }
+
+    let warnings: Vec<String> = layers
+        .iter()
+        .flat_map(|loaded| {
+            let label = loaded.layer.label();
+            loaded
+                .config
+                .deprecation_warnings()
+                .into_iter()
+                .map(move |warning| format!("{label}: {warning}"))
+        })
+        .collect();
+
+    let (mut config, provenance) = merge_layers(layers);
+    if config.base_dir.as_os_str().is_empty() {
+        config.base_dir = cwd.to_path_buf();
+    }
+    Ok(LayeredConfig {
+        config,
+        provenance,
+        warnings,
+    })
+}
+
 /// Load and fully process one config layer from `path` — version-gating, the
 /// legacy-key scan, `base_dir`, and `normalize_*`. The result is a self-contained
 /// layer. Errors if `path` is missing/unreadable: callers own the "is this file
@@ -1190,7 +1286,7 @@ mod tests {
 
     use super::{
         GraphLocator, Layer, ReadOutputFormat, TableCellLayout, global_config_file_from,
-        graph_resource_id_for_selection, load_config_in,
+        graph_resource_id_for_selection, load_config_in, load_layered_config_in,
     };
 
     #[test]
@@ -1288,6 +1384,61 @@ query:
             "query.roots not absolute: {:?}",
             config.query.roots
         );
+    }
+
+    #[test]
+    fn load_layered_config_merges_global_under_project() {
+        let global_dir = tempdir().unwrap();
+        let global_file = global_dir.path().join("config.yaml");
+        fs::write(
+            &global_file,
+            "version: 1\nservers:\n  prod:\n    endpoint: https://prod\n\
+             defaults:\n  output_format: kv\n  graph: shared\n",
+        )
+        .unwrap();
+        let project_dir = tempdir().unwrap();
+        fs::write(
+            project_dir.path().join("omnigraph.yaml"),
+            "version: 1\ndefaults:\n  graph: local\ngraphs:\n  local:\n    storage: ./l.omni\n",
+        )
+        .unwrap();
+
+        let layered = load_layered_config_in(project_dir.path(), Some(&global_file), None).unwrap();
+        // Global-only field inherited; per-leaf project value overrides the global.
+        assert!(layered.config.servers.contains_key("prod"));
+        assert_eq!(layered.config.default_output_format(), ReadOutputFormat::Kv);
+        assert_eq!(layered.config.default_graph_name(), Some("local"));
+        assert_eq!(
+            layered.provenance.origin("servers.prod"),
+            Some(Layer::Global)
+        );
+        assert_eq!(
+            layered.provenance.origin("defaults.output_format"),
+            Some(Layer::Global)
+        );
+        assert_eq!(
+            layered.provenance.origin("defaults.graph"),
+            Some(Layer::Project)
+        );
+    }
+
+    #[test]
+    fn load_layered_config_is_global_first_with_no_project_file() {
+        // The headline posture: a global config alone is fully honored from a
+        // working directory that has no `omnigraph.yaml` (RFC-002 §4).
+        let global_dir = tempdir().unwrap();
+        let global_file = global_dir.path().join("config.yaml");
+        fs::write(
+            &global_file,
+            "version: 1\ngraphs:\n  personal:\n    storage: ./p.omni\ndefaults:\n  graph: personal\n",
+        )
+        .unwrap();
+        let empty_cwd = tempdir().unwrap();
+
+        let layered = load_layered_config_in(empty_cwd.path(), Some(&global_file), None).unwrap();
+        assert_eq!(layered.config.default_graph_name(), Some("personal"));
+        assert!(layered.config.graphs.contains_key("personal"));
+        assert!(layered.warnings.is_empty(), "clean v1 layers must not warn");
     }
 
     #[test]
