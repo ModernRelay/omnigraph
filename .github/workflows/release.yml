@@ -122,11 +122,14 @@ jobs:
           ./scripts/update-homebrew-formula.sh "${GITHUB_REF_NAME}" homebrew-tap/Formula/omnigraph.rb
 
       # Diagnostic only: brew is not on PATH on the ubuntu runner by default, so
-      # set it up explicitly. continue-on-error keeps a failed/flaky audit from
-      # blocking the actual tap publish below — the formula is correct by
-      # construction (update-homebrew-formula.sh), so this is a canary, not a gate.
+      # set it up explicitly. Both this setup and the audit below are best-effort
+      # canaries, not gates — continue-on-error on each keeps a failed/flaky brew
+      # (the action is pinned to a moving @master ref) from skipping the actual
+      # tap publish below. The formula is correct by construction
+      # (update-homebrew-formula.sh), so brew tooling must never block the push.
       - name: Set up Homebrew
         if: env.HOMEBREW_TAP_SKIP != '1'
+        continue-on-error: true
         uses: Homebrew/actions/setup-homebrew@master
 
       - name: Audit generated formula
