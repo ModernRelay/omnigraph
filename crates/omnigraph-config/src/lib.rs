@@ -1072,14 +1072,13 @@ pub fn global_config_file() -> Option<PathBuf> {
 }
 
 /// The active context selected by `omnigraph use` — RFC-002 §5. A thin pointer to
-/// the default graph (and optionally its server), written to
-/// `<global>/state/active.yaml` and read as the `State` layer (between global and
-/// project) so a bare command targets the active graph.
+/// the default graph, written to `<global>/state/active.yaml` and read as the
+/// `State` layer (between global and project) so a bare command targets the active
+/// graph. (A default *server* belongs here too once server-qualified selection
+/// lands in V2/V3 — not modeled now to avoid an unused field.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveContext {
     pub graph: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub server: Option<String>,
 }
 
 /// Path of the active-context state file (`<global>/state/active.yaml`).
@@ -1100,9 +1099,8 @@ pub fn write_active_context(context: &ActiveContext) -> Result<()> {
 }
 
 /// Build the synthetic `State` layer config from an active-context file, if it
-/// exists: a thin config whose only effect is setting `defaults.graph` (and, when
-/// present, the default server). Marked not-loaded-from-file so it raises no
-/// version/legacy warnings.
+/// exists: a thin config whose only effect is setting `defaults.graph`. Marked
+/// not-loaded-from-file so it raises no version/legacy warnings.
 fn load_state_layer(path: &Path) -> Result<Option<OmnigraphConfig>> {
     if !path.exists() {
         return Ok(None);

@@ -533,7 +533,7 @@ enum ConfigCommand {
         #[arg(long)]
         config: Option<PathBuf>,
         /// Resolve the named graph (or `defaults.graph`) to its typed locator.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "show_origin")]
         resolved: bool,
         /// Annotate each value with the layer (global/project) it came from.
         #[arg(long = "show-origin")]
@@ -3166,7 +3166,6 @@ async fn main() -> Result<()> {
             resolved.resolve_graph(None, Some(&graph))?;
             write_active_context(&ActiveContext {
                 graph: graph.clone(),
-                server: None,
             })?;
             println!("active graph set to '{graph}'");
         }

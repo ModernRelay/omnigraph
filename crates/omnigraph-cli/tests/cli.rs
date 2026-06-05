@@ -372,6 +372,19 @@ fn config_view_resolved_prints_embedded_and_remote_locators() {
 }
 
 #[test]
+fn config_view_resolved_conflicts_with_show_origin() {
+    // The two modes are mutually exclusive; the parser rejects the combo loudly
+    // rather than silently dropping --show-origin.
+    output_failure(
+        cli()
+            .arg("config")
+            .arg("view")
+            .arg("--resolved")
+            .arg("--show-origin"),
+    );
+}
+
+#[test]
 fn use_sets_active_graph_targeted_by_bare_commands() {
     let graph_dir = tempdir().unwrap();
     let graph = graph_path(graph_dir.path());
