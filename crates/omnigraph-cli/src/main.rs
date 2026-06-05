@@ -26,8 +26,8 @@ use omnigraph_compiler::{
     json_params_to_param_map, lint_query_file,
 };
 use omnigraph_config::{
-    AliasCommand, GraphLocator, OmnigraphConfig, Provenance, ReadOutputFormat,
-    graph_resource_id_for_selection, load_layered_config,
+    ActiveContext, AliasCommand, GraphLocator, OmnigraphConfig, Provenance, ReadOutputFormat,
+    graph_resource_id_for_selection, load_layered_config, write_active_context,
 };
 use omnigraph_policy::{
     PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest, PolicyTestConfig,
@@ -317,6 +317,14 @@ enum Command {
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
+    },
+    /// Set the active graph (writes `~/.omnigraph/state/active.yaml`).
+    Use {
+        /// Graph to make active (must resolve in the merged config).
+        graph: String,
+        /// Project config file (defaults to ./omnigraph.yaml).
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 }
 
@@ -3200,6 +3208,17 @@ async fn main() -> Result<()> {
                 )?;
             }
         },
+        Command::Use { graph, config } => {
+            // Validate the graph resolves against the current merged config before
+            // making it the active default (loud fail on an unknown graph).
+            let resolved = load_cli_config(config.as_ref())?;
+            resolved.resolve_graph(None, Some(&graph))?;
+            write_active_context(&ActiveContext {
+                graph: graph.clone(),
+                server: None,
+            })?;
+            println!("active graph set to '{graph}'");
+        }
         Command::Optimize {
             uri,
             target,

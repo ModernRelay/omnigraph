@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
-use color_eyre::eyre::{Result, bail};
+use color_eyre::eyre::{Result, bail, eyre};
 use serde::{Deserialize, Serialize};
 
 mod merge;
@@ -1061,6 +1061,51 @@ pub fn global_config_file() -> Option<PathBuf> {
     global_config_file_from(|key| env::var_os(key), dirs::home_dir())
 }
 
+/// The active context selected by `omnigraph use` — RFC-002 §5. A thin pointer to
+/// the default graph (and optionally its server), written to
+/// `<global>/state/active.yaml` and read as the `State` layer (between global and
+/// project) so a bare command targets the active graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveContext {
+    pub graph: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+}
+
+/// Path of the active-context state file (`<global>/state/active.yaml`).
+pub fn active_context_file() -> Option<PathBuf> {
+    global_config_dir().map(|dir| dir.join("state").join("active.yaml"))
+}
+
+/// Write the active context to `<global>/state/active.yaml`, creating the
+/// `state/` directory. Errors if no global dir resolves (set `OMNIGRAPH_HOME`).
+pub fn write_active_context(context: &ActiveContext) -> Result<()> {
+    let path = active_context_file()
+        .ok_or_else(|| eyre!("cannot locate the global config dir; set OMNIGRAPH_HOME or $HOME"))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, serde_yaml::to_string(context)?)?;
+    Ok(())
+}
+
+/// Build the synthetic `State` layer config from an active-context file, if it
+/// exists: a thin config whose only effect is setting `defaults.graph` (and, when
+/// present, the default server). Marked not-loaded-from-file so it raises no
+/// version/legacy warnings.
+fn load_state_layer(path: &Path) -> Result<Option<OmnigraphConfig>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let context: ActiveContext = serde_yaml::from_str(&fs::read_to_string(path)?)?;
+    let mut config = OmnigraphConfig::default();
+    config.defaults.graph = Some(context.graph);
+    if let Some(parent) = path.parent() {
+        config.base_dir = parent.to_path_buf();
+    }
+    Ok(Some(config))
+}
+
 pub fn load_config(config_path: Option<&PathBuf>) -> Result<OmnigraphConfig> {
     load_config_in(&env::current_dir()?, config_path)
 }
@@ -1100,9 +1145,11 @@ pub struct LayeredConfig {
 pub fn load_layered_config(project_config_path: Option<&PathBuf>) -> Result<LayeredConfig> {
     let cwd = env::current_dir()?;
     let global = global_config_file();
+    let active = active_context_file();
     load_layered_config_in(
         &cwd,
         global.as_deref(),
+        active.as_deref(),
         project_config_path.map(PathBuf::as_path),
     )
 }
@@ -1116,6 +1163,7 @@ pub fn load_layered_config(project_config_path: Option<&PathBuf>) -> Result<Laye
 pub fn load_layered_config_in(
     cwd: &Path,
     global_file: Option<&Path>,
+    active_file: Option<&Path>,
     project_config_path: Option<&Path>,
 ) -> Result<LayeredConfig> {
     let mut layers: Vec<LoadedLayer> = Vec::new();
@@ -1130,8 +1178,15 @@ pub fn load_layered_config_in(
         }
     }
 
-    // The active-context State layer (from `omnigraph use`) slots here, between
-    // Global and Project, in a later change.
+    // Active-context State layer (from `omnigraph use`): between Global and Project.
+    if let Some(active) = active_file {
+        if let Some(config) = load_state_layer(active)? {
+            layers.push(LoadedLayer {
+                layer: Layer::State,
+                config,
+            });
+        }
+    }
 
     let project_path = project_config_path.map(Path::to_path_buf).or_else(|| {
         let default_path = cwd.join(DEFAULT_CONFIG_FILE);
@@ -1406,7 +1461,8 @@ query:
         )
         .unwrap();
 
-        let layered = load_layered_config_in(project_dir.path(), Some(&global_file), None).unwrap();
+        let layered =
+            load_layered_config_in(project_dir.path(), Some(&global_file), None, None).unwrap();
         // Global-only field inherited; per-leaf project value overrides the global.
         assert!(layered.config.servers.contains_key("prod"));
         assert_eq!(layered.config.default_output_format(), ReadOutputFormat::Kv);
@@ -1438,10 +1494,58 @@ query:
         .unwrap();
         let empty_cwd = tempdir().unwrap();
 
-        let layered = load_layered_config_in(empty_cwd.path(), Some(&global_file), None).unwrap();
+        let layered =
+            load_layered_config_in(empty_cwd.path(), Some(&global_file), None, None).unwrap();
         assert_eq!(layered.config.default_graph_name(), Some("personal"));
         assert!(layered.config.graphs.contains_key("personal"));
         assert!(layered.warnings.is_empty(), "clean v1 layers must not warn");
+    }
+
+    #[test]
+    fn state_layer_overrides_global_but_not_project() {
+        let global_dir = tempdir().unwrap();
+        let global_file = global_dir.path().join("config.yaml");
+        fs::write(
+            &global_file,
+            "version: 1\ndefaults:\n  graph: from_global\n",
+        )
+        .unwrap();
+        let state_dir = tempdir().unwrap();
+        let active = state_dir.path().join("active.yaml");
+        fs::write(&active, "graph: from_state\n").unwrap();
+        let project_dir = tempdir().unwrap();
+        fs::write(
+            project_dir.path().join("omnigraph.yaml"),
+            "version: 1\ndefaults:\n  graph: from_project\n",
+        )
+        .unwrap();
+
+        // Project > State > Global.
+        let with_project =
+            load_layered_config_in(project_dir.path(), Some(&global_file), Some(&active), None)
+                .unwrap();
+        assert_eq!(
+            with_project.config.default_graph_name(),
+            Some("from_project")
+        );
+        assert_eq!(
+            with_project.provenance.origin("defaults.graph"),
+            Some(Layer::Project)
+        );
+
+        // No project file (empty cwd) ⇒ State > Global.
+        let empty_cwd = tempdir().unwrap();
+        let without_project =
+            load_layered_config_in(empty_cwd.path(), Some(&global_file), Some(&active), None)
+                .unwrap();
+        assert_eq!(
+            without_project.config.default_graph_name(),
+            Some("from_state")
+        );
+        assert_eq!(
+            without_project.provenance.origin("defaults.graph"),
+            Some(Layer::State)
+        );
     }
 
     #[test]

@@ -368,6 +368,52 @@ fn config_view_resolved_prints_embedded_and_remote_locators() {
 }
 
 #[test]
+fn use_sets_active_graph_targeted_by_bare_commands() {
+    let graph_dir = tempdir().unwrap();
+    let graph = graph_path(graph_dir.path());
+    init_graph(&graph);
+
+    // A custom global home that both defines the graph and receives the state file.
+    let home_dir = tempdir().unwrap();
+    write_config(
+        &home_dir.path().join("config.yaml"),
+        &format!(
+            "version: 1\ngraphs:\n  g:\n    storage: {}\n",
+            yaml_string(&graph.to_string_lossy())
+        ),
+    );
+    let empty_cwd = tempdir().unwrap();
+
+    // `use` of an unknown graph fails loudly.
+    output_failure(
+        cli()
+            .env("OMNIGRAPH_HOME", home_dir.path())
+            .current_dir(empty_cwd.path())
+            .arg("use")
+            .arg("nonexistent"),
+    );
+
+    // `use g` records the active context.
+    output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", home_dir.path())
+            .current_dir(empty_cwd.path())
+            .arg("use")
+            .arg("g"),
+    );
+
+    // A bare command (no --graph) now targets the active graph.
+    let output = output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", home_dir.path())
+            .current_dir(empty_cwd.path())
+            .arg("snapshot")
+            .arg("--json"),
+    );
+    assert!(parse_stdout_json(&output).is_object());
+}
+
+#[test]
 fn schema_plan_json_reports_supported_additive_change() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
