@@ -25,6 +25,8 @@ A reference for the `omnigraph` binary's command surface and `omnigraph.yaml` sc
 | `cleanup --keep N --older-than 7d --confirm` | destructive version GC |
 | `embed` | offline JSONL embedding pipeline |
 | `policy validate \| test \| explain` | Cedar tooling. Selects `defaults.graph`, else `serve.graphs`, else top-level `policy.file` |
+| `config view [--resolved] [--show-origin] [--json] [<graph>]` | print the merged config; `--show-origin` labels each field with its source layer; `--resolved <graph>` prints the typed locator (embedded/remote) |
+| `use <graph>` | set the active graph (writes `~/.omnigraph/state/active.yaml`); a bare command then targets it |
 | `version` / `-v` | print `omnigraph 0.3.x` |
 
 ## `omnigraph.yaml` schema
@@ -92,6 +94,33 @@ aliases:
 | top-level `queries:` | `graphs.<name>.queries` |
 | `project:` | removed (no consumer) |
 | `uri:` | `storage:` (embedded) / `server:` (remote) |
+
+## Layered config (global-first)
+
+The CLI reads up to three config layers and merges them, so it works from any
+directory with no project file (the `kubectl`/`gh` posture). Precedence, low → high:
+
+**built-in defaults < global < active-context state < project < env vars < CLI flags**
+
+| Layer | Path | Notes |
+|---|---|---|
+| Global | `~/.omnigraph/config.yaml` | the primary, self-sufficient default; secret-free, machine-local |
+| State | `~/.omnigraph/state/active.yaml` | written by `omnigraph use`; sets the active graph |
+| Project | `./omnigraph.yaml` (or `--config`) | optional repo-scoped override + deployment manifest |
+
+**Global dir resolution:** `OMNIGRAPH_CONFIG` (explicit file) > `OMNIGRAPH_HOME` (dir) >
+`$XDG_CONFIG_HOME/omnigraph` (if set) > `~/.omnigraph`. The global file is
+`<dir>/config.yaml`.
+
+**Merge semantics:** settings-objects (`defaults`, `serve`) deep-merge per field; the
+named-resource maps (`servers`, `graphs`, `aliases`) union by key, with a higher
+layer's entry replacing the lower *wholesale*; lists and scalars replace. Relative
+paths (`policy.file`, `queries.<>.file`, `storage`, `query.roots`) resolve against the
+directory of the layer that defined them.
+
+`omnigraph config view --show-origin` prints which layer each value came from;
+`config view --resolved <graph>` prints the final embedded/remote locator. The server
+does **not** layer the global config — it reads only the project/`--config` manifest.
 
 ## Output formats (`query` command, alias: `read`)
 

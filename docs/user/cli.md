@@ -149,6 +149,16 @@ The config file can also define:
 When policy is enabled, `schema apply` is authorized through the
 `schema_apply` action and is typically limited to admins on protected `main`.
 
+### Global-first layering
+
+The CLI merges a user-global `~/.omnigraph/config.yaml` under the project
+`./omnigraph.yaml`, so it works from any directory with no project file. A graph,
+server, or default defined only in the global config is fully usable. Inspect the
+result with `omnigraph config view [--show-origin] [--resolved <graph>]`, and set the
+active default graph with `omnigraph use <graph>`. Precedence, env vars, and merge
+rules are in [cli-reference.md](cli-reference.md#layered-config-global-first). The
+server is unaffected — it reads only its project/`--config` deployment manifest.
+
 ## Deprecated names
 
 The CLI was renamed to align with the HTTP server's canonical endpoint

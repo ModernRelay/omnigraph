@@ -47,7 +47,14 @@ tests are inline in `omnigraph-config` (`src/lib.rs` test module); the
 `GraphLocator` discriminant +
 graph-identity tests are inline in `omnigraph-cli` (`src/main.rs`) plus
 `tests/cli.rs` / `tests/system_local.rs`; the server embedded-only rejection tests
-are in `omnigraph-server/tests/server.rs` (`multi_graph_startup`).
+are in `omnigraph-server/tests/server.rs` (`multi_graph_startup`). The **global-first
+layered config** (RFC-002 §4) — global-dir precedence, eager per-layer path
+resolution, the merge engine + provenance (`src/merge.rs`), `load_layered_config_in`,
+state-layer precedence, and error/warning layer-attribution — is inline in
+`omnigraph-config`; `config view` / `omnigraph use` end-to-end tests are in
+`omnigraph-cli/tests/cli.rs`. CLI tests pin `OMNIGRAPH_HOME` to an empty temp dir
+(`tests/support/mod.rs`) so spawned binaries never read the developer's real global
+config.
 
 ## Fixtures
 

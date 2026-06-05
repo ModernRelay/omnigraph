@@ -14,9 +14,17 @@ alias proposed below; and `uri:` is honored-but-deprecation-warned (not auto-rew
 `storage.uri`). **Crate-location corrections** (the "Reconciliation"/"Implementation"
 sections below predate V0): the config schema now lives in the extracted `omnigraph-config`
 crate, and `QueryRegistry` was extracted to `omnigraph-queries` (not "kept in
-`omnigraph-server`"). Deferred: layered global-first config + merge/provenance + `config
-view`, the `cli:`→`defaults:` / `server:`→`serve:` renames (V1-remainder), route unification
-+ remote client (V2), and the auth model (V3).
+`omnigraph-server`").
+
+**Implementation status — V1-remainder landed.** Also shipped: the schema reshape
+(`cli:`→`defaults:`, `server:`→`serve:` with a `graphs:` list, removed `project:` and
+top-level `policy:`/`queries:` — legacy spellings honored-but-warned, rejected under
+`version: 1`); and the **global-first layered config** — global `~/.omnigraph/config.yaml`
+merged under the project file with per-field provenance, eager per-layer path resolution,
+`omnigraph config view [--resolved] [--show-origin]`, and `omnigraph use` (active-context
+State layer). The server stays single-layer (deployment manifest). **Divergence:**
+`serve.graphs` ships in its final list shape but rejects >1 entry until route unification.
+Still deferred: route unification + remote client (V2) and the auth model (V3).
 
 ## Summary
 
