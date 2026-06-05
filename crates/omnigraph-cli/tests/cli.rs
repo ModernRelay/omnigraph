@@ -275,6 +275,99 @@ fn cli_resolves_graph_from_global_config_with_no_project_file() {
 }
 
 #[test]
+fn config_view_prints_merged_config_as_yaml() {
+    let temp = tempdir().unwrap();
+    let config = temp.path().join("omnigraph.yaml");
+    write_config(
+        &config,
+        "version: 1\ngraphs:\n  local:\n    storage: ./l.omni\n\
+         defaults:\n  graph: local\n  output_format: kv\n",
+    );
+    let output = output_success(cli().arg("config").arg("view").arg("--config").arg(&config));
+    let stdout = stdout_string(&output);
+    assert!(
+        stdout.contains("defaults:") && stdout.contains("local"),
+        "merged config should serialize defaults + graph: {stdout}"
+    );
+    // The always-empty legacy `project:`/`server:` blocks are suppressed.
+    assert!(
+        !stdout.contains("project:") && !stdout.contains("server:"),
+        "legacy noise blocks must not appear: {stdout}"
+    );
+}
+
+#[test]
+fn config_view_show_origin_labels_each_layer() {
+    let global_dir = tempdir().unwrap();
+    let global_file = global_dir.path().join("config.yaml");
+    write_config(
+        &global_file,
+        "version: 1\nservers:\n  prod:\n    endpoint: https://prod\ndefaults:\n  output_format: kv\n",
+    );
+    let project_dir = tempdir().unwrap();
+    let project = project_dir.path().join("omnigraph.yaml");
+    write_config(
+        &project,
+        "version: 1\ndefaults:\n  graph: local\ngraphs:\n  local:\n    storage: ./l.omni\n",
+    );
+
+    let output = output_success(
+        cli()
+            .env("OMNIGRAPH_CONFIG", &global_file)
+            .arg("config")
+            .arg("view")
+            .arg("--show-origin")
+            .arg("--config")
+            .arg(&project),
+    );
+    let stdout = stdout_string(&output);
+    assert!(stdout.contains("servers.prod (global)"), "{stdout}");
+    assert!(
+        stdout.contains("defaults.output_format (global)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("defaults.graph (project)"), "{stdout}");
+}
+
+#[test]
+fn config_view_resolved_prints_embedded_and_remote_locators() {
+    let temp = tempdir().unwrap();
+    let config = temp.path().join("omnigraph.yaml");
+    write_config(
+        &config,
+        "version: 1\nservers:\n  prod:\n    endpoint: https://prod.example\n\
+         graphs:\n  local:\n    storage: ./l.omni\n  staging:\n    server: prod\n    graph_id: prod\n",
+    );
+
+    let embedded = parse_stdout_json(&output_success(
+        cli()
+            .arg("config")
+            .arg("view")
+            .arg("--resolved")
+            .arg("--json")
+            .arg("--config")
+            .arg(&config)
+            .arg("local"),
+    ));
+    assert_eq!(embedded["kind"], "embedded");
+    assert!(embedded["uri"].as_str().unwrap().ends_with("l.omni"));
+
+    let remote = parse_stdout_json(&output_success(
+        cli()
+            .arg("config")
+            .arg("view")
+            .arg("--resolved")
+            .arg("--json")
+            .arg("--config")
+            .arg(&config)
+            .arg("staging"),
+    ));
+    assert_eq!(remote["kind"], "remote");
+    assert_eq!(remote["endpoint"], "https://prod.example");
+    assert_eq!(remote["graph_id"], "prod");
+}
+
+#[test]
 fn schema_plan_json_reports_supported_additive_change() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());

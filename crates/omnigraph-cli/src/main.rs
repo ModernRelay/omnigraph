@@ -26,8 +26,8 @@ use omnigraph_compiler::{
     json_params_to_param_map, lint_query_file,
 };
 use omnigraph_config::{
-    AliasCommand, GraphLocator, OmnigraphConfig, ReadOutputFormat, graph_resource_id_for_selection,
-    load_layered_config,
+    AliasCommand, GraphLocator, OmnigraphConfig, Provenance, ReadOutputFormat,
+    graph_resource_id_for_selection, load_layered_config,
 };
 use omnigraph_policy::{
     PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest, PolicyTestConfig,
@@ -313,6 +313,11 @@ enum Command {
         #[command(subcommand)]
         command: GraphsCommand,
     },
+    /// Inspect the merged configuration (global + project layers).
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
 }
 
 /// Operations on the graph registry of a multi-graph server (MR-668).
@@ -509,6 +514,27 @@ enum PolicyCommand {
         branch: Option<String>,
         #[arg(long = "target-branch")]
         target_branch: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Print the merged configuration and, optionally, where each value came from.
+    View {
+        /// Project config file (defaults to ./omnigraph.yaml).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Resolve the named graph (or `defaults.graph`) to its typed locator.
+        #[arg(long)]
+        resolved: bool,
+        /// Annotate each value with the layer (global/project) it came from.
+        #[arg(long = "show-origin")]
+        show_origin: bool,
+        /// Emit JSON instead of YAML.
+        #[arg(long)]
+        json: bool,
+        /// Graph to resolve with `--resolved` (defaults to `defaults.graph`).
+        graph: Option<String>,
     },
 }
 
@@ -785,6 +811,147 @@ fn load_cli_config(config_path: Option<&PathBuf>) -> Result<OmnigraphConfig> {
         load_env_file_into_process(&path)?;
     }
     Ok(loaded.config)
+}
+
+/// `config view`: print the merged config, its per-field origin, or a resolved
+/// graph locator. Reads the layered config directly (it needs the provenance the
+/// CLI's normal path drops).
+fn config_view(
+    config_path: Option<&PathBuf>,
+    resolved: bool,
+    show_origin: bool,
+    json: bool,
+    graph: Option<&str>,
+) -> Result<()> {
+    let loaded = load_layered_config(config_path)?;
+    for warning in &loaded.warnings {
+        eprintln!("warning: {warning}");
+    }
+
+    if resolved {
+        let locator = loaded.config.resolve_graph(None, graph)?;
+        return print_resolved_locator(&locator, json);
+    }
+    if show_origin {
+        return print_config_origins(&loaded.provenance, json);
+    }
+    // Prune null/empty values so the dump shows only what is actually set.
+    let mut value = serde_yaml::to_value(&loaded.config)?;
+    prune_empty(&mut value);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        print!("{}", serde_yaml::to_string(&value)?);
+    }
+    Ok(())
+}
+
+/// Recursively drop `null` values and empty maps/sequences from a config dump so
+/// `config view` shows only fields that are actually set.
+fn prune_empty(value: &mut serde_yaml::Value) {
+    match value {
+        serde_yaml::Value::Mapping(map) => {
+            for (_, child) in map.iter_mut() {
+                prune_empty(child);
+            }
+            map.retain(|_, child| !is_empty_value(child));
+        }
+        serde_yaml::Value::Sequence(seq) => {
+            for child in seq.iter_mut() {
+                prune_empty(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_empty_value(value: &serde_yaml::Value) -> bool {
+    match value {
+        serde_yaml::Value::Null => true,
+        serde_yaml::Value::Mapping(map) => map.is_empty(),
+        serde_yaml::Value::Sequence(seq) => seq.is_empty(),
+        _ => false,
+    }
+}
+
+/// Print each honored field's origin layer, sorted (deterministic).
+fn print_config_origins(provenance: &Provenance, json: bool) -> Result<()> {
+    if json {
+        let origins: std::collections::BTreeMap<&str, &str> = provenance
+            .iter()
+            .map(|(field, layer)| (field.as_str(), layer.label()))
+            .collect();
+        print_json(&origins)
+    } else {
+        for (field, layer) in provenance.iter() {
+            println!("{field} ({})", layer.label());
+        }
+        Ok(())
+    }
+}
+
+/// Print a resolved [`GraphLocator`] (embedded vs remote) in human or JSON form.
+fn print_resolved_locator(locator: &GraphLocator, json: bool) -> Result<()> {
+    match locator {
+        GraphLocator::Embedded {
+            uri,
+            branch,
+            snapshot,
+            graph_id,
+            ..
+        } => {
+            if json {
+                print_json(&serde_json::json!({
+                    "kind": "embedded",
+                    "uri": uri,
+                    "graph_id": graph_id,
+                    "branch": branch,
+                    "snapshot": snapshot,
+                }))
+            } else {
+                println!("embedded");
+                println!("  uri:      {uri}");
+                println!("  graph_id: {graph_id}");
+                if let Some(branch) = branch {
+                    println!("  branch:   {branch}");
+                }
+                if let Some(snapshot) = snapshot {
+                    println!("  snapshot: {snapshot}");
+                }
+                Ok(())
+            }
+        }
+        GraphLocator::Remote {
+            endpoint,
+            server,
+            graph_id,
+            branch,
+            snapshot,
+        } => {
+            if json {
+                print_json(&serde_json::json!({
+                    "kind": "remote",
+                    "endpoint": endpoint,
+                    "server": server,
+                    "graph_id": graph_id,
+                    "branch": branch,
+                    "snapshot": snapshot,
+                }))
+            } else {
+                println!("remote");
+                println!("  endpoint: {endpoint}");
+                println!("  server:   {server}");
+                println!("  graph_id: {graph_id}");
+                if let Some(branch) = branch {
+                    println!("  branch:   {branch}");
+                }
+                if let Some(snapshot) = snapshot {
+                    println!("  snapshot: {snapshot}");
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3014,6 +3181,23 @@ async fn main() -> Result<()> {
                 };
                 let decision = engine.authorize(&actor, &request)?;
                 print_policy_explain(&decision, &actor, &request);
+            }
+        },
+        Command::Config { command } => match command {
+            ConfigCommand::View {
+                config,
+                resolved,
+                show_origin,
+                json,
+                graph,
+            } => {
+                config_view(
+                    config.as_ref(),
+                    resolved,
+                    show_origin,
+                    json,
+                    graph.as_deref(),
+                )?;
             }
         },
         Command::Optimize {

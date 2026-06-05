@@ -390,7 +390,9 @@ pub struct OmnigraphConfig {
     /// `load_config_in`, which also rejects unsupported versions.
     #[serde(default)]
     pub version: Option<u32>,
-    #[serde(default)]
+    // Legacy, no consumer and empty after load — parsed for back-compat but never
+    // emitted by `config view` (`skip_serializing`).
+    #[serde(default, skip_serializing)]
     pub project: ProjectConfig,
     /// Named remote servers (endpoints) referenced by remote graph entries
     /// (`graphs.<name>.server`) and `server/graph_id` addressing — RFC-002 §1.
@@ -406,7 +408,8 @@ pub struct OmnigraphConfig {
     pub serve: Serve,
     /// Legacy spelling of `serve:` (no `version:`); rejected under v1, folded
     /// into `serve` at load. Do not read directly — use the `serve_*` accessors.
-    #[serde(default)]
+    /// Empty after load, so never emitted by `config view` (`skip_serializing`).
+    #[serde(default, skip_serializing)]
     pub server: ServerDefaults,
     #[serde(default)]
     pub auth: AuthDefaults,
