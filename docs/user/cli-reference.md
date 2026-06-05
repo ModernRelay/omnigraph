@@ -25,7 +25,7 @@ A reference for the `omnigraph` binary's command surface and `omnigraph.yaml` sc
 | `cleanup --keep N --older-than 7d --confirm` | destructive version GC |
 | `embed` | offline JSONL embedding pipeline |
 | `policy validate \| test \| explain` | Cedar tooling. Selects `defaults.graph`, else `serve.graphs`, else top-level `policy.file` |
-| `config view [--resolved] [--show-origin] [--json] [<graph>]` | print the merged config; `--show-origin` labels each field with its source layer; `--resolved <graph>` prints the typed locator (embedded/remote) |
+| `config view [--resolved] [--show-origin] [--json] [<graph>]` | print the merged config (null/empty pruned); `--show-origin` labels each field with its source layer; `--resolved <graph>` prints the full typed locator (embedded/remote, incl. region/endpoint/policy). `--resolved` and `--show-origin` are mutually exclusive |
 | `use <graph>` | set the active graph (writes `~/.omnigraph/state/active.yaml`); a bare command then targets it |
 | `version` / `-v` | print `omnigraph 0.3.x` |
 
@@ -110,7 +110,8 @@ directory with no project file (the `kubectl`/`gh` posture). Precedence, low →
 
 **Global dir resolution:** `OMNIGRAPH_CONFIG` (explicit file) > `OMNIGRAPH_HOME` (dir) >
 `$XDG_CONFIG_HOME/omnigraph` (if set) > `~/.omnigraph`. The global file is
-`<dir>/config.yaml`.
+`<dir>/config.yaml`. An explicit `OMNIGRAPH_CONFIG` that names a missing file is an
+**error** (a typo fails loudly); a missing default-location file is simply "no global layer".
 
 **Merge semantics:** settings-objects (`defaults`, `serve`) deep-merge per field; the
 named-resource maps (`servers`, `graphs`, `aliases`) union by key, with a higher

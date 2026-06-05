@@ -61,12 +61,13 @@ pub fn merge_layers(layers: Vec<LoadedLayer>) -> (OmnigraphConfig, Provenance) {
             legacy_keys: _,
         } = config;
 
-        if layer_version.is_some() {
-            version = layer_version;
-        }
+        // `version`/`base_dir` follow the highest *loaded-from-file* layer (project
+        // over global), like every other scalar — not "any layer that set it". The
+        // synthetic State layer (not loaded-from-file) contributes neither.
         if layer_loaded {
             loaded_from_file = true;
             base_dir = layer_base_dir;
+            version = layer_version;
         }
 
         // Settings-objects — deep-merge per leaf.
@@ -290,5 +291,16 @@ mod tests {
             keys, sorted,
             "provenance must iterate in deterministic sorted order"
         );
+    }
+
+    #[test]
+    fn merge_version_follows_highest_loaded_layer() {
+        // A legacy (no `version:`) project layered under a `version: 1` global
+        // yields the project's version (None) — highest-precedence wins, like any
+        // scalar, not "any layer that set it".
+        let (g, _g) = config("version: 1\n");
+        let (p, _p) = config("defaults:\n  graph: x\n");
+        let (merged, _) = merge_layers(vec![layer(Layer::Global, g), layer(Layer::Project, p)]);
+        assert_eq!(merged.version, None);
     }
 }
