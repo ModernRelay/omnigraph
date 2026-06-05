@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
-use color_eyre::eyre::{Result, bail, eyre};
+use color_eyre::eyre::{Result, WrapErr, bail, eyre};
 use serde::{Deserialize, Serialize};
 
 mod merge;
@@ -1118,6 +1118,8 @@ fn load_config_in(cwd: &Path, config_path: Option<&PathBuf>) -> Result<Omnigraph
     match resolved {
         // An explicit `--config` path errors if missing (via `load_single_layer`'s
         // read), exactly as before; a cwd-default is only `Some` when it exists.
+        // No file-context wrap here: the single-layer error message is what the
+        // existing callers/tests expect (the layered loader attributes the layer).
         Some(path) => load_single_layer(cwd, &path),
         None => {
             let mut config = OmnigraphConfig::default();
@@ -1132,6 +1134,7 @@ fn load_config_in(cwd: &Path, config_path: Option<&PathBuf>) -> Result<Omnigraph
 /// The outcome of a layered config load: the merged config, its per-field
 /// [`Provenance`], and the per-layer deprecation warnings (each labelled with its
 /// layer) collected before merge.
+#[derive(Debug)]
 pub struct LayeredConfig {
     pub config: OmnigraphConfig,
     pub provenance: Provenance,
@@ -1170,7 +1173,8 @@ pub fn load_layered_config_in(
 
     if let Some(global) = global_file {
         if global.exists() {
-            let config = load_single_layer(cwd, global)?;
+            let config = load_single_layer(cwd, global)
+                .wrap_err_with(|| format!("in global config {}", global.display()))?;
             layers.push(LoadedLayer {
                 layer: Layer::Global,
                 config,
@@ -1193,7 +1197,8 @@ pub fn load_layered_config_in(
         default_path.exists().then_some(default_path)
     });
     if let Some(path) = project_path {
-        let config = load_single_layer(cwd, &path)?;
+        let config = load_single_layer(cwd, &path)
+            .wrap_err_with(|| format!("in project config {}", path.display()))?;
         layers.push(LoadedLayer {
             layer: Layer::Project,
             config,
@@ -1545,6 +1550,40 @@ query:
         assert_eq!(
             without_project.provenance.origin("defaults.graph"),
             Some(Layer::State)
+        );
+    }
+
+    #[test]
+    fn layered_strictness_attributes_the_offending_file() {
+        // A strict (v1) error names which layer's file is at fault — loud,
+        // attributable failure (invariant 13).
+        let global_dir = tempdir().unwrap();
+        let global_file = global_dir.path().join("config.yaml");
+        fs::write(&global_file, "version: 1\nbogus_key: x\n").unwrap();
+        let empty_cwd = tempdir().unwrap();
+        let err = load_layered_config_in(empty_cwd.path(), Some(&global_file), None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("global config") && err.contains("config.yaml"),
+            "error must name the offending global file: {err}"
+        );
+    }
+
+    #[test]
+    fn layered_warnings_are_layer_prefixed() {
+        // Legacy global + clean project: the global's warnings are surfaced and
+        // prefixed with their layer.
+        let global_dir = tempdir().unwrap();
+        let global_file = global_dir.path().join("config.yaml");
+        fs::write(&global_file, "graphs:\n  g:\n    uri: ./g.omni\n").unwrap();
+        let empty_cwd = tempdir().unwrap();
+        let layered =
+            load_layered_config_in(empty_cwd.path(), Some(&global_file), None, None).unwrap();
+        assert!(
+            layered.warnings.iter().any(|w| w.starts_with("global:")),
+            "legacy global warnings must be prefixed: {:?}",
+            layered.warnings
         );
     }
 
