@@ -16,6 +16,40 @@ pub fn graph_resource_id_for_selection(
     selected_graph.unwrap_or(normalized_uri).to_string()
 }
 
+/// A config layer, ordered low→high by precedence — RFC-002 §4. On merge a
+/// higher layer's value wins over a lower one. `Default` is the built-in
+/// baseline; `Global` is `~/.omnigraph/config.yaml`; `State` is the active
+/// context written by `omnigraph use`; `Project` is `./omnigraph.yaml`. The
+/// derived `Ord` follows declaration order, so it *is* the precedence order —
+/// pinned by `layer_ordering_is_low_to_high`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Layer {
+    Default,
+    Global,
+    State,
+    Project,
+}
+
+/// Per-field origin of a merged config — a dotted field path (`defaults.graph`,
+/// `graphs.prod`) to the layer that supplied the winning value. Populated by the
+/// merge engine and consumed by `config view --show-origin`; the rest of the
+/// system reads the merged [`OmnigraphConfig`] directly and never needs this.
+#[derive(Debug, Clone, Default)]
+pub struct Provenance(BTreeMap<String, Layer>);
+
+impl Provenance {
+    /// The layer that set `field` (a dotted path), if any.
+    pub fn origin(&self, field: &str) -> Option<Layer> {
+        self.0.get(field).copied()
+    }
+
+    /// Iterate `(field, layer)` pairs in sorted (deterministic) order.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Layer)> {
+        self.0.iter()
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectConfig {
     pub name: Option<String>,
@@ -922,75 +956,81 @@ pub fn load_config(config_path: Option<&PathBuf>) -> Result<OmnigraphConfig> {
 }
 
 fn load_config_in(cwd: &Path, config_path: Option<&PathBuf>) -> Result<OmnigraphConfig> {
-    let explicit_path = config_path.cloned();
-    let config_path = explicit_path.or_else(|| {
+    let resolved = config_path.cloned().or_else(|| {
         let default_path = cwd.join(DEFAULT_CONFIG_FILE);
         default_path.exists().then_some(default_path)
     });
-    let loaded_from_file = config_path.is_some();
-
-    let mut config = if let Some(path) = &config_path {
-        let text = fs::read_to_string(path)?;
-        let mut unknown: Vec<String> = Vec::new();
-        let de = serde_yaml::Deserializer::from_str(&text);
-        let mut config: OmnigraphConfig =
-            serde_ignored::deserialize(de, |key| unknown.push(key.to_string()))?;
-        // Strictness is a function of the version, decided here — the one place
-        // the loader holds both the parsed version and the set of ignored fields.
-        // Legacy (no `version:`) tolerates unknown keys; `version: 1` rejects them
-        // at any depth (honored-or-rejected, RFC-002 §3). The v1-only typed blocks
-        // (`storage:`/`servers:`) enforce their own `deny_unknown_fields`.
-        match config.version {
-            Some(v) if v != 1 => bail!(
-                "unsupported config version {v}; this build supports version 1 \
-                 (omit `version:` for the legacy schema)"
-            ),
-            Some(1) if !unknown.is_empty() => {
-                unknown.sort();
-                bail!(
-                    "unknown config field(s) under `version: 1`: {} \
-                     (omit `version:` for the legacy lenient schema)",
-                    unknown.join(", ")
-                )
-            }
-            _ => {}
+    match resolved {
+        // An explicit `--config` path errors if missing (via `load_single_layer`'s
+        // read), exactly as before; a cwd-default is only `Some` when it exists.
+        Some(path) => load_single_layer(cwd, &path),
+        None => {
+            let mut config = OmnigraphConfig::default();
+            config.base_dir = cwd.to_path_buf();
+            config.normalize_graphs()?;
+            config.normalize_serve()?;
+            Ok(config)
         }
-        // Known-but-legacy top-level keys (renamed/removed by v1) are invisible
-        // to `serde_ignored` because they stay parseable for the legacy schema,
-        // so scan the raw text for them: reject under v1, record for the legacy
-        // deprecation warnings otherwise.
-        let legacy_keys = legacy_top_level_keys(&text);
-        if config.version == Some(1) && !legacy_keys.is_empty() {
-            let offenders = legacy_keys
-                .iter()
-                .map(|key| {
-                    format!(
-                        "`{key}:` — {}",
-                        legacy_key_migration_hint(key).unwrap_or("")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n  ");
+    }
+}
+
+/// Load and fully process one config layer from `path` — version-gating, the
+/// legacy-key scan, `base_dir`, and `normalize_*`. The result is a self-contained
+/// layer. Errors if `path` is missing/unreadable: callers own the "is this file
+/// present?" policy, so the layered loader can treat an absent global/project
+/// file as "no layer" (by checking existence first) while `load_config_in`
+/// preserves today's error-on-explicit-missing behavior.
+fn load_single_layer(cwd: &Path, path: &Path) -> Result<OmnigraphConfig> {
+    let text = fs::read_to_string(path)?;
+    let mut unknown: Vec<String> = Vec::new();
+    let de = serde_yaml::Deserializer::from_str(&text);
+    let mut config: OmnigraphConfig =
+        serde_ignored::deserialize(de, |key| unknown.push(key.to_string()))?;
+    // Strictness is a function of the version, decided here — the one place the
+    // loader holds both the parsed version and the set of ignored fields. Legacy
+    // (no `version:`) tolerates unknown keys; `version: 1` rejects them at any
+    // depth (honored-or-rejected, RFC-002 §3). The v1-only typed blocks
+    // (`storage:`/`servers:`) enforce their own `deny_unknown_fields`.
+    match config.version {
+        Some(v) if v != 1 => bail!(
+            "unsupported config version {v}; this build supports version 1 \
+             (omit `version:` for the legacy schema)"
+        ),
+        Some(1) if !unknown.is_empty() => {
+            unknown.sort();
             bail!(
-                "invalid key(s) under `version: 1`:\n  {offenders}\n(omit `version:` for the legacy lenient schema)"
-            );
+                "unknown config field(s) under `version: 1`: {} \
+                 (omit `version:` for the legacy lenient schema)",
+                unknown.join(", ")
+            )
         }
-        config.legacy_keys = legacy_keys;
-        config
-    } else {
-        OmnigraphConfig::default()
-    };
-
-    config.base_dir = if let Some(path) = config_path {
-        absolute_base_dir(cwd, &path)?
-    } else {
-        cwd.to_path_buf()
-    };
-    config.loaded_from_file = loaded_from_file;
-
+        _ => {}
+    }
+    // Known-but-legacy top-level keys (renamed/removed by v1) are invisible to
+    // `serde_ignored` because they stay parseable for the legacy schema, so scan
+    // the raw text for them: reject under v1, record for the legacy deprecation
+    // warnings otherwise.
+    let legacy_keys = legacy_top_level_keys(&text);
+    if config.version == Some(1) && !legacy_keys.is_empty() {
+        let offenders = legacy_keys
+            .iter()
+            .map(|key| {
+                format!(
+                    "`{key}:` — {}",
+                    legacy_key_migration_hint(key).unwrap_or("")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        bail!(
+            "invalid key(s) under `version: 1`:\n  {offenders}\n(omit `version:` for the legacy lenient schema)"
+        );
+    }
+    config.legacy_keys = legacy_keys;
+    config.base_dir = absolute_base_dir(cwd, path)?;
+    config.loaded_from_file = true;
     config.normalize_graphs()?;
     config.normalize_serve()?;
-
     Ok(config)
 }
 
@@ -1050,9 +1090,19 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        GraphLocator, ReadOutputFormat, TableCellLayout, graph_resource_id_for_selection,
+        GraphLocator, Layer, ReadOutputFormat, TableCellLayout, graph_resource_id_for_selection,
         load_config_in,
     };
+
+    #[test]
+    fn layer_ordering_is_low_to_high() {
+        // The merge engine relies on `Layer`'s derived `Ord` being the precedence
+        // order (declaration order). Pin it so a reorder can't silently flip merge
+        // precedence (RFC-002 §4).
+        assert!(Layer::Default < Layer::Global);
+        assert!(Layer::Global < Layer::State);
+        assert!(Layer::State < Layer::Project);
+    }
 
     #[test]
     fn load_config_reads_yaml_defaults_from_current_dir() {
