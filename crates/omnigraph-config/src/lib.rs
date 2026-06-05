@@ -1158,6 +1158,19 @@ pub struct LayeredConfig {
 pub fn load_layered_config(project_config_path: Option<&PathBuf>) -> Result<LayeredConfig> {
     let cwd = env::current_dir()?;
     let global = global_config_file();
+    // An explicitly-named global file (via `OMNIGRAPH_CONFIG`) is *required*: a
+    // typo must error loudly, not silently load no global layer. A missing
+    // default-location file (`~/.omnigraph/config.yaml`) stays optional.
+    if env::var_os("OMNIGRAPH_CONFIG").is_some() {
+        if let Some(path) = &global {
+            if !path.exists() {
+                bail!(
+                    "OMNIGRAPH_CONFIG points at a missing file: {}",
+                    path.display()
+                );
+            }
+        }
+    }
     let active = active_context_file();
     load_layered_config_in(
         &cwd,

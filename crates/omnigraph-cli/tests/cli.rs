@@ -418,6 +418,26 @@ fn use_sets_active_graph_targeted_by_bare_commands() {
 }
 
 #[test]
+fn explicit_omnigraph_config_pointing_at_missing_file_errors() {
+    // A typo'd OMNIGRAPH_CONFIG must fail loudly naming the file, not silently
+    // load no global layer.
+    let empty_cwd = tempdir().unwrap();
+    let missing = empty_cwd.path().join("does-not-exist.yaml");
+    let output = output_failure(
+        cli()
+            .current_dir(empty_cwd.path())
+            .env("OMNIGRAPH_CONFIG", &missing)
+            .arg("config")
+            .arg("view"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("OMNIGRAPH_CONFIG") && stderr.contains("does-not-exist.yaml"),
+        "missing OMNIGRAPH_CONFIG must error naming the file: {stderr}"
+    );
+}
+
+#[test]
 fn schema_plan_json_reports_supported_additive_change() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
