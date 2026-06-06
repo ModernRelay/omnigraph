@@ -234,104 +234,53 @@ async fn optimize_publishes_compaction_to_manifest_so_schema_apply_succeeds() {
     assert!(result.applied, "schema apply should report applied=true");
 }
 
-// Regression: `optimize` must reconcile a pre-existing manifest-behind-HEAD
-// drift, not only publish its own compaction. A graph compacted by a pre-fix
-// `optimize` (or left drifted by a recovery `restore` commit) has the Lance HEAD
-// ahead of the manifest pin with nothing left to compact. Running `optimize`
-// must catch the manifest up to HEAD even when the compaction plan is empty, so
-// strict writes / schema apply stop failing with "stale view".
+// Regression: `optimize` must REFUSE when an unresolved recovery sidecar is
+// pending. Operating on an unrecovered graph could publish a partial write that
+// the all-or-nothing recovery sweep would roll back; the operator must reopen
+// (run the recovery sweep) first.
 #[tokio::test]
-async fn optimize_reconciles_preexisting_manifest_head_drift() {
-    use lance::dataset::optimize::{CompactionOptions, compact_files};
-
+async fn optimize_defers_when_recovery_sidecar_is_pending() {
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().to_str().unwrap().trim_end_matches('/').to_string();
-    let mut db = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let db = init_and_load(&dir).await;
 
-    // Multiple Person fragments so a compaction actually moves the Lance HEAD.
-    for (name, age) in [("Eve", 40), ("Frank", 41), ("Grace", 42), ("Heidi", 43)] {
-        mutate_main(
-            &mut db,
-            MUTATION_QUERIES,
-            "insert_person",
-            &mixed_params(&[("$name", name)], &[("$age", age as i64)]),
-        )
-        .await
-        .expect("insert");
-    }
-
-    let full = {
-        let snap = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-        format!("{}/{}", root, snap.entry("node:Person").unwrap().table_path)
-    };
-    let manifest_before = db
-        .snapshot_of(ReadTarget::branch("main"))
-        .await
-        .unwrap()
-        .entry("node:Person")
-        .unwrap()
-        .table_version;
-
-    // Forge drift: compact node:Person via RAW Lance, bypassing optimize's
-    // manifest publish — exactly the state a pre-fix `optimize` left behind.
-    {
-        let mut raw = Dataset::open(&full).await.unwrap();
-        compact_files(&mut raw, CompactionOptions::default(), None)
-            .await
-            .unwrap();
-    }
-    let head_after_forge = Dataset::open(&full).await.unwrap().version().version;
-    assert!(
-        head_after_forge > manifest_before,
-        "raw compaction must create drift: HEAD {head_after_forge} > manifest {manifest_before}",
+    // Simulate an in-process failed write that left a recovery sidecar on disk.
+    let recovery_dir = dir.path().join("__recovery");
+    std::fs::create_dir_all(&recovery_dir).unwrap();
+    let person_path = node_table_uri(uri, "Person");
+    let sidecar_json = format!(
+        r#"{{
+            "schema_version": 1,
+            "operation_id": "01H000000000000000000DEFR",
+            "started_at": "0",
+            "branch": null,
+            "actor_id": "act-test",
+            "writer_kind": "Mutation",
+            "tables": [
+                {{
+                    "table_key": "node:Person",
+                    "table_path": "{}",
+                    "expected_version": 1,
+                    "post_commit_pin": 2
+                }}
+            ]
+        }}"#,
+        person_path
     );
-    assert_eq!(
-        db.snapshot_of(ReadTarget::branch("main"))
-            .await
-            .unwrap()
-            .entry("node:Person")
-            .unwrap()
-            .table_version,
-        manifest_before,
-        "raw compaction must not advance the manifest pin",
-    );
-
-    // optimize must reconcile the drift even though there is nothing to compact.
-    let stats = db.optimize().await.unwrap();
-    let person = stats
-        .iter()
-        .find(|s| s.table_key == "node:Person")
-        .expect("Person stat present");
-    assert!(
-        person.committed,
-        "optimize must publish a manifest catch-up for the drifted table",
-    );
-    assert_eq!(
-        person.fragments_added, 0,
-        "drift reconcile is metadata-only — no new compaction",
-    );
-
-    // Manifest now tracks the Lance HEAD.
-    let snap = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
-    let entry = snap.entry("node:Person").unwrap();
-    let lance_head = Dataset::open(&full).await.unwrap().version().version;
-    assert_eq!(
-        entry.table_version, lance_head,
-        "after optimize, manifest table_version ({}) must equal Lance HEAD ({})",
-        entry.table_version, lance_head,
-    );
-
-    // The reconciled table accepts a strict update (it failed with "stale view"
-    // while drifted).
-    let upd = mutate_main(
-        &mut db,
-        MUTATION_QUERIES,
-        "set_age",
-        &mixed_params(&[("$name", "Alice")], &[("$age", 50)]),
+    std::fs::write(
+        recovery_dir.join("01H000000000000000000DEFR.json"),
+        sidecar_json,
     )
-    .await
-    .expect("strict update after drift reconcile must commit");
-    assert_eq!(upd.affected_nodes, 1);
+    .unwrap();
+
+    let err = db
+        .optimize()
+        .await
+        .expect_err("optimize must defer (error) while a recovery sidecar is pending");
+    assert!(
+        err.to_string().to_lowercase().contains("recovery"),
+        "optimize defer error should mention recovery; got: {err}",
+    );
 }
 
 #[tokio::test]
