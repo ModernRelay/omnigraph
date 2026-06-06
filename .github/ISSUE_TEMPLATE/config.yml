@@ -1,0 +1,13 @@
+# Issues are for problem reports only. Disable blank issues so everything is
+# routed: bugs through the form, everything else to Discussions / SECURITY.md.
+blank_issues_enabled: false
+contact_links:
+  - name: 💡 Idea, feature request, or RFC
+    url: https://github.com/ModernRelay/omnigraph/discussions
+    about: Propose features and designs in Discussions. RFCs graduate from there into a docs/rfcs/ pull request.
+  - name: ❓ Question or help
+    url: https://github.com/ModernRelay/omnigraph/discussions
+    about: Ask in Discussions — questions are not tracked as Issues.
+  - name: 🔒 Security vulnerability
+    url: https://github.com/ModernRelay/omnigraph/blob/main/SECURITY.md
+    about: Report security issues privately per SECURITY.md — never as a public Issue.
