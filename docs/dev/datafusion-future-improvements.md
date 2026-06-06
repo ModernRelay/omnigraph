@@ -14,6 +14,10 @@ a DF-related change or a DF upstream release changes the picture.
 **Current pin:** DataFusion 53.1.0 (workspace dep `datafusion = "53"`,
 default-features = false, features = `["nested_expressions"]`). Pulled
 in transitively by Lance 6.0.1; our direct touchpoints are narrow.
+Lance 7.0.0 (stable, 2026-05-28) is now available upstream and **still**
+pins `datafusion = "^53"` / `arrow = "^58"` — so the pending 6.0.1 → 7.0.0
+bump is *not* a DataFusion bump and leaves everything under "Passive wins"
+below unchanged. See **Upstream cadence**.
 
 ## Direct touchpoints in our code
 
@@ -63,13 +67,13 @@ Ranked by leverage. Update when one ships.
 
 | Item | Effort | Notes |
 |---|---|---|
-| **`hydrate_nodes` (Expand-time pushdown) → `Expr`** | Medium (~2 days) | The Expand pipeline at `exec/query.rs:771-796` still serializes through `hydrate_nodes`'s `extra_filter_sql: Option<&str>` parameter. Migrating it pushes structured pushdown into `TableStorage::scan_stream(filter: Option<&str>)` → `Option<Expr>`, which cascades through 6+ call sites (`scan_stream_with`, `count_rows`, `count_rows_with_staged`). Largest remaining tech-debt slice on the structured-Expr refactor. |
+| **`hydrate_nodes` (Expand-time pushdown) → `Expr`** | Medium (~2 days) | The Expand pipeline (`exec/query.rs::hydrate_nodes`) still serializes through its `extra_filter_sql: Option<&str>` parameter. Migrating it pushes structured pushdown into `TableStorage::scan_stream(filter: Option<&str>)` → `Option<Expr>`, which cascades through 6+ call sites (`scan_stream_with`, `count_rows`, `count_rows_with_staged`). Largest remaining tech-debt slice on the structured-Expr refactor. |
 
-### Tier 2 — gated on Lance v7
+### Tier 2 — upstream-unblocked; gated on our Lance 6→7 bump
 
 | Item | Trigger | Notes |
 |---|---|---|
-| **Mutation delete predicate → `Expr`** via `DeleteBuilder::execute_uncommitted` (Lance [#6658](https://github.com/lance-format/lance/issues/6658)) | Lance v7.x bump | Issue closed 2026-05-14, but the public API first ships in `v7.0.0-beta.10`, not v6.x. Couples with **MR-A** (delete two-phase migration — tracked at [issue #112](https://github.com/ModernRelay/omnigraph/issues/112)). The DF Expr move at this site is half the work; the rest is retiring the parse-time D₂ rule and extending recovery sidecar coverage. |
+| **Mutation delete predicate → `Expr`** via `DeleteBuilder::execute_uncommitted` (Lance [#6658](https://github.com/lance-format/lance/issues/6658)) | Our 6.0.1 → 7.0.0 bump | **Upstream gate now satisfied:** the API shipped in `v7.0.0-beta.10` and is in Lance **7.0.0 stable** (2026-05-28). The only remaining gate is the repo's own Lance bump (still pinned 6.0.1). Couples with **MR-A** (delete two-phase migration — tracked at [issue #112](https://github.com/ModernRelay/omnigraph/issues/112)). The DF Expr move at this site is half the work; the rest is retiring the parse-time D₂ rule and extending recovery sidecar coverage. |
 | **`DeleteBuilder::from_expr(...)`** (Lance #6343, v5.0) | Same | The structured Expr variant of the inline delete path. Useful only while the inline `delete_where` residual still exists; supplanted by the staged form above once MR-A lands. |
 
 ### Tier 3 — future-shape (require owning more of the planner)
@@ -96,13 +100,19 @@ Ranked by leverage. Update when one ships.
 ## Upstream cadence
 
 We don't choose our DataFusion version directly — Lance does. Lance 6.0.1
-pins DF 53. Lance 7.0.0-rc.1 (2026-05-21) is on DF 53. Lance 7.x or 8.x
-may pick up DF 54 / 55; when that happens, refresh this doc with a new
-"Passive wins" row and a fresh upgrade audit.
+pins DF `^53`. Lance **7.0.0** (stable, 2026-05-28) **also** pins
+`datafusion = "^53"` / `arrow = "^58"` — confirmed against the published
+7.0.0 dependency manifest. So the 6.0.1 → 7.0.0 bump carries DataFusion
+forward unchanged: nothing under "Passive wins" moves, and the only
+DF-doc delta from that bump is the Tier 2 delete-`Expr` item un-gating
+(above). A DF 54 / 55 jump will arrive with a **later** Lance (8.x or
+beyond); when it does, refresh this doc with a new "Passive wins" row and
+a fresh upgrade audit.
 
-DataFusion 54.0.0 has shipped (per the upstream upgrade-guide index).
-Anything in 54 that would actively bite us when Lance picks it up is
-worth surfacing here as a heads-up; right now there's no urgency.
+DataFusion 54.0.0 has shipped upstream (per the upgrade-guide index) but
+is **not** in our stack — Lance has not picked it up as of 7.0.0. Treat
+anything in 54 as a heads-up only, and verify Lance's DF pin before
+acting; right now there's no urgency.
 
 ## Maintenance
 
