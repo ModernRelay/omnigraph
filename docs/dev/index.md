@@ -51,6 +51,18 @@ constraints. User-facing behavior should still be documented through
 | Install and deployment packaging | [install.md](../user/install.md), [deployment.md](../user/deployment.md) |
 | Release history | [releases/](../releases/) |
 
+## Contribution & Governance
+
+| Area | Read |
+|---|---|
+| How to contribute (external) | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
+| Governance model, roles, decision authority | [GOVERNANCE.md](../../GOVERNANCE.md) |
+| Public contribution RFC track | [rfcs/](../rfcs/) |
+
+The `docs/rfcs/` track is the **public, externally-authorable** RFC process. The
+maintainer/internal RFCs below (`rfc-00N-*.md`) are a separate, team-owned
+track; don't conflate the two.
+
 ## Active Implementation Plans
 
 Working documents for in-flight feature work. Removed when the work lands.
