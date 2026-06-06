@@ -4,24 +4,45 @@
 
 This setup gives every role change a reviewable PR and a permanent in-repository audit trail (`git log .github/codeowners-roles.yml`).
 
-## Current roles
+## Who owns what
 
-| Role | Members | Scope |
+The tables below are **generated** from `.github/codeowners-roles.yml` by `.github/scripts/render-codeowners.py` (the same render that produces `.github/CODEOWNERS`). They are the always-current "who owns what at this commit" view — don't edit them by hand; edit the yml and re-render.
+
+<!-- BEGIN GENERATED OWNERSHIP — edit codeowners-roles.yml + run render-codeowners.py -->
+
+**Path → owners** (GitHub applies *last match wins*; the `*` catch-all is listed first and is overridden by the specific patterns below it):
+
+| Path | Owners | Role(s) |
 |---|---|---|
-| `engineering` | `@ragnorc` | All code under `crates/**`, repository infrastructure, default for unmapped paths |
-| `docs` | `@ragnorc` | `docs/**`, README.md, AGENTS.md, CLAUDE.md, SECURITY.md |
+| `*` | @ragnorc | engineering |
+| `crates/**` | @ragnorc | engineering |
+| `docs/**` | @ragnorc | docs |
+| `README.md` | @ragnorc | docs |
+| `AGENTS.md` | @ragnorc | docs |
+| `CLAUDE.md` | @ragnorc | docs |
+| `SECURITY.md` | @ragnorc | docs |
 
-GitHub treats multiple owners in a CODEOWNERS line as **"any one of them satisfies the review requirement"**. To require N distinct approvers on a specific path, layer a CI check on top (not currently configured).
+**Roles**:
+
+| Role | Members | Description |
+|---|---|---|
+| `engineering` | @ragnorc | All production code under crates/**. Engine, CLI, server, compiler. |
+| `docs` | @ragnorc | Documentation under docs/**, plus repo-level docs (README.md, AGENTS.md, CLAUDE.md symlink, SECURITY.md). |
+
+<!-- END GENERATED OWNERSHIP -->
+
+GitHub treats multiple owners on a CODEOWNERS line as **"any one of them satisfies the review requirement"**. To require N distinct approvers on a specific path, layer a CI check on top (not currently configured).
 
 ## How to change role membership or path mappings
 
 1. Edit `.github/codeowners-roles.yml`.
-2. Run `python3 .github/scripts/render-codeowners.py` (requires PyYAML; `pip install pyyaml`).
-3. Commit both files in the same PR.
+2. Open a PR. **CI re-renders for you**: the `CODEOWNERS` workflow regenerates `.github/CODEOWNERS` and the ownership tables above and auto-commits them back to your PR branch on same-repository PRs — you don't have to run the script locally (though you can: `python3 .github/scripts/render-codeowners.py`, requires PyYAML).
+
+On a fork (where CI can't push back), the workflow instead fails with the diff so you can run the script and commit it yourself.
 
 CI fails the PR if:
-- `CODEOWNERS` was edited without a corresponding yml change, or
-- The yml was changed but the rendered `CODEOWNERS` doesn't match.
+- a fork PR left a generated artifact out of sync, or
+- `CODEOWNERS` was edited without a corresponding yml change (the `CODEOWNERS not hand-edited` check).
 
 ## How to add a new role
 
