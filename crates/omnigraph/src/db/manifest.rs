@@ -36,7 +36,7 @@ use publisher::{GraphNamespacePublisher, ManifestBatchPublisher};
 pub(crate) use recovery::{
     RecoveryMode, RecoverySidecar, RecoverySidecarHandle, SidecarKind, SidecarTablePin,
     SidecarTableRegistration, SidecarTombstone, delete_sidecar, has_schema_apply_sidecar,
-    new_sidecar, recover_manifest_drift, write_sidecar,
+    list_sidecars, new_sidecar, recover_manifest_drift, write_sidecar,
 };
 pub use state::SubTableEntry;
 #[cfg(test)]

@@ -502,9 +502,12 @@ pub(crate) fn decide(classifications: &[TableClassification]) -> SidecarDecision
 /// Skipping the restore in those cases would leave Lance HEAD ahead of
 /// the manifest with no recovery artifact left.
 ///
-/// Cost: under repeated mid-rollback crashes (rare), Lance HEAD
-/// accumulates extra restore commits that `omnigraph cleanup` reclaims.
-/// Bounded by the number of recovery iterations — typically 1.
+/// Cost: a successful roll-back appends one restore commit and then publishes
+/// the manifest to match (`roll_back_sidecar`), so the table converges
+/// (`manifest == HEAD`) in one pass. Only repeated crashes *between* the restore
+/// and that publish (rare) accumulate extra restore commits; each re-classified
+/// roll-back restores again and `omnigraph cleanup` reclaims the surplus.
+/// Bounded by the number of interrupted recovery iterations — typically 0.
 pub(crate) async fn restore_table_to_version(
     table_path: &str,
     branch: Option<&str>,
@@ -809,13 +812,24 @@ async fn roll_back_sidecar(
     sidecar: &RecoverySidecar,
     states: &[ClassifiedTable],
 ) -> Result<()> {
-    // Restore every table whose Lance HEAD has drifted from the
-    // manifest pin (RolledPastExpected, UnexpectedAtP1,
-    // UnexpectedMultistep). NoMovement tables are already at the
-    // manifest pin — no action. Restore is unconditional; repeated
-    // mid-rollback crashes accumulate a few extra Lance commits that
-    // `omnigraph cleanup` reclaims.
+    // Restore every drifted table (RolledPastExpected / UnexpectedAtP1 /
+    // UnexpectedMultistep) to its manifest-pinned content, then PUBLISH so
+    // `manifest == Lance HEAD` for each — symmetric with roll-forward. The
+    // restore commit's content equals the manifest-pinned version, so re-pinning
+    // the manifest to the new (restored) HEAD is content-correct and closes the
+    // orphaned-drift class (`HEAD > manifest` with no covering sidecar). This is
+    // what makes a failed-then-retried schema_apply converge: after one
+    // roll-back `manifest == HEAD`, so the retry's precondition passes instead of
+    // failing one version higher each iteration.
+    //
+    // NoMovement tables are already at the pin — excluded from both the restore
+    // and the publish. The audit `to_version` stays the *logical* rolled-back-to
+    // version (`manifest_pinned`), while the manifest is published at
+    // `manifest_pinned + 1` (the restore commit, same content) — keep that
+    // asymmetry so the audit records the drift (`from_version > to_version`).
     let mut outcomes = Vec::with_capacity(sidecar.tables.len());
+    let mut updates: Vec<ManifestChange> = Vec::with_capacity(sidecar.tables.len());
+    let mut expected: HashMap<String, u64> = HashMap::with_capacity(sidecar.tables.len());
     for (pin, state) in sidecar.tables.iter().zip(states.iter()) {
         if matches!(
             state.classification,
@@ -829,10 +843,20 @@ async fn roll_back_sidecar(
                 state.manifest_pinned,
             )
             .await?;
-            // `from_version` records the Lance HEAD observed BEFORE the
-            // restore (the actual drift), not the manifest pin. Operators
-            // reading `_graph_commit_recoveries.lance` see "rolled back
-            // from v7 to v5" rather than "v5 → v5".
+            // Publish the post-restore HEAD, CAS against the current (unmoved)
+            // manifest pin — the same helper roll-forward uses.
+            push_table_update_at_head(
+                root_uri,
+                &pin.table_key,
+                &pin.table_path,
+                pin.table_branch.as_deref(),
+                state.manifest_pinned,
+                &mut updates,
+                &mut expected,
+            )
+            .await?;
+            // `from_version` records the Lance HEAD observed BEFORE the restore
+            // (the actual drift); `to_version` the logical pin we rolled back to.
             outcomes.push(TableOutcome {
                 table_key: pin.table_key.clone(),
                 from_version: state.lance_head,
@@ -840,13 +864,23 @@ async fn roll_back_sidecar(
             });
         }
     }
-    // Manifest pin doesn't move on rollback; record an audit-only
-    // commit at the existing version so operators can correlate via
-    // `omnigraph commit list --filter actor=omnigraph:recovery`.
+    // Publish the restored HEADs so manifest == HEAD. A degenerate all-NoMovement
+    // roll-back restores nothing — there's nothing to publish, and the audit
+    // records the unchanged snapshot version.
+    let manifest_version = if updates.is_empty() {
+        snapshot.version()
+    } else {
+        let publisher = GraphNamespacePublisher::new(root_uri, sidecar.branch.as_deref());
+        publisher
+            .publish(&updates, &expected)
+            .await?
+            .version()
+            .version
+    };
     record_audit(
         root_uri,
         sidecar,
-        snapshot.version(),
+        manifest_version,
         RecoveryKind::RolledBack,
         outcomes,
     )
@@ -927,44 +961,20 @@ async fn roll_forward_all(
         HashMap::with_capacity(sidecar.tables.len() + sidecar.additional_registrations.len());
 
     for pin in &sidecar.tables {
-        // Open the dataset at its CURRENT Lance HEAD on the pin's branch
-        // (not at the sidecar's post_commit_pin). For strict-match writers
-        // (Mutation/Load) HEAD == post_commit_pin by construction. For
-        // loose-match writers (SchemaApply/EnsureIndices/BranchMerge) HEAD
-        // may be higher than post_commit_pin (multiple commit_staged
-        // calls per table); we want to publish to the actual current HEAD.
-        let head_ds = Dataset::open(&pin.table_path)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        let head_ds = match pin.table_branch.as_deref() {
-            Some(b) if b != "main" => head_ds
-                .checkout_branch(b)
-                .await
-                .map_err(|e| OmniError::Lance(e.to_string()))?,
-            _ => head_ds,
-        };
-        let head_version = head_ds.version().version;
-
-        let row_count = head_ds
-            .count_rows(None)
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
-
-        let table_relative_path = super::table_path_for_table_key(&pin.table_key)?;
-        let version_metadata = super::metadata::TableVersionMetadata::from_dataset(
+        // Publish to the table's CURRENT Lance HEAD on the pin's branch (not the
+        // sidecar's `post_commit_pin`, a lower bound for loose-match writers that
+        // run multiple commit_staged calls per table). CAS against the pin's
+        // pre-write `expected_version`.
+        let head_version = push_table_update_at_head(
             root_uri,
-            &table_relative_path,
-            &head_ds,
-        )?;
-
-        updates.push(ManifestChange::Update(SubTableUpdate {
-            table_key: pin.table_key.clone(),
-            table_version: head_version,
-            table_branch: pin.table_branch.clone(),
-            row_count,
-            version_metadata,
-        }));
-        expected.insert(pin.table_key.clone(), pin.expected_version);
+            &pin.table_key,
+            &pin.table_path,
+            pin.table_branch.as_deref(),
+            pin.expected_version,
+            &mut updates,
+            &mut expected,
+        )
+        .await?;
         published_versions.insert(pin.table_key.clone(), head_version);
     }
 
@@ -1053,6 +1063,57 @@ async fn roll_forward_all(
     let publisher = GraphNamespacePublisher::new(root_uri, sidecar.branch.as_deref());
     let new_dataset = publisher.publish(&updates, &expected).await?;
     Ok((new_dataset.version().version, published_versions))
+}
+
+/// Open `table_path` at its branch HEAD, read the current Lance HEAD version,
+/// row count, and version metadata, and push a `ManifestChange::Update` (plus
+/// its CAS `expected` entry) that re-pins the manifest to that HEAD. Returns the
+/// published HEAD version.
+///
+/// Shared by `roll_forward_all` (where `expected_version` is the sidecar's
+/// pre-write pin) and `roll_back_sidecar` (where it is the manifest-pinned
+/// version the table was just restored to). The HEAD is read AFTER any restore
+/// in the same single-threaded sweep, so no concurrent writer can have advanced
+/// it.
+async fn push_table_update_at_head(
+    root_uri: &str,
+    table_key: &str,
+    table_path: &str,
+    branch: Option<&str>,
+    expected_version: u64,
+    updates: &mut Vec<ManifestChange>,
+    expected: &mut HashMap<String, u64>,
+) -> Result<u64> {
+    let head_ds = Dataset::open(table_path)
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    let head_ds = match branch {
+        Some(b) if b != "main" => head_ds
+            .checkout_branch(b)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?,
+        _ => head_ds,
+    };
+    let head_version = head_ds.version().version;
+    let row_count = head_ds
+        .count_rows(None)
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))? as u64;
+    let table_relative_path = super::table_path_for_table_key(table_key)?;
+    let version_metadata = super::metadata::TableVersionMetadata::from_dataset(
+        root_uri,
+        &table_relative_path,
+        &head_ds,
+    )?;
+    updates.push(ManifestChange::Update(SubTableUpdate {
+        table_key: table_key.to_string(),
+        table_version: head_version,
+        table_branch: branch.map(str::to_string),
+        row_count,
+        version_metadata,
+    }));
+    expected.insert(table_key.to_string(), expected_version);
+    Ok(head_version)
 }
 
 /// Append the audit row describing this recovery action.

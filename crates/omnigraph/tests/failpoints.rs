@@ -1245,7 +1245,7 @@ async fn refresh_defers_rollback_eligible_sidecar_to_next_open() {
     // the rollback (will use Dataset::restore safely; no concurrent
     // writers at open time).
     drop(db);
-    let _db = Omnigraph::open(&uri).await.unwrap();
+    let db = Omnigraph::open(&uri).await.unwrap();
     // After full-sweep recovery, the sidecar should be processed
     // (deleted). Sidecar's tables are eligible for rollback (UnexpectedAtP1):
     // restore happens on Person (HEAD advances by 1).
@@ -1267,6 +1267,19 @@ async fn refresh_defers_rollback_eligible_sidecar_to_next_open() {
         final_head > post_head,
         "full sweep must run Dataset::restore (head advances); \
          post_head={post_head}, final_head={final_head}",
+    );
+    // Convergence: roll-back published the restored HEAD, so the manifest pin
+    // tracks Lance HEAD afterward (no residual drift).
+    let entry_version = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entry("node:Person")
+        .unwrap()
+        .table_version;
+    assert_eq!(
+        entry_version, final_head,
+        "full-sweep roll-back must publish so manifest pin ({entry_version}) == Lance HEAD ({final_head})",
     );
 }
 

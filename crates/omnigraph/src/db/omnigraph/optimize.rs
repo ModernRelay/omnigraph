@@ -119,10 +119,8 @@ pub struct TableOptimizeStats {
     pub fragments_removed: usize,
     /// Number of new, larger fragments Lance produced.
     pub fragments_added: usize,
-    /// Did this table get a new manifest version? True when compaction ran and
-    /// its compacted version was published, OR when optimize reconciled a
-    /// pre-existing manifest-behind-HEAD drift (a metadata-only catch-up, with
-    /// `fragments_added == fragments_removed == 0`).
+    /// Did this table get a new manifest version from the compaction? True when
+    /// compaction ran and its compacted version was published to `__manifest`.
     pub committed: bool,
     /// `Some(reason)` if this table was deliberately not compacted. When set,
     /// `fragments_removed == 0`, `fragments_added == 0`, and `!committed`.
@@ -171,6 +169,21 @@ pub struct TableCleanupStats {
 pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStats>> {
     db.ensure_schema_state_valid().await?;
     db.ensure_schema_apply_idle("optimize").await?;
+
+    // Refuse on an unrecovered graph. A pending recovery sidecar means a failed
+    // write left partial state that the open-time sweep must resolve (roll
+    // forward/back) first; compacting + publishing a table covered by such a
+    // sidecar could commit a partial write the sweep would roll back. Reopen the
+    // graph to run recovery, then re-run optimize.
+    if !crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter())
+        .await?
+        .is_empty()
+    {
+        return Err(OmniError::manifest_conflict(
+            "optimize requires a clean recovery state; reopen the graph to run the \
+             recovery sweep before optimizing",
+        ));
+    }
 
     let resolved = db.resolved_branch_target(None).await?;
     let snapshot = resolved.snapshot;
@@ -283,51 +296,20 @@ async fn optimize_one_table(
         .entry(&table_key)
         .map(|e| e.table_version)
         .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
-    let head_version = ds.version().version;
 
     // Precise "will it compact?" check — `plan_compaction` also accounts for
     // deletion materialization (which can rewrite even a single fragment). A
     // steady-state already-compacted table yields an empty plan and is never
     // pinned in a sidecar (a zero-commit pin would classify NoMovement on
-    // recovery and force an all-or-nothing rollback).
+    // recovery and force an all-or-nothing rollback). There is no drift to
+    // reconcile here: optimize runs only on a recovered graph (the pending-
+    // sidecar guard above), and recovery roll-back now publishes, so
+    // `HEAD == manifest` holds going in.
     let options = CompactionOptions::default();
     let plan = plan_compaction(&ds, &options)
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
     if plan.num_tasks() == 0 {
-        // Nothing to compact. But if the Lance HEAD is already ahead of the
-        // manifest pin, this table is in a pre-existing drift state: a pre-fix
-        // `optimize` (or a recovery `restore` commit) advanced the dataset HEAD
-        // without publishing. Reconcile the manifest forward to HEAD so reads
-        // observe the current version and strict writes / schema apply pass their
-        // HEAD-vs-manifest precondition. Such drift is content-preserving
-        // (compaction / restore), so this is a metadata-only catch-up: no Lance
-        // HEAD advances here, hence no sidecar / Phase-B gap — the CAS-guarded
-        // `__manifest` commit is atomic (fails clean → retried next run).
-        if head_version > expected_version {
-            let state = db.table_store.table_state(&full_path, &ds).await?;
-            let update = crate::db::SubTableUpdate {
-                table_key: table_key.clone(),
-                table_version: state.version,
-                table_branch: None,
-                row_count: state.row_count,
-                version_metadata: state.version_metadata,
-            };
-            let mut expected = std::collections::HashMap::new();
-            expected.insert(table_key.clone(), expected_version);
-            db.coordinator
-                .write()
-                .await
-                .commit_updates_with_actor_with_expected(&[update], &expected, None)
-                .await?;
-            // Manifest advanced (caught up to HEAD); report committed=true so the
-            // caller invalidates caches. fragments_* stay 0 — no compaction ran.
-            return Ok(TableOptimizeStats::compacted(
-                table_key,
-                &CompactionMetrics::default(),
-                true,
-            ));
-        }
         return Ok(TableOptimizeStats::compacted(
             table_key,
             &CompactionMetrics::default(),
