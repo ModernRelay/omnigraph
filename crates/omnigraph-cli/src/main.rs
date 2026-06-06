@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
@@ -8,6 +9,7 @@ use clap::{Arg, ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcomm
 use color_eyre::eyre::{Result, bail};
 use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
+use omnigraph::storage::normalize_root_uri;
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::{
@@ -17,14 +19,16 @@ use omnigraph_compiler::{
 };
 use omnigraph_server::api::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
-    BranchMergeOutput, BranchMergeRequest, ChangeOutput, ChangeRequest, CommitListOutput,
-    CommitOutput, ErrorOutput, ExportRequest, IngestOutput, IngestRequest, ReadOutput, ReadRequest,
-    SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput, SnapshotTableOutput,
-    commit_output, ingest_output, read_output, schema_apply_output, snapshot_payload,
+    BranchMergeOutput, BranchMergeRequest, ChangeOutput, CommitListOutput, CommitOutput,
+    ErrorOutput, ExportRequest, GraphListResponse, IngestOutput, IngestRequest, ReadOutput,
+    ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput,
+    SnapshotTableOutput, commit_output, ingest_output, read_output, schema_apply_output,
+    snapshot_payload,
 };
+use omnigraph_server::queries::{QueryRegistry, check, format_check_breakages};
 use omnigraph_server::{
     AliasCommand, OmnigraphConfig, PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest,
-    PolicyTestConfig, ReadOutputFormat, load_config,
+    PolicyTestConfig, ReadOutputFormat, graph_resource_id_for_selection, load_config,
 };
 use reqwest::Method;
 use reqwest::header::AUTHORIZATION;
@@ -66,16 +70,23 @@ enum Command {
     Version,
     /// Generate, clean, or refresh explicit seed embeddings
     Embed(EmbedArgs),
-    /// Initialize a new repo from a schema
+    /// Initialize a new graph from a schema
     Init {
         #[arg(long)]
         schema: PathBuf,
-        /// Repo URI (local path or s3://)
+        /// Graph URI (local path or s3://)
         uri: String,
+        /// Overwrite existing schema artifacts at the URI. Without
+        /// this flag, init refuses to touch a URI that already holds
+        /// `_schema.pg`, `_schema.ir.json`, or `__schema_state.json`
+        /// — closes the re-init footgun (MR-668 follow-up). With the
+        /// flag, the operator opts in to destructive semantics.
+        #[arg(long)]
+        force: bool,
     },
-    /// Load data into a repo
+    /// Load data into a graph
     Load {
-        /// Repo URI
+        /// Graph URI
         uri: Option<String>,
         #[arg(long)]
         target: Option<String>,
@@ -92,7 +103,7 @@ enum Command {
     },
     /// Ingest data into a reviewable named branch
     Ingest {
-        /// Repo URI
+        /// Graph URI
         uri: Option<String>,
         #[arg(long)]
         target: Option<String>,
@@ -119,14 +130,39 @@ enum Command {
         #[command(subcommand)]
         command: SchemaCommand,
     },
-    /// Query validation and linting
-    Query {
-        #[command(subcommand)]
-        command: QueryCommand,
+    /// Validate queries against a schema (offline) or repo (repo-backed).
+    ///
+    /// Canonical name is `lint` (matches the `omnigraph_compiler::lint`
+    /// module and the `OG-XXX-NNN` lint-code vocabulary). Replaces the
+    /// deprecated `omnigraph query lint` / `omnigraph query check` /
+    /// `omnigraph check` invocations — each is kept as an argv-level
+    /// shim that prints a one-line stderr warning and rewrites to
+    /// `omnigraph lint`. Aliases are deliberately *not* exposed via
+    /// clap's `visible_alias` because that would advertise two
+    /// equivalent canonical names, which agents emit interchangeably
+    /// (see MR-981).
+    Lint {
+        /// Graph URI
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        query: PathBuf,
+        #[arg(long)]
+        schema: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
     },
-    /// Show repo snapshot
+    /// Operate on the server-side stored-query registry (`queries:`).
+    Queries {
+        #[command(subcommand)]
+        command: QueriesCommand,
+    },
+    /// Show graph snapshot
     Snapshot {
-        /// Repo URI
+        /// Graph URI
         uri: Option<String>,
         #[arg(long)]
         target: Option<String>,
@@ -139,7 +175,7 @@ enum Command {
     },
     /// Export a full graph snapshot as JSONL
     Export {
-        /// Repo URI
+        /// Graph URI
         uri: Option<String>,
         #[arg(long)]
         target: Option<String>,
@@ -159,9 +195,14 @@ enum Command {
         #[command(subcommand)]
         command: CommitCommand,
     },
-    /// Execute a read query against a branch or snapshot
-    Read {
-        /// Repo URI
+    /// Execute a read query against a branch or snapshot.
+    ///
+    /// Canonical read endpoint. The previous name `omnigraph read` is
+    /// kept as a visible alias and prints a one-line deprecation warning
+    /// when used. Pairs with `omnigraph mutate` on the write side.
+    #[command(visible_alias = "read")]
+    Query {
+        /// Graph URI
         #[arg(long)]
         uri: Option<String>,
         #[arg(hide = true)]
@@ -170,10 +211,13 @@ enum Command {
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["query", "query_string"])]
         alias: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["alias", "query_string"])]
         query: Option<PathBuf>,
+        /// Inline GQ source — alternative to `--query <path>` and `--alias <name>`.
+        #[arg(short = 'e', long = "query-string", value_name = "GQ", conflicts_with_all = ["query", "alias"])]
+        query_string: Option<String>,
         #[arg(long)]
         name: Option<String>,
         #[command(flatten)]
@@ -189,9 +233,14 @@ enum Command {
         #[arg()]
         alias_args: Vec<String>,
     },
-    /// Execute a graph change query against a branch
-    Change {
-        /// Repo URI
+    /// Execute a graph mutation query against a branch.
+    ///
+    /// Canonical mutation endpoint. The previous name `omnigraph change`
+    /// is kept as a visible alias and prints a one-line deprecation
+    /// warning when used. Pairs with `omnigraph query` on the read side.
+    #[command(visible_alias = "change")]
+    Mutate {
+        /// Graph URI
         #[arg(long)]
         uri: Option<String>,
         #[arg(hide = true)]
@@ -200,10 +249,13 @@ enum Command {
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["query", "query_string"])]
         alias: Option<String>,
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["alias", "query_string"])]
         query: Option<PathBuf>,
+        /// Inline GQ source — alternative to `--query <path>` and `--alias <name>`.
+        #[arg(short = 'e', long = "query-string", value_name = "GQ", conflicts_with_all = ["query", "alias"])]
+        query_string: Option<String>,
         #[arg(long)]
         name: Option<String>,
         #[command(flatten)]
@@ -220,9 +272,9 @@ enum Command {
         #[command(subcommand)]
         command: PolicyCommand,
     },
-    /// Compact small Lance fragments in every table of the repo
+    /// Compact small Lance fragments in every table of the graph
     Optimize {
-        /// Repo URI
+        /// Graph URI
         uri: Option<String>,
         #[arg(long)]
         target: Option<String>,
@@ -231,9 +283,9 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Remove old Lance versions from every table of the repo (destructive)
+    /// Remove old Lance versions from every table of the graph (destructive)
     Cleanup {
-        /// Repo URI
+        /// Graph URI
         uri: Option<String>,
         #[arg(long)]
         target: Option<String>,
@@ -253,13 +305,40 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Manage graphs on a multi-graph server (MR-668)
+    Graphs {
+        #[command(subcommand)]
+        command: GraphsCommand,
+    },
+}
+
+/// Operations on the graph registry of a multi-graph server (MR-668).
+///
+/// All operations target a remote multi-graph server URL (http:// or
+/// https://). Local-URI invocations return a clear error. To add or
+/// remove graphs, operators edit `omnigraph.yaml` directly and restart
+/// the server — runtime mutation is not exposed in v0.6.0.
+#[derive(Debug, Subcommand)]
+enum GraphsCommand {
+    /// List every graph registered with the multi-graph server.
+    List {
+        /// Remote server URL (e.g. `https://server.example.com`).
+        #[arg(long)]
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum BranchCommand {
     /// Create a new branch
     Create {
-        /// Repo URI
+        /// Graph URI
         #[arg(long)]
         uri: Option<String>,
         #[arg(long)]
@@ -274,7 +353,7 @@ enum BranchCommand {
     },
     /// List branches
     List {
-        /// Repo URI
+        /// Graph URI
         #[arg(long)]
         uri: Option<String>,
         #[arg(long)]
@@ -286,7 +365,7 @@ enum BranchCommand {
     },
     /// Delete a branch
     Delete {
-        /// Repo URI
+        /// Graph URI
         #[arg(long)]
         uri: Option<String>,
         #[arg(long)]
@@ -299,7 +378,7 @@ enum BranchCommand {
     },
     /// Merge a source branch into a target branch
     Merge {
-        /// Repo URI
+        /// Graph URI
         #[arg(long)]
         uri: Option<String>,
         #[arg(long)]
@@ -318,7 +397,7 @@ enum BranchCommand {
 enum SchemaCommand {
     /// Plan a schema migration against the accepted persisted schema
     Plan {
-        /// Repo URI
+        /// Graph URI
         uri: Option<String>,
         #[arg(long)]
         target: Option<String>,
@@ -336,7 +415,7 @@ enum SchemaCommand {
     },
     /// Apply a supported schema migration
     Apply {
-        /// Repo URI
+        /// Graph URI
         uri: Option<String>,
         #[arg(long)]
         target: Option<String>,
@@ -361,7 +440,7 @@ enum SchemaCommand {
     /// Show the current accepted schema source
     #[command(alias = "get")]
     Show {
-        /// Repo URI
+        /// Graph URI
         uri: Option<String>,
         #[arg(long)]
         target: Option<String>,
@@ -373,30 +452,11 @@ enum SchemaCommand {
 }
 
 #[derive(Debug, Subcommand)]
-enum QueryCommand {
-    /// Validate queries and report higher-level drift warnings
-    #[command(visible_alias = "check")]
-    Lint {
-        /// Repo URI
-        uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
-        query: PathBuf,
-        #[arg(long)]
-        schema: Option<PathBuf>,
-        #[arg(long)]
-        json: bool,
-    },
-}
 
-#[derive(Debug, Subcommand)]
 enum CommitCommand {
     /// List graph commits
     List {
-        /// Repo URI
+        /// Graph URI
         uri: Option<String>,
         #[arg(long)]
         target: Option<String>,
@@ -409,7 +469,7 @@ enum CommitCommand {
     },
     /// Show a graph commit
     Show {
-        /// Repo URI
+        /// Graph URI
         #[arg(long)]
         uri: Option<String>,
         #[arg(long)]
@@ -446,6 +506,35 @@ enum PolicyCommand {
         branch: Option<String>,
         #[arg(long = "target-branch")]
         target_branch: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum QueriesCommand {
+    /// Type-check the stored-query registry against the live schema.
+    ///
+    /// Distinct from `omnigraph lint` (which lints one `.gq` file):
+    /// this validates the whole `queries:` registry — opening the graph
+    /// to read its schema and confirming every stored query still
+    /// type-checks. Exits non-zero on any breakage.
+    Validate {
+        /// Graph URI
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the registered stored queries (name, MCP exposure, params).
+    List {
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -582,7 +671,7 @@ fn finish_query_lint(output: &QueryLintOutput, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn ensure_local_repo_parent(uri: &str) -> Result<()> {
+fn ensure_local_graph_parent(uri: &str) -> Result<()> {
     if !uri.contains("://") {
         fs::create_dir_all(uri)?;
     }
@@ -690,25 +779,66 @@ fn load_cli_config(config_path: Option<&PathBuf>) -> Result<OmnigraphConfig> {
     Ok(config)
 }
 
-fn resolve_policy_engine(config: &OmnigraphConfig) -> Result<PolicyEngine> {
-    let policy_file = config
-        .resolve_policy_file()
-        .ok_or_else(|| color_eyre::eyre::eyre!("policy.file must be set in omnigraph.yaml"))?;
-    PolicyEngine::load(&policy_file, &policy_repo_id(config))
+#[derive(Debug, Clone)]
+struct ResolvedCliGraph {
+    uri: String,
+    selected: Option<String>,
+    graph_id: String,
+    policy_file: Option<PathBuf>,
+    is_remote: bool,
 }
 
-/// Open a local-URI repo and, when `policy.file` is configured in
-/// `omnigraph.yaml`, install the resolved `PolicyEngine` on the engine
-/// handle so every direct-engine write goes through
-/// `Omnigraph::enforce(...)` (MR-722). Without a configured policy this
-/// is identical to a bare `Omnigraph::open`.
-///
-/// Returns owned `Omnigraph`; chained on top of `Omnigraph::open(...)`'s
-/// existing future to keep call sites narrow.
-async fn open_local_db_with_policy(uri: &str, config: &OmnigraphConfig) -> Result<Omnigraph> {
-    let db = Omnigraph::open(uri).await?;
-    if config.resolve_policy_file().is_some() {
-        let engine = Arc::new(resolve_policy_engine(config)?);
+impl ResolvedCliGraph {
+    fn selected(&self) -> Option<&str> {
+        self.selected.as_deref()
+    }
+}
+
+struct ResolvedPolicyContext {
+    policy_file: PathBuf,
+    graph_id: String,
+}
+
+fn resolve_policy_context(config: &OmnigraphConfig) -> Result<ResolvedPolicyContext> {
+    let selected = config.resolve_policy_tooling_graph_selection()?;
+    let policy_file = config
+        .resolve_policy_file_for(selected)
+        .ok_or_else(|| {
+            color_eyre::eyre::eyre!(
+                "policy.file or graphs.<name>.policy.file must be set in omnigraph.yaml"
+            )
+        })?;
+    let graph_id = match selected {
+        Some(name) => graph_resource_id_for_selection(Some(name), ""),
+        None => graph_resource_id_for_selection(None, "default"),
+    };
+    Ok(ResolvedPolicyContext {
+        policy_file,
+        graph_id,
+    })
+}
+
+fn resolve_policy_engine(context: &ResolvedPolicyContext) -> Result<PolicyEngine> {
+    PolicyEngine::load_graph(&context.policy_file, &context.graph_id)
+}
+
+fn resolve_policy_engine_for_graph(graph: &ResolvedCliGraph) -> Result<PolicyEngine> {
+    let policy_file = graph.policy_file.as_ref().ok_or_else(|| {
+        color_eyre::eyre::eyre!(
+            "policy.file or graphs.<name>.policy.file must be set in omnigraph.yaml"
+        )
+    })?;
+    PolicyEngine::load_graph(policy_file, &graph.graph_id)
+}
+
+/// Open a local graph and install the policy resolved for the same graph
+/// identity that produced the URI. A named graph uses
+/// `graphs.<name>.policy.file`; an explicit positional URI is anonymous and
+/// uses the legacy top-level `policy.file`.
+async fn open_local_db_with_policy(graph: &ResolvedCliGraph) -> Result<Omnigraph> {
+    let db = Omnigraph::open(&graph.uri).await?;
+    if graph.policy_file.is_some() {
+        let engine = Arc::new(resolve_policy_engine_for_graph(graph)?);
         Ok(db.with_policy(engine as Arc<dyn omnigraph_policy::PolicyChecker>))
     } else {
         Ok(db)
@@ -721,29 +851,20 @@ async fn open_local_db_with_policy(uri: &str, config: &OmnigraphConfig) -> Resul
 /// policy is configured and this returns `None`, the engine-layer
 /// footgun guard intentionally denies — silent bypass via "I forgot the
 /// actor" is what the guard prevents.
-fn resolve_cli_actor<'a>(
-    cli_as: Option<&'a str>,
-    config: &'a OmnigraphConfig,
-) -> Option<&'a str> {
+fn resolve_cli_actor<'a>(cli_as: Option<&'a str>, config: &'a OmnigraphConfig) -> Option<&'a str> {
     cli_as.or(config.cli.actor.as_deref())
 }
 
-fn resolve_policy_tests_path(config: &OmnigraphConfig) -> Result<PathBuf> {
-    config.resolve_policy_tests_file().ok_or_else(|| {
-        color_eyre::eyre::eyre!(
-            "policy.tests.yaml requires policy.file to be set in omnigraph.yaml"
-        )
-    })
+fn resolve_policy_tests_path(context: &ResolvedPolicyContext) -> PathBuf {
+    context.policy_file.with_file_name("policy.tests.yaml")
 }
 
-fn policy_repo_id(config: &OmnigraphConfig) -> String {
-    if let Some(name) = &config.project.name {
-        return name.clone();
+fn normalize_policy_graph_uri(uri: &str) -> Result<String> {
+    if is_remote_uri(uri) {
+        Ok(uri.trim_end_matches('/').to_string())
+    } else {
+        Ok(normalize_root_uri(uri)?)
     }
-    config
-        .resolve_target_uri(None, None, config.server_graph_name())
-        .or_else(|_| config.resolve_target_uri(None, None, config.cli_graph_name()))
-        .unwrap_or_else(|_| "default".to_string())
 }
 
 fn resolve_remote_bearer_token(
@@ -827,6 +948,47 @@ fn resolve_uri(
     config.resolve_target_uri(cli_uri, cli_target, config.cli_graph_name())
 }
 
+fn resolve_cli_graph(
+    config: &OmnigraphConfig,
+    cli_uri: Option<String>,
+    cli_target: Option<&str>,
+) -> Result<ResolvedCliGraph> {
+    let selected = if cli_uri.is_some() {
+        None
+    } else {
+        cli_target
+            .map(str::to_string)
+            .or_else(|| config.cli_graph_name().map(str::to_string))
+    };
+    config.resolve_graph_selection(selected.as_deref())?;
+    let uri = resolve_uri(config, cli_uri, cli_target)?;
+    let normalized_uri = normalize_policy_graph_uri(&uri)?;
+    let graph_id = graph_resource_id_for_selection(selected.as_deref(), &normalized_uri);
+    Ok(ResolvedCliGraph {
+        graph_id,
+        is_remote: is_remote_uri(&uri),
+        policy_file: config.resolve_policy_file_for(selected.as_deref()),
+        selected,
+        uri,
+    })
+}
+
+fn resolve_local_graph(
+    config: &OmnigraphConfig,
+    cli_uri: Option<String>,
+    cli_target: Option<&str>,
+    operation: &str,
+) -> Result<ResolvedCliGraph> {
+    let graph = resolve_cli_graph(config, cli_uri, cli_target)?;
+    if graph.is_remote {
+        bail!(
+            "{} is only supported against local graph URIs in this milestone",
+            operation
+        );
+    }
+    Ok(graph)
+}
+
 /// Parse a Go-style compact duration: `7d`, `24h`, `30m`, `90s`, or a plain
 /// integer as seconds. Used by the `cleanup --older-than` flag.
 fn parse_duration_arg(s: &str) -> Result<std::time::Duration> {
@@ -834,8 +996,15 @@ fn parse_duration_arg(s: &str) -> Result<std::time::Duration> {
     if s.is_empty() {
         bail!("duration is empty");
     }
-    let (num_part, unit) = match s.char_indices().rev().find(|(_, c)| c.is_ascii_alphabetic()) {
-        Some((i, _)) => (&s[..i + 1 - s[i..].chars().next().unwrap().len_utf8()], &s[i..]),
+    let (num_part, unit) = match s
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_ascii_alphabetic())
+    {
+        Some((i, _)) => (
+            &s[..i + 1 - s[i..].chars().next().unwrap().len_utf8()],
+            &s[i..],
+        ),
         None => (s, ""),
     };
     let n: u64 = num_part
@@ -858,14 +1027,7 @@ fn resolve_local_uri(
     cli_target: Option<&str>,
     operation: &str,
 ) -> Result<String> {
-    let uri = resolve_uri(config, cli_uri, cli_target)?;
-    if is_remote_uri(&uri) {
-        bail!(
-            "{} is only supported against local repo URIs in this milestone",
-            operation
-        );
-    }
-    Ok(uri)
+    Ok(resolve_local_graph(config, cli_uri, cli_target, operation)?.uri)
 }
 
 fn resolve_branch(
@@ -906,7 +1068,9 @@ fn resolve_query_path(
         .map(PathBuf::from)
         .or_else(|| alias_query.map(PathBuf::from))
         .ok_or_else(|| {
-            color_eyre::eyre::eyre!("exactly one of --query or --alias must be provided")
+            color_eyre::eyre::eyre!(
+                "exactly one of --query, --query-string, or --alias must be provided"
+            )
         })
         .and_then(|query_path| config.resolve_query_path(&query_path))
 }
@@ -914,8 +1078,15 @@ fn resolve_query_path(
 fn resolve_query_source(
     config: &OmnigraphConfig,
     explicit_query: Option<&PathBuf>,
+    inline_query: Option<&str>,
     alias_query: Option<&str>,
 ) -> Result<String> {
+    if let Some(inline) = inline_query {
+        if inline.trim().is_empty() {
+            bail!("--query-string must not be empty");
+        }
+        return Ok(inline.to_string());
+    }
     Ok(fs::read_to_string(resolve_query_path(
         config,
         explicit_query,
@@ -1117,9 +1288,7 @@ fn render_schema_plan_step(step: &SchemaMigrationStep) -> String {
             type_name,
             drop_mode_label(*mode),
         ),
-        SchemaMigrationStep::UnsupportedChange {
-            entity, reason, ..
-        } => {
+        SchemaMigrationStep::UnsupportedChange { entity, reason, .. } => {
             // When a schema-lint code is attached, render code + tier
             // so operators see at-a-glance the kind of risk (destructive
             // / validated / safe) — not just the rule identifier.
@@ -1303,12 +1472,12 @@ fn print_commit_human(commit: &CommitOutput) {
     println!("created_at: {}", commit.created_at);
 }
 
-fn print_policy_explain(decision: &PolicyDecision, request: &PolicyRequest) {
+fn print_policy_explain(decision: &PolicyDecision, actor_id: &str, request: &PolicyRequest) {
     println!(
         "decision: {}",
         if decision.allowed { "allow" } else { "deny" }
     );
-    println!("actor: {}", request.actor_id);
+    println!("actor: {}", actor_id);
     println!("action: {}", request.action);
     if let Some(branch) = &request.branch {
         println!("branch: {}", branch);
@@ -1529,10 +1698,10 @@ async fn execute_query_lint(
         ));
     }
 
-    let has_repo_target =
+    let has_graph_target =
         cli_uri.is_some() || cli_target.is_some() || config.cli_graph_name().is_some();
-    if !has_repo_target {
-        bail!("query lint requires --schema <schema.pg> or a resolvable repo target");
+    if !has_graph_target {
+        bail!("query lint requires --schema <schema.pg> or a resolvable graph target");
     }
 
     let uri = resolve_local_uri(config, cli_uri, cli_target, "query lint")?;
@@ -1541,8 +1710,250 @@ async fn execute_query_lint(
         &db.catalog(),
         &query_source,
         query_path,
-        QueryLintSchemaSource::repo(uri),
+        QueryLintSchemaSource::graph(uri),
     ))
+}
+
+#[derive(serde::Serialize)]
+struct QueriesIssue {
+    query: String,
+    message: String,
+}
+
+#[derive(serde::Serialize)]
+struct QueriesValidateOutput {
+    ok: bool,
+    breakages: Vec<QueriesIssue>,
+    warnings: Vec<QueriesIssue>,
+}
+
+#[derive(serde::Serialize)]
+struct QueriesParam {
+    name: String,
+    #[serde(rename = "type")]
+    type_name: String,
+    nullable: bool,
+}
+
+#[derive(serde::Serialize)]
+struct QueriesListItem {
+    name: String,
+    mcp_expose: bool,
+    tool_name: Option<String>,
+    mutation: bool,
+    params: Vec<QueriesParam>,
+}
+
+#[derive(serde::Serialize)]
+struct QueriesListOutput {
+    queries: Vec<QueriesListItem>,
+}
+
+/// Resolve the selected graph to `(local URI, registry selection)` from one
+/// precedence, so a command's schema and its stored-query registry can never
+/// come from different graphs. A **positional URI is anonymous** (top-level
+/// registry, ignoring the configured default graph); otherwise `--target`
+/// or the configured `cli.graph` names the graph (its per-graph block).
+/// Mirrors the server's single-mode identity rule.
+fn resolve_selected_graph(
+    config: &OmnigraphConfig,
+    cli_uri: Option<String>,
+    cli_target: Option<&str>,
+    operation: &str,
+) -> Result<(String, Option<String>)> {
+    let graph = resolve_local_graph(config, cli_uri, cli_target, operation)?;
+    Ok((graph.uri, graph.selected))
+}
+
+/// Load the stored-query registry for an already-resolved graph selection
+/// (`None` = anonymous → top-level; `Some(name)` = that graph's block).
+fn load_registry_or_report(
+    config: &OmnigraphConfig,
+    selected: Option<&str>,
+) -> Result<QueryRegistry> {
+    QueryRegistry::load(config, config.query_entries_for(selected)).map_err(|errors| {
+        color_eyre::eyre::eyre!(
+            "stored-query registry failed to load:\n  {}",
+            errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        )
+    })
+}
+
+fn graph_query_registry_names(config: &OmnigraphConfig) -> Vec<&str> {
+    config
+        .graphs
+        .iter()
+        .filter_map(|(name, graph)| (!graph.queries.is_empty()).then_some(name.as_str()))
+        .collect()
+}
+
+fn resolve_registry_selection_for_list(
+    config: &OmnigraphConfig,
+    target: Option<&str>,
+) -> Result<Option<String>> {
+    let selected = target
+        .map(str::to_string)
+        .or_else(|| config.cli_graph_name().map(str::to_string));
+    if let Some(name) = selected.as_deref() {
+        config.resolve_graph_selection(Some(name))?;
+        return Ok(selected);
+    }
+
+    if !config.query_entries().is_empty() {
+        return Ok(None);
+    }
+
+    let graph_names = graph_query_registry_names(config);
+    if graph_names.is_empty() {
+        return Ok(None);
+    }
+
+    bail!(
+        "stored-query registries are configured for graph{} {} but no graph was selected. Pass `--target {}` or set `cli.graph`.",
+        if graph_names.len() == 1 { "" } else { "s" },
+        graph_names.join(", "),
+        graph_names[0],
+    )
+}
+
+fn validate_registry_for_catalog(
+    registry: &QueryRegistry,
+    catalog: &omnigraph_compiler::catalog::Catalog,
+    label: &str,
+) -> omnigraph::error::Result<()> {
+    let report = check(registry, catalog);
+    if report.has_breakages() {
+        return Err(omnigraph::error::OmniError::manifest(
+            format_check_breakages(label, &report),
+        ));
+    }
+    Ok(())
+}
+
+async fn execute_queries_validate(
+    uri: Option<String>,
+    target: Option<String>,
+    config_path: Option<&PathBuf>,
+    json: bool,
+) -> Result<()> {
+    let config = load_cli_config(config_path)?;
+    // One selection drives both the schema URI and the registry, so a
+    // positional URI and a `--target` can't validate different graphs.
+    let (uri, selected) =
+        resolve_selected_graph(&config, uri, target.as_deref(), "queries validate")?;
+    let registry = load_registry_or_report(&config, selected.as_deref())?;
+    let db = Omnigraph::open(&uri).await?;
+    let report = check(&registry, &db.catalog());
+
+    let output = QueriesValidateOutput {
+        ok: !report.has_breakages(),
+        breakages: report
+            .breakages
+            .iter()
+            .map(|b| QueriesIssue {
+                query: b.query.clone(),
+                message: b.message.clone(),
+            })
+            .collect(),
+        warnings: report
+            .warnings
+            .iter()
+            .map(|w| QueriesIssue {
+                query: w.query.clone(),
+                message: w.message.clone(),
+            })
+            .collect(),
+    };
+
+    if json {
+        print_json(&output)?;
+    } else {
+        if output.breakages.is_empty() {
+            println!(
+                "OK  {} stored quer{} type-check against the schema",
+                registry.len(),
+                if registry.len() == 1 { "y" } else { "ies" }
+            );
+        }
+        for issue in &output.breakages {
+            println!("ERROR  query '{}': {}", issue.query, issue.message);
+        }
+        for issue in &output.warnings {
+            println!("WARN   query '{}': {}", issue.query, issue.message);
+        }
+    }
+
+    if report.has_breakages() {
+        io::stdout().flush()?;
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn execute_queries_list(
+    target: Option<String>,
+    config_path: Option<&PathBuf>,
+    json: bool,
+) -> Result<()> {
+    let config = load_cli_config(config_path)?;
+    let selected = resolve_registry_selection_for_list(&config, target.as_deref())?;
+    let registry = load_registry_or_report(&config, selected.as_deref())?;
+
+    let output = QueriesListOutput {
+        queries: registry
+            .iter()
+            .map(|q| QueriesListItem {
+                name: q.name.clone(),
+                mcp_expose: q.expose,
+                tool_name: q.tool_name.clone(),
+                mutation: q.is_mutation(),
+                params: q
+                    .decl
+                    .params
+                    .iter()
+                    .map(|p| QueriesParam {
+                        name: p.name.clone(),
+                        type_name: p.type_name.clone(),
+                        nullable: p.nullable,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    };
+
+    if json {
+        print_json(&output)?;
+    } else if output.queries.is_empty() {
+        println!("(no stored queries registered)");
+    } else {
+        for q in &output.queries {
+            let kind = if q.mutation { "mutation" } else { "read" };
+            let params = q
+                .params
+                .iter()
+                .map(|p| {
+                    format!(
+                        "${}: {}{}",
+                        p.name,
+                        p.type_name,
+                        if p.nullable { "?" } else { "" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mcp = if q.mcp_expose {
+                format!(" [mcp: {}]", q.tool_name.as_deref().unwrap_or(&q.name))
+            } else {
+                String::new()
+            };
+            println!("{kind}  {}({params}){mcp}", q.name);
+        }
+    }
+    Ok(())
 }
 
 async fn execute_read(
@@ -1591,7 +2002,7 @@ async fn execute_read_remote(
 }
 
 async fn execute_change(
-    uri: &str,
+    graph: &ResolvedCliGraph,
     query_source: &str,
     query_name: Option<&str>,
     branch: &str,
@@ -1601,7 +2012,7 @@ async fn execute_change(
 ) -> Result<ChangeOutput> {
     let (selected_name, query_params) = select_named_query(query_source, query_name)?;
     let params = query_params_from_json(&query_params, params_json)?;
-    let db = open_local_db_with_policy(uri, config).await?;
+    let db = open_local_db_with_policy(graph).await?;
     let actor = resolve_cli_actor(cli_as_actor, config);
     let result = db
         .mutate_as(branch, query_source, &selected_name, &params, actor)
@@ -1613,6 +2024,33 @@ async fn execute_change(
         affected_edges: result.affected_edges,
         actor_id: actor.map(String::from),
     })
+}
+
+/// Build the JSON body for `POST /change` using the legacy wire shape.
+///
+/// `ChangeRequest`'s Rust field names are now `query` / `name` (the canonical
+/// wire shape going forward), but old `omnigraph-server` builds still require
+/// the legacy `query_source` / `query_name` keys on `/change`. Hand-rolling
+/// the JSON with the legacy names keeps a newer CLI talking to an older
+/// server intact -- the same byte-stability contract we apply to
+/// `execute_read_remote` against `/read`.
+fn legacy_change_request_body(
+    query_source: &str,
+    query_name: Option<&str>,
+    branch: &str,
+    params_json: Option<&Value>,
+) -> Value {
+    let mut body = serde_json::json!({
+        "query_source": query_source,
+        "branch": branch,
+    });
+    if let Some(name) = query_name {
+        body["query_name"] = Value::String(name.to_string());
+    }
+    if let Some(params) = params_json {
+        body["params"] = params.clone();
+    }
+    body
 }
 
 async fn execute_change_remote(
@@ -1628,12 +2066,12 @@ async fn execute_change_remote(
         client,
         Method::POST,
         remote_url(uri, "/change"),
-        Some(serde_json::to_value(ChangeRequest {
-            query_source: query_source.to_string(),
-            query_name: query_name.map(ToOwned::to_owned),
-            params: params_json.cloned(),
-            branch: Some(branch.to_string()),
-        })?),
+        Some(legacy_change_request_body(
+            query_source,
+            query_name,
+            branch,
+            params_json,
+        )),
         bearer_token,
     )
     .await
@@ -1688,10 +2126,74 @@ async fn execute_export_remote_to_writer<W: Write>(
     Ok(())
 }
 
+/// Rewrite deprecated CLI invocations into their canonical form.
+///
+/// The current rename pass moves four subcommands:
+///   - `omnigraph read`        -> `omnigraph query`  (clap `visible_alias` handles parsing; we warn)
+///   - `omnigraph change`      -> `omnigraph mutate` (clap `visible_alias` handles parsing; we warn)
+///   - `omnigraph check`       -> `omnigraph lint`   (rewrite required; no visible_alias by design)
+///   - `omnigraph query lint`  -> `omnigraph lint`   (rewrite required; `query` is now the read-runner)
+///   - `omnigraph query check` -> `omnigraph lint`   (rewrite required)
+///
+/// `check` is *not* a clap visible_alias on `lint` even though they're
+/// semantically equivalent. Visible aliases create two canonical names
+/// that agents emit interchangeably depending on training-data drift
+/// (see MR-981 §6 for the policy). The argv-shim + stderr warning
+/// pattern preserves back-compat for human users while pointing every
+/// caller at the single canonical name in `--help`.
+///
+/// Returns the (possibly rewritten) argv that clap should parse.
+fn rewrite_deprecated_argv(args: Vec<OsString>) -> Vec<OsString> {
+    if args.len() >= 3 {
+        let sub = args[1].to_str();
+        let sub2 = args[2].to_str();
+        if sub == Some("query") && matches!(sub2, Some("lint") | Some("check")) {
+            let suffix = sub2.unwrap();
+            eprintln!(
+                "warning: `omnigraph query {suffix}` is deprecated; use `omnigraph lint` instead"
+            );
+            // Drop the leading `query` token AND normalize `check` -> `lint`.
+            // `check` is no longer a clap visible_alias (MR-981 §6), so the
+            // rewritten argv must reach the canonical `lint` subcommand
+            // directly. Result for `omnigraph query check --query foo.gq`:
+            //   `omnigraph lint --query foo.gq`.
+            let mut out = Vec::with_capacity(args.len() - 1);
+            out.push(args[0].clone());
+            out.push(OsString::from("lint"));
+            out.extend(args[3..].iter().cloned());
+            return out;
+        }
+    }
+    if let Some(sub) = args.get(1).and_then(|s| s.to_str()) {
+        match sub {
+            "read" => eprintln!(
+                "warning: `omnigraph read` is deprecated; use `omnigraph query` instead"
+            ),
+            "change" => eprintln!(
+                "warning: `omnigraph change` is deprecated; use `omnigraph mutate` instead"
+            ),
+            "check" => {
+                eprintln!(
+                    "warning: `omnigraph check` is deprecated; use `omnigraph lint` instead"
+                );
+                // Rewrite the top-level subcommand to `lint`; pass through the rest.
+                let mut out = Vec::with_capacity(args.len());
+                out.push(args[0].clone());
+                out.push(OsString::from("lint"));
+                out.extend(args[2..].iter().cloned());
+                return out;
+            }
+            _ => {}
+        }
+    }
+    args
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
     let cli = {
+        let raw_args = rewrite_deprecated_argv(std::env::args_os().collect());
         let matches = Cli::command()
             .arg(
                 Arg::new("version")
@@ -1700,7 +2202,7 @@ async fn main() -> Result<()> {
                     .action(ArgAction::Version)
                     .help("Print version"),
             )
-            .get_matches();
+            .get_matches_from(raw_args);
         Cli::from_arg_matches(&matches)?
     };
     let http_client = build_http_client()?;
@@ -1716,10 +2218,15 @@ async fn main() -> Result<()> {
                 print_embed_human(&output);
             }
         }
-        Command::Init { schema, uri } => {
+        Command::Init { schema, uri, force } => {
             let schema_source = fs::read_to_string(&schema)?;
-            ensure_local_repo_parent(&uri)?;
-            Omnigraph::init(&uri, &schema_source).await?;
+            ensure_local_graph_parent(&uri)?;
+            Omnigraph::init_with_options(
+                &uri,
+                &schema_source,
+                omnigraph::db::InitOptions { force },
+            )
+            .await?;
             scaffold_config_if_missing(&uri)?;
             println!("initialized {}", uri);
         }
@@ -1733,9 +2240,10 @@ async fn main() -> Result<()> {
             json,
         } => {
             let config = load_cli_config(config.as_ref())?;
-            let uri = resolve_local_uri(&config, uri, target.as_deref(), "load")?;
+            let graph = resolve_local_graph(&config, uri, target.as_deref(), "load")?;
+            let uri = graph.uri.clone();
             let branch = resolve_branch(&config, branch, None, "main");
-            let db = open_local_db_with_policy(&uri, &config).await?;
+            let db = open_local_db_with_policy(&graph).await?;
             let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
             let result = db
                 .load_file_as(&branch, &data.to_string_lossy(), mode.into(), actor)
@@ -1776,10 +2284,11 @@ async fn main() -> Result<()> {
             let config = load_cli_config(config.as_ref())?;
             let bearer_token =
                 resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-            let uri = resolve_uri(&config, uri, target.as_deref())?;
+            let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
+            let uri = graph.uri.clone();
             let branch = resolve_branch(&config, branch, None, "main");
             let from = resolve_branch(&config, from, None, "main");
-            let payload = if is_remote_uri(&uri) {
+            let payload = if graph.is_remote {
                 let data = fs::read_to_string(&data)?;
                 remote_json::<IngestOutput>(
                     &http_client,
@@ -1795,7 +2304,7 @@ async fn main() -> Result<()> {
                 )
                 .await?
             } else {
-                let db = open_local_db_with_policy(&uri, &config).await?;
+                let db = open_local_db_with_policy(&graph).await?;
                 let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
                 let result = db
                     .ingest_file_as(
@@ -1826,9 +2335,10 @@ async fn main() -> Result<()> {
                 let config = load_cli_config(config.as_ref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-                let uri = resolve_uri(&config, uri, target.as_deref())?;
+                let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
+                let uri = graph.uri.clone();
                 let from = resolve_branch(&config, from, None, "main");
-                let payload = if is_remote_uri(&uri) {
+                let payload = if graph.is_remote {
                     remote_json::<BranchCreateOutput>(
                         &http_client,
                         Method::POST,
@@ -1841,7 +2351,7 @@ async fn main() -> Result<()> {
                     )
                     .await?
                 } else {
-                    let db = open_local_db_with_policy(&uri, &config).await?;
+                    let db = open_local_db_with_policy(&graph).await?;
                     let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
                     db.branch_create_from_as(ReadTarget::branch(&from), &name, actor)
                         .await?;
@@ -1867,8 +2377,9 @@ async fn main() -> Result<()> {
                 let config = load_cli_config(config.as_ref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-                let uri = resolve_uri(&config, uri, target.as_deref())?;
-                let payload = if is_remote_uri(&uri) {
+                let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
+                let uri = graph.uri.clone();
+                let payload = if graph.is_remote {
                     remote_json::<BranchListOutput>(
                         &http_client,
                         Method::GET,
@@ -1901,8 +2412,9 @@ async fn main() -> Result<()> {
                 let config = load_cli_config(config.as_ref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-                let uri = resolve_uri(&config, uri, target.as_deref())?;
-                let payload = if is_remote_uri(&uri) {
+                let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
+                let uri = graph.uri.clone();
+                let payload = if graph.is_remote {
                     remote_json::<BranchDeleteOutput>(
                         &http_client,
                         Method::DELETE,
@@ -1912,7 +2424,7 @@ async fn main() -> Result<()> {
                     )
                     .await?
                 } else {
-                    let db = open_local_db_with_policy(&uri, &config).await?;
+                    let db = open_local_db_with_policy(&graph).await?;
                     let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
                     db.branch_delete_as(&name, actor).await?;
                     BranchDeleteOutput {
@@ -1938,9 +2450,10 @@ async fn main() -> Result<()> {
                 let config = load_cli_config(config.as_ref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-                let uri = resolve_uri(&config, uri, target.as_deref())?;
+                let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
+                let uri = graph.uri.clone();
                 let into = resolve_branch(&config, into, None, "main");
-                let payload = if is_remote_uri(&uri) {
+                let payload = if graph.is_remote {
                     remote_json::<BranchMergeOutput>(
                         &http_client,
                         Method::POST,
@@ -1953,7 +2466,7 @@ async fn main() -> Result<()> {
                     )
                     .await?
                 } else {
-                    let db = open_local_db_with_policy(&uri, &config).await?;
+                    let db = open_local_db_with_policy(&graph).await?;
                     let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
                     let outcome = db.branch_merge_as(&source, &into, actor).await?;
                     BranchMergeOutput {
@@ -2088,9 +2601,10 @@ async fn main() -> Result<()> {
                 let config = load_cli_config(config.as_ref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-                let uri = resolve_uri(&config, uri, target.as_deref())?;
+                let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
+                let uri = graph.uri.clone();
                 let schema_source = fs::read_to_string(&schema)?;
-                let output = if is_remote_uri(&uri) {
+                let output = if graph.is_remote {
                     // MR-694 PR B: SchemaApplyRequest gained an
                     // allow_data_loss field so Hard-mode drops are no
                     // longer CLI-only. The previous bail is gone; the
@@ -2108,13 +2622,22 @@ async fn main() -> Result<()> {
                     )
                     .await?
                 } else {
-                    let db = open_local_db_with_policy(&uri, &config).await?;
+                    let db = open_local_db_with_policy(&graph).await?;
                     let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
+                    let registry = load_registry_or_report(&config, graph.selected())?;
+                    let registry = (!registry.is_empty()).then_some(registry);
+                    let label = graph.selected().unwrap_or(&uri).to_string();
                     let result = db
-                        .apply_schema_as(
+                        .apply_schema_as_with_catalog_check(
                             &schema_source,
                             omnigraph::db::SchemaApplyOptions { allow_data_loss },
                             actor,
+                            |catalog| {
+                                if let Some(registry) = registry.as_ref() {
+                                    validate_registry_for_catalog(registry, catalog, &label)?;
+                                }
+                                Ok(())
+                            },
                         )
                         .await?;
                     schema_apply_output(&uri, result)
@@ -2157,20 +2680,35 @@ async fn main() -> Result<()> {
                 }
             }
         },
-        Command::Query { command } => match command {
-            QueryCommand::Lint {
+        Command::Lint {
+            uri,
+            target,
+            config,
+            query,
+            schema,
+            json,
+        } => {
+            let config = load_cli_config(config.as_ref())?;
+            let output =
+                execute_query_lint(&config, uri, target.as_deref(), schema.as_ref(), &query)
+                    .await?;
+            finish_query_lint(&output, json)?;
+        }
+        Command::Queries { command } => match command {
+            QueriesCommand::Validate {
                 uri,
                 target,
                 config,
-                query,
-                schema,
                 json,
             } => {
-                let config = load_cli_config(config.as_ref())?;
-                let output =
-                    execute_query_lint(&config, uri, target.as_deref(), schema.as_ref(), &query)
-                        .await?;
-                finish_query_lint(&output, json)?;
+                execute_queries_validate(uri, target, config.as_ref(), json).await?;
+            }
+            QueriesCommand::List {
+                target,
+                config,
+                json,
+            } => {
+                execute_queries_list(target, config.as_ref(), json)?;
             }
         },
         Command::Snapshot {
@@ -2242,13 +2780,14 @@ async fn main() -> Result<()> {
                     .await?;
             }
         }
-        Command::Read {
+        Command::Query {
             uri,
             legacy_uri,
             target,
             config,
             alias,
             query,
+            query_string,
             name,
             params,
             branch,
@@ -2257,8 +2796,8 @@ async fn main() -> Result<()> {
             json,
             alias_args,
         } => {
-            if alias.is_some() == query.is_some() {
-                bail!("exactly one of --alias or --query must be provided");
+            if alias.is_none() && query.is_none() && query_string.is_none() {
+                bail!("exactly one of --query, --query-string, or --alias must be provided");
             }
 
             let config = load_cli_config(config.as_ref())?;
@@ -2277,10 +2816,12 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .or_else(|| alias_config.and_then(|alias| alias.graph.as_deref()));
             let bearer_token = resolve_remote_bearer_token(&config, uri.as_deref(), target_name)?;
-            let uri = resolve_uri(&config, uri, target_name)?;
+            let graph = resolve_cli_graph(&config, uri, target_name)?;
+            let uri = graph.uri.clone();
             let query_source = resolve_query_source(
                 &config,
                 query.as_ref(),
+                query_string.as_deref(),
                 alias_config.map(|a| a.query.as_str()),
             )?;
             let params_json = merged_params_json(
@@ -2298,7 +2839,7 @@ async fn main() -> Result<()> {
                 alias_config.and_then(|alias| alias.branch.clone()),
             )?;
             let query_name = name.or_else(|| alias_config.and_then(|alias| alias.name.clone()));
-            let output = if is_remote_uri(&uri) {
+            let output = if graph.is_remote {
                 execute_read_remote(
                     &http_client,
                     &uri,
@@ -2327,21 +2868,22 @@ async fn main() -> Result<()> {
             );
             print_read_output(&output, format, &config)?;
         }
-        Command::Change {
+        Command::Mutate {
             uri,
             legacy_uri,
             target,
             config,
             alias,
             query,
+            query_string,
             name,
             params,
             branch,
             json,
             alias_args,
         } => {
-            if alias.is_some() == query.is_some() {
-                bail!("exactly one of --alias or --query must be provided");
+            if alias.is_none() && query.is_none() && query_string.is_none() {
+                bail!("exactly one of --query, --query-string, or --alias must be provided");
             }
 
             let config = load_cli_config(config.as_ref())?;
@@ -2360,10 +2902,12 @@ async fn main() -> Result<()> {
                 .as_deref()
                 .or_else(|| alias_config.and_then(|alias| alias.graph.as_deref()));
             let bearer_token = resolve_remote_bearer_token(&config, uri.as_deref(), target_name)?;
-            let uri = resolve_uri(&config, uri, target_name)?;
+            let graph = resolve_cli_graph(&config, uri, target_name)?;
+            let uri = graph.uri.clone();
             let query_source = resolve_query_source(
                 &config,
                 query.as_ref(),
+                query_string.as_deref(),
                 alias_config.map(|a| a.query.as_str()),
             )?;
             let params_json = merged_params_json(
@@ -2381,7 +2925,7 @@ async fn main() -> Result<()> {
                 "main",
             );
             let query_name = name.or_else(|| alias_config.and_then(|alias| alias.name.clone()));
-            let output = if is_remote_uri(&uri) {
+            let output = if graph.is_remote {
                 execute_change_remote(
                     &http_client,
                     &uri,
@@ -2394,7 +2938,7 @@ async fn main() -> Result<()> {
                 .await?
             } else {
                 execute_change(
-                    &uri,
+                    &graph,
                     &query_source,
                     query_name.as_deref(),
                     &branch,
@@ -2413,20 +2957,19 @@ async fn main() -> Result<()> {
         Command::Policy { command } => match command {
             PolicyCommand::Validate { config } => {
                 let config = load_cli_config(config.as_ref())?;
-                let engine = resolve_policy_engine(&config)?;
-                let policy_file = config
-                    .resolve_policy_file()
-                    .expect("policy file should exist after resolve_policy_engine");
+                let context = resolve_policy_context(&config)?;
+                let engine = resolve_policy_engine(&context)?;
                 println!(
                     "policy valid: {} [{} actors]",
-                    policy_file.display(),
+                    context.policy_file.display(),
                     engine.known_actor_count()
                 );
             }
             PolicyCommand::Test { config } => {
                 let config = load_cli_config(config.as_ref())?;
-                let engine = resolve_policy_engine(&config)?;
-                let tests_path = resolve_policy_tests_path(&config)?;
+                let context = resolve_policy_context(&config)?;
+                let engine = resolve_policy_engine(&context)?;
+                let tests_path = resolve_policy_tests_path(&context);
                 let tests = PolicyTestConfig::load(&tests_path)?;
                 engine.run_tests(&tests)?;
                 println!("policy tests passed: {} cases", tests.cases.len());
@@ -2439,15 +2982,15 @@ async fn main() -> Result<()> {
                 target_branch,
             } => {
                 let config = load_cli_config(config.as_ref())?;
-                let engine = resolve_policy_engine(&config)?;
+                let context = resolve_policy_context(&config)?;
+                let engine = resolve_policy_engine(&context)?;
                 let request = PolicyRequest {
-                    actor_id: actor,
                     action,
                     branch,
                     target_branch,
                 };
-                let decision = engine.authorize(&request)?;
-                print_policy_explain(&decision, &request);
+                let decision = engine.authorize(&actor, &request)?;
+                print_policy_explain(&decision, &actor, &request);
             }
         },
         Command::Optimize {
@@ -2468,18 +3011,19 @@ async fn main() -> Result<()> {
                         "fragments_removed": s.fragments_removed,
                         "fragments_added": s.fragments_added,
                         "committed": s.committed,
+                        "skipped": s.skipped.map(|r| r.as_str()),
                     })).collect::<Vec<_>>(),
                 });
                 print_json(&value)?;
             } else {
                 println!("optimize {} — {} tables", uri, stats.len());
                 for s in &stats {
-                    if s.committed {
+                    if let Some(reason) = s.skipped {
+                        println!("  {:<40} skipped ({reason})", s.table_key);
+                    } else if s.committed {
                         println!(
                             "  {:<40} frags {} → {} ✓",
-                            s.table_key,
-                            s.fragments_removed + s.fragments_added - s.fragments_added,
-                            s.fragments_added
+                            s.table_key, s.fragments_removed, s.fragments_added
                         );
                     } else {
                         println!("  {:<40} no-op", s.table_key);
@@ -2499,17 +3043,16 @@ async fn main() -> Result<()> {
             let config = load_cli_config(config.as_ref())?;
             let uri = resolve_uri(&config, uri, target.as_deref())?;
 
-            let older_than_dur = older_than
-                .as_deref()
-                .map(parse_duration_arg)
-                .transpose()?;
+            let older_than_dur = older_than.as_deref().map(parse_duration_arg).transpose()?;
 
             if keep.is_none() && older_than_dur.is_none() {
                 bail!("cleanup requires at least one of --keep or --older-than");
             }
 
             let policy_desc = match (keep, older_than_dur) {
-                (Some(k), Some(d)) => format!("keep {} versions, remove anything older than {:?}", k, d),
+                (Some(k), Some(d)) => {
+                    format!("keep {} versions, remove anything older than {:?}", k, d)
+                }
                 (Some(k), None) => format!("keep {} versions", k),
                 (None, Some(d)) => format!("remove anything older than {:?}", d),
                 _ => unreachable!(),
@@ -2539,22 +3082,70 @@ async fn main() -> Result<()> {
                         "table_key": s.table_key,
                         "bytes_removed": s.bytes_removed,
                         "old_versions_removed": s.old_versions_removed,
+                        "error": s.error,
                     })).collect::<Vec<_>>(),
                 });
                 print_json(&value)?;
             } else {
                 let total_bytes: u64 = stats.iter().map(|s| s.bytes_removed).sum();
                 let total_versions: u64 = stats.iter().map(|s| s.old_versions_removed).sum();
+                let failed: Vec<&str> = stats
+                    .iter()
+                    .filter(|s| s.error.is_some())
+                    .map(|s| s.table_key.as_str())
+                    .collect();
                 println!(
                     "cleanup {} ({}) — removed {} versions ({} bytes) across {} tables",
                     uri,
                     policy_desc,
                     total_versions,
                     total_bytes,
-                    stats.len()
+                    stats.len() - failed.len()
                 );
+                if !failed.is_empty() {
+                    println!(
+                        "  {} table(s) failed and will be retried on the next cleanup: {}",
+                        failed.len(),
+                        failed.join(", ")
+                    );
+                }
             }
         }
+        Command::Graphs { command } => match command {
+            GraphsCommand::List {
+                uri,
+                target,
+                config,
+                json,
+            } => {
+                let config = load_cli_config(config.as_ref())?;
+                let bearer_token =
+                    resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
+                let uri = resolve_uri(&config, uri, target.as_deref())?;
+                if !is_remote_uri(&uri) {
+                    bail!(
+                        "`omnigraph graphs list` requires a remote multi-graph server URL \
+                         (http:// or https://). To enumerate local graphs, read `omnigraph.yaml` \
+                         directly."
+                    );
+                }
+                let payload = remote_json::<GraphListResponse>(
+                    &http_client,
+                    Method::GET,
+                    remote_url(&uri, "/graphs"),
+                    None,
+                    bearer_token.as_deref(),
+                )
+                .await?;
+                if json {
+                    print_json(&payload)?;
+                } else {
+                    for entry in payload.graphs {
+                        println!("{}\t{}", entry.graph_id, entry.uri);
+                    }
+                }
+            }
+        },
     }
     Ok(())
 }
@@ -2564,13 +3155,62 @@ mod tests {
     use std::fs;
 
     use super::{
-        DEFAULT_BEARER_TOKEN_ENV, apply_bearer_token, bearer_token_from_env_file, load_cli_config,
-        load_env_file_into_process, normalize_bearer_token, parse_env_assignment,
-        resolve_remote_bearer_token,
+        DEFAULT_BEARER_TOKEN_ENV, apply_bearer_token, bearer_token_from_env_file,
+        legacy_change_request_body, load_cli_config, load_env_file_into_process,
+        normalize_bearer_token, parse_env_assignment, resolve_policy_context,
+        resolve_cli_graph, resolve_remote_bearer_token,
     };
     use omnigraph_server::load_config;
     use reqwest::header::AUTHORIZATION;
+    use serde_json::json;
     use tempfile::tempdir;
+
+    #[test]
+    fn legacy_change_request_body_uses_legacy_field_names() {
+        // `execute_change_remote` hits `POST /change`, which old
+        // `omnigraph-server` builds deserialize as `ChangeRequest` with
+        // **required** `query_source` and optional `query_name` keys.
+        // Newer servers accept both spellings via serde alias, but a
+        // newer CLI must still emit the legacy keys on the wire so it
+        // can talk to an old server during a rolling upgrade.
+        let body = legacy_change_request_body(
+            "query insert_person($n: String) { insert Person { name: $n } }",
+            Some("insert_person"),
+            "main",
+            Some(&json!({ "n": "Alice" })),
+        );
+        assert_eq!(
+            body["query_source"].as_str(),
+            Some("query insert_person($n: String) { insert Person { name: $n } }"),
+        );
+        assert_eq!(body["query_name"].as_str(), Some("insert_person"));
+        assert_eq!(body["branch"].as_str(), Some("main"));
+        assert_eq!(body["params"]["n"].as_str(), Some("Alice"));
+        // Crucially, the **new** field names must NOT appear -- old
+        // servers would silently treat them as unknown fields and then
+        // fail on missing required `query_source`.
+        assert!(
+            body.get("query").is_none(),
+            "legacy /change body must not carry the renamed `query` key; got {body}"
+        );
+        assert!(
+            body.get("name").is_none(),
+            "legacy /change body must not carry the renamed `name` key; got {body}"
+        );
+    }
+
+    #[test]
+    fn legacy_change_request_body_omits_optional_fields_when_unset() {
+        let body = legacy_change_request_body(
+            "query find() { match { $p: Person } return { $p.name } }",
+            None,
+            "main",
+            None,
+        );
+        assert_eq!(body["branch"].as_str(), Some("main"));
+        assert!(body.get("query_name").is_none());
+        assert!(body.get("params").is_none());
+    }
 
     #[test]
     fn apply_bearer_token_adds_header_when_configured() {
@@ -2777,5 +3417,151 @@ graphs:
                 std::env::remove_var(key);
             }
         }
+    }
+
+    #[test]
+    fn graph_identity_resolve_policy_context_named_cli_graph_uses_graph_key_not_project_name_or_uri() {
+        let temp = tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            r#"
+project:
+  name: misleading-project
+graphs:
+  local:
+    uri: /tmp/local-policy-graph.omni
+    policy:
+      file: ./policy.yaml
+cli:
+  graph: local
+"#,
+        )
+        .unwrap();
+
+        let config = load_config(Some(&config_path)).unwrap();
+        let context = resolve_policy_context(&config).unwrap();
+        assert_eq!(context.graph_id, "local");
+    }
+
+    #[test]
+    fn graph_identity_resolve_policy_context_server_graph_uses_graph_key_when_cli_graph_absent() {
+        let temp = tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            r#"
+project:
+  name: misleading-project
+graphs:
+  local:
+    uri: /tmp/local-policy-graph.omni
+    policy:
+      file: ./server-policy.yaml
+server:
+  graph: local
+"#,
+        )
+        .unwrap();
+
+        let config = load_config(Some(&config_path)).unwrap();
+        let context = resolve_policy_context(&config).unwrap();
+        assert_eq!(context.graph_id, "local");
+        assert!(context.policy_file.ends_with("server-policy.yaml"));
+    }
+
+    #[test]
+    fn graph_identity_resolve_policy_context_anonymous_uses_top_level_default_identity() {
+        let temp = tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            r#"
+project:
+  name: misleading-project
+graphs:
+  local:
+    uri: /tmp/local-policy-graph.omni
+policy:
+  file: ./top-policy.yaml
+"#,
+        )
+        .unwrap();
+
+        let config = load_config(Some(&config_path)).unwrap();
+        let context = resolve_policy_context(&config).unwrap();
+        assert_eq!(context.graph_id, "default");
+        assert!(context.policy_file.ends_with("top-policy.yaml"));
+    }
+
+    #[test]
+    fn graph_identity_resolve_cli_graph_named_target_uses_graph_key_not_project_name_or_uri() {
+        let temp = tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            r#"
+project:
+  name: misleading-project
+graphs:
+  prod:
+    uri: s3://bucket/prod-graph/
+    policy:
+      file: ./prod-policy.yaml
+"#,
+        )
+        .unwrap();
+
+        let config = load_config(Some(&config_path)).unwrap();
+        let graph = resolve_cli_graph(&config, None, Some("prod")).unwrap();
+        assert_eq!(graph.selected(), Some("prod"));
+        assert_eq!(graph.graph_id, "prod");
+        assert_eq!(graph.uri, "s3://bucket/prod-graph/");
+    }
+
+    #[test]
+    fn graph_identity_resolve_cli_graph_positional_uri_uses_anonymous_normalized_uri() {
+        let temp = tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            r#"
+project:
+  name: misleading-project
+graphs:
+  local:
+    uri: /tmp/configured-graph.omni
+    policy:
+      file: ./policy.yaml
+cli:
+  graph: local
+"#,
+        )
+        .unwrap();
+
+        let config = load_config(Some(&config_path)).unwrap();
+        let local_graph_path = temp.path().join("explicit-graph.omni");
+        let local_graph = resolve_cli_graph(
+            &config,
+            Some(format!("file://{}", local_graph_path.display())),
+            None,
+        )
+        .unwrap();
+        assert_eq!(local_graph.selected(), None);
+        assert_eq!(
+            local_graph.graph_id,
+            local_graph_path.to_string_lossy().as_ref()
+        );
+        assert_eq!(local_graph.policy_file, None);
+
+        let s3_graph = resolve_cli_graph(
+            &config,
+            Some("s3://bucket/anonymous-graph/".to_string()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(s3_graph.selected(), None);
+        assert_eq!(s3_graph.graph_id, "s3://bucket/anonymous-graph");
+        assert_eq!(s3_graph.policy_file, None);
     }
 }

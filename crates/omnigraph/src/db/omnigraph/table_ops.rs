@@ -22,7 +22,12 @@ pub(super) async fn graph_index_for_resolved(
 }
 
 pub(super) async fn ensure_indices(db: &Omnigraph) -> Result<()> {
-    let current_branch = db.coordinator.read().await.current_branch().map(str::to_string);
+    let current_branch = db
+        .coordinator
+        .read()
+        .await
+        .current_branch()
+        .map(str::to_string);
     ensure_indices_for_branch(db, current_branch.as_deref()).await
 }
 
@@ -68,10 +73,7 @@ pub(super) async fn failpoint_publish_table_head_without_index_rebuild_for_test(
     .await
 }
 
-pub(super) async fn ensure_indices_for_branch(
-    db: &Omnigraph,
-    branch: Option<&str>,
-) -> Result<()> {
+pub(super) async fn ensure_indices_for_branch(db: &Omnigraph, branch: Option<&str>) -> Result<()> {
     db.ensure_schema_state_valid().await?;
     db.ensure_schema_apply_idle("ensure_indices").await?;
     let resolved = db.resolved_branch_target(branch).await?;
@@ -403,7 +405,12 @@ pub(super) async fn open_for_mutation(
     table_key: &str,
     op_kind: crate::db::MutationOpKind,
 ) -> Result<(Dataset, String, Option<String>)> {
-    let current_branch = db.coordinator.read().await.current_branch().map(str::to_string);
+    let current_branch = db
+        .coordinator
+        .read()
+        .await
+        .current_branch()
+        .map(str::to_string);
     open_for_mutation_on_branch(db, current_branch.as_deref(), table_key, op_kind).await
 }
 
@@ -476,6 +483,22 @@ pub(super) async fn open_owned_dataset_for_branch_write(
             Ok((ds, Some(active_branch.to_string())))
         }
         source_branch => {
+            crate::failpoints::maybe_fail("fork.before_classify")?;
+            // Authority check before forking: re-read the live manifest. If this
+            // table is already forked on active_branch, a concurrent first-write
+            // won the race and our snapshot is stale — that is a retryable
+            // conflict, not an orphan. (A zombie fork is never in the manifest,
+            // so this only fires for a live concurrent fork.)
+            let live = db.snapshot_for_branch(Some(active_branch)).await?;
+            if let Some(entry) = live.entry(table_key) {
+                if entry.table_branch.as_deref() == Some(active_branch) {
+                    return Err(OmniError::manifest_expected_version_mismatch(
+                        table_key,
+                        entry_version,
+                        entry.table_version,
+                    ));
+                }
+            }
             fork_dataset_from_entry_state(
                 db,
                 table_key,
@@ -807,7 +830,12 @@ pub(super) async fn commit_prepared_updates_on_branch(
     updates: &[crate::db::SubTableUpdate],
     actor_id: Option<&str>,
 ) -> Result<u64> {
-    let current_branch = db.coordinator.read().await.current_branch().map(str::to_string);
+    let current_branch = db
+        .coordinator
+        .read()
+        .await
+        .current_branch()
+        .map(str::to_string);
     let requested_branch = branch.map(str::to_string);
     if requested_branch == current_branch {
         return commit_prepared_updates(db, updates, actor_id).await;
@@ -835,7 +863,12 @@ pub(super) async fn commit_prepared_updates_on_branch_with_expected(
     expected_table_versions: &std::collections::HashMap<String, u64>,
     actor_id: Option<&str>,
 ) -> Result<u64> {
-    let current_branch = db.coordinator.read().await.current_branch().map(str::to_string);
+    let current_branch = db
+        .coordinator
+        .read()
+        .await
+        .current_branch()
+        .map(str::to_string);
     let requested_branch = branch.map(str::to_string);
     if requested_branch == current_branch {
         return commit_prepared_updates_with_expected(
@@ -870,7 +903,12 @@ pub(super) async fn commit_updates(
     updates: &[crate::db::SubTableUpdate],
 ) -> Result<u64> {
     db.ensure_schema_apply_not_locked("write commit").await?;
-    let current_branch = db.coordinator.read().await.current_branch().map(str::to_string);
+    let current_branch = db
+        .coordinator
+        .read()
+        .await
+        .current_branch()
+        .map(str::to_string);
     let prepared = prepare_updates_for_commit(db, current_branch.as_deref(), updates).await?;
     commit_prepared_updates(db, &prepared, None).await
 }
@@ -879,7 +917,11 @@ pub(super) async fn commit_manifest_updates(
     db: &Omnigraph,
     updates: &[crate::db::SubTableUpdate],
 ) -> Result<u64> {
-    db.coordinator.write().await.commit_manifest_updates(updates).await
+    db.coordinator
+        .write()
+        .await
+        .commit_manifest_updates(updates)
+        .await
 }
 
 pub(super) async fn record_merge_commit(
@@ -889,7 +931,9 @@ pub(super) async fn record_merge_commit(
     merged_parent_commit_id: &str,
     actor_id: Option<&str>,
 ) -> Result<String> {
-    db.coordinator.write().await
+    db.coordinator
+        .write()
+        .await
         .record_merge_commit(
             manifest_version,
             parent_commit_id,
@@ -923,7 +967,11 @@ pub(super) async fn commit_updates_on_branch_with_expected(
 }
 
 pub(super) async fn ensure_commit_graph_initialized(db: &Omnigraph) -> Result<()> {
-    db.coordinator.write().await.ensure_commit_graph_initialized().await
+    db.coordinator
+        .write()
+        .await
+        .ensure_commit_graph_initialized()
+        .await
 }
 
 pub(super) async fn invalidate_graph_index(db: &Omnigraph) {

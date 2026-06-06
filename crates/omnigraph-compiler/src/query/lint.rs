@@ -38,7 +38,7 @@ pub enum QueryLintQueryKind {
 #[serde(rename_all = "lowercase")]
 pub enum QueryLintSchemaSourceKind {
     File,
-    Repo,
+    Graph,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -59,9 +59,9 @@ impl QueryLintSchemaSource {
         }
     }
 
-    pub fn repo(uri: impl Into<String>) -> Self {
+    pub fn graph(uri: impl Into<String>) -> Self {
         Self {
-            kind: QueryLintSchemaSourceKind::Repo,
+            kind: QueryLintSchemaSourceKind::Graph,
             path: None,
             uri: Some(uri.into()),
         }

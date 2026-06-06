@@ -3,7 +3,7 @@
 #
 # Requires:
 #   - `gh` CLI authenticated.
-#   - Repo-admin or org-admin permissions on ModernRelay/omnigraph.
+#   - Repository-admin or org-admin permissions on ModernRelay/omnigraph.
 #
 # This script is idempotent: re-running applies whatever is currently
 # declared in .github/branch-protection.json. The JSON file is the

@@ -48,12 +48,80 @@ pub(super) async fn plan_schema(
     Ok(plan)
 }
 
-pub(super) async fn apply_schema(
+struct PlannedSchemaApply {
+    plan: SchemaMigrationPlan,
+    desired_ir: SchemaIR,
+    desired_catalog: Catalog,
+}
+
+async fn plan_schema_for_apply(
+    db: &Omnigraph,
+    desired_schema_source: &str,
+    options: SchemaApplyOptions,
+) -> Result<PlannedSchemaApply> {
+    db.ensure_schema_state_valid().await?;
+    let branches = db.coordinator.read().await.all_branches().await?;
+    // Skip `main` and internal system branches. The schema-apply lock branch
+    // is excluded because it is the cluster-wide schema-apply serializer.
+    // `__run__*` branches are no longer created; the filter remains as
+    // defense-in-depth for legacy graphs with leftover staging branches.
+    // A future production sweep will let this guard go.
+    let blocking_branches = branches
+        .into_iter()
+        .filter(|branch| branch != "main" && !is_internal_system_branch(branch))
+        .collect::<Vec<_>>();
+    if !blocking_branches.is_empty() {
+        return Err(OmniError::manifest_conflict(format!(
+            "schema apply requires a graph with only main; found non-main branches: {}",
+            blocking_branches.join(", ")
+        )));
+    }
+
+    let accepted_ir = read_accepted_schema_ir(db.uri(), Arc::clone(&db.storage)).await?;
+    let desired_ir = read_schema_ir_from_source(desired_schema_source)?;
+    let mut plan = plan_schema_migration(&accepted_ir, &desired_ir)
+        .map_err(|err| OmniError::manifest(err.to_string()))?;
+    promote_drops_to_hard(&mut plan, options.allow_data_loss);
+    if !plan.supported {
+        let message = plan
+            .steps
+            .iter()
+            .find_map(|step| step.unsupported_error_message())
+            .unwrap_or_else(|| "unsupported schema migration plan".to_string());
+        return Err(OmniError::manifest(message));
+    }
+
+    let mut desired_catalog = build_catalog_from_ir(&desired_ir)?;
+    fixup_blob_schemas(&mut desired_catalog);
+    Ok(PlannedSchemaApply {
+        plan,
+        desired_ir,
+        desired_catalog,
+    })
+}
+
+pub(super) async fn preview_schema_apply(
+    db: &Omnigraph,
+    desired_schema_source: &str,
+    options: SchemaApplyOptions,
+) -> Result<SchemaApplyPreview> {
+    let planned = plan_schema_for_apply(db, desired_schema_source, options).await?;
+    Ok(SchemaApplyPreview {
+        plan: planned.plan,
+        catalog: planned.desired_catalog,
+    })
+}
+
+pub(super) async fn apply_schema<F>(
     db: &Omnigraph,
     desired_schema_source: &str,
     options: SchemaApplyOptions,
     actor: Option<&str>,
-) -> Result<SchemaApplyResult> {
+    validate_catalog: F,
+) -> Result<SchemaApplyResult>
+where
+    F: FnOnce(&Catalog) -> Result<()>,
+{
     // Engine-layer policy gate (MR-722 chassis core).
     //
     // Fires BEFORE acquiring the schema-apply lock or doing any other
@@ -77,7 +145,7 @@ pub(super) async fn apply_schema(
     )?;
 
     acquire_schema_apply_lock(db).await?;
-    let result = apply_schema_with_lock(db, desired_schema_source, options).await;
+    let result = apply_schema_with_lock(db, desired_schema_source, options, validate_catalog).await;
     let release_result = release_schema_apply_lock(db).await;
     match (result, release_result) {
         (Ok(result), Ok(())) => Ok(result),
@@ -87,42 +155,22 @@ pub(super) async fn apply_schema(
     }
 }
 
-pub(super) async fn apply_schema_with_lock(
+pub(super) async fn apply_schema_with_lock<F>(
     db: &Omnigraph,
     desired_schema_source: &str,
     options: SchemaApplyOptions,
-) -> Result<SchemaApplyResult> {
-    db.ensure_schema_state_valid().await?;
-    let branches = db.coordinator.read().await.all_branches().await?;
-    // Skip `main` and internal system branches. The schema-apply lock branch
-    // is excluded because it is the cluster-wide schema-apply serializer.
-    // `__run__*` branches are no longer created; the filter remains as
-    // defense-in-depth for legacy repos with leftover staging branches.
-    // A future production sweep will let this guard go.
-    let blocking_branches = branches
-        .into_iter()
-        .filter(|branch| branch != "main" && !is_internal_system_branch(branch))
-        .collect::<Vec<_>>();
-    if !blocking_branches.is_empty() {
-        return Err(OmniError::manifest_conflict(format!(
-            "schema apply requires a repo with only main; found non-main branches: {}",
-            blocking_branches.join(", ")
-        )));
-    }
-
-    let accepted_ir = read_accepted_schema_ir(db.uri(), Arc::clone(&db.storage)).await?;
-    let desired_ir = read_schema_ir_from_source(desired_schema_source)?;
-    let mut plan = plan_schema_migration(&accepted_ir, &desired_ir)
-        .map_err(|err| OmniError::manifest(err.to_string()))?;
-    promote_drops_to_hard(&mut plan, options.allow_data_loss);
-    if !plan.supported {
-        let message = plan
-            .steps
-            .iter()
-            .find_map(|step| step.unsupported_error_message())
-            .unwrap_or_else(|| "unsupported schema migration plan".to_string());
-        return Err(OmniError::manifest(message));
-    }
+    validate_catalog: F,
+) -> Result<SchemaApplyResult>
+where
+    F: FnOnce(&Catalog) -> Result<()>,
+{
+    let planned = plan_schema_for_apply(db, desired_schema_source, options).await?;
+    validate_catalog(&planned.desired_catalog)?;
+    let PlannedSchemaApply {
+        plan,
+        desired_ir,
+        desired_catalog,
+    } = planned;
     if plan.steps.is_empty() {
         return Ok(SchemaApplyResult {
             supported: true,
@@ -131,9 +179,6 @@ pub(super) async fn apply_schema_with_lock(
             steps: plan.steps,
         });
     }
-
-    let mut desired_catalog = build_catalog_from_ir(&desired_ir)?;
-    fixup_blob_schemas(&mut desired_catalog);
 
     let snapshot = db.snapshot().await;
     let base_manifest_version = snapshot.version();
@@ -780,7 +825,7 @@ pub(super) async fn acquire_schema_apply_lock(db: &Omnigraph) -> Result<()> {
     if !blocking_branches.is_empty() {
         let _ = release_schema_apply_lock(db).await;
         return Err(OmniError::manifest_conflict(format!(
-            "schema apply requires a repo with only main; found non-main branches: {}",
+            "schema apply requires a graph with only main; found non-main branches: {}",
             blocking_branches.join(", ")
         )));
     }

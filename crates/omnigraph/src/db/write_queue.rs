@@ -91,10 +91,7 @@ impl WriteQueueManager {
     /// Empty input returns an empty Vec without touching the map.
     /// Duplicates in `keys` are deduped before acquisition (the same
     /// key acquired twice would deadlock against itself).
-    pub(crate) async fn acquire_many(
-        &self,
-        keys: &[TableQueueKey],
-    ) -> Vec<OwnedMutexGuard<()>> {
+    pub(crate) async fn acquire_many(&self, keys: &[TableQueueKey]) -> Vec<OwnedMutexGuard<()>> {
         if keys.is_empty() {
             return Vec::new();
         }
@@ -167,7 +164,10 @@ mod tests {
             qm2.acquire_many(&[z_clone, a_clone]).await
         })
         .await;
-        assert!(result.is_err(), "acquire_many should block on `a`, the lex-first key");
+        assert!(
+            result.is_err(),
+            "acquire_many should block on `a`, the lex-first key"
+        );
     }
 
     #[tokio::test]
@@ -180,9 +180,10 @@ mod tests {
         // Second acquire on same key should NOT complete within 200ms.
         let qm2 = Arc::clone(&qm);
         let k2 = k.clone();
-        let blocked = timeout(Duration::from_millis(200), async move {
-            qm2.acquire(&k2).await
-        })
+        let blocked = timeout(
+            Duration::from_millis(200),
+            async move { qm2.acquire(&k2).await },
+        )
         .await;
         assert!(blocked.is_err(), "second acquire on same key must block");
 

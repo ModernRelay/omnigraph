@@ -75,14 +75,7 @@ impl Omnigraph {
             None
         };
 
-        execute_query(
-            &ir,
-            params,
-            &snapshot,
-            graph_index.as_deref(),
-            &catalog,
-        )
-        .await
+        execute_query(&ir, params, &snapshot, graph_index.as_deref(), &catalog).await
     }
 }
 
@@ -360,11 +353,23 @@ pub async fn execute_query(
     }
 
     let mut wide: Option<RecordBatch> = None;
-    execute_pipeline(&ir.pipeline, params, snapshot, graph_index, catalog, &mut wide, &search_mode).await?;
+    execute_pipeline(
+        &ir.pipeline,
+        params,
+        snapshot,
+        graph_index,
+        catalog,
+        &mut wide,
+        &search_mode,
+    )
+    .await?;
     let wide_batch = wide.unwrap_or_else(|| RecordBatch::new_empty(Arc::new(Schema::empty())));
 
     // Project return expressions
-    let has_aggregates = ir.return_exprs.iter().any(|p| matches!(&p.expr, IRExpr::Aggregate { .. }));
+    let has_aggregates = ir
+        .return_exprs
+        .iter()
+        .any(|p| matches!(&p.expr, IRExpr::Aggregate { .. }));
     let mut result_batch = project_return(&wide_batch, &ir.return_exprs, params)?;
 
     // Apply ordering (skip if search mode already ordered the results)
@@ -516,9 +521,9 @@ async fn execute_rrf_query(
 }
 
 fn extract_id_column_by_name(batch: &RecordBatch, col_name: &str) -> Result<Vec<String>> {
-    let col = batch
-        .column_by_name(col_name)
-        .ok_or_else(|| OmniError::manifest(format!("batch missing '{}' column for RRF", col_name)))?;
+    let col = batch.column_by_name(col_name).ok_or_else(|| {
+        OmniError::manifest(format!("batch missing '{}' column for RRF", col_name))
+    })?;
     let ids = col
         .as_any()
         .downcast_ref::<StringArray>()
@@ -653,8 +658,19 @@ fn execute_pipeline<'a>(
                     })?;
                     if let Some(batch) = wide.as_mut() {
                         execute_expand(
-                            batch, gi, snapshot, catalog, src_var, dst_var, edge_type, *direction,
-                            dst_type, *min_hops, *max_hops, dst_filters, params,
+                            batch,
+                            gi,
+                            snapshot,
+                            catalog,
+                            src_var,
+                            dst_var,
+                            edge_type,
+                            *direction,
+                            dst_type,
+                            *min_hops,
+                            *max_hops,
+                            dst_filters,
+                            params,
                         )
                         .await?;
                     }
@@ -691,7 +707,9 @@ async fn execute_expand(
     let src_id_col_name = format!("{}.id", src_var);
     let src_ids = wide
         .column_by_name(&src_id_col_name)
-        .ok_or_else(|| OmniError::manifest(format!("wide batch missing '{}' column", src_id_col_name)))?
+        .ok_or_else(|| {
+            OmniError::manifest(format!("wide batch missing '{}' column", src_id_col_name))
+        })?
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| OmniError::manifest(format!("'{}' column is not Utf8", src_id_col_name)))?
@@ -1421,22 +1439,39 @@ fn literal_to_expr(lit: &Literal) -> Option<datafusion::prelude::Expr> {
 }
 
 fn prefix_batch(batch: &RecordBatch, variable: &str) -> Result<RecordBatch> {
-    let fields: Vec<Field> = batch.schema().fields().iter().map(|f| {
-        Field::new(format!("{}.{}", variable, f.name()), f.data_type().clone(), f.is_nullable())
-    }).collect();
+    let fields: Vec<Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| {
+            Field::new(
+                format!("{}.{}", variable, f.name()),
+                f.data_type().clone(),
+                f.is_nullable(),
+            )
+        })
+        .collect();
     let schema = Arc::new(Schema::new(fields));
-    RecordBatch::try_new(schema, batch.columns().to_vec()).map_err(|e| OmniError::Lance(e.to_string()))
+    RecordBatch::try_new(schema, batch.columns().to_vec())
+        .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
 fn cross_join_batches(left: &RecordBatch, right: &RecordBatch) -> Result<RecordBatch> {
     let n = left.num_rows();
     let m = right.num_rows();
     if n == 0 || m == 0 {
-        let mut fields: Vec<Field> = left.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+        let mut fields: Vec<Field> = left
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
         fields.extend(right.schema().fields().iter().map(|f| f.as_ref().clone()));
         return Ok(RecordBatch::new_empty(Arc::new(Schema::new(fields))));
     }
-    let left_indices: Vec<u32> = (0..n as u32).flat_map(|i| std::iter::repeat(i).take(m)).collect();
+    let left_indices: Vec<u32> = (0..n as u32)
+        .flat_map(|i| std::iter::repeat(i).take(m))
+        .collect();
     let right_indices: Vec<u32> = (0..n).flat_map(|_| 0..m as u32).collect();
     let left_expanded = take_batch(left, &UInt32Array::from(left_indices))?;
     let right_expanded = take_batch(right, &UInt32Array::from(right_indices))?;
@@ -1444,23 +1479,39 @@ fn cross_join_batches(left: &RecordBatch, right: &RecordBatch) -> Result<RecordB
 }
 
 fn hconcat_batches(left: &RecordBatch, right: &RecordBatch) -> Result<RecordBatch> {
-    let mut fields: Vec<Field> = left.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+    let mut fields: Vec<Field> = left
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
     if cfg!(debug_assertions) {
         let left_schema = left.schema();
-        let left_names: HashSet<&str> = left_schema.fields().iter().map(|f| f.name().as_str()).collect();
+        let left_names: HashSet<&str> = left_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
         let right_schema = right.schema();
         for f in right_schema.fields() {
-            debug_assert!(!left_names.contains(f.name().as_str()), "hconcat_batches: duplicate column '{}'", f.name());
+            debug_assert!(
+                !left_names.contains(f.name().as_str()),
+                "hconcat_batches: duplicate column '{}'",
+                f.name()
+            );
         }
     }
     fields.extend(right.schema().fields().iter().map(|f| f.as_ref().clone()));
     let mut columns: Vec<ArrayRef> = left.columns().to_vec();
     columns.extend(right.columns().to_vec());
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|e| OmniError::Lance(e.to_string()))
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
 fn take_batch(batch: &RecordBatch, indices: &UInt32Array) -> Result<RecordBatch> {
-    let columns: Vec<ArrayRef> = batch.columns().iter()
+    let columns: Vec<ArrayRef> = batch
+        .columns()
+        .iter()
         .map(|col| arrow_select::take::take(col.as_ref(), indices, None))
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| OmniError::Lance(e.to_string()))?;

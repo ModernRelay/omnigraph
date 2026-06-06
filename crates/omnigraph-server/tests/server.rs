@@ -8,14 +8,15 @@ use axum::body::{Body, to_bytes};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{Method, Request, StatusCode};
 use lance::index::DatasetIndexExt;
-use omnigraph::db::{Omnigraph, ReadTarget, SchemaApplyOptions};
+use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_policy::{PolicyChecker, PolicyEngine};
 use omnigraph_server::api::{
     BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorOutput, ExportRequest,
-    IngestRequest, ReadRequest, SchemaApplyRequest, SchemaOutput,
+    IngestRequest, QueryRequest, ReadRequest, SchemaApplyRequest, SchemaOutput,
 };
+use omnigraph_server::queries::{QueryRegistry, RegistrySpec};
 use omnigraph_server::{AppState, build_app};
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -105,40 +106,503 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-async fn init_loaded_repo() -> tempfile::TempDir {
-    init_repo_with_schema_and_data(
+async fn init_loaded_graph() -> tempfile::TempDir {
+    init_graph_with_schema_and_data(
         &fs::read_to_string(fixture("test.pg")).unwrap(),
         &fs::read_to_string(fixture("test.jsonl")).unwrap(),
     )
     .await
 }
 
-async fn init_repo_with_schema_and_data(schema: &str, data: &str) -> tempfile::TempDir {
+async fn init_graph_with_schema_and_data(schema: &str, data: &str) -> tempfile::TempDir {
     let temp = tempfile::tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    fs::create_dir_all(&repo).unwrap();
-    Omnigraph::init(repo.to_str().unwrap(), schema)
+    let graph = graph_path(temp.path());
+    fs::create_dir_all(&graph).unwrap();
+    Omnigraph::init(graph.to_str().unwrap(), schema)
         .await
         .unwrap();
-    let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let mut db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     load_jsonl(&mut db, data, LoadMode::Overwrite)
         .await
         .unwrap();
     temp
 }
 
-async fn init_repo_with_schema(schema: &str) -> tempfile::TempDir {
+async fn init_graph_with_schema(schema: &str) -> tempfile::TempDir {
     let temp = tempfile::tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    fs::create_dir_all(&repo).unwrap();
-    Omnigraph::init(repo.to_str().unwrap(), schema)
+    let graph = graph_path(temp.path());
+    fs::create_dir_all(&graph).unwrap();
+    Omnigraph::init(graph.to_str().unwrap(), schema)
         .await
         .unwrap();
     temp
 }
 
-fn repo_path(root: &Path) -> PathBuf {
+fn graph_path(root: &Path) -> PathBuf {
     root.join("server.omni")
+}
+
+fn stored_query_registry(specs: &[(&str, &str, bool)]) -> QueryRegistry {
+    QueryRegistry::from_specs(
+        specs
+            .iter()
+            .map(|(name, source, expose)| RegistrySpec {
+                name: name.to_string(),
+                source: source.to_string(),
+                expose: *expose,
+                tool_name: None,
+            })
+            .collect(),
+    )
+    .expect("specs parse and key==symbol")
+}
+
+#[tokio::test]
+async fn server_boots_with_a_valid_stored_query_registry() {
+    // A stored query that type-checks against the fixture schema
+    // (`Person { name, age }`) must let the server boot.
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let registry = stored_query_registry(&[(
+        "find_person",
+        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
+        false,
+    )]);
+    let state = AppState::open_single_with_queries(
+        graph.to_string_lossy().to_string(),
+        vec![],
+        None,
+        registry,
+    )
+    .await;
+    assert!(state.is_ok(), "valid registry should boot: {:?}", state.err());
+}
+
+#[tokio::test]
+async fn server_refuses_boot_on_type_broken_stored_query() {
+    // A stored query referencing a type not in the schema (`Widget`)
+    // must abort boot, naming the offending query.
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let registry = stored_query_registry(&[(
+        "ghost",
+        "query ghost() { match { $w: Widget } return { $w.name } }",
+        false,
+    )]);
+    let result = AppState::open_single_with_queries(
+        graph.to_string_lossy().to_string(),
+        vec![],
+        None,
+        registry,
+    )
+    .await;
+    // `AppState` is not `Debug`, so match rather than `expect_err`.
+    let err = match result {
+        Ok(_) => panic!("type-broken stored query must refuse boot"),
+        Err(err) => err,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("ghost"), "error should name the broken query: {msg}");
+    assert!(
+        msg.contains("schema check"),
+        "error should mention the schema check: {msg}"
+    );
+}
+
+/// Build a single-mode app with a stored-query registry plus a bearer→actor
+/// pairing and a policy, so invoke tests exercise the `invoke_query`
+/// boundary gate and the inner read/change gates together.
+async fn app_with_stored_queries(
+    specs: &[(&str, &str, bool)],
+    tokens: &[(&str, &str)],
+    policy: &str,
+) -> (tempfile::TempDir, Router) {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, policy).unwrap();
+    let registry = stored_query_registry(specs);
+    let state = AppState::open_single_with_queries(
+        graph.to_string_lossy().to_string(),
+        tokens
+            .iter()
+            .map(|(actor, token)| ((*actor).to_string(), (*token).to_string()))
+            .collect(),
+        Some(&policy_path),
+        registry,
+    )
+    .await
+    .unwrap();
+    (temp, build_app(state))
+}
+
+/// - `act-invoke`: invoke_query + read (stored reads, not mutations)
+/// - `act-full`:   invoke_query + read + change (stored mutations)
+/// - `act-noinvoke`: read only, no invoke_query (boundary-denied)
+/// - `act-invokeonly`: invoke_query only, no read (clears the boundary, inner read denies)
+const INVOKE_POLICY_YAML: &str = r#"
+version: 1
+groups:
+  invokers: ["act-invoke"]
+  full: ["act-full"]
+  readers: ["act-noinvoke"]
+  invoke_only: ["act-invokeonly"]
+protected_branches: [main]
+rules:
+  # invoke_query is graph-scoped — its own rules, no branch_scope.
+  - id: invokers-can-invoke
+    allow:
+      actors: { group: invokers }
+      actions: [invoke_query]
+  - id: full-can-invoke
+    allow:
+      actors: { group: full }
+      actions: [invoke_query]
+  - id: invoke-only-can-invoke
+    allow:
+      actors: { group: invoke_only }
+      actions: [invoke_query]
+  # read / change are branch-scoped.
+  - id: invokers-can-read
+    allow:
+      actors: { group: invokers }
+      actions: [read]
+      branch_scope: any
+  - id: full-can-read-change
+    allow:
+      actors: { group: full }
+      actions: [read, change]
+      branch_scope: any
+  - id: readers-can-read
+    allow:
+      actors: { group: readers }
+      actions: [read]
+      branch_scope: any
+"#;
+
+const STORED_QUERY_SCHEMA_APPLY_POLICY_YAML: &str = r#"
+version: 1
+groups:
+  admins: [act-ragnor]
+protected_branches: [main]
+rules:
+  - id: admins-can-invoke
+    allow:
+      actors: { group: admins }
+      actions: [invoke_query]
+  - id: admins-can-read
+    allow:
+      actors: { group: admins }
+      actions: [read]
+      branch_scope: any
+  - id: admins-can-schema-apply
+    allow:
+      actors: { group: admins }
+      actions: [schema_apply]
+      target_branch_scope: protected
+"#;
+
+const FIND_PERSON_GQ: &str =
+    "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }";
+
+fn invoke_request(name: &str, token: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .uri(format!("/queries/{name}"))
+        .method(Method::POST)
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
+fn invoke_request_bytes(
+    name: &str,
+    token: &str,
+    body: impl Into<Body>,
+    content_type: Option<&str>,
+) -> Request<Body> {
+    let mut builder = Request::builder()
+        .uri(format!("/queries/{name}"))
+        .method(Method::POST)
+        .header("authorization", format!("Bearer {token}"));
+    if let Some(content_type) = content_type {
+        builder = builder.header("content-type", content_type);
+    }
+    builder.body(body.into()).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_stored_read_returns_rows() {
+    let (_temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, false)],
+        &[("act-invoke", "t-invoke")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    let (status, body) = json_response(
+        &app,
+        invoke_request("find_person", "t-invoke", json!({ "params": { "name": "Alice" } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["query_name"], "find_person");
+    assert_eq!(body["row_count"], 1, "Alice is in the fixture; body: {body}");
+    assert!(body["rows"].is_array(), "read envelope shape; body: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_stored_read_accepts_absent_or_empty_body() {
+    let no_param_query = "query list_people() { match { $p: Person } return { $p.name } }";
+    let (_temp, app) = app_with_stored_queries(
+        &[("list_people", no_param_query, false)],
+        &[("act-invoke", "t-invoke")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+
+    let (status, body) = json_response(
+        &app,
+        invoke_request_bytes("list_people", "t-invoke", Body::empty(), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["query_name"], "list_people");
+
+    let (status, body) = json_response(
+        &app,
+        invoke_request_bytes(
+            "list_people",
+            "t-invoke",
+            Body::empty(),
+            Some("application/json"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let (status, body) = json_response(
+        &app,
+        invoke_request_bytes(
+            "list_people",
+            "t-invoke",
+            Body::from("{}"),
+            Some("application/json"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let (status, body) = json_response(
+        &app,
+        invoke_request_bytes(
+            "list_people",
+            "t-invoke",
+            Body::from("{"),
+            Some("application/json"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("invalid stored-query invocation body"),
+        "malformed JSON should be rejected as bad request; body: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_stored_mutation_double_gates_on_change() {
+    let specs: &[(&str, &str, bool)] = &[(
+        "add_person",
+        "query add_person($name: String) { insert Person { name: $name } }",
+        false,
+    )];
+    let (_temp, app) = app_with_stored_queries(
+        specs,
+        &[("act-invoke", "t-invoke"), ("act-full", "t-full")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+
+    // Has invoke_query but NOT change → the inner change gate denies (403).
+    let (status, body) = json_response(
+        &app,
+        invoke_request("add_person", "t-invoke", json!({ "params": { "name": "Eve" } })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "invoke_query without change must 403; body: {body}"
+    );
+
+    // Has invoke_query + change → applied.
+    let (status, body) = json_response(
+        &app,
+        invoke_request("add_person", "t-full", json!({ "params": { "name": "Eve" } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["affected_nodes"], 1, "body: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_stored_query_bad_param_is_400() {
+    let (_temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, false)],
+        &[("act-invoke", "t-invoke")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    // `name` is declared String; pass a number.
+    let (status, body) = json_response(
+        &app,
+        invoke_request("find_person", "t-invoke", json!({ "params": { "name": 123 } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(
+        body["error"].as_str().unwrap_or_default().contains("name"),
+        "400 should name the offending param; body: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_unknown_query_and_denied_actor_return_identical_404() {
+    let (_temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, false)],
+        &[("act-invoke", "t-invoke"), ("act-noinvoke", "t-noinvoke")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+
+    // Authorized actor, unknown query name → 404.
+    let (unknown_status, unknown_body) =
+        json_response(&app, invoke_request("does_not_exist", "t-invoke", json!({}))).await;
+    // Denied actor (no invoke_query), real query name → 404.
+    let (denied_status, denied_body) = json_response(
+        &app,
+        invoke_request("find_person", "t-noinvoke", json!({ "params": { "name": "Alice" } })),
+    )
+    .await;
+
+    assert_eq!(unknown_status, StatusCode::NOT_FOUND);
+    assert_eq!(denied_status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        unknown_body, denied_body,
+        "deny must be byte-identical to a missing query (no catalog probing)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_query_holder_without_read_sees_403_not_404() {
+    // The 404-hiding is for callers WITHOUT invoke_query. An actor that
+    // HOLDS invoke_query but lacks `read` clears the boundary gate, then the
+    // inner read gate denies → 403 for an EXISTING read query, vs 404 for an
+    // unknown one. Existence is visible to grant-holders by design (the
+    // documented double-gate); this pins that actual contract.
+    let (_temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, false)],
+        &[("act-invokeonly", "t-invokeonly")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    let (exists_status, _) = json_response(
+        &app,
+        invoke_request("find_person", "t-invokeonly", json!({ "params": { "name": "Alice" } })),
+    )
+    .await;
+    let (absent_status, _) =
+        json_response(&app, invoke_request("does_not_exist", "t-invokeonly", json!({}))).await;
+    assert_eq!(
+        exists_status,
+        StatusCode::FORBIDDEN,
+        "an existing read query the holder can't read → inner-gate 403"
+    );
+    assert_eq!(absent_status, StatusCode::NOT_FOUND, "unknown query still 404s");
+}
+
+fn get_request(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .method(Method::GET)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_queries_returns_only_exposed_with_typed_params() {
+    let (_temp, app) = app_with_stored_queries(
+        &[
+            ("find_person", FIND_PERSON_GQ, true),
+            (
+                "add_person",
+                "query add_person($name: String) { insert Person { name: $name } }",
+                true,
+            ),
+            ("hidden", "query hidden() { match { $p: Person } return { $p.name } }", false),
+        ],
+        &[("act-invoke", "t-invoke")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    let (status, body) = json_response(&app, get_request("/queries", "t-invoke")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let entries = body["queries"].as_array().unwrap();
+    let names: Vec<&str> = entries.iter().map(|q| q["name"].as_str().unwrap()).collect();
+    assert!(
+        names.contains(&"find_person") && names.contains(&"add_person"),
+        "exposed queries listed: {names:?}"
+    );
+    assert!(!names.contains(&"hidden"), "non-exposed query hidden from the catalog: {names:?}");
+
+    let fp = entries.iter().find(|q| q["name"] == "find_person").unwrap();
+    assert_eq!(fp["mutation"], false);
+    assert_eq!(fp["tool_name"], "find_person");
+    assert_eq!(fp["params"][0]["name"], "name");
+    assert_eq!(fp["params"][0]["kind"], "string");
+    let ap = entries.iter().find(|q| q["name"] == "add_person").unwrap();
+    assert_eq!(ap["mutation"], true, "stored insert → mutation");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_queries_is_read_gated_so_a_non_invoker_can_list() {
+    // The catalog is read-gated (not invoke_query-gated), so a reader who
+    // lacks invoke_query still enumerates the exposed queries — the
+    // documented probe-oracle gap until per-query Cedar filtering lands.
+    let (_temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, true)],
+        &[("act-noinvoke", "t-noinvoke")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    let (status, body) = json_response(&app, get_request("/queries", "t-noinvoke")).await;
+    assert_eq!(status, StatusCode::OK, "read-gated catalog; body: {body}");
+    let names: Vec<&str> = body["queries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|q| q["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"find_person"),
+        "a reader lists the catalog despite lacking invoke_query: {names:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_queries_is_empty_when_no_registry() {
+    let (_temp, app) = app_for_loaded_graph_with_auth("demo-token").await;
+    let (status, body) = json_response(&app, get_request("/queries", "demo-token")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        body["queries"].as_array().unwrap().is_empty(),
+        "no stored-query registry → empty catalog"
+    );
 }
 
 fn drifted_test_schema() -> String {
@@ -147,8 +611,8 @@ fn drifted_test_schema() -> String {
         .replace("age: I32?", "age: I64?")
 }
 
-async fn manifest_dataset_version(repo: &Path) -> u64 {
-    Omnigraph::open(repo.to_string_lossy().as_ref())
+async fn manifest_dataset_version(graph: &Path) -> u64 {
+    Omnigraph::open(graph.to_string_lossy().as_ref())
         .await
         .unwrap()
         .snapshot_of(ReadTarget::branch("main"))
@@ -157,7 +621,7 @@ async fn manifest_dataset_version(repo: &Path) -> u64 {
         .version()
 }
 
-fn s3_test_repo_uri(suite: &str) -> Option<String> {
+fn s3_test_graph_uri(suite: &str) -> Option<String> {
     let bucket = env::var("OMNIGRAPH_S3_TEST_BUCKET").ok()?;
     let prefix = env::var("OMNIGRAPH_S3_TEST_PREFIX")
         .ok()
@@ -170,10 +634,10 @@ fn s3_test_repo_uri(suite: &str) -> Option<String> {
     Some(format!("s3://{}/{}/{}/{}", bucket, prefix, suite, unique))
 }
 
-async fn app_for_loaded_repo() -> (tempfile::TempDir, Router) {
-    let temp = init_loaded_repo().await;
-    let repo = repo_path(temp.path());
-    let state = AppState::open(repo.to_string_lossy().to_string())
+async fn app_for_loaded_graph() -> (tempfile::TempDir, Router) {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let state = AppState::open(graph.to_string_lossy().to_string())
         .await
         .unwrap();
     (temp, build_app(state))
@@ -186,7 +650,7 @@ async fn app_for_loaded_repo() -> (tempfile::TempDir, Router) {
 /// so test cases retain their pre-MR-723 semantics ("auth required,
 /// every action permitted") without conflicting with the new state
 /// matrix. Tests that specifically need the State-2 deny path use
-/// `app_for_repo_with_auth_tokens_only` instead.
+/// `app_for_graph_with_auth_tokens_only` instead.
 fn permit_all_policy_yaml(actors: &[&str]) -> String {
     let members = actors
         .iter()
@@ -214,15 +678,15 @@ rules:
     )
 }
 
-async fn app_for_loaded_repo_with_auth(token: &str) -> (tempfile::TempDir, Router) {
+async fn app_for_loaded_graph_with_auth(token: &str) -> (tempfile::TempDir, Router) {
     // `AppState::new_with_bearer_token(token)` maps the token to actor "default";
     // permit-all policy needs to include that actor.
-    let temp = init_loaded_repo().await;
-    let repo = repo_path(temp.path());
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
     let policy_path = temp.path().join("policy.yaml");
     fs::write(&policy_path, permit_all_policy_yaml(&["default"])).unwrap();
     let state = AppState::open_with_bearer_tokens_and_policy(
-        repo.to_string_lossy().to_string(),
+        graph.to_string_lossy().to_string(),
         vec![("default".to_string(), token.to_string())],
         Some(&policy_path),
     )
@@ -231,16 +695,16 @@ async fn app_for_loaded_repo_with_auth(token: &str) -> (tempfile::TempDir, Route
     (temp, build_app(state))
 }
 
-async fn app_for_loaded_repo_with_auth_tokens(
+async fn app_for_loaded_graph_with_auth_tokens(
     tokens: &[(&str, &str)],
 ) -> (tempfile::TempDir, Router) {
-    let temp = init_loaded_repo().await;
-    let repo = repo_path(temp.path());
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
     let policy_path = temp.path().join("policy.yaml");
     let actors: Vec<&str> = tokens.iter().map(|(actor, _)| *actor).collect();
     fs::write(&policy_path, permit_all_policy_yaml(&actors)).unwrap();
     let state = AppState::open_with_bearer_tokens_and_policy(
-        repo.to_string_lossy().to_string(),
+        graph.to_string_lossy().to_string(),
         tokens
             .iter()
             .map(|(actor, token)| ((*actor).to_string(), (*token).to_string()))
@@ -252,16 +716,16 @@ async fn app_for_loaded_repo_with_auth_tokens(
     (temp, build_app(state))
 }
 
-async fn app_for_loaded_repo_with_auth_tokens_and_policy(
+async fn app_for_loaded_graph_with_auth_tokens_and_policy(
     tokens: &[(&str, &str)],
     policy: &str,
 ) -> (tempfile::TempDir, Router) {
-    let temp = init_loaded_repo().await;
-    let repo = repo_path(temp.path());
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
     let policy_path = temp.path().join("policy.yaml");
     fs::write(&policy_path, policy).unwrap();
     let state = AppState::open_with_bearer_tokens_and_policy(
-        repo.to_string_lossy().to_string(),
+        graph.to_string_lossy().to_string(),
         tokens
             .iter()
             .map(|(actor, token)| ((*actor).to_string(), (*token).to_string()))
@@ -273,17 +737,17 @@ async fn app_for_loaded_repo_with_auth_tokens_and_policy(
     (temp, build_app(state))
 }
 
-async fn app_for_repo_with_auth_tokens_and_policy(
+async fn app_for_graph_with_auth_tokens_and_policy(
     schema: &str,
     tokens: &[(&str, &str)],
     policy: &str,
 ) -> (tempfile::TempDir, Router) {
-    let temp = init_repo_with_schema(schema).await;
-    let repo = repo_path(temp.path());
+    let temp = init_graph_with_schema(schema).await;
+    let graph = graph_path(temp.path());
     let policy_path = temp.path().join("policy.yaml");
     fs::write(&policy_path, policy).unwrap();
     let state = AppState::open_with_bearer_tokens_and_policy(
-        repo.to_string_lossy().to_string(),
+        graph.to_string_lossy().to_string(),
         tokens
             .iter()
             .map(|(actor, token)| ((*actor).to_string(), (*token).to_string()))
@@ -299,14 +763,14 @@ async fn app_for_repo_with_auth_tokens_and_policy(
 /// Exercises ServerRuntimeState::DefaultDeny — authenticated requests
 /// for Read succeed, every other action is rejected with 403 from
 /// `authorize_request`'s state-2 branch.
-async fn app_for_repo_with_auth_tokens_only(
+async fn app_for_graph_with_auth_tokens_only(
     schema: &str,
     tokens: &[(&str, &str)],
 ) -> (tempfile::TempDir, Router) {
-    let temp = init_repo_with_schema(schema).await;
-    let repo = repo_path(temp.path());
+    let temp = init_graph_with_schema(schema).await;
+    let graph = graph_path(temp.path());
     let state = AppState::open_with_bearer_tokens_and_policy(
-        repo.to_string_lossy().to_string(),
+        graph.to_string_lossy().to_string(),
         tokens
             .iter()
             .map(|(actor, token)| ((*actor).to_string(), (*token).to_string()))
@@ -388,8 +852,8 @@ async fn json_response(app: &Router, request: Request<Body>) -> (StatusCode, Val
 }
 
 #[tokio::test]
-async fn schema_apply_route_updates_repo_for_authorized_admin() {
-    let (temp, app) = app_for_repo_with_auth_tokens_and_policy(
+async fn schema_apply_route_updates_graph_for_authorized_admin() {
+    let (temp, app) = app_for_graph_with_auth_tokens_and_policy(
         &fs::read_to_string(fixture("test.pg")).unwrap(),
         &[("act-ragnor", "admin-token")],
         SCHEMA_APPLY_POLICY_YAML,
@@ -414,8 +878,8 @@ async fn schema_apply_route_updates_repo_for_authorized_admin() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["applied"], true);
-    let repo = repo_path(temp.path());
-    let reopened = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let graph = graph_path(temp.path());
+    let reopened = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     assert!(
         reopened.catalog().node_types["Person"]
             .properties
@@ -423,9 +887,86 @@ async fn schema_apply_route_updates_repo_for_authorized_admin() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_apply_route_rejects_stored_query_breakage_before_publish() {
+    let (temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, true)],
+        &[("act-ragnor", "admin-token")],
+        STORED_QUERY_SCHEMA_APPLY_POLICY_YAML,
+    )
+    .await;
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/schema/apply")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer admin-token")
+        .body(Body::from(
+            serde_json::to_vec(&SchemaApplyRequest {
+                schema_source: renamed_age_schema(),
+                ..Default::default()
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+    let (status, payload) = json_response(&app, request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {payload}");
+    let message = payload["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("find_person") && message.contains("schema check"),
+        "registry breakage should name the stored query; body: {payload}"
+    );
+
+    let reopened = Omnigraph::open(graph_path(temp.path()).to_str().unwrap())
+        .await
+        .unwrap();
+    let person = &reopened.catalog().node_types["Person"];
+    assert!(person.properties.contains_key("age"));
+    assert!(!person.properties.contains_key("years"));
+
+    let (invoke_status, invoke_body) = json_response(
+        &app,
+        invoke_request(
+            "find_person",
+            "admin-token",
+            json!({ "params": { "name": "Alice" } }),
+        ),
+    )
+    .await;
+    assert_eq!(invoke_status, StatusCode::OK, "body: {invoke_body}");
+    assert_eq!(invoke_body["row_count"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_apply_route_noop_keeps_valid_stored_query_registry() {
+    let (_temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, true)],
+        &[("act-ragnor", "admin-token")],
+        STORED_QUERY_SCHEMA_APPLY_POLICY_YAML,
+    )
+    .await;
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/schema/apply")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer admin-token")
+        .body(Body::from(
+            serde_json::to_vec(&SchemaApplyRequest {
+                schema_source: fs::read_to_string(fixture("test.pg")).unwrap(),
+                ..Default::default()
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+    let (status, payload) = json_response(&app, request).await;
+    assert_eq!(status, StatusCode::OK, "body: {payload}");
+    assert_eq!(payload["applied"], false);
+}
+
 #[tokio::test]
 async fn schema_apply_route_requires_schema_apply_policy_permission() {
-    let (_temp, app) = app_for_repo_with_auth_tokens_and_policy(
+    let (_temp, app) = app_for_graph_with_auth_tokens_and_policy(
         &fs::read_to_string(fixture("test.pg")).unwrap(),
         &[("act-ragnor", "admin-token")],
         POLICY_YAML,
@@ -456,7 +997,7 @@ async fn schema_apply_route_requires_schema_apply_policy_permission() {
 
 #[tokio::test]
 async fn schema_apply_route_requires_bearer_token_when_policy_enabled() {
-    let (_temp, app) = app_for_repo_with_auth_tokens_and_policy(
+    let (_temp, app) = app_for_graph_with_auth_tokens_and_policy(
         &fs::read_to_string(fixture("test.pg")).unwrap(),
         &[("act-ragnor", "admin-token")],
         SCHEMA_APPLY_POLICY_YAML,
@@ -486,7 +1027,7 @@ async fn schema_apply_route_requires_bearer_token_when_policy_enabled() {
 
 #[tokio::test]
 async fn schema_apply_route_can_rename_type() {
-    let (temp, app) = app_for_repo_with_auth_tokens_and_policy(
+    let (temp, app) = app_for_graph_with_auth_tokens_and_policy(
         &fs::read_to_string(fixture("test.pg")).unwrap(),
         &[("act-ragnor", "admin-token")],
         SCHEMA_APPLY_POLICY_YAML,
@@ -510,8 +1051,8 @@ async fn schema_apply_route_can_rename_type() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["applied"], true);
-    let repo = repo_path(temp.path());
-    let reopened = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let graph = graph_path(temp.path());
+    let reopened = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     let snapshot = reopened
         .snapshot_of(ReadTarget::branch("main"))
         .await
@@ -522,7 +1063,7 @@ async fn schema_apply_route_can_rename_type() {
 
 #[tokio::test]
 async fn schema_apply_route_can_rename_property() {
-    let (temp, app) = app_for_repo_with_auth_tokens_and_policy(
+    let (temp, app) = app_for_graph_with_auth_tokens_and_policy(
         &fs::read_to_string(fixture("test.pg")).unwrap(),
         &[("act-ragnor", "admin-token")],
         SCHEMA_APPLY_POLICY_YAML,
@@ -546,8 +1087,8 @@ async fn schema_apply_route_can_rename_property() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["applied"], true);
-    let repo = repo_path(temp.path());
-    let reopened = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let graph = graph_path(temp.path());
+    let reopened = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     let person = &reopened.catalog().node_types["Person"];
     assert!(person.properties.contains_key("years"));
     assert!(!person.properties.contains_key("age"));
@@ -555,15 +1096,15 @@ async fn schema_apply_route_can_rename_property() {
 
 #[tokio::test]
 async fn schema_apply_route_can_add_index() {
-    let (temp, app) = app_for_repo_with_auth_tokens_and_policy(
+    let (temp, app) = app_for_graph_with_auth_tokens_and_policy(
         &fs::read_to_string(fixture("test.pg")).unwrap(),
         &[("act-ragnor", "admin-token")],
         SCHEMA_APPLY_POLICY_YAML,
     )
     .await;
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let before_index_count = {
-        let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+        let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
         let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
         let dataset = snapshot.open("node:Person").await.unwrap();
         dataset.load_indices().await.unwrap().len()
@@ -586,7 +1127,7 @@ async fn schema_apply_route_can_add_index() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["applied"], true);
-    let reopened = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let reopened = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     let snapshot = reopened
         .snapshot_of(ReadTarget::branch("main"))
         .await
@@ -598,7 +1139,7 @@ async fn schema_apply_route_can_add_index() {
 
 #[tokio::test]
 async fn schema_apply_route_rejects_unsupported_plan() {
-    let (_temp, app) = app_for_repo_with_auth_tokens_and_policy(
+    let (_temp, app) = app_for_graph_with_auth_tokens_and_policy(
         &fs::read_to_string(fixture("test.pg")).unwrap(),
         &[("act-ragnor", "admin-token")],
         SCHEMA_APPLY_POLICY_YAML,
@@ -629,16 +1170,16 @@ async fn schema_apply_route_rejects_unsupported_plan() {
 
 #[tokio::test]
 async fn schema_apply_route_rejects_when_non_main_branch_exists() {
-    let temp = init_repo_with_schema(&fs::read_to_string(fixture("test.pg")).unwrap()).await;
-    let repo = repo_path(temp.path());
-    let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let temp = init_graph_with_schema(&fs::read_to_string(fixture("test.pg")).unwrap()).await;
+    let graph = graph_path(temp.path());
+    let mut db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     db.branch_create("feature").await.unwrap();
     drop(db);
 
     let policy_path = temp.path().join("policy.yaml");
     fs::write(&policy_path, SCHEMA_APPLY_POLICY_YAML).unwrap();
     let state = AppState::open_with_bearer_tokens_and_policy(
-        repo.to_string_lossy().to_string(),
+        graph.to_string_lossy().to_string(),
         vec![("act-ragnor".to_string(), "admin-token".to_string())],
         Some(&policy_path),
     )
@@ -754,7 +1295,7 @@ fn mock_embedding(input: &str, dim: usize) -> Vec<f32> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn healthz_succeeds_after_startup() {
-    let (_temp, app) = app_for_loaded_repo().await;
+    let (_temp, app) = app_for_loaded_graph().await;
     let (status, body) = json_response(
         &app,
         Request::builder()
@@ -776,9 +1317,9 @@ async fn healthz_succeeds_after_startup() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn schema_drift_returns_conflict_for_snapshot_read_and_change() {
-    let (temp, app) = app_for_loaded_repo().await;
-    let repo = repo_path(temp.path());
-    fs::write(repo.join("_schema.pg"), drifted_test_schema()).unwrap();
+    let (temp, app) = app_for_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    fs::write(graph.join("_schema.pg"), drifted_test_schema()).unwrap();
 
     let (snapshot_status, snapshot_body) = json_response(
         &app,
@@ -831,8 +1372,8 @@ async fn schema_drift_returns_conflict_for_snapshot_read_and_change() {
     );
 
     let change = ChangeRequest {
-        query_source: MUTATION_QUERIES.to_string(),
-        query_name: Some("insert_person".to_string()),
+        query: MUTATION_QUERIES.to_string(),
+        name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "Mina", "age": 28 })),
         branch: Some("main".to_string()),
     };
@@ -861,7 +1402,7 @@ async fn schema_drift_returns_conflict_for_snapshot_read_and_change() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn protected_routes_require_bearer_token() {
-    let (_temp, app) = app_for_loaded_repo_with_auth("demo-token").await;
+    let (_temp, app) = app_for_loaded_graph_with_auth("demo-token").await;
     let (status, body) = json_response(
         &app,
         Request::builder()
@@ -882,7 +1423,7 @@ async fn protected_routes_require_bearer_token() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn protected_routes_accept_valid_bearer_token_while_healthz_stays_open() {
-    let (_temp, app) = app_for_loaded_repo_with_auth("demo-token").await;
+    let (_temp, app) = app_for_loaded_graph_with_auth("demo-token").await;
 
     let health = app
         .clone()
@@ -915,9 +1456,9 @@ async fn protected_routes_accept_valid_bearer_token_while_healthz_stays_open() {
 #[tokio::test(flavor = "multi_thread")]
 async fn export_route_returns_jsonl_for_branch_snapshot() {
     let token = "demo-token";
-    let temp = init_loaded_repo().await;
-    let repo = repo_path(temp.path());
-    let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let mut db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     db.branch_create_from(ReadTarget::branch("main"), "feature")
         .await
         .unwrap();
@@ -942,7 +1483,7 @@ async fn export_route_returns_jsonl_for_branch_snapshot() {
     let policy_path = temp.path().join("policy.yaml");
     fs::write(&policy_path, permit_all_policy_yaml(&["default"])).unwrap();
     let state = AppState::open_with_bearer_tokens_and_policy(
-        repo.to_string_lossy().to_string(),
+        graph.to_string_lossy().to_string(),
         vec![("default".to_string(), token.to_string())],
         Some(&policy_path),
     )
@@ -983,9 +1524,11 @@ async fn export_route_returns_jsonl_for_branch_snapshot() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn protected_routes_accept_any_configured_team_bearer_token() {
-    let (_temp, app) =
-        app_for_loaded_repo_with_auth_tokens(&[("team-01", "token-one"), ("team-02", "token-two")])
-            .await;
+    let (_temp, app) = app_for_loaded_graph_with_auth_tokens(&[
+        ("team-01", "token-one"),
+        ("team-02", "token-two"),
+    ])
+    .await;
 
     let (status, body) = json_response(
         &app,
@@ -1009,8 +1552,8 @@ async fn protected_routes_accept_any_configured_team_bearer_token() {
 /// the policy outcome.
 #[tokio::test(flavor = "multi_thread")]
 async fn bearer_token_resolves_to_correct_actor_for_policy_decisions() {
-    let temp = init_loaded_repo().await;
-    let repo = repo_path(temp.path());
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
     let policy_path = temp.path().join("policy.yaml");
     fs::write(
         &policy_path,
@@ -1030,7 +1573,7 @@ rules:
     )
     .unwrap();
     let state = AppState::open_with_bearer_tokens_and_policy(
-        repo.to_string_lossy().to_string(),
+        graph.to_string_lossy().to_string(),
         vec![
             ("act-a".to_string(), "token-a".to_string()),
             ("act-b".to_string(), "token-b".to_string()),
@@ -1110,8 +1653,8 @@ rules:
 /// → actor identity contract.
 #[tokio::test(flavor = "multi_thread")]
 async fn actor_id_resolves_from_bearer_token_ignoring_client_supplied_headers() {
-    let temp = init_loaded_repo().await;
-    let repo = repo_path(temp.path());
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
     let policy_path = temp.path().join("policy.yaml");
     // Same readers/writers split as
     // `bearer_token_resolves_to_correct_actor_for_policy_decisions` —
@@ -1135,7 +1678,7 @@ rules:
     )
     .unwrap();
     let state = AppState::open_with_bearer_tokens_and_policy(
-        repo.to_string_lossy().to_string(),
+        graph.to_string_lossy().to_string(),
         vec![
             ("act-a".to_string(), "token-a".to_string()),
             ("act-b".to_string(), "token-b".to_string()),
@@ -1215,7 +1758,7 @@ rules:
 
 #[tokio::test(flavor = "multi_thread")]
 async fn policy_allows_read_but_distinguishes_401_from_403() {
-    let (_temp, app) = app_for_loaded_repo_with_auth_tokens_and_policy(
+    let (_temp, app) = app_for_loaded_graph_with_auth_tokens_and_policy(
         &[("act-bruno", "team-token"), ("act-ragnor", "admin-token")],
         POLICY_YAML,
     )
@@ -1291,16 +1834,16 @@ async fn policy_allows_read_but_distinguishes_401_from_403() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn policy_uses_resolved_branch_for_snapshot_reads() {
-    let temp = init_loaded_repo().await;
-    let repo = repo_path(temp.path());
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
     let snapshot_id = {
-        let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+        let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
         db.resolve_snapshot("main").await.unwrap().to_string()
     };
     let policy_path = temp.path().join("policy.yaml");
     fs::write(&policy_path, POLICY_PROTECTED_READ_YAML).unwrap();
     let state = AppState::open_with_bearer_tokens_and_policy(
-        repo.to_string_lossy().to_string(),
+        graph.to_string_lossy().to_string(),
         vec![("act-bruno".to_string(), "team-token".to_string())],
         Some(&policy_path),
     )
@@ -1338,9 +1881,9 @@ async fn policy_uses_resolved_branch_for_snapshot_reads() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshot_route_returns_manifest_dataset_version() {
-    let (temp, app) = app_for_loaded_repo().await;
-    let repo = repo_path(temp.path());
-    let expected_manifest_version = manifest_dataset_version(&repo).await;
+    let (temp, app) = app_for_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let expected_manifest_version = manifest_dataset_version(&graph).await;
 
     let (snapshot_status, snapshot_body) = json_response(
         &app,
@@ -1363,7 +1906,7 @@ async fn snapshot_route_returns_manifest_dataset_version() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn schema_route_returns_current_source() {
-    let (_temp, app) = app_for_loaded_repo().await;
+    let (_temp, app) = app_for_loaded_graph().await;
     let (status, body) = json_response(
         &app,
         Request::builder()
@@ -1381,7 +1924,7 @@ async fn schema_route_returns_current_source() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn schema_route_requires_bearer_token_when_auth_configured() {
-    let (_temp, app) = app_for_loaded_repo_with_auth("demo-token").await;
+    let (_temp, app) = app_for_loaded_graph_with_auth("demo-token").await;
 
     let (missing_status, missing_body) = json_response(
         &app,
@@ -1416,13 +1959,13 @@ async fn schema_route_requires_bearer_token_when_auth_configured() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn schema_route_denied_when_actor_lacks_read_permission() {
-    let temp = init_loaded_repo().await;
-    let repo = repo_path(temp.path());
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
     let policy_path = temp.path().join("policy.yaml");
     // Policy grants branch_create only — no read action for act-bruno.
     fs::write(&policy_path, INGEST_CREATE_ONLY_POLICY_YAML).unwrap();
     let state = AppState::open_with_bearer_tokens_and_policy(
-        repo.to_string_lossy().to_string(),
+        graph.to_string_lossy().to_string(),
         vec![("act-bruno".to_string(), "team-token".to_string())],
         Some(&policy_path),
     )
@@ -1450,9 +1993,9 @@ async fn schema_route_denied_when_actor_lacks_read_permission() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn policy_blocks_change_on_protected_main_but_allows_unprotected_branch() {
-    let temp = init_loaded_repo().await;
-    let repo = repo_path(temp.path());
-    let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let mut db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     db.branch_create_from(ReadTarget::branch("main"), "feature")
         .await
         .unwrap();
@@ -1461,7 +2004,7 @@ async fn policy_blocks_change_on_protected_main_but_allows_unprotected_branch() 
     let policy_path = temp.path().join("policy.yaml");
     fs::write(&policy_path, POLICY_YAML).unwrap();
     let state = AppState::open_with_bearer_tokens_and_policy(
-        repo.to_string_lossy().to_string(),
+        graph.to_string_lossy().to_string(),
         vec![("act-bruno".to_string(), "team-token".to_string())],
         Some(&policy_path),
     )
@@ -1470,8 +2013,8 @@ async fn policy_blocks_change_on_protected_main_but_allows_unprotected_branch() 
     let app = build_app(state);
 
     let main_change = ChangeRequest {
-        query_source: MUTATION_QUERIES.to_string(),
-        query_name: Some("insert_person".to_string()),
+        query: MUTATION_QUERIES.to_string(),
+        name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "Mina", "age": 28 })),
         branch: Some("main".to_string()),
     };
@@ -1494,8 +2037,8 @@ async fn policy_blocks_change_on_protected_main_but_allows_unprotected_branch() 
     );
 
     let feature_change = ChangeRequest {
-        query_source: MUTATION_QUERIES.to_string(),
-        query_name: Some("insert_person".to_string()),
+        query: MUTATION_QUERIES.to_string(),
+        name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "Mina", "age": 28 })),
         branch: Some("feature".to_string()),
     };
@@ -1517,9 +2060,9 @@ async fn policy_blocks_change_on_protected_main_but_allows_unprotected_branch() 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn policy_blocks_non_admin_merge_to_main_and_allows_admin() {
-    let temp = init_loaded_repo().await;
-    let repo = repo_path(temp.path());
-    let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let mut db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     db.branch_create_from(ReadTarget::branch("main"), "feature")
         .await
         .unwrap();
@@ -1535,7 +2078,7 @@ async fn policy_blocks_non_admin_merge_to_main_and_allows_admin() {
     let policy_path = temp.path().join("policy.yaml");
     fs::write(&policy_path, POLICY_YAML).unwrap();
     let state = AppState::open_with_bearer_tokens_and_policy(
-        repo.to_string_lossy().to_string(),
+        graph.to_string_lossy().to_string(),
         vec![
             ("act-bruno".to_string(), "team-token".to_string()),
             ("act-ragnor".to_string(), "admin-token".to_string()),
@@ -1587,11 +2130,11 @@ async fn policy_blocks_non_admin_merge_to_main_and_allows_admin() {
 async fn authenticated_change_stamps_actor_on_commits() {
     // With the Run state machine removed, actor_id is recorded
     // directly on the commit graph (no intermediate run record).
-    let (_temp, app) = app_for_loaded_repo_with_auth_tokens(&[("act-andrew", "token-one")]).await;
+    let (_temp, app) = app_for_loaded_graph_with_auth_tokens(&[("act-andrew", "token-one")]).await;
 
     let change = ChangeRequest {
-        query_source: MUTATION_QUERIES.to_string(),
-        query_name: Some("insert_person".to_string()),
+        query: MUTATION_QUERIES.to_string(),
+        name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "Mina", "age": 28 })),
         branch: Some("main".to_string()),
     };
@@ -1630,8 +2173,8 @@ async fn authenticated_change_stamps_actor_on_commits() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
-    let (temp, app) = app_for_loaded_repo_with_auth_tokens(&[("act-andrew", "token-one")]).await;
-    let repo = repo_path(temp.path());
+    let (temp, app) = app_for_loaded_graph_with_auth_tokens(&[("act-andrew", "token-one")]).await;
+    let graph = graph_path(temp.path());
     let ingest = IngestRequest {
         branch: Some("feature-ingest".to_string()),
         from: Some("main".to_string()),
@@ -1661,7 +2204,7 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
     assert_eq!(body["tables"][0]["table_key"], "node:Person");
     assert_eq!(body["tables"][0]["rows_loaded"], 2);
 
-    let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     let snapshot = db
         .snapshot_of(ReadTarget::branch("feature-ingest"))
         .await
@@ -1680,10 +2223,10 @@ async fn ingest_creates_branch_returns_metadata_and_stamps_actor() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ingest_existing_branch_skips_branch_create_policy_check() {
-    let temp = init_loaded_repo().await;
-    let repo = repo_path(temp.path());
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
     {
-        let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+        let mut db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
         db.branch_create_from(ReadTarget::branch("main"), "feature")
             .await
             .unwrap();
@@ -1691,7 +2234,7 @@ async fn ingest_existing_branch_skips_branch_create_policy_check() {
     let policy_path = temp.path().join("policy.yaml");
     fs::write(&policy_path, POLICY_YAML).unwrap();
     let state = AppState::open_with_bearer_tokens_and_policy(
-        repo.to_string_lossy().to_string(),
+        graph.to_string_lossy().to_string(),
         vec![("act-bruno".to_string(), "team-token".to_string())],
         Some(&policy_path),
     )
@@ -1724,7 +2267,7 @@ async fn ingest_existing_branch_skips_branch_create_policy_check() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ingest_denies_missing_branch_without_branch_create_permission() {
-    let (_temp, app) = app_for_loaded_repo_with_auth_tokens_and_policy(
+    let (_temp, app) = app_for_loaded_graph_with_auth_tokens_and_policy(
         &[("act-bruno", "team-token")],
         POLICY_YAML,
     )
@@ -1757,7 +2300,7 @@ async fn ingest_denies_missing_branch_without_branch_create_permission() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ingest_denies_when_actor_lacks_change_permission() {
-    let (_temp, app) = app_for_loaded_repo_with_auth_tokens_and_policy(
+    let (_temp, app) = app_for_loaded_graph_with_auth_tokens_and_policy(
         &[("act-bruno", "team-token")],
         INGEST_CREATE_ONLY_POLICY_YAML,
     )
@@ -1790,7 +2333,7 @@ async fn ingest_denies_when_actor_lacks_change_permission() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ingest_rejects_payloads_over_32_mib() {
-    let (_temp, app) = app_for_loaded_repo().await;
+    let (_temp, app) = app_for_loaded_graph().await;
     let oversize = IngestRequest {
         branch: Some("feature".to_string()),
         from: Some("main".to_string()),
@@ -1815,7 +2358,7 @@ async fn ingest_rejects_payloads_over_32_mib() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
-    let (_temp, app) = app_for_loaded_repo_with_auth_tokens(&[
+    let (_temp, app) = app_for_loaded_graph_with_auth_tokens(&[
         ("act-andrew", "token-one"),
         ("act-ragnor", "token-two"),
     ])
@@ -1839,8 +2382,8 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
     assert_eq!(create_status, StatusCode::OK);
 
     let change = ChangeRequest {
-        query_source: MUTATION_QUERIES.to_string(),
-        query_name: Some("insert_person".to_string()),
+        query: MUTATION_QUERIES.to_string(),
+        name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "Zoe", "age": 33 })),
         branch: Some("feature".to_string()),
     };
@@ -1896,9 +2439,9 @@ async fn authenticated_branch_merge_stamps_merge_actor_on_head_commit() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn branch_merge_conflict_response_includes_structured_conflicts() {
-    let temp = init_loaded_repo().await;
-    let repo = repo_path(temp.path());
-    let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let mut db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     db.branch_create_from(ReadTarget::branch("main"), "feature")
         .await
         .unwrap();
@@ -1934,7 +2477,7 @@ async fn branch_merge_conflict_response_includes_structured_conflicts() {
     .unwrap();
     drop(db);
 
-    let state = AppState::open(repo.to_string_lossy().to_string())
+    let state = AppState::open(graph.to_string_lossy().to_string())
         .await
         .unwrap();
     let app = build_app(state);
@@ -1966,11 +2509,11 @@ async fn branch_merge_conflict_response_includes_structured_conflicts() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn repeated_read_after_change_sees_updated_state_from_same_app() {
-    let (_temp, app) = app_for_loaded_repo().await;
+    let (_temp, app) = app_for_loaded_graph().await;
 
     let change = ChangeRequest {
-        query_source: MUTATION_QUERIES.to_string(),
-        query_name: Some("insert_person".to_string()),
+        query: MUTATION_QUERIES.to_string(),
+        name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "Mina", "age": 28 })),
         branch: Some("main".to_string()),
     };
@@ -2010,8 +2553,267 @@ async fn repeated_read_after_change_sees_updated_state_from_same_app() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn query_endpoint_runs_inline_read() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    let query = QueryRequest {
+        query: fs::read_to_string(fixture("test.gq")).unwrap(),
+        name: Some("get_person".to_string()),
+        params: Some(json!({ "name": "Alice" })),
+        branch: Some("main".to_string()),
+        snapshot: None,
+    };
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/query")
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&query).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["query_name"], "get_person");
+    assert_eq!(body["row_count"], 1);
+    assert_eq!(body["rows"][0]["p.name"], "Alice");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_endpoint_rejects_mutation_with_400() {
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    let query = QueryRequest {
+        query: MUTATION_QUERIES.to_string(),
+        name: Some("insert_person".to_string()),
+        params: Some(json!({ "name": "Should", "age": 1 })),
+        branch: Some("main".to_string()),
+        snapshot: None,
+    };
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/query")
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&query).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let err = body["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("contains mutations") && err.contains("POST /mutate"),
+        "expected mutation-rejection message pointing at canonical /mutate, got: {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mutate_endpoint_runs_inline_mutation() {
+    // Canonical mutation endpoint. Pairs with `/query` on the read side.
+    // Same wire shape as `/change`, no deprecation signal.
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    let request = json!({
+        "query": MUTATION_QUERIES,
+        "name": "insert_person",
+        "params": { "name": "Mutie", "age": 30 },
+        "branch": "main",
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/mutate")
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // Canonical route is NOT deprecated; no Deprecation header expected.
+    assert!(
+        response.headers().get("deprecation").is_none(),
+        "POST /mutate must not advertise itself as deprecated"
+    );
+    let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(body["affected_nodes"], 1);
+    assert_eq!(body["query_name"], "insert_person");
+    assert_eq!(body["branch"], "main");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn change_endpoint_emits_deprecation_headers() {
+    // `/change` is kept indefinitely for back-compat but flagged at runtime
+    // per RFC 9745 (`Deprecation: true`) + RFC 8288 (`Link: </mutate>;
+    // rel="successor-version"`). The OpenAPI side is covered by
+    // `openapi_change_is_deprecated` in tests/openapi.rs.
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    let request = json!({
+        "query": MUTATION_QUERIES,
+        "name": "insert_person",
+        "params": { "name": "Legacyer", "age": 33 },
+        "branch": "main",
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/change")
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("deprecation")
+            .and_then(|v| v.to_str().ok()),
+        Some("true"),
+        "POST /change must advertise `Deprecation: true` (RFC 9745)"
+    );
+    assert_eq!(
+        response.headers().get("link").and_then(|v| v.to_str().ok()),
+        Some("</mutate>; rel=\"successor-version\""),
+        "POST /change must point at /mutate via `Link` rel=successor-version (RFC 8288)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn read_endpoint_emits_deprecation_headers() {
+    // `/read` is kept indefinitely for byte-stable back-compat but flagged
+    // at runtime per RFC 9745 + RFC 8288. Successor is `/query`.
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    let request = ReadRequest {
+        query_source: fs::read_to_string(fixture("test.gq")).unwrap(),
+        query_name: Some("get_person".to_string()),
+        params: Some(json!({ "name": "Alice" })),
+        branch: Some("main".to_string()),
+        snapshot: None,
+    };
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/read")
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("deprecation")
+            .and_then(|v| v.to_str().ok()),
+        Some("true"),
+        "POST /read must advertise `Deprecation: true` (RFC 9745)"
+    );
+    assert_eq!(
+        response.headers().get("link").and_then(|v| v.to_str().ok()),
+        Some("</query>; rel=\"successor-version\""),
+        "POST /read must point at /query via `Link` rel=successor-version (RFC 8288)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_endpoint_does_not_emit_deprecation_headers() {
+    // Sanity check the inverse: the canonical `/query` endpoint must not
+    // carry deprecation signaling, so SDK codegens don't propagate a
+    // bogus `@deprecated` marker.
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    let request = QueryRequest {
+        query: fs::read_to_string(fixture("test.gq")).unwrap(),
+        name: Some("get_person".to_string()),
+        params: Some(json!({ "name": "Alice" })),
+        branch: Some("main".to_string()),
+        snapshot: None,
+    };
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/query")
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers().get("deprecation").is_none(),
+        "POST /query is canonical and must not advertise itself as deprecated"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn change_endpoint_accepts_legacy_field_names() {
+    // The canonical wire field names on /change are `query` and `name`, but
+    // serde aliases keep the legacy `query_source`/`query_name` payload
+    // shape working for clients that haven't migrated yet. Pin both shapes.
+    let (_temp, app) = app_for_loaded_graph().await;
+
+    let legacy_body = json!({
+        "query_source": MUTATION_QUERIES,
+        "query_name": "insert_person",
+        "params": { "name": "Legacy", "age": 21 },
+        "branch": "main",
+    });
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/change")
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&legacy_body).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["affected_nodes"], 1);
+
+    let canonical_body = json!({
+        "query": MUTATION_QUERIES,
+        "name": "insert_person",
+        "params": { "name": "Canonical", "age": 22 },
+        "branch": "main",
+    });
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/change")
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&canonical_body).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["affected_nodes"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn remote_branch_list_create_merge_flow_works() {
-    let (_temp, app) = app_for_loaded_repo().await;
+    let (_temp, app) = app_for_loaded_graph().await;
 
     let (list_status, list_body) = json_response(
         &app,
@@ -2056,8 +2858,8 @@ async fn remote_branch_list_create_merge_flow_works() {
     assert_eq!(list_body["branches"], json!(["feature", "main"]));
 
     let change = ChangeRequest {
-        query_source: MUTATION_QUERIES.to_string(),
-        query_name: Some("insert_person".to_string()),
+        query: MUTATION_QUERIES.to_string(),
+        name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "Zoe", "age": 33 })),
         branch: Some("feature".to_string()),
     };
@@ -2138,7 +2940,7 @@ async fn remote_branch_list_create_merge_flow_works() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn remote_branch_delete_flow_works() {
-    let (_temp, app) = app_for_loaded_repo().await;
+    let (_temp, app) = app_for_loaded_graph().await;
 
     let create = BranchCreateRequest {
         from: Some("main".to_string()),
@@ -2183,14 +2985,14 @@ async fn remote_branch_delete_flow_works() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn branch_delete_denies_without_policy_permission() {
-    let (temp, app) = app_for_loaded_repo_with_auth_tokens_and_policy(
+    let (temp, app) = app_for_loaded_graph_with_auth_tokens_and_policy(
         &[("act-andrew", "token-admin"), ("act-bruno", "token-team")],
         POLICY_YAML,
     )
     .await;
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
 
-    let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let mut db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     db.branch_create_from(ReadTarget::branch("main"), "feature")
         .await
         .unwrap();
@@ -2216,8 +3018,8 @@ async fn branch_delete_denies_without_policy_permission() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn server_opens_s3_repo_directly_and_serves_snapshot_and_read() {
-    let Some(uri) = s3_test_repo_uri("server") else {
+async fn server_opens_s3_graph_directly_and_serves_snapshot_and_read() {
+    let Some(uri) = s3_test_graph_uri("server") else {
         eprintln!("skipping s3 server test: OMNIGRAPH_S3_TEST_BUCKET is not set");
         return;
     };
@@ -2315,9 +3117,9 @@ query vector_search_string($q: String) {
         ("OMNIGRAPH_EMBEDDINGS_MOCK", Some("1")),
         ("GEMINI_API_KEY", None),
     ]);
-    let temp = init_repo_with_schema_and_data(EMBED_SCHEMA, &data).await;
-    let repo = repo_path(temp.path());
-    let state = AppState::open(repo.to_string_lossy().to_string())
+    let temp = init_graph_with_schema_and_data(EMBED_SCHEMA, &data).await;
+    let graph = graph_path(temp.path());
+    let state = AppState::open(graph.to_string_lossy().to_string())
         .await
         .unwrap();
     let app = build_app(state);
@@ -2351,20 +3153,20 @@ async fn change_conflict_returns_manifest_conflict_409() {
     // a structured `manifest_conflict` body — `table_key`, `expected`,
     // and `actual` — so clients can detect-and-retry without parsing
     // the message.
-    let temp = init_loaded_repo().await;
-    let repo = repo_path(temp.path());
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
 
     // Build the server first so its handle pins the pre-mutation manifest
     // version. Then advance the manifest from outside the server. The
     // server's next /change call will capture stale `expected_versions`
     // (from its still-pinned snapshot) and the publisher's CAS rejects.
-    let state = AppState::open(repo.to_string_lossy().to_string())
+    let state = AppState::open(graph.to_string_lossy().to_string())
         .await
         .unwrap();
     let app = build_app(state);
 
     {
-        let mut db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+        let mut db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
         db.mutate(
             "main",
             MUTATION_QUERIES,
@@ -2390,8 +3192,8 @@ async fn change_conflict_returns_manifest_conflict_409() {
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::to_vec(&ChangeRequest {
-                    query_source: MUTATION_QUERIES.to_string(),
-                    query_name: Some("set_age".to_string()),
+                    query: MUTATION_QUERIES.to_string(),
+                    name: Some("set_age".to_string()),
                     params: Some(json!({ "name": "Alice", "age": 33 })),
                     branch: Some("main".to_string()),
                 })
@@ -2434,9 +3236,9 @@ async fn change_concurrent_inserts_same_key_serialize_without_409() {
     // node type and asserts: every request returns 200 (no 409),
     // and the final row count equals the seed count + N (every
     // staged batch actually committed).
-    let temp = init_loaded_repo().await;
-    let repo = repo_path(temp.path());
-    let state = AppState::open(repo.to_string_lossy().to_string())
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let state = AppState::open(graph.to_string_lossy().to_string())
         .await
         .unwrap();
     let app = build_app(state);
@@ -2450,8 +3252,8 @@ async fn change_concurrent_inserts_same_key_serialize_without_409() {
         let app = app.clone();
         handles.push(tokio::spawn(async move {
             let body = serde_json::to_vec(&ChangeRequest {
-                query_source: MUTATION_QUERIES.to_string(),
-                query_name: Some("insert_person".to_string()),
+                query: MUTATION_QUERIES.to_string(),
+                name: Some("insert_person".to_string()),
                 params: Some(json!({ "name": format!("racer-{i}"), "age": i as i32 })),
                 branch: Some("main".to_string()),
             })
@@ -2547,9 +3349,9 @@ async fn change_concurrent_updates_same_key_serialize_via_publisher_cas() {
     // Lance error variant. The drift check fires at the right architectural
     // layer (engine boundary, under the queue) and respects the existing
     // `MutationOpKind` policy.
-    let temp = init_loaded_repo().await;
-    let repo = repo_path(temp.path());
-    let state = AppState::open(repo.to_string_lossy().to_string())
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let state = AppState::open(graph.to_string_lossy().to_string())
         .await
         .unwrap();
     let app = build_app(state);
@@ -2563,8 +3365,8 @@ async fn change_concurrent_updates_same_key_serialize_via_publisher_cas() {
         let target_age = 100 + i as i32;
         handles.push(tokio::spawn(async move {
             let body = serde_json::to_vec(&ChangeRequest {
-                query_source: MUTATION_QUERIES.to_string(),
-                query_name: Some("set_age".to_string()),
+                query: MUTATION_QUERIES.to_string(),
+                name: Some("set_age".to_string()),
                 params: Some(json!({ "name": "Alice", "age": target_age })),
                 branch: Some("main".to_string()),
             })
@@ -2588,10 +3390,7 @@ async fn change_concurrent_updates_same_key_serialize_via_publisher_cas() {
     }
     let statuses: Vec<StatusCode> = results.iter().map(|(s, _)| *s).collect();
 
-    let ok_count = statuses
-        .iter()
-        .filter(|s| **s == StatusCode::OK)
-        .count();
+    let ok_count = statuses.iter().filter(|s| **s == StatusCode::OK).count();
     let conflict_count = statuses
         .iter()
         .filter(|s| **s == StatusCode::CONFLICT)
@@ -2621,7 +3420,8 @@ async fn change_concurrent_updates_same_key_serialize_via_publisher_cas() {
         statuses
     );
     assert_eq!(
-        ok_count, 1,
+        ok_count,
+        1,
         "expected exactly one update to commit and N-1 to receive 409 manifest_conflict \
          (op-kind-aware drift check rejects stale-V0 staged datasets at commit_all entry). \
          Got {} OK + {} 409 + {} other. \
@@ -2678,8 +3478,8 @@ mod matrix {
 
     impl Harness {
         pub async fn new() -> Self {
-            let temp = init_loaded_repo().await;
-            let repo = repo_path(temp.path());
+            let temp = init_loaded_graph().await;
+            let graph = graph_path(temp.path());
             // Build the WorkloadController explicitly with defaults rather
             // than letting `AppState::open` call
             // `WorkloadController::from_env()`. The admission-gate test
@@ -2692,20 +3492,16 @@ mod matrix {
             // 429 instead of the expected 200. Constructing the
             // controller here with explicit defaults makes cells
             // independent of any env mutation other tests perform.
-            let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
-            let workload =
-                omnigraph_server::workload::WorkloadController::with_defaults();
+            let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+            let workload = omnigraph_server::workload::WorkloadController::with_defaults();
             let state = AppState::new_with_workload(
-                repo.to_string_lossy().to_string(),
+                graph.to_string_lossy().to_string(),
                 db,
                 Vec::new(),
                 workload,
             );
             let app = build_app(state);
-            Self {
-                _temp: temp,
-                app,
-            }
+            Self { _temp: temp, app }
         }
 
         pub async fn create_branch(&self, from: &str, name: &str) {
@@ -2738,8 +3534,8 @@ mod matrix {
 
         pub async fn insert_person(&self, branch: &str, name: &str, age: i32) {
             let body = serde_json::to_vec(&ChangeRequest {
-                query_source: MUTATION_QUERIES.to_string(),
-                query_name: Some("insert_person".to_string()),
+                query: MUTATION_QUERIES.to_string(),
+                name: Some("insert_person".to_string()),
                 params: Some(json!({ "name": name, "age": age })),
                 branch: Some(branch.to_string()),
             })
@@ -2798,12 +3594,7 @@ mod matrix {
                 )
                 .await
                 .unwrap();
-            assert_eq!(
-                r.status(),
-                StatusCode::OK,
-                "snapshot {} failed",
-                branch
-            );
+            assert_eq!(r.status(), StatusCode::OK, "snapshot {} failed", branch);
             let body = to_bytes(r.into_body(), usize::MAX).await.unwrap();
             let v: Value = serde_json::from_slice(&body).unwrap();
             v["tables"]
@@ -2822,10 +3613,7 @@ mod matrix {
         /// just count.
         pub async fn person_exists(&self, branch: &str, name: &str) -> bool {
             let body = serde_json::to_vec(&ReadRequest {
-                query_source: include_str!(
-                    "../../omnigraph/tests/fixtures/test.gq"
-                )
-                .to_string(),
+                query_source: include_str!("../../omnigraph/tests/fixtures/test.gq").to_string(),
                 query_name: Some("get_person".to_string()),
                 params: Some(json!({ "name": name })),
                 branch: Some(branch.to_string()),
@@ -2893,8 +3681,8 @@ mod matrix {
         /// /change either deadlocks or returns a non-200.
         pub async fn assert_post_op_sentinel(&self, cell: &str, sentinel: &str) {
             let body = serde_json::to_vec(&ChangeRequest {
-                query_source: MUTATION_QUERIES.to_string(),
-                query_name: Some("insert_person".to_string()),
+                query: MUTATION_QUERIES.to_string(),
+                name: Some("insert_person".to_string()),
                 params: Some(json!({ "name": sentinel, "age": 99 })),
                 branch: Some("main".to_string()),
             })
@@ -2944,12 +3732,12 @@ mod matrix {
                 .unwrap();
                 let response = app
                     .oneshot(
-                    Request::builder()
-                        .uri("/branches/merge")
-                        .method(Method::POST)
-                        .header("content-type", "application/json")
-                        .body(Body::from(body))
-                        .unwrap(),
+                        Request::builder()
+                            .uri("/branches/merge")
+                            .method(Method::POST)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
                     )
                     .await
                     .unwrap();
@@ -2972,20 +3760,20 @@ mod matrix {
             tokio::spawn(async move {
                 barrier.wait().await;
                 let body = serde_json::to_vec(&ChangeRequest {
-                    query_source: MUTATION_QUERIES.to_string(),
-                    query_name: Some("insert_person".to_string()),
+                    query: MUTATION_QUERIES.to_string(),
+                    name: Some("insert_person".to_string()),
                     params: Some(json!({ "name": name, "age": age })),
                     branch: Some(branch),
                 })
                 .unwrap();
                 let response = app
                     .oneshot(
-                    Request::builder()
-                        .uri("/change")
-                        .method(Method::POST)
-                        .header("content-type", "application/json")
-                        .body(Body::from(body))
-                        .unwrap(),
+                        Request::builder()
+                            .uri("/change")
+                            .method(Method::POST)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
                     )
                     .await
                     .unwrap();
@@ -3013,12 +3801,12 @@ mod matrix {
                 .unwrap();
                 let response = app
                     .oneshot(
-                    Request::builder()
-                        .uri("/branches")
-                        .method(Method::POST)
-                        .header("content-type", "application/json")
-                        .body(Body::from(body))
-                        .unwrap(),
+                        Request::builder()
+                            .uri("/branches")
+                            .method(Method::POST)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
                     )
                     .await
                     .unwrap();
@@ -3040,11 +3828,11 @@ mod matrix {
                 barrier.wait().await;
                 let response = app
                     .oneshot(
-                    Request::builder()
-                        .uri(format!("/branches/{}", name))
-                        .method(Method::DELETE)
-                        .body(Body::empty())
-                        .unwrap(),
+                        Request::builder()
+                            .uri(format!("/branches/{}", name))
+                            .method(Method::DELETE)
+                            .body(Body::empty())
+                            .unwrap(),
                     )
                     .await
                     .unwrap();
@@ -3078,14 +3866,8 @@ async fn concurrent_branch_ops_morphological_matrix() {
 
         let (sa, sb) = h
             .run_pair(
-                matrix::op_merge(
-                    "feature-a-cella".to_string(),
-                    "target-a-cella".to_string(),
-                ),
-                matrix::op_merge(
-                    "feature-b-cella".to_string(),
-                    "target-b-cella".to_string(),
-                ),
+                matrix::op_merge("feature-a-cella".to_string(), "target-a-cella".to_string()),
+                matrix::op_merge("feature-b-cella".to_string(), "target-b-cella".to_string()),
             )
             .await;
         assert_eq!(sa.status, StatusCode::OK, "[{}] merge a", cell);
@@ -3128,20 +3910,15 @@ async fn concurrent_branch_ops_morphological_matrix() {
         let cell = "c:merge×merge:same-source-distinct-targets";
         let h = matrix::Harness::new().await;
         h.create_branch("main", "src-shared-cellc").await;
-        h.insert_person("src-shared-cellc", "Sharon-cellc", 50).await;
+        h.insert_person("src-shared-cellc", "Sharon-cellc", 50)
+            .await;
         h.create_branch("main", "tgt-1-cellc").await;
         h.create_branch("main", "tgt-2-cellc").await;
 
         let (sa, sb) = h
             .run_pair(
-                matrix::op_merge(
-                    "src-shared-cellc".to_string(),
-                    "tgt-1-cellc".to_string(),
-                ),
-                matrix::op_merge(
-                    "src-shared-cellc".to_string(),
-                    "tgt-2-cellc".to_string(),
-                ),
+                matrix::op_merge("src-shared-cellc".to_string(), "tgt-1-cellc".to_string()),
+                matrix::op_merge("src-shared-cellc".to_string(), "tgt-2-cellc".to_string()),
             )
             .await;
         assert_eq!(sa.status, StatusCode::OK, "[{}] merge into tgt-1", cell);
@@ -3183,7 +3960,11 @@ async fn concurrent_branch_ops_morphological_matrix() {
             let conflict = error
                 .manifest_conflict
                 .expect("merge 409 must include manifest_conflict");
-            assert_eq!(conflict.table_key, "node:Person", "[{}] conflict table", cell);
+            assert_eq!(
+                conflict.table_key, "node:Person",
+                "[{}] conflict table",
+                cell
+            );
             h.assert_persons("main", cell, &["FrankD-celld"], &["EveD-celld"])
                 .await;
         }
@@ -3236,22 +4017,18 @@ async fn concurrent_branch_ops_morphological_matrix() {
 
         let (sa, sb) = h
             .run_pair(
-                matrix::op_branch_create(
-                    "alpha-cellf".to_string(),
-                    "gamma-cellf".to_string(),
-                ),
-                matrix::op_branch_create(
-                    "beta-cellf".to_string(),
-                    "delta-cellf".to_string(),
-                ),
+                matrix::op_branch_create("alpha-cellf".to_string(), "gamma-cellf".to_string()),
+                matrix::op_branch_create("beta-cellf".to_string(), "delta-cellf".to_string()),
             )
             .await;
         assert_eq!(sa.status, StatusCode::OK, "[{}] gamma create", cell);
         assert_eq!(sb.status, StatusCode::OK, "[{}] delta create", cell);
         // gamma forks off alpha → must contain Eve.
-        h.assert_persons("gamma-cellf", cell, &["Eve-cellf"], &[]).await;
+        h.assert_persons("gamma-cellf", cell, &["Eve-cellf"], &[])
+            .await;
         // delta forks off beta → must NOT contain Eve.
-        h.assert_persons("delta-cellf", cell, &[], &["Eve-cellf"]).await;
+        h.assert_persons("delta-cellf", cell, &[], &["Eve-cellf"])
+            .await;
         h.assert_post_op_sentinel(cell, "sentinel-cellf").await;
     }
 
@@ -3272,7 +4049,8 @@ async fn concurrent_branch_ops_morphological_matrix() {
         assert_eq!(sa.status, StatusCode::OK, "[{}] create newborn", cell);
         assert_eq!(sb.status, StatusCode::OK, "[{}] delete doomed", cell);
         // newborn-cellg exists with main's content.
-        h.assert_persons("newborn-cellg", cell, &["Alice"], &[]).await;
+        h.assert_persons("newborn-cellg", cell, &["Alice"], &[])
+            .await;
         h.assert_post_op_sentinel(cell, "sentinel-cellg").await;
     }
 
@@ -3402,14 +4180,18 @@ async fn concurrent_branch_ops_morphological_matrix() {
             let conflict = error
                 .manifest_conflict
                 .expect("merge 409 must include manifest_conflict");
-            assert_eq!(conflict.table_key, "node:Person", "[{}] conflict table", cell);
+            assert_eq!(
+                conflict.table_key, "node:Person",
+                "[{}] conflict table",
+                cell
+            );
             h.assert_persons("main", cell, &["Steve-cellk"], &["Rita-cellk"])
                 .await;
         }
 
-        // Reopen via a fresh AppState on the same repo.
-        let repo_uri = format!("{}/server.omni", h._temp.path().display());
-        let reopened = AppState::open(repo_uri.clone()).await.unwrap();
+        // Reopen via a fresh AppState on the same graph.
+        let graph_uri = format!("{}/server.omni", h._temp.path().display());
+        let reopened = AppState::open(graph_uri.clone()).await.unwrap();
         let app2 = build_app(reopened);
         // Sanity: the same identity check via the new app must see
         // Rita and Steve.
@@ -3472,9 +4254,9 @@ query insert_c($name: String) {
     const SEED_COMPANIES: u64 = 2;
     const PER_TYPE: usize = 4;
 
-    let temp = init_loaded_repo().await;
-    let repo = repo_path(temp.path());
-    let state = AppState::open(repo.to_string_lossy().to_string())
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let state = AppState::open(graph.to_string_lossy().to_string())
         .await
         .unwrap();
     let app = build_app(state);
@@ -3484,8 +4266,8 @@ query insert_c($name: String) {
         let app_p = app.clone();
         handles.push(tokio::spawn(async move {
             let body = serde_json::to_vec(&ChangeRequest {
-                query_source: PERSON_QUERY.to_string(),
-                query_name: Some("insert_p".to_string()),
+                query: PERSON_QUERY.to_string(),
+                name: Some("insert_p".to_string()),
                 params: Some(json!({ "name": format!("p-{i}"), "age": i as i32 })),
                 branch: Some("main".to_string()),
             })
@@ -3501,8 +4283,8 @@ query insert_c($name: String) {
         let app_c = app.clone();
         handles.push(tokio::spawn(async move {
             let body = serde_json::to_vec(&ChangeRequest {
-                query_source: COMPANY_QUERY.to_string(),
-                query_name: Some("insert_c".to_string()),
+                query: COMPANY_QUERY.to_string(),
+                name: Some("insert_c".to_string()),
                 params: Some(json!({ "name": format!("c-{i}") })),
                 branch: Some("main".to_string()),
             })
@@ -3547,7 +4329,11 @@ query insert_c($name: String) {
     let lookup_count = |table_key: &str| -> u64 {
         body["tables"]
             .as_array()
-            .and_then(|tables| tables.iter().find(|t| t["table_key"].as_str() == Some(table_key)))
+            .and_then(|tables| {
+                tables
+                    .iter()
+                    .find(|t| t["table_key"].as_str() == Some(table_key))
+            })
             .and_then(|t| t["row_count"].as_u64())
             .unwrap_or_else(|| panic!("snapshot missing {}", table_key))
     };
@@ -3592,9 +4378,9 @@ async fn ingest_per_actor_admission_cap_returns_429() {
     // `AppState::new_with_workload` constructor closes that bug class —
     // this test no longer mutates global state and no longer needs
     // `#[serial]`.
-    let temp = init_loaded_repo().await;
-    let repo = repo_path(temp.path());
-    let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     let workload = omnigraph_server::workload::WorkloadController::new(
         1,             // per-actor in-flight cap (the fixture under test)
         1_000_000_000, // per-actor byte budget — large so it never bottlenecks
@@ -3605,18 +4391,16 @@ async fn ingest_per_actor_admission_cap_returns_429() {
     // enough to clear the State 3 path so the test reaches workload.
     let policy_path = temp.path().join("policy.yaml");
     fs::write(&policy_path, permit_all_policy_yaml(&["act-flooder"])).unwrap();
-    let policy_engine = omnigraph_server::PolicyEngine::load(
-        &policy_path,
-        repo.to_string_lossy().as_ref(),
-    )
-    .unwrap();
-    let state = AppState::new_with_workload(
-        repo.to_string_lossy().to_string(),
+    let policy_engine =
+        omnigraph_server::PolicyEngine::load_graph(&policy_path, graph.to_string_lossy().as_ref())
+            .unwrap();
+    let state = AppState::new_single(
+        graph.to_string_lossy().to_string(),
         db,
         vec![("act-flooder".to_string(), "flooder-token".to_string())],
+        Some(policy_engine),
         workload,
-    )
-    .with_policy_engine(policy_engine);
+    );
     let app = build_app(state);
     let _temp = temp;
 
@@ -3709,9 +4493,82 @@ async fn ingest_per_actor_admission_cap_returns_429() {
     }
 }
 
+/// Regression for B2 (MR-668): when an `AppState` is built with a
+/// per-graph policy and a custom workload, the engine inside the
+/// routing's `GraphHandle` MUST have the same policy applied via
+/// `Omnigraph::with_policy`. Pre-fix, `new_with_workload(...).with_policy_engine(p)`
+/// installed the policy only on the HTTP-layer `handle.policy`; the
+/// underlying `Arc<Omnigraph>` was reused without `with_policy`, so any
+/// caller reaching through `state.routing()` could bypass Cedar.
+///
+/// This test reaches the engine the same way an embedded SDK consumer
+/// or future routing code path would, and asserts the policy still
+/// fires. The deny path is "act-blocked has a valid bearer but isn't in
+/// the policy's allowed group" — i.e., authenticated-but-unauthorised.
+#[tokio::test(flavor = "multi_thread")]
+async fn engine_layer_policy_fires_via_direct_arc_omnigraph_from_new_single() {
+    use omnigraph_server::GraphRouting;
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+
+    // Permit `act-allowed` for change actions; `act-blocked` is not in
+    // any allowed group — every change request from them must deny.
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, permit_all_policy_yaml(&["act-allowed"])).unwrap();
+    let policy_engine =
+        omnigraph_server::PolicyEngine::load_graph(&policy_path, graph.to_string_lossy().as_ref())
+            .unwrap();
+
+    let workload = omnigraph_server::workload::WorkloadController::new(100, 1_000_000_000);
+    let state = AppState::new_single(
+        graph.to_string_lossy().to_string(),
+        db,
+        vec![("act-blocked".to_string(), "block-token".to_string())],
+        Some(policy_engine),
+        workload,
+    );
+
+    // Reach into the routing and pull the engine the same way an
+    // embedded consumer holding `Arc<Omnigraph>` would. If `new_single`
+    // failed to apply `with_policy` to the engine, this `mutate_as`
+    // would succeed — the HTTP-layer is bypassed entirely.
+    let handle = match state.routing() {
+        GraphRouting::Single { handle } => Arc::clone(handle),
+        GraphRouting::Multi { .. } => panic!("expected single-mode routing"),
+    };
+    let engine = Arc::clone(&handle.engine);
+
+    let mut params: omnigraph_compiler::ParamMap = Default::default();
+    params.insert(
+        "name".to_string(),
+        omnigraph_compiler::Literal::String("EngineLayerBlocked".to_string()),
+    );
+    params.insert("age".to_string(), omnigraph_compiler::Literal::Integer(30));
+    let result = engine
+        .mutate_as(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person",
+            &params,
+            Some("act-blocked"),
+        )
+        .await;
+    match result {
+        Err(OmniError::Policy(_)) => { /* expected — engine-layer gate fired */ }
+        Ok(_) => panic!(
+            "engine-layer policy did NOT fire — act-blocked successfully ran mutate_as via \
+             the engine pulled from the registry handle. AppState::new_single failed to apply \
+             with_policy to the underlying Omnigraph engine. This is the B2 footgun the \
+             with_policy_engine deletion was supposed to close."
+        ),
+        Err(other) => panic!("expected OmniError::Policy, got: {other:?}"),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn oversized_request_body_returns_payload_too_large() {
-    let (_temp, app) = app_for_loaded_repo().await;
+    let (_temp, app) = app_for_loaded_graph().await;
     let oversized = "x".repeat(1_100_000);
     let response = app
         .clone()
@@ -3739,7 +4596,7 @@ async fn oversized_request_body_returns_payload_too_large() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn default_deny_mode_allows_read_for_authenticated_actor() {
-    let (_temp, app) = app_for_repo_with_auth_tokens_only(
+    let (_temp, app) = app_for_graph_with_auth_tokens_only(
         &fs::read_to_string(fixture("test.pg")).unwrap(),
         &[("act-andrew", "demo-token")],
     )
@@ -3760,15 +4617,15 @@ async fn default_deny_mode_allows_read_for_authenticated_actor() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn default_deny_mode_rejects_change_with_forbidden() {
-    let (_temp, app) = app_for_repo_with_auth_tokens_only(
+    let (_temp, app) = app_for_graph_with_auth_tokens_only(
         &fs::read_to_string(fixture("test.pg")).unwrap(),
         &[("act-andrew", "demo-token")],
     )
     .await;
 
     let change = ChangeRequest {
-        query_source: MUTATION_QUERIES.to_string(),
-        query_name: Some("insert_person".to_string()),
+        query: MUTATION_QUERIES.to_string(),
+        name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "DefaultDeny", "age": 1 })),
         branch: Some("main".to_string()),
     };
@@ -3794,7 +4651,7 @@ async fn default_deny_mode_rejects_change_with_forbidden() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn default_deny_mode_rejects_schema_apply_with_forbidden() {
-    let (_temp, app) = app_for_repo_with_auth_tokens_only(
+    let (_temp, app) = app_for_graph_with_auth_tokens_only(
         &fs::read_to_string(fixture("test.pg")).unwrap(),
         &[("act-andrew", "demo-token")],
     )
@@ -3802,7 +4659,7 @@ async fn default_deny_mode_rejects_schema_apply_with_forbidden() {
 
     let req = SchemaApplyRequest {
         schema_source: additive_schema_with_nickname(),
-                ..Default::default()
+        ..Default::default()
     };
     let (status, body) = json_response(
         &app,
@@ -3862,13 +4719,13 @@ enum ParityDecision {
     Deny,
 }
 
-async fn build_parity_repo() -> (tempfile::TempDir, PathBuf, PathBuf) {
-    // Build a repo with `main` loaded and a `feature` branch ready for
-    // merge. Returns the repo path and a written policy.yaml path.
-    let temp = init_loaded_repo().await;
-    let repo = repo_path(temp.path());
+async fn build_parity_graph() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    // Build a graph with `main` loaded and a `feature` branch ready for
+    // merge. Returns the graph path and a written policy.yaml path.
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
     {
-        let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+        let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
         db.branch_create_from(ReadTarget::branch("main"), "feature")
             .await
             .unwrap();
@@ -3883,12 +4740,12 @@ async fn build_parity_repo() -> (tempfile::TempDir, PathBuf, PathBuf) {
     }
     let policy_path = temp.path().join("policy.yaml");
     fs::write(&policy_path, PARITY_POLICY_YAML).unwrap();
-    (temp, repo, policy_path)
+    (temp, graph, policy_path)
 }
 
-async fn sdk_change_decision(repo: &Path, policy_path: &Path, actor: &str) -> ParityDecision {
-    let policy = PolicyEngine::load(policy_path, repo.to_string_lossy().as_ref()).unwrap();
-    let db = Omnigraph::open(repo.to_str().unwrap())
+async fn sdk_change_decision(graph: &Path, policy_path: &Path, actor: &str) -> ParityDecision {
+    let policy = PolicyEngine::load_graph(policy_path, graph.to_string_lossy().as_ref()).unwrap();
+    let db = Omnigraph::open(graph.to_str().unwrap())
         .await
         .unwrap()
         .with_policy(Arc::new(policy) as Arc<dyn PolicyChecker>);
@@ -3901,7 +4758,13 @@ async fn sdk_change_decision(repo: &Path, policy_path: &Path, actor: &str) -> Pa
     );
     params.insert("age".to_string(), omnigraph_compiler::Literal::Integer(30));
     let result = db
-        .mutate_as("main", MUTATION_QUERIES, "insert_person", &params, Some(actor))
+        .mutate_as(
+            "main",
+            MUTATION_QUERIES,
+            "insert_person",
+            &params,
+            Some(actor),
+        )
         .await;
     match result {
         Ok(_) => ParityDecision::Allow,
@@ -3911,13 +4774,13 @@ async fn sdk_change_decision(repo: &Path, policy_path: &Path, actor: &str) -> Pa
 }
 
 async fn http_change_decision(
-    repo: &Path,
+    graph: &Path,
     policy_path: &PathBuf,
     actor: &str,
     token: &str,
 ) -> ParityDecision {
     let state = AppState::open_with_bearer_tokens_and_policy(
-        repo.to_string_lossy().to_string(),
+        graph.to_string_lossy().to_string(),
         vec![(actor.to_string(), token.to_string())],
         Some(policy_path),
     )
@@ -3925,8 +4788,8 @@ async fn http_change_decision(
     .unwrap();
     let app = build_app(state);
     let req = ChangeRequest {
-        query_source: MUTATION_QUERIES.to_string(),
-        query_name: Some("insert_person".to_string()),
+        query: MUTATION_QUERIES.to_string(),
+        name: Some("insert_person".to_string()),
         params: Some(json!({ "name": "ParityCharlie", "age": 30 })),
         branch: Some("main".to_string()),
     };
@@ -3948,9 +4811,9 @@ async fn http_change_decision(
     }
 }
 
-async fn sdk_merge_decision(repo: &Path, policy_path: &Path, actor: &str) -> ParityDecision {
-    let policy = PolicyEngine::load(policy_path, repo.to_string_lossy().as_ref()).unwrap();
-    let db = Omnigraph::open(repo.to_str().unwrap())
+async fn sdk_merge_decision(graph: &Path, policy_path: &Path, actor: &str) -> ParityDecision {
+    let policy = PolicyEngine::load_graph(policy_path, graph.to_string_lossy().as_ref()).unwrap();
+    let db = Omnigraph::open(graph.to_str().unwrap())
         .await
         .unwrap()
         .with_policy(Arc::new(policy) as Arc<dyn PolicyChecker>);
@@ -3963,13 +4826,13 @@ async fn sdk_merge_decision(repo: &Path, policy_path: &Path, actor: &str) -> Par
 }
 
 async fn http_merge_decision(
-    repo: &Path,
+    graph: &Path,
     policy_path: &PathBuf,
     actor: &str,
     token: &str,
 ) -> ParityDecision {
     let state = AppState::open_with_bearer_tokens_and_policy(
-        repo.to_string_lossy().to_string(),
+        graph.to_string_lossy().to_string(),
         vec![(actor.to_string(), token.to_string())],
         Some(policy_path),
     )
@@ -4001,12 +4864,12 @@ async fn http_merge_decision(
 #[tokio::test(flavor = "multi_thread")]
 async fn policy_decision_parity_change_admin_on_main_allowed() {
     // (act-ragnor, change, main) — admins-change-anywhere rule applies.
-    // Both SDK and HTTP must allow. Each path uses its own fresh repo
+    // Both SDK and HTTP must allow. Each path uses its own fresh graph
     // because allow→side-effects.
-    let (_t1, repo1, policy1) = build_parity_repo().await;
-    let sdk = sdk_change_decision(&repo1, &policy1, "act-ragnor").await;
-    let (_t2, repo2, policy2) = build_parity_repo().await;
-    let http = http_change_decision(&repo2, &policy2, "act-ragnor", "ragnor-token").await;
+    let (_t1, graph1, policy1) = build_parity_graph().await;
+    let sdk = sdk_change_decision(&graph1, &policy1, "act-ragnor").await;
+    let (_t2, graph2, policy2) = build_parity_graph().await;
+    let http = http_change_decision(&graph2, &policy2, "act-ragnor", "ragnor-token").await;
     assert!(
         matches!(sdk, ParityDecision::Allow) && matches!(http, ParityDecision::Allow),
         "SDK={sdk:?} HTTP={http:?} — should both Allow",
@@ -4016,11 +4879,11 @@ async fn policy_decision_parity_change_admin_on_main_allowed() {
 #[tokio::test(flavor = "multi_thread")]
 async fn policy_decision_parity_change_team_on_main_denied() {
     // (act-bruno, change, main) — no rule grants bruno change on
-    // protected. Both SDK and HTTP must deny. Same repo is reusable
+    // protected. Both SDK and HTTP must deny. Same graph is reusable
     // because deny→no side-effects.
-    let (_temp, repo, policy) = build_parity_repo().await;
-    let sdk = sdk_change_decision(&repo, &policy, "act-bruno").await;
-    let http = http_change_decision(&repo, &policy, "act-bruno", "bruno-token").await;
+    let (_temp, graph, policy) = build_parity_graph().await;
+    let sdk = sdk_change_decision(&graph, &policy, "act-bruno").await;
+    let http = http_change_decision(&graph, &policy, "act-bruno", "bruno-token").await;
     assert!(
         matches!(sdk, ParityDecision::Deny) && matches!(http, ParityDecision::Deny),
         "SDK={sdk:?} HTTP={http:?} — should both Deny",
@@ -4030,12 +4893,12 @@ async fn policy_decision_parity_change_team_on_main_denied() {
 #[tokio::test(flavor = "multi_thread")]
 async fn policy_decision_parity_branch_merge_admin_allowed() {
     // (act-ragnor, branch_merge, feature→main) — admins-merge-to-protected
-    // rule applies. Both Allow. Each path uses its own fresh repo —
+    // rule applies. Both Allow. Each path uses its own fresh graph —
     // a successful merge consumes the feature branch's commit on main.
-    let (_t1, repo1, policy1) = build_parity_repo().await;
-    let sdk = sdk_merge_decision(&repo1, &policy1, "act-ragnor").await;
-    let (_t2, repo2, policy2) = build_parity_repo().await;
-    let http = http_merge_decision(&repo2, &policy2, "act-ragnor", "ragnor-token").await;
+    let (_t1, graph1, policy1) = build_parity_graph().await;
+    let sdk = sdk_merge_decision(&graph1, &policy1, "act-ragnor").await;
+    let (_t2, graph2, policy2) = build_parity_graph().await;
+    let http = http_merge_decision(&graph2, &policy2, "act-ragnor", "ragnor-token").await;
     assert!(
         matches!(sdk, ParityDecision::Allow) && matches!(http, ParityDecision::Allow),
         "SDK={sdk:?} HTTP={http:?} — should both Allow",
@@ -4046,9 +4909,9 @@ async fn policy_decision_parity_branch_merge_admin_allowed() {
 async fn policy_decision_parity_branch_merge_team_denied() {
     // (act-bruno, branch_merge, feature→main) — no rule grants bruno
     // branch_merge. Both Deny.
-    let (_temp, repo, policy) = build_parity_repo().await;
-    let sdk = sdk_merge_decision(&repo, &policy, "act-bruno").await;
-    let http = http_merge_decision(&repo, &policy, "act-bruno", "bruno-token").await;
+    let (_temp, graph, policy) = build_parity_graph().await;
+    let sdk = sdk_merge_decision(&graph, &policy, "act-bruno").await;
+    let http = http_merge_decision(&graph, &policy, "act-bruno", "bruno-token").await;
     assert!(
         matches!(sdk, ParityDecision::Deny) && matches!(http, ParityDecision::Deny),
         "SDK={sdk:?} HTTP={http:?} — should both Deny",
@@ -4065,16 +4928,16 @@ async fn policy_decision_parity_branch_merge_team_denied() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn schema_apply_route_soft_drops_property_via_http() {
-    let (temp, app) = app_for_repo_with_auth_tokens_and_policy(
+    let (temp, app) = app_for_graph_with_auth_tokens_and_policy(
         &fs::read_to_string(fixture("test.pg")).unwrap(),
         &[("act-ragnor", "admin-token")],
         SCHEMA_APPLY_POLICY_YAML,
     )
     .await;
     // Load a row that has the column we're about to drop.
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     {
-        let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+        let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
         db.load(
             "main",
             r#"{"type":"Person","data":{"name":"PreDrop","age":42}}"#,
@@ -4083,7 +4946,7 @@ async fn schema_apply_route_soft_drops_property_via_http() {
         .await
         .unwrap();
     }
-    let pre_version = manifest_dataset_version(&repo).await;
+    let pre_version = manifest_dataset_version(&graph).await;
 
     let (status, payload) = json_response(
         &app,
@@ -4106,7 +4969,7 @@ async fn schema_apply_route_soft_drops_property_via_http() {
     assert_eq!(payload["applied"], true);
 
     // Catalog reflects the drop: `age` is gone from the live schema.
-    let reopened = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let reopened = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     assert!(
         !reopened.catalog().node_types["Person"]
             .properties
@@ -4134,13 +4997,13 @@ async fn schema_apply_route_soft_drops_property_via_http() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn schema_apply_route_soft_drops_node_type_via_http() {
-    let (temp, app) = app_for_repo_with_auth_tokens_and_policy(
+    let (temp, app) = app_for_graph_with_auth_tokens_and_policy(
         &fs::read_to_string(fixture("test.pg")).unwrap(),
         &[("act-ragnor", "admin-token")],
         SCHEMA_APPLY_POLICY_YAML,
     )
     .await;
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
 
     let (status, payload) = json_response(
         &app,
@@ -4162,7 +5025,7 @@ async fn schema_apply_route_soft_drops_node_type_via_http() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["applied"], true);
 
-    let reopened = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let reopened = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     assert!(
         !reopened.catalog().node_types.contains_key("Company"),
         "catalog should not contain `Company` after drop"
@@ -4175,15 +5038,15 @@ async fn schema_apply_route_soft_drops_node_type_via_http() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn schema_apply_route_hard_drops_property_with_allow_data_loss() {
-    let (temp, app) = app_for_repo_with_auth_tokens_and_policy(
+    let (temp, app) = app_for_graph_with_auth_tokens_and_policy(
         &fs::read_to_string(fixture("test.pg")).unwrap(),
         &[("act-ragnor", "admin-token")],
         SCHEMA_APPLY_POLICY_YAML,
     )
     .await;
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     {
-        let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+        let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
         db.load(
             "main",
             r#"{"type":"Person","data":{"name":"PreDropHard","age":50}}"#,
@@ -4215,7 +5078,7 @@ async fn schema_apply_route_hard_drops_property_with_allow_data_loss() {
     assert_eq!(payload["applied"], true);
 
     // Catalog reflects the drop.
-    let reopened = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+    let reopened = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     assert!(
         !reopened.catalog().node_types["Person"]
             .properties
@@ -4229,7 +5092,10 @@ async fn schema_apply_route_hard_drops_property_with_allow_data_loss() {
         .find(|s| s["kind"] == "drop_property")
         .expect("plan should include drop_property step");
     let mode = &drop_step["mode"];
-    assert_eq!(mode, "hard", "expected hard mode under allow_data_loss=true");
+    assert_eq!(
+        mode, "hard",
+        "expected hard mode under allow_data_loss=true"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4238,13 +5104,13 @@ async fn schema_apply_route_keeps_drops_soft_without_flag() {
     // allow_data_loss flag → drops stay Soft (prior column data
     // remains time-travel-reachable). Pins the default semantics
     // against accidental Hard promotion.
-    let (temp, app) = app_for_repo_with_auth_tokens_and_policy(
+    let (temp, app) = app_for_graph_with_auth_tokens_and_policy(
         &fs::read_to_string(fixture("test.pg")).unwrap(),
         &[("act-ragnor", "admin-token")],
         SCHEMA_APPLY_POLICY_YAML,
     )
     .await;
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
 
     let (status, payload) = json_response(
         &app,
@@ -4273,7 +5139,7 @@ async fn schema_apply_route_keeps_drops_soft_without_flag() {
         .expect("plan should include drop_property step");
     let mode = &drop_step["mode"];
     assert_eq!(mode, "soft", "expected soft mode without allow_data_loss");
-    let _ = repo;
+    let _ = graph;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4282,17 +5148,17 @@ async fn schema_apply_route_additive_property_preserves_existing_rows() {
     // AddProperty wasn't pinned with a row-count check anywhere.
     // Load N rows, apply schema adding nullable property, verify
     // every row is still readable and the new column is null.
-    let (temp, app) = app_for_repo_with_auth_tokens_and_policy(
+    let (temp, app) = app_for_graph_with_auth_tokens_and_policy(
         &fs::read_to_string(fixture("test.pg")).unwrap(),
         &[("act-ragnor", "admin-token")],
         SCHEMA_APPLY_POLICY_YAML,
     )
     .await;
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
 
     // Standard fixture data: 4 Persons + 1 Company. Load it.
     let pre_count = {
-        let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
+        let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
         db.load(
             "main",
             &fs::read_to_string(fixture("test.jsonl")).unwrap(),
@@ -4329,8 +5195,9 @@ async fn schema_apply_route_additive_property_preserves_existing_rows() {
     assert_eq!(payload["applied"], true);
 
     // Row count preserved.
-    let db = Omnigraph::open(repo.to_str().unwrap()).await.unwrap();
-    let snap = db.snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    let snap = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
         .unwrap();
     let post_count = snap.entry("node:Person").expect("Person").row_count;
@@ -4338,4 +5205,1005 @@ async fn schema_apply_route_additive_property_preserves_existing_rows() {
         post_count, pre_count,
         "AddProperty should preserve row count",
     );
+}
+
+// ─── MR-668: multi-graph startup ──────────────────────────────────────────
+
+mod multi_graph_startup {
+    use super::*;
+    use omnigraph::storage::normalize_root_uri;
+    use omnigraph_server::{
+        GraphHandle, GraphId, GraphKey, GraphRegistry, InsertError, ServerConfig, ServerConfigMode,
+        load_server_settings,
+    };
+    use std::sync::Arc;
+
+    async fn build_multi_mode_app(graph_ids: &[&str]) -> (Vec<tempfile::TempDir>, Router) {
+        let mut dirs = Vec::with_capacity(graph_ids.len());
+        let mut handles = Vec::with_capacity(graph_ids.len());
+        for id in graph_ids {
+            let dir = tempfile::tempdir().unwrap();
+            let graph_uri = dir.path().join(id).to_str().unwrap().to_string();
+            let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+            let engine = Omnigraph::init(&graph_uri, &schema).await.unwrap();
+            handles.push(Arc::new(GraphHandle {
+                key: GraphKey::cluster(GraphId::try_from(*id).unwrap()),
+                uri: graph_uri,
+                engine: Arc::new(engine),
+                policy: None,
+                queries: None,
+            }));
+            dirs.push(dir);
+        }
+        let workload = omnigraph_server::workload::WorkloadController::from_env();
+        let state = AppState::new_multi(handles, Vec::new(), None, workload, None).unwrap();
+        let app = build_app(state);
+        (dirs, app)
+    }
+
+    /// Cluster route `/graphs/{graph_id}/snapshot` resolves to the right
+    /// engine. Two graphs side by side; assert each responds to its own
+    /// id and does NOT respond to the other's URL.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cluster_routes_dispatch_per_graph_handle() {
+        let (_dirs, app) = build_multi_mode_app(&["alpha", "beta"]).await;
+        for id in ["alpha", "beta"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(format!("/graphs/{id}/snapshot?branch=main"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "graph '{id}' must respond OK on its cluster snapshot route"
+            );
+        }
+    }
+
+    /// Unknown graph id under the cluster prefix yields 404 (not 500,
+    /// not 410 — `Gone` is reserved for the future DELETE flow).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cluster_route_for_unknown_graph_returns_404() {
+        let (_dirs, app) = build_multi_mode_app(&["alpha"]).await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/graphs/nonexistent/snapshot?branch=main")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Coverage net for cluster-route regressions across every
+    /// protected handler — not just the few that have inner path
+    /// params. Bug-1 surfaced because only `/snapshot` was being
+    /// exercised in cluster mode, leaving the other six protected
+    /// routes implicitly untested. This sweep hits each one and
+    /// asserts the response shows the handler was reached: no 404
+    /// (router didn't match), no 500 with "Wrong number of path
+    /// arguments" (path extractor broke), no 500 with "missing
+    /// extension" (routing middleware didn't inject the handle).
+    ///
+    /// Status codes are negative assertions because each handler's
+    /// happy-path inputs differ — what matters is "the request
+    /// reached the handler," not "the handler returned 200." The
+    /// individual handlers' logic is already tested in single mode.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn all_protected_cluster_routes_resolve_to_their_handler() {
+        let (_dirs, app) = build_multi_mode_app(&["alpha"]).await;
+
+        // (method, path, body) — one minimal request per protected
+        // cluster route. Bodies are valid enough that the router and
+        // extractors succeed; whether the engine ultimately returns
+        // 200 or 4xx is per-handler and not what this test pins.
+        let cases: &[(Method, &str, Option<&str>)] = &[
+            (Method::GET, "/graphs/alpha/snapshot?branch=main", None),
+            (Method::GET, "/graphs/alpha/schema", None),
+            (Method::GET, "/graphs/alpha/branches", None),
+            (Method::GET, "/graphs/alpha/commits", None),
+            (
+                Method::POST,
+                "/graphs/alpha/read",
+                Some(r#"{"query_source":"query q() { return {} }"}"#),
+            ),
+            (
+                Method::POST,
+                "/graphs/alpha/change",
+                Some(r#"{"query_source":"query q() { return {} }"}"#),
+            ),
+            (
+                Method::POST,
+                "/graphs/alpha/export",
+                Some(r#"{"branch":"main"}"#),
+            ),
+            (
+                Method::POST,
+                "/graphs/alpha/schema/apply",
+                Some(r#"{"schema_source":"","allow_data_loss":false}"#),
+            ),
+            (Method::POST, "/graphs/alpha/ingest", Some(r#"{"data":""}"#)),
+            (
+                Method::POST,
+                "/graphs/alpha/branches/merge",
+                Some(r#"{"source":"main","target":"main"}"#),
+            ),
+        ];
+
+        for (method, path, body) in cases {
+            let req_body = body
+                .map(|s| Body::from(s.to_string()))
+                .unwrap_or_else(Body::empty);
+            let req = Request::builder()
+                .method(method.clone())
+                .uri(*path)
+                .header("content-type", "application/json")
+                .body(req_body)
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            let status = resp.status();
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body_str = String::from_utf8_lossy(&bytes);
+
+            assert_ne!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{} {} — router didn't match (cluster-route mounting regression). Body: {}",
+                method,
+                path,
+                body_str,
+            );
+            assert!(
+                !(status == StatusCode::INTERNAL_SERVER_ERROR
+                    && body_str.contains("Wrong number of path arguments")),
+                "{} {} — path extractor broke (Bug-1 class regression). Body: {}",
+                method,
+                path,
+                body_str,
+            );
+            assert!(
+                !(status == StatusCode::INTERNAL_SERVER_ERROR
+                    && body_str.to_lowercase().contains("missing extension")),
+                "{} {} — routing middleware didn't inject GraphHandle. Body: {}",
+                method,
+                path,
+                body_str,
+            );
+        }
+    }
+
+    /// Regression for the bot-surfaced path-extractor bug: cluster
+    /// routes whose inner path also captures a parameter
+    /// (`/graphs/{graph_id}/branches/{branch}`,
+    /// `/graphs/{graph_id}/commits/{commit_id}`) must extract the
+    /// inner param cleanly. Axum 0.8 propagates the outer `{graph_id}`
+    /// capture into nested handlers, so a `Path<String>` extractor
+    /// would see two values and fail with "Wrong number of path
+    /// arguments. Expected 1 but got 2." Today both DELETE branch and
+    /// GET commit-by-id break in multi-mode because their handlers
+    /// use bare `Path<String>` — this test pins the fix.
+    ///
+    /// The broader `all_protected_cluster_routes_resolve_to_their_handler`
+    /// test sweeps the full route surface; this one stays narrowly
+    /// targeted at the inner-path-param shape because that's the
+    /// specific regression class.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cluster_routes_with_inner_path_params_deserialize_correctly() {
+        let (_dirs, app) = build_multi_mode_app(&["alpha"]).await;
+
+        // Create a branch we can then delete — DELETE /graphs/alpha/branches/feature
+        let create_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/graphs/alpha/branches")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"feature"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            create_resp.status(),
+            StatusCode::OK,
+            "branch create on the cluster route must succeed before delete can be tested"
+        );
+
+        // DELETE /graphs/{graph_id}/branches/{branch} — exercises a handler
+        // whose only Path extractor (`branch`) is inside a nested route
+        // that also captures `graph_id`. The handler must pick `branch`
+        // by name, not by position.
+        let delete_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/graphs/alpha/branches/feature")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let delete_status = delete_resp.status();
+        let delete_body = to_bytes(delete_resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            delete_status,
+            StatusCode::OK,
+            "DELETE /graphs/{{id}}/branches/{{branch}} must extract `branch` cleanly. \
+             Body: {}",
+            String::from_utf8_lossy(&delete_body),
+        );
+
+        // GET /graphs/{graph_id}/commits/{commit_id} — same shape: the
+        // handler's only Path extractor is the inner `commit_id`, which
+        // must deserialize by name even though `graph_id` is also in scope.
+        // We don't know a real commit_id, but the failure mode under test
+        // is path extraction, not commit lookup — a 404 from the engine
+        // is fine; a 500 with "Wrong number of path arguments" is the bug.
+        let commit_resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/graphs/alpha/commits/0000000000000000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let commit_status = commit_resp.status();
+        let commit_body = to_bytes(commit_resp.into_body(), usize::MAX).await.unwrap();
+        let body_str = String::from_utf8_lossy(&commit_body);
+        assert!(
+            commit_status != StatusCode::INTERNAL_SERVER_ERROR
+                || !body_str.contains("Wrong number of path arguments"),
+            "GET /graphs/{{id}}/commits/{{commit_id}} must extract `commit_id` cleanly. \
+             Got: {} | {}",
+            commit_status,
+            body_str,
+        );
+    }
+
+    /// Flat routes 404 in multi mode — the router only mounts under
+    /// `/graphs/{graph_id}/...` so `/snapshot` doesn't resolve.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flat_routes_404_in_multi_mode() {
+        let (_dirs, app) = build_multi_mode_app(&["alpha"]).await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/snapshot?branch=main")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// `GraphId` validation runs at startup — a reserved name in
+    /// `omnigraph.yaml` produces a clear error rather than getting
+    /// rejected per-request.
+    #[test]
+    fn load_server_settings_rejects_reserved_graph_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            r#"
+graphs:
+  policies:
+    uri: /tmp/g1.omni
+"#,
+        )
+        .unwrap();
+        let err = load_server_settings(Some(&config_path), None, None, None, false).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid graph id 'policies'"),
+            "expected reserved-name rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registry_rejects_duplicate_normalized_graph_uris() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_uri = dir.path().join("same").to_str().unwrap().to_string();
+        let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+        let engine = Arc::new(Omnigraph::init(&graph_uri, &schema).await.unwrap());
+
+        let alpha = Arc::new(GraphHandle {
+            key: GraphKey::cluster(GraphId::try_from("alpha").unwrap()),
+            uri: graph_uri.clone(),
+            engine: Arc::clone(&engine),
+            policy: None,
+            queries: None,
+        });
+        let beta = Arc::new(GraphHandle {
+            key: GraphKey::cluster(GraphId::try_from("beta").unwrap()),
+            uri: format!("file://{graph_uri}/"),
+            engine,
+            policy: None,
+            queries: None,
+        });
+
+        match GraphRegistry::from_handles(vec![alpha, beta]) {
+            Err(InsertError::DuplicateUri(uri)) => {
+                assert!(
+                    normalize_root_uri(&uri).is_ok(),
+                    "duplicate URI should still be parseable, got {uri}"
+                );
+            }
+            Err(err) => panic!("expected DuplicateUri for normalized aliases, got {err:?}"),
+            Ok(_) => panic!("expected DuplicateUri for normalized aliases, got Ok"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registry_stores_canonical_graph_uri() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_uri = dir.path().join("canonical").to_str().unwrap().to_string();
+        let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+        let engine = Omnigraph::init(&graph_uri, &schema).await.unwrap();
+        let handle = Arc::new(GraphHandle {
+            key: GraphKey::cluster(GraphId::try_from("alpha").unwrap()),
+            uri: format!("file://{graph_uri}/"),
+            engine: Arc::new(engine),
+            policy: None,
+            queries: None,
+        });
+
+        let registry = GraphRegistry::from_handles(vec![handle]).unwrap();
+        let listed = registry.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].uri, graph_uri);
+    }
+
+    // ── Four-rule mode inference matrix ───────────────────────────────
+
+    /// Rule 1: CLI positional URI → Single.
+    #[test]
+    fn mode_inference_cli_uri_is_single() {
+        let settings = load_server_settings(
+            None,
+            Some("/tmp/cli.omni".to_string()),
+            None,
+            None,
+            true, // allow unauth so we get past the runtime-state check
+        )
+        .unwrap();
+        match settings.mode {
+            ServerConfigMode::Single { uri, .. } => assert_eq!(uri, "/tmp/cli.omni"),
+            ServerConfigMode::Multi { .. } => panic!("expected Single (rule 1), got Multi"),
+        }
+    }
+
+    /// Rule 2: --target picks one graph from `graphs:` map → Single.
+    #[test]
+    fn mode_inference_cli_target_is_single() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            r#"
+graphs:
+  alpha:
+    uri: /tmp/alpha.omni
+  beta:
+    uri: /tmp/beta.omni
+"#,
+        )
+        .unwrap();
+        let settings =
+            load_server_settings(Some(&config_path), None, Some("alpha".into()), None, true)
+                .unwrap();
+        match settings.mode {
+            ServerConfigMode::Single { uri, .. } => assert_eq!(uri, "/tmp/alpha.omni"),
+            ServerConfigMode::Multi { .. } => panic!("expected Single (rule 2), got Multi"),
+        }
+    }
+
+    /// Rule 3: `server.graph` set → Single (target picked from config).
+    #[test]
+    fn mode_inference_server_graph_is_single() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            r#"
+graphs:
+  alpha:
+    uri: /tmp/alpha.omni
+  beta:
+    uri: /tmp/beta.omni
+server:
+  graph: beta
+"#,
+        )
+        .unwrap();
+        let settings = load_server_settings(Some(&config_path), None, None, None, true).unwrap();
+        match settings.mode {
+            ServerConfigMode::Single { uri, .. } => assert_eq!(uri, "/tmp/beta.omni"),
+            ServerConfigMode::Multi { .. } => panic!("expected Single (rule 3), got Multi"),
+        }
+    }
+
+    /// Rule 4: `--config` + non-empty `graphs:` + no single-mode selector → Multi.
+    #[test]
+    fn mode_inference_config_plus_graphs_is_multi() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            r#"
+graphs:
+  alpha:
+    uri: /tmp/alpha.omni
+  beta:
+    uri: /tmp/beta.omni
+"#,
+        )
+        .unwrap();
+        let settings = load_server_settings(Some(&config_path), None, None, None, true).unwrap();
+        match settings.mode {
+            ServerConfigMode::Multi { graphs, .. } => {
+                let ids: Vec<&str> = graphs.iter().map(|g| g.graph_id.as_str()).collect();
+                // BTreeMap iteration order is alphabetical.
+                assert_eq!(ids, vec!["alpha", "beta"]);
+            }
+            ServerConfigMode::Single { .. } => panic!("expected Multi (rule 4), got Single"),
+        }
+    }
+
+    #[test]
+    fn mode_inference_multi_rejects_top_level_policy_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            r#"
+policy:
+  file: ./policy.yaml
+graphs:
+  alpha:
+    uri: /tmp/alpha.omni
+"#,
+        )
+        .unwrap();
+        let err = load_server_settings(Some(&config_path), None, None, None, true).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("top-level") && msg.contains("policy.file") && msg.contains("not honored"),
+            "expected top-level-not-honored guidance, got: {msg}"
+        );
+        assert!(
+            msg.contains("graphs.<graph_id>"),
+            "expected per-graph migration guidance, got: {msg}"
+        );
+        assert!(
+            msg.contains("server.policy.file"),
+            "expected server policy migration guidance, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn mode_inference_multi_rejects_top_level_queries() {
+        // Symmetric to the policy guard: a top-level `queries:` block in
+        // multi-graph mode is not honored (each graph uses its own), so it
+        // is a loud error rather than a silent no-op.
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            "queries:\n  q:\n    file: ./q.gq\ngraphs:\n  alpha:\n    uri: /tmp/alpha.omni\n",
+        )
+        .unwrap();
+        let err = load_server_settings(Some(&config_path), None, None, None, true).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("queries") && msg.contains("not honored"),
+            "top-level queries must be rejected in multi-graph mode: {msg}"
+        );
+    }
+
+    #[test]
+    fn single_mode_named_graph_rejects_top_level_blocks() {
+        // Serving a graph by name (`--target`/`server.graph`) uses its
+        // per-graph block; a populated top-level block would be silently
+        // shadowed, so boot refuses and names the per-graph location.
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            "policy:\n  file: ./top.yaml\ngraphs:\n  prod:\n    uri: /tmp/prod.omni\n",
+        )
+        .unwrap();
+        let err =
+            load_server_settings(Some(&config_path), None, Some("prod".to_string()), None, true)
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("prod") && msg.contains("policy.file") && msg.contains("graphs.prod"),
+            "named single-mode + top-level policy must refuse, naming the graph: {msg}"
+        );
+    }
+
+    #[test]
+    fn single_mode_named_graph_uses_per_graph_policy_and_queries() {
+        // The identity rule: `--target prod` attaches `graphs.prod`'s own
+        // policy + queries, not the top-level ones (which are absent here).
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("prod.gq"),
+            "query pq() { match { $u: User } return { $u.name } }",
+        )
+        .unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            "graphs:\n  prod:\n    uri: /tmp/prod.omni\n    policy:\n      file: ./prod-policy.yaml\n    \
+             queries:\n      pq:\n        file: ./prod.gq\n",
+        )
+        .unwrap();
+        let settings =
+            load_server_settings(Some(&config_path), None, Some("prod".to_string()), None, true)
+                .unwrap();
+        match settings.mode {
+            ServerConfigMode::Single {
+                graph_id,
+                policy_file,
+                queries,
+                ..
+            } => {
+                assert_eq!(graph_id, "prod", "named single-mode keeps graph identity");
+                assert!(
+                    policy_file
+                        .as_ref()
+                        .is_some_and(|p| p.ends_with("prod-policy.yaml")),
+                    "per-graph policy attached: {policy_file:?}"
+                );
+                assert!(queries.lookup("pq").is_some(), "per-graph query attached");
+            }
+            other => panic!("expected Single mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mode_inference_normalizes_multi_graph_uris() {
+        let temp = tempfile::tempdir().unwrap();
+        let graph = temp.path().join("alpha.omni");
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+graphs:
+  alpha:
+    uri: file://{}/
+"#,
+                graph.display()
+            ),
+        )
+        .unwrap();
+        let settings = load_server_settings(Some(&config_path), None, None, None, true).unwrap();
+        match settings.mode {
+            ServerConfigMode::Multi { graphs, .. } => {
+                assert_eq!(graphs[0].uri, graph.to_string_lossy());
+            }
+            ServerConfigMode::Single { .. } => panic!("expected Multi"),
+        }
+    }
+
+    /// Rule 5: nothing → error with migration hint.
+    #[test]
+    fn mode_inference_no_inputs_errors_with_migration_hint() {
+        let err = load_server_settings(None, None, None, None, true).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no graph to serve"),
+            "expected migration-hint error, got: {msg}"
+        );
+    }
+
+    /// Rule 4 sub-case: `--config` with empty `graphs:` map and no
+    /// single-mode selector → rule 5 fires (no graph to serve).
+    #[test]
+    fn mode_inference_empty_graphs_map_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(&config_path, "server:\n  bind: 127.0.0.1:8080\n").unwrap();
+        let err = load_server_settings(Some(&config_path), None, None, None, true).unwrap_err();
+        assert!(err.to_string().contains("no graph to serve"));
+    }
+
+    /// `--config` + `<URI>` together: URI wins → Single (the CLI URI
+    /// takes precedence over the config's graphs map).
+    #[test]
+    fn mode_inference_cli_uri_overrides_graphs_map() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            r#"
+graphs:
+  alpha:
+    uri: /tmp/alpha.omni
+"#,
+        )
+        .unwrap();
+        let settings = load_server_settings(
+            Some(&config_path),
+            Some("/tmp/cli-override.omni".to_string()),
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        match settings.mode {
+            ServerConfigMode::Single { uri, .. } => {
+                assert_eq!(
+                    uri, "/tmp/cli-override.omni",
+                    "CLI URI must win over graphs: map"
+                );
+            }
+            ServerConfigMode::Multi { .. } => {
+                panic!("expected Single (CLI URI wins), got Multi")
+            }
+        }
+    }
+
+    /// Per-graph `policy.file` is resolved relative to the config base_dir.
+    #[test]
+    fn per_graph_policy_file_is_resolved_relative_to_base_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            r#"
+graphs:
+  alpha:
+    uri: /tmp/alpha.omni
+    policy:
+      file: ./policies/alpha.yaml
+  beta:
+    uri: /tmp/beta.omni
+"#,
+        )
+        .unwrap();
+        let settings = load_server_settings(Some(&config_path), None, None, None, true).unwrap();
+        let graphs = match settings.mode {
+            ServerConfigMode::Multi { graphs, .. } => graphs,
+            _ => panic!("expected Multi"),
+        };
+        // graphs is BTreeMap-iter order (alphabetical).
+        let alpha = &graphs[0];
+        let beta = &graphs[1];
+        assert_eq!(alpha.graph_id, "alpha");
+        assert_eq!(
+            alpha.policy_file.as_ref().unwrap(),
+            &temp.path().join("policies/alpha.yaml")
+        );
+        assert_eq!(beta.graph_id, "beta");
+        assert!(beta.policy_file.is_none());
+    }
+
+    /// `server.policy.file` resolves alongside the graphs map.
+    #[test]
+    fn server_policy_file_is_resolved_relative_to_base_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            r#"
+server:
+  policy:
+    file: ./server-policy.yaml
+graphs:
+  alpha:
+    uri: /tmp/alpha.omni
+"#,
+        )
+        .unwrap();
+        let settings = load_server_settings(Some(&config_path), None, None, None, true).unwrap();
+        match settings.mode {
+            ServerConfigMode::Multi {
+                server_policy_file, ..
+            } => {
+                assert_eq!(
+                    server_policy_file.unwrap(),
+                    temp.path().join("server-policy.yaml")
+                );
+            }
+            _ => panic!("expected Multi"),
+        }
+    }
+
+    /// `GET /graphs` must NOT leak the registry in Open mode without
+    /// an explicit server policy. Operators who pass `--unauthenticated`
+    /// opted into trusting the network for graph DATA, not for leaking
+    /// server topology (graph IDs + URIs, which may contain S3 bucket
+    /// paths or internal hostnames). Cedar gating the management
+    /// surface is the documented contract for `server_graphs_list`
+    /// ("don't leak the registry until the operator explicitly
+    /// authorizes it"); enforcing that contract in every runtime
+    /// state — not just `PolicyEnabled` — is the correct-by-design
+    /// closure of the open-mode hole the bot-review pass surfaced.
+    ///
+    /// Today (pre-fix) this returns 200 because `authorize_request`'s
+    /// no-policy fallback only denies when `actor.is_some()`, so Open
+    /// mode (`actor: None`) falls through to `Ok(())`. The fix in the
+    /// next commit tightens the fallback so server-scoped actions
+    /// always require explicit policy.
+    ///
+    /// Sort-order coverage previously lived here; it has moved to
+    /// `get_graphs_with_server_policy_authorizes_per_cedar` where
+    /// the response body is now non-empty and operator-authorized.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_graphs_denied_in_open_mode_without_server_policy() {
+        let (_dirs, app) = build_multi_mode_app(&["beta", "alpha"]).await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/graphs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body_str = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "GET /graphs must require an explicit server policy in every \
+             runtime state; Open-mode bypass would leak server topology. \
+             Body: {body_str}",
+        );
+    }
+
+    /// `GET /graphs` returns 405 in single mode (resource exists in the
+    /// API surface, just not operational without a `graphs:` map).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_graphs_returns_405_in_single_mode() {
+        let temp = init_loaded_graph().await;
+        let graph = graph_path(temp.path());
+        let state = AppState::open(graph.to_string_lossy().to_string())
+            .await
+            .unwrap();
+        let app = build_app(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/graphs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    /// `GET /graphs` requires bearer auth when tokens are configured.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_graphs_requires_bearer_auth_when_configured() {
+        use omnigraph_server::{GraphHandle, GraphId, GraphKey};
+        // Build a multi-mode app with bearer tokens configured.
+        let dir = tempfile::tempdir().unwrap();
+        let graph_uri = dir.path().join("alpha").to_str().unwrap().to_string();
+        let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+        let engine = Omnigraph::init(&graph_uri, &schema).await.unwrap();
+        let handle = Arc::new(GraphHandle {
+            key: GraphKey::cluster(GraphId::try_from("alpha").unwrap()),
+            uri: graph_uri,
+            engine: Arc::new(engine),
+            policy: None,
+            queries: None,
+        });
+        let tokens = vec![("act-andrew".to_string(), "secret-token".to_string())];
+        let workload = omnigraph_server::workload::WorkloadController::from_env();
+        let state = AppState::new_multi(vec![handle], tokens, None, workload, None).unwrap();
+        let app = build_app(state);
+
+        // No Authorization header → 401.
+        let resp_no_auth = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/graphs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_no_auth.status(), StatusCode::UNAUTHORIZED);
+
+        // With auth but no server policy → 403 (default-deny, since
+        // GraphList is not Read).
+        let resp_authed = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/graphs")
+                    .header("authorization", "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_authed.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// `GET /graphs` with a server policy that allows `graph_list` → 200
+    /// and returns the registry sorted alphabetically by `graph_id`.
+    /// `GET /graphs` with a server policy that does NOT allow
+    /// `graph_list` (viewer group) → 403.
+    ///
+    /// This test owns the alphabetical-sort coverage that previously
+    /// lived in `get_graphs_lists_registered_graphs_in_multi_mode`.
+    /// That test now asserts denial in Open mode (server-scoped actions
+    /// require explicit policy in every runtime state), so the positive
+    /// body-shape assertions need a home where the response is
+    /// operator-authorized — here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_graphs_with_server_policy_authorizes_per_cedar() {
+        use omnigraph_policy::PolicyEngine;
+        use omnigraph_server::{GraphHandle, GraphId, GraphKey};
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Two graphs deliberately registered in non-alphabetical order
+        // so the test would fail if the handler relied on insertion
+        // order instead of server-side sorting.
+        let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+        let mut handles = Vec::new();
+        for id in ["beta", "alpha"] {
+            let graph_uri = dir.path().join(id).to_str().unwrap().to_string();
+            let engine = Omnigraph::init(&graph_uri, &schema).await.unwrap();
+            handles.push(Arc::new(GraphHandle {
+                key: GraphKey::cluster(GraphId::try_from(id).unwrap()),
+                uri: graph_uri,
+                engine: Arc::new(engine),
+                policy: None,
+                queries: None,
+            }));
+        }
+
+        // Server policy: admins can graph_list, viewers cannot.
+        let policy_path = dir.path().join("server-policy.yaml");
+        fs::write(
+            &policy_path,
+            r#"
+version: 1
+groups:
+  admins: [act-andrew]
+  viewers: [act-bruno]
+rules:
+  - id: admins-list-graphs
+    allow:
+      actors: { group: admins }
+      actions: [graph_list]
+"#,
+        )
+        .unwrap();
+        let server_policy = PolicyEngine::load_server(&policy_path).unwrap();
+
+        let tokens = vec![
+            ("act-andrew".to_string(), "andrew-token".to_string()),
+            ("act-bruno".to_string(), "bruno-token".to_string()),
+        ];
+        let workload = omnigraph_server::workload::WorkloadController::from_env();
+        let state =
+            AppState::new_multi(handles, tokens, Some(server_policy), workload, None).unwrap();
+        let app = build_app(state);
+
+        // Admin → 200, body returns both graphs alphabetically sorted.
+        let resp_admin = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/graphs")
+                    .header("authorization", "Bearer andrew-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp_admin.status(),
+            StatusCode::OK,
+            "admin must be allowed graph_list"
+        );
+        let body = to_bytes(resp_admin.into_body(), usize::MAX).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let graphs = json["graphs"].as_array().unwrap();
+        assert_eq!(graphs.len(), 2, "response must list both registered graphs");
+        assert_eq!(
+            graphs[0]["graph_id"].as_str().unwrap(),
+            "alpha",
+            "server must sort graphs alphabetically by graph_id (insertion order was 'beta', 'alpha')"
+        );
+        assert_eq!(graphs[1]["graph_id"].as_str().unwrap(), "beta");
+
+        // Viewer → 403
+        let resp_viewer = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/graphs")
+                    .header("authorization", "Bearer bruno-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp_viewer.status(),
+            StatusCode::FORBIDDEN,
+            "viewer must be denied graph_list (Cedar gate)"
+        );
+    }
+
+    /// Loads an `omnigraph.yaml` with two graphs and verifies multi-mode
+    /// inference plus graph entry resolution. Cluster-route dispatch is
+    /// covered by the route tests above.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn server_settings_load_multi_graph_config_entries() {
+        let cfg_dir = tempfile::tempdir().unwrap();
+        // Real graph storage dirs (the URIs in the config must point to
+        // a graph init-able location).
+        let alpha_dir = cfg_dir.path().join("alpha.omni");
+        let beta_dir = cfg_dir.path().join("beta.omni");
+        let schema = fs::read_to_string(fixture("test.pg")).unwrap();
+        Omnigraph::init(alpha_dir.to_str().unwrap(), &schema)
+            .await
+            .unwrap();
+        Omnigraph::init(beta_dir.to_str().unwrap(), &schema)
+            .await
+            .unwrap();
+
+        let config_path = cfg_dir.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+graphs:
+  alpha:
+    uri: {alpha}
+  beta:
+    uri: {beta}
+"#,
+                alpha = alpha_dir.display(),
+                beta = beta_dir.display(),
+            ),
+        )
+        .unwrap();
+
+        let settings: ServerConfig =
+            load_server_settings(Some(&config_path), None, None, None, true).unwrap();
+        assert!(matches!(settings.mode, ServerConfigMode::Multi { .. }));
+
+        match settings.mode {
+            ServerConfigMode::Multi { graphs, .. } => {
+                assert_eq!(graphs.len(), 2);
+                let ids: Vec<&str> = graphs.iter().map(|g| g.graph_id.as_str()).collect();
+                assert_eq!(ids, vec!["alpha", "beta"]);
+            }
+            _ => unreachable!(),
+        }
+    }
 }

@@ -16,6 +16,7 @@ __pycache__/
 *.pyc
 demo/*.omni/
 .omnigraph-rustfs-demo/
+/docs/internal
 
 # Local-only working files (not for the public repo)
 .claude/

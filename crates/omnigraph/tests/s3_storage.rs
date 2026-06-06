@@ -7,8 +7,8 @@ use omnigraph::loader::{LoadMode, load_jsonl};
 use helpers::*;
 
 #[tokio::test(flavor = "multi_thread")]
-async fn s3_compatible_repo_lifecycle_works() {
-    let Some(uri) = s3_test_repo_uri("omnigraph-runtime") else {
+async fn s3_compatible_graph_lifecycle_works() {
+    let Some(uri) = s3_test_graph_uri("omnigraph-runtime") else {
         eprintln!("skipping s3 runtime test: OMNIGRAPH_S3_TEST_BUCKET is not set");
         return;
     };
@@ -81,7 +81,7 @@ async fn s3_compatible_repo_lifecycle_works() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn s3_branch_change_merge_flow_works() {
-    let Some(uri) = s3_test_repo_uri("omnigraph-branching") else {
+    let Some(uri) = s3_test_graph_uri("omnigraph-branching") else {
         eprintln!("skipping s3 branch test: OMNIGRAPH_S3_TEST_BUCKET is not set");
         return;
     };
@@ -135,7 +135,7 @@ async fn s3_branch_change_merge_flow_works() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn s3_public_load_uses_hidden_run_and_publishes() {
-    let Some(uri) = s3_test_repo_uri("omnigraph-public-load") else {
+    let Some(uri) = s3_test_graph_uri("omnigraph-public-load") else {
         eprintln!("skipping s3 public load test: OMNIGRAPH_S3_TEST_BUCKET is not set");
         return;
     };

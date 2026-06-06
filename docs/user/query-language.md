@@ -70,7 +70,7 @@ A single mutation query must be **either insert/update-only or delete-only**. Mi
 
 > `mutation '<name>' on the same query mixes inserts/updates and deletes; split into separate mutations: (1) inserts and updates, then (2) deletes. This restriction lifts when Lance exposes a two-phase delete API (tracked: MR-793 / Lance-upstream).`
 
-Reason: under the staged-write rewire (MR-794), inserts and updates accumulate in memory and commit at end-of-query, while deletes still inline-commit (Lance 4.0.0 has no public two-phase delete). Mixing creates ordering hazards (same-row insert→delete becomes a no-op because the staged insert isn't visible to delete; cascading deletes of just-inserted edges break referential integrity by silent design). Until Lance exposes `DeleteJob::execute_uncommitted`, the parse-time rejection keeps both paths atomic and correct. See [docs/dev/runs.md](../dev/runs.md) and [docs/dev/invariants.md](../dev/invariants.md).
+Reason: under the staged-write rewire (MR-794), inserts and updates accumulate in memory and commit at end-of-query, while deletes still inline-commit (Lance 4.0.0 has no public two-phase delete). Mixing creates ordering hazards (same-row insert→delete becomes a no-op because the staged insert isn't visible to delete; cascading deletes of just-inserted edges break referential integrity by silent design). Until Lance exposes `DeleteJob::execute_uncommitted`, the parse-time rejection keeps both paths atomic and correct. See [docs/dev/writes.md](../dev/writes.md) and [docs/dev/invariants.md](../dev/invariants.md).
 
 ## IR (Intermediate Representation)
 

@@ -93,7 +93,7 @@ pub(crate) struct RecoveryAudit {
 }
 
 impl RecoveryAudit {
-    /// Open the recovery-audit dataset for the repo, or return a handle
+    /// Open the recovery-audit dataset for the graph, or return a handle
     /// with no dataset yet (created on first append). Mirrors the
     /// optional-dataset pattern from `_graph_commit_actors.lance`.
     pub(crate) async fn open(root_uri: &str) -> Result<Self> {
@@ -205,9 +205,7 @@ fn recovery_record_to_batch(record: &RecoveryAuditRecord) -> Result<RecordBatch>
         vec![
             Arc::new(StringArray::from(vec![record.graph_commit_id.clone()])),
             Arc::new(StringArray::from(vec![record.recovery_kind.as_str()])),
-            Arc::new(StringArray::from(vec![record
-                .recovery_for_actor
-                .clone()])),
+            Arc::new(StringArray::from(vec![record.recovery_for_actor.clone()])),
             Arc::new(StringArray::from(vec![record.operation_id.clone()])),
             Arc::new(StringArray::from(vec![record.sidecar_writer_kind.clone()])),
             Arc::new(StringArray::from(vec![outcomes_json])),
@@ -221,10 +219,14 @@ fn decode_row(batch: &RecordBatch, row: usize) -> Result<RecoveryAuditRecord> {
     let str_col = |name: &str| -> Result<&StringArray> {
         batch
             .column_by_name(name)
-            .ok_or_else(|| OmniError::manifest_internal(format!("missing column '{}' in recovery audit", name)))?
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!("missing column '{}' in recovery audit", name))
+            })?
             .as_any()
             .downcast_ref::<StringArray>()
-            .ok_or_else(|| OmniError::manifest_internal(format!("column '{}' has wrong type", name)))
+            .ok_or_else(|| {
+                OmniError::manifest_internal(format!("column '{}' has wrong type", name))
+            })
     };
     let ts_col = batch
         .column_by_name("created_at")
@@ -269,9 +271,7 @@ pub(crate) fn now_micros() -> Result<i64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
-        .map_err(|e| {
-            OmniError::manifest_internal(format!("system clock before unix epoch: {}", e))
-        })
+        .map_err(|e| OmniError::manifest_internal(format!("system clock before unix epoch: {}", e)))
 }
 
 #[cfg(test)]
@@ -307,7 +307,7 @@ mod tests {
         let root = dir.path().to_str().unwrap();
 
         let mut audit = RecoveryAudit::open(root).await.unwrap();
-        // Empty repo: list returns empty.
+        // Empty graph: list returns empty.
         assert!(audit.list().await.unwrap().is_empty());
 
         // Append + list.

@@ -6,7 +6,7 @@ usage() {
 Usage: update-homebrew-formula.sh <tag> [formula_path]
 
 Environment:
-  REPO_SLUG     GitHub repo that owns the Omnigraph release
+  REPO_SLUG     GitHub repository that owns the Omnigraph release
                 default: ModernRelay/omnigraph
 EOF
 }
@@ -64,25 +64,28 @@ cat >"$FORMULA_PATH" <<EOF
 class Omnigraph < Formula
   desc "Typed property graph database with Git-style workflows"
   homepage "https://github.com/${REPO_SLUG}"
-  license "MIT"
   version "${VERSION}"
-
-  on_macos do
-    depends_on arch: :arm64
-    url "${MACOS_ARM_URL}"
-    sha256 "${MACOS_ARM_SHA}"
-  end
-
-  on_linux do
-    url "${LINUX_X86_URL}"
-    sha256 "${LINUX_X86_SHA}"
-  end
-
+  license "MIT"
   head "https://github.com/${REPO_SLUG}.git", branch: "main"
 
   livecheck do
     url :stable
     regex(/^v?(\\d+(?:\\.\\d+)+)$/i)
+  end
+
+  on_macos do
+    depends_on arch: :arm64
+    on_arm do
+      url "${MACOS_ARM_URL}"
+      sha256 "${MACOS_ARM_SHA}"
+    end
+  end
+
+  on_linux do
+    on_intel do
+      url "${LINUX_X86_URL}"
+      sha256 "${LINUX_X86_SHA}"
+    end
   end
 
   def install

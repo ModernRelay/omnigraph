@@ -10,7 +10,7 @@ Three views, increasing zoom:
 2. **Layer view** — the eight-layer stack inside one OmniGraph process.
 3. **Component zoom-ins** — what's inside each layer.
 
-For runtime flows (read query, mutation), see [`docs/dev/execution.md`](execution.md). For the on-disk layout of a repo, see [`docs/user/storage.md`](../user/storage.md).
+For runtime flows (read query, mutation), see [`docs/dev/execution.md`](execution.md). For the on-disk layout of a graph, see [`docs/user/storage.md`](../user/storage.md).
 
 L1 (orange in the diagrams) is what we inherit from Lance; L2 (blue) is what OmniGraph adds. The L1/L2 framing is also called out in prose at the bottom of this doc.
 
@@ -63,7 +63,7 @@ flowchart TB
     subgraph engine[omnigraph engine]
         plan[exec query and mutation]:::l2
         gi[graph index CSR/CSC<br/>RuntimeCache LRU 8]:::l2
-        coord[coordinator<br/>ManifestRepo · CommitGraph]:::l2
+        coord[coordinator<br/>ManifestCoordinator · CommitGraph]:::l2
     end
 
     subgraph storage[storage trait — wraps Lance]
@@ -132,7 +132,7 @@ flowchart TB
 
     subgraph state[graph state]
         coord[GraphCoordinator]:::l2
-        mr[ManifestRepo<br/>db/manifest.rs]:::l2
+        mr[ManifestCoordinator<br/>db/manifest.rs]:::l2
         cg[CommitGraph<br/>_graph_commits.lance]:::l2
         stg[MutationStaging<br/>per-query in-memory accumulator<br/>exec/staging.rs]:::l2
     end
@@ -166,7 +166,7 @@ Code paths:
 
 - Read entry: `Omnigraph::query` at `crates/omnigraph/src/exec/query.rs:7`
 - Mutation entry: `Omnigraph::mutate` at `crates/omnigraph/src/exec/mutation.rs:511`
-- Manifest commit: `ManifestRepo::commit` at `crates/omnigraph/src/db/manifest.rs:280`
+- Manifest commit: `ManifestCoordinator::commit` at `crates/omnigraph/src/db/manifest.rs:280`
 - Graph index: `crates/omnigraph/src/graph_index/`
 - Loader: `Omnigraph::ingest` at `crates/omnigraph/src/loader/mod.rs:74`
 
@@ -207,7 +207,7 @@ contracts:
 This pattern realizes read-your-writes within a multi-statement mutation
 and keeps failure scope bounded for inserts/updates by construction at
 the writer layer. See [docs/dev/invariants.md](invariants.md) and
-[docs/dev/runs.md](runs.md) for the publisher CAS contract this builds on.
+[docs/dev/writes.md](writes.md) for the publisher CAS contract this builds on.
 
 ### Storage trait — today vs. roadmap
 
@@ -278,7 +278,7 @@ flowchart LR
     eng --> wq
 ```
 
-The server applies Cedar policy at the HTTP boundary today. The roadmap, called out in [docs/dev/invariants.md](invariants.md) as a known gap, is to push policy into the planner as predicates. After Cedar, mutating handlers go through `WorkloadController` (per-actor admission cap + byte budget; PR 2 / MR-686) before reaching the engine. The engine itself holds an `Arc<WriteQueueManager>` so concurrent mutations on the same `(table, branch)` serialize at the queue, while disjoint keys run in parallel — see [docs/user/server.md](../user/server.md) "Per-actor admission control" and [docs/dev/runs.md](runs.md). The CLI bypasses the HTTP layer (and admission) and calls the engine API directly.
+The server applies Cedar policy at the HTTP boundary today. The roadmap, called out in [docs/dev/invariants.md](invariants.md) as a known gap, is to push policy into the planner as predicates. After Cedar, mutating handlers go through `WorkloadController` (per-actor admission cap + byte budget; PR 2 / MR-686) before reaching the engine. The engine itself holds an `Arc<WriteQueueManager>` so concurrent mutations on the same `(table, branch)` serialize at the queue, while disjoint keys run in parallel — see [docs/user/server.md](../user/server.md) "Per-actor admission control" and [docs/dev/writes.md](writes.md). The CLI bypasses the HTTP layer (and admission) and calls the engine API directly.
 
 Code paths:
 

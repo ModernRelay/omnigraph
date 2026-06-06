@@ -1,8 +1,11 @@
 use omnigraph::db::{GraphCommit, MergeOutcome, ReadTarget, SchemaApplyResult, Snapshot};
 use omnigraph::error::{MergeConflict, MergeConflictKind};
 use omnigraph::loader::{IngestResult, LoadMode};
+use crate::queries::StoredQuery;
 use omnigraph_compiler::SchemaMigrationStep;
+use omnigraph_compiler::query::ast::Param;
 use omnigraph_compiler::result::QueryResult;
+use omnigraph_compiler::types::{PropType, ScalarType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utoipa::{IntoParams, ToSchema};
@@ -235,7 +238,9 @@ pub struct CommitListOutput {
 pub struct ReadRequest {
     /// GQ query source. May declare one or more named queries; pick one with
     /// `query_name` if there is more than one.
-    #[schema(example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}")]
+    #[schema(
+        example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}"
+    )]
     pub query_source: String,
     /// Name of the query to run when `query_source` declares multiple. Optional
     /// when only one query is declared.
@@ -248,25 +253,219 @@ pub struct ReadRequest {
     pub snapshot: Option<String>,
 }
 
+/// Inline read-query request for `POST /query`.
+///
+/// Friendlier-named alternative to [`ReadRequest`] for ad-hoc reads and
+/// AI-agent integration. Mutations are rejected with 400 — use `POST
+/// /mutate` (or its deprecated alias `POST /change`) for write queries.
+/// Field names are deliberately short (`query`, `name`) to match the GQ
+/// keyword and the CLI `-e` flag.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct QueryRequest {
+    /// GQ read-query source. May declare one or more named queries; pick one
+    /// with `name` when more than one is declared. Mutations
+    /// (`insert`/`update`/`delete`) get 400 — use `POST /mutate` (or its
+    /// deprecated alias `POST /change`) instead.
+    #[schema(example = "query get_person($name: String) {\n    match {\n        $p: Person { name: $name }\n    }\n    return { $p.name, $p.age }\n}")]
+    pub query: String,
+    /// Name of the query to run when `query` declares multiple. Optional when
+    /// only one query is declared.
+    pub name: Option<String>,
+    /// JSON object whose keys match the query's declared parameters.
+    pub params: Option<Value>,
+    /// Branch to read from. Mutually exclusive with `snapshot`. Defaults to `main`.
+    pub branch: Option<String>,
+    /// Snapshot id to read from. Mutually exclusive with `branch`.
+    pub snapshot: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChangeRequest {
     /// GQ mutation source containing `insert`, `update`, or `delete` statements.
-    /// May declare multiple named mutations; pick one with `query_name`.
-    #[schema(example = "query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}")]
-    pub query_source: String,
-    /// Name of the mutation to run when `query_source` declares multiple.
-    pub query_name: Option<String>,
+    /// May declare multiple named mutations; pick one with `name`.
+    ///
+    /// Accepts the legacy field name `query_source` as a deserialization alias.
+    #[schema(
+        example = "query insert_person($name: String, $age: I32) {\n    insert Person { name: $name, age: $age }\n}"
+    )]
+    #[serde(alias = "query_source")]
+    pub query: String,
+    /// Name of the mutation to run when `query` declares multiple.
+    ///
+    /// Accepts the legacy field name `query_name` as a deserialization alias.
+    #[serde(default, alias = "query_name")]
+    pub name: Option<String>,
     /// JSON object whose keys match the mutation's declared parameters.
+    #[serde(default)]
     pub params: Option<Value>,
     /// Target branch. Defaults to `main`.
+    #[serde(default)]
     pub branch: Option<String>,
+}
+
+/// Body for `POST /queries/{name}` — invokes the server-side stored query
+/// named in the path. The query source and name come from the registry,
+/// never the body; only the runtime inputs are supplied here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct InvokeStoredQueryRequest {
+    /// JSON object whose keys match the stored query's declared parameters.
+    #[serde(default)]
+    pub params: Option<Value>,
+    /// Branch to run against. Defaults to `main`; for a stored mutation the
+    /// write targets this branch.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Snapshot id to read from (read queries only — rejected for a stored
+    /// mutation). Mutually exclusive with `branch`.
+    #[serde(default)]
+    pub snapshot: Option<String>,
+}
+
+/// Response for `POST /queries/{name}`: the read envelope for a stored
+/// read, or the mutation envelope for a stored mutation. Serialized
+/// **untagged**, so the wire shape is exactly [`ReadOutput`] or
+/// [`ChangeOutput`] — classification follows the stored query, not a
+/// wrapper field.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum InvokeStoredQueryResponse {
+    Read(ReadOutput),
+    Change(ChangeOutput),
+}
+
+/// The kind of a stored-query parameter, decomposed so a client (e.g. an
+/// MCP server) can build a typed input schema with a closed `match` and
+/// never re-parse omnigraph's type spelling. `bigint`/`date`/`datetime`/
+/// `blob` are carried as JSON strings on the wire: a 64-bit integer past
+/// 2^53 loses precision as a JSON number, and Date/DateTime are ISO
+/// strings, Blob a blob-URI string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ParamKind {
+    String,
+    Bool,
+    Int,
+    #[serde(rename = "bigint")]
+    BigInt,
+    Float,
+    Date,
+    #[serde(rename = "datetime")]
+    DateTime,
+    Blob,
+    Vector,
+    List,
+}
+
+/// One declared parameter of a stored query, projected for the catalog.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ParamDescriptor {
+    pub name: String,
+    pub kind: ParamKind,
+    /// Element kind when `kind == list` (always a scalar — the grammar
+    /// forbids lists of vectors or nested lists).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_kind: Option<ParamKind>,
+    /// Dimension when `kind == vector`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_dim: Option<u32>,
+    /// `false` → the caller must supply it; `true` → optional.
+    pub nullable: bool,
+}
+
+/// One entry in the stored-query catalog (`GET /queries`).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct QueryCatalogEntry {
+    /// Registry key / invoke path segment (`POST /queries/{name}`).
+    pub name: String,
+    /// MCP tool id (the `tool_name` override, else `name`).
+    pub tool_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instruction: Option<String>,
+    /// `true` for a stored mutation → an MCP read-only hint of `false`.
+    pub mutation: bool,
+    pub params: Vec<ParamDescriptor>,
+}
+
+/// Response for `GET /queries`: the `mcp.expose` subset of a graph's
+/// stored-query registry, each with typed parameters.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct QueriesCatalogOutput {
+    pub queries: Vec<QueryCatalogEntry>,
+}
+
+/// Total map from a resolved scalar to its catalog kind. Exhaustive on
+/// purpose: a new `ScalarType` is a compile error here until catalogued.
+fn scalar_kind(scalar: ScalarType) -> ParamKind {
+    match scalar {
+        ScalarType::String => ParamKind::String,
+        ScalarType::Bool => ParamKind::Bool,
+        ScalarType::I32 | ScalarType::U32 => ParamKind::Int,
+        ScalarType::I64 | ScalarType::U64 => ParamKind::BigInt,
+        ScalarType::F32 | ScalarType::F64 => ParamKind::Float,
+        ScalarType::Date => ParamKind::Date,
+        ScalarType::DateTime => ParamKind::DateTime,
+        ScalarType::Blob => ParamKind::Blob,
+        ScalarType::Vector(_) => ParamKind::Vector,
+    }
+}
+
+fn param_descriptor(param: &Param) -> ParamDescriptor {
+    match PropType::from_param_type_name(&param.type_name, param.nullable) {
+        Some(pt) if pt.list => ParamDescriptor {
+            name: param.name.clone(),
+            kind: ParamKind::List,
+            item_kind: Some(scalar_kind(pt.scalar)),
+            vector_dim: None,
+            nullable: param.nullable,
+        },
+        Some(pt) => {
+            let (kind, vector_dim) = match pt.scalar {
+                ScalarType::Vector(dim) => (ParamKind::Vector, Some(dim)),
+                other => (scalar_kind(other), None),
+            };
+            ParamDescriptor {
+                name: param.name.clone(),
+                kind,
+                item_kind: None,
+                vector_dim,
+                nullable: param.nullable,
+            }
+        }
+        // Unreachable for a parsed query (every declared param type is
+        // grammatical); fall back to an opaque string so the field is still
+        // usable rather than dropped.
+        None => ParamDescriptor {
+            name: param.name.clone(),
+            kind: ParamKind::String,
+            item_kind: None,
+            vector_dim: None,
+            nullable: param.nullable,
+        },
+    }
+}
+
+/// Project a loaded stored query into its catalog entry (typed params,
+/// MCP tool name, read/mutate flag, description/instruction).
+pub fn query_catalog_entry(query: &StoredQuery) -> QueryCatalogEntry {
+    QueryCatalogEntry {
+        name: query.name.clone(),
+        tool_name: query.effective_tool_name().to_string(),
+        description: query.decl.description.clone(),
+        instruction: query.decl.instruction.clone(),
+        mutation: query.is_mutation(),
+        params: query.decl.params.iter().map(param_descriptor).collect(),
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct SchemaApplyRequest {
     /// Project schema in `.pg` source form. The diff against the current
     /// schema produces the migration steps that will be applied.
-    #[schema(example = "node Person {\n    name: String @key\n    age: I32?\n}\n\nedge Knows: Person -> Person")]
+    #[schema(
+        example = "node Person {\n    name: String @key\n    age: I32?\n}\n\nedge Knows: Person -> Person"
+    )]
     pub schema_source: String,
     /// When true, promote every `DropMode::Soft` step in the plan to
     /// `DropMode::Hard`, making the prior column data unreachable
@@ -303,7 +502,9 @@ pub struct IngestRequest {
     pub mode: Option<LoadMode>,
     /// NDJSON payload: one record per line, each shaped
     /// `{"type": "<TypeName>", "data": {...}}`.
-    #[schema(example = "{\"type\": \"Person\", \"data\": {\"name\": \"Alice\", \"age\": 30}}\n{\"type\": \"Person\", \"data\": {\"name\": \"Bob\", \"age\": 25}}")]
+    #[schema(
+        example = "{\"type\": \"Person\", \"data\": {\"name\": \"Alice\", \"age\": 30}}\n{\"type\": \"Person\", \"data\": {\"name\": \"Bob\", \"age\": 25}}"
+    )]
     pub data: String,
 }
 
@@ -344,6 +545,11 @@ pub enum ErrorCode {
     Forbidden,
     BadRequest,
     NotFound,
+    /// 405 Method Not Allowed — the route exists but the active server
+    /// mode doesn't serve this method (e.g. `GET /graphs` in single-graph
+    /// mode). Distinct from 404 so clients can tell "wrong context" from
+    /// "no such resource."
+    MethodNotAllowed,
     Conflict,
     /// 429 Too Many Requests — per-actor admission cap exceeded.
     /// Clients should respect the `Retry-After` header.
@@ -466,4 +672,24 @@ pub fn read_target_output(target: &ReadTarget) -> ReadTargetOutput {
             snapshot: Some(snapshot.as_str().to_string()),
         },
     }
+}
+
+// ─── MR-668 — management endpoint shapes ──────────────────────────────────
+
+/// One entry in the response from `GET /graphs`. Cluster operators
+/// consume this list to discover which graphs the server is currently
+/// serving. The shape is intentionally minimal — `graph_id` and `uri`
+/// are the only fields a routing client needs.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GraphInfo {
+    pub graph_id: String,
+    pub uri: String,
+}
+
+/// Response from `GET /graphs`. Lists every graph registered with the
+/// server in alphabetical order by `graph_id` (sorted server-side so
+/// clients get deterministic output across requests).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GraphListResponse {
+    pub graphs: Vec<GraphInfo>,
 }

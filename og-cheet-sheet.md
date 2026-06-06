@@ -5,22 +5,26 @@
 Use an explicit schema file:
 
 ```bash
-omnigraph query lint --query ./queries.gq --schema ./schema.pg --json
-omnigraph query check --query ./queries.gq --schema ./schema.pg
+omnigraph lint  --query ./queries.gq --schema ./schema.pg --json
+omnigraph check --query ./queries.gq --schema ./schema.pg
 ```
 
 Use a local or `s3://` repo target:
 
 ```bash
-omnigraph query lint --query ./queries.gq ./repo.omni --json
-omnigraph query check --query ./queries.gq s3://bucket/repo
+omnigraph lint  --query ./queries.gq ./repo.omni --json
+omnigraph check --query ./queries.gq s3://bucket/repo
 ```
 
 Use `omnigraph.yaml` target resolution:
 
 ```bash
-omnigraph query lint --query ./queries.gq --target local --config ./omnigraph.yaml
+omnigraph lint --query ./queries.gq --target local --config ./omnigraph.yaml
 ```
+
+> The previous `omnigraph query lint` / `omnigraph query check` spellings
+> are kept as deprecated argv shims that print a one-line warning to
+> stderr and rewrite to the canonical `omnigraph lint` / `omnigraph check`.
 
 ## What It Checks
 

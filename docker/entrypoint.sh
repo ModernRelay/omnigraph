@@ -9,8 +9,14 @@ fi
 
 bind="${OMNIGRAPH_BIND:-0.0.0.0:8080}"
 
+# URI comes from the env var (the positional arg wins over any config
+# `graphs` block in resolve_target_uri). OMNIGRAPH_CONFIG, when also set,
+# is forwarded as --config purely to supply a policy file — the two
+# compose. Without OMNIGRAPH_CONFIG the behavior is unchanged.
 if [ -n "${OMNIGRAPH_TARGET_URI:-}" ]; then
-  exec "$SERVER_BIN" "${OMNIGRAPH_TARGET_URI}" --bind "${bind}"
+  exec "$SERVER_BIN" "${OMNIGRAPH_TARGET_URI}" \
+    ${OMNIGRAPH_CONFIG:+--config "$OMNIGRAPH_CONFIG"} \
+    --bind "${bind}"
 fi
 
 if [ -n "${OMNIGRAPH_CONFIG:-}" ]; then
@@ -28,5 +34,7 @@ omnigraph-server container startup requires one of:
 Optional:
   - OMNIGRAPH_BIND (default: 0.0.0.0:8080)
   - OMNIGRAPH_TARGET (used with OMNIGRAPH_CONFIG)
+  - OMNIGRAPH_CONFIG (may also accompany OMNIGRAPH_TARGET_URI to add a
+    policy file; the URI still comes from OMNIGRAPH_TARGET_URI)
 EOF
 exit 64

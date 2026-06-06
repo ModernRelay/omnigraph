@@ -22,16 +22,16 @@ use helpers::recovery::{RecoveryExpectation, TableExpectation, assert_post_recov
 
 const TEST_SCHEMA: &str = include_str!("fixtures/test.pg");
 
-fn write_sidecar_file(repo_root: &Path, operation_id: &str, json: &str) {
-    let dir = repo_root.join("__recovery");
+fn write_sidecar_file(graph_root: &Path, operation_id: &str, json: &str) {
+    let dir = graph_root.join("__recovery");
     if !dir.exists() {
         std::fs::create_dir(&dir).unwrap();
     }
     std::fs::write(dir.join(format!("{}.json", operation_id)), json).unwrap();
 }
 
-fn list_recovery_dir(repo_root: &Path) -> Vec<String> {
-    let dir = repo_root.join("__recovery");
+fn list_recovery_dir(graph_root: &Path) -> Vec<String> {
+    let dir = graph_root.join("__recovery");
     if !dir.exists() {
         return Vec::new();
     }
@@ -41,7 +41,7 @@ fn list_recovery_dir(repo_root: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Full URI of a node-type Lance dataset under a fresh Omnigraph repo.
+/// Full URI of a node-type Lance dataset under a fresh Omnigraph graph.
 /// Mirrors the `nodes/{fnv1a64-hex(type_name)}` layout in `db/manifest/layout.rs`.
 fn node_table_uri(root: &str, type_name: &str) -> String {
     let h: u64 = fnv1a64(type_name.as_bytes());
@@ -283,8 +283,8 @@ async fn recovery_rolls_back_synthetic_drift_on_open() {
 // =====================================================================
 
 /// Helper: count rows in `_graph_commit_recoveries.lance` at the given root.
-async fn count_recovery_audit_rows(repo_root: &Path) -> usize {
-    let recoveries_dir = repo_root.join("_graph_commit_recoveries.lance");
+async fn count_recovery_audit_rows(graph_root: &Path) -> usize {
+    let recoveries_dir = graph_root.join("_graph_commit_recoveries.lance");
     if !recoveries_dir.exists() {
         return 0;
     }
@@ -306,9 +306,9 @@ async fn count_recovery_audit_rows(repo_root: &Path) -> usize {
 /// Helper: read the most recent recovery audit row's `recovery_kind`,
 /// `recovery_for_actor`, and `operation_id`. Returns `None` if no rows.
 async fn read_latest_recovery_audit(
-    repo_root: &Path,
+    graph_root: &Path,
 ) -> Option<(String, Option<String>, String, String)> {
-    let recoveries_dir = repo_root.join("_graph_commit_recoveries.lance");
+    let recoveries_dir = graph_root.join("_graph_commit_recoveries.lance");
     if !recoveries_dir.exists() {
         return None;
     }
@@ -357,8 +357,8 @@ async fn read_latest_recovery_audit(
 /// storage order (multiple batches concatenated). Used by the
 /// multi-sidecar fresh-snapshot test as a diagnostic alongside the
 /// post-recovery Lance HEAD assertion.
-async fn list_recovery_audit_kinds(repo_root: &Path) -> Vec<String> {
-    let recoveries_dir = repo_root.join("_graph_commit_recoveries.lance");
+async fn list_recovery_audit_kinds(graph_root: &Path) -> Vec<String> {
+    let recoveries_dir = graph_root.join("_graph_commit_recoveries.lance");
     if !recoveries_dir.exists() {
         return Vec::new();
     }
@@ -391,8 +391,8 @@ async fn list_recovery_audit_kinds(repo_root: &Path) -> Vec<String> {
 }
 
 /// Helper: count `_graph_commits.lance` rows tagged with the recovery actor.
-async fn count_recovery_actor_commits(repo_root: &Path) -> usize {
-    let actors_dir = repo_root.join("_graph_commit_actors.lance");
+async fn count_recovery_actor_commits(graph_root: &Path) -> usize {
+    let actors_dir = graph_root.join("_graph_commit_actors.lance");
     if !actors_dir.exists() {
         return 0;
     }
@@ -908,7 +908,7 @@ async fn recovery_ensure_indices_steady_state_no_sidecar() {
 /// ran) and rolls back any sibling table's legitimate index work.
 ///
 /// Integration verification: after a real init + ensure_indices on a
-/// repo where every table is empty, the recovery sweep must complete
+/// graph where every table is empty, the recovery sweep must complete
 /// cleanly (no leftover sidecar) AND the next ensure_indices must also
 /// leave no sidecar — proving the empty-table-scoping behavior lets
 /// steady-state runs incur zero sidecar I/O. The
@@ -930,7 +930,7 @@ async fn recovery_ensure_indices_handles_empty_tables() {
     db.ensure_indices().await.unwrap();
     assert!(
         list_recovery_dir(dir.path()).is_empty(),
-        "ensure_indices on an all-empty repo must not leave a sidecar"
+        "ensure_indices on an all-empty graph must not leave a sidecar"
     );
     // Reopen + ensure_indices — still steady state, still no sidecar.
     drop(db);
@@ -938,7 +938,7 @@ async fn recovery_ensure_indices_handles_empty_tables() {
     db.ensure_indices().await.unwrap();
     assert!(
         list_recovery_dir(dir.path()).is_empty(),
-        "second ensure_indices on an all-empty repo must also not leave a sidecar"
+        "second ensure_indices on an all-empty graph must also not leave a sidecar"
     );
 }
 

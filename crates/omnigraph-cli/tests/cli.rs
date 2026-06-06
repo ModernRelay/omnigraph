@@ -48,9 +48,9 @@ cases:
     expect: deny
 "#;
 
-fn manifest_dataset_version(repo: &std::path::Path) -> u64 {
+fn manifest_dataset_version(graph: &std::path::Path) -> u64 {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
-        Omnigraph::open(repo.to_string_lossy().as_ref())
+        Omnigraph::open(graph.to_string_lossy().as_ref())
             .await
             .unwrap()
             .snapshot_of(ReadTarget::branch("main"))
@@ -67,7 +67,7 @@ fn write_policy_config_fixture(root: &std::path::Path) -> (std::path::PathBuf, s
         &config,
         r#"
 project:
-  name: policy-test-repo
+  name: policy-test-graph
 policy:
   file: ./policy.yaml
 "#,
@@ -221,26 +221,26 @@ fn embed_seed_preserves_non_entity_rows() {
 }
 
 #[test]
-fn init_creates_repo_successfully_on_missing_local_directory() {
+fn init_creates_graph_successfully_on_missing_local_directory() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let schema = fixture("test.pg");
 
-    let output = output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&repo));
+    let output = output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&graph));
     let stdout = stdout_string(&output);
 
     assert!(stdout.contains("initialized"));
-    assert!(repo.join("_schema.pg").exists());
-    assert!(repo.join("__manifest").exists());
+    assert!(graph.join("_schema.pg").exists());
+    assert!(graph.join("__manifest").exists());
     assert!(temp.path().join("omnigraph.yaml").exists());
 }
 
 #[test]
 fn schema_plan_json_reports_supported_additive_change() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let schema_path = temp.path().join("next.pg");
-    init_repo(&repo);
+    init_graph(&graph);
 
     let next_schema = fs::read_to_string(fixture("test.pg")).unwrap().replace(
         "    age: I32?\n}",
@@ -255,7 +255,7 @@ fn schema_plan_json_reports_supported_additive_change() {
             .arg("--schema")
             .arg(&schema_path)
             .arg("--json")
-            .arg(&repo),
+            .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
 
@@ -270,9 +270,9 @@ fn schema_plan_json_reports_supported_additive_change() {
 #[test]
 fn schema_plan_json_reports_unsupported_type_change() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let schema_path = temp.path().join("breaking.pg");
-    init_repo(&repo);
+    init_graph(&graph);
 
     let breaking_schema = fs::read_to_string(fixture("test.pg"))
         .unwrap()
@@ -286,7 +286,7 @@ fn schema_plan_json_reports_unsupported_type_change() {
             .arg("--schema")
             .arg(&schema_path)
             .arg("--json")
-            .arg(&repo),
+            .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
 
@@ -303,9 +303,9 @@ fn schema_plan_json_reports_unsupported_type_change() {
 #[test]
 fn schema_apply_json_applies_supported_migration() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let schema_path = temp.path().join("next.pg");
-    init_repo(&repo);
+    init_graph(&graph);
 
     let next_schema = fs::read_to_string(fixture("test.pg")).unwrap().replace(
         "    age: I32?\n}",
@@ -320,7 +320,7 @@ fn schema_apply_json_applies_supported_migration() {
             .arg("--schema")
             .arg(&schema_path)
             .arg("--json")
-            .arg(&repo),
+            .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
 
@@ -330,7 +330,7 @@ fn schema_apply_json_applies_supported_migration() {
 
     let db = tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(Omnigraph::open(repo.to_string_lossy().as_ref()))
+        .block_on(Omnigraph::open(graph.to_string_lossy().as_ref()))
         .unwrap();
     assert!(
         db.catalog().node_types["Person"]
@@ -342,9 +342,9 @@ fn schema_apply_json_applies_supported_migration() {
 #[test]
 fn schema_apply_human_reports_noop() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let schema_path = fixture("test.pg");
-    init_repo(&repo);
+    init_graph(&graph);
 
     let output = output_success(
         cli()
@@ -352,7 +352,7 @@ fn schema_apply_human_reports_noop() {
             .arg("apply")
             .arg("--schema")
             .arg(&schema_path)
-            .arg(&repo),
+            .arg(&graph),
     );
     let stdout = stdout_string(&output);
 
@@ -363,9 +363,9 @@ fn schema_apply_human_reports_noop() {
 #[test]
 fn schema_apply_json_renames_type_and_updates_snapshot() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let schema_path = temp.path().join("rename.pg");
-    init_repo(&repo);
+    init_graph(&graph);
 
     let renamed_schema = fs::read_to_string(fixture("test.pg"))
         .unwrap()
@@ -384,14 +384,14 @@ fn schema_apply_json_renames_type_and_updates_snapshot() {
             .arg("--schema")
             .arg(&schema_path)
             .arg("--json")
-            .arg(&repo),
+            .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["applied"], true);
 
     let db = tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(Omnigraph::open(repo.to_string_lossy().as_ref()))
+        .block_on(Omnigraph::open(graph.to_string_lossy().as_ref()))
         .unwrap();
     let snapshot = tokio::runtime::Runtime::new()
         .unwrap()
@@ -404,9 +404,9 @@ fn schema_apply_json_renames_type_and_updates_snapshot() {
 #[test]
 fn schema_apply_json_renames_property_and_updates_catalog() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let schema_path = temp.path().join("rename-property.pg");
-    init_repo(&repo);
+    init_graph(&graph);
 
     let renamed_schema = fs::read_to_string(fixture("test.pg"))
         .unwrap()
@@ -420,14 +420,14 @@ fn schema_apply_json_renames_property_and_updates_catalog() {
             .arg("--schema")
             .arg(&schema_path)
             .arg("--json")
-            .arg(&repo),
+            .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["applied"], true);
 
     let db = tokio::runtime::Runtime::new()
         .unwrap()
-        .block_on(Omnigraph::open(repo.to_string_lossy().as_ref()))
+        .block_on(Omnigraph::open(graph.to_string_lossy().as_ref()))
         .unwrap();
     let person = &db.catalog().node_types["Person"];
     assert!(person.properties.contains_key("years"));
@@ -437,12 +437,12 @@ fn schema_apply_json_renames_property_and_updates_catalog() {
 #[test]
 fn schema_apply_json_adds_index_for_existing_property() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let schema_path = temp.path().join("index.pg");
-    init_repo(&repo);
+    init_graph(&graph);
 
     let before_index_count = tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let db = Omnigraph::open(repo.to_string_lossy().as_ref())
+        let db = Omnigraph::open(graph.to_string_lossy().as_ref())
             .await
             .unwrap();
         let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
@@ -462,13 +462,13 @@ fn schema_apply_json_adds_index_for_existing_property() {
             .arg("--schema")
             .arg(&schema_path)
             .arg("--json")
-            .arg(&repo),
+            .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["applied"], true);
 
     let after_index_count = tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let db = Omnigraph::open(repo.to_string_lossy().as_ref())
+        let db = Omnigraph::open(graph.to_string_lossy().as_ref())
             .await
             .unwrap();
         let snapshot = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
@@ -481,9 +481,9 @@ fn schema_apply_json_adds_index_for_existing_property() {
 #[test]
 fn schema_apply_rejects_unsupported_plan() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let schema_path = temp.path().join("breaking.pg");
-    init_repo(&repo);
+    init_graph(&graph);
 
     let breaking_schema = fs::read_to_string(fixture("test.pg"))
         .unwrap()
@@ -496,7 +496,7 @@ fn schema_apply_rejects_unsupported_plan() {
             .arg("apply")
             .arg("--schema")
             .arg(&schema_path)
-            .arg(&repo),
+            .arg(&graph),
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("changing property type"));
@@ -505,9 +505,9 @@ fn schema_apply_rejects_unsupported_plan() {
 #[test]
 fn schema_apply_rejects_when_non_main_branch_exists() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let schema_path = temp.path().join("next.pg");
-    init_repo(&repo);
+    init_graph(&graph);
     output_success(
         cli()
             .arg("branch")
@@ -515,7 +515,7 @@ fn schema_apply_rejects_when_non_main_branch_exists() {
             .arg("--from")
             .arg("main")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("feature"),
     );
 
@@ -531,10 +531,10 @@ fn schema_apply_rejects_when_non_main_branch_exists() {
             .arg("apply")
             .arg("--schema")
             .arg(&schema_path)
-            .arg(&repo),
+            .arg(&graph),
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("schema apply requires a repo with only main"));
+    assert!(stderr.contains("schema apply requires a graph with only main"));
 }
 
 #[test]
@@ -631,12 +631,208 @@ query list_people() {
     assert_eq!(stdout_string(&lint_output), stdout_string(&check_output));
 }
 
+/// `omnigraph lint` is the canonical top-level lint command after the
+/// query/mutate rename. `omnigraph query lint` and `omnigraph query check`
+/// are kept as deprecated argv shims (warning + rewrite). All three must
+/// produce identical stdout output.
 #[test]
-fn query_lint_can_use_local_repo_via_positional_uri() {
+fn lint_top_level_matches_deprecated_query_lint_output() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let schema_path = temp.path().join("schema.pg");
     let query_path = temp.path().join("queries.gq");
-    init_repo(&repo);
+    write_file(
+        &schema_path,
+        r#"
+node Person {
+    name: String
+}
+"#,
+    );
+    write_query_file(
+        &query_path,
+        r#"
+query list_people() {
+    match { $p: Person }
+    return { $p.name }
+}
+"#,
+    );
+
+    let canonical = output_success(
+        cli()
+            .arg("lint")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json"),
+    );
+    let deprecated_lint = output_success(
+        cli()
+            .arg("query")
+            .arg("lint")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json"),
+    );
+    let deprecated_check = output_success(
+        cli()
+            .arg("query")
+            .arg("check")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json"),
+    );
+
+    assert_eq!(stdout_string(&canonical), stdout_string(&deprecated_lint));
+    assert_eq!(stdout_string(&canonical), stdout_string(&deprecated_check));
+
+    // Canonical form must NOT emit the deprecation warning.
+    let canonical_stderr = String::from_utf8(canonical.stderr).unwrap();
+    assert!(
+        !canonical_stderr.contains("deprecated"),
+        "`omnigraph lint` is canonical and must not warn; got stderr: {canonical_stderr}"
+    );
+
+    // Deprecated forms MUST emit the one-line warning, pointing at the
+    // new top-level `omnigraph lint`.
+    let lint_stderr = String::from_utf8(deprecated_lint.stderr).unwrap();
+    assert!(
+        lint_stderr.contains("`omnigraph query lint` is deprecated")
+            && lint_stderr.contains("`omnigraph lint`"),
+        "expected deprecation warning pointing at `omnigraph lint`; got: {lint_stderr}"
+    );
+    let check_stderr = String::from_utf8(deprecated_check.stderr).unwrap();
+    assert!(
+        check_stderr.contains("`omnigraph query check` is deprecated")
+            && check_stderr.contains("`omnigraph lint`"),
+        "expected deprecation warning pointing at `omnigraph lint`; got: {check_stderr}"
+    );
+}
+
+/// Bare `omnigraph check` is NOT a clap `visible_alias` on `lint` (MR-981 §6:
+/// visible aliases give agents two canonical names to emit interchangeably).
+/// It's an argv-level shim: rewrites to `omnigraph lint`, prints a one-line
+/// stderr deprecation warning, and produces identical stdout to the canonical
+/// invocation. Cargo/Go users typing `check` keep working; help text shows
+/// only `lint`.
+#[test]
+fn deprecated_check_top_level_rewrites_to_lint() {
+    let temp = tempdir().unwrap();
+    let schema_path = temp.path().join("schema.pg");
+    let query_path = temp.path().join("queries.gq");
+    write_file(
+        &schema_path,
+        r#"
+node Person {
+    name: String
+}
+"#,
+    );
+    write_query_file(
+        &query_path,
+        r#"
+query list_people() {
+    match { $p: Person }
+    return { $p.name }
+}
+"#,
+    );
+
+    let canonical = output_success(
+        cli()
+            .arg("lint")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json"),
+    );
+    let deprecated_check = output_success(
+        cli()
+            .arg("check")
+            .arg("--query")
+            .arg(&query_path)
+            .arg("--schema")
+            .arg(&schema_path)
+            .arg("--json"),
+    );
+
+    assert_eq!(stdout_string(&canonical), stdout_string(&deprecated_check));
+
+    let check_stderr = String::from_utf8(deprecated_check.stderr).unwrap();
+    assert!(
+        check_stderr.contains("`omnigraph check` is deprecated")
+            && check_stderr.contains("`omnigraph lint`"),
+        "expected `omnigraph check` deprecation warning pointing at `omnigraph lint`; got: {check_stderr}"
+    );
+
+    // `check` must NOT appear in the canonical `omnigraph --help` output —
+    // agents copy the surface from help text and would otherwise emit both
+    // names interchangeably.
+    let help = cli().arg("--help").output().unwrap();
+    let stdout = String::from_utf8(help.stdout).unwrap();
+    let check_aliased = stdout
+        .lines()
+        .any(|line| line.trim_start().starts_with("lint") && line.contains("check"));
+    assert!(
+        !check_aliased,
+        "`check` must not be advertised as a visible alias of `lint`; help output: {stdout}"
+    );
+}
+
+/// `omnigraph read` and `omnigraph change` are kept as visible clap
+/// aliases for the new canonical `query` / `mutate` subcommands, plus an
+/// argv-level deprecation warning. The warning is emitted to stderr; the
+/// command otherwise behaves identically to the canonical form.
+#[test]
+fn deprecated_read_and_change_subcommands_emit_warnings() {
+    // Both subcommands require `--query`/`--query-string`/`--alias`, so
+    // invoking them with no args will exit non-zero. That's fine --
+    // we only care that the deprecation warning is printed before the
+    // argument-required error.
+    let output = cli().arg("read").output().unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("`omnigraph read` is deprecated")
+            && stderr.contains("`omnigraph query`"),
+        "expected `omnigraph read` deprecation warning; got: {stderr}"
+    );
+
+    let output = cli().arg("change").output().unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("`omnigraph change` is deprecated")
+            && stderr.contains("`omnigraph mutate`"),
+        "expected `omnigraph change` deprecation warning; got: {stderr}"
+    );
+
+    // Sanity check the inverse: the canonical names must NOT print the
+    // deprecation banner.
+    let output = cli().arg("query").arg("--help").output().unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("deprecated"),
+        "`omnigraph query` is canonical and must not warn; got: {stderr}"
+    );
+    let output = cli().arg("mutate").arg("--help").output().unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("deprecated"),
+        "`omnigraph mutate` is canonical and must not warn; got: {stderr}"
+    );
+}
+
+#[test]
+fn query_lint_can_use_local_graph_via_positional_uri() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    let query_path = temp.path().join("queries.gq");
+    init_graph(&graph);
     write_query_file(
         &query_path,
         r#"
@@ -654,24 +850,24 @@ query list_people() {
             .arg("--query")
             .arg(&query_path)
             .arg("--json")
-            .arg(&repo),
+            .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
 
     assert_eq!(payload["status"], "ok");
-    assert_eq!(payload["schema_source"]["kind"], "repo");
+    assert_eq!(payload["schema_source"]["kind"], "graph");
     assert_eq!(
         payload["schema_source"]["uri"].as_str(),
-        Some(repo.to_string_lossy().as_ref())
+        Some(graph.to_string_lossy().as_ref())
     );
 }
 
 #[test]
-fn query_lint_can_resolve_repo_and_query_from_config() {
+fn query_lint_can_resolve_graph_and_query_from_config() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let config_path = temp.path().join("omnigraph.yaml");
-    init_repo(&repo);
+    init_graph(&graph);
     write_query_file(
         &temp.path().join("queries.gq"),
         r#"
@@ -681,7 +877,7 @@ query list_people() {
 }
 "#,
     );
-    write_config(&config_path, &local_yaml_config(&repo));
+    write_config(&config_path, &local_yaml_config(&graph));
 
     let output = output_success(
         cli()
@@ -696,10 +892,10 @@ query list_people() {
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
 
     assert_eq!(payload["status"], "ok");
-    assert_eq!(payload["schema_source"]["kind"], "repo");
+    assert_eq!(payload["schema_source"]["kind"], "graph");
     assert_eq!(
         payload["schema_source"]["uri"].as_str(),
-        Some(repo.to_string_lossy().as_ref())
+        Some(graph.to_string_lossy().as_ref())
     );
 }
 
@@ -727,12 +923,12 @@ query list_people() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("query lint is only supported against local repo URIs in this milestone")
+        stderr.contains("query lint is only supported against local graph URIs in this milestone")
     );
 }
 
 #[test]
-fn query_lint_requires_schema_or_resolvable_repo_target() {
+fn query_lint_requires_schema_or_resolvable_graph_target() {
     let temp = tempdir().unwrap();
     let query_path = temp.path().join("queries.gq");
     write_query_file(
@@ -754,7 +950,7 @@ query list_people() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("query lint requires --schema <schema.pg> or a resolvable repo target")
+        stderr.contains("query lint requires --schema <schema.pg> or a resolvable graph target")
     );
 }
 
@@ -846,8 +1042,8 @@ query bad_update($slug: String) {
 #[test]
 fn load_json_outputs_summary_for_main_branch() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
     let data = fixture("test.jsonl");
 
     let output = output_success(
@@ -856,7 +1052,7 @@ fn load_json_outputs_summary_for_main_branch() {
             .arg("--data")
             .arg(&data)
             .arg("--json")
-            .arg(&repo),
+            .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
 
@@ -871,16 +1067,16 @@ fn load_json_outputs_summary_for_main_branch() {
 #[test]
 fn load_into_feature_branch_with_merge_mode_succeeds() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
 
     output_success(
         cli()
             .arg("branch")
             .arg("create")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--from")
             .arg("main")
             .arg("feature"),
@@ -901,7 +1097,7 @@ fn load_into_feature_branch_with_merge_mode_succeeds() {
             .arg("feature")
             .arg("--mode")
             .arg("merge")
-            .arg(&repo),
+            .arg(&graph),
     );
     let stdout = stdout_string(&output);
 
@@ -913,15 +1109,15 @@ fn load_into_feature_branch_with_merge_mode_succeeds() {
 #[test]
 fn read_json_outputs_rows_for_named_query() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
     let queries = fixture("test.gq");
 
     let output = output_success(
         cli()
             .arg("read")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--query")
             .arg(&queries)
             .arg("--name")
@@ -941,16 +1137,16 @@ fn read_json_outputs_rows_for_named_query() {
 #[test]
 fn export_jsonl_outputs_source_rows_for_selected_branch_and_type() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
 
     output_success(
         cli()
             .arg("branch")
             .arg("create")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--from")
             .arg("main")
             .arg("feature"),
@@ -970,13 +1166,13 @@ fn export_jsonl_outputs_source_rows_for_selected_branch_and_type() {
             .arg("feature")
             .arg("--mode")
             .arg("append")
-            .arg(&repo),
+            .arg(&graph),
     );
 
     let output = output_success(
         cli()
             .arg("export")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--branch")
             .arg("feature")
             .arg("--type")
@@ -1025,7 +1221,7 @@ fn policy_validate_fails_for_invalid_policy_file() {
         &config,
         r#"
 project:
-  name: policy-test-repo
+  name: policy-test-graph
 policy:
   file: ./policy.yaml
 "#,
@@ -1117,11 +1313,11 @@ fn policy_explain_reports_decision_and_matched_rule() {
 #[test]
 fn read_can_resolve_uri_from_config() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let config = temp.path().join("omnigraph.yaml");
-    init_repo(&repo);
-    load_fixture(&repo);
-    write_config(&config, &local_yaml_config(&repo));
+    init_graph(&graph);
+    load_fixture(&graph);
+    write_config(&config, &local_yaml_config(&graph));
 
     let output = output_success(
         cli()
@@ -1143,11 +1339,11 @@ fn read_can_resolve_uri_from_config() {
 #[test]
 fn read_alias_from_yaml_config_runs_with_kv_output() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let config = temp.path().join("omnigraph.yaml");
     let query = temp.path().join("aliases.gq");
-    init_repo(&repo);
-    load_fixture(&repo);
+    init_graph(&graph);
+    load_fixture(&graph);
     write_query_file(
         &query,
         &std::fs::read_to_string(fixture("test.gq")).unwrap(),
@@ -1156,7 +1352,7 @@ fn read_alias_from_yaml_config_runs_with_kv_output() {
         &config,
         &format!(
             "{}aliases:\n  owner:\n    command: read\n    query: aliases.gq\n    name: get_person\n    args: [name]\n    format: kv\n",
-            local_yaml_config(&repo)
+            local_yaml_config(&graph)
         ),
     );
 
@@ -1178,16 +1374,16 @@ fn read_alias_from_yaml_config_runs_with_kv_output() {
 #[test]
 fn read_alias_uses_alias_target_without_cli_default_and_accepts_url_like_arg() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let config = temp.path().join("omnigraph.yaml");
     let query = temp.path().join("aliases.gq");
     let data = temp.path().join("url-like.jsonl");
-    init_repo(&repo);
+    init_graph(&graph);
     write_jsonl(
         &data,
         r#"{"type":"Person","data":{"name":"https://example.com","age":30}}"#,
     );
-    output_success(cli().arg("load").arg("--data").arg(&data).arg(&repo));
+    output_success(cli().arg("load").arg("--data").arg(&data).arg(&graph));
     write_query_file(
         &query,
         &std::fs::read_to_string(fixture("test.gq")).unwrap(),
@@ -1196,7 +1392,7 @@ fn read_alias_uses_alias_target_without_cli_default_and_accepts_url_like_arg() {
         &config,
         &format!(
             "graphs:\n  local:\n    uri: '{}'\nquery:\n  roots:\n    - .\npolicy: {{}}\naliases:\n  owner:\n    command: read\n    query: aliases.gq\n    name: get_person\n    args: [name]\n    graph: local\n    format: kv\n",
-            repo.to_string_lossy()
+            graph.to_string_lossy()
         ),
     );
 
@@ -1218,11 +1414,11 @@ fn read_alias_uses_alias_target_without_cli_default_and_accepts_url_like_arg() {
 #[test]
 fn change_alias_from_yaml_config_persists_changes() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let config = temp.path().join("omnigraph.yaml");
     let query = temp.path().join("mutations.gq");
-    init_repo(&repo);
-    load_fixture(&repo);
+    init_graph(&graph);
+    load_fixture(&graph);
     write_query_file(
         &query,
         r#"
@@ -1235,7 +1431,7 @@ query insert_person($name: String, $age: I32) {
         &config,
         &format!(
             "{}aliases:\n  add_person:\n    command: change\n    query: mutations.gq\n    name: insert_person\n    args: [name, age]\n",
-            local_yaml_config(&repo)
+            local_yaml_config(&graph)
         ),
     );
 
@@ -1256,7 +1452,7 @@ query insert_person($name: String, $age: I32) {
     let verify = output_success(
         cli()
             .arg("read")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--query")
             .arg(fixture("test.gq"))
             .arg("--name")
@@ -1272,14 +1468,14 @@ query insert_person($name: String, $age: I32) {
 #[test]
 fn read_csv_format_outputs_header_and_row_values() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
 
     let output = output_success(
         cli()
             .arg("read")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--query")
             .arg(fixture("test.gq"))
             .arg("--name")
@@ -1298,14 +1494,14 @@ fn read_csv_format_outputs_header_and_row_values() {
 #[test]
 fn read_jsonl_format_outputs_metadata_header_first() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
 
     let output = output_success(
         cli()
             .arg("read")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--query")
             .arg(fixture("test.gq"))
             .arg("--name")
@@ -1324,9 +1520,9 @@ fn read_jsonl_format_outputs_metadata_header_first() {
 #[test]
 fn change_json_outputs_affected_counts_and_persists() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
     let mutation_file = temp.path().join("mutations.gq");
     write_query_file(
         &mutation_file,
@@ -1340,7 +1536,7 @@ query insert_person($name: String, $age: I32) {
     let output = output_success(
         cli()
             .arg("change")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--query")
             .arg(&mutation_file)
             .arg("--params")
@@ -1356,7 +1552,7 @@ query insert_person($name: String, $age: I32) {
     let verify = output_success(
         cli()
             .arg("read")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--query")
             .arg(fixture("test.gq"))
             .arg("--name")
@@ -1373,11 +1569,11 @@ query insert_person($name: String, $age: I32) {
 #[test]
 fn change_can_resolve_uri_and_branch_from_config() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let config = temp.path().join("omnigraph.yaml");
-    init_repo(&repo);
-    load_fixture(&repo);
-    write_config(&config, &local_yaml_config(&repo));
+    init_graph(&graph);
+    load_fixture(&graph);
+    write_config(&config, &local_yaml_config(&graph));
     let mutation_file = temp.path().join("config-mutations.gq");
     write_query_file(
         &mutation_file,
@@ -1407,14 +1603,14 @@ query insert_person($name: String, $age: I32) {
 #[test]
 fn read_requires_name_for_multi_query_files() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
 
     let output = output_failure(
         cli()
             .arg("read")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--query")
             .arg(fixture("test.gq")),
     );
@@ -1423,17 +1619,113 @@ fn read_requires_name_for_multi_query_files() {
 }
 
 #[test]
+fn read_supports_inline_query_string() {
+    let temp = tempdir().unwrap();
+    let repo = graph_path(temp.path());
+    init_graph(&repo);
+    load_fixture(&repo);
+
+    let output = output_success(
+        cli()
+            .arg("read")
+            .arg(&repo)
+            .arg("-e")
+            .arg("query find($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.age } }")
+            .arg("--params")
+            .arg(r#"{"name":"Alice"}"#)
+            .arg("--json"),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["query_name"], "find");
+    assert_eq!(payload["row_count"], 1);
+    assert_eq!(payload["rows"][0]["p.name"], "Alice");
+}
+
+#[test]
+fn change_supports_inline_query_string() {
+    let temp = tempdir().unwrap();
+    let repo = graph_path(temp.path());
+    init_graph(&repo);
+    load_fixture(&repo);
+
+    let output = output_success(
+        cli()
+            .arg("change")
+            .arg(&repo)
+            .arg("--query-string")
+            .arg("query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }")
+            .arg("--params")
+            .arg(r#"{"name":"Inline","age":42}"#)
+            .arg("--json"),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["query_name"], "add");
+    assert_eq!(payload["affected_nodes"], 1);
+
+    let verify = output_success(
+        cli()
+            .arg("read")
+            .arg(&repo)
+            .arg("-e")
+            .arg("query find($name: String) { match { $p: Person { name: $name } } return { $p.name } }")
+            .arg("--params")
+            .arg(r#"{"name":"Inline"}"#)
+            .arg("--json"),
+    );
+    let verify_payload: Value = serde_json::from_slice(&verify.stdout).unwrap();
+    assert_eq!(verify_payload["row_count"], 1);
+}
+
+#[test]
+fn read_rejects_query_string_combined_with_query() {
+    let temp = tempdir().unwrap();
+    let repo = graph_path(temp.path());
+    init_graph(&repo);
+    load_fixture(&repo);
+
+    let output = output_failure(
+        cli()
+            .arg("read")
+            .arg(&repo)
+            .arg("--query")
+            .arg(fixture("test.gq"))
+            .arg("-e")
+            .arg("query whatever() { match { $p: Person } return { $p.name } }"),
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("cannot be used") || stderr.contains("conflict"),
+        "expected clap conflict error, got: {stderr}"
+    );
+}
+
+#[test]
+fn read_rejects_empty_query_string() {
+    let temp = tempdir().unwrap();
+    let repo = graph_path(temp.path());
+    init_graph(&repo);
+    load_fixture(&repo);
+
+    let output = output_failure(cli().arg("read").arg(&repo).arg("-e").arg(""));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("must not be empty"),
+        "expected empty-string rejection, got: {stderr}"
+    );
+}
+
+#[test]
 fn branch_create_json_outputs_source_and_name() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
 
     let output = output_success(
         cli()
             .arg("branch")
             .arg("create")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--from")
             .arg("main")
             .arg("feature")
@@ -1443,21 +1735,21 @@ fn branch_create_json_outputs_source_and_name() {
 
     assert_eq!(payload["from"], "main");
     assert_eq!(payload["name"], "feature");
-    assert_eq!(payload["uri"], repo.to_string_lossy().as_ref());
+    assert_eq!(payload["uri"], graph.to_string_lossy().as_ref());
 }
 
 #[test]
 fn branch_list_outputs_sorted_branches() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
 
     output_success(
         cli()
             .arg("branch")
             .arg("create")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--from")
             .arg("main")
             .arg("zeta"),
@@ -1467,13 +1759,13 @@ fn branch_list_outputs_sorted_branches() {
             .arg("branch")
             .arg("create")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--from")
             .arg("main")
             .arg("alpha"),
     );
 
-    let output = output_success(cli().arg("branch").arg("list").arg("--uri").arg(&repo));
+    let output = output_success(cli().arg("branch").arg("list").arg("--uri").arg(&graph));
     let stdout = stdout_string(&output);
     let lines = stdout
         .lines()
@@ -1487,15 +1779,15 @@ fn branch_list_outputs_sorted_branches() {
 #[test]
 fn branch_delete_json_outputs_name_and_removes_branch() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
 
     output_success(
         cli()
             .arg("branch")
             .arg("create")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--from")
             .arg("main")
             .arg("feature"),
@@ -1506,15 +1798,15 @@ fn branch_delete_json_outputs_name_and_removes_branch() {
             .arg("branch")
             .arg("delete")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("feature")
             .arg("--json"),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["name"], "feature");
-    assert_eq!(payload["uri"], repo.to_string_lossy().as_ref());
+    assert_eq!(payload["uri"], graph.to_string_lossy().as_ref());
 
-    let listed = output_success(cli().arg("branch").arg("list").arg("--uri").arg(&repo));
+    let listed = output_success(cli().arg("branch").arg("list").arg("--uri").arg(&graph));
     let stdout = stdout_string(&listed);
     let lines = stdout
         .lines()
@@ -1527,15 +1819,15 @@ fn branch_delete_json_outputs_name_and_removes_branch() {
 #[test]
 fn branch_delete_rejects_main() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
 
     let output = output_failure(
         cli()
             .arg("branch")
             .arg("delete")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("main"),
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
@@ -1545,16 +1837,16 @@ fn branch_delete_rejects_main() {
 #[test]
 fn branch_merge_defaults_target_to_main() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
 
     output_success(
         cli()
             .arg("branch")
             .arg("create")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--from")
             .arg("main")
             .arg("feature"),
@@ -1574,7 +1866,7 @@ fn branch_merge_defaults_target_to_main() {
             .arg("feature")
             .arg("--mode")
             .arg("append")
-            .arg(&repo),
+            .arg(&graph),
     );
 
     let merge_output = output_success(
@@ -1582,7 +1874,7 @@ fn branch_merge_defaults_target_to_main() {
             .arg("branch")
             .arg("merge")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("feature")
             .arg("--json"),
     );
@@ -1594,7 +1886,7 @@ fn branch_merge_defaults_target_to_main() {
     let snapshot_output = output_success(
         cli()
             .arg("snapshot")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--branch")
             .arg("main")
             .arg("--json"),
@@ -1614,16 +1906,16 @@ fn branch_merge_defaults_target_to_main() {
 #[test]
 fn branch_merge_supports_explicit_target() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
 
     output_success(
         cli()
             .arg("branch")
             .arg("create")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--from")
             .arg("main")
             .arg("feature"),
@@ -1633,7 +1925,7 @@ fn branch_merge_supports_explicit_target() {
             .arg("branch")
             .arg("create")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("--from")
             .arg("main")
             .arg("experiment"),
@@ -1653,7 +1945,7 @@ fn branch_merge_supports_explicit_target() {
             .arg("feature")
             .arg("--mode")
             .arg("append")
-            .arg(&repo),
+            .arg(&graph),
     );
 
     let merge_output = output_success(
@@ -1661,7 +1953,7 @@ fn branch_merge_supports_explicit_target() {
             .arg("branch")
             .arg("merge")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("feature")
             .arg("--into")
             .arg("experiment")
@@ -1675,17 +1967,17 @@ fn branch_merge_supports_explicit_target() {
 #[test]
 fn snapshot_json_returns_manifest_version_and_tables() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
 
-    let output = output_success(cli().arg("snapshot").arg(&repo).arg("--json"));
+    let output = output_success(cli().arg("snapshot").arg(&graph).arg("--json"));
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
 
     assert_eq!(payload["branch"], "main");
     assert_eq!(
         payload["manifest_version"].as_u64().unwrap(),
-        manifest_dataset_version(&repo)
+        manifest_dataset_version(&graph)
     );
     assert!(payload["tables"].as_array().unwrap().len() >= 4);
 }
@@ -1755,11 +2047,11 @@ fn read_embedded_rows(path: std::path::PathBuf) -> Vec<Value> {
 #[test]
 fn snapshot_can_resolve_uri_from_config() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let config = temp.path().join("omnigraph.yaml");
-    init_repo(&repo);
-    load_fixture(&repo);
-    write_config(&config, &local_yaml_config(&repo));
+    init_graph(&graph);
+    load_fixture(&graph);
+    write_config(&config, &local_yaml_config(&graph));
 
     let output = output_success(
         cli()
@@ -1775,11 +2067,11 @@ fn snapshot_can_resolve_uri_from_config() {
 #[test]
 fn snapshot_human_output_includes_branch_and_table_summaries() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
 
-    let output = output_success(cli().arg("snapshot").arg(&repo));
+    let output = output_success(cli().arg("snapshot").arg(&graph));
     let stdout = stdout_string(&output);
 
     assert!(stdout.contains("branch: main"));
@@ -1791,11 +2083,11 @@ fn snapshot_human_output_includes_branch_and_table_summaries() {
 #[test]
 fn commit_show_accepts_long_uri_flag() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
 
-    let list = output_success(cli().arg("commit").arg("list").arg(&repo).arg("--json"));
+    let list = output_success(cli().arg("commit").arg("list").arg(&graph).arg("--json"));
     let list_payload: Value = serde_json::from_slice(&list.stdout).unwrap();
     let commit_id = list_payload["commits"][0]["graph_commit_id"]
         .as_str()
@@ -1807,7 +2099,7 @@ fn commit_show_accepts_long_uri_flag() {
             .arg("commit")
             .arg("show")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg(&commit_id)
             .arg("--json"),
     );
@@ -1818,11 +2110,11 @@ fn commit_show_accepts_long_uri_flag() {
 }
 
 #[test]
-fn cli_fails_for_missing_repo() {
+fn cli_fails_for_missing_graph() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
 
-    let output = output_failure(cli().arg("snapshot").arg(&repo));
+    let output = output_failure(cli().arg("snapshot").arg(&graph));
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
         stderr.contains("_schema.pg")
@@ -1834,7 +2126,7 @@ fn cli_fails_for_missing_repo() {
 #[test]
 fn cli_fails_for_missing_schema_or_data_file() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let missing_schema = temp.path().join("missing.pg");
     let missing_data = temp.path().join("missing.jsonl");
 
@@ -1843,7 +2135,7 @@ fn cli_fails_for_missing_schema_or_data_file() {
             .arg("init")
             .arg("--schema")
             .arg(&missing_schema)
-            .arg(&repo),
+            .arg(&graph),
     );
     assert!(
         String::from_utf8(init_output.stderr)
@@ -1851,13 +2143,13 @@ fn cli_fails_for_missing_schema_or_data_file() {
             .contains("No such file")
     );
 
-    init_repo(&repo);
+    init_graph(&graph);
     let load_output = output_failure(
         cli()
             .arg("load")
             .arg("--data")
             .arg(&missing_data)
-            .arg(&repo),
+            .arg(&graph),
     );
     assert!(
         String::from_utf8(load_output.stderr)
@@ -1869,16 +2161,16 @@ fn cli_fails_for_missing_schema_or_data_file() {
 #[test]
 fn cli_fails_for_invalid_merge_requests() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
-    load_fixture(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
 
     let missing_branch = output_failure(
         cli()
             .arg("branch")
             .arg("merge")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("missing"),
     );
     let missing_branch_stderr = String::from_utf8(missing_branch.stderr).unwrap();
@@ -1893,7 +2185,7 @@ fn cli_fails_for_invalid_merge_requests() {
             .arg("branch")
             .arg("merge")
             .arg("--uri")
-            .arg(&repo)
+            .arg(&graph)
             .arg("main")
             .arg("--into")
             .arg("main"),
@@ -1921,9 +2213,9 @@ fn cli_fails_for_invalid_merge_requests() {
 #[test]
 fn schema_apply_allow_data_loss_flag_promotes_drops_to_hard() {
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let schema_path = temp.path().join("drop-age.pg");
-    init_repo(&repo);
+    init_graph(&graph);
 
     // Drop the nullable `age` column.
     let next_schema = fs::read_to_string(fixture("test.pg"))
@@ -1939,7 +2231,7 @@ fn schema_apply_allow_data_loss_flag_promotes_drops_to_hard() {
             .arg(&schema_path)
             .arg("--allow-data-loss")
             .arg("--json")
-            .arg(&repo),
+            .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["applied"], true);
@@ -1962,9 +2254,9 @@ fn schema_apply_without_allow_data_loss_keeps_soft_drops() {
     // drops stay Soft. Pins default semantics against accidental Hard
     // promotion if a future refactor changes the option threading.
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
+    let graph = graph_path(temp.path());
     let schema_path = temp.path().join("drop-age-soft.pg");
-    init_repo(&repo);
+    init_graph(&graph);
 
     let next_schema = fs::read_to_string(fixture("test.pg"))
         .unwrap()
@@ -1978,7 +2270,7 @@ fn schema_apply_without_allow_data_loss_keeps_soft_drops() {
             .arg("--schema")
             .arg(&schema_path)
             .arg("--json")
-            .arg(&repo),
+            .arg(&graph),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["applied"], true);
@@ -2004,8 +2296,8 @@ fn schema_plan_parity_cli_and_sdk() {
     // the HTTP soft/hard drop tests, which exercise apply with
     // identical fixtures.
     let temp = tempdir().unwrap();
-    let repo = repo_path(temp.path());
-    init_repo(&repo);
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
     let schema_path = temp.path().join("plan-parity.pg");
     let next_schema = fs::read_to_string(fixture("test.pg")).unwrap().replace(
         "    age: I32?\n}",
@@ -2021,13 +2313,13 @@ fn schema_plan_parity_cli_and_sdk() {
             .arg("--schema")
             .arg(&schema_path)
             .arg("--json")
-            .arg(&repo),
+            .arg(&graph),
     );
     let cli_payload: Value = serde_json::from_slice(&cli_output.stdout).unwrap();
 
-    // SDK side: open repo, call plan_schema.
+    // SDK side: open graph, call plan_schema.
     let plan = tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let db = Omnigraph::open(repo.to_string_lossy().as_ref())
+        let db = Omnigraph::open(graph.to_string_lossy().as_ref())
             .await
             .unwrap();
         db.plan_schema(&next_schema).await.unwrap()
@@ -2039,4 +2331,340 @@ fn schema_plan_parity_cli_and_sdk() {
         "CLI plan steps must match SDK plan steps for identical input",
     );
     assert_eq!(cli_payload["supported"], plan.supported);
+}
+
+// ─── MR-668 PR 8 — omnigraph graphs subcommand ─────────────────────────────
+
+/// `omnigraph graphs --help` lists only the read-only `list`
+/// subcommand. Runtime add (`create`) and remove (`delete`) are
+/// deferred — operators add/remove graphs by editing `omnigraph.yaml`
+/// and restarting. This test pins the deferral against accidental
+/// re-introduction.
+#[test]
+fn graphs_subcommand_help_lists_list_only() {
+    let output = output_success(cli().arg("graphs").arg("--help"));
+    let stdout = stdout_string(&output);
+    assert!(
+        stdout.contains("list"),
+        "expected `list` subcommand in help output:\n{stdout}"
+    );
+    let lowered = stdout.to_lowercase();
+    assert!(
+        !lowered.contains("create a new graph"),
+        "graph create should not be in v0.6.0 help; got:\n{stdout}"
+    );
+    assert!(
+        !lowered.contains("delete a graph"),
+        "graph delete should not be in v0.6.0 help; got:\n{stdout}"
+    );
+}
+
+/// `omnigraph graphs list` against a local URI errors with a clear
+/// message — the CLI only operates against remote multi-graph servers.
+#[test]
+fn graphs_list_against_local_uri_errors_with_remote_only_message() {
+    let output = output_failure(
+        cli()
+            .arg("graphs")
+            .arg("list")
+            .arg("--uri")
+            .arg("/tmp/local"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("remote multi-graph server URL"),
+        "expected 'remote multi-graph server URL' rejection in stderr; got:\n{stderr}"
+    );
+}
+
+fn queries_test_config(graph_uri: &str, entry: &str, gq_file: &str) -> String {
+    format!(
+        "graphs:\n  local:\n    uri: '{}'\n    queries:\n      {entry}:\n        file: ./{gq_file}\n\
+         cli:\n  graph: local\npolicy: {{}}\n",
+        graph_uri.replace('\'', "''")
+    )
+}
+
+#[test]
+fn queries_validate_exits_zero_on_clean_registry() {
+    let graph = SystemGraph::loaded();
+    graph.write_query(
+        "find_person.gq",
+        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
+    );
+    let config = graph.write_config(
+        "omnigraph.yaml",
+        &queries_test_config(&graph.path().to_string_lossy(), "find_person", "find_person.gq"),
+    );
+    let output = output_success(cli().arg("queries").arg("validate").arg("--config").arg(&config));
+    let stdout = stdout_string(&output);
+    assert!(stdout.contains("OK"), "stdout:\n{stdout}");
+}
+
+#[test]
+fn queries_validate_exits_nonzero_on_type_broken_query() {
+    let graph = SystemGraph::loaded();
+    // `Widget` is not in the fixture schema.
+    graph.write_query("ghost.gq", "query ghost() { match { $w: Widget } return { $w.name } }");
+    let config = graph.write_config(
+        "omnigraph.yaml",
+        &queries_test_config(&graph.path().to_string_lossy(), "ghost", "ghost.gq"),
+    );
+    let output = output_failure(cli().arg("queries").arg("validate").arg("--config").arg(&config));
+    let stdout = stdout_string(&output);
+    assert!(
+        stdout.contains("ghost"),
+        "validation should name the broken query; stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn queries_list_prints_registered_query() {
+    let graph = SystemGraph::loaded();
+    graph.write_query(
+        "find_person.gq",
+        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
+    );
+    // Exposed with an explicit tool name so the list shows the MCP suffix.
+    let config = graph.write_config(
+        "omnigraph.yaml",
+        &format!(
+            concat!(
+                "graphs:\n",
+                "  local:\n",
+                "    uri: '{}'\n",
+                "    queries:\n",
+                "      find_person:\n",
+                "        file: ./find_person.gq\n",
+                "        mcp: {{ expose: true, tool_name: lookup_person }}\n",
+                "cli:\n",
+                "  graph: local\n",
+                "policy: {{}}\n",
+            ),
+            graph.path().to_string_lossy().replace('\'', "''")
+        ),
+    );
+    let output = output_success(cli().arg("queries").arg("list").arg("--config").arg(&config));
+    let stdout = stdout_string(&output);
+    assert!(stdout.contains("find_person"), "stdout:\n{stdout}");
+    assert!(
+        stdout.contains("$name: String"),
+        "list should show typed params; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[mcp: lookup_person]"),
+        "list should show the MCP tool name for exposed queries; stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn queries_list_requires_graph_selection_for_per_graph_only_registries() {
+    let graph = SystemGraph::loaded();
+    graph.write_query(
+        "find_person.gq",
+        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
+    );
+    let config = graph.write_config(
+        "omnigraph.yaml",
+        &format!(
+            concat!(
+                "graphs:\n",
+                "  local:\n",
+                "    uri: '{}'\n",
+                "    queries:\n",
+                "      find_person:\n",
+                "        file: ./find_person.gq\n",
+                "policy: {{}}\n",
+            ),
+            graph.path().to_string_lossy().replace('\'', "''")
+        ),
+    );
+
+    let output = output_failure(cli().arg("queries").arg("list").arg("--config").arg(&config));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("local") && stderr.contains("--target local"),
+        "error must name the graph and give a concrete selection hint; stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn queries_list_without_graph_selection_lists_top_level_registry() {
+    let graph = SystemGraph::loaded();
+    graph.write_query(
+        "top_find.gq",
+        "query top_find($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
+    );
+    let config = graph.write_config(
+        "omnigraph.yaml",
+        concat!(
+            "queries:\n",
+            "  top_find:\n",
+            "    file: ./top_find.gq\n",
+            "policy: {}\n",
+        ),
+    );
+
+    let output = output_success(cli().arg("queries").arg("list").arg("--config").arg(&config));
+    let stdout = stdout_string(&output);
+    assert!(stdout.contains("top_find"), "stdout:\n{stdout}");
+}
+
+#[test]
+fn queries_list_unknown_target_errors() {
+    // `queries list` opens no graph URI, so unknown-graph validation can't ride
+    // along on URI resolution the way it does for every other command. An
+    // unknown `--target` must still error (naming the graph) instead of
+    // silently falling back to the top-level registry and showing the wrong
+    // (or empty) catalog.
+    let graph = SystemGraph::loaded();
+    graph.write_query(
+        "find_person.gq",
+        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
+    );
+    let config = graph.write_config(
+        "omnigraph.yaml",
+        &queries_test_config(&graph.path().to_string_lossy(), "find_person", "find_person.gq"),
+    );
+    let output = output_failure(
+        cli()
+            .arg("queries")
+            .arg("list")
+            .arg("--target")
+            .arg("nonexistent")
+            .arg("--config")
+            .arg(&config),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("nonexistent"),
+        "error must name the unknown graph; stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn queries_commands_reject_named_graph_with_populated_top_level_block() {
+    // A named graph (here via `cli.graph`) uses its own `graphs.<name>` block,
+    // so a populated top-level `queries:` block would be silently ignored — a
+    // config the server REFUSES to boot. `queries validate`/`list` must reject
+    // it too (matching boot) instead of validating/listing the per-graph block
+    // and giving a false green.
+    let graph = SystemGraph::loaded();
+    graph.write_query(
+        "find_person.gq",
+        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
+    );
+    let config = graph.write_config(
+        "omnigraph.yaml",
+        &format!(
+            concat!(
+                "graphs:\n",
+                "  local:\n",
+                "    uri: '{}'\n",
+                "    queries:\n",
+                "      find_person:\n",
+                "        file: ./find_person.gq\n",
+                "cli:\n",
+                "  graph: local\n",
+                "queries:\n",                 // populated top-level block: the coherence violation
+                "  legacy:\n",
+                "    file: ./legacy.gq\n",
+                "policy: {{}}\n",
+            ),
+            graph.path().to_string_lossy().replace('\'', "''")
+        ),
+    );
+    // Both resolve `local` from cli.graph (no positional URI), so both must
+    // error and name the graph + the ignored block — like server boot does.
+    for sub in ["validate", "list"] {
+        let output = output_failure(cli().arg("queries").arg(sub).arg("--config").arg(&config));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("local") && stderr.contains("queries"),
+            "`queries {sub}` must reject a named graph with a populated top-level block; stderr:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn queries_validate_exits_nonzero_on_duplicate_tool_name() {
+    // Two exposed queries claiming one MCP tool name is a load-time
+    // collision — `queries validate` must fail (offline, before the engine
+    // opens) and name both queries plus the contested tool.
+    let graph = SystemGraph::loaded();
+    graph.write_query("a.gq", "query a() { match { $p: Person } return { $p.name } }");
+    graph.write_query("b.gq", "query b() { match { $p: Person } return { $p.name } }");
+    let config = graph.write_config(
+        "omnigraph.yaml",
+        &format!(
+            concat!(
+                "graphs:\n",
+                "  local:\n",
+                "    uri: '{}'\n",
+                "    queries:\n",
+                "      a:\n",
+                "        file: ./a.gq\n",
+                "        mcp: {{ expose: true, tool_name: dup }}\n",
+                "      b:\n",
+                "        file: ./b.gq\n",
+                "        mcp: {{ expose: true, tool_name: dup }}\n",
+                "cli:\n",
+                "  graph: local\n",
+                "policy: {{}}\n",
+            ),
+            graph.path().to_string_lossy().replace('\'', "''")
+        ),
+    );
+    let output = output_failure(cli().arg("queries").arg("validate").arg("--config").arg(&config));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("dup") && stderr.contains("'a'") && stderr.contains("'b'"),
+        "duplicate tool name should be reported naming both queries; stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn queries_validate_positional_uri_ignores_default_graph() {
+    // A positional URI is anonymous → the schema AND the registry both come
+    // from top-level, even when `cli.graph` names a graph whose per-graph
+    // queries would fail. Pins that the URI and registry can't diverge.
+    let graph = SystemGraph::loaded();
+    graph.write_query(
+        "clean.gq",
+        "query clean($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
+    );
+    // `Widget` is not in the fixture schema — the default graph's per-graph
+    // query would break validate if it were (wrongly) selected.
+    graph.write_query("broken.gq", "query broken() { match { $w: Widget } return { $w.name } }");
+    let config = graph.write_config(
+        "omnigraph.yaml",
+        concat!(
+            "cli:\n  graph: prod\n",
+            "graphs:\n",
+            "  prod:\n",
+            "    uri: /nonexistent-prod.omni\n",
+            "    queries:\n",
+            "      broken:\n",
+            "        file: ./broken.gq\n",
+            "queries:\n",
+            "  clean:\n",
+            "    file: ./clean.gq\n",
+            "policy: {}\n",
+        ),
+    );
+    // Positional URI = the real loaded graph; selection is anonymous, so the
+    // CLEAN top-level registry validates (not prod's broken one).
+    let output = output_success(
+        cli()
+            .arg("queries")
+            .arg("validate")
+            .arg(graph.path())
+            .arg("--config")
+            .arg(&config),
+    );
+    let stdout = stdout_string(&output);
+    assert!(
+        stdout.contains("OK"),
+        "positional URI must validate the top-level registry, not the cli.graph default; stdout:\n{stdout}"
+    );
 }

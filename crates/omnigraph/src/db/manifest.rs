@@ -6,6 +6,8 @@ use lance::Dataset;
 use lance_namespace::models::CreateTableVersionRequest;
 use omnigraph_compiler::catalog::Catalog;
 
+#[path = "manifest/graph.rs"]
+mod graph;
 #[path = "manifest/layout.rs"]
 mod layout;
 #[path = "manifest/metadata.rs"]
@@ -18,11 +20,10 @@ mod namespace;
 mod publisher;
 #[path = "manifest/recovery.rs"]
 mod recovery;
-#[path = "manifest/repo.rs"]
-mod repo;
 #[path = "manifest/state.rs"]
 mod state;
 
+use graph::{init_manifest_graph, open_manifest_graph, snapshot_state_at};
 use layout::{manifest_uri, open_manifest_dataset, type_name_hash};
 pub(crate) use metadata::TableVersionMetadata;
 #[cfg(test)]
@@ -33,11 +34,10 @@ pub(crate) use namespace::open_table_head_for_write;
 use namespace::{branch_manifest_namespace, staged_table_namespace};
 use publisher::{GraphNamespacePublisher, ManifestBatchPublisher};
 pub(crate) use recovery::{
-    delete_sidecar, has_schema_apply_sidecar, new_sidecar, recover_manifest_drift, write_sidecar,
     RecoveryMode, RecoverySidecar, RecoverySidecarHandle, SidecarKind, SidecarTablePin,
-    SidecarTableRegistration, SidecarTombstone,
+    SidecarTableRegistration, SidecarTombstone, delete_sidecar, has_schema_apply_sidecar,
+    new_sidecar, recover_manifest_drift, write_sidecar,
 };
-use repo::{init_manifest_repo, open_manifest_repo, snapshot_state_at};
 pub use state::SubTableEntry;
 #[cfg(test)]
 use state::string_column;
@@ -215,12 +215,12 @@ impl ManifestCoordinator {
         self
     }
 
-    /// Create a new repo at `root_uri` from a catalog.
+    /// Create a new graph at `root_uri` from a catalog.
     ///
     /// Creates per-type Lance datasets and the namespace `__manifest` table.
     pub async fn init(root_uri: &str, catalog: &Catalog) -> Result<Self> {
         let root = root_uri.trim_end_matches('/');
-        let (dataset, known_state) = init_manifest_repo(root, catalog).await?;
+        let (dataset, known_state) = init_manifest_graph(root, catalog).await?;
 
         Ok(Self::from_parts_with_default_publisher(
             root,
@@ -230,10 +230,10 @@ impl ManifestCoordinator {
         ))
     }
 
-    /// Open an existing repo's manifest.
+    /// Open an existing graph's manifest.
     pub async fn open(root_uri: &str) -> Result<Self> {
         let root = root_uri.trim_end_matches('/');
-        let (dataset, known_state) = open_manifest_repo(root, None).await?;
+        let (dataset, known_state) = open_manifest_graph(root, None).await?;
         Ok(Self::from_parts_with_default_publisher(
             root,
             dataset,
@@ -242,14 +242,14 @@ impl ManifestCoordinator {
         ))
     }
 
-    /// Open an existing repo's manifest at a specific branch.
+    /// Open an existing graph's manifest at a specific branch.
     pub async fn open_at_branch(root_uri: &str, branch: &str) -> Result<Self> {
         if branch == "main" {
             return Self::open(root_uri).await;
         }
 
         let root = root_uri.trim_end_matches('/');
-        let (dataset, known_state) = open_manifest_repo(root, Some(branch)).await?;
+        let (dataset, known_state) = open_manifest_graph(root, Some(branch)).await?;
         Ok(Self::from_parts_with_default_publisher(
             root,
             dataset,
@@ -410,7 +410,7 @@ impl ManifestCoordinator {
         Ok(descendants)
     }
 
-    /// Root URI of the repo.
+    /// Root URI of the graph.
     pub fn root_uri(&self) -> &str {
         &self.root_uri
     }

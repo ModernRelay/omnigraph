@@ -8,7 +8,7 @@ This page explains what the policy says and how to change it.
 
 | Setting | Value | Why |
 |---|---|---|
-| **Required status checks (strict)** | `Classify Changes`, `Check AGENTS.md Links`, `Test Workspace`, `Test omnigraph-server --features aws`, `CODEOWNERS / drift`, `CODEOWNERS / noedit` | Every PR must pass workspace tests, AGENTS.md link integrity, and the CODEOWNERS hygiene checks. `strict: true` requires the branch to be up-to-date with `main` before merge. |
+| **Required status checks (strict)** | `Classify Changes`, `Check AGENTS.md Links`, `Test Workspace`, `Test omnigraph-server --features aws`, `CODEOWNERS matches source`, `CODEOWNERS not hand-edited` | Every PR must pass workspace tests, AGENTS.md link integrity, and the CODEOWNERS hygiene checks. The two CODEOWNERS contexts must equal the job `name:` values in `.github/workflows/codeowners.yml` **verbatim** — a context naming a job that never reports (the old `CODEOWNERS / drift` used the job *id*, and the job was path-filtered) leaves every PR permanently pending and forces admin overrides. `strict: true` requires the branch to be up-to-date with `main` before merge. |
 | **Required approving reviews** | `1` | At least one reviewer. With a 2-person team, going higher would block all merges when one person is unavailable. |
 | **Require code-owner reviews** | `true` | The reviewer must be a code owner per `.github/CODEOWNERS`. This is what makes the codeowners chassis enforced. |
 | **Dismiss stale reviews on new commits** | `true` | A push after approval invalidates the prior review. Prevents the "approve, then sneak in unreviewed changes" pattern. |
@@ -16,12 +16,12 @@ This page explains what the policy says and how to change it.
 | **Disallow force pushes** | `true` | No history rewrites on `main`. |
 | **Disallow branch deletions** | `true` | `main` cannot be deleted. |
 | **Required conversation resolution** | `true` | All review comment threads must be resolved before merge. |
-| **Enforce on admins** | `true` | Even repo admins go through the gates. The point is no bypasses. |
+| **Enforce on admins** | `false` | Admins can override the gates (`enforce_admins: false` in the JSON). This is the intended escape hatch for the 2-person team; tightening to `true` is tracked under hardening below. |
 | **Required signed commits** | not yet | Not enabled. Would lock out maintainers until everyone enrolls GPG/SSH commit signing. Tracked as a follow-up. |
 
 ## How to apply
 
-Run from the repo root:
+Run from the repository root:
 
 ```bash
 ./scripts/apply-branch-protection.sh
@@ -29,7 +29,7 @@ Run from the repo root:
 
 The script reads `.github/branch-protection.json`, strips the human-readable `_comment` field (the GitHub API rejects unknown keys), and PUTs to `repos/ModernRelay/omnigraph/branches/main/protection`.
 
-Requires `gh` authenticated with a token that has admin permissions on the repo.
+Requires `gh` authenticated with a token that has admin permissions on the repository.
 
 To preview without applying:
 
@@ -57,7 +57,7 @@ Outputs the live policy. Compare against `.github/branch-protection.json` to det
 
 - **Audit trail**: `git log .github/branch-protection.json` shows every change with a reviewable diff and a merge commit.
 - **Disaster recovery**: if branch protection is accidentally removed or weakened via the UI, the JSON is the canonical recovery point.
-- **Consistency**: pairs with `.github/codeowners-roles.yml` (the CODEOWNERS source of truth). Repo policy lives in the repo.
+- **Consistency**: pairs with `.github/codeowners-roles.yml` (the CODEOWNERS source of truth). Repository policy lives in the repository.
 
 ## What this gates
 
@@ -69,7 +69,7 @@ After branch protection is applied, every PR targeting `main` must:
 4. Have all review conversations resolved.
 5. Be squash- or rebase-merged (no merge commits).
 
-Even repo admins are subject to these rules.
+Even repository admins are subject to these rules.
 
 ## Subsequent hardening (not in this PR)
 

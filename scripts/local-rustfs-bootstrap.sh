@@ -6,7 +6,14 @@ SOURCE_REF="${SOURCE_REF:-main}"
 RELEASE_CHANNEL="${RELEASE_CHANNEL:-edge}"
 WORKDIR="${WORKDIR:-$PWD/.omnigraph-rustfs-demo}"
 RUSTFS_CONTAINER_NAME="${RUSTFS_CONTAINER_NAME:-omnigraph-rustfs-demo}"
-RUSTFS_IMAGE="${RUSTFS_IMAGE:-rustfs/rustfs:latest}"
+# Pinned to 1.0.0-beta.3 (2026-05-14) — the last known-good tag, matching CI
+# (.github/workflows/ci.yml). `rustfs/rustfs:latest` (1.0.0-beta.4, 2026-05-21)
+# added a credentials-policy check that refuses to start when the access/secret
+# keys are values it considers "default" (rustfsadmin/rustfsadmin here). This
+# script still works on beta.4+ because it passes
+# RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS=true below — so overriding
+# RUSTFS_IMAGE to a newer tag is safe.
+RUSTFS_IMAGE="${RUSTFS_IMAGE:-rustfs/rustfs:1.0.0-beta.3}"
 RUSTFS_DATA_DIR="${RUSTFS_DATA_DIR:-$WORKDIR/rustfs-data}"
 BUCKET="${BUCKET:-omnigraph-local}"
 PREFIX="${PREFIX:-repos/context}"
@@ -73,9 +80,6 @@ platform_asset_name() {
   case "$os/$arch" in
     Linux/x86_64)
       printf 'omnigraph-linux-x86_64.tar.gz\n'
-      ;;
-    Darwin/x86_64)
-      printf 'omnigraph-macos-x86_64.tar.gz\n'
       ;;
     Darwin/arm64)
       printf 'omnigraph-macos-arm64.tar.gz\n'
@@ -268,6 +272,7 @@ start_rustfs() {
     -v "$RUSTFS_DATA_DIR:/data" \
     -e RUSTFS_ACCESS_KEY="$AWS_ACCESS_KEY_ID" \
     -e RUSTFS_SECRET_KEY="$AWS_SECRET_ACCESS_KEY" \
+    -e RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS=true \
     "$RUSTFS_IMAGE" \
     /data >/dev/null
 }
@@ -291,7 +296,7 @@ ensure_bucket() {
     s3api create-bucket --bucket "$BUCKET" >/dev/null 2>&1 || true
 }
 
-repo_prefix_has_objects() {
+graph_prefix_has_objects() {
   local key_count
   key_count="$("$AWS_BIN" --endpoint-url "$AWS_ENDPOINT_URL_S3" \
     s3api list-objects-v2 \
@@ -304,27 +309,27 @@ repo_prefix_has_objects() {
   [ -n "$key_count" ] && [ "$key_count" != "None" ] && [ "$key_count" != "0" ]
 }
 
-reset_repo_prefix() {
+reset_graph_prefix() {
   log "Removing existing objects under $REPO_URI"
   "$AWS_BIN" --endpoint-url "$AWS_ENDPOINT_URL_S3" \
     s3 rm "s3://$BUCKET/$PREFIX" --recursive >/dev/null
 }
 
-initialize_repo() {
+initialize_graph() {
   if "$BIN_DIR/omnigraph" snapshot "$REPO_URI" --json >/dev/null 2>&1; then
-    log "Reusing existing repo at $REPO_URI"
+    log "Reusing existing graph at $REPO_URI"
     return
   fi
 
-  if repo_prefix_has_objects; then
+  if graph_prefix_has_objects; then
     if [ "$RESET_REPO" = "1" ]; then
-      reset_repo_prefix
+      reset_graph_prefix
     else
-      die "found existing objects under $REPO_URI but could not open an Omnigraph repo there. This usually means a previous bootstrap left a partially initialized prefix. Rerun with RESET_REPO=1 to delete that prefix and recreate it, or set PREFIX to a new value."
+      die "found existing objects under $REPO_URI but could not open an Omnigraph graph there. This usually means a previous bootstrap left a partially initialized prefix. Rerun with RESET_REPO=1 to delete that prefix and recreate it, or set PREFIX to a new value."
     fi
   fi
 
-  log "Initializing repo at $REPO_URI"
+  log "Initializing graph at $REPO_URI"
   "$BIN_DIR/omnigraph" init --schema "$FIXTURE_DIR/context.pg" "$REPO_URI"
 
   log "Loading context fixture into $REPO_URI"
@@ -377,7 +382,7 @@ Omnigraph local RustFS demo is up.
 Server:
   $base_url
 
-Repo URI:
+Graph URI:
   $REPO_URI
 
 RustFS console:
@@ -414,7 +419,7 @@ main() {
   start_rustfs
   wait_for_rustfs
   ensure_bucket
-  initialize_repo
+  initialize_graph
   start_server
   print_summary "$(wait_for_server)"
 }

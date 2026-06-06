@@ -38,7 +38,7 @@ Use it this way:
    publishes one manifest update. Do not commit per statement. Delete-only
    queries are the documented inline residual; the parse-time D2 rule prevents
    mixing deletes with insert/update until Lance exposes two-phase delete.
-   Read [runs.md](runs.md) and [execution.md](execution.md).
+   Read [writes.md](writes.md) and [execution.md](execution.md).
 
 5. **Recovery is part of the commit protocol.** Writers that can advance Lance
    HEAD before manifest publish must write `__recovery/{ulid}.json` sidecars.
@@ -56,7 +56,7 @@ Use it this way:
    branch they read even when index coverage is partial. Expensive index work
    should converge from manifest state instead of extending the critical write
    path. Scalar staged index builds and vector inline residuals are documented
-   in [runs.md](runs.md) and [indexes.md](../user/indexes.md).
+   in [writes.md](writes.md) and [indexes.md](../user/indexes.md).
 
 8. **Schema identity survives renames.** Accepted schema identity must remain
    stable across type and property renames. Rename support belongs in migration
@@ -96,16 +96,24 @@ Use it this way:
 
 | Area | Current state | Source |
 |---|---|---|
-| Multi-table commit | Manifest CAS plus recovery sidecars; not a single Lance primitive | [runs.md](runs.md), [architecture.md](architecture.md) |
-| Constructive mutations | In-memory `MutationStaging`, one end-of-query table commit per touched table, then one manifest publish | [runs.md](runs.md), [execution.md](execution.md) |
-| Deletes | Inline-commit residual; delete-only queries allowed, mixed insert/update/delete rejected by D2 | [query-language.md](../user/query-language.md), [runs.md](runs.md) |
+| Multi-table commit | Manifest CAS plus recovery sidecars; not a single Lance primitive | [writes.md](writes.md), [architecture.md](architecture.md) |
+| Constructive mutations | In-memory `MutationStaging`, one end-of-query table commit per touched table, then one manifest publish | [writes.md](writes.md), [execution.md](execution.md) |
+| Deletes | Inline-commit residual; delete-only queries allowed, mixed insert/update/delete rejected by D2 | [query-language.md](../user/query-language.md), [writes.md](writes.md) |
+| Branch delete | Manifest is the single authority, flipped atomically first; per-table forks + commit-graph branch are derived state, reclaimed best-effort (`force_delete_branch`) with the `cleanup` reconciler as the guaranteed backstop. Reusing a name whose reclaim failed before `cleanup` surfaces an actionable error | [branches-commits.md](../user/branches-commits.md), [maintenance.md](../user/maintenance.md) |
 | Schema validation | Type checks, required fields, defaults, edge endpoint checks, and edge cardinality are enforced on write paths | [schema-language.md](../user/schema-language.md), [execution.md](execution.md) |
 | Unique constraints | Intra-batch and write-path checks exist; full cross-version uniqueness is still a gap | [schema-language.md](../user/schema-language.md) |
-| Storage trait | `TableStorage` exists as the sealed staged-write surface; full call-site migration and capability/stat surfaces are incomplete | [runs.md](runs.md), [architecture.md](architecture.md) |
+| Storage trait | `TableStorage` exists as the sealed staged-write surface; full call-site migration and capability/stat surfaces are incomplete | [writes.md](writes.md), [architecture.md](architecture.md) |
 | Index lifecycle | `ensure_indices` is explicit today; reconciler-based convergence is roadmap | [indexes.md](../user/indexes.md), [maintenance.md](../user/maintenance.md) |
 | Traversal IDs | Runtime still builds `TypeIndex`; Lance stable row-id based graph IDs are roadmap | [architecture.md](architecture.md), [query-language.md](../user/query-language.md) |
 | Auth | Bearer token hashing and server-side actor resolution are implemented at the HTTP boundary | [server.md](../user/server.md), [policy.md](../user/policy.md) |
 | Tests | Tempdir-backed Lance tests are the current substrate; there is no `MemStorage` test backend | [testing.md](testing.md) |
+
+The branch-delete reconciler is authority-derived: it reclaims orphaned forks
+today and degrades to a no-op if Lance ships an atomic multi-dataset branch
+operation, so the design composes with that future rather than blocking it. This
+is the same shape as invariant 7 (indexes are derived state); prefer it over a
+recovery-sidecar-style approach for any new multi-dataset metadata operation,
+since the sidecar would be scaffolding to remove once the substrate closes the gap.
 
 ## Known Gaps
 
@@ -122,6 +130,15 @@ them explicit.
 - **Deletes and vector indexes:** `delete_where` and vector index creation still
   advance Lance HEAD inline because the required public Lance APIs are missing.
   Keep D2 and recovery coverage in place until those residuals are removed.
+- **Blob-column compaction:** Lance `compact_files` mis-decodes blob-v2 columns
+  under its forced `BlobHandling::AllBinary` read ("more fields in the schema
+  than provided column indices"), so `optimize` skips any table with a `Blob`
+  property — reporting `SkipReason::BlobColumnsUnsupportedByLance` (loud, not a
+  silent drop) behind the `LANCE_SUPPORTS_BLOB_COMPACTION` gate. Reads and writes
+  are unaffected; only space/fragment reclamation on blob tables is deferred.
+  Remove the skip when the upstream Lance fix lands — the
+  `lance_surface_guards.rs::compact_files_still_fails_on_blob_columns` guard
+  turns red on that bump to force it.
 - **Planner capability/stat surfaces:** cost-aware planning, complete
   capability advertisement, and explain-with-cost are roadmap. Do not describe
   them as implemented.

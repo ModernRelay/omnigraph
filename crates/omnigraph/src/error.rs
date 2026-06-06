@@ -92,6 +92,14 @@ pub enum OmniError {
     /// callers can match on this variant directly.
     #[error("policy: {0}")]
     Policy(String),
+    /// `Omnigraph::init` was called against a URI that already holds
+    /// schema artifacts from a previous init. Strict mode (the default)
+    /// fails fast with this error before touching disk so an existing
+    /// graph's metadata cannot be overwritten or destroyed. Operators
+    /// who actually want to overwrite pass `InitOptions { force: true }`
+    /// (CLI: `omnigraph init --force`).
+    #[error("graph already initialized at '{uri}'; pass --force to overwrite")]
+    AlreadyInitialized { uri: String },
 }
 
 impl OmniError {

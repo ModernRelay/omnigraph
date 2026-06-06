@@ -8,7 +8,7 @@ use omnigraph_server::{ServerConfig, init_tracing, load_server_settings, serve};
 #[command(name = "omnigraph-server")]
 #[command(about = "HTTP server for the Omnigraph graph database")]
 struct Cli {
-    /// Repo URI
+    /// Graph URI
     uri: Option<String>,
     #[arg(long)]
     target: Option<String>,

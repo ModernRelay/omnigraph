@@ -5,33 +5,35 @@
 [![Crates.io](https://img.shields.io/crates/v/omnigraph-cli.svg)](https://crates.io/crates/omnigraph-cli)
 [![CI](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml/badge.svg)](https://github.com/ModernRelay/omnigraph/actions/workflows/ci.yml)
 
-**Object-storage native graph engine with git-style workflows. Designed for agents as first-class operators.**
+**Lakehouse native graph engine built for context assembly**
 
-Branch, commit, and merge typed graph data like source code. Multi-modal, self-hosted, open source.
+Omnigraph acts as operational state & coordination layer for agents
 
-Built on Rust, Arrow, DataFusion and Lance.
-
-Join the [Omnigraph Slack community](https://join.slack.com/t/omnigraphworkspace/shared_invite/zt-3wfpglyxj-lHvJGhuySPfqLtN35uJZNw)
-
-## Use Cases
-
-- Company brains / [Second brains](https://github.com/ModernRelay/omnigraph-cookbooks/tree/main/second-brain)
-- Context graphs
-- Backbone for multi-agent research
-- Incident response graphs
-- Compliance & audit graphs
-- Enterprise knowledge systems
-
-## Capabilities
-
-- Typed schema, typed queries, and typed mutations
+- Git-style versioning & branching
+- Multimodal retrieval (graph+vector/fts+filters) optimized for context assembly
+- Object storage native (S3, RustFS)
 - Native blob-as-data support (docs, images, videos, etc)
-- Schema-as-code, query validation and linting
-- Git-style graph workflows: branches, commits, merges, and transactional runs
-- Local, on-prem & cloud S3-native storage with snapshot-pinned reads
-- Graph traversal + text, fuzzy, BM25, vector, and RRF search in one runtime
-- Policy-as-code for server-side access control
-- Single CLI for multiple deployments
+- VPC, On-prem, hybrid deployment
+- [`Lance`](https://github.com/lance-format/lance) format as open storage layer
+
+| AS CODE | What it means |
+|---|---|
+| **Schema AS CODE** | Typed `.pg` schemas, planned, applied, enforced |
+| **Context AS CODE** | Linted queries & agentic nudges, versioned and reusable |
+| **Security AS CODE** | Cedar policies enforced server-side on every mutation |
+| **Dashboards AS CODE** | Declarative views & controls over the graph *(coming)* |
+
+## Core Use Cases
+
+| Use case | What it's for
+|---|---|
+| **Company brain** | Org knowledge unified into one queryable graph | 
+| **Context graph** | Decision traces and codified tribal knowledge |
+| **Agentic memory** | Durable, versioned memory for long-running agents |
+| **Dev graph** | Issues & dependency model for coding agents |
+| **R&D data layer** | Experiments & trials data written into branches |
+| **ML workflows** | Versioned, branchable graphs for training & eval |
+| **Karpathy's LLM wiki** | A living, agent-updatable knowledge base |
 
 ## Quick Install
 
@@ -60,7 +62,7 @@ curl -fsSL https://raw.githubusercontent.com/ModernRelay/omnigraph/main/scripts/
 That bootstrap:
 
 - starts RustFS on `127.0.0.1:9000`
-- creates a bucket and S3-backed repo
+- creates a bucket and S3-backed graph
 - loads the checked-in context fixture
 - launches `omnigraph-server` on `127.0.0.1:8080`
 
@@ -69,8 +71,8 @@ Docker must be installed and running first.
 The RustFS bootstrap prefers the rolling `edge` binaries and only falls back to
 source builds when release assets are unavailable.
 
-If a previous run left objects under the same repo prefix but did not finish
-initializing the repo, rerun with `RESET_REPO=1` or set `PREFIX` to a new
+If a previous run left objects under the same graph prefix but did not finish
+initializing the graph, rerun with `RESET_REPO=1` or set `PREFIX` to a new
 value.
 
 ## Common Commands
@@ -78,20 +80,37 @@ value.
 The same URI works for local paths, `s3://…`, or `http://host:port`.
 
 ```bash
-omnigraph init   --schema ./schema.pg ./repo.omni
-omnigraph load   --data   ./data.jsonl ./repo.omni
-omnigraph read   --query  ./queries.gq --name get_person --params '{"name":"Alice"}' ./repo.omni
-omnigraph change --query  ./queries.gq --name insert_person --params '{"name":"Mina"}' ./repo.omni
-omnigraph branch create --from main feature-x ./repo.omni
-omnigraph branch merge  feature-x --into main ./repo.omni
+omnigraph init   --schema ./schema.pg ./graph.omni
+omnigraph load   --data   ./data.jsonl ./graph.omni
+omnigraph read   --query  ./queries.gq --name get_person --params '{"name":"Alice"}' ./graph.omni
+omnigraph change --query  ./queries.gq --name insert_person --params '{"name":"Mina"}' ./graph.omni
+omnigraph branch create --from main feature-x ./graph.omni
+omnigraph branch merge  feature-x --into main ./graph.omni
 ```
 
-See [docs/user/cli.md](docs/user/cli.md) for schema apply, snapshots, ingest, runs, and policy commands.
+See [docs/user/cli.md](docs/user/cli.md) for schema apply, snapshots, ingest, commits, and policy commands.
+
+## Clients
+
+For programmatic access to a running `omnigraph-server`:
+
+- **TypeScript SDK** — [`@modernrelay/omnigraph`](https://www.npmjs.com/package/@modernrelay/omnigraph) ([source](https://github.com/ModernRelay/omnigraph-ts/tree/main/packages/sdk)). Instance-per-client, typed errors, camelCase types, async-iterator streaming export.
+
+  ```bash
+  npm install @modernrelay/omnigraph
+  ```
+
+- **Model Context Protocol server** — [`@modernrelay/omnigraph-mcp`](https://www.npmjs.com/package/@modernrelay/omnigraph-mcp) ([source](https://github.com/ModernRelay/omnigraph-ts/tree/main/packages/mcp)). Bridges Omnigraph to LLM hosts (Claude Desktop, Claude Code, …) over stdio. Exposes tools and resources for schema, branches, queries, mutations, ingest, and bundles curated best-practices guidance from the cookbook.
+
+  ```bash
+  npm install -g @modernrelay/omnigraph-mcp
+  ```
+
+Both packages are versioned in lockstep with `omnigraph-server` on major.minor: `@modernrelay/omnigraph@X.Y.*` targets `omnigraph-server@X.Y.*`. See [`ModernRelay/omnigraph-ts`](https://github.com/ModernRelay/omnigraph-ts) for the monorepo.
 
 ## Docs
 
 - [Install guide](docs/user/install.md)
-- [CLI guide](docs/user/cli.md)
 - [Deployment guide](docs/user/deployment.md)
 
 ## Build And Test
@@ -113,8 +132,8 @@ Notes:
 
 - `crates/omnigraph-compiler`: shared schema/query parser, typechecker, catalog, and IR lowering
 - `crates/omnigraph`: storage/runtime, branching, merge, change detection, and query execution
-- `crates/omnigraph-cli`: CLI for init/load/ingest/read/change/branch/snapshot/export/policy operations
-- `crates/omnigraph-server`: Axum HTTP server for remote reads, changes, ingest, export, branches, commits, and runs
+- `crates/omnigraph-cli`: CLI for graph lifecycle (init/load/ingest), query/mutate, branch/commit/merge, schema/lint, snapshot/export, policy, and maintenance (optimize/cleanup)
+- `crates/omnigraph-server`: Axum HTTP server for remote reads, changes, ingest, export, branches, and commits
 
 ## Contributing
 

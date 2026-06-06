@@ -18,11 +18,11 @@ of MRs, internal recovery mechanics, or contributor-only invariants.
 | Write queries and mutations | [query-language.md](query-language.md) |
 | Use embeddings | [embeddings.md](embeddings.md) |
 
-## Operate A Repo
+## Operate A Graph
 
 | Goal | Read |
 |---|---|
-| Understand repo layout and URI support | [storage.md](storage.md) |
+| Understand graph layout and URI support | [storage.md](storage.md) |
 | Work with branches, commits, and snapshots | [branches-commits.md](branches-commits.md) |
 | Coordinate multi-query workflows | [transactions.md](transactions.md) |
 | Read diffs and change feeds | [changes.md](changes.md) |

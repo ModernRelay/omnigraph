@@ -49,7 +49,7 @@ pub struct DeleteState {
 /// `exec/mutation.rs`) and the bulk loader (`loader/mod.rs`). The
 /// intent: defer Lance commits to end-of-query so a mid-query failure
 /// leaves the touched table at the pre-mutation HEAD instead of
-/// drifting ahead. See `docs/runs.md` for the publisher-CAS contract
+/// drifting ahead. See `docs/dev/writes.md` for the publisher-CAS contract
 /// this builds on.
 ///
 /// `transaction` is opaque from our side — Lance owns its semantics. We
@@ -177,6 +177,45 @@ impl TableStore {
             .map_err(|e| OmniError::Lance(e.to_string()))
     }
 
+    /// List the named Lance branches present on the dataset at `dataset_uri`.
+    /// The `cleanup` orphan reconciler diffs this against the manifest branch
+    /// set to find orphaned per-table forks. `main`/default is not a named
+    /// branch and never appears here.
+    pub async fn list_branches(&self, dataset_uri: &str) -> Result<Vec<String>> {
+        let ds = Dataset::open(dataset_uri)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let branches = ds
+            .list_branches()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        Ok(branches.into_keys().collect())
+    }
+
+    /// Idempotently drop `branch` from the dataset at `dataset_uri`.
+    ///
+    /// Unlike [`delete_branch`](Self::delete_branch), this tolerates an
+    /// already-absent branch — both a missing contents ref (Lance's
+    /// `force_delete_branch` handles that) and a missing `tree/{branch}/`
+    /// directory (the local-store `NotFound` quirk pinned by
+    /// `lance_surface_guards::force_delete_branch_semantics`). Safe to call on a
+    /// possibly-orphaned or already-reclaimed fork.
+    ///
+    /// A branch that still has referencing descendants (`RefConflict`) is NOT
+    /// tolerated: that is a real ordering error and surfaces as `OmniError::Lance`.
+    /// Used by the eager best-effort reclaim in `cleanup_deleted_branch_tables`
+    /// and the `cleanup` orphan reconciler.
+    pub async fn force_delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()> {
+        let mut ds = Dataset::open(dataset_uri)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        match ds.force_delete_branch(branch).await {
+            Ok(()) => Ok(()),
+            Err(lance::Error::RefNotFound { .. }) | Err(lance::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(OmniError::Lance(e.to_string())),
+        }
+    }
+
     pub async fn open_dataset_at_state(
         &self,
         table_path: &str,
@@ -243,21 +282,24 @@ impl TableStore {
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         self.ensure_expected_version(&source_ds, table_key, source_version)?;
 
-        match source_ds
+        if source_ds
             .create_branch(target_branch, source_version, None)
             .await
+            .is_err()
         {
-            Ok(_) => {}
-            Err(create_err) => match self
-                .open_dataset_head(dataset_uri, Some(target_branch))
-                .await
-            {
-                Ok(ds) => {
-                    self.ensure_expected_version(&ds, table_key, source_version)?;
-                    return Ok(ds);
-                }
-                Err(_) => return Err(OmniError::Lance(create_err.to_string())),
-            },
+            // The target branch ref already exists. The caller
+            // (`open_owned_dataset_for_branch_write`) re-reads the live manifest
+            // before forking and returns a retryable error when a concurrent
+            // writer legitimately holds the fork, so reaching here means the
+            // manifest does NOT reference this fork: it is an orphan from an
+            // incomplete prior `branch_delete`. Surface the actionable cleanup
+            // error rather than guessing from Lance branch versions.
+            return Err(OmniError::manifest_conflict(format!(
+                "branch '{}' has orphaned table state for '{}' from an incomplete \
+                 prior delete; run `omnigraph cleanup` to reclaim it before reusing \
+                 this branch name",
+                target_branch, table_key
+            )));
         }
 
         let ds = self
@@ -901,7 +943,7 @@ impl TableStore {
     /// Lift path: either a Lance API extension that lets
     /// `MergeInsertBuilder` accept additional staged fragments, or an
     /// in-memory pre-merge here that folds prior staged batches into the
-    /// input stream. See `docs/runs.md`.
+    /// input stream. See `docs/dev/writes.md`.
     pub async fn stage_merge_insert(
         &self,
         ds: Dataset,
@@ -1793,25 +1835,24 @@ mod tests {
     #[test]
     fn check_batch_unique_by_keys_errors_on_duplicate_id() {
         let batch = batch_with_ids(&["a", "b", "a"]);
-        let err =
-            check_batch_unique_by_keys(&batch, &["id".to_string()], "test").unwrap_err();
+        let err = check_batch_unique_by_keys(&batch, &["id".to_string()], "test").unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("duplicate source row for key 'a'"),
             "unexpected error: {msg}"
         );
-        assert!(msg.contains("MR-957"), "error should reference MR-957: {msg}");
+        assert!(
+            msg.contains("MR-957"),
+            "error should reference MR-957: {msg}"
+        );
     }
 
     #[test]
     fn check_batch_unique_by_keys_rejects_multi_column_keys() {
         let batch = batch_with_ids(&["a"]);
-        let err = check_batch_unique_by_keys(
-            &batch,
-            &["id".to_string(), "other".to_string()],
-            "test",
-        )
-        .unwrap_err();
+        let err =
+            check_batch_unique_by_keys(&batch, &["id".to_string(), "other".to_string()], "test")
+                .unwrap_err();
         assert!(err.to_string().contains("single-column keys only"));
     }
 }

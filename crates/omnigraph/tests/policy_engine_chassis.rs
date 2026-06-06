@@ -23,8 +23,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use omnigraph::db::{Omnigraph, ReadTarget, SchemaApplyOptions};
-use omnigraph::loader::LoadMode;
 use omnigraph::error::OmniError;
+use omnigraph::loader::LoadMode;
 use omnigraph_policy::{PolicyChecker, PolicyEngine};
 
 use helpers::*;
@@ -58,13 +58,16 @@ rules:
 "#;
 
 fn additive_schema() -> String {
-    helpers::TEST_SCHEMA.replace("    age: I32?\n}", "    age: I32?\n    nickname: String?\n}")
+    helpers::TEST_SCHEMA.replace(
+        "    age: I32?\n}",
+        "    age: I32?\n    nickname: String?\n}",
+    )
 }
 
 fn install_policy(db: Omnigraph, dir_path: &Path) -> (Omnigraph, Arc<PolicyEngine>) {
     let policy_path = dir_path.join("policy.yaml");
     fs::write(&policy_path, POLICY_YAML).unwrap();
-    let engine = PolicyEngine::load(&policy_path, dir_path.to_str().unwrap()).unwrap();
+    let engine = PolicyEngine::load_graph(&policy_path, dir_path.to_str().unwrap()).unwrap();
     let engine = Arc::new(engine);
     let db = db.with_policy(Arc::clone(&engine) as Arc<dyn PolicyChecker>);
     (db, engine)
@@ -238,7 +241,12 @@ async fn load_as_denies_when_policy_rejects_actor() {
     let (db, _engine) = init_with_policy(&dir).await;
 
     let result = db
-        .load_as("main", ONE_PERSON_JSONL, LoadMode::Merge, Some("act-denied"))
+        .load_as(
+            "main",
+            ONE_PERSON_JSONL,
+            LoadMode::Merge,
+            Some("act-denied"),
+        )
         .await;
     assert_denied(result, "load_as");
 }

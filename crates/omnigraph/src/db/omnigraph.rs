@@ -33,7 +33,7 @@ mod optimize;
 mod schema_apply;
 mod table_ops;
 
-pub use optimize::{CleanupPolicyOptions, TableCleanupStats, TableOptimizeStats};
+pub use optimize::{CleanupPolicyOptions, SkipReason, TableCleanupStats, TableOptimizeStats};
 pub use schema_apply::SchemaApplyOptions;
 
 use super::commit_graph::GraphCommit;
@@ -65,6 +65,12 @@ pub struct SchemaApplyResult {
     pub applied: bool,
     pub manifest_version: u64,
     pub steps: Vec<SchemaMigrationStep>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SchemaApplyPreview {
+    pub plan: SchemaMigrationPlan,
+    pub catalog: Catalog,
 }
 
 /// Top-level handle to an Omnigraph database.
@@ -165,31 +171,137 @@ pub enum OpenMode {
     ReadOnly,
 }
 
+/// Options for [`Omnigraph::init_with_options`].
+///
+/// `force` controls the safety preflight that prevents an
+/// accidental re-init from overwriting an existing graph's schema
+/// metadata. Default behavior (`force: false`) fails fast with
+/// [`OmniError::AlreadyInitialized`] if any of `_schema.pg`,
+/// `_schema.ir.json`, or `__schema_state.json` already exists at
+/// the target URI. With `force: true` the preflight is skipped —
+/// existing schema files are overwritten in place. Force does NOT
+/// purge old Lance datasets or `__manifest/`; reclaiming those
+/// still requires deleting the graph directory by hand (or via a
+/// future `DELETE /graphs/{id}`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InitOptions {
+    /// Skip the existing-graph preflight. Operators set this when
+    /// they actually mean to overwrite — e.g. `omnigraph init --force`.
+    pub force: bool,
+}
+
 impl Omnigraph {
-    /// Create a new repo at `uri` from schema source.
+    /// Create a new graph at `uri` from schema source.
     ///
-    /// Creates `_schema.pg`, per-type Lance datasets, and `__manifest`.
+    /// Strict mode: errors with [`OmniError::AlreadyInitialized`] if
+    /// `uri` already holds any of the three schema artifacts. To
+    /// overwrite an existing graph deliberately, call
+    /// [`Self::init_with_options`] with `InitOptions { force: true }`.
     pub async fn init(uri: &str, schema_source: &str) -> Result<Self> {
-        Self::init_with_storage(uri, schema_source, storage_for_uri(uri)?).await
+        Self::init_with_options(uri, schema_source, InitOptions::default()).await
+    }
+
+    /// Create a new graph at `uri`, with explicit init-time options.
+    ///
+    /// See [`InitOptions`] for the safety contract — by default this
+    /// behaves identically to [`Self::init`].
+    pub async fn init_with_options(
+        uri: &str,
+        schema_source: &str,
+        options: InitOptions,
+    ) -> Result<Self> {
+        Self::init_with_storage(uri, schema_source, storage_for_uri(uri)?, options).await
     }
 
     pub(crate) async fn init_with_storage(
         uri: &str,
         schema_source: &str,
         storage: Arc<dyn StorageAdapter>,
+        options: InitOptions,
     ) -> Result<Self> {
         let root = normalize_root_uri(uri)?;
+
+        // Preflight: refuse to clobber an existing graph unless the
+        // operator passed `force`. This runs BEFORE any parse or
+        // write so a misdirected `init` against an existing graph
+        // URI cannot reach a code path that overwrites or, on a
+        // later cleanup, deletes the schema files.
+        //
+        // Closes the "init is destructive against existing state"
+        // class: there is no longer a code path where strict-mode
+        // `init` can mutate a populated graph root.
+        if !options.force {
+            for candidate in [
+                schema_source_uri(&root),
+                schema_ir_uri(&root),
+                schema_state_uri(&root),
+            ] {
+                if storage.exists(&candidate).await? {
+                    return Err(OmniError::AlreadyInitialized { uri: root.clone() });
+                }
+            }
+        }
+
         let schema_ir = read_schema_ir_from_source(schema_source)?;
         let mut catalog = build_catalog_from_ir(&schema_ir)?;
         fixup_blob_schemas(&mut catalog);
 
-        // Write _schema.pg
-        let schema_path = join_uri(&root, SCHEMA_SOURCE_FILENAME);
-        storage.write_text(&schema_path, schema_source).await?;
-        write_schema_contract(&root, storage.as_ref(), &schema_ir).await?;
+        // Establish an atomic ownership claim on `_schema.pg` before
+        // writing the remaining init artifacts. A check-then-write preflight
+        // is not enough under concurrent `init` calls: two callers can both
+        // observe an empty root, one can successfully initialize, and the
+        // loser can then fail in Lance `WriteMode::Create`. Only the caller
+        // that atomically created `_schema.pg` may clean up schema artifacts
+        // on later failure.
+        let schema_pg_claimed = if options.force {
+            false
+        } else {
+            let schema_path = join_uri(&root, SCHEMA_SOURCE_FILENAME);
+            if !storage
+                .write_text_if_absent(&schema_path, schema_source)
+                .await?
+            {
+                return Err(OmniError::AlreadyInitialized { uri: root.clone() });
+            }
+            if let Err(err) = crate::failpoints::maybe_fail("init.after_schema_pg_written") {
+                best_effort_cleanup_init_artifacts(&root, storage.as_ref()).await;
+                return Err(err);
+            }
+            true
+        };
 
-        // Create manifest + per-type datasets
-        let coordinator = GraphCoordinator::init(&root, &catalog, Arc::clone(&storage)).await?;
+        // Run the I/O phase. On any error, best-effort-clean schema
+        // artifacts only when this invocation owns them: strict mode owns
+        // them after the atomic `_schema.pg` claim above; force mode owns
+        // destructive overwrite semantics by explicit operator request.
+        //
+        // Coverage gap: Lance per-type datasets and `__manifest/`
+        // directory created by `GraphCoordinator::init` are NOT cleaned
+        // up here — fully recursive directory deletion requires a
+        // `StorageAdapter::delete_prefix` primitive that's deferred
+        // along with `DELETE /graphs/{id}` (PR 2b in the MR-668 plan
+        // is currently deferred). If `init` fails after coordinator
+        // init succeeds, operators may need to remove the graph
+        // directory manually before retrying `init` on the same URI.
+        // Documented in the PR 2a commit message and `init` rustdoc.
+        let coordinator = match init_storage_phase(
+            &root,
+            schema_source,
+            &schema_ir,
+            &catalog,
+            &storage,
+            !schema_pg_claimed,
+        )
+        .await
+        {
+            Ok(coordinator) => coordinator,
+            Err(err) => {
+                if schema_pg_claimed || options.force {
+                    best_effort_cleanup_init_artifacts(&root, storage.as_ref()).await;
+                }
+                return Err(err);
+            }
+        };
 
         Ok(Self {
             root_uri: root.clone(),
@@ -205,7 +317,7 @@ impl Omnigraph {
         })
     }
 
-    /// Open an existing repo (read-write).
+    /// Open an existing graph (read-write).
     ///
     /// Reads `_schema.pg`, parses it, builds the catalog, and opens `__manifest`.
     /// Runs the open-time recovery sweep before returning — see [`OpenMode`].
@@ -213,7 +325,7 @@ impl Omnigraph {
         Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadWrite).await
     }
 
-    /// Open an existing repo for read-only consumers (NDJSON export,
+    /// Open an existing graph for read-only consumers (NDJSON export,
     /// `commit list`, etc.). Skips the recovery sweep — see [`OpenMode`].
     pub async fn open_read_only(uri: &str) -> Result<Self> {
         Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadOnly).await
@@ -387,6 +499,14 @@ impl Omnigraph {
         schema_apply::plan_schema(self, desired_schema_source, options).await
     }
 
+    pub async fn preview_schema_apply_with_options(
+        &self,
+        desired_schema_source: &str,
+        options: SchemaApplyOptions,
+    ) -> Result<SchemaApplyPreview> {
+        schema_apply::preview_schema_apply(self, desired_schema_source, options).await
+    }
+
     pub async fn apply_schema(&self, desired_schema_source: &str) -> Result<SchemaApplyResult> {
         self.apply_schema_as(desired_schema_source, SchemaApplyOptions::default(), None)
             .await
@@ -397,7 +517,8 @@ impl Omnigraph {
         desired_schema_source: &str,
         options: SchemaApplyOptions,
     ) -> Result<SchemaApplyResult> {
-        self.apply_schema_as(desired_schema_source, options, None).await
+        self.apply_schema_as(desired_schema_source, options, None)
+            .await
     }
 
     /// Apply a schema migration with an explicit actor for engine-layer
@@ -416,7 +537,28 @@ impl Omnigraph {
         options: SchemaApplyOptions,
         actor: Option<&str>,
     ) -> Result<SchemaApplyResult> {
-        schema_apply::apply_schema(self, desired_schema_source, options, actor).await
+        self.apply_schema_as_with_catalog_check(desired_schema_source, options, actor, |_| Ok(()))
+            .await
+    }
+
+    pub async fn apply_schema_as_with_catalog_check<F>(
+        &self,
+        desired_schema_source: &str,
+        options: SchemaApplyOptions,
+        actor: Option<&str>,
+        validate_catalog: F,
+    ) -> Result<SchemaApplyResult>
+    where
+        F: FnOnce(&Catalog) -> Result<()>,
+    {
+        schema_apply::apply_schema(
+            self,
+            desired_schema_source,
+            options,
+            actor,
+            validate_catalog,
+        )
+        .await
     }
 
     pub(crate) async fn ensure_schema_apply_idle(&self, operation: &str) -> Result<()> {
@@ -470,7 +612,7 @@ impl Omnigraph {
         Arc::clone(&self.merge_exclusive)
     }
 
-    /// Engine-level access to the repo's normalized root URI. Used by
+    /// Engine-level access to the graph's normalized root URI. Used by
     /// the recovery sidecar protocol to compute `__recovery/` paths.
     pub(crate) fn root_uri(&self) -> &str {
         &self.root_uri
@@ -510,9 +652,10 @@ impl Omnigraph {
         let normalized = normalize_branch_name(branch.unwrap_or("main"))?;
         let coord = self.coordinator.read().await;
         if normalized.as_deref() == coord.current_branch() {
-            let snapshot_id = coord.head_commit_id().await?.unwrap_or_else(|| {
-                SnapshotId::synthetic(coord.current_branch(), coord.version())
-            });
+            let snapshot_id = coord
+                .head_commit_id()
+                .await?
+                .unwrap_or_else(|| SnapshotId::synthetic(coord.current_branch(), coord.version()));
             return Ok(ResolvedTarget {
                 requested,
                 branch: coord.current_branch().map(str::to_string),
@@ -587,7 +730,7 @@ impl Omnigraph {
     ///    exist. Required BEFORE manifest-drift recovery so a
     ///    SchemaApply roll-forward doesn't publish the manifest while
     ///    the staging files remain unrenamed (which would corrupt the
-    ///    repo: data on new schema, catalog on old).
+    ///    graph: data on new schema, catalog on old).
     /// 3. `recover_manifest_drift(... RollForwardOnly)` — close the
     ///    finalize→publisher residual via roll-forward; defer rollback
     ///    work to next ReadWrite open.
@@ -668,7 +811,11 @@ impl Omnigraph {
 
     pub async fn resolve_snapshot(&self, branch: &str) -> Result<SnapshotId> {
         self.ensure_schema_state_valid().await?;
-        self.coordinator.read().await.resolve_snapshot_id(branch).await
+        self.coordinator
+            .read()
+            .await
+            .resolve_snapshot_id(branch)
+            .await
     }
 
     pub(crate) async fn resolved_target(
@@ -676,7 +823,11 @@ impl Omnigraph {
         target: impl Into<ReadTarget>,
     ) -> Result<ResolvedTarget> {
         self.ensure_schema_state_valid().await?;
-        self.coordinator.read().await.resolve_target(&target.into()).await
+        self.coordinator
+            .read()
+            .await
+            .resolve_target(&target.into())
+            .await
     }
 
     // ─── Change detection ────────────────────────────────────────────────
@@ -708,7 +859,9 @@ impl Omnigraph {
         filter: &crate::changes::ChangeFilter,
     ) -> Result<crate::changes::ChangeSet> {
         let coord = self.coordinator.read().await;
-        let from_commit = coord.resolve_commit(&SnapshotId::new(from_commit_id)).await?;
+        let from_commit = coord
+            .resolve_commit(&SnapshotId::new(from_commit_id))
+            .await?;
         let to_commit = coord.resolve_commit(&SnapshotId::new(to_commit_id)).await?;
         let from_snap = coord
             .resolve_target(&ReadTarget::Snapshot(SnapshotId::new(
@@ -753,7 +906,11 @@ impl Omnigraph {
     /// Create a Snapshot at any historical manifest version.
     pub async fn snapshot_at_version(&self, version: u64) -> Result<Snapshot> {
         self.ensure_schema_state_valid().await?;
-        self.coordinator.read().await.snapshot_at_version(version).await
+        self.coordinator
+            .read()
+            .await
+            .snapshot_at_version(version)
+            .await
     }
 
     pub async fn export_jsonl(
@@ -894,11 +1051,20 @@ impl Omnigraph {
     }
 
     pub(crate) async fn active_branch(&self) -> Option<String> {
-        self.coordinator.read().await.current_branch().map(str::to_string)
+        self.coordinator
+            .read()
+            .await
+            .current_branch()
+            .map(str::to_string)
     }
 
     async fn ensure_branch_delete_safe(&self, branch: &str, branches: &[String]) -> Result<()> {
-        let descendants = self.coordinator.read().await.branch_descendants(branch).await?;
+        let descendants = self
+            .coordinator
+            .read()
+            .await
+            .branch_descendants(branch)
+            .await?;
         if let Some(descendant) = descendants.first() {
             return Err(OmniError::manifest_conflict(format!(
                 "cannot delete branch '{}' because descendant branch '{}' still depends on it",
@@ -927,11 +1093,14 @@ impl Omnigraph {
         Ok(())
     }
 
-    async fn cleanup_deleted_branch_tables(
-        &self,
-        branch: &str,
-        owned_tables: &[(String, String)],
-    ) -> Result<()> {
+    /// Best-effort reclaim of the per-table Lance forks a just-deleted branch
+    /// owned. Runs AFTER the manifest authority flip, so the branch is already
+    /// gone and these forks are unreachable orphans. A failure here (transient
+    /// object-store error, the `branch_delete.before_table_cleanup` failpoint)
+    /// is logged and swallowed: the `cleanup` reconciler is the guaranteed
+    /// backstop that converges any leftover orphan. Uses `force_delete_branch`
+    /// so a partially-reclaimed retry is idempotent.
+    async fn cleanup_deleted_branch_tables(&self, branch: &str, owned_tables: &[(String, String)]) {
         let mut seen_paths = HashSet::new();
         let mut cleanup_targets = owned_tables
             .iter()
@@ -942,19 +1111,30 @@ impl Omnigraph {
 
         for (table_key, table_path) in cleanup_targets {
             let dataset_uri = self.table_store.dataset_uri(&table_path);
-            if let Err(err) = self.table_store.delete_branch(&dataset_uri, branch).await {
-                return Err(OmniError::manifest_internal(format!(
-                    "branch '{}' was deleted but cleanup failed for {}: {}",
-                    branch, table_key, err
-                )));
+            let outcome = match crate::failpoints::maybe_fail("branch_delete.before_table_cleanup")
+            {
+                Ok(()) => self.table_store.force_delete_branch(&dataset_uri, branch).await,
+                Err(injected) => Err(injected),
+            };
+            if let Err(err) = outcome {
+                tracing::warn!(
+                    target: "omnigraph::branch_delete::cleanup",
+                    branch = %branch,
+                    table = %table_key,
+                    error = %err,
+                    "best-effort fork reclaim failed; cleanup will reconcile the orphan",
+                );
             }
         }
-
-        Ok(())
     }
 
     async fn delete_branch_storage_only(&self, branch: &str) -> Result<()> {
-        let active = self.coordinator.read().await.current_branch().map(str::to_string);
+        let active = self
+            .coordinator
+            .read()
+            .await
+            .current_branch()
+            .map(str::to_string);
         if active.as_deref() == Some(branch) {
             return Err(OmniError::manifest_conflict(format!(
                 "cannot delete currently active branch '{}'",
@@ -969,9 +1149,12 @@ impl Omnigraph {
             .map(|entry| (entry.table_key.clone(), entry.table_path.clone()))
             .collect::<Vec<_>>();
 
+        // Authority flip (+ best-effort commit-graph reclaim) — must succeed.
         self.coordinator.write().await.branch_delete(branch).await?;
+        // Best-effort per-table fork reclaim; cleanup reconciles any leftover.
         self.cleanup_deleted_branch_tables(branch, &owned_tables)
-            .await
+            .await;
+        Ok(())
     }
 
     pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
@@ -1013,11 +1196,7 @@ impl Omnigraph {
         self.coordinator.write().await.branch_create(name).await
     }
 
-    pub async fn branch_create_from(
-        &self,
-        from: impl Into<ReadTarget>,
-        name: &str,
-    ) -> Result<()> {
+    pub async fn branch_create_from(&self, from: impl Into<ReadTarget>, name: &str) -> Result<()> {
         self.branch_create_from_as(from, name, None).await
     }
 
@@ -1134,7 +1313,9 @@ impl Omnigraph {
 
     pub async fn get_commit(&self, commit_id: &str) -> Result<GraphCommit> {
         self.ensure_schema_state_valid().await?;
-        self.coordinator.read().await
+        self.coordinator
+            .read()
+            .await
             .resolve_commit(&SnapshotId::new(commit_id))
             .await
     }
@@ -1449,6 +1630,71 @@ fn read_schema_ir_from_source(schema_source: &str) -> Result<SchemaIR> {
     build_schema_ir(&schema_ast).map_err(|err| OmniError::manifest(err.to_string()))
 }
 
+/// I/O phase of `Omnigraph::init_with_storage`. Split out so the caller
+/// can pattern-match on the result and run cleanup on error before
+/// returning the original error.
+///
+/// Failpoints fire at the phase boundaries:
+/// * `init.after_schema_pg_written` — `_schema.pg` is on disk. In strict mode
+///   this fires in the caller immediately after the atomic ownership claim; in
+///   force mode it fires here after the explicit overwrite.
+/// * `init.after_schema_contract_written` — `_schema.pg` + `_schema.ir.json`
+///   + `__schema_state.json` are on disk.
+/// * `init.after_coordinator_init` — all schema files plus Lance per-type
+///   datasets and `__manifest/` are on disk. (The cleanup wrapper can only
+///   remove the schema files; Lance directories need `delete_prefix` —
+///   deferred along with `DELETE /graphs/{id}`.)
+async fn init_storage_phase(
+    root: &str,
+    schema_source: &str,
+    schema_ir: &SchemaIR,
+    catalog: &Catalog,
+    storage: &Arc<dyn StorageAdapter>,
+    write_schema_pg: bool,
+) -> Result<GraphCoordinator> {
+    if write_schema_pg {
+        let schema_path = join_uri(root, SCHEMA_SOURCE_FILENAME);
+        storage.write_text(&schema_path, schema_source).await?;
+        crate::failpoints::maybe_fail("init.after_schema_pg_written")?;
+    }
+
+    write_schema_contract(root, storage.as_ref(), schema_ir).await?;
+    crate::failpoints::maybe_fail("init.after_schema_contract_written")?;
+
+    let coordinator = GraphCoordinator::init(root, catalog, Arc::clone(storage)).await?;
+    crate::failpoints::maybe_fail("init.after_coordinator_init")?;
+
+    Ok(coordinator)
+}
+
+/// Best-effort cleanup of init-phase artifacts. Called from
+/// `init_with_storage` on any error returned by `init_storage_phase`.
+///
+/// Removes the three schema files: `_schema.pg`, `_schema.ir.json`,
+/// `__schema_state.json`. Lance datasets and `__manifest/` are not
+/// touched here — recursive directory deletion requires a
+/// `StorageAdapter::delete_prefix` primitive that's deferred along
+/// with `DELETE /graphs/{id}` (MR-668 PR 2b).
+///
+/// Failures to delete are logged via `tracing::warn` and do not mask
+/// the original init error.
+async fn best_effort_cleanup_init_artifacts(root: &str, storage: &dyn StorageAdapter) {
+    for uri in [
+        schema_source_uri(root),
+        schema_ir_uri(root),
+        schema_state_uri(root),
+    ] {
+        if let Err(err) = storage.delete(&uri).await {
+            tracing::warn!(
+                target: "omnigraph::init::cleanup",
+                uri = %uri,
+                error = %err,
+                "init failed; best-effort cleanup could not delete artifact",
+            );
+        }
+    }
+}
+
 fn schema_table_key(type_kind: SchemaTypeKind, name: &str) -> String {
     match type_kind {
         SchemaTypeKind::Node => format!("node:{}", name),
@@ -1658,7 +1904,7 @@ mod tests {
     use crate::db::manifest::ManifestCoordinator;
     use async_trait::async_trait;
     use serde_json::Value;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use crate::storage::{LocalStorageAdapter, StorageAdapter, join_uri};
 
@@ -1712,6 +1958,11 @@ edge WorksAt: Person -> Company
             self.inner.write_text(uri, contents).await
         }
 
+        async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool> {
+            self.writes.lock().unwrap().push(uri.to_string());
+            self.inner.write_text_if_absent(uri, contents).await
+        }
+
         async fn exists(&self, uri: &str) -> Result<bool> {
             self.exists_checks.lock().unwrap().push(uri.to_string());
             self.inner.exists(uri).await
@@ -1735,13 +1986,96 @@ edge WorksAt: Person -> Company
         }
     }
 
+    #[derive(Debug)]
+    struct InitRaceStorageAdapter {
+        inner: LocalStorageAdapter,
+        root: String,
+        barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    #[async_trait]
+    impl StorageAdapter for InitRaceStorageAdapter {
+        async fn read_text(&self, uri: &str) -> Result<String> {
+            self.inner.read_text(uri).await
+        }
+
+        async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
+            self.inner.write_text(uri, contents).await
+        }
+
+        async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool> {
+            self.inner.write_text_if_absent(uri, contents).await
+        }
+
+        async fn exists(&self, uri: &str) -> Result<bool> {
+            let exists = self.inner.exists(uri).await?;
+            if uri == schema_state_uri(&self.root) {
+                self.barrier.wait().await;
+            }
+            Ok(exists)
+        }
+
+        async fn rename_text(&self, from_uri: &str, to_uri: &str) -> Result<()> {
+            self.inner.rename_text(from_uri, to_uri).await
+        }
+
+        async fn delete(&self, uri: &str) -> Result<()> {
+            self.inner.delete(uri).await
+        }
+
+        async fn list_dir(&self, dir_uri: &str) -> Result<Vec<String>> {
+            self.inner.list_dir(dir_uri).await
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_strict_init_does_not_delete_winning_schema_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap().to_string();
+        let root = normalize_root_uri(&uri).unwrap();
+        let storage: Arc<dyn StorageAdapter> = Arc::new(InitRaceStorageAdapter {
+            inner: LocalStorageAdapter,
+            root,
+            barrier: Arc::new(tokio::sync::Barrier::new(2)),
+        });
+
+        let left = Omnigraph::init_with_storage(
+            &uri,
+            TEST_SCHEMA,
+            Arc::clone(&storage),
+            InitOptions::default(),
+        );
+        let right = Omnigraph::init_with_storage(
+            &uri,
+            TEST_SCHEMA,
+            Arc::clone(&storage),
+            InitOptions::default(),
+        );
+        let (left, right) = tokio::join!(left, right);
+        let ok_count = usize::from(left.is_ok()) + usize::from(right.is_ok());
+        assert_eq!(ok_count, 1, "exactly one concurrent init should win");
+
+        assert!(
+            dir.path().join("_schema.pg").exists(),
+            "winning init must leave _schema.pg in place"
+        );
+        assert!(
+            dir.path().join("_schema.ir.json").exists(),
+            "winning init must leave _schema.ir.json in place"
+        );
+        assert!(
+            dir.path().join("__schema_state.json").exists(),
+            "winning init must leave __schema_state.json in place"
+        );
+    }
+
     #[tokio::test]
     async fn test_init_and_open_route_graph_metadata_through_storage_adapter() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let adapter = Arc::new(RecordingStorageAdapter::default());
 
-        Omnigraph::init_with_storage(uri, TEST_SCHEMA, adapter.clone())
+        Omnigraph::init_with_storage(uri, TEST_SCHEMA, adapter.clone(), InitOptions::default())
             .await
             .unwrap();
         assert!(adapter.writes().contains(&join_uri(uri, "_schema.pg")));

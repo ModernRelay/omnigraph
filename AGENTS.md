@@ -1,6 +1,6 @@
 # OmniGraph — Agent Guide
 
-This file is the always-on map for AI coding agents (Claude Code, Codex, Cursor, Cline) working in this repo. It is loaded into context on every turn, so it stays as a **map plus the rules and invariants that need to be in scope at all times** — the encyclopedia content lives under [`docs/`](docs/). When you need depth, follow a pointer.
+This file is the always-on map for AI coding agents (Claude Code, Codex, Cursor, Cline) working in this codebase. It is loaded into context on every turn, so it stays as a **map plus the rules and invariants that need to be in scope at all times** — the encyclopedia content lives under [`docs/`](docs/). When you need depth, follow a pointer.
 
 **Required reading every session, every change:**
 
@@ -16,8 +16,8 @@ Tools that support `@`-imports (Claude Code) auto-include all three files via th
 
 `CLAUDE.md` is a symlink to this file — there is exactly one source of truth. Edit `AGENTS.md`.
 
-**Version surveyed:** 0.4.2
-**Workspace crates:** `omnigraph-compiler`, `omnigraph` (engine), `omnigraph-cli`, `omnigraph-server`
+**Version surveyed:** 0.6.1
+**Workspace crates:** `omnigraph-compiler`, `omnigraph` (engine), `omnigraph-policy`, `omnigraph-cli`, `omnigraph-server`
 **Storage substrate:** Lance 6.x (columnar, versioned, branchable)
 **License:** MIT
 **Toolchain:** Rust stable, edition 2024
@@ -33,7 +33,7 @@ OmniGraph is a typed property-graph engine built as a coordination layer over ma
 - **Multi-modal querying**: vector ANN (`nearest`), full-text (`search`/`fuzzy`/`match_text`/`bm25`), Reciprocal Rank Fusion (`rrf`), and graph traversal (`Expand`, anti-join `not { … }`) in one runtime.
 - **Branches and commits across the whole graph**: Git-style — every successful publish appends to a commit DAG; merges are three-way at the row level.
 - **Atomic per-query writes**: `mutate_as` and `load` accumulate insert/update batches into an in-memory `MutationStaging.pending` per touched table; one `stage_*` + `commit_staged` per table runs at end-of-query, then `ManifestBatchPublisher::publish` commits the manifest atomically with per-table `expected_table_versions` CAS. A mid-query failure leaves Lance HEAD untouched on staged tables — no drift, no run state machine, no staging branches. Deletes still inline-commit; D₂ at parse time prevents inserts/updates and deletes from coexisting in one query.
-- **HTTP server**: Axum + utoipa OpenAPI, bearer auth (SHA-256 hashed, optional AWS Secrets Manager). Cedar policy enforcement is engine-wide — every `_as` writer calls `Omnigraph::enforce(action, scope, actor)`, so HTTP, CLI, and embedded SDK consumers all hit the same gate.
+- **HTTP server**: Axum + utoipa OpenAPI, bearer auth (SHA-256 hashed, optional AWS Secrets Manager). Cedar policy enforcement is engine-wide — every `_as` writer calls `Omnigraph::enforce(action, scope, actor)`, so HTTP, CLI, and embedded SDK consumers all hit the same gate. **Two modes** (v0.6.0+): single-graph (legacy flat routes) and multi-graph (`/graphs/{graph_id}/...` cluster routes + read-only `GET /graphs` enumeration). Per-graph + server-level Cedar policies. Runtime add/remove (`POST /graphs`, `DELETE /graphs/{id}`) is not exposed — operators edit `omnigraph.yaml` and restart.
 - **CLI** driven by a single `omnigraph.yaml`; multi-format output (json/jsonl/csv/kv/table).
 
 Throughout the docs, capabilities are split into **L1 — Inherited from Lance** vs **L2 — Added by OmniGraph**.
@@ -50,7 +50,7 @@ CLI (omnigraph)        HTTP Server (omnigraph-server, Axum)
            omnigraph-compiler  ── Pest grammars, catalog, IR, lowering, lint, migration plan
                       │
                       ▼
-           omnigraph (engine)  ── ManifestRepo, CommitGraph, RunRegistry, GraphIndex (CSR/CSC), exec
+           omnigraph (engine)  ── ManifestCoordinator, CommitGraph, RunRegistry, GraphIndex (CSR/CSC), exec
                       │
                       ▼
               Lance 6.x         ── columnar Arrow, fragments, per-dataset versions/branches, indexes
@@ -81,7 +81,7 @@ Full diagram and concurrency model: [docs/dev/architecture.md](docs/dev/architec
 | Embeddings (compiler + engine clients, env vars, `@embed`) | [docs/user/embeddings.md](docs/user/embeddings.md) |
 | Branches, commit graph, snapshots, system branches | [docs/user/branches-commits.md](docs/user/branches-commits.md) |
 | Transactions and atomicity (per-query atomic; branches as multi-query transactions) | [docs/user/transactions.md](docs/user/transactions.md) |
-| Direct-publish writes (the former Run state machine, now demoted to publisher CAS) | [docs/dev/runs.md](docs/dev/runs.md) |
+| Direct-publish write path (staging, D2, recovery sidecars; the former Run state machine) | [docs/dev/writes.md](docs/dev/writes.md) |
 | Three-way merge and conflict kinds | [docs/dev/merge.md](docs/dev/merge.md) |
 | Diff / change feed (`diff_between`, `diff_commits`) | [docs/user/changes.md](docs/user/changes.md) |
 | Query execution, mutation execution, bulk loader, `load` vs `ingest` | [docs/dev/execution.md](docs/dev/execution.md) |
@@ -164,38 +164,64 @@ If a proposal fits one of these, the burden is on the proposer to justify why th
 
 ---
 
+## Build, test, lint
+
+Rust stable workspace (edition 2024). `protoc` is a build dependency (`brew install protobuf` / `apt-get install protobuf-compiler libprotobuf-dev`). **Crate dir ≠ package name** for the engine: the directory is `crates/omnigraph` but its Cargo package is `omnigraph-engine` (use that in `-p`). The CLI binary built from `omnigraph-cli` is named `omnigraph`.
+
+```bash
+cargo build --workspace --locked              # build everything
+cargo test  --workspace --locked              # the canonical CI gate (matches CI exactly)
+cargo run -p omnigraph-cli -- <args>          # run the `omnigraph` CLI from source
+cargo run -p omnigraph-server -- <uri> --bind 0.0.0.0:8080   # run the server from source
+
+# Run one crate / one test file / one test fn
+cargo test -p omnigraph-engine --test traversal           # one integration-test file (see docs/dev/testing.md)
+cargo test -p omnigraph-engine --test writes concurrent   # one test fn by name substring
+cargo test -p omnigraph-engine some_inline_test -- --nocapture   # show stdout
+
+# Feature-gated suites (each is its own job in CI, not part of the default run)
+cargo test -p omnigraph-engine --features failpoints --test failpoints   # fault injection
+cargo build -p omnigraph-server --features aws   # AWS Secrets Manager bearer-token source
+```
+
+S3-backed tests (`s3_storage`, and the S3 paths in server/CLI system tests) **skip** unless `OMNIGRAPH_S3_TEST_BUCKET` + `AWS_*` (incl. `AWS_ENDPOINT_URL_S3` for non-AWS) are set; CI runs them against containerized RustFS. `scripts/local-rustfs-bootstrap.sh` stands up a local S3 environment.
+
+CI does **not** run `clippy` or `rustfmt` as gates — but `cargo test --workspace --locked` is the exact gate, so run it before pushing. Two non-test CI checks: `scripts/check-agents-md.sh` (doc cross-link integrity — run it after moving/renaming docs) and OpenAPI drift (`crates/omnigraph-server/tests/openapi.rs` regenerates `openapi.json`; set `OMNIGRAPH_UPDATE_OPENAPI=1` to update the checked-in copy when a server/API change is intentional).
+
+---
+
 ## Quick-reference flows
 
 ```bash
-# Initialize an S3-backed repo
-omnigraph init --schema ./schema.pg s3://my-bucket/repo.omni
+# Initialize an S3-backed graph
+omnigraph init --schema ./schema.pg s3://my-bucket/graph.omni
 
 # Bulk load
-omnigraph load --data ./seed.jsonl --mode overwrite s3://my-bucket/repo.omni
+omnigraph load --data ./seed.jsonl --mode overwrite s3://my-bucket/graph.omni
 
 # Branch + ingest a review batch
-omnigraph branch create --from main review/2026-04-25 s3://my-bucket/repo.omni
-omnigraph ingest --branch review/2026-04-25 --data ./batch.jsonl s3://my-bucket/repo.omni
+omnigraph branch create --from main review/2026-04-25 s3://my-bucket/graph.omni
+omnigraph ingest --branch review/2026-04-25 --data ./batch.jsonl s3://my-bucket/graph.omni
 
 # Run a hybrid (vector + BM25) query
 omnigraph read --query ./queries.gq --name find_similar \
-  --params '{"q":"trends in AI safety"}' --format table s3://my-bucket/repo.omni
+  --params '{"q":"trends in AI safety"}' --format table s3://my-bucket/graph.omni
 
 # Plan + apply schema migration
-omnigraph schema plan  --schema ./next.pg s3://my-bucket/repo.omni
-omnigraph schema apply --schema ./next.pg s3://my-bucket/repo.omni --json
+omnigraph schema plan  --schema ./next.pg s3://my-bucket/graph.omni
+omnigraph schema apply --schema ./next.pg s3://my-bucket/graph.omni --json
 
 # Merge review branch back
-omnigraph branch merge review/2026-04-25 --into main s3://my-bucket/repo.omni
+omnigraph branch merge review/2026-04-25 --into main s3://my-bucket/graph.omni
 
 # Compact + GC (preview, then confirm)
-omnigraph optimize s3://my-bucket/repo.omni
-omnigraph cleanup  --keep 10 --older-than 7d s3://my-bucket/repo.omni
-omnigraph cleanup  --keep 10 --older-than 7d --confirm s3://my-bucket/repo.omni
+omnigraph optimize s3://my-bucket/graph.omni
+omnigraph cleanup  --keep 10 --older-than 7d s3://my-bucket/graph.omni
+omnigraph cleanup  --keep 10 --older-than 7d --confirm s3://my-bucket/graph.omni
 
 # Stand up the HTTP server (token from env)
 OMNIGRAPH_SERVER_BEARER_TOKEN=xxxx \
-  omnigraph-server s3://my-bucket/repo.omni --bind 0.0.0.0:8080
+  omnigraph-server s3://my-bucket/graph.omni --bind 0.0.0.0:8080
 
 # Cedar policy explain
 omnigraph policy explain --actor act-alice --action change --branch main
@@ -211,7 +237,7 @@ omnigraph policy explain --actor act-alice --action change --branch main
 | Per-dataset versioning + time travel | ✅ | `snapshot_at_version`, `entity_at`, snapshot-pinned reads across many tables |
 | Per-dataset branches | ✅ | **Graph-level** branches (atomic across all sub-tables), lazy fork, system branch filtering |
 | Atomic single-dataset commits | ✅ | **Multi-table publish via three layers**, NOT a single Lance primitive: (1) per-table Lance `commit_staged` for the data write, (2) `__manifest` row-level CAS via `ManifestBatchPublisher` for cross-table ordering, (3) the open-time recovery sweep for the residual gap between (1) and (2). All three layers ship; the four migrated writers (`MutationStaging::finalize`, `schema_apply`, `branch_merge`, `ensure_indices`) write a `__recovery/{ulid}.json` sidecar before Phase B and delete it after Phase C. The next `Omnigraph::open` (gated on `OpenMode::ReadWrite`) runs the sweep in `db/manifest/recovery.rs`: classify, decide all-or-nothing per sidecar, roll forward via single `ManifestBatchPublisher::publish` or roll back via `Dataset::restore`, and record an audit row in `_graph_commit_recoveries.lance` (queryable via `omnigraph commit list --filter actor=omnigraph:recovery`). Continuous in-process recovery (no restart needed between Phase B failure and recovery) is the goal of a future background reconciler. Engine writes route through a sealed `TableStorage` trait exposing `stage_*` + `commit_staged` as the canonical staged-write surface; documented inline-commit residuals (`delete_where`, `create_vector_index`, plus legacy `append_batch` / `merge_insert_batches` / `overwrite_batch` / `create_*_index`) remain on the trait until upstream Lance ships a public two-phase API ([#6658](https://github.com/lance-format/lance/issues/6658), [#6666](https://github.com/lance-format/lance/issues/6666)) and the migration of every call site completes. |
-| Compaction (`compact_files`) | ✅ | `omnigraph optimize` orchestrates over all node/edge tables, bounded concurrency |
+| Compaction (`compact_files`) | ✅ | `omnigraph optimize` orchestrates over all node/edge tables, bounded concurrency; **skips blob-bearing tables** (reported via `TableOptimizeStats.skipped`, not silent), gated on `LANCE_SUPPORTS_BLOB_COMPACTION` until the upstream blob-v2 compaction-decode bug is fixed (see [docs/dev/invariants.md](docs/dev/invariants.md) Known Gaps) |
 | Cleanup (`cleanup_old_versions`) | ✅ | `omnigraph cleanup` with `--keep` / `--older-than` policy |
 | BTREE / inverted (FTS) / vector indexes | ✅ | `ensure_indices` builds them on every relevant column; idempotent; lazy across branches |
 | `merge_insert` upsert | ✅ | `LoadMode::Merge`, mutation `update`/`insert`/`delete` lowering |
@@ -222,12 +248,12 @@ omnigraph policy explain --actor act-alice --action change --branch main
 | Schema language | — | `.pg` + Pest grammar + catalog + interfaces + constraints + annotations |
 | Query language | — | `.gq` + Pest grammar + IR + lowering + linter |
 | Schema migration planning | — | `plan_schema_migration` + `apply_schema` step types + `__schema_apply_lock__` |
-| Commit graph (DAG) across whole repo | — | `_graph_commits.lance` with linear + merge parents, ULID ids, actor map |
+| Commit graph (DAG) across whole graph | — | `_graph_commits.lance` with linear + merge parents, ULID ids, actor map |
 | Per-query atomic writes | — | In-memory `MutationStaging.pending` accumulator + `stage_*` / `commit_staged` per touched table at end-of-query + publisher CAS via `commit_with_expected` (single manifest commit per `mutate_as` / `load`); D₂ parse-time rule keeps inserts/updates and deletes from mixing |
 | Three-way row-level merge | — | `OrderedTableCursor` + `StagedTableWriter`, structured `MergeConflictKind` |
 | Change feeds | — | `diff_between` / `diff_commits` with manifest fast path + ID streaming |
-| Cedar policy | — | 8 actions, branch / target_branch / protected scopes, validate/test/explain CLI. **Engine-wide enforcement** (MR-722): every `_as` writer (`apply_schema_as`, `mutate_as`, `load_as`, `ingest_as`, `branch_create_as` / `branch_create_from_as`, `branch_delete_as`, `branch_merge_as`) calls `Omnigraph::enforce(action, scope, actor)` — HTTP, CLI, embedded SDK all hit the same gate. |
-| HTTP server | — | Axum, OpenAPI via utoipa, bearer auth (SHA-256, AWS Secrets Manager option), `authorize_request` at the HTTP boundary (resolves bearer→actor, applies admission control), NDJSON streaming export |
+| Cedar policy | — | Per-graph actions plus server-scoped actions (see [docs/user/policy.md](docs/user/policy.md) for the current list), branch / target_branch / protected scopes, validate/test/explain CLI. **Engine-wide enforcement** (MR-722): every `_as` writer (`apply_schema_as`, `mutate_as`, `load_as`, `ingest_as`, `branch_create_as` / `branch_create_from_as`, `branch_delete_as`, `branch_merge_as`) calls `Omnigraph::enforce(action, scope, actor)` — HTTP, CLI, embedded SDK all hit the same gate. |
+| HTTP server | — | Axum, OpenAPI via utoipa, bearer auth (SHA-256, AWS Secrets Manager option), `authorize_request` at the HTTP boundary (resolves bearer→actor, applies admission control), NDJSON streaming export, **multi-graph mode (v0.6.0+) with cluster routes + read-only `GET /graphs` enumeration + per-graph + server-level Cedar policies. Add/remove graphs by editing `omnigraph.yaml` and restarting.** |
 | CLI with config | — | `omnigraph.yaml`, aliases, multi-format output (json/jsonl/csv/kv/table) |
 | Audit / actor tracking | — | `_as` write APIs + actor map in commit graph |
 | Local RustFS bootstrap | — | `scripts/local-rustfs-bootstrap.sh` one-shot S3-backed dev environment |
