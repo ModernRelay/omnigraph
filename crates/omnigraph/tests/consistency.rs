@@ -126,7 +126,7 @@ async fn load_merge_upserts_existing_and_inserts_new() {
 /// source batch had one row per key.
 ///
 /// Triggered by Lance's `processed_row_ids: Mutex<HashSet<u64>>`
-/// (lance-4.0.0 `src/dataset/write/merge_insert.rs:2099`) double-
+/// (lance-6.0.1 `src/dataset/write/merge_insert.rs:2099`) double-
 /// processing the same source/target match against datasets previously
 /// rewritten by merge_insert. Worked around by opting
 /// `MergeInsertBuilder` into `SourceDedupeBehavior::FirstSeen` in

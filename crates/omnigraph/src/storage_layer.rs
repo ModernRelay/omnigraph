@@ -105,8 +105,18 @@ impl SnapshotHandle {
         &self.inner
     }
 
-    /// Take ownership of the inner `Arc<Dataset>`. Used when committing
-    /// staged writes (the call needs to consume the snapshot).
+    /// Take ownership of the inner `Arc<Dataset>`. Used by the
+    /// `TableStorage` impl when an op needs to mutate the dataset in
+    /// place (commit a staged write, append, overwrite, …).
+    ///
+    /// Performance note: callers consume the returned `Arc` via
+    /// `Arc::try_unwrap(...).unwrap_or_else(|arc| (*arc).clone())`. The
+    /// fast path (no clone) only fires when the snapshot is single-ref
+    /// — i.e. the caller dropped every other `SnapshotHandle` clone
+    /// before calling. Holding parallel clones (e.g. across an `await`
+    /// point or stashed in a struct) forces a deep `Dataset` clone on
+    /// every mutating op. Engine callers should pass `SnapshotHandle`
+    /// by value into the mutating method, not keep a side copy.
     pub(crate) fn into_arc(self) -> Arc<Dataset> {
         self.inner
     }
@@ -118,6 +128,10 @@ impl SnapshotHandle {
     /// that the `TableStorage` trait does not (and should not)
     /// surface. Engine code that participates in the staged-write
     /// invariant must stay on the trait methods.
+    ///
+    /// Single-ref invariant: same fast-path/clone behavior as
+    /// `into_arc` — see that method's doc. Drop sibling
+    /// `SnapshotHandle` clones before calling.
     pub(crate) fn into_dataset(self) -> Dataset {
         Arc::try_unwrap(self.inner).unwrap_or_else(|arc| (*arc).clone())
     }
@@ -361,7 +375,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     //
     // * `delete_where` — Lance #6658 (two-phase delete).
     // * `create_*_index` — `build_index_metadata_from_segments` is
-    //   `pub(crate)` for vector indices in lance-4.0.0; scalar indices
+    //   `pub(crate)` for vector indices in lance-6.0.1; scalar indices
     //   migrate to staged in MR-793 Phase 2.
     // * `append_batch`, `merge_insert_batches`, `overwrite_batch` —
     //   legacy paths that will be demoted to `pub(crate)` in MR-793

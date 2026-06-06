@@ -367,7 +367,7 @@ async fn stage_merge_insert_then_commit_persists_merged_view() {
 /// `write_fragments_internal` lack per-column statistics. The result
 /// contains only matching committed rows; matching staged rows are
 /// silently absent. `scanner.use_stats(false)` does not bypass this in
-/// lance 4.0.0.
+/// lance 6.0.1.
 ///
 /// This test pins the actual behavior so a future change either
 /// preserves it (and updates the doc) or fixes it (and rewrites this
@@ -715,7 +715,7 @@ async fn stage_create_inverted_index_does_not_advance_head_until_commit() {
     );
 }
 
-/// Pin the inline-commit behavior of `delete_where`. Lance 4.0.0 does
+/// Pin the inline-commit behavior of `delete_where`. Lance 6.0.1 does
 /// NOT expose a public `DeleteJob::execute_uncommitted`
 /// (`pub(crate)` — see lance-format/lance#6658). The trait deliberately
 /// does NOT introduce a `stage_delete` wrapper that would secretly
@@ -755,9 +755,9 @@ async fn delete_where_advances_head_inline_documents_residual() {
 }
 
 /// Companion to `delete_where_*`: pin the inline-commit behavior of
-/// `create_vector_index`. Lance 4.0.0 vector indices take the
+/// `create_vector_index`. Lance 6.0.1 vector indices take the
 /// "segment commit path" which calls `build_index_metadata_from_segments`
-/// (`pub(crate)` in lance-4.0.0 `src/index.rs:111`). Until upstream
+/// (`pub(crate)` in lance-6.0.1 `src/index.rs:111`). Until upstream
 /// exposes that helper (companion ticket to lance-format/lance#6658),
 /// the trait surface deliberately does NOT include
 /// `stage_create_vector_index` — same rationale as `stage_delete`'s
@@ -820,7 +820,7 @@ async fn create_vector_index_advances_head_inline_documents_residual() {
 /// The Lance source confirms this — `restore()` (no args) takes the
 /// currently-checked-out version's content and applies it via
 /// `apply_commit` against the latest manifest, advancing HEAD by one.
-/// See lance-4.0.0 `src/dataset.rs:1106` and the transaction-spec
+/// See lance-6.0.1 `src/dataset.rs:1106` and the transaction-spec
 /// example at https://lance.org/format/table/transaction/.
 ///
 /// If the lance bump (4.0.0 → 4.x) ever changes this delta or the call
@@ -887,7 +887,7 @@ async fn lance_restore_appends_one_commit_with_checked_out_content() {
 /// and any future continuous-recovery reconciler's queue-acquisition
 /// requirement.
 ///
-/// `Dataset::restore`'s `check_restore_txn` (lance-4.0.0
+/// `Dataset::restore`'s `check_restore_txn` (lance-6.0.1
 /// `src/io/commit/conflict_resolver.rs:986`) returns `Ok(())` against
 /// almost every other op (Append, Update, Delete, CreateIndex, Merge, …),
 /// so a Restore commits successfully even with concurrent commits in

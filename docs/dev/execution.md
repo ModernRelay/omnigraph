@@ -84,7 +84,7 @@ Resolves expression values to literals, converts to typed Arrow arrays (`literal
 - `insert` (no `@key`, edges) → accumulate into `MutationStaging.pending` (Append mode); finalize calls `stage_append` once per touched table.
 - `insert` (`@key` node) → accumulate into `pending` (Merge mode); finalize calls `stage_merge_insert` once per touched table.
 - `update` → scan committed via Lance + pending via DataFusion `MemTable` (read-your-writes), apply assignments, accumulate into `pending` (Merge mode).
-- `delete` → still inline-commits via `delete_where` (Lance 4.0.0 has no public two-phase delete); recorded into `MutationStaging.inline_committed`.
+- `delete` → still inline-commits via `delete_where` (Lance v6.0.1 has no public two-phase delete; `DeleteBuilder::execute_uncommitted` first ships in v7.0.0-beta.10 — tracked as MR-A in [docs/dev/lance.md](lance.md)); recorded into `MutationStaging.inline_committed`.
 
 **D₂ parse-time rule.** A single mutation query is either insert/update-only or delete-only. Mixed → reject before any I/O. The check fires in `enforce_no_mixed_destructive_constructive(&ir)` inside `execute_named_mutation`.
 

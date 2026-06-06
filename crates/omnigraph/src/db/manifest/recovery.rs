@@ -25,7 +25,7 @@
 //!   version. Pinned by
 //!   `tests/staged_writes.rs::lance_restore_appends_one_commit_with_checked_out_content`.
 //! - `Dataset::restore` "wins" against concurrent Append/Update/Delete/
-//!   CreateIndex/Merge — see `check_restore_txn` at lance-4.0.0
+//!   CreateIndex/Merge — see `check_restore_txn` at lance-6.0.1
 //!   `src/io/commit/conflict_resolver.rs:986`. The hazard is documented
 //!   by `tests/staged_writes.rs::lance_restore_loses_to_concurrent_append_via_orphaning`.
 //!   This module sidesteps the hazard by running recovery only at

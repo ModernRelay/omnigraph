@@ -1004,7 +1004,7 @@ async fn publish_rewritten_merge_table(
 
     // Phase 2: delete removed rows via deletion vectors.
     //
-    // INLINE-COMMIT RESIDUAL: lance-4.0.0 does not expose a public
+    // INLINE-COMMIT RESIDUAL: lance-6.0.1 does not expose a public
     // two-phase delete API (DeleteJob is `pub(crate)` —
     // lance-format/lance#6658 is open with no PRs). We deliberately do
     // NOT introduce a `stage_delete` wrapper that would secretly

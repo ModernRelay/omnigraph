@@ -622,7 +622,7 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
                         }
                     } else if matches!(prop_type.scalar, ScalarType::Vector(_)) && !prop_type.list {
                         if !db.storage().has_vector_index(ds, prop_name).await? {
-                            // Inline-commit residual: lance-4.0.0 does not
+                            // Inline-commit residual: lance-6.0.1 does not
                             // expose `build_index_metadata_from_segments` as
                             // `pub`, so vector indices cannot be staged from
                             // outside the lance crate. Document at the call

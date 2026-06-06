@@ -738,7 +738,7 @@ impl TableStore {
         // merge_insert produce a spurious "Ambiguous merge inserts:
         // multiple source rows match the same target row on (id = ...)"
         // error. Lance's `processed_row_ids: Mutex<HashSet<u64>>`
-        // (lance-4.0.0 `src/dataset/write/merge_insert.rs:2099`)
+        // (lance-6.0.1 `src/dataset/write/merge_insert.rs:2099`)
         // double-processes the same source/target match against
         // datasets previously rewritten by merge_insert, and the default
         // `SourceDedupeBehavior::Fail` errors on the second insertion.
@@ -917,7 +917,7 @@ impl TableStore {
             }
         };
         // Assign real fragment IDs. Lance's `InsertBuilder::execute_uncommitted`
-        // returns fragments with `id = 0` ("Temporary ID" — see lance-4.0.0
+        // returns fragments with `id = 0` ("Temporary ID" — see lance-6.0.1
         // `dataset/write.rs:1044/1712`); the real assignment happens during
         // commit via `Transaction::fragments_with_ids`. Because we expose
         // these fragments to `scan_with_staged` *before* commit, two staged
@@ -1085,7 +1085,7 @@ impl TableStore {
                 "stage_overwrite called with empty batch".to_string(),
             ));
         }
-        // `enable_stable_row_ids: true` is defensive — empirically Lance 4.0.0
+        // `enable_stable_row_ids: true` is defensive — empirically Lance 6.0.1
         // preserves the source dataset's flag through `Operation::Overwrite`
         // when WriteParams omits it (pinned by
         // `stage_overwrite_preserves_stable_row_ids` in tests/staged_writes.rs),
@@ -1126,7 +1126,7 @@ impl TableStore {
         //   2) For stable-row-id datasets, assign row_id_meta starting
         //      at 0 (Overwrite is a fresh-start) so `scan_with_staged`
         //      doesn't hit the "Missing row id meta" panic in
-        //      lance-4.0.0 dataset/rowids.rs:22.
+        //      lance-6.0.1 dataset/rowids.rs:22.
         assign_fragment_ids(&mut new_fragments, 1);
         if ds.manifest.uses_stable_row_ids() {
             assign_row_id_meta(&mut new_fragments, 0)?;
@@ -1150,7 +1150,7 @@ impl TableStore {
     /// `IndexMetadata`; we manually wrap it in `Operation::CreateIndex
     /// { new_indices, removed_indices }` via the public `TransactionBuilder`,
     /// replicating the simple (non-segment-commit-path) branch of Lance's
-    /// `CreateIndexBuilder::execute` (lance-4.0.0 `src/index/create.rs:502-512`).
+    /// `CreateIndexBuilder::execute` (lance-6.0.1 `src/index/create.rs:502-512`).
     ///
     /// `removed_indices` mirrors `execute()` lines 466-476: when the
     /// build replaces an existing same-named index, those entries are
@@ -1159,7 +1159,7 @@ impl TableStore {
     /// MR-793 Phase 2: scalar index types (BTree, Inverted) are
     /// stage-able. Vector indices are NOT (segment-commit-path requires
     /// `build_index_metadata_from_segments` which is `pub(crate)` in
-    /// lance-4.0.0); see `create_vector_index` and Appendix A.3.
+    /// lance-6.0.1); see `create_vector_index` and Appendix A.3.
     pub async fn stage_create_btree_index(
         &self,
         ds: &Dataset,
@@ -1254,7 +1254,7 @@ impl TableStore {
     /// committed fragments carry; Lance's optimizer drops them from the
     /// filtered scan even when their data would match. Staged-fragment
     /// rows are silently absent from the result. `scanner.use_stats(false)`
-    /// does not fix this in lance 4.0.0. Callers needing correct filtered
+    /// does not fix this in lance 6.0.1. Callers needing correct filtered
     /// reads against staged data should use a different strategy — the
     /// engine's `MutationStaging` accumulator unions in-memory pending
     /// batches with the committed scan via DataFusion `MemTable` (see
@@ -1600,7 +1600,7 @@ fn prior_stages_fragment_count(prior_stages: &[StagedWrite]) -> u64 {
 }
 
 /// Assign sequential fragment IDs starting at `start_id`. Mirrors Lance's
-/// commit-time `Transaction::fragments_with_ids` (lance-4.0.0
+/// commit-time `Transaction::fragments_with_ids` (lance-6.0.1
 /// `dataset/transaction.rs:1456`) — fragments produced by
 /// `InsertBuilder::execute_uncommitted` start with `id = 0` as a temporary
 /// placeholder; we renumber here so they don't collide with committed
@@ -1631,7 +1631,7 @@ fn prior_stages_row_count(prior_stages: &[StagedWrite]) -> Result<u64> {
 
 /// Assign sequential row IDs to fragments that lack them, starting from
 /// `start_row_id`. Mirrors the relevant arm of Lance's
-/// `Transaction::assign_row_ids` (lance-4.0.0 `dataset/transaction.rs:2682`)
+/// `Transaction::assign_row_ids` (lance-6.0.1 `dataset/transaction.rs:2682`)
 /// for the `row_id_meta = None` case — fragments produced by
 /// `InsertBuilder::execute_uncommitted` against a stable-row-id dataset.
 ///

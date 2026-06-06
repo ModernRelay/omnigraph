@@ -35,15 +35,18 @@
 //! reaches the storage layer through `db.storage()` (returns
 //! `&dyn TableStorage`). The inherent inline-commit methods on
 //! `TableStore` (`append_batch`, `merge_insert_batch{,es}`,
-//! `overwrite_batch`, `create_{btree,inverted}_index`, `truncate_table`)
-//! are now `pub(crate)`, so the only direct users are
-//! `table_store.rs` itself (which IS the storage layer) and the bulk
-//! loader's `LoadMode::{Append, Overwrite, Merge}` concurrent
-//! fast-paths in `loader::write_batch_to_dataset` (the loader uses the
-//! trait surface for the staged-write path and falls back to the
-//! demoted inherent methods only for the concurrent fast-path, which
-//! has no two-phase shape in Lance 4.0.0). The file-level allow-list
-//! below matches that boundary.
+//! `overwrite_batch`, `create_{btree,inverted}_index`) are now
+//! `pub(crate)`, so the only direct users are `table_store.rs` itself
+//! (which IS the storage layer) and the bulk loader's
+//! `LoadMode::{Append, Overwrite, Merge}` concurrent fast-paths in
+//! `loader::write_batch_to_dataset` (the loader uses the trait surface
+//! for the staged-write path and falls back to the demoted inherent
+//! methods only for the concurrent fast-path, which has no two-phase
+//! shape in Lance v6.0.1). The remaining trait-surface residuals
+//! (`delete_where`, `create_vector_index`) are gated on the Lance v7.x
+//! bump (MR-A) and Lance #6666 respectively — see
+//! `docs/dev/lance.md` for the canonical tracking. The file-level
+//! allow-list below matches that boundary.
 
 use std::path::{Path, PathBuf};
 

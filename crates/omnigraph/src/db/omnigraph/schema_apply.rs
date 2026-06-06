@@ -567,7 +567,7 @@ where
         let dataset_uri = db.storage().dataset_uri(&entry.table_path);
         // Route through stage_overwrite + commit_staged for non-empty
         // batches. Lance's `InsertBuilder::execute_uncommitted`
-        // errors on empty data (lance-4.0.0 `src/dataset/write/insert.rs:144`),
+        // errors on empty data (lance-6.0.1 `src/dataset/write/insert.rs:144`),
         // so the empty-rewrite case stays on `overwrite_dataset` (which
         // accepts empty input). The empty case is rare in schema_apply
         // — it only fires when the source table itself was already empty
