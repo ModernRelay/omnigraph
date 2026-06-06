@@ -102,7 +102,7 @@ Use it this way:
 | Branch delete | Manifest is the single authority, flipped atomically first; per-table forks + commit-graph branch are derived state, reclaimed best-effort (`force_delete_branch`) with the `cleanup` reconciler as the guaranteed backstop. Reusing a name whose reclaim failed before `cleanup` surfaces an actionable error | [branches-commits.md](../user/branches-commits.md), [maintenance.md](../user/maintenance.md) |
 | Schema validation | Type checks, required fields, defaults, edge endpoint checks, and edge cardinality are enforced on write paths | [schema-language.md](../user/schema-language.md), [execution.md](execution.md) |
 | Unique constraints | Intra-batch and write-path checks exist; full cross-version uniqueness is still a gap | [schema-language.md](../user/schema-language.md) |
-| Storage trait | `TableStorage` exists as the sealed staged-write surface; full call-site migration and capability/stat surfaces are incomplete | [writes.md](writes.md), [architecture.md](architecture.md) |
+| Storage trait | `TableStorage` is the sealed staged-write surface; engine call sites all route through `db.storage()` (MR-854); inline-commit inherent methods are `pub(crate)`-demoted; capability/stat surfaces are roadmap | [writes.md](writes.md), [architecture.md](architecture.md) |
 | Index lifecycle | `ensure_indices` is explicit today; reconciler-based convergence is roadmap | [indexes.md](../user/indexes.md), [maintenance.md](../user/maintenance.md) |
 | Traversal IDs | Runtime still builds `TypeIndex`; Lance stable row-id based graph IDs are roadmap | [architecture.md](architecture.md), [query-language.md](../user/query-language.md) |
 | Auth | Bearer token hashing and server-side actor resolution are implemented at the HTTP boundary | [server.md](../user/server.md), [policy.md](../user/policy.md) |
@@ -124,9 +124,15 @@ them explicit.
   renames. The current compiler still derives type IDs from `kind:name`; this
   must be fixed before relying on renamed IDs across accepted schemas.
 - **Storage abstraction:** `TableStorage` is present, sealed, and canonical for
-  staged writes, but older inherent `TableStore` call sites and inline residuals
-  remain. New write paths should use the staged shape unless a documented Lance
-  blocker applies.
+  staged writes. MR-854 closed the call-site migration: every engine call site
+  routes through `db.storage()` and the inherent inline-commit methods on
+  `TableStore` (`append_batch`, `merge_insert_batch{,es}`, `overwrite_batch`,
+  `create_{btree,inverted}_index`) are `pub(crate)`, surviving only as the bulk
+  loader's `LoadMode::{Append, Overwrite, Merge}` concurrent fast-paths. The
+  remaining trait-surface residuals are `delete_where` (gated on MR-A — Lance
+  v7.x bump) and `create_vector_index` (gated on Lance #6666); see
+  [lance.md](lance.md) and [writes.md](writes.md). New write paths should use
+  the staged shape unless a documented Lance blocker applies.
 - **Deletes and vector indexes:** `delete_where` and vector index creation still
   advance Lance HEAD inline because the required public Lance APIs are missing.
   Keep D2 and recovery coverage in place until those residuals are removed.
