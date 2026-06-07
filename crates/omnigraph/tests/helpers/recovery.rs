@@ -181,6 +181,9 @@ pub async fn assert_post_recovery_invariants(
                 "audit row for {operation_id} recorded the wrong recovery_kind",
             );
             assert_rollback_outcomes_record_drift(&audit);
+            // Roll-back now publishes the restored HEAD, so manifest == Lance
+            // HEAD afterward (symmetric with roll-forward) — no residual drift.
+            assert_manifest_pins_match_lance_heads(graph_root, &tables).await?;
             assert_recovery_commit_shape(graph_root, &audit, &tables).await?;
             assert_non_main_did_not_move_main(graph_root, &tables).await?;
             assert_idempotent_reopen(graph_root, operation_id).await?;
