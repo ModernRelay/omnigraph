@@ -288,21 +288,24 @@ async fn load_jsonl_reader<R: BufRead>(
     let mut node_rows: HashMap<String, Vec<JsonValue>> = HashMap::new();
     let mut edge_rows: HashMap<String, Vec<(String, String, JsonValue)>> = HashMap::new();
 
-    for (line_num, line) in reader.lines().enumerate() {
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let value: JsonValue = serde_json::from_str(line).map_err(|e| {
-            OmniError::manifest(format!("invalid JSON on line {}: {}", line_num + 1, e))
+    // Parse a stream of JSON values. Accepts both compact JSONL (one object
+    // per line) and pretty-printed JSON where a single object spans multiple
+    // lines — serde's streaming deserializer treats any whitespace (including
+    // newlines) between top-level values as a separator.
+    for (idx, parsed) in serde_json::Deserializer::from_reader(reader)
+        .into_iter::<JsonValue>()
+        .enumerate()
+    {
+        let record_num = idx + 1;
+        let value: JsonValue = parsed.map_err(|e| {
+            OmniError::manifest(format!("invalid JSON at record {}: {}", record_num, e))
         })?;
 
         if let Some(type_name) = value.get("type").and_then(|v| v.as_str()) {
             if !catalog.node_types.contains_key(type_name) {
                 return Err(OmniError::manifest(format!(
-                    "line {}: unknown node type '{}'",
-                    line_num + 1,
+                    "record {}: unknown node type '{}'",
+                    record_num,
                     type_name
                 )));
             }
@@ -317,8 +320,8 @@ async fn load_jsonl_reader<R: BufRead>(
         } else if let Some(edge_name) = value.get("edge").and_then(|v| v.as_str()) {
             if catalog.lookup_edge_by_name(edge_name).is_none() {
                 return Err(OmniError::manifest(format!(
-                    "line {}: unknown edge type '{}'",
-                    line_num + 1,
+                    "record {}: unknown edge type '{}'",
+                    record_num,
                     edge_name
                 )));
             }
@@ -326,14 +329,14 @@ async fn load_jsonl_reader<R: BufRead>(
                 .get("from")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    OmniError::manifest(format!("line {}: edge missing 'from'", line_num + 1))
+                    OmniError::manifest(format!("record {}: edge missing 'from'", record_num))
                 })?
                 .to_string();
             let to = value
                 .get("to")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    OmniError::manifest(format!("line {}: edge missing 'to'", line_num + 1))
+                    OmniError::manifest(format!("record {}: edge missing 'to'", record_num))
                 })?
                 .to_string();
             let data = value
@@ -347,8 +350,8 @@ async fn load_jsonl_reader<R: BufRead>(
                 .push((from, to, data));
         } else {
             return Err(OmniError::manifest(format!(
-                "line {}: expected 'type' or 'edge' field",
-                line_num + 1
+                "record {}: expected 'type' or 'edge' field",
+                record_num
             )));
         }
     }
