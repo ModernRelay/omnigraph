@@ -7,8 +7,8 @@
       "Check AGENTS.md Links",
       "Test Workspace",
       "Test omnigraph-server --features aws",
-      "CODEOWNERS / drift",
-      "CODEOWNERS / noedit"
+      "CODEOWNERS matches source",
+      "CODEOWNERS not hand-edited"
     ]
   },
   "enforce_admins": false,

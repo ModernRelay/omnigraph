@@ -1,0 +1,55 @@
+name: Bug report
+description: Report a reproducible problem or wrong behavior in OmniGraph.
+title: "bug: <short summary>"
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Issues are for **reporting problems** — concrete, reproducible bugs.
+        For ideas, feature requests, or questions, please use
+        [Discussions](../../discussions) instead.
+        For a security vulnerability, follow [SECURITY.md](../../blob/main/SECURITY.md) — do **not** file it here.
+
+        A maintainer will triage this; once labelled **`accepted`** it's open for a pull request
+        (see [GOVERNANCE.md](../../blob/main/GOVERNANCE.md)).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What went wrong, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps, commands, schema/query, or a failing snippet.
+      placeholder: |
+        1. omnigraph init ...
+        2. omnigraph ...
+        3. observed: ...  / expected: ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `omnigraph --version` (or the engine/crate version) and how you installed it.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, architecture, and storage backend (local FS / S3 / RustFS / MinIO).
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / output
+      description: Relevant error text or logs. Will be rendered as code.
+      render: shell
+    validations:
+      required: false
