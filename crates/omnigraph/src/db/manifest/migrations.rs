@@ -46,7 +46,11 @@ use crate::error::{OmniError, Result};
 /// - v2 — `__manifest.object_id` carries the unenforced-PK annotation,
 ///   engaging Lance's bloom-filter conflict resolver at commit time. Added
 ///   alongside `expected_table_versions` OCC on `ManifestBatchPublisher::publish`.
-pub(super) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 2;
+/// - v3 — one-time sweep of legacy `__run__<id>` staging branches left on the
+///   `__manifest` dataset by the pre-v0.4.0 Run state machine (removed in
+///   MR-771). Once swept, the `is_internal_run_branch` defense-in-depth guard
+///   is no longer needed (MR-770).
+pub(super) const INTERNAL_MANIFEST_SCHEMA_VERSION: u32 = 3;
 
 const INTERNAL_SCHEMA_VERSION_KEY: &str = "omnigraph:internal_schema_version";
 const OBJECT_ID_PK_KEY: &str = "lance-schema:unenforced-primary-key";
@@ -89,6 +93,10 @@ pub(super) async fn migrate_internal_schema(dataset: &mut Dataset) -> Result<()>
                 migrate_v1_to_v2(dataset).await?;
                 current = 2;
             }
+            2 => {
+                migrate_v2_to_v3(dataset).await?;
+                current = 3;
+            }
             other => {
                 return Err(OmniError::manifest_internal(format!(
                     "no internal-schema migration registered for v{} → v{}",
@@ -120,6 +128,51 @@ async fn migrate_v1_to_v2(dataset: &mut Dataset) -> Result<()> {
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
     set_stamp(dataset, 2).await
+}
+
+/// v2 → v3: sweep legacy `__run__<id>` staging branches off the `__manifest`
+/// dataset, then bump the stamp.
+///
+/// The pre-v0.4.0 Run state machine (removed in MR-771) created graph-level
+/// staging branches named `__run__<ulid>` on `__manifest`. MR-771 stopped
+/// creating them but left any pre-existing ones in place; Lance's
+/// `list_branches` still enumerates them, so they leak into `branch_list()`
+/// and count as blocking branches at schema-apply time. This one-time sweep
+/// removes them so the `is_internal_run_branch` guard can retire (MR-770).
+///
+/// The `"__run__"` prefix is inlined here on purpose: this migration must keep
+/// working after the `run_registry` module (the guard) is deleted, so it does
+/// not depend on it.
+///
+/// Idempotent under both sequential retry and concurrent runners: each run
+/// re-enumerates `list_branches` fresh, and `force_delete_branch` tolerates a
+/// branch that is already gone — so a crash before the stamp bump, or a second
+/// process opening the same legacy graph at the same time, never errors out.
+async fn migrate_v2_to_v3(dataset: &mut Dataset) -> Result<()> {
+    const LEGACY_RUN_BRANCH_PREFIX: &str = "__run__";
+    let branches = dataset
+        .list_branches()
+        .await
+        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    let run_branches: Vec<String> = branches
+        .into_keys()
+        .filter(|name| {
+            name.trim_start_matches('/')
+                .starts_with(LEGACY_RUN_BRANCH_PREFIX)
+        })
+        .collect();
+    for name in run_branches {
+        // `force_delete_branch` deletes even when the `BranchContents` is
+        // already gone. Plain `delete_branch` errors "BranchContents not
+        // found", which would fail a second concurrent open (or a retry that
+        // raced another runner) after the first one swept the branch. Force is
+        // exactly Lance's documented path for cleaning up zombie branches.
+        dataset
+            .force_delete_branch(&name)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+    }
+    set_stamp(dataset, 3).await
 }
 
 async fn set_stamp(dataset: &mut Dataset, version: u32) -> Result<()> {

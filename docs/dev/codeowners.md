@@ -14,8 +14,8 @@ The tables below are **generated** from `.github/codeowners-roles.yml` by `.gith
 
 | Path | Owners | Role(s) |
 |---|---|---|
-| `*` | @ragnorc | engineering |
-| `crates/**` | @ragnorc | engineering |
+| `*` | @ragnorc @aaltshuler | engineering |
+| `crates/**` | @ragnorc @aaltshuler | engineering |
 | `docs/**` | @ragnorc | docs |
 | `README.md` | @ragnorc | docs |
 | `AGENTS.md` | @ragnorc | docs |
@@ -26,7 +26,7 @@ The tables below are **generated** from `.github/codeowners-roles.yml` by `.gith
 
 | Role | Members | Description |
 |---|---|---|
-| `engineering` | @ragnorc | All production code under crates/**. Engine, CLI, server, compiler. |
+| `engineering` | @ragnorc @aaltshuler | All production code under crates/**. Engine, CLI, server, compiler. |
 | `docs` | @ragnorc | Documentation under docs/**, plus repo-level docs (README.md, AGENTS.md, CLAUDE.md symlink, SECURITY.md). |
 
 <!-- END GENERATED OWNERSHIP -->
