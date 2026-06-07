@@ -1933,3 +1933,87 @@ query docs_with_tag($tag: String) {
         "contains-pushdown should return exactly the rows whose tags list contains 'red'"
     );
 }
+
+// ─── Maintenance in the full lifecycle: optimize (compaction) ────────────────
+
+/// `optimize` (Lance compaction) is part of a realistic graph lifecycle: it
+/// advances the Lance HEAD and publishes the compacted version to the manifest.
+/// The rest of the flow must keep working across that boundary — reads observe
+/// the compacted data, strict updates (which check Lance HEAD == manifest
+/// version) still commit, inserts still commit, and the state survives a reopen
+/// (the open-time recovery sweep finds no leftover drift). Before optimize
+/// published its compaction, the manifest lagged the Lance HEAD here and the
+/// post-optimize update below failed with "stale view ... refresh and retry".
+#[tokio::test]
+async fn full_flow_optimize_then_query_update_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = init_and_load(&dir).await;
+
+    // Build several Person fragments so compaction has something to merge.
+    for (name, age) in [("Eve", 40), ("Frank", 41), ("Grace", 42)] {
+        mutate_main(
+            &mut db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", name)], &[("$age", age)]),
+        )
+        .await
+        .unwrap();
+    }
+
+    let stats = db.optimize().await.unwrap();
+    assert!(
+        stats.iter().any(|s| s.committed),
+        "a multi-fragment table should have compacted in this flow"
+    );
+
+    // Reads observe the compacted data.
+    let qr = query_main(
+        &mut db,
+        TEST_QUERIES,
+        "get_person",
+        &params(&[("$name", "Alice")]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(qr.num_rows(), 1);
+
+    // Strict update after optimize commits (previously failed with "stale view"
+    // because the manifest lagged the compacted Lance HEAD).
+    let upd = mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 31)]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(upd.affected_nodes, 1);
+
+    // Insert after optimize also commits.
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Ivan")], &[("$age", 50)]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(count_rows(&db, "node:Person").await, 8); // 4 seed + Eve/Frank/Grace + Ivan
+
+    // State survives a reopen — the recovery sweep runs and finds no drift.
+    drop(db);
+    let reopened = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(count_rows(&reopened, "node:Person").await, 8);
+    let alice = reopened
+        .entity_at_target(ReadTarget::branch("main"), "node:Person", "Alice")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        alice["age"],
+        serde_json::json!(31),
+        "Alice's post-optimize age update must persist across reopen"
+    );
+}
