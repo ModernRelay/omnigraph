@@ -14,8 +14,11 @@ publisher's row-level CAS on `__manifest` is the single fence.
 
 - No `RunRecord`, no `_graph_runs.lance`, no `_graph_run_actors.lance`.
 - No `omnigraph run *` CLI subcommands and no `/runs/*` HTTP endpoints.
-- No `__run__<id>` staging branches. (Legacy on-disk artifacts from
-  pre-MR-771 repos are inert; MR-770 sweeps them in production.)
+- No `__run__<id>` staging branches; `__run__*` is no longer a reserved
+  name. The branch-name guard was removed in MR-770, and any stale
+  `__run__*` branch on an upgraded graph is swept off `__manifest` by the
+  v2→v3 internal-schema migration on first read-write open. (The inert
+  `_graph_runs.lance` bytes remain until a `delete_prefix` primitive lands.)
 - Cancelled mutation futures leave **no graph-level state** — only orphaned
   Lance fragments, which the existing `omnigraph cleanup` pipe reclaims.
 
@@ -245,9 +248,14 @@ list`.
 
 ## Migration code
 
-`db/manifest/migrations.rs` does not change. Active deletion of
-`_graph_runs.lance` belongs in MR-770 (the production sweep) — this PR
-stops *creating* run state but does not destroy legacy bytes on disk.
+`db/manifest/migrations.rs` carries the v2→v3 internal-schema step (MR-770):
+a one-time sweep that deletes legacy `__run__*` staging branches off
+`__manifest`. It runs in `Omnigraph::open(ReadWrite)` (via
+`manifest::migrate_on_open`, before the coordinator reads branch state) and
+again on the publisher's write path; both are idempotent once the stamp is at
+v3. Deleting the inert `_graph_runs.lance` / `_graph_run_actors.lance` dataset
+*bytes* is still deferred — it needs a `StorageAdapter::delete_prefix`
+primitive — but those bytes are invisible to graph-level state.
 
 ## Mid-query partial failure: closed by MR-794
 

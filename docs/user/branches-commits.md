@@ -9,8 +9,8 @@ Lance supports branching at the dataset level: a branch is a named lineage of ve
 OmniGraph builds *graph branches* on top by branching every sub-table coherently:
 
 - `branch_create(name)` / `branch_create_from(target, name)` — disallowed name `main`; fails if branch exists; ensures the schema-apply lock is idle. Atomic and authority-first like `branch_delete`: it flips the `__manifest` branch (authority), then creates the derived commit-graph branch, force-dropping any orphaned commit-graph ref left by an incomplete prior delete (the manifest branch is fresh, so a same-named commit-graph branch is provably a zombie). If commit-graph creation fails, the manifest branch is rolled back so the name never half-exists.
-- `branch_list()` — returns public branches, **filters internal** `__run__…` and `__schema_apply_lock__` prefixes.
-- `branch_delete(name)` — refuses if there are descendants or active runs on the branch. The manifest is the single authority for branch existence: deletion flips the `__manifest` branch ref first (one atomic op), after which the branch is gone from every snapshot. The owned per-table forks and the commit-graph branch are derived state, reclaimed best-effort with `force_delete_branch` after the flip. A failure during that reclaim (transient object-store error) does not fail the call or block the authority flip; the leftover forks are unreachable orphans that the [`cleanup`](maintenance.md) reconciler converges. One consequence: if a delete's best-effort reclaim fails, reusing that branch name before the next `cleanup` surfaces a clear error pointing at `cleanup` (the stale fork would otherwise collide on first write).
+- `branch_list()` — returns public branches, **filters the internal** `__schema_apply_lock__` branch.
+- `branch_delete(name)` — refuses if there are descendants on the branch, or if it is the current branch. The manifest is the single authority for branch existence: deletion flips the `__manifest` branch ref first (one atomic op), after which the branch is gone from every snapshot. The owned per-table forks and the commit-graph branch are derived state, reclaimed best-effort with `force_delete_branch` after the flip. A failure during that reclaim (transient object-store error) does not fail the call or block the authority flip; the leftover forks are unreachable orphans that the [`cleanup`](maintenance.md) reconciler converges. One consequence: if a delete's best-effort reclaim fails, reusing that branch name before the next `cleanup` surfaces a clear error pointing at `cleanup` (the stale fork would otherwise collide on first write).
 - **Lazy forking**: a branch only forks a sub-table when that sub-table is first mutated on it. Pure-read branches share fragments with their source. A fork collision is classified by the manifest authority, not by Lance branch versions: if the live manifest already records the fork on the active branch, a concurrent first-write won and the caller gets a retryable "refresh and retry"; if the manifest does not, a physical branch there is an orphan and the caller is pointed at `cleanup`.
 - `sync_branch(branch)` — re-binds the in-memory handle to the latest head of the branch.
 
@@ -51,10 +51,10 @@ Notes:
 
 ## L2 — Internal system branches
 
-Filtered from `branch_list()` but visible to internals:
+Internal or legacy branch refs:
 
-- `__schema_apply_lock__` — serializes schema migrations.
-- `__run__<run-id>` — legacy from the pre-v0.4.0 Run state machine (removed in MR-771). The branch-name guard predicate `is_internal_run_branch` is kept as defense-in-depth so users cannot create a branch matching the legacy prefix; the filter will be removed once production legacy branches are swept (MR-770).
+- `__schema_apply_lock__` — serializes schema migrations; filtered from `branch_list()` but visible to internals.
+- `__run__<run-id>` — legacy from the pre-v0.4.0 Run state machine (removed in MR-771). These are swept off `__manifest` on the first read-write open by the v2→v3 internal-schema migration (MR-770), and `__run__*` is no longer a reserved name. Known limitation: a pre-v0.4.0 graph opened **read-only** still surfaces any stale `__run__*` branch in `branch_list()` until its first read-write open (the migration is write-path-only, like all manifest migrations).
 
 ## L2 — Recovery audit trail
 
