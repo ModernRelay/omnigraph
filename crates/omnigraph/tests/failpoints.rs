@@ -1474,10 +1474,15 @@ edge WorksAt: Person -> Company
     }
 
     let db = Omnigraph::open(&uri).await.unwrap();
-    assert_eq!(
-        version_main(&db).await.unwrap(),
-        pre_failure_version,
-        "manifest must remain on the old schema when no schema staging files existed"
+    // Roll-back now publishes the restored version, so the manifest version
+    // advances — but to the OLD-schema content: the migration never applied
+    // (asserted by count_rows + the `_schema.pg` checks below), and the sweep
+    // converges (`manifest == Lance HEAD`, asserted by
+    // assert_post_recovery_invariants's RolledBack arm).
+    assert!(
+        version_main(&db).await.unwrap() > pre_failure_version,
+        "roll-back publishes the restored (old-schema) version, advancing the manifest; \
+         pre={pre_failure_version}",
     );
     assert_eq!(
         helpers::count_rows(&db, "node:Person").await,
