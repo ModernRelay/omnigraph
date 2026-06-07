@@ -1468,7 +1468,8 @@ pub(crate) fn enforce_unique_constraints_intra_batch(
             }
             // Join on the unit separator (U+001F) — a control char highly
             // unlikely to occur in real data, keeping composite keys
-            // effectively unambiguous (cf. `exec/merge.rs`, which uses `|`).
+            // effectively unambiguous. Matches `exec/merge.rs::row_signature`,
+            // which uses the same separator.
             let value = parts.join("\u{1f}");
             if let Some(prev_row) = seen.insert(value.clone(), row) {
                 return Err(OmniError::manifest(format!(
