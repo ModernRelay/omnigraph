@@ -48,6 +48,22 @@ const OBJECT_TYPE_TABLE_VERSION: &str = "table_version";
 const OBJECT_TYPE_TABLE_TOMBSTONE: &str = "table_tombstone";
 const TABLE_VERSION_MANAGEMENT_KEY: &str = "table_version_management";
 
+/// Apply pending internal-schema migrations against `__manifest` on the
+/// open-for-write path, independent of a publish.
+///
+/// `Omnigraph::open(ReadWrite)` calls this before the coordinator reads branch
+/// state, so branch-observing code (`branch_list`, the schema-apply
+/// blocking-branch checks) sees the post-migration graph. In particular the
+/// v2→v3 step sweeps legacy `__run__*` staging branches off `__manifest`
+/// (MR-770); running it here closes the window where those branches would
+/// otherwise block schema apply before the first publish runs the migration.
+///
+/// Idempotent: a no-op stamp read when the on-disk version already matches.
+pub(crate) async fn migrate_on_open(root_uri: &str) -> Result<()> {
+    let mut dataset = open_manifest_dataset(root_uri, None).await?;
+    migrations::migrate_internal_schema(&mut dataset).await
+}
+
 /// Immutable point-in-time view of the database.
 ///
 /// Cheap to create (no storage I/O). All reads within a query go through one

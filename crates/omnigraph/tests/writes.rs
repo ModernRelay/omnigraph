@@ -371,11 +371,10 @@ async fn cancelled_mutation_future_leaves_no_state() {
 
     // Cancel-safety property: no graph-level run/staging state remains.
     //
-    // Note: `branch_list()` already filters `__run__*` via
-    // `is_internal_system_branch`, so a runtime "no `__run__` branches" check
-    // would be vacuous. The structural property that no `__run__` branches
-    // can ever be created is enforced by deletion of `begin_run` etc. in
-    // (verified by the build itself — those symbols no longer exist).
+    // No `__run__` branches can ever be created: the Run state machine
+    // (`begin_run` etc.) was deleted in MR-771 — verified by the build itself,
+    // those symbols no longer exist. Any legacy `__run__*` branch on an
+    // upgraded graph is swept by the v2→v3 manifest migration.
     //
     // (1) The branch list is unchanged: cancellation/completion cannot
     //     synthesize new public branches.
@@ -442,34 +441,40 @@ async fn repeated_loads_do_not_accumulate_branches() {
     assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
 }
 
-/// User code must not be able to write to internal `__run__*` names.
-/// The branch-name guard predicate is kept as defense-in-depth; it
-/// will be removed once a future production sweep retires the legacy
-/// branches.
+/// After MR-770, `__run__*` is an ordinary branch name — the Run state machine
+/// and its `is_internal_run_branch` guard are gone. The surviving internal-ref
+/// guard still rejects the active `__schema_apply_lock__` branch on the public
+/// create/merge APIs.
 #[tokio::test]
-async fn public_branch_apis_reject_internal_run_refs() {
+async fn public_branch_apis_reject_internal_system_refs() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
 
-    let create_err = db.branch_create("__run__synthetic").await.unwrap_err();
+    // `__run__*` is no longer reserved — creating it now succeeds.
+    db.branch_create("__run__formerly_reserved")
+        .await
+        .expect("__run__ prefix is a normal branch name post-MR-770");
+
+    // The schema-apply lock branch is still rejected on public branch APIs.
+    let create_err = db.branch_create("__schema_apply_lock__").await.unwrap_err();
     let OmniError::Manifest(err) = create_err else {
         panic!("expected Manifest error");
     };
     assert!(
-        err.message.contains("internal run ref"),
+        err.message.contains("internal system ref"),
         "unexpected error: {}",
         err.message
     );
 
     let merge_err = db
-        .branch_merge("__run__synthetic", "main")
+        .branch_merge("__schema_apply_lock__", "main")
         .await
         .unwrap_err();
     let OmniError::Manifest(err) = merge_err else {
         panic!("expected Manifest error");
     };
     assert!(
-        err.message.contains("internal run refs"),
+        err.message.contains("internal system refs"),
         "unexpected error: {}",
         err.message
     );

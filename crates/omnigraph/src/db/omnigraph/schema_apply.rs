@@ -61,11 +61,11 @@ async fn plan_schema_for_apply(
 ) -> Result<PlannedSchemaApply> {
     db.ensure_schema_state_valid().await?;
     let branches = db.coordinator.read().await.all_branches().await?;
-    // Skip `main` and internal system branches. The schema-apply lock branch
-    // is excluded because it is the cluster-wide schema-apply serializer.
-    // `__run__*` branches are no longer created; the filter remains as
-    // defense-in-depth for legacy graphs with leftover staging branches.
-    // A future production sweep will let this guard go.
+    // Skip `main` and internal system branches (the schema-apply lock branch,
+    // the cluster-wide schema-apply serializer). Legacy `__run__*` staging
+    // branches were swept off `__manifest` by the v2→v3 migration that runs in
+    // `Omnigraph::open(ReadWrite)` before this check (MR-770), so they no
+    // longer appear here.
     let blocking_branches = branches
         .into_iter()
         .filter(|branch| branch != "main" && !is_internal_system_branch(branch))

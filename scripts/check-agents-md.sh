@@ -34,9 +34,14 @@ PY
 canonical=()
 while IFS= read -r line; do
   canonical+=("$line")
-done < <(find docs -type f -name '*.md' ! -path 'docs/releases/*' ! -path 'docs/internal/*' | sort)
+done < <(find docs -type f -name '*.md' ! -path 'docs/releases/*' ! -path 'docs/internal/*' ! -path 'docs/rfcs/*' | sort)
 if [[ -d docs/releases ]]; then
   canonical+=("docs/releases/")
+fi
+# RFCs are a growing collection (like releases): represent the directory, not
+# every per-RFC file. The dir must be linked from an audience index.
+if [[ -d docs/rfcs ]]; then
+  canonical+=("docs/rfcs/")
 fi
 
 linked=()

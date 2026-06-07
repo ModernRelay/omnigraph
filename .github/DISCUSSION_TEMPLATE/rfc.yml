@@ -1,0 +1,34 @@
+labels: ["rfc"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this to **incubate an RFC** — socialize a design and reach rough
+        consensus before writing the formal document. When it's ready, graduate
+        it into a pull request that adds `docs/rfcs/NNNN-title.md`
+        (see [docs/rfcs/README.md](../blob/main/docs/rfcs/README.md)); a
+        maintainer merging that PR is acceptance.
+
+        For a plain feature request or open-ended idea, use the **Ideas**
+        category instead. For bugs, open an [Issue](../../issues/new/choose).
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What needs solving, and why is it worth the long-run cost?
+    validations:
+      required: true
+  - type: textarea
+    id: sketch
+    attributes:
+      label: Proposed direction (sketch)
+      description: A rough shape of the design. Detail comes later in the RFC document.
+    validations:
+      required: true
+  - type: textarea
+    id: invariants
+    attributes:
+      label: Invariants touched
+      description: Which items in docs/dev/invariants.md does this affect or risk? Any deny-list brush?
+    validations:
+      required: false
