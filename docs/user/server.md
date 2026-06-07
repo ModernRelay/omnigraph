@@ -6,7 +6,9 @@ Axum 0.8 + tokio + utoipa-generated OpenAPI. **Two modes** (v0.6.0+): single-gra
 
 ### Single-graph mode (legacy)
 
-`omnigraph-server <URI>` or `omnigraph-server --target <name> --config omnigraph.yaml`. Routes are flat — `/snapshot`, `/read`, `/branches`, etc. Behavior unchanged from v0.6.0.
+`omnigraph-server <URI>` or `omnigraph-server --target <name> --config omnigraph.yaml`. Routes are flat — `/snapshot`, `/read`, `/branches`, etc.
+
+**Config follows graph identity.** A bare `<URI>` is an *anonymous* graph and uses the **top-level** `policy.file` / `queries:`. A graph chosen by **name** (`--target` / `server.graph`) uses its own `graphs.<name>.{policy.file, queries}` — the same block multi-graph mode uses. ⚠️ *Changed from v0.6.0, which always used top-level config in single mode: a named-graph config that puts `policy`/`queries` at top-level now **refuses boot** and points you at `graphs.<name>.…` (move the block there). Bare-`<URI>` single mode is unchanged.*
 
 ### Multi-graph mode (v0.6.0+)
 
@@ -19,6 +21,10 @@ Mode inference (four-rule matrix):
 3. `server.graph` in config → single
 4. `--config` + non-empty `graphs:` + no single-mode selector → **multi**
 5. otherwise → error with migration hint
+
+### Stored-query validation at startup
+
+If a graph declares a `queries:` registry (see [cli-reference](cli-reference.md)), the server **loads and type-checks every stored query against that graph's live schema at startup** and **refuses to boot** if any query references a type or property the schema lacks — the same fail-loud posture as a malformed policy file, so schema drift surfaces at the deploy boundary rather than at invocation. Two MCP-exposed queries claiming the same tool name is likewise a boot error. Non-blocking advisories (e.g. an MCP-exposed query with a vector parameter an agent cannot supply) are logged. Validate offline before deploying with `omnigraph queries validate`. Discover the exposed queries as a typed tool catalog with `GET /queries`, and invoke one over HTTP with `POST /queries/{name}` (both below).
 
 ## Endpoint inventory
 
@@ -34,6 +40,8 @@ Per-graph endpoints — same body shape across modes; URLs differ:
 | POST | `/export` | `/graphs/{id}/export` | bearer + `export` | NDJSON stream | `server_export` |
 | POST | `/mutate` | `/graphs/{id}/mutate` | bearer + `change` | mutation (canonical; `query`/`name`; accepts legacy `query_source`/`query_name` as serde aliases) | `server_mutate` |
 | POST | `/change` | `/graphs/{id}/change` | bearer + `change` | **deprecated** alias of `/mutate` (carries `Deprecation: true` + `Link: </mutate>; rel="successor-version"`) | `server_change` |
+| GET | `/queries` | `/graphs/{id}/queries` | bearer + `read` | list the `mcp.expose` stored queries as a typed tool catalog | `server_list_queries` |
+| POST | `/queries/{name}` | `/graphs/{id}/queries/{name}` | bearer + `invoke_query` (+ `change` for a stored mutation) | invoke a named query from the `queries:` registry; deny == 404 | `server_invoke_query` |
 | GET | `/schema` | `/graphs/{id}/schema` | bearer + `read` | get current `.pg` source | `server_schema_get` |
 | POST | `/schema/apply` | `/graphs/{id}/schema/apply` | bearer + `schema_apply` (target=`main`) | migrate | `server_schema_apply` |
 | POST | `/ingest` | `/graphs/{id}/ingest` | bearer + `branch_create` (if new) + `change` | bulk load | `server_ingest` (32 MB body limit) |
@@ -49,6 +57,23 @@ Server-level management endpoints (v0.6.0+):
 | Method | Path | Auth | Action | Handler |
 |---|---|---|---|---|
 | GET | `/graphs` | bearer + `graph_list` on `Server::"root"` | list registered graphs | `server_graphs_list` (405 in single mode) |
+
+### Stored-query catalog (`GET /queries`)
+
+List the graph's **`mcp.expose`** stored queries as a typed tool catalog — enough for a client (e.g. an MCP server) to register each as a tool without fetching `.gq` source. Each entry: `{ name, tool_name, description, instruction, mutation, params }`, where each param is `{ name, kind, item_kind?, vector_dim?, nullable }`. `kind` is one of `string | bool | int | bigint | float | date | datetime | blob | vector | list` (decomposed so a consumer maps it with a closed `switch`, never re-parsing GQ type spelling). `bigint` (I64/U64), `date`, `datetime`, and `blob` are carried as JSON **strings** — a 64-bit integer loses precision as a JSON number, dates are ISO strings, and a blob is a URI string.
+
+- **Read-gated** (works in default-deny mode). The catalog is **graph-wide** (branch-independent; `read` is authorized against `main`).
+- **`mcp.expose` defaults to `true`** — declaring a query in `queries:` lists it; set `mcp: { expose: false }` to keep it HTTP/service-callable but hidden from the catalog.
+- **Not Cedar-filtered per query (yet).** A caller with `read` but not `invoke_query` can *list* a query they can't *invoke* (which would 404). Closing that gap is future per-query authorization; for now the catalog is a discovery surface and `invoke_query` remains the invocation gate.
+
+### Stored-query invocation (`POST /queries/{name}`)
+
+Invoke a curated, server-side stored query by **name** — the source comes from the graph's `queries:` registry, so the client never sends `.gq`. The request body itself is optional; omit it for no-param queries, or send `{ "params": { … }, "branch": "main", "snapshot": null }`, where every field is optional and `params` keys match the query's declared parameters. The response is the **read envelope** (`ReadOutput`) for a stored read or the **mutation envelope** (`ChangeOutput`) for a stored mutation — serialized untagged, so the wire shape is identical to `/query` / `/mutate`.
+
+- **Gate:** `invoke_query` (per-graph, graph-scoped) at the boundary. A stored *mutation* is **double-gated** — it also passes the engine's `change` gate, so an actor with `invoke_query` but not `change` gets `403`.
+- **Deny == unknown, for callers without `invoke_query`:** for a caller lacking the grant, an `invoke_query` denial and an unknown query name return the **same `404`** (identical body), so the catalog can't be probed. A caller that *holds* `invoke_query` may still get the inner gate's `403` for an existing query it can't `read`/`change` (the double-gate, above) — so existence is visible to grant-holders by design.
+- **Requires an explicit policy grant when auth is on.** In default-deny mode (bearer tokens but no `policy.file`), only `read` is permitted, so *every* `/queries/{name}` call returns `404` until an `invoke_query` rule is configured.
+- A stored mutation cannot target a `snapshot` (`400`); a parameter type error is a structured `400` naming the parameter.
 
 ## Adding and removing graphs (multi mode)
 

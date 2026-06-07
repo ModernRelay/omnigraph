@@ -1087,9 +1087,9 @@ impl Omnigraph {
         target: &str,
         actor_id: Option<&str>,
     ) -> Result<MergeOutcome> {
-        if is_internal_run_branch(source) || is_internal_run_branch(target) {
+        if is_internal_system_branch(source) || is_internal_system_branch(target) {
             return Err(OmniError::manifest(format!(
-                "branch_merge does not allow internal run refs ('{}' -> '{}')",
+                "branch_merge does not allow internal system refs ('{}' -> '{}')",
                 source, target
             )));
         }

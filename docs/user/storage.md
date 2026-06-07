@@ -22,7 +22,7 @@ OmniGraph is **not** a single Lance dataset; it is a *graph* of datasets coordin
   - `edges/{fnv1a64-hex(edge_type_name)}` — one Lance dataset per edge type
   - `__manifest/` — the catalog of all sub-tables and their published versions
   - `_graph_commits.lance` / `_graph_commit_actors.lance` — the commit graph and its actor map
-  - (legacy `_graph_runs.lance` / `_graph_run_actors.lance` from pre-v0.4.0 graphs are inert; the run state machine was removed in MR-771 and these files are cleaned up via MR-770's production sweep)
+  - (legacy `_graph_runs.lance` / `_graph_run_actors.lance` from pre-v0.4.0 graphs are inert; the run state machine was removed in MR-771. The v2→v3 manifest migration sweeps stale `__run__*` branches on first write-open; the inert dataset bytes themselves remain until a `delete_prefix` storage primitive lands)
 - **Manifest row schema** (`object_id, object_type, location, metadata, base_objects, table_key, table_version, table_branch, row_count`):
   - `object_type` ∈ `table | table_version | table_tombstone`
   - `table_key` ∈ `node:<TypeName> | edge:<EdgeName>`
@@ -47,6 +47,7 @@ Adding a new on-disk shape change is one constant bump (`INTERNAL_MANIFEST_SCHEM
 |---|---|
 | v1 (implicit, pre-stamp) | `__manifest.object_id` had no PK annotation; publisher had no row-level CAS protection. |
 | v2 | `__manifest.object_id` carries `lance-schema:unenforced-primary-key=true`; row-level CAS engaged. Stamped as `omnigraph:internal_schema_version=2`. |
+| v3 | One-time sweep of legacy `__run__*` staging branches (pre-v0.4.0 Run state machine, removed MR-771) off `__manifest`. Runs at `Omnigraph::open(ReadWrite)` and on publish. Stamped as `omnigraph:internal_schema_version=3`. |
 
 ## On-disk layout
 
@@ -91,7 +92,7 @@ flowchart TB
 - **Graph root** is one directory (or S3 prefix). Everything below is part of one OmniGraph graph.
 - **`__manifest/`** is a Lance dataset whose rows describe which sub-table version is published at which graph-branch. Reading a snapshot starts here.
 - **`nodes/`** and **`edges/`** are sibling directories holding one Lance dataset per declared type. Names are `fnv1a64-hex` of the type name to keep paths fixed-length and case-safe.
-- **`_graph_commits.lance`** is an L2 dataset that records the graph-level commit DAG, with a paired `_graph_commit_actors.lance` for the actor map. (Pre-v0.4.0 graphs also have inert `_graph_runs.lance` / `_graph_run_actors.lance` from the removed Run state machine; MR-770 sweeps these in production.)
+- **`_graph_commits.lance`** is an L2 dataset that records the graph-level commit DAG, with a paired `_graph_commit_actors.lance` for the actor map. (Pre-v0.4.0 graphs also have inert `_graph_runs.lance` / `_graph_run_actors.lance` from the removed Run state machine; the v2→v3 migration sweeps their stale `__run__*` branches, and the dataset bytes are reclaimed once `delete_prefix` lands.)
 - **`_graph_commit_recoveries.lance`** — one row per recovery sweep action. Joined to `_graph_commits.lance` by `graph_commit_id`; the linked commit row carries `actor_id=omnigraph:recovery`. Operators correlate recoveries with the original mutations they rolled forward / back via this join. See `crates/omnigraph/src/db/recovery_audit.rs`.
 - **`__recovery/{ulid}.json`** — transient sidecar files written by the four migrated writers (`MutationStaging::finalize`, `schema_apply`, `branch_merge`, `ensure_indices`) before Phase B begins, deleted after Phase C succeeds. A sidecar persisting after process exit means the writer crashed in the Phase B → Phase C window; the next `Omnigraph::open` recovery sweep processes it. Steady-state directory is empty. See `crates/omnigraph/src/db/manifest/recovery.rs`.
 - **`_refs/branches/{name}.json`** is graph-level branch metadata — pointers from a branch name to the manifest version it heads.

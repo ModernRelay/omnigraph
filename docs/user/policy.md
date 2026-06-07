@@ -14,10 +14,11 @@ Per-graph actions (bind to `Omnigraph::Graph::"<graph_id>"`):
 6. `branch_delete`
 7. `branch_merge`
 8. `admin` — reserved for policy-management surfaces (hot reload, audit log, approvals). No call site today; see MR-724 for the reservation rationale.
+9. `invoke_query` — gates invoking a server-side stored query (the `queries:` registry). Graph-scoped (like `admin`) — per-branch access is enforced by the inner `read` / `change` gate, so a rule that sets `branch_scope` on `invoke_query` is rejected. Coarse in this release: an `invoke_query` allow rule permits any stored query on the graph; a future, additive refinement adds an optional per-query-name scope without changing rules written against the coarse action. Enforced at `POST /queries/{name}` (see [server](server.md)). A stored *mutation* is double-gated: `invoke_query` to reach the tool, plus `change` for the write itself (the engine `_as` writers still enforce per the query body).
 
 Server-scoped action (v0.6.0+; binds to `Omnigraph::Server::"root"`):
 
-9. `graph_list` — `GET /graphs` registry enumeration (multi-graph mode)
+10. `graph_list` — `GET /graphs` registry enumeration (multi-graph mode)
 
 Server-scoped actions cannot use `branch_scope` or `target_branch_scope` — they operate on the registry, not on a graph's branches. A rule cannot mix server-scoped and per-graph actions; split into separate rules. (Runtime `graph_create` / `graph_delete` are reserved but not shipped in v0.6.0; operators add/remove graphs by editing `omnigraph.yaml` and restarting.)
 
@@ -46,10 +47,15 @@ graphs:
     # no per-graph policy → no engine-layer Cedar enforcement on beta
 ```
 
-Top-level `policy.file` is single-graph / CLI-local policy only. Multi-graph
-server startup rejects it because applying one graph policy to every configured
-graph is ambiguous. Move per-graph rules to `graphs.<graph_id>.policy.file` and
-move `graph_list` rules to `server.policy.file`.
+**Config follows graph identity, not server mode.** A graph served by **name**
+(`--target <name>` or `server.graph`) uses its own `graphs.<name>.policy.file`,
+exactly as in multi-graph mode. Top-level `policy.file` applies only to an
+**anonymous** graph — one served by a bare `<URI>` with no `graphs:` entry.
+Serving a **named** graph (single- or multi-graph mode) while top-level
+`policy.file` (or `queries:`) is populated **refuses boot**, naming the block,
+since the top-level value would otherwise be silently shadowed by the per-graph
+block. Move per-graph rules to `graphs.<graph_id>.policy.file` and `graph_list`
+rules to `server.policy.file`.
 
 Each graph's HTTP request flows through its own per-graph policy. The management endpoint (`GET /graphs`) flows through the server-level policy. When `server.policy.file` is unset, `GET /graphs` is denied in every runtime state, including `--unauthenticated`; with bearer tokens configured, it returns 403 after admission control because `graph_list` is not a `read`-equivalent action. The operator must explicitly authorize via `server-policy.yaml` to expose `/graphs`.
 
@@ -91,6 +97,10 @@ HTTP writes ignore both — they resolve their actor server-side from the
 bearer token.
 
 ## CLI
+
+Policy tooling resolves its graph like server single-mode policy: `cli.graph`
+wins, otherwise `server.graph` is used, otherwise the top-level `policy.file`
+is validated/tested/explained as the anonymous policy.
 
 - `omnigraph policy validate` — parse + count actors, exit 1 on parse error.
 - `omnigraph policy test` — run cases in `policy.tests.yaml`, exit 1 on any expectation mismatch.

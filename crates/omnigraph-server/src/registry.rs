@@ -29,6 +29,7 @@ use tokio::sync::Mutex;
 
 use crate::identity::GraphKey;
 use crate::policy::PolicyEngine;
+use crate::queries::QueryRegistry;
 
 /// Open handle for a single graph in the registry. Cheap to clone (`Arc`-wrapped
 /// engine + policy). Cluster-mode handlers extract this via
@@ -47,6 +48,11 @@ pub struct GraphHandle {
     /// `_as` writers"; the HTTP-layer `require_bearer_auth` middleware still
     /// runs regardless.
     pub policy: Option<Arc<PolicyEngine>>,
+    /// Per-graph stored-query registry, loaded and validated at
+    /// startup. `None` means the operator declared no stored queries for
+    /// this graph — `POST /queries/{name}` then 404s. Mirrors the
+    /// optional `policy` shape.
+    pub queries: Option<Arc<QueryRegistry>>,
 }
 
 /// Immutable snapshot of the registry's current state. Replaced atomically
@@ -245,6 +251,7 @@ fn canonicalize_handle_uri(
         uri: canonical_uri.clone(),
         engine: Arc::clone(&handle.engine),
         policy: handle.policy.clone(),
+        queries: handle.queries.clone(),
     });
     Ok((canonical_uri, canonical_handle))
 }
@@ -276,6 +283,7 @@ mod tests {
             uri: graph_uri,
             engine: Arc::new(engine),
             policy: None,
+            queries: None,
         })
     }
 
@@ -340,12 +348,14 @@ mod tests {
             uri: shared_uri.clone(),
             engine: Arc::clone(&engine),
             policy: None,
+            queries: None,
         });
         let h2 = Arc::new(GraphHandle {
             key: GraphKey::cluster(GraphId::try_from("beta").unwrap()),
             uri: shared_uri,
             engine,
             policy: None,
+            queries: None,
         });
 
         let registry = GraphRegistry::new();
@@ -411,12 +421,14 @@ mod tests {
             uri: shared_uri.clone(),
             engine: Arc::clone(&engine),
             policy: None,
+            queries: None,
         });
         let h2 = Arc::new(GraphHandle {
             key: GraphKey::cluster(GraphId::try_from("beta").unwrap()),
             uri: shared_uri,
             engine,
             policy: None,
+            queries: None,
         });
         let err = match GraphRegistry::from_handles(vec![h1, h2]) {
             Ok(_) => panic!("expected DuplicateUri, got Ok"),

@@ -1,10 +1,29 @@
 # Contributing
 
-Small bug fixes and documentation improvements are welcome directly through pull
-requests.
+Thanks for your interest in OmniGraph. This page is the practical how-to; the
+rules and decision authority behind it live in [GOVERNANCE.md](GOVERNANCE.md).
 
-For larger changes, please open an issue or design discussion first so the
-proposed direction is clear before implementation starts.
+## Start in the right place
+
+| I want to… | Go to | Notes |
+|---|---|---|
+| **Report a bug** or wrong behavior | **[Open an Issue](../../issues/new/choose)** | Concrete and reproducible. A maintainer triages it; once labelled **`accepted`** it's open for a PR. |
+| **Suggest a feature / share an idea / ask** | **[Start a Discussion](../../discussions)** | Ideas and questions live here, not in Issues. |
+| **Propose a design / RFC** | **An RFC pull request** | Anyone can author one — see [docs/rfcs/README.md](docs/rfcs/README.md). A maintainer merging it is acceptance. |
+| **Fix something / implement a change** | **A pull request** | Must link an `accepted` issue or an accepted RFC — unless it's trivial (below). |
+| **Report a security vulnerability** | **[SECURITY.md](SECURITY.md)** | Do **not** open a public Issue. |
+
+### When can I just open a PR?
+The **trivial fast-lane** — open directly, no prior issue/RFC needed: typo and
+wording fixes, doc corrections, dependency bumps, comment fixes, obvious
+one-line CI tweaks. Anything more substantial needs a backing `accepted` issue
+or accepted RFC first, so the *why* is agreed before the *how* is reviewed. A PR
+that turns out to be non-trivial will be redirected — that's about process, not
+the merit of the change.
+
+> **Maintainers (ModernRelay team)** follow a separate internal process and are
+> not bound by the intake rules above. Everyone is bound by review, CODEOWNERS,
+> branch protection, and CI.
 
 ## Development
 
@@ -49,6 +68,11 @@ CI runs both.
 
 ## Pull Requests
 
-- keep changes focused
-- include tests for behavior changes when practical
-- update public docs when the user-facing surface changes
+- **Link the backing issue or RFC** (`Closes #123`, or reference the RFC) — or
+  mark the PR as trivial per the fast-lane.
+- Keep changes focused; one logical change per PR.
+- Include tests for behavior changes when practical.
+- Update public docs when the user-facing surface changes.
+
+New to the codebase? Read [AGENTS.md](AGENTS.md) — the architecture map and the
+always-on invariants every change is reviewed against.

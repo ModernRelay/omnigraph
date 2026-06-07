@@ -7,16 +7,23 @@
 - Lance `compact_files()` on every node + edge table on `main`.
 - Rewrites small fragments into fewer large ones; old fragments remain reachable via older manifests.
 - Bounded by `OMNIGRAPH_MAINTENANCE_CONCURRENCY` (default 8).
-- Returns `[TableOptimizeStats { table_key, fragments_removed, fragments_added, committed }]`.
+- Returns `[TableOptimizeStats { table_key, fragments_removed, fragments_added, committed, skipped }]`.
+- **Blob tables are skipped.** A table that declares any `Blob` property is not compacted: it is reported with `skipped: Some(BlobColumnsUnsupportedByLance)` (and logged via `tracing::warn`) instead of compacted, and the rest of the sweep proceeds normally. The current Lance `compact_files` mis-decodes blob-v2 columns under its forced `BlobHandling::AllBinary` read; **reads and writes are unaffected** — only compaction is. This is gated by `LANCE_SUPPORTS_BLOB_COMPACTION` (`db/omnigraph/optimize.rs`) and removed when the upstream Lance fix lands (see [docs/dev/lance.md](../dev/lance.md)). Consequence: fragment count and deleted-row space on blob tables are not reclaimed until then; query results are never affected.
 
 ## `cleanup_all_tables(db, options)` — destructive
 
 - Lance `cleanup_old_versions()` per table.
 - Removes manifests (and their unique fragments) older than the retention policy.
 - `CleanupPolicyOptions { keep_versions: Option<u32>, older_than: Option<Duration> }` — at least one is required.
-- Returns `[TableCleanupStats { table_key, bytes_removed, old_versions_removed }]`.
+- Returns `[TableCleanupStats { table_key, bytes_removed, old_versions_removed, error }]`.
+- **Fault-isolated per table.** A single table's transient failure (version GC or
+  orphan reclaim) is recorded on that table's stats row (`error: Some(..)`, logged
+  via `tracing`) and never aborts the healthy tables — cleanup is the convergence
+  backstop, so it does as much as it can and converges on re-run. The CLI reports
+  any failed tables; rerun `cleanup` to retry them.
 - CLI guards with `--confirm`; without it, prints a preview line.
 - **Recovery floor:** `--keep < 3` may garbage-collect Lance versions that the open-time recovery sweep needs as a rollback target (the sweep restores to the branch's manifest-pinned table version, which is HEAD-1 in the typical Phase B → Phase C drift case). Default `--keep 10` is safe.
+- **Orphaned-branch reconciliation:** before the version GC, cleanup runs `reconcile_orphaned_branches`, which `force_delete_branch`es any per-table or commit-graph Lance branch absent from the manifest branch list. These orphans arise when a `branch_delete` flips the manifest authority but a downstream best-effort reclaim does not complete (see [branches-commits.md](branches-commits.md)). The reconciler is authority-derived and idempotent (it no-ops once nothing is orphaned), runs regardless of the `keep_versions` / `older_than` values (those gate version GC only), and never reclaims `main` or system-branch forks. Reclaimed forks are logged via `tracing::info`.
 
 ## Tombstones
 

@@ -8,9 +8,9 @@
 # CI fails if this file drifts from its source, and rejects PRs that
 # edit this file directly without also editing the yml.
 
-*             @ragnorc
+*             @ragnorc @aaltshuler
 
-crates/**     @ragnorc
+crates/**     @ragnorc @aaltshuler
 docs/**       @ragnorc
 README.md     @ragnorc
 AGENTS.md     @ragnorc

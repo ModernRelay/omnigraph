@@ -483,6 +483,22 @@ pub(super) async fn open_owned_dataset_for_branch_write(
             Ok((ds, Some(active_branch.to_string())))
         }
         source_branch => {
+            crate::failpoints::maybe_fail("fork.before_classify")?;
+            // Authority check before forking: re-read the live manifest. If this
+            // table is already forked on active_branch, a concurrent first-write
+            // won the race and our snapshot is stale — that is a retryable
+            // conflict, not an orphan. (A zombie fork is never in the manifest,
+            // so this only fires for a live concurrent fork.)
+            let live = db.snapshot_for_branch(Some(active_branch)).await?;
+            if let Some(entry) = live.entry(table_key) {
+                if entry.table_branch.as_deref() == Some(active_branch) {
+                    return Err(OmniError::manifest_expected_version_mismatch(
+                        table_key,
+                        entry_version,
+                        entry.table_version,
+                    ));
+                }
+            }
             fork_dataset_from_entry_state(
                 db,
                 table_key,

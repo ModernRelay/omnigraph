@@ -8,7 +8,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{Method, Request, StatusCode};
 use lance::index::DatasetIndexExt;
-use omnigraph::db::{Omnigraph, ReadTarget, SchemaApplyOptions};
+use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::OmniError;
 use omnigraph::loader::{LoadMode, load_jsonl};
 use omnigraph_policy::{PolicyChecker, PolicyEngine};
@@ -16,6 +16,7 @@ use omnigraph_server::api::{
     BranchCreateRequest, BranchMergeRequest, ChangeRequest, ErrorOutput, ExportRequest,
     IngestRequest, QueryRequest, ReadRequest, SchemaApplyRequest, SchemaOutput,
 };
+use omnigraph_server::queries::{QueryRegistry, RegistrySpec};
 use omnigraph_server::{AppState, build_app};
 use serde_json::{Value, json};
 use serial_test::serial;
@@ -139,6 +140,469 @@ async fn init_graph_with_schema(schema: &str) -> tempfile::TempDir {
 
 fn graph_path(root: &Path) -> PathBuf {
     root.join("server.omni")
+}
+
+fn stored_query_registry(specs: &[(&str, &str, bool)]) -> QueryRegistry {
+    QueryRegistry::from_specs(
+        specs
+            .iter()
+            .map(|(name, source, expose)| RegistrySpec {
+                name: name.to_string(),
+                source: source.to_string(),
+                expose: *expose,
+                tool_name: None,
+            })
+            .collect(),
+    )
+    .expect("specs parse and key==symbol")
+}
+
+#[tokio::test]
+async fn server_boots_with_a_valid_stored_query_registry() {
+    // A stored query that type-checks against the fixture schema
+    // (`Person { name, age }`) must let the server boot.
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let registry = stored_query_registry(&[(
+        "find_person",
+        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }",
+        false,
+    )]);
+    let state = AppState::open_single_with_queries(
+        graph.to_string_lossy().to_string(),
+        vec![],
+        None,
+        registry,
+    )
+    .await;
+    assert!(state.is_ok(), "valid registry should boot: {:?}", state.err());
+}
+
+#[tokio::test]
+async fn server_refuses_boot_on_type_broken_stored_query() {
+    // A stored query referencing a type not in the schema (`Widget`)
+    // must abort boot, naming the offending query.
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let registry = stored_query_registry(&[(
+        "ghost",
+        "query ghost() { match { $w: Widget } return { $w.name } }",
+        false,
+    )]);
+    let result = AppState::open_single_with_queries(
+        graph.to_string_lossy().to_string(),
+        vec![],
+        None,
+        registry,
+    )
+    .await;
+    // `AppState` is not `Debug`, so match rather than `expect_err`.
+    let err = match result {
+        Ok(_) => panic!("type-broken stored query must refuse boot"),
+        Err(err) => err,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("ghost"), "error should name the broken query: {msg}");
+    assert!(
+        msg.contains("schema check"),
+        "error should mention the schema check: {msg}"
+    );
+}
+
+/// Build a single-mode app with a stored-query registry plus a bearer→actor
+/// pairing and a policy, so invoke tests exercise the `invoke_query`
+/// boundary gate and the inner read/change gates together.
+async fn app_with_stored_queries(
+    specs: &[(&str, &str, bool)],
+    tokens: &[(&str, &str)],
+    policy: &str,
+) -> (tempfile::TempDir, Router) {
+    let temp = init_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let policy_path = temp.path().join("policy.yaml");
+    fs::write(&policy_path, policy).unwrap();
+    let registry = stored_query_registry(specs);
+    let state = AppState::open_single_with_queries(
+        graph.to_string_lossy().to_string(),
+        tokens
+            .iter()
+            .map(|(actor, token)| ((*actor).to_string(), (*token).to_string()))
+            .collect(),
+        Some(&policy_path),
+        registry,
+    )
+    .await
+    .unwrap();
+    (temp, build_app(state))
+}
+
+/// - `act-invoke`: invoke_query + read (stored reads, not mutations)
+/// - `act-full`:   invoke_query + read + change (stored mutations)
+/// - `act-noinvoke`: read only, no invoke_query (boundary-denied)
+/// - `act-invokeonly`: invoke_query only, no read (clears the boundary, inner read denies)
+const INVOKE_POLICY_YAML: &str = r#"
+version: 1
+groups:
+  invokers: ["act-invoke"]
+  full: ["act-full"]
+  readers: ["act-noinvoke"]
+  invoke_only: ["act-invokeonly"]
+protected_branches: [main]
+rules:
+  # invoke_query is graph-scoped — its own rules, no branch_scope.
+  - id: invokers-can-invoke
+    allow:
+      actors: { group: invokers }
+      actions: [invoke_query]
+  - id: full-can-invoke
+    allow:
+      actors: { group: full }
+      actions: [invoke_query]
+  - id: invoke-only-can-invoke
+    allow:
+      actors: { group: invoke_only }
+      actions: [invoke_query]
+  # read / change are branch-scoped.
+  - id: invokers-can-read
+    allow:
+      actors: { group: invokers }
+      actions: [read]
+      branch_scope: any
+  - id: full-can-read-change
+    allow:
+      actors: { group: full }
+      actions: [read, change]
+      branch_scope: any
+  - id: readers-can-read
+    allow:
+      actors: { group: readers }
+      actions: [read]
+      branch_scope: any
+"#;
+
+const STORED_QUERY_SCHEMA_APPLY_POLICY_YAML: &str = r#"
+version: 1
+groups:
+  admins: [act-ragnor]
+protected_branches: [main]
+rules:
+  - id: admins-can-invoke
+    allow:
+      actors: { group: admins }
+      actions: [invoke_query]
+  - id: admins-can-read
+    allow:
+      actors: { group: admins }
+      actions: [read]
+      branch_scope: any
+  - id: admins-can-schema-apply
+    allow:
+      actors: { group: admins }
+      actions: [schema_apply]
+      target_branch_scope: protected
+"#;
+
+const FIND_PERSON_GQ: &str =
+    "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }";
+
+fn invoke_request(name: &str, token: &str, body: Value) -> Request<Body> {
+    Request::builder()
+        .uri(format!("/queries/{name}"))
+        .method(Method::POST)
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
+fn invoke_request_bytes(
+    name: &str,
+    token: &str,
+    body: impl Into<Body>,
+    content_type: Option<&str>,
+) -> Request<Body> {
+    let mut builder = Request::builder()
+        .uri(format!("/queries/{name}"))
+        .method(Method::POST)
+        .header("authorization", format!("Bearer {token}"));
+    if let Some(content_type) = content_type {
+        builder = builder.header("content-type", content_type);
+    }
+    builder.body(body.into()).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_stored_read_returns_rows() {
+    let (_temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, false)],
+        &[("act-invoke", "t-invoke")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    let (status, body) = json_response(
+        &app,
+        invoke_request("find_person", "t-invoke", json!({ "params": { "name": "Alice" } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["query_name"], "find_person");
+    assert_eq!(body["row_count"], 1, "Alice is in the fixture; body: {body}");
+    assert!(body["rows"].is_array(), "read envelope shape; body: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_stored_read_accepts_absent_or_empty_body() {
+    let no_param_query = "query list_people() { match { $p: Person } return { $p.name } }";
+    let (_temp, app) = app_with_stored_queries(
+        &[("list_people", no_param_query, false)],
+        &[("act-invoke", "t-invoke")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+
+    let (status, body) = json_response(
+        &app,
+        invoke_request_bytes("list_people", "t-invoke", Body::empty(), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["query_name"], "list_people");
+
+    let (status, body) = json_response(
+        &app,
+        invoke_request_bytes(
+            "list_people",
+            "t-invoke",
+            Body::empty(),
+            Some("application/json"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let (status, body) = json_response(
+        &app,
+        invoke_request_bytes(
+            "list_people",
+            "t-invoke",
+            Body::from("{}"),
+            Some("application/json"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let (status, body) = json_response(
+        &app,
+        invoke_request_bytes(
+            "list_people",
+            "t-invoke",
+            Body::from("{"),
+            Some("application/json"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("invalid stored-query invocation body"),
+        "malformed JSON should be rejected as bad request; body: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_stored_mutation_double_gates_on_change() {
+    let specs: &[(&str, &str, bool)] = &[(
+        "add_person",
+        "query add_person($name: String) { insert Person { name: $name } }",
+        false,
+    )];
+    let (_temp, app) = app_with_stored_queries(
+        specs,
+        &[("act-invoke", "t-invoke"), ("act-full", "t-full")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+
+    // Has invoke_query but NOT change → the inner change gate denies (403).
+    let (status, body) = json_response(
+        &app,
+        invoke_request("add_person", "t-invoke", json!({ "params": { "name": "Eve" } })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "invoke_query without change must 403; body: {body}"
+    );
+
+    // Has invoke_query + change → applied.
+    let (status, body) = json_response(
+        &app,
+        invoke_request("add_person", "t-full", json!({ "params": { "name": "Eve" } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["affected_nodes"], 1, "body: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_stored_query_bad_param_is_400() {
+    let (_temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, false)],
+        &[("act-invoke", "t-invoke")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    // `name` is declared String; pass a number.
+    let (status, body) = json_response(
+        &app,
+        invoke_request("find_person", "t-invoke", json!({ "params": { "name": 123 } })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(
+        body["error"].as_str().unwrap_or_default().contains("name"),
+        "400 should name the offending param; body: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_unknown_query_and_denied_actor_return_identical_404() {
+    let (_temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, false)],
+        &[("act-invoke", "t-invoke"), ("act-noinvoke", "t-noinvoke")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+
+    // Authorized actor, unknown query name → 404.
+    let (unknown_status, unknown_body) =
+        json_response(&app, invoke_request("does_not_exist", "t-invoke", json!({}))).await;
+    // Denied actor (no invoke_query), real query name → 404.
+    let (denied_status, denied_body) = json_response(
+        &app,
+        invoke_request("find_person", "t-noinvoke", json!({ "params": { "name": "Alice" } })),
+    )
+    .await;
+
+    assert_eq!(unknown_status, StatusCode::NOT_FOUND);
+    assert_eq!(denied_status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        unknown_body, denied_body,
+        "deny must be byte-identical to a missing query (no catalog probing)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_query_holder_without_read_sees_403_not_404() {
+    // The 404-hiding is for callers WITHOUT invoke_query. An actor that
+    // HOLDS invoke_query but lacks `read` clears the boundary gate, then the
+    // inner read gate denies → 403 for an EXISTING read query, vs 404 for an
+    // unknown one. Existence is visible to grant-holders by design (the
+    // documented double-gate); this pins that actual contract.
+    let (_temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, false)],
+        &[("act-invokeonly", "t-invokeonly")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    let (exists_status, _) = json_response(
+        &app,
+        invoke_request("find_person", "t-invokeonly", json!({ "params": { "name": "Alice" } })),
+    )
+    .await;
+    let (absent_status, _) =
+        json_response(&app, invoke_request("does_not_exist", "t-invokeonly", json!({}))).await;
+    assert_eq!(
+        exists_status,
+        StatusCode::FORBIDDEN,
+        "an existing read query the holder can't read → inner-gate 403"
+    );
+    assert_eq!(absent_status, StatusCode::NOT_FOUND, "unknown query still 404s");
+}
+
+fn get_request(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .method(Method::GET)
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_queries_returns_only_exposed_with_typed_params() {
+    let (_temp, app) = app_with_stored_queries(
+        &[
+            ("find_person", FIND_PERSON_GQ, true),
+            (
+                "add_person",
+                "query add_person($name: String) { insert Person { name: $name } }",
+                true,
+            ),
+            ("hidden", "query hidden() { match { $p: Person } return { $p.name } }", false),
+        ],
+        &[("act-invoke", "t-invoke")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    let (status, body) = json_response(&app, get_request("/queries", "t-invoke")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let entries = body["queries"].as_array().unwrap();
+    let names: Vec<&str> = entries.iter().map(|q| q["name"].as_str().unwrap()).collect();
+    assert!(
+        names.contains(&"find_person") && names.contains(&"add_person"),
+        "exposed queries listed: {names:?}"
+    );
+    assert!(!names.contains(&"hidden"), "non-exposed query hidden from the catalog: {names:?}");
+
+    let fp = entries.iter().find(|q| q["name"] == "find_person").unwrap();
+    assert_eq!(fp["mutation"], false);
+    assert_eq!(fp["tool_name"], "find_person");
+    assert_eq!(fp["params"][0]["name"], "name");
+    assert_eq!(fp["params"][0]["kind"], "string");
+    let ap = entries.iter().find(|q| q["name"] == "add_person").unwrap();
+    assert_eq!(ap["mutation"], true, "stored insert → mutation");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_queries_is_read_gated_so_a_non_invoker_can_list() {
+    // The catalog is read-gated (not invoke_query-gated), so a reader who
+    // lacks invoke_query still enumerates the exposed queries — the
+    // documented probe-oracle gap until per-query Cedar filtering lands.
+    let (_temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, true)],
+        &[("act-noinvoke", "t-noinvoke")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    let (status, body) = json_response(&app, get_request("/queries", "t-noinvoke")).await;
+    assert_eq!(status, StatusCode::OK, "read-gated catalog; body: {body}");
+    let names: Vec<&str> = body["queries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|q| q["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"find_person"),
+        "a reader lists the catalog despite lacking invoke_query: {names:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_queries_is_empty_when_no_registry() {
+    let (_temp, app) = app_for_loaded_graph_with_auth("demo-token").await;
+    let (status, body) = json_response(&app, get_request("/queries", "demo-token")).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        body["queries"].as_array().unwrap().is_empty(),
+        "no stored-query registry → empty catalog"
+    );
 }
 
 fn drifted_test_schema() -> String {
@@ -421,6 +885,83 @@ async fn schema_apply_route_updates_graph_for_authorized_admin() {
             .properties
             .contains_key("nickname")
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_apply_route_rejects_stored_query_breakage_before_publish() {
+    let (temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, true)],
+        &[("act-ragnor", "admin-token")],
+        STORED_QUERY_SCHEMA_APPLY_POLICY_YAML,
+    )
+    .await;
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/schema/apply")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer admin-token")
+        .body(Body::from(
+            serde_json::to_vec(&SchemaApplyRequest {
+                schema_source: renamed_age_schema(),
+                ..Default::default()
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+    let (status, payload) = json_response(&app, request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {payload}");
+    let message = payload["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("find_person") && message.contains("schema check"),
+        "registry breakage should name the stored query; body: {payload}"
+    );
+
+    let reopened = Omnigraph::open(graph_path(temp.path()).to_str().unwrap())
+        .await
+        .unwrap();
+    let person = &reopened.catalog().node_types["Person"];
+    assert!(person.properties.contains_key("age"));
+    assert!(!person.properties.contains_key("years"));
+
+    let (invoke_status, invoke_body) = json_response(
+        &app,
+        invoke_request(
+            "find_person",
+            "admin-token",
+            json!({ "params": { "name": "Alice" } }),
+        ),
+    )
+    .await;
+    assert_eq!(invoke_status, StatusCode::OK, "body: {invoke_body}");
+    assert_eq!(invoke_body["row_count"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_apply_route_noop_keeps_valid_stored_query_registry() {
+    let (_temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, true)],
+        &[("act-ragnor", "admin-token")],
+        STORED_QUERY_SCHEMA_APPLY_POLICY_YAML,
+    )
+    .await;
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/schema/apply")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer admin-token")
+        .body(Body::from(
+            serde_json::to_vec(&SchemaApplyRequest {
+                schema_source: fs::read_to_string(fixture("test.pg")).unwrap(),
+                ..Default::default()
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+    let (status, payload) = json_response(&app, request).await;
+    assert_eq!(status, StatusCode::OK, "body: {payload}");
+    assert_eq!(payload["applied"], false);
 }
 
 #[tokio::test]
@@ -4690,6 +5231,7 @@ mod multi_graph_startup {
                 uri: graph_uri,
                 engine: Arc::new(engine),
                 policy: None,
+                queries: None,
             }));
             dirs.push(dir);
         }
@@ -4985,12 +5527,14 @@ graphs:
             uri: graph_uri.clone(),
             engine: Arc::clone(&engine),
             policy: None,
+            queries: None,
         });
         let beta = Arc::new(GraphHandle {
             key: GraphKey::cluster(GraphId::try_from("beta").unwrap()),
             uri: format!("file://{graph_uri}/"),
             engine,
             policy: None,
+            queries: None,
         });
 
         match GraphRegistry::from_handles(vec![alpha, beta]) {
@@ -5016,6 +5560,7 @@ graphs:
             uri: format!("file://{graph_uri}/"),
             engine: Arc::new(engine),
             policy: None,
+            queries: None,
         });
 
         let registry = GraphRegistry::from_handles(vec![handle]).unwrap();
@@ -5138,17 +5683,99 @@ graphs:
         let err = load_server_settings(Some(&config_path), None, None, None, true).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("top-level `policy.file` is single-graph/CLI-local policy only"),
-            "expected single-graph policy guidance, got: {msg}"
+            msg.contains("top-level") && msg.contains("policy.file") && msg.contains("not honored"),
+            "expected top-level-not-honored guidance, got: {msg}"
         );
         assert!(
-            msg.contains("graphs.<graph_id>.policy.file"),
+            msg.contains("graphs.<graph_id>"),
             "expected per-graph migration guidance, got: {msg}"
         );
         assert!(
             msg.contains("server.policy.file"),
             "expected server policy migration guidance, got: {msg}"
         );
+    }
+
+    #[test]
+    fn mode_inference_multi_rejects_top_level_queries() {
+        // Symmetric to the policy guard: a top-level `queries:` block in
+        // multi-graph mode is not honored (each graph uses its own), so it
+        // is a loud error rather than a silent no-op.
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            "queries:\n  q:\n    file: ./q.gq\ngraphs:\n  alpha:\n    uri: /tmp/alpha.omni\n",
+        )
+        .unwrap();
+        let err = load_server_settings(Some(&config_path), None, None, None, true).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("queries") && msg.contains("not honored"),
+            "top-level queries must be rejected in multi-graph mode: {msg}"
+        );
+    }
+
+    #[test]
+    fn single_mode_named_graph_rejects_top_level_blocks() {
+        // Serving a graph by name (`--target`/`server.graph`) uses its
+        // per-graph block; a populated top-level block would be silently
+        // shadowed, so boot refuses and names the per-graph location.
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            "policy:\n  file: ./top.yaml\ngraphs:\n  prod:\n    uri: /tmp/prod.omni\n",
+        )
+        .unwrap();
+        let err =
+            load_server_settings(Some(&config_path), None, Some("prod".to_string()), None, true)
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("prod") && msg.contains("policy.file") && msg.contains("graphs.prod"),
+            "named single-mode + top-level policy must refuse, naming the graph: {msg}"
+        );
+    }
+
+    #[test]
+    fn single_mode_named_graph_uses_per_graph_policy_and_queries() {
+        // The identity rule: `--target prod` attaches `graphs.prod`'s own
+        // policy + queries, not the top-level ones (which are absent here).
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("prod.gq"),
+            "query pq() { match { $u: User } return { $u.name } }",
+        )
+        .unwrap();
+        let config_path = temp.path().join("omnigraph.yaml");
+        fs::write(
+            &config_path,
+            "graphs:\n  prod:\n    uri: /tmp/prod.omni\n    policy:\n      file: ./prod-policy.yaml\n    \
+             queries:\n      pq:\n        file: ./prod.gq\n",
+        )
+        .unwrap();
+        let settings =
+            load_server_settings(Some(&config_path), None, Some("prod".to_string()), None, true)
+                .unwrap();
+        match settings.mode {
+            ServerConfigMode::Single {
+                graph_id,
+                policy_file,
+                queries,
+                ..
+            } => {
+                assert_eq!(graph_id, "prod", "named single-mode keeps graph identity");
+                assert!(
+                    policy_file
+                        .as_ref()
+                        .is_some_and(|p| p.ends_with("prod-policy.yaml")),
+                    "per-graph policy attached: {policy_file:?}"
+                );
+                assert!(queries.lookup("pq").is_some(), "per-graph query attached");
+            }
+            other => panic!("expected Single mode, got {other:?}"),
+        }
     }
 
     #[test]
@@ -5383,6 +6010,7 @@ graphs:
             uri: graph_uri,
             engine: Arc::new(engine),
             policy: None,
+            queries: None,
         });
         let tokens = vec![("act-andrew".to_string(), "secret-token".to_string())];
         let workload = omnigraph_server::workload::WorkloadController::from_env();
@@ -5450,6 +6078,7 @@ graphs:
                 uri: graph_uri,
                 engine: Arc::new(engine),
                 policy: None,
+                queries: None,
             }));
         }
 

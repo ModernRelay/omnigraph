@@ -168,6 +168,8 @@ const EXPECTED_PATHS: &[&str] = &[
     "/export",
     "/change",
     "/mutate",
+    "/queries",
+    "/queries/{name}",
     "/schema",
     "/schema/apply",
     "/ingest",
@@ -701,6 +703,8 @@ fn protected_endpoints_reference_bearer_token_security() {
         ("/read", "post"),
         ("/change", "post"),
         ("/schema/apply", "post"),
+        ("/queries", "get"),
+        ("/queries/{name}", "post"),
         ("/ingest", "post"),
         ("/export", "post"),
         ("/snapshot", "get"),
@@ -913,6 +917,34 @@ fn post_endpoints_have_request_body() {
     }
 }
 
+#[test]
+fn invoke_stored_query_request_body_is_optional() {
+    let doc = openapi_json();
+    let request_body = &doc["paths"]["/queries/{name}"]["post"]["requestBody"];
+    assert!(
+        request_body.is_object(),
+        "POST /queries/{{name}} should document its optional request body"
+    );
+    assert_eq!(
+        request_body["required"].as_bool().unwrap_or(false),
+        false,
+        "stored-query invocation body should be optional"
+    );
+    let schema = &request_body["content"]["application/json"]["schema"];
+    let ref_path = schema["$ref"]
+        .as_str()
+        .or_else(|| {
+            schema["oneOf"]
+                .as_array()
+                .and_then(|schemas| schemas.iter().find_map(|schema| schema["$ref"].as_str()))
+        })
+        .unwrap();
+    assert!(
+        ref_path.contains("InvokeStoredQueryRequest"),
+        "POST /queries/{{name}} requestBody should reference InvokeStoredQueryRequest, got {ref_path}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Serialization round-trip test
 // ---------------------------------------------------------------------------
@@ -1117,6 +1149,7 @@ async fn app_for_multi_mode(graph_ids: &[&str]) -> (Vec<tempfile::TempDir>, Rout
             uri: graph_uri,
             engine: Arc::new(engine),
             policy: None,
+            queries: None,
         }));
         dirs.push(dir);
     }

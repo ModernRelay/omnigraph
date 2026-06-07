@@ -121,6 +121,31 @@ jobs:
         run: |
           ./scripts/update-homebrew-formula.sh "${GITHUB_REF_NAME}" homebrew-tap/Formula/omnigraph.rb
 
+      # Diagnostic only: brew is not on PATH on the ubuntu runner by default, so
+      # set it up explicitly. Both this setup and the audit below are best-effort
+      # canaries, not gates — continue-on-error on each keeps a failed/flaky brew
+      # (the action is pinned to a moving @master ref) from skipping the actual
+      # tap publish below. The formula is correct by construction
+      # (update-homebrew-formula.sh), so brew tooling must never block the push.
+      - name: Set up Homebrew
+        if: env.HOMEBREW_TAP_SKIP != '1'
+        continue-on-error: true
+        uses: Homebrew/actions/setup-homebrew@master
+
+      - name: Audit generated formula
+        if: env.HOMEBREW_TAP_SKIP != '1'
+        continue-on-error: true
+        run: |
+          # Audit the checked-out tap by name (brew audit rejects bare paths
+          # and needs tap context). Symlink the checkout into Homebrew's Taps
+          # tree so `modernrelay/tap/omnigraph` resolves to it. Offline audit
+          # (no --online) keeps it deterministic; it still catches the
+          # ComponentsOrder/structure class of problems.
+          tap_dir="$(brew --repository)/Library/Taps/modernrelay/homebrew-tap"
+          mkdir -p "$(dirname "$tap_dir")"
+          ln -sfn "$PWD/homebrew-tap" "$tap_dir"
+          brew audit --strict modernrelay/tap/omnigraph
+
       - name: Commit and push formula update
         if: env.HOMEBREW_TAP_SKIP != '1'
         working-directory: homebrew-tap

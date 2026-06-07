@@ -56,6 +56,21 @@ pub enum PolicyAction {
     /// from v0.6.0; operators add and remove graphs by editing
     /// `omnigraph.yaml` and restarting.
     GraphList,
+    /// Gates invoking a server-side stored query by name. Per-graph and
+    /// **graph-scoped** (no branch dimension, like `Admin`): the per-branch
+    /// access of the query body is enforced by the inner `Read`/`Change`
+    /// gate, so branch-scoping this outer gate would be redundant (and was
+    /// wrong for snapshot reads). A rule that sets `branch_scope` on
+    /// `invoke_query` is rejected by `validate()`. In this release it is
+    /// **coarse**: an `invoke_query` allow rule permits *any* stored query
+    /// on the graph (no per-query dimension yet); a future, additive
+    /// refinement adds an optional query-name scope.
+    ///
+    /// This gate sits at the HTTP boundary. The engine `_as` writers still
+    /// enforce `Read`/`Change` per the query body, so a stored *mutation*
+    /// is double-gated: `invoke_query` to reach the tool, plus `change` for
+    /// the write itself.
+    InvokeQuery,
 }
 
 impl PolicyAction {
@@ -70,6 +85,7 @@ impl PolicyAction {
             Self::BranchMerge => "branch_merge",
             Self::Admin => "admin",
             Self::GraphList => "graph_list",
+            Self::InvokeQuery => "invoke_query",
         }
     }
 
@@ -99,7 +115,8 @@ impl PolicyAction {
             | Self::BranchCreate
             | Self::BranchDelete
             | Self::BranchMerge
-            | Self::Admin => PolicyResourceKind::Graph,
+            | Self::Admin
+            | Self::InvokeQuery => PolicyResourceKind::Graph,
         }
     }
 }
@@ -155,6 +172,7 @@ impl FromStr for PolicyAction {
             "branch_merge" => Ok(Self::BranchMerge),
             "admin" => Ok(Self::Admin),
             "graph_list" => Ok(Self::GraphList),
+            "invoke_query" => Ok(Self::InvokeQuery),
             other => bail!("unknown policy action '{other}'"),
         }
     }
@@ -806,6 +824,7 @@ namespace Omnigraph {
     action "branch_delete" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "branch_merge" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
     action "admin" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
+    action "invoke_query" appliesTo { principal: Actor, resource: Graph, context: RequestContext };
 
     action "graph_list" appliesTo { principal: Actor, resource: Server, context: RequestContext };
 }
@@ -1262,6 +1281,80 @@ rules:
             )
             .unwrap();
         assert!(!deny.allowed);
+    }
+
+    #[test]
+    fn invoke_query_authorizes_per_graph() {
+        let policy: PolicyConfig = serde_yaml::from_str(
+            r#"
+version: 1
+groups:
+  team: [act-alice]
+  others: [act-bruno]
+rules:
+  - id: team-invoke-queries
+    allow:
+      actors: { group: team }
+      actions: [invoke_query]
+"#,
+        )
+        .unwrap();
+        let engine = PolicyCompiler::compile(&policy, "graph").unwrap();
+
+        let allow = engine
+            .authorize(
+                "act-alice",
+                &PolicyRequest {
+                    action: PolicyAction::InvokeQuery,
+                    branch: None,
+                    target_branch: None,
+                },
+            )
+            .unwrap();
+        assert!(allow.allowed);
+        assert_eq!(
+            allow.matched_rule_id.as_deref(),
+            Some("team-invoke-queries")
+        );
+
+        // Actor outside the group → deny.
+        let deny = engine
+            .authorize(
+                "act-bruno",
+                &PolicyRequest {
+                    action: PolicyAction::InvokeQuery,
+                    branch: None,
+                    target_branch: None,
+                },
+            )
+            .unwrap();
+        assert!(!deny.allowed);
+    }
+
+    #[test]
+    fn invoke_query_rejects_branch_scope() {
+        // invoke_query is graph-scoped (like admin) — per-branch access is
+        // enforced by the inner read/change gate — so a rule that puts a
+        // `branch_scope` qualifier on it is rejected at validate().
+        let policy: PolicyConfig = serde_yaml::from_str(
+            r#"
+version: 1
+groups:
+  team: [act-alice]
+rules:
+  - id: team-invoke-any-branch
+    allow:
+      actors: { group: team }
+      actions: [invoke_query]
+      branch_scope: any
+"#,
+        )
+        .unwrap();
+        let err = policy.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("branch_scope") && err.contains("invoke_query"),
+            "branch_scope on invoke_query must be rejected: {err}"
+        );
     }
 
     #[test]

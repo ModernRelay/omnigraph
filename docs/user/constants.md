@@ -4,13 +4,14 @@
 |---|---|---|
 | `MANIFEST_DIR` | `__manifest` | `db/manifest/layout.rs` |
 | Commit graph dir | `_graph_commits.lance` | `db/commit_graph.rs` |
-| Run registry dir (legacy, removed MR-771) | `_graph_runs.lance` | inert post-v0.4.0; reclaimed by MR-770 |
-| Run branch prefix (legacy, removed MR-771) | `__run__` | filtered by `is_internal_run_branch` defense-in-depth |
+| Run registry dir (legacy, removed MR-771) | `_graph_runs.lance` | inert post-v0.4.0; bytes remain until a `delete_prefix` primitive lands |
+| Run branch prefix (legacy, removed MR-771/MR-770) | `__run__` | swept off `__manifest` by the v2→v3 migration; no longer a reserved name |
 | Schema apply lock | `__schema_apply_lock__` | `db/mod.rs` |
 | Manifest publisher retry budget | `PUBLISHER_RETRY_BUDGET = 5` | `db/manifest/publisher.rs` |
-| Internal manifest schema version | `INTERNAL_MANIFEST_SCHEMA_VERSION = 2` | `db/manifest/migrations.rs` |
+| Internal manifest schema version | `INTERNAL_MANIFEST_SCHEMA_VERSION = 3` | `db/manifest/migrations.rs` |
 | Merge stage batch | `MERGE_STAGE_BATCH_ROWS = 8192` | `exec/merge.rs` |
 | Maintenance concurrency | `OMNIGRAPH_MAINTENANCE_CONCURRENCY=8` | `db/omnigraph/optimize.rs` |
+| Lance blob compaction support | `LANCE_SUPPORTS_BLOB_COMPACTION = false` | `db/omnigraph/optimize.rs` |
 | Graph index cache size | `8` (LRU) | `runtime_cache.rs` |
 | Default body limit | `1 MB` | `omnigraph-server/lib.rs` |
 | Ingest body limit | `32 MB` | `omnigraph-server/lib.rs` |

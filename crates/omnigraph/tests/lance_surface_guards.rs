@@ -242,3 +242,136 @@ async fn _compile_delete_result_field_shape() -> lance::Result<()> {
     let _num_deleted: u64 = result.num_deleted_rows;
     Ok(())
 }
+
+// --- Guard 9: force_delete_branch semantics --------------------------------
+//
+// The branch-delete reconciler (`db/omnigraph/optimize.rs::reconcile_orphaned_branches`)
+// and the eager best-effort reclaim in `cleanup_deleted_branch_tables` call
+// `force_delete_branch` to drop orphaned branch refs. The single-authority
+// design relies on three facts pinned here:
+//   1. plain `delete_branch` errors on a missing ref (so the design uses the
+//      force variant instead);
+//   2. `force_delete_branch` removes an existing (forked) branch — the orphan
+//      case, where a `tree/{branch}/` exists;
+//   3. `force_delete_branch` on a *fully-absent* branch (no tree dir) still
+//      errors on the local store, because `remove_dir_all`'s NotFound is not
+//      caught for Lance's native error variant. `TableStore::force_delete_branch`
+//      wraps this to be fully idempotent. Pin the raw quirk so a future Lance
+//      fix (which would let us simplify the wrapper) is noticed.
+
+#[tokio::test]
+async fn force_delete_branch_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard9.lance");
+    let uri = uri.to_str().unwrap();
+    let mut ds = fresh_dataset(uri).await;
+
+    // (1) Plain delete of a never-created branch errors (RefNotFound).
+    assert!(
+        ds.delete_branch("nope").await.is_err(),
+        "Dataset::delete_branch on a missing ref should error; if this is now \
+         Ok, the reconciler could drop the force variant."
+    );
+
+    // (2) force_delete_branch removes an existing (forked) branch.
+    let base = ds.version().version;
+    ds.create_branch("feature", base, None).await.unwrap();
+    ds.force_delete_branch("feature").await.unwrap();
+    assert!(
+        !ds.list_branches().await.unwrap().contains_key("feature"),
+        "force_delete_branch should remove an existing branch ref"
+    );
+
+    // (3) Quirk: force_delete on a fully-absent branch errors on the local
+    // store (worked around by TableStore::force_delete_branch).
+    assert!(
+        ds.force_delete_branch("never").await.is_err(),
+        "force_delete_branch on a fully-absent branch no longer errors — \
+         TableStore::force_delete_branch's NotFound tolerance can be simplified."
+    );
+}
+
+// --- Guard 10: blob-column compaction is still broken in this Lance --------
+//
+// `db/omnigraph/optimize.rs` skips tables with blob columns while
+// `LANCE_SUPPORTS_BLOB_COMPACTION = false`: Lance `compact_files` forces
+// `BlobHandling::AllBinary`, and the blob-v2 struct decoder mis-counts columns
+// ("more fields in the schema than provided column indices"), failing even a
+// pristine uniform-V2_2 multi-fragment blob table. Reads are unaffected (they
+// use descriptor handling).
+//
+// WHEN THIS TEST TURNS RED (compact_files no longer errors), the Lance bug is
+// fixed: flip `LANCE_SUPPORTS_BLOB_COMPACTION` to true in optimize.rs, drop the
+// blob-skip branch + the `optimize_skips_blob_table_and_reports_skip`
+// skip assertions in maintenance.rs, and re-pin docs/dev/lance.md.
+
+#[tokio::test]
+async fn compact_files_still_fails_on_blob_columns() {
+    use arrow_array::{LargeBinaryArray, StructArray};
+
+    fn blob_batch(start: i32, n: i32) -> RecordBatch {
+        let ids: Vec<String> = (start..start + n).map(|i| format!("n{i}")).collect();
+        let data =
+            LargeBinaryArray::from_iter_values((start..start + n).map(|i| format!("blob{i}")));
+        let blob_uri = StringArray::from(vec![None::<&str>; n as usize]);
+        let DataType::Struct(fields) = lance::blob::blob_field("content", true).data_type().clone()
+        else {
+            unreachable!("blob_field is always a Struct");
+        };
+        let content = StructArray::new(
+            fields,
+            vec![Arc::new(data) as _, Arc::new(blob_uri) as _],
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            lance::blob::blob_field("content", true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(ids)) as _, Arc::new(content) as _],
+        )
+        .unwrap()
+    }
+
+    async fn write(uri: &str, batch: RecordBatch, mode: WriteMode) {
+        let schema = batch.schema();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        // Blob v2 requires file version >= 2.2; without the pin the *write*
+        // would fail with a different error, masking the guard's intent.
+        let params = WriteParams {
+            mode,
+            enable_stable_row_ids: true,
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        };
+        Dataset::write(reader, uri, Some(params)).await.unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard10-blob.lance");
+    let uri = uri.to_str().unwrap();
+
+    // Uniform V2_2, two fragments → forces compaction to actually rewrite.
+    write(uri, blob_batch(0, 2), WriteMode::Create).await;
+    write(uri, blob_batch(100, 2), WriteMode::Append).await;
+
+    let mut ds = Dataset::open(uri).await.unwrap();
+    assert!(
+        ds.get_fragments().len() >= 2,
+        "guard needs a multi-fragment table to trigger a real compaction rewrite"
+    );
+
+    let result = compact_files(&mut ds, CompactionOptions::default(), None).await;
+    let err = result.expect_err(
+        "compact_files unexpectedly SUCCEEDED on a blob table — the Lance blob-v2 \
+         compaction bug is fixed. Flip LANCE_SUPPORTS_BLOB_COMPACTION to true in \
+         db/omnigraph/optimize.rs, remove the blob-skip branch, and re-pin docs/dev/lance.md.",
+    );
+    assert!(
+        err.to_string()
+            .contains("more fields in the schema than provided column indices"),
+        "blob compaction failed with an unexpected error (Lance internals may have \
+         shifted): {err}"
+    );
+}
