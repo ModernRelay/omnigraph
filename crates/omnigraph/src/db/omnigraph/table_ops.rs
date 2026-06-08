@@ -404,7 +404,7 @@ pub(super) async fn open_for_mutation(
     db: &Omnigraph,
     table_key: &str,
     op_kind: crate::db::MutationOpKind,
-) -> Result<(Dataset, String, Option<String>)> {
+) -> Result<(Dataset, String, Option<String>, u64)> {
     let current_branch = db
         .coordinator
         .read()
@@ -425,7 +425,7 @@ pub(super) async fn open_for_mutation_on_branch(
     branch: Option<&str>,
     table_key: &str,
     op_kind: crate::db::MutationOpKind,
-) -> Result<(Dataset, String, Option<String>)> {
+) -> Result<(Dataset, String, Option<String>, u64)> {
     db.ensure_schema_apply_not_locked("write").await?;
     let resolved = db.resolved_branch_target(branch).await?;
     let entry = resolved
@@ -433,6 +433,10 @@ pub(super) async fn open_for_mutation_on_branch(
         .entry(table_key)
         .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
     let full_path = format!("{}/{}", db.root_uri, entry.table_path);
+    // The manifest pin (`entry.table_version`) is the OCC fence threaded back to
+    // the caller — staging records it as `expected_version`, never the Lance
+    // HEAD, so benign drift tolerated below doesn't relocate into a spurious
+    // post-queue 409.
     match resolved.branch.as_deref() {
         None => {
             let ds = db
@@ -440,10 +444,10 @@ pub(super) async fn open_for_mutation_on_branch(
                 .open_dataset_head_for_write(table_key, &full_path, None)
                 .await?;
             if op_kind.strict_pre_stage_version_check() {
-                db.table_store
-                    .ensure_expected_version(&ds, table_key, entry.table_version)?;
+                db.ensure_writable_or_defer(&ds, table_key, None, entry.table_version, None)
+                    .await?;
             }
-            Ok((ds, full_path, None))
+            Ok((ds, full_path, None, entry.table_version))
         }
         Some(active_branch) => {
             let (ds, table_branch) = open_owned_dataset_for_branch_write(
@@ -456,7 +460,7 @@ pub(super) async fn open_for_mutation_on_branch(
                 op_kind,
             )
             .await?;
-            Ok((ds, full_path, table_branch))
+            Ok((ds, full_path, table_branch, entry.table_version))
         }
     }
 }
@@ -477,8 +481,8 @@ pub(super) async fn open_owned_dataset_for_branch_write(
                 .open_dataset_head_for_write(table_key, full_path, Some(active_branch))
                 .await?;
             if op_kind.strict_pre_stage_version_check() {
-                db.table_store
-                    .ensure_expected_version(&ds, table_key, entry_version)?;
+                db.ensure_writable_or_defer(&ds, table_key, Some(active_branch), entry_version, None)
+                    .await?;
             }
             Ok((ds, Some(active_branch.to_string())))
         }

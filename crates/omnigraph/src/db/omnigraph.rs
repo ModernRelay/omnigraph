@@ -628,6 +628,109 @@ impl Omnigraph {
         &self.root_uri
     }
 
+    /// Pre-stage write precondition for strict writers (Update / Delete /
+    /// SchemaRewrite / schema-apply index rebuild). Decides whether the writer
+    /// may proceed against a table whose Lance HEAD may sit ahead of the
+    /// manifest pin it captured in its snapshot.
+    ///
+    /// `expected_version` is the manifest pin from the caller's snapshot, which
+    /// may be STALE (another writer published since the caller opened). The OCC
+    /// fence must therefore be the *current* manifest pin, re-read fresh here on
+    /// the conflict path. `Lance HEAD > caller pin` is ambiguous between a stale
+    /// handle and genuine drift, and only the fresh pin disambiguates:
+    ///
+    /// - `HEAD == caller pin` — fresh and in sync (the current pin is squeezed
+    ///   between them); proceed without an extra manifest read.
+    /// - `caller pin != current pin` — the caller's pre-write view is stale (or
+    ///   inconsistent) relative to the live manifest: a normal optimistic-
+    ///   concurrency conflict. Reject with `ExpectedVersionMismatch` here, BEFORE
+    ///   any staged commit or recovery sidecar, so the client refreshes and
+    ///   retries and no residue is left. (Tolerating this would let a stale write
+    ///   advance Lance HEAD and write a sidecar before failing the publisher CAS.)
+    /// - `caller pin == current pin`, `HEAD == current pin` — no drift; proceed.
+    /// - `caller pin == current pin`, `HEAD > current pin` — genuine drift, the
+    ///   caller is fresh w.r.t. the manifest but durable Lance HEAD is ahead:
+    ///     - no sidecar pins the table — benign content-preserving drift
+    ///       (compaction / a recovery `restore` / an old-binary optimize / an
+    ///       external `compact_files`), which never published and leaves no
+    ///       sidecar. Proceed: the writer's commit + the publisher CAS reconcile
+    ///       the manifest.
+    ///     - a sidecar pins the table — a real in-flight partial write the
+    ///       open-time sweep will roll back. Defer; never write onto state
+    ///       recovery may revert.
+    /// - `HEAD < current pin` — the manifest cannot lead durable Lance state
+    ///   under the commit protocol; a hard, loud invariant violation.
+    ///
+    /// `exclude_operation_id` is the caller's OWN in-flight sidecar id, if it
+    /// has already written one (schema apply does, before its per-table head
+    /// re-checks); that sidecar is skipped so the writer does not defer against
+    /// itself. Mutation/load writers check before writing any sidecar and pass
+    /// `None`.
+    ///
+    /// Tolerating uncovered drift is correct only because such drift is always
+    /// content-preserving (see [`crate::db::manifest::sidecar_pins_table`]); a
+    /// future non-content-preserving HEAD advance with no sidecar would have to
+    /// register one or this would become a silent-data-loss vector.
+    pub(crate) async fn ensure_writable_or_defer(
+        &self,
+        ds: &Dataset,
+        table_key: &str,
+        branch: Option<&str>,
+        expected_version: u64,
+        exclude_operation_id: Option<&str>,
+    ) -> Result<()> {
+        let head = ds.version().version;
+        if head == expected_version {
+            // Caller's pinned version matches durable Lance HEAD: fresh and no
+            // drift (the live pin is squeezed between them). Fast path.
+            return Ok(());
+        }
+        // head != caller pin. Re-read the CURRENT manifest pin fresh — the
+        // caller's snapshot may be stale — to tell a stale handle (normal OCC
+        // conflict) apart from genuine Lance-HEAD-vs-manifest drift.
+        let coordinator = self.open_coordinator_for_branch(branch).await?;
+        let current_pin = coordinator
+            .snapshot()
+            .entry(table_key)
+            .map(|entry| entry.table_version)
+            .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {table_key}")))?;
+        if expected_version != current_pin {
+            // Stale (or inconsistent) pre-write view vs. the live manifest.
+            // Reject early — before any staged commit or sidecar — so the client
+            // refreshes and retries with no residue left behind.
+            return Err(OmniError::manifest_expected_version_mismatch(
+                table_key,
+                expected_version,
+                current_pin,
+            ));
+        }
+        if head < current_pin {
+            return Err(OmniError::manifest_internal(format!(
+                "manifest pin for '{table_key}' leads durable Lance HEAD \
+                 (pin={current_pin}, head={head}); the manifest cannot be ahead \
+                 of committed Lance state under the commit protocol",
+            )));
+        }
+        // caller is fresh (expected == current_pin) and head > current_pin:
+        // genuine drift. Benign (no sidecar) vs. a partial write (sidecar).
+        if crate::db::manifest::sidecar_pins_table(
+            self.root_uri(),
+            self.storage_adapter(),
+            table_key,
+            branch,
+            exclude_operation_id,
+        )
+        .await?
+        {
+            return Err(OmniError::manifest_conflict(format!(
+                "'{table_key}' has a pending recovery sidecar (Lance head={head} \
+                 is ahead of manifest pin={current_pin}); reopen the graph \
+                 to run the recovery sweep before writing",
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn open_coordinator_for_branch(
         &self,
         branch: Option<&str>,
@@ -1349,7 +1452,7 @@ impl Omnigraph {
         &self,
         table_key: &str,
         op_kind: crate::db::MutationOpKind,
-    ) -> Result<(Dataset, String, Option<String>)> {
+    ) -> Result<(Dataset, String, Option<String>, u64)> {
         table_ops::open_for_mutation(self, table_key, op_kind).await
     }
 
@@ -1358,7 +1461,7 @@ impl Omnigraph {
         branch: Option<&str>,
         table_key: &str,
         op_kind: crate::db::MutationOpKind,
-    ) -> Result<(Dataset, String, Option<String>)> {
+    ) -> Result<(Dataset, String, Option<String>, u64)> {
         table_ops::open_for_mutation_on_branch(self, branch, table_key, op_kind).await
     }
 
@@ -2131,7 +2234,7 @@ edge WorksAt: Person -> Company
     }
 
     async fn seed_person_row(db: &mut Omnigraph, name: &str, age: Option<i32>) {
-        let (mut ds, full_path, table_branch) = db
+        let (mut ds, full_path, table_branch, _manifest_pin) = db
             .open_for_mutation("node:Person", crate::db::MutationOpKind::Insert)
             .await
             .unwrap();

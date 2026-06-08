@@ -950,7 +950,7 @@ async fn publish_rewritten_merge_table(
     // source onto target). The inline `delete_where` later in this
     // function operates on rows the rewrite chose to remove, not
     // user-facing predicates, so Merge is the correct policy here.
-    let (ds, full_path, table_branch) = target_db
+    let (ds, full_path, table_branch, _manifest_pin) = target_db
         .open_for_mutation(table_key, crate::db::MutationOpKind::Merge)
         .await?;
     let mut current_ds = ds;

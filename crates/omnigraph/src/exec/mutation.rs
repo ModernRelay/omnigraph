@@ -620,10 +620,15 @@ async fn open_table_for_mutation(
             .await?;
         return Ok((ds, path.full_path.clone(), path.table_branch.clone()));
     }
-    let (ds, full_path, table_branch) = db
+    let (ds, full_path, table_branch, manifest_pin) = db
         .open_for_mutation_on_branch(branch, table_key, op_kind)
         .await?;
-    let expected_version = ds.version().version;
+    // The OCC fence staging records is the manifest pin, NOT the Lance HEAD
+    // (`ds.version()`). With benign drift now tolerated at the pre-stage check,
+    // capturing HEAD here would relocate the rejection into a spurious 409 at
+    // the post-queue strict check (`StagedMutation::commit_all`), which compares
+    // this value against the freshly re-read pin.
+    let expected_version = manifest_pin;
     staging.ensure_path(
         table_key,
         full_path.clone(),

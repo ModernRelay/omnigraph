@@ -418,7 +418,7 @@ async fn load_jsonl_reader<R: BufRead>(
     // accumulator. Overwrite → concurrent inline-commit (legacy path).
     if use_staging {
         for (type_name, table_key, batch, loaded_count) in prepared_nodes {
-            let (ds, full_path, table_branch) = db
+            let (ds, full_path, table_branch, _manifest_pin) = db
                 .open_for_mutation_on_branch(branch, &table_key, load_op_kind)
                 .await?;
             let expected_version = ds.version().version;
@@ -528,7 +528,7 @@ async fn load_jsonl_reader<R: BufRead>(
     // Phase 2e: write every edge type. Same dispatch as Phase 2b.
     if use_staging {
         for (edge_name, table_key, batch, loaded_count) in prepared_edges {
-            let (ds, full_path, table_branch) = db
+            let (ds, full_path, table_branch, _manifest_pin) = db
                 .open_for_mutation_on_branch(branch, &table_key, load_op_kind)
                 .await?;
             let expected_version = ds.version().version;
@@ -1208,7 +1208,7 @@ async fn write_batch_to_dataset(
         LoadMode::Merge => crate::db::MutationOpKind::Merge,
         LoadMode::Overwrite => crate::db::MutationOpKind::SchemaRewrite,
     };
-    let (mut ds, full_path, table_branch) = db
+    let (mut ds, full_path, table_branch, _manifest_pin) = db
         .open_for_mutation_on_branch(branch, table_key, op_kind)
         .await?;
     let table_store = db.table_store();

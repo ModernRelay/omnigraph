@@ -379,6 +379,65 @@ pub(crate) async fn list_sidecars(
     Ok(out)
 }
 
+/// True if any pending recovery sidecar pins `(table_key, branch)` — i.e. a
+/// failed multi-table write left partial state that the open-time sweep will
+/// roll back. Consumer-write preconditions use this to DEFER on sidecar-covered
+/// drift while tolerating benign orphaned drift (compaction / a recovery
+/// `restore` / an old-binary optimize / external `compact_files`), which is
+/// content-preserving and carries NO sidecar.
+///
+/// Branch match normalizes `None` (main/default) and `Some("main")` as equal.
+/// Checks both `RecoverySidecar.tables` (pins) AND `additional_registrations` —
+/// a SchemaApply sidecar pins a not-yet-registered added/renamed-target table
+/// only in `additional_registrations`.
+///
+/// `exclude_operation_id` skips the caller's OWN in-flight sidecar: a writer
+/// that has already written its sidecar (schema apply writes one before its
+/// per-table head re-checks) must not treat that sidecar as foreign and defer
+/// against itself. Mutation/load writers pass `None` (they check before writing
+/// any sidecar, so every sidecar found is foreign). A foreign sidecar means a
+/// PRIOR op crashed mid-flight on this still-open handle; the open-time sweep
+/// has not yet run for it.
+///
+/// Single-coordinator note: this reads `__recovery/` at precondition time. The
+/// only writer of sidecars on a graph is the local process, and the open-time
+/// sweep resolves them before request handlers run, so there is no
+/// read-then-write race under the single-coordinator model (see
+/// `recover_manifest_drift`). A future multi-coordinator deployment would need
+/// queue coordination here.
+pub(crate) async fn sidecar_pins_table(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    table_key: &str,
+    branch: Option<&str>,
+    exclude_operation_id: Option<&str>,
+) -> Result<bool> {
+    fn norm(b: Option<&str>) -> Option<&str> {
+        match b {
+            None | Some("main") => None,
+            other => other,
+        }
+    }
+    let want = norm(branch);
+    for sidecar in list_sidecars(root_uri, storage).await? {
+        if exclude_operation_id == Some(sidecar.operation_id.as_str()) {
+            continue;
+        }
+        let pinned = sidecar
+            .tables
+            .iter()
+            .any(|p| p.table_key == table_key && norm(p.table_branch.as_deref()) == want)
+            || sidecar
+                .additional_registrations
+                .iter()
+                .any(|r| r.table_key == table_key && norm(r.table_branch.as_deref()) == want);
+        if pinned {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Parse a sidecar body, enforcing the schema-version refusal policy.
 /// Exposed separately so unit tests can exercise the parse path without
 /// going through storage.

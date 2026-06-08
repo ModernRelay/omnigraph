@@ -467,6 +467,13 @@ where
         )
     };
 
+    // This apply's own in-flight sidecar id (if one was written above). The
+    // per-table head re-checks below exclude it so they tolerate benign drift
+    // without deferring against the apply's own recovery coverage.
+    let recovery_operation_id = recovery_handle
+        .as_ref()
+        .map(|handle| handle.operation_id.clone());
+
     for table_key in &added_tables {
         let table_path = table_path_for_table_key(table_key)?;
         let dataset_uri = db.table_store.dataset_uri(&table_path);
@@ -495,7 +502,8 @@ where
                 source_table_key
             ))
         })?;
-        ensure_snapshot_entry_head_matches(db, source_entry).await?;
+        ensure_snapshot_entry_head_matches(db, source_entry, recovery_operation_id.as_deref())
+            .await?;
         let source_ds = snapshot.open(source_table_key).await?;
         let current_catalog = db.catalog();
         let batch = batch_for_schema_apply_rewrite(
@@ -541,7 +549,7 @@ where
                 table_key
             ))
         })?;
-        ensure_snapshot_entry_head_matches(db, entry).await?;
+        ensure_snapshot_entry_head_matches(db, entry, recovery_operation_id.as_deref()).await?;
         let source_ds = snapshot.open(table_key).await?;
         let current_catalog = db.catalog();
         let batch = batch_for_schema_apply_rewrite(
@@ -610,14 +618,14 @@ where
                 table_key
             ))
         })?;
-        ensure_snapshot_entry_head_matches(db, entry).await?;
+        ensure_snapshot_entry_head_matches(db, entry, recovery_operation_id.as_deref()).await?;
         let dataset_uri = db.table_store.dataset_uri(&entry.table_path);
         let mut ds = db
             .table_store
             .open_dataset_head_for_write(table_key, &dataset_uri, entry.table_branch.as_deref())
             .await?;
-        db.table_store
-            .ensure_expected_version(&ds, table_key, entry.table_version)?;
+        // No redundant strict re-check here: `ensure_snapshot_entry_head_matches`
+        // above already applied the tolerant precondition for this entry.
         db.build_indices_on_dataset_for_catalog(&desired_catalog, table_key, &mut ds)
             .await?;
         let state = db.table_store.table_state(&dataset_uri, &ds).await?;
@@ -868,6 +876,7 @@ pub(super) async fn ensure_schema_apply_not_locked(db: &Omnigraph, operation: &s
 pub(super) async fn ensure_snapshot_entry_head_matches(
     db: &Omnigraph,
     entry: &SubTableEntry,
+    exclude_operation_id: Option<&str>,
 ) -> Result<()> {
     let dataset_uri = db.table_store.dataset_uri(&entry.table_path);
     let ds = db
@@ -878,8 +887,20 @@ pub(super) async fn ensure_snapshot_entry_head_matches(
             entry.table_branch.as_deref(),
         )
         .await?;
-    db.table_store
-        .ensure_expected_version(&ds, &entry.table_key, entry.table_version)
+    // Tolerate benign content-preserving drift (Lance HEAD ahead of the manifest
+    // pin with no recovery sidecar) — schema apply reads the source at the pinned
+    // version and rewrites onto HEAD, which is safe precisely because uncovered
+    // drift preserves content. A FOREIGN sidecar-covered drift defers to recovery;
+    // `exclude_operation_id` skips schema apply's OWN already-written sidecar so
+    // these per-table re-checks don't defer against the in-flight apply itself.
+    db.ensure_writable_or_defer(
+        &ds,
+        &entry.table_key,
+        entry.table_branch.as_deref(),
+        entry.table_version,
+        exclude_operation_id,
+    )
+    .await
 }
 
 pub(super) async fn batch_for_schema_apply_rewrite(
