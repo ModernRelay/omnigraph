@@ -382,23 +382,6 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     //   Phase 9 once all engine sites route through the staged
     //   primitives.
 
-    async fn append_batch(
-        &self,
-        dataset_uri: &str,
-        snapshot: SnapshotHandle,
-        batch: RecordBatch,
-    ) -> Result<(SnapshotHandle, TableState)>;
-
-    async fn merge_insert_batches(
-        &self,
-        dataset_uri: &str,
-        snapshot: SnapshotHandle,
-        batches: Vec<RecordBatch>,
-        key_columns: Vec<String>,
-        when_matched: WhenMatched,
-        when_not_matched: WhenNotMatched,
-    ) -> Result<TableState>;
-
     async fn overwrite_batch(
         &self,
         dataset_uri: &str,
@@ -416,18 +399,6 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
     async fn has_btree_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool>;
     async fn has_fts_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool>;
     async fn has_vector_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool>;
-
-    async fn create_btree_index(
-        &self,
-        snapshot: SnapshotHandle,
-        columns: &[&str],
-    ) -> Result<SnapshotHandle>;
-
-    async fn create_inverted_index(
-        &self,
-        snapshot: SnapshotHandle,
-        column: &str,
-    ) -> Result<SnapshotHandle>;
 
     async fn create_vector_index(
         &self,
@@ -736,39 +707,6 @@ impl TableStorage for TableStore {
             .map(StagedHandle::new)
     }
 
-    async fn append_batch(
-        &self,
-        dataset_uri: &str,
-        snapshot: SnapshotHandle,
-        batch: RecordBatch,
-    ) -> Result<(SnapshotHandle, TableState)> {
-        let mut ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
-        let state = TableStore::append_batch(self, dataset_uri, &mut ds, batch).await?;
-        Ok((SnapshotHandle::new(ds), state))
-    }
-
-    async fn merge_insert_batches(
-        &self,
-        dataset_uri: &str,
-        snapshot: SnapshotHandle,
-        batches: Vec<RecordBatch>,
-        key_columns: Vec<String>,
-        when_matched: WhenMatched,
-        when_not_matched: WhenNotMatched,
-    ) -> Result<TableState> {
-        let ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
-        TableStore::merge_insert_batches(
-            self,
-            dataset_uri,
-            ds,
-            batches,
-            key_columns,
-            when_matched,
-            when_not_matched,
-        )
-        .await
-    }
-
     async fn overwrite_batch(
         &self,
         dataset_uri: &str,
@@ -801,26 +739,6 @@ impl TableStorage for TableStore {
 
     async fn has_vector_index(&self, snapshot: &SnapshotHandle, column: &str) -> Result<bool> {
         TableStore::has_vector_index(self, snapshot.dataset(), column).await
-    }
-
-    async fn create_btree_index(
-        &self,
-        snapshot: SnapshotHandle,
-        columns: &[&str],
-    ) -> Result<SnapshotHandle> {
-        let mut ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
-        TableStore::create_btree_index(self, &mut ds, columns).await?;
-        Ok(SnapshotHandle::new(ds))
-    }
-
-    async fn create_inverted_index(
-        &self,
-        snapshot: SnapshotHandle,
-        column: &str,
-    ) -> Result<SnapshotHandle> {
-        let mut ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
-        TableStore::create_inverted_index(self, &mut ds, column).await?;
-        Ok(SnapshotHandle::new(ds))
     }
 
     async fn create_vector_index(

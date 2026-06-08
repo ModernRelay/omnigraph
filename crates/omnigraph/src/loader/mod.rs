@@ -435,7 +435,7 @@ async fn load_jsonl_reader<R: BufRead>(
         }
     } else {
         let node_write_results =
-            write_batches_concurrently(db, branch, mode, prepared_nodes).await?;
+            write_batches_concurrently(db, branch, prepared_nodes).await?;
         for (type_name, table_key, loaded_count, state, table_branch) in node_write_results {
             overwrite_updates.push(crate::db::SubTableUpdate {
                 table_key,
@@ -545,7 +545,7 @@ async fn load_jsonl_reader<R: BufRead>(
         }
     } else {
         let edge_write_results =
-            write_batches_concurrently(db, branch, mode, prepared_edges).await?;
+            write_batches_concurrently(db, branch, prepared_edges).await?;
         for (edge_name, table_key, loaded_count, state, table_branch) in edge_write_results {
             overwrite_updates.push(crate::db::SubTableUpdate {
                 table_key,
@@ -1163,7 +1163,6 @@ fn load_write_concurrency() -> usize {
 async fn write_batches_concurrently(
     db: &Omnigraph,
     branch: Option<&str>,
-    mode: LoadMode,
     prepared: Vec<(String, String, RecordBatch, usize)>,
 ) -> Result<
     Vec<(
@@ -1185,7 +1184,7 @@ async fn write_batches_concurrently(
     futures::stream::iter(prepared.into_iter().map(
         |(type_name, table_key, batch, loaded_count)| async move {
             let (state, table_branch) =
-                write_batch_to_dataset(db, branch, &table_key, batch, mode).await?;
+                write_batch_to_dataset(db, branch, &table_key, batch).await?;
             Ok::<_, OmniError>((type_name, table_key, loaded_count, state, table_branch))
         },
     ))
@@ -1196,65 +1195,29 @@ async fn write_batches_concurrently(
     .collect()
 }
 
+/// Bulk-overwrite fast-path: write one table's batch concurrently with the
+/// other tables. Only `LoadMode::Overwrite` reaches this path — `Append` and
+/// `Merge` route through the `MutationStaging` accumulator (the `use_staging`
+/// branch in the loader). `overwrite_batch` inline-commits (advances Lance
+/// HEAD); it is kept as the bulk fast-path because a fresh overwrite wipes the
+/// prior data and has no partial-drift correctness concern (re-running the
+/// overwrite recovers). A `stage_overwrite` primitive exists (schema_apply uses
+/// it) and could replace this path with a staged + recovery-sidecar shape; that
+/// migration is a tracked follow-up.
 async fn write_batch_to_dataset(
     db: &Omnigraph,
     branch: Option<&str>,
     table_key: &str,
     batch: RecordBatch,
-    mode: LoadMode,
 ) -> Result<(crate::table_store::TableState, Option<String>)> {
-    let op_kind = match mode {
-        LoadMode::Append => crate::db::MutationOpKind::Insert,
-        LoadMode::Merge => crate::db::MutationOpKind::Merge,
-        LoadMode::Overwrite => crate::db::MutationOpKind::SchemaRewrite,
-    };
     let (ds, full_path, table_branch) = db
-        .open_for_mutation_on_branch(branch, table_key, op_kind)
+        .open_for_mutation_on_branch(branch, table_key, crate::db::MutationOpKind::SchemaRewrite)
         .await?;
-
-    match mode {
-        LoadMode::Overwrite => {
-            // Inline-commit residual: the Overwrite path here is the
-            // legacy concurrent fast-path used by Phase 2 of the loader
-            // (Append/Merge route through MutationStaging instead).
-            // `overwrite_batch` advances Lance HEAD as a side effect;
-            // there is no public two-phase overwrite that fits this
-            // shape until Lance issues #6658/#6666 close.
-            let (_new_ds, state) = db
-                .storage()
-                .overwrite_batch(&full_path, ds, batch)
-                .await?;
-            Ok((state, table_branch))
-        }
-        LoadMode::Append => {
-            // Same residual class as Overwrite above. The staged-write
-            // path is the `use_staging` branch in `load_with_actor`;
-            // this concurrent path is the per-table fast-path retained
-            // for parallelism. MR-793 Phase 9 will demote
-            // `append_batch` to `pub(crate)` once this last consumer
-            // moves to the staged primitive.
-            let (_new_ds, state) = db
-                .storage()
-                .append_batch(&full_path, ds, batch)
-                .await?;
-            Ok((state, table_branch))
-        }
-        LoadMode::Merge => {
-            // Same residual class as the other two arms.
-            let state = db
-                .storage()
-                .merge_insert_batches(
-                    &full_path,
-                    ds,
-                    vec![batch],
-                    vec!["id".to_string()],
-                    lance::dataset::WhenMatched::UpdateAll,
-                    lance::dataset::WhenNotMatched::InsertAll,
-                )
-                .await?;
-            Ok((state, table_branch))
-        }
-    }
+    let (_new_ds, state) = db
+        .storage()
+        .overwrite_batch(&full_path, ds, batch)
+        .await?;
+    Ok((state, table_branch))
 }
 
 fn generate_id() -> String {

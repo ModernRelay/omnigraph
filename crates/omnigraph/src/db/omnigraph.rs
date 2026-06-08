@@ -2154,9 +2154,11 @@ edge WorksAt: Person -> Company
             })
             .collect();
         let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
-        let (_new_ds, state) = db
+        let staged = db.storage().stage_append(&ds, batch, &[]).await.unwrap();
+        let committed = db.storage().commit_staged(ds, staged).await.unwrap();
+        let state = db
             .storage()
-            .append_batch(&full_path, ds, batch)
+            .table_state(&full_path, &committed)
             .await
             .unwrap();
         db.commit_updates(&[crate::db::SubTableUpdate {
