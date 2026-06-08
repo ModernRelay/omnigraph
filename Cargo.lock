@@ -4569,6 +4569,7 @@ name = "omnigraph-cluster"
 version = "0.6.2"
 dependencies = [
  "omnigraph-compiler",
+ "omnigraph-engine",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -4576,6 +4577,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "time",
+ "tokio",
  "ulid",
 ]
 

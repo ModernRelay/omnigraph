@@ -5,6 +5,13 @@
 **Date:** 2026-06-07
 **Relationship:** generalizes today's `omnigraph.yaml` graph/query/policy configuration surface ([CLI reference](../user/cli-reference.md), [server docs](../user/server.md)) into a future cluster control plane. The distilled rules are in [cluster-axioms.md](cluster-axioms.md); detailed downstream implementation spec and blast-radius assessment in [cluster-config-implementation-spec.md](cluster-config-implementation-spec.md). This is a proposed architecture, not an implemented RFC.
 
+> **Implementation status.** The examples below describe the full target schema.
+> Stage 2B only accepts the read-only subset documented in
+> [cluster-config.md](../user/cluster-config.md). Future-phase fields such as
+> `env_file`, `apply`, `providers`, `pipelines`, `embeddings`, `ui`, `aliases`,
+> and `bindings` are intentionally rejected with typed diagnostics until their
+> reconciler semantics are implemented.
+
 > **Revision 2026-06-07 — full commitment to the Terraform paradigm.** Three changes from the earlier draft: (1) **state is an authoritative, locked ledger in a backend** (server-hosted *or* a separate cloud store), not "a mostly-rebuildable projection"; (2) `plan` is framed as the **CLI diff between local config and state**; (3) **ETL pipelines** (external data sources) are a first-class config asset — a second seam, alongside schema, where a definition triggers a data-plane effect. The full set of config assets (incl. **aliases**, **embeddings**) is enumerated below.
 
 ---
