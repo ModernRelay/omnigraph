@@ -106,30 +106,33 @@ the same drift class. Closing it requires either upstream Lance
 multi-dataset commit OR the omnigraph-side recovery-on-open reconciler
 described in `.context/mr-793-design.md` §15 (deferred to MR-795).
 
-### Inline-commit method residuals on `TableStorage` (MR-793 acceptance §1 option b)
+### Inline-commit residuals live on `InlineCommitResidual`, not `db.storage()` (MR-793 acceptance §1, by construction)
 
-MR-793's acceptance criterion §1 ("`TableStore` public API has no method that performs a manifest commit as a side effect of writing") is met **per-method** by enumerating every inline-commit method that remains on the trait surface, naming why it cannot yet be removed, and keeping the residual comment at every call site:
+MR-793's acceptance criterion §1 ("`TableStore` (or successor) public API has no method that performs a manifest commit as a side effect of writing") holds **by construction** after MR-854. `db.storage()` (`&dyn TableStorage`) exposes only staged primitives + reads; the inline-commit writes Lance cannot yet stage live on a separate `InlineCommitResidual` trait reached via `Omnigraph::storage_inline_residual()`. A new engine writer cannot couple a write with a Lance HEAD advance through the default surface — it would have to name the residual accessor explicitly. The dead legacy methods (trait `append_batch` / `merge_insert_batches`, inherent `merge_insert_batch{,es}`, `create_{btree,inverted}_index`) were removed; appends/merges and scalar index builds all use the `stage_*` primitives.
 
-| Method on `TableStorage` | Inline-commit reason | Closes when |
+Three methods remain on `InlineCommitResidual`, each named honestly at its call site:
+
+| Residual method | Inline-commit reason | Closes when |
 |---|---|---|
 | `delete_where` | `DeleteBuilder::execute_uncommitted` is not in Lance v6.0.1 (closed upstream as [#6658](https://github.com/lance-format/lance/issues/6658) but first ships in `v7.0.0-beta.10`); see [docs/dev/lance.md](lance.md) | MR-A: Lance v7.x bump migrates `delete_where` to staged, retires the parse-time D₂ mutation rule, and extends recovery sidecar coverage |
-| `create_vector_index` | Vector indices take Lance's "segment commit path"; `build_index_metadata_from_segments` is `pub(crate)` (Lance [#6666](https://github.com/lance-format/lance/issues/6666) still open) | Lance #6666 lands and `stage_create_vector_index` joins the trait |
+| `create_vector_index` | Vector indices take Lance's "segment commit path"; `build_index_metadata_from_segments` is `pub(crate)` (Lance [#6666](https://github.com/lance-format/lance/issues/6666) still open) | Lance #6666 lands and `stage_create_vector_index` joins the staged surface |
+| `overwrite_batch` | Removable legacy: a `stage_overwrite` primitive exists (schema_apply uses it), but the loader's bulk `LoadMode::Overwrite` fast-path still uses this inline path for cross-table write concurrency (see below) | The loader's overwrite fast-path migrates to `stage_overwrite` + `commit_staged` + a recovery sidecar (tracked follow-up) |
 
-MR-854 (Phase 1b + Phase 9) closed the remaining residuals on the engine surface: every `db.table_store.X(...)` call site was converted to `db.storage().X(...)` (trait dispatch through `&dyn TableStorage`), and the legacy inline-commit inherent methods on `TableStore` (`append_batch`, `merge_insert_batch`, `merge_insert_batches`, `overwrite_batch`, `create_btree_index`, `create_inverted_index`) were demoted from `pub` to `pub(crate)`. They survive only as the bulk loader's `LoadMode::{Append, Overwrite, Merge}` concurrent fast-paths (see "`LoadMode::Overwrite` residual" below) and as internal helpers for the staged primitives — no engine call site outside `table_store.rs` and `loader::write_batch_to_dataset` reaches them.
-
-After **MR-A (Lance v7 bump) + Lance #6666 ship**, the trait surface exposes only staged-write primitives + `commit_staged`. Until then this matrix names the two remaining residuals explicitly, every call site carries a one-line residual comment, and no engine code outside `table_store.rs` is permitted to reach the inline-commit Lance APIs (enforced by the `tests/forbidden_apis.rs` guard).
+The `tests/forbidden_apis.rs` guard still catches direct `lance::*` inline-commit misuse outside the storage layer; the trait split makes the staged-only default a type-system guarantee on top of it.
 
 ### `LoadMode::Overwrite` residual
 
 The bulk loader's Append and Merge modes use the staged-write path
-described above. `LoadMode::Overwrite` keeps the legacy inline-commit
-path: truncate-then-append doesn't fit the staged shape cleanly in
-Lance v6.0.1, and overwrite has no in-flight read-your-writes
-requirement (the prior data is being wiped). A mid-overwrite failure
-can leave Lance HEAD on a partially-truncated table; the next overwrite
-will replace it. Operator-driven (rare in agent workloads); document
-permanently until Lance exposes `Operation::Overwrite { fragments }` as
-a two-phase op.
+described above. `LoadMode::Overwrite` keeps an inline-commit fast-path
+(`InlineCommitResidual::overwrite_batch`): each table is overwritten and
+committed concurrently with the others, and a fresh overwrite wipes the
+prior data, so there is no in-flight read-your-writes requirement and no
+partial-drift correctness concern (a mid-overwrite failure leaves the old
+data; re-running the overwrite recovers). A `stage_overwrite` primitive
+already exists (schema_apply uses it), so this path can migrate to the
+staged + recovery-sidecar shape; preserving the cross-table write
+concurrency (`OMNIGRAPH_LOAD_CONCURRENCY`) is the open design point.
+Tracked as a follow-up.
 
 ### Open-time recovery sweep
 

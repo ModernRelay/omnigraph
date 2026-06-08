@@ -55,18 +55,18 @@ Adding/changing index types, fixing coverage, debugging FTS or vector recall, de
 
 | Topic | URL |
 |---|---|
-| Index spec overview | https://lance.org/format/table/index/ |
-| BTREE scalar index | https://lance.org/format/table/index/scalar/btree/ |
-| Bitmap scalar index | https://lance.org/format/table/index/scalar/bitmap/ |
-| Bloom-filter scalar index | https://lance.org/format/table/index/scalar/bloom_filter/ |
-| Label-list scalar index | https://lance.org/format/table/index/scalar/label_list/ |
-| Zone-map scalar index | https://lance.org/format/table/index/scalar/zonemap/ |
-| R-Tree scalar index (spatial) | https://lance.org/format/table/index/scalar/rtree/ |
-| Full-text search (FTS) index | https://lance.org/format/table/index/scalar/fts/ |
-| N-gram scalar index | https://lance.org/format/table/index/scalar/ngram/ |
-| Vector index | https://lance.org/format/table/index/vector/ |
-| Fragment-reuse system index | https://lance.org/format/table/index/system/frag_reuse/ |
-| MemWAL system index | https://lance.org/format/table/index/system/mem_wal/ |
+| Index spec overview | https://lance.org/format/index/ |
+| BTREE scalar index | https://lance.org/format/index/scalar/btree/ |
+| Bitmap scalar index | https://lance.org/format/index/scalar/bitmap/ |
+| Bloom-filter scalar index | https://lance.org/format/index/scalar/bloom_filter/ |
+| Label-list scalar index | https://lance.org/format/index/scalar/label_list/ |
+| Zone-map scalar index | https://lance.org/format/index/scalar/zonemap/ |
+| R-Tree scalar index (spatial) | https://lance.org/format/index/scalar/rtree/ |
+| Full-text search (FTS) index | https://lance.org/format/index/scalar/fts/ |
+| N-gram scalar index | https://lance.org/format/index/scalar/ngram/ |
+| Vector index | https://lance.org/format/index/vector/ |
+| Fragment-reuse system index | https://lance.org/format/index/system/frag_reuse/ |
+| MemWAL system index | https://lance.org/format/index/system/mem_wal/ |
 | HNSW Rust example | https://lance.org/examples/rust/hnsw/ |
 | Distributed indexing | https://lance.org/guide/distributed_indexing/ |
 | Tokenizer (FTS, n-gram) | https://lance.org/guide/tokenizer/ |
@@ -125,7 +125,7 @@ Touching `omnigraph optimize` / `cleanup`, the underlying `compact_files` / `cle
 |---|---|
 | Read-and-write guide (covers `compact_files`, `cleanup_old_versions`) | https://lance.org/guide/read_and_write/ |
 | Performance (compaction tradeoffs) | https://lance.org/guide/performance/ |
-| Fragment-reuse index | https://lance.org/format/table/index/system/frag_reuse/ |
+| Fragment-reuse index | https://lance.org/format/index/system/frag_reuse/ |
 
 ### DataFusion integration
 

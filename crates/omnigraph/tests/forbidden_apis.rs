@@ -31,22 +31,20 @@
 //!
 //! ## Allow-list shape
 //!
-//! After MR-854 (MR-793 Phase 1b + Phase 9), every engine call site
-//! reaches the storage layer through `db.storage()` (returns
-//! `&dyn TableStorage`). The inherent inline-commit methods on
-//! `TableStore` (`append_batch`, `merge_insert_batch{,es}`,
-//! `overwrite_batch`, `create_{btree,inverted}_index`) are now
-//! `pub(crate)`, so the only direct users are `table_store.rs` itself
-//! (which IS the storage layer) and the bulk loader's
-//! `LoadMode::{Append, Overwrite, Merge}` concurrent fast-paths in
-//! `loader::write_batch_to_dataset` (the loader uses the trait surface
-//! for the staged-write path and falls back to the demoted inherent
-//! methods only for the concurrent fast-path, which has no two-phase
-//! shape in Lance v6.0.1). The remaining trait-surface residuals
-//! (`delete_where`, `create_vector_index`) are gated on the Lance v7.x
-//! bump (MR-A) and Lance #6666 respectively — see
-//! `docs/dev/lance.md` for the canonical tracking. The file-level
-//! allow-list below matches that boundary.
+//! After MR-854, `db.storage()` (`&dyn TableStorage`) exposes only staged
+//! primitives + reads. The inline-commit writes live on a separate
+//! `InlineCommitResidual` trait reached via
+//! `Omnigraph::storage_inline_residual()`, so the default storage surface
+//! cannot couple "write bytes" with "advance HEAD" — engine code that
+//! wants an inline residual must name the residual accessor explicitly.
+//! The only residuals are `overwrite_batch` (the loader bulk-overwrite
+//! fast-path), `delete_where` (Lance #6658 / v7.x), and
+//! `create_vector_index` (Lance #6666). The dead legacy methods
+//! (trait `append_batch` / `merge_insert_batches`, inherent
+//! `merge_insert_batch{,es}`, `create_{btree,inverted}_index`) were
+//! removed entirely. This guard's scope is unchanged: it catches direct
+//! `lance::*` inline-commit misuse outside the storage layer. The
+//! file-level allow-list below matches that boundary.
 
 use std::path::{Path, PathBuf};
 
