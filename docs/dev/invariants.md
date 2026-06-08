@@ -99,6 +99,7 @@ Use it this way:
 | Multi-table commit | Manifest CAS plus recovery sidecars; not a single Lance primitive | [writes.md](writes.md), [architecture.md](architecture.md) |
 | Constructive mutations | In-memory `MutationStaging`, one end-of-query table commit per touched table, then one manifest publish | [writes.md](writes.md), [execution.md](execution.md) |
 | Deletes | Inline-commit residual; delete-only queries allowed, mixed insert/update/delete rejected by D2 | [query-language.md](../user/query-language.md), [writes.md](writes.md) |
+| Pre-stage write precondition | Strict writers tolerate benign `HEAD > manifest` drift with no sidecar (proceed), defer when a recovery sidecar pins the table, and reject a stale caller pin (`caller pin != fresh manifest pin`) with `ExpectedVersionMismatch`. The OCC fence is the fresh manifest pin, never the caller's snapshot pin. Correct *only* because uncovered drift is always content-preserving | [writes.md](writes.md) |
 | Branch delete | Manifest is the single authority, flipped atomically first; per-table forks + commit-graph branch are derived state, reclaimed best-effort (`force_delete_branch`) with the `cleanup` reconciler as the guaranteed backstop. Reusing a name whose reclaim failed before `cleanup` surfaces an actionable error | [branches-commits.md](../user/branches-commits.md), [maintenance.md](../user/maintenance.md) |
 | Schema validation | Type checks, required fields, defaults, edge endpoint checks, and edge cardinality are enforced on write paths | [schema-language.md](../user/schema-language.md), [execution.md](execution.md) |
 | Unique constraints | Intra-batch and write-path checks exist; full cross-version uniqueness is still a gap | [schema-language.md](../user/schema-language.md) |
@@ -165,6 +166,11 @@ case is exceptional.
   snapshot.
 - New write paths that can advance Lance HEAD before manifest publish without a
   recovery sidecar.
+- Advancing Lance HEAD with *non-content-preserving* data and no recovery
+  sidecar. The pre-stage write precondition tolerates uncovered `HEAD > manifest`
+  drift (proceeds without deferring) on the assumption it is content-preserving;
+  a path that breaks that assumption without registering a sidecar turns the
+  tolerance into a silent-data-loss vector.
 - Cross-query `BEGIN`/`COMMIT` transactions in the OSS engine. Use branches and
   merges for multi-query workflows.
 - Acknowledging writes before durable Lance and manifest persistence.

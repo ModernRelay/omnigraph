@@ -20,13 +20,13 @@ The engine's `tests/` is the principal coverage surface; most graph-shaped behav
 | `end_to_end.rs` | Full init → load → query/mutate flow |
 | `branching.rs` | Branch create / list / delete, lazy fork |
 | `merge_truth_table.rs` | Merge-pair truth table (MR-786): all 9×9 `(left_op, right_op)` cells from `{noop, addNode, removeNode, addEdge, removeEdge, setProperty, dropProperty, addLabel, removeLabel}`. Adding a new op to `OpVariant` forces a compile error in `build_case` until the new row + column are dispositioned. 36 executable cells run through real `branch_merge` with a structured oracle (`MergeOutcome` / `MergeConflictKind` + graph-state assert); 45 cells involving `dropProperty`/`addLabel`/`removeLabel` are recorded as `Unsupported` until the mutation grammar grows. |
-| `writes.rs` | Direct-publish writes: cancellation, concurrent-writer CAS, multi-statement atomicity, MR-794 staged-write rewire (D₂ rejection, insert+update coalesce, multi-append coalesce, partial-failure recovery, load RI/cardinality recovery) |
+| `writes.rs` | Direct-publish writes: cancellation, concurrent-writer CAS, multi-statement atomicity, MR-794 staged-write rewire (D₂ rejection, insert+update coalesce, multi-append coalesce, partial-failure recovery, load RI/cardinality recovery); pre-stage drift tolerance (`strict_update_proceeds_on_benign_drift_without_sidecar`, `delete_proceeds_on_benign_drift_without_sidecar`, `strict_update_defers_when_sidecar_pins_table`) |
 | `staged_writes.rs` | TableStore staged-write primitives (`stage_append`, `stage_merge_insert`, `commit_staged`, `scan_with_staged`, `count_rows_with_staged`) — primitive-level only; engine code uses the in-memory `MutationStaging` accumulator instead |
 | `lifecycle.rs` | Graph lifecycle, schema state |
 | `point_in_time.rs` | Snapshots, time travel (`snapshot_at_version`, `entity_at`) |
 | `changes.rs` | `diff_between` / `diff_commits` |
 | `consistency.rs` | Cross-table snapshot isolation, atomic publish |
-| `schema_apply.rs` | Migration plan + apply, schema-apply lock |
+| `schema_apply.rs` | Migration plan + apply, schema-apply lock; pre-stage drift tolerance (`additive_apply_proceeds_on_benign_drift_without_sidecar`, `additive_apply_defers_when_sidecar_pins_table`) |
 | `search.rs` | FTS / vector / hybrid (`bm25`, `nearest`, `rrf`) |
 | `traversal.rs` | `Expand`, variable-length hops, anti-join |
 | `aggregation.rs` | `count`, `sum`, `avg`, `min`, `max` |

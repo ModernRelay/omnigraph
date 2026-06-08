@@ -239,6 +239,63 @@ publisher commit produces exactly one winner. The residual above is
 about *our* abandoned commits in the failure path, not about
 concurrency races.
 
+### Pre-stage write precondition: tolerate benign drift, defer sidecar-covered
+
+Strict writers (Update / Delete / SchemaRewrite, and the schema-apply
+index rebuild) run a pre-stage precondition — `Omnigraph::ensure_writable_or_defer`
+— before staging. Insert/Merge skip it (Lance's auto-rebase + the queue +
+the publisher CAS handle their drift).
+
+A table's **Lance HEAD can legitimately sit ahead of its manifest pin**
+between an in-place HEAD advance and the next manifest publish. Sources:
+`optimize` compaction *before its publish*, a recovery `Dataset::restore`,
+an old-binary optimize that never published, an *external* `compact_files`,
+or a finalize→publisher residual. All of these are **content-preserving**
+and carry **no recovery sidecar**. The only `HEAD > pin` state that is *not*
+safe to write over is a real in-flight partial write, which the writer
+protocol always covers with a `__recovery/{ulid}.json` sidecar (Phase A).
+
+So the precondition disambiguates `HEAD > pin` by sidecar presence rather
+than rejecting it wholesale. The OCC fence is the **current** manifest pin,
+re-read fresh on the conflict path — *not* the caller's snapshot pin, which
+may be stale:
+
+- `HEAD == caller pin` → fresh, no drift → proceed (fast path, no extra read).
+- `caller pin != current pin` → the caller's pre-write view is stale relative
+  to the live manifest: a normal OCC conflict. Fail with
+  `ExpectedVersionMismatch` **here**, before any staged commit or sidecar, so
+  the client refreshes and retries with no residue left behind.
+- `caller pin == current pin`, `HEAD > pin`, **no sidecar** pins the table →
+  benign content-preserving drift → **proceed**; the writer's own
+  `commit_staged` + the publisher CAS reconcile the manifest at the commit
+  boundary.
+- `caller pin == current pin`, `HEAD > pin`, **a sidecar** pins the table →
+  defer with an actionable "reopen the graph to run the recovery sweep"
+  error; never write onto state the open-time sweep may roll back.
+- `HEAD < current pin` → the manifest cannot lead durable Lance state under
+  the commit protocol → loud invariant violation.
+
+This is the **consumer-side** complement to the producer-side convergence
+above (recovery roll-back and `optimize` both publish so `manifest == HEAD`).
+Convergence keeps *system-produced* drift bounded; the precondition is the
+net for drift no sidecar covers — legacy old-binary optimize, external Lance
+compaction — which heals at the point of use on the next strict write.
+
+> **Load-bearing invariant.** Tolerating uncovered drift is correct *only*
+> because such drift is always content-preserving: a strict write (and schema
+> apply, which reads source at the pinned version and rewrites onto HEAD)
+> overwrites the drifted HEAD assuming its rows equal the pinned version's
+> rows. A future code path that advances Lance HEAD with *different content*
+> and no sidecar would turn this tolerance into a silent-data-loss vector —
+> such a path must register a recovery sidecar. See
+> [docs/dev/invariants.md](invariants.md).
+
+> **Observable change (Hyrum's Law).** A strict write or schema apply on a
+> benign-drifted table now **succeeds** where it previously returned 409
+> "stale view … refresh and retry". Clients that depended on the 409 to detect
+> compaction/recovery drift must not — that 409 is reserved for genuine OCC
+> conflicts (stale handle / concurrent publisher).
+
 ## Conflict shape
 
 Concurrent writers to the same `(table, branch)` produce exactly one
