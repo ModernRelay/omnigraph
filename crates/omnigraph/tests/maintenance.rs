@@ -234,6 +234,108 @@ async fn optimize_publishes_compaction_to_manifest_so_schema_apply_succeeds() {
     assert!(result.applied, "schema apply should report applied=true");
 }
 
+// Regression: `optimize` must reconcile a pre-existing manifest-behind-HEAD
+// drift, not only publish its own compaction. A graph compacted by a pre-fix
+// `optimize` (or by an external raw `compact_files`) has the Lance HEAD ahead of
+// the manifest pin with nothing left to compact. Running `optimize` must catch
+// the manifest up to HEAD even when the compaction plan is empty, so strict
+// writes / schema apply stop failing with "stale view". The pending-sidecar
+// defer guard ensures the reconcile only ever sees benign (content-preserving)
+// drift, never a sidecar-covered partial write.
+#[tokio::test]
+async fn optimize_reconciles_preexisting_manifest_head_drift() {
+    use lance::dataset::optimize::{CompactionOptions, compact_files};
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap().trim_end_matches('/').to_string();
+    let mut db = init_and_load(&dir).await;
+
+    // Multiple Person fragments so a compaction actually moves the Lance HEAD.
+    for (name, age) in [("Eve", 40), ("Frank", 41), ("Grace", 42), ("Heidi", 43)] {
+        mutate_main(
+            &mut db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", name)], &[("$age", age as i64)]),
+        )
+        .await
+        .expect("insert");
+    }
+
+    let full = {
+        let snap = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+        format!("{}/{}", root, snap.entry("node:Person").unwrap().table_path)
+    };
+    let manifest_before = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entry("node:Person")
+        .unwrap()
+        .table_version;
+
+    // Forge drift: compact node:Person via RAW Lance, bypassing optimize's
+    // manifest publish — exactly the state a pre-fix `optimize` left behind.
+    {
+        let mut raw = Dataset::open(&full).await.unwrap();
+        compact_files(&mut raw, CompactionOptions::default(), None)
+            .await
+            .unwrap();
+    }
+    let head_after_forge = Dataset::open(&full).await.unwrap().version().version;
+    assert!(
+        head_after_forge > manifest_before,
+        "raw compaction must create drift: HEAD {head_after_forge} > manifest {manifest_before}",
+    );
+    assert_eq!(
+        db.snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .entry("node:Person")
+            .unwrap()
+            .table_version,
+        manifest_before,
+        "raw compaction must not advance the manifest pin",
+    );
+
+    // optimize must reconcile the drift even though there is nothing to compact.
+    let stats = db.optimize().await.unwrap();
+    let person = stats
+        .iter()
+        .find(|s| s.table_key == "node:Person")
+        .expect("Person stat present");
+    assert!(
+        person.committed,
+        "optimize must publish a manifest catch-up for the drifted table",
+    );
+    assert_eq!(
+        person.fragments_added, 0,
+        "drift reconcile is metadata-only — no new compaction",
+    );
+
+    // Manifest now tracks the Lance HEAD.
+    let snap = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let entry = snap.entry("node:Person").unwrap();
+    let lance_head = Dataset::open(&full).await.unwrap().version().version;
+    assert_eq!(
+        entry.table_version, lance_head,
+        "after optimize, manifest table_version ({}) must equal Lance HEAD ({})",
+        entry.table_version, lance_head,
+    );
+
+    // The reconciled table accepts a strict update (it failed with "stale view"
+    // while drifted).
+    let upd = mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 50)]),
+    )
+    .await
+    .expect("strict update after drift reconcile must commit");
+    assert_eq!(upd.affected_nodes, 1);
+}
+
 // Regression: `optimize` must REFUSE when an unresolved recovery sidecar is
 // pending. Operating on an unrecovered graph could publish a partial write that
 // the all-or-nothing recovery sweep would roll back; the operator must reopen
