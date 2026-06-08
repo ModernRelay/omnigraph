@@ -261,3 +261,87 @@ pub fn s3_test_graph_uri(suite: &str) -> Option<String> {
         .as_nanos();
     Some(format!("s3://{}/{}/{}/{}", bucket, prefix, suite, unique))
 }
+
+// ─── Drift forging (benign `Lance HEAD > manifest` drift + recovery sidecars) ──
+//
+// Shared by `writes.rs` and `schema_apply.rs` to exercise the consumer-side
+// tolerant write precondition. (`recovery.rs` / `maintenance.rs` / `failpoints.rs`
+// each still carry their own local `node_table_uri` from before this helper
+// existed; they predate it and are left untouched to keep this change scoped.)
+
+/// FNV-1a (64-bit) — mirrors the table-path hashing in `db/manifest/layout.rs`.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
+/// Full URI of a node-type Lance dataset under a graph root. Mirrors the
+/// `nodes/{fnv1a64-hex(type_name)}` layout in `db/manifest/layout.rs`.
+pub fn node_table_uri(root: &str, type_name: &str) -> String {
+    let h = fnv1a64(type_name.as_bytes());
+    format!("{}/nodes/{:016x}", root.trim_end_matches('/'), h)
+}
+
+/// Advance a node table's Lance HEAD by one WITHOUT touching the manifest — the
+/// shape of benign content-preserving drift (compaction / a recovery `restore` /
+/// an old-binary optimize / external `compact_files`), leaving NO recovery
+/// sidecar. Uses a never-matching `delete_where` (an inline Lance commit that
+/// removes no rows and is agnostic to the table's column set). Returns
+/// `(head_before, head_after)`.
+pub async fn forge_benign_drift(root: &str, type_name: &str) -> (u64, u64) {
+    use lance::Dataset;
+    use omnigraph::table_store::TableStore;
+
+    let table_uri = node_table_uri(root, type_name);
+    let store = TableStore::new(root);
+    let mut ds = Dataset::open(&table_uri).await.unwrap();
+    let before = ds.version().version;
+    store.delete_where(&table_uri, &mut ds, "1 = 2").await.unwrap();
+    let after = ds.version().version;
+    assert_eq!(
+        after,
+        before + 1,
+        "benign drift must advance Lance HEAD by exactly 1",
+    );
+    (before, after)
+}
+
+/// Write a recovery sidecar pinning a single node table at `expected_version`,
+/// classified `UnexpectedAtP1` (`post_commit_pin == expected_version`, while the
+/// observed Lance HEAD is `expected_version + 1`). That classification is
+/// roll-back-eligible, so a `RollForwardOnly` refresh DEFERS rather than reclaims
+/// it — the sidecar therefore survives on disk to the consumer-side precondition
+/// check under test. The caller is expected to have forged matching drift first.
+pub fn write_node_pin_sidecar(
+    root: &str,
+    operation_id: &str,
+    type_name: &str,
+    expected_version: u64,
+) {
+    let table_uri = node_table_uri(root, type_name);
+    let dir = std::path::Path::new(root).join("__recovery");
+    std::fs::create_dir_all(&dir).unwrap();
+    let json = format!(
+        r#"{{
+            "schema_version": 1,
+            "operation_id": "{operation_id}",
+            "started_at": "0",
+            "branch": null,
+            "actor_id": "act-test",
+            "writer_kind": "Mutation",
+            "tables": [
+                {{
+                    "table_key": "node:{type_name}",
+                    "table_path": "{table_uri}",
+                    "expected_version": {expected_version},
+                    "post_commit_pin": {expected_version}
+                }}
+            ]
+        }}"#,
+    );
+    std::fs::write(dir.join(format!("{operation_id}.json")), json).unwrap();
+}

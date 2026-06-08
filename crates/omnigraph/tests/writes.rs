@@ -1466,3 +1466,91 @@ async fn second_sequential_update_on_same_row_succeeds() {
         "Alice's age must reflect the second update"
     );
 }
+
+// ─── Consumer-side tolerance of benign `Lance HEAD > manifest` drift ──────────
+//
+// A table's Lance HEAD can sit ahead of the manifest pin after a benign,
+// content-preserving op that never published (compaction, a recovery `restore`,
+// an old-binary optimize, an external `compact_files`). That drift carries NO
+// recovery sidecar. The pre-stage write precondition must tolerate it — the
+// writer's own commit + publisher CAS reconcile the manifest — rather than
+// reject it as a stale view. When a recovery sidecar DOES pin the table (a real
+// in-flight partial write the open-time sweep will roll back), the same
+// precondition must instead defer and point the operator at recovery.
+
+/// Strict `update` on a benignly-drifted table (no sidecar) must SUCCEED.
+/// Red before the tolerant precondition: 409 `ExpectedVersionMismatch`
+/// ("stale view"). This also guards the spurious-409 trap — the post-queue
+/// strict check must compare the manifest pin, not the drifted Lance HEAD
+/// captured at the open site.
+#[tokio::test]
+async fn strict_update_proceeds_on_benign_drift_without_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+
+    forge_benign_drift(uri, "Person").await;
+
+    let result = mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
+    )
+    .await
+    .expect("strict update must tolerate benign HEAD>manifest drift with no sidecar");
+    assert_eq!(
+        result.affected_nodes, 1,
+        "the tolerated update must apply to exactly Alice",
+    );
+}
+
+/// Same benign drift, but a recovery sidecar pins the table → the strict op must
+/// DEFER (not proceed onto a possibly-rolled-back state, not 409 a generic
+/// stale view). The error must point the operator at recovery.
+#[tokio::test]
+async fn strict_update_defers_when_sidecar_pins_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+
+    let (head_before, _) = forge_benign_drift(uri, "Person").await;
+    write_node_pin_sidecar(uri, "01H00000000000000000000WD", "Person", head_before);
+
+    let err = mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 99)]),
+    )
+    .await
+    .expect_err("a sidecar-covered drift must defer, not proceed");
+    assert!(
+        err.to_string().contains("recover"),
+        "deferred write must point the operator at recovery; got: {err}",
+    );
+}
+
+/// Strict `delete` (the inline-commit residual) on a benignly-drifted table must
+/// also SUCCEED — guards the delete path's separate HEAD-capture / reopen site.
+#[tokio::test]
+async fn delete_proceeds_on_benign_drift_without_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+
+    forge_benign_drift(uri, "Person").await;
+
+    let result = mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "remove_person",
+        &params(&[("$name", "Alice")]),
+    )
+    .await
+    .expect("strict delete must tolerate benign HEAD>manifest drift with no sidecar");
+    assert_eq!(
+        result.affected_nodes, 1,
+        "the tolerated delete must remove exactly Alice",
+    );
+}

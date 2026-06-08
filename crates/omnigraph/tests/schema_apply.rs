@@ -736,3 +736,73 @@ edge Knows: Person -> Person {
     // current contract, the data is *unreachable* via omnigraph
     // (no manifest entry), which is the user-facing guarantee.
 }
+
+// ─── Tolerance of benign `Lance HEAD > manifest` drift (additive apply) ───────
+//
+// Schema apply reads each touched table's source at the manifest-pinned version
+// and rewrites onto its Lance HEAD. When HEAD has drifted benignly ahead of the
+// pin (content-preserving, no recovery sidecar — compaction / a recovery
+// `restore` / an old-binary optimize / an external `compact_files`), apply must
+// PROCEED: the content-preserving invariant makes the read-at-pin / write-at-HEAD
+// safe. A sidecar-covered drift (a real in-flight partial write the open-time
+// sweep will roll back) must instead DEFER to recovery.
+
+/// Additive apply (add a nullable Person property) on a benignly-drifted Person
+/// table (no sidecar) must SUCCEED. Red before the tolerant precondition: the
+/// HEAD==pin precondition 409s ("stale view").
+#[tokio::test]
+async fn additive_apply_proceeds_on_benign_drift_without_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+
+    forge_benign_drift(uri, "Person").await;
+
+    let desired = TEST_SCHEMA.replace(
+        "    age: I32?\n}",
+        "    age: I32?\n    nickname: String?\n}",
+    );
+    let result = db
+        .apply_schema(&desired)
+        .await
+        .expect("additive schema apply must tolerate benign HEAD>manifest drift");
+    assert!(result.applied, "additive apply should report applied");
+    assert!(
+        result.steps.iter().any(|step| matches!(
+            step,
+            SchemaMigrationStep::AddProperty {
+                type_kind: SchemaTypeKind::Node,
+                type_name,
+                property_name,
+                ..
+            } if type_name == "Person" && property_name == "nickname"
+        )),
+        "expected the AddProperty step to have applied: {:?}",
+        result.steps,
+    );
+}
+
+/// Same benign drift, but a recovery sidecar pins Person → additive apply must
+/// DEFER and point the operator at recovery.
+#[tokio::test]
+async fn additive_apply_defers_when_sidecar_pins_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+
+    let (head_before, _) = forge_benign_drift(uri, "Person").await;
+    write_node_pin_sidecar(uri, "01H00000000000000000000SD", "Person", head_before);
+
+    let desired = TEST_SCHEMA.replace(
+        "    age: I32?\n}",
+        "    age: I32?\n    nickname: String?\n}",
+    );
+    let err = db
+        .apply_schema(&desired)
+        .await
+        .expect_err("a sidecar-covered drift must defer schema apply");
+    assert!(
+        err.to_string().contains("recover"),
+        "deferred schema apply must point the operator at recovery; got: {err}",
+    );
+}
