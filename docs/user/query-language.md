@@ -79,7 +79,7 @@ Reason: under the staged-write rewire (MR-794), inserts and updates accumulate i
 Pipeline operations:
 
 - `NodeScan { variable, type_name, filters }`
-- `Expand { src_var, dst_var, edge_type, direction (Out|In), dst_type, min_hops, max_hops, dst_filters }` — destination filters are pushed *into* the expand so Lance scalar pushdown can prune.
+- `Expand { src_var, dst_var, edge_type, direction (Out|In), dst_type, min_hops, max_hops, dst_filters }` — destination filters are pushed *into* the expand so Lance scalar pushdown can prune. Executed one of two ways, chosen per-expand by frontier size: selective traversals (small frontier) resolve neighbors from the persisted `src`/`dst` BTREE (one indexed scan per hop, cost ∝ frontier); dense / whole-graph traversals fall back to the in-memory CSR adjacency index. Both produce identical results. Tunable via `OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER` / `OMNIGRAPH_EXPAND_INDEXED_MAX_HOPS`, with `OMNIGRAPH_TRAVERSAL_MODE=indexed|csr` forcing a mode (see [constants](constants.md)).
 - `Filter { left, op, right }`
 - `AntiJoin { outer_var, inner: Vec<IROp> }` — for `not { … }`
 

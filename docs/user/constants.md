@@ -13,6 +13,9 @@
 | Maintenance concurrency | `OMNIGRAPH_MAINTENANCE_CONCURRENCY=8` | `db/omnigraph/optimize.rs` |
 | Lance blob compaction support | `LANCE_SUPPORTS_BLOB_COMPACTION = false` | `db/omnigraph/optimize.rs` |
 | Graph index cache size | `8` (LRU) | `runtime_cache.rs` |
+| Expand indexed-path max frontier | `OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER=1024` | `exec/query.rs` |
+| Expand indexed-path max hops | `OMNIGRAPH_EXPAND_INDEXED_MAX_HOPS=6` | `exec/query.rs` |
+| Expand mode override | `OMNIGRAPH_TRAVERSAL_MODE` (`indexed`\|`csr`; unset = auto) | `exec/query.rs` |
 | Default body limit | `1 MB` | `omnigraph-server/lib.rs` |
 | Ingest body limit | `32 MB` | `omnigraph-server/lib.rs` |
 | Engine embed model | `gemini-embedding-2-preview` | `omnigraph/embedding.rs` |
