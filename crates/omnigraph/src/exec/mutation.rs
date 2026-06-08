@@ -1201,7 +1201,7 @@ impl Omnigraph {
             .await?;
         crate::failpoints::maybe_fail("mutation.delete_node_pre_primary_delete")?;
         let (_new_ds, delete_state) = self
-            .storage()
+            .storage_inline_residual()
             .delete_where(&full_path, ds, &pred_sql)
             .await?;
 
@@ -1251,7 +1251,7 @@ impl Omnigraph {
             .await?;
 
             let (_new_edge_ds, edge_delete) = self
-                .storage()
+                .storage_inline_residual()
                 .delete_where(&edge_full_path, edge_ds, &cascade_filter)
                 .await?;
 
@@ -1299,7 +1299,7 @@ impl Omnigraph {
         .await?;
 
         let (_new_ds, delete_state) = self
-            .storage()
+            .storage_inline_residual()
             .delete_where(&full_path, ds, &pred_sql)
             .await?;
         let affected = delete_state.deleted_rows;

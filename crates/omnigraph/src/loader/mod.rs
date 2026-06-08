@@ -1214,7 +1214,7 @@ async fn write_batch_to_dataset(
         .open_for_mutation_on_branch(branch, table_key, crate::db::MutationOpKind::SchemaRewrite)
         .await?;
     let (_new_ds, state) = db
-        .storage()
+        .storage_inline_residual()
         .overwrite_batch(&full_path, ds, batch)
         .await?;
     Ok((state, table_branch))

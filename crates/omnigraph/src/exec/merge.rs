@@ -1019,7 +1019,7 @@ async fn publish_rewritten_merge_table(
             .collect();
         let filter = format!("id IN ({})", escaped.join(", "));
         let (new_ds, _) = target_db
-            .storage()
+            .storage_inline_residual()
             .delete_where(&full_path, current_ds, &filter)
             .await?;
         current_ds = new_ds;

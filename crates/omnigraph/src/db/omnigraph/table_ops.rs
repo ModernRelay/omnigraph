@@ -628,7 +628,7 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
                             // outside the lance crate. Document at the call
                             // site; companion ticket to lance-format/lance#6658.
                             let new_snap = db
-                                .storage()
+                                .storage_inline_residual()
                                 .create_vector_index(ds.clone(), prop_name.as_str())
                                 .await
                                 .map_err(|e| {
