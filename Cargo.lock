@@ -4550,6 +4550,7 @@ dependencies = [
  "color-eyre",
  "lance",
  "lance-index",
+ "omnigraph-cluster",
  "omnigraph-compiler",
  "omnigraph-engine",
  "omnigraph-policy",
@@ -4561,6 +4562,19 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "omnigraph-cluster"
+version = "0.6.1"
+dependencies = [
+ "omnigraph-compiler",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
