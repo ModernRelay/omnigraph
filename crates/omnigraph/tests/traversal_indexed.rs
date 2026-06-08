@@ -14,6 +14,7 @@ mod helpers;
 use arrow_array::{Array, StringArray};
 
 use omnigraph::db::Omnigraph;
+use omnigraph::table_store::{IndexCoverage, TableStore};
 use omnigraph_compiler::ir::ParamMap;
 use serial_test::serial;
 
@@ -59,6 +60,33 @@ async fn both_modes(db: &mut Omnigraph, queries: &str, name: &str, params: &Para
         "indexed Expand must produce identical results to CSR for query '{name}'"
     );
     indexed
+}
+
+// The C6 index-coverage guard: `key_column_index_coverage` must report whether
+// a `key_col IN (...)` scan will use the persisted BTREE or silently full-scan.
+// Not #[serial] — it calls the helper directly and reads no env.
+#[tokio::test]
+async fn key_column_index_coverage_detects_btree_presence() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    let snap = snapshot_main(&db).await.unwrap();
+
+    // Edge `src` gets a BTREE from ensure_indices on load → Indexed.
+    let edge_ds = snap.open("edge:Knows").await.unwrap();
+    let src_cov = TableStore::key_column_index_coverage(&edge_ds, "src")
+        .await
+        .unwrap();
+    assert_eq!(src_cov, IndexCoverage::Indexed, "edge src is BTREE-indexed");
+
+    // A node property column with no scalar index → Degraded (the warn path).
+    let node_ds = snap.open("node:Person").await.unwrap();
+    let age_cov = TableStore::key_column_index_coverage(&node_ds, "age")
+        .await
+        .unwrap();
+    assert!(
+        matches!(age_cov, IndexCoverage::Degraded { .. }),
+        "non-indexed column should be Degraded, got {age_cov:?}"
+    );
 }
 
 #[tokio::test]

@@ -43,6 +43,19 @@ pub struct DeleteState {
     pub(crate) version_metadata: TableVersionMetadata,
 }
 
+/// Whether a `key_col IN (...)` scan on a dataset will be served by the
+/// persisted scalar (BTREE) index, or silently fall back to a full filtered
+/// scan. Detection-only (metadata, no IO); the scan returns the correct rows
+/// either way. Surfaced by the indexed traversal path so the silent perf
+/// fallback is observable, and available to a future cost-based planner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexCoverage {
+    /// The column has a usable BTREE and every fragment records `physical_rows`.
+    Indexed,
+    /// Lance will not use the scalar index for this scan (correct, full scan).
+    Degraded { reason: String },
+}
+
 /// A Lance write that has produced fragment files on object storage but is
 /// not yet committed to the dataset's manifest. The staged-write primitives
 /// are consumed by `MutationStaging` (`exec/staging.rs`,
@@ -626,6 +639,50 @@ impl TableStore {
         .try_collect()
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))
+    }
+
+    /// Metadata-only check (no IO) of whether `scan_edges_by_endpoint` — a
+    /// `key_col IN (...)` filter — on `ds` will be served by the persisted BTREE
+    /// on `column`, or silently fall back to a full filtered scan. Mirrors
+    /// Lance's own decision: scalar indices are disabled for the whole scan if
+    /// ANY fragment lacks `physical_rows` (lance `dataset/scanner.rs`
+    /// `create_filter_plan`), and are obviously unused if no BTREE on the
+    /// column exists. The scan is correct (returns all rows) either way — this
+    /// only surfaces the perf cliff so the indexed traversal can warn on it.
+    pub async fn key_column_index_coverage(ds: &Dataset, column: &str) -> Result<IndexCoverage> {
+        let Some(field_id) = ds.schema().field(column).map(|field| field.id) else {
+            return Ok(IndexCoverage::Degraded {
+                reason: format!("column '{}' not in schema", column),
+            });
+        };
+        let indices = ds
+            .load_indices()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let has_btree = indices
+            .iter()
+            .filter(|index| !is_system_index(index))
+            .filter(|index| index.fields.len() == 1 && index.fields[0] == field_id)
+            .any(|index| {
+                index
+                    .index_details
+                    .as_ref()
+                    .map(|details| details.type_url.ends_with("BTreeIndexDetails"))
+                    .unwrap_or(false)
+            });
+        if !has_btree {
+            return Ok(IndexCoverage::Degraded {
+                reason: format!("no BTREE index on '{}'", column),
+            });
+        }
+        // Same check Lance runs: a fragment missing physical_rows disables
+        // scalar indices for the entire scan (all-or-nothing).
+        if ds.fragments().iter().any(|f| f.physical_rows.is_none()) {
+            return Ok(IndexCoverage::Degraded {
+                reason: "a fragment is missing physical_rows".to_string(),
+            });
+        }
+        Ok(IndexCoverage::Indexed)
     }
 
     pub async fn count_rows(&self, ds: &Dataset, filter: Option<String>) -> Result<usize> {

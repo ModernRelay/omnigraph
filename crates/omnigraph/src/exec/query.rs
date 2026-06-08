@@ -870,6 +870,27 @@ async fn execute_expand_indexed(
     };
     let edge_table_key = format!("edge:{}", edge_type);
     let edge_ds = snapshot.open(&edge_table_key).await?;
+
+    // C6 guard: surface the silent scalar-index fallback. If Lance won't route
+    // the per-hop `key_col IN (...)` through the BTREE (no index, or a fragment
+    // missing physical_rows), the scan is a correct but O(|E|) full scan.
+    // Detection-only (metadata, no IO); never fails the query.
+    match crate::table_store::TableStore::key_column_index_coverage(&edge_ds, key_col).await {
+        Ok(crate::table_store::IndexCoverage::Degraded { reason }) => tracing::warn!(
+            target: "omnigraph::traverse",
+            edge = %edge_type,
+            key_col = key_col,
+            reason = %reason,
+            "indexed traversal falls back to a full edge scan (results correct, perf degraded)"
+        ),
+        Ok(crate::table_store::IndexCoverage::Indexed) => {}
+        Err(e) => tracing::debug!(
+            target: "omnigraph::traverse",
+            error = %e,
+            "index-coverage check failed; proceeding with traversal"
+        ),
+    }
+
     let max = max_hops.unwrap_or(min_hops.max(1));
 
     // Per-source BFS state in string-id space (no dense interning needed).
