@@ -322,6 +322,13 @@ async fn optimize_one_table(
         // a single CAS-guarded `__manifest` commit (atomic; fails clean →
         // retried next run), so there is no Phase-B gap and no sidecar is needed.
         if head_version > expected_version {
+            tracing::info!(
+                target: "omnigraph::optimize",
+                table = %table_key,
+                manifest_pin = expected_version,
+                lance_head = head_version,
+                "reconciling pre-existing manifest-behind-HEAD drift (metadata-only catch-up)",
+            );
             let state = db.table_store.table_state(&full_path, &ds).await?;
             let update = crate::db::SubTableUpdate {
                 table_key: table_key.clone(),
