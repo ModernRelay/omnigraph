@@ -312,6 +312,10 @@ async fn optimize_reconciles_preexisting_manifest_head_drift() {
         person.fragments_added, 0,
         "drift reconcile is metadata-only — no new compaction",
     );
+    assert_eq!(
+        person.fragments_removed, 0,
+        "drift reconcile is metadata-only — no fragments rewritten",
+    );
 
     // Manifest now tracks the Lance HEAD.
     let snap = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
