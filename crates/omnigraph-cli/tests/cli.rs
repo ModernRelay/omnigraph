@@ -215,6 +215,168 @@ fn cluster_plan_json_reads_inferred_local_state() {
 }
 
 #[test]
+fn cluster_status_json_reports_missing_state() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+
+    let json = parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg("status")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["state_observations"]["state_found"], false);
+    assert!(
+        json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "state_missing"),
+        "missing state should be a warning diagnostic: {json}"
+    );
+}
+
+#[test]
+fn cluster_status_json_reports_extended_state() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let state_dir = temp.path().join("__cluster");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        r#"
+{
+  "version": 1,
+  "state_revision": 5,
+  "applied_revision": {
+    "config_digest": "applied",
+    "resources": {
+      "graph.knowledge": { "digest": "graph-digest" }
+    }
+  },
+  "resource_statuses": {
+    "graph.knowledge": { "status": "applied", "conditions": ["healthy"] }
+  },
+  "approval_records": {},
+  "recovery_records": {},
+  "observations": {}
+}
+"#,
+    )
+    .unwrap();
+
+    let json = parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg("status")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["state_observations"]["state_revision"], 5);
+    assert!(
+        json["state_observations"]["state_cas"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    assert_eq!(json["resource_digests"]["graph.knowledge"], "graph-digest");
+    assert_eq!(
+        json["resource_statuses"]["graph.knowledge"]["status"],
+        "applied"
+    );
+}
+
+#[test]
+fn cluster_plan_json_includes_state_cas_revision_and_lock_observation() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let state_dir = temp.path().join("__cluster");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        r#"
+{
+  "version": 1,
+  "state_revision": 9,
+  "applied_revision": {
+    "config_digest": "old",
+    "resources": {
+      "graph.knowledge": { "digest": "old-graph" }
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    let json = parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg("plan")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["state_observations"]["state_revision"], 9);
+    assert!(
+        json["state_observations"]["state_cas"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    assert_eq!(json["state_observations"]["locked"], true);
+    assert!(json["state_observations"]["lock_id"].is_string());
+    assert!(!state_dir.join("lock.json").exists());
+}
+
+#[test]
+fn cluster_plan_locked_state_exits_nonzero() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let state_dir = temp.path().join("__cluster");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("lock.json"),
+        r#"
+{
+  "version": 1,
+  "lock_id": "held-lock",
+  "operation": "plan",
+  "created_at": "2026-06-08T00:00:00Z",
+  "pid": 123
+}
+"#,
+    )
+    .unwrap();
+
+    let output = output_failure(
+        cli()
+            .arg("cluster")
+            .arg("plan")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    );
+    let json = parse_stdout_json(&output);
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["state_observations"]["locked"], true);
+    assert!(
+        json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "state_lock_held"),
+        "locked state should produce a useful diagnostic: {json}"
+    );
+}
+
+#[test]
 fn cluster_validate_invalid_config_exits_nonzero() {
     let temp = tempdir().unwrap();
     fs::write(
