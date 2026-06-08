@@ -156,6 +156,18 @@ fn init_cluster_derived_graph(root: &std::path::Path) {
     );
 }
 
+fn write_cluster_lock(root: &std::path::Path, lock_id: &str, operation: &str) {
+    let state_dir = root.join("__cluster");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("lock.json"),
+        format!(
+            r#"{{"version":1,"lock_id":"{lock_id}","operation":"{operation}","created_at":"1970-01-01T00:00:00Z","pid":123}}"#
+        ),
+    )
+    .unwrap();
+}
+
 #[test]
 fn version_command_prints_current_cli_version() {
     let output = output_success(cli().arg("version"));
@@ -272,6 +284,32 @@ fn cluster_status_json_reports_missing_state() {
 }
 
 #[test]
+fn cluster_status_json_reports_lock_metadata() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    write_cluster_lock(temp.path(), "held-lock", "refresh");
+
+    let json = parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg("status")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["state_observations"]["locked"], true);
+    assert_eq!(json["state_observations"]["lock_id"], "held-lock");
+    assert_eq!(json["state_observations"]["lock_operation"], "refresh");
+    assert_eq!(json["state_observations"]["lock_pid"], 123);
+    assert_eq!(
+        json["state_observations"]["lock_created_at"],
+        "1970-01-01T00:00:00Z"
+    );
+    assert!(json["state_observations"]["lock_age_seconds"].is_number());
+}
+
+#[test]
 fn cluster_status_json_reports_extended_state() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
@@ -372,21 +410,7 @@ fn cluster_plan_json_includes_state_cas_revision_and_lock_observation() {
 fn cluster_plan_locked_state_exits_nonzero() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
-    let state_dir = temp.path().join("__cluster");
-    fs::create_dir_all(&state_dir).unwrap();
-    fs::write(
-        state_dir.join("lock.json"),
-        r#"
-{
-  "version": 1,
-  "lock_id": "held-lock",
-  "operation": "plan",
-  "created_at": "2026-06-08T00:00:00Z",
-  "pid": 123
-}
-"#,
-    )
-    .unwrap();
+    write_cluster_lock(temp.path(), "held-lock", "plan");
 
     let output = output_failure(
         cli()
@@ -401,14 +425,113 @@ fn cluster_plan_locked_state_exits_nonzero() {
     assert_eq!(json["state_observations"]["locked"], true);
     assert_eq!(json["state_observations"]["lock_acquired"], false);
     assert_eq!(json["state_observations"]["lock_id"], "held-lock");
+    assert_eq!(json["state_observations"]["lock_operation"], "plan");
+    assert_eq!(json["state_observations"]["lock_pid"], 123);
+    assert_eq!(
+        json["state_observations"]["lock_created_at"],
+        "1970-01-01T00:00:00Z"
+    );
+    assert!(json["state_observations"]["lock_age_seconds"].is_number());
     assert!(
         json["diagnostics"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|diagnostic| diagnostic["code"] == "state_lock_held"),
+            .any(|diagnostic| diagnostic["code"] == "state_lock_held"
+                && diagnostic["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("force-unlock held-lock")),
         "locked state should produce a useful diagnostic: {json}"
     );
+}
+
+#[test]
+fn cluster_force_unlock_json_removes_lock() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    write_cluster_lock(temp.path(), "held-lock", "plan");
+
+    let json = parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg("force-unlock")
+            .arg("held-lock")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["lock_removed"], true);
+    assert_eq!(json["state_observations"]["lock_id"], "held-lock");
+    assert_eq!(json["state_observations"]["lock_operation"], "plan");
+    assert!(!temp.path().join("__cluster/lock.json").exists());
+}
+
+#[test]
+fn cluster_force_unlock_wrong_id_exits_nonzero() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    write_cluster_lock(temp.path(), "held-lock", "plan");
+
+    let json = parse_stdout_json(&output_failure(
+        cli()
+            .arg("cluster")
+            .arg("force-unlock")
+            .arg("other-lock")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["lock_removed"], false);
+    assert!(
+        json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "state_lock_id_mismatch")
+    );
+    assert!(temp.path().join("__cluster/lock.json").exists());
+}
+
+#[test]
+fn cluster_locked_plan_then_force_unlock_then_plan_succeeds() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    write_cluster_lock(temp.path(), "held-lock", "plan");
+
+    let locked = parse_stdout_json(&output_failure(
+        cli()
+            .arg("cluster")
+            .arg("plan")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(locked["ok"], false);
+    assert_eq!(locked["state_observations"]["lock_id"], "held-lock");
+
+    let unlocked = parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg("force-unlock")
+            .arg("held-lock")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(unlocked["lock_removed"], true);
+
+    let planned = parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg("plan")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(planned["ok"], true);
 }
 
 #[test]

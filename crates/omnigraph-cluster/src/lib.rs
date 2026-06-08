@@ -110,6 +110,25 @@ pub struct StateObservations {
     pub lock_acquired: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acquired_lock_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_operation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_age_seconds: Option<u64>,
+}
+
+impl StateObservations {
+    fn observe_lock_metadata(&mut self, lock: &StateLockFile) {
+        self.locked = true;
+        self.lock_id = Some(lock.lock_id.clone());
+        self.lock_operation = Some(lock.operation.clone());
+        self.lock_created_at = Some(lock.created_at.clone());
+        self.lock_pid = Some(lock.pid);
+        self.lock_age_seconds = lock_age_seconds(&lock.created_at);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -205,6 +224,15 @@ pub struct StateSyncOutput {
     pub resource_digests: BTreeMap<String, String>,
     pub resource_statuses: BTreeMap<String, ResourceStatusRecord>,
     pub observations: BTreeMap<String, serde_json::Value>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ForceUnlockOutput {
+    pub ok: bool,
+    pub config_dir: String,
+    pub state_observations: StateObservations,
+    pub lock_removed: bool,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -518,6 +546,35 @@ pub fn status_config_dir(config_dir: impl AsRef<Path>) -> StatusOutput {
     }
 }
 
+pub fn force_unlock_config_dir(
+    config_dir: impl AsRef<Path>,
+    lock_id: impl AsRef<str>,
+) -> ForceUnlockOutput {
+    let parsed = parse_cluster_config(config_dir.as_ref());
+    let mut diagnostics = parsed.diagnostics;
+    let backend = LocalStateBackend::new(&parsed.config_dir);
+    let mut observations = backend.observations();
+    let mut lock_removed = false;
+
+    if let Some(raw) = parsed.raw.as_ref() {
+        let _settings = validate_cluster_header(raw, &mut diagnostics);
+        if !has_errors(&diagnostics) {
+            match backend.force_unlock(lock_id.as_ref(), &mut observations) {
+                Ok(()) => lock_removed = true,
+                Err(diagnostic) => diagnostics.push(diagnostic),
+            }
+        }
+    }
+
+    ForceUnlockOutput {
+        ok: !has_errors(&diagnostics),
+        config_dir: display_path(&parsed.config_dir),
+        state_observations: observations,
+        lock_removed,
+        diagnostics,
+    }
+}
+
 pub async fn refresh_config_dir(config_dir: impl AsRef<Path>) -> StateSyncOutput {
     sync_config_dir(config_dir.as_ref(), StateSyncOperation::Refresh).await
 }
@@ -791,7 +848,7 @@ fn validate_cluster_header(
             diagnostics.push(Diagnostic::error(
                 "unsupported_state_backend",
                 "state.backend",
-                "Stage 2B supports only omitted state.backend or `cluster`",
+                "Stage 2C supports only omitted state.backend or `cluster`",
             ));
         }
     }
@@ -824,6 +881,10 @@ impl LocalStateBackend {
             lock_id: None,
             lock_acquired: false,
             acquired_lock_id: None,
+            lock_operation: None,
+            lock_created_at: None,
+            lock_pid: None,
+            lock_age_seconds: None,
         }
     }
 
@@ -1035,11 +1096,11 @@ impl LocalStateBackend {
                 })
             }
             Err(err) if err.kind() == ErrorKind::AlreadyExists => {
-                self.observe_lock_id(observations);
+                self.observe_lock_metadata_lossy(observations);
                 Err(Diagnostic::error(
                     "state_lock_held",
                     CLUSTER_LOCK_FILE,
-                    "cluster state lock already exists; remove it only after confirming no cluster operation is active",
+                    state_lock_held_message(observations),
                 ))
             }
             Err(err) => Err(Diagnostic::error(
@@ -1048,6 +1109,52 @@ impl LocalStateBackend {
                 format!("could not acquire state lock: {err}"),
             )),
         }
+    }
+
+    fn force_unlock(
+        &self,
+        requested_lock_id: &str,
+        observations: &mut StateObservations,
+    ) -> Result<(), Diagnostic> {
+        let text = match fs::read_to_string(&self.lock_path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                return Err(Diagnostic::error(
+                    "state_lock_missing",
+                    CLUSTER_LOCK_FILE,
+                    "cluster state lock is not present; nothing was unlocked",
+                ));
+            }
+            Err(err) => {
+                return Err(Diagnostic::error(
+                    "state_lock_read_error",
+                    CLUSTER_LOCK_FILE,
+                    format!("could not read state lock: {err}"),
+                ));
+            }
+        };
+        observations.locked = true;
+        let lock = parse_lock_file_for_unlock(&text)?;
+        observations.observe_lock_metadata(&lock);
+
+        if lock.lock_id != requested_lock_id {
+            return Err(Diagnostic::error(
+                "state_lock_id_mismatch",
+                CLUSTER_LOCK_FILE,
+                format!(
+                    "cluster state lock id is {}; refusing to unlock with requested id {requested_lock_id}",
+                    lock.lock_id
+                ),
+            ));
+        }
+
+        fs::remove_file(&self.lock_path).map_err(|err| {
+            Diagnostic::error(
+                "state_unlock_error",
+                CLUSTER_LOCK_FILE,
+                format!("could not remove state lock: {err}"),
+            )
+        })
     }
 
     fn observe_lock(
@@ -1060,7 +1167,7 @@ impl LocalStateBackend {
             match fs::read_to_string(&self.lock_path) {
                 Ok(text) => match serde_json::from_str::<StateLockFile>(&text) {
                     Ok(lock) if lock.version == 1 => {
-                        observations.lock_id = Some(lock.lock_id);
+                        observations.observe_lock_metadata(&lock);
                     }
                     Ok(lock) => diagnostics.push(Diagnostic::warning(
                         "unsupported_state_lock_version",
@@ -1082,12 +1189,12 @@ impl LocalStateBackend {
         }
     }
 
-    fn observe_lock_id(&self, observations: &mut StateObservations) {
+    fn observe_lock_metadata_lossy(&self, observations: &mut StateObservations) {
         observations.locked = true;
         if let Ok(text) = fs::read_to_string(&self.lock_path) {
             if let Ok(lock) = serde_json::from_str::<StateLockFile>(&text) {
                 if lock.version == 1 {
-                    observations.lock_id = Some(lock.lock_id);
+                    observations.observe_lock_metadata(&lock);
                 }
             }
         }
@@ -1097,6 +1204,33 @@ impl LocalStateBackend {
 impl Drop for StateLockGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn parse_lock_file_for_unlock(text: &str) -> Result<StateLockFile, Diagnostic> {
+    let lock = serde_json::from_str::<StateLockFile>(text).map_err(|err| {
+        Diagnostic::error(
+            "invalid_state_lock",
+            CLUSTER_LOCK_FILE,
+            format!("could not parse state lock: {err}"),
+        )
+    })?;
+    if lock.version != 1 {
+        return Err(Diagnostic::error(
+            "unsupported_state_lock_version",
+            CLUSTER_LOCK_FILE,
+            format!("unsupported cluster state lock version {}", lock.version),
+        ));
+    }
+    Ok(lock)
+}
+
+fn state_lock_held_message(observations: &StateObservations) -> String {
+    match observations.lock_id.as_deref() {
+        Some(lock_id) => format!(
+            "cluster state lock already exists (lock id {lock_id}); run `omnigraph cluster force-unlock {lock_id}` only after confirming no cluster operation is active"
+        ),
+        None => "cluster state lock already exists; remove it only after confirming no cluster operation is active".to_string(),
     }
 }
 
@@ -1953,6 +2087,15 @@ fn now_rfc3339() -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
+fn lock_age_seconds(created_at: &str) -> Option<u64> {
+    let created_at = OffsetDateTime::parse(created_at, &Rfc3339).ok()?;
+    Some(
+        (OffsetDateTime::now_utc() - created_at)
+            .whole_seconds()
+            .max(0) as u64,
+    )
+}
+
 fn state_sync_operation_label(operation: StateSyncOperation) -> &'static str {
     match operation {
         StateSyncOperation::Refresh => "refresh",
@@ -2032,6 +2175,23 @@ policies:
         Omnigraph::init(graph.to_string_lossy().as_ref(), SCHEMA)
             .await
             .unwrap();
+    }
+
+    fn write_lock_file(config_dir: &Path, lock_id: &str, operation: &str) {
+        let state_dir = config_dir.join(CLUSTER_STATE_DIR);
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(
+            state_dir.join("lock.json"),
+            json!({
+                "version": 1,
+                "lock_id": lock_id,
+                "operation": operation,
+                "created_at": "1970-01-01T00:00:00Z",
+                "pid": 123
+            })
+            .to_string(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2384,6 +2544,164 @@ policies:
     }
 
     #[test]
+    fn status_surfaces_full_lock_metadata() {
+        let dir = fixture();
+        write_lock_file(dir.path(), "held-lock", "refresh");
+
+        let out = status_config_dir(dir.path());
+        assert!(out.ok, "{:?}", out.diagnostics);
+        assert!(out.state_observations.locked);
+        assert_eq!(out.state_observations.lock_id.as_deref(), Some("held-lock"));
+        assert_eq!(
+            out.state_observations.lock_operation.as_deref(),
+            Some("refresh")
+        );
+        assert_eq!(
+            out.state_observations.lock_created_at.as_deref(),
+            Some("1970-01-01T00:00:00Z")
+        );
+        assert_eq!(out.state_observations.lock_pid, Some(123));
+        assert!(out.state_observations.lock_age_seconds.is_some());
+    }
+
+    #[test]
+    fn force_unlock_matching_id_removes_lock() {
+        let dir = fixture();
+        write_lock_file(dir.path(), "held-lock", "plan");
+
+        let out = force_unlock_config_dir(dir.path(), "held-lock");
+        assert!(out.ok, "{:?}", out.diagnostics);
+        assert!(out.lock_removed);
+        assert_eq!(out.state_observations.lock_id.as_deref(), Some("held-lock"));
+        assert_eq!(
+            out.state_observations.lock_operation.as_deref(),
+            Some("plan")
+        );
+        assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
+    }
+
+    #[test]
+    fn force_unlock_wrong_id_fails_and_preserves_lock() {
+        let dir = fixture();
+        write_lock_file(dir.path(), "held-lock", "plan");
+
+        let out = force_unlock_config_dir(dir.path(), "other-lock");
+        assert!(!out.ok);
+        assert!(!out.lock_removed);
+        assert_eq!(out.state_observations.lock_id.as_deref(), Some("held-lock"));
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "state_lock_id_mismatch")
+        );
+        assert!(dir.path().join(CLUSTER_LOCK_FILE).exists());
+    }
+
+    #[test]
+    fn force_unlock_missing_lock_fails() {
+        let dir = fixture();
+
+        let out = force_unlock_config_dir(dir.path(), "held-lock");
+        assert!(!out.ok);
+        assert!(!out.lock_removed);
+        assert!(!out.state_observations.locked);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "state_lock_missing")
+        );
+    }
+
+    #[test]
+    fn force_unlock_invalid_lock_json_fails_and_preserves_lock() {
+        let dir = fixture();
+        let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(state_dir.join("lock.json"), "{").unwrap();
+
+        let out = force_unlock_config_dir(dir.path(), "held-lock");
+        assert!(!out.ok);
+        assert!(!out.lock_removed);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "invalid_state_lock")
+        );
+        assert!(dir.path().join(CLUSTER_LOCK_FILE).exists());
+    }
+
+    #[test]
+    fn force_unlock_unsupported_lock_version_fails_and_preserves_lock() {
+        let dir = fixture();
+        let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(
+            state_dir.join("lock.json"),
+            r#"{"version":2,"lock_id":"held-lock","operation":"plan","created_at":"1970-01-01T00:00:00Z","pid":123}"#,
+        )
+        .unwrap();
+
+        let out = force_unlock_config_dir(dir.path(), "held-lock");
+        assert!(!out.ok);
+        assert!(!out.lock_removed);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "unsupported_state_lock_version")
+        );
+        assert!(dir.path().join(CLUSTER_LOCK_FILE).exists());
+    }
+
+    #[test]
+    fn force_unlock_external_state_backend_rejected() {
+        let dir = fixture();
+        write_lock_file(dir.path(), "held-lock", "plan");
+        fs::write(
+            dir.path().join(CLUSTER_CONFIG_FILE),
+            r#"
+version: 1
+state:
+  backend: s3://state-bucket/cluster
+graphs:
+  knowledge:
+    schema: ./people.pg
+"#,
+        )
+        .unwrap();
+
+        let out = force_unlock_config_dir(dir.path(), "held-lock");
+        assert!(!out.ok);
+        assert!(!out.lock_removed);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "unsupported_state_backend")
+        );
+        assert!(dir.path().join(CLUSTER_LOCK_FILE).exists());
+    }
+
+    #[test]
+    fn plan_succeeds_after_force_unlock() {
+        let dir = fixture();
+        write_lock_file(dir.path(), "held-lock", "plan");
+
+        let locked = plan_config_dir(dir.path());
+        assert!(!locked.ok);
+        assert!(
+            locked
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "state_lock_held")
+        );
+
+        let unlocked = force_unlock_config_dir(dir.path(), "held-lock");
+        assert!(unlocked.ok, "{:?}", unlocked.diagnostics);
+
+        let out = plan_config_dir(dir.path());
+        assert!(out.ok, "{:?}", out.diagnostics);
+    }
+
+    #[test]
     fn plan_reports_state_cas_revision_and_removes_lock() {
         let dir = fixture();
         let state_dir = dir.path().join(CLUSTER_STATE_DIR);
@@ -2440,11 +2758,19 @@ policies:
         assert_eq!(out.state_observations.lock_id.as_deref(), Some("held-lock"));
         assert!(!out.state_observations.lock_acquired);
         assert!(out.state_observations.acquired_lock_id.is_none());
+        assert_eq!(
+            out.state_observations.lock_operation.as_deref(),
+            Some("plan")
+        );
         assert!(
             out.diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code == "state_lock_held")
         );
+        assert!(out.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "state_lock_held"
+                && diagnostic.message.contains("force-unlock held-lock")
+        }));
     }
 
     #[test]
@@ -2706,11 +3032,19 @@ graphs:
         assert!(out.state_observations.locked);
         assert_eq!(out.state_observations.lock_id.as_deref(), Some("held-lock"));
         assert!(!out.state_observations.lock_acquired);
+        assert_eq!(
+            out.state_observations.lock_operation.as_deref(),
+            Some("refresh")
+        );
         assert!(
             out.diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code == "state_lock_held")
         );
+        assert!(out.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "state_lock_held"
+                && diagnostic.message.contains("force-unlock held-lock")
+        }));
     }
 
     #[tokio::test]
