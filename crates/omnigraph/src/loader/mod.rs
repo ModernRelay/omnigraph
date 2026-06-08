@@ -1466,11 +1466,7 @@ pub(crate) fn enforce_unique_constraints_intra_batch(
             if any_null {
                 continue;
             }
-            // Join on the unit separator (U+001F) — a control char highly
-            // unlikely to occur in real data, keeping composite keys
-            // effectively unambiguous. Matches `exec/merge.rs::row_signature`,
-            // which uses the same separator.
-            let value = parts.join("\u{1f}");
+            let value = composite_unique_key(&parts);
             if let Some(prev_row) = seen.insert(value.clone(), row) {
                 return Err(OmniError::manifest(format!(
                     "@unique violation on {}.{}: value '{}' appears in rows {} and {}",
@@ -1484,6 +1480,18 @@ pub(crate) fn enforce_unique_constraints_intra_batch(
         }
     }
     Ok(())
+}
+
+/// Join one row's rendered, non-null column values into a single composite
+/// uniqueness key. The separator is the unit separator (U+001F) — a control
+/// char highly unlikely to occur in real data, so distinct tuples like
+/// `("a|b", "c")` and `("a", "b|c")` stay distinct rather than colliding.
+///
+/// Shared by the intake path (`enforce_unique_constraints_intra_batch`) and
+/// the branch-merge path (`exec/merge.rs::update_unique_constraints`) so the
+/// two cannot silently drift to incompatible keyings.
+pub(crate) fn composite_unique_key(parts: &[String]) -> String {
+    parts.join("\u{1f}")
 }
 
 /// Render a unique constraint's columns for error messages: a single column
