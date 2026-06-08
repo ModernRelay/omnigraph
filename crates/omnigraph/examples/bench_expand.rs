@@ -221,6 +221,65 @@ fn microbench_dedup() {
     );
 }
 
+/// Selective single-source traversal, timed cold in CSR vs indexed mode across
+/// growing |E|. The win of the indexed path: a small fixed frontier should be
+/// ~flat in |E| (one BTREE scan per hop), whereas CSR pays an O(|E|) adjacency
+/// build on the first (cold) query. Also asserts both modes return the same
+/// rows — a guard against the scalar-index `physical_rows` silent fallback
+/// dropping unindexed-fragment rows.
+async fn bench_selective_modes() {
+    println!("\n── Selective traversal: indexed vs CSR (cold, single-source knows{{1,2}}) ──");
+    let sel = r#"
+query sel($name: String) {
+    match {
+        $a: Person { name: $name }
+        $a knows{1,2} $b
+    }
+    return { $b.name }
+}
+"#;
+    for &(n, avg_deg) in &[(1_000usize, 8usize), (10_000, 8), (30_000, 8)] {
+        let jsonl = generate_jsonl(n, avg_deg, 42);
+        let mut params = ParamMap::new();
+        params.insert(
+            "name".to_string(),
+            omnigraph_compiler::query::ast::Literal::String("p0".to_string()),
+        );
+
+        let mut rows_by_mode: Vec<(&str, usize)> = Vec::new();
+        for mode in ["csr", "indexed"] {
+            // Fresh db per measurement so the query is cold (CSR pays its build).
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
+            load_jsonl(&mut db, &jsonl, LoadMode::Overwrite).await.unwrap();
+            // SAFE: example main drives queries sequentially; no concurrent env reader.
+            unsafe { std::env::set_var("OMNIGRAPH_TRAVERSAL_MODE", mode) };
+
+            let t = Instant::now();
+            let r = db
+                .query(ReadTarget::branch("main"), sel, "sel", &params)
+                .await
+                .expect("sel query");
+            let elapsed = t.elapsed();
+            let rows = r.num_rows();
+            rows_by_mode.push((mode, rows));
+            println!(
+                "  |E|≈{:>7}  {:<8} cold={:>9.2?}  rows={}",
+                n * avg_deg,
+                mode,
+                elapsed,
+                rows
+            );
+        }
+        unsafe { std::env::remove_var("OMNIGRAPH_TRAVERSAL_MODE") };
+        assert_eq!(
+            rows_by_mode[0].1, rows_by_mode[1].1,
+            "indexed and CSR must return identical rows (no silent drop under partial index coverage)"
+        );
+    }
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     println!("── End-to-end query latency ──");
@@ -261,6 +320,8 @@ async fn main() {
             );
         }
     }
+
+    bench_selective_modes().await;
 
     microbench_dedup();
 }
