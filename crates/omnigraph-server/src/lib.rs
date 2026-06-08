@@ -3,6 +3,7 @@ pub mod auth;
 pub mod config;
 pub mod graph_id;
 pub mod identity;
+pub mod mcp;
 pub mod policy;
 pub mod queries;
 pub mod registry;
@@ -1138,6 +1139,11 @@ pub fn build_app(state: AppState) -> Router {
         .route("/branches/merge", post(server_branch_merge))
         .route("/commits", get(server_commit_list))
         .route("/commits/{commit_id}", get(server_commit_show))
+        // MCP (RFC-003): a stateless Streamable-HTTP JSON-RPC endpoint that
+        // shares this group's bearer-auth + graph-handle middleware. Single
+        // mode serves it flat at `/mcp`; multi mode nests it to
+        // `/graphs/{graph_id}/mcp` (per-graph isolation for free).
+        .route_service("/mcp", mcp::mcp_service(state.clone()))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             resolve_graph_handle,

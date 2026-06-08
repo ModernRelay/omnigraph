@@ -851,6 +851,99 @@ async fn json_response(app: &Router, request: Request<Body>) -> (StatusCode, Val
     (status, value)
 }
 
+/// Build a stateless MCP JSON-RPC POST. rmcp's `handle_post` requires the
+/// `Accept` header to list both JSON and SSE and the content type to be JSON;
+/// a `Host` is needed so DNS-rebinding validation can run.
+fn mcp_post(body: Value) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri("/mcp")
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
+fn mcp_initialize_body() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "smoke", "version": "0.0.0" }
+        }
+    })
+}
+
+#[tokio::test]
+async fn mcp_initialize_advertises_tools_capability() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let (status, body) = json_response(&app, mcp_post(mcp_initialize_body())).await;
+    assert_eq!(status, StatusCode::OK, "initialize should 200");
+    assert_eq!(body["jsonrpc"], "2.0");
+    assert_eq!(body["id"], 1);
+    assert!(
+        body["result"]["capabilities"]["tools"].is_object(),
+        "advertises the tools capability: {body}"
+    );
+    // Resources are NOT advertised until the resources phase implements
+    // `list_resources`/`read_resource`; advertising a capability whose
+    // `resources/read` 404s would be a dishonest contract.
+    assert!(
+        body["result"]["capabilities"]["resources"].is_null(),
+        "does not advertise resources until implemented: {body}"
+    );
+    assert_eq!(body["result"]["serverInfo"]["name"], "omnigraph-server");
+}
+
+#[tokio::test]
+async fn mcp_requires_bearer_when_auth_enabled() {
+    // The §5.8 auth-decoupling invariant: /mcp sits behind the same
+    // `require_bearer_auth` middleware as the REST routes, so a missing bearer
+    // is rejected at the HTTP boundary (401) BEFORE rmcp runs, and a valid
+    // bearer reaches the handler (200). `route_layer` + `route_service` is the
+    // exact Axum interaction that could silently regress.
+    let (_temp, app) = app_for_loaded_graph_with_auth("mcp-token").await;
+
+    let no_bearer = app
+        .clone()
+        .oneshot(mcp_post(mcp_initialize_body()))
+        .await
+        .unwrap();
+    assert_eq!(
+        no_bearer.status(),
+        StatusCode::UNAUTHORIZED,
+        "no bearer must 401 at the middleware, not reach rmcp"
+    );
+
+    let mut with_bearer = mcp_post(mcp_initialize_body());
+    with_bearer
+        .headers_mut()
+        .insert(AUTHORIZATION, "Bearer mcp-token".parse().unwrap());
+    let (status, body) = json_response(&app, with_bearer).await;
+    assert_eq!(status, StatusCode::OK, "valid bearer reaches the handler");
+    assert_eq!(body["result"]["serverInfo"]["name"], "omnigraph-server");
+}
+
+#[tokio::test]
+async fn mcp_get_returns_405_not_404() {
+    // The MCP endpoint must route GET (the spec requires both POST + GET) and
+    // return 405 when SSE is not offered — rmcp's stateless mode gives this
+    // for free. A 404 would mean the endpoint isn't reachable.
+    let (_temp, app) = app_for_loaded_graph().await;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/mcp")
+        .header("host", "localhost")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
 #[tokio::test]
 async fn schema_apply_route_updates_graph_for_authorized_admin() {
     let (temp, app) = app_for_graph_with_auth_tokens_and_policy(
