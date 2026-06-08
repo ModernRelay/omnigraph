@@ -278,6 +278,97 @@ async fn recovery_rolls_back_synthetic_drift_on_open() {
     );
 }
 
+/// Regression: recovery roll-back must PUBLISH the restored version so
+/// `manifest == Lance HEAD` afterward (no residual "orphaned drift"). Before the
+/// fix, roll-back restored via `Dataset::restore` but left the manifest pin
+/// behind HEAD, so a subsequent strict write / schema apply failed its
+/// HEAD-vs-manifest precondition ("stale view … refresh and retry") — and a
+/// failed schema apply's own roll-back leaked +1 each retry (the original bug's
+/// loop). With convergence, one roll-back leaves `manifest == HEAD` and the
+/// follow-up succeeds.
+#[tokio::test]
+async fn recovery_rollback_converges_manifest_so_schema_apply_succeeds() {
+    use omnigraph::db::ReadTarget;
+    use omnigraph::loader::{LoadMode, load_jsonl};
+    use omnigraph::table_store::TableStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Person","data":{"name":"alice","age":30}}
+{"type":"Person","data":{"name":"bob","age":25}}
+"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+    drop(db);
+
+    // Forge a Phase-B residual: advance Person's Lance HEAD without publishing to
+    // the manifest (the manifest pin stays at the load's committed version).
+    let person_uri = node_table_uri(uri, "Person");
+    let store = TableStore::new(uri);
+    let mut ds = Dataset::open(&person_uri).await.unwrap();
+    let manifest_pin = ds.version().version;
+    let _ = store
+        .delete_where(&person_uri, &mut ds, "1 = 2")
+        .await
+        .unwrap();
+    drop(ds);
+
+    // Roll-back-classified sidecar (post_commit_pin != observed head ⇒
+    // UnexpectedAtP1 ⇒ RollBack).
+    let sidecar_json = format!(
+        r#"{{
+            "schema_version": 1,
+            "operation_id": "01H0000000000000000000CVG",
+            "started_at": "0",
+            "branch": null,
+            "actor_id": "act-test",
+            "writer_kind": "Mutation",
+            "tables": [
+                {{
+                    "table_key": "node:Person",
+                    "table_path": "{}",
+                    "expected_version": {},
+                    "post_commit_pin": {}
+                }}
+            ]
+        }}"#,
+        person_uri, manifest_pin, manifest_pin
+    );
+    write_sidecar_file(dir.path(), "01H0000000000000000000CVG", &sidecar_json);
+
+    // Reopen runs the sweep: restore Person to manifest_pin, then PUBLISH so the
+    // manifest tracks the restored Lance HEAD.
+    let db = Omnigraph::open(uri).await.unwrap();
+
+    // Convergence: manifest pin == Lance HEAD. Fails before the fix — the
+    // manifest stays at manifest_pin while HEAD advanced past it.
+    let snap = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let entry = snap.entry("node:Person").unwrap();
+    let lance_head = Dataset::open(&person_uri).await.unwrap().version().version;
+    assert_eq!(
+        entry.table_version, lance_head,
+        "roll-back must publish so manifest pin ({}) == Lance HEAD ({})",
+        entry.table_version, lance_head,
+    );
+
+    // The +1-loop victim: an additive schema apply must now succeed (its
+    // HEAD-vs-manifest precondition is satisfied). Before the fix this failed
+    // with "stale view … refresh and retry".
+    let desired = TEST_SCHEMA.replace(
+        "    age: I32?\n}",
+        "    age: I32?\n    nickname: String?\n}",
+    );
+    db.apply_schema(&desired)
+        .await
+        .expect("schema apply after a converging roll-back must succeed");
+}
+
 // =====================================================================
 // Phase 4 — roll-forward path + audit row recording
 // =====================================================================

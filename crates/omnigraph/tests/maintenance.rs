@@ -8,10 +8,12 @@ mod helpers;
 use std::time::Duration;
 
 use lance::Dataset;
-use omnigraph::db::{CleanupPolicyOptions, Omnigraph, SkipReason};
+use omnigraph::db::{CleanupPolicyOptions, Omnigraph, ReadTarget, SkipReason};
 use omnigraph::loader::{LoadMode, load_jsonl};
 
-use helpers::{TEST_DATA, TEST_SCHEMA, count_rows, init_and_load};
+use helpers::{
+    MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, count_rows, init_and_load, mixed_params, mutate_main,
+};
 
 /// Filesystem URI of a node sub-table, mirroring the engine's layout
 /// (FNV-1a of the type name under `nodes/`). Matches the helper in
@@ -161,6 +163,124 @@ node Tag {\n    slug: String @key\n}\n";
     assert_eq!(doc.fragments_added, 0);
     // The plain (non-blob) table is unaffected by the skip.
     assert_eq!(tag.skipped, None, "non-blob table must not be skipped");
+}
+
+// Regression: `optimize` must publish its compaction to the `__manifest` so the
+// manifest's recorded `table_version` tracks the compacted Lance HEAD.
+//
+// Lance `compact_files` advances the *dataset's* version (reserve-fragments +
+// rewrite commits) but knows nothing about OmniGraph's `__manifest`. If optimize
+// does not publish a manifest update, the manifest's `table_version` lags the
+// Lance HEAD: reads stay pinned to the pre-compaction version (compaction is
+// invisible to them) and any subsequent schema apply / strict update/delete
+// fails its HEAD-vs-manifest precondition with
+// "stale view of '<table>': expected manifest table version X but current is Y".
+// This pins the fix — optimize publishes the compacted version, so manifest ==
+// HEAD and migrations after a compaction succeed.
+#[tokio::test]
+async fn optimize_publishes_compaction_to_manifest_so_schema_apply_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap().trim_end_matches('/').to_string();
+    let mut db = init_and_load(&dir).await;
+
+    // Several separate inserts → multiple Person fragments, so `compact_files`
+    // actually merges and moves the Lance HEAD (a single fragment is a no-op).
+    for (name, age) in [("Eve", 40), ("Frank", 41), ("Grace", 42), ("Heidi", 43)] {
+        mutate_main(
+            &mut db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", name)], &[("$age", age as i64)]),
+        )
+        .await
+        .expect("insert");
+    }
+
+    let stats = db.optimize().await.unwrap();
+    let person = stats
+        .iter()
+        .find(|s| s.table_key == "node:Person")
+        .expect("Person stat present");
+    assert!(
+        person.committed,
+        "Person is multi-fragment, so optimize must have compacted it"
+    );
+
+    // After optimize, the manifest's recorded table_version must equal the actual
+    // Lance HEAD — optimize published its compaction, so there is no drift.
+    let snap = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let entry = snap.entry("node:Person").unwrap();
+    let manifest_version = entry.table_version;
+    let full = format!("{}/{}", root, entry.table_path);
+    let lance_head = Dataset::open(&full).await.unwrap().version().version;
+    assert_eq!(
+        manifest_version, lance_head,
+        "after optimize, manifest table_version ({manifest_version}) must equal Lance HEAD ({lance_head})",
+    );
+
+    // Reads observe the compacted version with rows preserved (4 seed + 4 inserts).
+    assert_eq!(count_rows(&db, "node:Person").await, 8);
+
+    // The headline: an additive (nullable property) migration touching the
+    // just-compacted table succeeds, where it previously failed with "stale view".
+    let desired = TEST_SCHEMA.replace(
+        "    age: I32?\n}",
+        "    age: I32?\n    nickname: String?\n}",
+    );
+    let result = db
+        .apply_schema(&desired)
+        .await
+        .expect("additive schema apply after optimize must succeed");
+    assert!(result.applied, "schema apply should report applied=true");
+}
+
+// Regression: `optimize` must REFUSE when an unresolved recovery sidecar is
+// pending. Operating on an unrecovered graph could publish a partial write that
+// the all-or-nothing recovery sweep would roll back; the operator must reopen
+// (run the recovery sweep) first.
+#[tokio::test]
+async fn optimize_defers_when_recovery_sidecar_is_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let db = init_and_load(&dir).await;
+
+    // Simulate an in-process failed write that left a recovery sidecar on disk.
+    let recovery_dir = dir.path().join("__recovery");
+    std::fs::create_dir_all(&recovery_dir).unwrap();
+    let person_path = node_table_uri(uri, "Person");
+    let sidecar_json = format!(
+        r#"{{
+            "schema_version": 1,
+            "operation_id": "01H000000000000000000DEFR",
+            "started_at": "0",
+            "branch": null,
+            "actor_id": "act-test",
+            "writer_kind": "Mutation",
+            "tables": [
+                {{
+                    "table_key": "node:Person",
+                    "table_path": "{}",
+                    "expected_version": 1,
+                    "post_commit_pin": 2
+                }}
+            ]
+        }}"#,
+        person_path
+    );
+    std::fs::write(
+        recovery_dir.join("01H000000000000000000DEFR.json"),
+        sidecar_json,
+    )
+    .unwrap();
+
+    let err = db
+        .optimize()
+        .await
+        .expect_err("optimize must defer (error) while a recovery sidecar is pending");
+    assert!(
+        err.to_string().to_lowercase().contains("recovery"),
+        "optimize defer error should mention recovery; got: {err}",
+    );
 }
 
 #[tokio::test]

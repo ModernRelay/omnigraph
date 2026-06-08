@@ -294,21 +294,19 @@ async fn composite_flow_canonical_lifecycle() {
     );
 
     // ─────────────────────────────────────────────────────────────────
-    // Step 10: optimize the post-merge graph — verify indices stay
-    // valid and queryable.
+    // Step 10: optimize the post-merge graph — verify compaction is
+    // published to the manifest (so the manifest pin tracks the compacted
+    // Lance HEAD), indices stay valid and queryable, and a post-optimize
+    // strict write commits.
     //
-    // **Known limitation**: `optimize_all_tables` calls Lance
-    // `compact_files` directly — it advances per-table Lance HEAD
-    // without updating the omnigraph `__manifest` pin. After optimize,
-    // the next writer's expected_table_versions captures the
-    // pre-optimize manifest pin, but the publisher's pre-check reads
-    // a higher version from the manifest dataset (because some other
-    // path — possibly schema-state recovery on reopen — wrote a newer
-    // __manifest row). The `ExpectedVersionMismatch` is benign
-    // (re-issuing the mutation after a snapshot refresh succeeds), but
-    // a composite test cannot reliably exercise post-optimize mutations
-    // until that path is investigated. Coverage of post-optimize
-    // mutations is left to a focused optimize+cleanup integration test.
+    // This step used to carry a "Known limitation": `optimize_all_tables`
+    // ran Lance `compact_files` without publishing the new version to
+    // `__manifest`, so the manifest pin lagged the Lance HEAD and the next
+    // strict write / schema apply failed with `ExpectedVersionMismatch`
+    // ("stale view … refresh and retry") — so post-optimize mutations were
+    // deliberately omitted here. optimize now publishes the compacted
+    // version, and this flow exercises exactly that previously-failing
+    // write below.
     // ─────────────────────────────────────────────────────────────────
     let optimize_stats = db.optimize().await.unwrap();
     assert!(
@@ -329,6 +327,28 @@ async fn composite_flow_canonical_lifecycle() {
         count_rows(&db, "node:Person").await,
         6,
         "row counts unchanged by optimize"
+    );
+
+    // A strict update on a compacted table is exactly the write that
+    // failed with "stale view" before optimize published its compaction.
+    // It must now commit (Alice is one of the seed Persons; an update
+    // leaves the row count at 6).
+    let post_optimize_update = mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 41)]),
+    )
+    .await
+    .expect("post-optimize strict update must commit — optimize published the manifest");
+    assert_eq!(
+        post_optimize_update.affected_nodes, 1,
+        "post-optimize update must affect exactly Alice"
+    );
+    assert_eq!(
+        count_rows(&db, "node:Person").await,
+        6,
+        "an update must not change the Person row count"
     );
 
     // ─────────────────────────────────────────────────────────────────
@@ -373,14 +393,27 @@ async fn composite_flow_canonical_lifecycle() {
         branches,
     );
 
-    // Final query exercise — full read path works post-reopen,
-    // post-cleanup. Post-cleanup mutation is omitted here pending
-    // resolution of the optimize-vs-manifest-pin interaction documented
-    // in Step 10.
+    // Final exercise — full read AND write path works post-reopen,
+    // post-cleanup. (The post-cleanup mutation was previously omitted
+    // pending resolution of the optimize-vs-manifest-pin interaction in
+    // Step 10; that is now fixed, so a strict write here must commit.)
     let final_total = query_main(&mut db, TEST_QUERIES, "total_people", &ParamMap::default())
         .await
         .unwrap();
     assert!(!final_total.batches().is_empty());
+
+    let post_reopen_update = mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "set_age",
+        &mixed_params(&[("$name", "Alice")], &[("$age", 42)]),
+    )
+    .await
+    .expect("post-reopen, post-cleanup strict update must commit");
+    assert_eq!(
+        post_reopen_update.affected_nodes, 1,
+        "post-reopen update must affect exactly Alice"
+    );
 }
 
 /// Cross-handle sequence that exercises operations after a schema_apply

@@ -153,10 +153,14 @@ are left at `Lance HEAD = manifest_pinned + 1`.
 
 **Recovery protocol** (lifecycle of every staged-write writer —
 `MutationStaging::finalize`, `schema_apply::apply_schema_with_lock`,
-`branch_merge_on_current_target`, `ensure_indices_for_branch`):
+`branch_merge_on_current_target`, `ensure_indices_for_branch`,
+`optimize_all_tables`):
 
 1. **Phase A**: writer writes a sidecar JSON to
-   `__recovery/{ulid}.json` BEFORE its first `commit_staged`. The
+   `__recovery/{ulid}.json` BEFORE its first HEAD-advancing commit
+   (`commit_staged`, or `compact_files` for `optimize_all_tables`,
+   which advances the Lance HEAD via a reserve-fragments + rewrite
+   commit rather than a staged write). The
    sidecar names every `(table_key, table_path, expected_version,
    post_commit_pin)` it intends to commit + the writer kind +
    actor_id.
@@ -191,8 +195,13 @@ recovery sweep in `crates/omnigraph/src/db/manifest/recovery.rs`:
   otherwise full open-time recovery rolls them back and refresh-time
   recovery leaves them for the next read-write open.
 - Otherwise **roll back**: per-table `Dataset::restore` to the
-  manifest-pinned table version for that branch. Rollback records the
-  actual restore target in the audit row's `to_version`.
+  manifest-pinned table version, then a single `ManifestBatchPublisher::publish`
+  of the restored HEAD — symmetric with roll-forward, so `manifest == HEAD`
+  after recovery (no residual drift). This convergence is what lets a
+  failed-then-retried schema apply succeed instead of failing one version higher
+  each iteration. The audit row's `to_version` records the logical
+  rolled-back-to version (`manifest_pinned`); the manifest is published at the
+  restore commit (`manifest_pinned + 1`, same content).
 - After a successful roll-forward or roll-back, an audit row is
   recorded — `_graph_commits.lance` carries
   a commit tagged `actor_id = "omnigraph:recovery"`, and a sibling
