@@ -119,8 +119,10 @@ pub struct TableOptimizeStats {
     pub fragments_removed: usize,
     /// Number of new, larger fragments Lance produced.
     pub fragments_added: usize,
-    /// Did this table get a new manifest version from the compaction? True when
-    /// compaction ran and its compacted version was published to `__manifest`.
+    /// Did this table get a new manifest version? True when compaction ran and
+    /// its compacted version was published to `__manifest`, OR when optimize
+    /// reconciled a pre-existing manifest-behind-HEAD drift (a metadata-only
+    /// catch-up, with `fragments_added == fragments_removed == 0`).
     pub committed: bool,
     /// `Some(reason)` if this table was deliberately not compacted. When set,
     /// `fragments_removed == 0`, `fragments_added == 0`, and `!committed`.
@@ -296,20 +298,51 @@ async fn optimize_one_table(
         .entry(&table_key)
         .map(|e| e.table_version)
         .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
+    let head_version = ds.version().version;
 
     // Precise "will it compact?" check — `plan_compaction` also accounts for
-    // deletion materialization (which can rewrite even a single fragment). A
-    // steady-state already-compacted table yields an empty plan and is never
-    // pinned in a sidecar (a zero-commit pin would classify NoMovement on
-    // recovery and force an all-or-nothing rollback). There is no drift to
-    // reconcile here: optimize runs only on a recovered graph (the pending-
-    // sidecar guard above), and recovery roll-back now publishes, so
-    // `HEAD == manifest` holds going in.
+    // deletion materialization (which can rewrite even a single fragment).
     let options = CompactionOptions::default();
     let plan = plan_compaction(&ds, &options)
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
     if plan.num_tasks() == 0 {
+        // Nothing to compact. But if the Lance HEAD is already ahead of the
+        // manifest pin, this table carries a pre-existing, uncovered drift: a
+        // pre-fix `optimize` (or an external raw `compact_files`) advanced the
+        // dataset HEAD without publishing to `__manifest`. Reconcile the manifest
+        // forward to HEAD so reads observe the current version and strict writes
+        // / schema apply pass their HEAD-vs-manifest precondition.
+        //
+        // This is safe precisely because the pending-sidecar guard at the top of
+        // `optimize_all_tables` already ran: no recovery sidecar is in flight, so
+        // `HEAD > manifest` here is necessarily benign and content-preserving
+        // (compaction-shaped), never a partial write the recovery sweep would
+        // roll back. And no Lance HEAD advances in this branch — the catch-up is
+        // a single CAS-guarded `__manifest` commit (atomic; fails clean →
+        // retried next run), so there is no Phase-B gap and no sidecar is needed.
+        if head_version > expected_version {
+            let state = db.table_store.table_state(&full_path, &ds).await?;
+            let update = crate::db::SubTableUpdate {
+                table_key: table_key.clone(),
+                table_version: state.version,
+                table_branch: None,
+                row_count: state.row_count,
+                version_metadata: state.version_metadata,
+            };
+            let mut expected = std::collections::HashMap::new();
+            expected.insert(table_key.clone(), expected_version);
+            db.coordinator
+                .write()
+                .await
+                .commit_updates_with_actor_with_expected(&[update], &expected, None)
+                .await?;
+            return Ok(TableOptimizeStats::compacted(
+                table_key,
+                &CompactionMetrics::default(),
+                true,
+            ));
+        }
         return Ok(TableOptimizeStats::compacted(
             table_key,
             &CompactionMetrics::default(),
