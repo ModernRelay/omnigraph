@@ -8,7 +8,11 @@ mod helpers;
 use std::time::Duration;
 
 use lance::Dataset;
-use omnigraph::db::{CleanupPolicyOptions, Omnigraph, ReadTarget, SkipReason};
+use lance::dataset::optimize::{CompactionOptions, compact_files};
+use omnigraph::db::{
+    CleanupPolicyOptions, Omnigraph, ReadTarget, RepairAction, RepairClassification, RepairOptions,
+    SkipReason,
+};
 use omnigraph::loader::{LoadMode, load_jsonl};
 
 use helpers::{
@@ -27,11 +31,64 @@ fn node_table_uri(root: &str, type_name: &str) -> String {
     format!("{}/nodes/{hash:016x}", root.trim_end_matches('/'))
 }
 
+async fn person_manifest_and_head(db: &Omnigraph, root: &str) -> (u64, u64, String) {
+    let snap = db.snapshot_of(ReadTarget::branch("main")).await.unwrap();
+    let entry = snap.entry("node:Person").unwrap();
+    let full = format!("{}/{}", root.trim_end_matches('/'), entry.table_path);
+    let head = Dataset::open(&full).await.unwrap().version().version;
+    (entry.table_version, head, full)
+}
+
+async fn add_person_fragments(db: &mut Omnigraph) {
+    for (name, age) in [("Eve", 40), ("Frank", 41), ("Grace", 42), ("Heidi", 43)] {
+        mutate_main(
+            db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", name)], &[("$age", age as i64)]),
+        )
+        .await
+        .expect("insert");
+    }
+}
+
+async fn forge_person_compaction_drift(db: &mut Omnigraph, root: &str) -> (u64, u64, String) {
+    add_person_fragments(db).await;
+    let (manifest_version, _, full) = person_manifest_and_head(db, root).await;
+    let mut ds = Dataset::open(&full).await.unwrap();
+    let metrics = compact_files(&mut ds, CompactionOptions::default(), None)
+        .await
+        .expect("raw Lance compaction");
+    let lance_head_version = ds.version().version;
+    assert!(
+        lance_head_version > manifest_version,
+        "raw Lance compaction should advance HEAD beyond manifest"
+    );
+    assert!(
+        metrics.fragments_removed > 0 || metrics.fragments_added > 0,
+        "test precondition: raw compaction should rewrite fragments"
+    );
+    (manifest_version, lance_head_version, full)
+}
+
+async fn forge_person_delete_drift(db: &Omnigraph, root: &str) -> (u64, u64, String) {
+    let (manifest_version, _, full) = person_manifest_and_head(db, root).await;
+    let mut ds = Dataset::open(&full).await.unwrap();
+    let deleted = ds.delete("name = 'Alice'").await.expect("raw Lance delete");
+    assert_eq!(deleted.num_deleted_rows, 1, "fixture should delete Alice");
+    let lance_head_version = deleted.new_dataset.version().version;
+    assert!(
+        lance_head_version > manifest_version,
+        "raw Lance delete should advance HEAD beyond manifest"
+    );
+    (manifest_version, lance_head_version, full)
+}
+
 #[tokio::test]
 async fn optimize_on_empty_graph_returns_stats_per_table_with_no_changes() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
-    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
 
     let stats = db.optimize().await.unwrap();
 
@@ -47,7 +104,7 @@ async fn optimize_on_empty_graph_returns_stats_per_table_with_no_changes() {
 #[tokio::test]
 async fn optimize_after_load_then_again_is_idempotent() {
     let dir = tempfile::tempdir().unwrap();
-    let mut db = init_and_load(&dir).await;
+    let db = init_and_load(&dir).await;
 
     // First pass may compact (load wrote real fragments).
     let _first = db.optimize().await.unwrap();
@@ -180,7 +237,12 @@ node Tag {\n    slug: String @key\n}\n";
 #[tokio::test]
 async fn optimize_publishes_compaction_to_manifest_so_schema_apply_succeeds() {
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().to_str().unwrap().trim_end_matches('/').to_string();
+    let root = dir
+        .path()
+        .to_str()
+        .unwrap()
+        .trim_end_matches('/')
+        .to_string();
     let mut db = init_and_load(&dir).await;
 
     // Several separate inserts → multiple Person fragments, so `compact_files`
@@ -232,6 +294,281 @@ async fn optimize_publishes_compaction_to_manifest_so_schema_apply_succeeds() {
         .await
         .expect("additive schema apply after optimize must succeed");
     assert!(result.applied, "schema apply should report applied=true");
+}
+
+#[tokio::test]
+async fn optimize_skips_preexisting_manifest_head_drift() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir
+        .path()
+        .to_str()
+        .unwrap()
+        .trim_end_matches('/')
+        .to_string();
+    let mut db = init_and_load(&dir).await;
+    let (manifest_before, head_before, _) = forge_person_compaction_drift(&mut db, &root).await;
+
+    let stats = db.optimize().await.unwrap();
+    let person = stats
+        .iter()
+        .find(|s| s.table_key == "node:Person")
+        .expect("Person stat present");
+    assert_eq!(person.skipped, Some(SkipReason::DriftNeedsRepair));
+    assert!(!person.committed);
+    assert_eq!(person.manifest_version, Some(manifest_before));
+    assert_eq!(person.lance_head_version, Some(head_before));
+
+    let (manifest_after, head_after, _) = person_manifest_and_head(&db, &root).await;
+    assert_eq!(
+        manifest_after, manifest_before,
+        "optimize must not publish uncovered drift"
+    );
+    assert_eq!(
+        head_after, head_before,
+        "optimize must not move drifted HEAD"
+    );
+}
+
+#[tokio::test]
+async fn repair_preview_reports_verified_maintenance_drift_without_healing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir
+        .path()
+        .to_str()
+        .unwrap()
+        .trim_end_matches('/')
+        .to_string();
+    let mut db = init_and_load(&dir).await;
+    let (manifest_before, head_before, _) = forge_person_compaction_drift(&mut db, &root).await;
+
+    let stats = db
+        .repair(RepairOptions {
+            confirm: false,
+            force: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(stats.manifest_version, None);
+    let person = stats
+        .tables
+        .iter()
+        .find(|s| s.table_key == "node:Person")
+        .expect("Person repair stat present");
+    assert_eq!(
+        person.classification,
+        RepairClassification::VerifiedMaintenance
+    );
+    assert_eq!(person.action, RepairAction::Preview);
+    assert_eq!(person.manifest_version, manifest_before);
+    assert_eq!(person.lance_head_version, head_before);
+    assert!(
+        person
+            .operations
+            .iter()
+            .all(|op| op == "ReserveFragments" || op == "Rewrite"),
+        "maintenance drift should only include Lance maintenance operations: {:?}",
+        person.operations
+    );
+
+    let (manifest_after, head_after, _) = person_manifest_and_head(&db, &root).await;
+    assert_eq!(manifest_after, manifest_before);
+    assert_eq!(head_after, head_before);
+}
+
+#[tokio::test]
+async fn repair_confirm_heals_verified_maintenance_drift() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir
+        .path()
+        .to_str()
+        .unwrap()
+        .trim_end_matches('/')
+        .to_string();
+    let mut db = init_and_load(&dir).await;
+    let (_, head_before, _) = forge_person_compaction_drift(&mut db, &root).await;
+
+    let stats = db
+        .repair(RepairOptions {
+            confirm: true,
+            force: false,
+        })
+        .await
+        .unwrap();
+    assert!(
+        stats.manifest_version.is_some(),
+        "confirmed repair should publish one manifest commit"
+    );
+    let person = stats
+        .tables
+        .iter()
+        .find(|s| s.table_key == "node:Person")
+        .expect("Person repair stat present");
+    assert_eq!(
+        person.classification,
+        RepairClassification::VerifiedMaintenance
+    );
+    assert_eq!(person.action, RepairAction::Healed);
+
+    let (manifest_after, head_after, _) = person_manifest_and_head(&db, &root).await;
+    assert_eq!(manifest_after, head_before);
+    assert_eq!(head_after, head_before);
+
+    let desired = TEST_SCHEMA.replace(
+        "    age: I32?\n}",
+        "    age: I32?\n    nickname: String?\n}",
+    );
+    let result = db
+        .apply_schema(&desired)
+        .await
+        .expect("strict schema apply should succeed after repair");
+    assert!(result.applied);
+}
+
+#[tokio::test]
+async fn repair_refuses_raw_delete_without_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir
+        .path()
+        .to_str()
+        .unwrap()
+        .trim_end_matches('/')
+        .to_string();
+    let db = init_and_load(&dir).await;
+    let (manifest_before, head_before, _) = forge_person_delete_drift(&db, &root).await;
+
+    let stats = db
+        .repair(RepairOptions {
+            confirm: true,
+            force: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(stats.manifest_version, None);
+    let person = stats
+        .tables
+        .iter()
+        .find(|s| s.table_key == "node:Person")
+        .expect("Person repair stat present");
+    assert_eq!(person.classification, RepairClassification::Suspicious);
+    assert_eq!(person.action, RepairAction::Refused);
+    assert!(
+        person.operations.iter().any(|op| op == "Delete"),
+        "raw Lance delete should be reported as a suspicious operation: {:?}",
+        person.operations
+    );
+
+    let (manifest_after, head_after, _) = person_manifest_and_head(&db, &root).await;
+    assert_eq!(manifest_after, manifest_before);
+    assert_eq!(head_after, head_before);
+    assert_eq!(
+        count_rows(&db, "node:Person").await,
+        4,
+        "manifest-pinned reads should still see the pre-delete version"
+    );
+}
+
+#[tokio::test]
+async fn repair_force_heals_suspicious_drift() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir
+        .path()
+        .to_str()
+        .unwrap()
+        .trim_end_matches('/')
+        .to_string();
+    let db = init_and_load(&dir).await;
+    let (_, head_before, _) = forge_person_delete_drift(&db, &root).await;
+
+    let stats = db
+        .repair(RepairOptions {
+            confirm: true,
+            force: true,
+        })
+        .await
+        .unwrap();
+    let person = stats
+        .tables
+        .iter()
+        .find(|s| s.table_key == "node:Person")
+        .expect("Person repair stat present");
+    assert_eq!(person.classification, RepairClassification::Suspicious);
+    assert_eq!(person.action, RepairAction::Forced);
+
+    let (manifest_after, head_after, _) = person_manifest_and_head(&db, &root).await;
+    assert_eq!(manifest_after, head_before);
+    assert_eq!(head_after, head_before);
+    assert_eq!(
+        count_rows(&db, "node:Person").await,
+        3,
+        "forced repair publishes the raw delete's HEAD"
+    );
+}
+
+#[tokio::test]
+async fn non_strict_load_refuses_uncovered_drift_before_folding_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir
+        .path()
+        .to_str()
+        .unwrap()
+        .trim_end_matches('/')
+        .to_string();
+    let mut db = init_and_load(&dir).await;
+    let (manifest_before, head_before, _) = forge_person_compaction_drift(&mut db, &root).await;
+
+    let err = load_jsonl(
+        &mut db,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Ivan\",\"age\":44}}",
+        LoadMode::Merge,
+    )
+    .await
+    .expect_err("merge load must not silently fold uncovered drift");
+    assert!(
+        err.to_string().contains("omnigraph repair"),
+        "error should point at explicit repair; got: {err}"
+    );
+
+    let (manifest_after, head_after, _) = person_manifest_and_head(&db, &root).await;
+    assert_eq!(manifest_after, manifest_before);
+    assert_eq!(head_after, head_before);
+}
+
+#[tokio::test]
+async fn delete_only_mutation_refuses_uncovered_drift_before_inline_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir
+        .path()
+        .to_str()
+        .unwrap()
+        .trim_end_matches('/')
+        .to_string();
+    let mut db = init_and_load(&dir).await;
+    let (manifest_before, head_before, _) = forge_person_compaction_drift(&mut db, &root).await;
+
+    let err = mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "remove_person",
+        &mixed_params(&[("$name", "Alice")], &[]),
+    )
+    .await
+    .expect_err("strict delete must reject uncovered drift before delete_where");
+    assert!(
+        err.to_string().contains("expected"),
+        "delete should fail as a strict stale-version write; got: {err}"
+    );
+
+    let (manifest_after, head_after, _) = person_manifest_and_head(&db, &root).await;
+    assert_eq!(manifest_after, manifest_before);
+    assert_eq!(
+        head_after, head_before,
+        "delete_where must not run after the strict drift guard fails"
+    );
+    assert_eq!(
+        count_rows(&db, "node:Person").await,
+        8,
+        "manifest-pinned reads should still see all rows present before the failed delete"
+    );
 }
 
 // Regression: `optimize` must REFUSE when an unresolved recovery sidecar is

@@ -139,6 +139,20 @@ them explicit.
   Remove the skip when the upstream Lance fix lands — the
   `lance_surface_guards.rs::compact_files_still_fails_on_blob_columns` guard
   turns red on that bump to force it.
+- **Manifest→commit-graph publish atomicity:** a graph commit advances
+  `__manifest` (the visibility authority) and then appends `_graph_commits` as
+  two separate writes (`commit_updates_with_actor_with_expected`, failpoint
+  `graph_publish.before_commit_append`). A crash between them leaves the manifest
+  at version N with no commit-graph row for N. Live reads and durability are
+  unaffected — the live version resolves via the manifest
+  (`GraphCoordinator::version()`), not the commit-graph head — and the open-time
+  recovery sweep does NOT repair it (`lance_head == manifest_pinned` classifies
+  `NoMovement`; a recovery sidecar would not change this). Impact is bounded to
+  commit history: `commit list` misses N, time-travel by commit id to N fails,
+  and merge-base loses a node (a likely-benign off-by-one re-merge). This affects
+  every publish, not a specific maintenance command. Eventual fix: make the
+  commit graph reconcilable from the manifest (or the two writes atomic) — not a
+  recovery-sidecar concern.
 - **Planner capability/stat surfaces:** cost-aware planning, complete
   capability advertisement, and explain-with-cost are roadmap. Do not describe
   them as implemented.
