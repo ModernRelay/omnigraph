@@ -42,3 +42,17 @@ query hybrid_search($vq: Vector(4), $tq: String) {
     order { rrf(nearest($d.embedding, $vq), bm25($d.title, $tq)) }
     limit 3
 }
+
+query rrf_two_fts($q: String) {
+    match { $d: Doc }
+    return { $d.slug, $d.title }
+    order { rrf(bm25($d.title, $q), bm25($d.body, $q)) }
+    limit 3
+}
+
+query rrf_two_vectors($q1: Vector(4), $q2: Vector(4)) {
+    match { $d: Doc }
+    return { $d.slug, $d.title }
+    order { rrf(nearest($d.embedding, $q1), nearest($d.embedding, $q2)) }
+    limit 3
+}
