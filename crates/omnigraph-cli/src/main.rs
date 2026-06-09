@@ -820,32 +820,40 @@ fn print_cluster_apply_human(output: &ApplyOutput) {
             "cluster apply: {} applied, {} deferred/blocked",
             output.applied_count, output.deferred_count
         );
-        for change in &output.changes {
-            match (&change.disposition, change.reason.as_deref()) {
-                (Some(disposition), Some(reason)) => println!(
-                    "  {:?} {} [{disposition:?}: {reason}]",
-                    change.operation, change.resource
-                ),
-                (Some(disposition), None) => println!(
-                    "  {:?} {} [{disposition:?}]",
-                    change.operation, change.resource
-                ),
-                _ => println!("  {:?} {}", change.operation, change.resource),
-            }
-        }
-        if output.changes.is_empty() {
-            println!("  no changes");
-        }
+    } else {
+        println!("cluster apply failed");
+    }
+    // The change list prints on failure too: an operator debugging a partial
+    // apply (payload or state-write error) needs to see what was attempted.
+    print_cluster_apply_changes(&output.changes);
+    if output.ok {
         let state = &output.state_observations;
         println!(
             "  state: revision {}, converged: {}, written: {}",
             state.state_revision, output.converged, output.state_written
         );
         println!("  note: applied = recorded in the cluster catalog; the server still boots from omnigraph.yaml");
-    } else {
-        println!("cluster apply failed");
     }
     print_cluster_diagnostics(&output.diagnostics);
+}
+
+fn print_cluster_apply_changes(changes: &[omnigraph_cluster::PlanChange]) {
+    for change in changes {
+        match (&change.disposition, change.reason.as_deref()) {
+            (Some(disposition), Some(reason)) => println!(
+                "  {:?} {} [{disposition:?}: {reason}]",
+                change.operation, change.resource
+            ),
+            (Some(disposition), None) => println!(
+                "  {:?} {} [{disposition:?}]",
+                change.operation, change.resource
+            ),
+            _ => println!("  {:?} {}", change.operation, change.resource),
+        }
+    }
+    if changes.is_empty() {
+        println!("  no changes");
+    }
 }
 
 fn print_cluster_status_human(output: &StatusOutput) {
