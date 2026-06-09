@@ -24,10 +24,6 @@
 //!   `build_index_metadata_from_segments`, still `pub(crate)` in Lance
 //!   6.0.1 ([#6666](https://github.com/lance-format/lance/issues/6666),
 //!   open). Scalar indices already stage.
-//! * `overwrite_batch` — removable legacy: `stage_overwrite` exists
-//!   (schema_apply uses it), but the loader's bulk `LoadMode::Overwrite`
-//!   fast-path still uses this inline path for cross-table write
-//!   concurrency. Staged migration is a tracked follow-up.
 //!
 //! Each is named honestly at its call site; the forbidden-API guard test
 //! catches direct lance::* misuse outside the storage layer.
@@ -375,8 +371,8 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
 
     // ── Index presence (reads, no HEAD advance) ──────────────────────
     //
-    // The inline-commit writes (`overwrite_batch`, `delete_where`,
-    // `create_vector_index`) are deliberately NOT on this trait. They live on
+    // The inline-commit writes (`delete_where`, `create_vector_index`) are
+    // deliberately NOT on this trait. They live on
     // the separate `InlineCommitResidual` trait, reachable only through
     // `Omnigraph::storage_inline_residual()`. As a result the default
     // `db.storage()` surface cannot couple "write bytes" with "advance HEAD"
@@ -428,19 +424,8 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
 /// * `create_vector_index` — vector-index segment-commit needs
 ///   `build_index_metadata_from_segments`, still `pub(crate)` in Lance 6.0.1
 ///   (Lance #6666). Scalar indices already stage.
-/// * `overwrite_batch` — removable legacy: `stage_overwrite` exists (schema_apply
-///   uses it), but the loader's bulk `LoadMode::Overwrite` fast-path still uses
-///   this inline path for cross-table write concurrency. Migrating it to the
-///   staged shape is a tracked follow-up.
 #[async_trait]
-pub trait InlineCommitResidual: sealed::Sealed + Send + Sync + Debug {
-    async fn overwrite_batch(
-        &self,
-        dataset_uri: &str,
-        snapshot: SnapshotHandle,
-        batch: RecordBatch,
-    ) -> Result<(SnapshotHandle, TableState)>;
-
+pub(crate) trait InlineCommitResidual: sealed::Sealed + Send + Sync + Debug {
     async fn delete_where(
         &self,
         dataset_uri: &str,
@@ -774,17 +759,6 @@ impl TableStorage for TableStore {
 
 #[async_trait]
 impl InlineCommitResidual for TableStore {
-    async fn overwrite_batch(
-        &self,
-        dataset_uri: &str,
-        snapshot: SnapshotHandle,
-        batch: RecordBatch,
-    ) -> Result<(SnapshotHandle, TableState)> {
-        let mut ds = Arc::try_unwrap(snapshot.into_arc()).unwrap_or_else(|arc| (*arc).clone());
-        let state = TableStore::overwrite_batch(self, dataset_uri, &mut ds, batch).await?;
-        Ok((SnapshotHandle::new(ds), state))
-    }
-
     async fn delete_where(
         &self,
         dataset_uri: &str,

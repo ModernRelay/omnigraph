@@ -728,11 +728,9 @@ impl TableStore {
     /// call, advancing Lance HEAD as a side effect. Not on the
     /// `TableStorage` trait surface — the staged primitive `stage_append`
     /// + `commit_staged` is the engine write path. This inherent
-    /// `pub(crate)` method survives only as the body of `overwrite_batch`
-    /// (the loader's `LoadMode::Overwrite` bulk fast-path) and recovery
-    /// test setup. Do not add new call sites — they re-introduce the
-    /// multi-phase commit drift the trait surface was designed to
-    /// eliminate.
+    /// `pub(crate)` method survives only for recovery test setup. Do not
+    /// add new engine call sites — they re-introduce the multi-phase
+    /// commit drift the trait surface was designed to eliminate.
     pub(crate) async fn append_batch(
         &self,
         dataset_uri: &str,
@@ -788,25 +786,6 @@ impl TableStore {
         }
     }
 
-    /// Legacy inline-commit overwrite: truncates then
-    /// `append_batch`-commits, advancing Lance HEAD as a side effect.
-    /// Demoted to `pub(crate)` by MR-793 Phase 9 — the staged primitive
-    /// `stage_overwrite` + `commit_staged` is the public engine surface;
-    /// this one survives only as the LoadMode::Overwrite concurrent
-    /// fast-path inside `loader::write_batch_to_dataset`. Do not add new
-    /// call sites.
-    pub(crate) async fn overwrite_batch(
-        &self,
-        dataset_uri: &str,
-        ds: &mut Dataset,
-        batch: RecordBatch,
-    ) -> Result<TableState> {
-        ds.truncate_table()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        self.append_batch(dataset_uri, ds, batch).await
-    }
-
     pub async fn overwrite_dataset(dataset_uri: &str, batch: RecordBatch) -> Result<Dataset> {
         let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
         let params = WriteParams {
@@ -821,7 +800,7 @@ impl TableStore {
             .map_err(|e| OmniError::Lance(e.to_string()))
     }
 
-    pub async fn delete_where(
+    pub(crate) async fn delete_where(
         &self,
         dataset_uri: &str,
         ds: &mut Dataset,
@@ -1094,11 +1073,6 @@ impl TableStore {
     /// MR-793 Phase 2: introduces this for the schema_apply rewrite path.
     /// Lance API verified in `.context/mr-793-design.md` Appendix A.1.
     pub async fn stage_overwrite(&self, ds: &Dataset, batch: RecordBatch) -> Result<StagedWrite> {
-        if batch.num_rows() == 0 {
-            return Err(OmniError::manifest_internal(
-                "stage_overwrite called with empty batch".to_string(),
-            ));
-        }
         // `enable_stable_row_ids: true` is defensive — empirically Lance 6.0.1
         // preserves the source dataset's flag through `Operation::Overwrite`
         // when WriteParams omits it (pinned by
@@ -1109,25 +1083,40 @@ impl TableStore {
         // dataset that was created without stable row IDs is a no-op per
         // Lance's row-id-lineage spec, so this stays correct for legacy
         // datasets.
-        let params = WriteParams {
-            mode: WriteMode::Overwrite,
-            enable_stable_row_ids: true,
-            allow_external_blob_outside_bases: true,
-            ..Default::default()
-        };
-        let transaction = InsertBuilder::new(Arc::new(ds.clone()))
-            .with_params(&params)
-            .execute_uncommitted(vec![batch])
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        let mut new_fragments = match &transaction.operation {
-            Operation::Overwrite { fragments, .. } => fragments.clone(),
-            other => {
-                return Err(OmniError::manifest_internal(format!(
-                    "stage_overwrite: unexpected Lance operation {:?}",
-                    std::mem::discriminant(other)
-                )));
-            }
+        let (transaction, mut new_fragments) = if batch.num_rows() == 0 {
+            let transaction = TransactionBuilder::new(
+                ds.manifest.version,
+                Operation::Overwrite {
+                    fragments: Vec::new(),
+                    schema: ds.schema().clone(),
+                    config_upsert_values: None,
+                    initial_bases: None,
+                },
+            )
+            .build();
+            (transaction, Vec::new())
+        } else {
+            let params = WriteParams {
+                mode: WriteMode::Overwrite,
+                enable_stable_row_ids: true,
+                allow_external_blob_outside_bases: true,
+                ..Default::default()
+            };
+            let transaction = InsertBuilder::new(Arc::new(ds.clone()))
+                .with_params(&params)
+                .execute_uncommitted(vec![batch])
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            let new_fragments = match &transaction.operation {
+                Operation::Overwrite { fragments, .. } => fragments.clone(),
+                other => {
+                    return Err(OmniError::manifest_internal(format!(
+                        "stage_overwrite: unexpected Lance operation {:?}",
+                        std::mem::discriminant(other)
+                    )));
+                }
+            };
+            (transaction, new_fragments)
         };
         // Overwrite REPLACES every committed fragment, and Lance restarts
         // fragment-ID and row-ID counters at the post-commit version.
@@ -1492,7 +1481,7 @@ impl TableStore {
         }))
     }
 
-    pub async fn create_vector_index(&self, ds: &mut Dataset, column: &str) -> Result<()> {
+    pub(crate) async fn create_vector_index(&self, ds: &mut Dataset, column: &str) -> Result<()> {
         let params = lance::index::vector::VectorIndexParams::ivf_flat(1, MetricType::L2);
         ds.create_index_builder(&[column], IndexType::Vector, &params)
             .replace(true)

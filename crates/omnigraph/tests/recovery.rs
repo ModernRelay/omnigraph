@@ -175,7 +175,6 @@ async fn read_only_open_skips_recovery_sweep() {
 #[tokio::test]
 async fn recovery_rolls_back_synthetic_drift_on_open() {
     use omnigraph::loader::{LoadMode, load_jsonl};
-    use omnigraph::table_store::TableStore;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -202,13 +201,9 @@ async fn recovery_rolls_back_synthetic_drift_on_open() {
     // residual the sweep recovers from is the manifest-vs-Lance-HEAD gap;
     // it's agnostic to *what* op caused the gap.
     let person_uri = node_table_uri(uri, "Person");
-    let store = TableStore::new(uri);
     let mut ds = Dataset::open(&person_uri).await.unwrap();
     let head_before_drift = ds.version().version;
-    let _ = store
-        .delete_where(&person_uri, &mut ds, "1 = 2")
-        .await
-        .unwrap();
+    let _ = helpers::lance_delete_inline(&mut ds, "1 = 2").await;
     let head_after_drift = ds.version().version;
     assert_eq!(
         head_after_drift,
@@ -290,7 +285,6 @@ async fn recovery_rolls_back_synthetic_drift_on_open() {
 async fn recovery_rollback_converges_manifest_so_schema_apply_succeeds() {
     use omnigraph::db::ReadTarget;
     use omnigraph::loader::{LoadMode, load_jsonl};
-    use omnigraph::table_store::TableStore;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -310,13 +304,9 @@ async fn recovery_rollback_converges_manifest_so_schema_apply_succeeds() {
     // Forge a Phase-B residual: advance Person's Lance HEAD without publishing to
     // the manifest (the manifest pin stays at the load's committed version).
     let person_uri = node_table_uri(uri, "Person");
-    let store = TableStore::new(uri);
     let mut ds = Dataset::open(&person_uri).await.unwrap();
     let manifest_pin = ds.version().version;
-    let _ = store
-        .delete_where(&person_uri, &mut ds, "1 = 2")
-        .await
-        .unwrap();
+    let _ = helpers::lance_delete_inline(&mut ds, "1 = 2").await;
     drop(ds);
 
     // Roll-back-classified sidecar (post_commit_pin != observed head ⇒
@@ -518,7 +508,6 @@ async fn count_recovery_actor_commits(graph_root: &Path) -> usize {
 #[tokio::test]
 async fn recovery_rolls_forward_after_phase_b_completes() {
     use omnigraph::loader::{LoadMode, load_jsonl};
-    use omnigraph::table_store::TableStore;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -535,16 +524,12 @@ async fn recovery_rolls_forward_after_phase_b_completes() {
     drop(db);
 
     let person_uri = node_table_uri(uri, "Person");
-    let store = TableStore::new(uri);
     let mut ds = Dataset::open(&person_uri).await.unwrap();
     let head_before = ds.version().version;
 
     // Synthesize a successful Phase B: advance Lance HEAD by one
     // (delete_where with no-match — no fragment changes, but version bumps).
-    let _ = store
-        .delete_where(&person_uri, &mut ds, "1 = 2")
-        .await
-        .unwrap();
+    let _ = helpers::lance_delete_inline(&mut ds, "1 = 2").await;
     let head_after = ds.version().version;
     assert_eq!(head_after, head_before + 1);
 
@@ -728,7 +713,6 @@ async fn recovery_records_rolled_forward_for_stale_sidecar_after_successful_roll
 #[tokio::test]
 async fn recovery_rolls_back_records_audit_row_with_recovery_actor() {
     use omnigraph::loader::{LoadMode, load_jsonl};
-    use omnigraph::table_store::TableStore;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -742,13 +726,9 @@ async fn recovery_rolls_back_records_audit_row_with_recovery_actor() {
     drop(db);
 
     let person_uri = node_table_uri(uri, "Person");
-    let store = TableStore::new(uri);
     let mut ds = Dataset::open(&person_uri).await.unwrap();
     let head_before = ds.version().version;
-    let _ = store
-        .delete_where(&person_uri, &mut ds, "1 = 2")
-        .await
-        .unwrap();
+    let _ = helpers::lance_delete_inline(&mut ds, "1 = 2").await;
     let head_after = ds.version().version;
     let _ = head_after;
 
@@ -795,7 +775,6 @@ async fn recovery_rolls_back_records_audit_row_with_recovery_actor() {
 #[tokio::test]
 async fn recovery_rolls_forward_with_null_actor() {
     use omnigraph::loader::{LoadMode, load_jsonl};
-    use omnigraph::table_store::TableStore;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -809,13 +788,9 @@ async fn recovery_rolls_forward_with_null_actor() {
     drop(db);
 
     let person_uri = node_table_uri(uri, "Person");
-    let store = TableStore::new(uri);
     let mut ds = Dataset::open(&person_uri).await.unwrap();
     let head_before = ds.version().version;
-    let _ = store
-        .delete_where(&person_uri, &mut ds, "1 = 2")
-        .await
-        .unwrap();
+    let _ = helpers::lance_delete_inline(&mut ds, "1 = 2").await;
     let head_after = ds.version().version;
 
     // Sidecar with no actor_id (CLI-driven mutation; common case).
@@ -871,7 +846,6 @@ async fn recovery_rolls_forward_with_null_actor() {
 #[tokio::test]
 async fn recovery_processes_multiple_sidecars_with_fresh_snapshot_per_iter() {
     use omnigraph::loader::{LoadMode, load_jsonl};
-    use omnigraph::table_store::TableStore;
 
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
@@ -889,21 +863,14 @@ async fn recovery_processes_multiple_sidecars_with_fresh_snapshot_per_iter() {
     // Synthesize drift on both tables independently.
     let person_uri = node_table_uri(uri, "Person");
     let company_uri = node_table_uri(uri, "Company");
-    let store = TableStore::new(uri);
     let mut person_ds = Dataset::open(&person_uri).await.unwrap();
     let person_pre = person_ds.version().version;
-    let _ = store
-        .delete_where(&person_uri, &mut person_ds, "1 = 2")
-        .await
-        .unwrap();
+    let _ = helpers::lance_delete_inline(&mut person_ds, "1 = 2").await;
     let person_post = person_ds.version().version;
 
     let mut company_ds = Dataset::open(&company_uri).await.unwrap();
     let company_pre = company_ds.version().version;
-    let _ = store
-        .delete_where(&company_uri, &mut company_ds, "1 = 2")
-        .await
-        .unwrap();
+    let _ = helpers::lance_delete_inline(&mut company_ds, "1 = 2").await;
     let company_post = company_ds.version().version;
 
     // Drop two sidecars; ULID prefix ensures sort order is A then B.

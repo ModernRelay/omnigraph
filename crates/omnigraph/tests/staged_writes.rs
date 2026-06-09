@@ -23,6 +23,9 @@ use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::{WhenMatched, WhenNotMatched};
+use lance::index::DatasetIndexExt;
+use lance_index::IndexType;
+use lance_linalg::distance::MetricType;
 use lance_table::format::Fragment;
 use omnigraph::table_store::{StagedWrite, TableStore};
 use std::sync::Arc;
@@ -632,6 +635,47 @@ async fn stage_overwrite_replaces_all_fragments() {
     );
 }
 
+#[tokio::test]
+async fn stage_overwrite_empty_batch_replaces_all_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap());
+
+    let ds = TableStore::write_dataset(
+        &uri,
+        person_batch(&[("alice", Some(30)), ("bob", Some(25))]),
+    )
+    .await
+    .unwrap();
+    let pre_version = ds.version().version;
+
+    let staged = store
+        .stage_overwrite(&ds, RecordBatch::new_empty(person_schema()))
+        .await
+        .unwrap();
+    assert!(
+        staged.new_fragments.is_empty(),
+        "empty overwrite should produce a zero-fragment Lance Overwrite transaction"
+    );
+    assert_eq!(
+        staged.removed_fragment_ids.len(),
+        ds.manifest.fragments.len(),
+        "empty overwrite still removes every committed fragment"
+    );
+    assert_eq!(
+        ds.version().version,
+        pre_version,
+        "staging empty overwrite must not advance HEAD"
+    );
+
+    let new_ds = store
+        .commit_staged(Arc::new(ds.clone()), staged.transaction)
+        .await
+        .unwrap();
+    assert_eq!(new_ds.version().version, pre_version + 1);
+    assert_eq!(new_ds.count_rows(None).await.unwrap(), 0);
+}
+
 /// `stage_create_btree_index` writes index segments to object storage
 /// but does NOT advance Lance HEAD until `commit_staged`. After commit,
 /// the index is queryable.
@@ -730,7 +774,6 @@ async fn stage_create_inverted_index_does_not_advance_head_until_commit() {
 async fn delete_where_advances_head_inline_documents_residual() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
 
     let mut ds = TableStore::write_dataset(
         &uri,
@@ -740,13 +783,11 @@ async fn delete_where_advances_head_inline_documents_residual() {
     .unwrap();
     let pre_version = ds.version().version;
 
-    let result = store
-        .delete_where(&uri, &mut ds, "id = 'alice'")
-        .await
-        .unwrap();
-    assert_eq!(result.deleted_rows, 1);
+    let result = ds.delete("id = 'alice'").await.unwrap();
+    ds = (*result.new_dataset).clone();
+    assert_eq!(result.num_deleted_rows, 1);
     assert!(
-        result.version > pre_version,
+        ds.version().version > pre_version,
         "delete_where ADVANCES Lance HEAD inline (the residual). When \
          lance-format/lance#6658 ships and we migrate to stage_delete + \
          commit_staged, flip this assertion to assert that staging does \
@@ -796,8 +837,9 @@ async fn create_vector_index_advances_head_inline_documents_residual() {
     let pre_version = ds.version().version;
     assert!(!store.has_vector_index(&ds, "embedding").await.unwrap());
 
-    store
-        .create_vector_index(&mut ds, "embedding")
+    let params = lance::index::vector::VectorIndexParams::ivf_flat(1, MetricType::L2);
+    ds.create_index_builder(&["embedding"], IndexType::Vector, &params)
+        .replace(true)
         .await
         .unwrap();
     assert!(

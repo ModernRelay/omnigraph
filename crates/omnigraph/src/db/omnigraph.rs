@@ -597,13 +597,13 @@ impl Omnigraph {
         &self.table_store
     }
 
-    /// Inline-commit residual surface (`overwrite_batch`, `delete_where`,
+    /// Inline-commit residual surface (`delete_where`,
     /// `create_vector_index`) — the writes Lance cannot yet express as a
     /// stage-then-commit pair. Deliberately separate from [`Self::storage`] so
     /// the default storage surface is staged-only and a new writer cannot couple
     /// "write bytes" with "advance HEAD" by reaching for `db.storage()`. Only
-    /// the handful of documented residual call sites (loader overwrite fast-path,
-    /// mutation/merge deletes, vector-index build) use this accessor. See
+    /// the handful of documented residual call sites (mutation/merge deletes,
+    /// vector-index build) use this accessor. See
     /// `crate::storage_layer::InlineCommitResidual` for the per-method blocker.
     pub(crate) fn storage_inline_residual(
         &self,
@@ -1161,7 +1161,11 @@ impl Omnigraph {
             let dataset_uri = self.storage().dataset_uri(&table_path);
             let outcome = match crate::failpoints::maybe_fail("branch_delete.before_table_cleanup")
             {
-                Ok(()) => self.storage().force_delete_branch(&dataset_uri, branch).await,
+                Ok(()) => {
+                    self.storage()
+                        .force_delete_branch(&dataset_uri, branch)
+                        .await
+                }
                 Err(injected) => Err(injected),
             };
             if let Err(err) = outcome {

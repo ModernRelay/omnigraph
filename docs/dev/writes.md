@@ -110,29 +110,28 @@ described in `.context/mr-793-design.md` §15 (deferred to MR-795).
 
 MR-793's acceptance criterion §1 ("`TableStore` (or successor) public API has no method that performs a manifest commit as a side effect of writing") holds **by construction** after MR-854. `db.storage()` (`&dyn TableStorage`) exposes only staged primitives + reads; the inline-commit writes Lance cannot yet stage live on a separate `InlineCommitResidual` trait reached via `Omnigraph::storage_inline_residual()`. A new engine writer cannot couple a write with a Lance HEAD advance through the default surface — it would have to name the residual accessor explicitly. The dead legacy methods (trait `append_batch` / `merge_insert_batches`, inherent `merge_insert_batch{,es}`, `create_{btree,inverted}_index`) were removed; appends/merges and scalar index builds all use the `stage_*` primitives.
 
-Three methods remain on `InlineCommitResidual`, each named honestly at its call site:
+Two methods remain on `InlineCommitResidual`, each named honestly at its call site:
 
 | Residual method | Inline-commit reason | Closes when |
 |---|---|---|
 | `delete_where` | `DeleteBuilder::execute_uncommitted` is not in Lance v6.0.1 (closed upstream as [#6658](https://github.com/lance-format/lance/issues/6658) but first ships in `v7.0.0-beta.10`); see [docs/dev/lance.md](lance.md) | MR-A: Lance v7.x bump migrates `delete_where` to staged, retires the parse-time D₂ mutation rule, and extends recovery sidecar coverage |
 | `create_vector_index` | Vector indices take Lance's "segment commit path"; `build_index_metadata_from_segments` is `pub(crate)` (Lance [#6666](https://github.com/lance-format/lance/issues/6666) still open) | Lance #6666 lands and `stage_create_vector_index` joins the staged surface |
-| `overwrite_batch` | Removable legacy: a `stage_overwrite` primitive exists (schema_apply uses it), but the loader's bulk `LoadMode::Overwrite` fast-path still uses this inline path for cross-table write concurrency (see below) | The loader's overwrite fast-path migrates to `stage_overwrite` + `commit_staged` + a recovery sidecar (tracked follow-up) |
 
 The `tests/forbidden_apis.rs` guard still catches direct `lance::*` inline-commit misuse outside the storage layer; the trait split makes the staged-only default a type-system guarantee on top of it.
 
-### `LoadMode::Overwrite` residual
+### `LoadMode::Overwrite` uses staged Lance `Overwrite`
 
-The bulk loader's Append and Merge modes use the staged-write path
-described above. `LoadMode::Overwrite` keeps an inline-commit fast-path
-(`InlineCommitResidual::overwrite_batch`): each table is overwritten and
-committed concurrently with the others, and a fresh overwrite wipes the
-prior data, so there is no in-flight read-your-writes requirement and no
-partial-drift correctness concern (a mid-overwrite failure leaves the old
-data; re-running the overwrite recovers). A `stage_overwrite` primitive
-already exists (schema_apply uses it), so this path can migrate to the
-staged + recovery-sidecar shape; preserving the cross-table write
-concurrency (`OMNIGRAPH_LOAD_CONCURRENCY`) is the open design point.
-Tracked as a follow-up.
+The bulk loader's Append, Merge, and Overwrite modes all use the
+staged-write path described above. `LoadMode::Overwrite` accumulates
+replacement batches in memory, validates node/edge constraints, referential
+integrity, and edge cardinality before any Lance HEAD movement, stages
+each touched table with Lance `Operation::Overwrite`, then runs
+`commit_staged` under the normal `SidecarKind::Load` recovery sidecar
+before publishing `__manifest`. `OMNIGRAPH_LOAD_CONCURRENCY` applies to the
+fragment-writing stage only; the commit and manifest publish still run
+under the per-table write queues. Empty-table overwrite is represented as
+a valid zero-fragment Lance `Overwrite` transaction, not as
+truncate-then-append.
 
 ### Open-time recovery sweep
 

@@ -195,6 +195,14 @@ pub async fn diff_since_branch(
     .await
 }
 
+/// Advance a Lance dataset HEAD directly from tests without going through
+/// OmniGraph's storage residual surface. Used to synthesize uncovered drift.
+pub async fn lance_delete_inline(ds: &mut lance::Dataset, filter: &str) -> usize {
+    let result = ds.delete(filter).await.unwrap();
+    *ds = (*result.new_dataset).clone();
+    result.num_deleted_rows as usize
+}
+
 /// Build a ParamMap from string key-value pairs.
 pub fn params(pairs: &[(&str, &str)]) -> ParamMap {
     pairs
