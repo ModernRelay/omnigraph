@@ -1121,6 +1121,14 @@ async fn execute_expand_indexed(
     let (key_col, opp_col) = endpoint_columns(direction);
 
     let max = max_hops.unwrap_or(min_hops.max(1));
+    // Cross-type edges cannot chain (a Company is not a `WorksAt` source), so a
+    // variable-length traversal over one is structurally single-hop. Enforce it
+    // here instead of relying on the hop-2 scan returning empty: this BFS interns
+    // every endpoint string into ONE dense id space, so a cross-type id-string
+    // collision (a Person and a Company sharing an id) would otherwise let hop 2
+    // de-intern a destination id back to the colliding source-type id and match
+    // its edges, emitting rows the CSR path never produces.
+    let max = if same_type { max } else { max.min(1) };
 
     // Per-source BFS state in DENSE id space: intern node ids to u32 once via a
     // per-traversal interner so visited/seen/frontier/neighbor-map avoid string
@@ -1365,6 +1373,9 @@ async fn execute_expand_csr(
     let max = max_hops.unwrap_or(min_hops.max(1));
 
     let same_type = src_type_name == dst_type_name;
+    // Cross-type edges cannot chain; a variable-length traversal over one is
+    // structurally single-hop (mirrors the indexed path's guarantee).
+    let max = if same_type { max } else { max.min(1) };
 
     // BFS to collect (src_row_idx, dst_dense) pairs with per-source dedup.
     // Dense u32 ids stay in hand through BFS, dedup, and align — we only
