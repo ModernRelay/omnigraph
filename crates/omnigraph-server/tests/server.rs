@@ -945,6 +945,287 @@ async fn mcp_get_returns_405_not_404() {
 }
 
 #[tokio::test]
+async fn mcp_tools_list_includes_builtins() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let (status, body) = json_response(
+        &app,
+        mcp_post(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let tools = body["result"]["tools"].as_array().expect("tools array");
+    let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    for expected in [
+        "health",
+        "snapshot",
+        "schema_get",
+        "branches_list",
+        "commits_list",
+        "query",
+        "mutate",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "tools/list missing `{expected}`: {names:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mcp_tools_call_snapshot_reads_through_extension_passthrough() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let (status, body) = json_response(
+        &app,
+        mcp_post(json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": { "name": "snapshot", "arguments": {} }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The handler resolved the GraphHandle from the request extensions and ran
+    // do_snapshot — this is the RFC-003 §5.8 actor/handle passthrough proof.
+    assert_ne!(
+        body["result"]["isError"],
+        json!(true),
+        "snapshot tool errored: {body}"
+    );
+    let text = body["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content block");
+    let snapshot: Value = serde_json::from_str(text).expect("snapshot json payload");
+    assert_eq!(snapshot["branch"], "main");
+    assert!(
+        snapshot["manifest_version"].is_number(),
+        "snapshot carries a manifest_version: {snapshot}"
+    );
+}
+
+#[tokio::test]
+async fn mcp_tools_call_unknown_tool_is_jsonrpc_error() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let (status, body) = json_response(
+        &app,
+        mcp_post(json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": { "name": "does_not_exist", "arguments": {} }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "JSON-RPC errors ride a 200");
+    assert!(
+        body["error"].is_object(),
+        "unknown tool is a JSON-RPC error, not a result: {body}"
+    );
+}
+
+/// A read-only actor (`act-reader`) and an admin (`act-admin`), so `tools/list`
+/// filtering by Cedar action is observable.
+const MCP_FILTER_POLICY_YAML: &str = r#"
+version: 1
+groups:
+  readers: ["act-reader"]
+  admins: ["act-admin"]
+protected_branches: [main]
+rules:
+  - id: read-only
+    allow:
+      actors: { group: readers }
+      actions: [read]
+      branch_scope: any
+  - id: admin-data
+    allow:
+      actors: { group: admins }
+      actions: [read, change, export]
+      branch_scope: any
+  - id: admin-targets
+    allow:
+      actors: { group: admins }
+      actions: [schema_apply, branch_create, branch_delete, branch_merge]
+      target_branch_scope: any
+"#;
+
+fn mcp_post_auth(body: Value, token: &str) -> Request<Body> {
+    let mut request = mcp_post(body);
+    request
+        .headers_mut()
+        .insert(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+    request
+}
+
+async fn mcp_tool_names(app: &Router, token: &str) -> Vec<String> {
+    let (status, body) = json_response(
+        app,
+        mcp_post_auth(
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+            token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(String::from))
+        .collect()
+}
+
+#[tokio::test]
+async fn mcp_tools_list_cedar_filters_by_policy() {
+    let (_temp, app) = app_with_stored_queries(
+        &[],
+        &[("act-reader", "reader-tok"), ("act-admin", "admin-tok")],
+        MCP_FILTER_POLICY_YAML,
+    )
+    .await;
+
+    let reader = mcp_tool_names(&app, "reader-tok").await;
+    assert!(reader.contains(&"snapshot".to_string()), "{reader:?}");
+    assert!(reader.contains(&"query".to_string()), "{reader:?}");
+    for hidden in ["mutate", "ingest", "branches_create", "branches_delete", "schema_apply"] {
+        assert!(
+            !reader.contains(&hidden.to_string()),
+            "read-only actor must NOT see `{hidden}`: {reader:?}"
+        );
+    }
+
+    let admin = mcp_tool_names(&app, "admin-tok").await;
+    for visible in ["mutate", "ingest", "branches_create", "schema_apply"] {
+        assert!(
+            admin.contains(&visible.to_string()),
+            "admin must see `{visible}`: {admin:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mcp_tools_call_mutate_writes() {
+    let (_temp, app) = app_for_loaded_graph_with_auth("admin-token").await;
+    let (status, body) = json_response(
+        &app,
+        mcp_post_auth(
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "mutate",
+                    "arguments": {
+                        "source": "query ins($name: String, $age: I32) { insert Person { name: $name, age: $age } }",
+                        "params": { "name": "Zelda", "age": 40 }
+                    }
+                }
+            }),
+            "admin-token",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(body["result"]["isError"], json!(true), "mutate failed: {body}");
+    let text = body["result"]["content"][0]["text"]
+        .as_str()
+        .expect("change envelope text");
+    let change: Value = serde_json::from_str(text).expect("change json");
+    assert!(
+        change["affected_nodes"].as_u64().unwrap_or(0) >= 1,
+        "mutate wrote a node through MCP: {change}"
+    );
+}
+
+#[tokio::test]
+async fn mcp_tools_call_denied_is_masked_as_unknown() {
+    let (_temp, app) =
+        app_with_stored_queries(&[], &[("act-reader", "reader-tok")], MCP_FILTER_POLICY_YAML).await;
+    let (status, denied) = json_response(
+        &app,
+        mcp_post_auth(
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "mutate", "arguments": { "source": "x" } }
+            }),
+            "reader-tok",
+        ),
+    )
+    .await;
+    let (_s, unknown) = json_response(
+        &app,
+        mcp_post_auth(
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "does_not_exist", "arguments": {} }
+            }),
+            "reader-tok",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // Deny ≡ unknown: a denied existing tool is reported with the SAME error
+    // code and the SAME `unknown tool: <name>` template as a truly-unknown tool
+    // (the echoed name is the one the caller already supplied), so an
+    // unauthorized caller cannot tell "denied" from "does not exist".
+    assert_eq!(denied["error"]["code"], json!(-32602));
+    assert_eq!(denied["error"]["code"], unknown["error"]["code"]);
+    assert_eq!(denied["error"]["message"], json!("unknown tool: mutate"));
+    assert_eq!(
+        unknown["error"]["message"],
+        json!("unknown tool: does_not_exist")
+    );
+}
+
+#[tokio::test]
+async fn mcp_tools_call_business_error_is_iserror() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let (status, body) = json_response(
+        &app,
+        mcp_post(json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "query", "arguments": { "source": "this is not valid gq" } }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // A bad query is a tool-execution error the model can self-correct on, NOT a
+    // JSON-RPC protocol error (the 2025-11-25 SEP-1303 split).
+    assert_eq!(
+        body["result"]["isError"],
+        json!(true),
+        "malformed GQ → isError result: {body}"
+    );
+    assert!(body["error"].is_null(), "not a JSON-RPC error: {body}");
+}
+
+#[tokio::test]
+async fn mcp_tool_annotations_match_read_write() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let (_s, body) = json_response(
+        &app,
+        mcp_post(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })),
+    )
+    .await;
+    let tools = body["result"]["tools"].as_array().expect("tools array");
+    let find = |name: &str| {
+        tools
+            .iter()
+            .find(|t| t["name"] == json!(name))
+            .unwrap_or_else(|| panic!("tool `{name}` listed"))
+            .clone()
+    };
+    assert_eq!(find("snapshot")["annotations"]["readOnlyHint"], json!(true));
+    let schema_apply = find("schema_apply");
+    assert_eq!(schema_apply["annotations"]["readOnlyHint"], json!(false));
+    assert_eq!(
+        schema_apply["annotations"]["destructiveHint"],
+        json!(true),
+        "schema_apply is destructive: {schema_apply}"
+    );
+}
+
+#[tokio::test]
 async fn schema_apply_route_updates_graph_for_authorized_admin() {
     let (temp, app) = app_for_graph_with_auth_tokens_and_policy(
         &fs::read_to_string(fixture("test.pg")).unwrap(),

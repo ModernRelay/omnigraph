@@ -16,16 +16,25 @@
 
 use std::sync::Arc;
 
+use axum::Router;
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
-    model::{ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo},
+    model::{
+        CallToolRequestParams, CallToolResult, ListToolsResult, PaginatedRequestParams,
+        ServerCapabilities, ServerInfo,
+    },
     service::RequestContext,
     transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
     },
 };
 
-use crate::AppState;
+use tower_http::limit::RequestBodyLimitLayer;
+
+use crate::{AppState, INGEST_REQUEST_BODY_LIMIT_BYTES};
+use builtins::Builtin;
+
+mod builtins;
 
 /// Server-level guidance returned in the MCP `initialize` response.
 const MCP_INSTRUCTIONS: &str = "OmniGraph is a versioned, branchable property graph. \
@@ -37,10 +46,10 @@ are not permitted to call.";
 /// streamable-HTTP service constructs one per request in stateless mode.
 #[derive(Clone)]
 pub(crate) struct OmnigraphMcpHandler {
-    // Wired in Phase 3 (tools) / Phase 5 (resources): the handler resolves the
-    // per-request actor + graph handle from the request extensions and routes
-    // tool calls through the shared `do_*` / `run_query` / `run_mutate` paths.
-    #[allow(dead_code)]
+    // The handler resolves the per-request actor + graph handle from the
+    // request extensions (`resolve_cx`) and routes tool calls through the shared
+    // `do_*` / `run_query` / `run_mutate` paths. `state` supplies workload
+    // admission, the server-level policy, and graph routing.
     state: AppState,
 }
 
@@ -71,22 +80,58 @@ impl ServerHandler for OmnigraphMcpHandler {
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        // Phase 3 populates this with the Cedar-filtered built-in tools; Phase 4
-        // adds the dynamic stored-query tools.
-        Ok(ListToolsResult::default())
+        let cx = builtins::resolve_cx(&self.state, &context)?;
+        let mut tools = Vec::new();
+        for &tool in Builtin::all() {
+            // Emit only tools the actor's Cedar policy permits. An operational
+            // failure (policy-engine error) propagates; a denial just hides.
+            if builtins::is_visible(tool, &cx)? {
+                tools.push(tool.descriptor());
+            }
+        }
+        // Phase 4 appends the dynamic stored-query tools here.
+        let mut result = ListToolsResult::default();
+        result.tools = tools;
+        Ok(result)
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let cx = builtins::resolve_cx(&self.state, &context)?;
+        let Some(tool) = Builtin::from_name(&request.name) else {
+            // Unknown tool → JSON-RPC error (a dispatch failure, not a
+            // tool-execution error).
+            return Err(McpError::invalid_params(
+                format!("unknown tool: {}", request.name),
+                None,
+            ));
+        };
+        // Enforce the visibility gate at call-time too, and mask a denial as
+        // "unknown tool" so the catalog isn't probeable without the grant (the
+        // same deny ≡ missing principle as `POST /queries/{name}`). The inner
+        // `do_*` / `run_*` re-authorizes against the real branch.
+        if !builtins::is_visible(tool, &cx)? {
+            return Err(McpError::invalid_params(
+                format!("unknown tool: {}", request.name),
+                None,
+            ));
+        }
+        let args = request.arguments.unwrap_or_default();
+        builtins::dispatch(tool, &cx, &args).await
     }
 }
 
-/// Build the stateless Streamable-HTTP MCP service mounted at `/mcp`.
+/// Build the `/mcp` route: a stateless Streamable-HTTP MCP service, body-capped.
 ///
-/// Mounted inside the `per_graph_protected` route group so the bearer-auth and
+/// Merged into the `per_graph_protected` route group so the bearer-auth and
 /// graph-handle middleware run first; in multi-graph mode the same service is
 /// reached at `/graphs/{graph_id}/mcp`.
-pub(crate) fn mcp_service(
-    state: AppState,
-) -> StreamableHttpService<OmnigraphMcpHandler, LocalSessionManager> {
+pub(crate) fn mcp_router(state: AppState) -> Router<AppState> {
     let handler = OmnigraphMcpHandler::new(state);
     // `StreamableHttpServerConfig` is `#[non_exhaustive]`: start from `Default`,
     // then flip to stateless JSON. Keep rmcp's loopback `allowed_hosts` default
@@ -96,9 +141,16 @@ pub(crate) fn mcp_service(
     let config = StreamableHttpServerConfig::default()
         .with_stateful_mode(false)
         .with_json_response(true);
-    StreamableHttpService::new(
+    let service = StreamableHttpService::new(
         move || Ok(handler.clone()),
         Arc::new(LocalSessionManager::default()),
         config,
-    )
+    );
+    // rmcp reads the request body directly (it doesn't go through axum's
+    // `Bytes`/`Json` extractor), so the router's `DefaultBodyLimit` does NOT
+    // bound `/mcp`. Cap it explicitly at the ingest limit (the largest tool
+    // payload) so an MCP `ingest`/`schema_apply` call can't stream unbounded.
+    Router::new()
+        .route_service("/mcp", service)
+        .layer(RequestBodyLimitLayer::new(INGEST_REQUEST_BODY_LIMIT_BYTES))
 }

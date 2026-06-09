@@ -610,6 +610,18 @@ fn hash_bearer_tokens(bearer_tokens: Vec<(String, String)>) -> Arc<[(BearerToken
 }
 
 impl ApiError {
+    /// HTTP status this error maps to. Lets the MCP layer classify operational
+    /// failures (500 → JSON-RPC error) from tool-execution errors (4xx/409 →
+    /// `isError` content the model can self-correct on).
+    pub(crate) fn status_code(&self) -> StatusCode {
+        self.status
+    }
+
+    /// The human-readable error message, for building MCP tool-error content.
+    pub(crate) fn message_str(&self) -> &str {
+        &self.message
+    }
+
     pub fn unauthorized(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
@@ -1143,7 +1155,7 @@ pub fn build_app(state: AppState) -> Router {
         // shares this group's bearer-auth + graph-handle middleware. Single
         // mode serves it flat at `/mcp`; multi mode nests it to
         // `/graphs/{graph_id}/mcp` (per-graph isolation for free).
-        .route_service("/mcp", mcp::mcp_service(state.clone()))
+        .merge(mcp::mcp_router(state.clone()))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             resolve_graph_handle,
