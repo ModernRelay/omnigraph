@@ -47,17 +47,24 @@ async fn sorted_names(db: &mut Omnigraph, queries: &str, name: &str, params: &Pa
     v
 }
 
-/// Run the same query under CSR then indexed mode; assert identical results and
-/// return them.
+/// Run the same query under CSR, indexed, and auto (cost-chooser) modes; assert
+/// all three produce identical results and return them. The auto pass exercises
+/// `choose_expand_mode` end to end: whichever path it selects, the rows must
+/// match the forced paths (the chooser changes which path runs, never the result).
 async fn both_modes(db: &mut Omnigraph, queries: &str, name: &str, params: &ParamMap) -> Vec<String> {
     set_mode("csr");
     let csr = sorted_names(db, queries, name, params).await;
     set_mode("indexed");
     let indexed = sorted_names(db, queries, name, params).await;
     clear_mode();
+    let auto = sorted_names(db, queries, name, params).await;
     assert_eq!(
         indexed, csr,
         "indexed Expand must produce identical results to CSR for query '{name}'"
+    );
+    assert_eq!(
+        auto, csr,
+        "auto (cost-chooser) Expand must produce identical results to the forced paths for query '{name}'"
     );
     indexed
 }
