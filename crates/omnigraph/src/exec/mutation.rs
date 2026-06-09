@@ -639,7 +639,7 @@ async fn open_table_for_mutation(
 ///
 /// Reason: under the staged-write writer, inserts and updates
 /// accumulate in memory and commit at end-of-query, while deletes still
-/// inline-commit (Lance lacks a public two-phase delete in 4.0.0).
+/// inline-commit (Lance lacks a public two-phase delete in 6.0.1).
 /// Mixing creates ordering hazards (same-row insert→delete becomes a no-op
 /// because the staged insert isn't visible to delete; cascading deletes
 /// of just-inserted edges break referential integrity by silent design).
@@ -1187,7 +1187,7 @@ impl Omnigraph {
         let affected_nodes = deleted_ids.len();
 
         // Delete nodes — still inline-commit (Lance's `Dataset::delete` is
-        // not exposed as a two-phase op in 4.0.0). D₂ keeps inserts and
+        // not exposed as a two-phase op in 6.0.1). D₂ keeps inserts and
         // deletes from coexisting in one query, so this advance of Lance
         // HEAD is the only HEAD movement during the query and the
         // publisher's CAS captures it intact.

@@ -48,7 +48,7 @@ shared by both `mutate_as` and the bulk loader:
   touched sub-tables. Cross-table conflicts surface as
   `ManifestConflictDetails::ExpectedVersionMismatch`.
 - **Deletes still inline-commit.** Lance's `Dataset::delete` is not
-  exposed as a two-phase op in 4.0.0; deletes go through `delete_where`
+  exposed as a two-phase op in 6.0.1; deletes go through `delete_where`
   immediately and record their post-write state in
   `MutationStaging.inline_committed`. The parse-time D₂ rule (below)
   prevents inserts/updates from coexisting with deletes in one query,
@@ -82,7 +82,7 @@ Three writers have been migrated onto staged primitives:
 * **`ensure_indices`** (`db/omnigraph/table_ops.rs::build_indices_on_dataset_for_catalog`)
   — scalar indices (BTree, Inverted) now use `stage_create_*_index` +
   `commit_staged`. Vector indices stay inline (residual — Lance
-  `build_index_metadata_from_segments` is `pub(crate)` in 4.0.0;
+  `build_index_metadata_from_segments` is `pub(crate)` in 6.0.1;
   companion ticket to lance-format/lance#6658 needed).
 * **`branch_merge::publish_rewritten_merge_table`**
   (`exec/merge.rs`) — merge_insert now uses `stage_merge_insert` +
@@ -285,7 +285,7 @@ guarantee — the in-memory accumulator evaporates with the dropped task
 and no Lance write was ever issued.
 
 For delete-touching mutations the legacy inline-commit shape is
-preserved (Lance has no public two-phase delete in 4.0.0) — the same
+preserved (Lance has no public two-phase delete in 6.0.1) — the same
 narrow window remains. The parse-time D₂ rule prevents inserts/updates
 from coexisting with deletes in one query, so a pure-delete failure
 cannot drift any staged-table state. If a delete-only multi-table

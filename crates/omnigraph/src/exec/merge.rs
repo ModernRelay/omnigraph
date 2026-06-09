@@ -1031,7 +1031,7 @@ async fn publish_rewritten_merge_table(
     // `stage_create_inverted_index` + `commit_staged` for scalar
     // indices. Vector indices remain inline-commit
     // (`build_index_metadata_from_segments` is `pub(crate)` in lance-
-    // 4.0.0 — companion ticket to lance-format/lance#6658).
+    // 6.0.1 — companion ticket to lance-format/lance#6666).
     let row_count = target_db
         .storage()
         .table_state(&full_path, &current_ds)
