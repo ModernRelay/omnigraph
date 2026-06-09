@@ -11,7 +11,8 @@ use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
 use omnigraph::storage::normalize_root_uri;
 use omnigraph_cluster::{
-    DiagnosticSeverity, PlanOutput, ValidateOutput, plan_config_dir, validate_config_dir,
+    DiagnosticSeverity, PlanOutput, StatusOutput, ValidateOutput, plan_config_dir,
+    status_config_dir, validate_config_dir,
 };
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::schema::parser::parse_schema;
@@ -333,6 +334,15 @@ enum ClusterCommand {
     },
     /// Produce a read-only plan by diffing cluster.yaml against __cluster/state.json.
     Plan {
+        /// Cluster config directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Emit JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read the local JSON state ledger without scanning live graph resources.
+    Status {
         /// Cluster config directory containing cluster.yaml.
         #[arg(long, default_value = ".")]
         config: PathBuf,
@@ -745,6 +755,34 @@ fn print_cluster_plan_human(output: &PlanOutput) {
     print_cluster_diagnostics(&output.diagnostics);
 }
 
+fn print_cluster_status_human(output: &StatusOutput) {
+    if output.ok {
+        let state = &output.state_observations;
+        if state.state_found {
+            println!(
+                "cluster state: revision {}, {} resource(s)",
+                state.state_revision, state.resource_count
+            );
+            if let Some(digest) = state.applied_config_digest.as_deref() {
+                println!("  applied config: {digest}");
+            }
+            if state.locked {
+                match state.lock_id.as_deref() {
+                    Some(lock_id) => println!("  lock: held ({lock_id})"),
+                    None => println!("  lock: held"),
+                }
+            } else {
+                println!("  lock: not held");
+            }
+        } else {
+            println!("cluster state missing");
+        }
+    } else {
+        println!("cluster status failed");
+    }
+    print_cluster_diagnostics(&output.diagnostics);
+}
+
 fn print_cluster_diagnostics(diagnostics: &[omnigraph_cluster::Diagnostic]) {
     for diagnostic in diagnostics {
         let label = match diagnostic.severity {
@@ -776,6 +814,19 @@ fn finish_cluster_plan(output: &PlanOutput, json: bool) -> Result<()> {
         print_json(output)?;
     } else {
         print_cluster_plan_human(output);
+    }
+    if !output.ok {
+        io::stdout().flush()?;
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn finish_cluster_status(output: &StatusOutput, json: bool) -> Result<()> {
+    if json {
+        print_json(output)?;
+    } else {
+        print_cluster_status_human(output);
     }
     if !output.ok {
         io::stdout().flush()?;
@@ -3216,6 +3267,10 @@ async fn main() -> Result<()> {
             ClusterCommand::Plan { config, json } => {
                 let output = plan_config_dir(config);
                 finish_cluster_plan(&output, json)?;
+            }
+            ClusterCommand::Status { config, json } => {
+                let output = status_config_dir(config);
+                finish_cluster_status(&output, json)?;
             }
         },
         Command::Graphs { command } => match command {
