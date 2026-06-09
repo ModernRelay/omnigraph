@@ -856,7 +856,7 @@ impl TableStore {
         // before the FirstSeen setter has a chance to silently collapse
         // anything):
         // - Load path: `enforce_unique_constraints_intra_batch`
-        //   (`loader/mod.rs:1453`) errors on intra-batch `@key` dups.
+        //   (`loader/mod.rs:1471`) errors on intra-batch `@key` dups.
         // - Mutate path: `MutationStaging::finalize` (`exec/staging.rs`)
         //   accumulates and dedupes by `id`.
         // - Branch-merge path: `compute_source_delta` /

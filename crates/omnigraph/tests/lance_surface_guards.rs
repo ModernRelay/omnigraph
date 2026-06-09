@@ -30,6 +30,7 @@ use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
+use lance::dataset::transaction::Operation;
 use lance::dataset::write::delete::DeleteResult;
 use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
 use lance::index::DatasetIndexExt;
@@ -225,6 +226,33 @@ async fn _compile_compact_files_signature() -> lance::Result<()> {
     Ok(())
 }
 
+// --- Guard 7b: transaction history exposes repair's classification surface -
+//
+// `db/omnigraph/repair.rs` reads Lance transactions between manifest and HEAD
+// and treats only `ReserveFragments` + `Rewrite` as safe maintenance drift.
+// Compile-only.
+
+#[allow(
+    dead_code,
+    unreachable_code,
+    unused_variables,
+    unused_mut,
+    clippy::diverging_sub_expression
+)]
+async fn _compile_transaction_history_for_repair_signature() -> lance::Result<()> {
+    let ds: Dataset = unimplemented!();
+    let tx = ds.read_transaction_by_version(1u64).await?;
+    if let Some(tx) = tx {
+        let operation = tx.operation;
+        let _name: &str = operation.name();
+        match operation {
+            Operation::Rewrite { .. } | Operation::ReserveFragments { .. } => {}
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 // --- Guard 8: Dataset::delete returns DeleteResult { new_dataset, num_deleted_rows } ---
 //
 // `table_store.rs::delete_where` consumes both fields. When MR-A migrates
@@ -332,7 +360,10 @@ async fn compact_files_still_fails_on_blob_columns() {
         ]));
         RecordBatch::try_new(
             schema,
-            vec![Arc::new(StringArray::from(ids)) as _, Arc::new(content) as _],
+            vec![
+                Arc::new(StringArray::from(ids)) as _,
+                Arc::new(content) as _,
+            ],
         )
         .unwrap()
     }

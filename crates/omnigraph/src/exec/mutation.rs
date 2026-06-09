@@ -569,7 +569,8 @@ use super::staging::{MutationStaging, PendingMode};
 /// via `open_for_mutation_on_branch`, which compares Lance HEAD against
 /// the manifest's pinned version — that fence is the engine's
 /// publisher-style OCC catching cross-writer drift before we make any
-/// changes.
+/// changes. For delete-only queries, this strict open is also the uncovered
+/// drift guard that runs before `delete_where` can inline-commit.
 ///
 /// On subsequent touches *within the same query*, behavior depends on
 /// whether the table has already been inline-committed by a delete op:
@@ -904,12 +905,12 @@ impl Omnigraph {
             let batch = build_insert_batch(&schema, &id, &resolved, &blob_props)?;
             crate::loader::validate_value_constraints(&batch, node_type)?;
             crate::loader::validate_enum_constraints(&batch, &node_type.properties, type_name)?;
-            let unique_props = crate::loader::unique_property_names_for_node(node_type);
-            if !unique_props.is_empty() {
+            let unique_groups = crate::loader::unique_constraint_groups_for_node(node_type);
+            if !unique_groups.is_empty() {
                 crate::loader::enforce_unique_constraints_intra_batch(
                     &batch,
                     type_name,
-                    &unique_props,
+                    &unique_groups,
                 )?;
             }
             let has_key = node_type.key_property().is_some();
@@ -945,12 +946,12 @@ impl Omnigraph {
             let batch = build_insert_batch(&schema, &id, &resolved, &blob_props)?;
             validate_edge_insert_endpoints(self, staging, branch, type_name, &resolved).await?;
             crate::loader::validate_enum_constraints(&batch, &edge_type.properties, type_name)?;
-            let unique_props = crate::loader::unique_property_names_for_edge(edge_type);
-            if !unique_props.is_empty() {
+            let unique_groups = crate::loader::unique_constraint_groups_for_edge(edge_type);
+            if !unique_groups.is_empty() {
                 crate::loader::enforce_unique_constraints_intra_batch(
                     &batch,
                     type_name,
-                    &unique_props,
+                    &unique_groups,
                 )?;
             }
             let table_key = format!("edge:{}", type_name);
@@ -1093,12 +1094,12 @@ impl Omnigraph {
         let node_type = &self.catalog().node_types[type_name];
         crate::loader::validate_value_constraints(&updated, node_type)?;
         crate::loader::validate_enum_constraints(&updated, &node_type.properties, type_name)?;
-        let unique_props = crate::loader::unique_property_names_for_node(node_type);
-        if !unique_props.is_empty() {
+        let unique_groups = crate::loader::unique_constraint_groups_for_node(node_type);
+        if !unique_groups.is_empty() {
             crate::loader::enforce_unique_constraints_intra_batch(
                 &updated,
                 type_name,
-                &unique_props,
+                &unique_groups,
             )?;
         }
 

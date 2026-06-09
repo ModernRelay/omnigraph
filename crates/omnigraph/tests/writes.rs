@@ -6,8 +6,8 @@
 //! What this file covers:
 //! - No `__run__*` branches are created by load or mutate.
 //! - Cancellation of a mutation future leaves no graph-level state.
-//! - Concurrent writers to the same table land exactly one publish; the
-//!   loser surfaces `ManifestConflictDetails::ExpectedVersionMismatch`.
+//! - Concurrent non-strict inserts/merges rebase under the per-table queue;
+//!   strict updates/deletes surface `ExpectedVersionMismatch` on stale state.
 //! - Failed mutations and loads leave the target unchanged.
 //! - Multi-statement mutations are atomic (one commit per query).
 //! - actor_id propagates through to the commit graph.
@@ -17,7 +17,7 @@ mod helpers;
 use arrow_array::Array;
 use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::error::{ManifestConflictDetails, ManifestErrorKind, OmniError};
+use omnigraph::error::OmniError;
 use omnigraph::loader::{LoadMode, load_jsonl};
 
 use helpers::*;
@@ -241,18 +241,11 @@ async fn partial_failure_leaves_target_queryable_and_unblocks_next_mutation() {
     assert_eq!(frank.num_rows(), 1, "Frank must be visible after publish");
 }
 
-/// Concurrent writers to the same `(table, branch)` produce exactly one
-/// success and one `ExpectedVersionMismatch`. The replacement for the old
-/// `concurrent_conflicting_run_publish_fails_cleanly` test — the OCC fence
-/// has moved from a graph-level run-publish merge into the publisher's
-/// per-table CAS.
-///
-/// Drives the race by interleaving two handles that captured the same
-/// pre-write manifest snapshot: A commits first; B's commit then sees
-/// `expected_versions[node:Person] = pre` while the manifest is at
-/// `pre + 1`, and the publisher rejects.
+/// Stale non-strict writers rebase to the live manifest pin under the
+/// per-table queue instead of folding raw drift or returning a false 409.
+/// Strict update/delete semantics are covered by the consistency/server tests.
 #[tokio::test]
-async fn concurrent_writers_one_succeeds_one_gets_expected_version_mismatch() {
+async fn stale_non_strict_insert_rebases_to_live_manifest_pin() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_string_lossy().into_owned();
 
@@ -281,40 +274,30 @@ async fn concurrent_writers_one_succeeds_one_gets_expected_version_mismatch() {
         .unwrap();
     }
 
-    // Writer B's coordinator is still at the pre-A snapshot. Its mutation
-    // captures expected_versions[node:Person] = pre (stale), then publishes
-    // — the publisher's CAS pre-check sees the manifest is now at post and
-    // rejects with ExpectedVersionMismatch.
-    let result_b = db_b
-        .mutate(
-            "main",
-            MUTATION_QUERIES,
-            "insert_person",
-            &mixed_params(&[("$name", "WriterB")], &[("$age", 42)]),
-        )
-        .await;
+    // Writer B's coordinator is still at the pre-A snapshot, but Insert is
+    // non-strict: commit_all re-reads the live manifest pin under the queue,
+    // verifies Lance HEAD equals that pin, and then lets Lance rebase the
+    // staged append.
+    db_b.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "WriterB")], &[("$age", 42)]),
+    )
+    .await
+    .unwrap();
 
-    let err = result_b.expect_err("stale writer must hit ExpectedVersionMismatch");
-    let OmniError::Manifest(manifest_err) = err else {
-        panic!("expected Manifest error, got {err:?}");
-    };
-    assert_eq!(manifest_err.kind, ManifestErrorKind::Conflict);
-    let Some(ManifestConflictDetails::ExpectedVersionMismatch {
-        ref table_key,
-        expected,
-        actual,
-    }) = manifest_err.details
-    else {
-        panic!(
-            "expected ExpectedVersionMismatch, got {:?}",
-            manifest_err.details,
-        );
-    };
-    assert_eq!(table_key, "node:Person");
-    assert!(
-        actual > expected,
-        "actual ({actual}) should be ahead of expected ({expected})",
-    );
+    for name in ["WriterA", "WriterB"] {
+        let person = query_main(
+            &mut db_b,
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", name)]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(person.num_rows(), 1, "{name} should be visible");
+    }
 }
 
 /// The cancellation hole that motivated removing the Run state machine: dropping a mutation future
