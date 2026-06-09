@@ -112,9 +112,11 @@ Missing `state_revision` is treated as `0`. Resource status values are
 
 Plan output compares desired resource digests against state resource digests
 and reports `create`, `update`, and `delete` changes. It also reports the state
-CAS (`sha256:<digest>`), state revision, and lock id used for the read. The
-command never writes `state.json`; apply, refresh, import, and live drift scans
-are later-stage work.
+CAS (`sha256:<digest>`) and state revision. `state_observations.locked` means an
+existing lock file was observed; a successful `plan` instead reports
+`lock_acquired: true` and an `acquired_lock_id`, then releases the lock before
+returning. The command never writes `state.json`; apply, refresh, import, and
+live drift scans are later-stage work.
 
 ## Status
 

@@ -350,8 +350,9 @@ fn cluster_plan_json_includes_state_cas_revision_and_lock_observation() {
             .unwrap()
             .starts_with("sha256:")
     );
-    assert_eq!(json["state_observations"]["locked"], true);
-    assert!(json["state_observations"]["lock_id"].is_string());
+    assert_eq!(json["state_observations"]["locked"], false);
+    assert_eq!(json["state_observations"]["lock_acquired"], true);
+    assert!(json["state_observations"]["acquired_lock_id"].is_string());
     assert!(!state_dir.join("lock.json").exists());
 }
 
@@ -386,6 +387,8 @@ fn cluster_plan_locked_state_exits_nonzero() {
     let json = parse_stdout_json(&output);
     assert_eq!(json["ok"], false);
     assert_eq!(json["state_observations"]["locked"], true);
+    assert_eq!(json["state_observations"]["lock_acquired"], false);
+    assert_eq!(json["state_observations"]["lock_id"], "held-lock");
     assert!(
         json["diagnostics"]
             .as_array()
