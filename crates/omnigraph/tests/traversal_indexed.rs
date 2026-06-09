@@ -233,3 +233,57 @@ query reach($name: String) {
          result means the id-string collision bled across types"
     );
 }
+
+const REACH_5: &str = r#"
+query reach($name: String) {
+    match {
+        $p: Person { name: $name }
+        $p knows{1,5} $f
+    }
+    return { $f.name }
+}
+"#;
+
+// A directed 3-cycle a->b->c->a, traversed with a hop ceiling (5) ABOVE the cycle
+// length. Variable-length traversal must terminate and dedup (the source is
+// seeded into `visited`, so the c->a back-edge does not re-emit a). Uses a
+// bounded range deliberately: an unbounded `{1,}` is a typecheck error, not a
+// runtime path. `both_modes` also confirms indexed == csr on the cycle.
+#[tokio::test]
+#[serial]
+async fn variable_hops_terminate_and_dedup_on_cycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let data = r#"{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"type":"Person","data":{"name":"c"}}
+{"edge":"Knows","from":"a","to":"b"}
+{"edge":"Knows","from":"b","to":"c"}
+{"edge":"Knows","from":"c","to":"a"}"#;
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+
+    let got = both_modes(&mut db, REACH_5, "reach", &params(&[("$name", "a")])).await;
+    // From a: b (1 hop), c (2 hops); the c->a back-edge hits the seeded source
+    // and is not re-emitted. No infinite loop, each node at most once.
+    assert_eq!(got, vec!["b", "c"]);
+}
+
+// A self-loop a->a plus a->b. Variable-length traversal must not loop forever and
+// must not re-emit the seeded source.
+#[tokio::test]
+#[serial]
+async fn variable_hops_handle_self_loop() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let data = r#"{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"edge":"Knows","from":"a","to":"a"}
+{"edge":"Knows","from":"a","to":"b"}"#;
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+
+    let got = both_modes(&mut db, REACH_5, "reach", &params(&[("$name", "a")])).await;
+    // a->a hits the seeded source (pruned); only b is reached.
+    assert_eq!(got, vec!["b"]);
+}

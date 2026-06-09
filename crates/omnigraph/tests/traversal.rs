@@ -46,6 +46,45 @@ query not_at_acme() {
     assert_eq!(names_vec, vec!["Bob", "Charlie", "Diana"]);
 }
 
+// Nested anti-join (double negation): proves `not { … not { … } }` recurses
+// through execute_pipeline. "People who do NOT work at any NON-Acme company":
+// inner `not { $c.name = "Acme" }` keeps the non-Acme employers, the outer `not`
+// removes anyone who has one. Alice (Acme only), Charlie & Diana (no employer)
+// remain — distinct from plain unemployed {Charlie, Diana}.
+#[tokio::test]
+async fn nested_anti_join_double_negation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let queries = r#"
+query no_nonacme_employer() {
+    match {
+        $p: Person
+        not {
+            $p worksAt $c
+            not {
+                $c.name = "Acme"
+            }
+        }
+    }
+    return { $p.name }
+}
+"#;
+    let result = query_main(&mut db, queries, "no_nonacme_employer", &ParamMap::new())
+        .await
+        .unwrap();
+
+    let batch = result.concat_batches().unwrap();
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut names_vec: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
+    names_vec.sort();
+    assert_eq!(names_vec, vec!["Alice", "Charlie", "Diana"]);
+}
+
 // ─── Variable-length hops ───────────────────────────────────────────────────
 
 const CHAIN_SCHEMA: &str = r#"
