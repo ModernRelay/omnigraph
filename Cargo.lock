@@ -4568,6 +4568,7 @@ dependencies = [
 name = "omnigraph-cluster"
 version = "0.6.2"
 dependencies = [
+ "fail",
  "omnigraph-compiler",
  "omnigraph-engine",
  "serde",
