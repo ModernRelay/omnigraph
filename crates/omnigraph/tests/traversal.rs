@@ -189,6 +189,51 @@ query no_nonacme_employer() {
     assert_eq!(names_vec, vec!["p3", "p4"]);
 }
 
+// Regression: a multi-hop anti-join must not take the bulk fast path. The fast
+// path answers via `has_neighbors` (ONE-hop existence), so `not { $p knows{2,2}
+// $x }` would wrongly drop a node that has a 1-hop neighbor but no 2-hop path.
+// Graph: a->b (b is a sink, so a has no 2-hop path), c->d->e (c has a 2-hop
+// path). Only c has a 2-hop knows path, so only c is removed.
+#[tokio::test]
+async fn anti_join_respects_multi_hop_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let data = r#"{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"type":"Person","data":{"name":"c"}}
+{"type":"Person","data":{"name":"d"}}
+{"type":"Person","data":{"name":"e"}}
+{"edge":"Knows","from":"a","to":"b"}
+{"edge":"Knows","from":"c","to":"d"}
+{"edge":"Knows","from":"d","to":"e"}"#;
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+
+    let queries = r#"
+query no_two_hop() {
+    match {
+        $p: Person
+        not { $p knows{2,2} $x }
+    }
+    return { $p.name }
+}
+"#;
+    let result = query_main(&mut db, queries, "no_two_hop", &ParamMap::new())
+        .await
+        .unwrap();
+    let batch = result.concat_batches().unwrap();
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut names_vec: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
+    names_vec.sort();
+    // Only c has a 2-hop knows path → removed; everyone else (incl. a, which has
+    // a 1-hop neighbor but no 2-hop path) is kept.
+    assert_eq!(names_vec, vec!["a", "b", "d", "e"]);
+}
+
 // ─── Variable-length hops ───────────────────────────────────────────────────
 
 const CHAIN_SCHEMA: &str = r#"
