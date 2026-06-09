@@ -556,6 +556,111 @@ async fn bm25_returns_ranked_results() {
     assert!(result.num_rows() <= 3, "bm25 should respect limit 3");
 }
 
+// Full rank-ORDER golden (not just top-1 / non-empty): pins ranks 2..k so a
+// regression corrupting the tail or reversing the sort direction fails loudly.
+// nearest skips apply_ordering (is_search_ordered) and returns Lance native
+// order, so result_slugs row order == rank order.
+#[tokio::test]
+#[serial]
+async fn nearest_full_rank_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    let result = query_main(
+        &mut db,
+        SEARCH_QUERIES,
+        "vector_search",
+        &vector_param("$q", &[0.1, 0.2, 0.3, 0.4]),
+    )
+    .await
+    .unwrap();
+    // [0.1,0.2,0.3,0.4] == ml-intro's embedding (dist 0); the rest by ascending L2.
+    assert_eq!(result_slugs(&result), vec!["ml-intro", "nlp-guide", "rl-intro"]);
+}
+
+#[tokio::test]
+#[serial]
+async fn bm25_full_rank_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    let result = query_main(
+        &mut db,
+        SEARCH_QUERIES,
+        "bm25_search",
+        &params(&[("$q", "Learning")]),
+    )
+    .await
+    .unwrap();
+    // Descending BM25 score order.
+    assert_eq!(result_slugs(&result), vec!["rl-intro", "ml-intro", "dl-basics"]);
+}
+
+// Characterization: fuzzy() does NOT match under the default tokenizer/index in
+// this setup — a one-edit typo ("Introductio" for "Introduction") returns no
+// rows. (`search`/`match_text` DO work, so FTS itself is fine; fuzzy term
+// queries specifically are inert here.) This pins that documented limitation
+// instead of leaving fuzzy silently unasserted: if a Lance/tokenizer change
+// makes fuzzy match, this turns red and should be promoted to a real
+// matched-set + exclusion golden.
+#[tokio::test]
+#[serial]
+async fn fuzzy_does_not_match_under_default_tokenizer() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    let r = query_main(&mut db, SEARCH_QUERIES, "fuzzy_search", &params(&[("$q", "Introductio")]))
+        .await
+        .unwrap();
+    assert!(
+        result_slugs(&r).is_empty(),
+        "fuzzy now matches — promote this to a real matched-set/exclusion golden"
+    );
+}
+
+// match_text is a FILTER on the body: assert the exact matched set, not contains.
+#[tokio::test]
+#[serial]
+async fn match_text_matches_exact_set_excludes_unrelated() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    // "neural" appears only in dl-basics's body ("neural networks").
+    let r = query_main(&mut db, SEARCH_QUERIES, "phrase_search", &params(&[("$q", "neural")]))
+        .await
+        .unwrap();
+    let mut got = result_slugs(&r);
+    got.sort();
+    assert_eq!(got, vec!["dl-basics"]);
+}
+
+// RRF fuses arms OTHER than the default nearest+bm25: two FTS arms (title+body).
+// Proves primary_var resolves when neither arm is `nearest`, and fusion runs.
+#[tokio::test]
+#[serial]
+async fn rrf_fuses_two_fts_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    let r = query_main(&mut db, SEARCH_QUERIES, "rrf_two_fts", &params(&[("$q", "learning")]))
+        .await
+        .unwrap();
+    assert_eq!(result_slugs(&r), vec!["dl-basics", "ml-intro", "rl-intro"]);
+}
+
+// RRF fuses two vector arms (no embedding creds — explicit vectors). A doc near
+// BOTH query vectors out-ranks one near only one.
+#[tokio::test]
+#[serial]
+async fn rrf_fuses_two_vector_queries() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    let r = query_main(
+        &mut db,
+        SEARCH_QUERIES,
+        "rrf_two_vectors",
+        &two_vector_params("$q1", &[0.1, 0.2, 0.3, 0.4], "$q2", &[0.5, 0.6, 0.7, 0.8]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result_slugs(&r), vec!["rl-intro", "ml-intro", "dl-basics"]);
+}
+
 #[tokio::test]
 #[serial]
 async fn mutation_commit_refreshes_search_indices_without_manual_ensure() {

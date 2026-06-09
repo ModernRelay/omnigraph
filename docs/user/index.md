@@ -13,6 +13,7 @@ of MRs, internal recovery mechanics, or contributor-only invariants.
 | Install OmniGraph | [install.md](install.md) |
 | Run the CLI locally | [cli.md](cli.md) |
 | Look up every CLI flag and config field | [cli-reference.md](cli-reference.md) |
+| Validate and plan cluster config | [cluster-config.md](cluster-config.md) |
 | Write schemas | [schema-language.md](schema-language.md) |
 | Read schema-lint diagnostic codes | [schema-lint.md](schema-lint.md) |
 | Write queries and mutations | [query-language.md](query-language.md) |
