@@ -33,6 +33,8 @@ hops) plus the index-coverage signal: the indexed path is preferred when its
 frontier-relative work beats building the CSR (≈ when `hops × frontier` is a
 small fraction of the source-vertex set), and CSR is preferred for dense/deep
 traversals or when the BTREE coverage is degraded and a full scan would be paid
-per hop. The two ceilings above are hard caps — beyond them CSR is always used —
-and the override flag forces a path (the `auto` result is identical either way;
+per hop. The two ceilings bound the **initial dispatch** frontier/hops (beyond
+them CSR is always used); they are not a hard per-hop bound — the cost model
+*estimates* total indexed work as ~`hops × frontier × fanout`, so dense fan-out is
+priced toward CSR rather than capped mid-traversal. The override flag forces a path (the `auto` result is identical either way;
 only the path differs).
