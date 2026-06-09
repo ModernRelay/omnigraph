@@ -670,36 +670,34 @@ fn update_unique_constraints(
     table_key: &str,
     batch: &RecordBatch,
     constraints: &[Vec<String>],
-    seen: &mut [HashMap<String, String>],
+    seen: &mut [HashMap<Vec<String>, String>],
     conflicts: &mut Vec<MergeConflict>,
 ) -> Result<()> {
     for (constraint_idx, columns) in constraints.iter().enumerate() {
         let seen = &mut seen[constraint_idx];
-        for row in 0..batch.num_rows() {
-            let mut parts = Vec::with_capacity(columns.len());
-            let mut any_null = false;
-            for column_name in columns {
-                let column = batch.column_by_name(column_name).ok_or_else(|| {
+        // Resolve the group's columns once. The candidate dataset always
+        // carries the full table schema, so a missing column is an internal
+        // error rather than a skip.
+        let group_columns = columns
+            .iter()
+            .map(|column_name| {
+                batch.column_by_name(column_name).cloned().ok_or_else(|| {
                     OmniError::manifest(format!(
                         "table {} missing unique column '{}'",
                         table_key, column_name
                     ))
-                })?;
-                if column.is_null(row) {
-                    any_null = true;
-                    break;
-                }
-                parts.push(
-                    array_value_to_string(column.as_ref(), row)
-                        .map_err(|e| OmniError::Lance(e.to_string()))?,
-                );
-            }
-            if any_null {
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for row in 0..batch.num_rows() {
+            // Same tuple key as the intake path — one shared derivation in
+            // `crate::loader::composite_unique_key`, so the two cannot drift on
+            // separator or scalar conversion. Null rows are exempt.
+            let Some(key) = crate::loader::composite_unique_key(&group_columns, row)? else {
                 continue;
-            }
-            let value = crate::loader::composite_unique_key(&parts);
+            };
             let row_id = row_id_at(batch, row)?;
-            if let Some(first_row_id) = seen.insert(value.clone(), row_id.clone()) {
+            if let Some(first_row_id) = seen.insert(key, row_id.clone()) {
                 conflicts.push(MergeConflict {
                     table_key: table_key.to_string(),
                     row_id: Some(row_id.clone()),
