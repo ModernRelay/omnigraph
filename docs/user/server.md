@@ -51,6 +51,7 @@ Per-graph endpoints — same body shape across modes; URLs differ:
 | POST | `/branches/merge` | `/graphs/{id}/branches/merge` | bearer + `branch_merge` | merge `source → target` | `server_branch_merge` |
 | GET | `/commits?branch=` | `/graphs/{id}/commits?branch=` | bearer + `read` | list | `server_commit_list` |
 | GET | `/commits/{commit_id}` | `/graphs/{id}/commits/{commit_id}` | bearer + `read` | show | `server_commit_show` |
+| POST | `/mcp` | `/graphs/{id}/mcp` | bearer + per-tool Cedar | MCP Streamable HTTP (JSON-RPC: `initialize`/`tools/*`/`resources/*`); `GET` → 405; not in `openapi.json` | `mcp::mcp_router` |
 
 Server-level management endpoints (v0.6.0+):
 
@@ -74,6 +75,40 @@ Invoke a curated, server-side stored query by **name** — the source comes from
 - **Deny == unknown, for callers without `invoke_query`:** for a caller lacking the grant, an `invoke_query` denial and an unknown query name return the **same `404`** (identical body), so the catalog can't be probed. A caller that *holds* `invoke_query` may still get the inner gate's `403` for an existing query it can't `read`/`change` (the double-gate, above) — so existence is visible to grant-holders by design.
 - **Requires an explicit policy grant when auth is on.** In default-deny mode (bearer tokens but no `policy.file`), only `read` is permitted, so *every* `/queries/{name}` call returns `404` until an `invoke_query` rule is configured.
 - A stored mutation cannot target a `snapshot` (`400`); a parameter type error is a structured `400` naming the parameter.
+
+## MCP server surface (`POST /mcp`)
+
+`POST /mcp` exposes the server as a **Model Context Protocol** endpoint over [Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports) (built on `rmcp`). It projects the server's operations as MCP **tools** and **resources** for LLM clients (Claude Code, Cursor, VS Code, the Claude Messages API connector), Cedar-gated through the **same `authorize` path the REST routes use** — there is no separate MCP authorization. Single-graph mode serves it at `/mcp`; multi-graph mode nests it at `/graphs/{id}/mcp` (per-graph isolation).
+
+**Transport.** Stateless, POST-only, `application/json` responses (no SSE, no `Mcp-Session-Id`); each request is authenticated independently by the same bearer middleware as the REST routes. `GET`/`DELETE /mcp` → `405`; a disallowed `Host`/`Origin` → `403` (DNS-rebinding guard, loopback by default); an unsupported `MCP-Protocol-Version` → `400`. JSON-RPC methods: `initialize`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`, `resources/list`, `resources/read`. Being JSON-RPC rather than REST, it is **not** described in `openapi.json`.
+
+**Tools.** 14 built-ins, each reusing the exact Cedar action and engine path of its REST route, plus one tool per **`mcp.expose`** stored query (named by its `tool_name`, parameters projected to JSON Schema):
+
+| Tool(s) | Cedar action |
+|---|---|
+| `health` | none |
+| `snapshot`, `schema_get`, `branches_list`, `commits_list`, `commits_get`, `query` | `read` |
+| `mutate`, `ingest` | `change` (+ `branch_create` for a forking ingest) |
+| `branches_create` / `branches_delete` / `branches_merge` | `branch_create` / `branch_delete` / `branch_merge` |
+| `schema_apply` | `schema_apply` |
+| `graphs_list` | `graph_list` (server-scoped; multi-graph only) |
+| *stored queries* | `invoke_query` (coarse), then inner `read`/`change` |
+
+Tools carry `readOnlyHint`/`destructiveHint` annotations from their read/mutate nature; the engine is a closed world, so `openWorldHint` is always `false`.
+
+**Resources.** `omnigraph://schema` (`read`), `omnigraph://branches` (`read`), and `omnigraph://graphs` (`graph_list`, multi-graph only).
+
+**Authorization (the gate).** `tools/list` and `resources/list` return **only** what the actor's policy permits — an actor with no grants sees an empty catalog (default-deny). `tools/call` enforces the same gate and **masks a denied or unknown tool identically** (`unknown tool: <name>`), so the catalog can't be probed without the grant. Stored-query tools are gated by the **coarse** `invoke_query` action (all exposed queries on the graph, or none — per-query scope is a future refinement) and then double-gated by the inner `read`/`change`. A bad/absent bearer is a transport-level `401` before any tool runs; an engine or validation error inside a tool is a `CallToolResult` with `isError: true` (so the model can self-correct), distinct from a JSON-RPC protocol error (unknown method/tool).
+
+> **`tools/list` is best-effort for branch-scoped policies.** Visibility is evaluated against the default branch, so a branch-scoped `change` policy may list `mutate` yet deny a call on a protected branch. `tools/call` is always the authoritative gate.
+
+**Connecting.** With a static bearer:
+
+```
+claude mcp add --transport http omnigraph https://og.example/mcp --header "Authorization: Bearer $OG_TOKEN"
+```
+
+This works with Claude Code, Cursor, VS Code, and the Claude Messages API MCP connector. **claude.ai web and ChatGPT consumer connectors require OAuth** (RFC 9728 + an authorization server), a planned additive layer: the handler already consumes a resolved actor and is agnostic to how the token was verified, so OAuth slots in without changing the tool surface.
 
 ## Adding and removing graphs (multi mode)
 
@@ -215,3 +250,7 @@ See [deployment.md](deployment.md) for token-source operational details.
   add `tower_http::limit` if a graph-wide cap is needed.
 - Pagination — none (commits/branches return everything; export streams).
 - Runtime graph add/remove — edit `omnigraph.yaml` and restart.
+- MCP OAuth — `/mcp` accepts a static bearer only today; OAuth (RFC 9728
+  protected-resource metadata + an authorization server) for claude.ai web /
+  ChatGPT connectors is a planned additive layer (the handler is already
+  auth-method-agnostic).

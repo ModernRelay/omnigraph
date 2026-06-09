@@ -8,7 +8,7 @@ This file is the always-on map of the test surface. **Consult it before every ta
 |---|---|---|
 | `omnigraph` (engine) | `crates/omnigraph/tests/` | Integration tests (21 files), fixture-driven, share `tests/helpers/mod.rs` |
 | `omnigraph-cli` | `crates/omnigraph-cli/tests/` | `cli.rs` (unit-ish), `system_local.rs`, `system_remote.rs`, share `tests/support/mod.rs` |
-| `omnigraph-server` | `crates/omnigraph-server/tests/` | `server.rs` (HTTP-level), `openapi.rs` (OpenAPI drift / regeneration) |
+| `omnigraph-server` | `crates/omnigraph-server/tests/` | `server.rs` (HTTP-level, incl. the `mcp_*` MCP-surface tests that reuse its `app_*`/`json_response` helpers), `openapi.rs` (OpenAPI drift / regeneration) |
 | `omnigraph-compiler` | mostly in-source `#[cfg(test)] mod tests` | Parser, type-checker, IR lowering, lint |
 
 The engine's `tests/` is the principal coverage surface; most graph-shaped behavior is exercised there.
