@@ -18,6 +18,10 @@ use omnigraph_api_types::{
     SnapshotTableOutput, commit_output, ingest_output, read_output, schema_apply_output,
     snapshot_payload,
 };
+use omnigraph_cluster::{
+    DiagnosticSeverity, PlanOutput, StateSyncOutput, StatusOutput, ValidateOutput,
+    import_config_dir, plan_config_dir, refresh_config_dir, status_config_dir, validate_config_dir,
+};
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::{
@@ -286,6 +290,25 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Classify and explicitly repair manifest/head drift
+    Repair {
+        /// Graph URI
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Publish verified maintenance drift. Without this flag, repair only
+        /// previews what it would do.
+        #[arg(long)]
+        confirm: bool,
+        /// Also publish suspicious or unverifiable drift. Requires
+        /// `--confirm`; use only after operator review.
+        #[arg(long, requires = "confirm")]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove old Lance versions from every table of the graph (destructive)
     Cleanup {
         /// Graph URI
@@ -308,6 +331,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Validate and plan read-only cluster configuration.
+    Cluster {
+        #[command(subcommand)]
+        command: ClusterCommand,
+    },
     /// Manage graphs on a multi-graph server (MR-668)
     Graphs {
         #[command(subcommand)]
@@ -325,6 +353,55 @@ enum Command {
         /// Project config file (defaults to ./omnigraph.yaml).
         #[arg(long)]
         config: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ClusterCommand {
+    /// Validate cluster.yaml and referenced schemas, queries, and policy files.
+    Validate {
+        /// Cluster config directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Emit JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Produce a read-only plan by diffing cluster.yaml against __cluster/state.json.
+    Plan {
+        /// Cluster config directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Emit JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read the local JSON state ledger without scanning live graph resources.
+    Status {
+        /// Cluster config directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Emit JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Refresh existing local JSON state from declared graph observations.
+    Refresh {
+        /// Cluster config directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Emit JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Import initial local JSON state from declared graph observations.
+    Import {
+        /// Cluster config directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Emit JSON instead of human text.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -717,6 +794,159 @@ fn ensure_local_graph_parent(uri: &str) -> Result<()> {
 
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+fn print_cluster_validate_human(output: &ValidateOutput) {
+    if output.ok {
+        println!(
+            "cluster config valid: {} resource(s), {} dependency edge(s)",
+            output.resources.len(),
+            output.dependencies.len()
+        );
+    } else {
+        println!("cluster config invalid");
+    }
+    print_cluster_diagnostics(&output.diagnostics);
+}
+
+fn print_cluster_plan_human(output: &PlanOutput) {
+    if output.ok {
+        println!(
+            "cluster plan: {} change(s), {} approval gate(s)",
+            output.changes.len(),
+            output.approvals_required.len()
+        );
+        for change in &output.changes {
+            println!("  {:?} {}", change.operation, change.resource);
+        }
+        if output.changes.is_empty() {
+            println!("  no changes");
+        }
+    } else {
+        println!("cluster plan failed");
+    }
+    print_cluster_diagnostics(&output.diagnostics);
+}
+
+fn print_cluster_status_human(output: &StatusOutput) {
+    if output.ok {
+        let state = &output.state_observations;
+        if state.state_found {
+            println!(
+                "cluster state: revision {}, {} resource(s)",
+                state.state_revision, state.resource_count
+            );
+            if let Some(digest) = state.applied_config_digest.as_deref() {
+                println!("  applied config: {digest}");
+            }
+            if state.locked {
+                match state.lock_id.as_deref() {
+                    Some(lock_id) => println!("  lock: held ({lock_id})"),
+                    None => println!("  lock: held"),
+                }
+            } else {
+                println!("  lock: not held");
+            }
+        } else {
+            println!("cluster state missing");
+        }
+    } else {
+        println!("cluster status failed");
+    }
+    print_cluster_diagnostics(&output.diagnostics);
+}
+
+fn print_cluster_state_sync_human(output: &StateSyncOutput) {
+    let operation = match output.operation {
+        omnigraph_cluster::StateSyncOperation::Refresh => "refresh",
+        omnigraph_cluster::StateSyncOperation::Import => "import",
+    };
+    if output.ok {
+        let state = &output.state_observations;
+        println!(
+            "cluster {operation}: revision {}, {} resource(s)",
+            state.state_revision, state.resource_count
+        );
+        if let Some(cas) = state.state_cas.as_deref() {
+            println!("  state_cas: {cas}");
+        }
+        if state.locked {
+            match state.lock_id.as_deref() {
+                Some(lock_id) => println!("  lock: acquired ({lock_id})"),
+                None => println!("  lock: acquired"),
+            }
+        } else {
+            println!("  lock: not acquired");
+        }
+    } else {
+        println!("cluster {operation} failed");
+    }
+    print_cluster_diagnostics(&output.diagnostics);
+}
+
+fn print_cluster_diagnostics(diagnostics: &[omnigraph_cluster::Diagnostic]) {
+    for diagnostic in diagnostics {
+        let label = match diagnostic.severity {
+            DiagnosticSeverity::Error => "ERROR",
+            DiagnosticSeverity::Warning => "WARN ",
+        };
+        println!(
+            "{label} {} {}: {}",
+            diagnostic.code, diagnostic.path, diagnostic.message
+        );
+    }
+}
+
+fn finish_cluster_validate(output: &ValidateOutput, json: bool) -> Result<()> {
+    if json {
+        print_json(output)?;
+    } else {
+        print_cluster_validate_human(output);
+    }
+    if !output.ok {
+        io::stdout().flush()?;
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn finish_cluster_plan(output: &PlanOutput, json: bool) -> Result<()> {
+    if json {
+        print_json(output)?;
+    } else {
+        print_cluster_plan_human(output);
+    }
+    if !output.ok {
+        io::stdout().flush()?;
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn finish_cluster_status(output: &StatusOutput, json: bool) -> Result<()> {
+    if json {
+        print_json(output)?;
+    } else {
+        print_cluster_status_human(output);
+    }
+    if !output.ok {
+        io::stdout().flush()?;
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn finish_cluster_state_sync(output: &StateSyncOutput, json: bool) -> Result<()> {
+    if json {
+        print_json(output)?;
+    } else {
+        print_cluster_state_sync_human(output);
+    }
+    if !output.ok {
+        io::stdout().flush()?;
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -3188,6 +3418,8 @@ async fn main() -> Result<()> {
                         "fragments_added": s.fragments_added,
                         "committed": s.committed,
                         "skipped": s.skipped.map(|r| r.as_str()),
+                        "manifest_version": s.manifest_version,
+                        "lance_head_version": s.lance_head_version,
                     })).collect::<Vec<_>>(),
                 });
                 print_json(&value)?;
@@ -3205,6 +3437,89 @@ async fn main() -> Result<()> {
                         println!("  {:<40} no-op", s.table_key);
                     }
                 }
+            }
+        }
+        Command::Repair {
+            uri,
+            target,
+            config,
+            confirm,
+            force,
+            json,
+        } => {
+            let config = load_cli_config(config.as_ref())?;
+            let uri = resolve_uri(&config, uri, target.as_deref())?;
+            let db = Omnigraph::open(&uri).await?;
+            let stats = db
+                .repair(omnigraph::db::RepairOptions { confirm, force })
+                .await?;
+            let refused_count = stats
+                .tables
+                .iter()
+                .filter(|s| matches!(s.action, omnigraph::db::RepairAction::Refused))
+                .count();
+            if json {
+                let value = serde_json::json!({
+                    "uri": uri,
+                    "confirm": confirm,
+                    "force": force,
+                    "manifest_version": stats.manifest_version,
+                    "tables": stats.tables.iter().map(|s| serde_json::json!({
+                        "table_key": s.table_key,
+                        "manifest_version": s.manifest_version,
+                        "lance_head_version": s.lance_head_version,
+                        "classification": s.classification.as_str(),
+                        "action": s.action.as_str(),
+                        "operations": s.operations,
+                        "error": s.error,
+                    })).collect::<Vec<_>>(),
+                });
+                print_json(&value)?;
+            } else {
+                let mode = if confirm { "confirm" } else { "preview" };
+                println!(
+                    "repair {} — {} mode, {} tables",
+                    uri,
+                    mode,
+                    stats.tables.len()
+                );
+                for s in &stats.tables {
+                    let drift = if s.manifest_version == s.lance_head_version {
+                        format!("{}", s.manifest_version)
+                    } else {
+                        format!("{} → {}", s.manifest_version, s.lance_head_version)
+                    };
+                    let ops = if s.operations.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", s.operations.join(", "))
+                    };
+                    let err = s
+                        .error
+                        .as_ref()
+                        .map(|err| format!(" ({err})"))
+                        .unwrap_or_default();
+                    println!(
+                        "  {:<40} {:<12} {:<22} {}{}{}",
+                        s.table_key,
+                        s.action.as_str(),
+                        s.classification.as_str(),
+                        drift,
+                        ops,
+                        err
+                    );
+                }
+                if !confirm {
+                    println!("rerun with --confirm to publish verified maintenance drift");
+                }
+            }
+            if refused_count > 0 {
+                bail!(
+                    "repair refused {} suspicious or unverifiable table(s); review the preview \
+                     output and rerun with --force --confirm only if publishing that drift is \
+                     intentional",
+                    refused_count
+                );
             }
         }
         Command::Cleanup {
@@ -3287,6 +3602,28 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Command::Cluster { command } => match command {
+            ClusterCommand::Validate { config, json } => {
+                let output = validate_config_dir(config);
+                finish_cluster_validate(&output, json)?;
+            }
+            ClusterCommand::Plan { config, json } => {
+                let output = plan_config_dir(config);
+                finish_cluster_plan(&output, json)?;
+            }
+            ClusterCommand::Status { config, json } => {
+                let output = status_config_dir(config);
+                finish_cluster_status(&output, json)?;
+            }
+            ClusterCommand::Refresh { config, json } => {
+                let output = refresh_config_dir(config).await;
+                finish_cluster_state_sync(&output, json)?;
+            }
+            ClusterCommand::Import { config, json } => {
+                let output = import_config_dir(config).await;
+                finish_cluster_state_sync(&output, json)?;
+            }
+        },
         Command::Graphs { command } => match command {
             GraphsCommand::List {
                 uri,

@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-config"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 description = "Configuration schema and loader for the Omnigraph graph database."
 license = "MIT"

@@ -188,7 +188,7 @@ node Thing {
 ///
 /// Defense in depth:
 /// 1. The loader's `enforce_unique_constraints_intra_batch`
-///    (`loader/mod.rs:1453`), invoked unconditionally on any node type
+///    (`loader/mod.rs:1442`), invoked unconditionally on any node type
 ///    with a `@key`, errors on intra-batch duplicate `@key` values at
 ///    intake — pinned by this test across every `LoadMode`.
 /// 2. The `check_batch_unique_by_keys` precondition at the top of
@@ -227,6 +227,122 @@ node Thing {
             "load mode {mode:?} must not persist any rows when the batch is rejected"
         );
     }
+}
+
+/// Regression for MR-983: a node-level composite `@unique(a, b)` must be
+/// enforced as a true composite key, not degraded into independent
+/// single-field checks. Pre-fix, `unique_property_names_for_node` flattened
+/// every constraint group into one property list, so `@unique(source,
+/// external_id)` was enforced as `@unique(source)` *and* `@unique(external_id)`
+/// — rejecting rows that were unique on the composite key and naming only the
+/// first field in the error.
+#[tokio::test]
+async fn loader_enforces_composite_unique_as_composite_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema = r#"
+node ExternalID {
+    slug: String @key
+    source: String @index
+    external_id: String @index
+    @unique(source, external_id)
+}
+"#;
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+
+    // Same `source`, different `external_id` → unique on the composite key.
+    // This is the exact repro from MR-983 and must be accepted.
+    let composite_ok = r#"{"type":"ExternalID","data":{"slug":"a","source":"whatsapp","external_id":"+E.164"}}
+{"type":"ExternalID","data":{"slug":"b","source":"whatsapp","external_id":"pn:12345"}}
+"#;
+    load_jsonl(&mut db, composite_ok, LoadMode::Overwrite)
+        .await
+        .expect("rows unique on the composite (source, external_id) must be accepted");
+    assert_eq!(count_rows(&db, "node:ExternalID").await, 2);
+
+    // Both composite columns equal → genuine violation. The error must name
+    // the whole composite, not just the first field.
+    let composite_dupe = r#"{"type":"ExternalID","data":{"slug":"c","source":"whatsapp","external_id":"dup"}}
+{"type":"ExternalID","data":{"slug":"d","source":"whatsapp","external_id":"dup"}}
+"#;
+    let err = load_jsonl(&mut db, composite_dupe, LoadMode::Overwrite)
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    // Columns are canonicalized to sorted order in the catalog, so the
+    // message reads `(external_id, source)`; assert order-agnostically that
+    // both composite columns are named (not just the first, as pre-fix).
+    assert!(
+        msg.contains("@unique violation")
+            && msg.contains("source")
+            && msg.contains("external_id"),
+        "composite violation must name both columns (got: {msg})"
+    );
+}
+
+/// Guard: the intake path (load/insert/update) and the branch-merge path must
+/// derive the same composite `@unique(a, b)` key, so a pair of rows unique on
+/// the tuple is accepted by BOTH. Both paths now key on the tuple itself (no
+/// separator), so a value containing any byte — including the `|` that an
+/// earlier merge-path join used as its separator — can't forge a collision.
+/// `("x|y", "z")` and `("x", "y|z")` are distinct tuples and must survive a
+/// load-on-branch then merge without a phantom `UniqueViolation`. This pins the
+/// cross-path consistency against any future drift in the shared keying.
+#[tokio::test]
+async fn composite_unique_key_is_consistent_across_intake_and_merge() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema = r#"
+node Item {
+    slug: String @key
+    a: String @index
+    b: String @index
+    @unique(a, b)
+}
+"#;
+    let insert_item = r#"
+query insert_item($slug: String, $a: String, $b: String) {
+    insert Item { slug: $slug, a: $a, b: $b }
+}
+"#;
+    let main = Omnigraph::init(uri, schema).await.unwrap();
+    main.branch_create("feature").await.unwrap();
+
+    // Two rows unique on the composite (a, b), where `a`/`b` carry a literal
+    // `|`. Distinct under a tuple key; identical (`x|y|z`) under a `|`-join.
+    let feature = Omnigraph::open(uri).await.unwrap();
+    feature
+        .mutate(
+            "feature",
+            insert_item,
+            "insert_item",
+            &params(&[("$slug", "r1"), ("$a", "x|y"), ("$b", "z")]),
+        )
+        .await
+        .expect("intake must accept the first composite-unique row");
+    feature
+        .mutate(
+            "feature",
+            insert_item,
+            "insert_item",
+            &params(&[("$slug", "r2"), ("$a", "x"), ("$b", "y|z")]),
+        )
+        .await
+        .expect("intake must accept the second composite-unique row (distinct on the tuple)");
+
+    // The merge re-validates uniqueness over the adopted source rows. Both
+    // rows are unique on (a, b), so this must merge cleanly with no phantom
+    // conflict — intake and merge must key the tuple identically.
+    let merge_result = feature.branch_merge("feature", "main").await;
+    assert!(
+        merge_result.is_ok(),
+        "rows unique on the composite (a, b) must merge cleanly; \
+         intake and merge must key the tuple the same way (got: {:?})",
+        merge_result.err()
+    );
+
+    let reopened = Omnigraph::open(uri).await.unwrap();
+    assert_eq!(count_rows(&reopened, "node:Item").await, 2);
 }
 
 /// Canary for the upstream Lance gap that the `FirstSeen` workaround

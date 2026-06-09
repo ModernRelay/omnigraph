@@ -1,5 +1,6 @@
 use std::fs;
 
+use lance::Dataset;
 use lance::index::DatasetIndexExt;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use serde_json::Value;
@@ -60,6 +61,25 @@ fn manifest_dataset_version(graph: &std::path::Path) -> u64 {
     })
 }
 
+fn forge_person_delete_drift(graph: &std::path::Path) -> (u64, u64) {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let uri = graph.to_string_lossy();
+        let db = Omnigraph::open(uri.as_ref()).await.unwrap();
+        let snap = db
+            .snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap();
+        let entry = snap.entry("node:Person").unwrap();
+        let full_path = format!("{}/{}", uri.trim_end_matches('/'), entry.table_path);
+        let mut ds = Dataset::open(&full_path).await.unwrap();
+        let deleted = ds.delete("name = 'Alice'").await.unwrap();
+        assert_eq!(deleted.num_deleted_rows, 1);
+        let head = deleted.new_dataset.version().version;
+        assert!(head > entry.table_version);
+        (entry.table_version, head)
+    })
+}
+
 fn write_policy_config_fixture(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
     let config = root.join("omnigraph.yaml");
     let policy = root.join("policy.yaml");
@@ -78,6 +98,64 @@ policy:
     (config, policy)
 }
 
+fn write_cluster_config_fixture(root: &std::path::Path) {
+    fs::write(
+        root.join("people.pg"),
+        r#"
+node Person {
+  name: String @key
+  age: I32?
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("people.gq"),
+        r#"
+query find_person($name: String) {
+  match { $p: Person { name: $name } }
+  return { $p.name, $p.age }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(root.join("base.policy.yaml"), "rules: []\n").unwrap();
+    fs::write(
+        root.join("cluster.yaml"),
+        r#"
+version: 1
+metadata:
+  name: company-brain
+state:
+  backend: cluster
+  lock: true
+graphs:
+  knowledge:
+    schema: ./people.pg
+    queries:
+      find_person:
+        file: ./people.gq
+policies:
+  base:
+    file: ./base.policy.yaml
+    applies_to: [knowledge]
+"#,
+    )
+    .unwrap();
+}
+
+fn init_cluster_derived_graph(root: &std::path::Path) {
+    let graph_dir = root.join("graphs");
+    fs::create_dir_all(&graph_dir).unwrap();
+    output_success(
+        cli()
+            .arg("init")
+            .arg("--schema")
+            .arg(root.join("people.pg"))
+            .arg(graph_dir.join("knowledge.omni")),
+    );
+}
+
 #[test]
 fn version_command_prints_current_cli_version() {
     let output = output_success(cli().arg("version"));
@@ -87,6 +165,470 @@ fn version_command_prints_current_cli_version() {
         stdout.trim(),
         format!("omnigraph {}", env!("CARGO_PKG_VERSION"))
     );
+}
+
+#[test]
+fn cluster_validate_config_success() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+
+    let output = output_success(
+        cli()
+            .arg("cluster")
+            .arg("validate")
+            .arg("--config")
+            .arg(temp.path()),
+    );
+    let stdout = stdout_string(&output);
+    assert!(stdout.contains("cluster config valid"), "{stdout}");
+}
+
+#[test]
+fn cluster_validate_json_is_stable() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+
+    let json = parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg("validate")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(json["ok"], true);
+    assert!(json["resource_digests"]["graph.knowledge"].is_string());
+    assert!(json["resource_digests"]["query.knowledge.find_person"].is_string());
+    assert_eq!(json["dependencies"][0]["from"], "policy.base");
+    assert_eq!(json["dependencies"][0]["to"], "graph.knowledge");
+}
+
+#[test]
+fn cluster_plan_json_reads_inferred_local_state() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let state_dir = temp.path().join("__cluster");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        r#"
+{
+  "version": 1,
+  "applied_revision": {
+    "config_digest": "old",
+    "resources": {
+      "graph.knowledge": { "digest": "old-graph" },
+      "policy.old": { "digest": "old-policy" }
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    let json = parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg("plan")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["state_observations"]["state_found"], true);
+    assert!(
+        json["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| change["resource"] == "policy.old" && change["operation"] == "delete"),
+        "plan should read state and delete stale resources: {json}"
+    );
+}
+
+#[test]
+fn cluster_status_json_reports_missing_state() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+
+    let json = parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg("status")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["state_observations"]["state_found"], false);
+    assert!(
+        json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "state_missing"),
+        "missing state should be a warning diagnostic: {json}"
+    );
+}
+
+#[test]
+fn cluster_status_json_reports_extended_state() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let state_dir = temp.path().join("__cluster");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        r#"
+{
+  "version": 1,
+  "state_revision": 5,
+  "applied_revision": {
+    "config_digest": "applied",
+    "resources": {
+      "graph.knowledge": { "digest": "graph-digest" }
+    }
+  },
+  "resource_statuses": {
+    "graph.knowledge": { "status": "applied", "conditions": ["healthy"] }
+  },
+  "approval_records": {},
+  "recovery_records": {},
+  "observations": {}
+}
+"#,
+    )
+    .unwrap();
+
+    let json = parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg("status")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["state_observations"]["state_revision"], 5);
+    assert!(
+        json["state_observations"]["state_cas"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    assert_eq!(json["resource_digests"]["graph.knowledge"], "graph-digest");
+    assert_eq!(
+        json["resource_statuses"]["graph.knowledge"]["status"],
+        "applied"
+    );
+}
+
+#[test]
+fn cluster_plan_json_includes_state_cas_revision_and_lock_observation() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let state_dir = temp.path().join("__cluster");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        r#"
+{
+  "version": 1,
+  "state_revision": 9,
+  "applied_revision": {
+    "config_digest": "old",
+    "resources": {
+      "graph.knowledge": { "digest": "old-graph" }
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    let json = parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg("plan")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["state_observations"]["state_revision"], 9);
+    assert!(
+        json["state_observations"]["state_cas"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    assert_eq!(json["state_observations"]["locked"], false);
+    assert_eq!(json["state_observations"]["lock_acquired"], true);
+    assert!(json["state_observations"]["acquired_lock_id"].is_string());
+    assert!(!state_dir.join("lock.json").exists());
+}
+
+#[test]
+fn cluster_plan_locked_state_exits_nonzero() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let state_dir = temp.path().join("__cluster");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("lock.json"),
+        r#"
+{
+  "version": 1,
+  "lock_id": "held-lock",
+  "operation": "plan",
+  "created_at": "2026-06-08T00:00:00Z",
+  "pid": 123
+}
+"#,
+    )
+    .unwrap();
+
+    let output = output_failure(
+        cli()
+            .arg("cluster")
+            .arg("plan")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    );
+    let json = parse_stdout_json(&output);
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["state_observations"]["locked"], true);
+    assert_eq!(json["state_observations"]["lock_acquired"], false);
+    assert_eq!(json["state_observations"]["lock_id"], "held-lock");
+    assert!(
+        json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "state_lock_held"),
+        "locked state should produce a useful diagnostic: {json}"
+    );
+}
+
+#[test]
+fn cluster_import_json_bootstraps_missing_state() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    init_cluster_derived_graph(temp.path());
+
+    let json = parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg("import")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["operation"], "import");
+    assert_eq!(json["state_observations"]["state_revision"], 1);
+    assert!(
+        json["state_observations"]["state_cas"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    assert_eq!(json["state_observations"]["locked"], false);
+    assert_eq!(json["state_observations"]["lock_acquired"], true);
+    assert!(json["state_observations"]["acquired_lock_id"].is_string());
+    assert!(json["observations"]["graph.knowledge"]["manifest_version"].is_number());
+    assert_eq!(
+        json["resource_statuses"]["graph.knowledge"]["status"],
+        "applied"
+    );
+    assert!(temp.path().join("__cluster/state.json").exists());
+    assert!(!temp.path().join("__cluster/lock.json").exists());
+}
+
+#[test]
+fn cluster_refresh_json_updates_revision_cas_and_removes_lock() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    init_cluster_derived_graph(temp.path());
+    let state_dir = temp.path().join("__cluster");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        r#"
+{
+  "version": 1,
+  "state_revision": 2,
+  "applied_revision": { "resources": {} }
+}
+"#,
+    )
+    .unwrap();
+
+    let json = parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg("refresh")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["operation"], "refresh");
+    assert_eq!(json["state_observations"]["state_revision"], 3);
+    assert!(
+        json["state_observations"]["state_cas"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    assert_eq!(json["state_observations"]["locked"], false);
+    assert_eq!(json["state_observations"]["lock_acquired"], true);
+    assert!(json["state_observations"]["acquired_lock_id"].is_string());
+    assert!(!state_dir.join("lock.json").exists());
+}
+
+#[test]
+fn cluster_refresh_missing_state_exits_nonzero() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+
+    let output = output_failure(
+        cli()
+            .arg("cluster")
+            .arg("refresh")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    );
+    let json = parse_stdout_json(&output);
+    assert_eq!(json["ok"], false);
+    assert!(
+        json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "state_missing"),
+        "missing state should produce a useful diagnostic: {json}"
+    );
+}
+
+#[test]
+fn cluster_import_existing_state_exits_nonzero() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let state_dir = temp.path().join("__cluster");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        r#"{"version":1,"applied_revision":{"resources":{}}}"#,
+    )
+    .unwrap();
+
+    let output = output_failure(
+        cli()
+            .arg("cluster")
+            .arg("import")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    );
+    let json = parse_stdout_json(&output);
+    assert_eq!(json["ok"], false);
+    assert!(
+        json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "state_already_exists"),
+        "existing state should produce a useful diagnostic: {json}"
+    );
+}
+
+#[test]
+fn cluster_refresh_and_import_locked_state_exit_nonzero() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let state_dir = temp.path().join("__cluster");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        r#"{"version":1,"applied_revision":{"resources":{}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        state_dir.join("lock.json"),
+        r#"{"version":1,"lock_id":"held-lock","operation":"refresh","created_at":"2026-06-08T00:00:00Z","pid":123}"#,
+    )
+    .unwrap();
+
+    let refresh = parse_stdout_json(&output_failure(
+        cli()
+            .arg("cluster")
+            .arg("refresh")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(refresh["state_observations"]["locked"], true);
+    assert_eq!(refresh["state_observations"]["lock_id"], "held-lock");
+    assert_eq!(refresh["state_observations"]["lock_acquired"], false);
+    assert!(
+        refresh["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "state_lock_held")
+    );
+
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let state_dir = temp.path().join("__cluster");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("lock.json"),
+        r#"{"version":1,"lock_id":"held-lock","operation":"import","created_at":"2026-06-08T00:00:00Z","pid":123}"#,
+    )
+    .unwrap();
+
+    let imported = parse_stdout_json(&output_failure(
+        cli()
+            .arg("cluster")
+            .arg("import")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(imported["state_observations"]["locked"], true);
+    assert_eq!(imported["state_observations"]["lock_id"], "held-lock");
+    assert_eq!(imported["state_observations"]["lock_acquired"], false);
+    assert!(
+        imported["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "state_lock_held")
+    );
+}
+
+#[test]
+fn cluster_validate_invalid_config_exits_nonzero() {
+    let temp = tempdir().unwrap();
+    fs::write(
+        temp.path().join("cluster.yaml"),
+        "version: 1\ngraphs: {}\npipelines: {}\n",
+    )
+    .unwrap();
+
+    let output = output_failure(
+        cli()
+            .arg("cluster")
+            .arg("validate")
+            .arg("--config")
+            .arg(temp.path()),
+    );
+    let stdout = stdout_string(&output);
+    assert!(stdout.contains("future_phase_field"), "{stdout}");
 }
 
 #[test]
@@ -448,6 +990,83 @@ fn explicit_omnigraph_config_pointing_at_missing_file_errors() {
         stderr.contains("OMNIGRAPH_CONFIG") && stderr.contains("does-not-exist.yaml"),
         "missing OMNIGRAPH_CONFIG must error naming the file: {stderr}"
     );
+}
+
+#[test]
+fn repair_json_reports_noop_on_clean_graph() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+
+    let output = output_success(cli().arg("repair").arg("--json").arg(&graph));
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(payload["confirm"], false);
+    assert_eq!(payload["force"], false);
+    assert_eq!(payload["manifest_version"], Value::Null);
+    let tables = payload["tables"].as_array().unwrap();
+    assert_eq!(tables.len(), 4);
+    assert!(tables.iter().all(|table| {
+        table["classification"] == "no_drift" && table["action"] == "no_op"
+    }));
+}
+
+#[test]
+fn repair_confirm_json_refuses_suspicious_drift_with_nonzero_exit_then_force_succeeds() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+    let graph_manifest_before = manifest_dataset_version(&graph);
+    let (table_manifest_before, table_head_before) = forge_person_delete_drift(&graph);
+
+    let refused = output_failure(
+        cli()
+            .arg("repair")
+            .arg("--confirm")
+            .arg("--json")
+            .arg(&graph),
+    );
+    let refused_payload: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(refused_payload["manifest_version"], Value::Null);
+    let person = refused_payload["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|table| table["table_key"] == "node:Person")
+        .unwrap();
+    assert_eq!(person["classification"], "suspicious");
+    assert_eq!(person["action"], "refused");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("repair refused"),
+        "stderr should explain the non-zero exit; got: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(manifest_dataset_version(&graph), graph_manifest_before);
+
+    let forced = output_success(
+        cli()
+            .arg("repair")
+            .arg("--force")
+            .arg("--confirm")
+            .arg("--json")
+            .arg(&graph),
+    );
+    let forced_payload: Value = serde_json::from_slice(&forced.stdout).unwrap();
+    let forced_manifest = forced_payload["manifest_version"].as_u64().unwrap();
+    assert!(forced_manifest > graph_manifest_before);
+    let person = forced_payload["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|table| table["table_key"] == "node:Person")
+        .unwrap();
+    assert_eq!(person["classification"], "suspicious");
+    assert_eq!(person["action"], "forced");
+    assert_eq!(person["manifest_version"], table_manifest_before);
+    assert_eq!(person["lance_head_version"], table_head_before);
+    assert_eq!(manifest_dataset_version(&graph), forced_manifest);
 }
 
 #[test]

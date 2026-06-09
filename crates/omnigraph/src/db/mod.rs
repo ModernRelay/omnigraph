@@ -3,7 +3,6 @@ pub mod graph_coordinator;
 pub mod manifest;
 mod omnigraph;
 mod recovery_audit;
-mod run_registry;
 mod schema_state;
 pub(crate) mod write_queue;
 
@@ -12,10 +11,10 @@ pub use graph_coordinator::{GraphCoordinator, ReadTarget, ResolvedTarget, Snapsh
 pub use manifest::{Snapshot, SubTableEntry, SubTableUpdate};
 pub(crate) use omnigraph::ensure_public_branch_ref;
 pub use omnigraph::{
-    CleanupPolicyOptions, InitOptions, MergeOutcome, Omnigraph, OpenMode, SchemaApplyOptions,
-    SchemaApplyResult, SkipReason, TableCleanupStats, TableOptimizeStats,
+    CleanupPolicyOptions, InitOptions, MergeOutcome, Omnigraph, OpenMode, RepairAction,
+    RepairClassification, RepairOptions, RepairStats, SchemaApplyOptions, SchemaApplyResult,
+    SkipReason, TableCleanupStats, TableOptimizeStats, TableRepairStats,
 };
-pub(crate) use run_registry::is_internal_run_branch;
 
 pub(crate) const SCHEMA_APPLY_LOCK_BRANCH: &str = "__schema_apply_lock__";
 
@@ -69,5 +68,8 @@ pub(crate) fn is_schema_apply_lock_branch(name: &str) -> bool {
 }
 
 pub(crate) fn is_internal_system_branch(name: &str) -> bool {
-    is_internal_run_branch(name) || is_schema_apply_lock_branch(name)
+    // Legacy `__run__*` staging branches (Run state machine, removed MR-771)
+    // are swept off `__manifest` by the v2→v3 internal-schema migration, so the
+    // only internal branch the engine still creates is the schema-apply lock.
+    is_schema_apply_lock_branch(name)
 }

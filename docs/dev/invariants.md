@@ -101,7 +101,7 @@ Use it this way:
 | Deletes | Inline-commit residual; delete-only queries allowed, mixed insert/update/delete rejected by D2 | [query-language.md](../user/query-language.md), [writes.md](writes.md) |
 | Branch delete | Manifest is the single authority, flipped atomically first; per-table forks + commit-graph branch are derived state, reclaimed best-effort (`force_delete_branch`) with the `cleanup` reconciler as the guaranteed backstop. Reusing a name whose reclaim failed before `cleanup` surfaces an actionable error | [branches-commits.md](../user/branches-commits.md), [maintenance.md](../user/maintenance.md) |
 | Schema validation | Type checks, required fields, defaults, edge endpoint checks, and edge cardinality are enforced on write paths | [schema-language.md](../user/schema-language.md), [execution.md](execution.md) |
-| Unique constraints | Intra-batch and write-path checks exist; full cross-version uniqueness is still a gap | [schema-language.md](../user/schema-language.md) |
+| Unique constraints | Intra-batch and write-path checks exist; intake and branch-merge derive the composite key through one shared function (`loader::composite_unique_key`, a separator-free `Vec<String>` tuple) and fail loudly on an un-keyable column type rather than silently exempting it; full cross-version uniqueness against already-committed rows is still a gap | [schema-language.md](../user/schema-language.md) |
 | Storage trait | `TableStorage` exists as the sealed staged-write surface; full call-site migration and capability/stat surfaces are incomplete | [writes.md](writes.md), [architecture.md](architecture.md) |
 | Index lifecycle | `ensure_indices` is explicit today; reconciler-based convergence is roadmap | [indexes.md](../user/indexes.md), [maintenance.md](../user/maintenance.md) |
 | Traversal IDs | Runtime still builds `TypeIndex`; Lance stable row-id based graph IDs are roadmap | [architecture.md](architecture.md), [query-language.md](../user/query-language.md) |
@@ -139,6 +139,20 @@ them explicit.
   Remove the skip when the upstream Lance fix lands — the
   `lance_surface_guards.rs::compact_files_still_fails_on_blob_columns` guard
   turns red on that bump to force it.
+- **Manifest→commit-graph publish atomicity:** a graph commit advances
+  `__manifest` (the visibility authority) and then appends `_graph_commits` as
+  two separate writes (`commit_updates_with_actor_with_expected`, failpoint
+  `graph_publish.before_commit_append`). A crash between them leaves the manifest
+  at version N with no commit-graph row for N. Live reads and durability are
+  unaffected — the live version resolves via the manifest
+  (`GraphCoordinator::version()`), not the commit-graph head — and the open-time
+  recovery sweep does NOT repair it (`lance_head == manifest_pinned` classifies
+  `NoMovement`; a recovery sidecar would not change this). Impact is bounded to
+  commit history: `commit list` misses N, time-travel by commit id to N fails,
+  and merge-base loses a node (a likely-benign off-by-one re-merge). This affects
+  every publish, not a specific maintenance command. Eventual fix: make the
+  commit graph reconcilable from the manifest (or the two writes atomic) — not a
+  recovery-sidecar concern.
 - **Planner capability/stat surfaces:** cost-aware planning, complete
   capability advertisement, and explain-with-cost are roadmap. Do not describe
   them as implemented.

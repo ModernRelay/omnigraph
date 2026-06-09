@@ -30,9 +30,13 @@ use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
+use lance::dataset::transaction::Operation;
 use lance::dataset::write::delete::DeleteResult;
 use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
+use lance::index::DatasetIndexExt;
 use lance_file::version::LanceFileVersion;
+use lance_index::IndexType;
+use lance_index::scalar::ScalarIndexParams;
 use lance_namespace::LanceNamespace;
 use lance_table::io::commit::ManifestNamingScheme;
 
@@ -222,6 +226,33 @@ async fn _compile_compact_files_signature() -> lance::Result<()> {
     Ok(())
 }
 
+// --- Guard 7b: transaction history exposes repair's classification surface -
+//
+// `db/omnigraph/repair.rs` reads Lance transactions between manifest and HEAD
+// and treats only `ReserveFragments` + `Rewrite` as safe maintenance drift.
+// Compile-only.
+
+#[allow(
+    dead_code,
+    unreachable_code,
+    unused_variables,
+    unused_mut,
+    clippy::diverging_sub_expression
+)]
+async fn _compile_transaction_history_for_repair_signature() -> lance::Result<()> {
+    let ds: Dataset = unimplemented!();
+    let tx = ds.read_transaction_by_version(1u64).await?;
+    if let Some(tx) = tx {
+        let operation = tx.operation;
+        let _name: &str = operation.name();
+        match operation {
+            Operation::Rewrite { .. } | Operation::ReserveFragments { .. } => {}
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 // --- Guard 8: Dataset::delete returns DeleteResult { new_dataset, num_deleted_rows } ---
 //
 // `table_store.rs::delete_where` consumes both fields. When MR-A migrates
@@ -376,5 +407,137 @@ async fn compact_files_still_fails_on_blob_columns() {
             .contains("more fields in the schema than provided column indices"),
         "blob compaction failed with an unexpected error (Lance internals may have \
          shifted): {err}"
+    );
+}
+
+// --- Guard 11: scalar-index coverage surface (physical_rows + index details) ---
+//
+// `table_store.rs::key_column_index_coverage` mirrors Lance's `create_filter_plan`
+// C6 fallback: it reads `fragment.physical_rows` (the field whose absence on ANY
+// fragment disables the scalar index for the whole scan) and sniffs the BTREE via
+// `load_indices()` → `index.fields` / `index.index_details.type_url`. This is the
+// one real Lance-internal coupling on the indexed-traversal read path. If any of
+// these surfaces renames or changes type, the coverage check (and the cost-based
+// traversal chooser that consumes it) silently misclassifies. Compile-only.
+
+#[allow(
+    dead_code,
+    unreachable_code,
+    unused_variables,
+    unused_mut,
+    clippy::diverging_sub_expression
+)]
+async fn _compile_scalar_index_coverage_surface() -> lance::Result<()> {
+    let ds: Dataset = unimplemented!();
+    // The create_filter_plan coupling: a fragment lacking `physical_rows`
+    // disables the scalar index for the entire scan.
+    for frag in ds.fragments().iter() {
+        let _physical_rows: Option<usize> = frag.physical_rows;
+        // `key_column_index_coverage` checks each current fragment id against the
+        // index `fragment_bitmap`.
+        let _id: u64 = frag.id;
+    }
+    // The index sniff: BTREE presence is detected by single-field index whose
+    // details type_url ends with "BTreeIndexDetails". The fragment coverage check
+    // reads `fragment_bitmap` (Option<RoaringBitmap>) and calls `.contains(u32)`.
+    let indices = ds.load_indices().await?;
+    for index in indices.iter() {
+        let _fields: &Vec<i32> = &index.fields;
+        if let Some(details) = index.index_details.as_ref() {
+            let _type_url: &str = details.type_url.as_str();
+        }
+        let _covered: Option<bool> = index.fragment_bitmap.as_ref().map(|b| b.contains(0u32));
+    }
+    Ok(())
+}
+
+// --- Guard 12: can a scalar BTREE be built on a system version column? --------
+//
+// The deferred persisted-adjacency artifact plan assumed a cheap delta read of
+// `_row_last_updated_at_version > V` could be a BTREE range lookup. Lance resolves
+// index columns from the dataset schema, and the version columns are system
+// metadata — so this probe documents whether the assumption holds. The outcome is
+// the load-bearing fact, not a pass/fail of intent: if this starts SUCCEEDING when
+// it currently errors (or vice versa), the artifact's delta-cost story changes.
+
+#[tokio::test]
+async fn scalar_index_on_system_version_column_probe() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard12.lance");
+    let mut ds = fresh_dataset(uri.to_str().unwrap()).await;
+
+    // Sanity: the system version column is present (stable row ids + V2_2).
+    assert!(
+        ds.schema().field("_row_last_updated_at_version").is_none(),
+        "PROBE NOTE: `_row_last_updated_at_version` is NOT in the user schema \
+         (it is system metadata); indexing it resolves through a different path."
+    );
+
+    let result = ds
+        .create_index_builder(
+            &["_row_last_updated_at_version"],
+            IndexType::BTree,
+            &ScalarIndexParams::default(),
+        )
+        .replace(true)
+        .await;
+
+    // Pin the observed behavior: a scalar index on the system version column is
+    // NOT buildable via the normal create-index path in this Lance. If this turns
+    // green (Ok), the artifact delta CAN use a version-column BTREE — revisit the
+    // deferred plan's Phase-2 delta-cost note in docs/dev/traversal handoff.
+    assert!(
+        result.is_err(),
+        "create_index on `_row_last_updated_at_version` unexpectedly SUCCEEDED — \
+         a system-column scalar index is now buildable; the persisted-artifact \
+         delta read could use it. Update the deferred-design notes."
+    );
+}
+
+// --- Guard 13: per-fragment deletion metadata is exposed without a scan -------
+//
+// The deferred artifact's delete-correctness coverage model needs to detect,
+// cheaply (O(fragments), no row scan), that a covered fragment acquired new
+// deletions. That hinges on Lance tracking deletions at fragment-metadata level.
+// This pins that a delete populates `fragment.deletion_file`, and probes whether
+// the deleted-row COUNT is available as metadata (`num_deleted_rows`) — the
+// difference between an O(fragments) coverage check and an O(|E|) scan.
+
+#[tokio::test]
+async fn fragment_deletion_metadata_is_available() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard13.lance");
+    let ds = fresh_dataset(uri.to_str().unwrap()).await; // 2 rows: alice, bob
+
+    let deleted: DeleteResult = {
+        let mut ds = ds;
+        ds.delete("id = 'alice'").await.unwrap()
+    };
+    assert_eq!(deleted.num_deleted_rows, 1, "one row deleted");
+    let ds = deleted.new_dataset;
+
+    // A delete must be tracked at fragment-metadata level (not only in data).
+    let with_deletion = ds
+        .fragments()
+        .iter()
+        .find(|f| f.deletion_file.is_some())
+        .expect(
+            "after a delete, some fragment must carry a deletion_file — if not, \
+             Lance changed deletion tracking; the artifact coverage model's \
+             cheap delete-detection assumption is invalid.",
+        );
+
+    // Probe: is the deleted-row count available as metadata (cheap), or must the
+    // deletion vector be read? Pin whichever holds so the artifact plan knows.
+    let count: Option<usize> = with_deletion
+        .deletion_file
+        .as_ref()
+        .and_then(|df| df.num_deleted_rows);
+    assert_eq!(
+        count,
+        Some(1),
+        "PROBE: deletion_file.num_deleted_rows is not a populated metadata count \
+         (got {count:?}); the artifact coverage model cannot cheaply detect \
+         per-fragment deletions and would need to read the deletion vector.",
     );
 }

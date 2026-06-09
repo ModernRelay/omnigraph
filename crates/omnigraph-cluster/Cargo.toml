@@ -1,0 +1,24 @@
+[package]
+name = "omnigraph-cluster"
+version = "0.6.2"
+edition = "2024"
+description = "Read-only cluster configuration validation and planning for Omnigraph."
+license = "MIT"
+repository = "https://github.com/ModernRelay/omnigraph"
+homepage = "https://github.com/ModernRelay/omnigraph"
+documentation = "https://docs.rs/omnigraph-cluster"
+
+[dependencies]
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.6.2" }
+omnigraph = { package = "omnigraph-engine", path = "../omnigraph", version = "0.6.2" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+ulid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }

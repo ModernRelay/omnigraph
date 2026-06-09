@@ -6,8 +6,8 @@
 //! What this file covers:
 //! - No `__run__*` branches are created by load or mutate.
 //! - Cancellation of a mutation future leaves no graph-level state.
-//! - Concurrent writers to the same table land exactly one publish; the
-//!   loser surfaces `ManifestConflictDetails::ExpectedVersionMismatch`.
+//! - Concurrent non-strict inserts/merges rebase under the per-table queue;
+//!   strict updates/deletes surface `ExpectedVersionMismatch` on stale state.
 //! - Failed mutations and loads leave the target unchanged.
 //! - Multi-statement mutations are atomic (one commit per query).
 //! - actor_id propagates through to the commit graph.
@@ -17,7 +17,7 @@ mod helpers;
 use arrow_array::Array;
 use omnigraph::db::commit_graph::CommitGraph;
 use omnigraph::db::{Omnigraph, ReadTarget};
-use omnigraph::error::{ManifestConflictDetails, ManifestErrorKind, OmniError};
+use omnigraph::error::OmniError;
 use omnigraph::loader::{LoadMode, load_jsonl};
 
 use helpers::*;
@@ -241,18 +241,11 @@ async fn partial_failure_leaves_target_queryable_and_unblocks_next_mutation() {
     assert_eq!(frank.num_rows(), 1, "Frank must be visible after publish");
 }
 
-/// Concurrent writers to the same `(table, branch)` produce exactly one
-/// success and one `ExpectedVersionMismatch`. The replacement for the old
-/// `concurrent_conflicting_run_publish_fails_cleanly` test — the OCC fence
-/// has moved from a graph-level run-publish merge into the publisher's
-/// per-table CAS.
-///
-/// Drives the race by interleaving two handles that captured the same
-/// pre-write manifest snapshot: A commits first; B's commit then sees
-/// `expected_versions[node:Person] = pre` while the manifest is at
-/// `pre + 1`, and the publisher rejects.
+/// Stale non-strict writers rebase to the live manifest pin under the
+/// per-table queue instead of folding raw drift or returning a false 409.
+/// Strict update/delete semantics are covered by the consistency/server tests.
 #[tokio::test]
-async fn concurrent_writers_one_succeeds_one_gets_expected_version_mismatch() {
+async fn stale_non_strict_insert_rebases_to_live_manifest_pin() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_string_lossy().into_owned();
 
@@ -281,40 +274,30 @@ async fn concurrent_writers_one_succeeds_one_gets_expected_version_mismatch() {
         .unwrap();
     }
 
-    // Writer B's coordinator is still at the pre-A snapshot. Its mutation
-    // captures expected_versions[node:Person] = pre (stale), then publishes
-    // — the publisher's CAS pre-check sees the manifest is now at post and
-    // rejects with ExpectedVersionMismatch.
-    let result_b = db_b
-        .mutate(
-            "main",
-            MUTATION_QUERIES,
-            "insert_person",
-            &mixed_params(&[("$name", "WriterB")], &[("$age", 42)]),
-        )
-        .await;
+    // Writer B's coordinator is still at the pre-A snapshot, but Insert is
+    // non-strict: commit_all re-reads the live manifest pin under the queue,
+    // verifies Lance HEAD equals that pin, and then lets Lance rebase the
+    // staged append.
+    db_b.mutate(
+        "main",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "WriterB")], &[("$age", 42)]),
+    )
+    .await
+    .unwrap();
 
-    let err = result_b.expect_err("stale writer must hit ExpectedVersionMismatch");
-    let OmniError::Manifest(manifest_err) = err else {
-        panic!("expected Manifest error, got {err:?}");
-    };
-    assert_eq!(manifest_err.kind, ManifestErrorKind::Conflict);
-    let Some(ManifestConflictDetails::ExpectedVersionMismatch {
-        ref table_key,
-        expected,
-        actual,
-    }) = manifest_err.details
-    else {
-        panic!(
-            "expected ExpectedVersionMismatch, got {:?}",
-            manifest_err.details,
-        );
-    };
-    assert_eq!(table_key, "node:Person");
-    assert!(
-        actual > expected,
-        "actual ({actual}) should be ahead of expected ({expected})",
-    );
+    for name in ["WriterA", "WriterB"] {
+        let person = query_main(
+            &mut db_b,
+            TEST_QUERIES,
+            "get_person",
+            &params(&[("$name", name)]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(person.num_rows(), 1, "{name} should be visible");
+    }
 }
 
 /// The cancellation hole that motivated removing the Run state machine: dropping a mutation future
@@ -371,11 +354,10 @@ async fn cancelled_mutation_future_leaves_no_state() {
 
     // Cancel-safety property: no graph-level run/staging state remains.
     //
-    // Note: `branch_list()` already filters `__run__*` via
-    // `is_internal_system_branch`, so a runtime "no `__run__` branches" check
-    // would be vacuous. The structural property that no `__run__` branches
-    // can ever be created is enforced by deletion of `begin_run` etc. in
-    // (verified by the build itself — those symbols no longer exist).
+    // No `__run__` branches can ever be created: the Run state machine
+    // (`begin_run` etc.) was deleted in MR-771 — verified by the build itself,
+    // those symbols no longer exist. Any legacy `__run__*` branch on an
+    // upgraded graph is swept by the v2→v3 manifest migration.
     //
     // (1) The branch list is unchanged: cancellation/completion cannot
     //     synthesize new public branches.
@@ -442,34 +424,40 @@ async fn repeated_loads_do_not_accumulate_branches() {
     assert_eq!(db.branch_list().await.unwrap(), vec!["main".to_string()]);
 }
 
-/// User code must not be able to write to internal `__run__*` names.
-/// The branch-name guard predicate is kept as defense-in-depth; it
-/// will be removed once a future production sweep retires the legacy
-/// branches.
+/// After MR-770, `__run__*` is an ordinary branch name — the Run state machine
+/// and its `is_internal_run_branch` guard are gone. The surviving internal-ref
+/// guard still rejects the active `__schema_apply_lock__` branch on the public
+/// create/merge APIs.
 #[tokio::test]
-async fn public_branch_apis_reject_internal_run_refs() {
+async fn public_branch_apis_reject_internal_system_refs() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = init_and_load(&dir).await;
 
-    let create_err = db.branch_create("__run__synthetic").await.unwrap_err();
+    // `__run__*` is no longer reserved — creating it now succeeds.
+    db.branch_create("__run__formerly_reserved")
+        .await
+        .expect("__run__ prefix is a normal branch name post-MR-770");
+
+    // The schema-apply lock branch is still rejected on public branch APIs.
+    let create_err = db.branch_create("__schema_apply_lock__").await.unwrap_err();
     let OmniError::Manifest(err) = create_err else {
         panic!("expected Manifest error");
     };
     assert!(
-        err.message.contains("internal run ref"),
+        err.message.contains("internal system ref"),
         "unexpected error: {}",
         err.message
     );
 
     let merge_err = db
-        .branch_merge("__run__synthetic", "main")
+        .branch_merge("__schema_apply_lock__", "main")
         .await
         .unwrap_err();
     let OmniError::Manifest(err) = merge_err else {
         panic!("expected Manifest error");
     };
     assert!(
-        err.message.contains("internal run refs"),
+        err.message.contains("internal system refs"),
         "unexpected error: {}",
         err.message
     );

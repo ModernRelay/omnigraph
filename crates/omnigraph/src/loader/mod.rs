@@ -288,21 +288,24 @@ async fn load_jsonl_reader<R: BufRead>(
     let mut node_rows: HashMap<String, Vec<JsonValue>> = HashMap::new();
     let mut edge_rows: HashMap<String, Vec<(String, String, JsonValue)>> = HashMap::new();
 
-    for (line_num, line) in reader.lines().enumerate() {
-        let line = line?;
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let value: JsonValue = serde_json::from_str(line).map_err(|e| {
-            OmniError::manifest(format!("invalid JSON on line {}: {}", line_num + 1, e))
+    // Parse a stream of JSON values. Accepts both compact JSONL (one object
+    // per line) and pretty-printed JSON where a single object spans multiple
+    // lines — serde's streaming deserializer treats any whitespace (including
+    // newlines) between top-level values as a separator.
+    for (idx, parsed) in serde_json::Deserializer::from_reader(reader)
+        .into_iter::<JsonValue>()
+        .enumerate()
+    {
+        let record_num = idx + 1;
+        let value: JsonValue = parsed.map_err(|e| {
+            OmniError::manifest(format!("invalid JSON at record {}: {}", record_num, e))
         })?;
 
         if let Some(type_name) = value.get("type").and_then(|v| v.as_str()) {
             if !catalog.node_types.contains_key(type_name) {
                 return Err(OmniError::manifest(format!(
-                    "line {}: unknown node type '{}'",
-                    line_num + 1,
+                    "record {}: unknown node type '{}'",
+                    record_num,
                     type_name
                 )));
             }
@@ -317,8 +320,8 @@ async fn load_jsonl_reader<R: BufRead>(
         } else if let Some(edge_name) = value.get("edge").and_then(|v| v.as_str()) {
             if catalog.lookup_edge_by_name(edge_name).is_none() {
                 return Err(OmniError::manifest(format!(
-                    "line {}: unknown edge type '{}'",
-                    line_num + 1,
+                    "record {}: unknown edge type '{}'",
+                    record_num,
                     edge_name
                 )));
             }
@@ -326,14 +329,14 @@ async fn load_jsonl_reader<R: BufRead>(
                 .get("from")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    OmniError::manifest(format!("line {}: edge missing 'from'", line_num + 1))
+                    OmniError::manifest(format!("record {}: edge missing 'from'", record_num))
                 })?
                 .to_string();
             let to = value
                 .get("to")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    OmniError::manifest(format!("line {}: edge missing 'to'", line_num + 1))
+                    OmniError::manifest(format!("record {}: edge missing 'to'", record_num))
                 })?
                 .to_string();
             let data = value
@@ -347,8 +350,8 @@ async fn load_jsonl_reader<R: BufRead>(
                 .push((from, to, data));
         } else {
             return Err(OmniError::manifest(format!(
-                "line {}: expected 'type' or 'edge' field",
-                line_num + 1
+                "record {}: expected 'type' or 'edge' field",
+                record_num
             )));
         }
     }
@@ -396,9 +399,9 @@ async fn load_jsonl_reader<R: BufRead>(
         let batch = build_node_batch(node_type, rows)?;
         validate_value_constraints(&batch, node_type)?;
         validate_enum_constraints(&batch, &node_type.properties, type_name)?;
-        let unique_props = unique_property_names_for_node(node_type);
-        if !unique_props.is_empty() {
-            enforce_unique_constraints_intra_batch(&batch, type_name, &unique_props)?;
+        let unique_groups = unique_constraint_groups_for_node(node_type);
+        if !unique_groups.is_empty() {
+            enforce_unique_constraints_intra_batch(&batch, type_name, &unique_groups)?;
         }
         let loaded_count = batch.num_rows();
         let table_key = format!("node:{}", type_name);
@@ -507,9 +510,9 @@ async fn load_jsonl_reader<R: BufRead>(
         let edge_type = &catalog.edge_types[edge_name];
         let batch = build_edge_batch(edge_type, rows)?;
         validate_enum_constraints(&batch, &edge_type.properties, edge_name)?;
-        let unique_props = unique_property_names_for_edge(edge_type);
-        if !unique_props.is_empty() {
-            enforce_unique_constraints_intra_batch(&batch, edge_name, &unique_props)?;
+        let unique_groups = unique_constraint_groups_for_edge(edge_type);
+        if !unique_groups.is_empty() {
+            enforce_unique_constraints_intra_batch(&batch, edge_name, &unique_groups)?;
         }
         let loaded_count = batch.num_rows();
         let table_key = format!("edge:{}", edge_name);
@@ -1422,8 +1425,16 @@ pub(crate) fn validate_enum_constraints(
     Ok(())
 }
 
-/// Detect duplicate values within a single `RecordBatch` for any of the named
-/// `unique_properties`. Returns an error on the first duplicate found.
+/// Detect duplicate values within a single `RecordBatch` for any of the
+/// `unique_constraints` groups. Each group is a list of one or more columns
+/// that together form a uniqueness key: a violation occurs when two rows share
+/// the same tuple of values across *all* columns in a group, so a composite
+/// `@unique(a, b)` only conflicts when both `a` and `b` match. Returns an
+/// error on the first duplicate found.
+///
+/// Rows where any column in a group is null are exempt (standard SQL semantics
+/// for uniqueness over nullable columns), as is any group whose columns are
+/// not all present in the batch (e.g. a partial-schema load).
 ///
 /// Note: this only catches duplicates *within* the batch. Cross-batch
 /// uniqueness against already-committed rows is not enforced here — that
@@ -1431,22 +1442,37 @@ pub(crate) fn validate_enum_constraints(
 pub(crate) fn enforce_unique_constraints_intra_batch(
     batch: &RecordBatch,
     type_name: &str,
-    unique_properties: &[String],
+    unique_constraints: &[Vec<String>],
 ) -> Result<()> {
-    for property in unique_properties {
-        let Some(col_idx) = batch.schema().index_of(property).ok() else {
+    for columns in unique_constraints {
+        // Resolve the group's columns once. A group whose columns aren't all
+        // present in this batch is skipped (e.g. a partial-schema load).
+        let Some(group_columns) = columns
+            .iter()
+            .map(|name| {
+                batch
+                    .schema()
+                    .index_of(name)
+                    .ok()
+                    .map(|i| batch.column(i).clone())
+            })
+            .collect::<Option<Vec<ArrayRef>>>()
+        else {
             continue;
         };
-        let arr = batch.column(col_idx);
-        let mut seen: HashMap<String, usize> = HashMap::new();
+        let mut seen: HashMap<Vec<String>, usize> = HashMap::new();
         for row in 0..batch.num_rows() {
-            let Some(value) = scalar_to_string(arr, row) else {
+            let Some(key) = composite_unique_key(&group_columns, row)? else {
                 continue;
             };
-            if let Some(prev_row) = seen.insert(value.clone(), row) {
+            if let Some(prev_row) = seen.insert(key.clone(), row) {
                 return Err(OmniError::manifest(format!(
                     "@unique violation on {}.{}: value '{}' appears in rows {} and {}",
-                    type_name, property, value, prev_row, row
+                    type_name,
+                    format_tuple(columns),
+                    format_tuple(&key),
+                    prev_row,
+                    row
                 )));
             }
         }
@@ -1454,80 +1480,131 @@ pub(crate) fn enforce_unique_constraints_intra_batch(
     Ok(())
 }
 
-/// Reduce a single Arrow scalar at (`array`, `row`) to a `String` for
-/// uniqueness comparison. Returns `None` for null values (nulls are exempt
-/// from uniqueness in standard SQL semantics).
-fn scalar_to_string(array: &ArrayRef, row: usize) -> Option<String> {
-    use arrow_array::Array;
+/// Build the composite uniqueness key for `row` over a constraint group's
+/// already-resolved columns (in declaration order).
+///
+/// The key is the *tuple* of per-column scalar strings (`Vec<String>`), keyed
+/// directly in the dedup map — there is no separator, so no data value can
+/// forge a collision (an earlier version joined on `U+001F`, which a value
+/// containing that control char could still defeat).
+///
+/// - `Ok(None)` if any column is null: the row is exempt (a partial tuple
+///   can't violate uniqueness under SQL null semantics).
+/// - `Ok(Some(tuple))` otherwise.
+/// - `Err(..)` propagated from [`unique_key_scalar`] on an un-keyable value.
+///
+/// Shared by the intake path (`enforce_unique_constraints_intra_batch`) and the
+/// branch-merge path (`exec/merge.rs::update_unique_constraints`) so the two
+/// derive identical keys and cannot drift on separator or scalar conversion.
+pub(crate) fn composite_unique_key(
+    group_columns: &[ArrayRef],
+    row: usize,
+) -> Result<Option<Vec<String>>> {
+    let mut parts = Vec::with_capacity(group_columns.len());
+    for column in group_columns {
+        match unique_key_scalar(column, row)? {
+            Some(value) => parts.push(value),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(parts))
+}
+
+/// Render a constraint's column tuple for error messages: a single item as
+/// `col`, a composite as `(a, b)`. Used for both the column list and the
+/// offending value tuple, which share the same shape.
+fn format_tuple(items: &[String]) -> String {
+    match items {
+        [single] => single.clone(),
+        _ => format!("({})", items.join(", ")),
+    }
+}
+
+/// Reduce a single Arrow scalar at (`array`, `row`) to its uniqueness-key
+/// string.
+///
+/// - `Ok(None)` for a null value: nulls are exempt from uniqueness (standard
+///   SQL semantics over nullable columns).
+/// - `Ok(Some(s))` for every scalar type a `@unique` / `@key` column can hold.
+///   Strings are covered in all three physical Arrow encodings (`Utf8`,
+///   `LargeUtf8`, `Utf8View`), so a legal string column is always keyable
+///   regardless of how Lance materializes it on read-back.
+/// - `Err(..)` for a non-null value whose Arrow type can't be reduced to a key
+///   (a list, blob, or vector column). This fails loudly rather than silently
+///   exempting the row, and because every legal scalar encoding is handled
+///   above, the error fires only for a genuinely un-keyable column type — never
+///   for a legal value that merely arrived in an unenumerated encoding.
+fn unique_key_scalar(array: &ArrayRef, row: usize) -> Result<Option<String>> {
+    use arrow_array::{Array, LargeStringArray, StringViewArray};
     if array.is_null(row) {
-        return None;
+        return Ok(None);
     }
     if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return Ok(Some(a.value(row).to_string()));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<StringViewArray>() {
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<UInt32Array>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<UInt64Array>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<Float32Array>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<BooleanArray>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<Date32Array>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<Date64Array>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
-    None
+    Err(OmniError::manifest(format!(
+        "uniqueness key: unsupported column type {:?} for @unique/@key enforcement",
+        array.data_type()
+    )))
 }
 
-/// Build the flat list of property names that must be checked for uniqueness
-/// on a node type. Includes both `@unique` properties (from
-/// `NodeType.unique_constraints`) and the `@key` (which implies uniqueness).
-pub(crate) fn unique_property_names_for_node(
+/// Build the list of uniqueness constraint groups to enforce on a node type.
+/// Each group is the column tuple of one constraint. Includes every
+/// `@unique(...)` constraint (from `NodeType.unique_constraints`) and the
+/// `@key` (which implies uniqueness over its column tuple). Grouping is
+/// preserved so a composite `@unique(a, b)` is enforced as a composite key
+/// rather than degraded into independent single-field checks.
+pub(crate) fn unique_constraint_groups_for_node(
     node_type: &omnigraph_compiler::catalog::NodeType,
-) -> Vec<String> {
-    let mut props: Vec<String> = node_type
-        .unique_constraints
-        .iter()
-        .flatten()
-        .cloned()
-        .collect();
-    if let Some(key) = &node_type.key {
-        props.extend(key.iter().cloned());
+) -> Vec<Vec<String>> {
+    let mut groups: Vec<Vec<String>> = node_type.unique_constraints.clone();
+    if let Some(key) = &node_type.key
+        && !groups.contains(key)
+    {
+        groups.push(key.clone());
     }
-    props.sort();
-    props.dedup();
-    props
+    groups
 }
 
-/// Same as [`unique_property_names_for_node`] but for an edge type.
-pub(crate) fn unique_property_names_for_edge(
+/// Same as [`unique_constraint_groups_for_node`] but for an edge type (edges
+/// have no `@key`).
+pub(crate) fn unique_constraint_groups_for_edge(
     edge_type: &omnigraph_compiler::catalog::EdgeType,
-) -> Vec<String> {
-    let mut props: Vec<String> = edge_type
-        .unique_constraints
-        .iter()
-        .flatten()
-        .cloned()
-        .collect();
-    props.sort();
-    props.dedup();
-    props
+) -> Vec<Vec<String>> {
+    edge_type.unique_constraints.clone()
 }
 
 fn extract_numeric_value(col: &ArrayRef, row: usize) -> Option<f64> {
@@ -2168,5 +2245,67 @@ edge WorksAt: Person -> Company
         assert!(result.is_err(), "expected NaN to be rejected");
         let err = result.unwrap_err().to_string();
         assert!(err.contains("NaN"), "error should mention NaN: {}", err);
+    }
+
+    #[test]
+    fn composite_unique_key_builds_tuple_and_exempts_null() {
+        let a: ArrayRef = Arc::new(StringArray::from(vec![Some("x|y"), Some("x"), None]));
+        let b: ArrayRef = Arc::new(StringArray::from(vec![Some("z"), Some("y|z"), Some("q")]));
+        let cols = [a, b];
+
+        // Tuple key, so `("x|y", "z")` and `("x", "y|z")` stay distinct —
+        // a separator-joined key (the old `|` join) would collapse both to
+        // `x|y|z`.
+        assert_eq!(
+            composite_unique_key(&cols, 0).unwrap(),
+            Some(vec!["x|y".to_string(), "z".to_string()])
+        );
+        assert_eq!(
+            composite_unique_key(&cols, 1).unwrap(),
+            Some(vec!["x".to_string(), "y|z".to_string()])
+        );
+        assert_ne!(
+            composite_unique_key(&cols, 0).unwrap(),
+            composite_unique_key(&cols, 1).unwrap()
+        );
+
+        // Any null column → the whole row is exempt (SQL null semantics).
+        assert_eq!(composite_unique_key(&cols, 2).unwrap(), None);
+    }
+
+    #[test]
+    fn unique_key_scalar_errors_loudly_on_unkeyable_type() {
+        use arrow_array::LargeBinaryArray;
+        // A binary/blob column can't be reduced to a uniqueness key. Before the
+        // hardening this returned `None`, so a `@unique` on such a column was
+        // silently un-enforced; now it errors instead of weakening the
+        // constraint in silence.
+        let blob: ArrayRef = Arc::new(LargeBinaryArray::from(vec![Some(&b"abc"[..])]));
+        let err = unique_key_scalar(&blob, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported column type"),
+            "un-keyable type must fail loudly (got: {err})"
+        );
+    }
+
+    #[test]
+    fn unique_key_scalar_handles_all_string_encodings() {
+        use arrow_array::{LargeStringArray, StringViewArray};
+        // A legal string column is keyable in every physical Arrow encoding
+        // Lance might hand back (Utf8 / LargeUtf8 / Utf8View). None of these may
+        // fall through to the loud `Err` path — that branch is reserved for
+        // genuinely un-keyable column types, not a legal value in an
+        // unenumerated encoding.
+        let utf8: ArrayRef = Arc::new(StringArray::from(vec![Some("v")]));
+        let large: ArrayRef = Arc::new(LargeStringArray::from(vec![Some("v")]));
+        let view: ArrayRef = Arc::new(StringViewArray::from(vec![Some("v")]));
+        for array in [&utf8, &large, &view] {
+            assert_eq!(
+                unique_key_scalar(array, 0).unwrap(),
+                Some("v".to_string()),
+                "string array {:?} must render, not error",
+                array.data_type()
+            );
+        }
     }
 }

@@ -51,6 +51,18 @@ constraints. User-facing behavior should still be documented through
 | Install and deployment packaging | [install.md](../user/install.md), [deployment.md](../user/deployment.md) |
 | Release history | [releases/](../releases/) |
 
+## Contribution & Governance
+
+| Area | Read |
+|---|---|
+| How to contribute (external) | [CONTRIBUTING.md](../../CONTRIBUTING.md) |
+| Governance model, roles, decision authority | [GOVERNANCE.md](../../GOVERNANCE.md) |
+| Public contribution RFC track | [rfcs/](../rfcs/) |
+
+The `docs/rfcs/` track is the **public, externally-authorable** RFC process. The
+maintainer/internal RFCs below (`rfc-00N-*.md`) are a separate, team-owned
+track; don't conflate the two.
+
 ## Active Implementation Plans
 
 Working documents for in-flight feature work. Removed when the work lands.
@@ -61,6 +73,7 @@ Working documents for in-flight feature work. Removed when the work lands.
 | Inline + stored queries, request/response envelope, MCP (MR-656 / MR-976 / MR-969) | [rfc-001-queries-envelope-mcp.md](rfc-001-queries-envelope-mcp.md) |
 | Config & CLI architecture — global-first layered config, typed locators, multi-server targeting, auth model (MR-973 / MR-974 / MR-981) | [rfc-002-config-cli-architecture.md](rfc-002-config-cli-architecture.md) |
 | MCP server surface — full tool parity, stored queries, modular auth (MR-969 / MR-956 / MR-974) | [rfc-003-mcp-server-surface.md](rfc-003-mcp-server-surface.md) |
+| Future cluster control plane — declarative as-code config, JSON state ledger, reconciler | [cluster-config-specs.md](cluster-config-specs.md), [cluster-axioms.md](cluster-axioms.md), [cluster-config-implementation-spec.md](cluster-config-implementation-spec.md) |
 
 ## Boundary
 

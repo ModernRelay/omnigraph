@@ -14,8 +14,11 @@ publisher's row-level CAS on `__manifest` is the single fence.
 
 - No `RunRecord`, no `_graph_runs.lance`, no `_graph_run_actors.lance`.
 - No `omnigraph run *` CLI subcommands and no `/runs/*` HTTP endpoints.
-- No `__run__<id>` staging branches. (Legacy on-disk artifacts from
-  pre-MR-771 repos are inert; MR-770 sweeps them in production.)
+- No `__run__<id>` staging branches; `__run__*` is no longer a reserved
+  name. The branch-name guard was removed in MR-770, and any stale
+  `__run__*` branch on an upgraded graph is swept off `__manifest` by the
+  v2→v3 internal-schema migration on first read-write open. (The inert
+  `_graph_runs.lance` bytes remain until a `delete_prefix` primitive lands.)
 - Cancelled mutation futures leave **no graph-level state** — only orphaned
   Lance fragments, which the existing `omnigraph cleanup` pipe reclaims.
 
@@ -154,10 +157,14 @@ are left at `Lance HEAD = manifest_pinned + 1`.
 
 **Recovery protocol** (lifecycle of every staged-write writer —
 `MutationStaging::finalize`, `schema_apply::apply_schema_with_lock`,
-`branch_merge_on_current_target`, `ensure_indices_for_branch`):
+`branch_merge_on_current_target`, `ensure_indices_for_branch`,
+`optimize_all_tables`):
 
 1. **Phase A**: writer writes a sidecar JSON to
-   `__recovery/{ulid}.json` BEFORE its first `commit_staged`. The
+   `__recovery/{ulid}.json` BEFORE its first HEAD-advancing commit
+   (`commit_staged`, or `compact_files` for `optimize_all_tables`,
+   which advances the Lance HEAD via a reserve-fragments + rewrite
+   commit rather than a staged write). The
    sidecar names every `(table_key, table_path, expected_version,
    post_commit_pin)` it intends to commit + the writer kind +
    actor_id.
@@ -192,8 +199,13 @@ recovery sweep in `crates/omnigraph/src/db/manifest/recovery.rs`:
   otherwise full open-time recovery rolls them back and refresh-time
   recovery leaves them for the next read-write open.
 - Otherwise **roll back**: per-table `Dataset::restore` to the
-  manifest-pinned table version for that branch. Rollback records the
-  actual restore target in the audit row's `to_version`.
+  manifest-pinned table version, then a single `ManifestBatchPublisher::publish`
+  of the restored HEAD — symmetric with roll-forward, so `manifest == HEAD`
+  after recovery (no residual drift). This convergence is what lets a
+  failed-then-retried schema apply succeed instead of failing one version higher
+  each iteration. The audit row's `to_version` records the logical
+  rolled-back-to version (`manifest_pinned`); the manifest is published at the
+  restore commit (`manifest_pinned + 1`, same content).
 - After a successful roll-forward or roll-back, an audit row is
   recorded — `_graph_commits.lance` carries
   a commit tagged `actor_id = "omnigraph:recovery"`, and a sibling
@@ -245,9 +257,14 @@ list`.
 
 ## Migration code
 
-`db/manifest/migrations.rs` does not change. Active deletion of
-`_graph_runs.lance` belongs in MR-770 (the production sweep) — this PR
-stops *creating* run state but does not destroy legacy bytes on disk.
+`db/manifest/migrations.rs` carries the v2→v3 internal-schema step (MR-770):
+a one-time sweep that deletes legacy `__run__*` staging branches off
+`__manifest`. It runs in `Omnigraph::open(ReadWrite)` (via
+`manifest::migrate_on_open`, before the coordinator reads branch state) and
+again on the publisher's write path; both are idempotent once the stamp is at
+v3. Deleting the inert `_graph_runs.lance` / `_graph_run_actors.lance` dataset
+*bytes* is still deferred — it needs a `StorageAdapter::delete_prefix`
+primitive — but those bytes are invisible to graph-level state.
 
 ## Mid-query partial failure: closed by MR-794
 
