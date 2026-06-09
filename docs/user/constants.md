@@ -13,6 +13,10 @@
 | Maintenance concurrency | `OMNIGRAPH_MAINTENANCE_CONCURRENCY=8` | `db/omnigraph/optimize.rs` |
 | Lance blob compaction support | `LANCE_SUPPORTS_BLOB_COMPACTION = false` | `db/omnigraph/optimize.rs` |
 | Graph index cache size | `8` (LRU) | `runtime_cache.rs` |
+| Expand indexed-path frontier ceiling | `OMNIGRAPH_EXPAND_INDEXED_MAX_FRONTIER=1024` | `exec/query.rs` |
+| Expand indexed-path hop ceiling | `OMNIGRAPH_EXPAND_INDEXED_MAX_HOPS=6` | `exec/query.rs` |
+| Expand CSR-build cost factor | `CSR_BUILD_FACTOR = 1.5` | `exec/query.rs` |
+| Expand mode override | `OMNIGRAPH_TRAVERSAL_MODE` (`indexed`\|`csr`; unset = cost-based auto) | `exec/query.rs` |
 | Default body limit | `1 MB` | `omnigraph-server/lib.rs` |
 | Ingest body limit | `32 MB` | `omnigraph-server/lib.rs` |
 | Engine embed model | `gemini-embedding-2-preview` | `omnigraph/embedding.rs` |
@@ -21,3 +25,16 @@
 | Embed retries | `4` | both clients |
 | Embed retry backoff | `200 ms` | both clients |
 | LANCE memory pool default | `1 GB` (raised in v0.3.0) | runtime |
+
+**Expand traversal dispatch.** With `OMNIGRAPH_TRAVERSAL_MODE` unset, the engine
+chooses the indexed (per-hop BTREE) vs CSR (whole-graph in-memory) path with a
+cost model over cheap manifest counts (frontier size, |E|, source-vertex count,
+hops) plus the index-coverage signal: the indexed path is preferred when its
+frontier-relative work beats building the CSR (≈ when `hops × frontier` is a
+small fraction of the source-vertex set), and CSR is preferred for dense/deep
+traversals or when the BTREE coverage is degraded and a full scan would be paid
+per hop. The two ceilings bound the **initial dispatch** frontier/hops (beyond
+them CSR is always used); they are not a hard per-hop bound — the cost model
+*estimates* total indexed work as ~`hops × frontier × fanout`, so dense fan-out is
+priced toward CSR rather than capped mid-traversal. The override flag forces a path (the `auto` result is identical either way;
+only the path differs).

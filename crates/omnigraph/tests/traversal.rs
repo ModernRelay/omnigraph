@@ -46,6 +46,194 @@ query not_at_acme() {
     assert_eq!(names_vec, vec!["Bob", "Charlie", "Diana"]);
 }
 
+// Nested anti-join (double negation): proves `not { … not { … } }` recurses
+// through execute_pipeline. "People who do NOT work at any NON-Acme company":
+// inner `not { $c.name = "Acme" }` keeps the non-Acme employers, the outer `not`
+// removes anyone who has one. Alice (Acme only), Charlie & Diana (no employer)
+// remain — distinct from plain unemployed {Charlie, Diana}.
+#[tokio::test]
+async fn nested_anti_join_double_negation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let queries = r#"
+query no_nonacme_employer() {
+    match {
+        $p: Person
+        not {
+            $p worksAt $c
+            not {
+                $c.name = "Acme"
+            }
+        }
+    }
+    return { $p.name }
+}
+"#;
+    let result = query_main(&mut db, queries, "no_nonacme_employer", &ParamMap::new())
+        .await
+        .unwrap();
+
+    let batch = result.concat_batches().unwrap();
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut names_vec: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
+    names_vec.sort();
+    assert_eq!(names_vec, vec!["Alice", "Charlie", "Diana"]);
+}
+
+// The anti-join has two execution forks: the CSR `has_neighbors` fast path
+// (bare single-op Expand inner) and the set-oriented inner-pipeline replay (when
+// dst_filters force a multi-op inner). They must agree. `not { $p worksAt $_ }`
+// takes the fast path; the same negation with an always-true dst filter
+// (`$c.name != ""`) is semantically identical but forces the slow path.
+#[tokio::test]
+async fn anti_join_fast_and_slow_paths_agree() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let queries = r#"
+query fast() {
+    match {
+        $p: Person
+        not { $p worksAt $_ }
+    }
+    return { $p.name }
+}
+query slow() {
+    match {
+        $p: Person
+        not {
+            $p worksAt $c
+            $c.name != ""
+        }
+    }
+    return { $p.name }
+}
+"#;
+    let names = |result: omnigraph_compiler::result::QueryResult| {
+        let batch = result.concat_batches().unwrap();
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let mut v: Vec<String> = (0..col.len()).map(|i| col.value(i).to_string()).collect();
+        v.sort();
+        v
+    };
+
+    let fast = names(query_main(&mut db, queries, "fast", &ParamMap::new()).await.unwrap());
+    let slow = names(query_main(&mut db, queries, "slow", &ParamMap::new()).await.unwrap());
+
+    assert_eq!(fast, slow, "anti-join fast and slow paths must agree");
+    // Alice->Acme, Bob->Globex employed; Charlie & Diana have no employer.
+    assert_eq!(fast, vec!["Charlie", "Diana"]);
+}
+
+// Regression: nested slow-path anti-joins must not collide on the synthetic
+// correlation tag. The outer anti-join tags rows with a correlation column that
+// rides through its inner pipeline; when the inner pipeline contains ANOTHER
+// slow-path anti-join, a fixed tag name would duplicate, and reading it by name
+// returns the OUTER tag — mis-correlating the inner negation. Fan-out (p1 works
+// at two companies) makes the inner row indices diverge from the outer tags, so
+// the bug produces a different person set than the correct one.
+#[tokio::test]
+async fn nested_anti_join_with_fanout_correlates_correctly() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    // p1 -> {Acme, Globex} (fan-out), p2 -> Globex, p3 -> Acme, p4 -> (none).
+    let data = r#"{"type":"Person","data":{"name":"p1"}}
+{"type":"Person","data":{"name":"p2"}}
+{"type":"Person","data":{"name":"p3"}}
+{"type":"Person","data":{"name":"p4"}}
+{"type":"Company","data":{"name":"Acme"}}
+{"type":"Company","data":{"name":"Globex"}}
+{"edge":"WorksAt","from":"p1","to":"Acme"}
+{"edge":"WorksAt","from":"p1","to":"Globex"}
+{"edge":"WorksAt","from":"p2","to":"Globex"}
+{"edge":"WorksAt","from":"p3","to":"Acme"}"#;
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+
+    let queries = r#"
+query no_nonacme_employer() {
+    match {
+        $p: Person
+        not {
+            $p worksAt $c
+            not {
+                $c.name = "Acme"
+            }
+        }
+    }
+    return { $p.name }
+}
+"#;
+    let result = query_main(&mut db, queries, "no_nonacme_employer", &ParamMap::new())
+        .await
+        .unwrap();
+    let batch = result.concat_batches().unwrap();
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut names_vec: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
+    names_vec.sort();
+    // p1 & p2 have a non-Acme employer (Globex) -> excluded; p3 (Acme only) and
+    // p4 (no employer) remain.
+    assert_eq!(names_vec, vec!["p3", "p4"]);
+}
+
+// Regression: a multi-hop anti-join must not take the bulk fast path. The fast
+// path answers via `has_neighbors` (ONE-hop existence), so `not { $p knows{2,2}
+// $x }` would wrongly drop a node that has a 1-hop neighbor but no 2-hop path.
+// Graph: a->b (b is a sink, so a has no 2-hop path), c->d->e (c has a 2-hop
+// path). Only c has a 2-hop knows path, so only c is removed.
+#[tokio::test]
+async fn anti_join_respects_multi_hop_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let data = r#"{"type":"Person","data":{"name":"a"}}
+{"type":"Person","data":{"name":"b"}}
+{"type":"Person","data":{"name":"c"}}
+{"type":"Person","data":{"name":"d"}}
+{"type":"Person","data":{"name":"e"}}
+{"edge":"Knows","from":"a","to":"b"}
+{"edge":"Knows","from":"c","to":"d"}
+{"edge":"Knows","from":"d","to":"e"}"#;
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+
+    let queries = r#"
+query no_two_hop() {
+    match {
+        $p: Person
+        not { $p knows{2,2} $x }
+    }
+    return { $p.name }
+}
+"#;
+    let result = query_main(&mut db, queries, "no_two_hop", &ParamMap::new())
+        .await
+        .unwrap();
+    let batch = result.concat_batches().unwrap();
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut names_vec: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
+    names_vec.sort();
+    // Only c has a 2-hop knows path → removed; everyone else (incl. a, which has
+    // a 1-hop neighbor but no 2-hop path) is kept.
+    assert_eq!(names_vec, vec!["a", "b", "d", "e"]);
+}
+
 // ─── Variable-length hops ───────────────────────────────────────────────────
 
 const CHAIN_SCHEMA: &str = r#"
