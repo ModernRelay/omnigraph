@@ -754,6 +754,142 @@ fn cluster_validate_invalid_config_exits_nonzero() {
     assert!(stdout.contains("future_phase_field"), "{stdout}");
 }
 
+/// Seed an applyable state: schema digest borrowed from `cluster validate`,
+/// graph entry present (composite recomputed by apply), queries/policies
+/// pending.
+fn write_cluster_applyable_state(root: &std::path::Path) -> serde_json::Value {
+    let validate = parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg("validate")
+            .arg("--config")
+            .arg(root)
+            .arg("--json"),
+    ));
+    let schema_digest = validate["resource_digests"]["schema.knowledge"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let state_dir = root.join("__cluster");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        format!(
+            r#"{{
+  "version": 1,
+  "state_revision": 1,
+  "applied_revision": {{
+    "resources": {{
+      "graph.knowledge": {{ "digest": "seed" }},
+      "schema.knowledge": {{ "digest": "{schema_digest}" }}
+    }}
+  }}
+}}
+"#
+        ),
+    )
+    .unwrap();
+    validate
+}
+
+#[test]
+fn cluster_apply_json_applies_query_and_policy() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let validate = write_cluster_applyable_state(temp.path());
+
+    let json = parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg("apply")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(json["ok"], true, "{json}");
+    assert_eq!(json["applied_count"], 2, "{json}");
+    assert_eq!(json["converged"], true, "{json}");
+    assert_eq!(json["state_written"], true, "{json}");
+    assert_eq!(
+        json["resource_statuses"]["query.knowledge.find_person"]["status"],
+        "applied"
+    );
+
+    let query_digest = validate["resource_digests"]["query.knowledge.find_person"]
+        .as_str()
+        .unwrap();
+    let payload = temp
+        .path()
+        .join("__cluster/resources/query/knowledge/find_person")
+        .join(format!("{query_digest}.gq"));
+    assert!(payload.exists(), "missing payload {}", payload.display());
+
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(temp.path().join("__cluster/state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["state_revision"], 2);
+    assert_eq!(
+        state["applied_revision"]["resources"]["query.knowledge.find_person"]["digest"],
+        *query_digest
+    );
+}
+
+#[test]
+fn cluster_apply_missing_state_exits_nonzero() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+
+    let output = output_failure(
+        cli()
+            .arg("cluster")
+            .arg("apply")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    );
+    let json = parse_stdout_json(&output);
+    assert_eq!(json["ok"], false);
+    assert!(
+        json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "state_missing"),
+        "{json}"
+    );
+    assert!(!temp.path().join("__cluster/resources").exists());
+}
+
+#[test]
+fn cluster_apply_locked_exits_nonzero() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    write_cluster_applyable_state(temp.path());
+    write_cluster_lock(temp.path(), "held-lock", "plan");
+
+    let output = output_failure(
+        cli()
+            .arg("cluster")
+            .arg("apply")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    );
+    let json = parse_stdout_json(&output);
+    assert_eq!(json["ok"], false);
+    assert!(
+        json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "state_lock_held"),
+        "{json}"
+    );
+    assert!(temp.path().join("__cluster/lock.json").exists());
+    assert!(!temp.path().join("__cluster/resources").exists());
+}
+
 #[test]
 fn short_version_flag_prints_current_cli_version() {
     let output = output_success(cli().arg("-v"));
