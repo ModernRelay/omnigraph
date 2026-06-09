@@ -42,7 +42,7 @@ of the two files.
 
 ## Supported `cluster.yaml`
 
-Stage 2C accepts only the read-only resource subset:
+Stage 3A accepts only this resource subset:
 
 ```yaml
 version: 1
