@@ -171,18 +171,19 @@ fn apply_cas_race_surfaces_state_cas_mismatch() {
 
     // Simulate the concurrent writer at the exact race window: rewrite
     // state.json (valid JSON, graph/schema digests preserved, revision 99)
-    // after apply read it but before apply writes.
+    // after apply read it but before apply writes. RAII-guarded so a panic
+    // inside apply cannot leak the callback into the global registry.
     let race_path = state_path(dir.path());
-    fail::cfg_callback("cluster_apply.before_state_write", move || {
-        let mut state: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&race_path).unwrap()).unwrap();
-        state["state_revision"] = serde_json::json!(99);
-        fs::write(&race_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
-    })
-    .expect("configure callback failpoint");
+    let failpoint =
+        ScopedFailPoint::with_callback("cluster_apply.before_state_write", move || {
+            let mut state: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&race_path).unwrap()).unwrap();
+            state["state_revision"] = serde_json::json!(99);
+            fs::write(&race_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+        });
 
     let out = apply_config_dir(dir.path());
-    fail::remove("cluster_apply.before_state_write");
+    drop(failpoint);
 
     assert!(!out.ok);
     assert!(!out.state_written);

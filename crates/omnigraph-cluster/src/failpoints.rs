@@ -32,6 +32,20 @@ impl ScopedFailPoint {
             name: name.to_string(),
         }
     }
+
+    /// Register a callback failpoint with the same Drop-based cleanup as
+    /// `new`. Without the guard, a panic while the point is active would
+    /// leak the callback into the process-global registry and fire it under
+    /// later tests in the same binary.
+    pub fn with_callback<F>(name: &str, callback: F) -> Self
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        fail::cfg_callback(name, callback).expect("configure callback failpoint");
+        Self {
+            name: name.to_string(),
+        }
+    }
 }
 
 #[cfg(feature = "failpoints")]
