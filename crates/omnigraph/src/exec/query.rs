@@ -1558,8 +1558,15 @@ async fn hydrate_nodes(
 fn bulk_anti_join_applies(inner_pipeline: &[IROp], outer_var: &str) -> bool {
     matches!(
         inner_pipeline,
-        [IROp::Expand { src_var, dst_filters, .. }]
-            if src_var == outer_var && dst_filters.is_empty()
+        [IROp::Expand { src_var, dst_filters, min_hops, max_hops, .. }]
+            if src_var == outer_var
+                && dst_filters.is_empty()
+                // `has_neighbors` is a ONE-hop existence test, so the fast path
+                // is valid only for a single-hop expand. Multi-hop negations
+                // (e.g. `not { $p knows{2,2} $x }`) fall to the slow path, whose
+                // inner Expand runs the real bounded traversal.
+                && *min_hops == 1
+                && (*max_hops).unwrap_or(1) == 1
     )
 }
 
