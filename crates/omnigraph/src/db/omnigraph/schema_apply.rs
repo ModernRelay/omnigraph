@@ -471,9 +471,8 @@ where
         let table_path = table_path_for_table_key(table_key)?;
         let dataset_uri = db.storage().dataset_uri(&table_path);
         let schema = schema_for_table_key(&desired_catalog, table_key)?;
-        let mut ds = SnapshotHandle::new(
-            TableStore::create_empty_dataset(&dataset_uri, &schema).await?,
-        );
+        let mut ds =
+            SnapshotHandle::new(TableStore::create_empty_dataset(&dataset_uri, &schema).await?);
         db.build_indices_on_dataset_for_catalog(&desired_catalog, table_key, &mut ds)
             .await?;
         let state = db.storage().table_state(&dataset_uri, &ds).await?;
@@ -515,9 +514,8 @@ where
         .await?;
         let table_path = table_path_for_table_key(target_table_key)?;
         let dataset_uri = db.storage().dataset_uri(&table_path);
-        let mut target_ds = SnapshotHandle::new(
-            TableStore::write_dataset(&dataset_uri, batch).await?,
-        );
+        let mut target_ds =
+            SnapshotHandle::new(TableStore::write_dataset(&dataset_uri, batch).await?);
         db.build_indices_on_dataset_for_catalog(&desired_catalog, target_table_key, &mut target_ds)
             .await?;
         let state = db.storage().table_state(&dataset_uri, &target_ds).await?;
@@ -565,31 +563,18 @@ where
         )
         .await?;
         let dataset_uri = db.storage().dataset_uri(&entry.table_path);
-        // Route through stage_overwrite + commit_staged for non-empty
-        // batches. Lance's `InsertBuilder::execute_uncommitted`
-        // errors on empty data (lance-6.0.1 `src/dataset/write/insert.rs:144`),
-        // so the empty-rewrite case stays on `overwrite_dataset` (which
-        // accepts empty input). The empty case is rare in schema_apply
-        // — it only fires when the source table itself was already empty
-        // — and schema_apply runs under `__schema_apply_lock__` so the
-        // narrow inline-commit residual is bounded.
-        let mut target_ds = if batch.num_rows() == 0 {
-            SnapshotHandle::new(TableStore::overwrite_dataset(&dataset_uri, batch).await?)
-        } else {
-            // Pass `entry.table_branch.as_deref()` (not `None`) for
-            // consistency with the indexed_tables block below. Schema
-            // apply runs under `__schema_apply_lock__` which today
-            // rejects non-main branches, so `entry.table_branch` is
-            // expected to be `None`. But the defensive passthrough
-            // means a future relaxation of the lock-check can't quietly
-            // open the wrong HEAD here.
-            let existing = db
-                .storage()
-                .open_dataset_head_for_write(table_key, &dataset_uri, entry.table_branch.as_deref())
-                .await?;
-            let staged = db.storage().stage_overwrite(&existing, batch).await?;
-            db.storage().commit_staged(existing, staged).await?
-        };
+        // Pass `entry.table_branch.as_deref()` (not `None`) for
+        // consistency with the indexed_tables block below. Schema
+        // apply runs under `__schema_apply_lock__` which today rejects
+        // non-main branches, so `entry.table_branch` is expected to be
+        // `None`. But the defensive passthrough means a future relaxation
+        // of the lock-check can't quietly open the wrong HEAD here.
+        let existing = db
+            .storage()
+            .open_dataset_head_for_write(table_key, &dataset_uri, entry.table_branch.as_deref())
+            .await?;
+        let staged = db.storage().stage_overwrite(&existing, batch).await?;
+        let mut target_ds = db.storage().commit_staged(existing, staged).await?;
         db.build_indices_on_dataset_for_catalog(&desired_catalog, table_key, &mut target_ds)
             .await?;
         let state = db.storage().table_state(&dataset_uri, &target_ds).await?;

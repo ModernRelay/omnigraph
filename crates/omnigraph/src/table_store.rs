@@ -12,7 +12,7 @@ use lance::dataset::{
     CommitBuilder, InsertBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode,
     WriteParams,
 };
-use lance::datatypes::BlobKind;
+use lance::datatypes::{BlobKind, Schema as LanceSchema};
 use lance::index::DatasetIndexExt;
 use lance::index::scalar::IndexDetails;
 use lance_file::version::LanceFileVersion;
@@ -786,20 +786,6 @@ impl TableStore {
         }
     }
 
-    pub async fn overwrite_dataset(dataset_uri: &str, batch: RecordBatch) -> Result<Dataset> {
-        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
-        let params = WriteParams {
-            mode: WriteMode::Overwrite,
-            enable_stable_row_ids: true,
-            data_storage_version: Some(LanceFileVersion::V2_2),
-            allow_external_blob_outside_bases: true,
-            ..Default::default()
-        };
-        Dataset::write(reader, dataset_uri, Some(params))
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))
-    }
-
     pub(crate) async fn delete_where(
         &self,
         dataset_uri: &str,
@@ -1077,18 +1063,19 @@ impl TableStore {
         // preserves the source dataset's flag through `Operation::Overwrite`
         // when WriteParams omits it (pinned by
         // `stage_overwrite_preserves_stable_row_ids` in tests/staged_writes.rs),
-        // but setting it explicitly matches the public `overwrite_dataset`
-        // path and keeps the invariant documented at every Overwrite site
+        // but setting it explicitly keeps the invariant documented at every Overwrite site
         // (see docs/storage.md "Stable row IDs"). Setting it on an existing
         // dataset that was created without stable row IDs is a no-op per
         // Lance's row-id-lineage spec, so this stays correct for legacy
         // datasets.
         let (transaction, mut new_fragments) = if batch.num_rows() == 0 {
+            let schema = LanceSchema::try_from(batch.schema().as_ref())
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
             let transaction = TransactionBuilder::new(
                 ds.manifest.version,
                 Operation::Overwrite {
                     fragments: Vec::new(),
-                    schema: ds.schema().clone(),
+                    schema,
                     config_upsert_values: None,
                     initial_bases: None,
                 },

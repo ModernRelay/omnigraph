@@ -88,10 +88,8 @@ Three writers have been migrated onto staged primitives:
   (`exec/merge.rs`) — merge_insert now uses `stage_merge_insert` +
   `commit_staged`. Deletes stay inline (Lance #6658 residual).
 * **`schema_apply` rewritten_tables** (`db/omnigraph/schema_apply.rs`)
-  — non-empty rewrites use `stage_overwrite` + `commit_staged`.
-  Empty-batch rewrites stay inline (Lance `InsertBuilder::execute_uncommitted`
-  rejects empty data; the empty case is rare and bounded by the
-  schema-apply lock branch).
+  — rewrites use `stage_overwrite` + `commit_staged`, including empty-table
+  rewrites via a zero-fragment Lance `Operation::Overwrite`.
 
 A defense-in-depth integration test (`tests/forbidden_apis.rs`) walks
 engine source and fails if non-allow-listed code calls Lance's

@@ -649,8 +649,13 @@ async fn stage_overwrite_empty_batch_replaces_all_rows() {
     .unwrap();
     let pre_version = ds.version().version;
 
+    let target_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, true),
+        Field::new("nickname", DataType::Utf8, true),
+    ]));
     let staged = store
-        .stage_overwrite(&ds, RecordBatch::new_empty(person_schema()))
+        .stage_overwrite(&ds, RecordBatch::new_empty(target_schema.clone()))
         .await
         .unwrap();
     assert!(
@@ -674,6 +679,12 @@ async fn stage_overwrite_empty_batch_replaces_all_rows() {
         .unwrap();
     assert_eq!(new_ds.version().version, pre_version + 1);
     assert_eq!(new_ds.count_rows(None).await.unwrap(), 0);
+    assert!(
+        arrow_schema::Schema::from(new_ds.schema())
+            .field_with_name("nickname")
+            .is_ok(),
+        "empty overwrite must commit the replacement batch schema"
+    );
 }
 
 /// `stage_create_btree_index` writes index segments to object storage
