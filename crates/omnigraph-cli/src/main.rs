@@ -10,6 +10,10 @@ use color_eyre::eyre::{Result, bail};
 use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
 use omnigraph::storage::normalize_root_uri;
+use omnigraph_cluster::{
+    DiagnosticSeverity, PlanOutput, StatusOutput, ValidateOutput, plan_config_dir,
+    status_config_dir, validate_config_dir,
+};
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::{
@@ -324,10 +328,46 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Validate and plan read-only cluster configuration.
+    Cluster {
+        #[command(subcommand)]
+        command: ClusterCommand,
+    },
     /// Manage graphs on a multi-graph server (MR-668)
     Graphs {
         #[command(subcommand)]
         command: GraphsCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ClusterCommand {
+    /// Validate cluster.yaml and referenced schemas, queries, and policy files.
+    Validate {
+        /// Cluster config directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Emit JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Produce a read-only plan by diffing cluster.yaml against __cluster/state.json.
+    Plan {
+        /// Cluster config directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Emit JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read the local JSON state ledger without scanning live graph resources.
+    Status {
+        /// Cluster config directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Emit JSON instead of human text.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -702,6 +742,118 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
     Ok(())
 }
 
+fn print_cluster_validate_human(output: &ValidateOutput) {
+    if output.ok {
+        println!(
+            "cluster config valid: {} resource(s), {} dependency edge(s)",
+            output.resources.len(),
+            output.dependencies.len()
+        );
+    } else {
+        println!("cluster config invalid");
+    }
+    print_cluster_diagnostics(&output.diagnostics);
+}
+
+fn print_cluster_plan_human(output: &PlanOutput) {
+    if output.ok {
+        println!(
+            "cluster plan: {} change(s), {} approval gate(s)",
+            output.changes.len(),
+            output.approvals_required.len()
+        );
+        for change in &output.changes {
+            println!("  {:?} {}", change.operation, change.resource);
+        }
+        if output.changes.is_empty() {
+            println!("  no changes");
+        }
+    } else {
+        println!("cluster plan failed");
+    }
+    print_cluster_diagnostics(&output.diagnostics);
+}
+
+fn print_cluster_status_human(output: &StatusOutput) {
+    if output.ok {
+        let state = &output.state_observations;
+        if state.state_found {
+            println!(
+                "cluster state: revision {}, {} resource(s)",
+                state.state_revision, state.resource_count
+            );
+            if let Some(digest) = state.applied_config_digest.as_deref() {
+                println!("  applied config: {digest}");
+            }
+            if state.locked {
+                match state.lock_id.as_deref() {
+                    Some(lock_id) => println!("  lock: held ({lock_id})"),
+                    None => println!("  lock: held"),
+                }
+            } else {
+                println!("  lock: not held");
+            }
+        } else {
+            println!("cluster state missing");
+        }
+    } else {
+        println!("cluster status failed");
+    }
+    print_cluster_diagnostics(&output.diagnostics);
+}
+
+fn print_cluster_diagnostics(diagnostics: &[omnigraph_cluster::Diagnostic]) {
+    for diagnostic in diagnostics {
+        let label = match diagnostic.severity {
+            DiagnosticSeverity::Error => "ERROR",
+            DiagnosticSeverity::Warning => "WARN ",
+        };
+        println!(
+            "{label} {} {}: {}",
+            diagnostic.code, diagnostic.path, diagnostic.message
+        );
+    }
+}
+
+fn finish_cluster_validate(output: &ValidateOutput, json: bool) -> Result<()> {
+    if json {
+        print_json(output)?;
+    } else {
+        print_cluster_validate_human(output);
+    }
+    if !output.ok {
+        io::stdout().flush()?;
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn finish_cluster_plan(output: &PlanOutput, json: bool) -> Result<()> {
+    if json {
+        print_json(output)?;
+    } else {
+        print_cluster_plan_human(output);
+    }
+    if !output.ok {
+        io::stdout().flush()?;
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn finish_cluster_status(output: &StatusOutput, json: bool) -> Result<()> {
+    if json {
+        print_json(output)?;
+    } else {
+        print_cluster_status_human(output);
+    }
+    if !output.ok {
+        io::stdout().flush()?;
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 fn is_remote_uri(uri: &str) -> bool {
     uri.starts_with("http://") || uri.starts_with("https://")
 }
@@ -820,13 +972,11 @@ struct ResolvedPolicyContext {
 
 fn resolve_policy_context(config: &OmnigraphConfig) -> Result<ResolvedPolicyContext> {
     let selected = config.resolve_policy_tooling_graph_selection()?;
-    let policy_file = config
-        .resolve_policy_file_for(selected)
-        .ok_or_else(|| {
-            color_eyre::eyre::eyre!(
-                "policy.file or graphs.<name>.policy.file must be set in omnigraph.yaml"
-            )
-        })?;
+    let policy_file = config.resolve_policy_file_for(selected).ok_or_else(|| {
+        color_eyre::eyre::eyre!(
+            "policy.file or graphs.<name>.policy.file must be set in omnigraph.yaml"
+        )
+    })?;
     let graph_id = match selected {
         Some(name) => graph_resource_id_for_selection(Some(name), ""),
         None => graph_resource_id_for_selection(None, "default"),
@@ -2185,16 +2335,14 @@ fn rewrite_deprecated_argv(args: Vec<OsString>) -> Vec<OsString> {
     }
     if let Some(sub) = args.get(1).and_then(|s| s.to_str()) {
         match sub {
-            "read" => eprintln!(
-                "warning: `omnigraph read` is deprecated; use `omnigraph query` instead"
-            ),
+            "read" => {
+                eprintln!("warning: `omnigraph read` is deprecated; use `omnigraph query` instead")
+            }
             "change" => eprintln!(
                 "warning: `omnigraph change` is deprecated; use `omnigraph mutate` instead"
             ),
             "check" => {
-                eprintln!(
-                    "warning: `omnigraph check` is deprecated; use `omnigraph lint` instead"
-                );
+                eprintln!("warning: `omnigraph check` is deprecated; use `omnigraph lint` instead");
                 // Rewrite the top-level subcommand to `lint`; pass through the rest.
                 let mut out = Vec::with_capacity(args.len());
                 out.push(args[0].clone());
@@ -3215,6 +3363,20 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Command::Cluster { command } => match command {
+            ClusterCommand::Validate { config, json } => {
+                let output = validate_config_dir(config);
+                finish_cluster_validate(&output, json)?;
+            }
+            ClusterCommand::Plan { config, json } => {
+                let output = plan_config_dir(config);
+                finish_cluster_plan(&output, json)?;
+            }
+            ClusterCommand::Status { config, json } => {
+                let output = status_config_dir(config);
+                finish_cluster_status(&output, json)?;
+            }
+        },
         Command::Graphs { command } => match command {
             GraphsCommand::List {
                 uri,
@@ -3261,8 +3423,8 @@ mod tests {
     use super::{
         DEFAULT_BEARER_TOKEN_ENV, apply_bearer_token, bearer_token_from_env_file,
         legacy_change_request_body, load_cli_config, load_env_file_into_process,
-        normalize_bearer_token, parse_env_assignment, resolve_policy_context,
-        resolve_cli_graph, resolve_remote_bearer_token,
+        normalize_bearer_token, parse_env_assignment, resolve_cli_graph, resolve_policy_context,
+        resolve_remote_bearer_token,
     };
     use omnigraph_server::load_config;
     use reqwest::header::AUTHORIZATION;
@@ -3524,7 +3686,8 @@ graphs:
     }
 
     #[test]
-    fn graph_identity_resolve_policy_context_named_cli_graph_uses_graph_key_not_project_name_or_uri() {
+    fn graph_identity_resolve_policy_context_named_cli_graph_uses_graph_key_not_project_name_or_uri()
+     {
         let temp = tempdir().unwrap();
         let config_path = temp.path().join("omnigraph.yaml");
         fs::write(

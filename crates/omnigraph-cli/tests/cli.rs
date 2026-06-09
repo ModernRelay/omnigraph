@@ -98,6 +98,52 @@ policy:
     (config, policy)
 }
 
+fn write_cluster_config_fixture(root: &std::path::Path) {
+    fs::write(
+        root.join("people.pg"),
+        r#"
+node Person {
+  name: String @key
+  age: I32?
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("people.gq"),
+        r#"
+query find_person($name: String) {
+  match { $p: Person { name: $name } }
+  return { $p.name, $p.age }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(root.join("base.policy.yaml"), "rules: []\n").unwrap();
+    fs::write(
+        root.join("cluster.yaml"),
+        r#"
+version: 1
+metadata:
+  name: company-brain
+state:
+  backend: cluster
+  lock: true
+graphs:
+  knowledge:
+    schema: ./people.pg
+    queries:
+      find_person:
+        file: ./people.gq
+policies:
+  base:
+    file: ./base.policy.yaml
+    applies_to: [knowledge]
+"#,
+    )
+    .unwrap();
+}
+
 #[test]
 fn version_command_prints_current_cli_version() {
     let output = output_success(cli().arg("version"));
@@ -107,6 +153,270 @@ fn version_command_prints_current_cli_version() {
         stdout.trim(),
         format!("omnigraph {}", env!("CARGO_PKG_VERSION"))
     );
+}
+
+#[test]
+fn cluster_validate_config_success() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+
+    let output = output_success(
+        cli()
+            .arg("cluster")
+            .arg("validate")
+            .arg("--config")
+            .arg(temp.path()),
+    );
+    let stdout = stdout_string(&output);
+    assert!(stdout.contains("cluster config valid"), "{stdout}");
+}
+
+#[test]
+fn cluster_validate_json_is_stable() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+
+    let json = parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg("validate")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(json["ok"], true);
+    assert!(json["resource_digests"]["graph.knowledge"].is_string());
+    assert!(json["resource_digests"]["query.knowledge.find_person"].is_string());
+    assert_eq!(json["dependencies"][0]["from"], "policy.base");
+    assert_eq!(json["dependencies"][0]["to"], "graph.knowledge");
+}
+
+#[test]
+fn cluster_plan_json_reads_inferred_local_state() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let state_dir = temp.path().join("__cluster");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        r#"
+{
+  "version": 1,
+  "applied_revision": {
+    "config_digest": "old",
+    "resources": {
+      "graph.knowledge": { "digest": "old-graph" },
+      "policy.old": { "digest": "old-policy" }
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    let json = parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg("plan")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["state_observations"]["state_found"], true);
+    assert!(
+        json["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| change["resource"] == "policy.old" && change["operation"] == "delete"),
+        "plan should read state and delete stale resources: {json}"
+    );
+}
+
+#[test]
+fn cluster_status_json_reports_missing_state() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+
+    let json = parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg("status")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["state_observations"]["state_found"], false);
+    assert!(
+        json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "state_missing"),
+        "missing state should be a warning diagnostic: {json}"
+    );
+}
+
+#[test]
+fn cluster_status_json_reports_extended_state() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let state_dir = temp.path().join("__cluster");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        r#"
+{
+  "version": 1,
+  "state_revision": 5,
+  "applied_revision": {
+    "config_digest": "applied",
+    "resources": {
+      "graph.knowledge": { "digest": "graph-digest" }
+    }
+  },
+  "resource_statuses": {
+    "graph.knowledge": { "status": "applied", "conditions": ["healthy"] }
+  },
+  "approval_records": {},
+  "recovery_records": {},
+  "observations": {}
+}
+"#,
+    )
+    .unwrap();
+
+    let json = parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg("status")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["state_observations"]["state_revision"], 5);
+    assert!(
+        json["state_observations"]["state_cas"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    assert_eq!(json["resource_digests"]["graph.knowledge"], "graph-digest");
+    assert_eq!(
+        json["resource_statuses"]["graph.knowledge"]["status"],
+        "applied"
+    );
+}
+
+#[test]
+fn cluster_plan_json_includes_state_cas_revision_and_lock_observation() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let state_dir = temp.path().join("__cluster");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        r#"
+{
+  "version": 1,
+  "state_revision": 9,
+  "applied_revision": {
+    "config_digest": "old",
+    "resources": {
+      "graph.knowledge": { "digest": "old-graph" }
+    }
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    let json = parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg("plan")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["state_observations"]["state_revision"], 9);
+    assert!(
+        json["state_observations"]["state_cas"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    assert_eq!(json["state_observations"]["locked"], false);
+    assert_eq!(json["state_observations"]["lock_acquired"], true);
+    assert!(json["state_observations"]["acquired_lock_id"].is_string());
+    assert!(!state_dir.join("lock.json").exists());
+}
+
+#[test]
+fn cluster_plan_locked_state_exits_nonzero() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let state_dir = temp.path().join("__cluster");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("lock.json"),
+        r#"
+{
+  "version": 1,
+  "lock_id": "held-lock",
+  "operation": "plan",
+  "created_at": "2026-06-08T00:00:00Z",
+  "pid": 123
+}
+"#,
+    )
+    .unwrap();
+
+    let output = output_failure(
+        cli()
+            .arg("cluster")
+            .arg("plan")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    );
+    let json = parse_stdout_json(&output);
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["state_observations"]["locked"], true);
+    assert_eq!(json["state_observations"]["lock_acquired"], false);
+    assert_eq!(json["state_observations"]["lock_id"], "held-lock");
+    assert!(
+        json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "state_lock_held"),
+        "locked state should produce a useful diagnostic: {json}"
+    );
+}
+
+#[test]
+fn cluster_validate_invalid_config_exits_nonzero() {
+    let temp = tempdir().unwrap();
+    fs::write(
+        temp.path().join("cluster.yaml"),
+        "version: 1\ngraphs: {}\npipelines: {}\n",
+    )
+    .unwrap();
+
+    let output = output_failure(
+        cli()
+            .arg("cluster")
+            .arg("validate")
+            .arg("--config")
+            .arg(temp.path()),
+    );
+    let stdout = stdout_string(&output);
+    assert!(stdout.contains("future_phase_field"), "{stdout}");
 }
 
 #[test]
@@ -895,8 +1205,7 @@ fn deprecated_read_and_change_subcommands_emit_warnings() {
     let output = cli().arg("read").output().unwrap();
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stderr.contains("`omnigraph read` is deprecated")
-            && stderr.contains("`omnigraph query`"),
+        stderr.contains("`omnigraph read` is deprecated") && stderr.contains("`omnigraph query`"),
         "expected `omnigraph read` deprecation warning; got: {stderr}"
     );
 
@@ -2491,9 +2800,19 @@ fn queries_validate_exits_zero_on_clean_registry() {
     );
     let config = graph.write_config(
         "omnigraph.yaml",
-        &queries_test_config(&graph.path().to_string_lossy(), "find_person", "find_person.gq"),
+        &queries_test_config(
+            &graph.path().to_string_lossy(),
+            "find_person",
+            "find_person.gq",
+        ),
     );
-    let output = output_success(cli().arg("queries").arg("validate").arg("--config").arg(&config));
+    let output = output_success(
+        cli()
+            .arg("queries")
+            .arg("validate")
+            .arg("--config")
+            .arg(&config),
+    );
     let stdout = stdout_string(&output);
     assert!(stdout.contains("OK"), "stdout:\n{stdout}");
 }
@@ -2502,12 +2821,21 @@ fn queries_validate_exits_zero_on_clean_registry() {
 fn queries_validate_exits_nonzero_on_type_broken_query() {
     let graph = SystemGraph::loaded();
     // `Widget` is not in the fixture schema.
-    graph.write_query("ghost.gq", "query ghost() { match { $w: Widget } return { $w.name } }");
+    graph.write_query(
+        "ghost.gq",
+        "query ghost() { match { $w: Widget } return { $w.name } }",
+    );
     let config = graph.write_config(
         "omnigraph.yaml",
         &queries_test_config(&graph.path().to_string_lossy(), "ghost", "ghost.gq"),
     );
-    let output = output_failure(cli().arg("queries").arg("validate").arg("--config").arg(&config));
+    let output = output_failure(
+        cli()
+            .arg("queries")
+            .arg("validate")
+            .arg("--config")
+            .arg(&config),
+    );
     let stdout = stdout_string(&output);
     assert!(
         stdout.contains("ghost"),
@@ -2541,7 +2869,13 @@ fn queries_list_prints_registered_query() {
             graph.path().to_string_lossy().replace('\'', "''")
         ),
     );
-    let output = output_success(cli().arg("queries").arg("list").arg("--config").arg(&config));
+    let output = output_success(
+        cli()
+            .arg("queries")
+            .arg("list")
+            .arg("--config")
+            .arg(&config),
+    );
     let stdout = stdout_string(&output);
     assert!(stdout.contains("find_person"), "stdout:\n{stdout}");
     assert!(
@@ -2577,7 +2911,13 @@ fn queries_list_requires_graph_selection_for_per_graph_only_registries() {
         ),
     );
 
-    let output = output_failure(cli().arg("queries").arg("list").arg("--config").arg(&config));
+    let output = output_failure(
+        cli()
+            .arg("queries")
+            .arg("list")
+            .arg("--config")
+            .arg(&config),
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("local") && stderr.contains("--target local"),
@@ -2602,7 +2942,13 @@ fn queries_list_without_graph_selection_lists_top_level_registry() {
         ),
     );
 
-    let output = output_success(cli().arg("queries").arg("list").arg("--config").arg(&config));
+    let output = output_success(
+        cli()
+            .arg("queries")
+            .arg("list")
+            .arg("--config")
+            .arg(&config),
+    );
     let stdout = stdout_string(&output);
     assert!(stdout.contains("top_find"), "stdout:\n{stdout}");
 }
@@ -2621,7 +2967,11 @@ fn queries_list_unknown_target_errors() {
     );
     let config = graph.write_config(
         "omnigraph.yaml",
-        &queries_test_config(&graph.path().to_string_lossy(), "find_person", "find_person.gq"),
+        &queries_test_config(
+            &graph.path().to_string_lossy(),
+            "find_person",
+            "find_person.gq",
+        ),
     );
     let output = output_failure(
         cli()
@@ -2663,7 +3013,7 @@ fn queries_commands_reject_named_graph_with_populated_top_level_block() {
                 "        file: ./find_person.gq\n",
                 "cli:\n",
                 "  graph: local\n",
-                "queries:\n",                 // populated top-level block: the coherence violation
+                "queries:\n", // populated top-level block: the coherence violation
                 "  legacy:\n",
                 "    file: ./legacy.gq\n",
                 "policy: {{}}\n",
@@ -2689,8 +3039,14 @@ fn queries_validate_exits_nonzero_on_duplicate_tool_name() {
     // collision — `queries validate` must fail (offline, before the engine
     // opens) and name both queries plus the contested tool.
     let graph = SystemGraph::loaded();
-    graph.write_query("a.gq", "query a() { match { $p: Person } return { $p.name } }");
-    graph.write_query("b.gq", "query b() { match { $p: Person } return { $p.name } }");
+    graph.write_query(
+        "a.gq",
+        "query a() { match { $p: Person } return { $p.name } }",
+    );
+    graph.write_query(
+        "b.gq",
+        "query b() { match { $p: Person } return { $p.name } }",
+    );
     let config = graph.write_config(
         "omnigraph.yaml",
         &format!(
@@ -2712,7 +3068,13 @@ fn queries_validate_exits_nonzero_on_duplicate_tool_name() {
             graph.path().to_string_lossy().replace('\'', "''")
         ),
     );
-    let output = output_failure(cli().arg("queries").arg("validate").arg("--config").arg(&config));
+    let output = output_failure(
+        cli()
+            .arg("queries")
+            .arg("validate")
+            .arg("--config")
+            .arg(&config),
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("dup") && stderr.contains("'a'") && stderr.contains("'b'"),
@@ -2732,7 +3094,10 @@ fn queries_validate_positional_uri_ignores_default_graph() {
     );
     // `Widget` is not in the fixture schema — the default graph's per-graph
     // query would break validate if it were (wrongly) selected.
-    graph.write_query("broken.gq", "query broken() { match { $w: Widget } return { $w.name } }");
+    graph.write_query(
+        "broken.gq",
+        "query broken() { match { $w: Widget } return { $w.name } }",
+    );
     let config = graph.write_config(
         "omnigraph.yaml",
         concat!(

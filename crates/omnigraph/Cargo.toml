@@ -55,3 +55,4 @@ omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.6.2" }
 tokio = { workspace = true }
 lance-namespace-impls = { workspace = true }
 serial_test = "3"
+proptest = "1"

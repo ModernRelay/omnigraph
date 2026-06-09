@@ -236,6 +236,15 @@ pub fn vector_param(name: &str, values: &[f32]) -> ParamMap {
     map
 }
 
+/// Build a ParamMap with two vector params.
+pub fn two_vector_params(name1: &str, vals1: &[f32], name2: &str, vals2: &[f32]) -> ParamMap {
+    let mut map = vector_param(name1, vals1);
+    let key = name2.strip_prefix('$').unwrap_or(name2).to_string();
+    let lit = Literal::List(vals2.iter().map(|v| Literal::Float(*v as f64)).collect());
+    map.insert(key, lit);
+    map
+}
+
 /// Build a ParamMap with a vector param and a string param.
 pub fn vector_and_string_params(
     vec_name: &str,
