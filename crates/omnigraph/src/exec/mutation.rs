@@ -569,7 +569,8 @@ use super::staging::{MutationStaging, PendingMode};
 /// via `open_for_mutation_on_branch`, which compares Lance HEAD against
 /// the manifest's pinned version — that fence is the engine's
 /// publisher-style OCC catching cross-writer drift before we make any
-/// changes.
+/// changes. For delete-only queries, this strict open is also the uncovered
+/// drift guard that runs before `delete_where` can inline-commit.
 ///
 /// On subsequent touches *within the same query*, behavior depends on
 /// whether the table has already been inline-committed by a delete op:

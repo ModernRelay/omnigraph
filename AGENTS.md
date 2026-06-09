@@ -214,9 +214,12 @@ omnigraph schema apply --schema ./next.pg s3://my-bucket/graph.omni --json
 # Merge review branch back
 omnigraph branch merge review/2026-04-25 --into main s3://my-bucket/graph.omni
 
-# Compact, repair uncovered drift if reported, then GC (preview, then confirm)
+# Compact, preview any uncovered drift, then repair/GC after review
 omnigraph optimize s3://my-bucket/graph.omni
+omnigraph repair s3://my-bucket/graph.omni
 omnigraph repair --confirm s3://my-bucket/graph.omni
+# For suspicious/unverifiable drift only after deliberate review:
+# omnigraph repair --force --confirm s3://my-bucket/graph.omni
 omnigraph cleanup  --keep 10 --older-than 7d s3://my-bucket/graph.omni
 omnigraph cleanup  --keep 10 --older-than 7d --confirm s3://my-bucket/graph.omni
 

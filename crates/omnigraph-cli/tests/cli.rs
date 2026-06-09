@@ -1,5 +1,6 @@
 use std::fs;
 
+use lance::Dataset;
 use lance::index::DatasetIndexExt;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use serde_json::Value;
@@ -57,6 +58,25 @@ fn manifest_dataset_version(graph: &std::path::Path) -> u64 {
             .await
             .unwrap()
             .version()
+    })
+}
+
+fn forge_person_delete_drift(graph: &std::path::Path) -> (u64, u64) {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let uri = graph.to_string_lossy();
+        let db = Omnigraph::open(uri.as_ref()).await.unwrap();
+        let snap = db
+            .snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap();
+        let entry = snap.entry("node:Person").unwrap();
+        let full_path = format!("{}/{}", uri.trim_end_matches('/'), entry.table_path);
+        let mut ds = Dataset::open(&full_path).await.unwrap();
+        let deleted = ds.delete("name = 'Alice'").await.unwrap();
+        assert_eq!(deleted.num_deleted_rows, 1);
+        let head = deleted.new_dataset.version().version;
+        assert!(head > entry.table_version);
+        (entry.table_version, head)
     })
 }
 
@@ -253,6 +273,63 @@ fn repair_json_reports_noop_on_clean_graph() {
     assert!(tables.iter().all(|table| {
         table["classification"] == "no_drift" && table["action"] == "no_op"
     }));
+}
+
+#[test]
+fn repair_confirm_json_refuses_suspicious_drift_with_nonzero_exit_then_force_succeeds() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+    let graph_manifest_before = manifest_dataset_version(&graph);
+    let (table_manifest_before, table_head_before) = forge_person_delete_drift(&graph);
+
+    let refused = output_failure(
+        cli()
+            .arg("repair")
+            .arg("--confirm")
+            .arg("--json")
+            .arg(&graph),
+    );
+    let refused_payload: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(refused_payload["manifest_version"], Value::Null);
+    let person = refused_payload["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|table| table["table_key"] == "node:Person")
+        .unwrap();
+    assert_eq!(person["classification"], "suspicious");
+    assert_eq!(person["action"], "refused");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("repair refused"),
+        "stderr should explain the non-zero exit; got: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(manifest_dataset_version(&graph), graph_manifest_before);
+
+    let forced = output_success(
+        cli()
+            .arg("repair")
+            .arg("--force")
+            .arg("--confirm")
+            .arg("--json")
+            .arg(&graph),
+    );
+    let forced_payload: Value = serde_json::from_slice(&forced.stdout).unwrap();
+    let forced_manifest = forced_payload["manifest_version"].as_u64().unwrap();
+    assert!(forced_manifest > graph_manifest_before);
+    let person = forced_payload["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|table| table["table_key"] == "node:Person")
+        .unwrap();
+    assert_eq!(person["classification"], "suspicious");
+    assert_eq!(person["action"], "forced");
+    assert_eq!(person["manifest_version"], table_manifest_before);
+    assert_eq!(person["lance_head_version"], table_head_before);
+    assert_eq!(manifest_dataset_version(&graph), forced_manifest);
 }
 
 #[test]

@@ -16,7 +16,7 @@
 ## `repair_all_tables(db, options)` — explicit
 
 - Handles **uncovered manifest/head drift**: a table's Lance HEAD is ahead of the manifest pin and no recovery sidecar records the writer intent.
-- Preview by default. `omnigraph repair --json <uri>` reports each table's `classification`, `action`, manifest/head versions, Lance operation names, and any classification error. `--confirm` publishes only verified maintenance drift. `--force --confirm` also publishes suspicious or unverifiable drift after operator review.
+- Preview by default. `omnigraph repair --json <uri>` reports each table's `classification`, `action`, manifest/head versions, Lance operation names, and any classification error. `--confirm` publishes only verified maintenance drift; if any suspicious or unverifiable table is refused, the CLI prints the per-table output and exits non-zero. `--force --confirm` also publishes suspicious or unverifiable drift after operator review.
 - Classifies drift by reading Lance transactions from `manifest_version + 1` through `lance_head_version`. Only `ReserveFragments` and `Rewrite` are verified maintenance. Semantic operations such as `Append`, `Delete`, `Update`, `Merge`, or missing transaction history are not auto-healed.
 - Publishes repair by advancing `__manifest` to the existing Lance HEAD; it does **not** rewrite Lance data. If the publish succeeds, normal reads and strict writes use the repaired version. If it fails, no new data-side partial state was created.
 - Requires a clean recovery state. Pending `__recovery` sidecars still belong to automatic sidecar recovery, not manual repair.

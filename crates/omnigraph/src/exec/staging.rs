@@ -503,7 +503,8 @@ impl StagedMutation {
         // HEAD>manifest drift is refused. For writes targeting a branch other
         // than the engine's bound branch (e.g., feature-branch ingest from a
         // server handle bound to main), the same helper also resolves the
-        // correct branch pin. The cost is one fresh manifest read per mutation.
+        // correct branch pin. The cost is one fresh manifest read per mutation
+        // plus one Lance HEAD open per staged table for the drift guard below.
         //
         // Multi-coordinator deployments (§VI.27 aspirational) get
         // genuine cross-process drift detection from this read for

@@ -533,6 +533,44 @@ async fn non_strict_load_refuses_uncovered_drift_before_folding_it() {
     assert_eq!(head_after, head_before);
 }
 
+#[tokio::test]
+async fn delete_only_mutation_refuses_uncovered_drift_before_inline_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir
+        .path()
+        .to_str()
+        .unwrap()
+        .trim_end_matches('/')
+        .to_string();
+    let mut db = init_and_load(&dir).await;
+    let (manifest_before, head_before, _) = forge_person_compaction_drift(&mut db, &root).await;
+
+    let err = mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "remove_person",
+        &mixed_params(&[("$name", "Alice")], &[]),
+    )
+    .await
+    .expect_err("strict delete must reject uncovered drift before delete_where");
+    assert!(
+        err.to_string().contains("expected"),
+        "delete should fail as a strict stale-version write; got: {err}"
+    );
+
+    let (manifest_after, head_after, _) = person_manifest_and_head(&db, &root).await;
+    assert_eq!(manifest_after, manifest_before);
+    assert_eq!(
+        head_after, head_before,
+        "delete_where must not run after the strict drift guard fails"
+    );
+    assert_eq!(
+        count_rows(&db, "node:Person").await,
+        8,
+        "manifest-pinned reads should still see all rows present before the failed delete"
+    );
+}
+
 // Regression: `optimize` must REFUSE when an unresolved recovery sidecar is
 // pending. Operating on an unrecovered graph could publish a partial write that
 // the all-or-nothing recovery sweep would roll back; the operator must reopen

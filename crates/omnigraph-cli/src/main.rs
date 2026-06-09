@@ -3066,6 +3066,11 @@ async fn main() -> Result<()> {
             let stats = db
                 .repair(omnigraph::db::RepairOptions { confirm, force })
                 .await?;
+            let refused_count = stats
+                .tables
+                .iter()
+                .filter(|s| matches!(s.action, omnigraph::db::RepairAction::Refused))
+                .count();
             if json {
                 let value = serde_json::json!({
                     "uri": uri,
@@ -3120,6 +3125,14 @@ async fn main() -> Result<()> {
                 if !confirm {
                     println!("rerun with --confirm to publish verified maintenance drift");
                 }
+            }
+            if refused_count > 0 {
+                bail!(
+                    "repair refused {} suspicious or unverifiable table(s); review the preview \
+                     output and rerun with --force --confirm only if publishing that drift is \
+                     intentional",
+                    refused_count
+                );
             }
         }
         Command::Cleanup {

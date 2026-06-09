@@ -289,6 +289,24 @@ async fn optimize_one_table(
     full_path: String,
     has_blob: bool,
 ) -> Result<TableOptimizeStats> {
+    // Lance `compact_files` mis-decodes blob-v2 columns under the forced
+    // `BlobHandling::AllBinary` read (see LANCE_SUPPORTS_BLOB_COMPACTION). Skip
+    // blob-bearing tables before acquiring the write queue; `repair` is the
+    // operator tool for full manifest/head drift classification.
+    if has_blob && !LANCE_SUPPORTS_BLOB_COMPACTION {
+        tracing::warn!(
+            target: "omnigraph::optimize",
+            table = %table_key,
+            "skipping compaction: table has blob columns the current Lance \
+             cannot rewrite (blob-v2 AllBinary decode bug); other tables \
+             unaffected — rerun after the Lance fix",
+        );
+        return Ok(TableOptimizeStats::skipped(
+            table_key,
+            SkipReason::BlobColumnsUnsupportedByLance,
+        ));
+    }
+
     // Serialize the whole compact→publish against concurrent mutations on this
     // (table, main): compaction is a Rewrite op that retryable-conflicts with a
     // concurrent Merge/Update/Delete on overlapping fragments, and an
@@ -333,23 +351,6 @@ async fn optimize_one_table(
             table_key,
             expected_version,
             lance_head_version,
-        ));
-    }
-
-    // Lance `compact_files` mis-decodes blob-v2 columns under the forced
-    // `BlobHandling::AllBinary` read (see LANCE_SUPPORTS_BLOB_COMPACTION). Skip
-    // blob-bearing tables and report it rather than aborting the whole sweep.
-    if has_blob && !LANCE_SUPPORTS_BLOB_COMPACTION {
-        tracing::warn!(
-            target: "omnigraph::optimize",
-            table = %table_key,
-            "skipping compaction: table has blob columns the current Lance \
-             cannot rewrite (blob-v2 AllBinary decode bug); other tables \
-             unaffected — rerun after the Lance fix",
-        );
-        return Ok(TableOptimizeStats::skipped(
-            table_key,
-            SkipReason::BlobColumnsUnsupportedByLance,
         ));
     }
 
