@@ -19,7 +19,7 @@ Top-level command families and subcommands. Graph-targeting commands accept eith
 | `commit list \| show` | inspect commit graph |
 | `schema plan \| apply \| show (alias: get)` | migrations |
 | `lint` (alias: `check`) | offline / graph-backed query validation. Replaces `query lint` / `query check`, which are kept as deprecated argv-level shims that print a one-line warning and rewrite to `omnigraph lint` |
-| `cluster validate \| plan \| status \| refresh \| import \| force-unlock` | cluster-control preview. `validate` checks a local `cluster.yaml` folder and referenced schema/query/policy files; `plan` diffs it against local JSON state at `__cluster/state.json`; `status` reads the state ledger; `refresh`/`import` explicitly update local JSON state from read-only graph observations; `force-unlock <LOCK_ID>` manually removes a held local state lock by exact id. No apply, graph-resource mutation, server change, automatic stale-lock breaking, or `plan --refresh` occurs in Stage 2C |
+| `cluster validate \| plan \| apply \| status \| refresh \| import \| force-unlock` | cluster-control preview. `validate` checks a local `cluster.yaml` folder and referenced schema/query/policy files; `plan` diffs it against local JSON state at `__cluster/state.json` and annotates each change with its apply disposition; `apply` executes the config-only (stored-query/policy) subset into the content-addressed local catalog under `__cluster/resources/` — graph/schema changes are deferred loudly, and nothing applied serves traffic (the server still boots from `omnigraph.yaml`); `status` reads the state ledger; `refresh`/`import` explicitly update local JSON state from read-only graph observations; `force-unlock <LOCK_ID>` manually removes a held local state lock by exact id. No graph-manifest movement, server change, automatic stale-lock breaking, or `plan --refresh` occurs in Stage 3A |
 | `optimize` | non-destructive Lance compaction (skips tables with `Blob` columns or uncovered drift; `--json` reports `skipped`) |
 | `repair [--confirm] [--force]` | preview or explicitly publish uncovered manifest/head drift. `--confirm` heals verified maintenance drift and exits non-zero if suspicious/unverifiable drift is refused; `--force --confirm` publishes suspicious/unverifiable drift after operator review |
 | `cleanup --keep N --older-than 7d --confirm` | destructive version GC |
@@ -78,6 +78,7 @@ policy:
 ```bash
 omnigraph cluster validate --config ./company-brain
 omnigraph cluster plan     --config ./company-brain --json
+omnigraph cluster apply    --config ./company-brain --json
 omnigraph cluster status   --config ./company-brain --json
 omnigraph cluster refresh  --config ./company-brain --json
 omnigraph cluster import   --config ./company-brain --json
@@ -85,16 +86,20 @@ omnigraph cluster force-unlock <LOCK_ID> --config ./company-brain --json
 ```
 
 `--config` is a directory containing `cluster.yaml`; it defaults to `.`.
-Stage 2C accepts graphs, schemas, stored queries, and policy bundle file
+Stage 3A accepts graphs, schemas, stored queries, and policy bundle file
 references. `cluster plan` reads local JSON state from
 `<config-dir>/__cluster/state.json`; a missing file means empty state. Plan,
-refresh, and import acquire `__cluster/lock.json` by default and release it
-before returning. `cluster status` reads state only and reports any existing
+apply, refresh, and import acquire `__cluster/lock.json` by default and release
+it before returning. `cluster apply` executes only stored-query/policy catalog
+writes (content-addressed under `__cluster/resources/`) and requires an
+existing `state.json`; graph/schema changes are deferred with warnings, and
+applied resources do not serve traffic — the server still boots from
+`omnigraph.yaml`. `cluster status` reads state only and reports any existing
 lock metadata. `force-unlock` removes a lock only when the supplied id exactly
 matches the lock file. `refresh` requires an existing `state.json`; `import`
 creates one only when it is missing. Both observe declared graphs read-only at
-`<config-dir>/graphs/<graph-id>.omni`. External state backends, apply,
-automatic stale-lock breaking, `plan --refresh`, pipelines, UI specs,
+`<config-dir>/graphs/<graph-id>.omni`. External state backends, graph/schema
+apply, automatic stale-lock breaking, `plan --refresh`, pipelines, UI specs,
 embeddings, aliases, and bindings are reserved for later stages. See
 [cluster-config.md](cluster-config.md).
 

@@ -1,19 +1,23 @@
 # Cluster Config
 
-**Status:** Stage 2C state-lock recovery preview.
+**Status:** Stage 3A config-only apply preview.
 
 Cluster config is the future control-plane configuration surface for a whole
 OmniGraph deployment. In this stage, OmniGraph can validate a local
 `cluster.yaml` folder, produce a deterministic read-only plan, inspect the
-local JSON state ledger, and explicitly refresh/import graph observations into
-that ledger. It can also manually remove a held local state lock by exact lock
-id. It does not apply desired changes, start servers, or write graph resources.
+local JSON state ledger, explicitly refresh/import graph observations into
+that ledger, manually remove a held local state lock by exact lock id, and
+**apply the config-only subset of the plan** — stored-query and policy-bundle
+catalog writes. It does not move graph manifests, change schemas, start
+servers, or serve anything it applies: the server still boots from
+`omnigraph.yaml`.
 
 ## Commands
 
 ```bash
 omnigraph cluster validate --config ./company-brain
 omnigraph cluster plan     --config ./company-brain --json
+omnigraph cluster apply    --config ./company-brain --json
 omnigraph cluster status   --config ./company-brain --json
 omnigraph cluster refresh  --config ./company-brain --json
 omnigraph cluster import   --config ./company-brain --json
@@ -51,9 +55,9 @@ policies:
 
 `metadata.name` is a display label. `state.backend` may be omitted or set to
 `cluster`; external state backends are reserved for a later stage. `state.lock`
-defaults to `true`. When enabled, `cluster plan`, `cluster refresh`, and
-`cluster import` briefly acquire `<config-dir>/__cluster/lock.json`, then remove
-it before returning. `cluster status` never acquires the lock; it only reports
+defaults to `true`. When enabled, `cluster plan`, `cluster apply`,
+`cluster refresh`, and `cluster import` briefly acquire
+`<config-dir>/__cluster/lock.json`, then remove it before returning. `cluster status` never acquires the lock; it only reports
 whether one is present. `cluster force-unlock` is the only lock-removal command;
 it requires the exact lock id and should be run only after confirming no cluster
 operation is active.
@@ -125,8 +129,53 @@ successful `plan` instead reports `lock_acquired: true` and an
 `acquired_lock_id`, then releases the lock before returning. The command never
 writes `state.json` and does not scan live graphs. Use explicit
 `cluster refresh` / `cluster import` when the state ledger should be updated
-from live observations. Apply and live drift scans during plan are later-stage
-work.
+from live observations. Live drift scans during plan are later-stage work.
+
+Each plan change carries a `disposition` field — an honest preview of what
+`cluster apply` will do with it in this stage: `applied` (executes), `derived`
+(a `graph.<id>` composite-digest update that converges automatically once its
+query digests land), `deferred` (graph/schema change, later phase), or
+`blocked` (query/policy gated by an unapplied or missing dependency, with the
+condition in `reason`).
+
+## Apply
+
+`cluster apply` executes the config-only subset of the plan — stored-query and
+policy-bundle changes. There is no confirm flag: `cluster plan` is the preview,
+and apply recomputes the same diff under the state lock before executing, so a
+stale preview can never be applied. Apply requires an existing `state.json`
+(`state_missing` directs you to `cluster import` first).
+
+For each applied create/update, the resource payload is written
+content-addressed into the local catalog:
+
+```text
+<config-dir>/__cluster/resources/query/<graph>/<name>/<digest>.gq
+<config-dir>/__cluster/resources/policy/<name>/<digest>.yaml
+```
+
+Extensions are fixed per kind regardless of the source file's name. Payloads
+are written before the state update because `state.json` is the publish point:
+if the final CAS-checked state write fails, no success is reported and the
+digest-named blobs already written are inert — re-running apply is the repair.
+Deletes remove the resource from state; their old payload blobs stay on disk
+(garbage collection is a later stage). Re-running a converged apply is a no-op:
+no state write, no revision change (`state_written: false`).
+
+**Applied means recorded in the cluster catalog — nothing more.** The server
+still boots from `omnigraph.yaml`; no query or policy applied here serves
+traffic until the server-boot stage ships, as an explicit per-deployment mode
+switch.
+
+Graph and schema changes are never executed by this stage. They are reported
+as `deferred` (warning `apply_unsupported_change`), and query/policy changes
+that depend on them are `blocked` (warning `apply_dependency_blocked`, status
+`blocked` in state). A partially-applicable plan still exits 0 with warnings;
+the JSON `converged` field is the automation signal for "state now matches the
+desired revision". The applied `config_digest` is only recorded when apply
+fully converges. The `graph.<id>` composite digest is recomputed from state's
+own schema/query digests after each apply, so applied query changes converge
+without graph movement.
 
 ## Status
 
