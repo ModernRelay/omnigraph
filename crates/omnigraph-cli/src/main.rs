@@ -283,6 +283,25 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Classify and explicitly repair manifest/head drift
+    Repair {
+        /// Graph URI
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Publish verified maintenance drift. Without this flag, repair only
+        /// previews what it would do.
+        #[arg(long)]
+        confirm: bool,
+        /// Also publish suspicious or unverifiable drift. Requires
+        /// `--confirm`; use only after operator review.
+        #[arg(long, requires = "confirm")]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove old Lance versions from every table of the graph (destructive)
     Cleanup {
         /// Graph URI
@@ -3012,6 +3031,8 @@ async fn main() -> Result<()> {
                         "fragments_added": s.fragments_added,
                         "committed": s.committed,
                         "skipped": s.skipped.map(|r| r.as_str()),
+                        "manifest_version": s.manifest_version,
+                        "lance_head_version": s.lance_head_version,
                     })).collect::<Vec<_>>(),
                 });
                 print_json(&value)?;
@@ -3028,6 +3049,76 @@ async fn main() -> Result<()> {
                     } else {
                         println!("  {:<40} no-op", s.table_key);
                     }
+                }
+            }
+        }
+        Command::Repair {
+            uri,
+            target,
+            config,
+            confirm,
+            force,
+            json,
+        } => {
+            let config = load_cli_config(config.as_ref())?;
+            let uri = resolve_uri(&config, uri, target.as_deref())?;
+            let db = Omnigraph::open(&uri).await?;
+            let stats = db
+                .repair(omnigraph::db::RepairOptions { confirm, force })
+                .await?;
+            if json {
+                let value = serde_json::json!({
+                    "uri": uri,
+                    "confirm": confirm,
+                    "force": force,
+                    "manifest_version": stats.manifest_version,
+                    "tables": stats.tables.iter().map(|s| serde_json::json!({
+                        "table_key": s.table_key,
+                        "manifest_version": s.manifest_version,
+                        "lance_head_version": s.lance_head_version,
+                        "classification": s.classification.as_str(),
+                        "action": s.action.as_str(),
+                        "operations": s.operations,
+                        "error": s.error,
+                    })).collect::<Vec<_>>(),
+                });
+                print_json(&value)?;
+            } else {
+                let mode = if confirm { "confirm" } else { "preview" };
+                println!(
+                    "repair {} — {} mode, {} tables",
+                    uri,
+                    mode,
+                    stats.tables.len()
+                );
+                for s in &stats.tables {
+                    let drift = if s.manifest_version == s.lance_head_version {
+                        format!("{}", s.manifest_version)
+                    } else {
+                        format!("{} → {}", s.manifest_version, s.lance_head_version)
+                    };
+                    let ops = if s.operations.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", s.operations.join(", "))
+                    };
+                    let err = s
+                        .error
+                        .as_ref()
+                        .map(|err| format!(" ({err})"))
+                        .unwrap_or_default();
+                    println!(
+                        "  {:<40} {:<12} {:<22} {}{}{}",
+                        s.table_key,
+                        s.action.as_str(),
+                        s.classification.as_str(),
+                        drift,
+                        ops,
+                        err
+                    );
+                }
+                if !confirm {
+                    println!("rerun with --confirm to publish verified maintenance drift");
                 }
             }
         }

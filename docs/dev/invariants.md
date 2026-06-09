@@ -150,9 +150,9 @@ them explicit.
   `NoMovement`; a recovery sidecar would not change this). Impact is bounded to
   commit history: `commit list` misses N, time-travel by commit id to N fails,
   and merge-base loses a node (a likely-benign off-by-one re-merge). This affects
-  every publish, not the optimize drift-reconcile specifically. Eventual fix:
-  make the commit graph reconcilable from the manifest (or the two writes
-  atomic) — not a recovery-sidecar concern.
+  every publish, not a specific maintenance command. Eventual fix: make the
+  commit graph reconcilable from the manifest (or the two writes atomic) — not a
+  recovery-sidecar concern.
 - **Planner capability/stat surfaces:** cost-aware planning, complete
   capability advertisement, and explain-with-cost are roadmap. Do not describe
   them as implemented.

@@ -1,16 +1,25 @@
-# Maintenance: Optimize & Cleanup
+# Maintenance: Optimize, Repair & Cleanup
 
-`db/omnigraph/optimize.rs`.
+`db/omnigraph/optimize.rs` and `db/omnigraph/repair.rs`.
 
 ## `optimize_all_tables(db)` — non-destructive
 
 - Lance `compact_files()` on every node + edge table on `main`, then **publishes the compacted version to the `__manifest`** so the manifest's `table_version` tracks the compacted Lance HEAD. Reads pin the manifest version, so without this publish compaction would be invisible to readers *and* would break the HEAD-vs-manifest precondition of the next schema apply / strict update/delete ("stale view … refresh and retry"). The publish advances the graph version (a system-attributed commit) only for tables that actually compacted.
 - Rewrites small fragments into fewer large ones; old fragments remain reachable via older manifests until `cleanup` runs.
 - Each table's compact→publish runs under its per-`(table, main)` write queue (serializing with concurrent mutations — compaction is a Lance `Rewrite` op that retryable-conflicts with a concurrent merge/update/delete on overlapping fragments). The Lance-HEAD-before-manifest-publish gap is covered by a `SidecarKind::Optimize` recovery sidecar (loose-match): a crash in that window rolls the compacted version forward on the next `Omnigraph::open` (compaction is content-preserving, so roll-forward is always safe).
-- **Requires a recovered graph.** `optimize` refuses (errors) when an unresolved recovery sidecar is present under `__recovery` — operating on an unrecovered graph could publish a partial write the open-time recovery sweep would roll back. Reopen the graph to run the recovery sweep, then re-run `optimize`. (Recovery roll-back now publishes its restored version, so a recovered graph always satisfies `manifest == Lance HEAD` going in; there is no leftover drift for `optimize` to interpret.)
+- **Requires a recovered graph.** `optimize` refuses (errors) when an unresolved recovery sidecar is present under `__recovery` — operating on an unrecovered graph could publish a partial write the open-time recovery sweep would roll back. Reopen the graph to run the recovery sweep, then re-run `optimize`.
+- **Uncovered drift is skipped, not interpreted.** If a table's Lance HEAD is ahead of the version recorded in `__manifest` and no recovery sidecar covers that movement, `optimize` reports `skipped: Some(DriftNeedsRepair)` with the manifest/head versions and leaves the table untouched. Run `omnigraph repair` to classify and explicitly publish that drift.
 - Bounded by `OMNIGRAPH_MAINTENANCE_CONCURRENCY` (default 8).
-- Returns `[TableOptimizeStats { table_key, fragments_removed, fragments_added, committed, skipped }]`.
+- Returns `[TableOptimizeStats { table_key, fragments_removed, fragments_added, committed, skipped, manifest_version, lance_head_version }]`.
 - **Blob tables are skipped.** A table that declares any `Blob` property is not compacted: it is reported with `skipped: Some(BlobColumnsUnsupportedByLance)` (and logged via `tracing::warn`) instead of compacted, and the rest of the sweep proceeds normally. The current Lance `compact_files` mis-decodes blob-v2 columns under its forced `BlobHandling::AllBinary` read; **reads and writes are unaffected** — only compaction is. This is gated by `LANCE_SUPPORTS_BLOB_COMPACTION` (`db/omnigraph/optimize.rs`) and removed when the upstream Lance fix lands (see [docs/dev/lance.md](../dev/lance.md)). Consequence: fragment count and deleted-row space on blob tables are not reclaimed until then; query results are never affected.
+
+## `repair_all_tables(db, options)` — explicit
+
+- Handles **uncovered manifest/head drift**: a table's Lance HEAD is ahead of the manifest pin and no recovery sidecar records the writer intent.
+- Preview by default. `omnigraph repair --json <uri>` reports each table's `classification`, `action`, manifest/head versions, Lance operation names, and any classification error. `--confirm` publishes only verified maintenance drift. `--force --confirm` also publishes suspicious or unverifiable drift after operator review.
+- Classifies drift by reading Lance transactions from `manifest_version + 1` through `lance_head_version`. Only `ReserveFragments` and `Rewrite` are verified maintenance. Semantic operations such as `Append`, `Delete`, `Update`, `Merge`, or missing transaction history are not auto-healed.
+- Publishes repair by advancing `__manifest` to the existing Lance HEAD; it does **not** rewrite Lance data. If the publish succeeds, normal reads and strict writes use the repaired version. If it fails, no new data-side partial state was created.
+- Requires a clean recovery state. Pending `__recovery` sidecars still belong to automatic sidecar recovery, not manual repair.
 
 ## `cleanup_all_tables(db, options)` — destructive
 

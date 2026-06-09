@@ -236,6 +236,26 @@ fn init_creates_graph_successfully_on_missing_local_directory() {
 }
 
 #[test]
+fn repair_json_reports_noop_on_clean_graph() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+
+    let output = output_success(cli().arg("repair").arg("--json").arg(&graph));
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert_eq!(payload["confirm"], false);
+    assert_eq!(payload["force"], false);
+    assert_eq!(payload["manifest_version"], Value::Null);
+    let tables = payload["tables"].as_array().unwrap();
+    assert_eq!(tables.len(), 4);
+    assert!(tables.iter().all(|table| {
+        table["classification"] == "no_drift" && table["action"] == "no_op"
+    }));
+}
+
+#[test]
 fn schema_plan_json_reports_supported_additive_change() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());

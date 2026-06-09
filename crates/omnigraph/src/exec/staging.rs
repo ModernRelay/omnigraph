@@ -495,25 +495,20 @@ impl StagedMutation {
         // until `ensure_path` learns how to bump expected_version on
         // op-kind upgrade.
         //
-        // Why per-branch (and not the bound-branch `db.snapshot()`):
-        // when the caller mutates a branch other than the engine's
-        // bound branch (e.g., feature-branch ingest from a server
-        // handle bound to main), `db.snapshot()` returns the bound
-        // branch's view of each table — which is the wrong pin for
-        // the publisher's CAS on a different branch. Using
-        // `snapshot_for_branch(branch)` resolves the per-branch
-        // entries correctly. The cost is one fresh manifest read per
-        // mutation; PR 1b's regression came from this same read, but
-        // that read is now strictly necessary for cross-branch
-        // correctness. Single-table same-branch mutations could still
-        // skip this read (queue exclusivity makes the publisher CAS a
-        // no-op), but the conditional adds complexity for marginal
-        // gain — left as a follow-up perf optimization.
+        // Why a fresh per-branch snapshot (and not the bound-branch
+        // `db.snapshot()` / `snapshot_for_branch()` fast path): a stale
+        // engine handle may be bound to the same branch it is writing. For
+        // non-strict Insert/Merge, that stale local view is allowed to rebase
+        // to the live manifest pin under the queue; only uncovered Lance
+        // HEAD>manifest drift is refused. For writes targeting a branch other
+        // than the engine's bound branch (e.g., feature-branch ingest from a
+        // server handle bound to main), the same helper also resolves the
+        // correct branch pin. The cost is one fresh manifest read per mutation.
         //
         // Multi-coordinator deployments (§VI.27 aspirational) get
         // genuine cross-process drift detection from this read for
         // free.
-        let snapshot = db.snapshot_for_branch(branch).await?;
+        let snapshot = db.fresh_snapshot_for_branch(branch).await?;
         for entry in staged.iter_mut() {
             let current = snapshot
                 .entry(&entry.table_key)
@@ -539,6 +534,35 @@ impl StagedMutation {
                     entry.expected_version,
                     current,
                 ));
+            }
+
+            // Separate manifest-visible concurrency from uncovered Lance drift.
+            // Non-strict inserts/merges are allowed to rebase from their staged
+            // read version to the fresh manifest pin above, but only if the
+            // live Lance HEAD still equals that manifest pin. If an external
+            // raw Lance write or a pre-fix maintenance path moved HEAD without
+            // publishing `__manifest`, this write must not silently fold it.
+            let head = db
+                .table_store()
+                .open_dataset_head_for_write(
+                    &entry.table_key,
+                    &entry.path.full_path,
+                    entry.path.table_branch.as_deref(),
+                )
+                .await?
+                .version()
+                .version;
+            if head < current {
+                return Err(OmniError::manifest_internal(format!(
+                    "table '{}' Lance HEAD version {} is behind manifest version {}",
+                    entry.table_key, head, current
+                )));
+            }
+            if head > current {
+                return Err(OmniError::manifest_conflict(format!(
+                    "table '{}' has Lance HEAD version {} ahead of manifest version {}; run `omnigraph repair` before writing",
+                    entry.table_key, head, current
+                )));
             }
 
             entry.expected_version = current;
