@@ -1513,7 +1513,7 @@ pub(crate) fn composite_unique_key(
 /// Render a constraint's column tuple for error messages: a single item as
 /// `col`, a composite as `(a, b)`. Used for both the column list and the
 /// offending value tuple, which share the same shape.
-pub(crate) fn format_tuple(items: &[String]) -> String {
+fn format_tuple(items: &[String]) -> String {
     match items {
         [single] => single.clone(),
         _ => format!("({})", items.join(", ")),
@@ -1526,15 +1526,26 @@ pub(crate) fn format_tuple(items: &[String]) -> String {
 /// - `Ok(None)` for a null value: nulls are exempt from uniqueness (standard
 ///   SQL semantics over nullable columns).
 /// - `Ok(Some(s))` for every scalar type a `@unique` / `@key` column can hold.
-/// - `Err(..)` for a non-null value whose Arrow type we can't reduce to a key.
-///   This fails loudly rather than silently exempting the row: a silent skip
-///   would quietly weaken a declared constraint.
+///   Strings are covered in all three physical Arrow encodings (`Utf8`,
+///   `LargeUtf8`, `Utf8View`), so a legal string column is always keyable
+///   regardless of how Lance materializes it on read-back.
+/// - `Err(..)` for a non-null value whose Arrow type can't be reduced to a key
+///   (a list, blob, or vector column). This fails loudly rather than silently
+///   exempting the row, and because every legal scalar encoding is handled
+///   above, the error fires only for a genuinely un-keyable column type — never
+///   for a legal value that merely arrived in an unenumerated encoding.
 fn unique_key_scalar(array: &ArrayRef, row: usize) -> Result<Option<String>> {
-    use arrow_array::Array;
+    use arrow_array::{Array, LargeStringArray, StringViewArray};
     if array.is_null(row) {
         return Ok(None);
     }
     if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
+        return Ok(Some(a.value(row).to_string()));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return Ok(Some(a.value(row).to_string()));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<StringViewArray>() {
         return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
@@ -2275,5 +2286,26 @@ edge WorksAt: Person -> Company
             err.to_string().contains("unsupported column type"),
             "un-keyable type must fail loudly (got: {err})"
         );
+    }
+
+    #[test]
+    fn unique_key_scalar_handles_all_string_encodings() {
+        use arrow_array::{LargeStringArray, StringViewArray};
+        // A legal string column is keyable in every physical Arrow encoding
+        // Lance might hand back (Utf8 / LargeUtf8 / Utf8View). None of these may
+        // fall through to the loud `Err` path — that branch is reserved for
+        // genuinely un-keyable column types, not a legal value in an
+        // unenumerated encoding.
+        let utf8: ArrayRef = Arc::new(StringArray::from(vec![Some("v")]));
+        let large: ArrayRef = Arc::new(LargeStringArray::from(vec![Some("v")]));
+        let view: ArrayRef = Arc::new(StringViewArray::from(vec![Some("v")]));
+        for array in [&utf8, &large, &view] {
+            assert_eq!(
+                unique_key_scalar(array, 0).unwrap(),
+                Some("v".to_string()),
+                "string array {:?} must render, not error",
+                array.data_type()
+            );
+        }
     }
 }
