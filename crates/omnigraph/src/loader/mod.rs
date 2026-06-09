@@ -399,9 +399,9 @@ async fn load_jsonl_reader<R: BufRead>(
         let batch = build_node_batch(node_type, rows)?;
         validate_value_constraints(&batch, node_type)?;
         validate_enum_constraints(&batch, &node_type.properties, type_name)?;
-        let unique_props = unique_property_names_for_node(node_type);
-        if !unique_props.is_empty() {
-            enforce_unique_constraints_intra_batch(&batch, type_name, &unique_props)?;
+        let unique_groups = unique_constraint_groups_for_node(node_type);
+        if !unique_groups.is_empty() {
+            enforce_unique_constraints_intra_batch(&batch, type_name, &unique_groups)?;
         }
         let loaded_count = batch.num_rows();
         let table_key = format!("node:{}", type_name);
@@ -510,9 +510,9 @@ async fn load_jsonl_reader<R: BufRead>(
         let edge_type = &catalog.edge_types[edge_name];
         let batch = build_edge_batch(edge_type, rows)?;
         validate_enum_constraints(&batch, &edge_type.properties, edge_name)?;
-        let unique_props = unique_property_names_for_edge(edge_type);
-        if !unique_props.is_empty() {
-            enforce_unique_constraints_intra_batch(&batch, edge_name, &unique_props)?;
+        let unique_groups = unique_constraint_groups_for_edge(edge_type);
+        if !unique_groups.is_empty() {
+            enforce_unique_constraints_intra_batch(&batch, edge_name, &unique_groups)?;
         }
         let loaded_count = batch.num_rows();
         let table_key = format!("edge:{}", edge_name);
@@ -1405,8 +1405,16 @@ pub(crate) fn validate_enum_constraints(
     Ok(())
 }
 
-/// Detect duplicate values within a single `RecordBatch` for any of the named
-/// `unique_properties`. Returns an error on the first duplicate found.
+/// Detect duplicate values within a single `RecordBatch` for any of the
+/// `unique_constraints` groups. Each group is a list of one or more columns
+/// that together form a uniqueness key: a violation occurs when two rows share
+/// the same tuple of values across *all* columns in a group, so a composite
+/// `@unique(a, b)` only conflicts when both `a` and `b` match. Returns an
+/// error on the first duplicate found.
+///
+/// Rows where any column in a group is null are exempt (standard SQL semantics
+/// for uniqueness over nullable columns), as is any group whose columns are
+/// not all present in the batch (e.g. a partial-schema load).
 ///
 /// Note: this only catches duplicates *within* the batch. Cross-batch
 /// uniqueness against already-committed rows is not enforced here — that
@@ -1414,27 +1422,65 @@ pub(crate) fn validate_enum_constraints(
 pub(crate) fn enforce_unique_constraints_intra_batch(
     batch: &RecordBatch,
     type_name: &str,
-    unique_properties: &[String],
+    unique_constraints: &[Vec<String>],
 ) -> Result<()> {
-    for property in unique_properties {
-        let Some(col_idx) = batch.schema().index_of(property).ok() else {
+    for columns in unique_constraints {
+        let Some(col_indices) = columns
+            .iter()
+            .map(|name| batch.schema().index_of(name).ok())
+            .collect::<Option<Vec<usize>>>()
+        else {
             continue;
         };
-        let arr = batch.column(col_idx);
         let mut seen: HashMap<String, usize> = HashMap::new();
         for row in 0..batch.num_rows() {
-            let Some(value) = scalar_to_string(arr, row) else {
+            let mut parts = Vec::with_capacity(col_indices.len());
+            let mut any_null = false;
+            for &col_idx in &col_indices {
+                let Some(value) = scalar_to_string(batch.column(col_idx), row) else {
+                    any_null = true;
+                    break;
+                };
+                parts.push(value);
+            }
+            if any_null {
                 continue;
-            };
+            }
+            let value = composite_unique_key(&parts);
             if let Some(prev_row) = seen.insert(value.clone(), row) {
                 return Err(OmniError::manifest(format!(
                     "@unique violation on {}.{}: value '{}' appears in rows {} and {}",
-                    type_name, property, value, prev_row, row
+                    type_name,
+                    format_unique_columns(columns),
+                    value,
+                    prev_row,
+                    row
                 )));
             }
         }
     }
     Ok(())
+}
+
+/// Join one row's rendered, non-null column values into a single composite
+/// uniqueness key. The separator is the unit separator (U+001F) — a control
+/// char highly unlikely to occur in real data, so distinct tuples like
+/// `("a|b", "c")` and `("a", "b|c")` stay distinct rather than colliding.
+///
+/// Shared by the intake path (`enforce_unique_constraints_intra_batch`) and
+/// the branch-merge path (`exec/merge.rs::update_unique_constraints`) so the
+/// two cannot silently drift to incompatible keyings.
+pub(crate) fn composite_unique_key(parts: &[String]) -> String {
+    parts.join("\u{1f}")
+}
+
+/// Render a unique constraint's columns for error messages: a single column
+/// as `col`, a composite as `(a, b)`.
+fn format_unique_columns(columns: &[String]) -> String {
+    match columns {
+        [single] => single.clone(),
+        _ => format!("({})", columns.join(", ")),
+    }
 }
 
 /// Reduce a single Arrow scalar at (`array`, `row`) to a `String` for
@@ -1478,39 +1524,30 @@ fn scalar_to_string(array: &ArrayRef, row: usize) -> Option<String> {
     None
 }
 
-/// Build the flat list of property names that must be checked for uniqueness
-/// on a node type. Includes both `@unique` properties (from
-/// `NodeType.unique_constraints`) and the `@key` (which implies uniqueness).
-pub(crate) fn unique_property_names_for_node(
+/// Build the list of uniqueness constraint groups to enforce on a node type.
+/// Each group is the column tuple of one constraint. Includes every
+/// `@unique(...)` constraint (from `NodeType.unique_constraints`) and the
+/// `@key` (which implies uniqueness over its column tuple). Grouping is
+/// preserved so a composite `@unique(a, b)` is enforced as a composite key
+/// rather than degraded into independent single-field checks.
+pub(crate) fn unique_constraint_groups_for_node(
     node_type: &omnigraph_compiler::catalog::NodeType,
-) -> Vec<String> {
-    let mut props: Vec<String> = node_type
-        .unique_constraints
-        .iter()
-        .flatten()
-        .cloned()
-        .collect();
-    if let Some(key) = &node_type.key {
-        props.extend(key.iter().cloned());
+) -> Vec<Vec<String>> {
+    let mut groups: Vec<Vec<String>> = node_type.unique_constraints.clone();
+    if let Some(key) = &node_type.key
+        && !groups.contains(key)
+    {
+        groups.push(key.clone());
     }
-    props.sort();
-    props.dedup();
-    props
+    groups
 }
 
-/// Same as [`unique_property_names_for_node`] but for an edge type.
-pub(crate) fn unique_property_names_for_edge(
+/// Same as [`unique_constraint_groups_for_node`] but for an edge type (edges
+/// have no `@key`).
+pub(crate) fn unique_constraint_groups_for_edge(
     edge_type: &omnigraph_compiler::catalog::EdgeType,
-) -> Vec<String> {
-    let mut props: Vec<String> = edge_type
-        .unique_constraints
-        .iter()
-        .flatten()
-        .cloned()
-        .collect();
-    props.sort();
-    props.dedup();
-    props
+) -> Vec<Vec<String>> {
+    edge_type.unique_constraints.clone()
 }
 
 fn extract_numeric_value(col: &ArrayRef, row: usize) -> Option<f64> {

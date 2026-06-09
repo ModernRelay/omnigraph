@@ -188,7 +188,7 @@ node Thing {
 ///
 /// Defense in depth:
 /// 1. The loader's `enforce_unique_constraints_intra_batch`
-///    (`loader/mod.rs:1453`), invoked unconditionally on any node type
+///    (`loader/mod.rs:1471`), invoked unconditionally on any node type
 ///    with a `@key`, errors on intra-batch duplicate `@key` values at
 ///    intake — pinned by this test across every `LoadMode`.
 /// 2. The `check_batch_unique_by_keys` precondition at the top of
@@ -227,6 +227,57 @@ node Thing {
             "load mode {mode:?} must not persist any rows when the batch is rejected"
         );
     }
+}
+
+/// Regression for MR-983: a node-level composite `@unique(a, b)` must be
+/// enforced as a true composite key, not degraded into independent
+/// single-field checks. Pre-fix, `unique_property_names_for_node` flattened
+/// every constraint group into one property list, so `@unique(source,
+/// external_id)` was enforced as `@unique(source)` *and* `@unique(external_id)`
+/// — rejecting rows that were unique on the composite key and naming only the
+/// first field in the error.
+#[tokio::test]
+async fn loader_enforces_composite_unique_as_composite_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema = r#"
+node ExternalID {
+    slug: String @key
+    source: String @index
+    external_id: String @index
+    @unique(source, external_id)
+}
+"#;
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+
+    // Same `source`, different `external_id` → unique on the composite key.
+    // This is the exact repro from MR-983 and must be accepted.
+    let composite_ok = r#"{"type":"ExternalID","data":{"slug":"a","source":"whatsapp","external_id":"+E.164"}}
+{"type":"ExternalID","data":{"slug":"b","source":"whatsapp","external_id":"pn:12345"}}
+"#;
+    load_jsonl(&mut db, composite_ok, LoadMode::Overwrite)
+        .await
+        .expect("rows unique on the composite (source, external_id) must be accepted");
+    assert_eq!(count_rows(&db, "node:ExternalID").await, 2);
+
+    // Both composite columns equal → genuine violation. The error must name
+    // the whole composite, not just the first field.
+    let composite_dupe = r#"{"type":"ExternalID","data":{"slug":"c","source":"whatsapp","external_id":"dup"}}
+{"type":"ExternalID","data":{"slug":"d","source":"whatsapp","external_id":"dup"}}
+"#;
+    let err = load_jsonl(&mut db, composite_dupe, LoadMode::Overwrite)
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    // Columns are canonicalized to sorted order in the catalog, so the
+    // message reads `(external_id, source)`; assert order-agnostically that
+    // both composite columns are named (not just the first, as pre-fix).
+    assert!(
+        msg.contains("@unique violation")
+            && msg.contains("source")
+            && msg.contains("external_id"),
+        "composite violation must name both columns (got: {msg})"
+    );
 }
 
 /// Canary for the upstream Lance gap that the `FirstSeen` workaround

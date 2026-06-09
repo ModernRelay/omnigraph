@@ -39,6 +39,26 @@ query insert_user($name: String, $email: String) {
 }
 "#;
 
+const EDGE_UNIQUE_SCHEMA: &str = r#"
+node Person {
+    name: String @key
+}
+
+edge Knows: Person -> Person {
+    @unique(src, dst)
+}
+"#;
+
+const EDGE_UNIQUE_DATA: &str = r#"{"type":"Person","data":{"name":"Alice"}}
+{"type":"Person","data":{"name":"Bob"}}
+{"type":"Person","data":{"name":"Carol"}}"#;
+
+const EDGE_UNIQUE_MUTATIONS: &str = r#"
+query add_knows($from: String, $to: String) {
+    insert Knows { from: $from, to: $to }
+}
+"#;
+
 const CARDINALITY_SCHEMA: &str = r#"
 node Person {
     name: String @key
@@ -1117,6 +1137,87 @@ async fn branch_merge_reports_unique_violation_conflict() {
         }
         other => panic!("expected merge conflicts, got {other:?}"),
     }
+}
+
+/// Regression for the MR-983 follow-up: the branch-merge path must enforce an
+/// edge composite `@unique(src, dst)` as a true composite key, consistent with
+/// the intake path. Two branches inserting the *same* (src, dst) pair must
+/// conflict on merge.
+#[tokio::test]
+async fn branch_merge_reports_composite_unique_violation_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = init_db_from_schema_and_data(&dir, EDGE_UNIQUE_SCHEMA, EDGE_UNIQUE_DATA).await;
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+
+    mutate_main(
+        &mut main,
+        EDGE_UNIQUE_MUTATIONS,
+        "add_knows",
+        &params(&[("$from", "Alice"), ("$to", "Bob")]),
+    )
+    .await
+    .unwrap();
+
+    mutate_branch(
+        &mut feature,
+        "feature",
+        EDGE_UNIQUE_MUTATIONS,
+        "add_knows",
+        &params(&[("$from", "Alice"), ("$to", "Bob")]),
+    )
+    .await
+    .unwrap();
+
+    let err = main.branch_merge("feature", "main").await.unwrap_err();
+    match err {
+        OmniError::MergeConflicts(conflicts) => {
+            assert!(conflicts.iter().any(|conflict| {
+                conflict.table_key == "edge:Knows"
+                    && conflict.kind == MergeConflictKind::UniqueViolation
+            }));
+        }
+        other => panic!("expected merge conflicts, got {other:?}"),
+    }
+}
+
+/// Sibling to the above: pairs sharing `src` but differing on `dst` are unique
+/// on the (src, dst) tuple and must merge cleanly. Guards against the composite
+/// degrading back into a single-field `@unique(src)` on the merge path.
+#[tokio::test]
+async fn branch_merge_allows_distinct_composite_unique_pairs() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut main = init_db_from_schema_and_data(&dir, EDGE_UNIQUE_SCHEMA, EDGE_UNIQUE_DATA).await;
+    main.branch_create("feature").await.unwrap();
+
+    let mut feature = Omnigraph::open(uri).await.unwrap();
+
+    mutate_main(
+        &mut main,
+        EDGE_UNIQUE_MUTATIONS,
+        "add_knows",
+        &params(&[("$from", "Alice"), ("$to", "Bob")]),
+    )
+    .await
+    .unwrap();
+
+    mutate_branch(
+        &mut feature,
+        "feature",
+        EDGE_UNIQUE_MUTATIONS,
+        "add_knows",
+        &params(&[("$from", "Alice"), ("$to", "Carol")]),
+    )
+    .await
+    .unwrap();
+
+    main.branch_merge("feature", "main")
+        .await
+        .expect("distinct (src, dst) pairs are unique on the composite and must merge cleanly");
+    assert_eq!(count_rows(&main, "edge:Knows").await, 2);
 }
 
 #[tokio::test]

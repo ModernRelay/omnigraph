@@ -697,7 +697,7 @@ fn update_unique_constraints(
             if any_null {
                 continue;
             }
-            let value = parts.join("|");
+            let value = crate::loader::composite_unique_key(&parts);
             let row_id = row_id_at(batch, row)?;
             if let Some(first_row_id) = seen.insert(value.clone(), row_id.clone()) {
                 conflicts.push(MergeConflict {
