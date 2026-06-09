@@ -1445,34 +1445,32 @@ pub(crate) fn enforce_unique_constraints_intra_batch(
     unique_constraints: &[Vec<String>],
 ) -> Result<()> {
     for columns in unique_constraints {
-        let Some(col_indices) = columns
+        // Resolve the group's columns once. A group whose columns aren't all
+        // present in this batch is skipped (e.g. a partial-schema load).
+        let Some(group_columns) = columns
             .iter()
-            .map(|name| batch.schema().index_of(name).ok())
-            .collect::<Option<Vec<usize>>>()
+            .map(|name| {
+                batch
+                    .schema()
+                    .index_of(name)
+                    .ok()
+                    .map(|i| batch.column(i).clone())
+            })
+            .collect::<Option<Vec<ArrayRef>>>()
         else {
             continue;
         };
-        let mut seen: HashMap<String, usize> = HashMap::new();
+        let mut seen: HashMap<Vec<String>, usize> = HashMap::new();
         for row in 0..batch.num_rows() {
-            let mut parts = Vec::with_capacity(col_indices.len());
-            let mut any_null = false;
-            for &col_idx in &col_indices {
-                let Some(value) = scalar_to_string(batch.column(col_idx), row) else {
-                    any_null = true;
-                    break;
-                };
-                parts.push(value);
-            }
-            if any_null {
+            let Some(key) = composite_unique_key(&group_columns, row)? else {
                 continue;
-            }
-            let value = composite_unique_key(&parts);
-            if let Some(prev_row) = seen.insert(value.clone(), row) {
+            };
+            if let Some(prev_row) = seen.insert(key.clone(), row) {
                 return Err(OmniError::manifest(format!(
                     "@unique violation on {}.{}: value '{}' appears in rows {} and {}",
                     type_name,
-                    format_unique_columns(columns),
-                    value,
+                    format_tuple(columns),
+                    format_tuple(&key),
                     prev_row,
                     row
                 )));
@@ -1482,66 +1480,105 @@ pub(crate) fn enforce_unique_constraints_intra_batch(
     Ok(())
 }
 
-/// Join one row's rendered, non-null column values into a single composite
-/// uniqueness key. The separator is the unit separator (U+001F) — a control
-/// char highly unlikely to occur in real data, so distinct tuples like
-/// `("a|b", "c")` and `("a", "b|c")` stay distinct rather than colliding.
+/// Build the composite uniqueness key for `row` over a constraint group's
+/// already-resolved columns (in declaration order).
 ///
-/// Shared by the intake path (`enforce_unique_constraints_intra_batch`) and
-/// the branch-merge path (`exec/merge.rs::update_unique_constraints`) so the
-/// two cannot silently drift to incompatible keyings.
-pub(crate) fn composite_unique_key(parts: &[String]) -> String {
-    parts.join("\u{1f}")
+/// The key is the *tuple* of per-column scalar strings (`Vec<String>`), keyed
+/// directly in the dedup map — there is no separator, so no data value can
+/// forge a collision (an earlier version joined on `U+001F`, which a value
+/// containing that control char could still defeat).
+///
+/// - `Ok(None)` if any column is null: the row is exempt (a partial tuple
+///   can't violate uniqueness under SQL null semantics).
+/// - `Ok(Some(tuple))` otherwise.
+/// - `Err(..)` propagated from [`unique_key_scalar`] on an un-keyable value.
+///
+/// Shared by the intake path (`enforce_unique_constraints_intra_batch`) and the
+/// branch-merge path (`exec/merge.rs::update_unique_constraints`) so the two
+/// derive identical keys and cannot drift on separator or scalar conversion.
+pub(crate) fn composite_unique_key(
+    group_columns: &[ArrayRef],
+    row: usize,
+) -> Result<Option<Vec<String>>> {
+    let mut parts = Vec::with_capacity(group_columns.len());
+    for column in group_columns {
+        match unique_key_scalar(column, row)? {
+            Some(value) => parts.push(value),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(parts))
 }
 
-/// Render a unique constraint's columns for error messages: a single column
-/// as `col`, a composite as `(a, b)`.
-fn format_unique_columns(columns: &[String]) -> String {
-    match columns {
+/// Render a constraint's column tuple for error messages: a single item as
+/// `col`, a composite as `(a, b)`. Used for both the column list and the
+/// offending value tuple, which share the same shape.
+fn format_tuple(items: &[String]) -> String {
+    match items {
         [single] => single.clone(),
-        _ => format!("({})", columns.join(", ")),
+        _ => format!("({})", items.join(", ")),
     }
 }
 
-/// Reduce a single Arrow scalar at (`array`, `row`) to a `String` for
-/// uniqueness comparison. Returns `None` for null values (nulls are exempt
-/// from uniqueness in standard SQL semantics).
-fn scalar_to_string(array: &ArrayRef, row: usize) -> Option<String> {
-    use arrow_array::Array;
+/// Reduce a single Arrow scalar at (`array`, `row`) to its uniqueness-key
+/// string.
+///
+/// - `Ok(None)` for a null value: nulls are exempt from uniqueness (standard
+///   SQL semantics over nullable columns).
+/// - `Ok(Some(s))` for every scalar type a `@unique` / `@key` column can hold.
+///   Strings are covered in all three physical Arrow encodings (`Utf8`,
+///   `LargeUtf8`, `Utf8View`), so a legal string column is always keyable
+///   regardless of how Lance materializes it on read-back.
+/// - `Err(..)` for a non-null value whose Arrow type can't be reduced to a key
+///   (a list, blob, or vector column). This fails loudly rather than silently
+///   exempting the row, and because every legal scalar encoding is handled
+///   above, the error fires only for a genuinely un-keyable column type — never
+///   for a legal value that merely arrived in an unenumerated encoding.
+fn unique_key_scalar(array: &ArrayRef, row: usize) -> Result<Option<String>> {
+    use arrow_array::{Array, LargeStringArray, StringViewArray};
     if array.is_null(row) {
-        return None;
+        return Ok(None);
     }
     if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return Ok(Some(a.value(row).to_string()));
+    }
+    if let Some(a) = array.as_any().downcast_ref::<StringViewArray>() {
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<Int32Array>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<Int64Array>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<UInt32Array>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<UInt64Array>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<Float32Array>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<Float64Array>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<BooleanArray>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<Date32Array>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
     if let Some(a) = array.as_any().downcast_ref::<Date64Array>() {
-        return Some(a.value(row).to_string());
+        return Ok(Some(a.value(row).to_string()));
     }
-    None
+    Err(OmniError::manifest(format!(
+        "uniqueness key: unsupported column type {:?} for @unique/@key enforcement",
+        array.data_type()
+    )))
 }
 
 /// Build the list of uniqueness constraint groups to enforce on a node type.
@@ -2208,5 +2245,67 @@ edge WorksAt: Person -> Company
         assert!(result.is_err(), "expected NaN to be rejected");
         let err = result.unwrap_err().to_string();
         assert!(err.contains("NaN"), "error should mention NaN: {}", err);
+    }
+
+    #[test]
+    fn composite_unique_key_builds_tuple_and_exempts_null() {
+        let a: ArrayRef = Arc::new(StringArray::from(vec![Some("x|y"), Some("x"), None]));
+        let b: ArrayRef = Arc::new(StringArray::from(vec![Some("z"), Some("y|z"), Some("q")]));
+        let cols = [a, b];
+
+        // Tuple key, so `("x|y", "z")` and `("x", "y|z")` stay distinct —
+        // a separator-joined key (the old `|` join) would collapse both to
+        // `x|y|z`.
+        assert_eq!(
+            composite_unique_key(&cols, 0).unwrap(),
+            Some(vec!["x|y".to_string(), "z".to_string()])
+        );
+        assert_eq!(
+            composite_unique_key(&cols, 1).unwrap(),
+            Some(vec!["x".to_string(), "y|z".to_string()])
+        );
+        assert_ne!(
+            composite_unique_key(&cols, 0).unwrap(),
+            composite_unique_key(&cols, 1).unwrap()
+        );
+
+        // Any null column → the whole row is exempt (SQL null semantics).
+        assert_eq!(composite_unique_key(&cols, 2).unwrap(), None);
+    }
+
+    #[test]
+    fn unique_key_scalar_errors_loudly_on_unkeyable_type() {
+        use arrow_array::LargeBinaryArray;
+        // A binary/blob column can't be reduced to a uniqueness key. Before the
+        // hardening this returned `None`, so a `@unique` on such a column was
+        // silently un-enforced; now it errors instead of weakening the
+        // constraint in silence.
+        let blob: ArrayRef = Arc::new(LargeBinaryArray::from(vec![Some(&b"abc"[..])]));
+        let err = unique_key_scalar(&blob, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported column type"),
+            "un-keyable type must fail loudly (got: {err})"
+        );
+    }
+
+    #[test]
+    fn unique_key_scalar_handles_all_string_encodings() {
+        use arrow_array::{LargeStringArray, StringViewArray};
+        // A legal string column is keyable in every physical Arrow encoding
+        // Lance might hand back (Utf8 / LargeUtf8 / Utf8View). None of these may
+        // fall through to the loud `Err` path — that branch is reserved for
+        // genuinely un-keyable column types, not a legal value in an
+        // unenumerated encoding.
+        let utf8: ArrayRef = Arc::new(StringArray::from(vec![Some("v")]));
+        let large: ArrayRef = Arc::new(LargeStringArray::from(vec![Some("v")]));
+        let view: ArrayRef = Arc::new(StringViewArray::from(vec![Some("v")]));
+        for array in [&utf8, &large, &view] {
+            assert_eq!(
+                unique_key_scalar(array, 0).unwrap(),
+                Some("v".to_string()),
+                "string array {:?} must render, not error",
+                array.data_type()
+            );
+        }
     }
 }
