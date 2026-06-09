@@ -20,8 +20,9 @@ use axum::Router;
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResult, ListToolsResult, PaginatedRequestParams,
-        ServerCapabilities, ServerInfo,
+        CallToolRequestParams, CallToolResult, ListResourcesResult, ListToolsResult,
+        PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult, ServerCapabilities,
+        ServerInfo,
     },
     service::RequestContext,
     transport::streamable_http_server::{
@@ -66,11 +67,12 @@ impl ServerHandler for OmnigraphMcpHandler {
         // `resources` with neither `listChanged` nor `subscribe` — stateless,
         // no server push.
         let mut info = ServerInfo::default();
-        // Advertise only `tools` for now. The resources phase adds
-        // `list_resources`/`read_resource`; advertising a `resources`
-        // capability whose `resources/read` returns method-not-found would be a
-        // dishonest contract, so `.enable_resources()` lands with that phase.
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        // Advertise `tools` and `resources` (no `listChanged`/`subscribe` —
+        // stateless, no server push). Both are backed by real handlers below.
+        info.capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_resources()
+            .build();
         info.server_info.name = "omnigraph-server".to_string();
         info.server_info.version = env!("CARGO_PKG_VERSION").to_string();
         info.instructions = Some(MCP_INSTRUCTIONS.to_string());
@@ -91,7 +93,11 @@ impl ServerHandler for OmnigraphMcpHandler {
                 tools.push(tool.descriptor());
             }
         }
-        // Phase 4 appends the dynamic stored-query tools here.
+        // Stored-query tools: gated as a group by the coarse `InvokeQuery`
+        // action (all exposed queries, or none).
+        if builtins::stored_invoke_visible(&cx)? {
+            tools.extend(builtins::stored_descriptors(&cx));
+        }
         let mut result = ListToolsResult::default();
         result.tools = tools;
         Ok(result)
@@ -103,26 +109,49 @@ impl ServerHandler for OmnigraphMcpHandler {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let cx = builtins::resolve_cx(&self.state, &context)?;
-        let Some(tool) = Builtin::from_name(&request.name) else {
-            // Unknown tool → JSON-RPC error (a dispatch failure, not a
-            // tool-execution error).
-            return Err(McpError::invalid_params(
-                format!("unknown tool: {}", request.name),
-                None,
-            ));
-        };
-        // Enforce the visibility gate at call-time too, and mask a denial as
-        // "unknown tool" so the catalog isn't probeable without the grant (the
-        // same deny ≡ missing principle as `POST /queries/{name}`). The inner
-        // `do_*` / `run_*` re-authorizes against the real branch.
-        if !builtins::is_visible(tool, &cx)? {
-            return Err(McpError::invalid_params(
-                format!("unknown tool: {}", request.name),
-                None,
-            ));
-        }
+        let name = request.name.to_string();
         let args = request.arguments.unwrap_or_default();
-        builtins::dispatch(tool, &cx, &args).await
+        // Deny ≡ unknown: a denied tool and an unknown one return the identical
+        // error so the catalog isn't probeable without the grant (the same
+        // principle as `POST /queries/{name}`). The inner `do_*` / `run_*`
+        // re-authorizes against the real branch.
+        let unknown = || McpError::invalid_params(format!("unknown tool: {name}"), None);
+
+        if let Some(tool) = Builtin::from_name(&name) {
+            if !builtins::is_visible(tool, &cx)? {
+                return Err(unknown());
+            }
+            return builtins::dispatch(tool, &cx, &args).await;
+        }
+        if builtins::is_stored_tool(&cx, &name) {
+            // Outer InvokeQuery gate (coarse); the inner Read/Change runs in
+            // run_query/run_mutate — the double-gate of POST /queries/{name}.
+            if !builtins::stored_invoke_visible(&cx)? {
+                return Err(unknown());
+            }
+            return builtins::call_stored_tool(&cx, &name, &args).await;
+        }
+        Err(unknown())
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        let cx = builtins::resolve_cx(&self.state, &context)?;
+        let mut result = ListResourcesResult::default();
+        result.resources = builtins::list_resources(&cx)?;
+        Ok(result)
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResult, McpError> {
+        let cx = builtins::resolve_cx(&self.state, &context)?;
+        builtins::read_resource(&cx, &request.uri).await
     }
 }
 

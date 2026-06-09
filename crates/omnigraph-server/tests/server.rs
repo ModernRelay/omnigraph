@@ -879,7 +879,7 @@ fn mcp_initialize_body() -> Value {
 }
 
 #[tokio::test]
-async fn mcp_initialize_advertises_tools_capability() {
+async fn mcp_initialize_advertises_tools_and_resources() {
     let (_temp, app) = app_for_loaded_graph().await;
     let (status, body) = json_response(&app, mcp_post(mcp_initialize_body())).await;
     assert_eq!(status, StatusCode::OK, "initialize should 200");
@@ -889,12 +889,9 @@ async fn mcp_initialize_advertises_tools_capability() {
         body["result"]["capabilities"]["tools"].is_object(),
         "advertises the tools capability: {body}"
     );
-    // Resources are NOT advertised until the resources phase implements
-    // `list_resources`/`read_resource`; advertising a capability whose
-    // `resources/read` 404s would be a dishonest contract.
     assert!(
-        body["result"]["capabilities"]["resources"].is_null(),
-        "does not advertise resources until implemented: {body}"
+        body["result"]["capabilities"]["resources"].is_object(),
+        "advertises the resources capability: {body}"
     );
     assert_eq!(body["result"]["serverInfo"]["name"], "omnigraph-server");
 }
@@ -1222,6 +1219,199 @@ async fn mcp_tool_annotations_match_read_write() {
         schema_apply["annotations"]["destructiveHint"],
         json!(true),
         "schema_apply is destructive: {schema_apply}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_stored_query_listed_and_callable() {
+    let (_temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, true)],
+        &[("act-invoke", "t-invoke")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    let names = mcp_tool_names(&app, "t-invoke").await;
+    assert!(
+        names.contains(&"find_person".to_string()),
+        "stored query is listed as a tool: {names:?}"
+    );
+
+    let (status, body) = json_response(
+        &app,
+        mcp_post_auth(
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "find_person", "arguments": { "name": "Alice" } }
+            }),
+            "t-invoke",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(body["result"]["isError"], json!(true), "stored read failed: {body}");
+    let text = body["result"]["content"][0]["text"]
+        .as_str()
+        .expect("read envelope text");
+    let read: Value = serde_json::from_str(text).expect("read json");
+    assert_eq!(read["query_name"], "find_person");
+    assert_eq!(read["row_count"], 1, "Alice is in the fixture: {read}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_stored_query_hidden_without_invoke_query() {
+    let (_temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, true)],
+        &[("act-noinvoke", "t-noinvoke")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    let names = mcp_tool_names(&app, "t-noinvoke").await;
+    assert!(
+        !names.contains(&"find_person".to_string()),
+        "no invoke_query → stored tool hidden: {names:?}"
+    );
+    let (status, body) = json_response(
+        &app,
+        mcp_post_auth(
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "find_person", "arguments": { "name": "Alice" } }
+            }),
+            "t-noinvoke",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["error"]["code"], json!(-32602));
+    assert_eq!(body["error"]["message"], json!("unknown tool: find_person"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_stored_query_double_gated_inner_read_denies() {
+    // act-invokeonly clears the outer invoke_query gate (tool is listed and
+    // reachable) but lacks `read`, so the inner gate inside run_query denies —
+    // surfacing as an isError tool result, the double-gate of POST /queries/{name}.
+    let (_temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, true)],
+        &[("act-invokeonly", "t-invokeonly")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    let names = mcp_tool_names(&app, "t-invokeonly").await;
+    assert!(
+        names.contains(&"find_person".to_string()),
+        "invoke_query holder sees the tool: {names:?}"
+    );
+    let (status, body) = json_response(
+        &app,
+        mcp_post_auth(
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "find_person", "arguments": { "name": "Alice" } }
+            }),
+            "t-invokeonly",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["result"]["isError"],
+        json!(true),
+        "inner read denial surfaces as isError: {body}"
+    );
+}
+
+async fn mcp_resource_uris(app: &Router, token: &str) -> Vec<String> {
+    let (status, body) = json_response(
+        app,
+        mcp_post_auth(
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "resources/list" }),
+            token,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["result"]["resources"]
+        .as_array()
+        .expect("resources array")
+        .iter()
+        .filter_map(|r| r["uri"].as_str().map(String::from))
+        .collect()
+}
+
+#[tokio::test]
+async fn mcp_resources_list_and_read() {
+    let (_temp, app) = app_for_loaded_graph().await;
+    let (status, body) = json_response(
+        &app,
+        mcp_post(json!({ "jsonrpc": "2.0", "id": 1, "method": "resources/list" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let uris: Vec<&str> = body["result"]["resources"]
+        .as_array()
+        .expect("resources array")
+        .iter()
+        .filter_map(|r| r["uri"].as_str())
+        .collect();
+    assert!(uris.contains(&"omnigraph://schema"), "{uris:?}");
+    assert!(uris.contains(&"omnigraph://branches"), "{uris:?}");
+    // graphs is server-scoped; single mode hides it.
+    assert!(!uris.contains(&"omnigraph://graphs"), "{uris:?}");
+
+    let (_s, schema) = json_response(
+        &app,
+        mcp_post(json!({
+            "jsonrpc": "2.0", "id": 2, "method": "resources/read",
+            "params": { "uri": "omnigraph://schema" }
+        })),
+    )
+    .await;
+    let text = schema["result"]["contents"][0]["text"]
+        .as_str()
+        .expect("schema text");
+    assert!(text.contains("Person"), "schema source: {text}");
+
+    let (_s, branches) = json_response(
+        &app,
+        mcp_post(json!({
+            "jsonrpc": "2.0", "id": 3, "method": "resources/read",
+            "params": { "uri": "omnigraph://branches" }
+        })),
+    )
+    .await;
+    let text = branches["result"]["contents"][0]["text"]
+        .as_str()
+        .expect("branches text");
+    assert!(text.contains("main"), "branches json: {text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_resource_read_denied_is_masked() {
+    // act-noread holds a token but matches no allow rule → Cedar denies read, so
+    // omnigraph://schema is not listed and a read is masked as unknown.
+    let (_temp, app) =
+        app_with_stored_queries(&[], &[("act-noread", "t-noread")], MCP_FILTER_POLICY_YAML).await;
+    let uris = mcp_resource_uris(&app, "t-noread").await;
+    assert!(
+        !uris.contains(&"omnigraph://schema".to_string()),
+        "no read → schema resource hidden: {uris:?}"
+    );
+    let (status, body) = json_response(
+        &app,
+        mcp_post_auth(
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "resources/read",
+                "params": { "uri": "omnigraph://schema" }
+            }),
+            "t-noread",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["error"]["message"],
+        json!("unknown resource: omnigraph://schema")
     );
 }
 

@@ -9,10 +9,13 @@ use std::sync::Arc;
 
 use rmcp::ErrorData as McpError;
 use rmcp::RoleServer;
-use rmcp::model::{CallToolResult, Content, JsonObject, Tool, ToolAnnotations};
+use rmcp::model::{
+    Annotated, CallToolResult, Content, JsonObject, RawResource, ReadResourceResult, Resource,
+    ResourceContents, Tool, ToolAnnotations,
+};
 use rmcp::service::RequestContext;
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::{
     AppState, Authz, GraphHandle, PolicyAction, PolicyRequest, ResolvedActor, api, authorize,
@@ -444,10 +447,17 @@ impl Builtin {
 /// `list_tools` (visibility) and `call_tool` (deny ≡ unknown masking). `Err` is
 /// an operational failure (propagates as a JSON-RPC error); `Ok(false)` hides.
 pub(crate) fn is_visible(tool: Builtin, cx: &ToolCx) -> Result<bool, McpError> {
-    let (policy, action) = match tool.gate() {
+    gate_allowed(&tool.gate(), cx)
+}
+
+/// Evaluate a gate against the actor's Cedar policy (the right policy source per
+/// scope). Uses `branch: None`; the actual `do_*`/`run_*` call re-authorizes
+/// with the real branch. Shared by tool visibility and resource visibility.
+fn gate_allowed(gate: &Gate, cx: &ToolCx) -> Result<bool, McpError> {
+    let (policy, action) = match gate {
         Gate::None => return Ok(true),
-        Gate::Graph(action) => (cx.handle.as_ref().and_then(|h| h.policy.as_deref()), action),
-        Gate::Server(action) => (cx.state.server_policy.as_deref(), action),
+        Gate::Graph(action) => (cx.handle.as_ref().and_then(|h| h.policy.as_deref()), *action),
+        Gate::Server(action) => (cx.state.server_policy.as_deref(), *action),
     };
     let request = PolicyRequest {
         action,
@@ -520,4 +530,314 @@ fn api_operational_error(err: crate::ApiError) -> McpError {
         StatusCode::UNAUTHORIZED => McpError::invalid_request(err.message_str().to_string(), None),
         _ => McpError::internal_error(err.message_str().to_string(), None),
     }
+}
+
+// ---- stored-query tools (RFC-003 §5.1 / §5.3) ------------------------------
+//
+// One MCP tool per `mcp.expose` entry in the graph's stored-query registry,
+// projected from the same `query_catalog_entry` the `GET /queries` catalog
+// uses. Double-gated like `POST /queries/{name}`: the coarse outer
+// `InvokeQuery` action gates reaching the tool (all exposed queries on the
+// graph, or none — per-query scope is deferred), then the inner `Read`/`Change`
+// in `run_query`/`run_mutate` gates the body.
+
+/// Is the outer `InvokeQuery` gate open for this actor? `Err` is operational
+/// (propagates); `Ok(false)` hides every stored-query tool.
+pub(crate) fn stored_invoke_visible(cx: &ToolCx) -> Result<bool, McpError> {
+    let policy = cx.handle.as_ref().and_then(|h| h.policy.as_deref());
+    let request = PolicyRequest {
+        action: PolicyAction::InvokeQuery,
+        branch: None,
+        target_branch: None,
+    };
+    match authorize(cx.actor_ref(), policy, request) {
+        Ok(Authz::Allowed) => Ok(true),
+        Ok(Authz::Denied(_)) => Ok(false),
+        Err(err) => Err(api_operational_error(err)),
+    }
+}
+
+/// Descriptors for the graph's exposed stored queries. A name that collides
+/// with a built-in is skipped (built-ins win — avoids a duplicate tool name in
+/// the catalog).
+pub(crate) fn stored_descriptors(cx: &ToolCx) -> Vec<Tool> {
+    let Some(registry) = cx.handle.as_ref().and_then(|h| h.queries.as_ref()) else {
+        return Vec::new();
+    };
+    registry
+        .iter()
+        .filter(|q| q.expose)
+        .filter_map(|q| {
+            let entry = api::query_catalog_entry(q);
+            if Builtin::from_name(&entry.tool_name).is_some() {
+                return None;
+            }
+            Some(stored_descriptor(&entry))
+        })
+        .collect()
+}
+
+/// Does this graph expose a stored-query tool named `name` (not shadowed by a
+/// built-in)?
+pub(crate) fn is_stored_tool(cx: &ToolCx, name: &str) -> bool {
+    if Builtin::from_name(name).is_some() {
+        return false;
+    }
+    cx.handle
+        .as_ref()
+        .and_then(|h| h.queries.as_ref())
+        .is_some_and(|reg| reg.iter().any(|q| q.expose && q.effective_tool_name() == name))
+}
+
+/// Dispatch an exposed stored-query tool. The caller has already enforced the
+/// outer `InvokeQuery` gate (deny ≡ unknown); this runs the registry source
+/// through `run_query` / `run_mutate`, whose inner `Read` / `Change` gate the
+/// body.
+pub(crate) async fn call_stored_tool(
+    cx: &ToolCx,
+    name: &str,
+    args: &JsonObject,
+) -> Result<CallToolResult, McpError> {
+    let handle = cx.graph()?;
+    let unknown = || McpError::invalid_params(format!("unknown tool: {name}"), None);
+    let registry = handle.queries.as_ref().ok_or_else(unknown)?;
+    let stored = registry
+        .iter()
+        .find(|q| q.expose && q.effective_tool_name() == name)
+        .ok_or_else(unknown)?;
+    let source = Arc::clone(&stored.source);
+    let query_name = stored.name.clone();
+    let mutation = stored.is_mutation();
+
+    // The query parameters are top-level tool args; `branch`/`snapshot` are
+    // invocation knobs. Peel the knobs off and pass the rest as the params
+    // object `run_query` / `run_mutate` expect.
+    let mut params = args.clone();
+    let branch = params
+        .remove("branch")
+        .and_then(|v| v.as_str().map(str::to_string));
+    let snapshot = params
+        .remove("snapshot")
+        .and_then(|v| v.as_str().map(str::to_string));
+    let params = Value::Object(params);
+
+    if mutation {
+        let branch = branch.unwrap_or_else(|| "main".to_string());
+        to_tool(
+            run_mutate(
+                cx.state.clone(),
+                Arc::clone(handle),
+                cx.actor_ref(),
+                &source,
+                Some(&query_name),
+                Some(&params),
+                branch,
+            )
+            .await,
+        )
+    } else {
+        match run_query(
+            Arc::clone(handle),
+            cx.actor_ref(),
+            &source,
+            Some(&query_name),
+            Some(&params),
+            branch,
+            snapshot,
+            true,
+        )
+        .await
+        {
+            Ok((selected, target, qr)) => ok_json(&api::read_output(selected, &target, qr)),
+            Err(err) => Ok(api_error_to_tool(err)),
+        }
+    }
+}
+
+fn stored_descriptor(entry: &api::QueryCatalogEntry) -> Tool {
+    let mut props = Map::new();
+    let mut required: Vec<Value> = Vec::new();
+    for p in &entry.params {
+        props.insert(p.name.clone(), param_schema(p));
+        if !p.nullable {
+            required.push(Value::String(p.name.clone()));
+        }
+    }
+    props.insert(
+        "branch".to_string(),
+        json!({"type": "string", "description": "Branch to target (default `main`)."}),
+    );
+    if !entry.mutation {
+        props.insert(
+            "snapshot".to_string(),
+            json!({"type": "string", "description": "Snapshot id to read (mutually exclusive with `branch`)."}),
+        );
+    }
+    let mut schema = Map::new();
+    schema.insert("type".to_string(), json!("object"));
+    schema.insert("properties".to_string(), Value::Object(props));
+    if !required.is_empty() {
+        schema.insert("required".to_string(), Value::Array(required));
+    }
+    schema.insert("additionalProperties".to_string(), json!(false));
+
+    let mut description = entry
+        .description
+        .clone()
+        .unwrap_or_else(|| format!("Stored query `{}`.", entry.name));
+    if let Some(instruction) = &entry.instruction {
+        description.push_str("\n\n");
+        description.push_str(instruction);
+    }
+    let annotations = if entry.mutation {
+        ToolAnnotations::new()
+            .read_only(false)
+            .destructive(true)
+            .open_world(false)
+    } else {
+        ToolAnnotations::new().read_only(true).open_world(false)
+    };
+    Tool::new(entry.tool_name.clone(), description, Arc::new(schema)).with_annotations(annotations)
+}
+
+/// Map a stored-query parameter to its JSON Schema (RFC-003 §5.3).
+fn param_schema(p: &api::ParamDescriptor) -> Value {
+    match p.kind {
+        api::ParamKind::List => {
+            let item = p
+                .item_kind
+                .map(scalar_schema)
+                .unwrap_or_else(|| json!({"type": "string"}));
+            json!({"type": "array", "items": item})
+        }
+        other => kind_schema(other, p.vector_dim),
+    }
+}
+
+fn scalar_schema(kind: api::ParamKind) -> Value {
+    kind_schema(kind, None)
+}
+
+fn kind_schema(kind: api::ParamKind, vector_dim: Option<u32>) -> Value {
+    use api::ParamKind::*;
+    match kind {
+        String => json!({"type": "string"}),
+        Bool => json!({"type": "boolean"}),
+        Int => json!({"type": "integer"}),
+        // JSON numbers lose precision past 2^53, so i64/u64 ride as strings.
+        BigInt => json!({"type": "string", "pattern": "^-?\\d+$"}),
+        Float => json!({"type": "number"}),
+        Date => json!({"type": "string", "format": "date"}),
+        DateTime => json!({"type": "string", "format": "date-time"}),
+        Blob => json!({"type": "string", "contentEncoding": "base64"}),
+        Vector => {
+            let dim = vector_dim.unwrap_or(0);
+            json!({"type": "array", "items": {"type": "number"}, "minItems": dim, "maxItems": dim})
+        }
+        // The grammar forbids lists/vectors of lists, so a bare List here is
+        // unreachable; fall back to an untyped array.
+        List => json!({"type": "array"}),
+    }
+}
+
+// ---- resources (RFC-003 §5.5) ----------------------------------------------
+//
+// Three read-only resources, each gated by the same action as its tool/route:
+// the schema source, the branch list, and (multi-graph) the graph registry. A
+// locked-down agent denied the gate never sees the resource (list-filtered) and
+// a read is masked as "unknown resource" (deny ≡ missing).
+
+const RESOURCE_SCHEMA: &str = "omnigraph://schema";
+const RESOURCE_BRANCHES: &str = "omnigraph://branches";
+const RESOURCE_GRAPHS: &str = "omnigraph://graphs";
+
+struct ResourceDef {
+    uri: &'static str,
+    name: &'static str,
+    description: &'static str,
+    mime: &'static str,
+    gate: Gate,
+}
+
+fn resource_defs() -> [ResourceDef; 3] {
+    [
+        ResourceDef {
+            uri: RESOURCE_SCHEMA,
+            name: "schema",
+            description: "The graph's `.pg` schema source.",
+            mime: "text/plain",
+            gate: Gate::Graph(PolicyAction::Read),
+        },
+        ResourceDef {
+            uri: RESOURCE_BRANCHES,
+            name: "branches",
+            description: "The graph's branch names, as JSON.",
+            mime: "application/json",
+            gate: Gate::Graph(PolicyAction::Read),
+        },
+        ResourceDef {
+            uri: RESOURCE_GRAPHS,
+            name: "graphs",
+            description: "The graphs registered with this server, as JSON (multi-graph mode).",
+            mime: "application/json",
+            gate: Gate::Server(PolicyAction::GraphList),
+        },
+    ]
+}
+
+/// The resources this actor may read (Cedar-filtered, same gate as the matching
+/// tool).
+pub(crate) fn list_resources(cx: &ToolCx) -> Result<Vec<Resource>, McpError> {
+    let mut out = Vec::new();
+    for def in resource_defs() {
+        if gate_allowed(&def.gate, cx)? {
+            let mut raw = RawResource::new(def.uri, def.name);
+            raw.description = Some(def.description.to_string());
+            raw.mime_type = Some(def.mime.to_string());
+            out.push(Annotated::new(raw, None));
+        }
+    }
+    Ok(out)
+}
+
+/// Read a resource by URI: enforce the gate (deny ≡ unknown resource), then
+/// return the schema source / branch list / graph registry as text.
+pub(crate) async fn read_resource(cx: &ToolCx, uri: &str) -> Result<ReadResourceResult, McpError> {
+    let unknown = || McpError::invalid_params(format!("unknown resource: {uri}"), None);
+    let def = resource_defs()
+        .into_iter()
+        .find(|d| d.uri == uri)
+        .ok_or_else(unknown)?;
+    if !gate_allowed(&def.gate, cx)? {
+        return Err(unknown());
+    }
+    let text = match uri {
+        RESOURCE_SCHEMA => {
+            do_schema_get(cx.graph()?, cx.actor_ref())
+                .await
+                .map_err(api_operational_error)?
+                .schema_source
+        }
+        RESOURCE_BRANCHES => {
+            let out = do_branches_list(cx.graph()?, cx.actor_ref())
+                .await
+                .map_err(api_operational_error)?;
+            json_text(&out)?
+        }
+        RESOURCE_GRAPHS => {
+            let out = do_graphs_list(&cx.state, cx.actor_ref())
+                .await
+                .map_err(api_operational_error)?;
+            json_text(&out)?
+        }
+        _ => return Err(unknown()),
+    };
+    Ok(ReadResourceResult::new(vec![ResourceContents::text(
+        text, uri,
+    )]))
+}
+
+fn json_text<T: Serialize>(value: &T) -> Result<String, McpError> {
+    serde_json::to_string_pretty(value)
+        .map_err(|err| McpError::internal_error(format!("serialize resource: {err}"), None))
 }
