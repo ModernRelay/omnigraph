@@ -11,8 +11,8 @@ use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
 use omnigraph::storage::normalize_root_uri;
 use omnigraph_cluster::{
-    DiagnosticSeverity, ForceUnlockOutput, PlanOutput, StateSyncOutput, StatusOutput,
-    ValidateOutput, force_unlock_config_dir, import_config_dir, plan_config_dir,
+    ApplyOutput, DiagnosticSeverity, ForceUnlockOutput, PlanOutput, StateSyncOutput, StatusOutput,
+    ValidateOutput, apply_config_dir, force_unlock_config_dir, import_config_dir, plan_config_dir,
     refresh_config_dir, status_config_dir, validate_config_dir,
 };
 use omnigraph_compiler::query::parser::parse_query;
@@ -354,6 +354,16 @@ enum ClusterCommand {
     },
     /// Produce a read-only plan by diffing cluster.yaml against __cluster/state.json.
     Plan {
+        /// Cluster config directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Emit JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply the config-only (query/policy) subset of the plan to the local
+    /// cluster catalog. Graph/schema changes are deferred to a later stage.
+    Apply {
         /// Cluster config directory containing cluster.yaml.
         #[arg(long, default_value = ".")]
         config: PathBuf,
@@ -804,6 +814,48 @@ fn print_cluster_plan_human(output: &PlanOutput) {
     print_cluster_diagnostics(&output.diagnostics);
 }
 
+fn print_cluster_apply_human(output: &ApplyOutput) {
+    if output.ok {
+        println!(
+            "cluster apply: {} applied, {} deferred/blocked",
+            output.applied_count, output.deferred_count
+        );
+    } else {
+        println!("cluster apply failed");
+    }
+    // The change list prints on failure too: an operator debugging a partial
+    // apply (payload or state-write error) needs to see what was attempted.
+    print_cluster_apply_changes(&output.changes);
+    if output.ok {
+        let state = &output.state_observations;
+        println!(
+            "  state: revision {}, converged: {}, written: {}",
+            state.state_revision, output.converged, output.state_written
+        );
+        println!("  note: applied = recorded in the cluster catalog; the server still boots from omnigraph.yaml");
+    }
+    print_cluster_diagnostics(&output.diagnostics);
+}
+
+fn print_cluster_apply_changes(changes: &[omnigraph_cluster::PlanChange]) {
+    for change in changes {
+        match (&change.disposition, change.reason.as_deref()) {
+            (Some(disposition), Some(reason)) => println!(
+                "  {:?} {} [{disposition:?}: {reason}]",
+                change.operation, change.resource
+            ),
+            (Some(disposition), None) => println!(
+                "  {:?} {} [{disposition:?}]",
+                change.operation, change.resource
+            ),
+            _ => println!("  {:?} {}", change.operation, change.resource),
+        }
+    }
+    if changes.is_empty() {
+        println!("  no changes");
+    }
+}
+
 fn print_cluster_status_human(output: &StatusOutput) {
     if output.ok {
         let state = &output.state_observations;
@@ -927,6 +979,19 @@ fn finish_cluster_plan(output: &PlanOutput, json: bool) -> Result<()> {
         print_json(output)?;
     } else {
         print_cluster_plan_human(output);
+    }
+    if !output.ok {
+        io::stdout().flush()?;
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn finish_cluster_apply(output: &ApplyOutput, json: bool) -> Result<()> {
+    if json {
+        print_json(output)?;
+    } else {
+        print_cluster_apply_human(output);
     }
     if !output.ok {
         io::stdout().flush()?;
@@ -3491,6 +3556,10 @@ async fn main() -> Result<()> {
             ClusterCommand::Plan { config, json } => {
                 let output = plan_config_dir(config);
                 finish_cluster_plan(&output, json)?;
+            }
+            ClusterCommand::Apply { config, json } => {
+                let output = apply_config_dir(config);
+                finish_cluster_apply(&output, json)?;
             }
             ClusterCommand::Status { config, json } => {
                 let output = status_config_dir(config);
