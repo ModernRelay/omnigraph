@@ -64,6 +64,21 @@ is trying to create. -->
    identity. It is not committed into `cluster.yaml`.
 6. `mcp.expose` remains supported in current `omnigraph.yaml` until the
    per-query policy replacement ships.
+7. **Single ownership (axiom 15).** While `omnigraph.yaml` and the cluster
+   catalog coexist, each fact is read from exactly one source at a time.
+   Phase 5 server boot is an exclusive mode switch — boot from cluster state
+   XOR from `omnigraph.yaml` — never a precedence-merge of both. No phase may
+   introduce a surface that reads the same fact (graph set, query registry,
+   policy wiring, bind address) from both sources with tie-break rules.
+8. **`omnigraph.yaml` shrinks; it does not get deprecated.** Its terminal role
+   is the per-operator layer: connection/cluster selection, the operator's
+   credential reference, active graph/branch context, CLI ergonomics, and
+   purely personal aliases (target home: the operator's global config dir per
+   RFC-002). Shared-truth keys migrate to `cluster.yaml`; per-operator keys
+   never do.
+9. **Bridges carry sunsets.** Every compatibility bridge names its replacement
+   and the phase that removes it (`mcp.expose` → Phase 6 policy-owned exposure
+   is the template). A bridge without an exit is a review-blocking finding.
 
 ## Terraform-Aligned Schema Validation
 
@@ -335,8 +350,6 @@ Target Phase-1 cluster-root layout:
       <ulid>.json
     recoveries/
       <ulid>.json
-    recovery/
-      <ulid>.json
     resources/
       query/<graph>/<name>/<digest>.gq
       policy/<name>/<digest>.yaml
@@ -586,7 +599,9 @@ replacement would make every invariant harder to audit. -->
 
 - Allow server startup from cluster state.
 - Add status and catalog endpoints as needed.
-- Keep the current `omnigraph.yaml` startup path as compatibility mode.
+- Keep the current `omnigraph.yaml` startup path as compatibility mode — an
+  **exclusive mode switch** per deployment (cluster state XOR `omnigraph.yaml`),
+  never a merged read of both (Compatibility Stance #7, axiom 15).
 - Regenerate OpenAPI for any HTTP surface.
 
 ### Phase 6: Policy-Owned Query Exposure

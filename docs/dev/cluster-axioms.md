@@ -24,6 +24,12 @@ consequences that follow from them.
 > Terraform-style JSON documents plus backend lock/CAS, not Lance control-plane
 > datasets. Lance remains a possible later backend only if row-level history or
 > queryability justifies the extra machinery.
+>
+> **Revision 2026-06-09 — single ownership during migration.** Axiom **15**
+> added: while `omnigraph.yaml` and the cluster catalog coexist, every fact has
+> exactly one owner at a time — coexistence is a **mode switch, never a merge**.
+> `omnigraph.yaml` does not get replaced; its job description shrinks to the
+> permanent per-operator layer.
 
 ---
 
@@ -72,6 +78,8 @@ invoke_query. This axiom is the target control-plane rule, not a statement
 about today's server catalog. -->
 **14. Exposure is a policy decision, not a config flag.** Target design: which stored queries (and the tools/dashboards built on them) an actor may **list or invoke** is decided by the policy layer (Cedar: `invoke_query` + catalog visibility), not by a per-query `expose:` boolean. The registry only says a query *exists* (name → file); **policy says who may see and run it**, so the MCP catalog (`GET /queries`) becomes each actor's policy-permitted set. This supersedes the engine's current `mcp.expose` flag only after per-query `invoke_query` scope and Cedar-filtered catalog listing land; until then, proposals must state the compatibility bridge to today's `mcp.expose` + coarse invocation gate.
 
+**15. Every fact has exactly one owner at a time; coexistence is a mode switch, never a merge.** `cluster.yaml` is not `omnigraph.yaml` v2 — the two documents end with disjoint jobs, and only the *shared-truth* parts of today's `omnigraph.yaml` (the set of graphs, stored-query registry, policy wiring, server boot source) migrate to the cluster catalog. The per-operator parts — connection/cluster selection, the operator's own credential reference, active graph/branch context, CLI ergonomics — are per-operator *by nature* (Sarah's and Bob's differ) and stay in the per-operator layer permanently; plan a **shrinking job description** for `omnigraph.yaml`, not an exit. During the migration window each fact is read from exactly one source at a time: a deployment serves from `omnigraph.yaml` **or** boots from cluster state (an exclusive mode switch), never from a precedence-merge of both. Two readers for one fact is the brittle-backcompat failure mode — it is the deny-list's "state that drifts from what it can be derived from" wearing a compatibility costume. Any compatibility bridge must name its replacement and its removal phase (the `mcp.expose` → policy-owned exposure bridge of axiom 14 is the template); bridges that accumulate without an exit are rejected at review.
+
 ---
 
 ## The one-line compression
@@ -82,7 +90,7 @@ about today's server catalog. -->
 
 ## How to use this file
 
-- **Reviewing a proposal:** walk axioms 0–14; any conflict is the burden of the proposer to justify. The most common tensions:
+- **Reviewing a proposal:** walk axioms 0–15; any conflict is the burden of the proposer to justify. The most common tensions:
   - Treating the *running system* as the source of truth for **intent** → axioms 2, 4 (intent lives in config).
   - Treating state as a throwaway derivation rather than an authoritative, locked, backend-held ledger → axiom 5, 12.
   - A runtime config-mutation API instead of declarative apply → axiom 3.
@@ -94,4 +102,5 @@ about today's server catalog. -->
   - A secret value (token, embedding key, pipeline source credential) inline in config instead of in the gitignored `.env` file → axiom 10.
   - A per-query `expose:`/visibility flag in target-state cluster config instead of governing list/invoke in policy; or failing to account for today's `mcp.expose` compatibility bridge → axiom 14.
   - Shipping `apply` before hermetic `validate` + read-only `plan` tests, or shipping graph/schema-moving apply before recovery tests for the graph/resource-moved-before-cluster-publish gap → axiom 5 and axiom 12.
+  - Reading one fact from both `omnigraph.yaml` and the cluster catalog with precedence rules (a merge instead of a mode switch), migrating per-operator concerns into shared cluster config, or adding a compatibility bridge with no named replacement and removal phase → axiom 15.
 - **Citing:** reference axioms by number in PRs and review comments so the rationale is stable across renames and refactors.
