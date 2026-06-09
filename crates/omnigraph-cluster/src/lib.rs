@@ -16,6 +16,8 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use ulid::Ulid;
 
+pub mod failpoints;
+
 pub const CLUSTER_CONFIG_FILE: &str = "cluster.yaml";
 pub const CLUSTER_GRAPHS_DIR: &str = "graphs";
 pub const CLUSTER_STATE_DIR: &str = "__cluster";
@@ -770,6 +772,21 @@ pub fn apply_config_dir(config_dir: impl AsRef<Path>) -> ApplyOutput {
         );
     }
 
+    // Crash point: payloads are on disk, state has not moved. A failure here
+    // must leave state.json byte-identical and acknowledge nothing; re-running
+    // apply repairs via the skip-if-exists blob reuse.
+    if let Err(diagnostic) = failpoints::maybe_fail("cluster_apply.after_payload_phase") {
+        diagnostics.push(diagnostic);
+        return early_return(
+            display_path(&desired.config_dir),
+            Some(desired.config_digest),
+            observations,
+            changes,
+            state.resource_statuses,
+            diagnostics,
+        );
+    }
+
     // State mutation. Apply owns query/policy statuses only; graph/schema
     // statuses belong to refresh/import observation and must not be clobbered.
     let before_value =
@@ -824,7 +841,13 @@ pub fn apply_config_dir(config_dir: impl AsRef<Path>) -> ApplyOutput {
     let mut state_write_failed = false;
     if after_value != before_value {
         new_state.state_revision = new_state.state_revision.saturating_add(1);
-        match backend.write_state(&new_state, expected_cas.as_deref(), &mut observations) {
+        // The failpoint error routes through state_write_failed so the
+        // persisted-statuses revert contract below is exercised; a cfg_callback
+        // on this point can mutate state.json to simulate a concurrent writer,
+        // making write_state's CAS check fail organically.
+        let write_result = failpoints::maybe_fail("cluster_apply.before_state_write")
+            .and_then(|()| backend.write_state(&new_state, expected_cas.as_deref(), &mut observations));
+        match write_result {
             Ok(()) => state_written = true,
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
