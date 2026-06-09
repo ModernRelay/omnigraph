@@ -134,6 +134,61 @@ query slow() {
     assert_eq!(fast, vec!["Charlie", "Diana"]);
 }
 
+// Regression: nested slow-path anti-joins must not collide on the synthetic
+// correlation tag. The outer anti-join tags rows with a correlation column that
+// rides through its inner pipeline; when the inner pipeline contains ANOTHER
+// slow-path anti-join, a fixed tag name would duplicate, and reading it by name
+// returns the OUTER tag — mis-correlating the inner negation. Fan-out (p1 works
+// at two companies) makes the inner row indices diverge from the outer tags, so
+// the bug produces a different person set than the correct one.
+#[tokio::test]
+async fn nested_anti_join_with_fanout_correlates_correctly() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    // p1 -> {Acme, Globex} (fan-out), p2 -> Globex, p3 -> Acme, p4 -> (none).
+    let data = r#"{"type":"Person","data":{"name":"p1"}}
+{"type":"Person","data":{"name":"p2"}}
+{"type":"Person","data":{"name":"p3"}}
+{"type":"Person","data":{"name":"p4"}}
+{"type":"Company","data":{"name":"Acme"}}
+{"type":"Company","data":{"name":"Globex"}}
+{"edge":"WorksAt","from":"p1","to":"Acme"}
+{"edge":"WorksAt","from":"p1","to":"Globex"}
+{"edge":"WorksAt","from":"p2","to":"Globex"}
+{"edge":"WorksAt","from":"p3","to":"Acme"}"#;
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&mut db, data, LoadMode::Overwrite).await.unwrap();
+
+    let queries = r#"
+query no_nonacme_employer() {
+    match {
+        $p: Person
+        not {
+            $p worksAt $c
+            not {
+                $c.name = "Acme"
+            }
+        }
+    }
+    return { $p.name }
+}
+"#;
+    let result = query_main(&mut db, queries, "no_nonacme_employer", &ParamMap::new())
+        .await
+        .unwrap();
+    let batch = result.concat_batches().unwrap();
+    let names = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let mut names_vec: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
+    names_vec.sort();
+    // p1 & p2 have a non-Acme employer (Globex) -> excluded; p3 (Acme only) and
+    // p4 (no employer) remain.
+    assert_eq!(names_vec, vec!["p3", "p4"]);
+}
+
 // ─── Variable-length hops ───────────────────────────────────────────────────
 
 const CHAIN_SCHEMA: &str = r#"
