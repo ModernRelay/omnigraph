@@ -75,8 +75,7 @@ pub struct CleanupPolicyOptions {
 }
 
 /// Why `optimize` did not compact a table. Typed so callers branch on the
-/// reason rather than sniffing a string. One variant today, gated by
-/// [`LANCE_SUPPORTS_BLOB_COMPACTION`].
+/// reason rather than sniffing a string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SkipReason {
@@ -84,6 +83,12 @@ pub enum SkipReason {
     /// `BlobHandling::AllBinary`, which mis-decodes blob-v2 columns; see
     /// [`LANCE_SUPPORTS_BLOB_COMPACTION`] and `docs/dev/lance.md`.
     BlobColumnsUnsupportedByLance,
+    /// The Lance dataset HEAD is ahead of the version recorded in
+    /// `__manifest`, and no recovery sidecar covers that movement. `optimize`
+    /// cannot infer whether the drift is benign maintenance or an external
+    /// semantic write, so it leaves the table untouched and points operators at
+    /// explicit `repair`.
+    DriftNeedsRepair,
 }
 
 impl SkipReason {
@@ -92,6 +97,7 @@ impl SkipReason {
     pub fn as_str(&self) -> &'static str {
         match self {
             SkipReason::BlobColumnsUnsupportedByLance => "blob_columns_unsupported_by_lance",
+            SkipReason::DriftNeedsRepair => "drift_needs_repair",
         }
     }
 }
@@ -103,6 +109,7 @@ impl std::fmt::Display for SkipReason {
             SkipReason::BlobColumnsUnsupportedByLance => {
                 "blob columns — Lance compaction unsupported"
             }
+            SkipReason::DriftNeedsRepair => "manifest/head drift — run omnigraph repair",
         };
         f.write_str(msg)
     }
@@ -125,6 +132,12 @@ pub struct TableOptimizeStats {
     /// `Some(reason)` if this table was deliberately not compacted. When set,
     /// `fragments_removed == 0`, `fragments_added == 0`, and `!committed`.
     pub skipped: Option<SkipReason>,
+    /// Manifest table version observed by optimize for drift skips. `None` for
+    /// normal compaction/no-op/blob skips.
+    pub manifest_version: Option<u64>,
+    /// Lance HEAD version observed by optimize for drift skips. `None` for
+    /// normal compaction/no-op/blob skips.
+    pub lance_head_version: Option<u64>,
 }
 
 impl TableOptimizeStats {
@@ -136,6 +149,8 @@ impl TableOptimizeStats {
             fragments_added: metrics.fragments_added,
             committed,
             skipped: None,
+            manifest_version: None,
+            lance_head_version: None,
         }
     }
 
@@ -147,6 +162,25 @@ impl TableOptimizeStats {
             fragments_added: 0,
             committed: false,
             skipped: Some(reason),
+            manifest_version: None,
+            lance_head_version: None,
+        }
+    }
+
+    /// Stat for a table skipped because the manifest and Lance HEAD disagree.
+    fn skipped_for_drift(
+        table_key: String,
+        manifest_version: u64,
+        lance_head_version: u64,
+    ) -> Self {
+        Self {
+            table_key,
+            fragments_removed: 0,
+            fragments_added: 0,
+            committed: false,
+            skipped: Some(SkipReason::DriftNeedsRepair),
+            manifest_version: Some(manifest_version),
+            lance_head_version: Some(lance_head_version),
         }
     }
 }
@@ -185,8 +219,7 @@ pub async fn optimize_all_tables(db: &Omnigraph) -> Result<Vec<TableOptimizeStat
         ));
     }
 
-    let resolved = db.resolved_branch_target(None).await?;
-    let snapshot = resolved.snapshot;
+    let snapshot = db.fresh_snapshot_for_branch(None).await?;
 
     // Compute per-table state (path + whether it has blob columns) up front, in
     // a scope that drops the catalog handle before the async stream starts.
@@ -258,7 +291,8 @@ async fn optimize_one_table(
 ) -> Result<TableOptimizeStats> {
     // Lance `compact_files` mis-decodes blob-v2 columns under the forced
     // `BlobHandling::AllBinary` read (see LANCE_SUPPORTS_BLOB_COMPACTION). Skip
-    // blob-bearing tables and report it rather than aborting the whole sweep.
+    // blob-bearing tables before acquiring the write queue; `repair` is the
+    // operator tool for full manifest/head drift classification.
     if has_blob && !LANCE_SUPPORTS_BLOB_COMPACTION {
         tracing::warn!(
             target: "omnigraph::optimize",
@@ -297,20 +331,41 @@ async fn optimize_one_table(
     // CAS baseline: the table's current manifest version, read under the queue
     // (in-memory coordinator snapshot, no storage I/O — stable for this section).
     let expected_version = db
-        .snapshot()
-        .await
+        .fresh_snapshot_for_branch(None)
+        .await?
         .entry(&table_key)
         .map(|e| e.table_version)
         .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
+
+    let lance_head_version = ds.version().version;
+    if lance_head_version < expected_version {
+        return Err(OmniError::manifest_internal(format!(
+            "table '{}' Lance HEAD version {} is behind manifest version {}",
+            table_key, lance_head_version, expected_version
+        )));
+    }
+    if lance_head_version > expected_version {
+        tracing::warn!(
+            target: "omnigraph::optimize",
+            table = %table_key,
+            manifest_version = expected_version,
+            lance_head_version,
+            "skipping compaction: Lance HEAD is ahead of the manifest; run `omnigraph repair` \
+             to classify and publish covered maintenance drift explicitly",
+        );
+        return Ok(TableOptimizeStats::skipped_for_drift(
+            table_key,
+            expected_version,
+            lance_head_version,
+        ));
+    }
 
     // Precise "will it compact?" check — `plan_compaction` also accounts for
     // deletion materialization (which can rewrite even a single fragment). A
     // steady-state already-compacted table yields an empty plan and is never
     // pinned in a sidecar (a zero-commit pin would classify NoMovement on
-    // recovery and force an all-or-nothing rollback). There is no drift to
-    // reconcile here: optimize runs only on a recovered graph (the pending-
-    // sidecar guard above), and recovery roll-back now publishes, so
-    // `HEAD == manifest` holds going in.
+    // recovery and force an all-or-nothing rollback). Uncovered pre-existing
+    // drift is skipped above and must go through explicit repair.
     let options = CompactionOptions::default();
     let plan = plan_compaction(&ds, &options)
         .await
@@ -655,7 +710,7 @@ fn orphan_branches(present: Vec<String>, keep: &std::collections::HashSet<String
     orphans
 }
 
-fn all_table_keys(catalog: &omnigraph_compiler::catalog::Catalog) -> Vec<String> {
+pub(super) fn all_table_keys(catalog: &omnigraph_compiler::catalog::Catalog) -> Vec<String> {
     let mut keys: Vec<String> = catalog
         .node_types
         .keys()
