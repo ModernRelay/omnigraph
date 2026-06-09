@@ -85,6 +85,55 @@ query no_nonacme_employer() {
     assert_eq!(names_vec, vec!["Alice", "Charlie", "Diana"]);
 }
 
+// The anti-join has two execution forks: the CSR `has_neighbors` fast path
+// (bare single-op Expand inner) and the set-oriented inner-pipeline replay (when
+// dst_filters force a multi-op inner). They must agree. `not { $p worksAt $_ }`
+// takes the fast path; the same negation with an always-true dst filter
+// (`$c.name != ""`) is semantically identical but forces the slow path.
+#[tokio::test]
+async fn anti_join_fast_and_slow_paths_agree() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    let queries = r#"
+query fast() {
+    match {
+        $p: Person
+        not { $p worksAt $_ }
+    }
+    return { $p.name }
+}
+query slow() {
+    match {
+        $p: Person
+        not {
+            $p worksAt $c
+            $c.name != ""
+        }
+    }
+    return { $p.name }
+}
+"#;
+    let names = |result: omnigraph_compiler::result::QueryResult| {
+        let batch = result.concat_batches().unwrap();
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let mut v: Vec<String> = (0..col.len()).map(|i| col.value(i).to_string()).collect();
+        v.sort();
+        v
+    };
+
+    let fast = names(query_main(&mut db, queries, "fast", &ParamMap::new()).await.unwrap());
+    let slow = names(query_main(&mut db, queries, "slow", &ParamMap::new()).await.unwrap());
+
+    assert_eq!(fast, slow, "anti-join fast and slow paths must agree");
+    // Alice->Acme, Bob->Globex employed; Charlie & Diana have no employer.
+    assert_eq!(fast, vec!["Charlie", "Diana"]);
+}
+
 // ─── Variable-length hops ───────────────────────────────────────────────────
 
 const CHAIN_SCHEMA: &str = r#"
