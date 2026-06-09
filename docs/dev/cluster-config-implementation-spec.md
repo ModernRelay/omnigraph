@@ -663,7 +663,11 @@ Hard gates:
 - Do not ship `cluster apply` until `cluster validate` and read-only
   `cluster plan` have hermetic tests.
 - Do not ship graph/schema-moving apply until failpoint recovery tests prove the
-  Phase B -> state publish gap is covered.
+  Phase B -> state publish gap is covered. (Stage 3B delivered the apply-side
+  half: `omnigraph-cluster` has failpoint infrastructure and tests for the
+  crash-after-payload and state-CAS-race windows of config-only apply, plus
+  catalog payload verification in status/refresh. Graph-moving sidecar
+  coverage remains Phase 4 work.)
 
 For docs-only changes, `scripts/check-agents-md.sh` is enough. For
 implementation phases, run the boundary tests above before widening to
