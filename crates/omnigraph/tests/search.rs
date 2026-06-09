@@ -556,6 +556,44 @@ async fn bm25_returns_ranked_results() {
     assert!(result.num_rows() <= 3, "bm25 should respect limit 3");
 }
 
+// Full rank-ORDER golden (not just top-1 / non-empty): pins ranks 2..k so a
+// regression corrupting the tail or reversing the sort direction fails loudly.
+// nearest skips apply_ordering (is_search_ordered) and returns Lance native
+// order, so result_slugs row order == rank order.
+#[tokio::test]
+#[serial]
+async fn nearest_full_rank_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    let result = query_main(
+        &mut db,
+        SEARCH_QUERIES,
+        "vector_search",
+        &vector_param("$q", &[0.1, 0.2, 0.3, 0.4]),
+    )
+    .await
+    .unwrap();
+    // [0.1,0.2,0.3,0.4] == ml-intro's embedding (dist 0); the rest by ascending L2.
+    assert_eq!(result_slugs(&result), vec!["ml-intro", "nlp-guide", "rl-intro"]);
+}
+
+#[tokio::test]
+#[serial]
+async fn bm25_full_rank_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_search_db(&dir).await;
+    let result = query_main(
+        &mut db,
+        SEARCH_QUERIES,
+        "bm25_search",
+        &params(&[("$q", "Learning")]),
+    )
+    .await
+    .unwrap();
+    // Descending BM25 score order.
+    assert_eq!(result_slugs(&result), vec!["rl-intro", "ml-intro", "dl-basics"]);
+}
+
 #[tokio::test]
 #[serial]
 async fn mutation_commit_refreshes_search_indices_without_manual_ensure() {
