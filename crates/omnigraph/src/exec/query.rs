@@ -869,6 +869,18 @@ fn choose_expand_mode(i: &ExpandCostInputs) -> ExpandMode {
     }
 }
 
+/// Hops the indexed path will actually run, for cost-model purposes. A cross-type
+/// edge cannot chain, so `execute_expand_indexed` caps it at one hop regardless of
+/// the requested range; the cost model must use that, or it over-estimates the
+/// indexed cost of a cross-type variable-length expand and skews toward CSR.
+fn cost_effective_hops(requested_max_hops: u32, same_type: bool) -> u32 {
+    if same_type {
+        requested_max_hops
+    } else {
+        requested_max_hops.min(1)
+    }
+}
+
 /// Gather the cost-model inputs from cheap manifest counts. `None` when the
 /// edge type, its source node type, or their manifest entries are absent (e.g.
 /// a not-yet-materialized table) — the caller then falls back to the legacy
@@ -884,6 +896,10 @@ fn gather_cost_inputs(
 ) -> Option<ExpandCostInputs> {
     let edge_entry = snapshot.entry(&format!("edge:{}", edge_type))?;
     let edge_def = catalog.edge_types.get(edge_type)?;
+    // Match the indexed path's cross-type one-hop cap so the cost estimate
+    // reflects what actually runs (see `cost_effective_hops`).
+    let effective_max_hops =
+        cost_effective_hops(effective_max_hops, edge_def.from_type == edge_def.to_type);
     // The frontier source vertices are the keyed endpoint's type: `from` for an
     // Out traversal (keyed on `src`), `to` for In (keyed on `dst`).
     let src_type = match direction {
@@ -2224,6 +2240,23 @@ mod expand_chooser_tests {
         // (cost ~0) over re-scanning per hop.
         let mut i = inputs(1, 10_000_000, 1_000_000, 1, IndexCoverage::Indexed);
         i.csr_cached = true;
+        assert_eq!(choose_expand_mode(&i), ExpandMode::Csr);
+    }
+
+    #[test]
+    fn cost_model_caps_cross_type_hops() {
+        // Same-type passes the requested range through; cross-type caps at 1,
+        // matching execute_expand_indexed.
+        assert_eq!(cost_effective_hops(5, true), 5);
+        assert_eq!(cost_effective_hops(5, false), 1);
+        assert_eq!(cost_effective_hops(1, false), 1);
+
+        // Consequence: a selective frontier where the requested 5 hops would
+        // (wrongly) flip cross-type to CSR, but the capped 1 hop — what actually
+        // runs — keeps it indexed.
+        let mut i = inputs(50, 10_000, 100, cost_effective_hops(5, false), IndexCoverage::Indexed);
+        assert_eq!(choose_expand_mode(&i), ExpandMode::IndexedScan);
+        i.effective_max_hops = 5; // as if the cross-type cap were not applied
         assert_eq!(choose_expand_mode(&i), ExpandMode::Csr);
     }
 }
