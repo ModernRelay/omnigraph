@@ -195,6 +195,14 @@ pub async fn diff_since_branch(
     .await
 }
 
+/// Advance a Lance dataset HEAD directly from tests without going through
+/// OmniGraph's storage residual surface. Used to synthesize uncovered drift.
+pub async fn lance_delete_inline(ds: &mut lance::Dataset, filter: &str) -> usize {
+    let result = ds.delete(filter).await.unwrap();
+    *ds = (*result.new_dataset).clone();
+    result.num_deleted_rows as usize
+}
+
 /// Build a ParamMap from string key-value pairs.
 pub fn params(pairs: &[(&str, &str)]) -> ParamMap {
     pairs
@@ -256,6 +264,27 @@ pub fn vector_and_string_params(
     let key = str_name.strip_prefix('$').unwrap_or(str_name).to_string();
     map.insert(key, Literal::String(str_value.to_string()));
     map
+}
+
+/// Test-only helper: perform a raw `Dataset::append` against Lance,
+/// advancing Lance HEAD without going through the manifest. Used by
+/// `recovery::*` and `staged_writes::*` tests that deliberately set up
+/// HEAD-ahead-of-manifest drift scenarios.
+///
+/// This mirrors the body of the engine's inline-commit
+/// `TableStore::append_batch` (which is `pub(crate)` after MR-854) —
+/// kept here as a test helper because integration tests need to
+/// simulate drift without depending on the demoted crate-internal API.
+pub async fn lance_append_inline(ds: &mut lance::Dataset, batch: RecordBatch) {
+    use lance::dataset::{WriteMode, WriteParams};
+    let schema = batch.schema();
+    let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Append,
+        allow_external_blob_outside_bases: true,
+        ..Default::default()
+    };
+    ds.append(reader, Some(params)).await.unwrap();
 }
 
 pub fn s3_test_graph_uri(suite: &str) -> Option<String> {

@@ -387,6 +387,65 @@ This proposal:
 
 The connection/credential/preference layer remains per operator: it points at a cluster, resolves that operator's identity, and holds personal ergonomics. The cluster config stays shared, secret-free, and reviewable; the state ledger stays authoritative and locked.
 
+### Migration model: single ownership, mode switch, shrinking job description (axiom 15)
+
+`omnigraph.yaml` is not being replaced; its **job description shrinks**. Only the
+shared-truth parts of its current role migrate to the cluster catalog (the set of
+graphs, the stored-query registry, policy wiring, the server boot source). The
+per-operator parts are per-operator *by nature* — Sarah's and Bob's differ — and
+keep `omnigraph.yaml`/the per-operator layer as a permanent, well-defined home.
+
+While both exist, **each fact has exactly one owner at any moment, and
+coexistence is a mode switch, never a merge**. The brittle version of backward
+compatibility — the server reading graphs from `omnigraph.yaml` *and* from
+cluster state with precedence rules gluing them together — is rejected outright:
+two readers for one truth means every bug becomes "which file won?" and every
+feature pays the tax twice. The realistic timeline has three windows:
+
+1. **Now → Phase 4 (no conflict).** Cluster apply writes only to its own catalog
+   (`__cluster/`); `omnigraph.yaml` serves traffic. `Applied` status must
+   visibly mean "recorded in the cluster catalog, not yet serving" so the
+   overlap is loud, not hidden.
+2. **Phase 5 (the mode switch).** A deployment opts into booting from cluster
+   state; `omnigraph.yaml`'s server-role keys become inert *for that
+   deployment*. Exclusive — boot from cluster state XOR `omnigraph.yaml` — with
+   no key-level aliasing and no merged precedence.
+3. **Phase 6+ (bridges with sunsets).** Targeted compatibility bridges are
+   allowed only with a named replacement and a removal phase; `mcp.expose` →
+   policy-owned exposure is the template. Bridges that accumulate without an
+   exit are review-rejected.
+
+Key-by-key compatibility inside one evolving file is the expensive kind of
+backcompat (the v1 `omnigraph.yaml` reshape's `--target`/legacy-key regressions
+are the in-repo cautionary tale); resource-ownership seams between two files
+with a mode switch is the cheap kind. Police the single-owner rule in every
+Phase 3–6 PR: a proposal that merges the two sources for one fact is the
+deny-list's "state that drifts from what it can be derived from" wearing a
+compatibility costume.
+
+### The per-operator layer: contents and destination
+
+The per-operator layer must be **complete** — everything an operator needs to
+work against any cluster from any directory, and nothing that two operators must
+agree on:
+
+| Per-operator concern | Today | Target |
+|---|---|---|
+| Connection (which cluster/server, named endpoints) | `omnigraph.yaml` `graphs.<name>` URIs / `servers:` refs | global config, per-operator |
+| Operator credential **reference** (`bearer_token_env`, env-file lookup) | `omnigraph.yaml` + `.env` | global config references; secret values stay in env/`.env`, never in any config |
+| Active context (current graph/branch selection) | ad-hoc per-command flags / `defaults` | global state layer (e.g. `omnigraph use`), explicitly **not** the cluster state ledger (axiom 5's "state" is the applied-cluster ledger, not a personal selection) |
+| CLI ergonomics (output format, table layout) | `omnigraph.yaml` `cli:`/`defaults:` | global config, per-operator |
+| Personal command shortcuts (purely personal aliases) | `omnigraph.yaml` `aliases:` | global config; *shared* aliases (team vocabulary) are cluster config — see the aliases split note above |
+
+Destination: this layer belongs in the operator's **global config dir**
+(`~/.omnigraph`, per the RFC-002 global-first layered-config direction —
+global config + active-context state file), not in a repo-committed file, so it
+survives `git clone`, works from any directory, and never collides with the
+shared cluster folder. The RFC-002 layering implementation is currently parked
+(PRs #139/#162 closed over review findings), but the *boundary* it draws is the
+one this spec depends on: per-operator → global dir; shared deployment intent →
+the cluster config folder; deployed reality → the state ledger.
+
 Implementation gate: the Terraform-style workflow must be testable in order.
 `cluster validate` must catch bad config before any apply path exists;
 read-only `cluster plan` must have deterministic structured-plan tests before

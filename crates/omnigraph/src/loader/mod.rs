@@ -305,8 +305,7 @@ async fn load_jsonl_reader<R: BufRead>(
             if !catalog.node_types.contains_key(type_name) {
                 return Err(OmniError::manifest(format!(
                     "record {}: unknown node type '{}'",
-                    record_num,
-                    type_name
+                    record_num, type_name
                 )));
             }
             let data = value
@@ -321,8 +320,7 @@ async fn load_jsonl_reader<R: BufRead>(
             if catalog.lookup_edge_by_name(edge_name).is_none() {
                 return Err(OmniError::manifest(format!(
                     "record {}: unknown edge type '{}'",
-                    record_num,
-                    edge_name
+                    record_num, edge_name
                 )));
             }
             let from = value
@@ -357,27 +355,23 @@ async fn load_jsonl_reader<R: BufRead>(
     }
 
     // Phase 2: Build per-type RecordBatches and accumulate into the
-    // staging pipeline. For Append/Merge, batches go into an in-memory
-    // accumulator and a single `stage_*` + `commit_staged` per touched
-    // table runs at end-of-load — a mid-load failure (RI / cardinality
-    // violation) leaves Lance HEAD untouched. For Overwrite, the legacy
-    // inline-commit path is preserved (truncate+append doesn't fit the
-    // staged shape cleanly, and overwrite has no in-flight read-your-writes
-    // requirement).
+    // staging pipeline. Batches go into an in-memory accumulator and a
+    // single `stage_*` + `commit_staged` per touched table runs at
+    // end-of-load — a mid-load failure (RI / cardinality violation) leaves
+    // Lance HEAD untouched. `LoadMode::Overwrite` uses Lance's staged
+    // `Overwrite` transaction rather than the former truncate-then-append
+    // inline path.
 
     let mut result = LoadResult::default();
     let snapshot = db.snapshot_for_branch(branch).await?;
-    let use_staging = !matches!(mode, LoadMode::Overwrite);
     let mut staging = MutationStaging::default();
-    let mut overwrite_updates: Vec<crate::db::SubTableUpdate> = Vec::new();
-    let mut overwrite_expected: HashMap<String, u64> = HashMap::new();
     let pending_mode = match mode {
         LoadMode::Merge => PendingMode::Merge,
         // Append-mode loads accumulate as Append. Edge tables (no @key)
         // and no-key node tables stay safe on the stage_append path. The
         // Merge mode applies dedupe-by-id; Append assumes unique inputs.
         LoadMode::Append => PendingMode::Append,
-        LoadMode::Overwrite => PendingMode::Append, // unused
+        LoadMode::Overwrite => PendingMode::Overwrite,
     };
     // Map LoadMode to MutationOpKind for the version-check policy.
     // Append/Merge skip the strict pre-stage check (concurrency-safe
@@ -405,81 +399,43 @@ async fn load_jsonl_reader<R: BufRead>(
         }
         let loaded_count = batch.num_rows();
         let table_key = format!("node:{}", type_name);
-        let entry = snapshot
+        let _entry = snapshot
             .entry(&table_key)
             .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
-        if !use_staging {
-            overwrite_expected.insert(table_key.clone(), entry.table_version);
-        }
         prepared_nodes.push((type_name.clone(), table_key, batch, loaded_count));
     }
 
-    // Phase 2b: write every node type. Append/Merge → in-memory
-    // accumulator. Overwrite → concurrent inline-commit (legacy path).
-    if use_staging {
-        for (type_name, table_key, batch, loaded_count) in prepared_nodes {
-            let (ds, full_path, table_branch) = db
-                .open_for_mutation_on_branch(branch, &table_key, load_op_kind)
-                .await?;
-            let expected_version = ds.version().version;
-            staging.ensure_path(
-                &table_key,
-                full_path,
-                table_branch,
-                expected_version,
-                load_op_kind,
-            );
-            let schema = batch.schema();
-            staging.append_batch(&table_key, schema, pending_mode, batch)?;
-            result.nodes_loaded.insert(type_name, loaded_count);
-        }
-    } else {
-        let node_write_results =
-            write_batches_concurrently(db, branch, mode, prepared_nodes).await?;
-        for (type_name, table_key, loaded_count, state, table_branch) in node_write_results {
-            overwrite_updates.push(crate::db::SubTableUpdate {
-                table_key,
-                table_version: state.version,
-                table_branch,
-                row_count: state.row_count,
-                version_metadata: state.version_metadata,
-            });
-            result.nodes_loaded.insert(type_name, loaded_count);
-        }
+    // Phase 2b: accumulate every node type in memory. Fragment writes are
+    // delayed until after all validation succeeds.
+    for (type_name, table_key, batch, loaded_count) in prepared_nodes {
+        let (ds, full_path, table_branch) = db
+            .open_for_mutation_on_branch(branch, &table_key, load_op_kind)
+            .await?;
+        let expected_version = ds.version();
+        staging.ensure_path(
+            &table_key,
+            full_path,
+            table_branch,
+            expected_version,
+            load_op_kind,
+        );
+        let schema = batch.schema();
+        staging.append_batch(&table_key, schema, pending_mode, batch)?;
+        result.nodes_loaded.insert(type_name, loaded_count);
     }
 
     // Phase 2c: Validate edge referential integrity — every src/dst must
-    // reference an existing node ID in the appropriate type. For staged
-    // loads, the lookup unions snapshot-committed IDs with the in-memory
-    // pending batches (which carry the just-staged node inserts).
+    // reference an existing node ID in the appropriate type. For
+    // Append/Merge the lookup unions snapshot-committed IDs with the
+    // in-memory pending batches. For Overwrite, a touched node table's
+    // pending batch is the replacement image, so committed rows are not
+    // included for that table.
     for (edge_name, rows) in &edge_rows {
         let edge_type = &catalog.edge_types[edge_name];
-        let from_ids = if use_staging {
-            collect_node_ids_with_pending(db, branch, &edge_type.from_type, &staging).await?
-        } else {
-            collect_node_ids(
-                db,
-                branch,
-                &edge_type.from_type,
-                &node_rows,
-                &catalog,
-                &overwrite_updates,
-            )
-            .await?
-        };
-        let to_ids = if use_staging {
-            collect_node_ids_with_pending(db, branch, &edge_type.to_type, &staging).await?
-        } else {
-            collect_node_ids(
-                db,
-                branch,
-                &edge_type.to_type,
-                &node_rows,
-                &catalog,
-                &overwrite_updates,
-            )
-            .await?
-        };
+        let from_ids =
+            collect_node_ids_with_pending(db, branch, &edge_type.from_type, &staging).await?;
+        let to_ids =
+            collect_node_ids_with_pending(db, branch, &edge_type.to_type, &staging).await?;
 
         for (i, (src, dst, _)) in rows.iter().enumerate() {
             if !from_ids.contains(src.as_str()) {
@@ -516,118 +472,72 @@ async fn load_jsonl_reader<R: BufRead>(
         }
         let loaded_count = batch.num_rows();
         let table_key = format!("edge:{}", edge_name);
-        let entry = snapshot
+        let _entry = snapshot
             .entry(&table_key)
             .ok_or_else(|| OmniError::manifest(format!("no manifest entry for {}", table_key)))?;
-        if !use_staging {
-            overwrite_expected.insert(table_key.clone(), entry.table_version);
-        }
         prepared_edges.push((edge_name.clone(), table_key, batch, loaded_count));
     }
 
-    // Phase 2e: write every edge type. Same dispatch as Phase 2b.
-    if use_staging {
-        for (edge_name, table_key, batch, loaded_count) in prepared_edges {
-            let (ds, full_path, table_branch) = db
-                .open_for_mutation_on_branch(branch, &table_key, load_op_kind)
-                .await?;
-            let expected_version = ds.version().version;
-            staging.ensure_path(
-                &table_key,
-                full_path,
-                table_branch,
-                expected_version,
-                load_op_kind,
-            );
-            let schema = batch.schema();
-            staging.append_batch(&table_key, schema, pending_mode, batch)?;
-            result.edges_loaded.insert(edge_name, loaded_count);
-        }
-    } else {
-        let edge_write_results =
-            write_batches_concurrently(db, branch, mode, prepared_edges).await?;
-        for (edge_name, table_key, loaded_count, state, table_branch) in edge_write_results {
-            overwrite_updates.push(crate::db::SubTableUpdate {
-                table_key,
-                table_version: state.version,
-                table_branch,
-                row_count: state.row_count,
-                version_metadata: state.version_metadata,
-            });
-            result.edges_loaded.insert(edge_name, loaded_count);
-        }
+    // Phase 2e: accumulate every edge type. Same dispatch as Phase 2b.
+    for (edge_name, table_key, batch, loaded_count) in prepared_edges {
+        let (ds, full_path, table_branch) = db
+            .open_for_mutation_on_branch(branch, &table_key, load_op_kind)
+            .await?;
+        let expected_version = ds.version();
+        staging.ensure_path(
+            &table_key,
+            full_path,
+            table_branch,
+            expected_version,
+            load_op_kind,
+        );
+        let schema = batch.schema();
+        staging.append_batch(&table_key, schema, pending_mode, batch)?;
+        result.edges_loaded.insert(edge_name, loaded_count);
     }
 
     // Phase 3: Validate edge cardinality constraints (before commit —
-    // invalid data must not be committed). Staged path scans committed
-    // edges via Lance + iterates pending edges in-memory. Overwrite path
-    // opens the just-written version (legacy behavior).
+    // invalid data must not be committed). The helper scans committed
+    // edges via Lance + iterates pending edges in-memory; for Overwrite it
+    // treats the pending edge batches as the replacement table image.
     for (edge_name, _) in &edge_rows {
         let edge_type = &catalog.edge_types[edge_name];
         let table_key = format!("edge:{}", edge_name);
-        if use_staging {
-            validate_edge_cardinality_with_pending_loader(
-                db, branch, edge_type, &table_key, &staging, mode,
-            )
-            .await?;
-        } else if let Some(update) = overwrite_updates.iter().find(|u| u.table_key == table_key) {
-            validate_edge_cardinality(
-                db,
-                branch,
-                edge_name,
-                update.table_version,
-                update.table_branch.as_deref(),
-            )
-            .await?;
-        }
+        validate_edge_cardinality_with_pending_loader(
+            db, branch, edge_type, &table_key, &staging, mode,
+        )
+        .await?;
     }
 
     // Phase 4: Atomic manifest commit with publisher-level OCC.
-    if use_staging {
-        let staged = staging.stage_all(db, branch).await?;
-        // `_queue_guards` holds per-(table_key, branch) write queues
-        // across the manifest publish below — see exec/mutation.rs for
-        // the rationale (interleaving prevention).
-        let (updates, expected_versions, sidecar_handle, _queue_guards) = staged
-            .commit_all(db, branch, crate::db::manifest::SidecarKind::Load, actor_id)
-            .await?;
-        // Same finalize → publisher residual as mutations: per-table
-        // staged commits have advanced Lance HEAD, but the manifest
-        // publish has not run yet. Reuse the mutation failpoint name so
-        // one failpoint pins the shared `MutationStaging` boundary.
-        crate::failpoints::maybe_fail("mutation.post_finalize_pre_publisher")?;
-        db.commit_updates_on_branch_with_expected(branch, &updates, &expected_versions, actor_id)
-            .await?;
-        // The recovery sidecar protects the per-table commit_staged →
-        // manifest publish window. Phase C succeeded — clean up
-        // best-effort: failing the user here would error out a write
-        // that already landed durably.
-        if let Some(handle) = sidecar_handle {
-            if let Err(err) =
-                crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await
-            {
-                tracing::warn!(
-                    error = %err,
-                    operation_id = handle.operation_id.as_str(),
-                    "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
-                );
-            }
-        }
-    } else {
-        // LoadMode::Overwrite keeps the legacy inline-commit path —
-        // truncate-then-append doesn't fit the staged shape (see
-        // `docs/dev/writes.md` "LoadMode::Overwrite residual"). The recovery
-        // sidecar is not applicable here because the writer doesn't go
-        // through MutationStaging; per-table inline commits + a final
-        // manifest publish handle their own residual via the documented
-        // operator workflow (re-run overwrite to recover).
-        db.commit_updates_on_branch_with_expected(
-            branch,
-            &overwrite_updates,
-            &overwrite_expected,
-            actor_id,
-        )
+    let staged = staging
+        .stage_all_with_concurrency(db, branch, load_write_concurrency())
         .await?;
+    // `_queue_guards` holds per-(table_key, branch) write queues
+    // across the manifest publish below — see exec/mutation.rs for
+    // the rationale (interleaving prevention).
+    let (updates, expected_versions, sidecar_handle, _queue_guards) = staged
+        .commit_all(db, branch, crate::db::manifest::SidecarKind::Load, actor_id)
+        .await?;
+    // Same finalize → publisher residual as mutations: per-table
+    // staged commits have advanced Lance HEAD, but the manifest
+    // publish has not run yet. Reuse the mutation failpoint name so
+    // one failpoint pins the shared `MutationStaging` boundary.
+    crate::failpoints::maybe_fail("mutation.post_finalize_pre_publisher")?;
+    db.commit_updates_on_branch_with_expected(branch, &updates, &expected_versions, actor_id)
+        .await?;
+    // The recovery sidecar protects the per-table commit_staged →
+    // manifest publish window. Phase C succeeded — clean up
+    // best-effort: failing the user here would error out a write
+    // that already landed durably.
+    if let Some(handle) = sidecar_handle {
+        if let Err(err) = crate::db::manifest::delete_sidecar(&handle, db.storage_adapter()).await {
+            tracing::warn!(
+                error = %err,
+                operation_id = handle.operation_id.as_str(),
+                "recovery sidecar cleanup failed; the next open's recovery sweep will resolve it"
+            );
+        }
     }
 
     Ok(result)
@@ -1157,89 +1067,6 @@ fn load_write_concurrency() -> usize {
         .unwrap_or(DEFAULT_LOAD_WRITE_CONCURRENCY)
 }
 
-/// Write a set of prepared `(type_name, table_key, batch, row_count)` tuples
-/// concurrently. Returns results in original iteration order so callers can
-/// zip them back to per-type metadata.
-async fn write_batches_concurrently(
-    db: &Omnigraph,
-    branch: Option<&str>,
-    mode: LoadMode,
-    prepared: Vec<(String, String, RecordBatch, usize)>,
-) -> Result<
-    Vec<(
-        String,
-        String,
-        usize,
-        crate::table_store::TableState,
-        Option<String>,
-    )>,
-> {
-    use futures::stream::StreamExt;
-
-    if prepared.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let concurrency = load_write_concurrency().min(prepared.len()).max(1);
-
-    futures::stream::iter(prepared.into_iter().map(
-        |(type_name, table_key, batch, loaded_count)| async move {
-            let (state, table_branch) =
-                write_batch_to_dataset(db, branch, &table_key, batch, mode).await?;
-            Ok::<_, OmniError>((type_name, table_key, loaded_count, state, table_branch))
-        },
-    ))
-    .buffered(concurrency)
-    .collect::<Vec<Result<_>>>()
-    .await
-    .into_iter()
-    .collect()
-}
-
-async fn write_batch_to_dataset(
-    db: &Omnigraph,
-    branch: Option<&str>,
-    table_key: &str,
-    batch: RecordBatch,
-    mode: LoadMode,
-) -> Result<(crate::table_store::TableState, Option<String>)> {
-    let op_kind = match mode {
-        LoadMode::Append => crate::db::MutationOpKind::Insert,
-        LoadMode::Merge => crate::db::MutationOpKind::Merge,
-        LoadMode::Overwrite => crate::db::MutationOpKind::SchemaRewrite,
-    };
-    let (mut ds, full_path, table_branch) = db
-        .open_for_mutation_on_branch(branch, table_key, op_kind)
-        .await?;
-    let table_store = db.table_store();
-
-    match mode {
-        LoadMode::Overwrite => {
-            let state = table_store
-                .overwrite_batch(&full_path, &mut ds, batch)
-                .await?;
-            Ok((state, table_branch))
-        }
-        LoadMode::Append => {
-            let state = table_store.append_batch(&full_path, &mut ds, batch).await?;
-            Ok((state, table_branch))
-        }
-        LoadMode::Merge => {
-            let state = table_store
-                .merge_insert_batch(
-                    &full_path,
-                    ds,
-                    batch,
-                    vec!["id".to_string()],
-                    lance::dataset::WhenMatched::UpdateAll,
-                    lance::dataset::WhenNotMatched::InsertAll,
-                )
-                .await?;
-            Ok((state, table_branch))
-        }
-    }
-}
-
 fn generate_id() -> String {
     ulid::Ulid::new().to_string()
 }
@@ -1672,10 +1499,7 @@ pub(crate) async fn validate_edge_cardinality(
         .await?;
 
     // Scan src column, count per source
-    let batches = db
-        .table_store()
-        .scan(&ds, Some(&["src"]), None, None)
-        .await?;
+    let batches = db.storage().scan(&ds, Some(&["src"]), None, None).await?;
 
     let mut counts: HashMap<String, u32> = HashMap::new();
     for batch in &batches {
@@ -1766,6 +1590,11 @@ async fn validate_edge_cardinality_with_pending_loader(
 /// - IDs from the staged loader's pending batches (in-memory; just-staged
 ///   inserts of this type)
 /// - IDs from the committed sub-table at the pre-load snapshot version
+///
+/// For `LoadMode::Overwrite`, if the node table is touched then the pending
+/// batches are the replacement image. In that case committed IDs are not
+/// included, so edge RI is validated against exactly what the overwrite will
+/// publish.
 async fn collect_node_ids_with_pending(
     db: &Omnigraph,
     branch: Option<&str>,
@@ -1788,6 +1617,10 @@ async fn collect_node_ids_with_pending(
         }
     }
 
+    if staging.pending_mode(&table_key) == Some(PendingMode::Overwrite) {
+        return Ok(ids);
+    }
+
     // From the committed Lance sub-table at the pre-load snapshot version.
     let snapshot = db.snapshot_for_branch(branch).await?;
     let Some(entry) = snapshot.entry(&table_key) else {
@@ -1801,10 +1634,7 @@ async fn collect_node_ids_with_pending(
         )
         .await?;
 
-    let batches = db
-        .table_store()
-        .scan(&ds, Some(&["id"]), None, None)
-        .await?;
+    let batches = db.storage().scan(&ds, Some(&["id"]), None, None).await?;
 
     for batch in &batches {
         let id_col = batch
@@ -1821,72 +1651,6 @@ async fn collect_node_ids_with_pending(
             if id_col.is_valid(i) {
                 ids.insert(id_col.value(i).to_string());
             }
-        }
-    }
-
-    Ok(ids)
-}
-
-/// Collect all valid node IDs for a given type. Union of:
-/// - IDs from the just-loaded batch (in memory, from node_rows)
-/// - IDs from the sub-table at the just-written version (if it was updated)
-/// - IDs from the sub-table at the snapshot-pinned version (if it was not updated)
-async fn collect_node_ids(
-    db: &Omnigraph,
-    branch: Option<&str>,
-    type_name: &str,
-    node_rows: &HashMap<String, Vec<JsonValue>>,
-    catalog: &omnigraph_compiler::catalog::Catalog,
-    updates: &[crate::db::SubTableUpdate],
-) -> Result<HashSet<String>> {
-    let mut ids = HashSet::new();
-
-    // IDs from the in-memory batch (just loaded in this operation)
-    if let Some(rows) = node_rows.get(type_name) {
-        if let Some(node_type) = catalog.node_types.get(type_name) {
-            if let Some(key_prop) = node_type.key_property() {
-                for row in rows {
-                    if let Some(id) = row.get(key_prop).and_then(|v| v.as_str()) {
-                        ids.insert(id.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    // IDs from the Lance sub-table
-    let table_key = format!("node:{}", type_name);
-    let snapshot = db.snapshot_for_branch(branch).await?;
-    let Some(entry) = snapshot.entry(&table_key) else {
-        return Ok(ids);
-    };
-    // Use the just-written version if this type was updated, else snapshot version
-    let updated = updates
-        .iter()
-        .find(|u| u.table_key == table_key)
-        .map(|u| (u.table_version, u.table_branch.as_deref()));
-    let (version, branch) = updated.unwrap_or((entry.table_version, entry.table_branch.as_deref()));
-    let ds = db
-        .open_dataset_at_state(&entry.table_path, branch, version)
-        .await?;
-
-    let batches = db
-        .table_store()
-        .scan(&ds, Some(&["id"]), None, None)
-        .await?;
-
-    for batch in &batches {
-        let id_col = batch
-            .column_by_name("id")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        for i in 0..batch.num_rows() {
-            if !id_col.is_valid(i) {
-                continue;
-            }
-            ids.insert(id_col.value(i).to_string());
         }
     }
 

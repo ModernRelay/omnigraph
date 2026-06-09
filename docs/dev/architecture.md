@@ -186,7 +186,8 @@ op-2 (insert/update) → read committed via Lance + pending via DataFusion
 op-N → push batch
 ─── end of query ───────────────────────────────────────
 finalize: per pending table:
-   concat batches → stage_append OR stage_merge_insert → commit_staged
+   concat batches → stage_append OR stage_merge_insert OR stage_overwrite
+                  → commit_staged
 publisher: ManifestBatchPublisher::publish (one cross-table CAS)
 ```
 
@@ -197,9 +198,10 @@ contracts:
 - `D₂` parse-time rule: a query is either insert/update-only or
   delete-only. Mixed → reject. Deletes still inline-commit (Lance
   4.0.0 has no public two-phase delete); D₂ keeps the inline path safe.
-- `LoadMode::Overwrite` keeps the inline-commit path
-  (truncate-then-append doesn't fit the staged shape; overwrite has no
-  in-flight read-your-writes requirement).
+- `LoadMode::Overwrite` uses Lance `Operation::Overwrite` through the
+  same staged path. Loader validation runs against the replacement
+  in-memory batches before any `commit_staged`, and the publish window is
+  covered by `SidecarKind::Load` recovery.
 - Read sites consume `TableStore::scan_with_pending`, which Lance-scans
   the committed snapshot at the captured `expected_version` and unions
   with a DataFusion `MemTable` over the pending batches.

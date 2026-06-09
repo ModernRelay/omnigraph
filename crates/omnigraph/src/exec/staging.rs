@@ -21,9 +21,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::storage_layer::{SnapshotHandle, StagedHandle};
 use arrow_array::{Array, RecordBatch, StringArray, UInt32Array};
 use arrow_schema::SchemaRef;
-use lance::Dataset;
+use futures::stream::StreamExt;
 use omnigraph_compiler::catalog::EdgeType;
 
 use crate::db::manifest::{
@@ -32,15 +33,13 @@ use crate::db::manifest::{
 use crate::db::{MutationOpKind, SubTableUpdate};
 use crate::error::{OmniError, Result};
 
-/// Whether the per-table accumulator should commit via `stage_append`
-/// (no @key inserts, edge inserts) or `stage_merge_insert` (any @key insert
-/// or update). Once set to `Merge` for a table within a query, subsequent
-/// inserts on that table are rolled into the same merge — a `WhenNotMatched
-/// = InsertAll` merge is correct for both cases.
+/// Whether the per-table accumulator should commit via `stage_append`,
+/// `stage_merge_insert`, or `stage_overwrite`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PendingMode {
     Append,
     Merge,
+    Overwrite,
 }
 
 /// Per-table accumulator. Each insert/update op pushes a `RecordBatch` into
@@ -158,9 +157,9 @@ impl MutationStaging {
         mode: PendingMode,
         batch: RecordBatch,
     ) -> Result<()> {
-        if batch.num_rows() == 0 {
-            // No-op — staging is purely additive; an empty batch should not
-            // be appended.
+        if batch.num_rows() == 0 && mode != PendingMode::Overwrite {
+            // No-op for additive modes. For Overwrite, an empty batch is
+            // observable: it means "replace this table with zero rows".
             return Ok(());
         }
         // If we've already accumulated a batch on this table, the new
@@ -174,6 +173,14 @@ impl MutationStaging {
         // caller a clearer point of failure attached to the specific
         // op that introduced the drift.
         if let Some(existing) = self.pending.get(table_key) {
+            if existing.mode == PendingMode::Overwrite || mode == PendingMode::Overwrite {
+                if existing.mode != mode {
+                    return Err(OmniError::manifest_internal(format!(
+                        "table '{}' cannot mix overwrite staging with append/merge staging",
+                        table_key
+                    )));
+                }
+            }
             if !schemas_compatible(&existing.schema, &batch.schema()) {
                 return Err(OmniError::manifest(format!(
                     "table '{}' accumulated mutation batches with mismatched schemas: \
@@ -194,8 +201,9 @@ impl MutationStaging {
             .pending
             .entry(table_key.to_string())
             .or_insert_with(|| PendingTable::new(schema.clone(), mode));
-        // Upgrade Append -> Merge if any op needs merge semantics.
-        if mode == PendingMode::Merge {
+        // Upgrade Append -> Merge if any op needs merge semantics. Overwrite
+        // is never mixed with additive modes (guarded above).
+        if mode == PendingMode::Merge && entry.mode == PendingMode::Append {
             entry.mode = PendingMode::Merge;
         }
         entry.batches.push(batch);
@@ -215,6 +223,11 @@ impl MutationStaging {
             .get(table_key)
             .map(|p| p.batches.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Accumulator mode for `table_key`, if this query has touched it.
+    pub(crate) fn pending_mode(&self, table_key: &str) -> Option<PendingMode> {
+        self.pending.get(table_key).map(|p| p.mode)
     }
 
     /// Schema of the accumulated batches for `table_key`, or `None` if no
@@ -251,7 +264,19 @@ impl MutationStaging {
     pub(crate) async fn stage_all(
         self,
         db: &crate::db::Omnigraph,
+        branch: Option<&str>,
+    ) -> Result<StagedMutation> {
+        self.stage_all_with_concurrency(db, branch, 1).await
+    }
+
+    /// Loader-facing variant of [`stage_all`] that preserves
+    /// `OMNIGRAPH_LOAD_CONCURRENCY` for the fragment-writing stage while
+    /// still leaving all Lance HEAD movement to [`StagedMutation::commit_all`].
+    pub(crate) async fn stage_all_with_concurrency(
+        self,
+        db: &crate::db::Omnigraph,
         _branch: Option<&str>,
+        concurrency: usize,
     ) -> Result<StagedMutation> {
         let MutationStaging {
             expected_versions,
@@ -261,7 +286,8 @@ impl MutationStaging {
             op_kinds,
         } = self;
 
-        let mut staged_entries: Vec<StagedTableEntry> = Vec::with_capacity(pending.len());
+        let mut stage_inputs: Vec<(String, PendingTable, StagedTablePath, u64)> =
+            Vec::with_capacity(pending.len());
         for (table_key, table) in pending {
             let path = paths.get(&table_key).cloned().ok_or_else(|| {
                 OmniError::manifest_internal(format!(
@@ -275,77 +301,22 @@ impl MutationStaging {
                     table_key
                 ))
             })?;
-
-            // Reopen the dataset for staging. The op_kind reflects the
-            // accumulated PendingTable's mode: Append-mode batches are
-            // INSERT-shaped (no key-based dedup at commit_staged); Merge-
-            // mode batches are MERGE-shaped (key-dedup at commit_staged).
-            // Both skip the strict pre-stage version check under the
-            // [`MutationOpKind`] policy: Lance's natural rebase + the
-            // per-(table, branch) queue + the publisher CAS in
-            // `commit_all` handle drift; the strict check would
-            // over-reject in-process concurrent inserts (PR 2 / MR-686
-            // Phase 2).
-            let stage_kind = match table.mode {
-                PendingMode::Append => crate::db::MutationOpKind::Insert,
-                PendingMode::Merge => crate::db::MutationOpKind::Merge,
-            };
-            let ds = db
-                .reopen_for_mutation(
-                    &table_key,
-                    &path.full_path,
-                    path.table_branch.as_deref(),
-                    expected,
-                    stage_kind,
-                )
-                .await?;
-
-            if table.batches.is_empty() {
-                continue;
-            }
-
-            // For Merge mode, dedupe accumulated batches by `id`, keeping
-            // the LAST occurrence (last-write-wins for the query). This
-            // is required because Lance's `MergeInsertBuilder` produces
-            // arbitrary results on duplicate keys in the source. Append
-            // mode is exempt because no-key node and edge inserts use
-            // ULID-generated ids that are unique within a query.
-            let combined = match table.mode {
-                PendingMode::Merge => dedupe_merge_batches_by_id(&table.schema, table.batches)?,
-                PendingMode::Append => {
-                    if table.batches.len() == 1 {
-                        table.batches.into_iter().next().unwrap()
-                    } else {
-                        arrow_select::concat::concat_batches(&table.schema, &table.batches)
-                            .map_err(|e| OmniError::Lance(e.to_string()))?
-                    }
-                }
-            };
-
-            // Stage produces uncommitted fragments + transaction. No
-            // Lance HEAD advance until `commit_all` runs `commit_staged`.
-            let staged = match table.mode {
-                PendingMode::Append => db.table_store().stage_append(&ds, combined, &[]).await?,
-                PendingMode::Merge => {
-                    db.table_store()
-                        .stage_merge_insert(
-                            ds.clone(),
-                            combined,
-                            vec!["id".to_string()],
-                            lance::dataset::WhenMatched::UpdateAll,
-                            lance::dataset::WhenNotMatched::InsertAll,
-                        )
-                        .await?
-                }
-            };
-            staged_entries.push(StagedTableEntry {
-                table_key,
-                path,
-                expected_version: expected,
-                dataset: ds,
-                staged_write: staged,
-            });
+            stage_inputs.push((table_key, table, path, expected));
         }
+        let concurrency = concurrency.min(stage_inputs.len()).max(1);
+        let staged_entries = futures::stream::iter(stage_inputs.into_iter().map(
+            |(table_key, table, path, expected)| async move {
+                stage_pending_table(db, table_key, table, path, expected).await
+            },
+        ))
+        .buffered(concurrency)
+        .collect::<Vec<Result<Option<StagedTableEntry>>>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
 
         Ok(StagedMutation {
             inline_committed,
@@ -355,6 +326,73 @@ impl MutationStaging {
             op_kinds,
         })
     }
+}
+
+async fn stage_pending_table(
+    db: &crate::db::Omnigraph,
+    table_key: String,
+    table: PendingTable,
+    path: StagedTablePath,
+    expected: u64,
+) -> Result<Option<StagedTableEntry>> {
+    // Reopen the dataset for staging. Append/Merge can be rebased later by
+    // Lance + publisher CAS; Overwrite is a strict replacement and uses the
+    // same SchemaRewrite policy as schema apply.
+    let stage_kind = match table.mode {
+        PendingMode::Append => crate::db::MutationOpKind::Insert,
+        PendingMode::Merge => crate::db::MutationOpKind::Merge,
+        PendingMode::Overwrite => crate::db::MutationOpKind::SchemaRewrite,
+    };
+    let ds = db
+        .reopen_for_mutation(
+            &table_key,
+            &path.full_path,
+            path.table_branch.as_deref(),
+            expected,
+            stage_kind,
+        )
+        .await?;
+
+    if table.batches.is_empty() {
+        return Ok(None);
+    }
+
+    let combined = match table.mode {
+        PendingMode::Merge => dedupe_merge_batches_by_id(&table.schema, table.batches)?,
+        PendingMode::Append | PendingMode::Overwrite => {
+            if table.batches.len() == 1 {
+                table.batches.into_iter().next().unwrap()
+            } else {
+                arrow_select::concat::concat_batches(&table.schema, &table.batches)
+                    .map_err(|e| OmniError::Lance(e.to_string()))?
+            }
+        }
+    };
+
+    // Stage produces uncommitted fragments + transaction. No Lance HEAD
+    // advance until `commit_all` runs `commit_staged`.
+    let staged = match table.mode {
+        PendingMode::Append => db.storage().stage_append(&ds, combined, &[]).await?,
+        PendingMode::Merge => {
+            db.storage()
+                .stage_merge_insert(
+                    ds.clone(),
+                    combined,
+                    vec!["id".to_string()],
+                    lance::dataset::WhenMatched::UpdateAll,
+                    lance::dataset::WhenNotMatched::InsertAll,
+                )
+                .await?
+        }
+        PendingMode::Overwrite => db.storage().stage_overwrite(&ds, combined).await?,
+    };
+    Ok(Some(StagedTableEntry {
+        table_key,
+        path,
+        expected_version: expected,
+        dataset: ds,
+        staged_write: staged,
+    }))
 }
 
 /// Output of [`MutationStaging::stage_all`]. Carries the staged Lance
@@ -389,15 +427,17 @@ pub(crate) struct StagedMutation {
 }
 
 /// Per-table state captured during `stage_all` and consumed by
-/// `commit_all`. Holds the opened `Dataset` so `commit_staged` doesn't
-/// re-open, and the `StagedWrite` whose `transaction` `commit_staged`
-/// will execute.
+/// `commit_all`. Holds the opened snapshot (so `commit_staged` doesn't
+/// re-open) plus the staged Lance transaction that `commit_staged`
+/// will execute. Both held as opaque `TableStorage` handles per MR-793
+/// §III.9 — the inner `lance::Dataset` / `StagedWrite` are not visible
+/// to engine code outside the storage layer.
 struct StagedTableEntry {
     table_key: String,
     path: StagedTablePath,
     expected_version: u64,
-    dataset: lance::Dataset,
-    staged_write: crate::table_store::StagedWrite,
+    dataset: SnapshotHandle,
+    staged_write: StagedHandle,
 }
 
 impl StagedMutation {
@@ -544,15 +584,14 @@ impl StagedMutation {
             // raw Lance write or a pre-fix maintenance path moved HEAD without
             // publishing `__manifest`, this write must not silently fold it.
             let head = db
-                .table_store()
+                .storage()
                 .open_dataset_head_for_write(
                     &entry.table_key,
                     &entry.path.full_path,
                     entry.path.table_branch.as_deref(),
                 )
                 .await?
-                .version()
-                .version;
+                .version();
             if head < current {
                 return Err(OmniError::manifest_internal(format!(
                     "table '{}' Lance HEAD version {} is behind manifest version {}",
@@ -672,14 +711,8 @@ impl StagedMutation {
                 staged_write,
             } = entry;
 
-            let new_ds = db
-                .table_store()
-                .commit_staged(Arc::new(dataset), staged_write.transaction)
-                .await?;
-            let state = db
-                .table_store()
-                .table_state(&path.full_path, &new_ds)
-                .await?;
+            let new_ds = db.storage().commit_staged(dataset, staged_write).await?;
+            let state = db.storage().table_state(&path.full_path, &new_ds).await?;
             updates.push(SubTableUpdate {
                 table_key,
                 table_version: state.version,
@@ -813,7 +846,9 @@ fn dedupe_merge_batches_by_id(
 /// Count edges per `src` value across committed (Lance scan) + pending
 /// (in-memory). Caller supplies an opened committed dataset so the
 /// mutation path (which already has one) and the loader path (which
-/// opens via snapshot) share the same body.
+/// opens via snapshot) share the same body. For overwrite staging, the
+/// pending batches are the replacement table image, so committed rows are
+/// intentionally skipped.
 ///
 /// `dedupe_key_column` controls whether committed rows are shadowed by
 /// pending:
@@ -828,7 +863,7 @@ fn dedupe_merge_batches_by_id(
 ///   `LoadMode::Merge` double-counts.
 pub(crate) async fn count_src_per_edge(
     db: &crate::db::Omnigraph,
-    committed_ds: &Dataset,
+    committed_ds: &SnapshotHandle,
     table_key: &str,
     staging: &MutationStaging,
     dedupe_key_column: Option<&str>,
@@ -859,41 +894,44 @@ pub(crate) async fn count_src_per_edge(
         _ => None,
     };
 
-    // Committed side: scan `src` plus the dedupe key column when set, so
-    // we can both count and shadow in one pass.
-    let projection: Vec<&str> = match dedupe_key_column {
-        Some(col) if pending_keys.as_ref().is_some_and(|s| !s.is_empty()) => vec!["src", col],
-        _ => vec!["src"],
-    };
-    let committed = db
-        .table_store()
-        .scan(committed_ds, Some(&projection), None, None)
-        .await?;
-    for batch in &committed {
-        let srcs = batch
-            .column_by_name("src")
-            .ok_or_else(|| OmniError::Lance("missing 'src' column on edge table".into()))?
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| OmniError::Lance("'src' column is not Utf8".into()))?;
-        // Optional shadow-key column (only present when dedupe is on).
-        let key_arr = match (&pending_keys, dedupe_key_column) {
-            (Some(set), Some(col)) if !set.is_empty() => batch
-                .column_by_name(col)
-                .and_then(|c| c.as_any().downcast_ref::<StringArray>()),
-            _ => None,
+    let replace_committed = staging.pending_mode(table_key) == Some(PendingMode::Overwrite);
+    if !replace_committed {
+        // Committed side: scan `src` plus the dedupe key column when set, so
+        // we can both count and shadow in one pass.
+        let projection: Vec<&str> = match dedupe_key_column {
+            Some(col) if pending_keys.as_ref().is_some_and(|s| !s.is_empty()) => vec!["src", col],
+            _ => vec!["src"],
         };
-        for i in 0..srcs.len() {
-            if !srcs.is_valid(i) {
-                continue;
-            }
-            // Shadow this committed row if its key is in pending.
-            if let (Some(arr), Some(set)) = (key_arr, pending_keys.as_ref()) {
-                if arr.is_valid(i) && set.contains(arr.value(i)) {
+        let committed = db
+            .storage()
+            .scan(committed_ds, Some(&projection), None, None)
+            .await?;
+        for batch in &committed {
+            let srcs = batch
+                .column_by_name("src")
+                .ok_or_else(|| OmniError::Lance("missing 'src' column on edge table".into()))?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| OmniError::Lance("'src' column is not Utf8".into()))?;
+            // Optional shadow-key column (only present when dedupe is on).
+            let key_arr = match (&pending_keys, dedupe_key_column) {
+                (Some(set), Some(col)) if !set.is_empty() => batch
+                    .column_by_name(col)
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>()),
+                _ => None,
+            };
+            for i in 0..srcs.len() {
+                if !srcs.is_valid(i) {
                     continue;
                 }
+                // Shadow this committed row if its key is in pending.
+                if let (Some(arr), Some(set)) = (key_arr, pending_keys.as_ref()) {
+                    if arr.is_valid(i) && set.contains(arr.value(i)) {
+                        continue;
+                    }
+                }
+                *counts.entry(srcs.value(i).to_string()).or_insert(0) += 1;
             }
-            *counts.entry(srcs.value(i).to_string()).or_insert(0) += 1;
         }
     }
 

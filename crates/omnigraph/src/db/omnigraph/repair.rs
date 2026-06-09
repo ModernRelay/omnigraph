@@ -165,10 +165,15 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
     let mut any_forced = false;
 
     for (table_key, full_path) in table_tasks {
+        // `classify_drift` inspects raw Lance transaction history
+        // (`read_transaction_by_version`), a Lance-only maintenance read the
+        // staged-write trait does not surface. Open via `db.storage()` and
+        // unwrap the opaque handle (mirrors optimize / cleanup).
         let ds = db
-            .table_store
+            .storage()
             .open_dataset_head_for_write(&table_key, &full_path, None)
-            .await?;
+            .await?
+            .into_dataset();
         let manifest_version = snapshot
             .entry(&table_key)
             .map(|e| e.table_version)
@@ -214,7 +219,10 @@ pub async fn repair_all_tables(db: &Omnigraph, options: RepairOptions) -> Result
         };
 
         if matches!(action, RepairAction::Healed | RepairAction::Forced) {
-            let state = db.table_store.table_state(&full_path, &ds).await?;
+            // Re-wrap the opened dataset to read its state through the trait
+            // surface (`table_state` is a read; no HEAD advance).
+            let snapshot = crate::storage_layer::SnapshotHandle::new(ds);
+            let state = db.storage().table_state(&full_path, &snapshot).await?;
             updates.push(crate::db::SubTableUpdate {
                 table_key: table_key.clone(),
                 table_version: state.version,
