@@ -2,7 +2,6 @@ use arrow_array::{
     Array, ArrayRef, RecordBatch, StringArray, StructArray, UInt8Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::SchemaRef;
-use arrow_select::concat::concat_batches;
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::blob::BlobArrayBuilder;
@@ -13,7 +12,7 @@ use lance::dataset::{
     CommitBuilder, InsertBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode,
     WriteParams,
 };
-use lance::datatypes::BlobKind;
+use lance::datatypes::{BlobKind, Schema as LanceSchema};
 use lance::index::DatasetIndexExt;
 use lance::index::scalar::IndexDetails;
 use lance_file::version::LanceFileVersion;
@@ -725,7 +724,14 @@ impl TableStore {
         })
     }
 
-    pub async fn append_batch(
+    /// Legacy inline-commit append: writes fragments AND commits in one
+    /// call, advancing Lance HEAD as a side effect. Not on the
+    /// `TableStorage` trait surface — the staged primitive `stage_append`
+    /// + `commit_staged` is the engine write path. This inherent
+    /// `pub(crate)` method survives only for recovery test setup. Do not
+    /// add new engine call sites — they re-introduce the multi-phase
+    /// commit drift the trait surface was designed to eliminate.
+    pub(crate) async fn append_batch(
         &self,
         dataset_uri: &str,
         ds: &mut Dataset,
@@ -780,139 +786,7 @@ impl TableStore {
         }
     }
 
-    pub async fn overwrite_batch(
-        &self,
-        dataset_uri: &str,
-        ds: &mut Dataset,
-        batch: RecordBatch,
-    ) -> Result<TableState> {
-        ds.truncate_table()
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        self.append_batch(dataset_uri, ds, batch).await
-    }
-
-    pub async fn overwrite_dataset(dataset_uri: &str, batch: RecordBatch) -> Result<Dataset> {
-        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
-        let params = WriteParams {
-            mode: WriteMode::Overwrite,
-            enable_stable_row_ids: true,
-            data_storage_version: Some(LanceFileVersion::V2_2),
-            allow_external_blob_outside_bases: true,
-            ..Default::default()
-        };
-        Dataset::write(reader, dataset_uri, Some(params))
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))
-    }
-
-    pub async fn merge_insert_batch(
-        &self,
-        dataset_uri: &str,
-        ds: Dataset,
-        batch: RecordBatch,
-        key_columns: Vec<String>,
-        when_matched: WhenMatched,
-        when_not_matched: WhenNotMatched,
-    ) -> Result<TableState> {
-        if batch.num_rows() == 0 {
-            return self.table_state(dataset_uri, &ds).await;
-        }
-
-        // Precondition for the FirstSeen workaround below: every caller of
-        // this primitive must hand in a source batch that is unique by
-        // `key_columns`. Without this check, `SourceDedupeBehavior::FirstSeen`
-        // would silently collapse genuine duplicates instead of erroring.
-        check_batch_unique_by_keys(&batch, &key_columns, "merge_insert_batch")?;
-
-        // TODO(lance-upstream): MergeInsertBuilder does not accept WriteParams,
-        // so allow_external_blob_outside_bases cannot be set here. External URI
-        // blobs via merge_insert (LoadMode::Merge, mutations) are unsupported
-        // until Lance exposes WriteParams on MergeInsertBuilder.
-        let ds = Arc::new(ds);
-        let mut builder = MergeInsertBuilder::try_new(ds, key_columns)
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        builder.when_matched(when_matched);
-        builder.when_not_matched(when_not_matched);
-        // Workaround for a Lance 4.0.x bug class where sequential
-        // merge_insert calls against rows previously rewritten by
-        // merge_insert produce a spurious "Ambiguous merge inserts:
-        // multiple source rows match the same target row on (id = ...)"
-        // error. Lance's `processed_row_ids: Mutex<HashSet<u64>>`
-        // (lance-4.0.0 `src/dataset/write/merge_insert.rs:2099`)
-        // double-processes the same source/target match against
-        // datasets previously rewritten by merge_insert, and the default
-        // `SourceDedupeBehavior::Fail` errors on the second insertion.
-        // `FirstSeen` makes Lance skip the duplicate match instead.
-        //
-        // Covers both observed surfaces:
-        // - PR #98 (sequential `load --mode merge` against same keys).
-        // - MR-920 (sequential `update T set {f} where x=y` on same row).
-        //
-        // Correctness-preserving for OmniGraph because every call path
-        // that reaches this primitive either pre-dedupes the source batch
-        // by id, or surfaces a real source dup via the
-        // `check_batch_unique_by_keys` precondition above (which fires
-        // before the FirstSeen setter has a chance to silently collapse
-        // anything):
-        // - Load path: `enforce_unique_constraints_intra_batch`
-        //   (`loader/mod.rs:1442`) errors on intra-batch `@key` dups.
-        // - Mutate path: `MutationStaging::finalize` (`exec/staging.rs`)
-        //   accumulates and dedupes by `id`.
-        // - Branch-merge path: `compute_source_delta` /
-        //   `compute_three_way_delta` (`exec/merge.rs`) walk via
-        //   `OrderedTableCursor` and `push_row` each id at most once.
-        // So FirstSeen only suppresses the spurious Lance behavior, never
-        // user data. Pinned by `loader_rejects_intra_batch_duplicate_keys`
-        // in `tests/consistency.rs` plus the
-        // `check_batch_unique_by_keys` precondition.
-        //
-        // Retire when upstream Lance fixes the bug class. Tracked at
-        // MR-957; upstream: lance-format/lance#6877.
-        builder.source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
-        let job = builder
-            .try_build()
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-
-        let schema = batch.schema();
-        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema);
-        let (new_ds, _stats) = job
-            .execute(lance_datafusion::utils::reader_to_stream(Box::new(reader)))
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        self.table_state(dataset_uri, &new_ds).await
-    }
-
-    pub async fn merge_insert_batches(
-        &self,
-        dataset_uri: &str,
-        ds: Dataset,
-        batches: Vec<RecordBatch>,
-        key_columns: Vec<String>,
-        when_matched: WhenMatched,
-        when_not_matched: WhenNotMatched,
-    ) -> Result<TableState> {
-        if batches.is_empty() {
-            return self.table_state(dataset_uri, &ds).await;
-        }
-        let batch = if batches.len() == 1 {
-            batches.into_iter().next().unwrap()
-        } else {
-            let schema = batches[0].schema();
-            concat_batches(&schema, &batches).map_err(|e| OmniError::Lance(e.to_string()))?
-        };
-        self.merge_insert_batch(
-            dataset_uri,
-            ds,
-            batch,
-            key_columns,
-            when_matched,
-            when_not_matched,
-        )
-        .await
-    }
-
-    pub async fn delete_where(
+    pub(crate) async fn delete_where(
         &self,
         dataset_uri: &str,
         ds: &mut Dataset,
@@ -1011,7 +885,7 @@ impl TableStore {
             }
         };
         // Assign real fragment IDs. Lance's `InsertBuilder::execute_uncommitted`
-        // returns fragments with `id = 0` ("Temporary ID" — see lance-4.0.0
+        // returns fragments with `id = 0` ("Temporary ID" — see lance-6.0.1
         // `dataset/write.rs:1044/1712`); the real assignment happens during
         // commit via `Transaction::fragments_with_ids`. Because we expose
         // these fragments to `scan_with_staged` *before* commit, two staged
@@ -1082,11 +956,12 @@ impl TableStore {
             ));
         }
 
-        // Precondition for FirstSeen below. See the comment on
-        // `merge_insert_batch` for why this check is here, not on the caller:
-        // every call path that reaches stage_merge_insert (load,
-        // MutationStaging::finalize, branch_merge::publish_rewritten_merge_table)
-        // must hand in a source batch that is unique by `key_columns`.
+        // Precondition for the FirstSeen workaround below: every call path that
+        // reaches stage_merge_insert (load, MutationStaging::finalize,
+        // branch_merge::publish_rewritten_merge_table) must hand in a source
+        // batch that is unique by `key_columns`. Without this check,
+        // `SourceDedupeBehavior::FirstSeen` would silently collapse genuine
+        // duplicates instead of erroring.
         check_batch_unique_by_keys(&batch, &key_columns, "stage_merge_insert")?;
 
         let ds = Arc::new(ds);
@@ -1094,11 +969,21 @@ impl TableStore {
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         builder.when_matched(when_matched);
         builder.when_not_matched(when_not_matched);
-        // See `merge_insert_batch` for the FirstSeen rationale. Workaround
-        // for the Lance 4.0.x bug class where sequential merge_insert /
-        // update against rows previously rewritten by merge_insert trips
-        // Lance's `processed_row_ids` HashSet and errors under the default
-        // `SourceDedupeBehavior::Fail`. Retire when upstream Lance is fixed.
+        // Workaround for a Lance bug class where sequential merge_insert calls
+        // against rows previously rewritten by merge_insert produce a spurious
+        // "Ambiguous merge inserts: multiple source rows match the same target
+        // row on (id = ...)" error. Lance's `processed_row_ids:
+        // Mutex<HashSet<u64>>` (lance-6.0.1 `src/dataset/write/merge_insert.rs`)
+        // double-processes the same source/target match against datasets
+        // previously rewritten by merge_insert, and the default
+        // `SourceDedupeBehavior::Fail` errors on the second insertion; FirstSeen
+        // makes Lance skip the duplicate match instead. Correctness-preserving
+        // because every call path pre-dedupes the source batch by id or surfaces
+        // a real source dup via `check_batch_unique_by_keys` above (load:
+        // `enforce_unique_constraints_intra_batch`; mutate:
+        // `MutationStaging::finalize`; branch-merge: the `OrderedTableCursor`
+        // walk in `exec/merge.rs`). Retire when upstream Lance fixes the bug
+        // class. Tracked at MR-957; upstream: lance-format/lance#6877.
         builder.source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
         let job = builder
             .try_build()
@@ -1174,40 +1059,51 @@ impl TableStore {
     /// MR-793 Phase 2: introduces this for the schema_apply rewrite path.
     /// Lance API verified in `.context/mr-793-design.md` Appendix A.1.
     pub async fn stage_overwrite(&self, ds: &Dataset, batch: RecordBatch) -> Result<StagedWrite> {
-        if batch.num_rows() == 0 {
-            return Err(OmniError::manifest_internal(
-                "stage_overwrite called with empty batch".to_string(),
-            ));
-        }
-        // `enable_stable_row_ids: true` is defensive — empirically Lance 4.0.0
+        // `enable_stable_row_ids: true` is defensive — empirically Lance 6.0.1
         // preserves the source dataset's flag through `Operation::Overwrite`
         // when WriteParams omits it (pinned by
         // `stage_overwrite_preserves_stable_row_ids` in tests/staged_writes.rs),
-        // but setting it explicitly matches the public `overwrite_dataset`
-        // path and keeps the invariant documented at every Overwrite site
+        // but setting it explicitly keeps the invariant documented at every Overwrite site
         // (see docs/storage.md "Stable row IDs"). Setting it on an existing
         // dataset that was created without stable row IDs is a no-op per
         // Lance's row-id-lineage spec, so this stays correct for legacy
         // datasets.
-        let params = WriteParams {
-            mode: WriteMode::Overwrite,
-            enable_stable_row_ids: true,
-            allow_external_blob_outside_bases: true,
-            ..Default::default()
-        };
-        let transaction = InsertBuilder::new(Arc::new(ds.clone()))
-            .with_params(&params)
-            .execute_uncommitted(vec![batch])
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        let mut new_fragments = match &transaction.operation {
-            Operation::Overwrite { fragments, .. } => fragments.clone(),
-            other => {
-                return Err(OmniError::manifest_internal(format!(
-                    "stage_overwrite: unexpected Lance operation {:?}",
-                    std::mem::discriminant(other)
-                )));
-            }
+        let (transaction, mut new_fragments) = if batch.num_rows() == 0 {
+            let schema = LanceSchema::try_from(batch.schema().as_ref())
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            let transaction = TransactionBuilder::new(
+                ds.manifest.version,
+                Operation::Overwrite {
+                    fragments: Vec::new(),
+                    schema,
+                    config_upsert_values: None,
+                    initial_bases: None,
+                },
+            )
+            .build();
+            (transaction, Vec::new())
+        } else {
+            let params = WriteParams {
+                mode: WriteMode::Overwrite,
+                enable_stable_row_ids: true,
+                allow_external_blob_outside_bases: true,
+                ..Default::default()
+            };
+            let transaction = InsertBuilder::new(Arc::new(ds.clone()))
+                .with_params(&params)
+                .execute_uncommitted(vec![batch])
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
+            let new_fragments = match &transaction.operation {
+                Operation::Overwrite { fragments, .. } => fragments.clone(),
+                other => {
+                    return Err(OmniError::manifest_internal(format!(
+                        "stage_overwrite: unexpected Lance operation {:?}",
+                        std::mem::discriminant(other)
+                    )));
+                }
+            };
+            (transaction, new_fragments)
         };
         // Overwrite REPLACES every committed fragment, and Lance restarts
         // fragment-ID and row-ID counters at the post-commit version.
@@ -1220,7 +1116,7 @@ impl TableStore {
         //   2) For stable-row-id datasets, assign row_id_meta starting
         //      at 0 (Overwrite is a fresh-start) so `scan_with_staged`
         //      doesn't hit the "Missing row id meta" panic in
-        //      lance-4.0.0 dataset/rowids.rs:22.
+        //      lance-6.0.1 dataset/rowids.rs:22.
         assign_fragment_ids(&mut new_fragments, 1);
         if ds.manifest.uses_stable_row_ids() {
             assign_row_id_meta(&mut new_fragments, 0)?;
@@ -1244,7 +1140,7 @@ impl TableStore {
     /// `IndexMetadata`; we manually wrap it in `Operation::CreateIndex
     /// { new_indices, removed_indices }` via the public `TransactionBuilder`,
     /// replicating the simple (non-segment-commit-path) branch of Lance's
-    /// `CreateIndexBuilder::execute` (lance-4.0.0 `src/index/create.rs:502-512`).
+    /// `CreateIndexBuilder::execute` (lance-6.0.1 `src/index/create.rs:502-512`).
     ///
     /// `removed_indices` mirrors `execute()` lines 466-476: when the
     /// build replaces an existing same-named index, those entries are
@@ -1253,7 +1149,7 @@ impl TableStore {
     /// MR-793 Phase 2: scalar index types (BTree, Inverted) are
     /// stage-able. Vector indices are NOT (segment-commit-path requires
     /// `build_index_metadata_from_segments` which is `pub(crate)` in
-    /// lance-4.0.0); see `create_vector_index` and Appendix A.3.
+    /// lance-6.0.1); see `create_vector_index` and Appendix A.3.
     pub async fn stage_create_btree_index(
         &self,
         ds: &Dataset,
@@ -1348,7 +1244,7 @@ impl TableStore {
     /// committed fragments carry; Lance's optimizer drops them from the
     /// filtered scan even when their data would match. Staged-fragment
     /// rows are silently absent from the result. `scanner.use_stats(false)`
-    /// does not fix this in lance 4.0.0. Callers needing correct filtered
+    /// does not fix this in lance 6.0.1. Callers needing correct filtered
     /// reads against staged data should use a different strategy — the
     /// engine's `MutationStaging` accumulator unions in-memory pending
     /// batches with the committed scan via DataFusion `MemTable` (see
@@ -1572,25 +1468,7 @@ impl TableStore {
         }))
     }
 
-    pub async fn create_btree_index(&self, ds: &mut Dataset, columns: &[&str]) -> Result<()> {
-        let params = ScalarIndexParams::default();
-        ds.create_index_builder(columns, IndexType::BTree, &params)
-            .replace(true)
-            .await
-            .map(|_| ())
-            .map_err(|e| OmniError::Lance(e.to_string()))
-    }
-
-    pub async fn create_inverted_index(&self, ds: &mut Dataset, column: &str) -> Result<()> {
-        let params = InvertedIndexParams::default();
-        ds.create_index_builder(&[column], IndexType::Inverted, &params)
-            .replace(true)
-            .await
-            .map(|_| ())
-            .map_err(|e| OmniError::Lance(e.to_string()))
-    }
-
-    pub async fn create_vector_index(&self, ds: &mut Dataset, column: &str) -> Result<()> {
+    pub(crate) async fn create_vector_index(&self, ds: &mut Dataset, column: &str) -> Result<()> {
         let params = lance::index::vector::VectorIndexParams::ivf_flat(1, MetricType::L2);
         ds.create_index_builder(&[column], IndexType::Vector, &params)
             .replace(true)
@@ -1674,7 +1552,7 @@ fn prior_stages_fragment_count(prior_stages: &[StagedWrite]) -> u64 {
 }
 
 /// Assign sequential fragment IDs starting at `start_id`. Mirrors Lance's
-/// commit-time `Transaction::fragments_with_ids` (lance-4.0.0
+/// commit-time `Transaction::fragments_with_ids` (lance-6.0.1
 /// `dataset/transaction.rs:1456`) — fragments produced by
 /// `InsertBuilder::execute_uncommitted` start with `id = 0` as a temporary
 /// placeholder; we renumber here so they don't collide with committed
@@ -1705,7 +1583,7 @@ fn prior_stages_row_count(prior_stages: &[StagedWrite]) -> Result<u64> {
 
 /// Assign sequential row IDs to fragments that lack them, starting from
 /// `start_row_id`. Mirrors the relevant arm of Lance's
-/// `Transaction::assign_row_ids` (lance-4.0.0 `dataset/transaction.rs:2682`)
+/// `Transaction::assign_row_ids` (lance-6.0.1 `dataset/transaction.rs:2682`)
 /// for the `row_id_meta = None` case — fragments produced by
 /// `InsertBuilder::execute_uncommitted` against a stable-row-id dataset.
 ///
@@ -1878,7 +1756,7 @@ fn combine_committed_with_staged(ds: &Dataset, staged: &[StagedWrite]) -> Vec<Fr
     combined
 }
 
-/// Precondition guard for `merge_insert_batch` and `stage_merge_insert`.
+/// Precondition guard for `stage_merge_insert`.
 /// Both opt into `SourceDedupeBehavior::FirstSeen` to suppress the Lance
 /// `processed_row_ids` bug (MR-957). FirstSeen would *also* silently
 /// collapse genuine duplicate source keys; this check restores fail-fast

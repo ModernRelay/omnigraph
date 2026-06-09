@@ -317,10 +317,16 @@ async fn optimize_one_table(
         .acquire_many(&[(table_key.clone(), None)])
         .await;
 
-    let mut ds = db
-        .table_store
+    // `compact_files` is a Lance-only maintenance API that needs `&mut Dataset`.
+    // The `TableStorage` trait deliberately does not surface it (the staged-write
+    // invariant covers writes; compaction is a separate concern). Unwrap the
+    // opaque `SnapshotHandle` via `into_dataset()` (`pub(crate)`, gated to the
+    // maintenance path).
+    let handle = db
+        .storage()
         .open_dataset_head_for_write(&table_key, &full_path, None)
         .await?;
+    let mut ds = handle.into_dataset();
 
     // CAS baseline: the table's current manifest version, read under the queue
     // (in-memory coordinator snapshot, no storage I/O — stable for this section).
@@ -408,7 +414,10 @@ async fn optimize_one_table(
     // expected = the version observed under the queue). On failure the sidecar
     // is intentionally left for the open-time recovery sweep to roll forward.
     if committed {
-        let state = db.table_store.table_state(&full_path, &ds).await?;
+        // Re-wrap the post-compaction dataset to read its state through the
+        // trait surface (`table_state` is a read; no HEAD advance).
+        let snapshot = crate::storage_layer::SnapshotHandle::new(ds);
+        let state = db.storage().table_state(&full_path, &snapshot).await?;
         let update = crate::db::SubTableUpdate {
             table_key: table_key.clone(),
             table_version: state.version,
@@ -493,7 +502,7 @@ pub async fn cleanup_all_tables(
     }
 
     let concurrency = maint_concurrency().min(table_tasks.len()).max(1);
-    let table_store = &db.table_store;
+    let storage = db.storage();
 
     // Fault-isolated per table: a single table's GC failure is recorded on its
     // stats row (`error: Some`) and logged, never aborting the healthy tables.
@@ -503,9 +512,13 @@ pub async fn cleanup_all_tables(
         .map(|(table_key, full_path)| async move {
             let outcome: Result<RemovalStats> = async {
                 crate::failpoints::maybe_fail("cleanup.table_gc")?;
-                let ds = table_store
+                // `cleanup_old_versions` is a Lance-only maintenance API not
+                // surfaced through `TableStorage` — see the optimize path
+                // above for the same rationale. Unwrap via `into_dataset()`.
+                let handle = storage
                     .open_dataset_head_for_write(&table_key, &full_path, None)
                     .await?;
+                let ds = handle.into_dataset();
                 let before_version = keep_versions
                     .map(|n| ds.version().version.saturating_sub(n as u64))
                     .filter(|v| *v > 0);
@@ -606,8 +619,9 @@ pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconci
 
     // Per-table fault isolation: one table's transient failure is recorded and
     // logged, never aborting the rest of the sweep.
+    let storage = db.storage();
     for (table_key, full_path) in table_targets {
-        let listed = match db.table_store.list_branches(&full_path).await {
+        let listed = match storage.list_branches(&full_path).await {
             Ok(listed) => listed,
             Err(err) => {
                 tracing::warn!(
@@ -622,7 +636,7 @@ pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconci
         };
         for branch in orphan_branches(listed, &keep) {
             let outcome = match crate::failpoints::maybe_fail("cleanup.reconcile_fork") {
-                Ok(()) => db.table_store.force_delete_branch(&full_path, &branch).await,
+                Ok(()) => storage.force_delete_branch(&full_path, &branch).await,
                 Err(injected) => Err(injected),
             };
             match outcome {

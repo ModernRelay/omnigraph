@@ -40,6 +40,7 @@ use crate::db::{ReadTarget, Snapshot};
 use crate::embedding::EmbeddingClient;
 use crate::error::{MergeConflict, MergeConflictKind, OmniError, Result};
 use crate::graph_index::GraphIndex;
+use crate::storage_layer::SnapshotHandle;
 use tempfile::{Builder as TempDirBuilder, TempDir};
 
 mod merge;

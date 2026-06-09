@@ -908,6 +908,76 @@ async fn recovery_rolls_forward_load_on_feature_branch() {
 }
 
 #[tokio::test]
+async fn recovery_rolls_forward_load_overwrite() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let operation_id;
+    let parent_commit_id;
+
+    {
+        let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+        load_jsonl(&mut db, helpers::TEST_DATA, LoadMode::Overwrite)
+            .await
+            .unwrap();
+        parent_commit_id = branch_head_commit_id(dir.path(), "main").await.unwrap();
+
+        let _failpoint = ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+        let err = db
+            .load(
+                "main",
+                r#"{"type":"Person","data":{"name":"OverwriteLoad","age":41}}
+"#,
+                LoadMode::Overwrite,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("injected failpoint triggered: mutation.post_finalize_pre_publisher"),
+            "unexpected error: {err}"
+        );
+        operation_id = single_sidecar_operation_id(dir.path());
+    }
+
+    let db = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(
+        helpers::count_rows(&db, "node:Person").await,
+        1,
+        "overwrite row must be visible after recovery rolls the load forward"
+    );
+    drop(db);
+
+    assert_post_recovery_invariants(
+        dir.path(),
+        &operation_id,
+        RecoveryExpectation::RolledForward {
+            tables: vec![
+                TableExpectation::main("node:Person")
+                    .expected_recovery_parent_commit_id(parent_commit_id)
+                    .follow_up_mutation(FollowUpMutation::new(
+                        "main",
+                        MUTATION_QUERIES,
+                        "insert_person",
+                        mixed_params(&[("$name", "AfterOverwriteLoad")], &[("$age", 42)]),
+                    )),
+            ],
+        },
+    )
+    .await
+    .unwrap();
+
+    let db = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(
+        helpers::count_rows(&db, "node:Person").await,
+        2,
+        "follow-up mutation must succeed after overwrite load recovery"
+    );
+}
+
+#[tokio::test]
 async fn recovery_rolls_forward_ensure_indices_on_feature_branch() {
     use lance::index::DatasetIndexExt;
     use omnigraph::loader::{LoadMode, load_jsonl};
@@ -1132,7 +1202,6 @@ async fn refresh_runs_roll_forward_recovery_in_process() {
 #[tokio::test]
 async fn refresh_defers_rollback_eligible_sidecar_to_next_open() {
     use omnigraph::loader::{LoadMode, load_jsonl};
-    use omnigraph::table_store::TableStore;
 
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
@@ -1162,12 +1231,8 @@ async fn refresh_defers_rollback_eligible_sidecar_to_next_open() {
     // touching the manifest) so the classifier can reach UnexpectedAtP1
     // / UnexpectedMultistep / RolledPastExpected paths that require
     // a real restore on rollback.
-    let store = TableStore::new(&uri);
     let mut ds = lance::Dataset::open(&person_uri).await.unwrap();
-    store
-        .delete_where(&person_uri, &mut ds, "1 = 2")
-        .await
-        .unwrap();
+    helpers::lance_delete_inline(&mut ds, "1 = 2").await;
     let head_after_drift = ds.version().version;
     assert_eq!(head_after_drift, manifest_pin + 1);
 
@@ -1697,8 +1762,9 @@ async fn optimize_phase_b_failure_recovered_on_next_open() {
             ScopedFailPoint::new("optimize.post_phase_b_pre_manifest_commit", "return");
         let err = db.optimize().await.unwrap_err();
         assert!(
-            err.to_string()
-                .contains("injected failpoint triggered: optimize.post_phase_b_pre_manifest_commit"),
+            err.to_string().contains(
+                "injected failpoint triggered: optimize.post_phase_b_pre_manifest_commit"
+            ),
             "unexpected error: {err}"
         );
 

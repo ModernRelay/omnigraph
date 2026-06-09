@@ -778,6 +778,47 @@ async fn load_with_bad_edge_reference_unblocks_next_load() {
     );
 }
 
+#[tokio::test]
+async fn load_overwrite_with_bad_edge_reference_unblocks_next_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let pre_persons = count_rows(&db, "node:Person").await;
+    let pre_edges = count_rows(&db, "edge:Knows").await;
+
+    let bad = r#"{"type": "Person", "data": {"name": "Mallory", "age": 5}}
+{"edge": "Knows", "from": "Mallory", "to": "Ghost"}
+"#;
+    let err = load_jsonl(&mut db, bad, LoadMode::Overwrite)
+        .await
+        .expect_err("RI violation must fail overwrite before commit_staged");
+    let OmniError::Manifest(manifest_err) = err else {
+        panic!("expected Manifest error, got {err:?}");
+    };
+    assert!(
+        manifest_err.message.contains("not found"),
+        "unexpected error: {}",
+        manifest_err.message,
+    );
+
+    assert_eq!(count_rows(&db, "node:Person").await, pre_persons);
+    assert_eq!(count_rows(&db, "edge:Knows").await, pre_edges);
+
+    let good = r#"{"type": "Person", "data": {"name": "Pat", "age": 55}}
+{"type": "Person", "data": {"name": "Quinn", "age": 56}}
+{"edge": "Knows", "from": "Pat", "to": "Quinn"}
+"#;
+    load_jsonl(&mut db, good, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    assert_eq!(count_rows(&db, "node:Person").await, 2);
+    assert_eq!(count_rows(&db, "edge:Knows").await, 1);
+}
+
 /// Same shape as the RI test above, but driven by a cardinality
 /// violation (`@card(0..1)` on `WorksAt`). The staged loader's pending
 /// edge accumulator drives the cardinality scan; a violation aborts
@@ -840,6 +881,56 @@ edge WorksAt: Person -> Company @card(0..1)
         pre_works + 1,
         "follow-up load must succeed (no drift on edge table)",
     );
+}
+
+#[tokio::test]
+async fn load_overwrite_with_cardinality_violation_unblocks_next_load() {
+    const CARD_SCHEMA: &str = r#"
+node Person {
+    name: String @key
+    age: I32?
+}
+node Company {
+    name: String @key
+}
+edge WorksAt: Person -> Company @card(0..1)
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, CARD_SCHEMA).await.unwrap();
+
+    let seed = r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}
+{"type": "Company", "data": {"name": "Acme"}}
+{"type": "Company", "data": {"name": "Bigco"}}
+"#;
+    load_jsonl(&mut db, seed, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let pre_works = count_rows(&db, "edge:WorksAt").await;
+
+    let bad = r#"{"edge": "WorksAt", "from": "Alice", "to": "Acme"}
+{"edge": "WorksAt", "from": "Alice", "to": "Bigco"}
+"#;
+    let err = load_jsonl(&mut db, bad, LoadMode::Overwrite)
+        .await
+        .expect_err("cardinality violation must fail overwrite before commit_staged");
+    let OmniError::Manifest(manifest_err) = err else {
+        panic!("expected Manifest error, got {err:?}");
+    };
+    assert!(
+        manifest_err.message.contains("@card violation"),
+        "unexpected error: {}",
+        manifest_err.message,
+    );
+    assert_eq!(count_rows(&db, "edge:WorksAt").await, pre_works);
+
+    let good = r#"{"edge": "WorksAt", "from": "Alice", "to": "Acme"}"#;
+    load_jsonl(&mut db, good, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    assert_eq!(count_rows(&db, "edge:WorksAt").await, 1);
 }
 
 // ─── Chained-mutation correctness — pinned coverage ─────────────────────────

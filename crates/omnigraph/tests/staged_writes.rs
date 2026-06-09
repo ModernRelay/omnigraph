@@ -23,6 +23,9 @@ use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lance::Dataset;
 use lance::dataset::{WhenMatched, WhenNotMatched};
+use lance::index::DatasetIndexExt;
+use lance_index::IndexType;
+use lance_linalg::distance::MetricType;
 use lance_table::format::Fragment;
 use omnigraph::table_store::{StagedWrite, TableStore};
 use std::sync::Arc;
@@ -32,6 +35,22 @@ fn person_schema() -> Arc<Schema> {
         Field::new("id", DataType::Utf8, false),
         Field::new("age", DataType::Int32, true),
     ]))
+}
+
+/// Test-only helper: raw `Dataset::append` to advance Lance HEAD without
+/// going through the manifest. Mirrors `TableStore::append_batch`'s body
+/// (which is `pub(crate)` after MR-854) — kept local so these
+/// drift-simulation tests don't depend on the demoted crate-internal API.
+async fn lance_append_inline_local(ds: &mut Dataset, batch: RecordBatch) {
+    use lance::dataset::{WriteMode, WriteParams};
+    let schema = batch.schema();
+    let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Append,
+        allow_external_blob_outside_bases: true,
+        ..Default::default()
+    };
+    ds.append(reader, Some(params)).await.unwrap();
 }
 
 fn person_batch(rows: &[(&str, Option<i32>)]) -> RecordBatch {
@@ -351,7 +370,7 @@ async fn stage_merge_insert_then_commit_persists_merged_view() {
 /// `write_fragments_internal` lack per-column statistics. The result
 /// contains only matching committed rows; matching staged rows are
 /// silently absent. `scanner.use_stats(false)` does not bypass this in
-/// lance 4.0.0.
+/// lance 6.0.1.
 ///
 /// This test pins the actual behavior so a future change either
 /// preserves it (and updates the doc) or fixes it (and rewrites this
@@ -616,6 +635,58 @@ async fn stage_overwrite_replaces_all_fragments() {
     );
 }
 
+#[tokio::test]
+async fn stage_overwrite_empty_batch_replaces_all_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap());
+
+    let ds = TableStore::write_dataset(
+        &uri,
+        person_batch(&[("alice", Some(30)), ("bob", Some(25))]),
+    )
+    .await
+    .unwrap();
+    let pre_version = ds.version().version;
+
+    let target_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, true),
+        Field::new("nickname", DataType::Utf8, true),
+    ]));
+    let staged = store
+        .stage_overwrite(&ds, RecordBatch::new_empty(target_schema.clone()))
+        .await
+        .unwrap();
+    assert!(
+        staged.new_fragments.is_empty(),
+        "empty overwrite should produce a zero-fragment Lance Overwrite transaction"
+    );
+    assert_eq!(
+        staged.removed_fragment_ids.len(),
+        ds.manifest.fragments.len(),
+        "empty overwrite still removes every committed fragment"
+    );
+    assert_eq!(
+        ds.version().version,
+        pre_version,
+        "staging empty overwrite must not advance HEAD"
+    );
+
+    let new_ds = store
+        .commit_staged(Arc::new(ds.clone()), staged.transaction)
+        .await
+        .unwrap();
+    assert_eq!(new_ds.version().version, pre_version + 1);
+    assert_eq!(new_ds.count_rows(None).await.unwrap(), 0);
+    assert!(
+        arrow_schema::Schema::from(new_ds.schema())
+            .field_with_name("nickname")
+            .is_ok(),
+        "empty overwrite must commit the replacement batch schema"
+    );
+}
+
 /// `stage_create_btree_index` writes index segments to object storage
 /// but does NOT advance Lance HEAD until `commit_staged`. After commit,
 /// the index is queryable.
@@ -699,7 +770,7 @@ async fn stage_create_inverted_index_does_not_advance_head_until_commit() {
     );
 }
 
-/// Pin the inline-commit behavior of `delete_where`. Lance 4.0.0 does
+/// Pin the inline-commit behavior of `delete_where`. Lance 6.0.1 does
 /// NOT expose a public `DeleteJob::execute_uncommitted`
 /// (`pub(crate)` — see lance-format/lance#6658). The trait deliberately
 /// does NOT introduce a `stage_delete` wrapper that would secretly
@@ -714,7 +785,6 @@ async fn stage_create_inverted_index_does_not_advance_head_until_commit() {
 async fn delete_where_advances_head_inline_documents_residual() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
 
     let mut ds = TableStore::write_dataset(
         &uri,
@@ -724,13 +794,11 @@ async fn delete_where_advances_head_inline_documents_residual() {
     .unwrap();
     let pre_version = ds.version().version;
 
-    let result = store
-        .delete_where(&uri, &mut ds, "id = 'alice'")
-        .await
-        .unwrap();
-    assert_eq!(result.deleted_rows, 1);
+    let result = ds.delete("id = 'alice'").await.unwrap();
+    ds = (*result.new_dataset).clone();
+    assert_eq!(result.num_deleted_rows, 1);
     assert!(
-        result.version > pre_version,
+        ds.version().version > pre_version,
         "delete_where ADVANCES Lance HEAD inline (the residual). When \
          lance-format/lance#6658 ships and we migrate to stage_delete + \
          commit_staged, flip this assertion to assert that staging does \
@@ -739,9 +807,9 @@ async fn delete_where_advances_head_inline_documents_residual() {
 }
 
 /// Companion to `delete_where_*`: pin the inline-commit behavior of
-/// `create_vector_index`. Lance 4.0.0 vector indices take the
+/// `create_vector_index`. Lance 6.0.1 vector indices take the
 /// "segment commit path" which calls `build_index_metadata_from_segments`
-/// (`pub(crate)` in lance-4.0.0 `src/index.rs:111`). Until upstream
+/// (`pub(crate)` in lance-6.0.1 `src/index.rs:111`). Until upstream
 /// exposes that helper (companion ticket to lance-format/lance#6658),
 /// the trait surface deliberately does NOT include
 /// `stage_create_vector_index` — same rationale as `stage_delete`'s
@@ -780,8 +848,9 @@ async fn create_vector_index_advances_head_inline_documents_residual() {
     let pre_version = ds.version().version;
     assert!(!store.has_vector_index(&ds, "embedding").await.unwrap());
 
-    store
-        .create_vector_index(&mut ds, "embedding")
+    let params = lance::index::vector::VectorIndexParams::ivf_flat(1, MetricType::L2);
+    ds.create_index_builder(&["embedding"], IndexType::Vector, &params)
+        .replace(true)
         .await
         .unwrap();
     assert!(
@@ -804,7 +873,7 @@ async fn create_vector_index_advances_head_inline_documents_residual() {
 /// The Lance source confirms this — `restore()` (no args) takes the
 /// currently-checked-out version's content and applies it via
 /// `apply_commit` against the latest manifest, advancing HEAD by one.
-/// See lance-4.0.0 `src/dataset.rs:1106` and the transaction-spec
+/// See lance-6.0.1 `src/dataset.rs:1106` and the transaction-spec
 /// example at https://lance.org/format/table/transaction/.
 ///
 /// If the lance bump (4.0.0 → 4.x) ever changes this delta or the call
@@ -815,7 +884,6 @@ async fn create_vector_index_advances_head_inline_documents_residual() {
 async fn lance_restore_appends_one_commit_with_checked_out_content() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
 
     // Build version history: v1 = {alice}, v2 = {alice, bob}, v3 = {alice, bob, carol}.
     let mut ds = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
@@ -823,16 +891,10 @@ async fn lance_restore_appends_one_commit_with_checked_out_content() {
         .unwrap();
     assert_eq!(ds.version().version, 1);
 
-    store
-        .append_batch(&uri, &mut ds, person_batch(&[("bob", Some(25))]))
-        .await
-        .unwrap();
+    lance_append_inline_local(&mut ds, person_batch(&[("bob", Some(25))])).await;
     assert_eq!(ds.version().version, 2);
 
-    store
-        .append_batch(&uri, &mut ds, person_batch(&[("carol", Some(40))]))
-        .await
-        .unwrap();
+    lance_append_inline_local(&mut ds, person_batch(&[("carol", Some(40))])).await;
     assert_eq!(ds.version().version, 3);
 
     let head_before = ds.version().version;
@@ -878,7 +940,7 @@ async fn lance_restore_appends_one_commit_with_checked_out_content() {
 /// and any future continuous-recovery reconciler's queue-acquisition
 /// requirement.
 ///
-/// `Dataset::restore`'s `check_restore_txn` (lance-4.0.0
+/// `Dataset::restore`'s `check_restore_txn` (lance-6.0.1
 /// `src/io/commit/conflict_resolver.rs:986`) returns `Ok(())` against
 /// almost every other op (Append, Update, Delete, CreateIndex, Merge, …),
 /// so a Restore commits successfully even with concurrent commits in
@@ -908,7 +970,6 @@ async fn lance_restore_appends_one_commit_with_checked_out_content() {
 async fn lance_restore_loses_to_concurrent_append_via_orphaning() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
-    let store = TableStore::new(dir.path().to_str().unwrap());
 
     // v1: seed with alice.
     let _ = TableStore::write_dataset(&uri, person_batch(&[("alice", Some(30))]))
@@ -925,10 +986,7 @@ async fn lance_restore_loses_to_concurrent_append_via_orphaning() {
     // This simulates a per-table-queue model where another tenant wrote
     // between recovery's open and recovery's restore call.
     let mut writer_handle = Dataset::open(&uri).await.unwrap();
-    store
-        .append_batch(&uri, &mut writer_handle, person_batch(&[("bob", Some(25))]))
-        .await
-        .unwrap();
+    lance_append_inline_local(&mut writer_handle, person_batch(&[("bob", Some(25))])).await;
     assert_eq!(writer_handle.version().version, 2);
 
     // Recovery now restores. Because restore's `check_restore_txn` returns
