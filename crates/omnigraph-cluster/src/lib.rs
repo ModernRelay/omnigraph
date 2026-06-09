@@ -4,17 +4,20 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
+use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph_compiler::build_catalog;
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::query::typecheck::typecheck_query_decl;
 use omnigraph_compiler::schema::parser::parse_schema;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use ulid::Ulid;
 
 pub const CLUSTER_CONFIG_FILE: &str = "cluster.yaml";
+pub const CLUSTER_GRAPHS_DIR: &str = "graphs";
 pub const CLUSTER_STATE_DIR: &str = "__cluster";
 pub const CLUSTER_STATE_FILE: &str = "__cluster/state.json";
 pub const CLUSTER_LOCK_FILE: &str = "__cluster/lock.json";
@@ -182,6 +185,26 @@ pub struct StatusOutput {
     pub state_observations: StateObservations,
     pub resource_digests: BTreeMap<String, String>,
     pub resource_statuses: BTreeMap<String, ResourceStatusRecord>,
+    pub observations: BTreeMap<String, serde_json::Value>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StateSyncOperation {
+    Refresh,
+    Import,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StateSyncOutput {
+    pub ok: bool,
+    pub operation: StateSyncOperation,
+    pub config_dir: String,
+    pub state_observations: StateObservations,
+    pub resource_digests: BTreeMap<String, String>,
+    pub resource_statuses: BTreeMap<String, ResourceStatusRecord>,
+    pub observations: BTreeMap<String, serde_json::Value>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -190,9 +213,16 @@ struct DesiredCluster {
     config_dir: PathBuf,
     config_digest: String,
     state_lock: bool,
+    graphs: Vec<DesiredGraph>,
     resource_digests: BTreeMap<String, String>,
     resources: Vec<ResourceSummary>,
     dependencies: Vec<Dependency>,
+}
+
+#[derive(Debug, Clone)]
+struct DesiredGraph {
+    id: String,
+    schema_digest: String,
 }
 
 #[derive(Debug)]
@@ -264,8 +294,10 @@ struct PolicyConfig {
     applies_to: Vec<String>,
 }
 
+// Stage 2A/2B accept these forward-compatible state sections so existing
+// ledgers won't churn while approval/recovery semantics are staged later.
 #[allow(dead_code)]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ClusterState {
     version: u32,
@@ -282,7 +314,7 @@ struct ClusterState {
     observations: BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AppliedRevisionState {
     #[serde(default)]
@@ -291,7 +323,7 @@ struct AppliedRevisionState {
     resources: BTreeMap<String, StateResource>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StateResource {
     digest: String,
@@ -317,6 +349,7 @@ struct LocalStateBackend {
 #[derive(Debug)]
 struct StateSnapshot {
     state: Option<ClusterState>,
+    state_cas: Option<String>,
 }
 
 #[derive(Debug)]
@@ -450,6 +483,7 @@ pub fn status_config_dir(config_dir: impl AsRef<Path>) -> StatusOutput {
 
     let mut resource_digests = BTreeMap::new();
     let mut resource_statuses = BTreeMap::new();
+    let mut state_observation_records = BTreeMap::new();
 
     if let Some(raw) = parsed.raw.as_ref() {
         let _settings = validate_cluster_header(raw, &mut diagnostics);
@@ -459,6 +493,7 @@ pub fn status_config_dir(config_dir: impl AsRef<Path>) -> StatusOutput {
                     if let Some(state) = snapshot.state {
                         resource_digests = state_resource_digests(&state);
                         resource_statuses = state.resource_statuses;
+                        state_observation_records = state.observations;
                     } else {
                         diagnostics.push(Diagnostic::warning(
                             "state_missing",
@@ -478,6 +513,185 @@ pub fn status_config_dir(config_dir: impl AsRef<Path>) -> StatusOutput {
         state_observations: observations,
         resource_digests,
         resource_statuses,
+        observations: state_observation_records,
+        diagnostics,
+    }
+}
+
+pub async fn refresh_config_dir(config_dir: impl AsRef<Path>) -> StateSyncOutput {
+    sync_config_dir(config_dir.as_ref(), StateSyncOperation::Refresh).await
+}
+
+pub async fn import_config_dir(config_dir: impl AsRef<Path>) -> StateSyncOutput {
+    sync_config_dir(config_dir.as_ref(), StateSyncOperation::Import).await
+}
+
+async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> StateSyncOutput {
+    let outcome = load_desired(config_dir);
+    let mut diagnostics = outcome.diagnostics;
+    let backend = LocalStateBackend::new(&outcome.config_dir);
+    let mut observations = backend.observations();
+
+    let Some(desired) = outcome.desired else {
+        return StateSyncOutput {
+            ok: false,
+            operation,
+            config_dir: display_path(&outcome.config_dir),
+            state_observations: observations,
+            resource_digests: BTreeMap::new(),
+            resource_statuses: BTreeMap::new(),
+            observations: BTreeMap::new(),
+            diagnostics,
+        };
+    };
+
+    if has_errors(&diagnostics) {
+        return StateSyncOutput {
+            ok: false,
+            operation,
+            config_dir: display_path(&desired.config_dir),
+            state_observations: observations,
+            resource_digests: desired.resource_digests,
+            resource_statuses: BTreeMap::new(),
+            observations: BTreeMap::new(),
+            diagnostics,
+        };
+    }
+
+    let operation_label = state_sync_operation_label(operation);
+    let _lock_guard = if desired.state_lock {
+        match backend.acquire_lock(operation_label, &mut observations) {
+            Ok(guard) => Some(guard),
+            Err(diagnostic) => {
+                diagnostics.push(diagnostic);
+                None
+            }
+        }
+    } else {
+        diagnostics.push(Diagnostic::warning(
+            "state_lock_disabled",
+            "state.lock",
+            format!(
+                "state.lock is false; {operation_label} wrote state without acquiring the cluster state lock"
+            ),
+        ));
+        None
+    };
+
+    if has_errors(&diagnostics) {
+        return StateSyncOutput {
+            ok: false,
+            operation,
+            config_dir: display_path(&desired.config_dir),
+            state_observations: observations,
+            resource_digests: desired.resource_digests,
+            resource_statuses: BTreeMap::new(),
+            observations: BTreeMap::new(),
+            diagnostics,
+        };
+    }
+
+    let snapshot = match backend.read_state(&mut observations) {
+        Ok(snapshot) => snapshot,
+        Err(diagnostic) => {
+            diagnostics.push(diagnostic);
+            return StateSyncOutput {
+                ok: false,
+                operation,
+                config_dir: display_path(&desired.config_dir),
+                state_observations: observations,
+                resource_digests: desired.resource_digests,
+                resource_statuses: BTreeMap::new(),
+                observations: BTreeMap::new(),
+                diagnostics,
+            };
+        }
+    };
+
+    let expected_cas = snapshot.state_cas;
+    let mut state = match (operation, snapshot.state) {
+        (StateSyncOperation::Refresh, Some(state)) => state,
+        (StateSyncOperation::Refresh, None) => {
+            diagnostics.push(Diagnostic::error(
+                "state_missing",
+                CLUSTER_STATE_FILE,
+                "refresh requires an existing state.json; run `cluster import` to bootstrap state",
+            ));
+            return StateSyncOutput {
+                ok: false,
+                operation,
+                config_dir: display_path(&desired.config_dir),
+                state_observations: observations,
+                resource_digests: BTreeMap::new(),
+                resource_statuses: BTreeMap::new(),
+                observations: BTreeMap::new(),
+                diagnostics,
+            };
+        }
+        (StateSyncOperation::Import, Some(state)) => {
+            diagnostics.push(Diagnostic::error(
+                "state_already_exists",
+                CLUSTER_STATE_FILE,
+                "import creates initial state only when state.json is missing; use `cluster refresh` for an existing state ledger",
+            ));
+            return StateSyncOutput {
+                ok: false,
+                operation,
+                config_dir: display_path(&desired.config_dir),
+                state_observations: observations,
+                resource_digests: state_resource_digests(&state),
+                resource_statuses: state.resource_statuses,
+                observations: state.observations,
+                diagnostics,
+            };
+        }
+        (StateSyncOperation::Import, None) => initial_import_state(&desired),
+    };
+
+    let graph_error_count = observe_declared_graphs(&desired, &mut state).await;
+    if graph_error_count > 0 {
+        diagnostics.push(Diagnostic::error(
+            "graph_observation_error",
+            CLUSTER_GRAPHS_DIR,
+            format!("{graph_error_count} graph observation(s) failed"),
+        ));
+    }
+
+    if operation == StateSyncOperation::Import && has_errors(&diagnostics) {
+        return StateSyncOutput {
+            ok: false,
+            operation,
+            config_dir: display_path(&desired.config_dir),
+            state_observations: observations,
+            resource_digests: state_resource_digests(&state),
+            resource_statuses: state.resource_statuses,
+            observations: state.observations,
+            diagnostics,
+        };
+    }
+
+    if operation == StateSyncOperation::Import {
+        state.state_revision = 1;
+    } else {
+        state.state_revision = state.state_revision.saturating_add(1);
+    }
+
+    match backend.write_state(&state, expected_cas.as_deref(), &mut observations) {
+        Ok(()) => {}
+        Err(diagnostic) => diagnostics.push(diagnostic),
+    }
+
+    let resource_digests = state_resource_digests(&state);
+    let ok = !has_errors(&diagnostics);
+
+    StateSyncOutput {
+        ok,
+        operation,
+        config_dir: display_path(&desired.config_dir),
+        state_observations: observations,
+        resource_digests,
+        resource_statuses: state.resource_statuses,
+        observations: state.observations,
         diagnostics,
     }
 }
@@ -577,7 +791,7 @@ fn validate_cluster_header(
             diagnostics.push(Diagnostic::error(
                 "unsupported_state_backend",
                 "state.backend",
-                "Stage 2A supports only omitted state.backend or `cluster`",
+                "Stage 2B supports only omitted state.backend or `cluster`",
             ));
         }
     }
@@ -620,7 +834,10 @@ impl LocalStateBackend {
         let text = match fs::read_to_string(&self.state_path) {
             Ok(text) => text,
             Err(err) if err.kind() == ErrorKind::NotFound => {
-                return Ok(StateSnapshot { state: None });
+                return Ok(StateSnapshot {
+                    state: None,
+                    state_cas: None,
+                });
             }
             Err(err) => {
                 return Err(Diagnostic::error(
@@ -632,7 +849,8 @@ impl LocalStateBackend {
         };
 
         observations.state_found = true;
-        observations.state_cas = Some(format!("sha256:{}", sha256_hex(text.as_bytes())));
+        let state_cas = format!("sha256:{}", sha256_hex(text.as_bytes()));
+        observations.state_cas = Some(state_cas.clone());
 
         let state = serde_json::from_str::<ClusterState>(&text).map_err(|err| {
             Diagnostic::error(
@@ -657,7 +875,109 @@ impl LocalStateBackend {
         observations.state_revision = state.state_revision;
         observations.resource_count = state.applied_revision.resources.len();
 
-        Ok(StateSnapshot { state: Some(state) })
+        Ok(StateSnapshot {
+            state: Some(state),
+            state_cas: Some(state_cas),
+        })
+    }
+
+    fn write_state(
+        &self,
+        state: &ClusterState,
+        expected_cas: Option<&str>,
+        observations: &mut StateObservations,
+    ) -> Result<(), Diagnostic> {
+        fs::create_dir_all(&self.state_dir).map_err(|err| {
+            Diagnostic::error(
+                "state_write_error",
+                CLUSTER_STATE_DIR,
+                format!("could not create cluster state directory: {err}"),
+            )
+        })?;
+
+        let current_cas = self.current_state_cas()?;
+        if current_cas.as_deref() != expected_cas {
+            return Err(Diagnostic::error(
+                "state_cas_mismatch",
+                CLUSTER_STATE_FILE,
+                "state.json changed while the command was running; re-run the command against the latest state",
+            ));
+        }
+
+        let mut payload = serde_json::to_string_pretty(state).map_err(|err| {
+            Diagnostic::error(
+                "state_write_error",
+                CLUSTER_STATE_FILE,
+                format!("could not encode state JSON: {err}"),
+            )
+        })?;
+        payload.push('\n');
+
+        let tmp_path = self
+            .state_dir
+            .join(format!("state.json.tmp.{}", Ulid::new()));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .map_err(|err| {
+                Diagnostic::error(
+                    "state_write_error",
+                    display_path(&tmp_path),
+                    format!("could not create temporary state file: {err}"),
+                )
+            })?;
+        file.write_all(payload.as_bytes()).map_err(|err| {
+            Diagnostic::error(
+                "state_write_error",
+                display_path(&tmp_path),
+                format!("could not write temporary state file: {err}"),
+            )
+        })?;
+        file.sync_all().map_err(|err| {
+            Diagnostic::error(
+                "state_write_error",
+                display_path(&tmp_path),
+                format!("could not sync temporary state file: {err}"),
+            )
+        })?;
+        drop(file);
+
+        if let Err(err) = fs::rename(&tmp_path, &self.state_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(Diagnostic::error(
+                "state_write_error",
+                CLUSTER_STATE_FILE,
+                format!("could not replace state.json atomically: {err}"),
+            ));
+        }
+
+        let written = fs::read_to_string(&self.state_path).map_err(|err| {
+            Diagnostic::error(
+                "state_write_error",
+                CLUSTER_STATE_FILE,
+                format!("could not read state.json after write: {err}"),
+            )
+        })?;
+        observations.state_found = true;
+        observations.applied_config_digest = state.applied_revision.config_digest.clone();
+        observations.state_revision = state.state_revision;
+        observations.state_cas = Some(format!("sha256:{}", sha256_hex(written.as_bytes())));
+        observations.resource_count = state.applied_revision.resources.len();
+
+        Ok(())
+    }
+
+    fn current_state_cas(&self) -> Result<Option<String>, Diagnostic> {
+        match fs::read(&self.state_path) {
+            Ok(bytes) => Ok(Some(format!("sha256:{}", sha256_hex(&bytes)))),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(Diagnostic::error(
+                "state_read_error",
+                CLUSTER_STATE_FILE,
+                format!("could not read state file for CAS check: {err}"),
+            )),
+        }
     }
 
     fn acquire_lock(
@@ -787,6 +1107,247 @@ fn state_resource_digests(state: &ClusterState) -> BTreeMap<String, String> {
         .iter()
         .map(|(address, resource)| (address.clone(), resource.digest.clone()))
         .collect()
+}
+
+fn initial_import_state(desired: &DesiredCluster) -> ClusterState {
+    ClusterState {
+        version: 1,
+        state_revision: 0,
+        applied_revision: AppliedRevisionState {
+            config_digest: Some(desired.config_digest.clone()),
+            resources: BTreeMap::new(),
+        },
+        resource_statuses: BTreeMap::new(),
+        approval_records: BTreeMap::new(),
+        recovery_records: BTreeMap::new(),
+        observations: BTreeMap::new(),
+    }
+}
+
+async fn observe_declared_graphs(desired: &DesiredCluster, state: &mut ClusterState) -> usize {
+    let mut graph_error_count = 0;
+    for graph in &desired.graphs {
+        let graph_address = graph_address(&graph.id);
+        let schema_address = schema_address(&graph.id);
+        let graph_path = desired
+            .config_dir
+            .join(CLUSTER_GRAPHS_DIR)
+            .join(format!("{}.omni", graph.id));
+        let graph_uri = display_path(&graph_path);
+        let observed_at = now_rfc3339();
+
+        if !graph_path.exists() {
+            state.applied_revision.resources.remove(&graph_address);
+            state.applied_revision.resources.remove(&schema_address);
+            state.observations.insert(
+                graph_address.clone(),
+                graph_observation_json(GraphObservationJson {
+                    address: &graph_address,
+                    graph_uri: &graph_uri,
+                    observed_at: &observed_at,
+                    exists: false,
+                    manifest_version: None,
+                    schema_digest: None,
+                    desired_schema_digest: &graph.schema_digest,
+                    schema_matches_desired: Some(false),
+                    error: Some("derived graph root is missing"),
+                }),
+            );
+            set_resource_status(
+                state,
+                &graph_address,
+                ResourceLifecycleStatus::Drifted,
+                "graph_missing",
+                "derived graph root is missing",
+            );
+            set_resource_status(
+                state,
+                &schema_address,
+                ResourceLifecycleStatus::Drifted,
+                "graph_missing",
+                "derived graph root is missing",
+            );
+            continue;
+        }
+
+        match observe_live_graph(&graph_uri).await {
+            Ok(observation) => {
+                let schema_matches = observation.schema_digest == graph.schema_digest;
+                state.applied_revision.resources.insert(
+                    schema_address.clone(),
+                    StateResource {
+                        digest: observation.schema_digest.clone(),
+                    },
+                );
+                let query_digests = state_query_digests_for_graph(state, &graph.id);
+                let graph_digest_value = graph_digest(
+                    &graph.id,
+                    Some(&observation.schema_digest),
+                    Some(&query_digests),
+                );
+                state.applied_revision.resources.insert(
+                    graph_address.clone(),
+                    StateResource {
+                        digest: graph_digest_value,
+                    },
+                );
+                state.observations.insert(
+                    graph_address.clone(),
+                    graph_observation_json(GraphObservationJson {
+                        address: &graph_address,
+                        graph_uri: &graph_uri,
+                        observed_at: &observed_at,
+                        exists: true,
+                        manifest_version: Some(observation.manifest_version),
+                        schema_digest: Some(observation.schema_digest.as_str()),
+                        desired_schema_digest: &graph.schema_digest,
+                        schema_matches_desired: Some(schema_matches),
+                        error: None,
+                    }),
+                );
+                if schema_matches {
+                    set_resource_status_applied(state, &graph_address);
+                    set_resource_status_applied(state, &schema_address);
+                } else {
+                    set_resource_status(
+                        state,
+                        &graph_address,
+                        ResourceLifecycleStatus::Drifted,
+                        "schema_mismatch",
+                        "live schema digest differs from desired schema digest",
+                    );
+                    set_resource_status(
+                        state,
+                        &schema_address,
+                        ResourceLifecycleStatus::Drifted,
+                        "schema_mismatch",
+                        "live schema digest differs from desired schema digest",
+                    );
+                }
+            }
+            Err(error) => {
+                graph_error_count += 1;
+                state.observations.insert(
+                    graph_address.clone(),
+                    graph_observation_json(GraphObservationJson {
+                        address: &graph_address,
+                        graph_uri: &graph_uri,
+                        observed_at: &observed_at,
+                        exists: true,
+                        manifest_version: None,
+                        schema_digest: None,
+                        desired_schema_digest: &graph.schema_digest,
+                        schema_matches_desired: None,
+                        error: Some(error.as_str()),
+                    }),
+                );
+                set_resource_status(
+                    state,
+                    &graph_address,
+                    ResourceLifecycleStatus::Error,
+                    "graph_observation_error",
+                    error.as_str(),
+                );
+                set_resource_status(
+                    state,
+                    &schema_address,
+                    ResourceLifecycleStatus::Error,
+                    "graph_observation_error",
+                    error.as_str(),
+                );
+            }
+        }
+    }
+    graph_error_count
+}
+
+struct LiveGraphObservation {
+    manifest_version: u64,
+    schema_digest: String,
+}
+
+async fn observe_live_graph(graph_uri: &str) -> Result<LiveGraphObservation, String> {
+    let db = Omnigraph::open_read_only(graph_uri)
+        .await
+        .map_err(|err| err.to_string())?;
+    let snapshot = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .map_err(|err| err.to_string())?;
+    let schema_source = db.schema_source();
+    Ok(LiveGraphObservation {
+        manifest_version: snapshot.version(),
+        schema_digest: sha256_hex(schema_source.as_bytes()),
+    })
+}
+
+struct GraphObservationJson<'a> {
+    address: &'a str,
+    graph_uri: &'a str,
+    observed_at: &'a str,
+    exists: bool,
+    manifest_version: Option<u64>,
+    schema_digest: Option<&'a str>,
+    desired_schema_digest: &'a str,
+    schema_matches_desired: Option<bool>,
+    error: Option<&'a str>,
+}
+
+fn graph_observation_json(observation: GraphObservationJson<'_>) -> serde_json::Value {
+    json!({
+        "kind": "graph",
+        "address": observation.address,
+        "graph_uri": observation.graph_uri,
+        "observed_at": observation.observed_at,
+        "exists": observation.exists,
+        "manifest_version": observation.manifest_version,
+        "schema_digest": observation.schema_digest,
+        "desired_schema_digest": observation.desired_schema_digest,
+        "schema_matches_desired": observation.schema_matches_desired,
+        "error": observation.error,
+    })
+}
+
+fn state_query_digests_for_graph(state: &ClusterState, graph_id: &str) -> BTreeMap<String, String> {
+    let prefix = format!("query.{graph_id}.");
+    state
+        .applied_revision
+        .resources
+        .iter()
+        .filter_map(|(address, resource)| {
+            address
+                .strip_prefix(&prefix)
+                .map(|name| (name.to_string(), resource.digest.clone()))
+        })
+        .collect()
+}
+
+fn set_resource_status_applied(state: &mut ClusterState, address: &str) {
+    state.resource_statuses.insert(
+        address.to_string(),
+        ResourceStatusRecord {
+            status: ResourceLifecycleStatus::Applied,
+            conditions: Vec::new(),
+            message: None,
+        },
+    );
+}
+
+fn set_resource_status(
+    state: &mut ClusterState,
+    address: &str,
+    status: ResourceLifecycleStatus,
+    condition: &str,
+    message: &str,
+) {
+    state.resource_statuses.insert(
+        address.to_string(),
+        ResourceStatusRecord {
+            status,
+            conditions: vec![condition.to_string()],
+            message: Some(message.to_string()),
+        },
+    );
 }
 
 fn load_desired(config_dir: &Path) -> LoadOutcome {
@@ -1019,6 +1580,17 @@ fn load_desired(config_dir: &Path) -> LoadOutcome {
         resource_list.push(resource);
     }
     let dependencies: Vec<_> = dependencies.into_iter().collect();
+    let graphs = raw
+        .graphs
+        .keys()
+        .map(|graph_id| DesiredGraph {
+            id: graph_id.clone(),
+            schema_digest: graph_schema_digests
+                .get(graph_id)
+                .cloned()
+                .unwrap_or_default(),
+        })
+        .collect();
     let config_digest = desired_config_digest(&raw, &resource_digests);
 
     LoadOutcome {
@@ -1026,6 +1598,7 @@ fn load_desired(config_dir: &Path) -> LoadOutcome {
             config_dir: config_dir.clone(),
             config_digest,
             state_lock: settings.state_lock,
+            graphs,
             resource_digests,
             resources: resource_list,
             dependencies,
@@ -1365,11 +1938,26 @@ fn desired_config_digest(
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+fn now_rfc3339() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+fn state_sync_operation_label(operation: StateSyncOperation) -> &'static str {
+    match operation {
+        StateSyncOperation::Refresh => "refresh",
+        StateSyncOperation::Import => "import",
+    }
 }
 
 fn has_errors(diagnostics: &[Diagnostic]) -> bool {
@@ -1385,7 +1973,9 @@ fn display_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
 
+    use omnigraph::db::Omnigraph;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -1433,6 +2023,15 @@ policies:
         )
         .unwrap();
         dir
+    }
+
+    async fn init_derived_graph(root: &Path) {
+        let graph_dir = root.join(CLUSTER_GRAPHS_DIR);
+        fs::create_dir_all(&graph_dir).unwrap();
+        let graph = graph_dir.join("knowledge.omni");
+        Omnigraph::init(graph.to_string_lossy().as_ref(), SCHEMA)
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -1905,5 +2504,281 @@ graphs:
                 .iter()
                 .any(|diagnostic| diagnostic.code == "unsupported_state_backend")
         );
+    }
+
+    #[tokio::test]
+    async fn import_missing_state_creates_state_with_graph_observation() {
+        let dir = fixture();
+        init_derived_graph(dir.path()).await;
+
+        let out = import_config_dir(dir.path()).await;
+        assert!(out.ok, "{:?}", out.diagnostics);
+        assert_eq!(out.state_observations.state_revision, 1);
+        assert!(out.state_observations.state_cas.is_some());
+        assert!(!out.state_observations.locked);
+        assert!(out.state_observations.lock_acquired);
+        assert!(out.state_observations.acquired_lock_id.is_some());
+        assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
+        assert_eq!(
+            out.resource_digests
+                .get("schema.knowledge")
+                .map(String::as_str),
+            Some(sha256_hex(SCHEMA.as_bytes()).as_str())
+        );
+        assert!(out.observations["graph.knowledge"]["manifest_version"].is_number());
+        assert_eq!(
+            out.observations["graph.knowledge"]["schema_matches_desired"],
+            true
+        );
+
+        let state: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join(CLUSTER_STATE_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(state["state_revision"], 1);
+        assert_eq!(
+            state["resource_statuses"]["graph.knowledge"]["status"],
+            "applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_existing_state_fails() {
+        let dir = fixture();
+        let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(
+            state_dir.join("state.json"),
+            r#"{"version":1,"applied_revision":{"resources":{}}}"#,
+        )
+        .unwrap();
+
+        let out = import_config_dir(dir.path()).await;
+        assert!(!out.ok);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "state_already_exists")
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_missing_state_fails() {
+        let dir = fixture();
+        let out = refresh_config_dir(dir.path()).await;
+        assert!(!out.ok);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "state_missing")
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_existing_minimal_state_increments_revision_and_updates_cas() {
+        let dir = fixture();
+        init_derived_graph(dir.path()).await;
+        let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(
+            state_dir.join("state.json"),
+            r#"{"version":1,"applied_revision":{"config_digest":"old","resources":{"graph.knowledge":{"digest":"old"}}}}"#,
+        )
+        .unwrap();
+
+        let out = refresh_config_dir(dir.path()).await;
+        assert!(out.ok, "{:?}", out.diagnostics);
+        assert_eq!(out.state_observations.state_revision, 1);
+        assert!(out.state_observations.state_cas.is_some());
+        assert!(!out.state_observations.locked);
+        assert!(out.state_observations.lock_acquired);
+        assert_eq!(
+            out.resource_statuses["graph.knowledge"].status,
+            ResourceLifecycleStatus::Applied
+        );
+        assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn refresh_records_live_schema_digest_and_manifest_version() {
+        let dir = fixture();
+        init_derived_graph(dir.path()).await;
+        let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(
+            state_dir.join("state.json"),
+            r#"{"version":1,"state_revision":4,"applied_revision":{"resources":{}}}"#,
+        )
+        .unwrap();
+
+        let out = refresh_config_dir(dir.path()).await;
+        assert!(out.ok, "{:?}", out.diagnostics);
+        assert_eq!(out.state_observations.state_revision, 5);
+        assert_eq!(
+            out.observations["graph.knowledge"]["schema_digest"],
+            sha256_hex(SCHEMA.as_bytes())
+        );
+        assert!(out.observations["graph.knowledge"]["manifest_version"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn missing_derived_graph_root_marks_drifted_and_plans_creates() {
+        let dir = fixture();
+        let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(
+            state_dir.join("state.json"),
+            r#"{"version":1,"applied_revision":{"resources":{"graph.knowledge":{"digest":"old-graph"},"schema.knowledge":{"digest":"old-schema"}}}}"#,
+        )
+        .unwrap();
+
+        let out = refresh_config_dir(dir.path()).await;
+        assert!(out.ok, "{:?}", out.diagnostics);
+        assert_eq!(
+            out.resource_statuses["graph.knowledge"].status,
+            ResourceLifecycleStatus::Drifted
+        );
+        assert!(!out.resource_digests.contains_key("graph.knowledge"));
+        assert_eq!(out.observations["graph.knowledge"]["exists"], false);
+
+        let plan = plan_config_dir(dir.path());
+        assert!(plan.ok, "{:?}", plan.diagnostics);
+        assert!(plan.changes.iter().any(|change| {
+            change.resource == "graph.knowledge" && change.operation == PlanOperation::Create
+        }));
+        assert!(plan.changes.iter().any(|change| {
+            change.resource == "schema.knowledge" && change.operation == PlanOperation::Create
+        }));
+    }
+
+    #[tokio::test]
+    async fn live_schema_mismatch_marks_drifted_and_causes_plan_update() {
+        let dir = fixture();
+        init_derived_graph(dir.path()).await;
+        fs::write(
+            dir.path().join("people.pg"),
+            SCHEMA.replace("age: I32?", "age: I32?\n  nickname: String?"),
+        )
+        .unwrap();
+        let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(
+            state_dir.join("state.json"),
+            r#"{"version":1,"applied_revision":{"resources":{"graph.knowledge":{"digest":"old-graph"},"schema.knowledge":{"digest":"old-schema"}}}}"#,
+        )
+        .unwrap();
+
+        let out = refresh_config_dir(dir.path()).await;
+        assert!(out.ok, "{:?}", out.diagnostics);
+        assert_eq!(
+            out.resource_statuses["schema.knowledge"].status,
+            ResourceLifecycleStatus::Drifted
+        );
+        assert_eq!(
+            out.observations["graph.knowledge"]["schema_matches_desired"],
+            false
+        );
+
+        let plan = plan_config_dir(dir.path());
+        assert!(plan.ok, "{:?}", plan.diagnostics);
+        assert!(plan.changes.iter().any(|change| {
+            change.resource == "schema.knowledge" && change.operation == PlanOperation::Update
+        }));
+    }
+
+    #[tokio::test]
+    async fn existing_lock_makes_refresh_fail() {
+        let dir = fixture();
+        let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(
+            state_dir.join("state.json"),
+            r#"{"version":1,"applied_revision":{"resources":{}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            state_dir.join("lock.json"),
+            r#"{"version":1,"lock_id":"held-lock","operation":"refresh","created_at":"2026-06-08T00:00:00Z","pid":123}"#,
+        )
+        .unwrap();
+
+        let out = refresh_config_dir(dir.path()).await;
+        assert!(!out.ok);
+        assert!(out.state_observations.locked);
+        assert_eq!(out.state_observations.lock_id.as_deref(), Some("held-lock"));
+        assert!(!out.state_observations.lock_acquired);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "state_lock_held")
+        );
+    }
+
+    #[tokio::test]
+    async fn state_lock_false_bypasses_refresh_lock_with_warning() {
+        let dir = fixture();
+        init_derived_graph(dir.path()).await;
+        fs::write(
+            dir.path().join(CLUSTER_CONFIG_FILE),
+            r#"
+version: 1
+state:
+  backend: cluster
+  lock: false
+graphs:
+  knowledge:
+    schema: ./people.pg
+"#,
+        )
+        .unwrap();
+        let state_dir = dir.path().join(CLUSTER_STATE_DIR);
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(
+            state_dir.join("state.json"),
+            r#"{"version":1,"applied_revision":{"resources":{}}}"#,
+        )
+        .unwrap();
+
+        let out = refresh_config_dir(dir.path()).await;
+        assert!(out.ok, "{:?}", out.diagnostics);
+        assert!(!out.state_observations.locked);
+        assert!(!out.state_observations.lock_acquired);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "state_lock_disabled")
+        );
+    }
+
+    #[tokio::test]
+    async fn external_state_backend_refresh_rejected() {
+        let dir = fixture();
+        fs::write(
+            dir.path().join(CLUSTER_CONFIG_FILE),
+            "version: 1\nstate:\n  backend: s3://bucket/state\ngraphs: {}\n",
+        )
+        .unwrap();
+
+        let out = refresh_config_dir(dir.path()).await;
+        assert!(!out.ok);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "unsupported_state_backend")
+        );
+    }
+
+    #[tokio::test]
+    async fn import_graph_open_error_does_not_create_state() {
+        let dir = fixture();
+        fs::create_dir_all(dir.path().join(CLUSTER_GRAPHS_DIR).join("knowledge.omni")).unwrap();
+
+        let out = import_config_dir(dir.path()).await;
+        assert!(!out.ok);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "graph_observation_error")
+        );
+        assert!(!dir.path().join(CLUSTER_STATE_FILE).exists());
     }
 }

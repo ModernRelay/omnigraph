@@ -144,6 +144,18 @@ policies:
     .unwrap();
 }
 
+fn init_cluster_derived_graph(root: &std::path::Path) {
+    let graph_dir = root.join("graphs");
+    fs::create_dir_all(&graph_dir).unwrap();
+    output_success(
+        cli()
+            .arg("init")
+            .arg("--schema")
+            .arg(root.join("people.pg"))
+            .arg(graph_dir.join("knowledge.omni")),
+    );
+}
+
 #[test]
 fn version_command_prints_current_cli_version() {
     let output = output_success(cli().arg("version"));
@@ -396,6 +408,206 @@ fn cluster_plan_locked_state_exits_nonzero() {
             .iter()
             .any(|diagnostic| diagnostic["code"] == "state_lock_held"),
         "locked state should produce a useful diagnostic: {json}"
+    );
+}
+
+#[test]
+fn cluster_import_json_bootstraps_missing_state() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    init_cluster_derived_graph(temp.path());
+
+    let json = parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg("import")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["operation"], "import");
+    assert_eq!(json["state_observations"]["state_revision"], 1);
+    assert!(
+        json["state_observations"]["state_cas"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    assert_eq!(json["state_observations"]["locked"], false);
+    assert_eq!(json["state_observations"]["lock_acquired"], true);
+    assert!(json["state_observations"]["acquired_lock_id"].is_string());
+    assert!(json["observations"]["graph.knowledge"]["manifest_version"].is_number());
+    assert_eq!(
+        json["resource_statuses"]["graph.knowledge"]["status"],
+        "applied"
+    );
+    assert!(temp.path().join("__cluster/state.json").exists());
+    assert!(!temp.path().join("__cluster/lock.json").exists());
+}
+
+#[test]
+fn cluster_refresh_json_updates_revision_cas_and_removes_lock() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    init_cluster_derived_graph(temp.path());
+    let state_dir = temp.path().join("__cluster");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        r#"
+{
+  "version": 1,
+  "state_revision": 2,
+  "applied_revision": { "resources": {} }
+}
+"#,
+    )
+    .unwrap();
+
+    let json = parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg("refresh")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["operation"], "refresh");
+    assert_eq!(json["state_observations"]["state_revision"], 3);
+    assert!(
+        json["state_observations"]["state_cas"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    assert_eq!(json["state_observations"]["locked"], false);
+    assert_eq!(json["state_observations"]["lock_acquired"], true);
+    assert!(json["state_observations"]["acquired_lock_id"].is_string());
+    assert!(!state_dir.join("lock.json").exists());
+}
+
+#[test]
+fn cluster_refresh_missing_state_exits_nonzero() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+
+    let output = output_failure(
+        cli()
+            .arg("cluster")
+            .arg("refresh")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    );
+    let json = parse_stdout_json(&output);
+    assert_eq!(json["ok"], false);
+    assert!(
+        json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "state_missing"),
+        "missing state should produce a useful diagnostic: {json}"
+    );
+}
+
+#[test]
+fn cluster_import_existing_state_exits_nonzero() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let state_dir = temp.path().join("__cluster");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        r#"{"version":1,"applied_revision":{"resources":{}}}"#,
+    )
+    .unwrap();
+
+    let output = output_failure(
+        cli()
+            .arg("cluster")
+            .arg("import")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    );
+    let json = parse_stdout_json(&output);
+    assert_eq!(json["ok"], false);
+    assert!(
+        json["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "state_already_exists"),
+        "existing state should produce a useful diagnostic: {json}"
+    );
+}
+
+#[test]
+fn cluster_refresh_and_import_locked_state_exit_nonzero() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let state_dir = temp.path().join("__cluster");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        r#"{"version":1,"applied_revision":{"resources":{}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        state_dir.join("lock.json"),
+        r#"{"version":1,"lock_id":"held-lock","operation":"refresh","created_at":"2026-06-08T00:00:00Z","pid":123}"#,
+    )
+    .unwrap();
+
+    let refresh = parse_stdout_json(&output_failure(
+        cli()
+            .arg("cluster")
+            .arg("refresh")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(refresh["state_observations"]["locked"], true);
+    assert_eq!(refresh["state_observations"]["lock_id"], "held-lock");
+    assert_eq!(refresh["state_observations"]["lock_acquired"], false);
+    assert!(
+        refresh["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "state_lock_held")
+    );
+
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let state_dir = temp.path().join("__cluster");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("lock.json"),
+        r#"{"version":1,"lock_id":"held-lock","operation":"import","created_at":"2026-06-08T00:00:00Z","pid":123}"#,
+    )
+    .unwrap();
+
+    let imported = parse_stdout_json(&output_failure(
+        cli()
+            .arg("cluster")
+            .arg("import")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(imported["state_observations"]["locked"], true);
+    assert_eq!(imported["state_observations"]["lock_id"], "held-lock");
+    assert_eq!(imported["state_observations"]["lock_acquired"], false);
+    assert!(
+        imported["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "state_lock_held")
     );
 }
 

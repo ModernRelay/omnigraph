@@ -1,12 +1,13 @@
 # Cluster Config
 
-**Status:** Stage 2A read-only preview.
+**Status:** Stage 2B state-observation preview.
 
 Cluster config is the future control-plane configuration surface for a whole
 OmniGraph deployment. In this stage, OmniGraph can validate a local
-`cluster.yaml` folder, produce a deterministic read-only plan, and inspect the
-local JSON state ledger. It does not apply changes, open graph roots, scan live
-cluster state, start servers, or write graph resources.
+`cluster.yaml` folder, produce a deterministic read-only plan, inspect the
+local JSON state ledger, and explicitly refresh/import graph observations into
+that ledger. It does not apply desired changes, start servers, or write graph
+resources.
 
 ## Commands
 
@@ -14,6 +15,8 @@ cluster state, start servers, or write graph resources.
 omnigraph cluster validate --config ./company-brain
 omnigraph cluster plan     --config ./company-brain --json
 omnigraph cluster status   --config ./company-brain --json
+omnigraph cluster refresh  --config ./company-brain --json
+omnigraph cluster import   --config ./company-brain --json
 ```
 
 `--config` points at a directory, not a file. The directory must contain
@@ -21,7 +24,7 @@ omnigraph cluster status   --config ./company-brain --json
 
 ## Supported `cluster.yaml`
 
-Stage 2A accepts only the read-only resource subset:
+Stage 2B accepts only the read-only resource subset:
 
 ```yaml
 version: 1
@@ -47,10 +50,10 @@ policies:
 
 `metadata.name` is a display label. `state.backend` may be omitted or set to
 `cluster`; external state backends are reserved for a later stage. `state.lock`
-defaults to `true`. When enabled, `cluster plan` briefly acquires
-`<config-dir>/__cluster/lock.json` while it reads state, then removes it before
-returning. `cluster status` never acquires the lock; it only reports whether one
-is present.
+defaults to `true`. When enabled, `cluster plan`, `cluster refresh`, and
+`cluster import` briefly acquire `<config-dir>/__cluster/lock.json`, then remove
+it before returning. `cluster status` never acquires the lock; it only reports
+whether one is present.
 
 ## Validation
 
@@ -115,8 +118,10 @@ and reports `create`, `update`, and `delete` changes. It also reports the state
 CAS (`sha256:<digest>`) and state revision. `state_observations.locked` means an
 existing lock file was observed; a successful `plan` instead reports
 `lock_acquired: true` and an `acquired_lock_id`, then releases the lock before
-returning. The command never writes `state.json`; apply, refresh, import, and
-live drift scans are later-stage work.
+returning. The command never writes `state.json` and does not scan live graphs.
+Use explicit `cluster refresh` / `cluster import` when the state ledger should
+be updated from live observations. Apply and live drift scans during plan are
+later-stage work.
 
 ## Status
 
@@ -124,3 +129,24 @@ live drift scans are later-stage work.
 ledger says is deployed. It does not validate referenced schema/query/policy
 files and does not inspect live graphs. Missing `state.json` succeeds with a
 warning; invalid state JSON or an unsupported state version fails.
+
+## Refresh And Import
+
+`cluster refresh` updates an existing `state.json` from actual observations.
+`cluster import` creates the first `state.json` when the ledger is missing.
+Both commands open declared graphs read-only at:
+
+```text
+<config-dir>/graphs/<graph-id>.omni
+```
+
+They observe only branch `main`, recording graph existence, manifest version,
+live schema digest, desired schema digest, and schema-match status under
+`observations["graph.<id>"]`. Missing graph roots are recorded as drift and
+remove the graph/schema digests from state so a later `plan` proposes creates.
+Invalid graph roots are recorded as errors; `refresh` persists the error
+observation and exits non-zero, while `import` exits non-zero without creating
+initial state.
+
+Refresh/import do not observe query or policy resources yet. Existing query and
+policy state digests are preserved on refresh and are not invented on import.
