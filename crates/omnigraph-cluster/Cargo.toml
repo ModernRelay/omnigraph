@@ -1,6 +1,6 @@
 [package]
 name = "omnigraph-cluster"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 description = "Read-only cluster configuration validation and planning for Omnigraph."
 license = "MIT"
@@ -9,7 +9,7 @@ homepage = "https://github.com/ModernRelay/omnigraph"
 documentation = "https://docs.rs/omnigraph-cluster"
 
 [dependencies]
-omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.6.1" }
+omnigraph-compiler = { path = "../omnigraph-compiler", version = "0.6.2" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

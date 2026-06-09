@@ -30,10 +30,14 @@ use crate::table_store::TableStore;
 
 mod export;
 mod optimize;
+mod repair;
 mod schema_apply;
 mod table_ops;
 
 pub use optimize::{CleanupPolicyOptions, SkipReason, TableCleanupStats, TableOptimizeStats};
+pub use repair::{
+    RepairAction, RepairClassification, RepairOptions, RepairStats, TableRepairStats,
+};
 pub use schema_apply::SchemaApplyOptions;
 
 use super::commit_graph::GraphCommit;
@@ -682,6 +686,16 @@ impl Omnigraph {
             .map(|resolved| resolved.snapshot)
     }
 
+    pub(crate) async fn fresh_snapshot_for_branch(&self, branch: Option<&str>) -> Result<Snapshot> {
+        self.ensure_schema_state_valid().await?;
+        let requested = ReadTarget::Branch(branch.unwrap_or("main").to_string());
+        let coord = self.coordinator.read().await;
+        coord
+            .resolve_target(&requested)
+            .await
+            .map(|resolved| resolved.snapshot)
+    }
+
     pub(crate) async fn version(&self) -> u64 {
         self.coordinator.read().await.version()
     }
@@ -997,6 +1011,13 @@ impl Omnigraph {
     /// node + edge table on `main`. See [`optimize`] for details.
     pub async fn optimize(&self) -> Result<Vec<optimize::TableOptimizeStats>> {
         optimize::optimize_all_tables(self).await
+    }
+
+    /// Classify and explicitly repair uncovered manifest/head drift. See
+    /// [`repair`] for the distinction between safe maintenance drift and
+    /// suspicious/unverifiable drift.
+    pub async fn repair(&self, options: repair::RepairOptions) -> Result<repair::RepairStats> {
+        repair::repair_all_tables(self, options).await
     }
 
     /// Remove Lance manifests (and the fragments they uniquely own) per the
