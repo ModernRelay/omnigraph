@@ -188,7 +188,7 @@ node Thing {
 ///
 /// Defense in depth:
 /// 1. The loader's `enforce_unique_constraints_intra_batch`
-///    (`loader/mod.rs:1471`), invoked unconditionally on any node type
+///    (`loader/mod.rs:1442`), invoked unconditionally on any node type
 ///    with a `@key`, errors on intra-batch duplicate `@key` values at
 ///    intake — pinned by this test across every `LoadMode`.
 /// 2. The `check_batch_unique_by_keys` precondition at the top of
@@ -278,6 +278,71 @@ node ExternalID {
             && msg.contains("external_id"),
         "composite violation must name both columns (got: {msg})"
     );
+}
+
+/// Guard: the intake path (load/insert/update) and the branch-merge path must
+/// derive the same composite `@unique(a, b)` key, so a pair of rows unique on
+/// the tuple is accepted by BOTH. Both paths now key on the tuple itself (no
+/// separator), so a value containing any byte — including the `|` that an
+/// earlier merge-path join used as its separator — can't forge a collision.
+/// `("x|y", "z")` and `("x", "y|z")` are distinct tuples and must survive a
+/// load-on-branch then merge without a phantom `UniqueViolation`. This pins the
+/// cross-path consistency against any future drift in the shared keying.
+#[tokio::test]
+async fn composite_unique_key_is_consistent_across_intake_and_merge() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema = r#"
+node Item {
+    slug: String @key
+    a: String @index
+    b: String @index
+    @unique(a, b)
+}
+"#;
+    let insert_item = r#"
+query insert_item($slug: String, $a: String, $b: String) {
+    insert Item { slug: $slug, a: $a, b: $b }
+}
+"#;
+    let main = Omnigraph::init(uri, schema).await.unwrap();
+    main.branch_create("feature").await.unwrap();
+
+    // Two rows unique on the composite (a, b), where `a`/`b` carry a literal
+    // `|`. Distinct under a tuple key; identical (`x|y|z`) under a `|`-join.
+    let feature = Omnigraph::open(uri).await.unwrap();
+    feature
+        .mutate(
+            "feature",
+            insert_item,
+            "insert_item",
+            &params(&[("$slug", "r1"), ("$a", "x|y"), ("$b", "z")]),
+        )
+        .await
+        .expect("intake must accept the first composite-unique row");
+    feature
+        .mutate(
+            "feature",
+            insert_item,
+            "insert_item",
+            &params(&[("$slug", "r2"), ("$a", "x"), ("$b", "y|z")]),
+        )
+        .await
+        .expect("intake must accept the second composite-unique row (distinct on the tuple)");
+
+    // The merge re-validates uniqueness over the adopted source rows. Both
+    // rows are unique on (a, b), so this must merge cleanly with no phantom
+    // conflict — intake and merge must key the tuple identically.
+    let merge_result = feature.branch_merge("feature", "main").await;
+    assert!(
+        merge_result.is_ok(),
+        "rows unique on the composite (a, b) must merge cleanly; \
+         intake and merge must key the tuple the same way (got: {:?})",
+        merge_result.err()
+    );
+
+    let reopened = Omnigraph::open(uri).await.unwrap();
+    assert_eq!(count_rows(&reopened, "node:Item").await, 2);
 }
 
 /// Canary for the upstream Lance gap that the `FirstSeen` workaround
