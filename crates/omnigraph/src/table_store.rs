@@ -659,28 +659,49 @@ impl TableStore {
             .load_indices()
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
-        let has_btree = indices
+        let btree = indices
             .iter()
             .filter(|index| !is_system_index(index))
             .filter(|index| index.fields.len() == 1 && index.fields[0] == field_id)
-            .any(|index| {
+            .find(|index| {
                 index
                     .index_details
                     .as_ref()
                     .map(|details| details.type_url.ends_with("BTreeIndexDetails"))
                     .unwrap_or(false)
             });
-        if !has_btree {
+        let Some(btree) = btree else {
             return Ok(IndexCoverage::Degraded {
                 reason: format!("no BTREE index on '{}'", column),
             });
-        }
+        };
         // Same check Lance runs: a fragment missing physical_rows disables
         // scalar indices for the entire scan (all-or-nothing).
         if ds.fragments().iter().any(|f| f.physical_rows.is_none()) {
             return Ok(IndexCoverage::Degraded {
                 reason: "a fragment is missing physical_rows".to_string(),
             });
+        }
+        // An index only covers the fragments it was built over; fragments
+        // appended afterward (edge-index creation is skipped once a BTREE exists)
+        // are scanned unindexed. If any CURRENT fragment is absent from the
+        // index's `fragment_bitmap`, the scan is partly a full scan — so the
+        // chooser must not price it as fully indexed. A `None` bitmap means Lance
+        // can't report coverage; don't over-degrade in that case.
+        if let Some(bitmap) = btree.fragment_bitmap.as_ref() {
+            let uncovered = ds
+                .fragments()
+                .iter()
+                .filter(|f| !bitmap.contains(f.id as u32))
+                .count();
+            if uncovered > 0 {
+                return Ok(IndexCoverage::Degraded {
+                    reason: format!(
+                        "{} fragment(s) not covered by the index on '{}'",
+                        uncovered, column
+                    ),
+                });
+            }
         }
         Ok(IndexCoverage::Indexed)
     }

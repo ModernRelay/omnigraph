@@ -402,15 +402,20 @@ async fn _compile_scalar_index_coverage_surface() -> lance::Result<()> {
     // disables the scalar index for the entire scan.
     for frag in ds.fragments().iter() {
         let _physical_rows: Option<usize> = frag.physical_rows;
+        // `key_column_index_coverage` checks each current fragment id against the
+        // index `fragment_bitmap`.
+        let _id: u64 = frag.id;
     }
     // The index sniff: BTREE presence is detected by single-field index whose
-    // details type_url ends with "BTreeIndexDetails".
+    // details type_url ends with "BTreeIndexDetails". The fragment coverage check
+    // reads `fragment_bitmap` (Option<RoaringBitmap>) and calls `.contains(u32)`.
     let indices = ds.load_indices().await?;
     for index in indices.iter() {
         let _fields: &Vec<i32> = &index.fields;
         if let Some(details) = index.index_details.as_ref() {
             let _type_url: &str = details.type_url.as_str();
         }
+        let _covered: Option<bool> = index.fragment_bitmap.as_ref().map(|b| b.contains(0u32));
     }
     Ok(())
 }

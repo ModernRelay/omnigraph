@@ -97,6 +97,44 @@ async fn key_column_index_coverage_detects_btree_presence() {
     );
 }
 
+// An edge appended after the BTREE was built lands in a new fragment that the
+// index does not cover (edge-index creation is skipped once a BTREE exists). The
+// scan is then partly a full scan, so coverage must report `Degraded` — otherwise
+// the cost chooser would price an unindexed-in-part scan as fully indexed.
+// (Results stay correct regardless — `indexed_finds_unindexed_appended_edge`.)
+#[tokio::test]
+async fn coverage_degrades_for_appended_unindexed_fragment() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+
+    // Fresh load: the Knows BTREE covers every fragment → Indexed.
+    let snap = snapshot_main(&db).await.unwrap();
+    let edge_ds = snap.open("edge:Knows").await.unwrap();
+    assert_eq!(
+        TableStore::key_column_index_coverage(&edge_ds, "src").await.unwrap(),
+        IndexCoverage::Indexed,
+        "freshly-loaded edge BTREE covers all fragments"
+    );
+
+    // Append an edge → a new, unindexed fragment outside the index fragment_bitmap.
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "add_friend",
+        &params(&[("$from", "Alice"), ("$to", "Diana")]),
+    )
+    .await
+    .unwrap();
+
+    let snap2 = snapshot_main(&db).await.unwrap();
+    let edge_ds2 = snap2.open("edge:Knows").await.unwrap();
+    let cov = TableStore::key_column_index_coverage(&edge_ds2, "src").await.unwrap();
+    assert!(
+        matches!(cov, IndexCoverage::Degraded { .. }),
+        "appended unindexed fragment must degrade coverage, got {cov:?}"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn indexed_matches_csr_one_hop_same_type() {
