@@ -422,6 +422,35 @@ pub(super) fn apply_ordering(
         });
     }
 
+    // Deterministic tie-break for a TOTAL order. `lexsort_to_indices` is unstable
+    // and the input row order is not guaranteed (scan parallelism, upstream
+    // hashing), so equal user-sort keys would otherwise come out run-dependent —
+    // making `ORDER ... LIMIT` non-deterministic. Append the bound entities' key
+    // columns (`<var>.id`, unique per row) in canonical (name-sorted) order as
+    // ascending tie-breaks. The combination of all bound keys uniquely identifies
+    // a result row, so the order is total and reproducible. (Aggregate results
+    // have no `.id` columns; their group rows are already distinct on the
+    // projected group keys.)
+    let mut tiebreak_cols: Vec<String> = source
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().to_string())
+        .filter(|name| name.ends_with(".id"))
+        .collect();
+    tiebreak_cols.sort();
+    for name in &tiebreak_cols {
+        if let Some(col) = source.column_by_name(name) {
+            sort_columns.push(SortColumn {
+                values: col.clone(),
+                options: Some(arrow_schema::SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                }),
+            });
+        }
+    }
+
     let indices =
         lexsort_to_indices(&sort_columns, None).map_err(|e| OmniError::Lance(e.to_string()))?;
 

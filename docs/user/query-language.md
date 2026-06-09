@@ -55,6 +55,8 @@ Used inside MATCH or as expressions inside RETURN/ORDER:
 
 - `order { <expr> [asc|desc], … }` — supports plain expressions and `nearest(...)`.
 - `limit <integer>` — required when there is a `nearest(...)` ordering.
+- **Total, deterministic order.** Rows with equal user-sort keys are broken by the bound entities' key columns (`<var>.id`, ascending) appended as a final tie-break, so the result is a *total* order — reproducible across runs, and `order … limit N` returns a deterministic top-N even when ties straddle the cutoff. (Aggregate results have no entity-key columns; their group rows are already distinct on the projected group keys.)
+- **NULL placement** is *nulls-first ascending, nulls-last descending* (i.e. `nulls_first = !descending`): a NULL sorts as if smaller than any value.
 
 ## Mutation statements
 
