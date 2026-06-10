@@ -1,6 +1,6 @@
 # HTTP Server (`omnigraph-server`)
 
-Axum 0.8 + tokio + utoipa-generated OpenAPI. **Two modes** (v0.6.0+): single-graph (legacy) and multi-graph (MR-668). Mode is inferred from CLI args + config shape.
+Axum 0.8 + tokio + utoipa-generated OpenAPI. **Two modes** (v0.6.0+): single-graph (legacy) and multi-graph (MR-668), with **two boot sources** for multi mode: `omnigraph.yaml` or — exclusively — a cluster directory (`--cluster`, RFC-005). Mode is inferred from CLI args + config shape.
 
 ## Modes
 
@@ -14,8 +14,20 @@ Axum 0.8 + tokio + utoipa-generated OpenAPI. **Two modes** (v0.6.0+): single-gra
 
 `omnigraph-server --config omnigraph.yaml` with a non-empty `graphs:` map and **no** single-mode selector (no `server.graph`, no `<URI>`, no `--target`). The server opens every configured graph in parallel at startup (bounded concurrency = 4, fail-fast on the first open error). Routes are nested under `/graphs/{graph_id}/...`. Bare flat paths return 404 in multi mode.
 
-Mode inference (four-rule matrix):
+### Cluster-booted multi mode (Phase 5)
 
+`omnigraph-server --cluster <dir>` boots from the cluster catalog's **applied
+revision** (`state.json` + content-addressed blobs) instead of
+`omnigraph.yaml` — an exclusive boot source: combining it with `<URI>`,
+`--target`, or `--config` is a startup error, and `omnigraph.yaml` is never
+read in this mode. Always multi-graph routing. See
+[cluster-config.md](cluster-config.md#serving-from-the-cluster-the-mode-switch)
+for what is read and the fail-fast readiness rules. `--bind`,
+`--unauthenticated`, and the bearer-token env vars work identically.
+
+Mode inference:
+
+0. CLI `--cluster <dir>` → **multi, cluster-booted** (exclusive)
 1. CLI positional `<URI>` → single
 2. CLI `--target <name>` → single
 3. `server.graph` in config → single

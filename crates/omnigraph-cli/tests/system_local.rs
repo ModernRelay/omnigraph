@@ -1633,3 +1633,84 @@ fn local_cli_actor_flag_overrides_config_actor() {
         "expected 'denied' when --as overrides config to bruno, got: {stderr}"
     );
 }
+
+/// Phase 5 (RFC-005): "applied means serving" — converge a cluster with the
+/// CLI, boot the real omnigraph-server binary with --cluster, and serve the
+/// applied stored query over HTTP with zero omnigraph.yaml involvement.
+#[test]
+fn local_cluster_apply_then_server_boots_from_cluster_state() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("people.pg"),
+        "\nnode Person {\n  name: String @key\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("people.gq"),
+        "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("cluster.yaml"),
+        r#"
+version: 1
+graphs:
+  knowledge:
+    schema: ./people.pg
+    queries:
+      find_person:
+        file: ./people.gq
+"#,
+    )
+    .unwrap();
+    for command in ["import", "apply"] {
+        let output = cli()
+            .arg("cluster")
+            .arg(command)
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "cluster {command} failed");
+    }
+    // Seed a row through the graph plane so the stored query has data.
+    let data = temp.path().join("seed.jsonl");
+    std::fs::write(&data, "{\"type\":\"Person\",\"data\":{\"name\":\"Ada\"}}\n").unwrap();
+    let output = cli()
+        .arg("load")
+        .arg("--data")
+        .arg(&data)
+        .arg(temp.path().join("graphs/knowledge.omni"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "graph load failed");
+
+    let server = spawn_server_with_cluster(temp.path());
+    let client = reqwest::blocking::Client::new();
+    let queries: serde_json::Value = client
+        .get(format!("{}/graphs/knowledge/queries", server.base_url))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert!(
+        queries["queries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|q| q["name"] == "find_person"),
+        "{queries}"
+    );
+    let response = client
+        .post(format!(
+            "{}/graphs/knowledge/queries/find_person",
+            server.base_url
+        ))
+        .json(&serde_json::json!({"params": {"name": "Ada"}}))
+        .send()
+        .unwrap();
+    assert!(response.status().is_success(), "{:?}", response.status());
+    let body: serde_json::Value = response.json().unwrap();
+    assert!(body.to_string().contains("Ada"), "{body}");
+}

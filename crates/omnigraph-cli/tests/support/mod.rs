@@ -212,6 +212,12 @@ pub fn spawn_server_with_config(config: &Path) -> TestServer {
     spawn_server_process(command)
 }
 
+pub fn spawn_server_with_cluster(cluster_dir: &Path) -> TestServer {
+    let mut command = server_process();
+    command.arg("--cluster").arg(cluster_dir).arg("--unauthenticated");
+    spawn_server_process(command)
+}
+
 pub fn spawn_server_with_config_env(config: &Path, envs: &[(&str, &str)]) -> TestServer {
     let mut command = server_process();
     command.arg("--config").arg(config);
