@@ -1,6 +1,6 @@
 # RFC: MCP Server Surface for `omnigraph-server` — Full Tool Parity, Stored Queries, Modular Auth
 
-**Status:** Proposed
+**Status:** Reference implementation shipped in [omnigraph#157](https://github.com/ModernRelay/omnigraph/pull/157) (proved rmcp 1.7 on edition 2024, the auth-extension passthrough, and the full tool/resource/Cedar surface). **This RFC is now the canonical spec for a clean reimplementation from `main`** that lands the surface with a dedicated `omnigraph-mcp` crate from the start — build from the **[Implementation Blueprint](#implementation-blueprint-canonical--build-the-fresh-implementation-from-this)** below, which incorporates the as-built reality and supersedes the §5 sketches where they differ. Deferred to follow-ups: per-query `invoke_query` scope (PR 0b), the OAuth/RFC-9728 layer (MR-956), and the stdio→proxy collapse.
 **Date:** 2026-06-01
 **Tickets:** MR-969 (stored queries + MCP exposure — the surface this completes), MR-956 (federated auth / WorkOS OAuth — the auth substrate this consumes), MR-971 (per-server credential resolver), MR-974 (agent setup surface — the installer that wires this), MR-668 (multi-graph server — shipped, the routing this builds on)
 **Builds on:** [omnigraph#128](https://github.com/ModernRelay/omnigraph/pull/128) (`ragnorc/stored-queries-mcp`) — the shipped stored-query registry, `GET /queries`, `POST /queries/{name}`, and the coarse `invoke_query` gate.
@@ -11,7 +11,7 @@
 
 Add a first-class **MCP (Model Context Protocol) server surface to `omnigraph-server`**, exposed over **Streamable HTTP**, that projects the server's operations as MCP tools and resources for LLM clients (Claude Code/Desktop/web, Cursor, etc.). Two populations of tools share one projection path:
 
-1. **Built-in operational tools** — parity with the existing `@modernrelay/omnigraph-mcp` stdio package's **13 tools** (`health`, `snapshot`, `read`, `schema_get`, `branches_list`, `commits_list`, `commits_get`, `change`, `ingest`, `branches_create`, `branches_delete`, `branches_merge`, `schema_apply`) and its **2 resources** (`omnigraph://schema`, `omnigraph://branches`), plus a new server-scoped `graphs_list` tool and an `omnigraph://graphs` resource (multi-graph mode).
+1. **Built-in operational tools** — parity with the existing `@modernrelay/omnigraph-mcp` stdio package's **13 tools** (`health`, `snapshot`, `read`, `schema_get`, `branches_list`, `commits_list`, `commits_get`, `change`, `ingest`, `branches_create`, `branches_delete`, `branches_merge`, `schema_apply`) and its **2 resources** (`omnigraph://schema`, `omnigraph://branches`). (Server-scoped graph discovery — a `graphs_list` tool / `omnigraph://graphs` resource — was considered but **dropped from MCP**; it stays REST-only via `GET /graphs`. See [B.10](#b10-routing-resolved).)
 2. **Dynamic stored-query tools** — one MCP tool per `mcp.expose: true` entry in the `queries:` registry (MR-969 / #128), with parameters typed from the `.gq` declaration via the shipped `query_catalog_entry` / `param_descriptor` projection.
 
 Every tool is **authorized by the server's existing Cedar policy engine**. The MCP layer never implements its own authentication: it consumes an **already-resolved `ResolvedActor`** from the server's bearer middleware (`require_bearer_auth` today; the `TokenVerifier` seam when MR-956 lands), so the **same MCP endpoint serves on-prem (static or customer-OIDC tokens) and our cloud (WorkOS OAuth) by configuration only**. Cloud OAuth is an additive layer (RFC 9728 protected-resource metadata) that slots in with zero MCP changes.
@@ -19,6 +19,147 @@ Every tool is **authorized by the server's existing Cedar policy engine**. The M
 The end-state collapses two diverging tool implementations into one: the in-server MCP is the canonical, Cedar-gated, remotely-reachable surface; the stdio package becomes a thin stdio↔HTTP proxy (local on-ramp) over it.
 
 > **Key caveat, stated up front (see §5.9 below):** the headline "a token scoped via Cedar to a *specific set* of stored queries" requires **per-query `invoke_query` scope**, which is *designed* (rfc-001) but **not yet implemented** — the shipped action is coarse (any stored query on the graph, or none). Per-actor Cedar curation works today for *built-in vs ad-hoc vs admin* tools and for *stored-vs-ad-hoc*; sub-selecting individual stored queries per actor is gated on a prerequisite (PR 0b). Until then, stored-query curation is graph-level (registry membership + `mcp.expose`).
+
+## Implementation Blueprint (canonical — build the fresh implementation from this)
+
+> This section is the **authoritative, verified spec**. A reference implementation shipped in [omnigraph#157](https://github.com/ModernRelay/omnigraph/pull/157) and proved every choice here: rmcp **1.7.0** integrates on edition 2024, the auth-extension passthrough works, all conformance MUSTs are met, and the surface splits cleanly into a transport crate + a server backend. Build a clean implementation from `main` by following B.1–B.13 in order. Where this blueprint and the older §5 design sketches differ, **the blueprint wins** (the §5 text is retained as design rationale). Every reuse point named here exists in the engine/server today.
+
+### B.1 Crate architecture & dependency direction
+
+Split the surface into a **transport crate** plus a **server-side backend**:
+
+- **`crates/omnigraph-mcp`** (new) — the rmcp Streamable-HTTP transport, the `McpBackend` trait, and rmcp model re-exports. `rmcp` (+ `tower-http`'s `limit` feature) live **only** here.
+- **`omnigraph-server`** depends on `omnigraph-mcp` and *implements* `McpBackend`. All omnigraph-specific tool/resource/Cedar/dispatch logic lives in the server.
+
+**The dependency MUST go `omnigraph-server → omnigraph-mcp`, never the reverse.** The server binary mounts `/mcp`, so a `mcp → server` dependency cycles at the package level (`server-bin → omnigraph-mcp → server-lib`), which Cargo rejects. The trait inverts the direction: the crate defines the seam, the server fills it. This is also *why* the crate cannot reach server internals (`AppState`, `do_*`, `authorize`, `api::*`) — it abstracts over them.
+
+`omnigraph-mcp/Cargo.toml`: `edition = "2024"`, version-locked to the workspace. Deps: `rmcp = { version = "1.7", default-features = false, features = ["server", "transport-streamable-http-server"] }`, `axum` (for `Router`), `http`, `tower-http = { features = ["limit"] }`, `tokio`, `async-trait`, `serde_json`. Add `"crates/omnigraph-mcp"` to the workspace `members`; in `omnigraph-server/Cargo.toml` drop `rmcp` and the `tower-http` `limit` feature, add `omnigraph-mcp`.
+
+### B.2 The `McpBackend` seam
+
+Use `#[async_trait]` (boxed futures sidestep the async-fn-in-trait `Send`-bound friction; the cost is negligible at MCP QPS, and the server already depends on `async-trait`):
+
+```rust
+#[async_trait]
+pub trait McpBackend: Clone + Send + Sync + 'static {
+    fn server_info(&self) -> ServerInfo;
+    async fn list_tools(&self, parts: &http::request::Parts) -> Result<Vec<Tool>, McpError>;
+    async fn call_tool(&self, parts: &http::request::Parts, name: &str, args: JsonObject)
+        -> Result<CallToolResult, McpError>;
+    async fn list_resources(&self, parts: &http::request::Parts) -> Result<Vec<Resource>, McpError>;
+    async fn read_resource(&self, parts: &http::request::Parts, uri: &str)
+        -> Result<ReadResourceResult, McpError>;
+}
+```
+
+**Why `&http::request::Parts` (the load-bearing mechanism — verified in rmcp source and `#157`).** rmcp's `StreamableHttpService` injects the original request's `http::request::Parts` into `RequestContext.extensions`. The server's `require_bearer_auth` + `resolve_graph_handle` middleware run *before* the MCP service and insert `ResolvedActor` + `Arc<GraphHandle>` into the request's extensions. The crate hands `&Parts` to the backend; the backend reads its own types from `parts.extensions`. The crate never names an omnigraph type → auth stays decoupled (§5.8) and the crate is reusable. The crate re-exports the rmcp model types the backend needs: `McpError (= rmcp::ErrorData)`, `Tool`, `CallToolResult`, `Content`, `JsonObject`, `Resource`, `RawResource`, `ResourceContents`, `ReadResourceResult`, `ServerInfo`, `ServerCapabilities`, `ToolAnnotations`, `Annotated` — so the server uses rmcp types via `omnigraph_mcp::…` and carries no direct rmcp dep.
+
+### B.3 Transport (lives in `omnigraph-mcp`)
+
+- A generic `struct McpService<B>` implements rmcp's `ServerHandler`, delegating each method to `B` after extracting `&Parts` from `ctx.extensions` once (missing → `McpError::internal_error`). `get_info → backend.server_info()`; `initialize`/`ping` use rmcp's defaults.
+- `pub fn mcp_router<B: McpBackend>(backend: B, body_limit: usize) -> axum::Router`:
+  - `let svc = StreamableHttpService::new(move || Ok(McpService::new(backend.clone())), Arc::new(LocalSessionManager::default()), config)` with `config = StreamableHttpServerConfig::default().with_stateful_mode(false).with_json_response(true)` (`StreamableHttpServerConfig` is `#[non_exhaustive]` — build from `Default`, mutate via the `with_*` setters; keep the loopback `allowed_hosts` default).
+  - Return `Router::new().route_service("/mcp", svc).layer(tower_http::limit::RequestBodyLimitLayer::new(body_limit))`. rmcp reads the body directly (not via an axum extractor), so axum's `DefaultBodyLimit` does **not** bound `/mcp`; the tower-http layer does.
+- **Stateless mode delivers these conformance MUSTs for free (verified against rmcp 1.7 source):** `GET`/`DELETE /mcp` → `405` (with `Allow`); a disallowed `Host`/`Origin` → `403` (loopback hosts by default — DNS-rebind guard); `MCP-Protocol-Version` → `400` on unsupported, default `2025-03-26` when absent. **No conformance middleware is needed** (the §5.6 "honour the header" footnote is satisfied by rmcp).
+- **Client/test obligations rmcp enforces:** the request must carry `Accept: application/json, text/event-stream` (both), `Content-Type: application/json`, and a `Host` header. rmcp negotiates `protocolVersion` (a recent client sees `2025-11-25`).
+
+### B.4 Server-side backend (lives in `omnigraph-server`)
+
+`struct OmnigraphMcpBackend { state: AppState }` (derive `Clone` — `AppState` is already `#[derive(Clone)]`, `Arc`-backed) implements `McpBackend`. Per request it resolves the actor + handle from `parts.extensions.get::<ResolvedActor>()` / `get::<Arc<GraphHandle>>()`.
+
+**Reuse, never reinvent.** First factor **10 thin `do_*` fns** out of the inline `server_*` HTTP handlers (each is `authorize_request(...) → engine call → DTO`) so REST and MCP dispatch one path: `do_snapshot`, `do_schema_get`, `do_branches_list`, `do_commits_list`, `do_commit_show`, `do_ingest`, `do_branch_create`, `do_branch_delete`, `do_branch_merge`, `do_schema_apply`. (No `do_graphs_list` — `graphs_list` is not an MCP tool, see B.10; `server_graphs_list` stays inline for `GET /graphs`.) Land that as a behavior-neutral refactor commit first (it keeps the REST handlers as thin wrappers; all server tests stay green). Then reuse as-is: `run_query` / `run_mutate` (already decoupled from request bodies), `authorize` → `Authz { Allowed, Denied(msg) }` (with `Err` reserved for operational 401/500), `api::query_catalog_entry` / `ParamKind` / `read_output`, `ApiError` (add `pub(crate) status_code()` + `message_str()` accessors for the error classifier). Mount in `build_app`: `.merge(mcp::mcp_router(state))` inside the `per_graph_protected` group, where the server's thin `mcp::mcp_router(state) = omnigraph_mcp::mcp_router(OmnigraphMcpBackend::new(state), INGEST_REQUEST_BODY_LIMIT_BYTES)`.
+
+Represent the built-ins as a `Builtin` enum (one variant per tool; `descriptor` / `gate` / `call` as match arms) — lower liability than ~14 unit structs + `dyn` + `async-trait` per tool. Stored-query tools are a sibling populator over `handle.queries`.
+
+### B.5 Tool catalog (13 built-ins) + Cedar mapping
+
+Each built-in reuses the **exact `PolicyAction` its REST route enforces**. (No `graphs_list` — server-scoped graph discovery is REST-only, see B.10.)
+
+| MCP tool | Scope | Cedar action |
+|---|---|---|
+| `health` | server | none (liveness/version) |
+| `snapshot`, `schema_get`, `branches_list`, `commits_list`, `commits_get` | graph | `Read` |
+| `query` (ad-hoc read) | graph | `Read` (`run_query` self-authorizes) |
+| `mutate` (ad-hoc write) | graph | `Change` |
+| `ingest` (NDJSON) | graph | `Change` (+ `BranchCreate` when `from` forks) |
+| `branches_create` / `branches_delete` / `branches_merge` | graph | `BranchCreate` / `BranchDelete` / `BranchMerge` |
+| `schema_apply` (`allow_data_loss`) | graph | `SchemaApply` |
+| *stored query* | graph | `InvokeQuery` (coarse) then inner `Read`/`Change` |
+
+Baked-in decisions (resolve the Open Questions):
+- **Tool ids are `query`/`mutate` only — no `read`/`change` aliases.** The server HTTP surface already deprecated `/read`,`/change`; a fresh in-server MCP has no legacy clients to keep, so it exposes only the canonical ids. [Open Q7 → resolved: no aliases.]
+- **Ad-hoc `query`/`mutate` are always exposed, Cedar-only** — no `mcp.allow_adhoc` switch. [Open Q3 → resolved: always-on + Cedar.]
+
+Annotations (rmcp defaults `destructiveHint` **and** `openWorldHint` to **true**, so set them explicitly via `ToolAnnotations::new().read_only(b).destructive(b).open_world(b)`): read tools → `read_only(true).open_world(false)`; `mutate`/`ingest`/`branches_delete`/`branches_merge`/`schema_apply` → `read_only(false).destructive(true).open_world(false)`; `branches_create` (additive) → `read_only(false).destructive(false).open_world(false)`.
+
+### B.6 Stored-query tools
+
+One MCP tool per `mcp.expose` registry entry (named by its `tool_name`), projected from the **same `api::query_catalog_entry`** the `GET /queries` catalog uses; parameters → JSON Schema per B.7. The outer gate is the **coarse `InvokeQuery`** action (all exposed queries on the graph, or none — per-query scope is deferred, see B.13); the call then runs the registry source through `run_query` / `run_mutate`, whose inner `Read` / `Change` gate the body — the **double-gate of `POST /queries/{name}`**. Skip a stored tool whose name collides with a built-in (built-ins win, so the catalog never has a duplicate tool name).
+
+### B.7 `ParamKind` → JSON Schema (stored-query params)
+
+| `ParamKind` | JSON Schema |
+|---|---|
+| String / Bool / Int / Float | `{"type":"string"}` / `{"type":"boolean"}` / `{"type":"integer"}` / `{"type":"number"}` |
+| BigInt (i64/u64) | `{"type":"string","pattern":"^-?\\d+$"}` (JSON numbers lose precision >2⁵³) |
+| Date / DateTime | `{"type":"string","format":"date"}` / `{"type":"string","format":"date-time"}` |
+| Blob | `{"type":"string","contentEncoding":"base64"}` |
+| Vector | `{"type":"array","items":{"type":"number"},"minItems":dim,"maxItems":dim}` (from `vector_dim`) |
+| List | `{"type":"array","items":<item_kind schema>}` (scalar items only) |
+
+`nullable == false` → in `required`. Add `branch` (and `snapshot` for reads) as optional invocation knobs. Fold `instruction` into the description.
+
+### B.8 `list` / `call` semantics
+
+- **`list_tools` / `list_resources`** are Cedar-filtered: for each tool/resource, evaluate `authorize(actor, policy_for(gate), { action, branch: None })`; emit only `Allowed`; an `Err` (operational, e.g. policy-engine error) propagates as a JSON-RPC error; a `Denied` simply hides. Stored-query tools list as a group iff the coarse `InvokeQuery` is allowed.
+- **`call_tool`:** an unknown tool **or** a denied tool returns the **identical** `unknown tool: <name>` (`-32602`) so the catalog can't be probed without the grant. A business/validation/engine failure (4xx/409) → `CallToolResult { isError: true }` (so the model self-corrects — the 2025-11-25 SEP-1303 split); an operational 5xx → JSON-RPC error. A missing/bad bearer is an HTTP `401` at the boundary *before* rmcp.
+- **Branch-scope caveat (R7):** list visibility evaluates with `branch: None`; the actual `do_*` / `run_*` re-authorizes against the real branch, so a branch-scoped policy may list a tool yet deny a specific-branch call. `tools/call` is authoritative.
+
+### B.9 Resources
+
+Two resources: `omnigraph://schema` (`Read` → `do_schema_get`) and `omnigraph://branches` (`Read` → `do_branches_list`, JSON text). (No `omnigraph://graphs` — server-scoped, dropped with `graphs_list`; see B.10.) `list_resources`/`read_resource` Cedar-filtered + masked exactly like tools. Advertise the `resources` capability only because both handlers are backed (don't advertise a capability whose `read` would 404).
+
+### B.10 Routing (RESOLVED)
+
+`/mcp` lives in the `per_graph_protected` route group: single mode → `POST /mcp`; multi mode → `POST /graphs/{graph_id}/mcp` (per-graph isolation; consistent with the `/graphs/{id}/...` REST cluster routing). [Open Q5 → resolved: per-graph, final.]
+
+**Decided: the MCP surface has no server-scoped tools or resources.** `graphs_list` and `omnigraph://graphs` are **dropped from MCP** — graph discovery is a REST/admin concern, served by `GET /graphs`. Every MCP tool/resource is graph-scoped, the per-graph `/mcp` is fully clean, and there is no flat server-level `/mcp`. (If a concrete need to enumerate graphs *over MCP* ever arises, add a flat server-level `POST /mcp` in the `management` group — bearer-only, no graph handle, server-scoped tools only — but do not build it speculatively.)
+
+**Do not** consolidate to a single flat `/mcp` that takes `graph_id` per call: MCP's `tools/list` cannot carry a graph, so it can't list per-graph stored-query tools; it also breaks isolation, pollutes every tool's `input_schema`, and diverges from the URL-scoped REST routing.
+
+### B.11 Auth (decoupled; OAuth is a committed fast-follow)
+
+The handler consumes an already-resolved `ResolvedActor` and **branches on nothing** about how the token was verified (§5.8). Static bearer works **today** with the developer clients; the consumer connectors need OAuth, a planned additive layer that changes zero MCP code (it only swaps the bearer middleware behind a `TokenVerifier`, and serves RFC 9728 metadata).
+
+| Integration | Static bearer (this surface) | Note |
+|---|---|---|
+| Claude Code, Cursor, VS Code | ✅ | `claude mcp add --transport http <url>/mcp --header "Authorization: Bearer <tok>"` |
+| Claude Messages API MCP connector | ✅ | caller passes `authorization_token` → `Authorization: Bearer` |
+| claude.ai web / Claude Desktop connectors | ❌ needs OAuth fast-follow | requires OAuth 2.1 + PKCE (S256) + RFC 9728 + DCR/CIMD/custom client id+secret |
+| ChatGPT developer-mode connectors | ❌ needs OAuth fast-follow | OAuth 2.1 (CIMD/DCR/PKCE) or "no auth"; no static-bearer mode |
+
+OAuth fast-follow (MR-956): serve `/.well-known/oauth-protected-resource` + `WWW-Authenticate` on 401, front a managed AS (WorkOS AuthKit by default) that supports DCR + PKCE, validate audience-bound JWTs offline → `ResolvedActor`. Keep it **config-gated/dual-mode** so a server that does not advertise OAuth lets the dev clients keep using the static `Authorization` header (avoids the Claude Code header-vs-OAuth conflict).
+
+### B.12 Tests & verification
+
+- **Protocol:** `initialize` handshake + advertised `{tools, resources}` caps; `tools/list` shape; `tools/call` happy path; JSON-RPC errors (`-32601`/`-32602`); `resources/list` + `resources/read`; `GET /mcp` → 405; `MCP-Protocol-Version` 400/default; `Origin` → 403.
+- **Cedar (coarse):** a read-only actor sees the read tools but not `mutate`/`ingest`/`branches_*`/`schema_apply`; a denied `tools/call` masks byte-identically to an unknown one; stored queries listed only with `invoke_query`; the double-gate (an `invoke_query`-only actor sees a stored tool but the call surfaces `isError` when the inner `read` denies).
+- **Dispatch:** a `mutate` call writes end-to-end (proves the actor/handle extension passthrough); a malformed query → `isError:true`, not a JSON-RPC error.
+- **Resources:** list + read of `schema`/`branches`; a denied read masks as unknown.
+- **Auth decoupling / no-bearer:** `/mcp` 401s without a bearer (before rmcp) and 200s with one; the suite is green under the static-hash verifier (and a mock `ResolvedActor` source proves verifier-agnosticism).
+- **Crate-level:** a tiny `omnigraph-mcp/tests/` with a trivial `McpBackend` impl serving `initialize` + `GET→405` proves the crate stands alone; add an rmcp surface-guard there pinning `StreamableHttpServerConfig` field names + the `ServerHandler` method shapes.
+- **Verification commands:** `cargo build --workspace --locked`; `cargo tree -p omnigraph-server -e normal | grep rmcp` shows rmcp **only** transitively under `omnigraph-mcp`; `cargo test -p omnigraph-server --test server` (incl. the `mcp_*` cases, black-box over `build_app`) + `--test openapi` (no `/mcp` leak — it carries no `#[utoipa::path]`); live smoke: run the server with a bearer + policy, `curl` `initialize`/`tools/list`/`tools/call`/`GET→405`.
+
+### B.13 Decisions locked
+
+- **rmcp 1.7** (not hand-rolled) — verified to integrate on edition 2024. [Open Q2 → resolved.]
+- **Coarse `invoke_query` only**; per-query scope deferred (PR 0b — adds a query-name dimension to `PolicyRequest` + the Cedar schema). [The headline caveat.]
+- **Ad-hoc `query`/`mutate` always exposed, Cedar-only**; no `mcp.allow_adhoc`. [Open Q3 → resolved.]
+- **`query`/`mutate` ids only**, no `read`/`change` aliases. [Open Q7 → resolved.]
+- **Per-graph `/mcp` routing**; `graphs_list`/`omnigraph://graphs` **dropped from MCP** (graph discovery via REST `GET /graphs`); no server-scoped MCP tools. [Open Q5 → resolved.]
+- **text-JSON `content` for v1**; `structuredContent`/`outputSchema` deferred. [Open Q4 → resolved.]
+- **BigInt as JSON string.** [Open Q1 → resolved.]
+- **Static bearer now, OAuth/RFC-9728 fast-follow.**
 
 ## Relationship to RFC-001
 
@@ -32,9 +173,11 @@ Everything else in rfc-001 (two-paths-one-engine, per-query `invoke_query` *as t
 
 > **Numbering note:** the `TokenVerifier`/WorkOS auth design is referred to in code (`crates/omnigraph-server/src/identity.rs`) as "RFC 0001," which is a *different* document from this repo's `docs/dev/rfc-001-queries-envelope-mcp.md`. To avoid the collision this RFC cites the auth substrate as **MR-956** throughout, never "RFC 0001."
 
-## Reconciliation with shipped code (verified against `ragnorc/stored-queries-mcp` HEAD)
+## Reconciliation with shipped code (historical — pre-MCP, against #128 HEAD)
 
-Verified against `crates/omnigraph-server/src/{lib.rs,api.rs}` and `crates/omnigraph-policy/src/lib.rs` at the current branch head (not the #128 PR body, and not `api.rs` alone):
+> *Historical: this was the gap analysis against `#128` (the stored-query REST foundation) before the MCP surface was built. The three ❌ items below — the MCP protocol surface, and the `TokenVerifier` — were subsequently built/addressed in [#157](https://github.com/ModernRelay/omnigraph/pull/157) (transport, tools, resources) except per-query scope and OAuth, which remain deferred. For the current build instructions see the [Implementation Blueprint](#implementation-blueprint-canonical--build-the-fresh-implementation-from-this).*
+
+Verified against `crates/omnigraph-server/src/{lib.rs,api.rs}` and `crates/omnigraph-policy/src/lib.rs` at the `#128` branch head:
 
 - ✅ `GET /queries` returns the `mcp.expose == true` subset as `QueriesCatalogOutput { queries: [QueryCatalogEntry] }`, each with typed `ParamDescriptor`s, `tool_name`, `description`, `instruction`, and a `mutation` flag. **MCP-ready projection, but exposed as bespoke REST/JSON — not the MCP wire protocol.**
 - ✅ `POST /queries/{name}` route exists (`server_invoke_query`, `lib.rs`).
@@ -78,6 +221,8 @@ Stack (verified `Cargo.toml`): Axum + utoipa (OpenAPI) + `omnigraph-policy` (Ced
 `omnigraph-server` (Axum) already implements every operation this RFC exposes as an authenticated HTTP route; each authorizes via a `PolicyAction` against the Cedar policy for a server-resolved actor and calls into the engine. The existing stdio MCP package is a *client* of these routes (it owns no business logic). MR-956 will introduce a `TokenVerifier` trait (`StaticHashTokenVerifier` today inline, `OidcJwtVerifier` for OIDC/WorkOS) producing the `ResolvedActor { actor_id, tenant_id: Option, scopes: Vec<Scope>, source }` that already exists in `identity.rs` and is consumed by Cedar — token *validation* is offline (cached JWKS), so on-prem/air-gapped has no request-path dependency on the cloud.
 
 ## Design
+
+> *§5 is the original design sketch (design rationale). Where it differs from the [Implementation Blueprint](#implementation-blueprint-canonical--build-the-fresh-implementation-from-this) above, the Blueprint is authoritative. Notable divergences proven out by [#157](https://github.com/ModernRelay/omnigraph/pull/157): the §5.1 per-tool `McpTool` trait became a `Builtin` enum + an `McpBackend` crate trait (B.1–B.4); §5.6's rmcp-vs-hand-roll is resolved to rmcp 1.7 (B.3); §5.7's "server tools on a per-graph endpoint" is resolved in B.10; the §5.2 `read`/`change` aliases are dropped (B.5).*
 
 ### 5.1 One tool model: a `McpTool` trait, two populators
 
@@ -222,9 +367,9 @@ With ad-hoc `query`/`mutate`/`schema_apply` present as tools, the **only** thing
 
 ## Relationship to the `@modernrelay/omnigraph-mcp` stdio package
 
-Verified surface of the package (`omnigraph-ts`, pkg version `0.3.0`, `@modelcontextprotocol/sdk@^1.29.0`, **stdio only**): **13 tools** (`health`, `snapshot`, `read`, `schema_get`, `branches_list`, `commits_list`, `commits_get`, `change`, `ingest`, `branches_create`, `branches_delete`, `branches_merge`, `schema_apply`) and **2 resources** (`omnigraph://schema`, `omnigraph://branches`). It is a thin client over the SDK → HTTP routes and **forwards the caller's bearer verbatim** (no inspection).
+Surface of the package (`omnigraph-ts`, `@modelcontextprotocol/sdk@^1.29.0`, **stdio only**). *Figures refreshed 2026-06: the package re-synced to the engine in [omnigraph-ts#11](https://github.com/ModernRelay/omnigraph-ts/pull/11) and is now at `0.6.1` — not the `0.3.0` this RFC was first drafted against.* It exposes **16 tools** (`health`, `snapshot`, `query`, `read`, `schema_get`, `branches_list`, `graphs_list`, `commits_list`, `commits_get`, `mutate`, `change`, `ingest`, `branches_create`, `branches_delete`, `branches_merge`, `schema_apply` — note it already canonicalized `query`/`mutate` with `read`/`change` as deprecated aliases, and added `graphs_list`) and **~9 resources** (`omnigraph://schema`, `omnigraph://branches`, `omnigraph://graphs`, plus a vendored `omnigraph://best-practices/*` cookbook). It is a thin client over the SDK → HTTP routes and **forwards the caller's bearer verbatim** (no inspection).
 
-Once parity lands, **collapse to one implementation**: the in-server MCP is canonical (Cedar-gated, remote-capable, the path that becomes a Claude-web connector via MR-956). The stdio package degrades to a **thin stdio↔HTTP proxy** forwarding JSON-RPC (and the incoming `Authorization`) to `/mcp` — staying the local on-ramp for Claude Code/Desktop while sharing one tool set, one Cedar gate. Transition: keep the current independent stdio package on its `0.3.x`/`0.6.x` line; ship proxy mode in a later TS minor once the server endpoint is GA. (Note: the package is currently several minors behind the server — its vendored `spec/openapi.json` predates the stored-query routes — so it needs the standard re-sync regardless of MCP work.)
+Once parity lands, **collapse to one implementation**: the in-server MCP is canonical (Cedar-gated, remote-capable, the path that becomes a Claude-web connector via MR-956). The stdio package degrades to a **thin stdio↔HTTP proxy** forwarding JSON-RPC (and the incoming `Authorization`) to `/mcp` — staying the local on-ramp for Claude Code/Desktop while sharing one tool set, one Cedar gate. Transition: keep the current independent stdio package on its `0.6.x` line; ship proxy mode in a later TS minor once the server endpoint is GA. (The package already re-synced to `0.6.1` in [omnigraph-ts#11](https://github.com/ModernRelay/omnigraph-ts/pull/11); its client-side stored-query-tools attempt, [omnigraph-ts#7](https://github.com/ModernRelay/omnigraph-ts/pull/7), was **closed** in favor of this server-side surface.)
 
 ## Testing
 
@@ -259,6 +404,8 @@ Once parity lands, **collapse to one implementation**: the in-server MCP is cano
 - `openapi.json` only gains the documented MCP envelope; existing REST routes untouched.
 
 ## Open Questions
+
+> *Resolved during [#157](https://github.com/ModernRelay/omnigraph/pull/157) — see [B.13](#b13-decisions-locked) for the locked decisions. Q1→string, Q2→rmcp 1.7, Q3→always-on Cedar-only, Q4→text-JSON v1, Q5→per-graph routing (graphs_list per B.10), Q6→stateless POST confirmed, Q7→no `read`/`change` aliases. Q8 (PR 0b shape: Cedar resource vs context attribute) remains open, gated on the deferred per-query scope work. The items below are kept as the original decision context.*
 
 1. **BigInt/u64 as JSON string** (recommended, precision-safe) vs number.
 2. **`rmcp` vs hand-rolled** JSON-RPC (spike `rmcp` on edition 2024; default to hand-roll on friction).
