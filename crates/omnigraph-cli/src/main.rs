@@ -1251,28 +1251,31 @@ async fn open_local_db_with_policy(graph: &ResolvedCliGraph) -> Result<Omnigraph
     }
 }
 
+/// Actor resolution for cluster operations. Cluster FACTS stay unlayered
+/// (cluster.yaml only), but the operator's identity is a per-operator fact —
+/// the per-operator config's permanent job. An explicit --as never touches
+/// any config (containers and CI stay config-free); without it, the standard
+/// cwd omnigraph.yaml search supplies `cli.actor`, and a malformed config
+/// fails loudly rather than silently dropping attribution. Deliberately
+/// `load_config`, NOT `load_cli_config`: the latter also loads
+/// `auth.env_file` into the process env — a second thing, violating the
+/// documented "exactly one thing" contract.
+fn resolve_cluster_actor(cli_as: Option<&str>) -> Result<Option<String>> {
+    if let Some(actor) = cli_as {
+        return Ok(Some(actor.to_string()));
+    }
+    let config = load_config(None).wrap_err(
+        "resolving the default actor from the per-operator omnigraph.yaml (pass --as <ACTOR> to skip this lookup)",
+    )?;
+    Ok(config.cli.actor.clone())
+}
+
 /// Resolve the CLI's effective actor identity for engine-layer policy
 /// (MR-722). Precedence: `--as <ACTOR>` (top-level flag) overrides
 /// `cli.actor` from `omnigraph.yaml`; both unset returns `None`. When
 /// policy is configured and this returns `None`, the engine-layer
 /// footgun guard intentionally denies — silent bypass via "I forgot the
 /// actor" is what the guard prevents.
-/// Actor resolution for cluster operations. Cluster FACTS stay unlayered
-/// (cluster.yaml only), but the operator's identity is a per-operator fact —
-/// the per-operator config's permanent job. An explicit --as never touches
-/// any config (containers and CI stay config-free); without it, the standard
-/// cwd omnigraph.yaml search supplies `cli.actor`, and a malformed config
-/// fails loudly rather than silently dropping attribution.
-fn resolve_cluster_actor(cli_as: Option<&str>) -> Result<Option<String>> {
-    if let Some(actor) = cli_as {
-        return Ok(Some(actor.to_string()));
-    }
-    let config = load_cli_config(None).wrap_err(
-        "resolving the default actor from the per-operator omnigraph.yaml (pass --as <ACTOR> to skip this lookup)",
-    )?;
-    Ok(config.cli.actor.clone())
-}
-
 fn resolve_cli_actor<'a>(cli_as: Option<&'a str>, config: &'a OmnigraphConfig) -> Option<&'a str> {
     cli_as.or(config.cli.actor.as_deref())
 }

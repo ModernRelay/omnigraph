@@ -4339,22 +4339,19 @@ fn cluster_apply_uses_cli_actor_from_local_config() {
         "cli:\n  actor: act-local\n",
     )
     .unwrap();
-    let run = |extra: &[&str]| {
-        let mut command = cli();
-        command.current_dir(temp.path());
-        for arg in extra {
-            command.arg(arg);
-        }
-        let output = command
-            .arg("cluster")
-            .arg("import")
-            .arg("--config")
-            .arg(temp.path())
-            .arg("--json")
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{output:?}");
-        // apply, capturing the echoed actor
+    // Phase 1: import once (setup, not under test).
+    let output = cli()
+        .current_dir(temp.path())
+        .arg("cluster")
+        .arg("import")
+        .arg("--config")
+        .arg(temp.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    // Phase 2: apply alone, capturing the echoed actor (idempotent re-runs).
+    let apply = |extra: &[&str]| {
         let mut command = cli();
         command.current_dir(temp.path());
         for arg in extra {
@@ -4372,24 +4369,8 @@ fn cluster_apply_uses_cli_actor_from_local_config() {
             serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
         json["actor"].clone()
     };
-    assert_eq!(run(&[]), "act-local", "cli.actor is the no-flag default");
-
-    // A fresh dir (state already imported above): the flag wins over config.
-    let mut command = cli();
-    command.current_dir(temp.path());
-    let output = command
-        .arg("--as")
-        .arg("andrew")
-        .arg("cluster")
-        .arg("apply")
-        .arg("--config")
-        .arg(temp.path())
-        .arg("--json")
-        .output()
-        .unwrap();
-    let json: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
-    assert_eq!(json["actor"], "andrew", "--as overrides cli.actor");
+    assert_eq!(apply(&[]), "act-local", "cli.actor is the no-flag default");
+    assert_eq!(apply(&["--as", "andrew"]), "andrew", "--as overrides cli.actor");
 }
 
 #[test]
