@@ -14,20 +14,20 @@ The tables below are **generated** from `.github/codeowners-roles.yml` by `.gith
 
 | Path | Owners | Role(s) |
 |---|---|---|
-| `*` | @ragnorc @aaltshuler | engineering |
-| `crates/**` | @ragnorc @aaltshuler | engineering |
-| `docs/**` | @ragnorc | docs |
-| `README.md` | @ragnorc | docs |
-| `AGENTS.md` | @ragnorc | docs |
-| `CLAUDE.md` | @ragnorc | docs |
-| `SECURITY.md` | @ragnorc | docs |
+| `*` | @aaltshuler | engineering |
+| `crates/**` | @aaltshuler | engineering |
+| `docs/**` | @aaltshuler | docs |
+| `README.md` | @aaltshuler | docs |
+| `AGENTS.md` | @aaltshuler | docs |
+| `CLAUDE.md` | @aaltshuler | docs |
+| `SECURITY.md` | @aaltshuler | docs |
 
 **Roles**:
 
 | Role | Members | Description |
 |---|---|---|
-| `engineering` | @ragnorc @aaltshuler | All production code under crates/**. Engine, CLI, server, compiler. |
-| `docs` | @ragnorc | Documentation under docs/**, plus repo-level docs (README.md, AGENTS.md, CLAUDE.md symlink, SECURITY.md). |
+| `engineering` | @aaltshuler | All production code under crates/**. Engine, CLI, server, compiler. |
+| `docs` | @aaltshuler | Documentation under docs/**, plus repo-level docs (README.md, AGENTS.md, CLAUDE.md symlink, SECURITY.md). |
 
 <!-- END GENERATED OWNERSHIP -->
 

@@ -21,7 +21,6 @@ roles:
       All production code under crates/**. Engine, CLI, server,
       compiler.
     members:
-      - ragnorc
       - aaltshuler
 
   docs:
@@ -29,7 +28,7 @@ roles:
       Documentation under docs/**, plus repo-level docs (README.md,
       AGENTS.md, CLAUDE.md symlink, SECURITY.md).
     members:
-      - ragnorc
+      - aaltshuler
 
 # Path → role mapping. GitHub CODEOWNERS uses "last match wins"
 # semantics — when multiple patterns match a file, only the last
