@@ -11,8 +11,8 @@ use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
 use omnigraph::storage::normalize_root_uri;
 use omnigraph_cluster::{
-    ApplyOptions, ApplyOutput, DiagnosticSeverity, ForceUnlockOutput, PlanOutput, StateSyncOutput, StatusOutput,
-    ValidateOutput, apply_config_dir_with_options, force_unlock_config_dir, import_config_dir, plan_config_dir,
+    ApplyOptions, ApplyOutput, ApproveOutput, DiagnosticSeverity, ForceUnlockOutput, PlanOutput, StateSyncOutput, StatusOutput,
+    ValidateOutput, apply_config_dir_with_options, approve_config_dir, force_unlock_config_dir, import_config_dir, plan_config_dir,
     refresh_config_dir, status_config_dir, validate_config_dir,
 };
 use omnigraph_compiler::query::parser::parse_query;
@@ -364,6 +364,18 @@ enum ClusterCommand {
     /// Apply the config-only (query/policy) subset of the plan to the local
     /// cluster catalog. Graph/schema changes are deferred to a later stage.
     Apply {
+        /// Cluster config directory containing cluster.yaml.
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Emit JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Record a digest-bound approval for a gated (irreversible) change,
+    /// e.g. a graph delete. Requires the global --as actor.
+    Approve {
+        /// Typed resource address of the gated change (e.g. graph.scratch).
+        resource: String,
         /// Cluster config directory containing cluster.yaml.
         #[arg(long, default_value = ".")]
         config: PathBuf,
@@ -1003,6 +1015,33 @@ fn finish_cluster_apply(output: &ApplyOutput, json: bool) -> Result<()> {
         print_json(output)?;
     } else {
         print_cluster_apply_human(output);
+    }
+    if !output.ok {
+        io::stdout().flush()?;
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn finish_cluster_approve(output: &ApproveOutput, json: bool) -> Result<()> {
+    if json {
+        print_json(output)?;
+    } else if output.ok {
+        println!(
+            "cluster approve: {} {} approved by {} (approval {})",
+            output
+                .operation
+                .as_ref()
+                .map(|operation| format!("{operation:?}").to_lowercase())
+                .unwrap_or_default(),
+            output.resource.as_deref().unwrap_or("?"),
+            output.approved_by.as_deref().unwrap_or("?"),
+            output.approval_id.as_deref().unwrap_or("?"),
+        );
+        print_cluster_diagnostics(&output.diagnostics);
+    } else {
+        println!("cluster approve failed");
+        print_cluster_diagnostics(&output.diagnostics);
     }
     if !output.ok {
         io::stdout().flush()?;
@@ -3580,6 +3619,19 @@ async fn main() -> Result<()> {
                 )
                 .await;
                 finish_cluster_apply(&output, json)?;
+            }
+            ClusterCommand::Approve {
+                resource,
+                config,
+                json,
+            } => {
+                let Some(approver) = cli.as_actor.as_deref() else {
+                    bail!(
+                        "`cluster approve` requires the global --as <ACTOR> flag: an approval without an approver is meaningless"
+                    );
+                };
+                let output = approve_config_dir(config, &resource, approver).await;
+                finish_cluster_approve(&output, json)?;
             }
             ClusterCommand::Status { config, json } => {
                 let output = status_config_dir(config);

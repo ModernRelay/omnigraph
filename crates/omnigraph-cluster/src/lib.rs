@@ -26,6 +26,7 @@ pub const CLUSTER_STATE_FILE: &str = "__cluster/state.json";
 pub const CLUSTER_LOCK_FILE: &str = "__cluster/lock.json";
 pub const CLUSTER_RESOURCES_DIR: &str = "__cluster/resources";
 pub const CLUSTER_RECOVERIES_DIR: &str = "__cluster/recoveries";
+pub const CLUSTER_APPROVALS_DIR: &str = "__cluster/approvals";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -212,6 +213,9 @@ pub struct BlastRadius {
 pub struct ApprovalRequirement {
     pub resource: String,
     pub reason: String,
+    /// True when a valid (digest-matching, unconsumed) approval artifact is
+    /// pending for this change.
+    pub satisfied: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -290,6 +294,47 @@ pub struct ApplyOutput {
     /// The statuses as persisted: post-apply on success, the pre-apply on-disk
     /// snapshot when the state write fails (never unpersisted in-memory state).
     pub resource_statuses: BTreeMap<String, ResourceStatusRecord>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// A digest-bound human approval for an irreversible operation (RFC-004
+/// §D4). Written by `cluster approve`, consumed by apply. The file is never
+/// deleted on consumption — it is rewritten with `consumed_at` and also
+/// summarized into the state ledger's `approval_records`, so the audit fact
+/// survives the loss of either store (axiom 11).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovalArtifact {
+    schema_version: u32,
+    approval_id: String,
+    resource: String,
+    operation: String,
+    reason: String,
+    bound_config_digest: String,
+    #[serde(default)]
+    bound_before_digest: Option<String>,
+    #[serde(default)]
+    bound_after_digest: Option<String>,
+    approved_by: String,
+    created_at: String,
+    #[serde(default)]
+    consumed_at: Option<String>,
+    #[serde(default)]
+    consumed_by_operation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApproveOutput {
+    pub ok: bool,
+    pub config_dir: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<PlanOperation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approved_by: Option<String>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -446,6 +491,10 @@ struct RecoverySidecar {
     desired_schema_digest: String,
     #[serde(default)]
     state_cas_base: Option<String>,
+    /// For graph_delete: the approval this operation consumes; lets a sweep
+    /// roll-forward consume it too.
+    #[serde(default)]
+    approval_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -453,7 +502,7 @@ struct RecoverySidecar {
 enum RecoverySidecarKind {
     GraphCreate,
     SchemaApply,
-    // GraphDelete arrives with stage 4C.
+    GraphDelete,
 }
 
 #[derive(Debug, Default)]
@@ -464,6 +513,9 @@ struct SweepOutcome {
     /// Sidecars whose outcome is recorded (rows 2/4): deleted only after the
     /// command's state write lands, so a CAS failure re-sweeps them.
     completed_sidecars: Vec<PathBuf>,
+    /// Approval artifacts consumed by a roll-forward (delete row 7b): their
+    /// files are rewritten with consumed_at only after the state write lands.
+    consumed_approvals: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -472,6 +524,7 @@ struct LocalStateBackend {
     state_path: PathBuf,
     lock_path: PathBuf,
     recoveries_dir: PathBuf,
+    approvals_dir: PathBuf,
 }
 
 #[derive(Debug)]
@@ -588,7 +641,14 @@ pub async fn plan_config_dir(config_dir: impl AsRef<Path>) -> PlanOutput {
     };
     // Plan previews dispositions without sweeping; a pending recovery is
     // surfaced as the cluster_recovery_pending warning above instead.
-    classify_changes(&mut changes, &desired.dependencies, &BTreeSet::new());
+    let artifacts = backend.list_approval_artifacts(&mut diagnostics);
+    let approved = approved_resources(
+        &artifacts,
+        &changes,
+        &desired.config_digest,
+        &mut diagnostics,
+    );
+    classify_changes(&mut changes, &desired.dependencies, &BTreeSet::new(), &approved);
 
     // Embed real migration steps for schema updates so plan is a data-aware
     // preview; failures degrade to the digest diff with a warning.
@@ -624,7 +684,7 @@ pub async fn plan_config_dir(config_dir: impl AsRef<Path>) -> PlanOutput {
         }
     }
     let blast_radius = compute_blast_radius(&changes, &desired.dependencies);
-    let approvals_required = compute_approvals(&changes);
+    let approvals_required = compute_approvals(&changes, &approved);
     let ok = !has_errors(&diagnostics);
 
     PlanOutput {
@@ -790,17 +850,29 @@ pub async fn apply_config_dir_with_options(
 
     let prior_resources = state_resource_digests(&state);
     let mut changes = diff_resources(&prior_resources, &desired.resource_digests);
-    classify_changes(&mut changes, &desired.dependencies, &sweep.pending_graphs);
+    let approval_artifacts = backend.list_approval_artifacts(&mut diagnostics);
+    let approved = approved_resources(
+        &approval_artifacts,
+        &changes,
+        &desired.config_digest,
+        &mut diagnostics,
+    );
+    classify_changes(
+        &mut changes,
+        &desired.dependencies,
+        &sweep.pending_graphs,
+        &approved,
+    );
 
-    // Defensive invariant: nothing the approval gate covers may be executable.
-    // Today approvals only cover graph/schema deletes (always deferred); this
-    // keeps a future widening of the executable set from silently bypassing it.
-    let approvals = compute_approvals(&changes);
+    // Defensive invariant: nothing the approval gate covers may be executable
+    // WITHOUT a matching approval. Gated changes with a valid artifact are the
+    // sanctioned exception (stage 4C).
+    let approvals = compute_approvals(&changes, &approved);
     let approval_violation = changes.iter().any(|change| {
         change.disposition == Some(ApplyDisposition::Applied)
             && approvals
                 .iter()
-                .any(|approval| approval.resource == change.resource)
+                .any(|approval| approval.resource == change.resource && !approval.satisfied)
     });
     if approval_violation {
         diagnostics.push(Diagnostic::error(
@@ -877,6 +949,7 @@ pub async fn apply_config_dir_with_options(
             expected_manifest_version: None,
             desired_schema_digest: desired_graph.schema_digest.clone(),
             state_cas_base: expected_cas.clone(),
+            approval_id: None,
         };
         let sidecar_path = match backend.write_recovery_sidecar(&sidecar) {
             Ok(path) => path,
@@ -1040,6 +1113,7 @@ pub async fn apply_config_dir_with_options(
             expected_manifest_version: None,
             desired_schema_digest: desired_graph.schema_digest.clone(),
             state_cas_base: expected_cas.clone(),
+            approval_id: None,
         };
         let sidecar_path = match backend.write_recovery_sidecar(&sidecar) {
             Ok(path) => path,
@@ -1225,6 +1299,121 @@ pub async fn apply_config_dir_with_options(
         );
     }
 
+    // Approved graph deletes execute LAST (RFC-004 §D5): catalog writes for
+    // surviving resources land first, then the irreversible work.
+    let graph_deletes_to_run: Vec<String> = changes
+        .iter()
+        .filter(|change| {
+            change.disposition == Some(ApplyDisposition::Applied)
+                && change.operation == PlanOperation::Delete
+                && matches!(resource_kind(&change.resource), ResourceKind::Graph(_))
+        })
+        .filter_map(|change| change.resource.strip_prefix("graph.").map(str::to_string))
+        .collect();
+    let mut executed_deletes: Vec<(String, Option<String>)> = Vec::new(); // (graph_id, approval_id)
+    let mut consumed_approval_ids: Vec<String> = Vec::new();
+    for graph_id in &graph_deletes_to_run {
+        if graph_moving_aborted {
+            diagnostics.push(Diagnostic::warning(
+                "graph_delete_skipped",
+                graph_address(graph_id),
+                "skipped after an earlier graph-moving operation failed in this run",
+            ));
+            failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphDelete);
+            continue;
+        }
+        let graph_addr = graph_address(graph_id);
+        // Re-locate the consumable approval (classification verified one exists).
+        let approval_id = approval_artifacts
+            .iter()
+            .map(|(_, artifact)| artifact)
+            .find(|artifact| {
+                artifact.consumed_at.is_none()
+                    && artifact.resource == graph_addr
+                    && artifact.bound_config_digest == desired.config_digest
+            })
+            .map(|artifact| artifact.approval_id.clone());
+        let graph_uri = display_path(
+            &desired
+                .config_dir
+                .join(CLUSTER_GRAPHS_DIR)
+                .join(format!("{graph_id}.omni")),
+        );
+        let observed_manifest_version = match Omnigraph::open_read_only(&graph_uri).await {
+            Ok(db) => match db.snapshot_of(ReadTarget::branch("main")).await {
+                Ok(snapshot) => Some(snapshot.version()),
+                Err(_) => None,
+            },
+            Err(_) => None, // partial/unopenable roots still get deleted
+        };
+        let sidecar = RecoverySidecar {
+            schema_version: 1,
+            operation_id: Ulid::new().to_string(),
+            started_at: now_rfc3339(),
+            actor: options.actor.clone(),
+            kind: RecoverySidecarKind::GraphDelete,
+            graph_id: graph_id.clone(),
+            graph_uri: graph_uri.clone(),
+            observed_manifest_version,
+            expected_manifest_version: None, // no post-op manifest exists
+            desired_schema_digest: String::new(),
+            state_cas_base: expected_cas.clone(),
+            approval_id: approval_id.clone(),
+        };
+        let sidecar_path = match backend.write_recovery_sidecar(&sidecar) {
+            Ok(path) => path,
+            Err(diagnostic) => {
+                diagnostics.push(diagnostic);
+                failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphDelete);
+                graph_moving_aborted = true;
+                continue;
+            }
+        };
+        if let Err(diagnostic) = failpoints::maybe_fail("cluster_apply.before_graph_delete") {
+            // Simulated crash before removal: row 8 retires the intent and
+            // the still-valid approval lets a later run retry.
+            diagnostics.push(diagnostic);
+            failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphDelete);
+            graph_moving_aborted = true;
+            continue;
+        }
+        match fs::remove_dir_all(PathBuf::from(&graph_uri)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {} // already gone
+            Err(err) => {
+                diagnostics.push(Diagnostic::error(
+                    "graph_delete_failed",
+                    graph_addr.clone(),
+                    format!("could not remove graph root '{graph_uri}': {err}"),
+                ));
+                failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphDelete);
+                graph_moving_aborted = true;
+                continue;
+            }
+        }
+        // Crash point: the root is gone, the ledger does not record it yet.
+        // The sweep rolls forward (row 7b) and consumes the approval.
+        if let Err(diagnostic) = failpoints::maybe_fail("cluster_apply.after_graph_delete") {
+            diagnostics.push(diagnostic);
+            return early_return(
+                display_path(&desired.config_dir),
+                Some(desired.config_digest),
+                observations,
+                changes,
+                state.resource_statuses,
+                diagnostics,
+            );
+        }
+        executed_deletes.push((graph_id.clone(), approval_id.clone()));
+        if let Some(approval_id) = approval_id {
+            consumed_approval_ids.push(approval_id);
+        }
+        completed_op_sidecars.push(sidecar_path);
+    }
+    if !failed_graphs.is_empty() {
+        demote_dependents_of_failed_graphs(&mut changes, &failed_graphs, &desired.dependencies);
+    }
+
     // State mutation. Apply owns query/policy statuses only; graph/schema
     // statuses belong to refresh/import observation and must not be clobbered
     // (the sweep above is the one exception: it owns recovery statuses).
@@ -1263,6 +1452,17 @@ pub async fn apply_config_dir_with_options(
                 }
             }
             _ => {}
+        }
+    }
+    for (graph_id, approval_id) in &executed_deletes {
+        tombstone_graph_subtree(
+            &mut new_state,
+            graph_id,
+            approval_id.as_deref(),
+            options.actor.as_deref(),
+        );
+        if let Some(approval_id) = approval_id {
+            record_approval_consumed(&mut new_state, approval_id, "apply");
         }
     }
     recompute_state_graph_digests(&mut new_state, &desired);
@@ -1306,6 +1506,9 @@ pub async fn apply_config_dir_with_options(
         {
             let _ = fs::remove_file(sidecar_path);
         }
+        let mut all_consumed = sweep.consumed_approvals.clone();
+        all_consumed.extend(consumed_approval_ids.iter().cloned());
+        mark_approvals_consumed(&backend, &all_consumed);
     }
     // On a failed state write, report the statuses that are actually on disk
     // (the pre-apply snapshot), not the in-memory mutations that were never
@@ -1345,6 +1548,126 @@ pub async fn apply_config_dir_with_options(
         converged,
         state_written,
         resource_statuses,
+        diagnostics,
+    }
+}
+
+/// Record a digest-bound human approval for a gated (irreversible) change —
+/// today: graph deletes. The artifact binds to the exact desired config
+/// digest and the change's before/after digests, so config or state drift
+/// invalidates it automatically (a stale approval can never authorize a
+/// different change).
+pub async fn approve_config_dir(
+    config_dir: impl AsRef<Path>,
+    resource: &str,
+    approved_by: &str,
+) -> ApproveOutput {
+    let outcome = load_desired(config_dir.as_ref());
+    let mut diagnostics = outcome.diagnostics;
+    let backend = LocalStateBackend::new(&outcome.config_dir);
+    let mut observations = backend.observations();
+
+    let fail = |config_dir: String, diagnostics: Vec<Diagnostic>| ApproveOutput {
+        ok: false,
+        config_dir,
+        approval_id: None,
+        resource: None,
+        operation: None,
+        approved_by: None,
+        diagnostics,
+    };
+
+    let Some(desired) = outcome.desired else {
+        return fail(display_path(&outcome.config_dir), diagnostics);
+    };
+    if has_errors(&diagnostics) {
+        return fail(display_path(&desired.config_dir), diagnostics);
+    }
+
+    let _lock_guard = if desired.state_lock {
+        match backend.acquire_lock("approve", &mut observations) {
+            Ok(guard) => Some(guard),
+            Err(diagnostic) => {
+                diagnostics.push(diagnostic);
+                return fail(display_path(&desired.config_dir), diagnostics);
+            }
+        }
+    } else {
+        diagnostics.push(Diagnostic::warning(
+            "state_lock_disabled",
+            "state.lock",
+            "state.lock is false; approve ran without acquiring the cluster state lock",
+        ));
+        None
+    };
+
+    let state = match backend.read_state(&mut observations) {
+        Ok(snapshot) => match snapshot.state {
+            Some(state) => state,
+            None => {
+                diagnostics.push(Diagnostic::error(
+                    "state_missing",
+                    CLUSTER_STATE_FILE,
+                    "approve requires an existing state.json; run `cluster import` first",
+                ));
+                return fail(display_path(&desired.config_dir), diagnostics);
+            }
+        },
+        Err(diagnostic) => {
+            diagnostics.push(diagnostic);
+            return fail(display_path(&desired.config_dir), diagnostics);
+        }
+    };
+
+    let prior_resources = state_resource_digests(&state);
+    let changes = diff_resources(&prior_resources, &desired.resource_digests);
+    let gates = compute_approvals(&changes, &BTreeSet::new());
+    let Some(change) = changes.iter().find(|change| {
+        change.resource == resource && gates.iter().any(|gate| gate.resource == resource)
+    }) else {
+        diagnostics.push(Diagnostic::error(
+            "approval_not_required",
+            resource,
+            "no pending change for this resource requires approval (check `cluster plan`)",
+        ));
+        return fail(display_path(&desired.config_dir), diagnostics);
+    };
+
+    let artifact = ApprovalArtifact {
+        schema_version: 1,
+        approval_id: Ulid::new().to_string(),
+        resource: change.resource.clone(),
+        operation: match change.operation {
+            PlanOperation::Create => "create",
+            PlanOperation::Update => "update",
+            PlanOperation::Delete => "delete",
+        }
+        .to_string(),
+        reason: gates
+            .iter()
+            .find(|gate| gate.resource == resource)
+            .map(|gate| gate.reason.clone())
+            .unwrap_or_default(),
+        bound_config_digest: desired.config_digest.clone(),
+        bound_before_digest: change.before_digest.clone(),
+        bound_after_digest: change.after_digest.clone(),
+        approved_by: approved_by.to_string(),
+        created_at: now_rfc3339(),
+        consumed_at: None,
+        consumed_by_operation: None,
+    };
+    if let Err(diagnostic) = backend.write_approval_artifact(&artifact) {
+        diagnostics.push(diagnostic);
+        return fail(display_path(&desired.config_dir), diagnostics);
+    }
+
+    ApproveOutput {
+        ok: !has_errors(&diagnostics),
+        config_dir: display_path(&desired.config_dir),
+        approval_id: Some(artifact.approval_id),
+        resource: Some(artifact.resource),
+        operation: Some(change.operation.clone()),
+        approved_by: Some(artifact.approved_by),
         diagnostics,
     }
 }
@@ -1642,6 +1965,7 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
             for sidecar_path in &sweep.completed_sidecars {
                 let _ = fs::remove_file(sidecar_path);
             }
+            mark_approvals_consumed(&backend, &sweep.consumed_approvals);
         }
         Err(diagnostic) => diagnostics.push(diagnostic),
     }
@@ -1773,8 +2097,100 @@ impl LocalStateBackend {
             state_path: config_dir.join(CLUSTER_STATE_FILE),
             lock_path: config_dir.join(CLUSTER_LOCK_FILE),
             recoveries_dir: config_dir.join(CLUSTER_RECOVERIES_DIR),
+            approvals_dir: config_dir.join(CLUSTER_APPROVALS_DIR),
             state_dir,
         }
+    }
+
+    /// List approval artifacts in ULID (filename) order; unparseable files
+    /// warn and stay on disk for the operator.
+    fn list_approval_artifacts(
+        &self,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Vec<(PathBuf, ApprovalArtifact)> {
+        let mut paths = Vec::new();
+        match fs::read_dir(&self.approvals_dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|ext| ext == "json") {
+                        paths.push(path);
+                    }
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => diagnostics.push(Diagnostic::warning(
+                "approval_read_error",
+                CLUSTER_APPROVALS_DIR,
+                format!("could not list approval artifacts: {err}"),
+            )),
+        }
+        paths.sort();
+        let mut artifacts = Vec::new();
+        for path in paths {
+            match fs::read_to_string(&path)
+                .map_err(|err| err.to_string())
+                .and_then(|text| {
+                    serde_json::from_str::<ApprovalArtifact>(&text).map_err(|err| err.to_string())
+                }) {
+                Ok(artifact) if artifact.schema_version == 1 => artifacts.push((path, artifact)),
+                Ok(artifact) => diagnostics.push(Diagnostic::warning(
+                    "unsupported_approval_version",
+                    display_path(&path),
+                    format!(
+                        "unsupported approval artifact version {}; leaving it in place",
+                        artifact.schema_version
+                    ),
+                )),
+                Err(err) => diagnostics.push(Diagnostic::warning(
+                    "invalid_approval_artifact",
+                    display_path(&path),
+                    format!("could not parse approval artifact ({err}); leaving it in place"),
+                )),
+            }
+        }
+        artifacts
+    }
+
+    /// Atomically write (or rewrite, e.g. on consumption) an approval artifact.
+    fn write_approval_artifact(&self, artifact: &ApprovalArtifact) -> Result<PathBuf, Diagnostic> {
+        fs::create_dir_all(&self.approvals_dir).map_err(|err| {
+            Diagnostic::error(
+                "approval_write_error",
+                CLUSTER_APPROVALS_DIR,
+                format!("could not create approvals directory: {err}"),
+            )
+        })?;
+        let target = self
+            .approvals_dir
+            .join(format!("{}.json", artifact.approval_id));
+        let mut payload = serde_json::to_string_pretty(artifact).map_err(|err| {
+            Diagnostic::error(
+                "approval_write_error",
+                display_path(&target),
+                format!("could not encode approval artifact: {err}"),
+            )
+        })?;
+        payload.push('\n');
+        let tmp_path = self
+            .approvals_dir
+            .join(format!("{}.json.tmp.{}", artifact.approval_id, Ulid::new()));
+        fs::write(&tmp_path, payload.as_bytes()).map_err(|err| {
+            Diagnostic::error(
+                "approval_write_error",
+                display_path(&tmp_path),
+                format!("could not write approval artifact: {err}"),
+            )
+        })?;
+        if let Err(err) = fs::rename(&tmp_path, &target) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(Diagnostic::error(
+                "approval_write_error",
+                display_path(&target),
+                format!("could not move approval artifact into place: {err}"),
+            ));
+        }
+        Ok(target)
     }
 
     /// List recovery sidecars in ULID (filename) order. Unparseable files are
@@ -2281,6 +2697,9 @@ async fn sweep_recovery_sidecars(
             RecoverySidecarKind::SchemaApply => {
                 sweep_schema_apply_sidecar(path, sidecar, state, diagnostics, &mut outcome).await;
             }
+            RecoverySidecarKind::GraphDelete => {
+                sweep_graph_delete_sidecar(path, sidecar, state, diagnostics, &mut outcome);
+            }
         }
     }
     outcome
@@ -2498,6 +2917,121 @@ async fn sweep_schema_apply_sidecar(
             "an interrupted schema apply left unexpected graph state; graph-moving work is blocked until repaired",
         ));
         outcome.pending_graphs.insert(sidecar.graph_id.clone());
+    }
+}
+
+fn sweep_graph_delete_sidecar(
+    path: PathBuf,
+    sidecar: RecoverySidecar,
+    state: &mut ClusterState,
+    diagnostics: &mut Vec<Diagnostic>,
+    outcome: &mut SweepOutcome,
+) {
+    let graph_address = graph_address(&sidecar.graph_id);
+    let root = PathBuf::from(&sidecar.graph_uri);
+
+    if root.exists() {
+        // Row 8: the delete never completed. Prefix removal is idempotent and
+        // works on partial roots, so the repair is simply the re-proposed,
+        // still-approved delete on a later run — retire the stale intent.
+        diagnostics.push(Diagnostic::warning(
+            "graph_delete_incomplete",
+            graph_address,
+            "a previous graph delete did not complete; it will be re-proposed by plan and can be retried under its approval",
+        ));
+        outcome.completed_sidecars.push(path);
+        return;
+    }
+
+    if !state.applied_revision.resources.contains_key(&graph_address) {
+        // Row 7: already tombstoned (or never recorded); crash fell between
+        // the state CAS and sidecar delete.
+        outcome.completed_sidecars.push(path);
+        return;
+    }
+
+    // Row 7b: the root is gone, the ledger is stale — roll forward the
+    // tombstone, consume the approval the sidecar carries, audit.
+    tombstone_graph_subtree(state, &sidecar.graph_id, sidecar.approval_id.as_deref(), sidecar.actor.as_deref());
+    state.recovery_records.insert(
+        sidecar.operation_id.clone(),
+        json!({
+            "kind": "graph_delete",
+            "graph_id": sidecar.graph_id,
+            "outcome": "rolled_forward",
+            "recovered_at": now_rfc3339(),
+            "actor": sidecar.actor,
+        }),
+    );
+    if let Some(approval_id) = &sidecar.approval_id {
+        record_approval_consumed(state, approval_id, &sidecar.operation_id);
+        outcome.consumed_approvals.push(approval_id.clone());
+    }
+    diagnostics.push(Diagnostic::warning(
+        "cluster_recovery_rolled_forward",
+        graph_address,
+        "an interrupted graph delete had completed on disk; cluster state was rolled forward to match",
+    ));
+    outcome.completed_sidecars.push(path);
+}
+
+/// Remove a graph's subtree (graph, schema, queries) from the ledger and
+/// leave a tombstone observation. Idempotent.
+fn tombstone_graph_subtree(
+    state: &mut ClusterState,
+    graph_id: &str,
+    approval_id: Option<&str>,
+    actor: Option<&str>,
+) {
+    let graph_addr = graph_address(graph_id);
+    let schema_addr = schema_address(graph_id);
+    let query_prefix = format!("query.{graph_id}.");
+    state.applied_revision.resources.remove(&graph_addr);
+    state.applied_revision.resources.remove(&schema_addr);
+    state
+        .applied_revision
+        .resources
+        .retain(|address, _| !address.starts_with(&query_prefix));
+    state.resource_statuses.remove(&graph_addr);
+    state.resource_statuses.remove(&schema_addr);
+    state
+        .resource_statuses
+        .retain(|address, _| !address.starts_with(&query_prefix));
+    state.observations.insert(
+        graph_addr,
+        json!({
+            "kind": "tombstone",
+            "deleted_at": now_rfc3339(),
+            "approval_id": approval_id,
+            "actor": actor,
+        }),
+    );
+}
+
+/// Record approval consumption in the state ledger. The artifact FILE is
+/// rewritten with consumed_at only after the state write lands, so a failed
+/// CAS leaves the approval valid for the retry.
+fn record_approval_consumed(state: &mut ClusterState, approval_id: &str, operation_id: &str) {
+    state.approval_records.insert(
+        approval_id.to_string(),
+        json!({
+            "consumed_at": now_rfc3339(),
+            "consumed_by_operation": operation_id,
+        }),
+    );
+}
+
+/// Mark approval artifact files consumed on disk (post-CAS).
+fn mark_approvals_consumed(backend: &LocalStateBackend, approval_ids: &[String]) {
+    if approval_ids.is_empty() {
+        return;
+    }
+    let mut sink = Vec::new();
+    for (_, mut artifact) in backend.list_approval_artifacts(&mut sink) {
+        if approval_ids.contains(&artifact.approval_id) && artifact.consumed_at.is_none() {
+            artifact.consumed_at = Some(now_rfc3339());
+            let _ = backend.write_approval_artifact(&artifact);
+        }
     }
 }
 
@@ -3127,22 +3661,72 @@ fn compute_blast_radius(changes: &[PlanChange], dependencies: &[Dependency]) -> 
         .collect()
 }
 
-fn compute_approvals(changes: &[PlanChange]) -> Vec<ApprovalRequirement> {
+fn compute_approvals(
+    changes: &[PlanChange],
+    approved: &BTreeSet<String>,
+) -> Vec<ApprovalRequirement> {
+    // One gate per subtree: the graph.<id> delete carries its schema and
+    // queries, so a schema delete whose graph is also deleted is not listed.
+    let graph_deletes: BTreeSet<String> = changes
+        .iter()
+        .filter(|change| change.operation == PlanOperation::Delete)
+        .filter_map(|change| change.resource.strip_prefix("graph.").map(str::to_string))
+        .collect();
     changes
         .iter()
         .filter_map(|change| {
-            if change.operation == PlanOperation::Delete
-                && (change.resource.starts_with("graph.") || change.resource.starts_with("schema."))
-            {
-                Some(ApprovalRequirement {
-                    resource: change.resource.clone(),
-                    reason: "delete may remove deployed graph or schema definition".to_string(),
-                })
-            } else {
-                None
+            if change.operation != PlanOperation::Delete {
+                return None;
             }
+            let gated = match resource_kind(&change.resource) {
+                ResourceKind::Graph(_) => true,
+                ResourceKind::Schema(graph) => !graph_deletes.contains(&graph),
+                _ => false,
+            };
+            gated.then(|| ApprovalRequirement {
+                resource: change.resource.clone(),
+                reason: "delete may remove deployed graph or schema definition".to_string(),
+                satisfied: approved.contains(&change.resource),
+            })
         })
         .collect()
+}
+
+/// Resources with a valid (digest-matching, unconsumed) pending approval.
+/// Near-misses — an artifact for the same resource whose bound digests no
+/// longer match — warn as `approval_stale` and never authorize anything.
+fn approved_resources(
+    artifacts: &[(PathBuf, ApprovalArtifact)],
+    changes: &[PlanChange],
+    config_digest: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> BTreeSet<String> {
+    let mut approved = BTreeSet::new();
+    for change in changes {
+        let candidates: Vec<&ApprovalArtifact> = artifacts
+            .iter()
+            .map(|(_, artifact)| artifact)
+            .filter(|artifact| artifact.consumed_at.is_none() && artifact.resource == change.resource)
+            .collect();
+        if candidates.is_empty() {
+            continue;
+        }
+        let matched = candidates.iter().any(|artifact| {
+            artifact.bound_config_digest == config_digest
+                && artifact.bound_before_digest == change.before_digest
+                && artifact.bound_after_digest == change.after_digest
+        });
+        if matched {
+            approved.insert(change.resource.clone());
+        } else {
+            diagnostics.push(Diagnostic::warning(
+                "approval_stale",
+                change.resource.clone(),
+                "an approval artifact exists but its bound digests no longer match the plan; re-run `cluster approve`",
+            ));
+        }
+    }
+    approved
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3182,6 +3766,7 @@ fn classify_changes(
     changes: &mut [PlanChange],
     dependencies: &[Dependency],
     pending_recovery: &BTreeSet<String>,
+    approved: &BTreeSet<String>,
 ) {
     let mut schema_creates = BTreeSet::new();
     let mut schema_pending = BTreeSet::new();
@@ -3219,6 +3804,12 @@ fn classify_changes(
             schema_pending.insert(graph.clone());
         }
     }
+    // Subtree deletes ride the approved graph delete.
+    let rides_approved_delete = |graph: &str| {
+        graph_deletes.contains(graph)
+            && approved.contains(&graph_address(graph))
+            && !pending_recovery.contains(graph)
+    };
 
     for change in changes.iter_mut() {
         let (disposition, reason) = match resource_kind(&change.resource) {
@@ -3238,6 +3829,15 @@ fn classify_changes(
                 PlanOperation::Create | PlanOperation::Update => {
                     (ApplyDisposition::Blocked, Some("cluster_recovery_pending"))
                 }
+                PlanOperation::Delete if graph_deletes.contains(&graph) => {
+                    if rides_approved_delete(&graph) {
+                        (ApplyDisposition::Applied, None)
+                    } else if pending_recovery.contains(&graph) {
+                        (ApplyDisposition::Blocked, Some("cluster_recovery_pending"))
+                    } else {
+                        (ApplyDisposition::Blocked, Some("approval_required"))
+                    }
+                }
                 _ => (ApplyDisposition::Deferred, Some("apply_unsupported_kind")),
             },
             ResourceKind::Graph(graph) => match change.operation {
@@ -3251,15 +3851,26 @@ fn classify_changes(
                 PlanOperation::Update if !schema_pending.contains(&graph) => {
                     (ApplyDisposition::Derived, None)
                 }
+                // Stage 4C: an approved graph delete executes (the
+                // irreversible tier — gated by a digest-bound artifact).
+                PlanOperation::Delete => {
+                    if pending_recovery.contains(&graph) {
+                        (ApplyDisposition::Blocked, Some("cluster_recovery_pending"))
+                    } else if rides_approved_delete(&graph) {
+                        (ApplyDisposition::Applied, None)
+                    } else {
+                        (ApplyDisposition::Blocked, Some("approval_required"))
+                    }
+                }
                 _ => (ApplyDisposition::Deferred, Some("apply_unsupported_kind")),
             },
             ResourceKind::Query { graph, .. } => match change.operation {
                 PlanOperation::Delete => {
-                    if graph_deletes.contains(&graph) {
-                        (
-                            ApplyDisposition::Blocked,
-                            Some("dependency_not_applied"),
-                        )
+                    if rides_approved_delete(&graph) {
+                        // Tombstoned with the approved graph delete.
+                        (ApplyDisposition::Applied, None)
+                    } else if graph_deletes.contains(&graph) {
+                        (ApplyDisposition::Blocked, Some("approval_required"))
                     } else {
                         (ApplyDisposition::Applied, None)
                     }
@@ -3309,6 +3920,7 @@ fn classify_changes(
 enum FailedGraphOrigin {
     GraphCreate,
     SchemaApply,
+    GraphDelete,
 }
 
 /// After a graph-moving operation fails mid-run, every change that depended
@@ -3328,12 +3940,15 @@ fn demote_dependents_of_failed_graphs(
         let demote_reason = match resource_kind(&change.resource) {
             ResourceKind::Graph(graph) => match failed.get(&graph) {
                 Some(FailedGraphOrigin::GraphCreate) => Some("graph_create_failed"),
+                Some(FailedGraphOrigin::GraphDelete) => Some("graph_delete_failed"),
                 Some(FailedGraphOrigin::SchemaApply) => Some("dependency_not_applied"),
                 None => None,
             },
             ResourceKind::Schema(graph) => match failed.get(&graph) {
                 Some(FailedGraphOrigin::SchemaApply) => Some("schema_apply_failed"),
-                Some(FailedGraphOrigin::GraphCreate) => Some("dependency_not_applied"),
+                Some(FailedGraphOrigin::GraphCreate) | Some(FailedGraphOrigin::GraphDelete) => {
+                    Some("dependency_not_applied")
+                }
                 None => None,
             },
             ResourceKind::Query { graph, .. } if failed.contains_key(&graph) => {
@@ -5302,7 +5917,7 @@ graphs:
     }
 
     #[tokio::test]
-    async fn apply_does_not_delete_subtree_of_deleted_graph() {
+    async fn apply_blocks_graph_delete_without_approval() {
         let dir = fixture();
         let desired = validate_config_dir(dir.path());
         let schema_digest = desired
@@ -5331,23 +5946,171 @@ graphs:
             .iter()
             .map(|change| (change.resource.as_str(), change))
             .collect();
+        // Stage 4C: deletes are gated, not deferred — every subtree change
+        // blocks on the single graph-level approval.
         assert_eq!(
             by_resource["graph.old"].disposition,
-            Some(ApplyDisposition::Deferred)
-        );
-        assert_eq!(
-            by_resource["schema.old"].disposition,
-            Some(ApplyDisposition::Deferred)
-        );
-        assert_eq!(
-            by_resource["query.old.q"].disposition,
             Some(ApplyDisposition::Blocked)
         );
+        assert_eq!(
+            by_resource["graph.old"].reason.as_deref(),
+            Some("approval_required")
+        );
+        assert_eq!(
+            by_resource["schema.old"].reason.as_deref(),
+            Some("approval_required")
+        );
+        assert_eq!(
+            by_resource["query.old.q"].reason.as_deref(),
+            Some("approval_required")
+        );
+        // State intact; nothing destroyed without the artifact.
         let state = read_state_json(dir.path());
         let resources = &state["applied_revision"]["resources"];
         assert_eq!(resources["graph.old"]["digest"], "3333");
         assert_eq!(resources["schema.old"]["digest"], "4444");
         assert_eq!(resources["query.old.q"]["digest"], "5555");
+    }
+
+    #[tokio::test]
+    async fn approve_writes_digest_bound_artifact() {
+        let dir = fixture();
+        write_applyable_state(dir.path());
+        // Seed a deletable subtree.
+        let state = read_state_json(dir.path());
+        let graph_digest_str = state["applied_revision"]["resources"]["graph.knowledge"]["digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let schema_digest_str = state["applied_revision"]["resources"]["schema.knowledge"]
+            ["digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        write_state_resources(
+            dir.path(),
+            &[
+                ("graph.knowledge", graph_digest_str.as_str()),
+                ("schema.knowledge", schema_digest_str.as_str()),
+                ("graph.old", "3333"),
+                ("schema.old", "4444"),
+            ],
+        );
+
+        let out = approve_config_dir(dir.path(), "graph.old", "andrew").await;
+        assert!(out.ok, "{:?}", out.diagnostics);
+        let approval_id = out.approval_id.clone().unwrap();
+        let artifact: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(
+                dir.path()
+                    .join(CLUSTER_APPROVALS_DIR)
+                    .join(format!("{approval_id}.json")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(artifact["resource"], "graph.old");
+        assert_eq!(artifact["operation"], "delete");
+        assert_eq!(artifact["approved_by"], "andrew");
+        assert_eq!(artifact["bound_before_digest"], "3333");
+        assert!(artifact["bound_after_digest"].is_null());
+        assert!(artifact["bound_config_digest"].is_string());
+        assert!(artifact["consumed_at"].is_null());
+
+        // A non-gated address is refused.
+        let not_gated = approve_config_dir(dir.path(), "query.knowledge.find_person", "andrew").await;
+        assert!(!not_gated.ok);
+        assert!(
+            not_gated
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "approval_not_required")
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_approval_is_ignored() {
+        let dir = fixture();
+        write_applyable_state(dir.path());
+        let state = read_state_json(dir.path());
+        let graph_digest_str = state["applied_revision"]["resources"]["graph.knowledge"]["digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let schema_digest_str = state["applied_revision"]["resources"]["schema.knowledge"]
+            ["digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        write_state_resources(
+            dir.path(),
+            &[
+                ("graph.knowledge", graph_digest_str.as_str()),
+                ("schema.knowledge", schema_digest_str.as_str()),
+                ("graph.old", "3333"),
+            ],
+        );
+        let approved = approve_config_dir(dir.path(), "graph.old", "andrew").await;
+        assert!(approved.ok, "{:?}", approved.diagnostics);
+        // The config moves after approval: the bound config digest no longer
+        // matches and the artifact authorizes nothing.
+        fs::write(dir.path().join("base.policy.yaml"), "rules: [] # moved\n").unwrap();
+
+        let out = apply_config_dir(dir.path()).await;
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "approval_stale"),
+            "{:?}",
+            out.diagnostics
+        );
+        let by_resource: BTreeMap<&str, &PlanChange> = out
+            .changes
+            .iter()
+            .map(|change| (change.resource.as_str(), change))
+            .collect();
+        assert_eq!(
+            by_resource["graph.old"].reason.as_deref(),
+            Some("approval_required")
+        );
+        let state = read_state_json(dir.path());
+        assert_eq!(
+            state["applied_revision"]["resources"]["graph.old"]["digest"],
+            "3333"
+        );
+    }
+
+    #[tokio::test]
+    async fn compute_approvals_one_gate_per_subtree() {
+        let dir = fixture();
+        write_applyable_state(dir.path());
+        let state = read_state_json(dir.path());
+        let g = state["applied_revision"]["resources"]["graph.knowledge"]["digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let sc = state["applied_revision"]["resources"]["schema.knowledge"]["digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        write_state_resources(
+            dir.path(),
+            &[
+                ("graph.knowledge", g.as_str()),
+                ("schema.knowledge", sc.as_str()),
+                ("graph.old", "3333"),
+                ("schema.old", "4444"),
+                ("query.old.q", "5555"),
+            ],
+        );
+        let plan = plan_config_dir(dir.path()).await;
+        let gated: Vec<&str> = plan
+            .approvals_required
+            .iter()
+            .map(|gate| gate.resource.as_str())
+            .collect();
+        assert_eq!(gated, vec!["graph.old"], "{plan:?}");
+        assert!(!plan.approvals_required[0].satisfied);
     }
 
     #[tokio::test]
@@ -6103,6 +6866,200 @@ graphs:
                 .any(|diagnostic| diagnostic.code == "cluster_recovery_pending")
         );
         assert!(sidecar.exists());
+    }
+
+    /// Seed: converged knowledge subtree + a stale `old` graph subtree with a
+    /// real directory on disk.
+    fn seed_deletable_state(config_dir: &Path) {
+        write_applyable_state(config_dir);
+        let state = read_state_json(config_dir);
+        let g = state["applied_revision"]["resources"]["graph.knowledge"]["digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let sc = state["applied_revision"]["resources"]["schema.knowledge"]["digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        write_state_resources(
+            config_dir,
+            &[
+                ("graph.knowledge", g.as_str()),
+                ("schema.knowledge", sc.as_str()),
+                ("graph.old", "3333"),
+                ("schema.old", "4444"),
+                ("query.old.q", "5555"),
+            ],
+        );
+        let root = config_dir.join(CLUSTER_GRAPHS_DIR).join("old.omni");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("_schema.pg"), "stale").unwrap();
+    }
+
+    #[tokio::test]
+    async fn apply_executes_approved_graph_delete() {
+        let dir = fixture();
+        seed_deletable_state(dir.path());
+        let approved = approve_config_dir(dir.path(), "graph.old", "andrew").await;
+        assert!(approved.ok, "{:?}", approved.diagnostics);
+        let approval_id = approved.approval_id.clone().unwrap();
+
+        let out = apply_config_dir(dir.path()).await;
+        assert!(out.ok, "{:?}", out.diagnostics);
+        assert!(out.converged, "{out:?}");
+        let by_resource: BTreeMap<&str, &PlanChange> = out
+            .changes
+            .iter()
+            .map(|change| (change.resource.as_str(), change))
+            .collect();
+        assert_eq!(by_resource["graph.old"].disposition, Some(ApplyDisposition::Applied));
+        assert_eq!(by_resource["schema.old"].disposition, Some(ApplyDisposition::Applied));
+        assert_eq!(by_resource["query.old.q"].disposition, Some(ApplyDisposition::Applied));
+        // The root is gone; the subtree is tombstoned out of the ledger.
+        assert!(!dir.path().join(CLUSTER_GRAPHS_DIR).join("old.omni").exists());
+        let state = read_state_json(dir.path());
+        let resources = state["applied_revision"]["resources"].as_object().unwrap();
+        assert!(!resources.contains_key("graph.old"));
+        assert!(!resources.contains_key("schema.old"));
+        assert!(!resources.contains_key("query.old.q"));
+        assert_eq!(state["observations"]["graph.old"]["kind"], "tombstone");
+        assert_eq!(state["observations"]["graph.old"]["approval_id"], approval_id);
+        // Approval consumed in BOTH stores: ledger summary + artifact file.
+        assert!(state["approval_records"][&approval_id]["consumed_at"].is_string());
+        let artifact: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(
+                dir.path()
+                    .join(CLUSTER_APPROVALS_DIR)
+                    .join(format!("{approval_id}.json")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(artifact["consumed_at"].is_string(), "{artifact}");
+        // Sidecar retired.
+        assert!(
+            fs::read_dir(dir.path().join(CLUSTER_RECOVERIES_DIR))
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(true)
+        );
+        // A consumed approval authorizes nothing further (idempotent re-apply).
+        let again = apply_config_dir(dir.path()).await;
+        assert!(again.ok && again.converged && !again.state_written, "{again:?}");
+    }
+
+    fn write_delete_sidecar(
+        config_dir: &Path,
+        graph_id: &str,
+        approval_id: Option<&str>,
+        operation_id: &str,
+    ) -> PathBuf {
+        let dir = config_dir.join(CLUSTER_RECOVERIES_DIR);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{operation_id}.json"));
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "schema_version": 1,
+                "operation_id": operation_id,
+                "started_at": "1970-01-01T00:00:00Z",
+                "kind": "graph_delete",
+                "graph_id": graph_id,
+                "graph_uri": derived_graph_uri(config_dir, graph_id),
+                "desired_schema_digest": "",
+                "approval_id": approval_id,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn sweep_retires_delete_sidecar_when_tombstoned() {
+        let dir = fixture();
+        write_applyable_state(dir.path()); // no graph.old in state, no root
+        let sidecar = write_delete_sidecar(dir.path(), "old", None, "01DROW7");
+
+        let out = apply_config_dir(dir.path()).await;
+        assert!(out.ok, "{:?}", out.diagnostics);
+        assert!(!sidecar.exists());
+        let state = read_state_json(dir.path());
+        assert!(
+            state["recovery_records"]
+                .as_object()
+                .is_none_or(|records| records.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_rolls_forward_completed_delete() {
+        let dir = fixture();
+        seed_deletable_state(dir.path());
+        // Approve, then simulate: root removed, state stale, sidecar present.
+        let approved = approve_config_dir(dir.path(), "graph.old", "andrew").await;
+        let approval_id = approved.approval_id.unwrap();
+        fs::remove_dir_all(dir.path().join(CLUSTER_GRAPHS_DIR).join("old.omni")).unwrap();
+        let sidecar = write_delete_sidecar(dir.path(), "old", Some(&approval_id), "01DROW7B");
+
+        let out = apply_config_dir(dir.path()).await;
+        assert!(out.ok, "{:?}", out.diagnostics);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "cluster_recovery_rolled_forward")
+        );
+        assert!(!sidecar.exists());
+        let state = read_state_json(dir.path());
+        assert!(
+            !state["applied_revision"]["resources"]
+                .as_object()
+                .unwrap()
+                .contains_key("graph.old")
+        );
+        assert_eq!(state["observations"]["graph.old"]["kind"], "tombstone");
+        assert!(state["approval_records"][&approval_id]["consumed_at"].is_string());
+        assert!(
+            state["recovery_records"]
+                .as_object()
+                .unwrap()
+                .values()
+                .any(|record| record["kind"] == "graph_delete"
+                    && record["outcome"] == "rolled_forward")
+        );
+        // The artifact file is marked consumed post-CAS.
+        let artifact: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(
+                dir.path()
+                    .join(CLUSTER_APPROVALS_DIR)
+                    .join(format!("{approval_id}.json")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(artifact["consumed_at"].is_string());
+        assert!(out.converged, "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn sweep_reproposes_incomplete_delete() {
+        let dir = fixture();
+        seed_deletable_state(dir.path()); // root present
+        let approved = approve_config_dir(dir.path(), "graph.old", "andrew").await;
+        assert!(approved.ok);
+        let sidecar = write_delete_sidecar(dir.path(), "old", approved.approval_id.as_deref(), "01DROW8");
+
+        // Row 8: the stale intent is retired with a warning, and the same run
+        // re-executes the still-approved delete to completion.
+        let out = apply_config_dir(dir.path()).await;
+        assert!(out.ok, "{:?}", out.diagnostics);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "graph_delete_incomplete")
+        );
+        assert!(!sidecar.exists());
+        assert!(!dir.path().join(CLUSTER_GRAPHS_DIR).join("old.omni").exists());
+        assert!(out.converged, "{out:?}");
     }
 
     #[test]

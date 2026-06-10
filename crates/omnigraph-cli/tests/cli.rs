@@ -1358,7 +1358,7 @@ fn cluster_e2e_graph_root_destruction_drifts_then_apply_recreates_empty_graph() 
 /// (applied), its composite (derived) — shows all four dispositions at once
 /// before the graph-plane schema apply closes the loop.
 #[test]
-fn cluster_e2e_multi_graph_mixed_dispositions_then_converge() {
+fn cluster_e2e_multi_graph_mixed_dispositions_then_approve_and_converge() {
     let temp = tempdir().unwrap();
     write_multi_graph_cluster_fixture(temp.path());
     // No manual init: Stage 4A creates both graphs.
@@ -1424,22 +1424,29 @@ policies:
     let mixed = cluster_json(temp.path(), "apply");
     assert_eq!(mixed["ok"], true, "{mixed}");
     assert_eq!(mixed["converged"], false, "{mixed}");
+    // Stage 4C: deletes are gated on a digest-bound approval, one gate per
+    // subtree (the graph-level approval carries schema + queries).
     assert_eq!(
         change_for(&mixed, "graph.engineering")["disposition"],
-        "deferred"
-    );
-    assert_eq!(
-        change_for(&mixed, "schema.engineering")["disposition"],
-        "deferred"
-    );
-    assert_eq!(
-        change_for(&mixed, "query.engineering.find_service")["disposition"],
         "blocked"
     );
     assert_eq!(
-        change_for(&mixed, "query.engineering.find_service")["reason"],
-        "dependency_not_applied"
+        change_for(&mixed, "graph.engineering")["reason"],
+        "approval_required"
     );
+    assert_eq!(
+        change_for(&mixed, "schema.engineering")["reason"],
+        "approval_required"
+    );
+    assert_eq!(
+        change_for(&mixed, "query.engineering.find_service")["reason"],
+        "approval_required"
+    );
+    let gate_plan = cluster_json(temp.path(), "plan");
+    let gates = gate_plan["approvals_required"].as_array().unwrap();
+    assert_eq!(gates.len(), 1, "{gate_plan}");
+    assert_eq!(gates[0]["resource"], "graph.engineering");
+    assert_eq!(gates[0]["satisfied"], false);
     assert_eq!(
         change_for(&mixed, "query.knowledge.find_person")["disposition"],
         "applied"
@@ -1461,7 +1468,55 @@ policies:
     let mut sorted = order.clone();
     sorted.sort_unstable();
     assert_eq!(order, sorted, "{mixed}");
-    // Graph deletion cannot converge until stage 4C's approval artifacts.
+    // The conclusion: an apply without approval stays blocked; the approved
+    // delete converges the cluster, tombstoning the removed graph.
+    let still_blocked = cluster_json(temp.path(), "apply");
+    assert_eq!(still_blocked["converged"], false, "{still_blocked}");
+
+    let approve = parse_stdout_json(&output_success(
+        cli()
+            .arg("--as")
+            .arg("andrew")
+            .arg("cluster")
+            .arg("approve")
+            .arg("graph.engineering")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json"),
+    ));
+    assert_eq!(approve["ok"], true, "{approve}");
+    assert_eq!(approve["approved_by"], "andrew");
+
+    let converge = cluster_json(temp.path(), "apply");
+    assert_eq!(converge["ok"], true, "{converge}");
+    assert_eq!(converge["converged"], true, "{converge}");
+    assert!(!temp.path().join("graphs/engineering.omni").exists());
+
+    let status = cluster_json(temp.path(), "status");
+    assert_eq!(status["observations"]["graph.engineering"]["kind"], "tombstone");
+    let final_plan = cluster_json(temp.path(), "plan");
+    assert!(
+        final_plan["changes"].as_array().unwrap().is_empty(),
+        "{final_plan}"
+    );
+}
+
+/// An approval without an approver is meaningless: approve requires --as.
+#[test]
+fn cluster_e2e_approve_requires_actor() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+
+    let output = output_failure(
+        cli()
+            .arg("cluster")
+            .arg("approve")
+            .arg("graph.knowledge")
+            .arg("--config")
+            .arg(temp.path()),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--as"), "{stderr}");
 }
 
 /// Stage 4A headline: a declared graph is created by `cluster apply` itself —

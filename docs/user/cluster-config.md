@@ -1,6 +1,6 @@
 # Cluster Config
 
-**Status:** Stage 4B schema-apply preview.
+**Status:** Stage 4C — Phase 4 complete (graph create, schema apply, gated graph delete).
 
 Cluster config is the future control-plane configuration surface for a whole
 OmniGraph deployment. In this stage, OmniGraph can validate a local
@@ -9,11 +9,10 @@ local JSON state ledger, explicitly refresh/import graph observations into
 that ledger, manually remove a held local state lock by exact lock id, and
 **apply the executable subset of the plan** — stored-query and policy-bundle
 catalog writes, **graph creation** (a declared graph that does not exist yet
-is initialized by apply at the derived root), and **schema updates**: a
-changed schema is migrated on the live graph by apply itself, soft drops
-only. It does not delete graphs (a later stage), perform data-loss
-migrations, start servers, or serve anything it applies: the server still
-boots from `omnigraph.yaml`.
+is initialized by apply at the derived root), **schema updates** (soft drops
+only), and — behind an explicit, digest-bound **approval** — **graph
+deletion**. It does not perform data-loss schema migrations, start servers,
+or serve anything it applies: the server still boots from `omnigraph.yaml`.
 
 ## Commands
 
@@ -21,6 +20,7 @@ boots from `omnigraph.yaml`.
 omnigraph cluster validate --config ./company-brain
 omnigraph cluster plan     --config ./company-brain --json
 omnigraph cluster apply    --config ./company-brain --json
+omnigraph cluster approve  graph.<id> --config ./company-brain --as <actor>
 omnigraph cluster status   --config ./company-brain --json
 omnigraph cluster refresh  --config ./company-brain --json
 omnigraph cluster import   --config ./company-brain --json
@@ -253,7 +253,38 @@ in recovery sidecars and audit entries and threads it to the engine's
 schema-apply (so commit attribution and Cedar enforcement — wherever a policy
 checker is installed — work unchanged).
 
-Schema deletes (removing a graph) are never executed by this stage. They are
+### Approvals and graph deletion
+
+Deleting a graph is the irreversible tier: it requires a recorded human
+decision. `cluster plan` lists the gate under `approvals_required` (one gate
+per graph — the graph-level approval carries its schema and queries);
+`cluster approve graph.<id> --as <actor>` writes a digest-bound artifact to
+
+```text
+<config-dir>/__cluster/approvals/<approval-id>.json
+```
+
+bound to the exact desired config digest and the change's state digest, so
+**any config or state drift after approving invalidates the artifact**
+automatically (`approval_stale` warning; it never authorizes a different
+change). An unapproved delete blocks with `approval_required`.
+
+An approved delete executes **last** in the apply run: the graph root is
+removed recursively, the subtree (graph, schema, its queries) is tombstoned
+out of the state ledger with a tombstone observation, and the approval is
+consumed — recorded in the state's `approval_records` in the same state
+update, and the artifact file rewritten with `consumed_at` (the file is never
+deleted: the audit fact survives the loss of either store). A failed run
+consumes nothing; the approval stays valid for the retry. Catalog blobs of
+the deleted graph's queries stay on disk (GC is a later stage).
+
+Crash recovery for deletes: a completed-but-unrecorded delete is rolled
+forward by the sweep (tombstone + approval consumption + audit entry); an
+incomplete delete (root still present) is retired with a
+`graph_delete_incomplete` warning and simply **re-proposed** — prefix removal
+is idempotent, so the still-approved retry is the repair.
+
+Standalone schema deletes are never executed by this stage. They are
 reported as `deferred` (warning `apply_unsupported_change`), and query/policy
 changes that depend on them are `blocked` (warning `apply_dependency_blocked`, status
 `blocked` in state). A partially-applicable plan still exits 0 with warnings;
