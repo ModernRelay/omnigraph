@@ -1,15 +1,17 @@
 # Cluster Config
 
-**Status:** Stage 3A config-only apply preview.
+**Status:** Stage 4A graph-create apply preview.
 
 Cluster config is the future control-plane configuration surface for a whole
 OmniGraph deployment. In this stage, OmniGraph can validate a local
 `cluster.yaml` folder, produce a deterministic read-only plan, inspect the
 local JSON state ledger, explicitly refresh/import graph observations into
 that ledger, manually remove a held local state lock by exact lock id, and
-**apply the config-only subset of the plan** — stored-query and policy-bundle
-catalog writes. It does not move graph manifests, change schemas, start
-servers, or serve anything it applies: the server still boots from
+**apply the executable subset of the plan** — stored-query and policy-bundle
+catalog writes, and **graph creation**: a declared graph that does not exist
+yet is initialized by apply itself at the derived root. It does not change
+existing schemas (deferred to a later stage), move existing graph manifests,
+start servers, or serve anything it applies: the server still boots from
 `omnigraph.yaml`.
 
 ## Commands
@@ -153,8 +155,8 @@ condition in `reason`).
 
 ## Apply
 
-`cluster apply` executes the config-only subset of the plan — stored-query and
-policy-bundle changes. There is no confirm flag: `cluster plan` is the preview,
+`cluster apply` executes the executable subset of the plan — stored-query and
+policy-bundle changes, and graph creates. There is no confirm flag: `cluster plan` is the preview,
 and apply recomputes the same diff under the state lock before executing, so a
 stale preview can never be applied. Apply requires an existing `state.json`
 (`state_missing` directs you to `cluster import` first).
@@ -180,9 +182,39 @@ still boots from `omnigraph.yaml`; no query or policy applied here serves
 traffic until the server-boot stage ships, as an explicit per-deployment mode
 switch.
 
-Graph and schema changes are never executed by this stage. They are reported
-as `deferred` (warning `apply_unsupported_change`), and query/policy changes
-that depend on them are `blocked` (warning `apply_dependency_blocked`, status
+### Graph creation
+
+A `graph.<id>` create (the graph is declared but no root exists) is executed
+by apply: the graph is initialized at the derived root
+
+```text
+<config-dir>/graphs/<graph-id>.omni
+```
+
+with the declared schema, before any catalog writes, so queries and policies
+that depend on the new graph apply **in the same run**. Each create is fenced
+by a recovery sidecar under `__cluster/recoveries/{ulid}.json`, written before
+the init and removed only after the state update lands. If apply crashes in
+between, the next state-mutating command (`apply`, `refresh`, `import`) runs a
+**recovery sweep** that classifies the survivor by observation: an absent root
+removes the stale intent; a completed create rolls the cluster state forward
+(recorded in the state's `recovery_records`); a partial root reports
+`graph_create_incomplete` (status `error` — remove the root and re-run apply;
+nothing is auto-deleted); unexpected graph content reports
+`actual_applied_state_pending` (status `drifted` — run `cluster refresh` and
+re-plan). While a kept sidecar is pending, that graph's create and its
+dependents are blocked with `cluster_recovery_pending`. Read-only commands
+(`status`, `plan`) warn about pending sidecars without acting on them.
+
+**Re-creation is convergence.** If a graph root disappears out-of-band,
+`refresh` records the drift and the next `plan` proposes a create — and apply
+will execute it, producing an **empty** graph at the root. The data was
+already lost when the root vanished; the create is visible in the plan
+(disposition `applied`) before anything runs.
+
+Schema changes to existing graphs are never executed by this stage. They are
+reported as `deferred` (warning `apply_unsupported_change`), and query/policy
+changes that depend on them are `blocked` (warning `apply_dependency_blocked`, status
 `blocked` in state). A partially-applicable plan still exits 0 with warnings;
 the JSON `converged` field is the automation signal for "state now matches the
 desired revision". The applied `config_digest` is only recorded when apply
