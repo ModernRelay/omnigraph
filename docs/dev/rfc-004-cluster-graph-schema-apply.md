@@ -1,6 +1,7 @@
 # RFC: Cluster Graph & Schema Apply — Phase 4 of the Cluster Control Plane
 
-**Status:** Proposed
+**Status:** Landed (4A #170, 4B #171, 4C — all shipped)
+**Implementation deviations:** (1) D3 row 8 retires the stale delete sidecar and lets the still-approved delete re-propose and retry, instead of a pending-block — prefix removal is idempotent, so the retry is the repair. (2) The approver/actor flag is the CLI's existing global `--as`, not a dedicated `--actor`/`--by`. (3) Consumed approval artifacts are rewritten with `consumed_at` rather than moved into state — the file and the ledger record both survive independently (axiom 11).
 **Date:** 2026-06-10
 **Builds on:** cluster Stages 1–3B (shipped: validate/plan/status/refresh/import/force-unlock, config-only `cluster apply` with content-addressed catalog publish, catalog payload verification, failpoint-proven crash/CAS recovery for the apply protocol). Normative context: [cluster-config-specs.md](cluster-config-specs.md), [cluster-axioms.md](cluster-axioms.md), [cluster-config-implementation-spec.md](cluster-config-implementation-spec.md).
 **Target release:** unversioned (phased — see Sequencing); no cluster functionality is in a tagged release yet.
