@@ -1451,9 +1451,10 @@ policies:
         change_for(&mixed, "query.knowledge.find_person")["disposition"],
         "applied"
     );
-    // policy.shared's applies_to narrowed, but its FILE digest is unchanged
-    // — applies_to lives in cluster.yaml (the config digest), so it is not a
-    // resource change.
+    // 5A: policy.shared's applies_to narrowed with an unchanged file digest
+    // — now a first-class binding change, applied in the same run.
+    assert_eq!(change_for(&mixed, "policy.shared")["binding_change"], true);
+    assert_eq!(change_for(&mixed, "policy.shared")["disposition"], "applied");
     assert_eq!(
         change_for(&mixed, "graph.knowledge")["disposition"],
         "derived"

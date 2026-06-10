@@ -815,7 +815,8 @@ fn print_cluster_plan_human(output: &PlanOutput) {
             output.approvals_required.len()
         );
         for change in &output.changes {
-            println!("  {:?} {}", change.operation, change.resource);
+            let bindings = if change.binding_change { " [bindings]" } else { "" };
+            println!("  {:?} {}{bindings}", change.operation, change.resource);
             if let Some(migration) = &change.migration {
                 if !migration.supported {
                     println!("      migration UNSUPPORTED:");
@@ -862,16 +863,17 @@ fn print_cluster_apply_human(output: &ApplyOutput) {
 
 fn print_cluster_apply_changes(changes: &[omnigraph_cluster::PlanChange]) {
     for change in changes {
+        let bindings = if change.binding_change { " [bindings]" } else { "" };
         match (&change.disposition, change.reason.as_deref()) {
             (Some(disposition), Some(reason)) => println!(
-                "  {:?} {} [{disposition:?}: {reason}]",
+                "  {:?} {}{bindings} [{disposition:?}: {reason}]",
                 change.operation, change.resource
             ),
             (Some(disposition), None) => println!(
-                "  {:?} {} [{disposition:?}]",
+                "  {:?} {}{bindings} [{disposition:?}]",
                 change.operation, change.resource
             ),
-            _ => println!("  {:?} {}", change.operation, change.resource),
+            _ => println!("  {:?} {}{bindings}", change.operation, change.resource),
         }
     }
     if changes.is_empty() {
