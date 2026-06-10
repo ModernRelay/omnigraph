@@ -218,6 +218,18 @@ pub fn spawn_server_with_cluster(cluster_dir: &Path) -> TestServer {
     spawn_server_process(command)
 }
 
+/// Cluster boot with the server process's cwd set explicitly — used to prove
+/// rule 0 never touches the cwd omnigraph.yaml search.
+pub fn spawn_server_with_cluster_in(cluster_dir: &Path, cwd: &Path) -> TestServer {
+    let mut command = server_process();
+    command
+        .arg("--cluster")
+        .arg(cluster_dir)
+        .arg("--unauthenticated")
+        .current_dir(cwd);
+    spawn_server_process(command)
+}
+
 pub fn spawn_server_with_cluster_env(cluster_dir: &Path, envs: &[(&str, &str)]) -> TestServer {
     let mut command = server_process();
     command.arg("--cluster").arg(cluster_dir);
