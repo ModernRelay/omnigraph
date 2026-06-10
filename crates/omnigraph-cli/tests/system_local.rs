@@ -595,8 +595,12 @@ policy: {{}}
         ),
     );
 
+    // current_dir matters: `init` scaffolds an omnigraph.yaml into its cwd,
+    // and without this it pollutes the crate dir, breaking unrelated tests
+    // (anything resolving a graph target from the cwd config).
     output_success(
         cli()
+            .current_dir(query_root)
             .arg("init")
             .arg("--schema")
             .arg(fixture("test.pg"))
@@ -604,6 +608,7 @@ policy: {{}}
     );
     output_success(
         cli()
+            .current_dir(query_root)
             .arg("load")
             .arg("--data")
             .arg(fixture("test.jsonl"))
@@ -2151,4 +2156,38 @@ policies:
     // Denied invocation is deliberately 404, indistinguishable from an
     // unknown query — the server's anti-probing contract.
     assert_eq!(invoke("admin-token").status().as_u16(), 404);
+}
+
+/// Rule 0 (axiom 15): a --cluster server never reads omnigraph.yaml — not
+/// even the implicit cwd search. A MALFORMED config in the process cwd must
+/// not affect boot or serving.
+#[test]
+fn cluster_server_boot_ignores_local_config_in_cwd() {
+    let cluster = tempfile::tempdir().unwrap();
+    std::fs::write(
+        cluster.path().join("people.pg"),
+        "\nnode Person {\n  name: String @key\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        cluster.path().join("cluster.yaml"),
+        "version: 1\ngraphs:\n  knowledge:\n    schema: ./people.pg\n",
+    )
+    .unwrap();
+    for command in ["import", "apply"] {
+        let output = cli()
+            .arg("cluster")
+            .arg(command)
+            .arg("--config")
+            .arg(cluster.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "cluster {command} failed");
+    }
+    let cwd = tempfile::tempdir().unwrap();
+    std::fs::write(cwd.path().join("omnigraph.yaml"), "{{{{ not yaml").unwrap();
+
+    let server = spawn_server_with_cluster_in(cluster.path(), cwd.path());
+    let response = reqwest::blocking::get(format!("{}/healthz", server.base_url)).unwrap();
+    assert!(response.status().is_success());
 }

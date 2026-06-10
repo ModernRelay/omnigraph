@@ -36,15 +36,26 @@ omnigraph cluster force-unlock <LOCK_ID> --config ./company-brain --json
 ## Relationship to `omnigraph.yaml`
 
 `cluster.yaml` does not replace `omnigraph.yaml`, and the two never describe
-the same fact. `omnigraph.yaml` remains how the CLI and server are configured
-today (graph targets, server bind, CLI defaults, credential env references) and
-is its long-term home for per-operator settings. `cluster.yaml` is the shared
-desired state of a whole deployment, read only by the `cluster` commands via
-`--config`. In the current stage, nothing recorded in the cluster state ledger
-affects what a server serves or what other CLI commands target — the cluster
-catalog is inspectable, not live. When server boot from cluster state ships in
-a later stage, it will be an explicit per-deployment mode switch, not a merge
-of the two files.
+the same fact. `omnigraph.yaml` is the permanent **per-operator** layer (CLI
+defaults, the operator's identity and credential references, graph targets
+for data-plane commands); `cluster.yaml` is the shared desired state of a
+whole deployment, read only by the `cluster` commands via `--config`.
+
+The exact contract:
+
+- **Cluster commands read `omnigraph.yaml` for exactly one thing**: the
+  `cli.actor` default used by `apply`/`approve` when `--as` is omitted —
+  operator identity is a per-operator fact. With `--as` present, no config
+  is read at all. Nothing else (its graph set, targets, bind, queries,
+  policies) ever influences a cluster command; a malformed `omnigraph.yaml`
+  breaks only the no-flag actor lookup, loudly.
+- **A `--cluster` server reads `omnigraph.yaml` for nothing** — not even the
+  implicit current-directory search runs (mode-inference rule 0). Boot from
+  cluster state XOR `omnigraph.yaml`, never a merge.
+- **The other direction is ergonomics, not coupling**: a per-operator
+  `omnigraph.yaml` may point `graphs.<name>.uri` at a cluster's derived root
+  (`./company-brain/graphs/knowledge.omni`) so data-plane commands can use
+  `--target <name>` — an ordinary local path, no special handling.
 
 ## Supported `cluster.yaml`
 

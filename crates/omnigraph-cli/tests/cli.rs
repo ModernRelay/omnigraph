@@ -4325,3 +4325,212 @@ fn queries_validate_positional_uri_ignores_default_graph() {
         "positional URI must validate the top-level registry, not the cli.graph default; stdout:\n{stdout}"
     );
 }
+
+// ---- per-operator local config (omnigraph.yaml) vs the cluster surfaces ----
+
+/// Cluster ops resolve operator identity per-operator: --as wins, and
+/// without it the cwd omnigraph.yaml's `cli.actor` is the default.
+#[test]
+fn cluster_apply_uses_cli_actor_from_local_config() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    fs::write(
+        temp.path().join("omnigraph.yaml"),
+        "cli:\n  actor: act-local\n",
+    )
+    .unwrap();
+    // Phase 1: import once (setup, not under test).
+    let output = cli()
+        .current_dir(temp.path())
+        .arg("cluster")
+        .arg("import")
+        .arg("--config")
+        .arg(temp.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    // Phase 2: apply alone, capturing the echoed actor (idempotent re-runs).
+    let apply = |extra: &[&str]| {
+        let mut command = cli();
+        command.current_dir(temp.path());
+        for arg in extra {
+            command.arg(arg);
+        }
+        let output = command
+            .arg("cluster")
+            .arg("apply")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json")
+            .output()
+            .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+        json["actor"].clone()
+    };
+    assert_eq!(apply(&[]), "act-local", "cli.actor is the no-flag default");
+    assert_eq!(apply(&["--as", "andrew"]), "andrew", "--as overrides cli.actor");
+}
+
+#[test]
+fn cluster_approve_uses_cli_actor_fallback() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    fs::write(
+        temp.path().join("omnigraph.yaml"),
+        "cli:\n  actor: act-local\n",
+    )
+    .unwrap();
+    // Converge, then remove the graph so a gated delete is pending.
+    for command in ["import", "apply"] {
+        let output = cli()
+            .current_dir(temp.path())
+            .arg("cluster")
+            .arg(command)
+            .arg("--config")
+            .arg(temp.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "cluster {command} failed");
+    }
+    fs::write(temp.path().join("cluster.yaml"), "version: 1\ngraphs: {}\n").unwrap();
+
+    let output = cli()
+        .current_dir(temp.path())
+        .arg("cluster")
+        .arg("approve")
+        .arg("graph.knowledge")
+        .arg("--config")
+        .arg(temp.path())
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let json: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+    assert_eq!(json["approved_by"], "act-local");
+
+    // With neither flag nor config: refused with the actionable message.
+    let bare = tempdir().unwrap();
+    write_cluster_config_fixture(bare.path());
+    let output = output_failure(
+        cli()
+            .current_dir(bare.path())
+            .arg("cluster")
+            .arg("approve")
+            .arg("graph.knowledge")
+            .arg("--config")
+            .arg(bare.path()),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--as"), "{stderr}");
+    assert!(stderr.contains("cli.actor"), "{stderr}");
+}
+
+/// A malformed omnigraph.yaml in the cwd must never break cluster commands;
+/// it is read for exactly one thing (the actor default when --as is absent),
+/// and only that path fails loudly.
+#[test]
+fn cluster_commands_ignore_malformed_local_config() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    fs::write(temp.path().join("omnigraph.yaml"), "{{{{ not yaml").unwrap();
+
+    for command in ["validate", "plan", "status"] {
+        let output = cli()
+            .current_dir(temp.path())
+            .arg("cluster")
+            .arg(command)
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() || command == "plan", // plan warns state-missing pre-import; still must not config-error
+            "cluster {command} affected by malformed omnigraph.yaml: {output:?}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("omnigraph.yaml"),
+            "cluster {command} touched omnigraph.yaml"
+        );
+    }
+    // import + apply with an explicit --as: the config is never loaded.
+    for (command, args) in [("import", vec![]), ("apply", vec!["--as", "andrew"])] {
+        let mut invocation = cli();
+        invocation.current_dir(temp.path());
+        for arg in &args {
+            invocation.arg(arg);
+        }
+        let output = invocation
+            .arg("cluster")
+            .arg(command)
+            .arg("--config")
+            .arg(temp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "cluster {command} affected by malformed omnigraph.yaml: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // Only the no-flag actor lookup is allowed to fail, and loudly.
+    let output = output_failure(
+        cli()
+            .current_dir(temp.path())
+            .arg("cluster")
+            .arg("apply")
+            .arg("--config")
+            .arg(temp.path()),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("omnigraph.yaml") && stderr.contains("--as"),
+        "the actor-default config read must fail loudly and actionably: {stderr}"
+    );
+}
+
+/// A well-formed omnigraph.yaml with a CONFLICTING world view (different
+/// graphs, server bind) leaks nothing into cluster outputs.
+#[test]
+fn cluster_commands_ignore_conflicting_local_config() {
+    let baseline = tempdir().unwrap();
+    write_cluster_config_fixture(baseline.path());
+    let with_config = tempdir().unwrap();
+    write_cluster_config_fixture(with_config.path());
+    fs::write(
+        with_config.path().join("omnigraph.yaml"),
+        r#"
+server:
+  bind: 0.0.0.0:9999
+graphs:
+  phantom:
+    uri: ./phantom.omni
+"#,
+    )
+    .unwrap();
+
+    let validate = |dir: &std::path::Path| {
+        let output = cli()
+            .current_dir(dir)
+            .arg("cluster")
+            .arg("validate")
+            .arg("--config")
+            .arg(dir)
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_str::<serde_json::Value>(String::from_utf8_lossy(&output.stdout).trim())
+            .unwrap()
+    };
+    let (a, b) = (validate(baseline.path()), validate(with_config.path()));
+    // Compare the path-free invariants (paths embed each tempdir).
+    for key in ["ok", "diagnostics", "resource_digests", "dependencies"] {
+        assert_eq!(a[key], b[key], "conflicting omnigraph.yaml leaked into cluster validate ({key})");
+    }
+    let leaked = b.to_string();
+    assert!(!leaked.contains("phantom") && !leaked.contains("9999"), "{leaked}");
+}

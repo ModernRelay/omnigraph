@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Arg, ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
-use color_eyre::eyre::{Result, bail};
+use color_eyre::eyre::{Result, WrapErr, bail};
 use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
 use omnigraph::storage::normalize_root_uri;
@@ -1249,6 +1249,25 @@ async fn open_local_db_with_policy(graph: &ResolvedCliGraph) -> Result<Omnigraph
     } else {
         Ok(db)
     }
+}
+
+/// Actor resolution for cluster operations. Cluster FACTS stay unlayered
+/// (cluster.yaml only), but the operator's identity is a per-operator fact —
+/// the per-operator config's permanent job. An explicit --as never touches
+/// any config (containers and CI stay config-free); without it, the standard
+/// cwd omnigraph.yaml search supplies `cli.actor`, and a malformed config
+/// fails loudly rather than silently dropping attribution. Deliberately
+/// `load_config`, NOT `load_cli_config`: the latter also loads
+/// `auth.env_file` into the process env — a second thing, violating the
+/// documented "exactly one thing" contract.
+fn resolve_cluster_actor(cli_as: Option<&str>) -> Result<Option<String>> {
+    if let Some(actor) = cli_as {
+        return Ok(Some(actor.to_string()));
+    }
+    let config = load_config(None).wrap_err(
+        "resolving the default actor from the per-operator omnigraph.yaml (pass --as <ACTOR> to skip this lookup)",
+    )?;
+    Ok(config.cli.actor.clone())
 }
 
 /// Resolve the CLI's effective actor identity for engine-layer policy
@@ -3610,16 +3629,12 @@ async fn main() -> Result<()> {
                 finish_cluster_plan(&output, json)?;
             }
             ClusterCommand::Apply { config, json } => {
-                // The global --as actor attributes graph-moving operations
-                // (sidecars, audit entries, engine schema-apply commits).
-                // Cluster config stays unlayered: no omnigraph.yaml fallback.
-                let output = apply_config_dir_with_options(
-                    config,
-                    ApplyOptions {
-                        actor: cli.as_actor.clone(),
-                    },
-                )
-                .await;
+                // The actor attributes graph-moving operations (sidecars,
+                // audit entries, engine schema-apply commits). Cluster FACTS
+                // stay unlayered; the operator's identity resolves --as flag
+                // first, then the per-operator omnigraph.yaml `cli.actor`.
+                let actor = resolve_cluster_actor(cli.as_actor.as_deref())?;
+                let output = apply_config_dir_with_options(config, ApplyOptions { actor }).await;
                 finish_cluster_apply(&output, json)?;
             }
             ClusterCommand::Approve {
@@ -3627,12 +3642,12 @@ async fn main() -> Result<()> {
                 config,
                 json,
             } => {
-                let Some(approver) = cli.as_actor.as_deref() else {
+                let Some(approver) = resolve_cluster_actor(cli.as_actor.as_deref())? else {
                     bail!(
-                        "`cluster approve` requires the global --as <ACTOR> flag: an approval without an approver is meaningless"
+                        "`cluster approve` requires an approver: pass the global --as <ACTOR> flag or set `cli.actor` in your omnigraph.yaml — an approval without an approver is meaningless"
                     );
                 };
-                let output = approve_config_dir(config, &resource, approver).await;
+                let output = approve_config_dir(config, &resource, &approver).await;
                 finish_cluster_approve(&output, json)?;
             }
             ClusterCommand::Status { config, json } => {
