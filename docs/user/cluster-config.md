@@ -20,14 +20,14 @@ or serve anything it applies: the server still boots from `omnigraph.yaml`.
 ## Commands
 
 ```bash
-omnigraph cluster validate --config ./company-brain
-omnigraph cluster plan     --config ./company-brain --json
-omnigraph cluster apply    --config ./company-brain --json
-omnigraph cluster approve  graph.<id> --config ./company-brain --as <actor>
-omnigraph cluster status   --config ./company-brain --json
-omnigraph cluster refresh  --config ./company-brain --json
-omnigraph cluster import   --config ./company-brain --json
-omnigraph cluster force-unlock <LOCK_ID> --config ./company-brain --json
+omnigraph cluster validate --config company-brain
+omnigraph cluster plan     --config company-brain --json
+omnigraph cluster apply    --config company-brain --json
+omnigraph cluster approve  graph.<id> --config company-brain --as <actor>
+omnigraph cluster status   --config company-brain --json
+omnigraph cluster refresh  --config company-brain --json
+omnigraph cluster import   --config company-brain --json
+omnigraph cluster force-unlock <LOCK_ID> --config company-brain --json
 ```
 
 `--config` points at a directory, not a file. The directory must contain
@@ -54,7 +54,7 @@ The exact contract:
   cluster state XOR `omnigraph.yaml`, never a merge.
 - **The other direction is ergonomics, not coupling**: a per-operator
   `omnigraph.yaml` may point `graphs.<name>.uri` at a cluster's derived root
-  (`./company-brain/graphs/knowledge.omni`) so data-plane commands can use
+  (`company-brain/graphs/knowledge.omni`) so data-plane commands can use
   `--target <name>` — an ordinary local path, no special handling.
 
 ## Supported `cluster.yaml`
@@ -72,16 +72,34 @@ state:
 
 graphs:
   knowledge:
-    schema: ./knowledge.pg
-    queries:
-      find_experts:
-        file: ./knowledge.gq
+    schema: knowledge.pg
+    queries: queries/          # discover every `query <name>` in queries/*.gq
 
 policies:
   base:
-    file: ./base.policy.yaml
+    file: base.policy.yaml
     applies_to: [knowledge]
 ```
+
+`queries` is Terraform-shaped — the `.gq` files are the declaration. Three
+forms:
+
+```yaml
+queries: queries/                  # directory: top-level *.gq, sorted; every declaration registers
+queries: [people.gq, extra/a.gq]   # explicit files; every declaration in each
+queries:                           # fine-grained name -> file map
+  find_experts:
+    file: knowledge.gq
+```
+
+Discovery is loud: an unreadable or unparseable `.gq`, or the same query name
+declared in two files, fails validation (`query_parse_error`,
+`duplicate_query_name`). Each discovered query is still an individually
+addressed resource (`query.<graph>.<name>`) with its own plan/apply lifecycle;
+the digest is the containing file's hash, so editing a multi-query file
+updates all of its queries together. Paths are relative to the config
+directory — the cluster is one explicit folder, so no `./` prefixes are
+needed.
 
 `metadata.name` is a display label. `state.backend` may be omitted or set to
 `cluster`; external state backends are reserved for a later stage. `state.lock`
@@ -324,7 +342,7 @@ without graph movement.
 ## Serving from the cluster (the mode switch)
 
 ```bash
-omnigraph-server --cluster ./company-brain --bind 0.0.0.0:8080
+omnigraph-server --cluster company-brain --bind 0.0.0.0:8080
 ```
 
 `--cluster <dir>` is an **exclusive boot source** (axiom 15): it cannot

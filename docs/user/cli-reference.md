@@ -54,7 +54,7 @@ cli:
 query:
   roots: [<dir>, …]   # search path for .gq files
 auth:
-  env_file: ./.env.omni
+  env_file: .env.omni
 aliases:
   <alias>:
     # accepted values: `read` / `query` (read alias), `change` / `mutate`
@@ -70,20 +70,20 @@ aliases:
 queries:                          # top-level registry — applies only to a bare-URI (anonymous) graph; a graph served by name uses its `graphs.<id>.queries`. Mirrors top-level `policy`.
   <query-name>: { file: <path-to-.gq> }   # mcp.expose defaults to true
 policy:
-  file: ./policy.yaml
+  file: policy.yaml
 ```
 
 ## Cluster config preview
 
 ```bash
-omnigraph cluster validate --config ./company-brain
-omnigraph cluster plan     --config ./company-brain --json
-omnigraph cluster apply    --config ./company-brain --json
-omnigraph cluster approve  graph.<id> --config ./company-brain --as <actor>
-omnigraph cluster status   --config ./company-brain --json
-omnigraph cluster refresh  --config ./company-brain --json
-omnigraph cluster import   --config ./company-brain --json
-omnigraph cluster force-unlock <LOCK_ID> --config ./company-brain --json
+omnigraph cluster validate --config company-brain
+omnigraph cluster plan     --config company-brain --json
+omnigraph cluster apply    --config company-brain --json
+omnigraph cluster approve  graph.<id> --config company-brain --as <actor>
+omnigraph cluster status   --config company-brain --json
+omnigraph cluster refresh  --config company-brain --json
+omnigraph cluster import   --config company-brain --json
+omnigraph cluster force-unlock <LOCK_ID> --config company-brain --json
 ```
 
 `--config` is a directory containing `cluster.yaml`; it defaults to `.`.

@@ -32,7 +32,8 @@ Lay out a config directory:
 company-brain/
 ├── cluster.yaml
 ├── people.pg            # schema for the "knowledge" graph
-├── people.gq            # a stored query
+├── queries/             # stored queries — the .gq files ARE the declaration
+│   └── people.gq
 └── base.policy.yaml     # a Cedar policy bundle
 ```
 
@@ -43,27 +44,25 @@ metadata:
   name: company-brain
 graphs:
   knowledge:
-    schema: ./people.pg
-    queries:
-      find_person:
-        file: ./people.gq
+    schema: people.pg
+    queries: queries/            # every `query <name>` in queries/*.gq registers
 policies:
   base:
-    file: ./base.policy.yaml
+    file: base.policy.yaml
     applies_to: [knowledge]      # graph-bound; use [cluster] for server-level
 ```
 
 Bring it to life:
 
 ```bash
-omnigraph cluster validate --config ./company-brain   # parse + typecheck everything
-omnigraph cluster import   --config ./company-brain   # create the state ledger
-omnigraph cluster plan     --config ./company-brain   # preview: what would apply do?
-omnigraph cluster apply    --config ./company-brain   # converge
+omnigraph cluster validate --config company-brain   # parse + typecheck everything
+omnigraph cluster import   --config company-brain   # create the state ledger
+omnigraph cluster plan     --config company-brain   # preview: what would apply do?
+omnigraph cluster apply    --config company-brain   # converge
 ```
 
 That single `apply` **creates the graph** (at the derived root
-`./company-brain/graphs/knowledge.omni`), applies its schema, and publishes
+`company-brain/graphs/knowledge.omni`), applies its schema, and publishes
 the query and policy into the content-addressed catalog
 (`__cluster/resources/…`). The output lists every change with its
 disposition; `converged: true` means there is nothing left to do — re-running
@@ -73,14 +72,14 @@ Load data through the normal graph plane (the control plane manages
 *definitions*, not rows):
 
 ```bash
-omnigraph load --data ./seed.jsonl ./company-brain/graphs/knowledge.omni
+omnigraph load --data seed.jsonl company-brain/graphs/knowledge.omni
 ```
 
 Serve it:
 
 ```bash
 OMNIGRAPH_SERVER_BEARER_TOKENS_JSON='{"act-reader":"s3cret"}' \
-  omnigraph-server --cluster ./company-brain --bind 0.0.0.0:8080
+  omnigraph-server --cluster company-brain --bind 0.0.0.0:8080
 ```
 
 `--cluster` is an **exclusive boot source**: it cannot be combined with a
@@ -103,8 +102,8 @@ Every change follows the same loop, whatever its kind:
 
 ```bash
 $EDITOR company-brain/people.pg          # or any .gq / policy / cluster.yaml edit
-omnigraph cluster plan  --config ./company-brain
-omnigraph cluster apply --config ./company-brain --as andrew
+omnigraph cluster plan  --config company-brain
+omnigraph cluster apply --config company-brain --as andrew
 # restart cluster-booted servers to pick it up
 ```
 
@@ -142,8 +141,8 @@ anything runs.
 ## 3. Inspect: status, refresh, drift
 
 ```bash
-omnigraph cluster status  --config ./company-brain --json   # ledger only, read-only
-omnigraph cluster refresh --config ./company-brain          # re-observe live graphs
+omnigraph cluster status  --config company-brain --json   # ledger only, read-only
+omnigraph cluster refresh --config company-brain          # re-observe live graphs
 ```
 
 `status` never touches the graphs; `refresh` opens them read-only and
@@ -164,13 +163,13 @@ converges the ledger.
 Removing a graph from `cluster.yaml` never executes silently:
 
 ```bash
-omnigraph cluster apply --config ./company-brain
+omnigraph cluster apply --config company-brain
 #   Delete graph.scratch [Blocked: approval_required]
 
-omnigraph cluster approve graph.scratch --config ./company-brain --as andrew
+omnigraph cluster approve graph.scratch --config company-brain --as andrew
 #   cluster approve: delete graph.scratch approved by andrew (approval 01KT…)
 
-omnigraph cluster apply --config ./company-brain --as andrew
+omnigraph cluster apply --config company-brain --as andrew
 #   Delete graph.scratch [Applied]   ← root removed, subtree tombstoned
 ```
 
@@ -196,8 +195,8 @@ again**.
 **A held lock** (a crashed process left `__cluster/lock.json`):
 
 ```bash
-omnigraph cluster status --config ./company-brain      # shows the lock holder + id
-omnigraph cluster force-unlock <LOCK_ID> --config ./company-brain
+omnigraph cluster status --config company-brain      # shows the lock holder + id
+omnigraph cluster force-unlock <LOCK_ID> --config company-brain
 ```
 
 Force-unlock requires the exact lock id (from status) — there is no blind
@@ -240,7 +239,7 @@ with an in-flight apply.
 - **`omnigraph.yaml` still has a job**: per-operator settings — your
   `cli.actor` default for `--as`, CLI defaults, credentials, and data-plane
   ergonomics (point `graphs.<name>.uri` at a derived root like
-  `./company-brain/graphs/knowledge.omni` to use `--target <name>` for
+  `company-brain/graphs/knowledge.omni` to use `--target <name>` for
   loads). It just no longer describes the deployment — a server boots from
   one source or the other, never a merge of both.
 

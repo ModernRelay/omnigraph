@@ -35,13 +35,13 @@ In multi mode (`omnigraph.yaml` with a non-empty `graphs:` map), policy files at
 ```yaml
 server:
   policy:
-    file: ./server-policy.yaml          # server-level: graph_list
+    file: server-policy.yaml          # server-level: graph_list
 
 graphs:
   alpha:
     uri: s3://tenant-bucket/alpha
     policy:
-      file: ./policies/alpha.yaml       # per-graph: read, change, branch_*, schema_apply
+      file: policies/alpha.yaml       # per-graph: read, change, branch_*, schema_apply
   beta:
     uri: s3://tenant-bucket/beta
     # no per-graph policy → no engine-layer Cedar enforcement on beta
@@ -78,8 +78,8 @@ rules:
 
 ```yaml
 policy:
-  file: ./policy.yaml          # Cedar rules + groups
-  tests: ./policy.tests.yaml   # declarative test cases
+  file: policy.yaml          # Cedar rules + groups
+  tests: policy.tests.yaml   # declarative test cases
 
 cli:
   actor: act-andrew            # default actor for CLI direct-engine writes
