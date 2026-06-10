@@ -5508,7 +5508,7 @@ graphs:
 "#,
         )
         .unwrap();
-        let err = load_server_settings(Some(&config_path), None, None, None, false).unwrap_err();
+        let err = load_server_settings(Some(&config_path), None, None, None, None, false).unwrap_err();
         assert!(
             err.to_string().contains("invalid graph id 'policies'"),
             "expected reserved-name rejection, got: {err}"
@@ -5576,6 +5576,7 @@ graphs:
     fn mode_inference_cli_uri_is_single() {
         let settings = load_server_settings(
             None,
+            None,
             Some("/tmp/cli.omni".to_string()),
             None,
             None,
@@ -5605,7 +5606,7 @@ graphs:
         )
         .unwrap();
         let settings =
-            load_server_settings(Some(&config_path), None, Some("alpha".into()), None, true)
+            load_server_settings(Some(&config_path), None, None, Some("alpha".into()), None, true)
                 .unwrap();
         match settings.mode {
             ServerConfigMode::Single { uri, .. } => assert_eq!(uri, "/tmp/alpha.omni"),
@@ -5631,7 +5632,7 @@ server:
 "#,
         )
         .unwrap();
-        let settings = load_server_settings(Some(&config_path), None, None, None, true).unwrap();
+        let settings = load_server_settings(Some(&config_path), None, None, None, None, true).unwrap();
         match settings.mode {
             ServerConfigMode::Single { uri, .. } => assert_eq!(uri, "/tmp/beta.omni"),
             ServerConfigMode::Multi { .. } => panic!("expected Single (rule 3), got Multi"),
@@ -5654,7 +5655,7 @@ graphs:
 "#,
         )
         .unwrap();
-        let settings = load_server_settings(Some(&config_path), None, None, None, true).unwrap();
+        let settings = load_server_settings(Some(&config_path), None, None, None, None, true).unwrap();
         match settings.mode {
             ServerConfigMode::Multi { graphs, .. } => {
                 let ids: Vec<&str> = graphs.iter().map(|g| g.graph_id.as_str()).collect();
@@ -5680,7 +5681,7 @@ graphs:
 "#,
         )
         .unwrap();
-        let err = load_server_settings(Some(&config_path), None, None, None, true).unwrap_err();
+        let err = load_server_settings(Some(&config_path), None, None, None, None, true).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("top-level") && msg.contains("policy.file") && msg.contains("not honored"),
@@ -5708,7 +5709,7 @@ graphs:
             "queries:\n  q:\n    file: ./q.gq\ngraphs:\n  alpha:\n    uri: /tmp/alpha.omni\n",
         )
         .unwrap();
-        let err = load_server_settings(Some(&config_path), None, None, None, true).unwrap_err();
+        let err = load_server_settings(Some(&config_path), None, None, None, None, true).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("queries") && msg.contains("not honored"),
@@ -5729,7 +5730,7 @@ graphs:
         )
         .unwrap();
         let err =
-            load_server_settings(Some(&config_path), None, Some("prod".to_string()), None, true)
+            load_server_settings(Some(&config_path), None, None, Some("prod".to_string()), None, true)
                 .unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -5756,7 +5757,7 @@ graphs:
         )
         .unwrap();
         let settings =
-            load_server_settings(Some(&config_path), None, Some("prod".to_string()), None, true)
+            load_server_settings(Some(&config_path), None, None, Some("prod".to_string()), None, true)
                 .unwrap();
         match settings.mode {
             ServerConfigMode::Single {
@@ -5795,7 +5796,7 @@ graphs:
             ),
         )
         .unwrap();
-        let settings = load_server_settings(Some(&config_path), None, None, None, true).unwrap();
+        let settings = load_server_settings(Some(&config_path), None, None, None, None, true).unwrap();
         match settings.mode {
             ServerConfigMode::Multi { graphs, .. } => {
                 assert_eq!(graphs[0].uri, graph.to_string_lossy());
@@ -5807,7 +5808,7 @@ graphs:
     /// Rule 5: nothing → error with migration hint.
     #[test]
     fn mode_inference_no_inputs_errors_with_migration_hint() {
-        let err = load_server_settings(None, None, None, None, true).unwrap_err();
+        let err = load_server_settings(None, None, None, None, None, true).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("no graph to serve"),
@@ -5822,7 +5823,7 @@ graphs:
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("omnigraph.yaml");
         fs::write(&config_path, "server:\n  bind: 127.0.0.1:8080\n").unwrap();
-        let err = load_server_settings(Some(&config_path), None, None, None, true).unwrap_err();
+        let err = load_server_settings(Some(&config_path), None, None, None, None, true).unwrap_err();
         assert!(err.to_string().contains("no graph to serve"));
     }
 
@@ -5843,6 +5844,7 @@ graphs:
         .unwrap();
         let settings = load_server_settings(
             Some(&config_path),
+            None,
             Some("/tmp/cli-override.omni".to_string()),
             None,
             None,
@@ -5880,7 +5882,7 @@ graphs:
 "#,
         )
         .unwrap();
-        let settings = load_server_settings(Some(&config_path), None, None, None, true).unwrap();
+        let settings = load_server_settings(Some(&config_path), None, None, None, None, true).unwrap();
         let graphs = match settings.mode {
             ServerConfigMode::Multi { graphs, .. } => graphs,
             _ => panic!("expected Multi"),
@@ -5914,7 +5916,7 @@ graphs:
 "#,
         )
         .unwrap();
-        let settings = load_server_settings(Some(&config_path), None, None, None, true).unwrap();
+        let settings = load_server_settings(Some(&config_path), None, None, None, None, true).unwrap();
         match settings.mode {
             ServerConfigMode::Multi {
                 server_policy_file, ..
@@ -6194,7 +6196,7 @@ graphs:
         .unwrap();
 
         let settings: ServerConfig =
-            load_server_settings(Some(&config_path), None, None, None, true).unwrap();
+            load_server_settings(Some(&config_path), None, None, None, None, true).unwrap();
         assert!(matches!(settings.mode, ServerConfigMode::Multi { .. }));
 
         match settings.mode {
@@ -6206,4 +6208,234 @@ graphs:
             _ => unreachable!(),
         }
     }
+}
+
+// ---- Phase 5: cluster-mode boot (RFC-005) ----
+
+/// Build and converge a real cluster directory: cluster.yaml + schema +
+/// stored query (+ optional policies), then `import` + `apply` so the
+/// catalog and state ledger exist exactly as an operator would have them.
+async fn converged_cluster_dir(policies_yaml: &str) -> tempfile::TempDir {
+    let temp = tempfile::tempdir().unwrap();
+    fs::write(
+        temp.path().join("people.pg"),
+        "\nnode Person {\n  name: String @key\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("people.gq"),
+        "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("cluster.yaml"),
+        format!(
+            r#"
+version: 1
+graphs:
+  knowledge:
+    schema: ./people.pg
+    queries:
+      find_person:
+        file: ./people.gq
+{policies_yaml}"#
+        ),
+    )
+    .unwrap();
+    let import = omnigraph_cluster::import_config_dir(temp.path()).await;
+    assert!(import.ok, "{:?}", import.diagnostics);
+    let apply = omnigraph_cluster::apply_config_dir(temp.path()).await;
+    assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+    temp
+}
+
+fn cluster_settings(dir: &Path) -> color_eyre::eyre::Result<omnigraph_server::ServerConfig> {
+    omnigraph_server::load_server_settings(None, Some(&dir.to_path_buf()), None, None, None, true)
+}
+
+#[tokio::test]
+async fn cluster_boot_serves_applied_state() {
+    let temp = converged_cluster_dir("").await;
+    let settings = cluster_settings(temp.path()).unwrap();
+    let omnigraph_server::ServerConfigMode::Multi {
+        graphs,
+        config_path,
+        server_policy_file,
+    } = settings.mode
+    else {
+        panic!("cluster boot must select multi-graph routing");
+    };
+    assert_eq!(graphs.len(), 1);
+    assert_eq!(graphs[0].graph_id, "knowledge");
+    assert!(server_policy_file.is_none());
+
+    let state =
+        omnigraph_server::open_multi_graph_state(graphs, Vec::new(), None, config_path)
+            .await
+            .unwrap();
+    let app = build_app(state);
+
+    // The management surface keeps its closed-by-default contract: without a
+    // cluster-scoped policy bundle there is no server-level Cedar engine, so
+    // GET /graphs refuses even in cluster mode.
+    let (status, body) = json_response(
+        &app,
+        Request::builder().uri("/graphs").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/graphs/knowledge/queries")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["queries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|q| q["name"] == "find_person"),
+        "{body}"
+    );
+
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/graphs/knowledge/queries/find_person")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"params":{"name":"nobody"}}"#))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn cluster_boot_wires_policy_bindings_into_cedar_slots() {
+    let temp = tempfile::tempdir().unwrap();
+    drop(temp);
+    let policy_block = r#"policies:
+  graph_rules:
+    file: ./graph.policy.yaml
+    applies_to: [knowledge]
+  cluster_rules:
+    file: ./cluster.policy.yaml
+    applies_to: [cluster]
+"#;
+    let temp = {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("people.pg"),
+            "\nnode Person {\n  name: String @key\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("people.gq"),
+            "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("graph.policy.yaml"),
+            permit_all_policy_yaml(&["default"]),
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("cluster.policy.yaml"),
+            permit_all_policy_yaml(&["default"]).replace("protected_branches: [main]\n", "protected_branches: [main]\nkind: server\n"),
+        )
+        .unwrap();
+        fs::write(
+            temp.path().join("cluster.yaml"),
+            format!(
+                r#"
+version: 1
+graphs:
+  knowledge:
+    schema: ./people.pg
+    queries:
+      find_person:
+        file: ./people.gq
+{policy_block}"#
+            ),
+        )
+        .unwrap();
+        let import = omnigraph_cluster::import_config_dir(temp.path()).await;
+        assert!(import.ok, "{:?}", import.diagnostics);
+        let apply = omnigraph_cluster::apply_config_dir(temp.path()).await;
+        assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
+        temp
+    };
+
+    let settings = cluster_settings(temp.path()).unwrap();
+    let omnigraph_server::ServerConfigMode::Multi {
+        graphs,
+        server_policy_file,
+        ..
+    } = settings.mode
+    else {
+        panic!("cluster boot must select multi-graph routing");
+    };
+    let graph_policy = graphs[0].policy_file.as_ref().expect("graph-bound bundle");
+    assert!(
+        graph_policy
+            .to_string_lossy()
+            .contains("__cluster/resources/policy/graph_rules/"),
+        "{graph_policy:?}"
+    );
+    let server_policy = server_policy_file.expect("cluster-bound bundle");
+    assert!(
+        server_policy
+            .to_string_lossy()
+            .contains("__cluster/resources/policy/cluster_rules/"),
+        "{server_policy:?}"
+    );
+}
+
+#[tokio::test]
+async fn cluster_boot_refusals() {
+    // Mutual exclusion with --config / URI.
+    let temp = converged_cluster_dir("").await;
+    let dir = temp.path().to_path_buf();
+    let err = omnigraph_server::load_server_settings(
+        Some(&dir.join("omnigraph.yaml")),
+        Some(&dir),
+        None,
+        None,
+        None,
+        true,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("exclusive boot source"), "{err}");
+    let err = omnigraph_server::load_server_settings(
+        None,
+        Some(&dir),
+        Some("file:///tmp/x.omni".to_string()),
+        None,
+        None,
+        true,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("exclusive boot source"), "{err}");
+
+    // Tampered catalog blob refuses boot with the remedy.
+    let blob_dir = dir.join("__cluster/resources/query/knowledge/find_person");
+    let blob = fs::read_dir(&blob_dir).unwrap().next().unwrap().unwrap().path();
+    fs::write(&blob, "tampered").unwrap();
+    let err = cluster_settings(&dir).unwrap_err();
+    assert!(
+        err.to_string().contains("catalog_payload_digest_mismatch"),
+        "{err}"
+    );
+    assert!(err.to_string().contains("cluster refresh"), "{err}");
+
+    // Missing state refuses with the import/apply remedy.
+    let empty = tempfile::tempdir().unwrap();
+    let err = cluster_settings(empty.path()).unwrap_err();
+    assert!(err.to_string().contains("cluster_state_missing"), "{err}");
 }

@@ -4673,6 +4673,7 @@ dependencies = [
  "futures",
  "lance",
  "lance-index",
+ "omnigraph-cluster",
  "omnigraph-compiler",
  "omnigraph-engine",
  "omnigraph-policy",
