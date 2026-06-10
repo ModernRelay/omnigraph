@@ -1424,22 +1424,29 @@ policies:
     let mixed = cluster_json(temp.path(), "apply");
     assert_eq!(mixed["ok"], true, "{mixed}");
     assert_eq!(mixed["converged"], false, "{mixed}");
+    // Stage 4C: deletes are gated on a digest-bound approval, one gate per
+    // subtree (the graph-level approval carries schema + queries).
     assert_eq!(
         change_for(&mixed, "graph.engineering")["disposition"],
-        "deferred"
-    );
-    assert_eq!(
-        change_for(&mixed, "schema.engineering")["disposition"],
-        "deferred"
-    );
-    assert_eq!(
-        change_for(&mixed, "query.engineering.find_service")["disposition"],
         "blocked"
     );
     assert_eq!(
-        change_for(&mixed, "query.engineering.find_service")["reason"],
-        "dependency_not_applied"
+        change_for(&mixed, "graph.engineering")["reason"],
+        "approval_required"
     );
+    assert_eq!(
+        change_for(&mixed, "schema.engineering")["reason"],
+        "approval_required"
+    );
+    assert_eq!(
+        change_for(&mixed, "query.engineering.find_service")["reason"],
+        "approval_required"
+    );
+    let gate_plan = cluster_json(temp.path(), "plan");
+    let gates = gate_plan["approvals_required"].as_array().unwrap();
+    assert_eq!(gates.len(), 1, "{gate_plan}");
+    assert_eq!(gates[0]["resource"], "graph.engineering");
+    assert_eq!(gates[0]["satisfied"], false);
     assert_eq!(
         change_for(&mixed, "query.knowledge.find_person")["disposition"],
         "applied"
@@ -1461,7 +1468,7 @@ policies:
     let mut sorted = order.clone();
     sorted.sort_unstable();
     assert_eq!(order, sorted, "{mixed}");
-    // Graph deletion cannot converge until stage 4C's approval artifacts.
+    // Conclusion (approve + converge) extends below once the delete executor lands.
 }
 
 /// Stage 4A headline: a declared graph is created by `cluster apply` itself —
