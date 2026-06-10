@@ -99,14 +99,14 @@ fn query_blob(config_dir: &Path, digests: &BTreeMap<String, String>) -> PathBuf 
         .join(format!("{}.gq", digests["query.knowledge.find_person"]))
 }
 
-#[test]
-fn failpoint_wiring_returns_injected_diagnostic() {
+#[tokio::test]
+async fn failpoint_wiring_returns_injected_diagnostic() {
     let scenario = FailScenario::setup();
     let dir = fixture();
     seed_applyable_state(dir.path());
 
     let _failpoint = ScopedFailPoint::new("cluster_apply.after_payload_phase", "return");
-    let out = apply_config_dir(dir.path());
+    let out = apply_config_dir(dir.path()).await;
     assert!(!out.ok);
     assert!(out.diagnostics.iter().any(|diagnostic| {
         diagnostic.code == "injected_failpoint"
@@ -121,8 +121,8 @@ fn failpoint_wiring_returns_injected_diagnostic() {
 /// Crash between the payload phase and the state write: blobs are on disk,
 /// state.json is byte-identical, nothing is acknowledged — and a plain re-run
 /// repairs by trusting the existing content-addressed blobs.
-#[test]
-fn apply_crash_after_payload_phase_leaves_state_unmoved_then_recovers() {
+#[tokio::test]
+async fn apply_crash_after_payload_phase_leaves_state_unmoved_then_recovers() {
     let scenario = FailScenario::setup();
     let dir = fixture();
     let digests = seed_applyable_state(dir.path());
@@ -130,7 +130,7 @@ fn apply_crash_after_payload_phase_leaves_state_unmoved_then_recovers() {
 
     {
         let _failpoint = ScopedFailPoint::new("cluster_apply.after_payload_phase", "return");
-        let out = apply_config_dir(dir.path());
+        let out = apply_config_dir(dir.path()).await;
         assert!(!out.ok);
         assert!(!out.state_written);
         assert!(!out.converged);
@@ -149,7 +149,7 @@ fn apply_crash_after_payload_phase_leaves_state_unmoved_then_recovers() {
     }
 
     // The repair is a plain re-run: existing blobs are trusted by digest.
-    let recovered = apply_config_dir(dir.path());
+    let recovered = apply_config_dir(dir.path()).await;
     assert!(recovered.ok, "{:?}", recovered.diagnostics);
     assert!(recovered.converged);
     assert!(recovered.state_written);
@@ -163,8 +163,8 @@ fn apply_crash_after_payload_phase_leaves_state_unmoved_then_recovers() {
 /// A concurrent writer mutating state.json between apply's read and its write
 /// (possible under `state.lock: false`) must surface `state_cas_mismatch`,
 /// acknowledge nothing, and leave the concurrent writer's state on disk.
-#[test]
-fn apply_cas_race_surfaces_state_cas_mismatch() {
+#[tokio::test]
+async fn apply_cas_race_surfaces_state_cas_mismatch() {
     let scenario = FailScenario::setup();
     let dir = fixture();
     let digests = seed_applyable_state(dir.path());
@@ -182,7 +182,7 @@ fn apply_cas_race_surfaces_state_cas_mismatch() {
             fs::write(&race_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
         });
 
-    let out = apply_config_dir(dir.path());
+    let out = apply_config_dir(dir.path()).await;
     drop(failpoint);
 
     assert!(!out.ok);
@@ -212,8 +212,136 @@ fn apply_cas_race_surfaces_state_cas_mismatch() {
     assert!(query_blob(dir.path(), &digests).exists());
 
     // Recovery is a plain re-run against the rewritten state.
-    let recovered = apply_config_dir(dir.path());
+    let recovered = apply_config_dir(dir.path()).await;
     assert!(recovered.ok, "{:?}", recovered.diagnostics);
     assert!(recovered.converged);
+    scenario.teardown();
+}
+
+fn seed_empty_state(config_dir: &Path) {
+    let state_dir = config_dir.join("__cluster");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        r#"{
+  "version": 1,
+  "state_revision": 1,
+  "applied_revision": { "resources": {} }
+}
+"#,
+    )
+    .unwrap();
+}
+
+fn recovery_sidecars(config_dir: &Path) -> Vec<PathBuf> {
+    match fs::read_dir(config_dir.join("__cluster/recoveries")) {
+        Ok(entries) => {
+            let mut paths: Vec<PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+                .collect();
+            paths.sort();
+            paths
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Crash before the init: the create-intent sidecar survives, nothing moved.
+/// The next run's sweep removes the intent (row 1) and the same run creates
+/// the graph and converges.
+#[tokio::test]
+async fn create_crash_before_init_recovers_via_sweep() {
+    let scenario = FailScenario::setup();
+    let dir = fixture();
+    seed_empty_state(dir.path());
+
+    {
+        let _failpoint = ScopedFailPoint::new("cluster_apply.before_graph_create", "return");
+        let out = apply_config_dir(dir.path()).await;
+        assert!(!out.ok);
+        assert!(out.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "injected_failpoint"
+                && diagnostic
+                    .message
+                    .contains("cluster_apply.before_graph_create")
+        }));
+        assert_eq!(recovery_sidecars(dir.path()).len(), 1);
+        assert!(!dir.path().join("graphs/knowledge.omni").exists());
+        // No resource digest moved.
+        let state: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(dir.path().join("__cluster/state.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            state["applied_revision"]["resources"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    let recovered = apply_config_dir(dir.path()).await;
+    assert!(recovered.ok, "{:?}", recovered.diagnostics);
+    assert!(recovered.converged);
+    assert!(dir.path().join("graphs/knowledge.omni").exists());
+    assert!(recovery_sidecars(dir.path()).is_empty());
+    scenario.teardown();
+}
+
+/// Crash after the init but before the state CAS: the graph exists, the
+/// ledger is stale, nothing was acknowledged. The next run's sweep rolls the
+/// ledger forward (row 4) with an audit entry, and the run converges.
+#[tokio::test]
+async fn create_crash_after_init_rolls_state_forward() {
+    let scenario = FailScenario::setup();
+    let dir = fixture();
+    seed_empty_state(dir.path());
+    let state_before = fs::read(dir.path().join("__cluster/state.json")).unwrap();
+
+    {
+        let _failpoint = ScopedFailPoint::new("cluster_apply.after_graph_create", "return");
+        let out = apply_config_dir(dir.path()).await;
+        assert!(!out.ok);
+        assert!(!out.state_written);
+        // The graph exists; the cluster state is byte-identical (no ack).
+        assert!(dir.path().join("graphs/knowledge.omni").exists());
+        assert_eq!(
+            fs::read(dir.path().join("__cluster/state.json")).unwrap(),
+            state_before
+        );
+        // The sidecar carries the post-init manifest pin.
+        let sidecars = recovery_sidecars(dir.path());
+        assert_eq!(sidecars.len(), 1);
+        let sidecar: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&sidecars[0]).unwrap()).unwrap();
+        assert!(
+            sidecar["expected_manifest_version"].is_number(),
+            "{sidecar}"
+        );
+    }
+
+    let recovered = apply_config_dir(dir.path()).await;
+    assert!(recovered.ok, "{:?}", recovered.diagnostics);
+    assert!(
+        recovered
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "cluster_recovery_rolled_forward")
+    );
+    assert!(recovered.converged);
+    assert!(recovery_sidecars(dir.path()).is_empty());
+    let state: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(dir.path().join("__cluster/state.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        state["recovery_records"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|record| record["outcome"] == "rolled_forward")
+    );
     scenario.teardown();
 }
