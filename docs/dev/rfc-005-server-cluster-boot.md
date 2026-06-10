@@ -1,6 +1,7 @@
 # RFC: Server Boots from Cluster State — Phase 5 of the Cluster Control Plane
 
-**Status:** Proposed
+**Status:** Landed (5A policy bindings #175; 5B/5C the `--cluster` boot mode — one PR)
+**Implementation deviations:** (1) cluster mode reuses `ServerConfigMode::Multi` (a new settings *source*, not a new enum variant; `config_path` carries the cluster dir). (2) Stored queries load via `QueryRegistry::from_specs` from verified blob *content*, not blob paths. (3) More than one policy bundle binding a single scope is a boot error (the serving pipeline holds one bundle per graph + one server-level; stacking is a later slice). (4) `GET /graphs` keeps its closed-by-default contract — without a cluster-bound bundle there is no server-level Cedar engine, so enumeration refuses.
 **Date:** 2026-06-10
 **Builds on:** Phase 4 complete ([rfc-004-cluster-graph-schema-apply.md](rfc-004-cluster-graph-schema-apply.md), Landed): `cluster apply` converges graphs, schemas, stored queries, and policies into the cluster catalog. Normative context: [cluster-config-specs.md](cluster-config-specs.md) (the migration model's "window 2"), [cluster-axioms.md](cluster-axioms.md) (axiom 15), [cluster-config-implementation-spec.md](cluster-config-implementation-spec.md) (Phase 5 rollout, Compatibility Stance #7–#9, exit criterion 7).
 **Target release:** unversioned (phased — see Sequencing).

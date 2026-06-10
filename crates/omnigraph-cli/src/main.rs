@@ -856,7 +856,7 @@ fn print_cluster_apply_human(output: &ApplyOutput) {
             "  state: revision {}, converged: {}, written: {}",
             state.state_revision, output.converged, output.state_written
         );
-        println!("  note: applied = recorded in the cluster catalog; the server still boots from omnigraph.yaml");
+        println!("  note: cluster-booted servers (--cluster) serve this on their next restart; omnigraph.yaml deployments are unaffected");
     }
     print_cluster_diagnostics(&output.diagnostics);
 }

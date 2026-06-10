@@ -1,6 +1,6 @@
 # Cluster Config
 
-**Status:** Stage 4C — Phase 4 complete (graph create, schema apply, gated graph delete).
+**Status:** Phase 5 — cluster-booted serving (`omnigraph-server --cluster`).
 
 Cluster config is the future control-plane configuration surface for a whole
 OmniGraph deployment. In this stage, OmniGraph can validate a local
@@ -190,10 +190,12 @@ Deletes remove the resource from state; their old payload blobs stay on disk
 (garbage collection is a later stage). Re-running a converged apply is a no-op:
 no state write, no revision change (`state_written: false`).
 
-**Applied means recorded in the cluster catalog — nothing more.** The server
-still boots from `omnigraph.yaml`; no query or policy applied here serves
-traffic until the server-boot stage ships, as an explicit per-deployment mode
-switch.
+**Applied means serving — for deployments that opt in.** A server started
+with `--cluster <dir>` boots from the applied revision (see
+[Serving from the cluster](#serving-from-the-cluster-the-mode-switch)); it
+picks up newly applied state on its next restart. Deployments still booting
+from `omnigraph.yaml` are untouched: for them, applied means recorded in the
+catalog, nothing more.
 
 ### Graph creation
 
@@ -304,6 +306,40 @@ desired revision". The applied `config_digest` is only recorded when apply
 fully converges. The `graph.<id>` composite digest is recomputed from state's
 own schema/query digests after each apply, so applied query changes converge
 without graph movement.
+
+## Serving from the cluster (the mode switch)
+
+```bash
+omnigraph-server --cluster ./company-brain --bind 0.0.0.0:8080
+```
+
+`--cluster <dir>` is an **exclusive boot source** (axiom 15): it cannot
+combine with a graph URI, `--target`, or `--config`, and in this mode
+`omnigraph.yaml` is never read — not for graphs, not for queries, not for
+policies. The server serves the **applied revision**: graph roots recorded in
+`state.json`, stored-query and policy content from the content-addressed
+catalog at the applied digests (re-verified at boot), and policy bundles
+wired by their applied `applies_to` bindings — `cluster`-bound bundles become
+the server-level Cedar engine, graph-bound bundles attach per graph.
+Un-applied config drift never leaks into serving; `cluster plan` is where
+drift is visible. Routing is always multi-graph (`/graphs/{id}/...`). Bearer
+tokens and the bind address stay process-level (flags/env) — they are
+per-replica facts, not cluster facts.
+
+Boot is fail-fast: missing or unreadable state, pending recovery sidecars,
+missing/tampered catalog blobs, policy entries without binding metadata
+(pre-binding ledgers — re-run `cluster apply`), an empty graph set, more than
+one policy bundle binding a single scope (split or merge bundles; stacked
+scopes are a later stage), unopenable graph roots, and stored queries that no
+longer type-check all refuse startup with a remedy. A held state lock is
+*not* an error — boot reads the atomically-replaced state file without
+locking.
+
+Serving is static per process: the server reads the applied revision once at
+startup, so picking up newly applied state means restarting it. Stored
+queries are all listed in `GET /queries` in cluster mode (the cluster
+registry has no expose flag; exposure becomes a policy decision in a later
+phase).
 
 ## Status
 
