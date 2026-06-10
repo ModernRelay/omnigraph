@@ -1,6 +1,6 @@
 # Cluster Config
 
-**Status:** Stage 4A graph-create apply preview.
+**Status:** Stage 4B schema-apply preview.
 
 Cluster config is the future control-plane configuration surface for a whole
 OmniGraph deployment. In this stage, OmniGraph can validate a local
@@ -8,11 +8,12 @@ OmniGraph deployment. In this stage, OmniGraph can validate a local
 local JSON state ledger, explicitly refresh/import graph observations into
 that ledger, manually remove a held local state lock by exact lock id, and
 **apply the executable subset of the plan** — stored-query and policy-bundle
-catalog writes, and **graph creation**: a declared graph that does not exist
-yet is initialized by apply itself at the derived root. It does not change
-existing schemas (deferred to a later stage), move existing graph manifests,
-start servers, or serve anything it applies: the server still boots from
-`omnigraph.yaml`.
+catalog writes, **graph creation** (a declared graph that does not exist yet
+is initialized by apply at the derived root), and **schema updates**: a
+changed schema is migrated on the live graph by apply itself, soft drops
+only. It does not delete graphs (a later stage), perform data-loss
+migrations, start servers, or serve anything it applies: the server still
+boots from `omnigraph.yaml`.
 
 ## Commands
 
@@ -156,7 +157,8 @@ condition in `reason`).
 ## Apply
 
 `cluster apply` executes the executable subset of the plan — stored-query and
-policy-bundle changes, and graph creates. There is no confirm flag: `cluster plan` is the preview,
+policy-bundle changes, graph creates, and schema updates. There is no confirm
+flag: `cluster plan` is the preview,
 and apply recomputes the same diff under the state lock before executing, so a
 stale preview can never be applied. Apply requires an existing `state.json`
 (`state_missing` directs you to `cluster import` first).
@@ -212,7 +214,46 @@ will execute it, producing an **empty** graph at the root. The data was
 already lost when the root vanished; the create is visible in the plan
 (disposition `applied`) before anything runs.
 
-Schema changes to existing graphs are never executed by this stage. They are
+### Schema updates
+
+A `schema.<id>` update (the declared schema differs from what state records)
+is executed by apply via the engine's schema-apply, after graph creates and
+before catalog writes — so a query change that depends on the new schema
+applies in the same run. Each schema apply is sidecar-fenced like a create:
+pre-operation manifest version recorded, post-operation version written back,
+sidecar retired only after the state update lands; the recovery sweep
+classifies survivors by schema digest (consistent ledger → retired; completed
+on the graph → state rolled forward with an audit entry; anything else →
+`drifted`/`actual_applied_state_pending`, kept).
+
+Migrations run with **soft drops only** — a removed property disappears from
+the current version while prior versions retain the data (reversible until
+`cleanup`). Data-loss migrations (`allow_data_loss`) are not reachable from
+cluster apply until the approval-artifact stage. Unsupported migrations
+(e.g. changing a property's type), engine lock contention, or graphs with
+user branches fail loudly as `schema_apply_failed` with the engine's message;
+dependent changes are demoted to `blocked` and graph-moving work stops for
+the run.
+
+`cluster plan` previews schema updates with the engine's real migration plan:
+each schema change carries a `migration` field (`supported` + typed steps),
+and the human output prints the steps. If the live graph cannot be opened the
+preview degrades to the digest diff with a `schema_preview_unavailable`
+warning.
+
+**Drift is converged, not just reported.** A schema changed out-of-band on
+the live graph shows up as `drifted` after `refresh`, and the next plan
+proposes migrating it back to the declared schema — apply executes that like
+any other soft migration. Drift correction is gated by the same rules as any
+change; nothing about it is hidden (the plan shows the steps, including soft
+drops of out-of-band fields).
+
+**Attribution.** `cluster apply --as <actor>` records the operator identity
+in recovery sidecars and audit entries and threads it to the engine's
+schema-apply (so commit attribution and Cedar enforcement — wherever a policy
+checker is installed — work unchanged).
+
+Schema deletes (removing a graph) are never executed by this stage. They are
 reported as `deferred` (warning `apply_unsupported_change`), and query/policy
 changes that depend on them are `blocked` (warning `apply_dependency_blocked`, status
 `blocked` in state). A partially-applicable plan still exits 0 with warnings;
