@@ -81,7 +81,8 @@ Written under the state lock **before** any engine call that can move or create 
 Path: `__cluster/recoveries/{operation_id}.json`, atomic write (temp + rename, the `write_state` discipline). Notes:
 
 - `observed_manifest_version` is the live graph's main-branch manifest version read at sidecar-write time (`null` for `graph_create` — no graph yet). This is the fencing value: apply refuses to proceed if it differs from the version recorded in `observations["graph.<id>"]` at plan time *and* re-observed under the lock (the same recompute-under-lock posture as Stage 3A's diff).
-- `expected_manifest_version` starts `null` and is **rewritten into the sidecar immediately after the engine call returns** with `SchemaApplyResult.manifest_version` (or the post-init observation). A crash before that rewrite leaves `null`, which the sweep treats as "engine call outcome unknown — classify by observation only."
+- `expected_manifest_version` starts `null` and is **rewritten into the sidecar immediately after the engine call returns** with `SchemaApplyResult.manifest_version` (or the post-init observation). A crash before that rewrite leaves `null`, which the sweep treats as "engine call outcome unknown — classify by observation only." For `graph_delete` the field is **always `null`** — prefix removal produces no new manifest version, so there is no rewrite step for that kind; delete sidecars are classified purely by root presence + state tombstone (D3 rows 7/7b/8).
+- `state_cas_base` is **recorded for audit and diagnostics only — the sweep decision logic never consults it.** The sweep re-reads `state.json` under the lock and performs ordinary CAS-checked writes, so an independent state mutation between sidecar write and sweep is handled by the CAS like any other concurrent write, not by this field. Its value is forensic: a recovery audit entry can show which state revision the interrupted operation departed from.
 - One sidecar per graph-moving resource operation. Apply processes graph-moving operations strictly sequentially (D5), so at most one sidecar is pending per apply run *per graph*, and the sweep processes sidecars in ULID order.
 
 ### D3. Recovery decision matrix — roll-forward-only (exit criterion 2, second half)
@@ -93,15 +94,16 @@ Path: `__cluster/recoveries/{operation_id}.json`, atomic write (temp + rename, t
 | # | Sidecar kind | Observation | Decision |
 |---|---|---|---|
 | 1 | any | Graph at `observed_manifest_version` (nothing moved) | Engine call never landed. Delete sidecar; the command's own plan/apply re-proposes the change. |
-| 2 | any | Graph at `expected_manifest_version`; state already records the outcome | Crash fell between state CAS and sidecar delete. Delete sidecar; done. |
+| 2 | `graph_create` / `schema_apply` | Graph at `expected_manifest_version`; state already records the outcome | Crash fell between state CAS and sidecar delete. Delete sidecar; done. |
 | 3 | `schema_apply` | Graph at `expected_manifest_version` (or, when `expected` is `null`, live schema digest == `desired_schema_digest`); state stale | **Roll the cluster state forward**: record the live schema digest, recompute the graph composite, set statuses `applied`, append a `recovery_records` entry (audit), CAS-write, delete sidecar. |
 | 4 | `graph_create` | Graph opens read-only and its schema digest == `desired_schema_digest`; state stale | Same roll-forward as #3 (the create completed). |
 | 5 | `graph_create` | Root exists but the graph does not open (the engine's partial-init gap) | Status `error`, condition `graph_create_incomplete`, message: remove the root and re-run apply. **No auto-delete** — reconciler-initiated deletion is the same data-loss class as human deletion (high-risk decision #7). Sidecar kept until the operator acts and a sweep observes a clean state. |
 | 6 | any | Graph at any other version (out-of-band movement during the crash window) | Status `drifted`, condition `actual_applied_state_pending`; sidecar kept; the command refuses graph-moving work for that graph until `cluster refresh` re-observes and the operator re-plans. No success is acknowledged for the interrupted operation. |
-| 7 | `graph_delete` | Root absent; state stale | Roll forward: tombstone the graph subtree out of state (D6), record audit, delete sidecar. |
+| 7 | `graph_delete` | Root absent; state already tombstoned | The delete kind's analog of row 2 (no manifest exists to version-check): crash fell between state CAS and sidecar delete. Delete sidecar; done. |
+| 7b | `graph_delete` | Root absent; state stale | Roll forward: tombstone the graph subtree out of state (D6), record audit, delete sidecar. Idempotent — re-entry after a crash mid-row lands in row 7. |
 | 8 | `graph_delete` | Root present (delete crashed mid-prefix-removal or never started) | If the approval artifact is still attached (D4), the delete is re-proposed by plan and re-runnable; status `drifted`, condition `graph_delete_incomplete`. Partial prefix removal leaves an unopenable graph — same operator message as #5. |
 
-Rows 3, 4 and 7 are the only mutations the sweep performs, and each is an ordinary CAS-checked state write under the lock — the sweep introduces no new write machinery.
+Rows 3, 4 and 7b are the only mutations the sweep performs, and each is an ordinary CAS-checked state write under the lock — the sweep introduces no new write machinery.
 
 ### D4. Approval artifacts (exit criteria 1-partial and 6-partial; axioms 8 and 11)
 
@@ -173,7 +175,7 @@ Additive. Stage 3A/3B behavior is unchanged for catalog-only configs; existing s
 |---|---|---|
 | **4A graph create** | `Omnigraph::init` at derived roots; create-intent sidecar; D3 rows 1/2/4/5; dependents unblock in-run | Failpoint tests for crash-before/after-init; e2e: declare graph → apply → import-less convergence |
 | **4B schema apply** | Full sidecar lifecycle; roll-forward sweep (D3 rows 3/6); actor threading; plan data-impact preview; soft-drop default | Failpoint tests per matrix row; e2e: schema evolution fully cluster-driven (replaces the Stage 3A defer→manual→refresh loop) |
-| **4C graph delete** | `cluster approve` + artifact consumption; prefix removal; tombstones; D3 rows 7/8 | Failpoint tests incl. partial-removal; e2e: gated delete refused without artifact, executed with it, stale artifact rejected |
+| **4C graph delete** | `cluster approve` + artifact consumption; prefix removal; tombstones; D3 rows 7/7b/8 | Failpoint tests incl. partial-removal; e2e: gated delete refused without artifact, executed with it, stale artifact rejected |
 
 Each stage is a separate PR with boundary-matched tests (the Stage 1–3B discipline). 4A ships first because it moves no existing manifest; 4B is the heart; 4C last because it is the only irreversible-tier executor and consumes the approval machinery 4B's hard-drop path also needs.
 
