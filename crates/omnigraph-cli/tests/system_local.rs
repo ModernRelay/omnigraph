@@ -1717,6 +1717,13 @@ graphs:
 
 // ---- Comprehensive full-cycle cluster e2e (Phases 1-5 composed) ----
 
+/// Run a `cluster` subcommand and return its JSON output. Deliberately does
+/// NOT assert a zero exit code: blocked/unconverged runs (e.g. an `apply`
+/// awaiting an approval) exit non-zero by contract while still emitting the
+/// structured output the caller asserts on (`ok`/`converged`/dispositions).
+/// Commands where failure is never expected must assert on those fields
+/// (every call here checks `ok` or `converged`) or use `cli()` directly with
+/// `status.success()`.
 fn cluster_cli(dir: &std::path::Path, args: &[&str]) -> serde_json::Value {
     let mut command = cli();
     command.arg("cluster");
@@ -1813,12 +1820,30 @@ fn invoke_query(
     (status, body)
 }
 
+/// Opt-out for the comprehensive system e2es below. They need no external
+/// services — only the workspace-built `omnigraph`/`omnigraph-server`
+/// binaries (cargo provides them via `CARGO_BIN_EXE_*`), ephemeral localhost
+/// ports, and local-FS temp dirs — but they spawn real server processes and
+/// run multi-stage lifecycles, so constrained sandboxes can suppress them:
+/// `OMNIGRAPH_SKIP_SYSTEM_E2E=1 cargo test ...` (same skip-with-message
+/// pattern as the S3 tests' `OMNIGRAPH_S3_TEST_BUCKET` gate).
+fn skip_system_e2e(test_name: &str) -> bool {
+    if std::env::var("OMNIGRAPH_SKIP_SYSTEM_E2E").is_ok_and(|v| !v.is_empty() && v != "0") {
+        eprintln!("skipping {test_name}: OMNIGRAPH_SKIP_SYSTEM_E2E is set");
+        return true;
+    }
+    false
+}
+
 /// The whole control-plane story in one test: declare two graphs → converge
 /// (apply creates them) → serve → evolve schema+query in one apply → restart
 /// serves the new shape → out-of-band drift converged back → approved graph
 /// delete → restart serves the survivor only → plan empty.
 #[test]
 fn local_cluster_full_lifecycle_declare_serve_evolve_delete() {
+    if skip_system_e2e("local_cluster_full_lifecycle_declare_serve_evolve_delete") {
+        return;
+    }
     let temp = tempfile::tempdir().unwrap();
     let dir = temp.path();
     write_two_graph_cluster(dir);
@@ -1931,8 +1956,15 @@ fn local_cluster_full_lifecycle_declare_serve_evolve_delete() {
         .output()
         .unwrap();
     assert!(
-        !String::from_utf8_lossy(&schema_show.stdout).contains("rogue"),
-        "drift must be soft-dropped back to the declared schema"
+        schema_show.status.success(),
+        "schema show failed: {}",
+        String::from_utf8_lossy(&schema_show.stderr)
+    );
+    let shown = String::from_utf8_lossy(&schema_show.stdout);
+    assert!(shown.contains("Person"), "schema show produced no schema: {shown}");
+    assert!(
+        !shown.contains("rogue"),
+        "drift must be soft-dropped back to the declared schema: {shown}"
     );
 
     // Retire engineering: gated delete, then the server serves the survivor.
@@ -2005,6 +2037,9 @@ graphs:
 /// owns query invocation — enforced over HTTP with bearer-resolved actors.
 #[test]
 fn local_cluster_serving_enforces_applied_policy_bindings() {
+    if skip_system_e2e("local_cluster_serving_enforces_applied_policy_bindings") {
+        return;
+    }
     let temp = tempfile::tempdir().unwrap();
     let dir = temp.path();
     std::fs::write(
