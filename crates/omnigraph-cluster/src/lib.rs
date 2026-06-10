@@ -449,13 +449,17 @@ fn resolve_query_decls(
     graph_id: &str,
     decl: &QueriesDecl,
     diagnostics: &mut Vec<Diagnostic>,
-) -> BTreeMap<String, QueryConfig> {
+) -> (BTreeMap<String, QueryConfig>, BTreeMap<PathBuf, String>) {
     let paths: Vec<PathBuf> = match decl {
         QueriesDecl::Explicit(map) => {
-            return map
-                .iter()
-                .map(|(name, config)| (name.clone(), QueryConfig { file: config.file.clone() }))
-                .collect();
+            return (
+                map.iter()
+                    .map(|(name, config)| {
+                        (name.clone(), QueryConfig { file: config.file.clone() })
+                    })
+                    .collect(),
+                BTreeMap::new(),
+            );
         }
         QueriesDecl::Discover(path) => vec![path.clone()],
         QueriesDecl::DiscoverMany(paths) => paths.clone(),
@@ -499,6 +503,10 @@ fn resolve_query_decls(
 
     let mut registry: BTreeMap<String, QueryConfig> = BTreeMap::new();
     let mut origin: BTreeMap<String, PathBuf> = BTreeMap::new();
+    // Content read once at discovery and handed to the caller — the per-query
+    // digest/typecheck pass reuses it instead of re-reading (no N+1 reads, no
+    // window for the file to change between enumeration and validation).
+    let mut contents: BTreeMap<PathBuf, String> = BTreeMap::new();
     for (declared, resolved) in files {
         let source = match fs::read_to_string(&resolved) {
             Ok(source) => source,
@@ -539,8 +547,9 @@ fn resolve_query_decls(
             origin.insert(name.clone(), declared.clone());
             registry.insert(name, QueryConfig { file: declared.clone() });
         }
+        contents.insert(declared, source);
     }
-    registry
+    (registry, contents)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3725,7 +3734,8 @@ fn load_desired(config_dir: &Path) -> LoadOutcome {
             }
         });
 
-        let graph_queries = resolve_query_decls(&config_dir, graph_id, &graph.queries, &mut diagnostics);
+        let (graph_queries, query_contents) =
+            resolve_query_decls(&config_dir, graph_id, &graph.queries, &mut diagnostics);
         for (query_name, query) in &graph_queries {
             validate_id(
                 "query name",
@@ -3744,7 +3754,11 @@ fn load_desired(config_dir: &Path) -> LoadOutcome {
             });
 
             let query_path = resolve_config_path(&config_dir, &query.file);
-            match fs::read_to_string(&query_path) {
+            let source = match query_contents.get(&query.file) {
+                Some(cached) => Ok(cached.clone()),
+                None => fs::read_to_string(&query_path),
+            };
+            match source {
                 Ok(source) => {
                     let digest = sha256_hex(source.as_bytes());
                     graph_query_digests
