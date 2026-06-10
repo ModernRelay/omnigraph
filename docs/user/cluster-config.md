@@ -115,7 +115,10 @@ resource is planned as a create. If present, the file must use this shape:
       "graph.knowledge": { "digest": "..." },
       "schema.knowledge": { "digest": "..." },
       "query.knowledge.find_experts": { "digest": "..." },
-      "policy.base": { "digest": "..." }
+      "policy.base": {
+        "digest": "...",
+        "applies_to": ["cluster", "graph.knowledge"]
+      }
     }
   },
   "resource_statuses": {
@@ -146,6 +149,14 @@ successful `plan` instead reports `lock_acquired: true` and an
 writes `state.json` and does not scan live graphs. Use explicit
 `cluster refresh` / `cluster import` when the state ledger should be updated
 from live observations. Live drift scans during plan are later-stage work.
+
+Policy entries additionally record their applied `applies_to` bindings as
+normalized typed refs — the state ledger is serving-sufficient for the
+future server-boot stage. A change to `applies_to` alone (the policy file
+digest unchanged) appears in the plan as an Update marked `binding_change`
+(human output: `[bindings]`), applies like any catalog change, and counts
+toward convergence; ledgers written before this field existed are backfilled
+by the next apply.
 
 Each plan change carries a `disposition` field — an honest preview of what
 `cluster apply` will do with it in this stage: `applied` (executes), `derived`
