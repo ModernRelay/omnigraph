@@ -86,6 +86,7 @@ Full diagram and concurrency model: [docs/dev/architecture.md](docs/dev/architec
 | Diff / change feed (`diff_between`, `diff_commits`) | [docs/user/changes.md](docs/user/changes.md) |
 | Query execution, mutation execution, bulk loader, `load` vs `ingest` | [docs/dev/execution.md](docs/dev/execution.md) |
 | `optimize` (compaction) and `cleanup` (version GC) | [docs/user/maintenance.md](docs/user/maintenance.md) |
+| Cluster operator guide (deploy/manage clusters, approvals, recovery, serving) | [docs/user/cluster.md](docs/user/cluster.md) |
 | Cedar policy actions, scopes, CLI | [docs/user/policy.md](docs/user/policy.md) |
 | HTTP server endpoints, auth, error model, body limits | [docs/user/server.md](docs/user/server.md) |
 | CLI quick-start | [docs/user/cli.md](docs/user/cli.md) |
