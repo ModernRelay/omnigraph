@@ -218,6 +218,15 @@ pub fn spawn_server_with_cluster(cluster_dir: &Path) -> TestServer {
     spawn_server_process(command)
 }
 
+pub fn spawn_server_with_cluster_env(cluster_dir: &Path, envs: &[(&str, &str)]) -> TestServer {
+    let mut command = server_process();
+    command.arg("--cluster").arg(cluster_dir);
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    spawn_server_process(command)
+}
+
 pub fn spawn_server_with_config_env(config: &Path, envs: &[(&str, &str)]) -> TestServer {
     let mut command = server_process();
     command.arg("--config").arg(config);
