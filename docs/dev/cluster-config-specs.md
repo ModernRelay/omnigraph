@@ -178,6 +178,21 @@ but it remains a separate CAS step from graph manifest movement. -->
 
 ## ETL pipelines (the second data-plane seam)
 
+> **Scope note (2026-06-10): descoped to a separate project.** Pipelines are
+> a product surface of their own (scheduler, connectors, mapping language,
+> idempotency, run ledger) and will be designed and built outside the cluster
+> control-plane track. What this spec retains is the **socket** they plug
+> into, which is already enforced: (1) the `pipelines:` config field is
+> reserved — `cluster validate` rejects it with a typed `future_phase_field`
+> diagnostic, so it can never be silently squatted; (2) the typed address
+> form `pipeline.<name>` and the `Pipeline` resource kind are reserved in the
+> resource model; (3) axiom 13 fixes the contract any future implementation
+> must satisfy — the pipeline *definition* is a reconciled cluster resource,
+> its *execution* is data-plane and never reconciled. The design text below
+> stands as the requirements record for that project, not as a phase of this
+> one.
+
+
 External data — from another database, an API, a file drop, a stream — is a first-class config asset, not glue code that lives nowhere.
 
 A **Pipeline** is declared in config: a **source** (e.g. `notion`, `github`, `slack`, `gdrive`, `postgres`, `http`, `s3-files`, `kafka`), an optional **schedule/trigger**, and **one or more target graphs**, each with its own **mapping/transform** (external records → graph types & properties). A single feed can **fan out across graphs** — e.g. a GitHub sync that populates both the `engineering` graph and the people/teams in `knowledge`. It is reconciled like any resource — `apply` creates / updates / deletes / (re)schedules the pipeline *definition*. This is the canonical "company brain" move: the deployment's graphs are continuously assembled from the SaaS tools the org already uses.

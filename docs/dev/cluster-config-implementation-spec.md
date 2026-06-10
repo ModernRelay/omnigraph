@@ -529,7 +529,7 @@ These are the concrete "what requires downstream" rules.
 | Server registry | Boot from cluster state, eventually reload/reconcile graph handles, expose statuses | High | Affects routing, OpenAPI, auth, and workload admission |
 | API types/OpenAPI | Plan/status/apply DTOs if HTTP management endpoints ship | Medium/high | OpenAPI drift must be regenerated |
 | UI specs | New renderer/spec validator/binding checker | High | New product surface, not currently implemented |
-| Pipelines | New scheduler/runtime/connector/mapping/idempotency/run ledger | Very high | Second data-plane seam; large product and correctness surface |
+| Pipelines | New scheduler/runtime/connector/mapping/idempotency/run ledger | Very high | **Separate project** (socket reserved here); second data-plane seam, large product and correctness surface |
 | Embeddings | Cluster-level defaults, env refs, model/dimension validation, index interaction | Medium | Existing embedding code is mostly offline/client-side |
 | Docs | User docs for cluster config, policy, server, CLI; dev docs for invariants/testing | High | Public contract changes |
 | Tests | New cluster suites plus extensions to config/server/policy/recovery/schema/query tests | High | Needs boundary-matched coverage |
@@ -616,13 +616,22 @@ actor threading, 4A/4B/4C staging).
   docs and migrations say it can be narrowed.
 - Deprecate and later remove `mcp.expose` from target-state cluster config.
 
-### Phase 7: Pipeline Runtime
+### Pipelines: separate project (socket only)
 
-- Add scheduler/worker/runtime.
-- Add source connector contracts, mapping validation, idempotency keys,
-  per-target run status, and retry behavior.
-- Treat fan-out execution as data-plane writes unless explicitly staged through
-  branch/merge.
+Pipelines are **descoped from this rollout** (2026-06-10): the runtime
+(scheduler/worker, connector contracts, mapping validation, idempotency keys,
+per-target run status, retry behavior) is a separate project with its own
+RFC. This rollout guarantees only the socket:
+
+- `pipelines:` stays a reserved config field, rejected with a typed
+  `future_phase_field` diagnostic (enforced + test-covered in
+  `omnigraph-cluster`).
+- `pipeline.<name>` stays a reserved typed address; the resource model
+  (kind-agnostic state entries, extensible sidecar kinds, dependency edges)
+  accepts the new kind without reshaping.
+- Axiom 13 is the contract the future implementation must satisfy: the
+  definition is reconciled, the execution is data-plane; fan-out is statusful,
+  never silently atomic.
 
 ## Test Ownership
 
@@ -725,4 +734,4 @@ Before implementation begins beyond parser/validate, the RFC must answer:
 6. Bootstrap authority and first-actor story.
 7. Server startup and migration path from `omnigraph.yaml`.
 8. Per-query policy schema and compatibility bridge for `mcp.expose`.
-9. Pipeline runtime owner, status schema, and idempotency contract.
+9. Pipeline runtime owner, status schema, and idempotency contract — **deferred to the separate pipelines project's own RFC**; this rollout only reserves the socket.
