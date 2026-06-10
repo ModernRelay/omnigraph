@@ -3558,7 +3558,7 @@ async fn main() -> Result<()> {
                 finish_cluster_plan(&output, json)?;
             }
             ClusterCommand::Apply { config, json } => {
-                let output = apply_config_dir(config);
+                let output = apply_config_dir(config).await;
                 finish_cluster_apply(&output, json)?;
             }
             ClusterCommand::Status { config, json } => {

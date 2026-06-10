@@ -99,14 +99,14 @@ fn query_blob(config_dir: &Path, digests: &BTreeMap<String, String>) -> PathBuf 
         .join(format!("{}.gq", digests["query.knowledge.find_person"]))
 }
 
-#[test]
-fn failpoint_wiring_returns_injected_diagnostic() {
+#[tokio::test]
+async fn failpoint_wiring_returns_injected_diagnostic() {
     let scenario = FailScenario::setup();
     let dir = fixture();
     seed_applyable_state(dir.path());
 
     let _failpoint = ScopedFailPoint::new("cluster_apply.after_payload_phase", "return");
-    let out = apply_config_dir(dir.path());
+    let out = apply_config_dir(dir.path()).await;
     assert!(!out.ok);
     assert!(out.diagnostics.iter().any(|diagnostic| {
         diagnostic.code == "injected_failpoint"
@@ -121,8 +121,8 @@ fn failpoint_wiring_returns_injected_diagnostic() {
 /// Crash between the payload phase and the state write: blobs are on disk,
 /// state.json is byte-identical, nothing is acknowledged — and a plain re-run
 /// repairs by trusting the existing content-addressed blobs.
-#[test]
-fn apply_crash_after_payload_phase_leaves_state_unmoved_then_recovers() {
+#[tokio::test]
+async fn apply_crash_after_payload_phase_leaves_state_unmoved_then_recovers() {
     let scenario = FailScenario::setup();
     let dir = fixture();
     let digests = seed_applyable_state(dir.path());
@@ -130,7 +130,7 @@ fn apply_crash_after_payload_phase_leaves_state_unmoved_then_recovers() {
 
     {
         let _failpoint = ScopedFailPoint::new("cluster_apply.after_payload_phase", "return");
-        let out = apply_config_dir(dir.path());
+        let out = apply_config_dir(dir.path()).await;
         assert!(!out.ok);
         assert!(!out.state_written);
         assert!(!out.converged);
@@ -149,7 +149,7 @@ fn apply_crash_after_payload_phase_leaves_state_unmoved_then_recovers() {
     }
 
     // The repair is a plain re-run: existing blobs are trusted by digest.
-    let recovered = apply_config_dir(dir.path());
+    let recovered = apply_config_dir(dir.path()).await;
     assert!(recovered.ok, "{:?}", recovered.diagnostics);
     assert!(recovered.converged);
     assert!(recovered.state_written);
@@ -163,8 +163,8 @@ fn apply_crash_after_payload_phase_leaves_state_unmoved_then_recovers() {
 /// A concurrent writer mutating state.json between apply's read and its write
 /// (possible under `state.lock: false`) must surface `state_cas_mismatch`,
 /// acknowledge nothing, and leave the concurrent writer's state on disk.
-#[test]
-fn apply_cas_race_surfaces_state_cas_mismatch() {
+#[tokio::test]
+async fn apply_cas_race_surfaces_state_cas_mismatch() {
     let scenario = FailScenario::setup();
     let dir = fixture();
     let digests = seed_applyable_state(dir.path());
@@ -182,7 +182,7 @@ fn apply_cas_race_surfaces_state_cas_mismatch() {
             fs::write(&race_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
         });
 
-    let out = apply_config_dir(dir.path());
+    let out = apply_config_dir(dir.path()).await;
     drop(failpoint);
 
     assert!(!out.ok);
@@ -212,7 +212,7 @@ fn apply_cas_race_surfaces_state_cas_mismatch() {
     assert!(query_blob(dir.path(), &digests).exists());
 
     // Recovery is a plain re-run against the rewritten state.
-    let recovered = apply_config_dir(dir.path());
+    let recovered = apply_config_dir(dir.path()).await;
     assert!(recovered.ok, "{:?}", recovered.diagnostics);
     assert!(recovered.converged);
     scenario.teardown();
