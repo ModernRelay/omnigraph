@@ -58,6 +58,26 @@ got=$(sh "$ep" some-uri --bind 1.2.3.4:9 --extra)
 check "explicit args passthrough" \
   "ARGS: some-uri --bind 1.2.3.4:9 --extra" "$got"
 
+got=$(OMNIGRAPH_CLUSTER="/var/lib/omnigraph/company-brain" OMNIGRAPH_BIND="0.0.0.0:8080" sh "$ep")
+check "CLUSTER only (Phase 5 mode switch)" \
+  "ARGS: --cluster /var/lib/omnigraph/company-brain --bind 0.0.0.0:8080" "$got"
+
+# Exclusivity: OMNIGRAPH_CLUSTER refuses every combination, exit 64.
+for combo in "OMNIGRAPH_TARGET_URI=s3://b/g" "OMNIGRAPH_CONFIG=/etc/o.yaml" "OMNIGRAPH_TARGET=active"; do
+  if out=$(env "$combo" OMNIGRAPH_CLUSTER="/data/cluster" sh "$ep" 2>&1); then
+    echo "FAIL: CLUSTER + ${combo%%=*} unexpectedly succeeded: $out"
+    fail=1
+  else
+    status=$?
+    if [ "$status" -ne 64 ]; then
+      echo "FAIL: CLUSTER + ${combo%%=*} exited $status, want 64"
+      fail=1
+    else
+      echo "ok: CLUSTER + ${combo%%=*} refused (64)"
+    fi
+  fi
+done
+
 if [ "$fail" -ne 0 ]; then
   echo "entrypoint_test: FAILED"
   exit 1
