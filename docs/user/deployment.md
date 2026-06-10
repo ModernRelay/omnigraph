@@ -33,7 +33,7 @@ On Windows, the binaries are `omnigraph.exe` and `omnigraph-server.exe`.
 Run against a local graph:
 
 ```bash
-omnigraph-server ./graph.omni --bind 0.0.0.0:8080
+omnigraph-server graph.omni --bind 0.0.0.0:8080
 ```
 
 Run against an object-store-backed graph:
@@ -208,7 +208,7 @@ docker run --rm -p 8080:8080 \
   -e OMNIGRAPH_CONFIG="/etc/omnigraph/omnigraph.yaml" \
   -v "$PWD/config:/etc/omnigraph:ro" \
   omnigraph-server:local
-# /etc/omnigraph/omnigraph.yaml contains `policy: { file: ./policy.yaml }`;
+# /etc/omnigraph/omnigraph.yaml contains `policy: { file: policy.yaml }`;
 # policy.yaml (+ optional policy.tests.yaml) sit beside it in the mount.
 ```
 

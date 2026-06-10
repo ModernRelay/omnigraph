@@ -47,8 +47,8 @@ query register_employee_with_team($name: String, $age: I32, $team: String) {
 ```
 
 ```bash
-omnigraph change --query ./mutations.gq --name register_employee_with_team \
-    --params '{"name":"Alice","age":30,"team":"Acme"}' ./graph.omni
+omnigraph change --query mutations.gq --name register_employee_with_team \
+    --params '{"name":"Alice","age":30,"team":"Acme"}' graph.omni
 ```
 
 If the second statement fails (e.g. `Acme` doesn't exist), the publisher never publishes; `Alice` is not in the database. Atomic.
@@ -57,10 +57,10 @@ If the second statement fails (e.g. `Acme` doesn't exist), the publisher never p
 
 ```bash
 # Query 1
-omnigraph change --query ./mutations.gq --name register_employee --params '{"name":"Alice","age":30}' ./graph.omni
+omnigraph change --query mutations.gq --name register_employee --params '{"name":"Alice","age":30}' graph.omni
 
 # Query 2 — runs after Query 1 has already published
-omnigraph change --query ./mutations.gq --name link_to_team --params '{"name":"Alice","team":"Acme"}' ./graph.omni
+omnigraph change --query mutations.gq --name link_to_team --params '{"name":"Alice","team":"Acme"}' graph.omni
 ```
 
 These are **two publishes** on `main`. If Query 2 fails, Query 1's effects are already visible. There is no `ROLLBACK` for Query 1.
@@ -75,32 +75,32 @@ The pattern when you need to run multiple queries — possibly across multiple c
 
 ```bash
 # Fork a working branch from main.
-omnigraph branch create --from main onboarding/2026-04-25 ./graph.omni
+omnigraph branch create --from main onboarding/2026-04-25 graph.omni
 
 # Run any number of mutations on the branch — each one is its own publish on the branch.
 # Concurrent reads of `main` are unaffected.
 omnigraph change --branch onboarding/2026-04-25 \
-    --query ./mutations.gq --name register_employee \
-    --params '{"name":"Alice","age":30}' ./graph.omni
+    --query mutations.gq --name register_employee \
+    --params '{"name":"Alice","age":30}' graph.omni
 
 omnigraph change --branch onboarding/2026-04-25 \
-    --query ./mutations.gq --name register_employee \
-    --params '{"name":"Bob","age":25}' ./graph.omni
+    --query mutations.gq --name register_employee \
+    --params '{"name":"Bob","age":25}' graph.omni
 
 omnigraph change --branch onboarding/2026-04-25 \
-    --query ./mutations.gq --name link_to_team \
-    --params '{"name":"Alice","team":"Acme"}' ./graph.omni
+    --query mutations.gq --name link_to_team \
+    --params '{"name":"Alice","team":"Acme"}' graph.omni
 
 # Inspect the branch — read queries work just like on main.
 omnigraph read --branch onboarding/2026-04-25 \
-    --query ./queries.gq --name list_employees ./graph.omni
+    --query queries.gq --name list_employees graph.omni
 
 # Happy with what's on the branch? Merge it. This is one atomic publish:
 # `main` flips to include every commit on the branch.
-omnigraph branch merge onboarding/2026-04-25 --into main ./graph.omni
+omnigraph branch merge onboarding/2026-04-25 --into main graph.omni
 
 # OR: not happy? Throw it away. `main` is untouched.
-# omnigraph branch delete onboarding/2026-04-25 ./graph.omni
+# omnigraph branch delete onboarding/2026-04-25 graph.omni
 ```
 
 Properties:
@@ -115,16 +115,16 @@ Two agents writing to the same graph independently:
 
 ```bash
 # Agent A
-omnigraph branch create --from main agent-a/work ./graph.omni
-omnigraph change --branch agent-a/work … ./graph.omni
+omnigraph branch create --from main agent-a/work graph.omni
+omnigraph change --branch agent-a/work … graph.omni
 # … many mutations …
-omnigraph branch merge agent-a/work --into main ./graph.omni
+omnigraph branch merge agent-a/work --into main graph.omni
 
 # Agent B (running concurrently)
-omnigraph branch create --from main agent-b/work ./graph.omni
-omnigraph change --branch agent-b/work … ./graph.omni
+omnigraph branch create --from main agent-b/work graph.omni
+omnigraph change --branch agent-b/work … graph.omni
 # … many mutations …
-omnigraph branch merge agent-b/work --into main ./graph.omni
+omnigraph branch merge agent-b/work --into main graph.omni
 ```
 
 Each agent sees a consistent snapshot of `main` at the time it forked. The first merge to `main` lands as a fast-forward (or a no-op if no concurrent change). The second merge runs three-way: rows touched by both branches surface as `MergeConflict`s for the caller to resolve.
