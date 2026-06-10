@@ -588,6 +588,10 @@ replacement would make every invariant harder to audit. -->
 
 ### Phase 4: Graph And Schema Apply
 
+Detailed design: [rfc-004-cluster-graph-schema-apply.md](rfc-004-cluster-graph-schema-apply.md)
+(cluster sidecar schema, roll-forward-only recovery matrix, approval artifacts,
+actor threading, 4A/4B/4C staging).
+
 - Add graph create/delete as cluster resources.
 - Make schema apply cluster-aware, with sidecar coverage for graph manifest
   movements before JSON state publish.
