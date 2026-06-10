@@ -229,7 +229,8 @@ with an in-flight apply.
 - **Replicas**: any number of `--cluster` servers can serve the same config
   directory; boot is read-only. Roll out a change by `apply` once, then
   restarting replicas (serving is static per process — there is no hot
-  reload yet).
+  reload yet). Container/cloud recipes (AWS ECS+EFS, Railway volumes):
+  [deployment.md](deployment.md#cluster-mode-in-containers-aws-railway).
 - **The directory is the deployable unit**: config, catalog, ledger,
   approvals, and graph data all live under it. Back it up as a whole;
   version the *config files* (not `__cluster/` or `graphs/`) in git.

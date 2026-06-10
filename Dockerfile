@@ -11,9 +11,13 @@ RUN groupadd --system omnigraph \
     && useradd --system --gid omnigraph --create-home --home-dir /var/lib/omnigraph omnigraph
 
 COPY target/release/omnigraph-server /usr/local/bin/omnigraph-server
+# The CLI ships in the image so the cluster day-2 loop (cluster
+# apply/approve/status, data loads by explicit URI) runs in-container via
+# `docker exec` / ECS exec / `railway shell` — no omnigraph.yaml required.
+COPY target/release/omnigraph /usr/local/bin/omnigraph
 COPY docker/entrypoint.sh /usr/local/bin/omnigraph-entrypoint
 
-RUN chmod 0755 /usr/local/bin/omnigraph-server /usr/local/bin/omnigraph-entrypoint
+RUN chmod 0755 /usr/local/bin/omnigraph-server /usr/local/bin/omnigraph /usr/local/bin/omnigraph-entrypoint
 
 ENV OMNIGRAPH_BIND=0.0.0.0:8080
 
