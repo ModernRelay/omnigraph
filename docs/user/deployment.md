@@ -45,6 +45,71 @@ omnigraph-server s3://my-bucket/graphs/example/releases/2026-04-10-v0.1.0 \
   --bind 0.0.0.0:8080
 ```
 
+## Cluster Mode in Containers (AWS, Railway)
+
+A cluster-booted deployment serves a **cluster directory** (config + state
+ledger + content-addressed catalog + graph data) from a mounted volume — the
+one structural difference from the stateless S3 single-graph shape, which
+needs no volume at all. The container contract:
+
+```bash
+docker run -d \
+  -v /srv/company-brain:/var/lib/omnigraph/cluster \
+  -e OMNIGRAPH_CLUSTER=/var/lib/omnigraph/cluster \
+  -e OMNIGRAPH_SERVER_BEARER_TOKEN=... \
+  -p 8080:8080 <image>
+```
+
+`OMNIGRAPH_CLUSTER` is exclusive: combining it with `OMNIGRAPH_TARGET_URI`,
+`OMNIGRAPH_CONFIG`, or `OMNIGRAPH_TARGET` fails fast (exit 64), the same
+rule the server itself enforces. The image also ships the `omnigraph` CLI,
+so the day-2 loop runs in-container with no `omnigraph.yaml`:
+
+```bash
+docker exec -it <container> sh -c \
+  'omnigraph cluster apply --as andrew --config /var/lib/omnigraph/cluster'
+# then restart the container to pick up the applied state
+```
+
+### AWS (ECS/Fargate + EFS)
+
+1. Push the image to ECR (the `package.yml` workflow builds it).
+2. Create an EFS filesystem; mount it in the task definition at
+   `/var/lib/omnigraph/cluster`.
+3. Task environment: `OMNIGRAPH_CLUSTER=/var/lib/omnigraph/cluster`, bearer
+   tokens via Secrets Manager/SSM into `OMNIGRAPH_SERVER_BEARER_TOKENS_JSON`
+   (or the `--features aws` build's native Secrets Manager source).
+4. ALB in front for TLS; target the container's 8080 with `/healthz` checks.
+5. Day-2: ECS exec into the task → edit/upload config on the volume →
+   `omnigraph cluster apply --as <you>` → force a new deployment (restart).
+
+For a deployment that doesn't need the cluster control plane, the classic
+stateless shape — `OMNIGRAPH_TARGET_URI=s3://bucket/graph.omni`, no volume —
+remains the simplest AWS architecture (see Binary/Container Deployment
+above).
+
+### Railway
+
+1. Create a service from the image; attach a **volume** mounted at
+   `/var/lib/omnigraph/cluster`.
+2. Variables: `OMNIGRAPH_CLUSTER=/var/lib/omnigraph/cluster`,
+   `OMNIGRAPH_SERVER_BEARER_TOKEN=<token>`. Railway terminates TLS at its
+   edge and routes to the exposed 8080.
+3. Day-2: `railway shell` (or `railway run`) → `omnigraph cluster apply
+   --as <you> --config /var/lib/omnigraph/cluster` → redeploy/restart the
+   service.
+
+### Constraints (current honest list)
+
+- **Cluster directories are local-filesystem** — the volume is mandatory;
+  S3-hosted cluster dirs are not supported.
+- **No hot reload** — applied changes serve on the next restart.
+- **Single-writer apply** — run `cluster apply` from one place at a time
+  (the state lock enforces this; CI or one operator shell, not both).
+- **Multi-replica serving off a shared volume (EFS) is documented but
+  unvalidated** — boot is lock-free read-only so it should compose, but it
+  is not yet exercised by tests.
+
 ## One-Command Local RustFS Bootstrap
 
 The easiest local S3-backed deployment path is:
