@@ -11,8 +11,8 @@ use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
 use omnigraph::storage::normalize_root_uri;
 use omnigraph_cluster::{
-    ApplyOutput, DiagnosticSeverity, ForceUnlockOutput, PlanOutput, StateSyncOutput, StatusOutput,
-    ValidateOutput, apply_config_dir, force_unlock_config_dir, import_config_dir, plan_config_dir,
+    ApplyOptions, ApplyOutput, DiagnosticSeverity, ForceUnlockOutput, PlanOutput, StateSyncOutput, StatusOutput,
+    ValidateOutput, apply_config_dir_with_options, force_unlock_config_dir, import_config_dir, plan_config_dir,
     refresh_config_dir, status_config_dir, validate_config_dir,
 };
 use omnigraph_compiler::query::parser::parse_query;
@@ -804,6 +804,17 @@ fn print_cluster_plan_human(output: &PlanOutput) {
         );
         for change in &output.changes {
             println!("  {:?} {}", change.operation, change.resource);
+            if let Some(migration) = &change.migration {
+                if !migration.supported {
+                    println!("      migration UNSUPPORTED:");
+                }
+                for step in &migration.steps {
+                    println!(
+                        "      {}",
+                        serde_json::to_string(step).unwrap_or_else(|_| format!("{step:?}"))
+                    );
+                }
+            }
         }
         if output.changes.is_empty() {
             println!("  no changes");
@@ -3554,11 +3565,20 @@ async fn main() -> Result<()> {
                 finish_cluster_validate(&output, json)?;
             }
             ClusterCommand::Plan { config, json } => {
-                let output = plan_config_dir(config);
+                let output = plan_config_dir(config).await;
                 finish_cluster_plan(&output, json)?;
             }
             ClusterCommand::Apply { config, json } => {
-                let output = apply_config_dir(config).await;
+                // The global --as actor attributes graph-moving operations
+                // (sidecars, audit entries, engine schema-apply commits).
+                // Cluster config stays unlayered: no omnigraph.yaml fallback.
+                let output = apply_config_dir_with_options(
+                    config,
+                    ApplyOptions {
+                        actor: cli.as_actor.clone(),
+                    },
+                )
+                .await;
                 finish_cluster_apply(&output, json)?;
             }
             ClusterCommand::Status { config, json } => {

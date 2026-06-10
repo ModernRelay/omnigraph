@@ -4,7 +4,8 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
-use omnigraph::db::{Omnigraph, ReadTarget};
+use omnigraph::db::{Omnigraph, ReadTarget, SchemaApplyOptions};
+use omnigraph_compiler::SchemaMigrationPlan;
 use omnigraph_compiler::build_catalog;
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::query::typecheck::typecheck_query_decl;
@@ -182,7 +183,7 @@ pub enum ApplyDisposition {
     Blocked,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PlanChange {
     pub resource: String,
     pub operation: PlanOperation,
@@ -194,6 +195,11 @@ pub struct PlanChange {
     pub disposition: Option<ApplyDisposition>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// For schema updates: the engine's migration plan against the live
+    /// graph (RFC-004 §D7's data-aware preview). Absent when the preview is
+    /// unavailable (warning `schema_preview_unavailable`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub migration: Option<SchemaMigrationPlan>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -268,6 +274,8 @@ pub struct ForceUnlockOutput {
 pub struct ApplyOutput {
     pub ok: bool,
     pub config_dir: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
     pub desired_revision: DesiredRevision,
     pub state_observations: StateObservations,
     /// Every planned change, with `disposition`/`reason` always populated.
@@ -444,7 +452,8 @@ struct RecoverySidecar {
 #[serde(rename_all = "snake_case")]
 enum RecoverySidecarKind {
     GraphCreate,
-    // SchemaApply and GraphDelete arrive with stages 4B/4C.
+    SchemaApply,
+    // GraphDelete arrives with stage 4C.
 }
 
 #[derive(Debug, Default)]
@@ -499,7 +508,7 @@ pub fn validate_config_dir(config_dir: impl AsRef<Path>) -> ValidateOutput {
     }
 }
 
-pub fn plan_config_dir(config_dir: impl AsRef<Path>) -> PlanOutput {
+pub async fn plan_config_dir(config_dir: impl AsRef<Path>) -> PlanOutput {
     let outcome = load_desired(config_dir.as_ref());
     let mut diagnostics = outcome.diagnostics;
     let backend = LocalStateBackend::new(&outcome.config_dir);
@@ -580,6 +589,40 @@ pub fn plan_config_dir(config_dir: impl AsRef<Path>) -> PlanOutput {
     // Plan previews dispositions without sweeping; a pending recovery is
     // surfaced as the cluster_recovery_pending warning above instead.
     classify_changes(&mut changes, &desired.dependencies, &BTreeSet::new());
+
+    // Embed real migration steps for schema updates so plan is a data-aware
+    // preview; failures degrade to the digest diff with a warning.
+    for change in &mut changes {
+        if change.operation != PlanOperation::Update {
+            continue;
+        }
+        let ResourceKind::Schema(graph_id) = resource_kind(&change.resource) else {
+            continue;
+        };
+        let graph_uri = display_path(
+            &desired
+                .config_dir
+                .join(CLUSTER_GRAPHS_DIR)
+                .join(format!("{graph_id}.omni")),
+        );
+        let source_path = desired
+            .resources
+            .iter()
+            .find(|resource| resource.address == change.resource)
+            .and_then(|resource| resource.path.clone());
+        let preview = match source_path {
+            Some(path) => preview_schema_migration(&graph_uri, &path).await,
+            None => Err("no schema source recorded".to_string()),
+        };
+        match preview {
+            Ok(migration) => change.migration = Some(migration),
+            Err(err) => diagnostics.push(Diagnostic::warning(
+                "schema_preview_unavailable",
+                change.resource.clone(),
+                format!("could not preview the schema migration: {err}"),
+            )),
+        }
+    }
     let blast_radius = compute_blast_radius(&changes, &desired.dependencies);
     let approvals_required = compute_approvals(&changes);
     let ok = !has_errors(&diagnostics);
@@ -610,12 +653,29 @@ pub fn plan_config_dir(config_dir: impl AsRef<Path>) -> PlanOutput {
 /// state is the publish point: a failure after payload writes leaves inert
 /// digest-named blobs and no success acknowledgement; re-running apply is the
 /// repair.
+/// Options for `cluster apply`. `actor` attributes graph-moving operations
+/// (recorded in sidecars and audit entries, threaded to the engine's
+/// `apply_schema_as` so Cedar enforcement fires wherever a policy checker is
+/// installed).
+#[derive(Debug, Clone, Default)]
+pub struct ApplyOptions {
+    pub actor: Option<String>,
+}
+
 pub async fn apply_config_dir(config_dir: impl AsRef<Path>) -> ApplyOutput {
+    apply_config_dir_with_options(config_dir, ApplyOptions::default()).await
+}
+
+pub async fn apply_config_dir_with_options(
+    config_dir: impl AsRef<Path>,
+    options: ApplyOptions,
+) -> ApplyOutput {
     let outcome = load_desired(config_dir.as_ref());
     let mut diagnostics = outcome.diagnostics;
     let backend = LocalStateBackend::new(&outcome.config_dir);
     let mut observations = backend.observations();
 
+    let actor_for_output = options.actor.clone();
     let early_return = |config_dir: String,
                         config_digest: Option<String>,
                         observations: StateObservations,
@@ -625,6 +685,7 @@ pub async fn apply_config_dir(config_dir: impl AsRef<Path>) -> ApplyOutput {
         ApplyOutput {
             ok: !has_errors(&diagnostics),
             config_dir,
+            actor: actor_for_output.clone(),
             desired_revision: DesiredRevision {
                 config_digest,
             },
@@ -780,18 +841,18 @@ pub async fn apply_config_dir(config_dir: impl AsRef<Path>) -> ApplyOutput {
         })
         .filter_map(|change| change.resource.strip_prefix("graph.").map(str::to_string))
         .collect();
-    let mut completed_create_sidecars: Vec<PathBuf> = Vec::new();
-    let mut failed_graphs: BTreeSet<String> = BTreeSet::new();
-    let mut creates_aborted = false;
+    let mut completed_op_sidecars: Vec<PathBuf> = Vec::new();
+    let mut failed_graphs: BTreeMap<String, FailedGraphOrigin> = BTreeMap::new();
+    let mut graph_moving_aborted = false;
     for graph_id in &graph_creates_to_run {
-        if creates_aborted {
+        if graph_moving_aborted {
             // A prior create failed: stop graph-moving work (loud partials).
             diagnostics.push(Diagnostic::warning(
                 "graph_create_skipped",
                 graph_address(graph_id),
                 "skipped after an earlier graph create failed in this run",
             ));
-            failed_graphs.insert(graph_id.clone());
+            failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphCreate);
             continue;
         }
         let Some(desired_graph) = desired.graphs.iter().find(|graph| &graph.id == graph_id)
@@ -808,7 +869,7 @@ pub async fn apply_config_dir(config_dir: impl AsRef<Path>) -> ApplyOutput {
             schema_version: 1,
             operation_id: Ulid::new().to_string(),
             started_at: now_rfc3339(),
-            actor: None,
+            actor: options.actor.clone(),
             kind: RecoverySidecarKind::GraphCreate,
             graph_id: graph_id.clone(),
             graph_uri: graph_uri.clone(),
@@ -821,8 +882,8 @@ pub async fn apply_config_dir(config_dir: impl AsRef<Path>) -> ApplyOutput {
             Ok(path) => path,
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
-                failed_graphs.insert(graph_id.clone());
-                creates_aborted = true;
+                failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphCreate);
+                graph_moving_aborted = true;
                 continue;
             }
         };
@@ -830,8 +891,8 @@ pub async fn apply_config_dir(config_dir: impl AsRef<Path>) -> ApplyOutput {
             // Simulated crash before the init: the sidecar stays for the
             // sweep (row 1: root absent -> intent removed next run).
             diagnostics.push(diagnostic);
-            failed_graphs.insert(graph_id.clone());
-            creates_aborted = true;
+            failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphCreate);
+            graph_moving_aborted = true;
             continue;
         }
         // Re-read + re-verify the schema source under the lock — the same
@@ -870,8 +931,8 @@ pub async fn apply_config_dir(config_dir: impl AsRef<Path>) -> ApplyOutput {
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
                 let _ = fs::remove_file(&sidecar_path); // nothing moved
-                failed_graphs.insert(graph_id.clone());
-                creates_aborted = true;
+                failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphCreate);
+                graph_moving_aborted = true;
                 continue;
             }
         };
@@ -885,8 +946,8 @@ pub async fn apply_config_dir(config_dir: impl AsRef<Path>) -> ApplyOutput {
                 ));
                 // The sidecar stays: the sweep classifies whether the failed
                 // init left a partial root (row 5) or nothing (row 1).
-                failed_graphs.insert(graph_id.clone());
-                creates_aborted = true;
+                failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphCreate);
+                graph_moving_aborted = true;
                 continue;
             }
         }
@@ -914,8 +975,174 @@ pub async fn apply_config_dir(config_dir: impl AsRef<Path>) -> ApplyOutput {
                 diagnostics,
             );
         }
-        completed_create_sidecars.push(sidecar_path);
+        completed_op_sidecars.push(sidecar_path);
     }
+
+    // Schema applies execute next (RFC-004 §D5): the first cluster operation
+    // that moves an EXISTING graph manifest, sidecar-fenced the same way.
+    let schema_updates_to_run: Vec<String> = changes
+        .iter()
+        .filter(|change| {
+            change.disposition == Some(ApplyDisposition::Applied)
+                && change.operation == PlanOperation::Update
+                && matches!(resource_kind(&change.resource), ResourceKind::Schema(_))
+        })
+        .filter_map(|change| change.resource.strip_prefix("schema.").map(str::to_string))
+        .collect();
+    for graph_id in &schema_updates_to_run {
+        if graph_moving_aborted {
+            diagnostics.push(Diagnostic::warning(
+                "schema_apply_skipped",
+                schema_address(graph_id),
+                "skipped after an earlier graph-moving operation failed in this run",
+            ));
+            failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::SchemaApply);
+            continue;
+        }
+        let Some(desired_graph) = desired.graphs.iter().find(|graph| &graph.id == graph_id)
+        else {
+            continue;
+        };
+        let graph_uri = display_path(
+            &desired
+                .config_dir
+                .join(CLUSTER_GRAPHS_DIR)
+                .join(format!("{graph_id}.omni")),
+        );
+        // Read-write open: the engine's own recovery sweep runs here, which
+        // is exactly what we want before moving its manifest.
+        let db = match Omnigraph::open(&graph_uri).await {
+            Ok(db) => db,
+            Err(err) => {
+                diagnostics.push(Diagnostic::error(
+                    "schema_apply_failed",
+                    schema_address(graph_id),
+                    format!("could not open graph at '{graph_uri}': {err}"),
+                ));
+                failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::SchemaApply);
+                graph_moving_aborted = true;
+                continue;
+            }
+        };
+        let observed_manifest_version = match db.snapshot_of(ReadTarget::branch("main")).await {
+            Ok(snapshot) => Some(snapshot.version()),
+            Err(_) => None,
+        };
+        let mut sidecar = RecoverySidecar {
+            schema_version: 1,
+            operation_id: Ulid::new().to_string(),
+            started_at: now_rfc3339(),
+            actor: options.actor.clone(),
+            kind: RecoverySidecarKind::SchemaApply,
+            graph_id: graph_id.clone(),
+            graph_uri: graph_uri.clone(),
+            observed_manifest_version,
+            expected_manifest_version: None,
+            desired_schema_digest: desired_graph.schema_digest.clone(),
+            state_cas_base: expected_cas.clone(),
+        };
+        let sidecar_path = match backend.write_recovery_sidecar(&sidecar) {
+            Ok(path) => path,
+            Err(diagnostic) => {
+                diagnostics.push(diagnostic);
+                failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::SchemaApply);
+                graph_moving_aborted = true;
+                continue;
+            }
+        };
+        if let Err(diagnostic) = failpoints::maybe_fail("cluster_apply.before_schema_apply") {
+            // Simulated crash before the engine call: the sidecar stays; the
+            // sweep retires it next run (ledger still consistent with live).
+            diagnostics.push(diagnostic);
+            failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::SchemaApply);
+            graph_moving_aborted = true;
+            continue;
+        }
+        // Re-read + digest-verify the desired schema source under the lock.
+        let schema_source = source_paths
+            .get(schema_address(graph_id).as_str())
+            .ok_or_else(|| {
+                Diagnostic::error(
+                    "schema_apply_failed",
+                    schema_address(graph_id),
+                    "no schema source recorded for graph",
+                )
+            })
+            .and_then(|path| {
+                fs::read_to_string(Path::new(path)).map_err(|err| {
+                    Diagnostic::error(
+                        "schema_apply_failed",
+                        schema_address(graph_id),
+                        format!("could not read schema source '{path}': {err}"),
+                    )
+                })
+            })
+            .and_then(|source| {
+                if sha256_hex(source.as_bytes()) == desired_graph.schema_digest {
+                    Ok(source)
+                } else {
+                    Err(Diagnostic::error(
+                        "resource_content_changed",
+                        schema_address(graph_id),
+                        "schema source changed while apply was running; re-run `cluster apply`",
+                    ))
+                }
+            });
+        let schema_source = match schema_source {
+            Ok(source) => source,
+            Err(diagnostic) => {
+                diagnostics.push(diagnostic);
+                let _ = fs::remove_file(&sidecar_path); // nothing moved
+                failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::SchemaApply);
+                graph_moving_aborted = true;
+                continue;
+            }
+        };
+        // Soft drops only: allow_data_loss stays false until the approval
+        // artifacts of stage 4C exist (RFC-004 §D4).
+        match db
+            .apply_schema_as(
+                &schema_source,
+                SchemaApplyOptions::default(),
+                options.actor.as_deref(),
+            )
+            .await
+        {
+            Ok(result) => {
+                sidecar.expected_manifest_version = Some(result.manifest_version);
+                if let Err(diagnostic) = backend.write_recovery_sidecar(&sidecar) {
+                    diagnostics.push(diagnostic);
+                }
+            }
+            Err(err) => {
+                diagnostics.push(Diagnostic::error(
+                    "schema_apply_failed",
+                    schema_address(graph_id),
+                    format!("schema apply failed on '{graph_uri}': {err}"),
+                ));
+                // Sidecar stays; the sweep retires it (live digest unchanged
+                // == ledger consistent) or flags real movement.
+                failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::SchemaApply);
+                graph_moving_aborted = true;
+                continue;
+            }
+        }
+        // Crash point: the manifest moved, the ledger does not record it yet.
+        // A failure here acknowledges nothing; the sweep rolls forward.
+        if let Err(diagnostic) = failpoints::maybe_fail("cluster_apply.after_schema_apply") {
+            diagnostics.push(diagnostic);
+            return early_return(
+                display_path(&desired.config_dir),
+                Some(desired.config_digest),
+                observations,
+                changes,
+                state.resource_statuses,
+                diagnostics,
+            );
+        }
+        completed_op_sidecars.push(sidecar_path);
+    }
+
     if !failed_graphs.is_empty() {
         demote_dependents_of_failed_graphs(&mut changes, &failed_graphs, &desired.dependencies);
     }
@@ -1075,7 +1302,7 @@ pub async fn apply_config_dir(config_dir: impl AsRef<Path>) -> ApplyOutput {
         for sidecar_path in sweep
             .completed_sidecars
             .iter()
-            .chain(completed_create_sidecars.iter())
+            .chain(completed_op_sidecars.iter())
         {
             let _ = fs::remove_file(sidecar_path);
         }
@@ -1107,6 +1334,7 @@ pub async fn apply_config_dir(config_dir: impl AsRef<Path>) -> ApplyOutput {
     ApplyOutput {
         ok: !has_errors(&diagnostics),
         config_dir: display_path(&desired.config_dir),
+        actor: options.actor.clone(),
         desired_revision: DesiredRevision {
             config_digest: Some(desired.config_digest),
         },
@@ -2050,6 +2278,9 @@ async fn sweep_recovery_sidecars(
             RecoverySidecarKind::GraphCreate => {
                 sweep_graph_create_sidecar(path, sidecar, state, diagnostics, &mut outcome).await;
             }
+            RecoverySidecarKind::SchemaApply => {
+                sweep_schema_apply_sidecar(path, sidecar, state, diagnostics, &mut outcome).await;
+            }
         }
     }
     outcome
@@ -2171,6 +2402,102 @@ async fn sweep_graph_create_sidecar(
             ));
             outcome.pending_graphs.insert(sidecar.graph_id.clone());
         }
+    }
+}
+
+async fn sweep_schema_apply_sidecar(
+    path: PathBuf,
+    sidecar: RecoverySidecar,
+    state: &mut ClusterState,
+    diagnostics: &mut Vec<Diagnostic>,
+    outcome: &mut SweepOutcome,
+) {
+    let graph_address = graph_address(&sidecar.graph_id);
+    let schema_addr = schema_address(&sidecar.graph_id);
+
+    // Digest-based classification: robust to unrelated manifest movement;
+    // the sidecar's version pins stay forensic.
+    let live_digest = match Omnigraph::open_read_only(&sidecar.graph_uri).await {
+        Ok(db) => sha256_hex(db.schema_source().as_bytes()),
+        Err(err) => {
+            // Cannot verify the interrupted operation — refuse to guess.
+            diagnostics.push(Diagnostic::warning(
+                "cluster_recovery_pending",
+                graph_address.clone(),
+                format!(
+                    "an interrupted schema apply cannot be verified (graph '{}' did not open: {err}); graph-moving work is blocked until repaired",
+                    sidecar.graph_uri
+                ),
+            ));
+            outcome.pending_graphs.insert(sidecar.graph_id.clone());
+            return;
+        }
+    };
+
+    let recorded = state
+        .applied_revision
+        .resources
+        .get(&schema_addr)
+        .map(|resource| resource.digest.clone());
+    if recorded.as_deref() == Some(live_digest.as_str()) {
+        // Ledger consistent with the live graph (the apply never landed, or
+        // landed and was recorded): the sidecar is stale intent — retire it.
+        outcome.completed_sidecars.push(path);
+    } else if live_digest == sidecar.desired_schema_digest {
+        // RFC-004 §D3 row 3: the schema apply completed on the graph; roll
+        // the cluster state forward to observable reality.
+        state.applied_revision.resources.insert(
+            schema_addr.clone(),
+            StateResource {
+                digest: live_digest.clone(),
+            },
+        );
+        let query_digests = state_query_digests_for_graph(state, &sidecar.graph_id);
+        let composite = graph_digest(&sidecar.graph_id, Some(&live_digest), Some(&query_digests));
+        state
+            .applied_revision
+            .resources
+            .insert(graph_address.clone(), StateResource { digest: composite });
+        set_resource_status_applied(state, &graph_address);
+        set_resource_status_applied(state, &schema_addr);
+        state.recovery_records.insert(
+            sidecar.operation_id.clone(),
+            json!({
+                "kind": "schema_apply",
+                "graph_id": sidecar.graph_id,
+                "outcome": "rolled_forward",
+                "recovered_at": now_rfc3339(),
+                "actor": sidecar.actor,
+            }),
+        );
+        diagnostics.push(Diagnostic::warning(
+            "cluster_recovery_rolled_forward",
+            graph_address.clone(),
+            "an interrupted schema apply had completed on the graph; cluster state was rolled forward to match",
+        ));
+        outcome.completed_sidecars.push(path);
+    } else {
+        // Row 6: live schema is neither the recorded nor the desired digest.
+        set_resource_status(
+            state,
+            &graph_address,
+            ResourceLifecycleStatus::Drifted,
+            "actual_applied_state_pending",
+            "graph state does not match the interrupted operation; run `cluster refresh` and re-plan",
+        );
+        set_resource_status(
+            state,
+            &schema_addr,
+            ResourceLifecycleStatus::Drifted,
+            "actual_applied_state_pending",
+            "graph state does not match the interrupted operation; run `cluster refresh` and re-plan",
+        );
+        diagnostics.push(Diagnostic::warning(
+            "cluster_recovery_pending",
+            graph_address.clone(),
+            "an interrupted schema apply left unexpected graph state; graph-moving work is blocked until repaired",
+        ));
+        outcome.pending_graphs.insert(sidecar.graph_id.clone());
     }
 }
 
@@ -2330,6 +2657,23 @@ async fn observe_declared_graphs(desired: &DesiredCluster, state: &mut ClusterSt
         }
     }
     graph_error_count
+}
+
+/// RFC-004 §D7: the data-aware preview — the engine's migration plan for a
+/// desired schema against the live graph, computed read-only (no lock).
+async fn preview_schema_migration(
+    graph_uri: &str,
+    schema_path: &str,
+) -> Result<SchemaMigrationPlan, String> {
+    let source = fs::read_to_string(schema_path).map_err(|err| err.to_string())?;
+    let db = Omnigraph::open_read_only(graph_uri)
+        .await
+        .map_err(|err| err.to_string())?;
+    let preview = db
+        .preview_schema_apply_with_options(&source, SchemaApplyOptions::default())
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(preview.plan)
 }
 
 struct LiveGraphObservation {
@@ -2736,6 +3080,7 @@ fn diff_resources(
                 after_digest: Some(after.clone()),
                 disposition: None,
                 reason: None,
+                migration: None,
             }),
             Some(before) if before != after => changes.push(PlanChange {
                 resource: address.clone(),
@@ -2744,6 +3089,7 @@ fn diff_resources(
                 after_digest: Some(after.clone()),
                 disposition: None,
                 reason: None,
+                migration: None,
             }),
             Some(_) => {}
         }
@@ -2757,6 +3103,7 @@ fn diff_resources(
                 after_digest: None,
                 disposition: None,
                 reason: None,
+                migration: None,
             });
         }
     }
@@ -2846,9 +3193,10 @@ fn classify_changes(
                 PlanOperation::Create => {
                     schema_creates.insert(graph);
                 }
-                // Schema updates (4B) and deletes (4C) are still pending in
-                // this stage and block dependents.
-                _ => {
+                // Schema updates execute in-run before catalog writes (4B)
+                // and no longer block dependents; deletes (4C) still do.
+                PlanOperation::Update => {}
+                PlanOperation::Delete => {
                     schema_pending.insert(graph);
                 }
             },
@@ -2882,7 +3230,12 @@ fn classify_changes(
                     // Applied with the graph create — the init carries it.
                     (ApplyDisposition::Applied, None)
                 }
-                PlanOperation::Create if graph_creates.contains(&graph) => {
+                PlanOperation::Update if !pending_recovery.contains(&graph) => {
+                    // Stage 4B: schema updates execute via the engine's
+                    // schema apply (soft drops only; allow_data_loss is 4C).
+                    (ApplyDisposition::Applied, None)
+                }
+                PlanOperation::Create | PlanOperation::Update => {
                     (ApplyDisposition::Blocked, Some("cluster_recovery_pending"))
                 }
                 _ => (ApplyDisposition::Deferred, Some("apply_unsupported_kind")),
@@ -2952,13 +3305,20 @@ fn classify_changes(
     }
 }
 
-/// After a graph create fails mid-run, every change that depended on that
-/// graph (its schema, its queries, policies referencing it) flips from
-/// Applied to Blocked so the output and the persisted statuses tell the
-/// truth about what this run actually executed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailedGraphOrigin {
+    GraphCreate,
+    SchemaApply,
+}
+
+/// After a graph-moving operation fails mid-run, every change that depended
+/// on that graph flips from Applied to Blocked so the output and the
+/// persisted statuses tell the truth about what this run actually executed.
+/// The originating change carries the failure code; dependents carry
+/// `dependency_not_applied`.
 fn demote_dependents_of_failed_graphs(
     changes: &mut [PlanChange],
-    failed: &BTreeSet<String>,
+    failed: &BTreeMap<String, FailedGraphOrigin>,
     dependencies: &[Dependency],
 ) {
     for change in changes.iter_mut() {
@@ -2966,11 +3326,17 @@ fn demote_dependents_of_failed_graphs(
             continue;
         }
         let demote_reason = match resource_kind(&change.resource) {
-            ResourceKind::Graph(graph) if failed.contains(&graph) => Some("graph_create_failed"),
-            ResourceKind::Schema(graph) if failed.contains(&graph) => {
-                Some("dependency_not_applied")
-            }
-            ResourceKind::Query { graph, .. } if failed.contains(&graph) => {
+            ResourceKind::Graph(graph) => match failed.get(&graph) {
+                Some(FailedGraphOrigin::GraphCreate) => Some("graph_create_failed"),
+                Some(FailedGraphOrigin::SchemaApply) => Some("dependency_not_applied"),
+                None => None,
+            },
+            ResourceKind::Schema(graph) => match failed.get(&graph) {
+                Some(FailedGraphOrigin::SchemaApply) => Some("schema_apply_failed"),
+                Some(FailedGraphOrigin::GraphCreate) => Some("dependency_not_applied"),
+                None => None,
+            },
+            ResourceKind::Query { graph, .. } if failed.contains_key(&graph) => {
                 Some("dependency_not_applied")
             }
             ResourceKind::Policy(_) => {
@@ -2979,7 +3345,7 @@ fn demote_dependents_of_failed_graphs(
                         && dep
                             .to
                             .strip_prefix("graph.")
-                            .is_some_and(|graph| failed.contains(graph))
+                            .is_some_and(|graph| failed.contains_key(graph))
                 });
                 blocked.then_some("dependency_not_applied")
             }
@@ -3681,10 +4047,10 @@ graphs:
         );
     }
 
-    #[test]
-    fn missing_state_plans_creates() {
+    #[tokio::test]
+    async fn missing_state_plans_creates() {
         let dir = fixture();
-        let out = plan_config_dir(dir.path());
+        let out = plan_config_dir(dir.path()).await;
         assert!(out.ok, "{:?}", out.diagnostics);
         assert!(!out.state_observations.state_found);
         assert!(!out.state_observations.locked);
@@ -3698,10 +4064,10 @@ graphs:
         assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
     }
 
-    #[test]
-    fn config_digest_ignores_yaml_comments_and_formatting() {
+    #[tokio::test]
+    async fn config_digest_ignores_yaml_comments_and_formatting() {
         let dir = fixture();
-        let first = plan_config_dir(dir.path());
+        let first = plan_config_dir(dir.path()).await;
         assert!(first.ok, "{:?}", first.diagnostics);
 
         fs::write(
@@ -3724,7 +4090,7 @@ policies:
         )
         .unwrap();
 
-        let second = plan_config_dir(dir.path());
+        let second = plan_config_dir(dir.path()).await;
         assert!(second.ok, "{:?}", second.diagnostics);
         assert_eq!(
             first.desired_revision.config_digest,
@@ -3732,10 +4098,10 @@ policies:
         );
     }
 
-    #[test]
-    fn existing_state_plans_update_and_delete_deterministically() {
+    #[tokio::test]
+    async fn existing_state_plans_update_and_delete_deterministically() {
         let dir = fixture();
-        let first = plan_config_dir(dir.path());
+        let first = plan_config_dir(dir.path()).await;
         let state_dir = dir.path().join("__cluster");
         fs::create_dir_all(&state_dir).unwrap();
         fs::write(
@@ -3755,7 +4121,7 @@ policies:
         )
         .unwrap();
 
-        let out = plan_config_dir(dir.path());
+        let out = plan_config_dir(dir.path()).await;
         assert!(out.ok, "{:?}", out.diagnostics);
         let rendered: Vec<_> = out
             .changes
@@ -3773,8 +4139,8 @@ policies:
         );
     }
 
-    #[test]
-    fn old_minimal_state_json_still_plans_with_default_revision() {
+    #[tokio::test]
+    async fn old_minimal_state_json_still_plans_with_default_revision() {
         let dir = fixture();
         let state_dir = dir.path().join(CLUSTER_STATE_DIR);
         fs::create_dir_all(&state_dir).unwrap();
@@ -3792,7 +4158,7 @@ policies:
         )
         .unwrap();
 
-        let out = plan_config_dir(dir.path());
+        let out = plan_config_dir(dir.path()).await;
         assert!(out.ok, "{:?}", out.diagnostics);
         assert_eq!(out.state_observations.state_revision, 0);
         assert!(out.state_observations.state_cas.is_some());
@@ -4018,12 +4384,12 @@ graphs:
         assert!(dir.path().join(CLUSTER_LOCK_FILE).exists());
     }
 
-    #[test]
-    fn plan_succeeds_after_force_unlock() {
+    #[tokio::test]
+    async fn plan_succeeds_after_force_unlock() {
         let dir = fixture();
         write_lock_file(dir.path(), "held-lock", "plan");
 
-        let locked = plan_config_dir(dir.path());
+        let locked = plan_config_dir(dir.path()).await;
         assert!(!locked.ok);
         assert!(
             locked
@@ -4035,12 +4401,12 @@ graphs:
         let unlocked = force_unlock_config_dir(dir.path(), "held-lock");
         assert!(unlocked.ok, "{:?}", unlocked.diagnostics);
 
-        let out = plan_config_dir(dir.path());
+        let out = plan_config_dir(dir.path()).await;
         assert!(out.ok, "{:?}", out.diagnostics);
     }
 
-    #[test]
-    fn plan_reports_state_cas_revision_and_removes_lock() {
+    #[tokio::test]
+    async fn plan_reports_state_cas_revision_and_removes_lock() {
         let dir = fixture();
         let state_dir = dir.path().join(CLUSTER_STATE_DIR);
         fs::create_dir_all(&state_dir).unwrap();
@@ -4056,7 +4422,7 @@ graphs:
 }"#;
         fs::write(state_dir.join("state.json"), state).unwrap();
 
-        let out = plan_config_dir(dir.path());
+        let out = plan_config_dir(dir.path()).await;
         assert!(out.ok, "{:?}", out.diagnostics);
         assert_eq!(out.state_observations.state_revision, 7);
         assert_eq!(
@@ -4073,8 +4439,8 @@ graphs:
         );
     }
 
-    #[test]
-    fn existing_lock_makes_plan_fail() {
+    #[tokio::test]
+    async fn existing_lock_makes_plan_fail() {
         let dir = fixture();
         let state_dir = dir.path().join(CLUSTER_STATE_DIR);
         fs::create_dir_all(&state_dir).unwrap();
@@ -4090,7 +4456,7 @@ graphs:
         )
         .unwrap();
 
-        let out = plan_config_dir(dir.path());
+        let out = plan_config_dir(dir.path()).await;
         assert!(!out.ok);
         assert!(out.state_observations.locked);
         assert_eq!(out.state_observations.lock_id.as_deref(), Some("held-lock"));
@@ -4111,8 +4477,8 @@ graphs:
         }));
     }
 
-    #[test]
-    fn state_lock_false_bypasses_lock_with_warning() {
+    #[tokio::test]
+    async fn state_lock_false_bypasses_lock_with_warning() {
         let dir = fixture();
         fs::write(
             dir.path().join(CLUSTER_CONFIG_FILE),
@@ -4128,7 +4494,7 @@ graphs:
         )
         .unwrap();
 
-        let out = plan_config_dir(dir.path());
+        let out = plan_config_dir(dir.path()).await;
         assert!(out.ok, "{:?}", out.diagnostics);
         assert!(!out.state_observations.locked);
         assert!(!out.state_observations.lock_acquired);
@@ -4153,15 +4519,15 @@ graphs:
         assert_eq!(out.diagnostics[0].code, "unsupported_state_backend");
     }
 
-    #[test]
-    fn external_state_backend_plan_rejected() {
+    #[tokio::test]
+    async fn external_state_backend_plan_rejected() {
         let dir = fixture();
         fs::write(
             dir.path().join(CLUSTER_CONFIG_FILE),
             "version: 1\nstate:\n  backend: s3://bucket/state\ngraphs: {}\n",
         )
         .unwrap();
-        let out = plan_config_dir(dir.path());
+        let out = plan_config_dir(dir.path()).await;
         assert!(!out.ok);
         assert!(
             out.diagnostics
@@ -4304,7 +4670,7 @@ graphs:
         assert!(!out.resource_digests.contains_key("graph.knowledge"));
         assert_eq!(out.observations["graph.knowledge"]["exists"], false);
 
-        let plan = plan_config_dir(dir.path());
+        let plan = plan_config_dir(dir.path()).await;
         assert!(plan.ok, "{:?}", plan.diagnostics);
         assert!(plan.changes.iter().any(|change| {
             change.resource == "graph.knowledge" && change.operation == PlanOperation::Create
@@ -4342,7 +4708,7 @@ graphs:
             false
         );
 
-        let plan = plan_config_dir(dir.path());
+        let plan = plan_config_dir(dir.path()).await;
         assert!(plan.ok, "{:?}", plan.diagnostics);
         assert!(plan.changes.iter().any(|change| {
             change.resource == "schema.knowledge" && change.operation == PlanOperation::Update
@@ -4689,19 +5055,22 @@ graphs:
     }
 
     #[tokio::test]
-    async fn apply_defers_schema_change_and_blocks_dependent_query() {
+    async fn apply_schema_update_and_dependent_query_in_one_run() {
         let dir = fixture();
+        init_derived_graph(dir.path()).await;
         write_applyable_state(dir.path());
-        // Change the schema after seeding state: schema.knowledge now differs.
+        // Schema update + a query update that depends on the new field: one
+        // apply executes the schema migration first, then the catalog write.
+        fs::write(dir.path().join("people.pg"), SCHEMA_V2).unwrap();
         fs::write(
-            dir.path().join("people.pg"),
-            "\nnode Person {\n  name: String @key\n  age: I32?\n  bio: String?\n}\n",
+            dir.path().join("people.gq"),
+            "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name, $p.bio }\n}\n",
         )
         .unwrap();
 
         let out = apply_config_dir(dir.path()).await;
         assert!(out.ok, "{:?}", out.diagnostics);
-        assert!(!out.converged);
+        assert!(out.converged, "{out:?}");
         let by_resource: BTreeMap<&str, &PlanChange> = out
             .changes
             .iter()
@@ -4709,58 +5078,112 @@ graphs:
             .collect();
         assert_eq!(
             by_resource["schema.knowledge"].disposition,
-            Some(ApplyDisposition::Deferred)
-        );
-        assert_eq!(
-            by_resource["graph.knowledge"].disposition,
-            Some(ApplyDisposition::Deferred)
+            Some(ApplyDisposition::Applied)
         );
         assert_eq!(
             by_resource["query.knowledge.find_person"].disposition,
+            Some(ApplyDisposition::Applied)
+        );
+        assert_eq!(
+            by_resource["graph.knowledge"].disposition,
+            Some(ApplyDisposition::Derived)
+        );
+        // The live graph carries the new schema.
+        let db = Omnigraph::open_read_only(&derived_graph_uri(dir.path(), "knowledge"))
+            .await
+            .unwrap();
+        let desired = validate_config_dir(dir.path());
+        assert_eq!(
+            sha256_hex(db.schema_source().as_bytes()),
+            desired.resource_digests["schema.knowledge"]
+        );
+        let state = read_state_json(dir.path());
+        assert_eq!(
+            state["applied_revision"]["resources"]["schema.knowledge"]["digest"],
+            desired.resource_digests["schema.knowledge"]
+        );
+        // Sidecar retired after the CAS landed.
+        assert!(
+            !dir.path().join(CLUSTER_RECOVERIES_DIR).exists()
+                || fs::read_dir(dir.path().join(CLUSTER_RECOVERIES_DIR))
+                    .unwrap()
+                    .next()
+                    .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_unsupported_schema_change_fails_loudly() {
+        let dir = fixture();
+        init_derived_graph(dir.path()).await;
+        write_applyable_state(dir.path());
+        // Property type changes are unsupported by the engine planner.
+        fs::write(
+            dir.path().join("people.pg"),
+            "\nnode Person {\n  name: String @key\n  age: I64?\n}\n",
+        )
+        .unwrap();
+
+        let out = apply_config_dir(dir.path()).await;
+        assert!(!out.ok);
+        assert!(out.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "schema_apply_failed"
+                && diagnostic.message.contains("changing property type")
+        }));
+        let by_resource: BTreeMap<&str, &PlanChange> = out
+            .changes
+            .iter()
+            .map(|change| (change.resource.as_str(), change))
+            .collect();
+        assert_eq!(
+            by_resource["schema.knowledge"].disposition,
             Some(ApplyDisposition::Blocked)
         );
         assert_eq!(
-            by_resource["query.knowledge.find_person"].reason.as_deref(),
-            Some("dependency_not_applied")
+            by_resource["schema.knowledge"].reason.as_deref(),
+            Some("schema_apply_failed")
         );
-        // Policy is independent of the schema and still applies.
-        assert_eq!(
-            by_resource["policy.base"].disposition,
-            Some(ApplyDisposition::Applied)
-        );
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "apply_unsupported_change")
-        );
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "apply_dependency_blocked")
-        );
-
+        // The live schema and the ledger are unchanged.
         let state = read_state_json(dir.path());
+        let desired = validate_config_dir(dir.path());
+        assert_ne!(
+            state["applied_revision"]["resources"]["schema.knowledge"]["digest"],
+            desired.resource_digests["schema.knowledge"]
+        );
+        // Second run: the sweep retires the stale sidecar (ledger consistent)
+        // and the run fails just as loudly — idempotent loudness.
+        let second = apply_config_dir(dir.path()).await;
+        assert!(!second.ok);
+        assert!(
+            second
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "schema_apply_failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_blocks_schema_update_while_recovery_pending() {
+        let dir = fixture();
+        init_derived_graph(dir.path()).await;
+        write_state_resources(dir.path(), &[("schema.knowledge", "stale-digest")]);
+        fs::write(dir.path().join("people.pg"), SCHEMA_V2).unwrap();
+        // A pending sidecar whose intent matches neither live nor recorded.
+        write_schema_apply_sidecar(dir.path(), "knowledge", "intended-digest", "01PENDS");
+
+        let out = apply_config_dir(dir.path()).await;
+        let by_resource: BTreeMap<&str, &PlanChange> = out
+            .changes
+            .iter()
+            .map(|change| (change.resource.as_str(), change))
+            .collect();
         assert_eq!(
-            state["resource_statuses"]["query.knowledge.find_person"]["status"],
-            "blocked"
+            by_resource["schema.knowledge"].disposition,
+            Some(ApplyDisposition::Blocked)
         );
-        // The blocked query wrote no payload and no state digest.
-        assert!(
-            state["applied_revision"]["resources"]
-                .get("query.knowledge.find_person")
-                .is_none()
-        );
-        assert!(
-            !dir.path()
-                .join(CLUSTER_RESOURCES_DIR)
-                .join("query")
-                .exists()
-        );
-        // Not converged: the applied config digest must not be claimed.
-        assert!(
-            state["applied_revision"]
-                .get("config_digest")
-                .is_none_or(serde_json::Value::is_null)
+        assert_eq!(
+            by_resource["schema.knowledge"].reason.as_deref(),
+            Some("cluster_recovery_pending")
         );
     }
 
@@ -5233,7 +5656,7 @@ graphs:
         let refresh = refresh_config_dir(dir.path()).await;
         assert!(refresh.ok, "{:?}", refresh.diagnostics);
 
-        let plan = plan_config_dir(dir.path());
+        let plan = plan_config_dir(dir.path()).await;
         let query_change = plan
             .changes
             .iter()
@@ -5500,6 +5923,188 @@ graphs:
         assert_eq!(state["resource_statuses"]["graph.knowledge"]["status"], "error");
     }
 
+    #[tokio::test]
+    async fn plan_embeds_migration_preview_for_schema_update() {
+        let dir = fixture();
+        init_derived_graph(dir.path()).await;
+        write_applyable_state(dir.path());
+        fs::write(
+            dir.path().join("people.pg"),
+            "\nnode Person {\n  name: String @key\n  age: I32?\n  bio: String?\n}\n",
+        )
+        .unwrap();
+
+        let out = plan_config_dir(dir.path()).await;
+        assert!(out.ok, "{:?}", out.diagnostics);
+        let schema_change = out
+            .changes
+            .iter()
+            .find(|change| change.resource == "schema.knowledge")
+            .unwrap();
+        let migration = schema_change.migration.as_ref().expect("preview embedded");
+        assert!(migration.supported);
+        assert!(
+            serde_json::to_string(&migration.steps)
+                .unwrap()
+                .contains("add_property"),
+            "{migration:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_warns_when_preview_unavailable() {
+        let dir = fixture();
+        write_applyable_state(dir.path()); // digests recorded, but no live root
+        fs::write(
+            dir.path().join("people.pg"),
+            "\nnode Person {\n  name: String @key\n  age: I32?\n  bio: String?\n}\n",
+        )
+        .unwrap();
+
+        let out = plan_config_dir(dir.path()).await;
+        assert!(out.ok, "{:?}", out.diagnostics);
+        let schema_change = out
+            .changes
+            .iter()
+            .find(|change| change.resource == "schema.knowledge")
+            .unwrap();
+        assert!(schema_change.migration.is_none());
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "schema_preview_unavailable")
+        );
+    }
+
+    fn write_schema_apply_sidecar(
+        config_dir: &Path,
+        graph_id: &str,
+        desired_schema_digest: &str,
+        operation_id: &str,
+    ) -> PathBuf {
+        let dir = config_dir.join(CLUSTER_RECOVERIES_DIR);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{operation_id}.json"));
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "schema_version": 1,
+                "operation_id": operation_id,
+                "started_at": "1970-01-01T00:00:00Z",
+                "kind": "schema_apply",
+                "graph_id": graph_id,
+                "graph_uri": derived_graph_uri(config_dir, graph_id),
+                "desired_schema_digest": desired_schema_digest,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    const SCHEMA_V2: &str = "\nnode Person {\n  name: String @key\n  age: I32?\n  bio: String?\n}\n";
+
+    #[tokio::test]
+    async fn sweep_retires_schema_sidecar_when_ledger_consistent() {
+        let dir = fixture();
+        init_derived_graph(dir.path()).await;
+        write_applyable_state(dir.path()); // state digest == live digest
+        let sidecar =
+            write_schema_apply_sidecar(dir.path(), "knowledge", "never-applied", "01SROW1");
+
+        let out = apply_config_dir(dir.path()).await;
+        assert!(out.ok, "{:?}", out.diagnostics);
+        assert!(!sidecar.exists());
+        let state = read_state_json(dir.path());
+        assert!(
+            state["recovery_records"]
+                .as_object()
+                .is_none_or(|records| records.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_rolls_forward_completed_schema_apply() {
+        let dir = fixture();
+        init_derived_graph(dir.path()).await;
+        write_applyable_state(dir.path());
+        // The schema apply completed on the graph out-of-process...
+        let graph_uri = derived_graph_uri(dir.path(), "knowledge");
+        let db = Omnigraph::open(&graph_uri).await.unwrap();
+        db.apply_schema(SCHEMA_V2).await.unwrap();
+        // ...the desired config matches it, and the sidecar records the intent.
+        fs::write(dir.path().join("people.pg"), SCHEMA_V2).unwrap();
+        let desired = validate_config_dir(dir.path());
+        let v2_digest = desired.resource_digests["schema.knowledge"].clone();
+        let sidecar = write_schema_apply_sidecar(dir.path(), "knowledge", &v2_digest, "01SROW3");
+
+        let out = apply_config_dir(dir.path()).await;
+        assert!(out.ok, "{:?}", out.diagnostics);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "cluster_recovery_rolled_forward")
+        );
+        assert!(!sidecar.exists());
+        let state = read_state_json(dir.path());
+        assert_eq!(
+            state["applied_revision"]["resources"]["schema.knowledge"]["digest"],
+            v2_digest
+        );
+        assert!(
+            state["recovery_records"]
+                .as_object()
+                .unwrap()
+                .values()
+                .any(|record| record["kind"] == "schema_apply"
+                    && record["outcome"] == "rolled_forward")
+        );
+        assert!(out.converged, "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn sweep_flags_unexpected_schema_apply_state_as_pending() {
+        let dir = fixture();
+        init_derived_graph(dir.path()).await; // live = v1
+        write_state_resources(dir.path(), &[("schema.knowledge", "stale-digest")]);
+        // Sidecar intended a digest that is neither live nor recorded.
+        let sidecar =
+            write_schema_apply_sidecar(dir.path(), "knowledge", "intended-digest", "01SROW6");
+
+        let out = apply_config_dir(dir.path()).await;
+        assert!(out.ok, "{:?}", out.diagnostics); // warnings only
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "cluster_recovery_pending")
+        );
+        assert!(sidecar.exists());
+        let state = read_state_json(dir.path());
+        assert_eq!(
+            state["resource_statuses"]["schema.knowledge"]["status"],
+            "drifted"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_keeps_schema_sidecar_for_unopenable_root() {
+        let dir = fixture();
+        write_applyable_state(dir.path());
+        let root = dir.path().join(CLUSTER_GRAPHS_DIR).join("knowledge.omni");
+        fs::create_dir_all(&root).unwrap(); // exists, won't open
+        let sidecar =
+            write_schema_apply_sidecar(dir.path(), "knowledge", "whatever", "01SROWX");
+
+        let out = apply_config_dir(dir.path()).await;
+        assert!(out.ok, "{:?}", out.diagnostics); // warning: cannot verify
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "cluster_recovery_pending")
+        );
+        assert!(sidecar.exists());
+    }
+
     #[test]
     fn status_warns_on_pending_recovery_sidecar() {
         let dir = fixture();
@@ -5516,10 +6121,10 @@ graphs:
         );
     }
 
-    #[test]
-    fn plan_annotates_apply_dispositions() {
+    #[tokio::test]
+    async fn plan_annotates_apply_dispositions() {
         let dir = fixture();
-        let out = plan_config_dir(dir.path());
+        let out = plan_config_dir(dir.path()).await;
         assert!(out.ok, "{:?}", out.diagnostics);
         let by_resource: BTreeMap<&str, &PlanChange> = out
             .changes
