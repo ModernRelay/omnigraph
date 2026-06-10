@@ -75,6 +75,7 @@ Working documents for in-flight feature work. Removed when the work lands.
 | MCP server surface — full tool parity, stored queries, modular auth (MR-969 / MR-956 / MR-974) | [rfc-003-mcp-server-surface.md](rfc-003-mcp-server-surface.md) |
 | Future cluster control plane — declarative as-code config, JSON state ledger, reconciler | [cluster-config-specs.md](cluster-config-specs.md), [cluster-axioms.md](cluster-axioms.md), [cluster-config-implementation-spec.md](cluster-config-implementation-spec.md) |
 | Cluster graph & schema apply — Phase 4 sidecars, roll-forward recovery, approval artifacts | [rfc-004-cluster-graph-schema-apply.md](rfc-004-cluster-graph-schema-apply.md) |
+| Server boots from cluster state — Phase 5 mode switch, applied-revision serving | [rfc-005-server-cluster-boot.md](rfc-005-server-cluster-boot.md) |
 
 ## Boundary
 

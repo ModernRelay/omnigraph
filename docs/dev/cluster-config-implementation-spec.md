@@ -601,6 +601,10 @@ actor threading, 4A/4B/4C staging).
 
 ### Phase 5: Server Reads Cluster Catalog
 
+Detailed design: [rfc-005-server-cluster-boot.md](rfc-005-server-cluster-boot.md)
+(the --cluster mode switch, applied-revision serving, serving metadata in
+state, readiness table, migration path).
+
 - Allow server startup from cluster state.
 - Add status and catalog endpoints as needed.
 - Keep the current `omnigraph.yaml` startup path as compatibility mode — an
