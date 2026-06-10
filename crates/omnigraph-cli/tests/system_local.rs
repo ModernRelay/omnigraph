@@ -595,8 +595,12 @@ policy: {{}}
         ),
     );
 
+    // current_dir matters: `init` scaffolds an omnigraph.yaml into its cwd,
+    // and without this it pollutes the crate dir, breaking unrelated tests
+    // (anything resolving a graph target from the cwd config).
     output_success(
         cli()
+            .current_dir(query_root)
             .arg("init")
             .arg("--schema")
             .arg(fixture("test.pg"))
@@ -604,6 +608,7 @@ policy: {{}}
     );
     output_success(
         cli()
+            .current_dir(query_root)
             .arg("load")
             .arg("--data")
             .arg(fixture("test.jsonl"))
