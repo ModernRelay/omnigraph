@@ -804,6 +804,17 @@ fn print_cluster_plan_human(output: &PlanOutput) {
         );
         for change in &output.changes {
             println!("  {:?} {}", change.operation, change.resource);
+            if let Some(migration) = &change.migration {
+                if !migration.supported {
+                    println!("      migration UNSUPPORTED:");
+                }
+                for step in &migration.steps {
+                    println!(
+                        "      {}",
+                        serde_json::to_string(step).unwrap_or_else(|_| format!("{step:?}"))
+                    );
+                }
+            }
         }
         if output.changes.is_empty() {
             println!("  no changes");
