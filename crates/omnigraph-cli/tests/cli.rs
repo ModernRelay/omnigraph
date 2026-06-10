@@ -1285,7 +1285,7 @@ node Person {
 /// Disaster input fails closed: a destroyed graph root drifts the ledger,
 /// the plan proposes deferred creates, and apply moves nothing.
 #[test]
-fn cluster_e2e_graph_root_destruction_drifts_and_apply_moves_nothing() {
+fn cluster_e2e_graph_root_destruction_drifts_then_apply_recreates_empty_graph() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
     init_cluster_derived_graph(temp.path());
@@ -1327,15 +1327,20 @@ fn cluster_e2e_graph_root_destruction_drifts_and_apply_moves_nothing() {
 
     let plan = cluster_json(temp.path(), "plan");
     assert_eq!(change_for(&plan, "graph.knowledge")["operation"], "create");
-    assert_eq!(change_for(&plan, "graph.knowledge")["disposition"], "deferred");
-    assert_eq!(change_for(&plan, "schema.knowledge")["disposition"], "deferred");
+    // Stage 4A: the re-create is executable and the plan says so — nothing
+    // hidden about converging a destroyed root back to an EMPTY graph (the
+    // data was already lost; this is declarative convergence, RFC-004 §D1).
+    assert_eq!(change_for(&plan, "graph.knowledge")["disposition"], "applied");
+    assert_eq!(change_for(&plan, "schema.knowledge")["disposition"], "applied");
     // Converged-then-destroyed: query/policy are already in state at the
     // desired digests, so they are not changes at all.
     assert_eq!(plan["changes"].as_array().unwrap().len(), 2, "{plan}");
 
-    let disaster_apply = cluster_json(temp.path(), "apply");
-    assert_eq!(disaster_apply["applied_count"], 0, "{disaster_apply}");
-    assert_eq!(disaster_apply["converged"], false, "{disaster_apply}");
+    let recreate = cluster_json(temp.path(), "apply");
+    assert_eq!(recreate["ok"], true, "{recreate}");
+    assert_eq!(recreate["converged"], true, "{recreate}");
+    // The empty graph is back on disk; catalog state survived throughout.
+    assert!(temp.path().join("graphs/knowledge.omni").exists());
     let state: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(temp.path().join("__cluster/state.json")).unwrap(),
     )
@@ -1352,59 +1357,84 @@ fn cluster_e2e_graph_root_destruction_drifts_and_apply_moves_nothing() {
     );
 }
 
-/// The disposition matrix as a system: one apply over two graphs (one live,
-/// one not yet created) plus graph-spanning and cluster-scoped policies must
-/// produce all four dispositions at once — then converge after the second
-/// graph appears.
+/// The disposition matrix as a system under Stage 4A: a fresh multi-graph
+/// config converges in ONE apply (both graphs created, spanning and
+/// cluster-scoped policies applied), and a later mixed run — schema update
+/// (deferred), its dependent query (blocked), an independent query update
+/// (applied), its composite (derived) — shows all four dispositions at once
+/// before the graph-plane schema apply closes the loop.
 #[test]
 fn cluster_e2e_multi_graph_mixed_dispositions_then_converge() {
     let temp = tempdir().unwrap();
     write_multi_graph_cluster_fixture(temp.path());
-    init_cluster_derived_graph(temp.path()); // knowledge only
+    // No manual init: Stage 4A creates both graphs.
 
     let import = cluster_json(temp.path(), "import");
     assert_eq!(import["ok"], true, "{import}");
 
     let apply = cluster_json(temp.path(), "apply");
     assert_eq!(apply["ok"], true, "{apply}");
-    assert_eq!(apply["converged"], false, "{apply}");
-    assert_eq!(apply["applied_count"], 2, "{apply}");
+    assert_eq!(apply["converged"], true, "{apply}");
+    assert_eq!(change_for(&apply, "graph.knowledge")["disposition"], "applied");
     assert_eq!(
-        change_for(&apply, "query.knowledge.find_person")["disposition"],
-        "applied"
-    );
-    assert_eq!(
-        change_for(&apply, "policy.cluster_wide")["disposition"],
+        change_for(&apply, "graph.engineering")["disposition"],
         "applied"
     );
     assert_eq!(
         change_for(&apply, "query.engineering.find_service")["disposition"],
+        "applied"
+    );
+    // The graph-spanning and cluster-scoped policies ride the same run.
+    assert_eq!(change_for(&apply, "policy.shared")["disposition"], "applied");
+    assert_eq!(
+        change_for(&apply, "policy.cluster_wide")["disposition"],
+        "applied"
+    );
+    assert!(temp.path().join("graphs/knowledge.omni").exists());
+    assert!(temp.path().join("graphs/engineering.omni").exists());
+
+    // Mixed run: a knowledge schema update (4B territory — deferred) gates
+    // its query update (blocked), while an engineering query update is
+    // independent (applied) and re-derives its composite.
+    fs::write(
+        temp.path().join("people.pg"),
+        "\nnode Person {\n  name: String @key\n  age: I32?\n  bio: String?\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("people.gq"),
+        "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("services.gq"),
+        "\nquery find_service($name: String) {\n  match { $s: Service { name: $name } }\n  return { $s.name, $s.name }\n}\n",
+    )
+    .unwrap();
+
+    let mixed = cluster_json(temp.path(), "apply");
+    assert_eq!(mixed["ok"], true, "{mixed}");
+    assert_eq!(mixed["converged"], false, "{mixed}");
+    assert_eq!(change_for(&mixed, "schema.knowledge")["disposition"], "deferred");
+    assert_eq!(change_for(&mixed, "graph.knowledge")["disposition"], "deferred");
+    assert_eq!(
+        change_for(&mixed, "query.knowledge.find_person")["disposition"],
         "blocked"
     );
     assert_eq!(
-        change_for(&apply, "query.engineering.find_service")["reason"],
-        "dependency_missing"
-    );
-    // One missing dependency graph blocks the whole spanning policy.
-    assert_eq!(change_for(&apply, "policy.shared")["disposition"], "blocked");
-    assert_eq!(
-        change_for(&apply, "graph.engineering")["disposition"],
-        "deferred"
+        change_for(&mixed, "query.knowledge.find_person")["reason"],
+        "dependency_not_applied"
     );
     assert_eq!(
-        change_for(&apply, "schema.engineering")["disposition"],
-        "deferred"
+        change_for(&mixed, "query.engineering.find_service")["disposition"],
+        "applied"
     );
     assert_eq!(
-        change_for(&apply, "graph.knowledge")["disposition"],
+        change_for(&mixed, "graph.engineering")["disposition"],
         "derived"
     );
-    assert_eq!(
-        apply["resource_statuses"]["policy.shared"]["status"],
-        "blocked"
-    );
     // Deterministic ordering: changes sorted by resource address.
-    let order: Vec<&str> = apply["changes"]
+    let order: Vec<&str> = mixed["changes"]
         .as_array()
         .unwrap()
         .iter()
@@ -1412,26 +1442,60 @@ fn cluster_e2e_multi_graph_mixed_dispositions_then_converge() {
         .collect();
     let mut sorted = order.clone();
     sorted.sort_unstable();
-    assert_eq!(order, sorted, "{apply}");
+    assert_eq!(order, sorted, "{mixed}");
 
-    // The second graph appears; refresh observes it; apply converges.
-    init_named_cluster_graph(temp.path(), "engineering", "services.pg");
+    // The graph-plane tool applies the schema; refresh observes; converge.
+    output_success(
+        cli()
+            .arg("schema")
+            .arg("apply")
+            .arg(temp.path().join("graphs/knowledge.omni"))
+            .arg("--schema")
+            .arg(temp.path().join("people.pg"))
+            .arg("--json"),
+    );
     let refresh = cluster_json(temp.path(), "refresh");
     assert_eq!(refresh["ok"], true, "{refresh}");
-
     let converge = cluster_json(temp.path(), "apply");
-    assert_eq!(converge["ok"], true, "{converge}");
     assert_eq!(converge["converged"], true, "{converge}");
-    assert_eq!(
-        change_for(&converge, "query.engineering.find_service")["disposition"],
-        "applied"
-    );
-    assert_eq!(change_for(&converge, "policy.shared")["disposition"], "applied");
 
     let final_plan = cluster_json(temp.path(), "plan");
     assert!(
         final_plan["changes"].as_array().unwrap().is_empty(),
         "{final_plan}"
+    );
+}
+
+/// Stage 4A headline: a declared graph is created by `cluster apply` itself —
+/// no manual `omnigraph init` anywhere in the flow.
+#[test]
+fn cluster_e2e_declared_graph_created_by_apply() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+
+    let import = cluster_json(temp.path(), "import");
+    assert_eq!(import["ok"], true, "{import}");
+
+    let apply = cluster_json(temp.path(), "apply");
+    assert_eq!(apply["ok"], true, "{apply}");
+    assert_eq!(apply["converged"], true, "{apply}");
+    assert_eq!(change_for(&apply, "graph.knowledge")["disposition"], "applied");
+    assert!(temp.path().join("graphs/knowledge.omni").exists());
+
+    // The created graph is a real graph: the per-graph CLI can open it.
+    let snapshot = output_success(
+        cli()
+            .arg("snapshot")
+            .arg(temp.path().join("graphs/knowledge.omni")),
+    );
+    assert!(!stdout_string(&snapshot).is_empty());
+
+    let plan = cluster_json(temp.path(), "plan");
+    assert!(plan["changes"].as_array().unwrap().is_empty(), "{plan}");
+    let status = cluster_json(temp.path(), "status");
+    assert_eq!(
+        status["resource_statuses"]["graph.knowledge"]["status"],
+        "applied"
     );
 }
 
