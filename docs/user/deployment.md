@@ -67,7 +67,7 @@ so the day-2 loop runs in-container with no `omnigraph.yaml`:
 
 ```bash
 docker exec -it <container> sh -c \
-  'omnigraph cluster apply --as andrew --config /var/lib/omnigraph/cluster'
+  'omnigraph cluster apply --as <you> --config /var/lib/omnigraph/cluster'
 # then restart the container to pick up the applied state
 ```
 
@@ -81,7 +81,8 @@ docker exec -it <container> sh -c \
    (or the `--features aws` build's native Secrets Manager source).
 4. ALB in front for TLS; target the container's 8080 with `/healthz` checks.
 5. Day-2: ECS exec into the task → edit/upload config on the volume →
-   `omnigraph cluster apply --as <you>` → force a new deployment (restart).
+   `omnigraph cluster apply --as <you> --config /var/lib/omnigraph/cluster`
+   → force a new deployment (restart).
 
 For a deployment that doesn't need the cluster control plane, the classic
 stateless shape — `OMNIGRAPH_TARGET_URI=s3://bucket/graph.omni`, no volume —
