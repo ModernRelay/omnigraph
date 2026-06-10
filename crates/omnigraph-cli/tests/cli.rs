@@ -1435,6 +1435,67 @@ fn cluster_e2e_multi_graph_mixed_dispositions_then_converge() {
     );
 }
 
+/// Catalog payload drift self-heals across the command surface: status warns
+/// read-only, refresh persists the drift and drops the digest, apply
+/// republishes the blob, status comes back clean.
+#[test]
+fn cluster_e2e_payload_drift_self_heals() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    init_cluster_derived_graph(temp.path());
+    let import = cluster_json(temp.path(), "import");
+    assert_eq!(import["ok"], true, "{import}");
+    let apply = cluster_json(temp.path(), "apply");
+    assert_eq!(apply["converged"], true, "{apply}");
+
+    let query_digest = change_for(&apply, "query.knowledge.find_person")["after_digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let blob = temp
+        .path()
+        .join("__cluster/resources/query/knowledge/find_person")
+        .join(format!("{query_digest}.gq"));
+    fs::remove_file(&blob).unwrap();
+
+    let status = cluster_json(temp.path(), "status");
+    assert_eq!(status["ok"], true, "{status}");
+    assert!(
+        status["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "catalog_payload_missing"),
+        "{status}"
+    );
+
+    let refresh = cluster_json(temp.path(), "refresh");
+    assert_eq!(refresh["ok"], true, "{refresh}");
+    assert_eq!(
+        refresh["resource_statuses"]["query.knowledge.find_person"]["status"],
+        "drifted"
+    );
+
+    let heal = cluster_json(temp.path(), "apply");
+    assert_eq!(heal["ok"], true, "{heal}");
+    assert_eq!(heal["converged"], true, "{heal}");
+    assert!(blob.exists(), "blob republished");
+
+    let clean = cluster_json(temp.path(), "status");
+    assert!(
+        !clean["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| {
+                diagnostic["code"]
+                    .as_str()
+                    .is_some_and(|code| code.starts_with("catalog_payload"))
+            }),
+        "{clean}"
+    );
+}
+
 #[test]
 fn short_version_flag_prints_current_cli_version() {
     let output = output_success(cli().arg("-v"));

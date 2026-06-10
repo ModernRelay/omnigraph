@@ -198,6 +198,16 @@ files and does not inspect live graphs. Missing `state.json` succeeds with a
 warning; invalid state JSON or an unsupported state version fails. If a lock is
 present, status reports its id, operation, creation time, pid, and age.
 
+Status also verifies the catalog payloads read-only: every query/policy digest
+recorded in state is checked against its content-addressed blob under
+`__cluster/resources/` (existence and full digest re-hash). A missing or
+mismatched blob is reported as a warning (`catalog_payload_missing` /
+`catalog_payload_mismatch`); an unreadable blob is an error
+(`catalog_payload_read_error`) because an unverifiable catalog must not report
+healthy. Status never writes state — persisting the `drifted` condition is
+refresh's job. The check runs without the state lock, so it is a point-in-time
+report.
+
 ## Refresh And Import
 
 `cluster refresh` updates an existing `state.json` from actual observations.
@@ -216,8 +226,27 @@ Invalid graph roots are recorded as errors; `refresh` persists the error
 observation and exits non-zero, while `import` exits non-zero without creating
 initial state.
 
-Refresh/import do not observe query or policy resources yet. Existing query and
-policy state digests are preserved on refresh and are not invented on import.
+Refresh also verifies the catalog payloads of every query/policy digest
+recorded in state (the same check `cluster status` reports read-only), and
+closes the loop:
+
+- a **missing** or **digest-mismatched** blob marks the resource `drifted`
+  (condition `payload_missing` / `payload_mismatch`) and removes its digest
+  from state — so the next `cluster plan` proposes a create and the next
+  `cluster apply` republishes the blob (the self-heal loop, mirroring how a
+  missing graph root is handled);
+- an **unreadable** blob (IO error other than not-found) keeps the digest,
+  marks the resource `error` (condition `payload_read_error`), and exits
+  non-zero — transient IO must not trigger a spurious republish.
+
+Upgrade note: a state ledger written before catalog publish existed records
+query/policy digests with no blobs on disk; the first refresh after upgrading
+flags them all `payload_missing`, and a single `cluster apply` republishes
+everything and converges.
+
+Refresh/import do not observe query or policy resources beyond their catalog
+payloads yet. Existing query and policy state digests are preserved on refresh
+(unless their payload drifted, above) and are not invented on import.
 
 ## Force Unlock
 
