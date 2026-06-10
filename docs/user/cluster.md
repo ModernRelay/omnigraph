@@ -109,8 +109,10 @@ omnigraph cluster apply --config ./company-brain --as andrew
 ```
 
 `--as <actor>` attributes the run: it is recorded in recovery sidecars and
-audit entries and threaded into the engine's commit history. Make it a habit
-on every apply (it is required for `approve`).
+audit entries and threaded into the engine's commit history. Set
+`cli: { actor: <you> }` in your per-operator `omnigraph.yaml` to make it the
+default when `--as` is omitted (the flag always wins; `approve` requires one
+of the two).
 
 What each change kind does:
 
@@ -234,9 +236,12 @@ with an in-flight apply.
 - **CI-driven convergence**: `validate` and `plan --json` are read-only and
   safe in pipelines; gate `apply --as ci` on plan review. Approvals are the
   human step by design — keep `cluster approve` out of automation.
-- **`omnigraph.yaml` still has a job**: per-operator settings (CLI defaults,
-  credentials, active context). It just no longer describes the deployment —
-  a server boots from one source or the other, never a merge of both.
+- **`omnigraph.yaml` still has a job**: per-operator settings — your
+  `cli.actor` default for `--as`, CLI defaults, credentials, and data-plane
+  ergonomics (point `graphs.<name>.uri` at a derived root like
+  `./company-brain/graphs/knowledge.omni` to use `--target <name>` for
+  loads). It just no longer describes the deployment — a server boots from
+  one source or the other, never a merge of both.
 
 ## What the control plane does not do (yet)
 
