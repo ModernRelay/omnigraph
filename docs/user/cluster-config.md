@@ -2,6 +2,9 @@
 
 **Status:** Phase 5 — cluster-booted serving (`omnigraph-server --cluster`).
 
+> New to the cluster tooling? Start with the operator how-to guide,
+> [cluster.md](cluster.md) — this document is the reference.
+
 Cluster config is the future control-plane configuration surface for a whole
 OmniGraph deployment. In this stage, OmniGraph can validate a local
 `cluster.yaml` folder, produce a deterministic read-only plan, inspect the
