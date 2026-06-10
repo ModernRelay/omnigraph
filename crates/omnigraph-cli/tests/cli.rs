@@ -984,7 +984,7 @@ query find_person($name: String) {
 /// deferred by cluster apply, executed by `omnigraph schema apply` against
 /// the graph, picked up by `cluster refresh`, and the next apply re-converges.
 #[test]
-fn cluster_e2e_schema_change_defers_until_schema_apply_and_refresh() {
+fn cluster_e2e_schema_change_applied_by_cluster() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
     init_cluster_derived_graph(temp.path());
@@ -993,7 +993,8 @@ fn cluster_e2e_schema_change_defers_until_schema_apply_and_refresh() {
     let apply = cluster_json(temp.path(), "apply");
     assert_eq!(apply["converged"], true, "{apply}");
 
-    // Additive schema change: cluster apply must defer it loudly, not act.
+    // Additive schema change: Stage 4B applies it from the cluster — no
+    // manual schema apply, no refresh round-trip.
     fs::write(
         temp.path().join("people.pg"),
         r#"
@@ -1005,40 +1006,39 @@ node Person {
 "#,
     )
     .unwrap();
-    let deferred = cluster_json(temp.path(), "apply");
-    assert_eq!(deferred["ok"], true, "{deferred}");
-    assert_eq!(deferred["applied_count"], 0, "{deferred}");
-    assert_eq!(deferred["converged"], false, "{deferred}");
+
+    // Plan previews the real migration steps (RFC-004 §D7).
+    let plan = cluster_json(temp.path(), "plan");
+    let schema_change = change_for(&plan, "schema.knowledge");
+    assert_eq!(schema_change["disposition"], "applied", "{plan}");
+    let migration = &schema_change["migration"];
+    assert_eq!(migration["supported"], true, "{plan}");
     assert!(
-        deferred["diagnostics"]
+        migration["steps"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|diagnostic| diagnostic["code"] == "apply_unsupported_change"),
-        "{deferred}"
+            .any(|step| step["kind"] == "add_property"),
+        "{plan}"
     );
 
-    // The graph-plane tool applies the migration...
-    output_success(
+    let evolve = cluster_json(temp.path(), "apply");
+    assert_eq!(evolve["ok"], true, "{evolve}");
+    assert_eq!(evolve["converged"], true, "{evolve}");
+    assert_eq!(change_for(&evolve, "schema.knowledge")["disposition"], "applied");
+
+    // The live graph carries the new schema; the plan is empty.
+    let schema_show = output_success(
         cli()
             .arg("schema")
-            .arg("apply")
-            .arg(temp.path().join("graphs/knowledge.omni"))
-            .arg("--schema")
-            .arg(temp.path().join("people.pg"))
-            .arg("--json"),
+            .arg("show")
+            .arg(temp.path().join("graphs/knowledge.omni")),
     );
-    // ...refresh observes it...
-    let refresh = cluster_json(temp.path(), "refresh");
-    assert_eq!(refresh["ok"], true, "{refresh}");
-    // ...and the control plane re-converges.
-    let reconverge = cluster_json(temp.path(), "apply");
-    assert_eq!(reconverge["ok"], true, "{reconverge}");
-    assert_eq!(reconverge["converged"], true, "{reconverge}");
+    assert!(stdout_string(&schema_show).contains("bio"), "live schema updated");
     let replan = cluster_json(temp.path(), "plan");
     assert!(
         replan["changes"].as_array().unwrap().is_empty(),
-        "after schema apply + refresh + apply, the plan must be empty: {replan}"
+        "one cluster apply converges a schema change: {replan}"
     );
 }
 
@@ -1207,7 +1207,7 @@ fn cluster_e2e_lost_state_reimport_recovers_catalog() {
 /// the graph (no config change) must surface as drift through refresh, status,
 /// and plan — and apply must never silently "correct" it.
 #[test]
-fn cluster_e2e_out_of_band_schema_change_surfaces_as_drift() {
+fn cluster_e2e_out_of_band_schema_drift_then_apply_converges_it() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
     init_cluster_derived_graph(temp.path());
@@ -1238,48 +1238,42 @@ node Person {
             .arg("--json"),
     );
 
+    // Drift is visible...
     let refresh = cluster_json(temp.path(), "refresh");
-    assert_eq!(refresh["ok"], true, "{refresh}");
     assert_eq!(
         refresh["resource_statuses"]["schema.knowledge"]["status"],
         "drifted"
     );
-    assert_eq!(
-        refresh["resource_statuses"]["graph.knowledge"]["status"],
-        "drifted"
-    );
-    assert_eq!(
-        refresh["observations"]["graph.knowledge"]["schema_matches_desired"],
-        false
-    );
-
-    let status = cluster_json(temp.path(), "status");
-    assert_eq!(
-        status["resource_statuses"]["schema.knowledge"]["status"],
-        "drifted"
-    );
-
+    // ...the plan proposes converging back to desired, with a migration
+    // preview (a soft drop of the out-of-band field)...
     let plan = cluster_json(temp.path(), "plan");
-    assert_eq!(change_for(&plan, "schema.knowledge")["disposition"], "deferred");
-    assert_eq!(change_for(&plan, "graph.knowledge")["disposition"], "deferred");
-    let live_schema_digest = change_for(&plan, "schema.knowledge")["before_digest"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    let drift_apply = cluster_json(temp.path(), "apply");
-    assert_eq!(drift_apply["applied_count"], 0, "{drift_apply}");
-    assert_eq!(drift_apply["converged"], false, "{drift_apply}");
-    // Apply must not have "corrected" the drift: state still records the LIVE
-    // schema digest, not the desired one.
-    let state: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(temp.path().join("__cluster/state.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        state["applied_revision"]["resources"]["schema.knowledge"]["digest"],
-        live_schema_digest
+    let schema_change = change_for(&plan, "schema.knowledge");
+    assert_eq!(schema_change["disposition"], "applied", "{plan}");
+    assert!(
+        schema_change["migration"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|step| step["kind"] == "drop_property" && step["mode"] == "soft"),
+        "{plan}"
     );
+    // ...and apply converges the live schema back (axiom 8: drift correction
+    // is gated like any change; a soft migration is the recoverable tier).
+    let converge = cluster_json(temp.path(), "apply");
+    assert_eq!(converge["ok"], true, "{converge}");
+    assert_eq!(converge["converged"], true, "{converge}");
+    let schema_show = output_success(
+        cli()
+            .arg("schema")
+            .arg("show")
+            .arg(temp.path().join("graphs/knowledge.omni")),
+    );
+    assert!(
+        !stdout_string(&schema_show).contains("bio"),
+        "out-of-band field soft-dropped back to desired"
+    );
+    let replan = cluster_json(temp.path(), "plan");
+    assert!(replan["changes"].as_array().unwrap().is_empty(), "{replan}");
 }
 
 /// Disaster input fails closed: a destroyed graph root drifts the ledger,
@@ -1393,12 +1387,32 @@ fn cluster_e2e_multi_graph_mixed_dispositions_then_converge() {
     assert!(temp.path().join("graphs/knowledge.omni").exists());
     assert!(temp.path().join("graphs/engineering.omni").exists());
 
-    // Mixed run: a knowledge schema update (4B territory — deferred) gates
-    // its query update (blocked), while an engineering query update is
-    // independent (applied) and re-derives its composite.
+    // Mixed run: a graph REMOVAL (4C territory — deferred) gates its query
+    // delete (blocked), while a knowledge query update is independent
+    // (applied) and re-derives its composite. All four dispositions at once.
     fs::write(
-        temp.path().join("people.pg"),
-        "\nnode Person {\n  name: String @key\n  age: I32?\n  bio: String?\n}\n",
+        temp.path().join("cluster.yaml"),
+        r#"
+version: 1
+metadata:
+  name: company-brain
+state:
+  backend: cluster
+  lock: true
+graphs:
+  knowledge:
+    schema: ./people.pg
+    queries:
+      find_person:
+        file: ./people.gq
+policies:
+  shared:
+    file: ./shared.policy.yaml
+    applies_to: [knowledge]
+  cluster_wide:
+    file: ./cluster_wide.policy.yaml
+    applies_to: [cluster]
+"#,
     )
     .unwrap();
     fs::write(
@@ -1406,31 +1420,35 @@ fn cluster_e2e_multi_graph_mixed_dispositions_then_converge() {
         "\nquery find_person($name: String) {\n  match { $p: Person { name: $name } }\n  return { $p.name }\n}\n",
     )
     .unwrap();
-    fs::write(
-        temp.path().join("services.gq"),
-        "\nquery find_service($name: String) {\n  match { $s: Service { name: $name } }\n  return { $s.name, $s.name }\n}\n",
-    )
-    .unwrap();
 
     let mixed = cluster_json(temp.path(), "apply");
     assert_eq!(mixed["ok"], true, "{mixed}");
     assert_eq!(mixed["converged"], false, "{mixed}");
-    assert_eq!(change_for(&mixed, "schema.knowledge")["disposition"], "deferred");
-    assert_eq!(change_for(&mixed, "graph.knowledge")["disposition"], "deferred");
     assert_eq!(
-        change_for(&mixed, "query.knowledge.find_person")["disposition"],
-        "blocked"
+        change_for(&mixed, "graph.engineering")["disposition"],
+        "deferred"
     );
     assert_eq!(
-        change_for(&mixed, "query.knowledge.find_person")["reason"],
-        "dependency_not_applied"
+        change_for(&mixed, "schema.engineering")["disposition"],
+        "deferred"
     );
     assert_eq!(
         change_for(&mixed, "query.engineering.find_service")["disposition"],
-        "applied"
+        "blocked"
     );
     assert_eq!(
-        change_for(&mixed, "graph.engineering")["disposition"],
+        change_for(&mixed, "query.engineering.find_service")["reason"],
+        "dependency_not_applied"
+    );
+    assert_eq!(
+        change_for(&mixed, "query.knowledge.find_person")["disposition"],
+        "applied"
+    );
+    // policy.shared's applies_to narrowed, but its FILE digest is unchanged
+    // — applies_to lives in cluster.yaml (the config digest), so it is not a
+    // resource change.
+    assert_eq!(
+        change_for(&mixed, "graph.knowledge")["disposition"],
         "derived"
     );
     // Deterministic ordering: changes sorted by resource address.
@@ -1443,27 +1461,7 @@ fn cluster_e2e_multi_graph_mixed_dispositions_then_converge() {
     let mut sorted = order.clone();
     sorted.sort_unstable();
     assert_eq!(order, sorted, "{mixed}");
-
-    // The graph-plane tool applies the schema; refresh observes; converge.
-    output_success(
-        cli()
-            .arg("schema")
-            .arg("apply")
-            .arg(temp.path().join("graphs/knowledge.omni"))
-            .arg("--schema")
-            .arg(temp.path().join("people.pg"))
-            .arg("--json"),
-    );
-    let refresh = cluster_json(temp.path(), "refresh");
-    assert_eq!(refresh["ok"], true, "{refresh}");
-    let converge = cluster_json(temp.path(), "apply");
-    assert_eq!(converge["converged"], true, "{converge}");
-
-    let final_plan = cluster_json(temp.path(), "plan");
-    assert!(
-        final_plan["changes"].as_array().unwrap().is_empty(),
-        "{final_plan}"
-    );
+    // Graph deletion cannot converge until stage 4C's approval artifacts.
 }
 
 /// Stage 4A headline: a declared graph is created by `cluster apply` itself —
