@@ -1190,6 +1190,149 @@ async fn refresh_runs_roll_forward_recovery_in_process() {
     assert_eq!(helpers::count_rows(&db, "node:Person").await, 2);
 }
 
+/// The long-lived-process contract for `load`: a Phase B → Phase C
+/// failure (per-table `commit_staged` advanced Lance HEAD, manifest
+/// publish did not land, sidecar persists) must not wedge subsequent
+/// loads on the same engine handle. This is the server shape — `POST
+/// /ingest` calls `load_as` on a shared handle with no reopen between
+/// requests — so the follow-up load must heal the sidecar-covered
+/// drift in-process: no restart, no explicit `refresh()`, no
+/// `omnigraph repair`.
+#[tokio::test]
+async fn load_after_finalize_publisher_failure_heals_without_reopen() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+
+    // Failed multi-table load: Person + Company + WorksAt all run
+    // commit_staged (Lance HEAD advances on three tables), then the
+    // publisher is wedged before the manifest commit.
+    {
+        let _failpoint = ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+        let err = load_jsonl(
+            &mut db,
+            r#"{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Person","data":{"name":"Bob","age":25}}
+{"type":"Company","data":{"name":"Acme"}}
+{"edge":"WorksAt","from":"Alice","to":"Acme"}
+"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("injected failpoint triggered: mutation.post_finalize_pre_publisher"),
+            "unexpected error: {err}"
+        );
+        let recovery_dir = dir.path().join("__recovery");
+        assert_eq!(
+            std::fs::read_dir(&recovery_dir).unwrap().count(),
+            1,
+            "exactly one sidecar must persist after the finalize failure"
+        );
+    }
+
+    // Follow-up load on the SAME handle, touching the drifted tables.
+    // Must succeed without manual intervention.
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Person","data":{"name":"Carol","age":41}}
+{"type":"Company","data":{"name":"Globex"}}
+"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect(
+        "a follow-up load on the same handle must heal sidecar-covered \
+         drift in-process instead of demanding repair/restart",
+    );
+
+    // Both batches are visible: the first load rolled forward, the
+    // second landed normally on top of it.
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 3);
+    assert_eq!(helpers::count_rows(&db, "node:Company").await, 2);
+    assert_eq!(helpers::count_rows(&db, "edge:WorksAt").await, 1);
+
+    // The sidecar was consumed by the in-process roll-forward.
+    let recovery_dir = dir.path().join("__recovery");
+    if recovery_dir.exists() {
+        assert_eq!(
+            std::fs::read_dir(&recovery_dir).unwrap().count(),
+            0,
+            "sidecar must be consumed by the in-process roll-forward"
+        );
+    }
+}
+
+/// Same contract as
+/// `load_after_finalize_publisher_failure_heals_without_reopen`, for the
+/// mutation entry point: after a failed mutation leaves a sidecar, the
+/// next mutation on the same handle heals it in-process — no explicit
+/// `refresh()` (which `refresh_runs_roll_forward_recovery_in_process`
+/// covers), no reopen.
+#[tokio::test]
+async fn mutation_after_finalize_publisher_failure_heals_without_reopen() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+
+    {
+        let _failpoint = ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+        let err = mutate_main(
+            &mut db,
+            MUTATION_QUERIES,
+            "insert_person",
+            &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("injected failpoint triggered: mutation.post_finalize_pre_publisher"),
+            "unexpected error: {err}"
+        );
+        let recovery_dir = dir.path().join("__recovery");
+        assert_eq!(
+            std::fs::read_dir(&recovery_dir).unwrap().count(),
+            1,
+            "exactly one sidecar must persist after the finalize failure"
+        );
+    }
+
+    // Follow-up mutation on the SAME handle, same table. No refresh, no
+    // reopen — the write entry point heals the drift itself.
+    mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Frank")], &[("$age", 33)]),
+    )
+    .await
+    .expect(
+        "a follow-up mutation on the same handle must heal sidecar-covered \
+         drift in-process instead of demanding repair/restart",
+    );
+
+    // Eve rolled forward, Frank landed normally.
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 2);
+
+    let recovery_dir = dir.path().join("__recovery");
+    if recovery_dir.exists() {
+        assert_eq!(
+            std::fs::read_dir(&recovery_dir).unwrap().count(),
+            0,
+            "sidecar must be consumed by the in-process roll-forward"
+        );
+    }
+}
+
 /// Refresh-time recovery must NOT call `Dataset::restore` — it can
 /// silently orphan a concurrent writer's commit. Sidecars that would
 /// require rollback must be left on disk for the next ReadWrite open.
