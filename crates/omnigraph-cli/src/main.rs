@@ -130,6 +130,8 @@ async fn main() -> Result<()> {
             json,
         } => {
             let config = load_cli_config(config.as_ref())?;
+            let uri =
+                apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
             let bearer_token =
                 resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
             let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
@@ -198,6 +200,8 @@ async fn main() -> Result<()> {
                  use `omnigraph load --from <base> --mode <mode>` (ingest defaults: --from main --mode merge)"
             );
             let config = load_cli_config(config.as_ref())?;
+            let uri =
+                apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
             let bearer_token =
                 resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
             let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
@@ -250,6 +254,8 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_cli_config(config.as_ref())?;
+                let uri =
+                    apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
@@ -293,6 +299,8 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_cli_config(config.as_ref())?;
+                let uri =
+                    apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
@@ -328,6 +336,8 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_cli_config(config.as_ref())?;
+                let uri =
+                    apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
@@ -367,6 +377,8 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_cli_config(config.as_ref())?;
+                let uri =
+                    apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
@@ -417,6 +429,8 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_cli_config(config.as_ref())?;
+                let uri =
+                    apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let uri = resolve_uri(&config, uri, target.as_deref())?;
@@ -456,6 +470,8 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_cli_config(config.as_ref())?;
+                let uri =
+                    apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let uri = resolve_uri(&config, uri, target.as_deref())?;
@@ -519,6 +535,8 @@ async fn main() -> Result<()> {
                 allow_data_loss,
             } => {
                 let config = load_cli_config(config.as_ref())?;
+                let uri =
+                    apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
@@ -576,6 +594,8 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_cli_config(config.as_ref())?;
+                let uri =
+                    apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let uri = resolve_uri(&config, uri, target.as_deref())?;
@@ -640,6 +660,8 @@ async fn main() -> Result<()> {
             json,
         } => {
             let config = load_cli_config(config.as_ref())?;
+            let uri =
+                apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
             let bearer_token =
                 resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
             let uri = resolve_uri(&config, uri, target.as_deref())?;
@@ -675,6 +697,8 @@ async fn main() -> Result<()> {
             table_keys,
         } => {
             let config = load_cli_config(config.as_ref())?;
+            let uri =
+                apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
             let bearer_token =
                 resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
             let uri = resolve_uri(&config, uri, target.as_deref())?;
@@ -736,6 +760,7 @@ async fn main() -> Result<()> {
             let target_name = target
                 .as_deref()
                 .or_else(|| alias_config.and_then(|alias| alias.graph.as_deref()));
+            let uri = apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target_name)?;
             let bearer_token = resolve_remote_bearer_token(&config, uri.as_deref(), target_name)?;
             let graph = resolve_cli_graph(&config, uri, target_name)?;
             let uri = graph.uri.clone();
@@ -822,6 +847,7 @@ async fn main() -> Result<()> {
             let target_name = target
                 .as_deref()
                 .or_else(|| alias_config.and_then(|alias| alias.graph.as_deref()));
+            let uri = apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target_name)?;
             let bearer_token = resolve_remote_bearer_token(&config, uri.as_deref(), target_name)?;
             let graph = resolve_cli_graph(&config, uri, target_name)?;
             let uri = graph.uri.clone();
@@ -1177,6 +1203,8 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_cli_config(config.as_ref())?;
+                let uri =
+                    apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let uri = resolve_uri(&config, uri, target.as_deref())?;

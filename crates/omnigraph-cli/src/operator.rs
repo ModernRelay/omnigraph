@@ -468,6 +468,25 @@ mod tests {
     }
 
     #[test]
+    fn server_lookup_supports_targeting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(
+            &path,
+            "servers:\n  intel-dev:\n    url: http://127.0.0.1:8080/\n",
+        )
+        .unwrap();
+        let config = load_operator_config_at(&path).unwrap();
+        // the --server resolution shape: bare url and graph-scoped url
+        let base = config.servers["intel-dev"].url.trim_end_matches('/');
+        assert_eq!(base, "http://127.0.0.1:8080");
+        assert_eq!(
+            format!("{base}/graphs/spike"),
+            "http://127.0.0.1:8080/graphs/spike"
+        );
+    }
+
+    #[test]
     fn token_env_name_uppercases_and_underscores() {
         assert_eq!(token_env_name("intel-dev"), "OMNIGRAPH_TOKEN_INTEL_DEV");
         assert_eq!(token_env_name("prod"), "OMNIGRAPH_TOKEN_PROD");

@@ -264,6 +264,57 @@ pub(crate) fn resolve_remote_bearer_token(
     Ok(None)
 }
 
+/// `--server <name>` (RFC-007 PR 3): resolve an operator-defined server
+/// name (+ optional `--graph` for multi-graph servers) to the effective
+/// remote URI. The result feeds the ordinary `uri` slot, so graph
+/// resolution and the keyed-token URL match work unchanged — the flag is
+/// sugar for a URI the operator already owns. Unknown names fail loudly,
+/// listing what IS defined.
+pub(crate) fn resolve_server_flag(
+    server: Option<&str>,
+    graph: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(server) = server else {
+        return Ok(None);
+    };
+    let operator_config = operator::load_operator_config()?;
+    let Some(entry) = operator_config.servers.get(server) else {
+        let known = operator_config
+            .servers
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        color_eyre::eyre::bail!(
+            "unknown server '{server}' — servers defined in the operator config: [{known}] (add it under servers: in ~/.omnigraph/config.yaml)"
+        );
+    };
+    let base = entry.url.trim_end_matches('/');
+    Ok(Some(match graph {
+        Some(graph) => format!("{base}/graphs/{graph}"),
+        None => base.to_string(),
+    }))
+}
+
+/// Apply `--server`/`--graph` to a command's uri/target slots: exclusive
+/// with both (loud error, not silent precedence), no-op when absent.
+pub(crate) fn apply_server_flag(
+    server: Option<&str>,
+    graph: Option<&str>,
+    uri: Option<String>,
+    target: Option<&str>,
+) -> Result<Option<String>> {
+    if server.is_none() {
+        return Ok(uri);
+    }
+    if uri.is_some() || target.is_some() {
+        color_eyre::eyre::bail!(
+            "--server is exclusive with a positional URI and --target — pick one way to address the graph"
+        );
+    }
+    resolve_server_flag(server, graph)
+}
+
 /// The remote base URL a token resolution is FOR — the same scoping
 /// `graph_bearer_token_env` uses: an explicit http(s) `--uri` wins, else
 /// the config-resolved target's uri (when remote). Local URIs → None.

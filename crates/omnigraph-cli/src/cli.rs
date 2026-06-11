@@ -21,6 +21,17 @@ pub(crate) struct Cli {
     #[arg(long = "as", global = true, value_name = "ACTOR")]
     pub(crate) as_actor: Option<String>,
 
+    /// Target an operator-defined server by name (RFC-007): resolves to
+    /// its `url` from `servers:` in ~/.omnigraph/config.yaml. Exclusive
+    /// with a positional URI or `--target`.
+    #[arg(long, global = true, value_name = "NAME")]
+    pub(crate) server: Option<String>,
+
+    /// Graph id on a multi-graph `--server` (appends `/graphs/<id>` to
+    /// the server url). Requires --server.
+    #[arg(long, global = true, value_name = "GRAPH_ID", requires = "server")]
+    pub(crate) graph: Option<String>,
+
     #[command(subcommand)]
     pub(crate) command: Command,
 }
