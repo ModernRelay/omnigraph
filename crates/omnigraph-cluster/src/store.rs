@@ -58,16 +58,30 @@ impl Drop for StateLockGuard {
                 let path = self.uri.trim_start_matches("file://");
                 let _ = std::fs::remove_file(path);
             }
-            // Object stores need an async delete; best-effort spawn. A crash
-            // here leaves the lock for `force-unlock` — same as a process
-            // kill, and the same recovery path.
+            // Object stores need an async delete, and it must COMPLETE
+            // before a short-lived CLI process exits — a spawned task dies
+            // with the runtime and leaks the lock (caught by the s3 smoke
+            // test: import's lock survived into the next command). On the
+            // multi-thread runtime (the CLI and the gated s3 tests),
+            // block_in_place waits for the delete; on a current-thread
+            // runtime that's not allowed, so fall back to a spawn —
+            // best-effort, with `force-unlock` as the documented recovery,
+            // same as a crash.
             StorageKind::S3 => {
                 let adapter = Arc::clone(&self.adapter);
                 let uri = self.uri.clone();
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.spawn(async move {
-                        let _ = adapter.delete(&uri).await;
-                    });
+                    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                        tokio::task::block_in_place(move || {
+                            handle.block_on(async move {
+                                let _ = adapter.delete(&uri).await;
+                            });
+                        });
+                    } else {
+                        handle.spawn(async move {
+                            let _ = adapter.delete(&uri).await;
+                        });
+                    }
                 }
             }
         }
