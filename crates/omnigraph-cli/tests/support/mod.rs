@@ -12,12 +12,24 @@ use reqwest::blocking::Client;
 use serde_json::Value;
 use tempfile::{TempDir, tempdir};
 
+/// Hermetic default: point OMNIGRAPH_HOME at a path that exists on no
+/// machine, so spawned binaries never read the developer's real
+/// ~/.omnigraph/ (an absent operator config is an empty layer). Tests
+/// exercising the operator layer override the var explicitly.
+pub const HERMETIC_OPERATOR_HOME: &str = "/nonexistent/omnigraph-test-home";
+
 pub fn cli() -> Command {
-    Command::cargo_bin("omnigraph").unwrap()
+    let mut command = Command::cargo_bin("omnigraph").unwrap();
+    command.env("OMNIGRAPH_HOME", HERMETIC_OPERATOR_HOME);
+    command.env_remove("OMNIGRAPH_CONFIG");
+    command
 }
 
 pub fn cli_process() -> StdCommand {
-    StdCommand::new(assert_cmd::cargo::cargo_bin("omnigraph"))
+    let mut command = StdCommand::new(assert_cmd::cargo::cargo_bin("omnigraph"));
+    command.env("OMNIGRAPH_HOME", HERMETIC_OPERATOR_HOME);
+    command.env_remove("OMNIGRAPH_CONFIG");
+    command
 }
 
 fn server_process() -> StdCommand {

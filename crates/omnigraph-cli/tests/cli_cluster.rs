@@ -726,6 +726,73 @@ fn cluster_apply_uses_cli_actor_from_local_config() {
     assert_eq!(apply(&["--as", "andrew"]), "andrew", "--as overrides cli.actor");
 }
 
+/// RFC-007 PR 1: the operator layer joins the actor chain —
+/// `--as` > legacy `cli.actor` (RFC-008 window) > `operator.actor` > none.
+#[test]
+fn cluster_apply_uses_operator_actor_from_omnigraph_home() {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    let operator_home = tempdir().unwrap();
+    fs::write(
+        operator_home.path().join("config.yaml"),
+        "operator:\n  actor: act-operator\n",
+    )
+    .unwrap();
+
+    let output = cli()
+        .current_dir(temp.path())
+        .env("OMNIGRAPH_HOME", operator_home.path())
+        .arg("cluster")
+        .arg("import")
+        .arg("--config")
+        .arg(temp.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    let apply = |extra: &[&str]| {
+        let mut command = cli();
+        command
+            .current_dir(temp.path())
+            .env("OMNIGRAPH_HOME", operator_home.path());
+        for arg in extra {
+            command.arg(arg);
+        }
+        let output = command
+            .arg("cluster")
+            .arg("apply")
+            .arg("--config")
+            .arg(temp.path())
+            .arg("--json")
+            .output()
+            .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
+        json["actor"].clone()
+    };
+
+    // No --as, no omnigraph.yaml: the operator identity applies.
+    assert_eq!(
+        apply(&[]),
+        "act-operator",
+        "operator.actor is the no-flag, no-legacy-config default"
+    );
+    // --as still wins over everything.
+    assert_eq!(apply(&["--as", "andrew"]), "andrew");
+
+    // A legacy cli.actor (RFC-008 window) outranks the operator layer.
+    fs::write(
+        temp.path().join("omnigraph.yaml"),
+        "cli:\n  actor: act-legacy\n",
+    )
+    .unwrap();
+    assert_eq!(
+        apply(&[]),
+        "act-legacy",
+        "legacy cli.actor wins over operator.actor during the deprecation window"
+    );
+}
+
 #[test]
 fn cluster_approve_uses_cli_actor_fallback() {
     let temp = tempdir().unwrap();
