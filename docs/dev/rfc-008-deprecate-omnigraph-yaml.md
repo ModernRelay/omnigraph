@@ -132,7 +132,7 @@ contract), retirement is staged, loud, and tooled:
    hand-edited anyway (Terraform has no config scaffolder either). New
    users copy from the cluster quick-start; migrants get a ready-to-review
    `cluster.yaml` from `config migrate`.
-4. **Opt-in strict.** `OMNIGRAPH_NO_LEGACY_CONFIG=1` turns the warning into
+4. **Opt-in strict** *(landed — the release gap to stages 1–3 collapsed: no version boundary was crossed between them, so all four ship in the same release)*. `OMNIGRAPH_NO_LEGACY_CONFIG=1` turns the warning into
    an error — for teams that finished migrating and want regressions caught.
 5. **Remove at the next major.** Loading the file becomes an error pointing
    at `config migrate`. The `OmnigraphConfig` code path, the dual

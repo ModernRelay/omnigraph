@@ -610,3 +610,39 @@ fn config_migrate_splits_legacy_config() {
     assert!(output.status.success(), "{output:?}");
     assert!(temp.path().join("cluster.yaml.proposed").exists());
 }
+
+/// RFC-008 stage 4: OMNIGRAPH_NO_LEGACY_CONFIG refuses a present legacy
+/// file (pointing at config migrate) but changes nothing on migrated
+/// setups with no file.
+#[test]
+fn strict_mode_refuses_legacy_file_but_not_its_absence() {
+    let temp = tempdir().unwrap();
+    fs::write(temp.path().join("omnigraph.yaml"), "cli:\n  actor: a\n").unwrap();
+    let output = cli()
+        .current_dir(temp.path())
+        .env("OMNIGRAPH_NO_LEGACY_CONFIG", "1")
+        .arg("graphs")
+        .arg("list")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("OMNIGRAPH_NO_LEGACY_CONFIG") && stderr.contains("config migrate"),
+        "{stderr}"
+    );
+
+    // Migrated setup (no file): strict mode is a no-op — a config-loading
+    // command that tolerates empty defaults succeeds.
+    let clean = tempdir().unwrap();
+    let output = cli()
+        .current_dir(clean.path())
+        .env("OMNIGRAPH_NO_LEGACY_CONFIG", "1")
+        .arg("queries")
+        .arg("list")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
