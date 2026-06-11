@@ -498,3 +498,43 @@ fn graphs_list_against_local_uri_errors_with_remote_only_message() {
         "expected 'remote multi-graph server URL' rejection in stderr; got:\n{stderr}"
     );
 }
+
+/// RFC-008 stage 1: loading a legacy omnigraph.yaml emits the per-key
+/// deprecation block (the migration map applied to THIS file), suppressible
+/// via OMNIGRAPH_SUPPRESS_YAML_DEPRECATION.
+#[test]
+fn legacy_config_load_warns_per_key_and_suppression_silences() {
+    let temp = tempdir().unwrap();
+    fs::write(
+        temp.path().join("omnigraph.yaml"),
+        "cli:\n  actor: act-x\ngraphs:\n  g:\n    uri: /tmp/never-opened\n",
+    )
+    .unwrap();
+
+    // `graphs list --json` loads the config and exits without touching the
+    // graph URI.
+    let output = cli()
+        .current_dir(temp.path())
+        .arg("graphs")
+        .arg("list")
+        .arg("--json")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("deprecated (RFC-008)") && stderr.contains("`cli.actor` -> `operator.actor`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("config migrate"), "{stderr}");
+
+    let output = cli()
+        .current_dir(temp.path())
+        .env("OMNIGRAPH_SUPPRESS_YAML_DEPRECATION", "1")
+        .arg("graphs")
+        .arg("list")
+        .arg("--json")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("deprecated (RFC-008)"), "{stderr}");
+}
