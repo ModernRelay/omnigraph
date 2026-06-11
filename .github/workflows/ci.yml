@@ -351,7 +351,10 @@ jobs:
         run: cargo test --locked -p omnigraph-engine --test s3_storage -- --nocapture
 
       - name: Run RustFS server smoke
-        run: cargo test --locked -p omnigraph-server --test server server_opens_s3_repo_directly_and_serves_snapshot_and_read -- --nocapture
+        # The exact test name (not a loose substring): a filter that matches
+        # nothing passes vacuously, which silently ran zero tests here for a
+        # while (the old filter said s3_repo; the test says s3_graph).
+        run: cargo test --locked -p omnigraph-server --test s3 server_opens_s3_graph_directly_and_serves_snapshot_and_read -- --nocapture
 
       - name: Run RustFS CLI smoke
         run: cargo test --locked -p omnigraph-cli --test system_local local_cli_s3_end_to_end_init_load_read_flow -- --nocapture
