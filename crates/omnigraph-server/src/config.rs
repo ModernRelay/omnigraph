@@ -549,7 +549,9 @@ fn load_config_in(
     });
 
     let mut config = if let Some(path) = &config_path {
-        serde_yaml::from_str::<OmnigraphConfig>(&fs::read_to_string(path)?)?
+        let text = fs::read_to_string(path)?;
+        warn_yaml_deprecation_once(path, &text);
+        serde_yaml::from_str::<OmnigraphConfig>(&text)?
     } else {
         OmnigraphConfig::default()
     };
@@ -561,6 +563,74 @@ fn load_config_in(
     };
 
     Ok(config)
+}
+
+/// RFC-008 stage 1: suppress the legacy-config deprecation warning
+/// (one process), for CI logs during the deprecation window.
+pub const SUPPRESS_YAML_DEPRECATION_ENV: &str = "OMNIGRAPH_SUPPRESS_YAML_DEPRECATION";
+
+/// RFC-008's migration map (the "Where every key goes" table), applied to
+/// the keys actually present in a loaded file — never a generic banner.
+/// Keys are `(yaml pointer, destination)`; the pointer is matched against
+/// the file's real top-level/nested keys.
+const YAML_DEPRECATION_MAP: &[(&str, &str)] = &[
+    ("graphs", "cluster.yaml `graphs:` (team surface) — or flags/env for the zero-config tier"),
+    ("queries", "the cluster catalog (`.gq` discovery in cluster.yaml)"),
+    ("policy", "cluster.yaml `policies:` + `applies_to` bindings"),
+    ("server", "flags/env (`--bind`); meaningless under cluster boot"),
+    ("auth", "the operator credentials chain (`omnigraph login <server>`)"),
+    ("aliases", "operator `aliases:` (bindings) + catalog stored queries (content)"),
+    ("query", "obsolete — cluster query discovery replaced `query.roots`"),
+    ("project", "cluster.yaml `metadata.name`"),
+    ("cli.actor", "`operator.actor` in ~/.omnigraph/config.yaml"),
+    ("cli.output_format", "`defaults.output` in ~/.omnigraph/config.yaml"),
+    ("cli.table_max_column_width", "`defaults.table_max_column_width` in ~/.omnigraph/config.yaml"),
+    ("cli.table_cell_layout", "`defaults.table_cell_layout` in ~/.omnigraph/config.yaml"),
+    ("cli.graph", "explicit `--target`/`--server` (no operator default-target yet)"),
+    ("cli.branch", "explicit `--branch`"),
+];
+
+/// Emit the per-key deprecation block once per process when a legacy
+/// `omnigraph.yaml` is actually loaded. `omnigraph config migrate`
+/// produces the split these lines describe.
+fn warn_yaml_deprecation_once(path: &Path, text: &str) {
+    static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if env::var_os(SUPPRESS_YAML_DEPRECATION_ENV).is_some() {
+        return;
+    }
+    let lines = yaml_deprecation_lines(text);
+    if lines.is_empty() {
+        return;
+    }
+    WARNED.get_or_init(|| {
+        eprintln!(
+            "warning: '{}' is deprecated (RFC-008) — its keys have new homes; run `omnigraph config migrate` for the split, set {SUPPRESS_YAML_DEPRECATION_ENV}=1 to silence:",
+            path.display()
+        );
+        for line in &lines {
+            eprintln!("  {line}");
+        }
+    });
+}
+
+fn yaml_deprecation_lines(text: &str) -> Vec<String> {
+    let Ok(mapping) = serde_yaml::from_str::<serde_yaml::Mapping>(text) else {
+        return Vec::new();
+    };
+    let present = |pointer: &str| -> bool {
+        match pointer.split_once('.') {
+            None => mapping.contains_key(pointer),
+            Some((outer, inner)) => mapping
+                .get(outer)
+                .and_then(|value| value.as_mapping())
+                .is_some_and(|nested| nested.contains_key(inner)),
+        }
+    };
+    YAML_DEPRECATION_MAP
+        .iter()
+        .filter(|(pointer, _)| present(pointer))
+        .map(|(pointer, destination)| format!("`{pointer}` -> {destination}"))
+        .collect()
 }
 
 fn absolute_base_dir(cwd: &Path, path: &Path) -> Result<PathBuf> {
@@ -606,6 +676,22 @@ mod tests {
         fs::write(temp.path().join("omnigraph.yaml"), "cli:\n  actor: act-cwd\n").unwrap();
         let config = load_config_in(temp.path(), None, Some(&env_path)).unwrap();
         assert_eq!(config.cli.actor.as_deref(), Some("act-env"));
+    }
+
+    #[test]
+    fn yaml_deprecation_lines_name_present_keys_only() {
+        let lines = super::yaml_deprecation_lines(
+            "graphs:\n  g:\n    uri: /tmp/x\ncli:\n  actor: a\n  branch: main\n",
+        );
+        let joined = lines.join("\n");
+        assert!(joined.contains("`graphs` ->"), "{joined}");
+        assert!(joined.contains("`cli.actor` -> `operator.actor`"), "{joined}");
+        assert!(joined.contains("`cli.branch` ->"), "{joined}");
+        assert!(!joined.contains("`aliases`"), "{joined}");
+        assert!(!joined.contains("`cli.output_format`"), "{joined}");
+
+        assert!(super::yaml_deprecation_lines("").is_empty());
+        assert!(super::yaml_deprecation_lines("not: [valid").is_empty());
     }
 
     #[test]

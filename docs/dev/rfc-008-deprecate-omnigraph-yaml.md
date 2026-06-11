@@ -112,22 +112,26 @@ Two placements worth defending:
 Per Hyrum's Law (the repo's own deny-list: shipped observable behavior is
 contract), retirement is staged, loud, and tooled:
 
-1. **Warn.** Loading `omnigraph.yaml` emits a one-line deprecation notice
+1. **Warn** *(landed)*. Loading `omnigraph.yaml` emits a one-line deprecation notice
    naming the replacement for each key actually present in the file (not a
    generic banner — the migration map above, applied to *your* file).
    Suppressible per-process (`OMNIGRAPH_SUPPRESS_YAML_DEPRECATION=1`) for
    CI logs during the window.
-2. **Migrate.** `omnigraph config migrate` reads an existing
+2. **Migrate** *(landed)*. `omnigraph config migrate` reads an existing
    `omnigraph.yaml` and writes the split: the team half as a ready-to-review
    `cluster.yaml` (+ moves query/policy files into the checkout layout),
    the personal half merged into `~/.omnigraph/config.yaml` — printing a
    diff-style summary and touching nothing without `--write`. The command
    is the test of the migration map's completeness: any key it cannot
    place is a bug in this RFC.
-3. **Stop scaffolding.** `omnigraph init` stops generating
-   `omnigraph.yaml` (it currently scaffolds one into cwd — the source of
-   the test-pollution bug). `omnigraph cluster init` (new, small) scaffolds
-   a minimal `cluster.yaml` instead.
+3. **Stop scaffolding** *(landed)*. `omnigraph init` stops generating
+   `omnigraph.yaml` (it scaffolded one into cwd — the source of the
+   test-pollution bug). **No replacement scaffold**: a minimal
+   `cluster.yaml` is five lines; a generator would be a second copy of the
+   schema to keep in sync, producing a file that is unusable until
+   hand-edited anyway (Terraform has no config scaffolder either). New
+   users copy from the cluster quick-start; migrants get a ready-to-review
+   `cluster.yaml` from `config migrate`.
 4. **Opt-in strict.** `OMNIGRAPH_NO_LEGACY_CONFIG=1` turns the warning into
    an error — for teams that finished migrating and want regressions caught.
 5. **Remove at the next major.** Loading the file becomes an error pointing

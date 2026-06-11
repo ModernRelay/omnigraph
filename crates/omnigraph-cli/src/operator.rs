@@ -91,6 +91,10 @@ pub(crate) struct OperatorIdentity {
 pub(crate) struct OperatorDefaults {
     /// Default read output format, below every more-specific source.
     pub(crate) output: Option<ReadOutputFormat>,
+    /// Table rendering preferences (below the legacy cli.table_* keys
+    /// during the RFC-008 window).
+    pub(crate) table_max_column_width: Option<usize>,
+    pub(crate) table_cell_layout: Option<omnigraph_server::config::TableCellLayout>,
     #[serde(flatten)]
     unknown: serde_yaml::Mapping,
 }
