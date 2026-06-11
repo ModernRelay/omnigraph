@@ -1449,6 +1449,26 @@ async fn refresh_defers_rollback_eligible_sidecar_to_next_open() {
          pre_head={pre_head}, post_head={post_head}",
     );
 
+    // A write attempt while the rollback-eligible sidecar is deferred:
+    // the write-entry heal defers it again (roll-forward-only), and the
+    // commit-time drift guard must name the actual recovery path (a
+    // read-write reopen) — NOT `omnigraph repair`, which refuses while
+    // a sidecar is pending.
+    let err = mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Grace")], &[("$age", 50)]),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("a pending recovery sidecar requires rollback"),
+        "drift guard must point at a read-write reopen for sidecar-covered \
+         rollback-eligible drift; got: {err}"
+    );
+
     // Cross-check: drop the engine and reopen — full sweep handles
     // the rollback (will use Dataset::restore safely; no concurrent
     // writers at open time).

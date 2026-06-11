@@ -599,9 +599,36 @@ impl StagedMutation {
                 )));
             }
             if head > current {
+                // Error path only: tell the operator which drift class
+                // this is. Uncovered drift (external raw Lance write,
+                // pre-fix maintenance) goes through `omnigraph repair`.
+                // Sidecar-covered drift reaching this guard means the
+                // write-entry heal deferred it (rollback-eligible), and
+                // `repair` refuses while a sidecar is pending — the
+                // recovery path is a read-write reopen. A list failure
+                // must not mask the conflict; fall back to the
+                // uncovered-drift wording.
+                let sidecar_covered =
+                    crate::db::manifest::list_sidecars(db.root_uri(), db.storage_adapter())
+                        .await
+                        .map(|sidecars| {
+                            sidecars.iter().any(|sidecar| {
+                                sidecar
+                                    .tables
+                                    .iter()
+                                    .any(|pin| pin.table_key == entry.table_key)
+                            })
+                        })
+                        .unwrap_or(false);
+                let action = if sidecar_covered {
+                    "a pending recovery sidecar requires rollback — reopen the graph \
+                     read-write (e.g. restart the server) to recover"
+                } else {
+                    "run `omnigraph repair` before writing"
+                };
                 return Err(OmniError::manifest_conflict(format!(
-                    "table '{}' has Lance HEAD version {} ahead of manifest version {}; run `omnigraph repair` before writing",
-                    entry.table_key, head, current
+                    "table '{}' has Lance HEAD version {} ahead of manifest version {}; {}",
+                    entry.table_key, head, current, action
                 )));
             }
 
