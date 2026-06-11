@@ -1217,43 +1217,6 @@ async fn main() -> Result<()> {
             }
         }
         Command::Cluster { command } => match command {
-            ClusterCommand::Init {
-                config,
-                name,
-                storage,
-                json,
-            } => {
-                let target = config.join("cluster.yaml");
-                if target.exists() {
-                    bail!(
-                        "'{}' already exists — cluster init refuses to overwrite",
-                        target.display()
-                    );
-                }
-                std::fs::create_dir_all(&config)?;
-                let mut scaffold = String::from("version: 1\n");
-                if let Some(name) = &name {
-                    scaffold.push_str(&format!("metadata:\n  name: {name}\n"));
-                }
-                match &storage {
-                    Some(root) => scaffold.push_str(&format!("storage: {root}\n")),
-                    None => scaffold.push_str(
-                        "# storage: s3://bucket/prefix   # omit: this folder is the storage root\n",
-                    ),
-                }
-                scaffold.push_str(
-                    "graphs: {}\n# graphs:\n#   knowledge:\n#     schema: knowledge.pg\n#     queries: queries/\n",
-                );
-                std::fs::write(&target, scaffold)?;
-                if json {
-                    print_json(&serde_json::json!({ "created": target.display().to_string() }))?;
-                } else {
-                    println!(
-                        "created {} — declare graphs, then `omnigraph cluster import` and `apply`",
-                        target.display()
-                    );
-                }
-            }
             ClusterCommand::Validate { config, json } => {
                 let output = validate_config_dir(config);
                 finish_cluster_validate(&output, json)?;

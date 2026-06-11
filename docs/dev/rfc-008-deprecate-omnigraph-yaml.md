@@ -125,9 +125,13 @@ contract), retirement is staged, loud, and tooled:
    is the test of the migration map's completeness: any key it cannot
    place is a bug in this RFC.
 3. **Stop scaffolding** *(landed)*. `omnigraph init` stops generating
-   `omnigraph.yaml` (it currently scaffolds one into cwd — the source of
-   the test-pollution bug). `omnigraph cluster init` (new, small) scaffolds
-   a minimal `cluster.yaml` instead.
+   `omnigraph.yaml` (it scaffolded one into cwd — the source of the
+   test-pollution bug). **No replacement scaffold**: a minimal
+   `cluster.yaml` is five lines; a generator would be a second copy of the
+   schema to keep in sync, producing a file that is unusable until
+   hand-edited anyway (Terraform has no config scaffolder either). New
+   users copy from the cluster quick-start; migrants get a ready-to-review
+   `cluster.yaml` from `config migrate`.
 4. **Opt-in strict.** `OMNIGRAPH_NO_LEGACY_CONFIG=1` turns the warning into
    an error — for teams that finished migrating and want regressions caught.
 5. **Remove at the next major.** Loading the file becomes an error pointing
