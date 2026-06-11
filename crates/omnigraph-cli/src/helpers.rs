@@ -677,69 +677,6 @@ pub(crate) fn normalize_legacy_alias_uri(
     (Some(candidate), alias_args)
 }
 
-pub(crate) fn scaffold_config_if_missing(uri: &str) -> Result<()> {
-    let path = inferred_config_path(uri)?;
-    if path.exists() {
-        return Ok(());
-    }
-
-    fs::write(
-        path,
-        format!(
-            "\
-project:
-  name: Omnigraph Project
-
-graphs:
-  local:
-    uri: {}
-    # bearer_token_env: OMNIGRAPH_BEARER_TOKEN
-
-server:
-  graph: local
-  bind: 127.0.0.1:8080
-
-cli:
-  graph: local
-  branch: main
-  output_format: table
-  table_max_column_width: 80
-  table_cell_layout: truncate
-
-query:
-  roots:
-    - queries
-    - .
-
-aliases:
-  # owner:
-  #   command: read
-  #   query: context.gq
-  #   name: decision_owner
-  #   args: [slug]
-  #   graph: local
-  #   branch: main
-  #   format: kv
-  #
-  # attach_trace:
-  #   command: change
-  #   query: mutations.gq
-  #   name: attach_trace
-  #   args: [decision_slug, trace_slug]
-  #   graph: local
-  #   branch: main
-
-# auth:
-#   env_file: ./.env.omni
-#
-# policy:
-#   file: ./policy.yaml
-",
-            yaml_string(uri),
-        ),
-    )?;
-    Ok(())
-}
 
 pub(crate) fn inferred_config_path(uri: &str) -> Result<PathBuf> {
     if uri.contains("://") {

@@ -345,6 +345,23 @@ pub(crate) enum Command {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ClusterCommand {
+    /// Scaffold a minimal cluster.yaml in the config directory (refuses
+    /// if one exists). The cluster checkout replaces the legacy
+    /// omnigraph.yaml scaffold (RFC-008 stage 3).
+    Init {
+        /// Directory to scaffold into (default: .)
+        #[arg(long, default_value = ".")]
+        config: PathBuf,
+        /// Optional deployment label (metadata.name)
+        #[arg(long)]
+        name: Option<String>,
+        /// Optional storage root URI (s3://bucket/prefix); omit for the
+        /// config-dir layout
+        #[arg(long)]
+        storage: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Validate cluster.yaml and referenced schemas, queries, and policy files.
     Validate {
         /// Cluster config directory containing cluster.yaml.
