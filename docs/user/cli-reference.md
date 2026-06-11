@@ -9,8 +9,8 @@ Top-level command families and subcommands. Graph-targeting commands accept eith
 | Command | Purpose |
 |---|---|
 | `init` | `--schema <pg>` → initialize a graph (also scaffolds `omnigraph.yaml` if missing) |
-| `load` | bulk load a branch (`--mode overwrite\|append\|merge`) |
-| `ingest` | branch-creating transactional load (`--from <base>`) |
+| `load` | bulk load a branch, local or remote (`--mode overwrite\|append\|merge` is **required** — overwrite is destructive, so there is no default). Without `--from` the target branch must exist; `--from <base>` forks a missing `--branch` from `<base>` first |
+| `ingest` | deprecated alias of `load --from <base>` (defaults: `--from main --mode merge`); prints a one-line warning to stderr |
 | `query` (alias: `read`) | run named read query; source via `--query <path>`, `-e`/`--query-string <GQ>`, or `--alias <name>` (exactly one). `read` is the deprecated previous name and prints a one-line warning to stderr |
 | `mutate` (alias: `change`) | run mutation query; same `--query` / `-e` / `--alias` mutual-exclusion as `query`. `change` is the deprecated previous name and prints a one-line warning to stderr |
 | `snapshot` | print current snapshot (per-table version + row count) |

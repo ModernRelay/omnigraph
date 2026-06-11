@@ -2650,6 +2650,8 @@ fn load_json_outputs_summary_for_main_branch() {
     let output = output_success(
         cli()
             .arg("load")
+            .arg("--mode")
+            .arg("overwrite")
             .arg("--data")
             .arg(&data)
             .arg("--json")
@@ -2984,7 +2986,15 @@ fn read_alias_uses_alias_target_without_cli_default_and_accepts_url_like_arg() {
         &data,
         r#"{"type":"Person","data":{"name":"https://example.com","age":30}}"#,
     );
-    output_success(cli().arg("load").arg("--data").arg(&data).arg(&graph));
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--mode")
+            .arg("overwrite")
+            .arg("--data")
+            .arg(&data)
+            .arg(&graph),
+    );
     write_query_file(
         &query,
         &std::fs::read_to_string(fixture("test.gq")).unwrap(),
@@ -3748,6 +3758,8 @@ fn cli_fails_for_missing_schema_or_data_file() {
     let load_output = output_failure(
         cli()
             .arg("load")
+            .arg("--mode")
+            .arg("overwrite")
             .arg("--data")
             .arg(&missing_data)
             .arg(&graph),

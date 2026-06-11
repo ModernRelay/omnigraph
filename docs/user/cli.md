@@ -42,7 +42,7 @@ omnigraph branch create --uri graph.omni --from main feature-x
 omnigraph branch list --uri graph.omni
 omnigraph branch merge --uri graph.omni feature-x --into main
 
-omnigraph ingest --data batch.jsonl --branch review/import-2026-04-09 graph.omni
+omnigraph load --data batch.jsonl --branch review/import-2026-04-09 --from main --mode merge graph.omni
 omnigraph export graph.omni --branch main --type Person > people.jsonl
 omnigraph commit list graph.omni --branch main --json
 omnigraph commit show --uri graph.omni <commit-id> --json

@@ -89,7 +89,7 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Load data into a graph
+    /// Load data into a graph (local or remote)
     Load {
         /// Graph URI
         uri: Option<String>,
@@ -99,14 +99,21 @@ enum Command {
         config: Option<PathBuf>,
         #[arg(long)]
         data: PathBuf,
+        /// Target branch (defaults to main). Without --from it must exist.
         #[arg(long)]
         branch: Option<String>,
-        #[arg(long, default_value = "overwrite")]
+        /// Base branch to fork --branch from when it doesn't exist yet.
+        /// Without this flag a missing branch is an error, never a fork.
+        #[arg(long)]
+        from: Option<String>,
+        /// How existing rows are handled: overwrite | append | merge.
+        /// Required — overwrite is destructive, so there is no default.
+        #[arg(long)]
         mode: CliLoadMode,
         #[arg(long)]
         json: bool,
     },
-    /// Ingest data into a reviewable named branch
+    /// Deprecated alias of `load --from <base>` (defaults: --mode merge, --from main)
     Ingest {
         /// Graph URI
         uri: Option<String>,
@@ -686,14 +693,53 @@ impl CliLoadMode {
 }
 
 #[derive(Debug, Serialize)]
-struct LoadOutput<'a> {
-    uri: &'a str,
-    branch: &'a str,
-    mode: &'a str,
+struct LoadOutput {
+    uri: String,
+    branch: String,
+    mode: &'static str,
+    /// Present only when `--from` was given; echoes the requested base.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_branch: Option<String>,
+    branch_created: bool,
     nodes_loaded: usize,
     edges_loaded: usize,
     node_types_loaded: usize,
     edge_types_loaded: usize,
+}
+
+/// Map a remote `/ingest` response onto the CLI's load output. Table keys
+/// carry `node:`/`edge:` prefixes, so the per-kind sums are derivable
+/// client-side without the catalog.
+fn load_output_from_tables(
+    uri: &str,
+    branch: &str,
+    mode: CliLoadMode,
+    output: &IngestOutput,
+) -> LoadOutput {
+    let mut nodes_loaded = 0;
+    let mut edges_loaded = 0;
+    let mut node_types_loaded = 0;
+    let mut edge_types_loaded = 0;
+    for table in &output.tables {
+        if table.table_key.starts_with("node:") {
+            nodes_loaded += table.rows_loaded;
+            node_types_loaded += 1;
+        } else if table.table_key.starts_with("edge:") {
+            edges_loaded += table.rows_loaded;
+            edge_types_loaded += 1;
+        }
+    }
+    LoadOutput {
+        uri: uri.to_string(),
+        branch: branch.to_string(),
+        mode: mode.as_str(),
+        base_branch: output.base_branch.clone(),
+        branch_created: output.branch_created,
+        nodes_loaded,
+        edges_loaded,
+        node_types_loaded,
+        edge_types_loaded,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1561,25 +1607,22 @@ fn merged_params_json(
     }
 }
 
-fn print_load_human(
-    uri: &str,
-    branch: &str,
-    mode: CliLoadMode,
-    nodes_loaded: usize,
-    edges_loaded: usize,
-    node_types_loaded: usize,
-    edge_types_loaded: usize,
-) {
+fn print_load_human(payload: &LoadOutput) {
     println!(
         "loaded {} on branch {} with {}: {} nodes across {} node types, {} edges across {} edge types",
-        uri,
-        branch,
-        mode.as_str(),
-        nodes_loaded,
-        node_types_loaded,
-        edges_loaded,
-        edge_types_loaded
+        payload.uri,
+        payload.branch,
+        payload.mode,
+        payload.nodes_loaded,
+        payload.node_types_loaded,
+        payload.edges_loaded,
+        payload.edge_types_loaded
     );
+    if payload.branch_created {
+        if let Some(base) = &payload.base_branch {
+            println!("branch {} created from {}", payload.branch, base);
+        }
+    }
 }
 
 fn print_ingest_human(output: &IngestOutput) {
@@ -2659,39 +2702,60 @@ async fn main() -> Result<()> {
             config,
             data,
             branch,
+            from,
             mode,
             json,
         } => {
             let config = load_cli_config(config.as_ref())?;
-            let graph = resolve_local_graph(&config, uri, target.as_deref(), "load")?;
+            let bearer_token =
+                resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
+            let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
             let uri = graph.uri.clone();
             let branch = resolve_branch(&config, branch, None, "main");
-            let db = open_local_db_with_policy(&graph).await?;
-            let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
-            let result = db
-                .load_file_as(&branch, None, &data.to_string_lossy(), mode.into(), actor)
+            let payload = if graph.is_remote {
+                let data = fs::read_to_string(&data)?;
+                let output = remote_json::<IngestOutput>(
+                    &http_client,
+                    Method::POST,
+                    remote_url(&uri, "/ingest"),
+                    Some(serde_json::to_value(IngestRequest {
+                        branch: Some(branch.clone()),
+                        from: from.clone(),
+                        mode: Some(mode.into()),
+                        data,
+                    })?),
+                    bearer_token.as_deref(),
+                )
                 .await?;
-            let payload = LoadOutput {
-                uri: &uri,
-                branch: &branch,
-                mode: mode.as_str(),
-                nodes_loaded: result.nodes_loaded.values().sum(),
-                edges_loaded: result.edges_loaded.values().sum(),
-                node_types_loaded: result.nodes_loaded.len(),
-                edge_types_loaded: result.edges_loaded.len(),
+                load_output_from_tables(&uri, &branch, mode, &output)
+            } else {
+                let db = open_local_db_with_policy(&graph).await?;
+                let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
+                let result = db
+                    .load_file_as(
+                        &branch,
+                        from.as_deref(),
+                        &data.to_string_lossy(),
+                        mode.into(),
+                        actor,
+                    )
+                    .await?;
+                LoadOutput {
+                    uri: uri.clone(),
+                    branch: branch.clone(),
+                    mode: mode.as_str(),
+                    base_branch: result.base_branch.clone(),
+                    branch_created: result.branch_created,
+                    nodes_loaded: result.nodes_loaded.values().sum(),
+                    edges_loaded: result.edges_loaded.values().sum(),
+                    node_types_loaded: result.nodes_loaded.len(),
+                    edge_types_loaded: result.edges_loaded.len(),
+                }
             };
             if json {
                 print_json(&payload)?;
             } else {
-                print_load_human(
-                    &uri,
-                    &branch,
-                    mode,
-                    payload.nodes_loaded,
-                    payload.edges_loaded,
-                    payload.node_types_loaded,
-                    payload.edge_types_loaded,
-                );
+                print_load_human(&payload);
             }
         }
         Command::Ingest {
@@ -2704,6 +2768,11 @@ async fn main() -> Result<()> {
             mode,
             json,
         } => {
+            // stderr so `--json` consumers reading stdout are unaffected.
+            eprintln!(
+                "warning: `omnigraph ingest` is deprecated and will be removed in a future release; \
+                 use `omnigraph load --from <base> --mode <mode>` (ingest defaults: --from main --mode merge)"
+            );
             let config = load_cli_config(config.as_ref())?;
             let bearer_token =
                 resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;

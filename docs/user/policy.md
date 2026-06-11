@@ -105,12 +105,13 @@ is validated/tested/explained as the anonymous policy.
 - `omnigraph policy validate` — parse + count actors, exit 1 on parse error.
 - `omnigraph policy test` — run cases in `policy.tests.yaml`, exit 1 on any expectation mismatch.
 - `omnigraph policy explain --actor … --action … [--branch …] [--target-branch …]` — show decision and matched rule.
-- `omnigraph --as <ACTOR> <subcommand>` — set the actor for the duration of one invocation. Effective for `change`, `load`, `ingest`, `branch create|delete|merge`, and `schema apply` against local URIs. No-op against remote HTTP URIs (actor is bearer-token-resolved server-side).
+- `omnigraph --as <ACTOR> <subcommand>` — set the actor for the duration of one invocation. Effective for `change`, `load` (and its deprecated `ingest` alias), `branch create|delete|merge`, and `schema apply` against local URIs. No-op against remote HTTP URIs (actor is bearer-token-resolved server-side).
 
 ## Enforcement
 
 Policy is a property of the **engine**, not the transport. Every mutating
-write — `mutate_as`, `load_as`, `ingest_as`, `apply_schema_as`,
+write — `mutate_as`, `load_as` (the deprecated `ingest_as` shims route
+through it), `apply_schema_as`,
 `branch_create_as`, `branch_create_from_as`, `branch_delete_as`,
 `branch_merge_as` — calls `Omnigraph::enforce(action, scope, actor)` at
 the head of the method. The gate fires identically whether the call

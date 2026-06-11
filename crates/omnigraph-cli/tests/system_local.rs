@@ -221,6 +221,8 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
     output_success(
         cli()
             .arg("load")
+            .arg("--mode")
+            .arg("overwrite")
             .arg("--data")
             .arg(fixture("test.jsonl"))
             .arg(graph.path()),
@@ -397,7 +399,7 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
 {"type":"Person","data":{"name":"Bob","age":26}}"#,
     );
 
-    let ingest_payload = parse_stdout_json(&output_success(
+    let ingest_output = output_success(
         cli()
             .arg("ingest")
             .arg("--data")
@@ -406,7 +408,13 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
             .arg("feature-ingest")
             .arg(graph.path())
             .arg("--json"),
-    ));
+    );
+    // The deprecation warning goes to stderr so --json stdout stays clean.
+    assert!(
+        String::from_utf8_lossy(&ingest_output.stderr).contains("deprecated"),
+        "ingest must warn about its deprecation on stderr"
+    );
+    let ingest_payload = parse_stdout_json(&ingest_output);
     assert_eq!(ingest_payload["branch"], "feature-ingest");
     assert_eq!(ingest_payload["base_branch"], "main");
     assert_eq!(ingest_payload["branch_created"], true);
@@ -457,6 +465,88 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
     ));
     assert_eq!(bob["row_count"], 1);
     assert_eq!(bob["rows"][0]["p.age"], 26);
+}
+
+/// The unified `load` subsumes ingest: `--from` opts into fork-if-missing,
+/// while without it a missing branch is an error — never an implicit fork.
+#[test]
+fn local_cli_load_from_forks_branch_and_missing_branch_errors_without_from() {
+    let graph = SystemGraph::loaded();
+    let extra = graph.write_jsonl(
+        "system-local-load-from.jsonl",
+        r#"{"type":"Person","data":{"name":"Zoe","age":33}}"#,
+    );
+
+    // Without --from, a missing branch must fail and create nothing.
+    let failure = output_failure(
+        cli()
+            .arg("load")
+            .arg("--mode")
+            .arg("merge")
+            .arg("--data")
+            .arg(&extra)
+            .arg("--branch")
+            .arg("feature-load")
+            .arg(graph.path()),
+    );
+    assert!(
+        String::from_utf8_lossy(&failure.stderr).contains("feature-load"),
+        "error should name the missing branch"
+    );
+
+    // With --from, the branch is forked and the load lands on it.
+    let payload = parse_stdout_json(&output_success(
+        cli()
+            .arg("load")
+            .arg("--mode")
+            .arg("merge")
+            .arg("--data")
+            .arg(&extra)
+            .arg("--branch")
+            .arg("feature-load")
+            .arg("--from")
+            .arg("main")
+            .arg(graph.path())
+            .arg("--json"),
+    ));
+    assert_eq!(payload["branch"], "feature-load");
+    assert_eq!(payload["base_branch"], "main");
+    assert_eq!(payload["branch_created"], true);
+    assert_eq!(payload["mode"], "merge");
+    assert_eq!(payload["nodes_loaded"], 1);
+
+    let snapshot = parse_stdout_json(&output_success(
+        cli()
+            .arg("snapshot")
+            .arg(graph.path())
+            .arg("--branch")
+            .arg("feature-load")
+            .arg("--json"),
+    ));
+    assert_eq!(snapshot["branch"], "feature-load");
+}
+
+/// `--mode` is required: overwrite is destructive, so the unified `load`
+/// has no implicit default.
+#[test]
+fn local_cli_load_requires_mode_flag() {
+    let graph = SystemGraph::loaded();
+    let extra = graph.write_jsonl(
+        "system-local-load-no-mode.jsonl",
+        r#"{"type":"Person","data":{"name":"Zoe","age":33}}"#,
+    );
+
+    let failure = output_failure(
+        cli()
+            .arg("load")
+            .arg("--data")
+            .arg(&extra)
+            .arg(graph.path()),
+    );
+    assert!(
+        String::from_utf8_lossy(&failure.stderr).contains("--mode"),
+        "clap should demand the missing --mode flag"
+    );
 }
 
 #[test]
@@ -512,6 +602,8 @@ fn local_cli_export_round_trips_full_branch_graph() {
     output_success(
         cli()
             .arg("load")
+            .arg("--mode")
+            .arg("overwrite")
             .arg("--data")
             .arg(&export_path)
             .arg(&imported_graph),
@@ -610,6 +702,8 @@ policy: {{}}
         cli()
             .current_dir(query_root)
             .arg("load")
+            .arg("--mode")
+            .arg("overwrite")
             .arg("--data")
             .arg(fixture("test.jsonl"))
             .arg(&graph_uri),
@@ -867,7 +961,15 @@ query get_task($slug: String) {
     );
 
     output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&graph));
-    output_success(cli().arg("load").arg("--data").arg(&data).arg(&graph));
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--mode")
+            .arg("overwrite")
+            .arg("--data")
+            .arg(&data)
+            .arg(&graph),
+    );
 
     let filtered = parse_stdout_json(&output_success(
         cli()
@@ -997,7 +1099,15 @@ query vector_search($q: String) {
     );
 
     output_success(cli().arg("init").arg("--schema").arg(&schema).arg(&graph));
-    output_success(cli().arg("load").arg("--data").arg(&data).arg(&graph));
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--mode")
+            .arg("overwrite")
+            .arg("--data")
+            .arg(&data)
+            .arg(&graph),
+    );
 
     let result = parse_stdout_json(&output_success(
         cli()
@@ -1221,6 +1331,8 @@ fn local_cli_load_enforces_engine_layer_policy() {
             .arg("--as")
             .arg("act-bruno")
             .arg("load")
+            .arg("--mode")
+            .arg("overwrite")
             .arg("--config")
             .arg(&config)
             .arg("--data")
@@ -1239,6 +1351,8 @@ fn local_cli_load_enforces_engine_layer_policy() {
             .arg("--as")
             .arg("act-ragnor")
             .arg("load")
+            .arg("--mode")
+            .arg("overwrite")
             .arg("--config")
             .arg(&config)
             .arg("--data")
@@ -1684,6 +1798,8 @@ graphs:
     std::fs::write(&data, "{\"type\":\"Person\",\"data\":{\"name\":\"Ada\"}}\n").unwrap();
     let output = cli()
         .arg("load")
+        .arg("--mode")
+        .arg("overwrite")
         .arg("--data")
         .arg(&data)
         .arg(temp.path().join("graphs/knowledge.omni"))
@@ -1796,6 +1912,8 @@ fn seed_graph(dir: &std::path::Path, graph: &str, row: &str) {
     std::fs::write(&data, row).unwrap();
     let output = cli()
         .arg("load")
+        .arg("--mode")
+        .arg("overwrite")
         .arg("--data")
         .arg(&data)
         .arg(dir.join(format!("graphs/{graph}.omni")))
