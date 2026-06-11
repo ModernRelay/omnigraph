@@ -2265,6 +2265,77 @@ async fn ingest_existing_branch_skips_branch_create_policy_check() {
     assert_eq!(body["base_branch"], "other-base");
 }
 
+/// Regression: branch creation is opt-in by presence of `from`. A request
+/// without `from` against a branch that doesn't exist must 404 — not
+/// silently fork `main` and land the data on the typo'd branch.
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_without_from_returns_404_for_missing_branch_and_creates_nothing() {
+    let (temp, app) = app_for_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    let ingest = IngestRequest {
+        branch: Some("feature-typo".to_string()),
+        from: None,
+        mode: Some(LoadMode::Merge),
+        data: r#"{"type":"Person","data":{"name":"Zoe","age":33}}"#.to_string(),
+    };
+
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/ingest")
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&ingest).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let error: ErrorOutput = serde_json::from_value(body).unwrap();
+    assert_eq!(error.code, Some(omnigraph_server::api::ErrorCode::NotFound));
+
+    let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+    assert!(
+        !db.branch_list()
+            .await
+            .unwrap()
+            .contains(&"feature-typo".to_string()),
+        "a 404'd ingest must not create the branch"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_without_from_loads_into_existing_branch() {
+    let (temp, app) = app_for_loaded_graph().await;
+    let graph = graph_path(temp.path());
+    {
+        let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
+        db.branch_create_from(ReadTarget::branch("main"), "feature")
+            .await
+            .unwrap();
+    }
+    let ingest = IngestRequest {
+        branch: Some("feature".to_string()),
+        from: None,
+        mode: Some(LoadMode::Merge),
+        data: r#"{"type":"Person","data":{"name":"Zoe","age":33}}"#.to_string(),
+    };
+
+    let (status, body) = json_response(
+        &app,
+        Request::builder()
+            .uri("/ingest")
+            .method(Method::POST)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&ingest).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["branch"], "feature");
+    assert_eq!(body["branch_created"], false);
+    assert_eq!(body["base_branch"], serde_json::Value::Null);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn ingest_denies_missing_branch_without_branch_create_permission() {
     let (_temp, app) = app_for_loaded_graph_with_auth_tokens_and_policy(

@@ -1587,7 +1587,7 @@ fn print_ingest_human(output: &IngestOutput) {
         "ingested {} into branch {} from {} with {} ({})",
         output.uri,
         output.branch,
-        output.base_branch,
+        output.base_branch.as_deref().unwrap_or("main"),
         output.mode.as_str(),
         if output.branch_created {
             "branch created"
@@ -2729,11 +2729,8 @@ async fn main() -> Result<()> {
             } else {
                 let db = open_local_db_with_policy(&graph).await?;
                 let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
-                // Deprecated shim retained until the CLI ingest command
-                // becomes an alias of the unified `load` handler.
-                #[allow(deprecated)]
                 let result = db
-                    .ingest_file_as(
+                    .load_file_as(
                         &branch,
                         Some(&from),
                         &data.to_string_lossy(),
@@ -2741,7 +2738,7 @@ async fn main() -> Result<()> {
                         actor,
                     )
                     .await?;
-                ingest_output(&uri, &result, None)
+                ingest_output(&uri, &result, mode.into(), None)
             };
             if json {
                 print_json(&payload)?;
