@@ -286,7 +286,7 @@ Three PRs, each independently useful, each landable without the next:
    §D4 chain (env + credentials file), the §D5 trust rules, and
    `omnigraph login <name>` (atomic write, `0600`). Legacy mechanisms
    untouched and tested-as-untouched.
-3. **PR 3 — operator targeting.** `--server <name>` on remote-capable
+3. **PR 3 — operator targeting** *(landed)*. `--server <name>` on remote-capable
    commands and `aliases:` in the operator layer (server + graph + query +
    default params), resolving through operator-defined servers. This is
    the *bridge* toward RFC-002's locator — multi-server addressing in a

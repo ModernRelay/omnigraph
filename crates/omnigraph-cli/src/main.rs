@@ -746,6 +746,34 @@ async fn main() -> Result<()> {
             }
 
             let config = load_cli_config(config.as_ref())?;
+            // Operator aliases (RFC-007 PR 3): pure bindings to stored
+            // queries. A legacy file-alias with the same name wins during
+            // the RFC-008 window (with a warning); an alias name found
+            // only in the operator layer takes the invoke path here.
+            if let Some(alias_name) = alias.as_deref() {
+                let operator_config = crate::operator::load_operator_config()?;
+                if let Some(operator_alias) = operator_config.aliases.get(alias_name) {
+                    if config.alias(alias_name).is_ok() {
+                        eprintln!(
+                            "warning: alias '{alias_name}' is defined in both omnigraph.yaml (legacy, wins during the deprecation window) and the operator config; the legacy definition applies"
+                        );
+                    } else {
+                        let output = execute_operator_alias(
+                            &http_client,
+                            &config,
+                            alias_name,
+                            operator_alias,
+                            &alias_args,
+                            load_params_json(&params)?,
+                        )
+                        .await?;
+                        let format =
+                            resolve_read_format(&config, format, json, operator_alias.format);
+                        print_read_output(&output, format, &config)?;
+                        return Ok(());
+                    }
+                }
+            }
             let alias = resolve_alias(&config, alias.as_deref(), AliasCommand::Read)?;
             let alias_name = alias.as_ref().map(|(name, _)| *name);
             let alias_config = alias.as_ref().map(|(_, alias)| *alias);

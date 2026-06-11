@@ -2,7 +2,7 @@
 
 A reference for the `omnigraph` binary's command surface and `omnigraph.yaml` schema. For a quick-start guide, see [cli.md](cli.md).
 
-Top-level command families and subcommands. Graph-targeting commands accept either a positional `URI`, `--uri`, or a `--target <name>` resolved against `omnigraph.yaml`; `cluster` commands use `--config <dir>`.
+Top-level command families and subcommands. Graph-targeting commands accept a positional `URI`, `--uri`, a `--target <name>` resolved against `omnigraph.yaml`, or `--server <name>` (an operator-defined server from `~/.omnigraph/config.yaml`, optionally with `--graph <id>` for multi-graph servers; exclusive with the other forms); `cluster` commands use `--config <dir>`.
 
 ## Top-level commands
 
@@ -66,6 +66,29 @@ newer CLI works on an older one). `$OMNIGRAPH_CONFIG=<path>` stands in for
 refused). Token from `--token`, or — preferred, keeps it out of shell
 history — one line on stdin: `echo $TOKEN | omnigraph login prod`.
 `omnigraph logout <name>` removes it (idempotent).
+
+#### Operator aliases — bindings, not content
+
+An operator alias is a personal name for *invoking a stored query on a
+named server* — it carries no query content (the stored query in the
+catalog is the team's contract; the alias, its defaults, and its name are
+yours):
+
+```yaml
+aliases:
+  triage:
+    server: intel-dev        # names an entry under servers:
+    graph: spike             # optional (multi-graph servers)
+    query: weekly_triage     # the STORED query's name — never a file
+    args: [since]            # positional args -> params, in order
+    params: { limit: 20 }    # fixed defaults; positionals/--params win
+    format: table
+```
+
+`omnigraph query --alias triage 2026-06-01` invokes
+`POST <server>/graphs/spike/queries/weekly_triage` with the keyed
+credential. A legacy `omnigraph.yaml` alias with the same name wins during
+the deprecation window (with a warning).
 
 A remote command whose URL prefix-matches an operator server's `url` (the
 `gh` host model — no flags needed) resolves its token through:

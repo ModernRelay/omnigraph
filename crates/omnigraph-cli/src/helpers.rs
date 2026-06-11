@@ -296,6 +296,57 @@ pub(crate) fn resolve_server_flag(
     }))
 }
 
+/// Execute an OPERATOR alias (RFC-007 PR 3): a pure binding invoking a
+/// stored query by name on a named server — POST {base}/queries/{name}.
+/// Param precedence: --params > positional args > the alias's fixed
+/// params. The keyed token applies via the ordinary URL match.
+pub(crate) async fn execute_operator_alias(
+    client: &reqwest::Client,
+    config: &OmnigraphConfig,
+    alias_name: &str,
+    alias: &crate::operator::OperatorAlias,
+    alias_args: &[String],
+    explicit_params: Option<Value>,
+) -> Result<ReadOutput> {
+    let uri = resolve_server_flag(Some(&alias.server), alias.graph.as_deref())?
+        .expect("server name is present");
+    let bearer_token = resolve_remote_bearer_token(config, Some(&uri), None)?;
+
+    let mut params = serde_json::Map::new();
+    for (key, value) in &alias.params {
+        let Some(key) = key.as_str() else {
+            bail!("alias '{alias_name}': params keys must be strings");
+        };
+        params.insert(key.to_string(), serde_json::to_value(value)?);
+    }
+    if alias_args.len() > alias.args.len() {
+        bail!(
+            "alias '{alias_name}' takes {} positional arg(s) ({}), got {}",
+            alias.args.len(),
+            alias.args.join(", "),
+            alias_args.len()
+        );
+    }
+    for (name, value) in alias.args.iter().zip(alias_args) {
+        params.insert(name.clone(), parse_alias_value(value));
+    }
+    if let Some(Value::Object(explicit)) = explicit_params {
+        for (key, value) in explicit {
+            params.insert(key, value);
+        }
+    }
+
+    let body = (!params.is_empty()).then(|| serde_json::json!({ "params": params }));
+    remote_json(
+        client,
+        Method::POST,
+        remote_url(&uri, &format!("/queries/{}", alias.query)),
+        body,
+        bearer_token.as_deref(),
+    )
+    .await
+}
+
 /// Apply `--server`/`--graph` to a command's uri/target slots: exclusive
 /// with both (loud error, not silent precedence), no-op when absent.
 pub(crate) fn apply_server_flag(

@@ -38,8 +38,34 @@ pub(crate) struct OperatorConfig {
     /// can redefine an entry here. No tokens in this file, ever.
     #[serde(default)]
     pub(crate) servers: BTreeMap<String, OperatorServer>,
+    /// Personal alias bindings (RFC-007 PR 3); see OperatorAlias.
+    #[serde(default)]
+    pub(crate) aliases: BTreeMap<String, OperatorAlias>,
     /// Everything this CLI version doesn't know. Warned once at load,
     /// otherwise ignored (forward compatibility within the operator layer).
+    #[serde(flatten)]
+    unknown: serde_yaml::Mapping,
+}
+
+/// A personal alias: a pure BINDING to a stored query on a named server —
+/// never content, never a file (RFC-007 §D2 "Aliases are bindings, not
+/// content"). The stored query is the team's contract; the alias, its
+/// defaults, and its name are the operator's.
+#[derive(Debug, Deserialize)]
+pub(crate) struct OperatorAlias {
+    /// Names an entry under `servers:`.
+    pub(crate) server: String,
+    /// Graph id for multi-graph servers (appends `/graphs/<id>`).
+    pub(crate) graph: Option<String>,
+    /// The STORED query's name on that server.
+    pub(crate) query: String,
+    /// Positional CLI args bind to these param names, in order.
+    #[serde(default)]
+    pub(crate) args: Vec<String>,
+    /// Fixed default params; positionals and `--params` override per key.
+    #[serde(default)]
+    pub(crate) params: serde_yaml::Mapping,
+    pub(crate) format: Option<ReadOutputFormat>,
     #[serde(flatten)]
     unknown: serde_yaml::Mapping,
 }
@@ -162,6 +188,9 @@ impl OperatorConfig {
         collect(&self.defaults.unknown, "defaults.");
         for (name, server) in &self.servers {
             collect(&server.unknown, &format!("servers.{name}."));
+        }
+        for (name, alias) in &self.aliases {
+            collect(&alias.unknown, &format!("aliases.{name}."));
         }
         warnings
     }
@@ -425,10 +454,8 @@ mod tests {
         let config = load_operator_config_at(&path).unwrap();
         assert_eq!(config.actor(), Some("act-a"));
         let warnings = config.unknown_key_warnings();
-        // `servers` became a known key in PR 2; `aliases` stays unknown
-        // until PR 3.
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
-        assert!(warnings.iter().any(|w| w.contains("`aliases`")));
+        // `servers` (PR 2) and `aliases` (PR 3) are known keys now.
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings.iter().any(|w| w.contains("`operator.color`")));
         assert_eq!(config.servers["prod"].url, "https://example.com");
     }
