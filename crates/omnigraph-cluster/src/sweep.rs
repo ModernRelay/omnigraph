@@ -19,13 +19,13 @@ pub(crate) async fn sweep_recovery_sidecars(
     for (path, sidecar) in backend.list_recovery_sidecars(diagnostics).await {
         match sidecar.kind {
             RecoverySidecarKind::GraphCreate => {
-                sweep_graph_create_sidecar(path, sidecar, state, diagnostics, &mut outcome).await;
+                sweep_graph_create_sidecar(backend, path, sidecar, state, diagnostics, &mut outcome).await;
             }
             RecoverySidecarKind::SchemaApply => {
                 sweep_schema_apply_sidecar(path, sidecar, state, diagnostics, &mut outcome).await;
             }
             RecoverySidecarKind::GraphDelete => {
-                sweep_graph_delete_sidecar(path, sidecar, state, diagnostics, &mut outcome);
+                sweep_graph_delete_sidecar(backend, path, sidecar, state, diagnostics, &mut outcome).await;
             }
         }
     }
@@ -33,6 +33,7 @@ pub(crate) async fn sweep_recovery_sidecars(
 }
 
 pub(crate) async fn sweep_graph_create_sidecar(
+    backend: &ClusterStore,
     path: String,
     sidecar: RecoverySidecar,
     state: &mut ClusterState,
@@ -41,13 +42,12 @@ pub(crate) async fn sweep_graph_create_sidecar(
 ) {
     let graph_address = graph_address(&sidecar.graph_id);
     let schema_addr = schema_address(&sidecar.graph_id);
-    let graph_path = PathBuf::from(&sidecar.graph_uri);
 
     // Row 1: nothing moved — the init never landed. The sidecar is pure
     // intent; retire it (deferred to the command's post-CAS cleanup, like
     // every other completed sidecar — a failed CAS simply re-sweeps it) and
     // let the command's own plan re-propose the create.
-    if !graph_path.exists() {
+    if !backend.graph_root_exists(&sidecar.graph_uri).await {
         outcome.completed_sidecars.push(path);
         return;
     }
@@ -251,7 +251,8 @@ pub(crate) async fn sweep_schema_apply_sidecar(
     }
 }
 
-pub(crate) fn sweep_graph_delete_sidecar(
+pub(crate) async fn sweep_graph_delete_sidecar(
+    backend: &ClusterStore,
     path: String,
     sidecar: RecoverySidecar,
     state: &mut ClusterState,
@@ -259,9 +260,8 @@ pub(crate) fn sweep_graph_delete_sidecar(
     outcome: &mut SweepOutcome,
 ) {
     let graph_address = graph_address(&sidecar.graph_id);
-    let root = PathBuf::from(&sidecar.graph_uri);
 
-    if root.exists() {
+    if backend.graph_root_exists(&sidecar.graph_uri).await {
         // Row 8: the delete never completed. Prefix removal is idempotent and
         // works on partial roots, so the repair is simply the re-proposed,
         // still-approved delete on a later run — retire the stale intent.

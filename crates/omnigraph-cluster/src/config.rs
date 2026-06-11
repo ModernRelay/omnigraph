@@ -239,8 +239,33 @@ pub(crate) fn validate_cluster_header(
         }
     }
 
+    if let Some(storage) = raw.storage.as_deref() {
+        let trimmed = storage.trim();
+        if trimmed.is_empty() {
+            diagnostics.push(Diagnostic::error(
+                "invalid_storage_root",
+                "storage",
+                "storage must be a non-empty URI (e.g. s3://bucket/prefix) when provided",
+            ));
+        } else if let Some(rest) = trimmed.strip_prefix("s3://") {
+            if rest.trim_start_matches('/').is_empty() {
+                diagnostics.push(Diagnostic::error(
+                    "invalid_storage_root",
+                    "storage",
+                    "storage s3:// URI must name a bucket",
+                ));
+            }
+        }
+    }
+
     ClusterSettings {
         state_lock: raw.state.lock.unwrap_or(true),
+        storage_root: raw
+            .storage
+            .as_deref()
+            .map(str::trim)
+            .filter(|storage| !storage.is_empty())
+            .map(|storage| storage.trim_end_matches('/').to_string()),
     }
 }
 
@@ -271,19 +296,19 @@ pub(crate) fn initial_import_state(desired: &DesiredCluster) -> ClusterState {
 }
 
 
-pub(crate) async fn observe_declared_graphs(desired: &DesiredCluster, state: &mut ClusterState) -> usize {
+pub(crate) async fn observe_declared_graphs(
+    desired: &DesiredCluster,
+    backend: &ClusterStore,
+    state: &mut ClusterState,
+) -> usize {
     let mut graph_error_count = 0;
     for graph in &desired.graphs {
         let graph_address = graph_address(&graph.id);
         let schema_address = schema_address(&graph.id);
-        let graph_path = desired
-            .config_dir
-            .join(CLUSTER_GRAPHS_DIR)
-            .join(format!("{}.omni", graph.id));
-        let graph_uri = display_path(&graph_path);
+        let graph_uri = backend.graph_root(&graph.id);
         let observed_at = now_rfc3339();
 
-        if !graph_path.exists() {
+        if !backend.graph_root_exists(&graph_uri).await {
             state.applied_revision.resources.remove(&graph_address);
             state.applied_revision.resources.remove(&schema_address);
             state.observations.insert(
@@ -737,6 +762,7 @@ pub(crate) fn load_desired(config_dir: &Path) -> LoadOutcome {
         desired: Some(DesiredCluster {
             config_dir: config_dir.clone(),
             config_digest,
+            storage_root: settings.storage_root.clone(),
             state_lock: settings.state_lock,
             graphs,
             resource_digests,

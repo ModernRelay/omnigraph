@@ -40,6 +40,8 @@ company-brain/
 ```yaml
 # cluster.yaml
 version: 1
+# storage: s3://omnigraph-local/clusters/company-brain   # optional: put the
+#   ledger, catalog, and graph data on object storage (default: this folder)
 metadata:
   name: company-brain
 graphs:

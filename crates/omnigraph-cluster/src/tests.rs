@@ -2762,6 +2762,70 @@ policies:
 
     // ---- serving snapshot (5B read-only loader) ----
 
+    // ---- storage: root (RFC-006) ----
+
+    #[tokio::test]
+    async fn storage_root_defaults_to_config_dir_layout() {
+        let dir = fixture();
+        init_derived_graph(dir.path()).await;
+        write_applyable_state(dir.path());
+        let out = apply_config_dir(dir.path()).await;
+        assert!(out.converged, "{out:?}");
+        // No storage: key — the original on-disk layout, byte-compatible.
+        assert!(dir.path().join(CLUSTER_STATE_FILE).exists());
+        assert!(dir.path().join(CLUSTER_RESOURCES_DIR).exists());
+        assert!(dir.path().join("graphs/knowledge.omni").exists());
+    }
+
+    #[tokio::test]
+    async fn storage_root_file_uri_relocates_the_cluster() {
+        let dir = fixture();
+        let storage = tempfile::tempdir().unwrap();
+        let storage_path = storage.path().to_string_lossy().to_string();
+        let mut config = fs::read_to_string(dir.path().join("cluster.yaml")).unwrap();
+        config = config.replace("version: 1\n", &format!("version: 1\nstorage: {storage_path}\n"));
+        fs::write(dir.path().join("cluster.yaml"), config).unwrap();
+
+        let import = import_config_dir(dir.path()).await;
+        assert!(import.ok, "{:?}", import.diagnostics);
+        let out = apply_config_dir(dir.path()).await;
+        assert!(out.ok && out.converged, "{:?}", out.diagnostics);
+
+        // Everything lives under the declared root; nothing under config dir.
+        assert!(storage.path().join("__cluster/state.json").exists());
+        assert!(storage.path().join("graphs/knowledge.omni").exists());
+        assert!(storage.path().join(CLUSTER_RESOURCES_DIR).exists());
+        assert!(!dir.path().join(CLUSTER_STATE_FILE).exists());
+        assert!(!dir.path().join("graphs").exists());
+
+        // The serving snapshot follows the root.
+        let snapshot = read_serving_snapshot(dir.path()).await.unwrap();
+        assert!(
+            snapshot.graphs[0]
+                .root
+                .starts_with(storage.path()),
+            "{:?}",
+            snapshot.graphs[0].root
+        );
+    }
+
+    #[test]
+    fn storage_root_invalid_uri_fails_validation() {
+        let dir = fixture();
+        let mut config = fs::read_to_string(dir.path().join("cluster.yaml")).unwrap();
+        config = config.replace("version: 1\n", "version: 1\nstorage: \"s3://\"\n");
+        fs::write(dir.path().join("cluster.yaml"), config).unwrap();
+        let out = validate_config_dir(dir.path());
+        assert!(!out.ok);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "invalid_storage_root"),
+            "{:?}",
+            out.diagnostics
+        );
+    }
+
     #[tokio::test]
     async fn serving_snapshot_reads_converged_cluster() {
         let dir = fixture();

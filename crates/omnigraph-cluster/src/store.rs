@@ -375,6 +375,34 @@ impl ClusterStore {
             .unwrap_or(false)
     }
 
+    /// Raw payload read: `Ok(None)` for a missing blob, `Err` for transport
+    /// failures — callers classify (verify loops need the three-way split).
+    pub(crate) async fn read_payload(
+        &self,
+        kind: &ResourceKind,
+        digest: &str,
+    ) -> Result<Option<String>, String> {
+        let Some(relative) = Self::payload_relative(kind, digest) else {
+            return Ok(None);
+        };
+        let uri = self.uri(&relative);
+        match self.adapter.exists(&uri).await {
+            Ok(false) => return Ok(None),
+            Ok(true) => {}
+            Err(err) => return Err(err.to_string()),
+        }
+        self.adapter
+            .read_text(&uri)
+            .await
+            .map(Some)
+            .map_err(|err| {
+                format!(
+                    "could not read catalog payload '{}': {err}",
+                    self.display(&relative)
+                )
+            })
+    }
+
     /// Idempotent content-addressed write: a payload already present at its
     /// digest is by definition identical.
     pub(crate) async fn write_payload(

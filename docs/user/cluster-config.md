@@ -101,6 +101,20 @@ updates all of its queries together. Paths are relative to the config
 directory — the cluster is one explicit folder, so no `./` prefixes are
 needed.
 
+`storage:` (optional) is the **storage root URI** for everything the cluster
+stores — the state ledger, lock, content-addressed catalog, recovery
+sidecars, approval artifacts, and the derived graph roots
+(`<storage>/graphs/<id>.omni`). Absent, it defaults to the config directory
+itself (the original layout, byte-compatible with pre-existing clusters).
+`s3://bucket/prefix` puts the whole cluster on S3-compatible object storage:
+the ledger CAS uses conditional writes (verified against AWS S3 semantics and
+RustFS), the lock becomes genuinely cross-machine, and graph roots are
+engine-native S3 URIs. Credentials are **never** in `cluster.yaml` — the
+standard `AWS_*` environment contract applies, identical to graph storage.
+Declared configuration (`cluster.yaml` and the schema/query/policy sources it
+references) always stays in the working tree: config is versioned in git,
+state lives in the store — the Terraform split.
+
 `metadata.name` is a display label. `state.backend` may be omitted or set to
 `cluster`; external state backends are reserved for a later stage. `state.lock`
 defaults to `true`. When enabled, `cluster plan`, `cluster apply`,
