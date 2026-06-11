@@ -88,7 +88,7 @@ The full `OmnigraphConfig` surface (verified against
 | `cli.actor` | identity | `operator.actor` (RFC-007 §D3) |
 | `cli.output_format`, `cli.table_*` | personal ergonomics | `defaults:` in operator config (RFC-007 §D2) |
 | `cli.graph`, `cli.branch` | personal targeting | operator config: named servers + a per-operator default target (RFC-007 PR 3) |
-| `aliases.<name>` | personal ergonomics over shared queries | operator config `aliases:` — the *queries* they invoke are cluster-owned; the *shorthand* is personal |
+| `aliases.<name>` | a personal name conflated with a content pointer | **splits in two** (RFC-007 §D2 "bindings, not content"): the referenced `.gq` file's *content* becomes a catalog stored query (team-reviewed); the *binding* becomes an operator alias referencing that name. `config migrate` proposes both halves but cannot publish catalog content itself — that is a `cluster apply` |
 | `query.roots` | discovery convenience | obsolete — cluster query discovery (#183) replaced it |
 | `project.name` | label | dropped (the cluster's `metadata.name` is the deployment label) |
 

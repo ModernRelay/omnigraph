@@ -137,10 +137,13 @@ servers:                     # operator-owned endpoint definitions
     # No token here, ever. Resolution: §D4.
 
 aliases:                     # personal shorthand over CLUSTER-owned queries
-  triage:                    # (the query is the shared contract; the alias,
-    server: intel-dev        #  its defaults, and its name are mine — RFC-008)
-    graph: spike
-    query: weekly_triage
+  triage:
+    server: intel-dev        # required: names an operator server above
+    graph: spike             # optional (omit for single-mode servers)
+    query: weekly_triage     # STORED query name on that server — never a file
+    args: [since]            # positional CLI args -> params, in order
+    params: { limit: 20 }    # optional fixed defaults (positionals/--params win)
+    format: table            # optional; feeds the format cascade
 
 defaults:
   output: table              # read --format default
@@ -150,6 +153,38 @@ Unknown keys are a **warning, not an error** in this layer (an operator file
 written by a newer CLI must not brick an older one; contrast with
 `cluster.yaml`, where unknown keys are deliberately fatal because they
 change what a *plan* means).
+
+#### Aliases are bindings, not content
+
+Three things must not be conflated:
+
+- **Stored queries (the cluster catalog)** are *content plus its canonical,
+  team-owned name* — reviewed, digest-pinned, invocable by name over HTTP.
+- **Legacy `omnigraph.yaml` aliases** conflate a personal name with a
+  pointer to query *content in a local file* — which is why they break
+  across directories and can drift from the catalog. RFC-008 retires them.
+- **Operator aliases** are pure **bindings, zero content**: a personal name
+  → (server, graph, stored-query *name*, arg mapping, defaults). An alias
+  that carries content competes with the catalog; an alias that references
+  a name composes with it.
+
+The three senses of "global", resolved by this split:
+
+1. **Across graphs/servers** — preserved and strengthened: today's aliases
+   are "global" only within one per-directory config file; operator
+   aliases live in one `$HOME` file, each binding self-contained, usable
+   from any cwd.
+2. **Across operators (team-shared shorthand)** — deliberately *no alias
+   mechanism*: the shared name IS the stored query's catalog name. A team
+   that wants a shorter shared name renames the query in `cluster.yaml`
+   (reviewed, one name). A parallel team-alias namespace would be two
+   shared names for one thing — pure drift surface.
+3. **Across machines** — dotfile the one operator file; bindings carry no
+   local-file dependencies.
+
+Collision rule during the RFC-008 window: a legacy file-alias with the
+same name **wins**, with a warning naming both definitions — consistent
+with §D3's legacy-outranks-operator ordering.
 
 ### D3. Precedence and the merge rule
 
@@ -251,7 +286,7 @@ Three PRs, each independently useful, each landable without the next:
    §D4 chain (env + credentials file), the §D5 trust rules, and
    `omnigraph login <name>` (atomic write, `0600`). Legacy mechanisms
    untouched and tested-as-untouched.
-3. **PR 3 — operator targeting.** `--server <name>` on remote-capable
+3. **PR 3 — operator targeting** *(landed)*. `--server <name>` on remote-capable
    commands and `aliases:` in the operator layer (server + graph + query +
    default params), resolving through operator-defined servers. This is
    the *bridge* toward RFC-002's locator — multi-server addressing in a

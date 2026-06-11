@@ -2424,3 +2424,124 @@ fn local_cli_keyed_credentials_authenticate_url_matched_server() {
     let output = remote_read(&[]);
     assert!(!output.status.success(), "logout must revoke access");
 }
+
+/// RFC-007 PR 3: --server targeting and operator aliases (pure bindings to
+/// stored queries) end to end, with the keyed credential from PR 2.
+#[test]
+fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
+    let graph = SystemGraph::loaded();
+    graph.write_query(
+        "stored-find-person.gq",
+        "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.name } }",
+    );
+    // invoke_query is policy-gated (anti-probing 404 without the grant),
+    // so the server gets a per-graph bundle granting it to the operator.
+    graph.write_file(
+        "graph.policy.yaml",
+        "version: 1\ngroups:\n  ops: [\"act-op\"]\nprotected_branches: [main]\nrules:\n  - id: allow-invoke\n    allow:\n      actors: { group: ops }\n      actions: [invoke_query]\n  - id: allow-read\n    allow:\n      actors: { group: ops }\n      actions: [read]\n      branch_scope: any\n",
+    );
+    let config = graph.write_config(
+        "omnigraph-server.yaml",
+        &format!(
+            "graphs:\n  local:\n    uri: {}\n    policy:\n      file: ./graph.policy.yaml\n    queries:\n      find_person:\n        file: ./stored-find-person.gq\n",
+            yaml_string(&graph.path().to_string_lossy())
+        ),
+    );
+    let server = spawn_server_with_config_env(
+        &config,
+        &[(
+            "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
+            r#"{"act-op":"srv-tok"}"#,
+        )],
+    );
+
+    let operator_home = tempfile::tempdir().unwrap();
+    fs::write(
+        operator_home.path().join("config.yaml"),
+        format!(
+            "servers:\n  dev:\n    url: {}\naliases:\n  who:\n    server: dev\n    graph: local\n    query: find_person\n    args: [name]\n",
+            server.base_url
+        ),
+    )
+    .unwrap();
+    fs::write(
+        operator_home.path().join("credentials"),
+        "[dev]\ntoken = srv-tok\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            operator_home.path().join("credentials"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+
+    // The operator alias: name + positional arg, nothing else — server,
+    // graph, stored query, and token all resolve from the operator layer.
+    let output = cli()
+        .env("OMNIGRAPH_HOME", operator_home.path())
+        .arg("query")
+        .arg("--alias")
+        .arg("who")
+        .arg("Alice")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "operator alias must invoke the stored query: {output:?}"
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["rows"][0]["p.name"], "Alice", "{payload}");
+
+    // --server/--graph: the same stored query via explicit targeting.
+    let output = cli()
+        .env("OMNIGRAPH_HOME", operator_home.path())
+        .arg("query")
+        .arg("--server")
+        .arg("dev")
+        .arg("--graph")
+        .arg("local")
+        .arg("--query-string")
+        .arg("query q($name: String) { match { $p: Person { name: $name } } return { $p.name } }")
+        .arg("--params")
+        .arg(r#"{"name":"Alice"}"#)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    // Unknown --server errors listing what IS defined.
+    let output = cli()
+        .env("OMNIGRAPH_HOME", operator_home.path())
+        .arg("query")
+        .arg("--server")
+        .arg("nope")
+        .arg("--query-string")
+        .arg("query q() { match { $p: Person } return { $p.name } }")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown server 'nope'") && stderr.contains("dev"), "{stderr}");
+
+    // --server is exclusive with a positional URI.
+    let output = cli()
+        .env("OMNIGRAPH_HOME", operator_home.path())
+        .arg("query")
+        .arg(&server.base_url)
+        .arg("--server")
+        .arg("dev")
+        .arg("--query-string")
+        .arg("query q() { match { $p: Person } return { $p.name } }")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("exclusive"),
+        "{output:?}"
+    );
+}
