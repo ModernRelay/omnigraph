@@ -3,27 +3,28 @@
 **Status:** Proposed
 **Date:** 2026-06-11
 **Builds on:** [rfc-002-config-cli-architecture.md](rfc-002-config-cli-architecture.md) (Proposed; implementation parked — PRs #139/#162 closed over review findings), [rfc-005-server-cluster-boot.md](rfc-005-server-cluster-boot.md) (Landed), RFC-006 storage roots (#186/#190/#194, landed). The #139 review record is a normative input: every design rule in §D6 traces to a confirmed finding.
+**Paired with:** [rfc-008-deprecate-omnigraph-yaml.md](rfc-008-deprecate-omnigraph-yaml.md) — together they define the two-surface architecture this RFC's operator half belongs to.
 **Target release:** unversioned (staged; see Sequencing).
 
 ## Summary
 
-Give OmniGraph the operator half of the Terraform config split. Terraform
-separates `~/.terraformrc` (who I am, my credentials, my CLI behavior) from
-the working directory's `*.tf` (what the project declares). OmniGraph today
-has only the project half: `./omnigraph.yaml` in the current working
-directory (or `--config <path>`), and nothing else — no home-level config,
-no walk-up, no env override for the CLI. Operator identity and credentials
-must be re-declared in every directory an operator works from, and — worse —
-they end up in files that live next to repo-committed project config.
+Give OmniGraph the operator half of the **two-surface config architecture**
+(RFC-008): **cluster config** (team-owned, in a repo — what the system *is*)
+and **operator config** (person-owned, in `$HOME` — who *I* am). This is
+Terraform's split: `~/.terraformrc` for the operator, the checkout for the
+declaration. OmniGraph today has neither half cleanly — `omnigraph.yaml`
+mixes both concerns (RFC-008 retires it), and there is no home-level config
+at all: identity and credentials get re-declared per working directory, in
+files that sit next to repo-committed config.
 
-This RFC introduces **`~/.omnigraph/config.yaml`** (the operator layer) and
-a **keyed credentials chain**, scoped deliberately small:
+This RFC introduces **`~/.omnigraph/config.yaml`** (the operator surface)
+and a **keyed credentials chain**, scoped deliberately small:
 
 1. **Operator identity** — a default actor for every `--as` cascade.
 2. **Credentials by server name** — no more inventing env-var names per
-   server; secrets never inline, never in the project layer.
-3. **Named servers** — operator-owned endpoint definitions that project
-   configs can reference but not redefine.
+   server; secrets never inline, never in any repo-committed file.
+3. **Named servers** — operator-owned endpoint definitions; nothing a
+   checkout supplies can redefine them.
 
 It is explicitly a **subset of RFC-002**, sequenced to land. RFC-002 settled
 the right long-term decisions (one `~/.omnigraph/` dir, credentials keyed by
@@ -63,11 +64,14 @@ Three concrete pains, all hit in real operation this cycle:
   that problem belongs to the slice that introduces it).
 - **OS keychain integration** — the credentials *chain* (§D4) leaves a slot
   for it; this RFC ships env + file sources only.
-- **Project-file walk-up.** Terraform does not walk up from subdirectories
+- **Config-file walk-up.** Terraform does not walk up from subdirectories
   and neither do we — `--config` (or running in the directory) stays the
-  explicit, deterministic story. Rejected, not deferred: walk-up makes "which
-  config am I using" a function of cwd depth, the class of surprise this RFC
-  exists to remove.
+  explicit, deterministic story for cluster checkouts. Rejected, not
+  deferred: walk-up makes "which config am I using" a function of cwd
+  depth, the class of surprise this RFC exists to remove.
+- **Retiring `omnigraph.yaml`** — that is RFC-008's job, with its own
+  staging. This RFC builds the destination; during RFC-008's deprecation
+  window the legacy file keeps loading exactly as today.
 - **Renaming or removing anything.** No flag renames, no key renames, no
   schema-version bumps (findings #1, #3, #10).
 
@@ -95,9 +99,10 @@ Three concrete pains, all hit in real operation this cycle:
 ### D1. Files and discovery
 
 ```
-~/.omnigraph/config.yaml      # the operator layer (this RFC)
+~/.omnigraph/config.yaml      # the operator surface (this RFC)
 ~/.omnigraph/credentials      # keyed secrets, 0600, git-irrelevant (§D4)
-./omnigraph.yaml              # the project layer (unchanged)
+./cluster.yaml + checkout     # the team surface (unchanged; RFC-004..006)
+./omnigraph.yaml              # legacy, loads as today through RFC-008's window
 ```
 
 Discovery order for the operator file: `$OMNIGRAPH_HOME/config.yaml` if
@@ -105,10 +110,12 @@ Discovery order for the operator file: `$OMNIGRAPH_HOME/config.yaml` if
 empty layer, never an error. `~` is expanded wherever paths are read
 (finding #9 — today a literal `./~/...` directory gets created).
 
-`OMNIGRAPH_CONFIG=<path>` becomes a first-class override for the *project*
-file in the CLI (highest precedence below the `--config` flag), aligning the
+`OMNIGRAPH_CONFIG=<path>` becomes a first-class override for the `--config`
+argument in the CLI (highest precedence below the flag itself), aligning the
 CLI with the container contract that already uses this variable for the
-server. One name, one meaning, both binaries.
+server. One name, one meaning, both binaries — it points at whatever the
+command's `--config` would (a cluster checkout for cluster commands; the
+legacy file during RFC-008's window).
 
 Per RFC-002 §4 (adopted verbatim): `~/.omnigraph/` is the one canonical
 dir — cache/state subdirectories arrive with their own slices; XDG roots are
@@ -118,7 +125,7 @@ fallback read location if set, but is never written to).
 ### D2. The operator schema (v1 of this layer)
 
 ```yaml
-# ~/.omnigraph/config.yaml — about the OPERATOR, never about a project
+# ~/.omnigraph/config.yaml — about the OPERATOR, never about the system
 operator:
   actor: act-andrew          # default for every --as cascade
 
@@ -128,6 +135,12 @@ servers:                     # operator-owned endpoint definitions
   prod:
     url: https://graph.modernrelay.ai
     # No token here, ever. Resolution: §D4.
+
+aliases:                     # personal shorthand over CLUSTER-owned queries
+  triage:                    # (the query is the shared contract; the alias,
+    server: intel-dev        #  its defaults, and its name are mine — RFC-008)
+    graph: spike
+    query: weekly_triage
 
 defaults:
   output: table              # read --format default
@@ -140,27 +153,32 @@ change what a *plan* means).
 
 ### D3. Precedence and the merge rule
 
+The end-state cascade is short, because the team surface (cluster config)
+deliberately carries **no operator-resolvable keys** — no actor, no tokens,
+no output preferences. Identity can never come from a checkout:
+
 ```
-flag  >  env  >  project omnigraph.yaml  >  operator config  >  built-in
+flag  >  env  >  operator config  >  built-in
 ```
 
-with exactly one principled inversion (§D5): **credentials and endpoint
-definitions never come from the project layer when an operator-layer
-definition exists for the same server name.**
+During RFC-008's deprecation window, a legacy `omnigraph.yaml` slots in
+between env and operator config (its keys win over operator defaults,
+preserving today's behavior for unmigrated setups) — with the §D5
+credential inversion: **credentials and endpoint definitions never come
+from a legacy/checkout file when an operator-layer definition exists for
+the same server name.**
 
 Merging is **key-level**: scalars override per key; maps (`servers:`,
-`graphs:`) merge per *entry*, and entries merge per *field* (finding #13 —
-`merge_map` replacing whole entries silently dropped sibling fields). A
-project file referencing `server: prod` composes with the operator's
-`servers.prod.url`; it does not need to re-declare it and cannot
-accidentally clobber half of it.
+`aliases:`) merge per *entry*, and entries merge per *field* (finding #13 —
+`merge_map` replacing whole entries silently dropped sibling fields).
 
 Concretely for the two flows this slice touches:
 
-- **Actor**: `--as` > project `as:`/actor key (unchanged semantics) >
-  `operator.actor` > none (commands that need an actor keep failing loudly).
-- **Output format**: `--format` > project default > `defaults.output` >
-  `table`.
+- **Actor**: `--as` > legacy `cli.actor` (window only, unchanged semantics)
+  > `operator.actor` > none (commands that need an actor keep failing
+  loudly).
+- **Output format**: `--format` > legacy default (window only) >
+  `defaults.output` > `table`.
 
 ### D4. Credentials: keyed by server name, by-reference always
 
@@ -173,29 +191,33 @@ the same chain). For a server named `<name>`, the resolution chain is:
 3. The legacy pair — `bearer_token_env` + `auth.env_file` — exactly as
    today, for configs that already use it.
 
-No inline secrets in any YAML file, operator or project (the existing
-invariant 12 posture extended to disk). A future `omnigraph login <name>`
+No inline secrets in any YAML file, anywhere (the existing invariant 12
+posture extended to disk). A future `omnigraph login <name>`
 writes/rotates one section of the credentials file via temp + rename
 (finding #7: every operator-layer write is atomic), creating it `0600`.
 
 ### D5. The trust boundary (the security findings, made structural)
 
-Findings #4, #5, #6 share one root cause: the project layer — a file that
-arrives with a *repo checkout* — could redirect where requests go and what
-secrets they carry. The rules:
+Findings #4, #5, #6 share one root cause: a file that arrives with a
+*repo checkout* could redirect where requests go and what secrets they
+carry. In the end state this is closed by construction — cluster config has
+no server/credential keys at all, and the operator surface never comes from
+a checkout. The rules below therefore govern the **RFC-008 window** (while
+legacy `omnigraph.yaml` still loads) and stand as the permanent law for any
+future checkout-supplied surface:
 
-1. **A project file may *reference* a server by name; it may not *redefine*
-   an operator-defined server.** If `./omnigraph.yaml` declares
-   `servers.prod.url` and `~/.omnigraph/config.yaml` also defines `prod`,
-   the operator definition wins and the CLI warns about the shadowed
-   project entry. A project-only server name keeps working (legacy compat),
-   but the keyed-credentials chain (§D4 steps 1–2) never resolves for it —
-   only the legacy explicit `bearer_token_env` does. Net effect: a malicious
-   checkout cannot point `prod` at an attacker host and harvest the
-   operator's `prod` token.
-2. **`auth.env_file` keeps auto-loading (compat), but project-layer
+1. **A checkout-supplied file may *reference* a server by name; it may not
+   *redefine* an operator-defined server.** If a legacy `./omnigraph.yaml`
+   declares `servers.prod.url` and `~/.omnigraph/config.yaml` also defines
+   `prod`, the operator definition wins and the CLI warns about the
+   shadowed entry. A legacy-only server name keeps working (compat), but
+   the keyed-credentials chain (§D4 steps 1–2) never resolves for it —
+   only the legacy explicit `bearer_token_env` does. Net effect: a
+   malicious checkout cannot point `prod` at an attacker host and harvest
+   the operator's `prod` token.
+2. **`auth.env_file` keeps auto-loading (compat), but checkout-layer
    env-files cannot *override* variables already set in the process or by
-   the operator layer** — first-set-wins, operator-before-project (the
+   the operator layer** — first-set-wins, operator-before-checkout (the
    existing real-env-wins rule, extended one layer down). Finding #5's
    injection becomes a no-op against any var the operator actually uses.
 3. **A token is sent only to the server it is keyed to.** The legacy
@@ -223,16 +245,22 @@ Three PRs, each independently useful, each landable without the next:
    `~/.omnigraph/config.yaml` (+ `OMNIGRAPH_HOME`, `~`-expansion, warn-only
    unknown keys), `operator.actor` joining the `--as` cascade,
    `defaults.output` joining the format cascade, `OMNIGRAPH_CONFIG` env for
-   the CLI's project file. Docs: `cli-reference.md` gains the layer table.
+   the CLI's `--config`. Docs: `cli-reference.md` gains the two-surface
+   table.
 2. **PR 2 — keyed credentials.** `servers:` in the operator layer, the
    §D4 chain (env + credentials file), the §D5 trust rules, and
    `omnigraph login <name>` (atomic write, `0600`). Legacy mechanisms
    untouched and tested-as-untouched.
-3. **PR 3 — project references.** `server: <name>` in project
-   graph/target entries resolving through operator-defined servers, with
-   the shadowing warning. This is the *bridge* toward RFC-002's locator —
-   it gives multi-server addressing a safe, minimal form without the
-   `GraphLocator` rework.
+3. **PR 3 — operator targeting.** `--server <name>` on remote-capable
+   commands and `aliases:` in the operator layer (server + graph + query +
+   default params), resolving through operator-defined servers. This is
+   the *bridge* toward RFC-002's locator — multi-server addressing in a
+   safe, minimal form without the `GraphLocator` rework — and the
+   replacement RFC-008 needs before legacy aliases can migrate.
+
+RFC-008's deprecation stages begin only after PRs 1–2 are on main: the
+operator surface must exist before `config migrate` has somewhere to move
+keys to.
 
 ## Open questions
 
@@ -248,15 +276,13 @@ Three PRs, each independently useful, each landable without the next:
 
 ## Relationship to RFC-002 and RFC-008
 
-**RFC-008 supersedes this RFC's "project layer" framing**: with
-`omnigraph.yaml` deprecated
+**RFC-008 is the other half of this design**: this RFC builds the operator
+surface; RFC-008 retires the mixed-ownership file
 ([rfc-008-deprecate-omnigraph-yaml.md](rfc-008-deprecate-omnigraph-yaml.md)),
-the project layer *is* the cluster checkout. References to project
-`omnigraph.yaml` in §D3/§D5 describe the transitional window only; the
-trust-boundary rules apply unchanged to whatever the project layer is at a
-given stage. Sequencing couples them: RFC-007 PRs 1–2 must land before
-RFC-008's migration stages can begin (the operator layer is what keys
-migrate *to*).
+leaving exactly two config surfaces — cluster (team) and operator (person).
+Every mention of `omnigraph.yaml` in this RFC describes the deprecation
+window only. Sequencing couples them: RFC-007 PRs 1–2 land first, then
+RFC-008's migration stages run against them.
 
 RFC-002 remains the umbrella architecture. This RFC implements its §2
 (layered config, global-first), §4 (file naming / one dir), and §5
