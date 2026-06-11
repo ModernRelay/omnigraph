@@ -127,7 +127,13 @@ jobs:
     name: Test Workspace
     needs: classify_changes
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 75, not 45: a cold rust-cache (every Cargo.lock change) costs a full
+    # workspace + failpoints-feature build on a 2-core runner, which now
+    # exceeds 45 minutes on slow runner days. A timed-out run never SAVES
+    # its cache, so an undersized budget self-perpetuates: every retry
+    # starts cold and dies the same way (observed 2026-06-11, four runs).
+    # Warm-cache runs stay ~15 minutes; this is headroom, not a target.
+    timeout-minutes: 75
     permissions:
       contents: write
     env:
