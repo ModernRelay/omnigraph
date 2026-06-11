@@ -401,14 +401,14 @@ async fn cluster_boot_serves_applied_state() {
     let omnigraph_server::ServerConfigMode::Multi {
         graphs,
         config_path,
-        server_policy_file,
+        server_policy,
     } = settings.mode
     else {
         panic!("cluster boot must select multi-graph routing");
     };
     assert_eq!(graphs.len(), 1);
     assert_eq!(graphs[0].graph_id, "knowledge");
-    assert!(server_policy_file.is_none());
+    assert!(server_policy.is_none());
 
     let state =
         omnigraph_server::open_multi_graph_state(graphs, Vec::new(), None, config_path)
@@ -516,26 +516,26 @@ graphs:
     let settings = cluster_settings(temp.path()).await.unwrap();
     let omnigraph_server::ServerConfigMode::Multi {
         graphs,
-        server_policy_file,
+        server_policy,
         ..
     } = settings.mode
     else {
         panic!("cluster boot must select multi-graph routing");
     };
-    let graph_policy = graphs[0].policy_file.as_ref().expect("graph-bound bundle");
-    assert!(
-        graph_policy
-            .to_string_lossy()
-            .contains("__cluster/resources/policy/graph_rules/"),
-        "{graph_policy:?}"
-    );
-    let server_policy = server_policy_file.expect("cluster-bound bundle");
-    assert!(
-        server_policy
-            .to_string_lossy()
-            .contains("__cluster/resources/policy/cluster_rules/"),
-        "{server_policy:?}"
-    );
+    // Cluster boots carry policy CONTENT (digest-verified catalog blobs),
+    // not paths — the catalog may live on object storage.
+    let omnigraph_server::PolicySource::Inline(graph_policy) =
+        graphs[0].policy.as_ref().expect("graph-bound bundle")
+    else {
+        panic!("cluster-mode graph policy must be inline content");
+    };
+    assert!(graph_policy.contains("actors:"), "{graph_policy:?}");
+    let omnigraph_server::PolicySource::Inline(server_policy) =
+        server_policy.expect("cluster-bound bundle")
+    else {
+        panic!("cluster-mode server policy must be inline content");
+    };
+    assert!(server_policy.contains("kind: server"), "{server_policy:?}");
 }
 
 #[tokio::test]

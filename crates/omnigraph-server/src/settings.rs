@@ -14,7 +14,19 @@ pub(crate) async fn load_cluster_settings(
     cli_bind: Option<String>,
     cli_allow_unauthenticated: bool,
 ) -> Result<ServerConfig> {
-    let snapshot = omnigraph_cluster::read_serving_snapshot(cluster_dir).await.map_err(|diagnostics| {
+    // `--cluster` accepts either a config directory (the ledger location is
+    // resolved through cluster.yaml's `storage:` key) or a storage-root URI
+    // directly (`s3://bucket/prefix`) — config-free serving: the ledger and
+    // catalog on the bucket ARE the deployment artifact.
+    // Any scheme-qualified argument (s3://, file://) is a storage root; a
+    // bare path is a config directory.
+    let cluster_arg = cluster_dir.to_string_lossy();
+    let snapshot = if cluster_arg.contains("://") {
+        omnigraph_cluster::read_serving_snapshot_from_storage(cluster_arg.as_ref()).await
+    } else {
+        omnigraph_cluster::read_serving_snapshot(cluster_dir).await
+    }
+    .map_err(|diagnostics| {
         let details = diagnostics
             .iter()
             .map(|diagnostic| format!("[{}] {}: {}", diagnostic.code, diagnostic.path, diagnostic.message))
@@ -26,19 +38,25 @@ pub(crate) async fn load_cluster_settings(
     // Bindings -> Cedar slots. The serving pipeline loads one bundle per
     // graph plus one server-level bundle; stacked bundles per scope are a
     // later slice — refuse loudly rather than silently merging policy.
-    let mut server_policy_file: Option<PathBuf> = None;
-    let mut graph_policy_files: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut server_policy: Option<PolicySource> = None;
+    let mut graph_policies: BTreeMap<String, PolicySource> = BTreeMap::new();
     for policy in &snapshot.policies {
         for binding in &policy.applies_to {
             if binding == "cluster" {
-                if server_policy_file.replace(policy.blob_path.clone()).is_some() {
+                if server_policy
+                    .replace(PolicySource::Inline(policy.source.clone()))
+                    .is_some()
+                {
                     bail!(
                         "multiple policy bundles bind the cluster scope; cluster-mode serving supports one bundle per scope — split or merge bundles (multi-bundle scopes are a later slice)"
                     );
                 }
             } else if let Some(graph_id) = binding.strip_prefix("graph.") {
-                if graph_policy_files
-                    .insert(graph_id.to_string(), policy.blob_path.clone())
+                if graph_policies
+                    .insert(
+                        graph_id.to_string(),
+                        PolicySource::Inline(policy.source.clone()),
+                    )
                     .is_some()
                 {
                     bail!(
@@ -80,7 +98,7 @@ pub(crate) async fn load_cluster_settings(
         graphs.push(GraphStartupConfig {
             graph_id: graph.graph_id.clone(),
             uri: graph.root.to_string_lossy().to_string(),
-            policy_file: graph_policy_files.get(&graph.graph_id).cloned(),
+            policy: graph_policies.get(&graph.graph_id).cloned(),
             queries: registry,
         });
     }
@@ -97,7 +115,7 @@ pub(crate) async fn load_cluster_settings(
         mode: ServerConfigMode::Multi {
             graphs,
             config_path: cluster_dir.clone(),
-            server_policy_file,
+            server_policy,
         },
         bind: cli_bind.unwrap_or_else(|| "127.0.0.1:8080".to_string()),
         allow_unauthenticated: cli_allow_unauthenticated || env_unauth,
@@ -226,18 +244,18 @@ pub async fn load_server_settings(
             graphs.push(GraphStartupConfig {
                 graph_id: name.clone(),
                 uri,
-                policy_file: config.resolve_target_policy_file(name),
+                policy: config.resolve_target_policy_file(name).map(PolicySource::File),
                 queries,
             });
         }
         let config_path = config_path
             .cloned()
             .expect("has_explicit_config implies config_path is Some");
-        let server_policy_file = config.resolve_server_policy_file();
+        let server_policy = config.resolve_server_policy_file().map(PolicySource::File);
         ServerConfigMode::Multi {
             graphs,
             config_path,
-            server_policy_file,
+            server_policy,
         }
     } else {
         // Rule 5 → error with migration hint.
@@ -729,11 +747,11 @@ server:
                         .join("alpha.omni")
                         .to_string_lossy()
                         .into_owned(),
-                    policy_file: None,
+                    policy: None,
                     queries: crate::queries::QueryRegistry::default(),
                 }],
                 config_path: temp.path().join("omnigraph.yaml"),
-                server_policy_file: Some(policy_path),
+                server_policy: Some(crate::PolicySource::File(policy_path)),
             },
             bind: "127.0.0.1:0".to_string(),
             allow_unauthenticated: false,
