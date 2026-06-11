@@ -16,7 +16,7 @@ Axum 0.8 + tokio + utoipa-generated OpenAPI. **Two modes** (v0.6.0+): single-gra
 
 ### Cluster-booted multi mode (Phase 5)
 
-`omnigraph-server --cluster <dir>` boots from the cluster catalog's **applied
+`omnigraph-server --cluster <dir-or-uri>` boots from the cluster catalog's **applied
 revision** (`state.json` + content-addressed blobs) instead of
 `omnigraph.yaml` — an exclusive boot source: combining it with `<URI>`,
 `--target`, or `--config` is a startup error, and `omnigraph.yaml` is never
@@ -27,7 +27,7 @@ for what is read and the fail-fast readiness rules. `--bind`,
 
 Mode inference:
 
-0. CLI `--cluster <dir>` → **multi, cluster-booted** (exclusive)
+0. CLI `--cluster <dir | s3://…>` → **multi, cluster-booted** (exclusive; a scheme-qualified argument reads the ledger straight from the storage root, no local config)
 1. CLI positional `<URI>` → single
 2. CLI `--target <name>` → single
 3. `server.graph` in config → single

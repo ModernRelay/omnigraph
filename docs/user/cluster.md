@@ -84,6 +84,12 @@ OMNIGRAPH_SERVER_BEARER_TOKENS_JSON='{"act-reader":"s3cret"}' \
   omnigraph-server --cluster company-brain --bind 0.0.0.0:8080
 ```
 
+`--cluster` accepts either a **config directory** (the storage root resolves
+through `cluster.yaml`'s `storage:` key) or a **storage-root URI directly**
+(`--cluster s3://bucket/prefix`) — config-free serving: a serving box needs
+only the URI and credentials, no checkout of the config repo. The ledger and
+catalog on the bucket are the deployment artifact.
+
 `--cluster` is an **exclusive boot source**: it cannot be combined with a
 graph URI, `--target`, or `--config`, and `omnigraph.yaml` is never read in
 this mode. Routing is always multi-graph:

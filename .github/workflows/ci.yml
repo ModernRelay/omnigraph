@@ -89,7 +89,9 @@ jobs:
               crates/omnigraph/src/storage.rs) run_rustfs_ci=true ;;
               crates/omnigraph/src/db/manifest.rs|crates/omnigraph/src/db/manifest/*) run_rustfs_ci=true ;;
               crates/omnigraph/tests/s3_storage.rs|crates/omnigraph/tests/helpers/*) run_rustfs_ci=true ;;
-              crates/omnigraph-server/tests/server.rs) run_rustfs_ci=true ;;
+              crates/omnigraph-cluster/src/store.rs|crates/omnigraph-cluster/src/serve.rs) run_rustfs_ci=true ;;
+              crates/omnigraph-cluster/tests/s3_cluster.rs) run_rustfs_ci=true ;;
+              crates/omnigraph-server/tests/s3.rs|crates/omnigraph-server/tests/support/*) run_rustfs_ci=true ;;
               crates/omnigraph-cli/tests/system_local.rs) run_rustfs_ci=true ;;
             esac
           done
@@ -351,10 +353,14 @@ jobs:
         run: cargo test --locked -p omnigraph-engine --test s3_storage -- --nocapture
 
       - name: Run RustFS server smoke
-        # The exact test name (not a loose substring): a filter that matches
-        # nothing passes vacuously, which silently ran zero tests here for a
-        # while (the old filter said s3_repo; the test says s3_graph).
-        run: cargo test --locked -p omnigraph-server --test s3 server_opens_s3_graph_directly_and_serves_snapshot_and_read -- --nocapture
+        # No name filter: every test in the s3 target is bucket-gated, and a
+        # filter matching nothing passes vacuously (which silently ran zero
+        # tests here for a while — the old filter said s3_repo, the test
+        # said s3_graph).
+        run: cargo test --locked -p omnigraph-server --test s3 -- --nocapture
+
+      - name: Run RustFS cluster e2e
+        run: cargo test --locked -p omnigraph-cluster --test s3_cluster -- --nocapture
 
       - name: Run RustFS CLI smoke
         run: cargo test --locked -p omnigraph-cli --test system_local local_cli_s3_end_to_end_init_load_read_flow -- --nocapture

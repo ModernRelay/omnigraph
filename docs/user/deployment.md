@@ -47,10 +47,31 @@ omnigraph-server s3://my-bucket/graphs/example/releases/2026-04-10-v0.1.0 \
 
 ## Cluster Mode in Containers (AWS, Railway)
 
-A cluster-booted deployment serves a **cluster directory** (config + state
-ledger + content-addressed catalog + graph data) from a mounted volume — the
-one structural difference from the stateless S3 single-graph shape, which
-needs no volume at all. The container contract:
+A cluster-booted deployment has **two shapes** since the `storage:` root
+(RFC-006):
+
+- **Bucket, no volume (preferred for cloud)** — the cluster's ledger,
+  catalog, and graph data live under an object-storage root
+  (`storage: s3://bucket/prefix` in `cluster.yaml`). The server boots
+  **config-free** from the bare URI; the container needs no volume at all:
+
+  ```bash
+  docker run -d \
+    -e OMNIGRAPH_CLUSTER=s3://my-bucket/clusters/company-brain \
+    -e AWS_ACCESS_KEY_ID=... -e AWS_SECRET_ACCESS_KEY=... \
+    -e OMNIGRAPH_SERVER_BEARER_TOKEN=... \
+    -p 8080:8080 <image>
+  ```
+
+  Day-2 runs from any operator checkout of the config repo:
+  `omnigraph cluster apply --config ./company-brain` (the `storage:` key
+  routes every stored byte to the bucket), then restart the service. The
+  state lock is genuinely cross-machine on object storage, so CI and
+  operator shells contend safely.
+
+- **Volume (file-rooted)** — the original shape: the whole cluster
+  directory on a mounted volume. Still fully supported; the container
+  contract:
 
 ```bash
 docker run -d \
@@ -102,8 +123,6 @@ above).
 
 ### Constraints (current honest list)
 
-- **Cluster directories are local-filesystem** — the volume is mandatory;
-  S3-hosted cluster dirs are not supported.
 - **No hot reload** — applied changes serve on the next restart.
 - **Single-writer apply** — run `cluster apply` from one place at a time
   (the state lock enforces this; CI or one operator shell, not both).
