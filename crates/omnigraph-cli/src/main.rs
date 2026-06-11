@@ -758,6 +758,15 @@ async fn main() -> Result<()> {
                             "warning: alias '{alias_name}' is defined in both omnigraph.yaml (legacy, wins during the deprecation window) and the operator config; the legacy definition applies"
                         );
                     } else {
+                        // The hidden legacy-uri positional swallows the first
+                        // bare arg; an operator alias always knows its target,
+                        // so reclaim it as the first positional param.
+                        let (_, alias_args) = normalize_legacy_alias_uri(
+                            legacy_uri.clone(),
+                            true,
+                            Some(alias_name),
+                            alias_args.clone(),
+                        );
                         let output = execute_operator_alias(
                             &http_client,
                             &config,
