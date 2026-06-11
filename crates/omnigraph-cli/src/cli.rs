@@ -56,6 +56,12 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Legacy-config tooling (RFC-008): split omnigraph.yaml into its
+    /// two destinations.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Remove a named server's stored credential. Idempotent.
     Logout {
         name: String,
@@ -681,3 +687,20 @@ impl CliLoadMode {
     }
 }
 
+#[derive(Debug, Subcommand)]
+pub(crate) enum ConfigCommand {
+    /// Propose (and with --write, apply) the RFC-008 split of a legacy
+    /// omnigraph.yaml: team half -> a ready-to-review cluster.yaml,
+    /// personal half -> ~/.omnigraph/config.yaml (key-level merge,
+    /// existing entries always win). Touches nothing without --write.
+    Migrate {
+        /// Path to the legacy omnigraph.yaml (default: ./omnigraph.yaml)
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Apply the split instead of only printing it
+        #[arg(long)]
+        write: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}

@@ -42,6 +42,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 mod embed;
+mod migrate;
 mod operator;
 mod read_format;
 
@@ -73,6 +74,42 @@ async fn main() -> Result<()> {
     };
     let http_client = build_http_client()?;
     match cli.command {
+        Command::Config { command } => match command {
+            ConfigCommand::Migrate { config, write, json } => {
+                let path = migrate::legacy_config_path(config.as_ref());
+                if !path.exists() {
+                    bail!(
+                        "no legacy config at '{}' — nothing to migrate",
+                        path.display()
+                    );
+                }
+                let legacy = load_config(Some(&path))?;
+                let report = migrate::build_report(&legacy, &path);
+                if write {
+                    let legacy_dir = path
+                        .parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                        .unwrap_or(std::path::Path::new("."))
+                        .to_path_buf();
+                    let written = migrate::apply_report(&report, &legacy_dir)?;
+                    if json {
+                        print_json(&serde_json::json!({
+                            "report": report,
+                            "written": written,
+                        }))?;
+                    } else {
+                        print!("{}", migrate::render_report(&report));
+                        for line in written {
+                            println!("wrote: {line}");
+                        }
+                    }
+                } else if json {
+                    print_json(&report)?;
+                } else {
+                    print!("{}", migrate::render_report(&report));
+                }
+            }
+        },
         Command::Login { name, token, json } => {
             let token = match token {
                 Some(token) => token,
