@@ -167,3 +167,80 @@ async fn s3_public_load_uses_hidden_run_and_publishes() {
     .to_rust_json();
     assert_eq!(loaded[0]["p.name"], "Loaded-Over-S3");
 }
+
+/// The conditional-write contract the cluster ledger depends on (RFC-006):
+/// versioned read -> If-Match replace -> stale token refused. Pins the
+/// S3-compatible backend's behavior (RustFS in CI) — turns red if a backend
+/// bump regresses conditional puts.
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_adapter_conditional_writes_contract() {
+    let Some(uri) = s3_test_graph_uri("adapter-cas") else {
+        eprintln!("skipping s3 adapter cas test: OMNIGRAPH_S3_TEST_BUCKET is not set");
+        return;
+    };
+    use omnigraph::storage::storage_for_uri;
+    let adapter = storage_for_uri(&uri).unwrap();
+    let object = format!("{uri}/cas-probe.json");
+
+    assert!(adapter.write_text_if_absent(&object, "v1").await.unwrap());
+    assert!(!adapter.write_text_if_absent(&object, "v1b").await.unwrap());
+
+    let (text, version) = adapter.read_text_versioned(&object).await.unwrap();
+    assert_eq!(text, "v1");
+    let next = adapter
+        .write_text_if_match(&object, "v2", &version)
+        .await
+        .unwrap()
+        .expect("fresh etag must win");
+    assert!(
+        adapter
+            .write_text_if_match(&object, "v3", &version)
+            .await
+            .unwrap()
+            .is_none(),
+        "stale etag must be refused"
+    );
+    let again = adapter
+        .write_text_if_match(&object, "v3", &next)
+        .await
+        .unwrap();
+    assert!(again.is_some());
+
+    // Prefix delete: recursive + idempotent.
+    adapter
+        .write_text(&format!("{uri}/tree/a.json"), "a")
+        .await
+        .unwrap();
+    adapter
+        .write_text(&format!("{uri}/tree/sub/b.json"), "b")
+        .await
+        .unwrap();
+    adapter.delete_prefix(&format!("{uri}/tree")).await.unwrap();
+    assert!(!adapter.exists(&format!("{uri}/tree/a.json")).await.unwrap());
+    adapter.delete_prefix(&format!("{uri}/tree")).await.unwrap();
+    adapter.delete(&object).await.unwrap();
+}
+
+/// Schema apply against an S3 graph — the cluster's schema executor will
+/// lean on this; previously untested upstream on object storage.
+#[tokio::test(flavor = "multi_thread")]
+async fn s3_schema_apply_migrates_live_graph() {
+    let Some(uri) = s3_test_graph_uri("schema-apply") else {
+        eprintln!("skipping s3 schema apply test: OMNIGRAPH_S3_TEST_BUCKET is not set");
+        return;
+    };
+    let mut db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(&mut db, TEST_DATA, LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let desired = format!("{TEST_SCHEMA}\nnode Note {{\n    title: String @key\n}}\n");
+    let result = db.apply_schema(&desired).await.unwrap();
+    assert!(result.applied, "{result:?}");
+
+    let reopened = Omnigraph::open(&uri).await.unwrap();
+    assert!(
+        reopened.schema_source().contains("Note"),
+        "live S3 schema must carry the migration"
+    );
+}

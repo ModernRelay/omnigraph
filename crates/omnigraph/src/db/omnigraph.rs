@@ -2029,6 +2029,25 @@ edge WorksAt: Person -> Company
         async fn list_dir(&self, dir_uri: &str) -> Result<Vec<String>> {
             self.inner.list_dir(dir_uri).await
         }
+
+        async fn read_text_versioned(&self, uri: &str) -> Result<(String, String)> {
+            self.inner.read_text_versioned(uri).await
+        }
+
+        async fn write_text_if_match(
+            &self,
+            uri: &str,
+            contents: &str,
+            expected_version: &str,
+        ) -> Result<Option<String>> {
+            self.inner
+                .write_text_if_match(uri, contents, expected_version)
+                .await
+        }
+
+        async fn delete_prefix(&self, prefix_uri: &str) -> Result<()> {
+            self.inner.delete_prefix(prefix_uri).await
+        }
     }
 
     #[derive(Debug)]
@@ -2070,6 +2089,25 @@ edge WorksAt: Person -> Company
 
         async fn list_dir(&self, dir_uri: &str) -> Result<Vec<String>> {
             self.inner.list_dir(dir_uri).await
+        }
+
+        async fn read_text_versioned(&self, uri: &str) -> Result<(String, String)> {
+            self.inner.read_text_versioned(uri).await
+        }
+
+        async fn write_text_if_match(
+            &self,
+            uri: &str,
+            contents: &str,
+            expected_version: &str,
+        ) -> Result<Option<String>> {
+            self.inner
+                .write_text_if_match(uri, contents, expected_version)
+                .await
+        }
+
+        async fn delete_prefix(&self, prefix_uri: &str) -> Result<()> {
+            self.inner.delete_prefix(prefix_uri).await
         }
     }
 
