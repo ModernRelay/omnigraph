@@ -48,6 +48,9 @@ listed there.
 operator:
   actor: act-andrew     # default identity for every --as cascade:
                         #   --as > legacy cli.actor > operator.actor > none
+servers:                # operator-owned endpoints; names key the credentials
+  prod:
+    url: https://graph.example.com     # no tokens in this file, ever
 defaults:
   output: table         # read format default, below --json/--format/alias/legacy
 ```
@@ -55,6 +58,26 @@ defaults:
 Absent file = empty layer. Unknown keys warn and load (a file written for a
 newer CLI works on an older one). `$OMNIGRAPH_CONFIG=<path>` stands in for
 `--config` (the flag wins) in both the CLI and the server.
+
+#### Credentials keyed by server name
+
+`omnigraph login <name>` stores a bearer token in
+`~/.omnigraph/credentials` (created `0600`; group/world-readable files are
+refused). Token from `--token`, or — preferred, keeps it out of shell
+history — one line on stdin: `echo $TOKEN | omnigraph login prod`.
+`omnigraph logout <name>` removes it (idempotent).
+
+A remote command whose URL prefix-matches an operator server's `url` (the
+`gh` host model — no flags needed) resolves its token through:
+
+| Order | Source |
+|---|---|
+| 1 | `OMNIGRAPH_TOKEN_<NAME>` env (`prod` → `OMNIGRAPH_TOKEN_PROD`) |
+| 2 | `[<name>]` section in `~/.omnigraph/credentials` |
+| 3 | the legacy chain unchanged (`bearer_token_env` → `OMNIGRAPH_BEARER_TOKEN` → `auth.env_file`) |
+
+A token is only ever sent to the server it is keyed to: URLs matching no
+operator server use the legacy chain alone.
 
 ## `omnigraph.yaml` schema (legacy combined file)
 

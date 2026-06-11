@@ -2309,3 +2309,118 @@ fn cluster_server_boot_ignores_local_config_in_cwd() {
     let response = reqwest::blocking::get(format!("{}/healthz", server.base_url)).unwrap();
     assert!(response.status().is_success());
 }
+
+/// RFC-007 PR 2: keyed credentials end to end — `login` stores a 0600
+/// credential, the URL-matched server's token chain authenticates remote
+/// reads (env > file), a non-matching URL never sees the token (§D5 rule
+/// 3), and `logout` revokes.
+#[test]
+fn local_cli_keyed_credentials_authenticate_url_matched_server() {
+    let graph = SystemGraph::loaded();
+    let server = spawn_server_with_env(
+        graph.path(),
+        &[("OMNIGRAPH_SERVER_BEARER_TOKEN", "secret-tok")],
+    );
+    let operator_home = tempfile::tempdir().unwrap();
+    let write_server_url = |url: &str| {
+        fs::write(
+            operator_home.path().join("config.yaml"),
+            format!("servers:\n  test-srv:\n    url: {url}\n"),
+        )
+        .unwrap();
+    };
+    write_server_url(&server.base_url);
+
+    let remote_read = |envs: &[(&str, &str)]| {
+        let mut command = cli();
+        command.env("OMNIGRAPH_HOME", operator_home.path());
+        for (name, value) in envs {
+            command.env(name, value);
+        }
+        command
+            .arg("read")
+            .arg(&server.base_url)
+            .arg("--query")
+            .arg(fixture("test.gq"))
+            .arg("--name")
+            .arg("get_person")
+            .arg("--params")
+            .arg(r#"{"name":"Alice"}"#)
+            .arg("--json")
+            .output()
+            .unwrap()
+    };
+
+    // No credential anywhere: the server refuses.
+    let output = remote_read(&[]);
+    assert!(!output.status.success(), "{output:?}");
+
+    // login with a WRONG token (via stdin, the documented pipe flow).
+    let output = cli()
+        .env("OMNIGRAPH_HOME", operator_home.path())
+        .arg("login")
+        .arg("test-srv")
+        .write_stdin("wrong-tok\n")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let output = remote_read(&[]);
+    assert!(!output.status.success(), "wrong token must not authenticate");
+
+    // Re-login rotates to the right token (via --token); 0600 on disk.
+    let output = cli()
+        .env("OMNIGRAPH_HOME", operator_home.path())
+        .arg("login")
+        .arg("test-srv")
+        .arg("--token")
+        .arg("secret-tok")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let credentials = operator_home.path().join("credentials");
+    let text = fs::read_to_string(&credentials).unwrap();
+    assert!(text.contains("[test-srv]"), "{text}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&credentials).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{:o}", mode & 0o777);
+    }
+    let output = remote_read(&[]);
+    assert!(
+        output.status.success(),
+        "keyed credential must authenticate the URL-matched server: {output:?}"
+    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["rows"][0]["p.name"], "Alice");
+
+    // OMNIGRAPH_TOKEN_<NAME> env outranks the credentials file.
+    let output = remote_read(&[("OMNIGRAPH_TOKEN_TEST_SRV", "env-wrong")]);
+    assert!(
+        !output.status.success(),
+        "keyed env token must outrank the credentials file"
+    );
+
+    // §D5 rule 3: a URL matching no operator server never sees the token.
+    write_server_url("http://127.0.0.1:1");
+    let output = remote_read(&[]);
+    assert!(
+        !output.status.success(),
+        "token keyed to another url must not be sent here"
+    );
+    write_server_url(&server.base_url);
+
+    // logout revokes; idempotent.
+    for _ in 0..2 {
+        let output = cli()
+            .env("OMNIGRAPH_HOME", operator_home.path())
+            .arg("logout")
+            .arg("test-srv")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+    let output = remote_read(&[]);
+    assert!(!output.status.success(), "logout must revoke access");
+}
