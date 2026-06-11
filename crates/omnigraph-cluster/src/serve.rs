@@ -40,13 +40,15 @@ pub struct ServingSnapshot {
 /// failure is collected and the whole snapshot refused; no partial serving.
 /// Takes no lock: the state file is replaced atomically, so this reads a
 /// consistent point-in-time ledger.
-pub fn read_serving_snapshot(config_dir: impl AsRef<Path>) -> Result<ServingSnapshot, Vec<Diagnostic>> {
+pub async fn read_serving_snapshot(
+    config_dir: impl AsRef<Path>,
+) -> Result<ServingSnapshot, Vec<Diagnostic>> {
     let config_dir = config_dir.as_ref().to_path_buf();
-    let backend = LocalStateBackend::new(&config_dir);
+    let backend = ClusterStore::for_config_dir(&config_dir);
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
 
     // A ledger a sweep is about to rewrite must not start serving.
-    let sidecars = backend.list_recovery_sidecars(&mut diagnostics);
+    let sidecars = backend.list_recovery_sidecars(&mut diagnostics).await;
     if !sidecars.is_empty() {
         diagnostics.push(Diagnostic::error(
             "cluster_recovery_pending",
@@ -59,7 +61,7 @@ pub fn read_serving_snapshot(config_dir: impl AsRef<Path>) -> Result<ServingSnap
     }
 
     let mut observations = backend.observations();
-    let state = match backend.read_state(&mut observations) {
+    let state = match backend.read_state(&mut observations).await {
         Ok(snapshot) => match snapshot.state {
             Some(state) => Some(state),
             None => {

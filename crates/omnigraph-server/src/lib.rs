@@ -893,12 +893,12 @@ fn format_registry_load_errors(label: &str, errors: &[queries::LoadError]) -> St
 /// catalog blob content, policy bundles from blob paths with their applied
 /// bindings. Always multi-graph routing. The unauthenticated/env handling
 /// matches the omnigraph.yaml path.
-fn load_cluster_settings(
+async fn load_cluster_settings(
     cluster_dir: &PathBuf,
     cli_bind: Option<String>,
     cli_allow_unauthenticated: bool,
 ) -> Result<ServerConfig> {
-    let snapshot = omnigraph_cluster::read_serving_snapshot(cluster_dir).map_err(|diagnostics| {
+    let snapshot = omnigraph_cluster::read_serving_snapshot(cluster_dir).await.map_err(|diagnostics| {
         let details = diagnostics
             .iter()
             .map(|diagnostic| format!("[{}] {}: {}", diagnostic.code, diagnostic.path, diagnostic.message))
@@ -988,7 +988,7 @@ fn load_cluster_settings(
     })
 }
 
-pub fn load_server_settings(
+pub async fn load_server_settings(
     config_path: Option<&PathBuf>,
     cli_cluster: Option<&PathBuf>,
     cli_uri: Option<String>,
@@ -1005,7 +1005,7 @@ pub fn load_server_settings(
                 "--cluster is an exclusive boot source; it cannot combine with a graph URI, --target, or --config (axiom 15: a deployment serves from one source)"
             );
         }
-        return load_cluster_settings(cluster_dir, cli_bind, cli_allow_unauthenticated);
+        return load_cluster_settings(cluster_dir, cli_bind, cli_allow_unauthenticated).await;
     }
     let config = load_config(config_path)?;
     let bind = cli_bind.unwrap_or_else(|| config.server_bind().to_string());
@@ -3363,8 +3363,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn server_settings_load_from_yaml_config() {
+    #[tokio::test]
+    async fn server_settings_load_from_yaml_config() {
         let temp = tempdir().unwrap();
         let config = temp.path().join("omnigraph.yaml");
         fs::write(
@@ -3380,7 +3380,7 @@ server:
         )
         .unwrap();
 
-        let settings = load_server_settings(Some(&config), None, None, None, None, false).unwrap();
+        let settings = load_server_settings(Some(&config), None, None, None, None, false).await.unwrap();
         match &settings.mode {
             ServerConfigMode::Single { uri, graph_id, .. } => {
                 assert_eq!(uri, "/tmp/demo.omni");
@@ -3391,8 +3391,8 @@ server:
         assert_eq!(settings.bind, "0.0.0.0:9090");
     }
 
-    #[test]
-    fn server_settings_cli_flags_override_yaml_config() {
+    #[tokio::test]
+    async fn server_settings_cli_flags_override_yaml_config() {
         let temp = tempdir().unwrap();
         let config = temp.path().join("omnigraph.yaml");
         fs::write(
@@ -3416,6 +3416,7 @@ server:
             Some("0.0.0.0:9999".to_string()),
             false,
         )
+        .await
         .unwrap();
         match &settings.mode {
             ServerConfigMode::Single { uri, graph_id, .. } => {
@@ -3427,8 +3428,8 @@ server:
         assert_eq!(settings.bind, "0.0.0.0:9999");
     }
 
-    #[test]
-    fn server_settings_can_resolve_named_target() {
+    #[tokio::test]
+    async fn server_settings_can_resolve_named_target() {
         let temp = tempdir().unwrap();
         let config = temp.path().join("omnigraph.yaml");
         fs::write(
@@ -3448,6 +3449,7 @@ server:
 
         let settings =
             load_server_settings(Some(&config), None, None, Some("dev".to_string()), None, false)
+                .await
                 .unwrap();
         match &settings.mode {
             ServerConfigMode::Single { uri, graph_id, .. } => {
@@ -3458,9 +3460,9 @@ server:
         }
     }
 
-    #[test]
-    fn server_settings_require_uri_from_cli_or_config() {
-        let error = load_server_settings(None, None, None, None, None, false).unwrap_err();
+    #[tokio::test]
+    async fn server_settings_require_uri_from_cli_or_config() {
+        let error = load_server_settings(None, None, None, None, None, false).await.unwrap_err();
         assert!(
             error.to_string().contains("no graph to serve"),
             "expected mode-inference error, got: {error}",
@@ -3598,9 +3600,9 @@ server:
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn unauthenticated_env_var_classification() {
+    async fn unauthenticated_env_var_classification() {
         // MR-723 PR A: closes the gap where the env-var read path inside
         // `load_server_settings` was structurally implemented but not
         // exercised by any test. Three properties to pin, all in one
@@ -3627,7 +3629,7 @@ server:
         // Truthy values flip Open mode on, even with CLI flag off.
         for value in ["1", "true", "yes", "TRUE", "anything"] {
             let _guard = EnvGuard::set(&[("OMNIGRAPH_UNAUTHENTICATED", Some(value))]);
-            let settings = load_server_settings(Some(&config_path), None, None, None, None, false)
+            let settings = load_server_settings(Some(&config_path), None, None, None, None, false).await
                 .expect("settings load should succeed");
             assert!(
                 settings.allow_unauthenticated,
@@ -3638,7 +3640,7 @@ server:
         // Falsy values keep refusal behavior, even with CLI flag off.
         for value in ["0", "false", "FALSE", ""] {
             let _guard = EnvGuard::set(&[("OMNIGRAPH_UNAUTHENTICATED", Some(value))]);
-            let settings = load_server_settings(Some(&config_path), None, None, None, None, false)
+            let settings = load_server_settings(Some(&config_path), None, None, None, None, false).await
                 .expect("settings load should succeed");
             assert!(
                 !settings.allow_unauthenticated,
@@ -3648,7 +3650,7 @@ server:
 
         // Unset env var: also false.
         let _guard = EnvGuard::set(&[("OMNIGRAPH_UNAUTHENTICATED", None)]);
-        let settings = load_server_settings(Some(&config_path), None, None, None, None, false)
+        let settings = load_server_settings(Some(&config_path), None, None, None, None, false).await
             .expect("settings load should succeed");
         assert!(
             !settings.allow_unauthenticated,
@@ -3659,7 +3661,7 @@ server:
         // CLI flag wins even when env is falsy — `serve()` honors the
         // OR of both inputs.
         let _guard = EnvGuard::set(&[("OMNIGRAPH_UNAUTHENTICATED", Some("0"))]);
-        let settings = load_server_settings(Some(&config_path), None, None, None, None, true)
+        let settings = load_server_settings(Some(&config_path), None, None, None, None, true).await
             .expect("settings load should succeed");
         assert!(
             settings.allow_unauthenticated,

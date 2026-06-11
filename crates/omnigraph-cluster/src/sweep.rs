@@ -11,12 +11,12 @@ use super::*;
 /// Mutations ride the calling command's CAS-checked state write; completed
 /// sidecars are deleted only after that write lands.
 pub(crate) async fn sweep_recovery_sidecars(
-    backend: &LocalStateBackend,
+    backend: &ClusterStore,
     state: &mut ClusterState,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> SweepOutcome {
     let mut outcome = SweepOutcome::default();
-    for (path, sidecar) in backend.list_recovery_sidecars(diagnostics) {
+    for (path, sidecar) in backend.list_recovery_sidecars(diagnostics).await {
         match sidecar.kind {
             RecoverySidecarKind::GraphCreate => {
                 sweep_graph_create_sidecar(path, sidecar, state, diagnostics, &mut outcome).await;
@@ -33,7 +33,7 @@ pub(crate) async fn sweep_recovery_sidecars(
 }
 
 pub(crate) async fn sweep_graph_create_sidecar(
-    path: PathBuf,
+    path: String,
     sidecar: RecoverySidecar,
     state: &mut ClusterState,
     diagnostics: &mut Vec<Diagnostic>,
@@ -44,9 +44,11 @@ pub(crate) async fn sweep_graph_create_sidecar(
     let graph_path = PathBuf::from(&sidecar.graph_uri);
 
     // Row 1: nothing moved — the init never landed. The sidecar is pure
-    // intent; remove it and let the command's own plan re-propose the create.
+    // intent; retire it (deferred to the command's post-CAS cleanup, like
+    // every other completed sidecar — a failed CAS simply re-sweeps it) and
+    // let the command's own plan re-propose the create.
     if !graph_path.exists() {
-        let _ = fs::remove_file(&path);
+        outcome.completed_sidecars.push(path);
         return;
     }
 
@@ -153,7 +155,7 @@ pub(crate) async fn sweep_graph_create_sidecar(
 }
 
 pub(crate) async fn sweep_schema_apply_sidecar(
-    path: PathBuf,
+    path: String,
     sidecar: RecoverySidecar,
     state: &mut ClusterState,
     diagnostics: &mut Vec<Diagnostic>,
@@ -250,7 +252,7 @@ pub(crate) async fn sweep_schema_apply_sidecar(
 }
 
 pub(crate) fn sweep_graph_delete_sidecar(
-    path: PathBuf,
+    path: String,
     sidecar: RecoverySidecar,
     state: &mut ClusterState,
     diagnostics: &mut Vec<Diagnostic>,
@@ -351,15 +353,15 @@ pub(crate) fn record_approval_consumed(state: &mut ClusterState, approval_id: &s
 }
 
 /// Mark approval artifact files consumed on disk (post-CAS).
-pub(crate) fn mark_approvals_consumed(backend: &LocalStateBackend, approval_ids: &[String]) {
+pub(crate) async fn mark_approvals_consumed(backend: &ClusterStore, approval_ids: &[String]) {
     if approval_ids.is_empty() {
         return;
     }
     let mut sink = Vec::new();
-    for (_, mut artifact) in backend.list_approval_artifacts(&mut sink) {
+    for (_, mut artifact) in backend.list_approval_artifacts(&mut sink).await {
         if approval_ids.contains(&artifact.approval_id) && artifact.consumed_at.is_none() {
             artifact.consumed_at = Some(now_rfc3339());
-            let _ = backend.write_approval_artifact(&artifact);
+            let _ = backend.write_approval_artifact(&artifact).await;
         }
     }
 }

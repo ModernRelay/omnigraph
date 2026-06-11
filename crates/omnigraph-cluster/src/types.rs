@@ -503,7 +503,8 @@ pub(crate) struct SweepOutcome {
     pub(crate) pending_graphs: BTreeSet<String>,
     /// Sidecars whose outcome is recorded (rows 2/4): deleted only after the
     /// command's state write lands, so a CAS failure re-sweeps them.
-    pub(crate) completed_sidecars: Vec<PathBuf>,
+    /// Store URIs (the storage layer addresses everything by URI).
+    pub(crate) completed_sidecars: Vec<String>,
     /// Approval artifacts consumed by a roll-forward (delete row 7b): their
     /// files are rewritten with consumed_at only after the state write lands.
     pub(crate) consumed_approvals: Vec<String>,

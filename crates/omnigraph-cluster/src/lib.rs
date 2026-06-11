@@ -25,7 +25,7 @@ mod diff;
 mod serve;
 mod sweep;
 mod store;
-use store::{LocalStateBackend, StateLockGuard, StateSnapshot};
+use store::{ClusterStore, StateLockGuard, StateSnapshot};
 pub use types::*;
 use types::*;
 pub use serve::{ServingGraph, ServingPolicy, ServingQuery, ServingSnapshot, read_serving_snapshot};
@@ -69,7 +69,7 @@ pub fn validate_config_dir(config_dir: impl AsRef<Path>) -> ValidateOutput {
 pub async fn plan_config_dir(config_dir: impl AsRef<Path>) -> PlanOutput {
     let outcome = load_desired(config_dir.as_ref());
     let mut diagnostics = outcome.diagnostics;
-    let backend = LocalStateBackend::new(&outcome.config_dir);
+    let backend = ClusterStore::for_config_dir(&outcome.config_dir);
     let mut observations = backend.observations();
 
     let Some(desired) = outcome.desired else {
@@ -107,7 +107,7 @@ pub async fn plan_config_dir(config_dir: impl AsRef<Path>) -> PlanOutput {
     }
 
     let _lock_guard = if desired.state_lock {
-        match backend.acquire_lock("plan", &mut observations) {
+        match backend.acquire_lock("plan", &mut observations).await {
             Ok(guard) => Some(guard),
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
@@ -130,7 +130,7 @@ pub async fn plan_config_dir(config_dir: impl AsRef<Path>) -> PlanOutput {
     let mut prior_resources = BTreeMap::new();
     let mut prior_state: Option<ClusterState> = None;
     if !has_errors(&diagnostics) {
-        match backend.read_state(&mut observations) {
+        match backend.read_state(&mut observations).await {
             Ok(snapshot) => {
                 if let Some(state) = snapshot.state {
                     prior_resources = state_resource_digests(&state);
@@ -151,7 +151,7 @@ pub async fn plan_config_dir(config_dir: impl AsRef<Path>) -> PlanOutput {
     }
     // Plan previews dispositions without sweeping; a pending recovery is
     // surfaced as the cluster_recovery_pending warning above instead.
-    let artifacts = backend.list_approval_artifacts(&mut diagnostics);
+    let artifacts = backend.list_approval_artifacts(&mut diagnostics).await;
     let approved = approved_resources(
         &artifacts,
         &changes,
@@ -242,7 +242,7 @@ pub async fn apply_config_dir_with_options(
 ) -> ApplyOutput {
     let outcome = load_desired(config_dir.as_ref());
     let mut diagnostics = outcome.diagnostics;
-    let backend = LocalStateBackend::new(&outcome.config_dir);
+    let backend = ClusterStore::for_config_dir(&outcome.config_dir);
     let mut observations = backend.observations();
 
     let actor_for_output = options.actor.clone();
@@ -294,7 +294,7 @@ pub async fn apply_config_dir_with_options(
 
     // Named guard: the lock must be held until the state outcome is recorded.
     let _lock_guard = if desired.state_lock {
-        match backend.acquire_lock("apply", &mut observations) {
+        match backend.acquire_lock("apply", &mut observations).await {
             Ok(guard) => Some(guard),
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
@@ -321,7 +321,7 @@ pub async fn apply_config_dir_with_options(
         );
     }
 
-    let snapshot = match backend.read_state(&mut observations) {
+    let snapshot = match backend.read_state(&mut observations).await {
         Ok(snapshot) => snapshot,
         Err(diagnostic) => {
             diagnostics.push(diagnostic);
@@ -361,7 +361,7 @@ pub async fn apply_config_dir_with_options(
     let prior_resources = state_resource_digests(&state);
     let mut changes = diff_resources(&prior_resources, &desired.resource_digests);
     append_policy_binding_changes(&mut changes, Some(&state), &desired);
-    let approval_artifacts = backend.list_approval_artifacts(&mut diagnostics);
+    let approval_artifacts = backend.list_approval_artifacts(&mut diagnostics).await;
     let approved = approved_resources(
         &approval_artifacts,
         &changes,
@@ -424,7 +424,7 @@ pub async fn apply_config_dir_with_options(
         })
         .filter_map(|change| change.resource.strip_prefix("graph.").map(str::to_string))
         .collect();
-    let mut completed_op_sidecars: Vec<PathBuf> = Vec::new();
+    let mut completed_op_sidecars: Vec<String> = Vec::new();
     let mut failed_graphs: BTreeMap<String, FailedGraphOrigin> = BTreeMap::new();
     let mut graph_moving_aborted = false;
     for graph_id in &graph_creates_to_run {
@@ -462,7 +462,7 @@ pub async fn apply_config_dir_with_options(
             state_cas_base: expected_cas.clone(),
             approval_id: None,
         };
-        let sidecar_path = match backend.write_recovery_sidecar(&sidecar) {
+        let sidecar_path = match backend.write_recovery_sidecar(&sidecar).await {
             Ok(path) => path,
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
@@ -514,7 +514,7 @@ pub async fn apply_config_dir_with_options(
             Ok(source) => source,
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
-                let _ = fs::remove_file(&sidecar_path); // nothing moved
+                backend.delete_object(&sidecar_path).await; // nothing moved
                 failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphCreate);
                 graph_moving_aborted = true;
                 continue;
@@ -540,7 +540,7 @@ pub async fn apply_config_dir_with_options(
         if let Ok(db) = Omnigraph::open_read_only(&graph_uri).await {
             if let Ok(snapshot) = db.snapshot_of(ReadTarget::branch("main")).await {
                 sidecar.expected_manifest_version = Some(snapshot.version());
-                if let Err(diagnostic) = backend.write_recovery_sidecar(&sidecar) {
+                if let Err(diagnostic) = backend.write_recovery_sidecar(&sidecar).await {
                     diagnostics.push(diagnostic);
                 }
             }
@@ -626,7 +626,7 @@ pub async fn apply_config_dir_with_options(
             state_cas_base: expected_cas.clone(),
             approval_id: None,
         };
-        let sidecar_path = match backend.write_recovery_sidecar(&sidecar) {
+        let sidecar_path = match backend.write_recovery_sidecar(&sidecar).await {
             Ok(path) => path,
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
@@ -677,7 +677,7 @@ pub async fn apply_config_dir_with_options(
             Ok(source) => source,
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
-                let _ = fs::remove_file(&sidecar_path); // nothing moved
+                backend.delete_object(&sidecar_path).await; // nothing moved
                 failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::SchemaApply);
                 graph_moving_aborted = true;
                 continue;
@@ -695,7 +695,7 @@ pub async fn apply_config_dir_with_options(
         {
             Ok(result) => {
                 sidecar.expected_manifest_version = Some(result.manifest_version);
-                if let Err(diagnostic) = backend.write_recovery_sidecar(&sidecar) {
+                if let Err(diagnostic) = backend.write_recovery_sidecar(&sidecar).await {
                     diagnostics.push(diagnostic);
                 }
             }
@@ -871,7 +871,7 @@ pub async fn apply_config_dir_with_options(
             state_cas_base: expected_cas.clone(),
             approval_id: approval_id.clone(),
         };
-        let sidecar_path = match backend.write_recovery_sidecar(&sidecar) {
+        let sidecar_path = match backend.write_recovery_sidecar(&sidecar).await {
             Ok(path) => path,
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
@@ -1004,8 +1004,14 @@ pub async fn apply_config_dir_with_options(
         // persisted-statuses revert contract below is exercised; a cfg_callback
         // on this point can mutate state.json to simulate a concurrent writer,
         // making write_state's CAS check fail organically.
-        let write_result = failpoints::maybe_fail("cluster_apply.before_state_write")
-            .and_then(|()| backend.write_state(&new_state, expected_cas.as_deref(), &mut observations));
+        let write_result = match failpoints::maybe_fail("cluster_apply.before_state_write") {
+            Ok(()) => {
+                backend
+                    .write_state(&new_state, expected_cas.as_deref(), &mut observations)
+                    .await
+            }
+            Err(diagnostic) => Err(diagnostic),
+        };
         match write_result {
             Ok(()) => state_written = true,
             Err(diagnostic) => {
@@ -1017,16 +1023,16 @@ pub async fn apply_config_dir_with_options(
     // Completed (rows 2/4) sweep sidecars are deleted only once their outcome
     // is durably recorded; on a failed write they stay and re-sweep next run.
     if !state_write_failed {
-        for sidecar_path in sweep
+        for sidecar_uri in sweep
             .completed_sidecars
             .iter()
             .chain(completed_op_sidecars.iter())
         {
-            let _ = fs::remove_file(sidecar_path);
+            backend.delete_object(sidecar_uri).await;
         }
         let mut all_consumed = sweep.consumed_approvals.clone();
         all_consumed.extend(consumed_approval_ids.iter().cloned());
-        mark_approvals_consumed(&backend, &all_consumed);
+        mark_approvals_consumed(&backend, &all_consumed).await;
     }
     // On a failed state write, report the statuses that are actually on disk
     // (the pre-apply snapshot), not the in-memory mutations that were never
@@ -1082,7 +1088,7 @@ pub async fn approve_config_dir(
 ) -> ApproveOutput {
     let outcome = load_desired(config_dir.as_ref());
     let mut diagnostics = outcome.diagnostics;
-    let backend = LocalStateBackend::new(&outcome.config_dir);
+    let backend = ClusterStore::for_config_dir(&outcome.config_dir);
     let mut observations = backend.observations();
 
     let fail = |config_dir: String, diagnostics: Vec<Diagnostic>| ApproveOutput {
@@ -1103,7 +1109,7 @@ pub async fn approve_config_dir(
     }
 
     let _lock_guard = if desired.state_lock {
-        match backend.acquire_lock("approve", &mut observations) {
+        match backend.acquire_lock("approve", &mut observations).await {
             Ok(guard) => Some(guard),
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
@@ -1119,7 +1125,7 @@ pub async fn approve_config_dir(
         None
     };
 
-    let state = match backend.read_state(&mut observations) {
+    let state = match backend.read_state(&mut observations).await {
         Ok(snapshot) => match snapshot.state {
             Some(state) => state,
             None => {
@@ -1174,7 +1180,7 @@ pub async fn approve_config_dir(
         consumed_at: None,
         consumed_by_operation: None,
     };
-    if let Err(diagnostic) = backend.write_approval_artifact(&artifact) {
+    if let Err(diagnostic) = backend.write_approval_artifact(&artifact).await {
         diagnostics.push(diagnostic);
         return fail(display_path(&desired.config_dir), diagnostics);
     }
@@ -1191,12 +1197,12 @@ pub async fn approve_config_dir(
 }
 
 
-pub fn status_config_dir(config_dir: impl AsRef<Path>) -> StatusOutput {
+pub async fn status_config_dir(config_dir: impl AsRef<Path>) -> StatusOutput {
     let parsed = parse_cluster_config(config_dir.as_ref());
     let mut diagnostics = parsed.diagnostics;
-    let backend = LocalStateBackend::new(&parsed.config_dir);
+    let backend = ClusterStore::for_config_dir(&parsed.config_dir);
     let mut observations = backend.observations();
-    backend.observe_lock(&mut observations, &mut diagnostics);
+    backend.observe_lock(&mut observations, &mut diagnostics).await;
     warn_pending_recovery_sidecars(&parsed.config_dir, &mut diagnostics);
 
     let mut resource_digests = BTreeMap::new();
@@ -1206,7 +1212,7 @@ pub fn status_config_dir(config_dir: impl AsRef<Path>) -> StatusOutput {
     if let Some(raw) = parsed.raw.as_ref() {
         let _settings = validate_cluster_header(raw, &mut diagnostics);
         if !has_errors(&diagnostics) {
-            match backend.read_state(&mut observations) {
+            match backend.read_state(&mut observations).await {
                 Ok(snapshot) => {
                     if let Some(state) = snapshot.state {
                         // Read-only point-in-time catalog check: report the
@@ -1244,20 +1250,20 @@ pub fn status_config_dir(config_dir: impl AsRef<Path>) -> StatusOutput {
     }
 }
 
-pub fn force_unlock_config_dir(
+pub async fn force_unlock_config_dir(
     config_dir: impl AsRef<Path>,
     lock_id: impl AsRef<str>,
 ) -> ForceUnlockOutput {
     let parsed = parse_cluster_config(config_dir.as_ref());
     let mut diagnostics = parsed.diagnostics;
-    let backend = LocalStateBackend::new(&parsed.config_dir);
+    let backend = ClusterStore::for_config_dir(&parsed.config_dir);
     let mut observations = backend.observations();
     let mut lock_removed = false;
 
     if let Some(raw) = parsed.raw.as_ref() {
         let _settings = validate_cluster_header(raw, &mut diagnostics);
         if !has_errors(&diagnostics) {
-            match backend.force_unlock(lock_id.as_ref(), &mut observations) {
+            match backend.force_unlock(lock_id.as_ref(), &mut observations).await {
                 Ok(()) => lock_removed = true,
                 Err(diagnostic) => diagnostics.push(diagnostic),
             }
@@ -1284,7 +1290,7 @@ pub async fn import_config_dir(config_dir: impl AsRef<Path>) -> StateSyncOutput 
 async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> StateSyncOutput {
     let outcome = load_desired(config_dir);
     let mut diagnostics = outcome.diagnostics;
-    let backend = LocalStateBackend::new(&outcome.config_dir);
+    let backend = ClusterStore::for_config_dir(&outcome.config_dir);
     let mut observations = backend.observations();
 
     let Some(desired) = outcome.desired else {
@@ -1315,7 +1321,7 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
 
     let operation_label = state_sync_operation_label(operation);
     let _lock_guard = if desired.state_lock {
-        match backend.acquire_lock(operation_label, &mut observations) {
+        match backend.acquire_lock(operation_label, &mut observations).await {
             Ok(guard) => Some(guard),
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
@@ -1346,7 +1352,7 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
         };
     }
 
-    let snapshot = match backend.read_state(&mut observations) {
+    let snapshot = match backend.read_state(&mut observations).await {
         Ok(snapshot) => snapshot,
         Err(diagnostic) => {
             diagnostics.push(diagnostic);
@@ -1477,14 +1483,14 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
         state.state_revision = state.state_revision.saturating_add(1);
     }
 
-    match backend.write_state(&state, expected_cas.as_deref(), &mut observations) {
+    match backend.write_state(&state, expected_cas.as_deref(), &mut observations).await {
         Ok(()) => {
             // Completed sweep sidecars are deleted only after their outcome
             // is durably recorded; on failure they stay and re-sweep.
-            for sidecar_path in &sweep.completed_sidecars {
-                let _ = fs::remove_file(sidecar_path);
+            for sidecar_uri in &sweep.completed_sidecars {
+                backend.delete_object(sidecar_uri).await;
             }
-            mark_approvals_consumed(&backend, &sweep.consumed_approvals);
+            mark_approvals_consumed(&backend, &sweep.consumed_approvals).await;
         }
         Err(diagnostic) => diagnostics.push(diagnostic),
     }

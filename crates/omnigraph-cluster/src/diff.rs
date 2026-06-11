@@ -142,7 +142,7 @@ pub(crate) fn compute_approvals(
 /// Near-misses — an artifact for the same resource whose bound digests no
 /// longer match — warn as `approval_stale` and never authorize anything.
 pub(crate) fn approved_resources(
-    artifacts: &[(PathBuf, ApprovalArtifact)],
+    artifacts: &[(String, ApprovalArtifact)],
     changes: &[PlanChange],
     config_digest: &str,
     diagnostics: &mut Vec<Diagnostic>,

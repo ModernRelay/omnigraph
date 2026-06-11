@@ -351,8 +351,8 @@ policies:
         }));
     }
 
-    #[test]
-    fn extended_state_json_status_surfaces_statuses() {
+    #[tokio::test]
+    async fn extended_state_json_status_surfaces_statuses() {
         let dir = fixture();
         let state_dir = dir.path().join(CLUSTER_STATE_DIR);
         fs::create_dir_all(&state_dir).unwrap();
@@ -380,7 +380,7 @@ policies:
 }"#;
         fs::write(state_dir.join("state.json"), state).unwrap();
 
-        let out = status_config_dir(dir.path());
+        let out = status_config_dir(dir.path()).await;
         assert!(out.ok, "{:?}", out.diagnostics);
         assert!(out.state_observations.state_found);
         assert_eq!(out.state_observations.state_revision, 42);
@@ -400,10 +400,10 @@ policies:
         );
     }
 
-    #[test]
-    fn missing_state_status_succeeds_with_warning() {
+    #[tokio::test]
+    async fn missing_state_status_succeeds_with_warning() {
         let dir = fixture();
-        let out = status_config_dir(dir.path());
+        let out = status_config_dir(dir.path()).await;
         assert!(out.ok, "{:?}", out.diagnostics);
         assert!(!out.state_observations.state_found);
         assert_eq!(out.state_observations.state_revision, 0);
@@ -414,14 +414,14 @@ policies:
         );
     }
 
-    #[test]
-    fn invalid_state_status_fails() {
+    #[tokio::test]
+    async fn invalid_state_status_fails() {
         let dir = fixture();
         let state_dir = dir.path().join(CLUSTER_STATE_DIR);
         fs::create_dir_all(&state_dir).unwrap();
         fs::write(state_dir.join("state.json"), "{").unwrap();
 
-        let out = status_config_dir(dir.path());
+        let out = status_config_dir(dir.path()).await;
         assert!(!out.ok);
         assert!(out.state_observations.state_found);
         assert!(
@@ -431,12 +431,12 @@ policies:
         );
     }
 
-    #[test]
-    fn status_surfaces_full_lock_metadata() {
+    #[tokio::test]
+    async fn status_surfaces_full_lock_metadata() {
         let dir = fixture();
         write_lock_file(dir.path(), "held-lock", "refresh");
 
-        let out = status_config_dir(dir.path());
+        let out = status_config_dir(dir.path()).await;
         assert!(out.ok, "{:?}", out.diagnostics);
         assert!(out.state_observations.locked);
         assert_eq!(out.state_observations.lock_id.as_deref(), Some("held-lock"));
@@ -452,12 +452,12 @@ policies:
         assert!(out.state_observations.lock_age_seconds.is_some());
     }
 
-    #[test]
-    fn force_unlock_matching_id_removes_lock() {
+    #[tokio::test]
+    async fn force_unlock_matching_id_removes_lock() {
         let dir = fixture();
         write_lock_file(dir.path(), "held-lock", "plan");
 
-        let out = force_unlock_config_dir(dir.path(), "held-lock");
+        let out = force_unlock_config_dir(dir.path(), "held-lock").await;
         assert!(out.ok, "{:?}", out.diagnostics);
         assert!(out.lock_removed);
         assert_eq!(out.state_observations.lock_id.as_deref(), Some("held-lock"));
@@ -468,12 +468,12 @@ policies:
         assert!(!dir.path().join(CLUSTER_LOCK_FILE).exists());
     }
 
-    #[test]
-    fn force_unlock_wrong_id_fails_and_preserves_lock() {
+    #[tokio::test]
+    async fn force_unlock_wrong_id_fails_and_preserves_lock() {
         let dir = fixture();
         write_lock_file(dir.path(), "held-lock", "plan");
 
-        let out = force_unlock_config_dir(dir.path(), "other-lock");
+        let out = force_unlock_config_dir(dir.path(), "other-lock").await;
         assert!(!out.ok);
         assert!(!out.lock_removed);
         assert_eq!(out.state_observations.lock_id.as_deref(), Some("held-lock"));
@@ -485,11 +485,11 @@ policies:
         assert!(dir.path().join(CLUSTER_LOCK_FILE).exists());
     }
 
-    #[test]
-    fn force_unlock_missing_lock_fails() {
+    #[tokio::test]
+    async fn force_unlock_missing_lock_fails() {
         let dir = fixture();
 
-        let out = force_unlock_config_dir(dir.path(), "held-lock");
+        let out = force_unlock_config_dir(dir.path(), "held-lock").await;
         assert!(!out.ok);
         assert!(!out.lock_removed);
         assert!(!out.state_observations.locked);
@@ -500,14 +500,14 @@ policies:
         );
     }
 
-    #[test]
-    fn force_unlock_invalid_lock_json_fails_and_preserves_lock() {
+    #[tokio::test]
+    async fn force_unlock_invalid_lock_json_fails_and_preserves_lock() {
         let dir = fixture();
         let state_dir = dir.path().join(CLUSTER_STATE_DIR);
         fs::create_dir_all(&state_dir).unwrap();
         fs::write(state_dir.join("lock.json"), "{").unwrap();
 
-        let out = force_unlock_config_dir(dir.path(), "held-lock");
+        let out = force_unlock_config_dir(dir.path(), "held-lock").await;
         assert!(!out.ok);
         assert!(!out.lock_removed);
         assert!(
@@ -518,8 +518,8 @@ policies:
         assert!(dir.path().join(CLUSTER_LOCK_FILE).exists());
     }
 
-    #[test]
-    fn force_unlock_unsupported_lock_version_fails_and_preserves_lock() {
+    #[tokio::test]
+    async fn force_unlock_unsupported_lock_version_fails_and_preserves_lock() {
         let dir = fixture();
         let state_dir = dir.path().join(CLUSTER_STATE_DIR);
         fs::create_dir_all(&state_dir).unwrap();
@@ -529,7 +529,7 @@ policies:
         )
         .unwrap();
 
-        let out = force_unlock_config_dir(dir.path(), "held-lock");
+        let out = force_unlock_config_dir(dir.path(), "held-lock").await;
         assert!(!out.ok);
         assert!(!out.lock_removed);
         assert!(
@@ -540,8 +540,8 @@ policies:
         assert!(dir.path().join(CLUSTER_LOCK_FILE).exists());
     }
 
-    #[test]
-    fn force_unlock_external_state_backend_rejected() {
+    #[tokio::test]
+    async fn force_unlock_external_state_backend_rejected() {
         let dir = fixture();
         write_lock_file(dir.path(), "held-lock", "plan");
         fs::write(
@@ -557,7 +557,7 @@ graphs:
         )
         .unwrap();
 
-        let out = force_unlock_config_dir(dir.path(), "held-lock");
+        let out = force_unlock_config_dir(dir.path(), "held-lock").await;
         assert!(!out.ok);
         assert!(!out.lock_removed);
         assert!(
@@ -582,7 +582,7 @@ graphs:
                 .any(|diagnostic| diagnostic.code == "state_lock_held")
         );
 
-        let unlocked = force_unlock_config_dir(dir.path(), "held-lock");
+        let unlocked = force_unlock_config_dir(dir.path(), "held-lock").await;
         assert!(unlocked.ok, "{:?}", unlocked.diagnostics);
 
         let out = plan_config_dir(dir.path()).await;
@@ -1886,7 +1886,7 @@ graphs:
         let state_before = fs::read_to_string(dir.path().join(CLUSTER_STATE_FILE)).unwrap();
         fs::remove_file(&blob).unwrap();
 
-        let out = status_config_dir(dir.path());
+        let out = status_config_dir(dir.path()).await;
         assert!(out.ok, "{:?}", out.diagnostics);
         assert!(out.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "catalog_payload_missing"
@@ -2001,7 +2001,7 @@ graphs:
         assert!(apply.ok && apply.converged, "{:?}", apply.diagnostics);
         assert_eq!(fs::read_to_string(&blob).unwrap(), original);
 
-        let status = status_config_dir(dir.path());
+        let status = status_config_dir(dir.path()).await;
         assert!(
             !status
                 .diagnostics
@@ -2012,12 +2012,12 @@ graphs:
         );
     }
 
-    #[test]
-    fn verification_skips_graph_and_schema_resources() {
+    #[tokio::test]
+    async fn verification_skips_graph_and_schema_resources() {
         let dir = fixture();
         write_applyable_state(dir.path()); // graph + schema digests only, no blobs
 
-        let out = status_config_dir(dir.path());
+        let out = status_config_dir(dir.path()).await;
         assert!(
             !out.diagnostics
                 .iter()
@@ -2770,7 +2770,7 @@ policies:
         let converge = apply_config_dir(dir.path()).await;
         assert!(converge.converged, "{converge:?}");
 
-        let snapshot = read_serving_snapshot(dir.path()).expect("converged cluster must serve");
+        let snapshot = read_serving_snapshot(dir.path()).await.expect("converged cluster must serve");
         assert_eq!(snapshot.graphs.len(), 1);
         assert_eq!(snapshot.graphs[0].graph_id, "knowledge");
         assert!(snapshot.graphs[0].root.ends_with("graphs/knowledge.omni"));
@@ -2782,10 +2782,10 @@ policies:
         assert!(snapshot.policies[0].blob_path.exists());
     }
 
-    #[test]
-    fn serving_snapshot_refuses_missing_state() {
+    #[tokio::test]
+    async fn serving_snapshot_refuses_missing_state() {
         let dir = fixture();
-        let err = read_serving_snapshot(dir.path()).unwrap_err();
+        let err = read_serving_snapshot(dir.path()).await.unwrap_err();
         assert!(
             err.iter().any(|diagnostic| diagnostic.code == "cluster_state_missing"),
             "{err:?}"
@@ -2800,7 +2800,7 @@ policies:
         apply_config_dir(dir.path()).await;
         write_schema_apply_sidecar(dir.path(), "knowledge", "whatever", "01SERVE");
 
-        let err = read_serving_snapshot(dir.path()).unwrap_err();
+        let err = read_serving_snapshot(dir.path()).await.unwrap_err();
         assert!(
             err.iter().any(|diagnostic| diagnostic.code == "cluster_recovery_pending"),
             "{err:?}"
@@ -2814,7 +2814,7 @@ policies:
         write_applyable_state(dir.path());
         apply_config_dir(dir.path()).await;
         // Tamper with the query blob...
-        let snapshot = read_serving_snapshot(dir.path()).unwrap();
+        let snapshot = read_serving_snapshot(dir.path()).await.unwrap();
         let desired = validate_config_dir(dir.path());
         let query_digest = &desired.resource_digests["query.knowledge.find_person"];
         let blob = dir
@@ -2838,7 +2838,7 @@ policies:
         )
         .unwrap();
 
-        let err = read_serving_snapshot(dir.path()).unwrap_err();
+        let err = read_serving_snapshot(dir.path()).await.unwrap_err();
         assert!(
             err.iter()
                 .any(|diagnostic| diagnostic.code == "catalog_payload_digest_mismatch"),
@@ -2851,12 +2851,12 @@ policies:
         let _ = snapshot; // the pre-tamper read succeeded
     }
 
-    #[test]
-    fn serving_snapshot_refuses_empty_cluster() {
+    #[tokio::test]
+    async fn serving_snapshot_refuses_empty_cluster() {
         let dir = fixture();
         write_state_resources(dir.path(), &[]); // state exists, no graphs
 
-        let err = read_serving_snapshot(dir.path()).unwrap_err();
+        let err = read_serving_snapshot(dir.path()).await.unwrap_err();
         assert!(
             err.iter().any(|diagnostic| diagnostic.code == "cluster_empty"),
             "{err:?}"
@@ -2972,13 +2972,13 @@ policies:
         );
     }
 
-    #[test]
-    fn status_warns_on_pending_recovery_sidecar() {
+    #[tokio::test]
+    async fn status_warns_on_pending_recovery_sidecar() {
         let dir = fixture();
         write_applyable_state(dir.path());
         write_create_sidecar(dir.path(), "knowledge", "irrelevant", "01STATUS");
 
-        let out = status_config_dir(dir.path());
+        let out = status_config_dir(dir.path()).await;
         assert!(out.ok, "{:?}", out.diagnostics);
         assert!(
             out.diagnostics

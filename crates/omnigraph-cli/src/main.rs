@@ -3720,7 +3720,7 @@ async fn main() -> Result<()> {
                 finish_cluster_approve(&output, json)?;
             }
             ClusterCommand::Status { config, json } => {
-                let output = status_config_dir(config);
+                let output = status_config_dir(config).await;
                 finish_cluster_status(&output, json)?;
             }
             ClusterCommand::Refresh { config, json } => {
@@ -3736,7 +3736,7 @@ async fn main() -> Result<()> {
                 config,
                 json,
             } => {
-                let output = force_unlock_config_dir(config, lock_id);
+                let output = force_unlock_config_dir(config, lock_id).await;
                 finish_cluster_force_unlock(&output, json)?;
             }
         },
