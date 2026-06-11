@@ -246,7 +246,17 @@ Three PRs, each independently useful, each landable without the next:
   version) — slice 1 or slice 2? It materially helps debugging precedence,
   which argues early.
 
-## Relationship to RFC-002
+## Relationship to RFC-002 and RFC-008
+
+**RFC-008 supersedes this RFC's "project layer" framing**: with
+`omnigraph.yaml` deprecated
+([rfc-008-deprecate-omnigraph-yaml.md](rfc-008-deprecate-omnigraph-yaml.md)),
+the project layer *is* the cluster checkout. References to project
+`omnigraph.yaml` in §D3/§D5 describe the transitional window only; the
+trust-boundary rules apply unchanged to whatever the project layer is at a
+given stage. Sequencing couples them: RFC-007 PRs 1–2 must land before
+RFC-008's migration stages can begin (the operator layer is what keys
+migrate *to*).
 
 RFC-002 remains the umbrella architecture. This RFC implements its §2
 (layered config, global-first), §4 (file naming / one dir), and §5

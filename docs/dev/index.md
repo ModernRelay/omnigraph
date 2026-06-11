@@ -77,6 +77,7 @@ Working documents for in-flight feature work. Removed when the work lands.
 | Cluster graph & schema apply — Phase 4 sidecars, roll-forward recovery, approval artifacts | [rfc-004-cluster-graph-schema-apply.md](rfc-004-cluster-graph-schema-apply.md) |
 | Server boots from cluster state — Phase 5 mode switch, applied-revision serving | [rfc-005-server-cluster-boot.md](rfc-005-server-cluster-boot.md) |
 | Per-operator config — `~/.omnigraph/` identity, keyed credentials, named servers (the operator slice of RFC-002) | [rfc-007-operator-config.md](rfc-007-operator-config.md) |
+| Deprecate `omnigraph.yaml` — one concern per config surface; key-by-key migration map and staged retirement | [rfc-008-deprecate-omnigraph-yaml.md](rfc-008-deprecate-omnigraph-yaml.md) |
 
 ## Boundary
 
