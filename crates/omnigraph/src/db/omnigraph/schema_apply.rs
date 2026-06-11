@@ -144,6 +144,14 @@ where
         actor,
     )?;
 
+    // Converge any pending recovery sidecar before planning: a table
+    // rewrite over sidecar-covered drift would otherwise re-plan from
+    // the manifest pin and orphan the drifted Phase-B commit (silently
+    // dropping its rows) while the stale sidecar lingers to misclassify
+    // against the post-apply pins. Runs before the apply's own sidecar
+    // exists, so the heal can never observe it.
+    db.heal_pending_recovery_sidecars().await?;
+
     acquire_schema_apply_lock(db).await?;
     let result = apply_schema_with_lock(db, desired_schema_source, options, validate_catalog).await;
     let release_result = release_schema_apply_lock(db).await;

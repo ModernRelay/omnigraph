@@ -1081,6 +1081,13 @@ impl Omnigraph {
             actor_id,
         )?;
         self.ensure_schema_apply_idle("branch_merge").await?;
+        // Converge any pending recovery sidecar before the merge
+        // captures its target snapshot: the merge's publish would
+        // otherwise make the drifted Phase-B commit visible as an
+        // unattributed side effect (manifest catches up to HEAD with no
+        // recovery audit row) and leave the stale sidecar behind. Runs
+        // before the merge's own sidecar exists.
+        self.heal_pending_recovery_sidecars().await?;
         self.branch_merge_impl(source, target, actor_id).await
     }
 
