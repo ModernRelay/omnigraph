@@ -162,11 +162,11 @@ Atomicity guarantee for multi-statement mutations: a mid-query failure leaves La
 
 | Mode | Semantics | Path (post-MR-794) |
 |---|---|---|
-| `Overwrite` | Replace all data in the target tables on the branch | Inline-commit per type, then publisher CAS at end-of-load. Truncate-then-append doesn't fit the staged shape; documented residual. |
+| `Overwrite` | Replace all data in the target tables on the branch | Same accumulator; one `stage_overwrite` + `commit_staged` per touched table at end-of-load (a staged Lance `Operation::Overwrite` transaction — HEAD does not advance until commit; MR-793 Phase 2); publisher CAS. |
 | `Append` | Strict insert; duplicates error | In-memory `MutationStaging` accumulator; one `stage_append` + `commit_staged` per touched table at end-of-load; publisher CAS. |
 | `Merge` | Upsert by `id` (`merge_insert`) | Same accumulator; one `stage_merge_insert` per touched table at end-of-load (Merge mode dedupes by `id`, last-write-wins); publisher CAS. |
 
-For Append/Merge, a mid-load failure (RI / cardinality violation, validation error) leaves Lance HEAD untouched on the staged tables — the next load on the same tables proceeds normally with no `ExpectedVersionMismatch`. For Overwrite, a mid-load failure can still leave Lance HEAD on a partially-truncated table; the next overwrite replaces it.
+For all three modes, a mid-load failure (RI / cardinality violation, validation error) leaves Lance HEAD untouched on the staged tables — the next load on the same tables proceeds normally with no `ExpectedVersionMismatch`.
 
 ## `load` vs `ingest`
 
