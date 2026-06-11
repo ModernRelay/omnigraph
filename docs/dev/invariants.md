@@ -42,10 +42,12 @@ Use it this way:
 
 5. **Recovery is part of the commit protocol.** Writers that can advance Lance
    HEAD before manifest publish must write `__recovery/{ulid}.json` sidecars.
-   `Omnigraph::open` in read-write mode runs the all-or-nothing sweep, and
-   `refresh` runs roll-forward-only recovery for long-lived processes. Do not
-   add a new writer kind without sidecar coverage or an explicit proof that no
-   Lance HEAD can move before manifest publish.
+   `Omnigraph::open` in read-write mode runs the all-or-nothing sweep; the
+   staged-write entry points (`load_as`, `mutate_as`) and `refresh` run
+   roll-forward-only recovery in-process, so a long-lived process converges on
+   its next write rather than at restart. Do not add a new writer kind without
+   sidecar coverage or an explicit proof that no Lance HEAD can move before
+   manifest publish.
 
 6. **Strong consistency is the default.** Reads are snapshot-isolated, writes
    are durable before acknowledgement, and branch reads observe the current

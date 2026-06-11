@@ -215,19 +215,37 @@ Triggers for the residual: transient Lance write errors during finalize
 (object-store retry budget exhaustion, disk full); persistent publisher
 contention exceeding `PUBLISHER_RETRY_BUDGET = 5` retries.
 
-**Long-running servers**: `Omnigraph::refresh` runs roll-forward-only
-recovery in-process — the common Phase B → Phase C residual closes
-without a restart. The next mutation on the same handle (after refresh)
-no longer surfaces `ExpectedVersionMismatch` for the failed table.
+**Long-running servers**: the staged-write entry points (`load_as`,
+`mutate_as`) and `Omnigraph::refresh` run roll-forward-only recovery
+in-process (`recovery::heal_pending_sidecars_roll_forward`) — the
+common Phase B → Phase C residual closes on the next write, without a
+restart and without an explicit refresh. The heal lists `__recovery/`
+(one `list_dir`; empty in the steady state) and, per sidecar, acquires
+the same per-`(table_key, table_branch)` write queues every sidecar
+writer holds from before `write_sidecar` until after `delete_sidecar` —
+so it serializes against a live writer instead of rolling its
+in-flight sidecar forward from under it (a sidecar whose queues can be
+acquired belongs to a writer that finished or died; an existence
+re-check after the wait skips the finished case). Lock order is
+queues → coordinator, matching every writer's commit→publish path.
+Pinned by
+`tests/failpoints.rs::load_after_finalize_publisher_failure_heals_without_reopen`
+and `mutation_after_finalize_publisher_failure_heals_without_reopen`.
 Sidecars that would require a `Dataset::restore` (mixed / unexpected
 state) are deferred to the next `OpenMode::ReadWrite` open: restore is
 unsafe under concurrency because Lance's `check_restore_txn` accepts
 the restore against in-flight Append/Update/Delete commits and
 silently orphans them (pinned by
 `tests/staged_writes.rs::lance_restore_loses_to_concurrent_append_via_orphaning`).
+When such a deferred sidecar blocks a write, the commit-time drift
+guard says so explicitly ("a pending recovery sidecar requires
+rollback — reopen the graph read-write") instead of pointing at
+`omnigraph repair`, which refuses while a sidecar is pending.
 Continuous in-process recovery for the rollback path is the goal of a
-future background reconciler with per-(table, branch) writer-queue
-acquisition.
+future background reconciler. The maintenance entry points
+(`apply_schema_as`, `branch_merge_as`, `ensure_indices`) do not heal at
+entry yet; their strict HEAD-vs-manifest preconditions still fail
+loudly on drift.
 
 The publisher-CAS contract is unchanged: a *concurrent writer* that
 advances any of our touched tables between snapshot capture and
