@@ -109,7 +109,9 @@ operator server use the legacy chain alone.
 > naming each present key's new home (suppress in CI with
 > `OMNIGRAPH_SUPPRESS_YAML_DEPRECATION=1`); `omnigraph config migrate`
 > produces the split. The file keeps working through the deprecation
-> window.
+> window. Migrated teams can set `OMNIGRAPH_NO_LEGACY_CONFIG=1` to turn
+> any legacy-file load into a hard error (regression guard; the file's
+> absence is always fine).
 
 ```yaml
 project: { name }
