@@ -28,10 +28,11 @@
 //!   CreateIndex/Merge — see `check_restore_txn` at lance-6.0.1
 //!   `src/io/commit/conflict_resolver.rs:986`. The hazard is documented
 //!   by `tests/staged_writes.rs::lance_restore_loses_to_concurrent_append_via_orphaning`.
-//!   This module sidesteps the hazard by running recovery only at
-//!   `Omnigraph::open` (before any other writers can race). A future
-//!   continuous in-process recovery reconciler will need to guard via
-//!   per-(table_key, branch) queue acquisition.
+//!   The open-time sweep sidesteps the hazard by running before any
+//!   other writers can race; the in-process heal
+//!   ([`heal_pending_sidecars_roll_forward`]) never restores (roll-
+//!   forward only) and guards via per-(table_key, branch) queue
+//!   acquisition.
 
 use std::collections::HashMap;
 
@@ -534,6 +535,123 @@ pub(crate) async fn restore_table_to_version(
     Ok(())
 }
 
+/// In-process heal for pending recovery sidecars — the entry point for
+/// long-lived handles (`Omnigraph::refresh` and the staged-write entry
+/// points `load_as` / `mutate_as`).
+///
+/// Steady-state cost is one `list_dir` of `__recovery/` (typically
+/// empty → immediate return), so write entry points can afford to call
+/// this on every request. When sidecars exist, each is processed in
+/// `RecoveryMode::RollForwardOnly`: the common Phase B → Phase C
+/// residual (per-table `commit_staged` landed, manifest publish did
+/// not) rolls forward in-process; rollback-eligible or invariant-
+/// violating sidecars are deferred to the next ReadWrite open, exactly
+/// as `Omnigraph::refresh` documents.
+///
+/// Concurrency: unlike the open-time sweep, this runs while other
+/// writers may be in flight. Every sidecar writer (mutation/load
+/// finalize, schema_apply, branch_merge, ensure_indices, optimize)
+/// acquires its per-`(table_key, table_branch)` write queues *before*
+/// `write_sidecar` and holds them until after `delete_sidecar` — so
+/// acquiring the same queues here blocks until that writer either
+/// finished (sidecar deleted; the existence re-check skips it) or died
+/// (sidecar is genuinely orphaned; safe to process). Without this, the
+/// heal could observe a live writer's sidecar in its commit→publish
+/// window, roll it forward, and fail that writer's own publish CAS.
+/// Lock order is queues → coordinator, matching every writer's
+/// commit→publish path.
+///
+/// `schema_state_recovery`: callers that already ran
+/// `recover_schema_state_files` (refresh) pass the result so a
+/// SchemaApply sidecar whose staging rename completed in the same pass
+/// stays roll-forward-eligible; write-entry callers pass `None` and the
+/// reconcile runs lazily, only when sidecars were found.
+///
+/// Returns `true` when at least one sidecar was processed (the caller
+/// should invalidate per-snapshot caches).
+pub(crate) async fn heal_pending_sidecars_roll_forward(
+    root_uri: &str,
+    storage: std::sync::Arc<dyn StorageAdapter>,
+    coordinator: &tokio::sync::RwLock<GraphCoordinator>,
+    write_queue: &crate::db::write_queue::WriteQueueManager,
+    schema_state_recovery: Option<SchemaStateRecovery>,
+) -> Result<bool> {
+    let sidecars = list_sidecars(root_uri, storage.as_ref()).await?;
+    if sidecars.is_empty() {
+        return Ok(false);
+    }
+    // Schema-staging reconcile before any SchemaApply sidecar is
+    // classified — same ordering as open and refresh (a SchemaApply
+    // roll-forward must not publish the manifest while the staging
+    // files remain unrenamed).
+    let schema_state_recovery = match schema_state_recovery {
+        Some(recovery) => recovery,
+        None => {
+            let mut coord = coordinator.write().await;
+            coord.refresh().await?;
+            let snapshot = coord.snapshot();
+            crate::db::schema_state::recover_schema_state_files(
+                root_uri,
+                std::sync::Arc::clone(&storage),
+                &snapshot,
+            )
+            .await?
+        }
+    };
+    let mut processed_any = false;
+    for sidecar in sidecars {
+        // Serialize against a possibly-live writer (see fn docs). Guards
+        // are scoped per sidecar so two sidecars never hold queues
+        // simultaneously (no cross-sidecar lock-order surface).
+        let queue_keys: Vec<crate::db::write_queue::TableQueueKey> = sidecar
+            .tables
+            .iter()
+            .map(|pin| (pin.table_key.clone(), pin.table_branch.clone()))
+            .collect();
+        let _guards = write_queue.acquire_many(&queue_keys).await;
+        // Re-check after the wait: the writer we blocked on may have
+        // completed Phase C and deleted its sidecar.
+        if !storage
+            .exists(&sidecar_uri(root_uri, &sidecar.operation_id))
+            .await?
+        {
+            continue;
+        }
+        // Fresh per-branch snapshot — same rationale as
+        // `recover_manifest_drift`: classify against the branch the
+        // sidecar's writer targeted, refreshed after any prior
+        // sidecar's roll-forward.
+        let branch_snapshot = match sidecar.branch.as_deref() {
+            Some(b) => {
+                let mut branch_coord =
+                    GraphCoordinator::open_branch(root_uri, b, std::sync::Arc::clone(&storage))
+                        .await?;
+                branch_coord.refresh().await?;
+                branch_coord.snapshot()
+            }
+            None => {
+                let mut coord = coordinator.write().await;
+                coord.refresh().await?;
+                coord.snapshot()
+            }
+        };
+        process_sidecar(
+            root_uri,
+            storage.as_ref(),
+            &branch_snapshot,
+            &sidecar,
+            RecoveryMode::RollForwardOnly,
+            schema_state_recovery,
+        )
+        .await?;
+        processed_any = true;
+    }
+    // Re-read coordinator state so the caller's handle observes the
+    // post-heal manifest.
+    coordinator.write().await.refresh().await?;
+    Ok(processed_any)
+}
+
 /// Open-time recovery sweep — the entry point invoked from
 /// `Omnigraph::open` (gated on `OpenMode::ReadWrite`).
 ///
@@ -549,9 +667,10 @@ pub(crate) async fn restore_table_to_version(
 ///
 /// Concurrency: today recovery runs synchronously in `Omnigraph::open`
 /// *before* the engine is wrapped in the server's `Arc<RwLock<Omnigraph>>`.
-/// No request handlers can race. A future per-(table_key, branch) writer
-/// queue model (paired with a background reconciler) will need to acquire
-/// queues before the sweep restores or publishes.
+/// No request handlers can race, so this sweep does NOT acquire write
+/// queues. In-process callers (refresh, write entry points) must use
+/// [`heal_pending_sidecars_roll_forward`] instead, which serializes
+/// against live writers via per-(table_key, branch) queue acquisition.
 pub(crate) async fn recover_manifest_drift(
     root_uri: &str,
     storage: std::sync::Arc<dyn StorageAdapter>,

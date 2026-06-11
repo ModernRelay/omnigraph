@@ -378,10 +378,11 @@ impl Omnigraph {
                 recover_schema_state_files(&root, Arc::clone(&storage), &coordinator.snapshot())
                     .await?;
             // Recovery sweep: close the Phase B → Phase C residual on
-            // any sidecar left over from a crashed writer. Continuous
-            // in-process recovery for long-running servers (no restart
-            // required between Phase B failure and recovery) is a
-            // separate background-reconciler effort.
+            // any sidecar left over from a crashed writer. Long-running
+            // processes additionally converge in-process: the staged-
+            // write entry points and `refresh` run the roll-forward-only
+            // heal (`heal_pending_sidecars_roll_forward`); only
+            // rollback-eligible sidecars wait for this open-time sweep.
             crate::db::manifest::recover_manifest_drift(
                 &root,
                 Arc::clone(&storage),
@@ -755,7 +756,7 @@ impl Omnigraph {
     ///
     /// Composition mirrors `Omnigraph::open_with_storage_and_mode`'s
     /// recovery sequence, in the same order, with one restriction: the
-    /// manifest-drift sweep runs in `RollForwardOnly` mode (rollback /
+    /// manifest-drift heal runs in `RollForwardOnly` mode (rollback /
     /// abort cases defer to the next ReadWrite open because
     /// `Dataset::restore` is unsafe under concurrency). Each step:
     ///
@@ -767,46 +768,83 @@ impl Omnigraph {
     ///    SchemaApply roll-forward doesn't publish the manifest while
     ///    the staging files remain unrenamed (which would corrupt the
     ///    graph: data on new schema, catalog on old).
-    /// 3. `recover_manifest_drift(... RollForwardOnly)` — close the
+    /// 3. `heal_pending_sidecars_roll_forward` — close the
     ///    finalize→publisher residual via roll-forward; defer rollback
-    ///    work to next ReadWrite open.
+    ///    work to next ReadWrite open. Serializes against live writers
+    ///    by acquiring each sidecar's per-(table_key, branch) write
+    ///    queues, so refresh never rolls forward an in-flight writer's
+    ///    sidecar from under it.
     /// 4. `runtime_cache.invalidate_all` — drop stale per-snapshot caches.
     ///
     /// Steady state cost: one `list_dir` of `__recovery/` (typically
     /// returns empty → early return for both passes). No additional
     /// Lance reads.
     ///
-    /// Engine-internal callers that already hold an in-flight sidecar
-    /// (e.g. `schema_apply` mid-write) MUST use
+    /// The staged-write entry points (`load_as`, `mutate_as`) run the
+    /// same heal via
+    /// [`heal_pending_recovery_sidecars`](Self::heal_pending_recovery_sidecars),
+    /// so a long-lived server converges on the next write without an
+    /// explicit refresh. Engine-internal callers that already hold an
+    /// in-flight sidecar (e.g. `schema_apply` mid-write) MUST use
     /// [`refresh_coordinator_only`](Self::refresh_coordinator_only) to
     /// avoid the recovery sweep racing their own sidecar.
     pub async fn refresh(&self) -> Result<()> {
-        // Scope the coord write guard to the recovery section only.
+        // Scope the coord write guard to the schema-state section only.
         // `reload_schema_if_source_changed` (below) acquires
         // `self.coordinator.read().await` when the on-disk schema source
         // has drifted from the cached `schema_source`. Tokio's RwLock is
         // not reentrant, so holding the write across that call deadlocks.
         // Pinned by `composite_flow_schema_apply_then_branch_ops_no_deadlock_in_refresh`.
-        {
+        // The heal also takes the lock itself (queues → coordinator
+        // order), so it must run after this guard is released.
+        let schema_state_recovery = {
             let mut coord = self.coordinator.write().await;
             coord.refresh().await?;
-            let schema_state_recovery = recover_schema_state_files(
+            recover_schema_state_files(
                 &self.root_uri,
                 Arc::clone(&self.storage),
                 &coord.snapshot(),
             )
-            .await?;
-            crate::db::manifest::recover_manifest_drift(
-                &self.root_uri,
-                Arc::clone(&self.storage),
-                &mut *coord,
-                crate::db::manifest::RecoveryMode::RollForwardOnly,
-                schema_state_recovery,
-            )
-            .await?;
-        } // ← write guard released before reload's read acquisition
+            .await?
+        }; // ← write guard released before the heal's queue acquisition
+        crate::db::manifest::heal_pending_sidecars_roll_forward(
+            &self.root_uri,
+            Arc::clone(&self.storage),
+            &self.coordinator,
+            &self.write_queue,
+            Some(schema_state_recovery),
+        )
+        .await?;
         self.reload_schema_if_source_changed().await?;
         self.runtime_cache.invalidate_all().await;
+        Ok(())
+    }
+
+    /// Write-entry heal: converge any pending recovery sidecars (a
+    /// previously failed writer's Phase B → Phase C residual) before
+    /// starting a new staged write, so a long-lived process (the HTTP
+    /// server, an embedded handle) recovers on its next write instead
+    /// of wedging every write on the commit-time drift guard until
+    /// restart. Roll-forward only; rollback-eligible sidecars defer to
+    /// the next ReadWrite open exactly as [`refresh`](Self::refresh)
+    /// does.
+    ///
+    /// Steady-state cost: one `list_dir` of `__recovery/` (typically
+    /// empty → immediate return). See
+    /// `recovery::heal_pending_sidecars_roll_forward` for the
+    /// concurrency contract (per-table write-queue acquisition).
+    pub(crate) async fn heal_pending_recovery_sidecars(&self) -> Result<()> {
+        let processed = crate::db::manifest::heal_pending_sidecars_roll_forward(
+            &self.root_uri,
+            Arc::clone(&self.storage),
+            &self.coordinator,
+            &self.write_queue,
+            None,
+        )
+        .await?;
+        if processed {
+            self.runtime_cache.invalidate_all().await;
+        }
         Ok(())
     }
 

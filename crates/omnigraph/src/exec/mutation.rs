@@ -715,6 +715,14 @@ impl Omnigraph {
         actor_id: Option<&str>,
     ) -> Result<MutationResult> {
         self.ensure_schema_state_valid().await?;
+        // Converge any pending recovery sidecar (a previously failed
+        // writer's Phase B → Phase C residual) before executing: the
+        // inline delete path advances Lance HEAD during execution and
+        // the staged path's commit-time drift guard refuses
+        // sidecar-covered drift, so a long-lived handle must heal here
+        // — not at restart. One `list_dir` when no sidecars exist (the
+        // steady state).
+        self.heal_pending_recovery_sidecars().await?;
         let requested = Self::normalize_branch_name(branch)?;
         // Reject internal `__run__*` / system-prefixed branches at the
         // public write boundary. Direct-publish paths assert this
