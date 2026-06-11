@@ -317,3 +317,353 @@ impl SystemGraph {
         spawn_server_with_config_env(config, envs)
     }
 }
+
+// ---- helpers moved from the monolithic tests/cli.rs ----
+#[allow(unused_imports)]
+use lance::Dataset;
+#[allow(unused_imports)]
+use lance::index::DatasetIndexExt;
+#[allow(unused_imports)]
+use omnigraph::db::{Omnigraph, ReadTarget};
+
+pub const POLICY_YAML: &str = r#"
+version: 1
+groups:
+  team: [act-andrew, act-bruno]
+  admins: [act-andrew]
+protected_branches: [main]
+rules:
+  - id: team-read
+    allow:
+      actors: { group: team }
+      actions: [read]
+      branch_scope: any
+  - id: team-write
+    allow:
+      actors: { group: team }
+      actions: [change]
+      branch_scope: unprotected
+  - id: admins-promote
+    allow:
+      actors: { group: admins }
+      actions: [branch_merge]
+      target_branch_scope: protected
+"#;
+
+pub const POLICY_TESTS_YAML: &str = r#"
+version: 1
+cases:
+  - id: allow-feature-write
+    actor: act-andrew
+    action: change
+    branch: feature
+    expect: allow
+  - id: deny-main-write
+    actor: act-bruno
+    action: change
+    branch: main
+    expect: deny
+"#;
+
+pub fn manifest_dataset_version(graph: &std::path::Path) -> u64 {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        Omnigraph::open(graph.to_string_lossy().as_ref())
+            .await
+            .unwrap()
+            .snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap()
+            .version()
+    })
+}
+
+pub fn forge_person_delete_drift(graph: &std::path::Path) -> (u64, u64) {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let uri = graph.to_string_lossy();
+        let db = Omnigraph::open(uri.as_ref()).await.unwrap();
+        let snap = db
+            .snapshot_of(ReadTarget::branch("main"))
+            .await
+            .unwrap();
+        let entry = snap.entry("node:Person").unwrap();
+        let full_path = format!("{}/{}", uri.trim_end_matches('/'), entry.table_path);
+        let mut ds = Dataset::open(&full_path).await.unwrap();
+        let deleted = ds.delete("name = 'Alice'").await.unwrap();
+        assert_eq!(deleted.num_deleted_rows, 1);
+        let head = deleted.new_dataset.version().version;
+        assert!(head > entry.table_version);
+        (entry.table_version, head)
+    })
+}
+
+pub fn write_policy_config_fixture(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let config = root.join("omnigraph.yaml");
+    let policy = root.join("policy.yaml");
+    fs::write(
+        &config,
+        r#"
+project:
+  name: policy-test-graph
+policy:
+  file: ./policy.yaml
+"#,
+    )
+    .unwrap();
+    fs::write(&policy, POLICY_YAML).unwrap();
+    fs::write(root.join("policy.tests.yaml"), POLICY_TESTS_YAML).unwrap();
+    (config, policy)
+}
+
+pub fn write_cluster_config_fixture(root: &std::path::Path) {
+    fs::write(
+        root.join("people.pg"),
+        r#"
+node Person {
+  name: String @key
+  age: I32?
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("people.gq"),
+        r#"
+query find_person($name: String) {
+  match { $p: Person { name: $name } }
+  return { $p.name, $p.age }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(root.join("base.policy.yaml"), "rules: []\n").unwrap();
+    fs::write(
+        root.join("cluster.yaml"),
+        r#"
+version: 1
+metadata:
+  name: company-brain
+state:
+  backend: cluster
+  lock: true
+graphs:
+  knowledge:
+    schema: ./people.pg
+    queries:
+      find_person:
+        file: ./people.gq
+policies:
+  base:
+    file: ./base.policy.yaml
+    applies_to: [knowledge]
+"#,
+    )
+    .unwrap();
+}
+
+pub fn init_cluster_derived_graph(root: &std::path::Path) {
+    init_named_cluster_graph(root, "knowledge", "people.pg");
+}
+
+pub fn init_named_cluster_graph(root: &std::path::Path, graph_id: &str, schema_file: &str) {
+    let graph_dir = root.join("graphs");
+    fs::create_dir_all(&graph_dir).unwrap();
+    output_success(
+        cli()
+            .arg("init")
+            .arg("--schema")
+            .arg(root.join(schema_file))
+            .arg(graph_dir.join(format!("{graph_id}.omni"))),
+    );
+}
+
+pub fn write_cluster_lock(root: &std::path::Path, lock_id: &str, operation: &str) {
+    let state_dir = root.join("__cluster");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("lock.json"),
+        format!(
+            r#"{{"version":1,"lock_id":"{lock_id}","operation":"{operation}","created_at":"1970-01-01T00:00:00Z","pid":123}}"#
+        ),
+    )
+    .unwrap();
+}
+
+pub fn write_cluster_applyable_state(root: &std::path::Path) -> serde_json::Value {
+    let validate = parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg("validate")
+            .arg("--config")
+            .arg(root)
+            .arg("--json"),
+    ));
+    let schema_digest = validate["resource_digests"]["schema.knowledge"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let state_dir = root.join("__cluster");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        state_dir.join("state.json"),
+        format!(
+            r#"{{
+  "version": 1,
+  "state_revision": 1,
+  "applied_revision": {{
+    "resources": {{
+      "graph.knowledge": {{ "digest": "seed" }},
+      "schema.knowledge": {{ "digest": "{schema_digest}" }}
+    }}
+  }}
+}}
+"#
+        ),
+    )
+    .unwrap();
+    validate
+}
+
+pub fn cluster_json(root: &std::path::Path, command: &str) -> serde_json::Value {
+    parse_stdout_json(&output_success(
+        cli()
+            .arg("cluster")
+            .arg(command)
+            .arg("--config")
+            .arg(root)
+            .arg("--json"),
+    ))
+}
+
+pub fn write_multi_graph_cluster_fixture(root: &std::path::Path) {
+    write_cluster_config_fixture(root);
+    fs::write(
+        root.join("services.pg"),
+        r#"
+node Service {
+  name: String @key
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("services.gq"),
+        r#"
+query find_service($name: String) {
+  match { $s: Service { name: $name } }
+  return { $s.name }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(root.join("cluster_wide.policy.yaml"), "rules: []\n").unwrap();
+    fs::write(root.join("shared.policy.yaml"), "rules: []\n").unwrap();
+    fs::write(
+        root.join("cluster.yaml"),
+        r#"
+version: 1
+metadata:
+  name: company-brain
+state:
+  backend: cluster
+  lock: true
+graphs:
+  knowledge:
+    schema: ./people.pg
+    queries:
+      find_person:
+        file: ./people.gq
+  engineering:
+    schema: ./services.pg
+    queries:
+      find_service:
+        file: ./services.gq
+policies:
+  shared:
+    file: ./shared.policy.yaml
+    applies_to: [knowledge, engineering]
+  cluster_wide:
+    file: ./cluster_wide.policy.yaml
+    applies_to: [cluster]
+"#,
+    )
+    .unwrap();
+}
+
+pub fn change_for<'j>(json: &'j serde_json::Value, resource: &str) -> &'j serde_json::Value {
+    json["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|change| change["resource"] == resource)
+        .unwrap_or_else(|| panic!("missing change for {resource}: {json}"))
+}
+
+pub fn write_seed_fixture(root: &std::path::Path) -> std::path::PathBuf {
+    fs::create_dir_all(root.join("data")).unwrap();
+    fs::create_dir_all(root.join("build")).unwrap();
+    let raw_seed = root.join("data/seed.jsonl");
+    let seed = root.join("seed.yaml");
+
+    fs::write(
+        &raw_seed,
+        concat!(
+            "{\"type\":\"Decision\",\"data\":{\"slug\":\"dec-alpha\",\"intent\":\"Alpha ship\"}}\n",
+            "{\"type\":\"Decision\",\"data\":{\"slug\":\"dec-beta\",\"intent\":\"Beta ship\",\"embedding\":[0.1,0.2]}}\n"
+        ),
+    )
+    .unwrap();
+
+    fs::write(
+        &seed,
+        concat!(
+            "graph:\n",
+            "  slug: mr-context-graph\n",
+            "sources:\n",
+            "  raw_seed: ./data/seed.jsonl\n",
+            "artifacts:\n",
+            "  embedded_seed: ./build/seed.embedded.jsonl\n",
+            "embeddings:\n",
+            "  model: gemini-embedding-2-preview\n",
+            "  dimension: 4\n",
+            "  types:\n",
+            "    Decision:\n",
+            "      target: embedding\n",
+            "      fields: [slug, intent]\n"
+        ),
+    )
+    .unwrap();
+
+    seed
+}
+
+pub fn write_seed_fixture_with_edge(root: &std::path::Path) -> std::path::PathBuf {
+    let seed = write_seed_fixture(root);
+    let raw_seed = root.join("data/seed.jsonl");
+    fs::write(
+        &raw_seed,
+        concat!(
+            "{\"type\":\"Decision\",\"data\":{\"slug\":\"dec-alpha\",\"intent\":\"Alpha ship\"}}\n",
+            "{\"type\":\"Decision\",\"data\":{\"slug\":\"dec-beta\",\"intent\":\"Beta ship\",\"embedding\":[0.1,0.2]}}\n",
+            "{\"edge\":\"Triggered\",\"from\":\"sig-alpha\",\"to\":\"dec-alpha\"}\n"
+        ),
+    )
+    .unwrap();
+    seed
+}
+
+pub fn read_embedded_rows(path: std::path::PathBuf) -> Vec<Value> {
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+pub fn queries_test_config(graph_uri: &str, entry: &str, gq_file: &str) -> String {
+    format!(
+        "graphs:\n  local:\n    uri: '{}'\n    queries:\n      {entry}:\n        file: ./{gq_file}\n\
+         cli:\n  graph: local\npolicy: {{}}\n",
+        graph_uri.replace('\'', "''")
+    )
+}
