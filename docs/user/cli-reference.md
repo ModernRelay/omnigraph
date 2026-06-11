@@ -27,7 +27,36 @@ Top-level command families and subcommands. Graph-targeting commands accept eith
 | `policy validate \| test \| explain` | Cedar tooling. Selects `cli.graph`, else `server.graph`, else top-level `policy.file` |
 | `version` / `-v` | print `omnigraph 0.3.x` |
 
-## `omnigraph.yaml` schema
+## Config surfaces
+
+Two config surfaces with single owners (RFC-007/RFC-008), plus a zero-config
+tier:
+
+| Surface | Owner | Location | Declares |
+|---|---|---|---|
+| Cluster config | the team, in a repo | `cluster.yaml` + checkout ([cluster-config.md](cluster-config.md)) | what the system **is**: graphs, schemas, queries, policies, storage |
+| Operator config | one person | `~/.omnigraph/config.yaml` (override dir with `$OMNIGRAPH_HOME`) | who **I** am: identity, ergonomics |
+| Flags / env | per invocation | — | everything, explicitly |
+
+`omnigraph.yaml` (below) is the legacy combined file — fully supported
+today, slated for staged deprecation (RFC-008); its keys' future homes are
+listed there.
+
+### `~/.omnigraph/config.yaml` (operator)
+
+```yaml
+operator:
+  actor: act-andrew     # default identity for every --as cascade:
+                        #   --as > legacy cli.actor > operator.actor > none
+defaults:
+  output: table         # read format default, below --json/--format/alias/legacy
+```
+
+Absent file = empty layer. Unknown keys warn and load (a file written for a
+newer CLI works on an older one). `$OMNIGRAPH_CONFIG=<path>` stands in for
+`--config` (the flag wins) in both the CLI and the server.
+
+## `omnigraph.yaml` schema (legacy combined file)
 
 ```yaml
 project: { name }
