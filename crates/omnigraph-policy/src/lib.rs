@@ -277,7 +277,14 @@ pub struct PolicyEngine {
 
 impl PolicyConfig {
     pub fn load(path: &Path) -> Result<Self> {
-        let config: Self = serde_yaml::from_str(&fs::read_to_string(path)?)?;
+        Self::from_source(&fs::read_to_string(path)?)
+    }
+
+    /// Parse + validate a policy from YAML source. The from-content twin of
+    /// `load` for callers whose policies don't live on the local filesystem
+    /// (e.g. a cluster catalog on object storage).
+    pub fn from_source(source: &str) -> Result<Self> {
+        let config: Self = serde_yaml::from_str(source)?;
         config.validate()?;
         Ok(config)
     }
@@ -465,13 +472,26 @@ impl PolicyEngine {
         PolicyCompiler::compile(&config, graph_id)
     }
 
+    /// `load_graph` from YAML content instead of a file path — for policies
+    /// that live in a non-filesystem catalog (cluster object storage).
+    pub fn load_graph_from_source(source: &str, graph_id: &str) -> Result<Self> {
+        let config = PolicyConfig::from_source(source)?;
+        validate_kind_alignment(&config, PolicyEngineKind::Graph)?;
+        PolicyCompiler::compile(&config, graph_id)
+    }
+
     /// Load a server-level policy file. Rejects rules whose actions
     /// are per-graph (e.g. `read`, `change`) — those belong in a
     /// per-graph policy file, not the server one. Takes no `graph_id`:
     /// server-scoped actions resolve against the singleton
     /// `Omnigraph::Server::"root"` entity, never a Graph.
     pub fn load_server(path: &Path) -> Result<Self> {
-        let config = PolicyConfig::load(path)?;
+        Self::load_server_from_source(&fs::read_to_string(path)?)
+    }
+
+    /// `load_server` from YAML content instead of a file path.
+    pub fn load_server_from_source(source: &str) -> Result<Self> {
+        let config = PolicyConfig::from_source(source)?;
         validate_kind_alignment(&config, PolicyEngineKind::Server)?;
         // The Graph entity created by the compiler is never referenced
         // by a server-scoped rule, so the label below is purely a
@@ -1002,6 +1022,42 @@ impl PolicyChecker for PolicyEngine {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn from_source_twins_match_path_loaders() {
+        let yaml = r#"
+version: 1
+groups:
+  readers: ["act-r"]
+protected_branches: [main]
+rules:
+  - id: r1
+    allow:
+      actors: { group: readers }
+      actions: [read]
+      branch_scope: any
+"#;
+        let config = PolicyConfig::from_source(yaml).unwrap();
+        assert_eq!(config.version, 1);
+        let engine = PolicyEngine::load_graph_from_source(yaml, "g1").unwrap();
+        drop(engine);
+
+        let server_yaml = r#"
+version: 1
+kind: server
+groups:
+  admins: ["act-a"]
+rules:
+  - id: s1
+    allow:
+      actors: { group: admins }
+      actions: [graph_list]
+"#;
+        PolicyEngine::load_server_from_source(server_yaml).unwrap();
+        // Kind misalignment stays loud through the from-source path.
+        assert!(PolicyEngine::load_graph_from_source(server_yaml, "g1").is_err());
+        assert!(PolicyEngine::load_server_from_source(yaml).is_err());
+    }
     use super::{
         PolicyAction, PolicyCompiler, PolicyConfig, PolicyEngine, PolicyExpectation, PolicyRequest,
         PolicyTestCase, PolicyTestConfig,
