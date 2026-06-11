@@ -206,6 +206,10 @@ case is exceptional.
   fits.
 - Discarding retrieval score/rank before fusion or projection decisions.
 - Auto-creating placeholder nodes for orphan edges.
+- Raw filesystem I/O for cluster-stored state (ledger, lock, sidecars,
+  approvals, catalog) outside the cluster crate's storage module — every
+  stored byte goes through the engine `StorageAdapter` so `file://` and
+  `s3://` stay one code path.
 - Wire-protocol-specific code in compiler or engine crates.
 - Cloud-only correctness fixes or forks of the OSS engine for correctness.
 - Mutating immutable substrate state in place, including Lance fragments or

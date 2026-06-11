@@ -25,11 +25,10 @@ mod diff;
 mod serve;
 mod sweep;
 mod store;
-use store::{LocalStateBackend, StateLockGuard, StateSnapshot};
+use store::{ClusterStore, StateLockGuard, StateSnapshot};
 pub use types::*;
 use types::*;
 pub use serve::{ServingGraph, ServingPolicy, ServingQuery, ServingSnapshot, read_serving_snapshot};
-use serve::read_verified_payload;
 use config::{QueriesDecl, observe_declared_graphs, validate_cluster_header, future_field_diagnostics, initial_import_state, observe_live_graph, preview_schema_migration, state_resource_digests, graph_address, policy_address, query_address, schema_address, load_desired, normalize_policy_target, parse_cluster_config, resolve_config_path, resolve_query_decls, validate_id, validate_query_source};
 use diff::{FailedGraphOrigin, ResourceKind, append_policy_binding_changes, approved_resources, classify_changes, compute_approvals, compute_blast_radius, demote_dependents_of_failed_graphs, diff_resources, resource_kind};
 use sweep::{mark_approvals_consumed, record_approval_consumed, sweep_recovery_sidecars, tombstone_graph_subtree, warn_pending_recovery_sidecars};
@@ -42,6 +41,18 @@ pub const CLUSTER_LOCK_FILE: &str = "__cluster/lock.json";
 pub const CLUSTER_RESOURCES_DIR: &str = "__cluster/resources";
 pub const CLUSTER_RECOVERIES_DIR: &str = "__cluster/recoveries";
 pub const CLUSTER_APPROVALS_DIR: &str = "__cluster/approvals";
+
+/// The store for a load outcome: the declared `storage:` root when present,
+/// the config directory itself otherwise. A bad root is a loud error.
+fn store_for(
+    config_dir: &Path,
+    storage_root: Option<&str>,
+) -> Result<ClusterStore, Diagnostic> {
+    match storage_root {
+        Some(root) => ClusterStore::for_storage_root(root),
+        None => Ok(ClusterStore::for_config_dir(config_dir)),
+    }
+}
 
 pub fn validate_config_dir(config_dir: impl AsRef<Path>) -> ValidateOutput {
     let outcome = load_desired(config_dir.as_ref());
@@ -69,7 +80,17 @@ pub fn validate_config_dir(config_dir: impl AsRef<Path>) -> ValidateOutput {
 pub async fn plan_config_dir(config_dir: impl AsRef<Path>) -> PlanOutput {
     let outcome = load_desired(config_dir.as_ref());
     let mut diagnostics = outcome.diagnostics;
-    let backend = LocalStateBackend::new(&outcome.config_dir);
+    let storage_root = outcome
+        .desired
+        .as_ref()
+        .and_then(|desired| desired.storage_root.clone());
+    let backend = match store_for(&outcome.config_dir, storage_root.as_deref()) {
+        Ok(backend) => backend,
+        Err(diagnostic) => {
+            diagnostics.push(diagnostic);
+            ClusterStore::for_config_dir(&outcome.config_dir)
+        }
+    };
     let mut observations = backend.observations();
 
     let Some(desired) = outcome.desired else {
@@ -107,7 +128,7 @@ pub async fn plan_config_dir(config_dir: impl AsRef<Path>) -> PlanOutput {
     }
 
     let _lock_guard = if desired.state_lock {
-        match backend.acquire_lock("plan", &mut observations) {
+        match backend.acquire_lock("plan", &mut observations).await {
             Ok(guard) => Some(guard),
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
@@ -130,7 +151,7 @@ pub async fn plan_config_dir(config_dir: impl AsRef<Path>) -> PlanOutput {
     let mut prior_resources = BTreeMap::new();
     let mut prior_state: Option<ClusterState> = None;
     if !has_errors(&diagnostics) {
-        match backend.read_state(&mut observations) {
+        match backend.read_state(&mut observations).await {
             Ok(snapshot) => {
                 if let Some(state) = snapshot.state {
                     prior_resources = state_resource_digests(&state);
@@ -151,7 +172,7 @@ pub async fn plan_config_dir(config_dir: impl AsRef<Path>) -> PlanOutput {
     }
     // Plan previews dispositions without sweeping; a pending recovery is
     // surfaced as the cluster_recovery_pending warning above instead.
-    let artifacts = backend.list_approval_artifacts(&mut diagnostics);
+    let artifacts = backend.list_approval_artifacts(&mut diagnostics).await;
     let approved = approved_resources(
         &artifacts,
         &changes,
@@ -169,12 +190,7 @@ pub async fn plan_config_dir(config_dir: impl AsRef<Path>) -> PlanOutput {
         let ResourceKind::Schema(graph_id) = resource_kind(&change.resource) else {
             continue;
         };
-        let graph_uri = display_path(
-            &desired
-                .config_dir
-                .join(CLUSTER_GRAPHS_DIR)
-                .join(format!("{graph_id}.omni")),
-        );
+        let graph_uri = backend.graph_root(&graph_id);
         let source_path = desired
             .resources
             .iter()
@@ -242,7 +258,17 @@ pub async fn apply_config_dir_with_options(
 ) -> ApplyOutput {
     let outcome = load_desired(config_dir.as_ref());
     let mut diagnostics = outcome.diagnostics;
-    let backend = LocalStateBackend::new(&outcome.config_dir);
+    let storage_root = outcome
+        .desired
+        .as_ref()
+        .and_then(|desired| desired.storage_root.clone());
+    let backend = match store_for(&outcome.config_dir, storage_root.as_deref()) {
+        Ok(backend) => backend,
+        Err(diagnostic) => {
+            diagnostics.push(diagnostic);
+            ClusterStore::for_config_dir(&outcome.config_dir)
+        }
+    };
     let mut observations = backend.observations();
 
     let actor_for_output = options.actor.clone();
@@ -294,7 +320,7 @@ pub async fn apply_config_dir_with_options(
 
     // Named guard: the lock must be held until the state outcome is recorded.
     let _lock_guard = if desired.state_lock {
-        match backend.acquire_lock("apply", &mut observations) {
+        match backend.acquire_lock("apply", &mut observations).await {
             Ok(guard) => Some(guard),
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
@@ -321,7 +347,7 @@ pub async fn apply_config_dir_with_options(
         );
     }
 
-    let snapshot = match backend.read_state(&mut observations) {
+    let snapshot = match backend.read_state(&mut observations).await {
         Ok(snapshot) => snapshot,
         Err(diagnostic) => {
             diagnostics.push(diagnostic);
@@ -361,7 +387,7 @@ pub async fn apply_config_dir_with_options(
     let prior_resources = state_resource_digests(&state);
     let mut changes = diff_resources(&prior_resources, &desired.resource_digests);
     append_policy_binding_changes(&mut changes, Some(&state), &desired);
-    let approval_artifacts = backend.list_approval_artifacts(&mut diagnostics);
+    let approval_artifacts = backend.list_approval_artifacts(&mut diagnostics).await;
     let approved = approved_resources(
         &approval_artifacts,
         &changes,
@@ -424,7 +450,7 @@ pub async fn apply_config_dir_with_options(
         })
         .filter_map(|change| change.resource.strip_prefix("graph.").map(str::to_string))
         .collect();
-    let mut completed_op_sidecars: Vec<PathBuf> = Vec::new();
+    let mut completed_op_sidecars: Vec<String> = Vec::new();
     let mut failed_graphs: BTreeMap<String, FailedGraphOrigin> = BTreeMap::new();
     let mut graph_moving_aborted = false;
     for graph_id in &graph_creates_to_run {
@@ -442,12 +468,7 @@ pub async fn apply_config_dir_with_options(
         else {
             continue;
         };
-        let graph_uri = display_path(
-            &desired
-                .config_dir
-                .join(CLUSTER_GRAPHS_DIR)
-                .join(format!("{graph_id}.omni")),
-        );
+        let graph_uri = backend.graph_root(graph_id);
         let mut sidecar = RecoverySidecar {
             schema_version: 1,
             operation_id: Ulid::new().to_string(),
@@ -462,7 +483,7 @@ pub async fn apply_config_dir_with_options(
             state_cas_base: expected_cas.clone(),
             approval_id: None,
         };
-        let sidecar_path = match backend.write_recovery_sidecar(&sidecar) {
+        let sidecar_path = match backend.write_recovery_sidecar(&sidecar).await {
             Ok(path) => path,
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
@@ -514,7 +535,7 @@ pub async fn apply_config_dir_with_options(
             Ok(source) => source,
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
-                let _ = fs::remove_file(&sidecar_path); // nothing moved
+                backend.delete_object(&sidecar_path).await; // nothing moved
                 failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::GraphCreate);
                 graph_moving_aborted = true;
                 continue;
@@ -540,7 +561,7 @@ pub async fn apply_config_dir_with_options(
         if let Ok(db) = Omnigraph::open_read_only(&graph_uri).await {
             if let Ok(snapshot) = db.snapshot_of(ReadTarget::branch("main")).await {
                 sidecar.expected_manifest_version = Some(snapshot.version());
-                if let Err(diagnostic) = backend.write_recovery_sidecar(&sidecar) {
+                if let Err(diagnostic) = backend.write_recovery_sidecar(&sidecar).await {
                     diagnostics.push(diagnostic);
                 }
             }
@@ -587,12 +608,7 @@ pub async fn apply_config_dir_with_options(
         else {
             continue;
         };
-        let graph_uri = display_path(
-            &desired
-                .config_dir
-                .join(CLUSTER_GRAPHS_DIR)
-                .join(format!("{graph_id}.omni")),
-        );
+        let graph_uri = backend.graph_root(graph_id);
         // Read-write open: the engine's own recovery sweep runs here, which
         // is exactly what we want before moving its manifest.
         let db = match Omnigraph::open(&graph_uri).await {
@@ -626,7 +642,7 @@ pub async fn apply_config_dir_with_options(
             state_cas_base: expected_cas.clone(),
             approval_id: None,
         };
-        let sidecar_path = match backend.write_recovery_sidecar(&sidecar) {
+        let sidecar_path = match backend.write_recovery_sidecar(&sidecar).await {
             Ok(path) => path,
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
@@ -677,7 +693,7 @@ pub async fn apply_config_dir_with_options(
             Ok(source) => source,
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
-                let _ = fs::remove_file(&sidecar_path); // nothing moved
+                backend.delete_object(&sidecar_path).await; // nothing moved
                 failed_graphs.insert(graph_id.clone(), FailedGraphOrigin::SchemaApply);
                 graph_moving_aborted = true;
                 continue;
@@ -695,7 +711,7 @@ pub async fn apply_config_dir_with_options(
         {
             Ok(result) => {
                 sidecar.expected_manifest_version = Some(result.manifest_version);
-                if let Err(diagnostic) = backend.write_recovery_sidecar(&sidecar) {
+                if let Err(diagnostic) = backend.write_recovery_sidecar(&sidecar).await {
                     diagnostics.push(diagnostic);
                 }
             }
@@ -767,9 +783,9 @@ pub async fn apply_config_dir_with_options(
             .after_digest
             .as_deref()
             .expect("create/update always carries an after digest");
-        let Some(target) = payload_path(&desired.config_dir, &kind, digest) else {
+        if ClusterStore::payload_relative(&kind, digest).is_none() {
             continue;
-        };
+        }
         let Some(source) = source_paths.get(change.resource.as_str()) else {
             diagnostics.push(Diagnostic::error(
                 "resource_payload_write_error",
@@ -779,7 +795,8 @@ pub async fn apply_config_dir_with_options(
             continue;
         };
         if let Err(diagnostic) =
-            write_resource_payload(&target, Path::new(source), digest, &change.resource)
+            write_resource_payload(&backend, &kind, Path::new(source), digest, &change.resource)
+                .await
         {
             diagnostics.push(diagnostic);
         }
@@ -844,12 +861,7 @@ pub async fn apply_config_dir_with_options(
                     && artifact.bound_config_digest == desired.config_digest
             })
             .map(|artifact| artifact.approval_id.clone());
-        let graph_uri = display_path(
-            &desired
-                .config_dir
-                .join(CLUSTER_GRAPHS_DIR)
-                .join(format!("{graph_id}.omni")),
-        );
+        let graph_uri = backend.graph_root(graph_id);
         let observed_manifest_version = match Omnigraph::open_read_only(&graph_uri).await {
             Ok(db) => match db.snapshot_of(ReadTarget::branch("main")).await {
                 Ok(snapshot) => Some(snapshot.version()),
@@ -871,7 +883,7 @@ pub async fn apply_config_dir_with_options(
             state_cas_base: expected_cas.clone(),
             approval_id: approval_id.clone(),
         };
-        let sidecar_path = match backend.write_recovery_sidecar(&sidecar) {
+        let sidecar_path = match backend.write_recovery_sidecar(&sidecar).await {
             Ok(path) => path,
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
@@ -888,9 +900,10 @@ pub async fn apply_config_dir_with_options(
             graph_moving_aborted = true;
             continue;
         }
-        match fs::remove_dir_all(PathBuf::from(&graph_uri)) {
+        // Prefix delete through the storage layer: remove_dir_all locally,
+        // list+delete on object stores (idempotent; already-gone is fine).
+        match backend.delete_graph_root(&graph_uri).await {
             Ok(()) => {}
-            Err(err) if err.kind() == ErrorKind::NotFound => {} // already gone
             Err(err) => {
                 diagnostics.push(Diagnostic::error(
                     "graph_delete_failed",
@@ -1004,8 +1017,14 @@ pub async fn apply_config_dir_with_options(
         // persisted-statuses revert contract below is exercised; a cfg_callback
         // on this point can mutate state.json to simulate a concurrent writer,
         // making write_state's CAS check fail organically.
-        let write_result = failpoints::maybe_fail("cluster_apply.before_state_write")
-            .and_then(|()| backend.write_state(&new_state, expected_cas.as_deref(), &mut observations));
+        let write_result = match failpoints::maybe_fail("cluster_apply.before_state_write") {
+            Ok(()) => {
+                backend
+                    .write_state(&new_state, expected_cas.as_deref(), &mut observations)
+                    .await
+            }
+            Err(diagnostic) => Err(diagnostic),
+        };
         match write_result {
             Ok(()) => state_written = true,
             Err(diagnostic) => {
@@ -1017,16 +1036,16 @@ pub async fn apply_config_dir_with_options(
     // Completed (rows 2/4) sweep sidecars are deleted only once their outcome
     // is durably recorded; on a failed write they stay and re-sweep next run.
     if !state_write_failed {
-        for sidecar_path in sweep
+        for sidecar_uri in sweep
             .completed_sidecars
             .iter()
             .chain(completed_op_sidecars.iter())
         {
-            let _ = fs::remove_file(sidecar_path);
+            backend.delete_object(sidecar_uri).await;
         }
         let mut all_consumed = sweep.consumed_approvals.clone();
         all_consumed.extend(consumed_approval_ids.iter().cloned());
-        mark_approvals_consumed(&backend, &all_consumed);
+        mark_approvals_consumed(&backend, &all_consumed).await;
     }
     // On a failed state write, report the statuses that are actually on disk
     // (the pre-apply snapshot), not the in-memory mutations that were never
@@ -1082,7 +1101,17 @@ pub async fn approve_config_dir(
 ) -> ApproveOutput {
     let outcome = load_desired(config_dir.as_ref());
     let mut diagnostics = outcome.diagnostics;
-    let backend = LocalStateBackend::new(&outcome.config_dir);
+    let storage_root = outcome
+        .desired
+        .as_ref()
+        .and_then(|desired| desired.storage_root.clone());
+    let backend = match store_for(&outcome.config_dir, storage_root.as_deref()) {
+        Ok(backend) => backend,
+        Err(diagnostic) => {
+            diagnostics.push(diagnostic);
+            ClusterStore::for_config_dir(&outcome.config_dir)
+        }
+    };
     let mut observations = backend.observations();
 
     let fail = |config_dir: String, diagnostics: Vec<Diagnostic>| ApproveOutput {
@@ -1103,7 +1132,7 @@ pub async fn approve_config_dir(
     }
 
     let _lock_guard = if desired.state_lock {
-        match backend.acquire_lock("approve", &mut observations) {
+        match backend.acquire_lock("approve", &mut observations).await {
             Ok(guard) => Some(guard),
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
@@ -1119,7 +1148,7 @@ pub async fn approve_config_dir(
         None
     };
 
-    let state = match backend.read_state(&mut observations) {
+    let state = match backend.read_state(&mut observations).await {
         Ok(snapshot) => match snapshot.state {
             Some(state) => state,
             None => {
@@ -1174,7 +1203,7 @@ pub async fn approve_config_dir(
         consumed_at: None,
         consumed_by_operation: None,
     };
-    if let Err(diagnostic) = backend.write_approval_artifact(&artifact) {
+    if let Err(diagnostic) = backend.write_approval_artifact(&artifact).await {
         diagnostics.push(diagnostic);
         return fail(display_path(&desired.config_dir), diagnostics);
     }
@@ -1191,12 +1220,25 @@ pub async fn approve_config_dir(
 }
 
 
-pub fn status_config_dir(config_dir: impl AsRef<Path>) -> StatusOutput {
+pub async fn status_config_dir(config_dir: impl AsRef<Path>) -> StatusOutput {
     let parsed = parse_cluster_config(config_dir.as_ref());
     let mut diagnostics = parsed.diagnostics;
-    let backend = LocalStateBackend::new(&parsed.config_dir);
+    let storage_root = parsed.raw.as_ref().and_then(|raw| {
+        raw.storage
+            .as_deref()
+            .map(str::trim)
+            .filter(|root| !root.is_empty())
+            .map(|root| root.trim_end_matches('/').to_string())
+    });
+    let backend = match store_for(&parsed.config_dir, storage_root.as_deref()) {
+        Ok(backend) => backend,
+        Err(diagnostic) => {
+            diagnostics.push(diagnostic);
+            ClusterStore::for_config_dir(&parsed.config_dir)
+        }
+    };
     let mut observations = backend.observations();
-    backend.observe_lock(&mut observations, &mut diagnostics);
+    backend.observe_lock(&mut observations, &mut diagnostics).await;
     warn_pending_recovery_sidecars(&parsed.config_dir, &mut diagnostics);
 
     let mut resource_digests = BTreeMap::new();
@@ -1206,14 +1248,14 @@ pub fn status_config_dir(config_dir: impl AsRef<Path>) -> StatusOutput {
     if let Some(raw) = parsed.raw.as_ref() {
         let _settings = validate_cluster_header(raw, &mut diagnostics);
         if !has_errors(&diagnostics) {
-            match backend.read_state(&mut observations) {
+            match backend.read_state(&mut observations).await {
                 Ok(snapshot) => {
                     if let Some(state) = snapshot.state {
                         // Read-only point-in-time catalog check: report the
                         // findings as diagnostics; persisting Drifted statuses
                         // is refresh's job. Status never writes state.
                         for (address, finding) in
-                            verify_catalog_payloads(&parsed.config_dir, &state)
+                            verify_catalog_payloads(&backend, &state).await
                         {
                             diagnostics.push(payload_finding_diagnostic(&address, &finding));
                         }
@@ -1244,20 +1286,33 @@ pub fn status_config_dir(config_dir: impl AsRef<Path>) -> StatusOutput {
     }
 }
 
-pub fn force_unlock_config_dir(
+pub async fn force_unlock_config_dir(
     config_dir: impl AsRef<Path>,
     lock_id: impl AsRef<str>,
 ) -> ForceUnlockOutput {
     let parsed = parse_cluster_config(config_dir.as_ref());
     let mut diagnostics = parsed.diagnostics;
-    let backend = LocalStateBackend::new(&parsed.config_dir);
+    let storage_root = parsed.raw.as_ref().and_then(|raw| {
+        raw.storage
+            .as_deref()
+            .map(str::trim)
+            .filter(|root| !root.is_empty())
+            .map(|root| root.trim_end_matches('/').to_string())
+    });
+    let backend = match store_for(&parsed.config_dir, storage_root.as_deref()) {
+        Ok(backend) => backend,
+        Err(diagnostic) => {
+            diagnostics.push(diagnostic);
+            ClusterStore::for_config_dir(&parsed.config_dir)
+        }
+    };
     let mut observations = backend.observations();
     let mut lock_removed = false;
 
     if let Some(raw) = parsed.raw.as_ref() {
         let _settings = validate_cluster_header(raw, &mut diagnostics);
         if !has_errors(&diagnostics) {
-            match backend.force_unlock(lock_id.as_ref(), &mut observations) {
+            match backend.force_unlock(lock_id.as_ref(), &mut observations).await {
                 Ok(()) => lock_removed = true,
                 Err(diagnostic) => diagnostics.push(diagnostic),
             }
@@ -1284,7 +1339,17 @@ pub async fn import_config_dir(config_dir: impl AsRef<Path>) -> StateSyncOutput 
 async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> StateSyncOutput {
     let outcome = load_desired(config_dir);
     let mut diagnostics = outcome.diagnostics;
-    let backend = LocalStateBackend::new(&outcome.config_dir);
+    let storage_root = outcome
+        .desired
+        .as_ref()
+        .and_then(|desired| desired.storage_root.clone());
+    let backend = match store_for(&outcome.config_dir, storage_root.as_deref()) {
+        Ok(backend) => backend,
+        Err(diagnostic) => {
+            diagnostics.push(diagnostic);
+            ClusterStore::for_config_dir(&outcome.config_dir)
+        }
+    };
     let mut observations = backend.observations();
 
     let Some(desired) = outcome.desired else {
@@ -1315,7 +1380,7 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
 
     let operation_label = state_sync_operation_label(operation);
     let _lock_guard = if desired.state_lock {
-        match backend.acquire_lock(operation_label, &mut observations) {
+        match backend.acquire_lock(operation_label, &mut observations).await {
             Ok(guard) => Some(guard),
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
@@ -1346,7 +1411,7 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
         };
     }
 
-    let snapshot = match backend.read_state(&mut observations) {
+    let snapshot = match backend.read_state(&mut observations).await {
         Ok(snapshot) => snapshot,
         Err(diagnostic) => {
             diagnostics.push(diagnostic);
@@ -1412,7 +1477,7 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
     // a drifted query digest first means the live-graph composite recompute
     // below already excludes it, so the persisted graph.<id> composite stays
     // consistent and the next plan shows exactly the create + derived update.
-    for (address, finding) in verify_catalog_payloads(&desired.config_dir, &state) {
+    for (address, finding) in verify_catalog_payloads(&backend, &state).await {
         diagnostics.push(payload_finding_diagnostic(&address, &finding));
         match finding {
             PayloadFinding::Missing => {
@@ -1449,7 +1514,7 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
         }
     }
 
-    let graph_error_count = observe_declared_graphs(&desired, &mut state).await;
+    let graph_error_count = observe_declared_graphs(&desired, &backend, &mut state).await;
     if graph_error_count > 0 {
         diagnostics.push(Diagnostic::error(
             "graph_observation_error",
@@ -1477,14 +1542,14 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
         state.state_revision = state.state_revision.saturating_add(1);
     }
 
-    match backend.write_state(&state, expected_cas.as_deref(), &mut observations) {
+    match backend.write_state(&state, expected_cas.as_deref(), &mut observations).await {
         Ok(()) => {
             // Completed sweep sidecars are deleted only after their outcome
             // is durably recorded; on failure they stay and re-sweep.
-            for sidecar_path in &sweep.completed_sidecars {
-                let _ = fs::remove_file(sidecar_path);
+            for sidecar_uri in &sweep.completed_sidecars {
+                backend.delete_object(sidecar_uri).await;
             }
-            mark_approvals_consumed(&backend, &sweep.consumed_approvals);
+            mark_approvals_consumed(&backend, &sweep.consumed_approvals).await;
         }
         Err(diagnostic) => diagnostics.push(diagnostic),
     }
@@ -1506,28 +1571,6 @@ async fn sync_config_dir(config_dir: &Path, operation: StateSyncOperation) -> St
 
 
 
-/// Content-addressed catalog path for an applied resource payload. Extensions
-/// are fixed per kind (`.gq` / `.yaml`) regardless of the source file's name,
-/// so the catalog layout cannot drift with operator file conventions.
-fn payload_path(config_dir: &Path, kind: &ResourceKind, digest: &str) -> Option<PathBuf> {
-    let resources_dir = config_dir.join(CLUSTER_RESOURCES_DIR);
-    match kind {
-        ResourceKind::Query { graph, name } => Some(
-            resources_dir
-                .join("query")
-                .join(graph)
-                .join(name)
-                .join(format!("{digest}.gq")),
-        ),
-        ResourceKind::Policy(name) => Some(
-            resources_dir
-                .join("policy")
-                .join(name)
-                .join(format!("{digest}.yaml")),
-        ),
-        _ => None,
-    }
-}
 
 #[derive(Debug, PartialEq, Eq)]
 enum PayloadFinding {
@@ -1541,34 +1584,26 @@ enum PayloadFinding {
 /// unknown addresses have no payloads and are skipped. Read-only; findings
 /// are deterministic (BTreeMap order). Payloads are small (queries, policy
 /// bundles), so a full digest re-hash is cheap.
-fn verify_catalog_payloads(
-    config_dir: &Path,
+async fn verify_catalog_payloads(
+    backend: &ClusterStore,
     state: &ClusterState,
 ) -> Vec<(String, PayloadFinding)> {
     let mut findings = Vec::new();
     for (address, resource) in &state.applied_revision.resources {
         let kind = resource_kind(address);
-        let Some(path) = payload_path(config_dir, &kind, &resource.digest) else {
+        if ClusterStore::payload_relative(&kind, &resource.digest).is_none() {
             continue;
-        };
-        match fs::read(&path) {
-            Ok(bytes) => {
-                let actual_digest = sha256_hex(&bytes);
+        }
+        match backend.read_payload(&kind, &resource.digest).await {
+            Ok(Some(text)) => {
+                let actual_digest = sha256_hex(text.as_bytes());
                 if actual_digest != resource.digest {
                     findings.push((address.clone(), PayloadFinding::Mismatch { actual_digest }));
                 }
             }
-            Err(err) if err.kind() == ErrorKind::NotFound => {
-                findings.push((address.clone(), PayloadFinding::Missing));
-            }
+            Ok(None) => findings.push((address.clone(), PayloadFinding::Missing)),
             Err(err) => {
-                findings.push((
-                    address.clone(),
-                    PayloadFinding::ReadError(format!(
-                        "could not read catalog payload '{}': {err}",
-                        path.display()
-                    )),
-                ));
+                findings.push((address.clone(), PayloadFinding::ReadError(err)));
             }
         }
     }
@@ -1600,13 +1635,15 @@ fn payload_finding_diagnostic(address: &str, finding: &PayloadFinding) -> Diagno
 /// digest-named file is trusted as-is. The digest re-check is the apply-side
 /// TOCTOU detector — the source file changing between `load_desired` and the
 /// payload write must fail loudly, never publish mismatched content.
-fn write_resource_payload(
-    target: &Path,
+async fn write_resource_payload(
+    backend: &ClusterStore,
+    kind: &ResourceKind,
     source: &Path,
     expected_digest: &str,
     resource: &str,
 ) -> Result<(), Diagnostic> {
-    if target.exists() {
+    if backend.payload_exists(kind, expected_digest).await {
+        // Content-addressed: an existing digest-named object is identical.
         return Ok(());
     }
     let bytes = fs::read(source).map_err(|err| {
@@ -1617,6 +1654,9 @@ fn write_resource_payload(
         )
     })?;
     if sha256_hex(&bytes) != expected_digest {
+        // The apply-side TOCTOU detector: the source changing between
+        // load_desired and this write must fail loudly, never publish
+        // mismatched content.
         return Err(Diagnostic::error(
             "resource_content_changed",
             resource,
@@ -1626,54 +1666,23 @@ fn write_resource_payload(
             ),
         ));
     }
-    let parent = target.parent().expect("payload path always has a parent");
-    fs::create_dir_all(parent).map_err(|err| {
+    let content = String::from_utf8(bytes).map_err(|err| {
         Diagnostic::error(
             "resource_payload_write_error",
             resource,
-            format!("could not create payload directory: {err}"),
+            format!("resource source is not valid UTF-8: {err}"),
         )
     })?;
-    let file_name = target
-        .file_name()
-        .expect("payload path always has a file name")
-        .to_string_lossy();
-    let tmp_path = parent.join(format!("{file_name}.tmp.{}", Ulid::new()));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp_path)
+    backend
+        .write_payload(kind, expected_digest, &content)
+        .await
         .map_err(|err| {
             Diagnostic::error(
                 "resource_payload_write_error",
                 resource,
-                format!("could not create temporary payload file: {err}"),
+                format!("could not write payload: {err}"),
             )
-        })?;
-    let write_result = file
-        .write_all(&bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|err| {
-            Diagnostic::error(
-                "resource_payload_write_error",
-                resource,
-                format!("could not write payload file: {err}"),
-            )
-        });
-    drop(file);
-    if let Err(diagnostic) = write_result {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(diagnostic);
-    }
-    if let Err(err) = fs::rename(&tmp_path, target) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(Diagnostic::error(
-            "resource_payload_write_error",
-            resource,
-            format!("could not move payload file into place: {err}"),
-        ));
-    }
-    Ok(())
+        })
 }
 
 /// Recompute the composite `graph.<id>` digests for state-resident graphs from

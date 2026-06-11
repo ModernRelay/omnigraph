@@ -43,6 +43,7 @@ async fn main() -> Result<()> {
         cli.target,
         cli.bind,
         cli.unauthenticated,
-    )?;
+    )
+    .await?;
     serve(settings).await
 }

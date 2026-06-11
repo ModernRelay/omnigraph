@@ -40,13 +40,31 @@ pub struct ServingSnapshot {
 /// failure is collected and the whole snapshot refused; no partial serving.
 /// Takes no lock: the state file is replaced atomically, so this reads a
 /// consistent point-in-time ledger.
-pub fn read_serving_snapshot(config_dir: impl AsRef<Path>) -> Result<ServingSnapshot, Vec<Diagnostic>> {
+pub async fn read_serving_snapshot(
+    config_dir: impl AsRef<Path>,
+) -> Result<ServingSnapshot, Vec<Diagnostic>> {
     let config_dir = config_dir.as_ref().to_path_buf();
-    let backend = LocalStateBackend::new(&config_dir);
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
+    // The declared storage: root decides where the ledger/catalog/graphs
+    // live; config parse errors surface through the normal validation path.
+    let parsed = parse_cluster_config(&config_dir);
+    let storage_root = parsed.raw.as_ref().and_then(|raw| {
+        raw.storage
+            .as_deref()
+            .map(str::trim)
+            .filter(|root| !root.is_empty())
+            .map(|root| root.trim_end_matches('/').to_string())
+    });
+    let backend = match storage_root.as_deref() {
+        Some(root) => match ClusterStore::for_storage_root(root) {
+            Ok(backend) => backend,
+            Err(diagnostic) => return Err(vec![diagnostic]),
+        },
+        None => ClusterStore::for_config_dir(&config_dir),
+    };
 
     // A ledger a sweep is about to rewrite must not start serving.
-    let sidecars = backend.list_recovery_sidecars(&mut diagnostics);
+    let sidecars = backend.list_recovery_sidecars(&mut diagnostics).await;
     if !sidecars.is_empty() {
         diagnostics.push(Diagnostic::error(
             "cluster_recovery_pending",
@@ -59,7 +77,7 @@ pub fn read_serving_snapshot(config_dir: impl AsRef<Path>) -> Result<ServingSnap
     }
 
     let mut observations = backend.observations();
-    let state = match backend.read_state(&mut observations) {
+    let state = match backend.read_state(&mut observations).await {
         Ok(snapshot) => match snapshot.state {
             Some(state) => Some(state),
             None => {
@@ -87,9 +105,7 @@ pub fn read_serving_snapshot(config_dir: impl AsRef<Path>) -> Result<ServingSnap
         match resource_kind(address) {
             ResourceKind::Graph(graph_id) => {
                 graphs.push(ServingGraph {
-                    root: config_dir
-                        .join(CLUSTER_GRAPHS_DIR)
-                        .join(format!("{graph_id}.omni")),
+                    root: PathBuf::from(backend.graph_root(&graph_id)),
                     graph_id,
                 });
             }
@@ -98,7 +114,7 @@ pub fn read_serving_snapshot(config_dir: impl AsRef<Path>) -> Result<ServingSnap
                 let ResourceKind::Query { graph, name } = &kind else {
                     unreachable!()
                 };
-                match read_verified_payload(&config_dir, &kind, &entry.digest, address) {
+                match backend.read_verified_payload(&kind, &entry.digest, address).await {
                     Ok(source) => queries.push(ServingQuery {
                         graph_id: graph.clone(),
                         name: name.clone(),
@@ -119,11 +135,14 @@ pub fn read_serving_snapshot(config_dir: impl AsRef<Path>) -> Result<ServingSnap
                     ));
                     continue;
                 };
-                match read_verified_payload(&config_dir, &kind, &entry.digest, address) {
+                match backend.read_verified_payload(&kind, &entry.digest, address).await {
                     Ok(_) => policies.push(ServingPolicy {
                         name: name.clone(),
-                        blob_path: payload_path(&config_dir, &kind, &entry.digest)
-                            .expect("policy kind always has a payload path"),
+                        blob_path: PathBuf::from(
+                            backend
+                                .payload_display(&kind, &entry.digest)
+                                .expect("policy kind always has a payload path"),
+                        ),
                         applies_to,
                     }),
                     Err(diagnostic) => diagnostics.push(diagnostic),
@@ -150,40 +169,3 @@ pub fn read_serving_snapshot(config_dir: impl AsRef<Path>) -> Result<ServingSnap
     })
 }
 
-/// Read a catalog blob and verify it against the recorded digest.
-pub(crate) fn read_verified_payload(
-    config_dir: &Path,
-    kind: &ResourceKind,
-    digest: &str,
-    address: &str,
-) -> Result<String, Diagnostic> {
-    let path = payload_path(config_dir, kind, digest)
-        .expect("query/policy kinds always have a payload path");
-    let bytes = fs::read(&path).map_err(|err| {
-        Diagnostic::error(
-            "catalog_payload_missing",
-            address,
-            format!(
-                "catalog blob '{}' unreadable ({err}); run `cluster refresh` then `cluster apply`, and restart",
-                display_path(&path)
-            ),
-        )
-    })?;
-    if sha256_hex(&bytes) != digest {
-        return Err(Diagnostic::error(
-            "catalog_payload_digest_mismatch",
-            address,
-            format!(
-                "catalog blob '{}' does not match its recorded digest; run `cluster refresh` then `cluster apply`, and restart",
-                display_path(&path)
-            ),
-        ));
-    }
-    String::from_utf8(bytes).map_err(|err| {
-        Diagnostic::error(
-            "catalog_payload_invalid",
-            address,
-            format!("catalog blob is not valid UTF-8: {err}"),
-        )
-    })
-}

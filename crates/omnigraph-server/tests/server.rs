@@ -5567,8 +5567,8 @@ mod multi_graph_startup {
     /// `GraphId` validation runs at startup — a reserved name in
     /// `omnigraph.yaml` produces a clear error rather than getting
     /// rejected per-request.
-    #[test]
-    fn load_server_settings_rejects_reserved_graph_id() {
+    #[tokio::test]
+    async fn load_server_settings_rejects_reserved_graph_id() {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("omnigraph.yaml");
         fs::write(
@@ -5580,7 +5580,7 @@ graphs:
 "#,
         )
         .unwrap();
-        let err = load_server_settings(Some(&config_path), None, None, None, None, false).unwrap_err();
+        let err = load_server_settings(Some(&config_path), None, None, None, None, false).await.unwrap_err();
         assert!(
             err.to_string().contains("invalid graph id 'policies'"),
             "expected reserved-name rejection, got: {err}"
@@ -5644,8 +5644,8 @@ graphs:
     // ── Four-rule mode inference matrix ───────────────────────────────
 
     /// Rule 1: CLI positional URI → Single.
-    #[test]
-    fn mode_inference_cli_uri_is_single() {
+    #[tokio::test]
+    async fn mode_inference_cli_uri_is_single() {
         let settings = load_server_settings(
             None,
             None,
@@ -5654,6 +5654,7 @@ graphs:
             None,
             true, // allow unauth so we get past the runtime-state check
         )
+        .await
         .unwrap();
         match settings.mode {
             ServerConfigMode::Single { uri, .. } => assert_eq!(uri, "/tmp/cli.omni"),
@@ -5662,8 +5663,8 @@ graphs:
     }
 
     /// Rule 2: --target picks one graph from `graphs:` map → Single.
-    #[test]
-    fn mode_inference_cli_target_is_single() {
+    #[tokio::test]
+    async fn mode_inference_cli_target_is_single() {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("omnigraph.yaml");
         fs::write(
@@ -5679,6 +5680,7 @@ graphs:
         .unwrap();
         let settings =
             load_server_settings(Some(&config_path), None, None, Some("alpha".into()), None, true)
+                .await
                 .unwrap();
         match settings.mode {
             ServerConfigMode::Single { uri, .. } => assert_eq!(uri, "/tmp/alpha.omni"),
@@ -5687,8 +5689,8 @@ graphs:
     }
 
     /// Rule 3: `server.graph` set → Single (target picked from config).
-    #[test]
-    fn mode_inference_server_graph_is_single() {
+    #[tokio::test]
+    async fn mode_inference_server_graph_is_single() {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("omnigraph.yaml");
         fs::write(
@@ -5704,7 +5706,7 @@ server:
 "#,
         )
         .unwrap();
-        let settings = load_server_settings(Some(&config_path), None, None, None, None, true).unwrap();
+        let settings = load_server_settings(Some(&config_path), None, None, None, None, true).await.unwrap();
         match settings.mode {
             ServerConfigMode::Single { uri, .. } => assert_eq!(uri, "/tmp/beta.omni"),
             ServerConfigMode::Multi { .. } => panic!("expected Single (rule 3), got Multi"),
@@ -5712,8 +5714,8 @@ server:
     }
 
     /// Rule 4: `--config` + non-empty `graphs:` + no single-mode selector → Multi.
-    #[test]
-    fn mode_inference_config_plus_graphs_is_multi() {
+    #[tokio::test]
+    async fn mode_inference_config_plus_graphs_is_multi() {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("omnigraph.yaml");
         fs::write(
@@ -5727,7 +5729,7 @@ graphs:
 "#,
         )
         .unwrap();
-        let settings = load_server_settings(Some(&config_path), None, None, None, None, true).unwrap();
+        let settings = load_server_settings(Some(&config_path), None, None, None, None, true).await.unwrap();
         match settings.mode {
             ServerConfigMode::Multi { graphs, .. } => {
                 let ids: Vec<&str> = graphs.iter().map(|g| g.graph_id.as_str()).collect();
@@ -5738,8 +5740,8 @@ graphs:
         }
     }
 
-    #[test]
-    fn mode_inference_multi_rejects_top_level_policy_file() {
+    #[tokio::test]
+    async fn mode_inference_multi_rejects_top_level_policy_file() {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("omnigraph.yaml");
         fs::write(
@@ -5753,7 +5755,7 @@ graphs:
 "#,
         )
         .unwrap();
-        let err = load_server_settings(Some(&config_path), None, None, None, None, true).unwrap_err();
+        let err = load_server_settings(Some(&config_path), None, None, None, None, true).await.unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("top-level") && msg.contains("policy.file") && msg.contains("not honored"),
@@ -5769,8 +5771,8 @@ graphs:
         );
     }
 
-    #[test]
-    fn mode_inference_multi_rejects_top_level_queries() {
+    #[tokio::test]
+    async fn mode_inference_multi_rejects_top_level_queries() {
         // Symmetric to the policy guard: a top-level `queries:` block in
         // multi-graph mode is not honored (each graph uses its own), so it
         // is a loud error rather than a silent no-op.
@@ -5781,7 +5783,7 @@ graphs:
             "queries:\n  q:\n    file: ./q.gq\ngraphs:\n  alpha:\n    uri: /tmp/alpha.omni\n",
         )
         .unwrap();
-        let err = load_server_settings(Some(&config_path), None, None, None, None, true).unwrap_err();
+        let err = load_server_settings(Some(&config_path), None, None, None, None, true).await.unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("queries") && msg.contains("not honored"),
@@ -5789,8 +5791,8 @@ graphs:
         );
     }
 
-    #[test]
-    fn single_mode_named_graph_rejects_top_level_blocks() {
+    #[tokio::test]
+    async fn single_mode_named_graph_rejects_top_level_blocks() {
         // Serving a graph by name (`--target`/`server.graph`) uses its
         // per-graph block; a populated top-level block would be silently
         // shadowed, so boot refuses and names the per-graph location.
@@ -5803,6 +5805,7 @@ graphs:
         .unwrap();
         let err =
             load_server_settings(Some(&config_path), None, None, Some("prod".to_string()), None, true)
+                .await
                 .unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -5811,8 +5814,8 @@ graphs:
         );
     }
 
-    #[test]
-    fn single_mode_named_graph_uses_per_graph_policy_and_queries() {
+    #[tokio::test]
+    async fn single_mode_named_graph_uses_per_graph_policy_and_queries() {
         // The identity rule: `--target prod` attaches `graphs.prod`'s own
         // policy + queries, not the top-level ones (which are absent here).
         let temp = tempfile::tempdir().unwrap();
@@ -5830,6 +5833,7 @@ graphs:
         .unwrap();
         let settings =
             load_server_settings(Some(&config_path), None, None, Some("prod".to_string()), None, true)
+                .await
                 .unwrap();
         match settings.mode {
             ServerConfigMode::Single {
@@ -5851,8 +5855,8 @@ graphs:
         }
     }
 
-    #[test]
-    fn mode_inference_normalizes_multi_graph_uris() {
+    #[tokio::test]
+    async fn mode_inference_normalizes_multi_graph_uris() {
         let temp = tempfile::tempdir().unwrap();
         let graph = temp.path().join("alpha.omni");
         let config_path = temp.path().join("omnigraph.yaml");
@@ -5868,7 +5872,7 @@ graphs:
             ),
         )
         .unwrap();
-        let settings = load_server_settings(Some(&config_path), None, None, None, None, true).unwrap();
+        let settings = load_server_settings(Some(&config_path), None, None, None, None, true).await.unwrap();
         match settings.mode {
             ServerConfigMode::Multi { graphs, .. } => {
                 assert_eq!(graphs[0].uri, graph.to_string_lossy());
@@ -5878,9 +5882,9 @@ graphs:
     }
 
     /// Rule 5: nothing → error with migration hint.
-    #[test]
-    fn mode_inference_no_inputs_errors_with_migration_hint() {
-        let err = load_server_settings(None, None, None, None, None, true).unwrap_err();
+    #[tokio::test]
+    async fn mode_inference_no_inputs_errors_with_migration_hint() {
+        let err = load_server_settings(None, None, None, None, None, true).await.unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("no graph to serve"),
@@ -5890,19 +5894,19 @@ graphs:
 
     /// Rule 4 sub-case: `--config` with empty `graphs:` map and no
     /// single-mode selector → rule 5 fires (no graph to serve).
-    #[test]
-    fn mode_inference_empty_graphs_map_errors() {
+    #[tokio::test]
+    async fn mode_inference_empty_graphs_map_errors() {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("omnigraph.yaml");
         fs::write(&config_path, "server:\n  bind: 127.0.0.1:8080\n").unwrap();
-        let err = load_server_settings(Some(&config_path), None, None, None, None, true).unwrap_err();
+        let err = load_server_settings(Some(&config_path), None, None, None, None, true).await.unwrap_err();
         assert!(err.to_string().contains("no graph to serve"));
     }
 
     /// `--config` + `<URI>` together: URI wins → Single (the CLI URI
     /// takes precedence over the config's graphs map).
-    #[test]
-    fn mode_inference_cli_uri_overrides_graphs_map() {
+    #[tokio::test]
+    async fn mode_inference_cli_uri_overrides_graphs_map() {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("omnigraph.yaml");
         fs::write(
@@ -5922,6 +5926,7 @@ graphs:
             None,
             true,
         )
+        .await
         .unwrap();
         match settings.mode {
             ServerConfigMode::Single { uri, .. } => {
@@ -5937,8 +5942,8 @@ graphs:
     }
 
     /// Per-graph `policy.file` is resolved relative to the config base_dir.
-    #[test]
-    fn per_graph_policy_file_is_resolved_relative_to_base_dir() {
+    #[tokio::test]
+    async fn per_graph_policy_file_is_resolved_relative_to_base_dir() {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("omnigraph.yaml");
         fs::write(
@@ -5954,7 +5959,7 @@ graphs:
 "#,
         )
         .unwrap();
-        let settings = load_server_settings(Some(&config_path), None, None, None, None, true).unwrap();
+        let settings = load_server_settings(Some(&config_path), None, None, None, None, true).await.unwrap();
         let graphs = match settings.mode {
             ServerConfigMode::Multi { graphs, .. } => graphs,
             _ => panic!("expected Multi"),
@@ -5972,8 +5977,8 @@ graphs:
     }
 
     /// `server.policy.file` resolves alongside the graphs map.
-    #[test]
-    fn server_policy_file_is_resolved_relative_to_base_dir() {
+    #[tokio::test]
+    async fn server_policy_file_is_resolved_relative_to_base_dir() {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("omnigraph.yaml");
         fs::write(
@@ -5988,7 +5993,7 @@ graphs:
 "#,
         )
         .unwrap();
-        let settings = load_server_settings(Some(&config_path), None, None, None, None, true).unwrap();
+        let settings = load_server_settings(Some(&config_path), None, None, None, None, true).await.unwrap();
         match settings.mode {
             ServerConfigMode::Multi {
                 server_policy_file, ..
@@ -6268,7 +6273,7 @@ graphs:
         .unwrap();
 
         let settings: ServerConfig =
-            load_server_settings(Some(&config_path), None, None, None, None, true).unwrap();
+            load_server_settings(Some(&config_path), None, None, None, None, true).await.unwrap();
         assert!(matches!(settings.mode, ServerConfigMode::Multi { .. }));
 
         match settings.mode {
@@ -6321,14 +6326,14 @@ graphs:
     temp
 }
 
-fn cluster_settings(dir: &Path) -> color_eyre::eyre::Result<omnigraph_server::ServerConfig> {
-    omnigraph_server::load_server_settings(None, Some(&dir.to_path_buf()), None, None, None, true)
+async fn cluster_settings(dir: &Path) -> color_eyre::eyre::Result<omnigraph_server::ServerConfig> {
+    omnigraph_server::load_server_settings(None, Some(&dir.to_path_buf()), None, None, None, true).await
 }
 
 #[tokio::test]
 async fn cluster_boot_serves_applied_state() {
     let temp = converged_cluster_dir("").await;
-    let settings = cluster_settings(temp.path()).unwrap();
+    let settings = cluster_settings(temp.path()).await.unwrap();
     let omnigraph_server::ServerConfigMode::Multi {
         graphs,
         config_path,
@@ -6444,7 +6449,7 @@ graphs:
         temp
     };
 
-    let settings = cluster_settings(temp.path()).unwrap();
+    let settings = cluster_settings(temp.path()).await.unwrap();
     let omnigraph_server::ServerConfigMode::Multi {
         graphs,
         server_policy_file,
@@ -6482,6 +6487,7 @@ async fn cluster_boot_refusals() {
         None,
         true,
     )
+    .await
     .unwrap_err();
     assert!(err.to_string().contains("exclusive boot source"), "{err}");
     let err = omnigraph_server::load_server_settings(
@@ -6492,6 +6498,7 @@ async fn cluster_boot_refusals() {
         None,
         true,
     )
+    .await
     .unwrap_err();
     assert!(err.to_string().contains("exclusive boot source"), "{err}");
 
@@ -6499,7 +6506,7 @@ async fn cluster_boot_refusals() {
     let blob_dir = dir.join("__cluster/resources/query/knowledge/find_person");
     let blob = fs::read_dir(&blob_dir).unwrap().next().unwrap().unwrap().path();
     fs::write(&blob, "tampered").unwrap();
-    let err = cluster_settings(&dir).unwrap_err();
+    let err = cluster_settings(&dir).await.unwrap_err();
     assert!(
         err.to_string().contains("catalog_payload_digest_mismatch"),
         "{err}"
@@ -6508,6 +6515,6 @@ async fn cluster_boot_refusals() {
 
     // Missing state refuses with the import/apply remedy.
     let empty = tempfile::tempdir().unwrap();
-    let err = cluster_settings(empty.path()).unwrap_err();
+    let err = cluster_settings(empty.path()).await.unwrap_err();
     assert!(err.to_string().contains("cluster_state_missing"), "{err}");
 }

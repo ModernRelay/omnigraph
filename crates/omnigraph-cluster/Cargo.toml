@@ -23,6 +23,10 @@ serde_yaml = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
+# Runtime handle only — best-effort async lock release in
+# StateLockGuard::drop on object-store backends (cluster commands always
+# run inside the caller's tokio runtime).
+tokio = { workspace = true }
 ulid = { workspace = true }
 
 [dev-dependencies]

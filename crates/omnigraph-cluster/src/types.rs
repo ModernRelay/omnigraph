@@ -322,6 +322,8 @@ pub struct ApproveOutput {
 pub(crate) struct DesiredCluster {
     pub(crate) config_dir: PathBuf,
     pub(crate) config_digest: String,
+    /// The declared `storage:` root, if any (None ⇒ the config dir itself).
+    pub(crate) storage_root: Option<String>,
     pub(crate) state_lock: bool,
     pub(crate) graphs: Vec<DesiredGraph>,
     pub(crate) resource_digests: BTreeMap<String, String>,
@@ -345,9 +347,10 @@ pub(crate) struct ParsedConfig {
     pub(crate) config_file: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct ClusterSettings {
     pub(crate) state_lock: bool,
+    pub(crate) storage_root: Option<String>,
 }
 
 #[derive(Debug)]
@@ -364,6 +367,12 @@ pub(crate) struct RawClusterConfig {
     pub(crate) version: u32,
     #[serde(default)]
     pub(crate) metadata: Metadata,
+    /// Storage root URI for everything the cluster stores: the state
+    /// ledger, catalog, sidecars, approvals, and derived graph roots.
+    /// Absent ⇒ `file://<config-dir>` (the original layout, byte-compatible).
+    /// `s3://bucket/prefix` puts the whole cluster on object storage.
+    #[serde(default)]
+    pub(crate) storage: Option<String>,
     #[serde(default)]
     pub(crate) state: StateConfig,
     #[serde(default)]
@@ -503,7 +512,8 @@ pub(crate) struct SweepOutcome {
     pub(crate) pending_graphs: BTreeSet<String>,
     /// Sidecars whose outcome is recorded (rows 2/4): deleted only after the
     /// command's state write lands, so a CAS failure re-sweeps them.
-    pub(crate) completed_sidecars: Vec<PathBuf>,
+    /// Store URIs (the storage layer addresses everything by URI).
+    pub(crate) completed_sidecars: Vec<String>,
     /// Approval artifacts consumed by a roll-forward (delete row 7b): their
     /// files are rewritten with consumed_at only after the state write lands.
     pub(crate) consumed_approvals: Vec<String>,
