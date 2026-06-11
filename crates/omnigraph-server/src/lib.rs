@@ -2722,6 +2722,9 @@ async fn server_ingest(
         .try_admit(&actor_arc, est_bytes)
         .map_err(ApiError::from_workload_reject)?;
 
+    // Deprecated shim retained until the from-absent semantics change
+    // lands; the handler then calls `load_as` directly.
+    #[allow(deprecated)]
     let result = {
         let db = &handle.engine;
         db.ingest_as(&branch, Some(&from), &request.data, mode, actor_id)

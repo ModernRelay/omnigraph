@@ -2669,7 +2669,7 @@ async fn main() -> Result<()> {
             let db = open_local_db_with_policy(&graph).await?;
             let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
             let result = db
-                .load_file_as(&branch, &data.to_string_lossy(), mode.into(), actor)
+                .load_file_as(&branch, None, &data.to_string_lossy(), mode.into(), actor)
                 .await?;
             let payload = LoadOutput {
                 uri: &uri,
@@ -2729,6 +2729,9 @@ async fn main() -> Result<()> {
             } else {
                 let db = open_local_db_with_policy(&graph).await?;
                 let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
+                // Deprecated shim retained until the CLI ingest command
+                // becomes an alias of the unified `load` handler.
+                #[allow(deprecated)]
                 let result = db
                     .ingest_file_as(
                         &branch,

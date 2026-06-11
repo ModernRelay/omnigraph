@@ -4731,6 +4731,7 @@ async fn build_parity_graph() -> (tempfile::TempDir, PathBuf, PathBuf) {
             .unwrap();
         db.load_as(
             "feature",
+            None,
             r#"{"type":"Person","data":{"name":"ParityEve","age":29}}"#,
             LoadMode::Append,
             None,

@@ -243,6 +243,7 @@ async fn load_as_denies_when_policy_rejects_actor() {
     let result = db
         .load_as(
             "main",
+            None,
             ONE_PERSON_JSONL,
             LoadMode::Merge,
             Some("act-denied"),
@@ -258,6 +259,7 @@ async fn load_as_allows_when_policy_permits_actor() {
 
     db.load_as(
         "main",
+        None,
         ONE_PERSON_JSONL,
         LoadMode::Merge,
         Some("act-allowed"),
@@ -281,6 +283,7 @@ async fn load_file_as_denies_when_policy_rejects_actor() {
     let result = db
         .load_file_as(
             "main",
+            None,
             data_path.to_str().unwrap(),
             LoadMode::Merge,
             Some("act-denied"),
@@ -298,6 +301,7 @@ async fn load_file_as_allows_when_policy_permits_actor() {
 
     db.load_file_as(
         "main",
+        None,
         data_path.to_str().unwrap(),
         LoadMode::Merge,
         Some("act-allowed"),
@@ -307,6 +311,7 @@ async fn load_file_as_allows_when_policy_permits_actor() {
 }
 
 #[tokio::test]
+#[allow(deprecated)]
 async fn ingest_as_denies_when_policy_rejects_actor() {
     let dir = tempfile::tempdir().unwrap();
     let (db, _engine) = init_with_policy(&dir).await;
@@ -324,6 +329,7 @@ async fn ingest_as_denies_when_policy_rejects_actor() {
 }
 
 #[tokio::test]
+#[allow(deprecated)]
 async fn ingest_as_allows_when_policy_permits_actor() {
     let dir = tempfile::tempdir().unwrap();
     let (db, _engine) = init_with_policy(&dir).await;
