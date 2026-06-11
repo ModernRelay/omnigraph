@@ -3,6 +3,7 @@
 //! main.rs in the modularization).
 
 use super::*;
+use crate::operator;
 
 pub(crate) fn ensure_local_graph_parent(uri: &str) -> Result<()> {
     if !uri.contains("://") {
@@ -167,18 +168,40 @@ pub(crate) async fn open_local_db_with_policy(graph: &ResolvedCliGraph) -> Resul
     }
 }
 
+/// THE actor chain (RFC-007 §D3) — every command that needs an identity
+/// resolves through this one function (one path per concern):
+/// `--as` > legacy `cli.actor` in omnigraph.yaml (RFC-008 window) >
+/// `operator.actor` in ~/.omnigraph/config.yaml > none.
+pub(crate) fn resolve_actor(
+    cli_as: Option<&str>,
+    legacy_config_actor: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(actor) = cli_as {
+        return Ok(Some(actor.to_string()));
+    }
+    if let Some(actor) = legacy_config_actor {
+        return Ok(Some(actor.to_string()));
+    }
+    Ok(operator::load_operator_config()?
+        .actor()
+        .map(str::to_string))
+}
+
 pub(crate) fn resolve_cluster_actor(cli_as: Option<&str>) -> Result<Option<String>> {
     if let Some(actor) = cli_as {
         return Ok(Some(actor.to_string()));
     }
     let config = load_config(None).wrap_err(
-        "resolving the default actor from the per-operator omnigraph.yaml (pass --as <ACTOR> to skip this lookup)",
+        "resolving the default actor from omnigraph.yaml (pass --as <ACTOR> to skip this lookup)",
     )?;
-    Ok(config.cli.actor.clone())
+    resolve_actor(None, config.cli.actor.as_deref())
 }
 
-pub(crate) fn resolve_cli_actor<'a>(cli_as: Option<&'a str>, config: &'a OmnigraphConfig) -> Option<&'a str> {
-    cli_as.or(config.cli.actor.as_deref())
+pub(crate) fn resolve_cli_actor(
+    cli_as: Option<&str>,
+    config: &OmnigraphConfig,
+) -> Result<Option<String>> {
+    resolve_actor(cli_as, config.cli.actor.as_deref())
 }
 
 pub(crate) fn resolve_policy_tests_path(context: &ResolvedPolicyContext) -> PathBuf {
@@ -460,6 +483,9 @@ pub(crate) fn merged_params_json(
     }
 }
 
+/// The format cascade (RFC-007 §D3): `--json` > `--format` > alias format >
+/// legacy `cli.output_format` (RFC-008 window) > operator `defaults.output`
+/// > table.
 pub(crate) fn resolve_read_format(
     config: &OmnigraphConfig,
     cli_format: Option<ReadOutputFormat>,
@@ -467,12 +493,17 @@ pub(crate) fn resolve_read_format(
     alias_format: Option<ReadOutputFormat>,
 ) -> ReadOutputFormat {
     if json {
-        ReadOutputFormat::Json
-    } else {
-        cli_format
-            .or(alias_format)
-            .unwrap_or_else(|| config.cli_output_format())
+        return ReadOutputFormat::Json;
     }
+    cli_format
+        .or(alias_format)
+        .or(config.cli.output_format)
+        .or_else(|| {
+            operator::load_operator_config()
+                .ok()
+                .and_then(|operator| operator.output())
+        })
+        .unwrap_or_default()
 }
 
 pub(crate) fn resolve_alias<'a>(
@@ -935,7 +966,8 @@ pub(crate) async fn execute_change(
     let (selected_name, query_params) = select_named_query(query_source, query_name)?;
     let params = query_params_from_json(&query_params, params_json)?;
     let db = open_local_db_with_policy(graph).await?;
-    let actor = resolve_cli_actor(cli_as_actor, config);
+    let actor = resolve_cli_actor(cli_as_actor, config)?;
+    let actor = actor.as_deref();
     let result = db
         .mutate_as(branch, query_source, &selected_name, &params, actor)
         .await?;

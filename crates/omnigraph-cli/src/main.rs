@@ -42,6 +42,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 mod embed;
+mod operator;
 mod read_format;
 
 use embed::{EmbedArgs, EmbedOutput, execute_embed};
@@ -129,7 +130,8 @@ async fn main() -> Result<()> {
                 load_output_from_tables(&uri, &branch, mode, &output)
             } else {
                 let db = open_local_db_with_policy(&graph).await?;
-                let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
+                let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config)?;
+                let actor = actor.as_deref();
                 let result = db
                     .load_file_as(
                         &branch,
@@ -196,7 +198,8 @@ async fn main() -> Result<()> {
                 .await?
             } else {
                 let db = open_local_db_with_policy(&graph).await?;
-                let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
+                let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config)?;
+                let actor = actor.as_deref();
                 let result = db
                     .load_file_as(
                         &branch,
@@ -243,7 +246,8 @@ async fn main() -> Result<()> {
                     .await?
                 } else {
                     let db = open_local_db_with_policy(&graph).await?;
-                    let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
+                    let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config)?;
+                let actor = actor.as_deref();
                     db.branch_create_from_as(ReadTarget::branch(&from), &name, actor)
                         .await?;
                     BranchCreateOutput {
@@ -316,7 +320,8 @@ async fn main() -> Result<()> {
                     .await?
                 } else {
                     let db = open_local_db_with_policy(&graph).await?;
-                    let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
+                    let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config)?;
+                let actor = actor.as_deref();
                     db.branch_delete_as(&name, actor).await?;
                     BranchDeleteOutput {
                         uri: uri.clone(),
@@ -358,7 +363,8 @@ async fn main() -> Result<()> {
                     .await?
                 } else {
                     let db = open_local_db_with_policy(&graph).await?;
-                    let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
+                    let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config)?;
+                let actor = actor.as_deref();
                     let outcome = db.branch_merge_as(&source, &into, actor).await?;
                     BranchMergeOutput {
                         source: source.clone(),
@@ -514,7 +520,8 @@ async fn main() -> Result<()> {
                     .await?
                 } else {
                     let db = open_local_db_with_policy(&graph).await?;
-                    let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
+                    let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config)?;
+                let actor = actor.as_deref();
                     let registry = load_registry_or_report(&config, graph.selected())?;
                     let registry = (!registry.is_empty()).then_some(registry);
                     let label = graph.selected().unwrap_or(&uri).to_string();

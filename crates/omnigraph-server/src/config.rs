@@ -526,12 +526,23 @@ pub fn default_config_path() -> PathBuf {
     PathBuf::from(DEFAULT_CONFIG_FILE)
 }
 
+/// `OMNIGRAPH_CONFIG` env var: a first-class stand-in for `--config`, one
+/// name with one meaning in both binaries (the container entrypoint already
+/// uses it for the server; RFC-007 §D1 extends it to the CLI).
+pub const CONFIG_PATH_ENV: &str = "OMNIGRAPH_CONFIG";
+
 pub fn load_config(config_path: Option<&PathBuf>) -> Result<OmnigraphConfig> {
-    load_config_in(&env::current_dir()?, config_path)
+    let env_path = env::var_os(CONFIG_PATH_ENV).map(PathBuf::from);
+    load_config_in(&env::current_dir()?, config_path, env_path.as_ref())
 }
 
-fn load_config_in(cwd: &Path, config_path: Option<&PathBuf>) -> Result<OmnigraphConfig> {
-    let explicit_path = config_path.cloned();
+fn load_config_in(
+    cwd: &Path,
+    config_path: Option<&PathBuf>,
+    env_path: Option<&PathBuf>,
+) -> Result<OmnigraphConfig> {
+    // Precedence: explicit --config flag > $OMNIGRAPH_CONFIG > ./omnigraph.yaml.
+    let explicit_path = config_path.or(env_path).cloned();
     let config_path = explicit_path.or_else(|| {
         let default_path = cwd.join(DEFAULT_CONFIG_FILE);
         default_path.exists().then_some(default_path)
@@ -576,6 +587,28 @@ mod tests {
     };
 
     #[test]
+    fn env_config_path_stands_in_for_the_flag_but_loses_to_it() {
+        let temp = tempdir().unwrap();
+        let flag_path = temp.path().join("flag.yaml");
+        let env_path = temp.path().join("env.yaml");
+        fs::write(&flag_path, "cli:\n  actor: act-flag\n").unwrap();
+        fs::write(&env_path, "cli:\n  actor: act-env\n").unwrap();
+
+        // $OMNIGRAPH_CONFIG used when no flag…
+        let config = load_config_in(temp.path(), None, Some(&env_path)).unwrap();
+        assert_eq!(config.cli.actor.as_deref(), Some("act-env"));
+
+        // …loses to an explicit --config…
+        let config = load_config_in(temp.path(), Some(&flag_path), Some(&env_path)).unwrap();
+        assert_eq!(config.cli.actor.as_deref(), Some("act-flag"));
+
+        // …and beats the cwd default file.
+        fs::write(temp.path().join("omnigraph.yaml"), "cli:\n  actor: act-cwd\n").unwrap();
+        let config = load_config_in(temp.path(), None, Some(&env_path)).unwrap();
+        assert_eq!(config.cli.actor.as_deref(), Some("act-env"));
+    }
+
+    #[test]
     fn load_config_reads_yaml_defaults_from_current_dir() {
         let temp = tempdir().unwrap();
         fs::write(
@@ -598,7 +631,7 @@ policy: {}
         )
         .unwrap();
 
-        let config = load_config_in(temp.path(), None).unwrap();
+        let config = load_config_in(temp.path(), None, None).unwrap();
         assert_eq!(config.cli_graph_name(), Some("local"));
         assert_eq!(config.cli_branch(), "main");
         assert_eq!(config.cli_output_format(), ReadOutputFormat::Kv);
@@ -633,7 +666,7 @@ policy: {}
         )
         .unwrap();
 
-        let config = load_config_in(&child, None).unwrap();
+        let config = load_config_in(&child, None, None).unwrap();
         assert!(config.graphs.is_empty());
     }
 
@@ -657,7 +690,7 @@ policy: {}
             "graphs:\n  local:\n    uri: ./demo.omni\n",
         )
         .unwrap();
-        let config = load_config_in(temp.path(), None).unwrap();
+        let config = load_config_in(temp.path(), None, None).unwrap();
 
         // A known graph passes through unchanged.
         assert_eq!(config.resolve_graph_selection(Some("local")).unwrap(), Some("local"));
@@ -680,7 +713,7 @@ policy: {}
             "graphs:\n  local:\n    uri: ./demo.omni\npolicy:\n  file: ./top.yaml\n",
         )
         .unwrap();
-        let incoherent = load_config_in(temp2.path(), None).unwrap();
+        let incoherent = load_config_in(temp2.path(), None, None).unwrap();
         let err = incoherent
             .resolve_graph_selection(Some("local"))
             .unwrap_err()
@@ -705,7 +738,7 @@ policy: {}
              server:\n  graph: local\ncli:\n  graph: prod\n",
         )
         .unwrap();
-        let config = load_config_in(temp.path(), None).unwrap();
+        let config = load_config_in(temp.path(), None, None).unwrap();
         assert_eq!(
             config.resolve_policy_tooling_graph_selection().unwrap(),
             Some("prod")
@@ -717,7 +750,7 @@ policy: {}
             "graphs:\n  local:\n    uri: ./local.omni\nserver:\n  graph: local\n",
         )
         .unwrap();
-        let config = load_config_in(temp.path(), None).unwrap();
+        let config = load_config_in(temp.path(), None, None).unwrap();
         assert_eq!(
             config.resolve_policy_tooling_graph_selection().unwrap(),
             Some("local")
@@ -725,7 +758,7 @@ policy: {}
 
         let temp = tempdir().unwrap();
         fs::write(temp.path().join("omnigraph.yaml"), "policy: {}\n").unwrap();
-        let config = load_config_in(temp.path(), None).unwrap();
+        let config = load_config_in(temp.path(), None, None).unwrap();
         assert_eq!(config.resolve_policy_tooling_graph_selection().unwrap(), None);
 
         let temp = tempdir().unwrap();
@@ -734,7 +767,7 @@ policy: {}
             "graphs:\n  local:\n    uri: ./local.omni\nserver:\n  graph: ghost\n",
         )
         .unwrap();
-        let config = load_config_in(temp.path(), None).unwrap();
+        let config = load_config_in(temp.path(), None, None).unwrap();
         let err = config
             .resolve_policy_tooling_graph_selection()
             .unwrap_err()
@@ -760,7 +793,7 @@ policy: {}
         )
         .unwrap();
 
-        let config = load_config_in(temp.path(), None).unwrap();
+        let config = load_config_in(temp.path(), None, None).unwrap();
         let resolved = config.resolve_query_path(Path::new("test.gq")).unwrap();
         assert_eq!(resolved, temp.path().join("queries").join("test.gq"));
     }
@@ -777,7 +810,7 @@ policy: {}
         fs::write(ambient_dir.join("local.gq"), "query ambient { return {} }").unwrap();
 
         let config =
-            load_config_in(&ambient_dir, Some(&config_dir.join("omnigraph.yaml"))).unwrap();
+            load_config_in(&ambient_dir, Some(&config_dir.join("omnigraph.yaml")), None).unwrap();
         let resolved = config.resolve_query_path(Path::new("local.gq")).unwrap();
 
         assert_eq!(resolved, config_dir.join("local.gq"));
@@ -807,7 +840,7 @@ queries:
         )
         .unwrap();
 
-        let config = load_config_in(temp.path(), None).unwrap();
+        let config = load_config_in(temp.path(), None, None).unwrap();
 
         // Per-graph registry (multi-graph mode).
         let prod = config.target_query_entries("prod").unwrap();
@@ -848,7 +881,7 @@ queries:
              policy:\n      file: ./prod.yaml\n  bare:\n    uri: s3://b/bare\n",
         )
         .unwrap();
-        let config = load_config_in(temp.path(), None).unwrap();
+        let config = load_config_in(temp.path(), None, None).unwrap();
 
         // Named graph with its own policy → per-graph (not top-level).
         assert!(
@@ -884,7 +917,7 @@ queries:
         )
         .unwrap();
 
-        let config = load_config_in(temp.path(), None).unwrap();
+        let config = load_config_in(temp.path(), None, None).unwrap();
         // Additive: no `queries:` anywhere → empty registries everywhere.
         assert!(config.query_entries().is_empty());
         assert!(
@@ -904,7 +937,7 @@ queries:
         )
         .unwrap();
 
-        let config = load_config_in(temp.path(), None).unwrap();
+        let config = load_config_in(temp.path(), None, None).unwrap();
         assert_eq!(
             config.resolve_policy_file().unwrap(),
             temp.path().join("policy.yaml")
@@ -927,7 +960,7 @@ cli:
         )
         .unwrap();
 
-        let config = load_config_in(temp.path(), None).unwrap();
+        let config = load_config_in(temp.path(), None, None).unwrap();
         assert_eq!(
             config.graph_bearer_token_env(
                 Some("https://override.example.com"),
