@@ -559,3 +559,30 @@ impl Drop for StateLockGuard {
         let _ = fs::remove_file(&self.path);
     }
 }
+
+pub(crate) fn parse_lock_file_for_unlock(text: &str) -> Result<StateLockFile, Diagnostic> {
+    let lock = serde_json::from_str::<StateLockFile>(text).map_err(|err| {
+        Diagnostic::error(
+            "invalid_state_lock",
+            CLUSTER_LOCK_FILE,
+            format!("could not parse state lock: {err}"),
+        )
+    })?;
+    if lock.version != 1 {
+        return Err(Diagnostic::error(
+            "unsupported_state_lock_version",
+            CLUSTER_LOCK_FILE,
+            format!("unsupported cluster state lock version {}", lock.version),
+        ));
+    }
+    Ok(lock)
+}
+
+pub(crate) fn state_lock_held_message(observations: &StateObservations) -> String {
+    match observations.lock_id.as_deref() {
+        Some(lock_id) => format!(
+            "cluster state lock already exists (lock id {lock_id}); run `omnigraph cluster force-unlock {lock_id}` only after confirming no cluster operation is active"
+        ),
+        None => "cluster state lock already exists; remove it only after confirming no cluster operation is active".to_string(),
+    }
+}
