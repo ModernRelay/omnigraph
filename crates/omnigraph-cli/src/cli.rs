@@ -29,6 +29,28 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     /// Print the CLI version
     Version,
+    /// Store a bearer token for a named server in ~/.omnigraph/credentials
+    /// (0600). Token from --token or one line on stdin:
+    /// `echo $TOKEN | omnigraph login prod`. The keyed token applies to
+    /// requests whose URL matches the server's `url` in the operator
+    /// config's `servers:` map.
+    Login {
+        /// Server name (keys the credential; declare its url under
+        /// `servers:` in ~/.omnigraph/config.yaml)
+        name: String,
+        /// The token. Prefer piping via stdin over this flag (shell
+        /// history).
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a named server's stored credential. Idempotent.
+    Logout {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Generate, clean, or refresh explicit seed embeddings
     Embed(EmbedArgs),
     /// Initialize a new graph from a schema

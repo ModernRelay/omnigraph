@@ -73,6 +73,29 @@ async fn main() -> Result<()> {
     };
     let http_client = build_http_client()?;
     match cli.command {
+        Command::Login { name, token, json } => {
+            let token = match token {
+                Some(token) => token,
+                None => {
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    line
+                }
+            };
+            let Some(token) = normalize_bearer_token(Some(token)) else {
+                color_eyre::eyre::bail!(
+                    "no token provided: pass --token <TOKEN> or pipe it on stdin (echo $TOKEN | omnigraph login {name})"
+                );
+            };
+            let operator_config = crate::operator::load_operator_config()?;
+            let declared = operator_config.servers.contains_key(&name);
+            let path = crate::operator::write_credential(&name, &token)?;
+            finish_login(&name, &path, declared, json)?;
+        }
+        Command::Logout { name, json } => {
+            let path = crate::operator::remove_credential(&name)?;
+            finish_logout(&name, &path, json)?;
+        }
         Command::Version => {
             println!("omnigraph {}", env!("CARGO_PKG_VERSION"));
         }

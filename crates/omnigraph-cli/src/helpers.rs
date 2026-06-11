@@ -221,6 +221,21 @@ pub(crate) fn resolve_remote_bearer_token(
     explicit_uri: Option<&str>,
     explicit_target: Option<&str>,
 ) -> Result<Option<String>> {
+    // The keyed hop (RFC-007 §D4, gh-host model): when the effective remote
+    // URL belongs to an operator-defined server, that server's keyed chain
+    // applies first — OMNIGRAPH_TOKEN_<NAME> env, then the 0600 credentials
+    // file. Ok(None) falls through to the legacy chain unchanged, and the
+    // keyed token is structurally scoped to its own server (§D5 rule 3):
+    // a URL matching no operator server never sees it.
+    if let Some(remote_url) = effective_remote_url(config, explicit_uri, explicit_target) {
+        let operator_config = operator::load_operator_config()?;
+        if let Some(server) = operator_config.find_server_for_url(&remote_url) {
+            if let Some(token) = operator::resolve_keyed_token(server)? {
+                return Ok(Some(token));
+            }
+        }
+    }
+
     let scoped_env =
         config.graph_bearer_token_env(explicit_uri, explicit_target, config.cli_graph_name());
     let mut env_names = Vec::new();
@@ -247,6 +262,22 @@ pub(crate) fn resolve_remote_bearer_token(
     }
 
     Ok(None)
+}
+
+/// The remote base URL a token resolution is FOR — the same scoping
+/// `graph_bearer_token_env` uses: an explicit http(s) `--uri` wins, else
+/// the config-resolved target's uri (when remote). Local URIs → None.
+fn effective_remote_url(
+    config: &OmnigraphConfig,
+    explicit_uri: Option<&str>,
+    explicit_target: Option<&str>,
+) -> Option<String> {
+    if let Some(uri) = explicit_uri {
+        return is_remote_uri(uri).then(|| uri.to_string());
+    }
+    let target = config.resolve_target_name(explicit_uri, explicit_target, config.cli_graph_name())?;
+    let uri = &config.graphs.get(target)?.uri;
+    is_remote_uri(uri).then(|| uri.clone())
 }
 
 pub(crate) fn build_http_client() -> Result<reqwest::Client> {

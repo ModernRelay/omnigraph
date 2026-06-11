@@ -241,13 +241,13 @@ future checkout-supplied surface:
 
 Three PRs, each independently useful, each landable without the next:
 
-1. **PR 1 — the operator file + identity.** Loader for
+1. **PR 1 — the operator file + identity** *(landed: #196)*. Loader for
    `~/.omnigraph/config.yaml` (+ `OMNIGRAPH_HOME`, `~`-expansion, warn-only
    unknown keys), `operator.actor` joining the `--as` cascade,
    `defaults.output` joining the format cascade, `OMNIGRAPH_CONFIG` env for
    the CLI's `--config`. Docs: `cli-reference.md` gains the two-surface
    table.
-2. **PR 2 — keyed credentials.** `servers:` in the operator layer, the
+2. **PR 2 — keyed credentials** *(landed)*. `servers:` in the operator layer, the
    §D4 chain (env + credentials file), the §D5 trust rules, and
    `omnigraph login <name>` (atomic write, `0600`). Legacy mechanisms
    untouched and tested-as-untouched.

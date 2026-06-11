@@ -195,8 +195,14 @@ cli:
         .unwrap();
 
         let previous = std::env::var_os(DEFAULT_BEARER_TOKEN_ENV);
+        let previous_home = std::env::var_os("OMNIGRAPH_HOME");
         unsafe {
             std::env::remove_var(DEFAULT_BEARER_TOKEN_ENV);
+            // Hermetic: the keyed hop (RFC-007 PR 2) must not pick up a real
+            // ~/.omnigraph on the developer's machine — and with no operator
+            // servers defined, the legacy chain below must behave
+            // byte-identically to pre-PR-2 (tested-as-untouched).
+            std::env::set_var("OMNIGRAPH_HOME", temp.path().join("no-operator-config"));
         }
 
         let config_path = temp.path().join("omnigraph.yaml");
@@ -220,6 +226,11 @@ cli:
                 std::env::set_var(DEFAULT_BEARER_TOKEN_ENV, value);
             } else {
                 std::env::remove_var(DEFAULT_BEARER_TOKEN_ENV);
+            }
+            if let Some(value) = previous_home {
+                std::env::set_var("OMNIGRAPH_HOME", value);
+            } else {
+                std::env::remove_var("OMNIGRAPH_HOME");
             }
         }
     }
