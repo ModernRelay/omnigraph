@@ -65,15 +65,18 @@ pub enum LoadMode {
     Merge,
 }
 
-/// Load JSONL data into an Omnigraph database.
-pub async fn load_jsonl(db: &mut Omnigraph, data: &str, mode: LoadMode) -> Result<LoadResult> {
+/// Convenience: load JSONL data onto the database handle's *active branch*
+/// (`main` when unbound). Equivalent to `db.load(active_branch, data, mode)`;
+/// use `Omnigraph::load`/`load_as` directly when targeting an explicit branch
+/// or when fork-from-base semantics are needed.
+pub async fn load_jsonl(db: &Omnigraph, data: &str, mode: LoadMode) -> Result<LoadResult> {
     let current_branch = db.active_branch().await;
     let branch = current_branch.as_deref().unwrap_or("main");
     db.load(branch, data, mode).await
 }
 
-/// Load JSONL data from a file path.
-pub async fn load_jsonl_file(db: &mut Omnigraph, path: &str, mode: LoadMode) -> Result<LoadResult> {
+/// Convenience: like [`load_jsonl`] but reading from a file path.
+pub async fn load_jsonl_file(db: &Omnigraph, path: &str, mode: LoadMode) -> Result<LoadResult> {
     let current_branch = db.active_branch().await;
     let branch = current_branch.as_deref().unwrap_or("main");
     db.load_file(branch, path, mode).await
