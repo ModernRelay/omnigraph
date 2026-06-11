@@ -1,6 +1,6 @@
 use omnigraph::db::{GraphCommit, MergeOutcome, ReadTarget, SchemaApplyResult, Snapshot};
 use omnigraph::error::{MergeConflict, MergeConflictKind};
-use omnigraph::loader::{IngestResult, LoadMode};
+use omnigraph::loader::{LoadMode, LoadResult};
 use crate::queries::StoredQuery;
 use omnigraph_compiler::SchemaMigrationStep;
 use omnigraph_compiler::query::ast::Param;
@@ -208,7 +208,9 @@ pub struct IngestTableOutput {
 pub struct IngestOutput {
     pub uri: String,
     pub branch: String,
-    pub base_branch: String,
+    /// Base branch a fork was requested from (the request's `from`), echoed
+    /// even when the branch already existed. `null` when `from` was absent.
+    pub base_branch: Option<String>,
     pub branch_created: bool,
     #[schema(value_type = LoadModeSchema)]
     pub mode: LoadMode,
@@ -493,9 +495,12 @@ pub struct SchemaOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct IngestRequest {
-    /// Target branch. Created from `from` if it does not yet exist. Defaults to `main`.
+    /// Target branch. Defaults to `main`. Without `from`, the branch must
+    /// already exist — a missing branch is a 404, never an implicit fork.
     pub branch: Option<String>,
-    /// Parent branch used to create `branch` if it does not exist. Defaults to `main`.
+    /// Parent branch used to create `branch` if it does not exist. Branch
+    /// creation is opt-in by presence of this field; omit it to require an
+    /// existing branch.
     pub from: Option<String>,
     /// How existing rows are handled. Defaults to `merge`.
     #[schema(value_type = Option<LoadModeSchema>)]
@@ -642,18 +647,23 @@ pub fn read_output(query_name: String, target: &ReadTarget, result: QueryResult)
     }
 }
 
-pub fn ingest_output(uri: &str, result: &IngestResult, actor_id: Option<String>) -> IngestOutput {
+pub fn ingest_output(
+    uri: &str,
+    result: &LoadResult,
+    mode: LoadMode,
+    actor_id: Option<String>,
+) -> IngestOutput {
     IngestOutput {
         uri: uri.to_string(),
         branch: result.branch.clone(),
         base_branch: result.base_branch.clone(),
         branch_created: result.branch_created,
-        mode: result.mode,
+        mode,
         tables: result
-            .tables
-            .iter()
+            .to_ingest_tables()
+            .into_iter()
             .map(|table| IngestTableOutput {
-                table_key: table.table_key.clone(),
+                table_key: table.table_key,
                 rows_loaded: table.rows_loaded,
             })
             .collect(),

@@ -162,18 +162,18 @@ Atomicity guarantee for multi-statement mutations: a mid-query failure leaves La
 
 | Mode | Semantics | Path (post-MR-794) |
 |---|---|---|
-| `Overwrite` | Replace all data in the target tables on the branch | Inline-commit per type, then publisher CAS at end-of-load. Truncate-then-append doesn't fit the staged shape; documented residual. |
+| `Overwrite` | Replace all data in the target tables on the branch | Same accumulator; one `stage_overwrite` + `commit_staged` per touched table at end-of-load (a staged Lance `Operation::Overwrite` transaction — HEAD does not advance until commit; MR-793 Phase 2); publisher CAS. |
 | `Append` | Strict insert; duplicates error | In-memory `MutationStaging` accumulator; one `stage_append` + `commit_staged` per touched table at end-of-load; publisher CAS. |
 | `Merge` | Upsert by `id` (`merge_insert`) | Same accumulator; one `stage_merge_insert` per touched table at end-of-load (Merge mode dedupes by `id`, last-write-wins); publisher CAS. |
 
-For Append/Merge, a mid-load failure (RI / cardinality violation, validation error) leaves Lance HEAD untouched on the staged tables — the next load on the same tables proceeds normally with no `ExpectedVersionMismatch`. For Overwrite, a mid-load failure can still leave Lance HEAD on a partially-truncated table; the next overwrite replaces it.
+For all three modes, a mid-load failure (RI / cardinality violation, validation error) leaves Lance HEAD untouched on the staged tables — the next load on the same tables proceeds normally with no `ExpectedVersionMismatch`.
 
-## `load` vs `ingest`
+## `load` and the deprecated `ingest` shims
 
-- `load(branch, data, mode)` — direct load to a branch (single publisher commit per call).
-- `ingest(branch, from, data, mode)` — branch-creating wrapper: if `branch` doesn't exist, fork it from `from` (default `main`) via `branch_create_from`, then call `load(branch, data, mode)`.
-- Returns `IngestResult { branch, base_branch, branch_created, mode, tables[] }`.
-- `ingest_as(actor_id)` records the actor on the resulting commit.
+- `load_as(branch, base, data, mode, actor)` — the unified entry (single publisher commit per call). `base: Some(b)` forks a missing `branch` from `b` first (via `branch_create_from_as`, which enforces `BranchCreate`); `base: None` requires the branch to exist — staging fails on an unknown branch, so a typo'd name can never create one.
+- `load(branch, data, mode)` — convenience wrapper with `base: None` and no actor.
+- Returns `LoadResult { branch, base_branch, branch_created, nodes_loaded, edges_loaded }`.
+- `ingest{,_as,_file,_file_as}` are `#[deprecated]` shims over `load_as` preserving the historical contract (`from: None` forks from `main`; returns `IngestResult`); they are slated for removal. The CLI `ingest` command is a deprecated alias of `load --from <base>`.
 
 ## Embeddings during load
 

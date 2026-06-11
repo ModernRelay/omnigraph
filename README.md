@@ -88,7 +88,7 @@ omnigraph branch create --from main feature-x ./graph.omni
 omnigraph branch merge  feature-x --into main ./graph.omni
 ```
 
-See [docs/user/cli.md](docs/user/cli.md) for schema apply, snapshots, ingest, commits, and policy commands.
+See [docs/user/cli.md](docs/user/cli.md) for schema apply, snapshots, data loading, commits, and policy commands.
 
 ## Clients
 
@@ -132,7 +132,7 @@ Notes:
 
 - `crates/omnigraph-compiler`: shared schema/query parser, typechecker, catalog, and IR lowering
 - `crates/omnigraph`: storage/runtime, branching, merge, change detection, and query execution
-- `crates/omnigraph-cli`: CLI for graph lifecycle (init/load/ingest), query/mutate, branch/commit/merge, schema/lint, snapshot/export, policy, and maintenance (optimize/cleanup)
+- `crates/omnigraph-cli`: CLI for graph lifecycle (init/load), query/mutate, branch/commit/merge, schema/lint, snapshot/export, policy, and maintenance (optimize/cleanup)
 - `crates/omnigraph-server`: Axum HTTP server for remote reads, changes, ingest, export, branches, and commits
 
 ## Contributing

@@ -26,6 +26,14 @@ use crate::exec::staging::{MutationStaging, PendingMode};
 /// Result of a load operation.
 #[derive(Debug, Clone, Default)]
 pub struct LoadResult {
+    /// Branch the load landed on (`"main"` when no branch was given).
+    pub branch: String,
+    /// Base branch a fork was requested from (the `base` parameter of
+    /// `load_as`), recorded verbatim even when the target branch already
+    /// existed and no fork happened.
+    pub base_branch: Option<String>,
+    /// True when this load created `branch` by forking it from `base_branch`.
+    pub branch_created: bool,
     pub nodes_loaded: HashMap<String, usize>,
     pub edges_loaded: HashMap<String, usize>,
 }
@@ -57,21 +65,27 @@ pub enum LoadMode {
     Merge,
 }
 
-/// Load JSONL data into an Omnigraph database.
-pub async fn load_jsonl(db: &mut Omnigraph, data: &str, mode: LoadMode) -> Result<LoadResult> {
+/// Convenience: load JSONL data onto the database handle's *active branch*
+/// (`main` when unbound). Equivalent to `db.load(active_branch, data, mode)`;
+/// use `Omnigraph::load`/`load_as` directly when targeting an explicit branch
+/// or when fork-from-base semantics are needed.
+pub async fn load_jsonl(db: &Omnigraph, data: &str, mode: LoadMode) -> Result<LoadResult> {
     let current_branch = db.active_branch().await;
     let branch = current_branch.as_deref().unwrap_or("main");
     db.load(branch, data, mode).await
 }
 
-/// Load JSONL data from a file path.
-pub async fn load_jsonl_file(db: &mut Omnigraph, path: &str, mode: LoadMode) -> Result<LoadResult> {
+/// Convenience: like [`load_jsonl`] but reading from a file path.
+pub async fn load_jsonl_file(db: &Omnigraph, path: &str, mode: LoadMode) -> Result<LoadResult> {
     let current_branch = db.active_branch().await;
     let branch = current_branch.as_deref().unwrap_or("main");
     db.load_file(branch, path, mode).await
 }
 
 impl Omnigraph {
+    #[deprecated(
+        note = "use `load_as` with an explicit `base` instead; the ingest family will be removed in a future release"
+    )]
     pub async fn ingest(
         &self,
         branch: &str,
@@ -79,9 +93,17 @@ impl Omnigraph {
         data: &str,
         mode: LoadMode,
     ) -> Result<IngestResult> {
+        #[allow(deprecated)]
         self.ingest_as(branch, from, data, mode, None).await
     }
 
+    /// Deprecated shim over the unified `load_as`. Preserves the historical
+    /// ingest contract exactly: `from: None` means fork from `main`, and the
+    /// base branch is recorded in the result even when the target branch
+    /// already existed (no fork happened).
+    #[deprecated(
+        note = "use `load_as` with an explicit `base` instead; the ingest family will be removed in a future release"
+    )]
     pub async fn ingest_as(
         &self,
         branch: &str,
@@ -90,22 +112,24 @@ impl Omnigraph {
         mode: LoadMode,
         actor_id: Option<&str>,
     ) -> Result<IngestResult> {
-        // Engine-layer policy gate (MR-722 fan-out / PR #3). Scope is
-        // `Branch(branch)` for the data-write portion. If ingest creates
-        // a new branch as a side-effect (target branch doesn't exist),
-        // the inner `branch_create_from_as` call below additionally
-        // checks `BranchCreate` — both authorities are genuinely needed
-        // for "ingest into a fresh branch", so the layered check is
-        // correct, not redundant.
-        self.enforce(
-            omnigraph_policy::PolicyAction::Change,
-            &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
-            actor_id,
-        )?;
-        self.ingest_with_current_actor(branch, from, data, mode, actor_id)
-            .await
+        let result = self
+            .load_as(branch, Some(from.unwrap_or("main")), data, mode, actor_id)
+            .await?;
+        Ok(IngestResult {
+            branch: result.branch.clone(),
+            base_branch: result
+                .base_branch
+                .clone()
+                .unwrap_or_else(|| "main".to_string()),
+            branch_created: result.branch_created,
+            mode,
+            tables: result.to_ingest_tables(),
+        })
     }
 
+    #[deprecated(
+        note = "use `load_file_as` with an explicit `base` instead; the ingest family will be removed in a future release"
+    )]
     pub async fn ingest_file(
         &self,
         branch: &str,
@@ -113,9 +137,13 @@ impl Omnigraph {
         path: &str,
         mode: LoadMode,
     ) -> Result<IngestResult> {
+        #[allow(deprecated)]
         self.ingest_file_as(branch, from, path, mode, None).await
     }
 
+    #[deprecated(
+        note = "use `load_file_as` with an explicit `base` instead; the ingest family will be removed in a future release"
+    )]
     pub async fn ingest_file_as(
         &self,
         branch: &str,
@@ -125,69 +153,35 @@ impl Omnigraph {
         actor_id: Option<&str>,
     ) -> Result<IngestResult> {
         let data = std::fs::read_to_string(path).map_err(OmniError::Io)?;
+        #[allow(deprecated)]
         self.ingest_as(branch, from, &data, mode, actor_id).await
     }
 
-    async fn ingest_with_current_actor(
-        &self,
-        branch: &str,
-        from: Option<&str>,
-        data: &str,
-        mode: LoadMode,
-        actor_id: Option<&str>,
-    ) -> Result<IngestResult> {
-        self.ensure_schema_state_valid().await?;
-        let target_branch =
-            Self::normalize_branch_name(branch)?.unwrap_or_else(|| "main".to_string());
-        let base_branch = Self::normalize_branch_name(from.unwrap_or("main"))?
-            .unwrap_or_else(|| "main".to_string());
-        let branch_created = !self
-            .branch_list()
-            .await?
-            .iter()
-            .any(|name| name == &target_branch);
-        if branch_created {
-            // Thread the actor through to the implicit BranchCreate so
-            // policy decisions match what an explicit `branch_create_from_as`
-            // call would see. Calling the no-actor variant here would
-            // bypass BranchCreate enforcement when policy is installed —
-            // the footgun guard catches that case too, but threading is
-            // the correct fix.
-            self.branch_create_from_as(
-                crate::db::ReadTarget::branch(&base_branch),
-                &target_branch,
-                actor_id,
-            )
-            .await?;
-        }
-
-        let result = self.load_as(&target_branch, data, mode, actor_id).await?;
-        Ok(IngestResult {
-            branch: target_branch,
-            base_branch,
-            branch_created,
-            mode,
-            tables: result.to_ingest_tables(),
-        })
-    }
-
     pub async fn load(&self, branch: &str, data: &str, mode: LoadMode) -> Result<LoadResult> {
-        self.load_as(branch, data, mode, None).await
+        self.load_as(branch, None, data, mode, None).await
     }
 
+    /// Load JSONL data onto `branch`.
+    ///
+    /// `base` selects the branch-creation behavior: with `Some(base)`, a
+    /// missing target branch is forked from `base` first (the former
+    /// `ingest` semantics); with `None`, the target branch must already
+    /// exist — staging fails on an unknown branch when it resolves the
+    /// manifest snapshot, so a typo'd branch name can never create one.
     pub async fn load_as(
         &self,
         branch: &str,
+        base: Option<&str>,
         data: &str,
         mode: LoadMode,
         actor_id: Option<&str>,
     ) -> Result<LoadResult> {
         // Engine-layer policy gate (MR-722 fan-out / PR #3). Scope is
         // `Branch(branch)` to match the HTTP-layer Change convention.
-        // `ingest_as` also calls `load_as` after enforcing its own
-        // Change gate — that double-check is fine because both gates
-        // resolve to identical Cedar decisions for the same actor +
-        // branch (the second check is a structurally-correct no-op).
+        // When a fork happens below, `branch_create_from_as` additionally
+        // checks `BranchCreate` — both authorities are genuinely needed
+        // for "load into a fresh branch", so the layered check is
+        // correct, not redundant.
         self.enforce(
             omnigraph_policy::PolicyAction::Change,
             &omnigraph_policy::ResourceScope::Branch(branch.to_string()),
@@ -205,15 +199,47 @@ impl Omnigraph {
         // `commit_prepared_updates_on_branch_with_expected`) and leave
         // `self.coordinator` with a stale manifest snapshot.
         let requested = Self::normalize_branch_name(branch)?;
+        let base_branch = match base {
+            Some(base) => {
+                Some(Self::normalize_branch_name(base)?.unwrap_or_else(|| "main".to_string()))
+            }
+            None => None,
+        };
+        // Fork-if-missing only when a base branch was explicitly given.
+        // `requested == None` is `main`, which always exists.
+        let mut branch_created = false;
+        if let (Some(target), Some(base_name)) = (requested.as_deref(), base_branch.as_deref()) {
+            let exists = self.branch_list().await?.iter().any(|name| name == target);
+            if !exists {
+                // Thread the actor through to the implicit BranchCreate so
+                // policy decisions match what an explicit `branch_create_from_as`
+                // call would see. Calling the no-actor variant here would
+                // bypass BranchCreate enforcement when policy is installed —
+                // the footgun guard catches that case too, but threading is
+                // the correct fix.
+                self.branch_create_from_as(
+                    crate::db::ReadTarget::branch(base_name),
+                    target,
+                    actor_id,
+                )
+                .await?;
+                branch_created = true;
+            }
+        }
         // Direct-to-target writes: no Run state machine, no `__run__` staging
         // branch. Cross-table OCC is enforced by the publisher's
         // `expected_table_versions` CAS inside `load_jsonl_reader`.
-        self.load_direct_on_branch(requested.as_deref(), data, mode, actor_id)
-            .await
+        let mut result = self
+            .load_direct_on_branch(requested.as_deref(), data, mode, actor_id)
+            .await?;
+        result.branch = requested.unwrap_or_else(|| "main".to_string());
+        result.base_branch = base_branch;
+        result.branch_created = branch_created;
+        Ok(result)
     }
 
     pub async fn load_file(&self, branch: &str, path: &str, mode: LoadMode) -> Result<LoadResult> {
-        self.load_file_as(branch, path, mode, None).await
+        self.load_file_as(branch, None, path, mode, None).await
     }
 
     /// Read a file into memory and delegate to `load_as`. Used by the
@@ -222,12 +248,13 @@ impl Omnigraph {
     pub async fn load_file_as(
         &self,
         branch: &str,
+        base: Option<&str>,
         path: &str,
         mode: LoadMode,
         actor_id: Option<&str>,
     ) -> Result<LoadResult> {
-        let data = std::fs::read_to_string(path).map_err(|e| OmniError::Io(e))?;
-        self.load_as(branch, &data, mode, actor_id).await
+        let data = std::fs::read_to_string(path).map_err(OmniError::Io)?;
+        self.load_as(branch, base, &data, mode, actor_id).await
     }
 
     async fn load_direct_on_branch(
@@ -1824,6 +1851,7 @@ edge WorksAt: Person -> Company
     }
 
     #[tokio::test]
+    #[allow(deprecated)]
     async fn test_ingest_creates_branch_and_reports_tables() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
@@ -1868,6 +1896,7 @@ edge WorksAt: Person -> Company
     }
 
     #[tokio::test]
+    #[allow(deprecated)]
     async fn test_ingest_existing_branch_ignores_from_and_merges_data() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
@@ -1942,6 +1971,7 @@ edge WorksAt: Person -> Company
     }
 
     #[tokio::test]
+    #[allow(deprecated)]
     async fn test_ingest_as_stamps_actor_on_branch_head_commit() {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
@@ -1965,6 +1995,68 @@ edge WorksAt: Person -> Company
             .last()
             .unwrap();
         assert_eq!(head.actor_id.as_deref(), Some("act-andrew"));
+    }
+
+    #[tokio::test]
+    async fn test_load_as_with_base_forks_missing_branch_and_stamps_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        let result = db
+            .load_as("feature", Some("main"), TEST_DATA, LoadMode::Merge, None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.branch, "feature");
+        assert_eq!(result.base_branch.as_deref(), Some("main"));
+        assert!(result.branch_created);
+        assert!(
+            db.branch_list()
+                .await
+                .unwrap()
+                .contains(&"feature".to_string())
+        );
+
+        // Re-loading onto the now-existing branch records the base but
+        // performs no fork.
+        let again = db
+            .load_as(
+                "feature",
+                Some("main"),
+                r#"{"type":"Person","data":{"name":"Bob","age":26}}"#,
+                LoadMode::Merge,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!again.branch_created);
+        assert_eq!(again.base_branch.as_deref(), Some("main"));
+    }
+
+    #[tokio::test]
+    async fn test_load_as_without_base_errors_on_missing_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+        let result = db
+            .load_as("nonexistent", None, TEST_DATA, LoadMode::Merge, None)
+            .await;
+        assert!(result.is_err(), "load without base must not create branches");
+        assert!(
+            !db.branch_list()
+                .await
+                .unwrap()
+                .contains(&"nonexistent".to_string()),
+            "failed load must not leave a branch behind"
+        );
+
+        // Loads to main carry the default branch metadata.
+        let main_load = db.load("main", TEST_DATA, LoadMode::Overwrite).await.unwrap();
+        assert_eq!(main_load.branch, "main");
+        assert_eq!(main_load.base_branch, None);
+        assert!(!main_load.branch_created);
     }
 
     #[test]

@@ -652,6 +652,8 @@ query add_friend($from: String, $to: String) {
     output_success(
         cli()
             .arg("load")
+            .arg("--mode")
+            .arg("overwrite")
             .arg("--data")
             .arg(&export_path)
             .arg(&imported_graph),
@@ -753,6 +755,71 @@ fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
     ));
     assert_eq!(zoe["row_count"], 1);
     assert_eq!(zoe["rows"][0]["p.name"], "Zoe");
+}
+
+/// The unified `load` works against remote graphs through the server's
+/// `/ingest` endpoint: without `--from` a missing branch is a hard error
+/// (no implicit fork), with `--from` it forks like ingest did.
+#[test]
+#[ignore = "requires loopback socket permissions in sandboxed runners"]
+fn remote_load_round_trips_and_requires_from_for_new_branches() {
+    let graph = SystemGraph::loaded();
+    let server = graph.spawn_server();
+    let config = graph.write_config("omnigraph.yaml", &remote_yaml_config(&server.base_url));
+    let extra = graph.write_jsonl(
+        "system-remote-load.jsonl",
+        r#"{"type":"Person","data":{"name":"Zoe","age":33}}"#,
+    );
+
+    // Missing branch without --from: refused remotely, nothing created.
+    let failure = output_failure(
+        cli()
+            .arg("load")
+            .arg("--config")
+            .arg(&config)
+            .arg("--mode")
+            .arg("merge")
+            .arg("--data")
+            .arg(&extra)
+            .arg("--branch")
+            .arg("feature-load"),
+    );
+    assert!(
+        String::from_utf8_lossy(&failure.stderr).contains("feature-load"),
+        "error should name the missing branch"
+    );
+
+    // With --from, the remote load forks and lands the rows.
+    let payload = parse_stdout_json(&output_success(
+        cli()
+            .arg("load")
+            .arg("--config")
+            .arg(&config)
+            .arg("--mode")
+            .arg("merge")
+            .arg("--data")
+            .arg(&extra)
+            .arg("--branch")
+            .arg("feature-load")
+            .arg("--from")
+            .arg("main")
+            .arg("--json"),
+    ));
+    assert_eq!(payload["branch"], "feature-load");
+    assert_eq!(payload["base_branch"], "main");
+    assert_eq!(payload["branch_created"], true);
+    assert_eq!(payload["nodes_loaded"], 1);
+
+    let snapshot = parse_stdout_json(&output_success(
+        cli()
+            .arg("snapshot")
+            .arg("--config")
+            .arg(&config)
+            .arg("--branch")
+            .arg("feature-load")
+            .arg("--json"),
+    ));
+    assert_eq!(snapshot["branch"], "feature-load");
 }
 
 #[test]

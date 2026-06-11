@@ -93,7 +93,15 @@ pub fn init_graph(graph: &Path) {
 
 pub fn load_fixture(graph: &Path) {
     let data = fixture("test.jsonl");
-    output_success(cli().arg("load").arg("--data").arg(&data).arg(graph));
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--mode")
+            .arg("overwrite")
+            .arg("--data")
+            .arg(&data)
+            .arg(graph),
+    );
 }
 
 pub fn write_jsonl(path: &Path, rows: &str) {

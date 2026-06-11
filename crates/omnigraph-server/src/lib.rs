@@ -2663,13 +2663,15 @@ async fn server_schema_apply(
     ),
     security(("bearer_token" = [])),
 )]
-/// Bulk-ingest NDJSON data into a branch.
+/// Bulk-load NDJSON data into a branch.
 ///
 /// `data` is NDJSON with one record per line. `mode` controls behavior on
 /// existing rows: `merge` upserts by id (default), `append` blindly inserts,
-/// `overwrite` replaces table contents. If `branch` does not exist it is
-/// created from `from` (defaults to `main`). **Destructive** when `mode` is
-/// `overwrite` or when ingest produces conflicting writes.
+/// `overwrite` replaces table contents. Branch creation is opt-in by
+/// presence of `from`: with `from` set, a missing `branch` is created from
+/// it; without `from`, `branch` must already exist — a missing branch is a
+/// 404, never an implicit fork. **Destructive** when `mode` is `overwrite`
+/// or when the load produces conflicting writes.
 async fn server_ingest(
     State(state): State<AppState>,
     Extension(handle): Extension<Arc<GraphHandle>>,
@@ -2677,7 +2679,7 @@ async fn server_ingest(
     Json(request): Json<IngestRequest>,
 ) -> std::result::Result<Json<IngestOutput>, ApiError> {
     let branch = request.branch.unwrap_or_else(|| "main".to_string());
-    let from = request.from.unwrap_or_else(|| "main".to_string());
+    let from = request.from;
     let mode = request.mode.unwrap_or(omnigraph::loader::LoadMode::Merge);
     let actor_arc = actor
         .as_ref()
@@ -2697,15 +2699,25 @@ async fn server_ingest(
     };
 
     if !branch_exists {
-        authorize_request(
-            actor.as_ref().map(|Extension(actor)| actor),
-            handle.policy.as_deref(),
-            PolicyRequest {
-                action: PolicyAction::BranchCreate,
-                branch: Some(from.clone()),
-                target_branch: Some(branch.clone()),
-            },
-        )?;
+        match from.as_deref() {
+            // Fork-if-missing is opt-in by presence of `from`; without it a
+            // typo'd branch name must surface as an error, not silently
+            // create a fork and land the data there.
+            None => {
+                return Err(ApiError::not_found(format!(
+                    "branch '{branch}' not found; pass `from` to create it"
+                )));
+            }
+            Some(from) => authorize_request(
+                actor.as_ref().map(|Extension(actor)| actor),
+                handle.policy.as_deref(),
+                PolicyRequest {
+                    action: PolicyAction::BranchCreate,
+                    branch: Some(from.to_string()),
+                    target_branch: Some(branch.clone()),
+                },
+            )?,
+        }
     }
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
@@ -2724,7 +2736,7 @@ async fn server_ingest(
 
     let result = {
         let db = &handle.engine;
-        db.ingest_as(&branch, Some(&from), &request.data, mode, actor_id)
+        db.load_as(&branch, from.as_deref(), &request.data, mode, actor_id)
             .await
             .map_err(ApiError::from_omni)?
     };
@@ -2732,6 +2744,7 @@ async fn server_ingest(
     Ok(Json(ingest_output(
         handle.uri.as_str(),
         &result,
+        mode,
         actor_id.map(str::to_string),
     )))
 }

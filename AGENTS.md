@@ -200,9 +200,8 @@ omnigraph init --schema ./schema.pg s3://my-bucket/graph.omni
 # Bulk load
 omnigraph load --data ./seed.jsonl --mode overwrite s3://my-bucket/graph.omni
 
-# Branch + ingest a review batch
-omnigraph branch create --from main review/2026-04-25 s3://my-bucket/graph.omni
-omnigraph ingest --branch review/2026-04-25 --data ./batch.jsonl s3://my-bucket/graph.omni
+# Load a review batch onto its own branch (--from forks it if missing)
+omnigraph load --branch review/2026-04-25 --from main --mode merge --data ./batch.jsonl s3://my-bucket/graph.omni
 
 # Run a hybrid (vector + BM25) query
 omnigraph read --query ./queries.gq --name find_similar \
@@ -258,7 +257,7 @@ omnigraph policy explain --actor act-alice --action change --branch main
 | Per-query atomic writes | — | In-memory `MutationStaging.pending` accumulator + `stage_*` / `commit_staged` per touched table at end-of-query + publisher CAS via `commit_with_expected` (single manifest commit per `mutate_as` / `load`); D₂ parse-time rule keeps inserts/updates and deletes from mixing |
 | Three-way row-level merge | — | `OrderedTableCursor` + `StagedTableWriter`, structured `MergeConflictKind` |
 | Change feeds | — | `diff_between` / `diff_commits` with manifest fast path + ID streaming |
-| Cedar policy | — | Per-graph actions plus server-scoped actions (see [docs/user/policy.md](docs/user/policy.md) for the current list), branch / target_branch / protected scopes, validate/test/explain CLI. **Engine-wide enforcement** (MR-722): every `_as` writer (`apply_schema_as`, `mutate_as`, `load_as`, `ingest_as`, `branch_create_as` / `branch_create_from_as`, `branch_delete_as`, `branch_merge_as`) calls `Omnigraph::enforce(action, scope, actor)` — HTTP, CLI, embedded SDK all hit the same gate. |
+| Cedar policy | — | Per-graph actions plus server-scoped actions (see [docs/user/policy.md](docs/user/policy.md) for the current list), branch / target_branch / protected scopes, validate/test/explain CLI. **Engine-wide enforcement** (MR-722): every `_as` writer (`apply_schema_as`, `mutate_as`, `load_as` — the deprecated `ingest_as` shims route through it — `branch_create_as` / `branch_create_from_as`, `branch_delete_as`, `branch_merge_as`) calls `Omnigraph::enforce(action, scope, actor)` — HTTP, CLI, embedded SDK all hit the same gate. |
 | HTTP server | — | Axum, OpenAPI via utoipa, bearer auth (SHA-256, AWS Secrets Manager option), `authorize_request` at the HTTP boundary (resolves bearer→actor, applies admission control), NDJSON streaming export, **multi-graph mode (v0.6.0+) with cluster routes + read-only `GET /graphs` enumeration + per-graph + server-level Cedar policies. Add/remove graphs by editing `omnigraph.yaml` and restarting.** |
 | CLI with config | — | `omnigraph.yaml`, aliases, multi-format output (json/jsonl/csv/kv/table) |
 | Audit / actor tracking | — | `_as` write APIs + actor map in commit graph |
