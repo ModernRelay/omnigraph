@@ -702,12 +702,14 @@ graphs:
         let alpha = &graphs[0];
         let beta = &graphs[1];
         assert_eq!(alpha.graph_id, "alpha");
-        assert_eq!(
-            alpha.policy_file.as_ref().unwrap(),
-            &temp.path().join("policies/alpha.yaml")
-        );
+        let omnigraph_server::PolicySource::File(alpha_policy) =
+            alpha.policy.as_ref().unwrap()
+        else {
+            panic!("yaml-configured policy must stay file-based");
+        };
+        assert_eq!(alpha_policy, &temp.path().join("policies/alpha.yaml"));
         assert_eq!(beta.graph_id, "beta");
-        assert!(beta.policy_file.is_none());
+        assert!(beta.policy.is_none());
     }
 
     /// `server.policy.file` resolves alongside the graphs map.
@@ -729,13 +731,11 @@ graphs:
         .unwrap();
         let settings = load_server_settings(Some(&config_path), None, None, None, None, true).await.unwrap();
         match settings.mode {
-            ServerConfigMode::Multi {
-                server_policy_file, ..
-            } => {
-                assert_eq!(
-                    server_policy_file.unwrap(),
-                    temp.path().join("server-policy.yaml")
-                );
+            ServerConfigMode::Multi { server_policy, .. } => {
+                let omnigraph_server::PolicySource::File(path) = server_policy.unwrap() else {
+                    panic!("yaml-configured server policy must stay file-based");
+                };
+                assert_eq!(path, temp.path().join("server-policy.yaml"));
             }
             _ => panic!("expected Multi"),
         }

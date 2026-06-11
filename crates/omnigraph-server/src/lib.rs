@@ -193,18 +193,28 @@ pub enum ServerConfigMode {
         config_path: PathBuf,
         /// `server.policy.file` (server-level Cedar policy for the
         /// management endpoints). Wired into `GET /graphs` authorization.
-        server_policy_file: Option<PathBuf>,
+        server_policy: Option<PolicySource>,
     },
 }
 
+/// Where a Cedar policy bundle comes from at startup. File-based for
+/// omnigraph.yaml deployments; inline (digest-verified catalog content)
+/// for cluster-mode boots, where the catalog may live on object storage
+/// and the server must not re-read mutable state after the snapshot.
+#[derive(Debug, Clone)]
+pub enum PolicySource {
+    File(PathBuf),
+    Inline(String),
+}
+
 /// One graph's startup-time configuration: id, opened URI, optional
-/// per-graph policy file path. Constructed by `load_server_settings`
+/// per-graph policy source. Constructed by `load_server_settings`
 /// in multi mode; consumed by `serve`'s parallel open loop.
 #[derive(Debug, Clone)]
 pub struct GraphStartupConfig {
     pub graph_id: String,
     pub uri: String,
-    pub policy_file: Option<PathBuf>,
+    pub policy: Option<PolicySource>,
     /// Per-graph stored-query registry, loaded and identity-checked at
     /// settings-build time; type-checked against the schema when this
     /// graph's engine opens.
@@ -994,9 +1004,9 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         ServerConfigMode::Single { policy_file, .. } => policy_file.is_some(),
         ServerConfigMode::Multi {
             graphs,
-            server_policy_file,
+            server_policy,
             ..
-        } => server_policy_file.is_some() || graphs.iter().any(|g| g.policy_file.is_some()),
+        } => server_policy.is_some() || graphs.iter().any(|g| g.policy.is_some()),
     };
     let runtime_state = classify_server_runtime_state(
         !tokens.is_empty(),
@@ -1045,7 +1055,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         ServerConfigMode::Multi {
             graphs,
             config_path,
-            server_policy_file,
+            server_policy,
         } => {
             info!(
                 bind = %bind,
@@ -1054,7 +1064,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
                 config = %config_path.display(),
                 "serving omnigraph"
             );
-            open_multi_graph_state(graphs, tokens, server_policy_file.as_ref(), config_path).await?
+            open_multi_graph_state(graphs, tokens, server_policy.as_ref(), config_path).await?
         }
     };
 
@@ -1063,6 +1073,14 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// Load a graph-scoped policy bundle from either source kind.
+fn load_graph_policy(source: &PolicySource, graph_id: &str) -> Result<PolicyEngine> {
+    match source {
+        PolicySource::File(path) => Ok(PolicyEngine::load_graph(path, graph_id)?),
+        PolicySource::Inline(text) => Ok(PolicyEngine::load_graph_from_source(text, graph_id)?),
+    }
 }
 
 /// Parallel open of every graph in the startup config, with bounded
@@ -1076,7 +1094,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
 pub async fn open_multi_graph_state(
     graphs: Vec<GraphStartupConfig>,
     tokens: Vec<(String, String)>,
-    server_policy_file: Option<&PathBuf>,
+    server_policy_source: Option<&PolicySource>,
     config_path: PathBuf,
 ) -> Result<AppState> {
     use futures::{StreamExt, TryStreamExt};
@@ -1089,8 +1107,11 @@ pub async fn open_multi_graph_state(
     // The placeholder graph_id `"server"` is the sentinel the Cedar
     // resource-model refactor maps to the singleton
     // `Omnigraph::Server::"root"` entity at evaluation time.
-    let server_policy = match server_policy_file {
-        Some(path) => Some(PolicyEngine::load_server(path)?),
+    let server_policy = match server_policy_source {
+        Some(PolicySource::File(path)) => Some(PolicyEngine::load_server(path)?),
+        Some(PolicySource::Inline(source)) => {
+            Some(PolicyEngine::load_server_from_source(source)?)
+        }
         None => None,
     };
 
@@ -1128,9 +1149,9 @@ async fn open_single_graph(cfg: GraphStartupConfig) -> Result<Arc<GraphHandle>> 
     // owned `Arc`, so no borrow of `db` survives into the match.
     let queries = validate_and_attach(cfg.queries, &db.catalog(), graph_id.as_str())?;
 
-    let (policy_arc, db) = match &cfg.policy_file {
-        Some(path) => {
-            let policy = PolicyEngine::load_graph(path, graph_id.as_str())?;
+    let (policy_arc, db) = match &cfg.policy {
+        Some(source) => {
+            let policy = load_graph_policy(source, graph_id.as_str())?;
             let policy_arc: Arc<PolicyEngine> = Arc::new(policy);
             let checker = Arc::clone(&policy_arc) as Arc<dyn omnigraph_policy::PolicyChecker>;
             (Some(policy_arc), db.with_policy(checker))

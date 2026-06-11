@@ -23,7 +23,10 @@ pub struct ServingQuery {
 #[derive(Debug, Clone)]
 pub struct ServingPolicy {
     pub name: String,
-    pub blob_path: PathBuf,
+    /// The policy bundle CONTENT, digest-verified against the applied
+    /// revision at read time. Content, not a path: the catalog may live on
+    /// object storage, and the server must not re-read mutable state.
+    pub source: String,
     pub applies_to: Vec<String>,
 }
 
@@ -44,7 +47,6 @@ pub async fn read_serving_snapshot(
     config_dir: impl AsRef<Path>,
 ) -> Result<ServingSnapshot, Vec<Diagnostic>> {
     let config_dir = config_dir.as_ref().to_path_buf();
-    let mut diagnostics: Vec<Diagnostic> = Vec::new();
     // The declared storage: root decides where the ledger/catalog/graphs
     // live; config parse errors surface through the normal validation path.
     let parsed = parse_cluster_config(&config_dir);
@@ -62,6 +64,25 @@ pub async fn read_serving_snapshot(
         },
         None => ClusterStore::for_config_dir(&config_dir),
     };
+    read_snapshot_with_store(backend).await
+}
+
+/// Read the applied revision directly from a storage root URI — config-free
+/// serving: a `--cluster s3://bucket/prefix` server needs no local files at
+/// all, only the bucket and credentials. The ledger and catalog ARE the
+/// deployment artifact.
+pub async fn read_serving_snapshot_from_storage(
+    storage_root: &str,
+) -> Result<ServingSnapshot, Vec<Diagnostic>> {
+    let backend =
+        ClusterStore::for_storage_root(storage_root).map_err(|diagnostic| vec![diagnostic])?;
+    read_snapshot_with_store(backend).await
+}
+
+async fn read_snapshot_with_store(
+    backend: ClusterStore,
+) -> Result<ServingSnapshot, Vec<Diagnostic>> {
+    let mut diagnostics: Vec<Diagnostic> = Vec::new();
 
     // A ledger a sweep is about to rewrite must not start serving.
     let sidecars = backend.list_recovery_sidecars(&mut diagnostics).await;
@@ -136,13 +157,9 @@ pub async fn read_serving_snapshot(
                     continue;
                 };
                 match backend.read_verified_payload(&kind, &entry.digest, address).await {
-                    Ok(_) => policies.push(ServingPolicy {
+                    Ok(source) => policies.push(ServingPolicy {
                         name: name.clone(),
-                        blob_path: PathBuf::from(
-                            backend
-                                .payload_display(&kind, &entry.digest)
-                                .expect("policy kind always has a payload path"),
-                        ),
+                        source,
                         applies_to,
                     }),
                     Err(diagnostic) => diagnostics.push(diagnostic),

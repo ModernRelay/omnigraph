@@ -14,10 +14,10 @@ struct Cli {
     target: Option<String>,
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Boot from a cluster directory (the applied revision in
-    /// __cluster/state.json + content-addressed catalog blobs) instead of
-    /// omnigraph.yaml. Exclusive: cannot combine with <URI>, --target, or
-    /// --config.
+    /// Boot from a cluster: either a config directory (storage resolved
+    /// through cluster.yaml) or a storage-root URI directly
+    /// (s3://bucket/prefix — config-free serving from the bucket).
+    /// Exclusive: cannot combine with <URI>, --target, or --config.
     #[arg(long)]
     cluster: Option<PathBuf>,
     #[arg(long)]

@@ -2843,7 +2843,9 @@ policies:
         assert!(snapshot.queries[0].source.contains("query find_person"));
         assert_eq!(snapshot.policies.len(), 1);
         assert_eq!(snapshot.policies[0].applies_to, vec!["graph.knowledge"]);
-        assert!(snapshot.policies[0].blob_path.exists());
+        // Content, not a path: the catalog may live on object storage.
+        // The fixture bundle is `rules: []` — assert the verified text.
+        assert!(snapshot.policies[0].source.contains("rules:"));
     }
 
     #[tokio::test]
