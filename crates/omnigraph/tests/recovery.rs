@@ -263,6 +263,89 @@ async fn drift_guard_advice_ignores_other_branch_sidecars() {
     );
 }
 
+/// A deferred sidecar pinned to a branch that is subsequently DELETED
+/// must not wedge the graph: the branch's tree and forks are reclaimed,
+/// so the pinned drift is unreachable and the sidecar is provably moot.
+/// Both the write-entry heal and the open-time sweep must classify it
+/// as orphaned (audit + discard) instead of failing to open the dead
+/// branch on every write and every ReadWrite open — a terminal state,
+/// since `repair` refuses while a sidecar is pending.
+#[tokio::test]
+async fn deleted_branch_sidecar_does_not_wedge_writes_or_open() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":30}}\n",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    db.branch_create("feature").await.unwrap();
+    db.mutate(
+        "feature",
+        helpers::MUTATION_QUERIES,
+        "insert_person",
+        &helpers::mixed_params(&[("$name", "eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+
+    // A rollback-eligible (deferred) sidecar pinned to feature — shaped
+    // so every roll-forward-only pass leaves it on disk.
+    let person_uri = node_table_uri(&uri, "Person");
+    let sidecar_json = format!(
+        r#"{{
+        "schema_version": 1,
+        "operation_id": "01H000000000000000000000DB",
+        "started_at": "0",
+        "branch": "feature",
+        "actor_id": null,
+        "writer_kind": "Mutation",
+        "tables": [
+            {{
+                "table_key": "node:Person",
+                "table_path": "{person_uri}",
+                "expected_version": 999,
+                "post_commit_pin": 1000,
+                "table_branch": "feature"
+            }}
+        ]
+    }}"#
+    );
+    write_sidecar_file(dir.path(), "01H000000000000000000000DB", &sidecar_json);
+
+    // Branch delete defers the rollback-eligible sidecar and proceeds —
+    // the sidecar now references a branch that no longer exists.
+    db.branch_delete("feature").await.unwrap();
+
+    // The next write's heal must classify the orphan and discard it,
+    // not fail opening the dead branch.
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Bob\",\"age\":25}}\n",
+        LoadMode::Merge,
+    )
+    .await
+    .expect("a write after deleting a sidecar-pinned branch must succeed");
+    assert_eq!(
+        list_recovery_dir(dir.path()).len(),
+        0,
+        "the orphaned sidecar must be discarded (with an audit row), not left to wedge"
+    );
+
+    // And a fresh ReadWrite open must succeed too (the sweep shares the
+    // same classification).
+    drop(db);
+    let db = Omnigraph::open(&uri)
+        .await
+        .expect("ReadWrite open after deleting a sidecar-pinned branch must succeed");
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 2);
+}
+
 #[tokio::test]
 async fn read_only_open_skips_recovery_sweep() {
     let dir = tempfile::tempdir().unwrap();
