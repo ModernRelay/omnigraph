@@ -2048,6 +2048,91 @@ async fn orphaned_branch_discard_is_idempotent_across_delete_failure() {
     );
 }
 
+/// When the commit-time drift guard cannot LIST sidecars to classify
+/// the drift (transient storage fault on the guard's list, after the
+/// entry heal's list succeeded), it must say so and name BOTH recovery
+/// paths — not confidently route to `omnigraph repair`, which refuses
+/// while a sidecar is pending. Sequenced failpoint: first list (entry
+/// heal) passes, second list (the guard) fails.
+#[tokio::test]
+async fn drift_guard_names_both_paths_when_sidecar_list_fails() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"alice\",\"age\":30}}\n",
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+
+    // Rollback-eligible (deferred) sidecar covering main's Person drift —
+    // same shape as refresh_defers_rollback_eligible_sidecar_to_next_open.
+    let snapshot = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap();
+    let entry = snapshot.entry("node:Person").unwrap();
+    let person_uri = format!("{}/{}", uri.trim_end_matches('/'), entry.table_path);
+    let manifest_pin = entry.table_version;
+    let mut ds = lance::Dataset::open(&person_uri).await.unwrap();
+    helpers::lance_delete_inline(&mut ds, "1 = 2").await;
+    let head_after_drift = ds.version().version;
+    let sidecar_json = format!(
+        r#"{{
+            "schema_version": 1,
+            "operation_id": "01H0000000000000000000LSTF",
+            "started_at": "0",
+            "branch": null,
+            "actor_id": null,
+            "writer_kind": "Mutation",
+            "tables": [
+                {{
+                    "table_key":"node:Person",
+                    "table_path":"{}",
+                    "expected_version":{},
+                    "post_commit_pin":{}
+                }}
+            ]
+        }}"#,
+        person_uri,
+        manifest_pin - 1,
+        head_after_drift,
+    );
+    let recovery_dir = dir.path().join("__recovery");
+    std::fs::create_dir_all(&recovery_dir).unwrap();
+    std::fs::write(
+        recovery_dir.join("01H0000000000000000000LSTF.json"),
+        &sidecar_json,
+    )
+    .unwrap();
+
+    // First list (entry heal) passes and defers the sidecar; second
+    // list (the guard's classification) fails.
+    let _failpoint = ScopedFailPoint::new("recovery.sidecar_list", "1*off->1*return");
+    let err = load_jsonl(
+        &mut db,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"bob\",\"age\":25}}\n",
+        LoadMode::Merge,
+    )
+    .await
+    .err()
+    .expect("drift must still fail the write");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("could not classify the drift")
+            && msg.contains("omnigraph repair")
+            && msg.contains("reopen the graph read-write"),
+        "an unclassifiable drift must name BOTH recovery paths, not \
+         confidently route to repair; got: {msg}"
+    );
+}
+
 /// The other half of the orphan-discard fault matrix: the audit append
 /// fails AFTER the recovery commit landed. The retry (keyed on the
 /// audit row, the operator-facing record) must converge to exactly one
