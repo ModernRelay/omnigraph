@@ -42,6 +42,8 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 mod embed;
+mod migrate;
+mod operator;
 mod read_format;
 
 use embed::{EmbedArgs, EmbedOutput, execute_embed};
@@ -72,6 +74,65 @@ async fn main() -> Result<()> {
     };
     let http_client = build_http_client()?;
     match cli.command {
+        Command::Config { command } => match command {
+            ConfigCommand::Migrate { config, write, json } => {
+                let path = migrate::legacy_config_path(config.as_ref());
+                if !path.exists() {
+                    bail!(
+                        "no legacy config at '{}' — nothing to migrate",
+                        path.display()
+                    );
+                }
+                let legacy = load_config(Some(&path))?;
+                let report = migrate::build_report(&legacy, &path);
+                if write {
+                    let legacy_dir = path
+                        .parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                        .unwrap_or(std::path::Path::new("."))
+                        .to_path_buf();
+                    let written = migrate::apply_report(&report, &legacy_dir)?;
+                    if json {
+                        print_json(&serde_json::json!({
+                            "report": report,
+                            "written": written,
+                        }))?;
+                    } else {
+                        print!("{}", migrate::render_report(&report));
+                        for line in written {
+                            println!("wrote: {line}");
+                        }
+                    }
+                } else if json {
+                    print_json(&report)?;
+                } else {
+                    print!("{}", migrate::render_report(&report));
+                }
+            }
+        },
+        Command::Login { name, token, json } => {
+            let token = match token {
+                Some(token) => token,
+                None => {
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    line
+                }
+            };
+            let Some(token) = normalize_bearer_token(Some(token)) else {
+                color_eyre::eyre::bail!(
+                    "no token provided: pass --token <TOKEN> or pipe it on stdin (echo $TOKEN | omnigraph login {name})"
+                );
+            };
+            let operator_config = crate::operator::load_operator_config()?;
+            let declared = operator_config.servers.contains_key(&name);
+            let path = crate::operator::write_credential(&name, &token)?;
+            finish_login(&name, &path, declared, json)?;
+        }
+        Command::Logout { name, json } => {
+            let path = crate::operator::remove_credential(&name)?;
+            finish_logout(&name, &path, json)?;
+        }
         Command::Version => {
             println!("omnigraph {}", env!("CARGO_PKG_VERSION"));
         }
@@ -92,7 +153,6 @@ async fn main() -> Result<()> {
                 omnigraph::db::InitOptions { force },
             )
             .await?;
-            scaffold_config_if_missing(&uri)?;
             println!("initialized {}", uri);
         }
         Command::Load {
@@ -106,6 +166,8 @@ async fn main() -> Result<()> {
             json,
         } => {
             let config = load_cli_config(config.as_ref())?;
+            let uri =
+                apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
             let bearer_token =
                 resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
             let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
@@ -129,7 +191,8 @@ async fn main() -> Result<()> {
                 load_output_from_tables(&uri, &branch, mode, &output)
             } else {
                 let db = open_local_db_with_policy(&graph).await?;
-                let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
+                let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config)?;
+                let actor = actor.as_deref();
                 let result = db
                     .load_file_as(
                         &branch,
@@ -173,6 +236,8 @@ async fn main() -> Result<()> {
                  use `omnigraph load --from <base> --mode <mode>` (ingest defaults: --from main --mode merge)"
             );
             let config = load_cli_config(config.as_ref())?;
+            let uri =
+                apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
             let bearer_token =
                 resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
             let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
@@ -196,7 +261,8 @@ async fn main() -> Result<()> {
                 .await?
             } else {
                 let db = open_local_db_with_policy(&graph).await?;
-                let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
+                let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config)?;
+                let actor = actor.as_deref();
                 let result = db
                     .load_file_as(
                         &branch,
@@ -224,6 +290,8 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_cli_config(config.as_ref())?;
+                let uri =
+                    apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
@@ -243,7 +311,8 @@ async fn main() -> Result<()> {
                     .await?
                 } else {
                     let db = open_local_db_with_policy(&graph).await?;
-                    let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
+                    let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config)?;
+                let actor = actor.as_deref();
                     db.branch_create_from_as(ReadTarget::branch(&from), &name, actor)
                         .await?;
                     BranchCreateOutput {
@@ -266,6 +335,8 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_cli_config(config.as_ref())?;
+                let uri =
+                    apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
@@ -301,6 +372,8 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_cli_config(config.as_ref())?;
+                let uri =
+                    apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
@@ -316,7 +389,8 @@ async fn main() -> Result<()> {
                     .await?
                 } else {
                     let db = open_local_db_with_policy(&graph).await?;
-                    let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
+                    let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config)?;
+                let actor = actor.as_deref();
                     db.branch_delete_as(&name, actor).await?;
                     BranchDeleteOutput {
                         uri: uri.clone(),
@@ -339,6 +413,8 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_cli_config(config.as_ref())?;
+                let uri =
+                    apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
@@ -358,7 +434,8 @@ async fn main() -> Result<()> {
                     .await?
                 } else {
                     let db = open_local_db_with_policy(&graph).await?;
-                    let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
+                    let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config)?;
+                let actor = actor.as_deref();
                     let outcome = db.branch_merge_as(&source, &into, actor).await?;
                     BranchMergeOutput {
                         source: source.clone(),
@@ -388,6 +465,8 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_cli_config(config.as_ref())?;
+                let uri =
+                    apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let uri = resolve_uri(&config, uri, target.as_deref())?;
@@ -427,6 +506,8 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_cli_config(config.as_ref())?;
+                let uri =
+                    apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let uri = resolve_uri(&config, uri, target.as_deref())?;
@@ -490,6 +571,8 @@ async fn main() -> Result<()> {
                 allow_data_loss,
             } => {
                 let config = load_cli_config(config.as_ref())?;
+                let uri =
+                    apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
@@ -514,7 +597,8 @@ async fn main() -> Result<()> {
                     .await?
                 } else {
                     let db = open_local_db_with_policy(&graph).await?;
-                    let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config);
+                    let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config)?;
+                let actor = actor.as_deref();
                     let registry = load_registry_or_report(&config, graph.selected())?;
                     let registry = (!registry.is_empty()).then_some(registry);
                     let label = graph.selected().unwrap_or(&uri).to_string();
@@ -546,6 +630,8 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_cli_config(config.as_ref())?;
+                let uri =
+                    apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let uri = resolve_uri(&config, uri, target.as_deref())?;
@@ -610,6 +696,8 @@ async fn main() -> Result<()> {
             json,
         } => {
             let config = load_cli_config(config.as_ref())?;
+            let uri =
+                apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
             let bearer_token =
                 resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
             let uri = resolve_uri(&config, uri, target.as_deref())?;
@@ -645,6 +733,8 @@ async fn main() -> Result<()> {
             table_keys,
         } => {
             let config = load_cli_config(config.as_ref())?;
+            let uri =
+                apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
             let bearer_token =
                 resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
             let uri = resolve_uri(&config, uri, target.as_deref())?;
@@ -692,6 +782,43 @@ async fn main() -> Result<()> {
             }
 
             let config = load_cli_config(config.as_ref())?;
+            // Operator aliases (RFC-007 PR 3): pure bindings to stored
+            // queries. A legacy file-alias with the same name wins during
+            // the RFC-008 window (with a warning); an alias name found
+            // only in the operator layer takes the invoke path here.
+            if let Some(alias_name) = alias.as_deref() {
+                let operator_config = crate::operator::load_operator_config()?;
+                if let Some(operator_alias) = operator_config.aliases.get(alias_name) {
+                    if config.alias(alias_name).is_ok() {
+                        eprintln!(
+                            "warning: alias '{alias_name}' is defined in both omnigraph.yaml (legacy, wins during the deprecation window) and the operator config; the legacy definition applies"
+                        );
+                    } else {
+                        // The hidden legacy-uri positional swallows the first
+                        // bare arg; an operator alias always knows its target,
+                        // so reclaim it as the first positional param.
+                        let (_, alias_args) = normalize_legacy_alias_uri(
+                            legacy_uri.clone(),
+                            true,
+                            Some(alias_name),
+                            alias_args.clone(),
+                        );
+                        let output = execute_operator_alias(
+                            &http_client,
+                            &config,
+                            alias_name,
+                            operator_alias,
+                            &alias_args,
+                            load_params_json(&params)?,
+                        )
+                        .await?;
+                        let format =
+                            resolve_read_format(&config, format, json, operator_alias.format);
+                        print_read_output(&output, format, &config)?;
+                        return Ok(());
+                    }
+                }
+            }
             let alias = resolve_alias(&config, alias.as_deref(), AliasCommand::Read)?;
             let alias_name = alias.as_ref().map(|(name, _)| *name);
             let alias_config = alias.as_ref().map(|(_, alias)| *alias);
@@ -706,6 +833,7 @@ async fn main() -> Result<()> {
             let target_name = target
                 .as_deref()
                 .or_else(|| alias_config.and_then(|alias| alias.graph.as_deref()));
+            let uri = apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target_name)?;
             let bearer_token = resolve_remote_bearer_token(&config, uri.as_deref(), target_name)?;
             let graph = resolve_cli_graph(&config, uri, target_name)?;
             let uri = graph.uri.clone();
@@ -792,6 +920,7 @@ async fn main() -> Result<()> {
             let target_name = target
                 .as_deref()
                 .or_else(|| alias_config.and_then(|alias| alias.graph.as_deref()));
+            let uri = apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target_name)?;
             let bearer_token = resolve_remote_bearer_token(&config, uri.as_deref(), target_name)?;
             let graph = resolve_cli_graph(&config, uri, target_name)?;
             let uri = graph.uri.clone();
@@ -1147,6 +1276,8 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_cli_config(config.as_ref())?;
+                let uri =
+                    apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
                 let bearer_token =
                     resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
                 let uri = resolve_uri(&config, uri, target.as_deref())?;

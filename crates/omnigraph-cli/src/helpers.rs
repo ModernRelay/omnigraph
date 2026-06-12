@@ -3,6 +3,7 @@
 //! main.rs in the modularization).
 
 use super::*;
+use crate::operator;
 
 pub(crate) fn ensure_local_graph_parent(uri: &str) -> Result<()> {
     if !uri.contains("://") {
@@ -167,18 +168,40 @@ pub(crate) async fn open_local_db_with_policy(graph: &ResolvedCliGraph) -> Resul
     }
 }
 
+/// THE actor chain (RFC-007 §D3) — every command that needs an identity
+/// resolves through this one function (one path per concern):
+/// `--as` > legacy `cli.actor` in omnigraph.yaml (RFC-008 window) >
+/// `operator.actor` in ~/.omnigraph/config.yaml > none.
+pub(crate) fn resolve_actor(
+    cli_as: Option<&str>,
+    legacy_config_actor: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(actor) = cli_as {
+        return Ok(Some(actor.to_string()));
+    }
+    if let Some(actor) = legacy_config_actor {
+        return Ok(Some(actor.to_string()));
+    }
+    Ok(operator::load_operator_config()?
+        .actor()
+        .map(str::to_string))
+}
+
 pub(crate) fn resolve_cluster_actor(cli_as: Option<&str>) -> Result<Option<String>> {
     if let Some(actor) = cli_as {
         return Ok(Some(actor.to_string()));
     }
     let config = load_config(None).wrap_err(
-        "resolving the default actor from the per-operator omnigraph.yaml (pass --as <ACTOR> to skip this lookup)",
+        "resolving the default actor from omnigraph.yaml (pass --as <ACTOR> to skip this lookup)",
     )?;
-    Ok(config.cli.actor.clone())
+    resolve_actor(None, config.cli.actor.as_deref())
 }
 
-pub(crate) fn resolve_cli_actor<'a>(cli_as: Option<&'a str>, config: &'a OmnigraphConfig) -> Option<&'a str> {
-    cli_as.or(config.cli.actor.as_deref())
+pub(crate) fn resolve_cli_actor(
+    cli_as: Option<&str>,
+    config: &OmnigraphConfig,
+) -> Result<Option<String>> {
+    resolve_actor(cli_as, config.cli.actor.as_deref())
 }
 
 pub(crate) fn resolve_policy_tests_path(context: &ResolvedPolicyContext) -> PathBuf {
@@ -198,6 +221,21 @@ pub(crate) fn resolve_remote_bearer_token(
     explicit_uri: Option<&str>,
     explicit_target: Option<&str>,
 ) -> Result<Option<String>> {
+    // The keyed hop (RFC-007 §D4, gh-host model): when the effective remote
+    // URL belongs to an operator-defined server, that server's keyed chain
+    // applies first — OMNIGRAPH_TOKEN_<NAME> env, then the 0600 credentials
+    // file. Ok(None) falls through to the legacy chain unchanged, and the
+    // keyed token is structurally scoped to its own server (§D5 rule 3):
+    // a URL matching no operator server never sees it.
+    if let Some(remote_url) = effective_remote_url(config, explicit_uri, explicit_target) {
+        let operator_config = operator::load_operator_config()?;
+        if let Some(server) = operator_config.find_server_for_url(&remote_url) {
+            if let Some(token) = operator::resolve_keyed_token(server)? {
+                return Ok(Some(token));
+            }
+        }
+    }
+
     let scoped_env =
         config.graph_bearer_token_env(explicit_uri, explicit_target, config.cli_graph_name());
     let mut env_names = Vec::new();
@@ -224,6 +262,124 @@ pub(crate) fn resolve_remote_bearer_token(
     }
 
     Ok(None)
+}
+
+/// `--server <name>` (RFC-007 PR 3): resolve an operator-defined server
+/// name (+ optional `--graph` for multi-graph servers) to the effective
+/// remote URI. The result feeds the ordinary `uri` slot, so graph
+/// resolution and the keyed-token URL match work unchanged — the flag is
+/// sugar for a URI the operator already owns. Unknown names fail loudly,
+/// listing what IS defined.
+pub(crate) fn resolve_server_flag(
+    server: Option<&str>,
+    graph: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(server) = server else {
+        return Ok(None);
+    };
+    let operator_config = operator::load_operator_config()?;
+    let Some(entry) = operator_config.servers.get(server) else {
+        let known = operator_config
+            .servers
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        color_eyre::eyre::bail!(
+            "unknown server '{server}' — servers defined in the operator config: [{known}] (add it under servers: in ~/.omnigraph/config.yaml)"
+        );
+    };
+    let base = entry.url.trim_end_matches('/');
+    Ok(Some(match graph {
+        Some(graph) => format!("{base}/graphs/{graph}"),
+        None => base.to_string(),
+    }))
+}
+
+/// Execute an OPERATOR alias (RFC-007 PR 3): a pure binding invoking a
+/// stored query by name on a named server — POST {base}/queries/{name}.
+/// Param precedence: --params > positional args > the alias's fixed
+/// params. The keyed token applies via the ordinary URL match.
+pub(crate) async fn execute_operator_alias(
+    client: &reqwest::Client,
+    config: &OmnigraphConfig,
+    alias_name: &str,
+    alias: &crate::operator::OperatorAlias,
+    alias_args: &[String],
+    explicit_params: Option<Value>,
+) -> Result<ReadOutput> {
+    let uri = resolve_server_flag(Some(&alias.server), alias.graph.as_deref())?
+        .expect("server name is present");
+    let bearer_token = resolve_remote_bearer_token(config, Some(&uri), None)?;
+
+    let mut params = serde_json::Map::new();
+    for (key, value) in &alias.params {
+        let Some(key) = key.as_str() else {
+            bail!("alias '{alias_name}': params keys must be strings");
+        };
+        params.insert(key.to_string(), serde_json::to_value(value)?);
+    }
+    if alias_args.len() > alias.args.len() {
+        bail!(
+            "alias '{alias_name}' takes {} positional arg(s) ({}), got {}",
+            alias.args.len(),
+            alias.args.join(", "),
+            alias_args.len()
+        );
+    }
+    for (name, value) in alias.args.iter().zip(alias_args) {
+        params.insert(name.clone(), parse_alias_value(value));
+    }
+    if let Some(Value::Object(explicit)) = explicit_params {
+        for (key, value) in explicit {
+            params.insert(key, value);
+        }
+    }
+
+    let body = (!params.is_empty()).then(|| serde_json::json!({ "params": params }));
+    remote_json(
+        client,
+        Method::POST,
+        remote_url(&uri, &format!("/queries/{}", alias.query)),
+        body,
+        bearer_token.as_deref(),
+    )
+    .await
+}
+
+/// Apply `--server`/`--graph` to a command's uri/target slots: exclusive
+/// with both (loud error, not silent precedence), no-op when absent.
+pub(crate) fn apply_server_flag(
+    server: Option<&str>,
+    graph: Option<&str>,
+    uri: Option<String>,
+    target: Option<&str>,
+) -> Result<Option<String>> {
+    if server.is_none() {
+        return Ok(uri);
+    }
+    if uri.is_some() || target.is_some() {
+        color_eyre::eyre::bail!(
+            "--server is exclusive with a positional URI and --target — pick one way to address the graph"
+        );
+    }
+    resolve_server_flag(server, graph)
+}
+
+/// The remote base URL a token resolution is FOR — the same scoping
+/// `graph_bearer_token_env` uses: an explicit http(s) `--uri` wins, else
+/// the config-resolved target's uri (when remote). Local URIs → None.
+fn effective_remote_url(
+    config: &OmnigraphConfig,
+    explicit_uri: Option<&str>,
+    explicit_target: Option<&str>,
+) -> Option<String> {
+    if let Some(uri) = explicit_uri {
+        return is_remote_uri(uri).then(|| uri.to_string());
+    }
+    let target = config.resolve_target_name(explicit_uri, explicit_target, config.cli_graph_name())?;
+    let uri = &config.graphs.get(target)?.uri;
+    is_remote_uri(uri).then(|| uri.clone())
 }
 
 pub(crate) fn build_http_client() -> Result<reqwest::Client> {
@@ -460,6 +616,9 @@ pub(crate) fn merged_params_json(
     }
 }
 
+/// The format cascade (RFC-007 §D3): `--json` > `--format` > alias format >
+/// legacy `cli.output_format` (RFC-008 window) > operator `defaults.output`
+/// > table.
 pub(crate) fn resolve_read_format(
     config: &OmnigraphConfig,
     cli_format: Option<ReadOutputFormat>,
@@ -467,12 +626,17 @@ pub(crate) fn resolve_read_format(
     alias_format: Option<ReadOutputFormat>,
 ) -> ReadOutputFormat {
     if json {
-        ReadOutputFormat::Json
-    } else {
-        cli_format
-            .or(alias_format)
-            .unwrap_or_else(|| config.cli_output_format())
+        return ReadOutputFormat::Json;
     }
+    cli_format
+        .or(alias_format)
+        .or(config.cli.output_format)
+        .or_else(|| {
+            operator::load_operator_config()
+                .ok()
+                .and_then(|operator| operator.output())
+        })
+        .unwrap_or_default()
 }
 
 pub(crate) fn resolve_alias<'a>(
@@ -513,69 +677,6 @@ pub(crate) fn normalize_legacy_alias_uri(
     (Some(candidate), alias_args)
 }
 
-pub(crate) fn scaffold_config_if_missing(uri: &str) -> Result<()> {
-    let path = inferred_config_path(uri)?;
-    if path.exists() {
-        return Ok(());
-    }
-
-    fs::write(
-        path,
-        format!(
-            "\
-project:
-  name: Omnigraph Project
-
-graphs:
-  local:
-    uri: {}
-    # bearer_token_env: OMNIGRAPH_BEARER_TOKEN
-
-server:
-  graph: local
-  bind: 127.0.0.1:8080
-
-cli:
-  graph: local
-  branch: main
-  output_format: table
-  table_max_column_width: 80
-  table_cell_layout: truncate
-
-query:
-  roots:
-    - queries
-    - .
-
-aliases:
-  # owner:
-  #   command: read
-  #   query: context.gq
-  #   name: decision_owner
-  #   args: [slug]
-  #   graph: local
-  #   branch: main
-  #   format: kv
-  #
-  # attach_trace:
-  #   command: change
-  #   query: mutations.gq
-  #   name: attach_trace
-  #   args: [decision_slug, trace_slug]
-  #   graph: local
-  #   branch: main
-
-# auth:
-#   env_file: ./.env.omni
-#
-# policy:
-#   file: ./policy.yaml
-",
-            yaml_string(uri),
-        ),
-    )?;
-    Ok(())
-}
 
 pub(crate) fn inferred_config_path(uri: &str) -> Result<PathBuf> {
     if uri.contains("://") {
@@ -935,7 +1036,8 @@ pub(crate) async fn execute_change(
     let (selected_name, query_params) = select_named_query(query_source, query_name)?;
     let params = query_params_from_json(&query_params, params_json)?;
     let db = open_local_db_with_policy(graph).await?;
-    let actor = resolve_cli_actor(cli_as_actor, config);
+    let actor = resolve_cli_actor(cli_as_actor, config)?;
+    let actor = actor.as_deref();
     let result = db
         .mutate_as(branch, query_source, &selected_name, &params, actor)
         .await?;

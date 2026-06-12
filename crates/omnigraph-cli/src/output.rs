@@ -716,10 +716,7 @@ pub(crate) fn print_read_output(
         render_read(
             output,
             format,
-            &ReadRenderOptions {
-                max_column_width: config.table_max_column_width(),
-                cell_layout: config.table_cell_layout(),
-            },
+            &resolve_table_render_options(config),
         )?
     );
     Ok(())
@@ -827,4 +824,67 @@ pub(crate) struct QueriesListItem {
 #[derive(serde::Serialize)]
 pub(crate) struct QueriesListOutput {
     pub(crate) queries: Vec<QueriesListItem>,
+}
+
+pub(crate) fn finish_login(
+    server: &str,
+    credentials_path: &std::path::Path,
+    declared: bool,
+    json: bool,
+) -> Result<()> {
+    if json {
+        print_json(&serde_json::json!({
+            "server": server,
+            "credentials_path": credentials_path.display().to_string(),
+            "declared": declared,
+        }))?;
+    } else {
+        println!(
+            "stored credential for '{server}' in {}",
+            credentials_path.display()
+        );
+    }
+    if !declared {
+        eprintln!(
+            "note: '{server}' is not declared under servers: in the operator config; the token applies once you add `servers:\n  {server}:\n    url: <server url>` to ~/.omnigraph/config.yaml"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn finish_logout(
+    server: &str,
+    credentials_path: &std::path::Path,
+    json: bool,
+) -> Result<()> {
+    if json {
+        print_json(&serde_json::json!({
+            "server": server,
+            "credentials_path": credentials_path.display().to_string(),
+        }))?;
+    } else {
+        println!(
+            "removed credential for '{server}' from {}",
+            credentials_path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Table prefs cascade (RFC-007/008): legacy cli.table_* (window) >
+/// operator defaults.table_* > built-in.
+pub(crate) fn resolve_table_render_options(config: &OmnigraphConfig) -> ReadRenderOptions {
+    let operator = crate::operator::load_operator_config().unwrap_or_default();
+    ReadRenderOptions {
+        max_column_width: config
+            .cli
+            .table_max_column_width
+            .or(operator.defaults.table_max_column_width)
+            .unwrap_or(80),
+        cell_layout: config
+            .cli
+            .table_cell_layout
+            .or(operator.defaults.table_cell_layout)
+            .unwrap_or_default(),
+    }
 }

@@ -526,19 +526,49 @@ pub fn default_config_path() -> PathBuf {
     PathBuf::from(DEFAULT_CONFIG_FILE)
 }
 
+/// `OMNIGRAPH_CONFIG` env var: a first-class stand-in for `--config`, one
+/// name with one meaning in both binaries (the container entrypoint already
+/// uses it for the server; RFC-007 §D1 extends it to the CLI).
+pub const CONFIG_PATH_ENV: &str = "OMNIGRAPH_CONFIG";
+
+/// RFC-008 stage 4 — opt-in strict mode: when set, loading a legacy
+/// `omnigraph.yaml` is a hard error instead of a warning. For teams that
+/// finished migrating and want regressions caught (a stray legacy file
+/// would otherwise silently outrank operator config during the window).
+/// The rehearsal for stage 5's removal.
+pub const NO_LEGACY_CONFIG_ENV: &str = "OMNIGRAPH_NO_LEGACY_CONFIG";
+
 pub fn load_config(config_path: Option<&PathBuf>) -> Result<OmnigraphConfig> {
-    load_config_in(&env::current_dir()?, config_path)
+    let env_path = env::var_os(CONFIG_PATH_ENV).map(PathBuf::from);
+    let strict = env::var_os(NO_LEGACY_CONFIG_ENV).is_some();
+    load_config_in(&env::current_dir()?, config_path, env_path.as_ref(), strict)
 }
 
-fn load_config_in(cwd: &Path, config_path: Option<&PathBuf>) -> Result<OmnigraphConfig> {
-    let explicit_path = config_path.cloned();
+fn load_config_in(
+    cwd: &Path,
+    config_path: Option<&PathBuf>,
+    env_path: Option<&PathBuf>,
+    strict_no_legacy: bool,
+) -> Result<OmnigraphConfig> {
+    // Precedence: explicit --config flag > $OMNIGRAPH_CONFIG > ./omnigraph.yaml.
+    let explicit_path = config_path.or(env_path).cloned();
     let config_path = explicit_path.or_else(|| {
         let default_path = cwd.join(DEFAULT_CONFIG_FILE);
         default_path.exists().then_some(default_path)
     });
 
     let mut config = if let Some(path) = &config_path {
-        serde_yaml::from_str::<OmnigraphConfig>(&fs::read_to_string(path)?)?
+        if strict_no_legacy {
+            // Strict refuses the FILE, not its absence — flag-less
+            // invocations on migrated setups keep working.
+            bail!(
+                "legacy config '{}' refused: {NO_LEGACY_CONFIG_ENV} is set (RFC-008 strict mode); run `omnigraph config migrate`, then remove the file — or unset the variable",
+                path.display()
+            );
+        }
+        let text = fs::read_to_string(path)?;
+        warn_yaml_deprecation_once(path, &text);
+        serde_yaml::from_str::<OmnigraphConfig>(&text)?
     } else {
         OmnigraphConfig::default()
     };
@@ -550,6 +580,74 @@ fn load_config_in(cwd: &Path, config_path: Option<&PathBuf>) -> Result<Omnigraph
     };
 
     Ok(config)
+}
+
+/// RFC-008 stage 1: suppress the legacy-config deprecation warning
+/// (one process), for CI logs during the deprecation window.
+pub const SUPPRESS_YAML_DEPRECATION_ENV: &str = "OMNIGRAPH_SUPPRESS_YAML_DEPRECATION";
+
+/// RFC-008's migration map (the "Where every key goes" table), applied to
+/// the keys actually present in a loaded file — never a generic banner.
+/// Keys are `(yaml pointer, destination)`; the pointer is matched against
+/// the file's real top-level/nested keys.
+const YAML_DEPRECATION_MAP: &[(&str, &str)] = &[
+    ("graphs", "cluster.yaml `graphs:` (team surface) — or flags/env for the zero-config tier"),
+    ("queries", "the cluster catalog (`.gq` discovery in cluster.yaml)"),
+    ("policy", "cluster.yaml `policies:` + `applies_to` bindings"),
+    ("server", "flags/env (`--bind`); meaningless under cluster boot"),
+    ("auth", "the operator credentials chain (`omnigraph login <server>`)"),
+    ("aliases", "operator `aliases:` (bindings) + catalog stored queries (content)"),
+    ("query", "obsolete — cluster query discovery replaced `query.roots`"),
+    ("project", "cluster.yaml `metadata.name`"),
+    ("cli.actor", "`operator.actor` in ~/.omnigraph/config.yaml"),
+    ("cli.output_format", "`defaults.output` in ~/.omnigraph/config.yaml"),
+    ("cli.table_max_column_width", "`defaults.table_max_column_width` in ~/.omnigraph/config.yaml"),
+    ("cli.table_cell_layout", "`defaults.table_cell_layout` in ~/.omnigraph/config.yaml"),
+    ("cli.graph", "explicit `--target`/`--server` (no operator default-target yet)"),
+    ("cli.branch", "explicit `--branch`"),
+];
+
+/// Emit the per-key deprecation block once per process when a legacy
+/// `omnigraph.yaml` is actually loaded. `omnigraph config migrate`
+/// produces the split these lines describe.
+fn warn_yaml_deprecation_once(path: &Path, text: &str) {
+    static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if env::var_os(SUPPRESS_YAML_DEPRECATION_ENV).is_some() {
+        return;
+    }
+    let lines = yaml_deprecation_lines(text);
+    if lines.is_empty() {
+        return;
+    }
+    WARNED.get_or_init(|| {
+        eprintln!(
+            "warning: '{}' is deprecated (RFC-008) — its keys have new homes; run `omnigraph config migrate` for the split, set {SUPPRESS_YAML_DEPRECATION_ENV}=1 to silence:",
+            path.display()
+        );
+        for line in &lines {
+            eprintln!("  {line}");
+        }
+    });
+}
+
+fn yaml_deprecation_lines(text: &str) -> Vec<String> {
+    let Ok(mapping) = serde_yaml::from_str::<serde_yaml::Mapping>(text) else {
+        return Vec::new();
+    };
+    let present = |pointer: &str| -> bool {
+        match pointer.split_once('.') {
+            None => mapping.contains_key(pointer),
+            Some((outer, inner)) => mapping
+                .get(outer)
+                .and_then(|value| value.as_mapping())
+                .is_some_and(|nested| nested.contains_key(inner)),
+        }
+    };
+    YAML_DEPRECATION_MAP
+        .iter()
+        .filter(|(pointer, _)| present(pointer))
+        .map(|(pointer, destination)| format!("`{pointer}` -> {destination}"))
+        .collect()
 }
 
 fn absolute_base_dir(cwd: &Path, path: &Path) -> Result<PathBuf> {
@@ -576,6 +674,63 @@ mod tests {
     };
 
     #[test]
+    fn env_config_path_stands_in_for_the_flag_but_loses_to_it() {
+        let temp = tempdir().unwrap();
+        let flag_path = temp.path().join("flag.yaml");
+        let env_path = temp.path().join("env.yaml");
+        fs::write(&flag_path, "cli:\n  actor: act-flag\n").unwrap();
+        fs::write(&env_path, "cli:\n  actor: act-env\n").unwrap();
+
+        // $OMNIGRAPH_CONFIG used when no flag…
+        let config = load_config_in(temp.path(), None, Some(&env_path), false).unwrap();
+        assert_eq!(config.cli.actor.as_deref(), Some("act-env"));
+
+        // …loses to an explicit --config…
+        let config = load_config_in(temp.path(), Some(&flag_path), Some(&env_path), false).unwrap();
+        assert_eq!(config.cli.actor.as_deref(), Some("act-flag"));
+
+        // …and beats the cwd default file.
+        fs::write(temp.path().join("omnigraph.yaml"), "cli:\n  actor: act-cwd\n").unwrap();
+        let config = load_config_in(temp.path(), None, Some(&env_path), false).unwrap();
+        assert_eq!(config.cli.actor.as_deref(), Some("act-env"));
+    }
+
+    #[test]
+    fn strict_mode_refuses_the_file_not_its_absence() {
+        let temp = tempdir().unwrap();
+        // No file: strict mode changes nothing (defaults load).
+        let config = load_config_in(temp.path(), None, None, true).unwrap();
+        assert!(config.cli.actor.is_none());
+
+        // File present: strict refuses with the migrate pointer.
+        fs::write(temp.path().join("omnigraph.yaml"), "cli:\n  actor: a\n").unwrap();
+        let err = load_config_in(temp.path(), None, None, true).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("OMNIGRAPH_NO_LEGACY_CONFIG") && message.contains("config migrate"),
+            "{message}"
+        );
+        // Without strict, the same file loads.
+        assert!(load_config_in(temp.path(), None, None, false).is_ok());
+    }
+
+    #[test]
+    fn yaml_deprecation_lines_name_present_keys_only() {
+        let lines = super::yaml_deprecation_lines(
+            "graphs:\n  g:\n    uri: /tmp/x\ncli:\n  actor: a\n  branch: main\n",
+        );
+        let joined = lines.join("\n");
+        assert!(joined.contains("`graphs` ->"), "{joined}");
+        assert!(joined.contains("`cli.actor` -> `operator.actor`"), "{joined}");
+        assert!(joined.contains("`cli.branch` ->"), "{joined}");
+        assert!(!joined.contains("`aliases`"), "{joined}");
+        assert!(!joined.contains("`cli.output_format`"), "{joined}");
+
+        assert!(super::yaml_deprecation_lines("").is_empty());
+        assert!(super::yaml_deprecation_lines("not: [valid").is_empty());
+    }
+
+    #[test]
     fn load_config_reads_yaml_defaults_from_current_dir() {
         let temp = tempdir().unwrap();
         fs::write(
@@ -598,7 +753,7 @@ policy: {}
         )
         .unwrap();
 
-        let config = load_config_in(temp.path(), None).unwrap();
+        let config = load_config_in(temp.path(), None, None, false).unwrap();
         assert_eq!(config.cli_graph_name(), Some("local"));
         assert_eq!(config.cli_branch(), "main");
         assert_eq!(config.cli_output_format(), ReadOutputFormat::Kv);
@@ -633,7 +788,7 @@ policy: {}
         )
         .unwrap();
 
-        let config = load_config_in(&child, None).unwrap();
+        let config = load_config_in(&child, None, None, false).unwrap();
         assert!(config.graphs.is_empty());
     }
 
@@ -657,7 +812,7 @@ policy: {}
             "graphs:\n  local:\n    uri: ./demo.omni\n",
         )
         .unwrap();
-        let config = load_config_in(temp.path(), None).unwrap();
+        let config = load_config_in(temp.path(), None, None, false).unwrap();
 
         // A known graph passes through unchanged.
         assert_eq!(config.resolve_graph_selection(Some("local")).unwrap(), Some("local"));
@@ -680,7 +835,7 @@ policy: {}
             "graphs:\n  local:\n    uri: ./demo.omni\npolicy:\n  file: ./top.yaml\n",
         )
         .unwrap();
-        let incoherent = load_config_in(temp2.path(), None).unwrap();
+        let incoherent = load_config_in(temp2.path(), None, None, false).unwrap();
         let err = incoherent
             .resolve_graph_selection(Some("local"))
             .unwrap_err()
@@ -705,7 +860,7 @@ policy: {}
              server:\n  graph: local\ncli:\n  graph: prod\n",
         )
         .unwrap();
-        let config = load_config_in(temp.path(), None).unwrap();
+        let config = load_config_in(temp.path(), None, None, false).unwrap();
         assert_eq!(
             config.resolve_policy_tooling_graph_selection().unwrap(),
             Some("prod")
@@ -717,7 +872,7 @@ policy: {}
             "graphs:\n  local:\n    uri: ./local.omni\nserver:\n  graph: local\n",
         )
         .unwrap();
-        let config = load_config_in(temp.path(), None).unwrap();
+        let config = load_config_in(temp.path(), None, None, false).unwrap();
         assert_eq!(
             config.resolve_policy_tooling_graph_selection().unwrap(),
             Some("local")
@@ -725,7 +880,7 @@ policy: {}
 
         let temp = tempdir().unwrap();
         fs::write(temp.path().join("omnigraph.yaml"), "policy: {}\n").unwrap();
-        let config = load_config_in(temp.path(), None).unwrap();
+        let config = load_config_in(temp.path(), None, None, false).unwrap();
         assert_eq!(config.resolve_policy_tooling_graph_selection().unwrap(), None);
 
         let temp = tempdir().unwrap();
@@ -734,7 +889,7 @@ policy: {}
             "graphs:\n  local:\n    uri: ./local.omni\nserver:\n  graph: ghost\n",
         )
         .unwrap();
-        let config = load_config_in(temp.path(), None).unwrap();
+        let config = load_config_in(temp.path(), None, None, false).unwrap();
         let err = config
             .resolve_policy_tooling_graph_selection()
             .unwrap_err()
@@ -760,7 +915,7 @@ policy: {}
         )
         .unwrap();
 
-        let config = load_config_in(temp.path(), None).unwrap();
+        let config = load_config_in(temp.path(), None, None, false).unwrap();
         let resolved = config.resolve_query_path(Path::new("test.gq")).unwrap();
         assert_eq!(resolved, temp.path().join("queries").join("test.gq"));
     }
@@ -777,7 +932,7 @@ policy: {}
         fs::write(ambient_dir.join("local.gq"), "query ambient { return {} }").unwrap();
 
         let config =
-            load_config_in(&ambient_dir, Some(&config_dir.join("omnigraph.yaml"))).unwrap();
+            load_config_in(&ambient_dir, Some(&config_dir.join("omnigraph.yaml")), None, false).unwrap();
         let resolved = config.resolve_query_path(Path::new("local.gq")).unwrap();
 
         assert_eq!(resolved, config_dir.join("local.gq"));
@@ -807,7 +962,7 @@ queries:
         )
         .unwrap();
 
-        let config = load_config_in(temp.path(), None).unwrap();
+        let config = load_config_in(temp.path(), None, None, false).unwrap();
 
         // Per-graph registry (multi-graph mode).
         let prod = config.target_query_entries("prod").unwrap();
@@ -848,7 +1003,7 @@ queries:
              policy:\n      file: ./prod.yaml\n  bare:\n    uri: s3://b/bare\n",
         )
         .unwrap();
-        let config = load_config_in(temp.path(), None).unwrap();
+        let config = load_config_in(temp.path(), None, None, false).unwrap();
 
         // Named graph with its own policy → per-graph (not top-level).
         assert!(
@@ -884,7 +1039,7 @@ queries:
         )
         .unwrap();
 
-        let config = load_config_in(temp.path(), None).unwrap();
+        let config = load_config_in(temp.path(), None, None, false).unwrap();
         // Additive: no `queries:` anywhere → empty registries everywhere.
         assert!(config.query_entries().is_empty());
         assert!(
@@ -904,7 +1059,7 @@ queries:
         )
         .unwrap();
 
-        let config = load_config_in(temp.path(), None).unwrap();
+        let config = load_config_in(temp.path(), None, None, false).unwrap();
         assert_eq!(
             config.resolve_policy_file().unwrap(),
             temp.path().join("policy.yaml")
@@ -927,7 +1082,7 @@ cli:
         )
         .unwrap();
 
-        let config = load_config_in(temp.path(), None).unwrap();
+        let config = load_config_in(temp.path(), None, None, false).unwrap();
         assert_eq!(
             config.graph_bearer_token_env(
                 Some("https://override.example.com"),

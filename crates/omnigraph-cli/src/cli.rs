@@ -21,6 +21,17 @@ pub(crate) struct Cli {
     #[arg(long = "as", global = true, value_name = "ACTOR")]
     pub(crate) as_actor: Option<String>,
 
+    /// Target an operator-defined server by name (RFC-007): resolves to
+    /// its `url` from `servers:` in ~/.omnigraph/config.yaml. Exclusive
+    /// with a positional URI or `--target`.
+    #[arg(long, global = true, value_name = "NAME")]
+    pub(crate) server: Option<String>,
+
+    /// Graph id on a multi-graph `--server` (appends `/graphs/<id>` to
+    /// the server url). Requires --server.
+    #[arg(long, global = true, value_name = "GRAPH_ID", requires = "server")]
+    pub(crate) graph: Option<String>,
+
     #[command(subcommand)]
     pub(crate) command: Command,
 }
@@ -29,6 +40,34 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     /// Print the CLI version
     Version,
+    /// Store a bearer token for a named server in ~/.omnigraph/credentials
+    /// (0600). Token from --token or one line on stdin:
+    /// `echo $TOKEN | omnigraph login prod`. The keyed token applies to
+    /// requests whose URL matches the server's `url` in the operator
+    /// config's `servers:` map.
+    Login {
+        /// Server name (keys the credential; declare its url under
+        /// `servers:` in ~/.omnigraph/config.yaml)
+        name: String,
+        /// The token. Prefer piping via stdin over this flag (shell
+        /// history).
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Legacy-config tooling (RFC-008): split omnigraph.yaml into its
+    /// two destinations.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+    /// Remove a named server's stored credential. Idempotent.
+    Logout {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Generate, clean, or refresh explicit seed embeddings
     Embed(EmbedArgs),
     /// Initialize a new graph from a schema
@@ -648,3 +687,20 @@ impl CliLoadMode {
     }
 }
 
+#[derive(Debug, Subcommand)]
+pub(crate) enum ConfigCommand {
+    /// Propose (and with --write, apply) the RFC-008 split of a legacy
+    /// omnigraph.yaml: team half -> a ready-to-review cluster.yaml,
+    /// personal half -> ~/.omnigraph/config.yaml (key-level merge,
+    /// existing entries always win). Touches nothing without --write.
+    Migrate {
+        /// Path to the legacy omnigraph.yaml (default: ./omnigraph.yaml)
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Apply the split instead of only printing it
+        #[arg(long)]
+        write: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}

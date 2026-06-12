@@ -36,7 +36,8 @@ fn init_creates_graph_successfully_on_missing_local_directory() {
     assert!(stdout.contains("initialized"));
     assert!(graph.join("_schema.pg").exists());
     assert!(graph.join("__manifest").exists());
-    assert!(temp.path().join("omnigraph.yaml").exists());
+    // RFC-008 stage 3: init no longer scaffolds the legacy config file.
+    assert!(!temp.path().join("omnigraph.yaml").exists());
 }
 
 #[test]
@@ -497,4 +498,151 @@ fn graphs_list_against_local_uri_errors_with_remote_only_message() {
         stderr.contains("remote multi-graph server URL"),
         "expected 'remote multi-graph server URL' rejection in stderr; got:\n{stderr}"
     );
+}
+
+/// RFC-008 stage 1: loading a legacy omnigraph.yaml emits the per-key
+/// deprecation block (the migration map applied to THIS file), suppressible
+/// via OMNIGRAPH_SUPPRESS_YAML_DEPRECATION.
+#[test]
+fn legacy_config_load_warns_per_key_and_suppression_silences() {
+    let temp = tempdir().unwrap();
+    fs::write(
+        temp.path().join("omnigraph.yaml"),
+        "cli:\n  actor: act-x\ngraphs:\n  g:\n    uri: /tmp/never-opened\n",
+    )
+    .unwrap();
+
+    // `graphs list --json` loads the config and exits without touching the
+    // graph URI.
+    let output = cli()
+        .current_dir(temp.path())
+        .arg("graphs")
+        .arg("list")
+        .arg("--json")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("deprecated (RFC-008)") && stderr.contains("`cli.actor` -> `operator.actor`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("config migrate"), "{stderr}");
+
+    let output = cli()
+        .current_dir(temp.path())
+        .env("OMNIGRAPH_SUPPRESS_YAML_DEPRECATION", "1")
+        .arg("graphs")
+        .arg("list")
+        .arg("--json")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("deprecated (RFC-008)"), "{stderr}");
+}
+
+/// RFC-008 stage 2: `config migrate` proposes the split read-only, applies
+/// it with --write (operator merge never clobbers; cluster.yaml emitted),
+/// and a second --write is idempotent.
+#[test]
+fn config_migrate_splits_legacy_config() {
+    let temp = tempdir().unwrap();
+    fs::write(
+        temp.path().join("omnigraph.yaml"),
+        "graphs:\n  prod:\n    uri: https://graph.example.com\n    bearer_token_env: PROD_TOKEN\ncli:\n  actor: act-me\n  output_format: json\npolicy:\n  file: ./top.policy.yaml\n",
+    )
+    .unwrap();
+    let operator_home = tempfile::tempdir().unwrap();
+    fs::write(
+        operator_home.path().join("config.yaml"),
+        "operator:\n  actor: act-existing\n",
+    )
+    .unwrap();
+
+    // Read-only proposal: names both halves, writes nothing.
+    let output = cli()
+        .current_dir(temp.path())
+        .env("OMNIGRAPH_HOME", operator_home.path())
+        .env("OMNIGRAPH_SUPPRESS_YAML_DEPRECATION", "1")
+        .arg("config")
+        .arg("migrate")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("team half -> cluster.yaml"), "{stdout}");
+    assert!(stdout.contains("operator.actor: act-me"), "{stdout}");
+    assert!(stdout.contains("omnigraph login prod"), "{stdout}");
+    assert!(!temp.path().join("cluster.yaml").exists());
+
+    // --write: cluster.yaml lands; the existing operator actor is KEPT.
+    let output = cli()
+        .current_dir(temp.path())
+        .env("OMNIGRAPH_HOME", operator_home.path())
+        .env("OMNIGRAPH_SUPPRESS_YAML_DEPRECATION", "1")
+        .arg("config")
+        .arg("migrate")
+        .arg("--write")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let cluster = fs::read_to_string(temp.path().join("cluster.yaml")).unwrap();
+    assert!(cluster.contains("version: 1") && cluster.contains("  prod:"), "{cluster}");
+    let operator_text =
+        fs::read_to_string(operator_home.path().join("config.yaml")).unwrap();
+    assert!(operator_text.contains("act-existing"), "{operator_text}");
+    assert!(!operator_text.contains("act-me"), "existing keys win: {operator_text}");
+    assert!(operator_text.contains("output: json"), "{operator_text}");
+    assert!(
+        operator_text.contains("url: https://graph.example.com"),
+        "{operator_text}"
+    );
+
+    // Second --write: cluster.yaml exists -> proposal file, no clobber.
+    let output = cli()
+        .current_dir(temp.path())
+        .env("OMNIGRAPH_HOME", operator_home.path())
+        .env("OMNIGRAPH_SUPPRESS_YAML_DEPRECATION", "1")
+        .arg("config")
+        .arg("migrate")
+        .arg("--write")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(temp.path().join("cluster.yaml.proposed").exists());
+}
+
+/// RFC-008 stage 4: OMNIGRAPH_NO_LEGACY_CONFIG refuses a present legacy
+/// file (pointing at config migrate) but changes nothing on migrated
+/// setups with no file.
+#[test]
+fn strict_mode_refuses_legacy_file_but_not_its_absence() {
+    let temp = tempdir().unwrap();
+    fs::write(temp.path().join("omnigraph.yaml"), "cli:\n  actor: a\n").unwrap();
+    let output = cli()
+        .current_dir(temp.path())
+        .env("OMNIGRAPH_NO_LEGACY_CONFIG", "1")
+        .arg("graphs")
+        .arg("list")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("OMNIGRAPH_NO_LEGACY_CONFIG") && stderr.contains("config migrate"),
+        "{stderr}"
+    );
+
+    // Migrated setup (no file): strict mode is a no-op — a config-loading
+    // command that tolerates empty defaults succeeds.
+    let clean = tempdir().unwrap();
+    let output = cli()
+        .current_dir(clean.path())
+        .env("OMNIGRAPH_NO_LEGACY_CONFIG", "1")
+        .arg("queries")
+        .arg("list")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
 }

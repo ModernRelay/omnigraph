@@ -2,13 +2,13 @@
 
 A reference for the `omnigraph` binary's command surface and `omnigraph.yaml` schema. For a quick-start guide, see [cli.md](cli.md).
 
-Top-level command families and subcommands. Graph-targeting commands accept either a positional `URI`, `--uri`, or a `--target <name>` resolved against `omnigraph.yaml`; `cluster` commands use `--config <dir>`.
+Top-level command families and subcommands. Graph-targeting commands accept a positional `URI`, `--uri`, a `--target <name>` resolved against `omnigraph.yaml`, or `--server <name>` (an operator-defined server from `~/.omnigraph/config.yaml`, optionally with `--graph <id>` for multi-graph servers; exclusive with the other forms); `cluster` commands use `--config <dir>`.
 
 ## Top-level commands
 
 | Command | Purpose |
 |---|---|
-| `init` | `--schema <pg>` → initialize a graph (also scaffolds `omnigraph.yaml` if missing) |
+| `init` | `--schema <pg>` → initialize a graph (no longer scaffolds `omnigraph.yaml` — RFC-008; start cluster configs from the [cluster.md](cluster.md) quick-start or `config migrate`) |
 | `load` | bulk load a branch, local or remote (`--mode overwrite\|append\|merge` is **required** — overwrite is destructive, so there is no default). Without `--from` the target branch must exist; `--from <base>` forks a missing `--branch` from `<base>` first |
 | `ingest` | deprecated alias of `load --from <base>` (defaults: `--from main --mode merge`); prints a one-line warning to stderr |
 | `query` (alias: `read`) | run named read query; source via `--query <path>`, `-e`/`--query-string <GQ>`, or `--alias <name>` (exactly one). `read` is the deprecated previous name and prints a one-line warning to stderr |
@@ -19,6 +19,7 @@ Top-level command families and subcommands. Graph-targeting commands accept eith
 | `commit list \| show` | inspect commit graph |
 | `schema plan \| apply \| show (alias: get)` | migrations |
 | `lint` (alias: `check`) | offline / graph-backed query validation. Replaces `query lint` / `query check`, which are kept as deprecated argv-level shims that print a one-line warning and rewrite to `omnigraph lint` |
+| `config migrate` | propose (or `--write`: apply) the RFC-008 split of a legacy `omnigraph.yaml` — team half → ready-to-review `cluster.yaml`, personal half → `~/.omnigraph/config.yaml` (key-level merge, existing entries win), plus dropped-key reasons and manual steps |
 | `cluster validate \| plan \| apply \| approve \| status \| refresh \| import \| force-unlock` | declarative cluster control plane. `validate` checks a local `cluster.yaml` folder and referenced schema/query/policy files; `plan` diffs it against local JSON state at `__cluster/state.json`, annotates dispositions, and embeds real schema-migration previews; `apply` converges the cluster — stored-query/policy catalog writes (content-addressed under `__cluster/resources/`), graph creates, schema updates (soft drops only; `--as` records the actor), and graph deletes behind a digest-bound approval from `cluster approve <resource> --as <actor>` (`apply`/`approve` default the actor from the per-operator `omnigraph.yaml`'s `cli.actor` when `--as` is omitted; nothing else in that file affects cluster commands); what apply converges is what an `omnigraph-server --cluster <dir>` deployment serves on its next restart (omnigraph.yaml deployments are unaffected); `status` reads the state ledger; `refresh`/`import` explicitly update local JSON state from read-only graph observations; `force-unlock <LOCK_ID>` manually removes a held local state lock by exact id |
 | `optimize` | non-destructive Lance compaction (skips tables with `Blob` columns or uncovered drift; `--json` reports `skipped`) |
 | `repair [--confirm] [--force]` | preview or explicitly publish uncovered manifest/head drift. `--confirm` heals verified maintenance drift and exits non-zero if suspicious/unverifiable drift is refused; `--force --confirm` publishes suspicious/unverifiable drift after operator review |
@@ -27,7 +28,90 @@ Top-level command families and subcommands. Graph-targeting commands accept eith
 | `policy validate \| test \| explain` | Cedar tooling. Selects `cli.graph`, else `server.graph`, else top-level `policy.file` |
 | `version` / `-v` | print `omnigraph 0.3.x` |
 
-## `omnigraph.yaml` schema
+## Config surfaces
+
+Two config surfaces with single owners (RFC-007/RFC-008), plus a zero-config
+tier:
+
+| Surface | Owner | Location | Declares |
+|---|---|---|---|
+| Cluster config | the team, in a repo | `cluster.yaml` + checkout ([cluster-config.md](cluster-config.md)) | what the system **is**: graphs, schemas, queries, policies, storage |
+| Operator config | one person | `~/.omnigraph/config.yaml` (override dir with `$OMNIGRAPH_HOME`) | who **I** am: identity, ergonomics |
+| Flags / env | per invocation | — | everything, explicitly |
+
+`omnigraph.yaml` (below) is the legacy combined file — fully supported
+today, slated for staged deprecation (RFC-008); its keys' future homes are
+listed there.
+
+### `~/.omnigraph/config.yaml` (operator)
+
+```yaml
+operator:
+  actor: act-andrew     # default identity for every --as cascade:
+                        #   --as > legacy cli.actor > operator.actor > none
+servers:                # operator-owned endpoints; names key the credentials
+  prod:
+    url: https://graph.example.com     # no tokens in this file, ever
+defaults:
+  output: table         # read format default, below --json/--format/alias/legacy
+```
+
+Absent file = empty layer. Unknown keys warn and load (a file written for a
+newer CLI works on an older one). `$OMNIGRAPH_CONFIG=<path>` stands in for
+`--config` (the flag wins) in both the CLI and the server.
+
+#### Credentials keyed by server name
+
+`omnigraph login <name>` stores a bearer token in
+`~/.omnigraph/credentials` (created `0600`; group/world-readable files are
+refused). Token from `--token`, or — preferred, keeps it out of shell
+history — one line on stdin: `echo $TOKEN | omnigraph login prod`.
+`omnigraph logout <name>` removes it (idempotent).
+
+#### Operator aliases — bindings, not content
+
+An operator alias is a personal name for *invoking a stored query on a
+named server* — it carries no query content (the stored query in the
+catalog is the team's contract; the alias, its defaults, and its name are
+yours):
+
+```yaml
+aliases:
+  triage:
+    server: intel-dev        # names an entry under servers:
+    graph: spike             # optional (multi-graph servers)
+    query: weekly_triage     # the STORED query's name — never a file
+    args: [since]            # positional args -> params, in order
+    params: { limit: 20 }    # fixed defaults; positionals/--params win
+    format: table
+```
+
+`omnigraph query --alias triage 2026-06-01` invokes
+`POST <server>/graphs/spike/queries/weekly_triage` with the keyed
+credential. A legacy `omnigraph.yaml` alias with the same name wins during
+the deprecation window (with a warning).
+
+A remote command whose URL prefix-matches an operator server's `url` (the
+`gh` host model — no flags needed) resolves its token through:
+
+| Order | Source |
+|---|---|
+| 1 | `OMNIGRAPH_TOKEN_<NAME>` env (`prod` → `OMNIGRAPH_TOKEN_PROD`) |
+| 2 | `[<name>]` section in `~/.omnigraph/credentials` |
+| 3 | the legacy chain unchanged (`bearer_token_env` → `OMNIGRAPH_BEARER_TOKEN` → `auth.env_file`) |
+
+A token is only ever sent to the server it is keyed to: URLs matching no
+operator server use the legacy chain alone.
+
+## `omnigraph.yaml` schema (legacy combined file)
+
+> **Deprecated (RFC-008).** Loading this file prints a per-key notice
+> naming each present key's new home (suppress in CI with
+> `OMNIGRAPH_SUPPRESS_YAML_DEPRECATION=1`); `omnigraph config migrate`
+> produces the split. The file keeps working through the deprecation
+> window. Migrated teams can set `OMNIGRAPH_NO_LEGACY_CONFIG=1` to turn
+> any legacy-file load into a hard error (regression guard; the file's
+> absence is always fine).
 
 ```yaml
 project: { name }

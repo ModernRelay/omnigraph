@@ -792,6 +792,25 @@ mod tests {
         }
     }
 
+    /// Regression for the write_text_if_absent buffering bug, via the
+    /// `storage_for_uri` + `file://` construction path and a multi-thread
+    /// runtime (complements `local_write_text_if_absent_is_read_visible_-
+    /// on_return`, which uses the direct constructor and plain paths): a
+    /// reader immediately after Ok(true) must never see the created file
+    /// empty or short.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_text_if_absent_is_read_consistent_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = storage_for_uri(&format!("file://{}", dir.path().display())).unwrap();
+        let payload = "x".repeat(64 * 1024);
+        for i in 0..200 {
+            let uri = format!("file://{}/f{}.json", dir.path().display(), i);
+            assert!(adapter.write_text_if_absent(&uri, &payload).await.unwrap());
+            let read = std::fs::read_to_string(dir.path().join(format!("f{i}.json"))).unwrap();
+            assert_eq!(read.len(), payload.len(), "iteration {i}: short read");
+        }
+    }
+
     /// Object-store semantics on the local filesystem: only objects exist.
     /// An empty directory is not an object and not a non-empty prefix —
     /// callers that genuinely probe local directories use std::fs.

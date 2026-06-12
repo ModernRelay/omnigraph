@@ -984,6 +984,52 @@ fn read_csv_format_outputs_header_and_row_values() {
     assert!(stdout.contains("Alice"));
 }
 
+/// RFC-007 PR 1: the format cascade's operator hop — `defaults.output` in
+/// ~/.omnigraph/config.yaml applies when nothing more specific is given,
+/// and `--format` still wins over it.
+#[test]
+fn read_uses_operator_default_output_format() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+    let operator_home = tempdir().unwrap();
+    fs::write(
+        operator_home.path().join("config.yaml"),
+        "defaults:\n  output: csv\n",
+    )
+    .unwrap();
+
+    let read = |extra: &[&str]| {
+        let mut command = cli();
+        command
+            .env("OMNIGRAPH_HOME", operator_home.path())
+            .arg("read")
+            .arg(&graph)
+            .arg("--query")
+            .arg(fixture("test.gq"))
+            .arg("--name")
+            .arg("get_person")
+            .arg("--params")
+            .arg(r#"{"name":"Alice"}"#);
+        for arg in extra {
+            command.arg(arg);
+        }
+        stdout_string(&output_success(&mut command))
+    };
+
+    let stdout = read(&[]);
+    assert!(
+        stdout.lines().next().unwrap().contains("p.name") && stdout.contains("Alice"),
+        "operator defaults.output: csv applies with no --format: {stdout}"
+    );
+    let stdout = read(&["--format", "jsonl"]);
+    assert!(
+        stdout.starts_with('{'),
+        "--format wins over the operator default: {stdout}"
+    );
+}
+
 #[test]
 fn read_jsonl_format_outputs_metadata_header_first() {
     let temp = tempdir().unwrap();
