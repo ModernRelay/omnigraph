@@ -63,7 +63,7 @@ base64 = "0.22"
 ariadne = "0.4"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-object_store = { version = "0.12.5", default-features = false, features = ["aws"] }
+object_store = { version = "0.12.5", default-features = false, features = ["aws", "fs"] }
 fail = "0.5"
 time = { version = "0.3", features = ["formatting"] }
 axum = { version = "0.8", features = ["json", "macros"] }

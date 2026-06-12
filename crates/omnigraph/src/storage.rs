@@ -1,14 +1,15 @@
 use std::env;
 use std::fmt::Debug;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use object_store::aws::AmazonS3Builder;
+use object_store::local::LocalFileSystem;
+use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
 use object_store::{DynObjectStore, ObjectStore, PutMode, PutPayload};
-use tokio::io::AsyncWriteExt;
 use url::Url;
 
 use crate::error::{OmniError, Result};
@@ -38,20 +39,28 @@ pub trait StorageAdapter: Debug + Send + Sync {
     /// List all files (non-recursively, files only) directly under `dir_uri`.
     /// Returns full URIs (same scheme as `dir_uri`). The result is unordered.
     /// Returns Ok(empty) if the directory does not exist or is empty.
+    /// Consumers must tolerate non-payload residue appearing in storage
+    /// (backend staging files are filtered by the backend, but crash residue
+    /// of any future producer may not be) — filter by suffix, never assume
+    /// every entry is yours.
     async fn list_dir(&self, dir_uri: &str) -> Result<Vec<String>>;
-    /// Read a text object together with its backend version token (S3: the
-    /// object's ETag; local: sha256 of the content). The token is opaque —
-    /// valid only for `write_text_if_match` against the same adapter.
+    /// Read a text object together with its backend version token (stores
+    /// with conditional-update support: the object's ETag; local: sha256 of
+    /// the content). The token is opaque — valid only for
+    /// `write_text_if_match` against the same adapter.
     async fn read_text_versioned(&self, uri: &str) -> Result<(String, String)>;
     /// Replace the object at `uri` only if its current version still matches
     /// `expected_version` (obtained from a prior versioned read/write on this
     /// adapter). Returns `Ok(Some(new_version))` on success and `Ok(None)`
     /// when the precondition failed (a concurrent writer won — the CAS-lost
-    /// case callers must surface, never swallow). S3 uses a conditional put
-    /// (If-Match); local compares content then replaces via temp + rename —
-    /// the same single-machine semantics the callers had before this trait,
-    /// safe under the callers' own lock protocol but not a cross-process
-    /// barrier by itself.
+    /// case callers must surface, never swallow). Stores with conditional
+    /// updates (S3, in-memory) use a true conditional put (If-Match); the
+    /// local filesystem has no such primitive (`PutMode::Update` is
+    /// unimplemented upstream), so local compares content then replaces via
+    /// an atomic staged write — the same single-machine semantics the
+    /// callers had before this trait, safe under the callers' own lock
+    /// protocol but not a cross-process barrier by itself (see the Known
+    /// Gaps entry in docs/dev/invariants.md).
     async fn write_text_if_match(
         &self,
         uri: &str,
@@ -59,14 +68,18 @@ pub trait StorageAdapter: Debug + Send + Sync {
         expected_version: &str,
     ) -> Result<Option<String>>;
     /// Recursively delete every object under `prefix_uri`. Returns Ok(())
-    /// when nothing exists there (idempotent). Local: `remove_dir_all`;
-    /// S3: list + delete (NOT atomic — callers must tolerate partial
-    /// prefixes on crash, which the cluster delete protocol does by retry).
+    /// when nothing exists there (idempotent). Local: `remove_dir_all`
+    /// (directories are a local-FS concept; list+delete would leave empty
+    /// directory skeletons that local existence probes report as present);
+    /// object stores: list + delete (NOT atomic — callers must tolerate
+    /// partial prefixes on crash, which the cluster delete protocol does by
+    /// retry).
     async fn delete_prefix(&self, prefix_uri: &str) -> Result<()>;
 }
 
-/// Version token for local files: content identity. ETags are unavailable
-/// on the filesystem; sha256 is stable, cheap at these object sizes, and
+/// Version token for local files: content identity. The local filesystem
+/// backend reports mtime-derived ETags too coarse for CAS (sub-granularity
+/// rewrites collide); sha256 is stable, cheap at these object sizes, and
 /// already the cluster ledger's CAS vocabulary.
 fn local_version_token(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -80,13 +93,34 @@ pub enum StorageKind {
     S3,
 }
 
-#[derive(Debug, Default)]
-pub struct LocalStorageAdapter;
-
+/// The one storage implementation: every backend is an
+/// [`object_store::ObjectStore`], so the semantics (atomic-visibility puts,
+/// conditional creates, path-delimited listing) are upstream-maintained and
+/// identical across backends by construction. The per-backend residue is
+/// confined to [`UriCodec`] (URI ↔ object path mapping) and the
+/// `supports_conditional_update` capability flag (false only for the local
+/// filesystem, where upstream `PutMode::Update` is unimplemented).
 #[derive(Debug)]
-pub struct S3StorageAdapter {
-    bucket: String,
+pub struct ObjectStorageAdapter {
     store: Arc<DynObjectStore>,
+    codec: UriCodec,
+    /// Whether the backend implements `PutMode::Update` (ETag-conditioned
+    /// put). Gates BOTH the version-token source in `read_text_versioned`
+    /// and the `write_text_if_match` strategy — the two must agree or every
+    /// CAS loses.
+    supports_conditional_update: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UriCodec {
+    /// Plain absolute/relative paths or `file://` URIs, mapped onto a
+    /// root-anchored [`LocalFileSystem`].
+    Local,
+    /// `s3://{bucket}/{key}` URIs, mapped onto a bucket-scoped store.
+    S3 { bucket: String },
+    /// Opaque keys for the in-memory test/embedded backend; leading
+    /// slashes are stripped.
+    Memory,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,362 +129,71 @@ struct S3Location {
     key: String,
 }
 
+/// Backwards-compatible local constructor used by in-crate tests; delegates
+/// to the unified adapter. New code should use
+/// [`ObjectStorageAdapter::local`] or [`storage_for_uri`].
+#[derive(Debug, Default)]
+pub struct LocalStorageAdapter;
+
+static SHARED_LOCAL: LazyLock<ObjectStorageAdapter> = LazyLock::new(ObjectStorageAdapter::local);
+
 #[async_trait]
 impl StorageAdapter for LocalStorageAdapter {
     async fn read_text(&self, uri: &str) -> Result<String> {
-        let path = local_path_from_uri(uri)?;
-        Ok(tokio::fs::read_to_string(&path).await?)
+        SHARED_LOCAL.read_text(uri).await
     }
-
     async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
-        let path = local_path_from_uri(uri)?;
-        // Ensure parent directory exists. S3 has no equivalent (PutObject
-        // is path-agnostic). For local fs, callers like the recovery
-        // sidecar protocol expect transparent directory creation under
-        // the graph root (the `__recovery/` directory doesn't pre-exist;
-        // first sidecar write creates it).
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-        }
-        // Publish atomically: complete temp file, then rename into
-        // place. A reader at `path` sees the old object or the new one,
-        // never a truncated in-progress write — the same object-level
-        // atomic visibility the S3 adapter gets from PutObject, which
-        // callers (sidecar protocol, cluster state) assume. Plain
-        // `tokio::fs::write(&path, ..)` would expose an empty/partial
-        // object between create-truncate and the final byte.
-        let tmp = path.with_extension(format!("tmp.{}", ulid::Ulid::new()));
-        tokio::fs::write(&tmp, contents).await?;
-        if let Err(err) = tokio::fs::rename(&tmp, &path).await {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(err.into());
-        }
-        Ok(())
+        SHARED_LOCAL.write_text(uri, contents).await
     }
-
     async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool> {
-        let path = local_path_from_uri(uri)?;
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-        }
-        // Atomic no-replace publish: complete temp file, then
-        // `hard_link` it to the destination — link fails with
-        // AlreadyExists if the destination exists, so exactly one of N
-        // concurrent claimants wins, and the winner's object is fully
-        // readable at the instant it becomes visible. The previous
-        // `create_new` + buffered `File::write_all` shape had two bugs:
-        // the claim was visible (as an empty file) before the contents,
-        // and `write_all` could resolve before the bytes left tokio's
-        // internal buffer, acknowledging a write a same-thread reader
-        // could not yet see (pinned by
-        // `local_write_text_if_absent_is_read_visible_on_return`).
-        let tmp = path.with_extension(format!("tmp.{}", ulid::Ulid::new()));
-        tokio::fs::write(&tmp, contents).await?;
-        let linked = tokio::fs::hard_link(&tmp, &path).await;
-        let _ = tokio::fs::remove_file(&tmp).await;
-        match linked {
-            Ok(()) => Ok(true),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-            Err(err) => Err(err.into()),
-        }
+        SHARED_LOCAL.write_text_if_absent(uri, contents).await
     }
-
     async fn exists(&self, uri: &str) -> Result<bool> {
-        Ok(local_path_from_uri(uri)?.exists())
+        SHARED_LOCAL.exists(uri).await
     }
-
     async fn rename_text(&self, from_uri: &str, to_uri: &str) -> Result<()> {
-        let from = local_path_from_uri(from_uri)?;
-        let to = local_path_from_uri(to_uri)?;
-        tokio::fs::rename(&from, &to).await?;
-        Ok(())
+        SHARED_LOCAL.rename_text(from_uri, to_uri).await
     }
-
     async fn delete(&self, uri: &str) -> Result<()> {
-        let path = local_path_from_uri(uri)?;
-        match tokio::fs::remove_file(&path).await {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err.into()),
-        }
+        SHARED_LOCAL.delete(uri).await
     }
-
     async fn list_dir(&self, dir_uri: &str) -> Result<Vec<String>> {
-        let path = local_path_from_uri(dir_uri)?;
-        let mut out = Vec::new();
-        let mut entries = match tokio::fs::read_dir(&path).await {
-            Ok(e) => e,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-            Err(err) => return Err(err.into()),
-        };
-        let dir_str = dir_uri.trim_end_matches('/');
-        while let Some(entry) = entries.next_entry().await? {
-            let ft = entry.file_type().await?;
-            if !ft.is_file() {
-                continue;
-            }
-            if let Some(name) = entry.file_name().to_str() {
-                out.push(format!("{}/{}", dir_str, name));
-            }
-        }
-        Ok(out)
+        SHARED_LOCAL.list_dir(dir_uri).await
     }
-
     async fn read_text_versioned(&self, uri: &str) -> Result<(String, String)> {
-        let path = local_path_from_uri(uri)?;
-        let bytes = tokio::fs::read(&path).await?;
-        let version = local_version_token(&bytes);
-        let text = String::from_utf8(bytes).map_err(|err| {
-            OmniError::manifest_internal(format!("storage read failed for '{}': {}", uri, err))
-        })?;
-        Ok((text, version))
+        SHARED_LOCAL.read_text_versioned(uri).await
     }
-
     async fn write_text_if_match(
         &self,
         uri: &str,
         contents: &str,
         expected_version: &str,
     ) -> Result<Option<String>> {
-        let path = local_path_from_uri(uri)?;
-        let current = match tokio::fs::read(&path).await {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(err.into()),
-        };
-        if local_version_token(&current) != expected_version {
-            return Ok(None);
-        }
-        let tmp = path.with_extension(format!("tmp.{}", ulid::Ulid::new()));
-        tokio::fs::write(&tmp, contents.as_bytes()).await?;
-        if let Err(err) = tokio::fs::rename(&tmp, &path).await {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(err.into());
-        }
-        Ok(Some(local_version_token(contents.as_bytes())))
+        SHARED_LOCAL
+            .write_text_if_match(uri, contents, expected_version)
+            .await
     }
-
     async fn delete_prefix(&self, prefix_uri: &str) -> Result<()> {
-        let path = local_path_from_uri(prefix_uri)?;
-        match tokio::fs::remove_dir_all(&path).await {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err.into()),
-        }
+        SHARED_LOCAL.delete_prefix(prefix_uri).await
     }
 }
 
-#[async_trait]
-impl StorageAdapter for S3StorageAdapter {
-    async fn read_text(&self, uri: &str) -> Result<String> {
-        let location = self.object_path(uri)?;
-        let bytes = self
-            .store
-            .get(&location)
-            .await
-            .map_err(|err| storage_backend_error("read", uri, err))?
-            .bytes()
-            .await
-            .map_err(|err| storage_backend_error("read", uri, err))?;
-
-        String::from_utf8(bytes.to_vec()).map_err(|err| {
-            OmniError::manifest_internal(format!("storage read failed for '{}': {}", uri, err))
-        })
-    }
-
-    async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
-        let location = self.object_path(uri)?;
-        self.store
-            .put(&location, PutPayload::from(contents.as_bytes().to_vec()))
-            .await
-            .map_err(|err| storage_backend_error("write", uri, err))?;
-        Ok(())
-    }
-
-    async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool> {
-        let location = self.object_path(uri)?;
-        match self
-            .store
-            .put_opts(
-                &location,
-                PutPayload::from(contents.as_bytes().to_vec()),
-                PutMode::Create.into(),
-            )
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(object_store::Error::AlreadyExists { .. })
-            | Err(object_store::Error::Precondition { .. }) => Ok(false),
-            Err(err) => Err(storage_backend_error("write_if_absent", uri, err)),
+impl ObjectStorageAdapter {
+    /// Local-filesystem backend rooted at `/`. URIs are plain paths or
+    /// `file://` URIs; relative paths are lexically absolutized against the
+    /// current working directory.
+    pub fn local() -> Self {
+        Self {
+            store: Arc::new(LocalFileSystem::new()),
+            codec: UriCodec::Local,
+            supports_conditional_update: false,
         }
     }
 
-    async fn exists(&self, uri: &str) -> Result<bool> {
-        let location = self.object_path(uri)?;
-        match self.store.head(&location).await {
-            Ok(_) => Ok(true),
-            Err(object_store::Error::NotFound { .. }) => {
-                let mut entries = self.store.list(Some(&location));
-                let has_prefix_entries = entries
-                    .try_next()
-                    .await
-                    .map_err(|err| storage_backend_error("exists", uri, err))?
-                    .is_some();
-                Ok(has_prefix_entries)
-            }
-            Err(err) => Err(storage_backend_error("exists", uri, err)),
-        }
-    }
-
-    async fn rename_text(&self, from_uri: &str, to_uri: &str) -> Result<()> {
-        // S3 has no atomic rename. Copy then delete; if the copy succeeds and
-        // the delete fails (or the process crashes between them), both
-        // source and destination exist with the same content. Recovery code
-        // must tolerate this case — see schema_state::recover_schema_state_files.
-        let from = self.object_path(from_uri)?;
-        let to = self.object_path(to_uri)?;
-        self.store
-            .copy(&from, &to)
-            .await
-            .map_err(|err| storage_backend_error("rename:copy", from_uri, err))?;
-        self.store
-            .delete(&from)
-            .await
-            .map_err(|err| storage_backend_error("rename:delete", from_uri, err))?;
-        Ok(())
-    }
-
-    async fn delete(&self, uri: &str) -> Result<()> {
-        let location = self.object_path(uri)?;
-        match self.store.delete(&location).await {
-            Ok(()) => Ok(()),
-            Err(object_store::Error::NotFound { .. }) => Ok(()),
-            Err(err) => Err(storage_backend_error("delete", uri, err)),
-        }
-    }
-
-    async fn list_dir(&self, dir_uri: &str) -> Result<Vec<String>> {
-        // Normalize: ensure the URI describes a directory (trailing '/') so
-        // we don't match sibling paths with a shared prefix
-        // (e.g. listing `__recovery` shouldn't match `__recovery_log/...`).
-        let dir_with_slash = if dir_uri.ends_with('/') {
-            dir_uri.to_string()
-        } else {
-            format!("{}/", dir_uri)
-        };
-        // object_store::Path strips the trailing '/'; re-add it for filtering.
-        let prefix_loc = self.object_path(&dir_with_slash)?;
-        let prefix_with_slash = format!("{}/", prefix_loc.as_ref());
-
-        let mut entries = self.store.list(Some(&prefix_loc));
-        let mut out = Vec::new();
-        let bucket_root = format!("{}{}/", S3_SCHEME_PREFIX, self.bucket);
-        while let Some(meta) = entries
-            .try_next()
-            .await
-            .map_err(|err| storage_backend_error("list_dir", dir_uri, err))?
-        {
-            let key_str = meta.location.as_ref();
-            // Require the directory boundary to filter out sibling-prefix
-            // matches (object_store's `list` is prefix-based, not dir-based).
-            if !key_str.starts_with(&prefix_with_slash) {
-                continue;
-            }
-            let suffix = &key_str[prefix_with_slash.len()..];
-            // Non-recursive: skip anything inside a sub-directory.
-            if suffix.contains('/') {
-                continue;
-            }
-            out.push(format!("{}{}", bucket_root, key_str));
-        }
-        Ok(out)
-    }
-
-    async fn read_text_versioned(&self, uri: &str) -> Result<(String, String)> {
-        let location = self.object_path(uri)?;
-        let result = self
-            .store
-            .get(&location)
-            .await
-            .map_err(|err| storage_backend_error("read", uri, err))?;
-        let etag = result.meta.e_tag.clone();
-        let bytes = result
-            .bytes()
-            .await
-            .map_err(|err| storage_backend_error("read", uri, err))?;
-        // Every S3-compatible store we target returns ETags; fall back to a
-        // content token rather than failing if one ever omits it.
-        let version = etag.unwrap_or_else(|| local_version_token(&bytes));
-        let text = String::from_utf8(bytes.to_vec()).map_err(|err| {
-            OmniError::manifest_internal(format!("storage read failed for '{}': {}", uri, err))
-        })?;
-        Ok((text, version))
-    }
-
-    async fn write_text_if_match(
-        &self,
-        uri: &str,
-        contents: &str,
-        expected_version: &str,
-    ) -> Result<Option<String>> {
-        let location = self.object_path(uri)?;
-        let mode = PutMode::Update(object_store::UpdateVersion {
-            e_tag: Some(expected_version.to_string()),
-            version: None,
-        });
-        match self
-            .store
-            .put_opts(
-                &location,
-                PutPayload::from(contents.as_bytes().to_vec()),
-                mode.into(),
-            )
-            .await
-        {
-            Ok(result) => Ok(Some(
-                result
-                    .e_tag
-                    .unwrap_or_else(|| local_version_token(contents.as_bytes())),
-            )),
-            Err(object_store::Error::Precondition { .. })
-            | Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(err) => Err(storage_backend_error("write_if_match", uri, err)),
-        }
-    }
-
-    async fn delete_prefix(&self, prefix_uri: &str) -> Result<()> {
-        let dir_with_slash = if prefix_uri.ends_with('/') {
-            prefix_uri.to_string()
-        } else {
-            format!("{}/", prefix_uri)
-        };
-        let prefix_loc = self.object_path(&dir_with_slash)?;
-        let mut entries = self.store.list(Some(&prefix_loc));
-        let mut locations = Vec::new();
-        while let Some(meta) = entries
-            .try_next()
-            .await
-            .map_err(|err| storage_backend_error("delete_prefix", prefix_uri, err))?
-        {
-            locations.push(meta.location);
-        }
-        for location in locations {
-            match self.store.delete(&location).await {
-                Ok(()) => {}
-                Err(object_store::Error::NotFound { .. }) => {}
-                Err(err) => return Err(storage_backend_error("delete_prefix", prefix_uri, err)),
-            }
-        }
-        Ok(())
-    }
-}
-
-impl S3StorageAdapter {
-    fn from_root_uri(root_uri: &str) -> Result<Self> {
+    /// S3 backend scoped to the bucket named in `root_uri`. Credentials and
+    /// endpoint come from the standard `AWS_*` environment variables (the
+    /// same ones Lance reads for its dataset stores).
+    pub fn s3_from_root_uri(root_uri: &str) -> Result<Self> {
         let location = parse_s3_uri(root_uri)?;
         let mut builder = AmazonS3Builder::from_env().with_bucket_name(&location.bucket);
 
@@ -476,28 +219,310 @@ impl S3StorageAdapter {
         })?;
 
         Ok(Self {
-            bucket: location.bucket,
             store: Arc::new(store),
+            codec: UriCodec::S3 {
+                bucket: location.bucket,
+            },
+            supports_conditional_update: true,
         })
     }
 
+    /// In-memory backend for tests and embedded experiments. Implements the
+    /// FULL contract including true conditional updates (unlike the local
+    /// filesystem), so contract tests exercise the strong-CAS path without a
+    /// bucket. State lives only as long as the adapter.
+    pub fn in_memory() -> Self {
+        Self {
+            store: Arc::new(InMemory::new()),
+            codec: UriCodec::Memory,
+            supports_conditional_update: true,
+        }
+    }
+
     fn object_path(&self, uri: &str) -> Result<ObjectPath> {
-        let location = parse_s3_uri(uri)?;
-        if location.bucket != self.bucket {
-            return Err(OmniError::manifest_internal(format!(
-                "s3 storage bucket mismatch for '{}': expected '{}', found '{}'",
-                uri, self.bucket, location.bucket
-            )));
+        match &self.codec {
+            UriCodec::Local => {
+                let path = absolutize_lexically(local_path_from_uri(uri)?)?;
+                ObjectPath::from_absolute_path(&path).map_err(|err| {
+                    OmniError::manifest_internal(format!(
+                        "invalid local object path for '{}': {}",
+                        uri, err
+                    ))
+                })
+            }
+            UriCodec::S3 { bucket } => {
+                let location = parse_s3_uri(uri)?;
+                if &location.bucket != bucket {
+                    return Err(OmniError::manifest_internal(format!(
+                        "s3 storage bucket mismatch for '{}': expected '{}', found '{}'",
+                        uri, bucket, location.bucket
+                    )));
+                }
+                if location.key.is_empty() {
+                    return Err(OmniError::manifest_internal(format!(
+                        "s3 storage path is empty for '{}'",
+                        uri
+                    )));
+                }
+                ObjectPath::parse(&location.key).map_err(|err| {
+                    OmniError::manifest_internal(format!(
+                        "invalid s3 object path for '{}': {}",
+                        uri, err
+                    ))
+                })
+            }
+            UriCodec::Memory => {
+                ObjectPath::parse(uri.trim_start_matches('/')).map_err(|err| {
+                    OmniError::manifest_internal(format!(
+                        "invalid memory object path for '{}': {}",
+                        uri, err
+                    ))
+                })
+            }
         }
-        if location.key.is_empty() {
-            return Err(OmniError::manifest_internal(format!(
-                "s3 storage path is empty for '{}'",
-                uri
-            )));
-        }
-        ObjectPath::parse(&location.key).map_err(|err| {
-            OmniError::manifest_internal(format!("invalid s3 object path for '{}': {}", uri, err))
+    }
+}
+
+#[async_trait]
+impl StorageAdapter for ObjectStorageAdapter {
+    async fn read_text(&self, uri: &str) -> Result<String> {
+        let location = self.object_path(uri)?;
+        let bytes = self
+            .store
+            .get(&location)
+            .await
+            .map_err(|err| storage_backend_error("read", uri, err))?
+            .bytes()
+            .await
+            .map_err(|err| storage_backend_error("read", uri, err))?;
+
+        String::from_utf8(bytes.to_vec()).map_err(|err| {
+            OmniError::manifest_internal(format!("storage read failed for '{}': {}", uri, err))
         })
+    }
+
+    async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
+        // Atomic visibility is the backend's contract: object stores via
+        // PutObject; LocalFileSystem via an internal staged-temp + rename
+        // (a reader sees the old object or the new one, never a truncated
+        // in-progress write). Callers (sidecar protocol, cluster state)
+        // assume it.
+        let location = self.object_path(uri)?;
+        self.store
+            .put(&location, PutPayload::from(contents.as_bytes().to_vec()))
+            .await
+            .map_err(|err| storage_backend_error("write", uri, err))?;
+        Ok(())
+    }
+
+    async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool> {
+        // PutMode::Create: atomic no-replace publish on every backend —
+        // exactly one of N concurrent claimants wins, and the winner's
+        // object is fully readable at the instant it becomes visible
+        // (LocalFileSystem stages the temp file completely, then
+        // hard_links it; pinned by
+        // `local_write_text_if_absent_is_read_visible_on_return`).
+        let location = self.object_path(uri)?;
+        match self
+            .store
+            .put_opts(
+                &location,
+                PutPayload::from(contents.as_bytes().to_vec()),
+                PutMode::Create.into(),
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::AlreadyExists { .. })
+            | Err(object_store::Error::Precondition { .. }) => Ok(false),
+            Err(err) => Err(storage_backend_error("write_if_absent", uri, err)),
+        }
+    }
+
+    async fn exists(&self, uri: &str) -> Result<bool> {
+        // head() answers for objects; the list fallback answers for
+        // "directory-shaped" URIs (e.g. a Lance dataset root, whose
+        // `_versions/*.manifest` makes any committed dataset non-empty).
+        // Object-store semantics throughout: only objects exist —
+        // an EMPTY local directory does not (callers that probe local
+        // directories use std::fs directly).
+        let location = self.object_path(uri)?;
+        match self.store.head(&location).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => {
+                let mut entries = self.store.list(Some(&location));
+                let has_prefix_entries = entries
+                    .try_next()
+                    .await
+                    .map_err(|err| storage_backend_error("exists", uri, err))?
+                    .is_some();
+                Ok(has_prefix_entries)
+            }
+            Err(err) => Err(storage_backend_error("exists", uri, err)),
+        }
+    }
+
+    async fn rename_text(&self, from_uri: &str, to_uri: &str) -> Result<()> {
+        // ObjectStore::rename: LocalFileSystem overrides it with an atomic
+        // fs::rename (creating missing destination parents); object stores
+        // use the default copy + delete — if the copy succeeds and the
+        // delete fails (or the process crashes between them), both source
+        // and destination exist with the same content. Recovery code must
+        // tolerate this case — see schema_state::recover_schema_state_files.
+        let from = self.object_path(from_uri)?;
+        let to = self.object_path(to_uri)?;
+        self.store
+            .rename(&from, &to)
+            .await
+            .map_err(|err| storage_backend_error("rename", from_uri, err))?;
+        Ok(())
+    }
+
+    async fn delete(&self, uri: &str) -> Result<()> {
+        let location = self.object_path(uri)?;
+        match self.store.delete(&location).await {
+            Ok(()) => Ok(()),
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(err) => Err(storage_backend_error("delete", uri, err)),
+        }
+    }
+
+    async fn list_dir(&self, dir_uri: &str) -> Result<Vec<String>> {
+        // list_with_delimiter is non-recursive and path-delimited on every
+        // backend (no sibling-prefix bleed: listing `__recovery` cannot
+        // match `__recovery_log/...`), and returns Ok(empty) for a missing
+        // directory. Output URIs are anchored on the INPUT `dir_uri` plus
+        // the entry filename, so the strings round-trip byte-identically
+        // into read_text/delete regardless of scheme (plain path, file://,
+        // s3://).
+        let anchor = dir_uri.trim_end_matches('/');
+        let prefix = self.object_path(anchor)?;
+        let listing = self
+            .store
+            .list_with_delimiter(Some(&prefix))
+            .await
+            .map_err(|err| storage_backend_error("list_dir", dir_uri, err))?;
+        let mut out = Vec::with_capacity(listing.objects.len());
+        for meta in listing.objects {
+            if let Some(name) = meta.location.filename() {
+                out.push(format!("{}/{}", anchor, name));
+            }
+        }
+        Ok(out)
+    }
+
+    async fn read_text_versioned(&self, uri: &str) -> Result<(String, String)> {
+        let location = self.object_path(uri)?;
+        let result = self
+            .store
+            .get(&location)
+            .await
+            .map_err(|err| storage_backend_error("read", uri, err))?;
+        let etag = result.meta.e_tag.clone();
+        let bytes = result
+            .bytes()
+            .await
+            .map_err(|err| storage_backend_error("read", uri, err))?;
+        // The token SOURCE must agree with the write_text_if_match strategy
+        // below: conditional-update backends compare ETags server-side, so
+        // the token is the ETag; the local emulation compares content, so
+        // the token is the content hash. Mixing them makes every CAS lose.
+        let version = if self.supports_conditional_update {
+            // Every S3-compatible store we target returns ETags; fall back
+            // to a content token rather than failing if one ever omits it.
+            etag.unwrap_or_else(|| local_version_token(&bytes))
+        } else {
+            local_version_token(&bytes)
+        };
+        let text = String::from_utf8(bytes.to_vec()).map_err(|err| {
+            OmniError::manifest_internal(format!("storage read failed for '{}': {}", uri, err))
+        })?;
+        Ok((text, version))
+    }
+
+    async fn write_text_if_match(
+        &self,
+        uri: &str,
+        contents: &str,
+        expected_version: &str,
+    ) -> Result<Option<String>> {
+        let location = self.object_path(uri)?;
+        if self.supports_conditional_update {
+            let mode = PutMode::Update(object_store::UpdateVersion {
+                e_tag: Some(expected_version.to_string()),
+                version: None,
+            });
+            return match self
+                .store
+                .put_opts(
+                    &location,
+                    PutPayload::from(contents.as_bytes().to_vec()),
+                    mode.into(),
+                )
+                .await
+            {
+                Ok(result) => Ok(Some(
+                    result
+                        .e_tag
+                        .unwrap_or_else(|| local_version_token(contents.as_bytes())),
+                )),
+                Err(object_store::Error::Precondition { .. })
+                | Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(err) => Err(storage_backend_error("write_if_match", uri, err)),
+            };
+        }
+        // Local emulation: content-compare then atomic replace. NOT a
+        // cross-process CAS (check-then-act gap) — safe under the callers'
+        // lock protocol only; tracked in docs/dev/invariants.md Known Gaps.
+        let current = match self.store.get(&location).await {
+            Ok(result) => result
+                .bytes()
+                .await
+                .map_err(|err| storage_backend_error("read", uri, err))?,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(err) => return Err(storage_backend_error("read", uri, err)),
+        };
+        if local_version_token(&current) != expected_version {
+            return Ok(None);
+        }
+        self.store
+            .put(&location, PutPayload::from(contents.as_bytes().to_vec()))
+            .await
+            .map_err(|err| storage_backend_error("write_if_match", uri, err))?;
+        Ok(Some(local_version_token(contents.as_bytes())))
+    }
+
+    async fn delete_prefix(&self, prefix_uri: &str) -> Result<()> {
+        // Directories are a local-FS concept: a list+delete loop would
+        // leave empty directory skeletons that local existence probes
+        // (cluster graph_root_exists uses std Path::exists) report as
+        // still-present. remove_dir_all reclaims them in one call.
+        if self.codec == UriCodec::Local {
+            let path = absolutize_lexically(local_path_from_uri(prefix_uri)?)?;
+            return match tokio::fs::remove_dir_all(&path).await {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(err.into()),
+            };
+        }
+        let prefix = self.object_path(prefix_uri.trim_end_matches('/'))?;
+        let mut entries = self.store.list(Some(&prefix));
+        let mut locations = Vec::new();
+        while let Some(meta) = entries
+            .try_next()
+            .await
+            .map_err(|err| storage_backend_error("delete_prefix", prefix_uri, err))?
+        {
+            locations.push(meta.location);
+        }
+        for location in locations {
+            match self.store.delete(&location).await {
+                Ok(()) => {}
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(err) => return Err(storage_backend_error("delete_prefix", prefix_uri, err)),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -511,8 +536,8 @@ pub fn storage_kind_for_uri(uri: &str) -> StorageKind {
 
 pub fn storage_for_uri(uri: &str) -> Result<Arc<dyn StorageAdapter>> {
     match storage_kind_for_uri(uri) {
-        StorageKind::Local => Ok(Arc::new(LocalStorageAdapter)),
-        StorageKind::S3 => Ok(Arc::new(S3StorageAdapter::from_root_uri(uri)?)),
+        StorageKind::Local => Ok(Arc::new(ObjectStorageAdapter::local())),
+        StorageKind::S3 => Ok(Arc::new(ObjectStorageAdapter::s3_from_root_uri(uri)?)),
     }
 }
 
@@ -556,6 +581,38 @@ fn local_path_from_uri(uri: &str) -> Result<PathBuf> {
         return local_path_from_file_uri(uri);
     }
     Ok(PathBuf::from(uri))
+}
+
+/// Lexically absolutize a local path: join relative paths onto the current
+/// working directory and fold `.` / `..` components, without touching the
+/// filesystem. Required because `object_store::path::Path` rejects
+/// relative and dot segments, while callers (the CLI in particular) pass
+/// paths like `./graph.omni` verbatim.
+fn absolutize_lexically(path: PathBuf) -> Result<PathBuf> {
+    let joined = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .map_err(|err| {
+                OmniError::manifest_internal(format!(
+                    "cannot resolve relative storage path '{}': {}",
+                    path.display(),
+                    err
+                ))
+            })?
+            .join(path)
+    };
+    let mut out = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    Ok(out)
 }
 
 fn local_path_from_file_uri(uri: &str) -> Result<PathBuf> {

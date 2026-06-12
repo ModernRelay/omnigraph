@@ -1954,9 +1954,16 @@ graphs:
         let dir = fixture();
         init_derived_graph(dir.path()).await;
         let blob = converge_fixture(dir.path()).await;
-        // A same-named directory yields a non-NotFound IO error portably.
-        fs::remove_file(&blob).unwrap();
-        fs::create_dir(&blob).unwrap();
+        // Make the payload unreadable without removing it: permission
+        // denied is a genuine non-NotFound IO error. (A same-named
+        // directory no longer triggers this path: object-store semantics
+        // classify a directory at an object path as NotFound — "only
+        // objects exist" — which is the missing-payload case, not the
+        // unreadable one.) Requires a non-root test runner, which is what
+        // CI and dev machines use.
+        let mut perms = fs::metadata(&blob).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o000);
+        fs::set_permissions(&blob, perms).unwrap();
 
         let out = refresh_config_dir(dir.path()).await;
         assert!(!out.ok);
