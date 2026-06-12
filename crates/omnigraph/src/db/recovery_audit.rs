@@ -43,6 +43,11 @@ const RECOVERIES_DIR: &str = "_graph_commit_recoveries.lance";
 pub(crate) enum RecoveryKind {
     RolledForward,
     RolledBack,
+    /// The sidecar's branch no longer exists in the manifest: its tree
+    /// and forks are reclaimed, the pinned drift is unreachable, and the
+    /// sidecar is provably moot — discarded with this audit row instead
+    /// of wedging every heal/sweep on a dead-branch open.
+    OrphanedBranchDiscarded,
 }
 
 impl RecoveryKind {
@@ -50,6 +55,7 @@ impl RecoveryKind {
         match self {
             RecoveryKind::RolledForward => "RolledForward",
             RecoveryKind::RolledBack => "RolledBack",
+            RecoveryKind::OrphanedBranchDiscarded => "OrphanedBranchDiscarded",
         }
     }
 
@@ -57,6 +63,7 @@ impl RecoveryKind {
         match s {
             "RolledForward" => Ok(RecoveryKind::RolledForward),
             "RolledBack" => Ok(RecoveryKind::RolledBack),
+            "OrphanedBranchDiscarded" => Ok(RecoveryKind::OrphanedBranchDiscarded),
             other => Err(OmniError::manifest_internal(format!(
                 "unknown recovery_kind '{}' in _graph_commit_recoveries.lance",
                 other

@@ -649,6 +649,27 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
         // sidecar's roll-forward.
         let branch_snapshot = match sidecar.branch.as_deref() {
             Some(b) => {
+                // Orphan check against the manifest's branch list (the
+                // authority) BEFORE opening: a deferred sidecar whose
+                // branch was deleted would otherwise wedge every write
+                // on the dead-branch open.
+                let (branch_exists, main_version) = {
+                    let mut coord = coordinator.write().await;
+                    coord.refresh().await?;
+                    let exists = coord.all_branches().await?.iter().any(|name| name == b);
+                    (exists, coord.snapshot().version())
+                };
+                if !branch_exists {
+                    discard_orphaned_branch_sidecar(
+                        root_uri,
+                        storage.as_ref(),
+                        &sidecar,
+                        main_version,
+                    )
+                    .await?;
+                    processed_any = true;
+                    continue;
+                }
                 let mut branch_coord =
                     GraphCoordinator::open_branch(root_uri, b, std::sync::Arc::clone(&storage))
                         .await?;
@@ -676,6 +697,51 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
     // post-heal manifest.
     coordinator.write().await.refresh().await?;
     Ok(processed_any)
+}
+
+/// Discard a sidecar whose branch no longer exists in the manifest (the
+/// authority — callers must key the orphan classification off the branch
+/// LIST, never off a `Not found` from an open, which could be a transient
+/// storage error masking real recovery intent). The branch's tree and
+/// per-table forks are already reclaimed, so the drift the sidecar pins is
+/// unreachable and the sidecar is provably moot; leaving it would wedge
+/// every heal (write entry) and every ReadWrite open on a dead-branch
+/// open, with `repair` refusing while it pends. Records an
+/// `OrphanedBranchDiscarded` audit row (commit appended on main — the
+/// sidecar's own branch has no commit graph anymore).
+async fn discard_orphaned_branch_sidecar(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+    manifest_version: u64,
+) -> Result<()> {
+    warn!(
+        operation_id = sidecar.operation_id.as_str(),
+        writer_kind = ?sidecar.writer_kind,
+        branch = sidecar.branch.as_deref().unwrap_or("<none>"),
+        "recovery: discarding sidecar for a deleted branch (drift unreachable; audit recorded)"
+    );
+    let mut graph = CommitGraph::open(root_uri).await?;
+    let graph_commit_id = graph
+        .append_commit(None, manifest_version, Some(RECOVERY_ACTOR))
+        .await?;
+    let mut audit = RecoveryAudit::open(root_uri).await?;
+    audit
+        .append(RecoveryAuditRecord {
+            graph_commit_id,
+            recovery_kind: RecoveryKind::OrphanedBranchDiscarded,
+            recovery_for_actor: sidecar.actor_id.clone(),
+            operation_id: sidecar.operation_id.clone(),
+            sidecar_writer_kind: format!("{:?}", sidecar.writer_kind),
+            per_table_outcomes: Vec::new(),
+            created_at: now_micros()?,
+        })
+        .await?;
+    let handle = RecoverySidecarHandle {
+        operation_id: sidecar.operation_id.clone(),
+        sidecar_uri: sidecar_uri(root_uri, &sidecar.operation_id),
+    };
+    delete_sidecar(&handle, storage).await
 }
 
 /// The write-queue key serializing schema-apply's sidecar lifecycle
@@ -733,6 +799,21 @@ pub(crate) async fn recover_manifest_drift(
     for sidecar in sidecars {
         let branch_snapshot = match sidecar.branch.as_deref() {
             Some(b) => {
+                // Orphan check against the manifest's branch list (the
+                // authority) BEFORE opening — same classification as the
+                // write-entry heal: a deferred sidecar whose branch was
+                // deleted would otherwise fail every ReadWrite open.
+                coordinator.refresh().await?;
+                if !coordinator.all_branches().await?.iter().any(|name| name == b) {
+                    discard_orphaned_branch_sidecar(
+                        root_uri,
+                        storage.as_ref(),
+                        &sidecar,
+                        coordinator.snapshot().version(),
+                    )
+                    .await?;
+                    continue;
+                }
                 let mut branch_coord =
                     GraphCoordinator::open_branch(root_uri, b, std::sync::Arc::clone(&storage))
                         .await?;
