@@ -143,6 +143,39 @@ pub fn sidecar_operation_ids(graph_root: &Path) -> Vec<String> {
     ids
 }
 
+/// Recovery-audit rows' `recovery_kind` values at `graph_root`, in
+/// storage order. Empty when the audit dataset doesn't exist yet.
+pub async fn recovery_audit_kinds(graph_root: &Path) -> Vec<String> {
+    let recoveries_dir = graph_root.join("_graph_commit_recoveries.lance");
+    if !recoveries_dir.exists() {
+        return Vec::new();
+    }
+    let ds = Dataset::open(recoveries_dir.to_str().unwrap())
+        .await
+        .expect("recoveries dataset opens");
+    let batches: Vec<RecordBatch> = ds
+        .scan()
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    for batch in batches {
+        let kinds = batch
+            .column_by_name("recovery_kind")
+            .expect("recovery_kind column present")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("recovery_kind is Utf8");
+        for i in 0..kinds.len() {
+            out.push(kinds.value(i).to_string());
+        }
+    }
+    out
+}
+
 pub async fn branch_head_commit_id(graph_root: &Path, branch: &str) -> Result<String> {
     let graph = match branch {
         "main" => CommitGraph::open(&graph_uri(graph_root)).await?,

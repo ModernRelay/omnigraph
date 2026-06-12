@@ -1943,6 +1943,111 @@ async fn branch_merge_after_finalize_publisher_failure_heals_without_reopen() {
     assert_eq!(helpers::count_rows(&db, "node:Person").await, 3);
 }
 
+/// Discarding an orphaned-branch sidecar must be idempotent across a
+/// Phase D delete failure: the audit row + commit land before the
+/// sidecar delete, so a delete fault leaves the sidecar on disk with
+/// the audit already written — the retry must NOT append a second
+/// audit row for the same operation, only finish the delete.
+#[tokio::test]
+async fn orphaned_branch_discard_is_idempotent_across_delete_failure() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":30}}\n",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    db.branch_create("feature").await.unwrap();
+    helpers::mutate_branch(
+        &mut db,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+
+    // Deferred-shape sidecar pinned to feature (head < expected ⇒
+    // invariant violation ⇒ every roll-forward-only pass defers it).
+    let person_uri = node_table_uri(&uri, "Person");
+    let sidecar_json = format!(
+        r#"{{
+        "schema_version": 1,
+        "operation_id": "01H000000000000000000000ID",
+        "started_at": "0",
+        "branch": "feature",
+        "actor_id": null,
+        "writer_kind": "Mutation",
+        "tables": [
+            {{
+                "table_key": "node:Person",
+                "table_path": "{person_uri}",
+                "expected_version": 999,
+                "post_commit_pin": 1000,
+                "table_branch": "feature"
+            }}
+        ]
+    }}"#
+    );
+    let recovery_dir = dir.path().join("__recovery");
+    std::fs::create_dir_all(&recovery_dir).unwrap();
+    std::fs::write(
+        recovery_dir.join("01H000000000000000000000ID.json"),
+        &sidecar_json,
+    )
+    .unwrap();
+
+    // Orphan the sidecar.
+    db.branch_delete("feature").await.unwrap();
+
+    // First write: the discard path writes its audit row, then the
+    // sidecar delete fails (injected). The write fails loudly.
+    {
+        let _failpoint = ScopedFailPoint::new("recovery.sidecar_delete", "return");
+        let err = load_jsonl(
+            &mut db,
+            "{\"type\":\"Person\",\"data\":{\"name\":\"Bob\",\"age\":25}}\n",
+            LoadMode::Merge,
+        )
+        .await
+        .err()
+        .expect("a sidecar-delete fault mid-discard must fail the write");
+        assert!(
+            err.to_string()
+                .contains("injected failpoint triggered: recovery.sidecar_delete"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(std::fs::read_dir(&recovery_dir).unwrap().count(), 1);
+    }
+
+    // Retry: must finish the delete WITHOUT a second audit row.
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Bob\",\"age\":25}}\n",
+        LoadMode::Merge,
+    )
+    .await
+    .expect("the retry must complete the orphan discard and the write");
+    assert_eq!(std::fs::read_dir(&recovery_dir).unwrap().count(), 0);
+    let orphan_rows = helpers::recovery::recovery_audit_kinds(dir.path())
+        .await
+        .into_iter()
+        .filter(|kind| kind == "OrphanedBranchDiscarded")
+        .count();
+    assert_eq!(
+        orphan_rows, 1,
+        "exactly one OrphanedBranchDiscarded audit row despite the delete-fault retry"
+    );
+}
+
 /// After the write-entry heal rolls a SchemaApply sidecar forward (a
 /// crashed apply on the SAME handle: staging promoted, registrations
 /// published), the handle's in-memory catalog must be reloaded — disk
