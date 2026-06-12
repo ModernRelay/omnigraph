@@ -326,6 +326,9 @@ pub(crate) async fn write_sidecar(
     storage: &dyn StorageAdapter,
     sidecar: &RecoverySidecar,
 ) -> Result<RecoverySidecarHandle> {
+    // Failpoint: models a storage put failure (S3 PutObject / fs write)
+    // in Phase A — every writer must abort before any HEAD advance.
+    crate::failpoints::maybe_fail("recovery.sidecar_write")?;
     debug_assert_eq!(sidecar.schema_version, SIDECAR_SCHEMA_VERSION);
     let uri = sidecar_uri(root_uri, &sidecar.operation_id);
     let json = serde_json::to_string_pretty(sidecar).map_err(|err| {
@@ -343,6 +346,10 @@ pub(crate) async fn delete_sidecar(
     handle: &RecoverySidecarHandle,
     storage: &dyn StorageAdapter,
 ) -> Result<()> {
+    // Failpoint: models a storage delete failure (S3 DeleteObject) in
+    // Phase D — callers swallow it (the write already published) and the
+    // stale sidecar is healed by the next write or open.
+    crate::failpoints::maybe_fail("recovery.sidecar_delete")?;
     storage.delete(&handle.sidecar_uri).await
 }
 
@@ -357,6 +364,10 @@ pub(crate) async fn list_sidecars(
     root_uri: &str,
     storage: &dyn StorageAdapter,
 ) -> Result<Vec<RecoverySidecar>> {
+    // Failpoint: models a storage list failure (S3 ListObjectsV2) — every
+    // consumer (open-time sweep, write-entry heal) must fail loudly
+    // rather than silently skipping recovery.
+    crate::failpoints::maybe_fail("recovery.sidecar_list")?;
     let dir = recovery_dir_uri(root_uri);
     let mut uris = storage.list_dir(&dir).await?;
     // Sort by URI so the sweep processes sidecars deterministically.
@@ -1253,6 +1264,11 @@ async fn record_audit(
     kind: RecoveryKind,
     outcomes: Vec<TableOutcome>,
 ) -> Result<()> {
+    // Failpoint: models an audit write failure after the roll-forward /
+    // roll-back publish already landed — the sweep aborts, the sidecar
+    // stays, and re-entry records the audit row (see the retry note in
+    // the doc comment above).
+    crate::failpoints::maybe_fail("recovery.record_audit")?;
     // Non-main recovery commits must be appended on the sidecar branch's
     // commit graph, otherwise parent_commit_id comes from the global
     // main head. BranchMerge additionally records the source branch's

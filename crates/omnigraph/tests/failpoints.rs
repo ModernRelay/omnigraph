@@ -1269,6 +1269,179 @@ async fn load_after_finalize_publisher_failure_heals_without_reopen() {
     }
 }
 
+/// Phase A storage-fault contract: a sidecar PUT failure (S3 PutObject /
+/// fs write, injected at `recovery.sidecar_write`) must abort the load
+/// BEFORE any Lance HEAD advances — no sidecar, no drift, nothing to
+/// recover — and the same handle must write normally once the fault
+/// clears (a transient storage error never wedges the graph).
+#[tokio::test]
+async fn sidecar_write_failure_aborts_load_with_no_head_advance() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+
+    let person_uri = node_table_uri(&uri, "Person");
+    let pre_head = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .version()
+        .version;
+
+    {
+        let _failpoint = ScopedFailPoint::new("recovery.sidecar_write", "return");
+        let err = load_jsonl(
+            &mut db,
+            r#"{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Company","data":{"name":"Acme"}}
+"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("injected failpoint triggered: recovery.sidecar_write"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // Phase A ordering: the sidecar write precedes the first
+    // commit_staged, so the failed load left no sidecar and moved no
+    // Lance HEAD — manifest and HEAD agree, nothing to recover.
+    let recovery_dir = dir.path().join("__recovery");
+    if recovery_dir.exists() {
+        assert_eq!(
+            std::fs::read_dir(&recovery_dir).unwrap().count(),
+            0,
+            "a Phase A put failure must not leave a sidecar"
+        );
+    }
+    let post_head = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    assert_eq!(
+        pre_head, post_head,
+        "a Phase A put failure must abort before any Lance HEAD advance"
+    );
+    let manifest_pin = db
+        .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entry("node:Person")
+        .unwrap()
+        .table_version;
+    assert_eq!(manifest_pin, post_head, "no drift after a Phase A abort");
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 0);
+
+    // Fault cleared: the same handle writes normally — no wedge, no
+    // recovery required.
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Company","data":{"name":"Acme"}}
+"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("a transient sidecar put failure must not wedge later writes");
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 1);
+    assert_eq!(helpers::count_rows(&db, "node:Company").await, 1);
+}
+
+/// Phase A storage-fault contract for branch_merge — the multi-table
+/// writer where sidecar-before-commit ordering matters most. A sidecar
+/// PUT failure must abort the merge before any target-table HEAD moves;
+/// retrying after the fault clears merges cleanly.
+#[tokio::test]
+async fn sidecar_write_failure_aborts_branch_merge_with_no_head_advance() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Person","data":{"name":"Alice","age":30}}
+"#,
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+
+    db.branch_create("feature").await.unwrap();
+    // Diverge BOTH sides so Person is a RewriteMerged candidate (the
+    // merge path that pins a recovery sidecar; an unchanged target would
+    // adopt source state without one).
+    helpers::mutate_branch(
+        &mut db,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+    helpers::mutate_main(
+        &mut db,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Mallory")], &[("$age", 35)]),
+    )
+    .await
+    .unwrap();
+
+    let person_uri = node_table_uri(&uri, "Person");
+    let pre_head = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .version()
+        .version;
+
+    {
+        let _failpoint = ScopedFailPoint::new("recovery.sidecar_write", "return");
+        let err = db.branch_merge("feature", "main").await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("injected failpoint triggered: recovery.sidecar_write"),
+            "unexpected error: {err}"
+        );
+    }
+
+    let recovery_dir = dir.path().join("__recovery");
+    if recovery_dir.exists() {
+        assert_eq!(
+            std::fs::read_dir(&recovery_dir).unwrap().count(),
+            0,
+            "a Phase A put failure must not leave a sidecar"
+        );
+    }
+    let post_head = lance::Dataset::open(&person_uri)
+        .await
+        .unwrap()
+        .version()
+        .version;
+    assert_eq!(
+        pre_head, post_head,
+        "a Phase A put failure must abort the merge before any target \
+         Lance HEAD advance"
+    );
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 2);
+
+    // Fault cleared: the merge lands cleanly.
+    db.branch_merge("feature", "main")
+        .await
+        .expect("a transient sidecar put failure must not wedge the merge");
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 3);
+}
+
 /// Same contract as
 /// `load_after_finalize_publisher_failure_heals_without_reopen`, for the
 /// mutation entry point: after a failed mutation leaves a sidecar, the
