@@ -1,6 +1,6 @@
 # RFC: Config & CLI Architecture — Layered Config, Client Targeting, File Naming
 
-**Status:** Proposed
+**Status:** Proposed (umbrella; implementation parked — PRs #139/#162). Its pieces have since landed or been superseded piecemeal: layered config/file-naming/credentials → [rfc-007-operator-config.md](rfc-007-operator-config.md) (landed); the project-manifest role of `omnigraph.yaml` → deprecated by [rfc-008-deprecate-omnigraph-yaml.md](rfc-008-deprecate-omnigraph-yaml.md) (stages 1–4 landed); the `omnigraph-api-types` extraction and client unification → [rfc-009-unify-access-paths.md](rfc-009-unify-access-paths.md) (proposed; salvages #139's clean extraction). Still exclusively here: `GraphLocator`/multi-homing (§1), roles (§3), the State layer / `omnigraph use`. Do not implement from this document without checking those successors first.
 **Date:** 2026-05-30
 **Tickets:** MR-668 (multi-graph server, shipped — the dependency this builds on), MR-969 (stored queries + MCP — supplies the in-repo agent tool surface), MR-973 (quickstart / onboarding), MR-974 (agent setup surface), MR-981 (agent-friendly CLI hardening)
 **Target release:** v0.8.x (tentative; phased — see Rollout)

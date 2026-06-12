@@ -78,6 +78,7 @@ Working documents for in-flight feature work. Removed when the work lands.
 | Server boots from cluster state — Phase 5 mode switch, applied-revision serving | [rfc-005-server-cluster-boot.md](rfc-005-server-cluster-boot.md) |
 | Per-operator config — `~/.omnigraph/` identity, keyed credentials, named servers (the operator slice of RFC-002) | [rfc-007-operator-config.md](rfc-007-operator-config.md) |
 | Deprecate `omnigraph.yaml` — one concern per config surface; key-by-key migration map and staged retirement | [rfc-008-deprecate-omnigraph-yaml.md](rfc-008-deprecate-omnigraph-yaml.md) |
+| Unify CLI embedded/remote access paths — parity referee, shared wire-DTO crate, `GraphClient` trait, declared plane capabilities | [rfc-009-unify-access-paths.md](rfc-009-unify-access-paths.md) |
 
 ## Boundary
 

@@ -134,7 +134,7 @@ contract), retirement is staged, loud, and tooled:
    `cluster.yaml` from `config migrate`.
 4. **Opt-in strict** *(landed — the release gap to stages 1–3 collapsed: no version boundary was crossed between them, so all four ship in the same release)*. `OMNIGRAPH_NO_LEGACY_CONFIG=1` turns the warning into
    an error — for teams that finished migrating and want regressions caught.
-5. **Remove at the next major.** Loading the file becomes an error pointing
+5. **Remove at the next major** *(eased by [rfc-009-unify-access-paths.md](rfc-009-unify-access-paths.md) Phases 4–5: declared plane capabilities and route alignment shrink the yaml-boot removal diff)*. Loading the file becomes an error pointing
    at `config migrate`. The `OmnigraphConfig` code path, the dual
    query-registry loaders, and the yaml-mode server boot source are deleted
    — the payoff that makes the whole exercise worth it.
