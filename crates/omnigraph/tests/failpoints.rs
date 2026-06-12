@@ -1354,6 +1354,300 @@ async fn sidecar_write_failure_aborts_load_with_no_head_advance() {
     assert_eq!(helpers::count_rows(&db, "node:Company").await, 1);
 }
 
+/// Real-backend coverage of the sidecar lifecycle: the same-handle heal
+/// scenario on an S3-compatible store, exercising sidecar put / list /
+/// delete through `S3StorageAdapter` (object_store) instead of the
+/// local-FS adapter. Skips unless `OMNIGRAPH_S3_TEST_BUCKET` is set
+/// (same gate as `s3_storage.rs`); CI runs it against RustFS.
+#[tokio::test]
+async fn s3_load_recovers_after_publisher_failure_without_reopen() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let Some(uri) = helpers::s3_test_graph_uri("failpoints") else {
+        eprintln!(
+            "skipping s3_load_recovers_after_publisher_failure_without_reopen: \
+             OMNIGRAPH_S3_TEST_BUCKET is not set"
+        );
+        return;
+    };
+
+    let _scenario = FailScenario::setup();
+    let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+
+    // Failed load: commit_staged lands on S3, manifest publish does not;
+    // the sidecar PUT went through the S3 adapter.
+    {
+        let _failpoint = ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+        let err = load_jsonl(
+            &mut db,
+            r#"{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Company","data":{"name":"Acme"}}
+"#,
+            LoadMode::Merge,
+        )
+        .await
+        .err()
+        .expect("finalize failpoint must fail the load");
+        assert!(
+            err.to_string()
+                .contains("injected failpoint triggered: mutation.post_finalize_pre_publisher"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // Same-handle follow-up load: the entry heal LISTs __recovery/ on
+    // S3, rolls the sidecar forward, DELETEs it, and the write lands.
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Person","data":{"name":"Bob","age":25}}
+"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("the same-handle heal must converge on an S3-backed graph");
+
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 2);
+    assert_eq!(helpers::count_rows(&db, "node:Company").await, 1);
+
+    // Reopen cross-check: nothing left for the open-time sweep, state
+    // converged (the heal consumed the sidecar on S3).
+    drop(db);
+    let db = Omnigraph::open(&uri).await.unwrap();
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 2);
+}
+
+/// Storage-fault contract for the recovery AUDIT write (injected at
+/// `recovery.record_audit`): a failure after the roll-forward's manifest
+/// publish aborts that recovery attempt loudly and keeps the sidecar;
+/// re-entry detects the already-published manifest (stale-sidecar path),
+/// records exactly one `RolledForward` audit row, and converges — the
+/// documented retry tolerance in `record_audit`'s contract, exercised
+/// end-to-end through a real injected failure.
+#[tokio::test]
+async fn record_audit_failure_after_roll_forward_converges_on_next_write() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+
+    // Pending sidecar with real drift.
+    {
+        let _failpoint = ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+        load_jsonl(
+            &mut db,
+            r#"{"type":"Person","data":{"name":"Alice","age":30}}
+"#,
+            LoadMode::Merge,
+        )
+        .await
+        .err()
+        .expect("finalize failpoint must fail the load");
+    }
+
+    // The next write's heal rolls forward (manifest publish lands) but
+    // the audit write fails — the write must fail loudly and the sidecar
+    // must survive for the retry.
+    {
+        let _failpoint = ScopedFailPoint::new("recovery.record_audit", "return");
+        let err = load_jsonl(
+            &mut db,
+            r#"{"type":"Person","data":{"name":"Bob","age":25}}
+"#,
+            LoadMode::Merge,
+        )
+        .await
+        .err()
+        .expect("an audit write failure mid-heal must fail the write");
+        assert!(
+            err.to_string()
+                .contains("injected failpoint triggered: recovery.record_audit"),
+            "unexpected error: {err}"
+        );
+        let recovery_dir = dir.path().join("__recovery");
+        assert_eq!(
+            std::fs::read_dir(&recovery_dir).unwrap().count(),
+            1,
+            "the sidecar must survive an audit write failure so the retry can record it"
+        );
+    }
+
+    // Fault cleared: the next write converges — stale-sidecar audit
+    // recovery (manifest already advanced) + the write itself.
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Person","data":{"name":"Carol","age":41}}
+"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("recovery must converge once the audit fault clears");
+
+    let recovery_dir = dir.path().join("__recovery");
+    if recovery_dir.exists() {
+        assert_eq!(std::fs::read_dir(&recovery_dir).unwrap().count(), 0);
+    }
+    // Alice (rolled forward) + Carol (clean). Bob's write failed before
+    // staging anything — the heal error aborted his load at entry.
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 2);
+    // Exactly one audit row despite two recovery attempts: the first
+    // attempt's audit failed before any row landed; the retry recorded
+    // the roll-forward once.
+    let audit_uri = format!(
+        "{}/_graph_commit_recoveries.lance",
+        uri.trim_end_matches('/')
+    );
+    let audit_rows = lance::Dataset::open(&audit_uri)
+        .await
+        .expect("audit dataset exists after the retried recovery")
+        .count_rows(None)
+        .await
+        .unwrap();
+    assert_eq!(audit_rows, 1, "exactly one recovery audit row");
+}
+
+/// Storage-fault contract for the `__recovery/` LIST (S3 ListObjectsV2,
+/// injected at `recovery.sidecar_list`): every consumer fails loudly —
+/// the write-entry heal fails the write, the open-time sweep fails the
+/// open — rather than silently skipping recovery over a pending sidecar
+/// (which would be consumer tolerance of drift). Once the fault clears,
+/// open recovers normally.
+#[tokio::test]
+async fn sidecar_list_failure_fails_write_and_open_loudly_then_clears() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+
+    // Pending sidecar via the usual finalize → publisher failure.
+    {
+        let _failpoint = ScopedFailPoint::new("mutation.post_finalize_pre_publisher", "return");
+        let err = load_jsonl(
+            &mut db,
+            r#"{"type":"Person","data":{"name":"Alice","age":30}}
+"#,
+            LoadMode::Merge,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("injected failpoint triggered: mutation.post_finalize_pre_publisher"),
+            "unexpected error: {err}"
+        );
+        let recovery_dir = dir.path().join("__recovery");
+        assert_eq!(std::fs::read_dir(&recovery_dir).unwrap().count(), 1);
+    }
+
+    let _failpoint = ScopedFailPoint::new("recovery.sidecar_list", "return");
+
+    // Write-entry heal: the list failure surfaces as the write's error —
+    // no silent skip that would proceed over the pending sidecar.
+    let err = load_jsonl(
+        &mut db,
+        r#"{"type":"Person","data":{"name":"Bob","age":25}}
+"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("injected failpoint triggered: recovery.sidecar_list"),
+        "the write-entry heal must surface a list failure loudly; got: {err}"
+    );
+
+    // Open-time sweep: a fresh ReadWrite open fails on the same fault.
+    drop(db);
+    let err = Omnigraph::open(&uri)
+        .await
+        .err()
+        .expect("open must fail while the sidecar list fault is active");
+    assert!(
+        err.to_string()
+            .contains("injected failpoint triggered: recovery.sidecar_list"),
+        "the open-time sweep must surface a list failure loudly; got: {err}"
+    );
+
+    // Fault cleared: open recovers the pending sidecar normally.
+    drop(_failpoint);
+    let db = Omnigraph::open(&uri).await.unwrap();
+    let recovery_dir = dir.path().join("__recovery");
+    if recovery_dir.exists() {
+        assert_eq!(
+            std::fs::read_dir(&recovery_dir).unwrap().count(),
+            0,
+            "open after the fault clears must recover the sidecar"
+        );
+    }
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 1);
+}
+
+/// Phase D storage-fault contract: a sidecar DELETE failure (S3
+/// DeleteObject, injected at `recovery.sidecar_delete`) after a
+/// successful manifest publish must NOT fail the user's write — the
+/// data is durable and visible. The stale sidecar it leaves behind is
+/// consumed by the next write's entry heal (attributed `RolledForward`
+/// audit row), not by an operator.
+#[tokio::test]
+async fn sidecar_delete_failure_keeps_write_success_and_next_write_heals() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+
+    {
+        let _failpoint = ScopedFailPoint::new("recovery.sidecar_delete", "return");
+        // The load itself must succeed: commit_staged + manifest publish
+        // landed; only the Phase D cleanup failed (swallowed + logged).
+        load_jsonl(
+            &mut db,
+            r#"{"type":"Person","data":{"name":"Alice","age":30}}
+"#,
+            LoadMode::Merge,
+        )
+        .await
+        .expect("a Phase D delete failure must not fail a write that already published");
+        assert_eq!(helpers::count_rows(&db, "node:Person").await, 1);
+        let recovery_dir = dir.path().join("__recovery");
+        assert_eq!(
+            std::fs::read_dir(&recovery_dir).unwrap().count(),
+            1,
+            "the swallowed delete leaves a stale sidecar behind"
+        );
+    }
+
+    // Fault cleared: the next write's entry heal consumes the stale
+    // sidecar (manifest pin already caught up — the stale-sidecar
+    // roll-forward audit path) and the write lands.
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Person","data":{"name":"Bob","age":25}}
+"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("a stale sidecar from a failed Phase D delete must not block later writes");
+
+    let recovery_dir = dir.path().join("__recovery");
+    if recovery_dir.exists() {
+        assert_eq!(
+            std::fs::read_dir(&recovery_dir).unwrap().count(),
+            0,
+            "the stale sidecar must be consumed by the next write's heal"
+        );
+    }
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 2);
+}
+
 /// Phase A storage-fault contract for branch_merge — the multi-table
 /// writer where sidecar-before-commit ordering matters most. A sidecar
 /// PUT failure must abort the merge before any target-table HEAD moves;
