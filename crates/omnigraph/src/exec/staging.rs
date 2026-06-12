@@ -613,10 +613,15 @@ impl StagedMutation {
                         .await
                         .map(|sidecars| {
                             sidecars.iter().any(|sidecar| {
-                                sidecar
-                                    .tables
-                                    .iter()
-                                    .any(|pin| pin.table_key == entry.table_key)
+                                sidecar.tables.iter().any(|pin| {
+                                    // Branch-aware: a sidecar pinning the
+                                    // same table on ANOTHER branch does not
+                                    // cover this branch's drift — a reopen
+                                    // would recover that sidecar but leave
+                                    // this drift for `repair`.
+                                    pin.table_key == entry.table_key
+                                        && pin.table_branch == entry.path.table_branch
+                                })
                             })
                         })
                         .unwrap_or(false);
