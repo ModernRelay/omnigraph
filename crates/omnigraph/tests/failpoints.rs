@@ -1943,6 +1943,84 @@ async fn branch_merge_after_finalize_publisher_failure_heals_without_reopen() {
     assert_eq!(helpers::count_rows(&db, "node:Person").await, 3);
 }
 
+/// After the write-entry heal rolls a SchemaApply sidecar forward (a
+/// crashed apply on the SAME handle: staging promoted, registrations
+/// published), the handle's in-memory catalog must be reloaded — disk
+/// and manifest are on the new schema, and validating subsequent
+/// writes against the stale catalog rejects rows of types the graph
+/// already has.
+#[tokio::test]
+async fn load_after_schema_apply_phase_b_failure_uses_recovered_catalog() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"alice\",\"age\":30}}\n",
+        LoadMode::Append,
+    )
+    .await
+    .unwrap();
+
+    // v2: a Person property (rewritten_tables work) + a new Tag type
+    // (table-set change, keeps the staging disambiguator decisive).
+    let v2_schema = r#"node Person {
+    name: String @key
+    age: I32?
+    city: String?
+}
+
+node Company {
+    name: String @key
+}
+
+node Tag {
+    label: String @key
+}
+
+edge Knows: Person -> Person {
+    since: Date?
+}
+
+edge WorksAt: Person -> Company
+"#;
+    {
+        let _failpoint = ScopedFailPoint::new("schema_apply.after_staging_write", "return");
+        let err = db.apply_schema(v2_schema).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("injected failpoint triggered: schema_apply.after_staging_write"),
+            "unexpected error: {err}"
+        );
+        let recovery_dir = dir.path().join("__recovery");
+        assert_eq!(std::fs::read_dir(&recovery_dir).unwrap().count(), 1);
+    }
+
+    // Same handle: a load of the NEW type. The entry heal rolls the
+    // apply forward (staging promoted, manifest registers node:Tag) —
+    // and the loader must then validate against the RECOVERED catalog,
+    // not the stale in-memory one.
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Tag\",\"data\":{\"label\":\"t1\"}}\n",
+        LoadMode::Merge,
+    )
+    .await
+    .expect(
+        "after the heal rolls the schema apply forward, the same handle \
+         must accept rows of the recovered schema's types",
+    );
+    assert_eq!(helpers::count_rows(&db, "node:Tag").await, 1);
+    let recovery_dir = dir.path().join("__recovery");
+    if recovery_dir.exists() {
+        assert_eq!(std::fs::read_dir(&recovery_dir).unwrap().count(), 0);
+    }
+}
+
 /// A concurrent write's entry heal must NOT promote a LIVE schema
 /// apply's staging files. The apply pauses just after writing its
 /// staging files (sidecar on disk from Phase A, staging on disk,
