@@ -729,6 +729,16 @@ async fn discard_orphaned_branch_sidecar(
     // with the audit already durable. Append only once per operation —
     // the retry's sole remaining job is finishing the delete. (Cold
     // path: the list scan runs only when an orphaned sidecar exists.)
+    //
+    // Documented residual: the commit append and the audit append are
+    // two writes. A failure BETWEEN them leaves a recovery commit with
+    // no audit row; the retry (keyed on the audit row, the operator-
+    // facing record) appends a second commit before the audit lands —
+    // bounded commit-graph noise, audit row still exactly-once. Same
+    // not-atomic-pair-write tolerance as `record_audit` and the
+    // manifest→commit-graph Known Gap; keying on commit rows instead
+    // would need an operation_id column on `_graph_commits`, and
+    // audit-before-commit would dangle the `graph_commit_id` join.
     let already_recorded = audit.list().await?.iter().any(|record| {
         record.operation_id == sidecar.operation_id
             && record.recovery_kind == RecoveryKind::OrphanedBranchDiscarded
@@ -738,6 +748,9 @@ async fn discard_orphaned_branch_sidecar(
         let graph_commit_id = graph
             .append_commit(None, manifest_version, Some(RECOVERY_ACTOR))
             .await?;
+        // Failpoint: the residual window above — commit appended, audit
+        // not yet durable.
+        crate::failpoints::maybe_fail("recovery.orphan_discard_audit_append")?;
         audit
             .append(RecoveryAuditRecord {
                 graph_commit_id,

@@ -2048,6 +2048,122 @@ async fn orphaned_branch_discard_is_idempotent_across_delete_failure() {
     );
 }
 
+/// The other half of the orphan-discard fault matrix: the audit append
+/// fails AFTER the recovery commit landed. The retry (keyed on the
+/// audit row, the operator-facing record) must converge to exactly one
+/// audit row and a consumed sidecar. The second recovery commit the
+/// retry appends is the documented not-atomic-pair-write tolerance
+/// (same class as `record_audit` and the manifest→commit-graph Known
+/// Gap): bounded commit-graph noise, never a lost or duplicated audit
+/// record under clean failures.
+#[tokio::test]
+async fn orphaned_branch_discard_converges_across_audit_append_failure() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":30}}\n",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    db.branch_create("feature").await.unwrap();
+    helpers::mutate_branch(
+        &mut db,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+
+    // Deferred-shape sidecar pinned to feature, then orphaned.
+    let person_uri = node_table_uri(&uri, "Person");
+    let sidecar_json = format!(
+        r#"{{
+        "schema_version": 1,
+        "operation_id": "01H000000000000000000000AF",
+        "started_at": "0",
+        "branch": "feature",
+        "actor_id": null,
+        "writer_kind": "Mutation",
+        "tables": [
+            {{
+                "table_key": "node:Person",
+                "table_path": "{person_uri}",
+                "expected_version": 999,
+                "post_commit_pin": 1000,
+                "table_branch": "feature"
+            }}
+        ]
+    }}"#
+    );
+    let recovery_dir = dir.path().join("__recovery");
+    std::fs::create_dir_all(&recovery_dir).unwrap();
+    std::fs::write(
+        recovery_dir.join("01H000000000000000000000AF.json"),
+        &sidecar_json,
+    )
+    .unwrap();
+    db.branch_delete("feature").await.unwrap();
+
+    // First write: the recovery commit lands, then the audit append
+    // fails (injected). The write fails loudly; the sidecar survives so
+    // the discard is retried with the audit still owed.
+    {
+        let _failpoint = ScopedFailPoint::new("recovery.orphan_discard_audit_append", "return");
+        let err = load_jsonl(
+            &mut db,
+            "{\"type\":\"Person\",\"data\":{\"name\":\"Bob\",\"age\":25}}\n",
+            LoadMode::Merge,
+        )
+        .await
+        .err()
+        .expect("an audit-append fault mid-discard must fail the write");
+        assert!(
+            err.to_string()
+                .contains("injected failpoint triggered: recovery.orphan_discard_audit_append"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&recovery_dir).unwrap().count(),
+            1,
+            "the sidecar must survive an audit-append fault so the discard is retried"
+        );
+        let orphan_rows = helpers::recovery::recovery_audit_kinds(dir.path())
+            .await
+            .into_iter()
+            .filter(|kind| kind == "OrphanedBranchDiscarded")
+            .count();
+        assert_eq!(orphan_rows, 0, "no audit row landed before the fault");
+    }
+
+    // Retry: converges — sidecar consumed, exactly one audit row.
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Bob\",\"age\":25}}\n",
+        LoadMode::Merge,
+    )
+    .await
+    .expect("the retry must complete the orphan discard and the write");
+    assert_eq!(std::fs::read_dir(&recovery_dir).unwrap().count(), 0);
+    let orphan_rows = helpers::recovery::recovery_audit_kinds(dir.path())
+        .await
+        .into_iter()
+        .filter(|kind| kind == "OrphanedBranchDiscarded")
+        .count();
+    assert_eq!(
+        orphan_rows, 1,
+        "exactly one OrphanedBranchDiscarded audit row despite the audit-fault retry"
+    );
+}
+
 /// After the write-entry heal rolls a SchemaApply sidecar forward (a
 /// crashed apply on the SAME handle: staging promoted, registrations
 /// published), the handle's in-memory catalog must be reloaded — disk
