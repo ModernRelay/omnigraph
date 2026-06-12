@@ -319,6 +319,12 @@ Every mention of `omnigraph.yaml` in this RFC describes the deprecation
 window only. Sequencing couples them: RFC-007 PRs 1–2 land first, then
 RFC-008's migration stages run against them.
 
+[rfc-009-unify-access-paths.md](rfc-009-unify-access-paths.md) consumes
+this RFC's surfaces: the actor chain and keyed-credential chain become
+constructor-time inputs of its `RemoteClient`/`EmbeddedClient`, and
+`--server`/operator aliases resolve to the same (base URL, credential)
+pair before its `GraphClient` trait is touched.
+
 RFC-002 remains the umbrella architecture. This RFC implements its §2
 (layered config, global-first), §4 (file naming / one dir), and §5
 (credentials) in their minimal load-bearing form, and explicitly defers §1
