@@ -135,6 +135,57 @@ async fn recovery_refuses_unknown_schema_version_on_open() {
 }
 
 #[tokio::test]
+async fn recovery_refuses_corrupt_sidecar_on_open_and_write() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+    // A truncated/garbage sidecar — e.g. a crashed writer or a partial
+    // local-FS write (S3 PutObject is atomic; local fs::write is not).
+    write_sidecar_file(dir.path(), "01H000000000000000000000CC", "{not json");
+
+    // A live handle's write-entry heal must surface the parse failure
+    // loudly instead of proceeding over a sidecar it cannot interpret.
+    let err = load_jsonl(
+        &mut db,
+        r#"{"type":"Person","data":{"name":"Alice","age":30}}
+"#,
+        LoadMode::Merge,
+    )
+    .await
+    .err()
+    .expect("expected the write to fail on the corrupt sidecar");
+    assert!(
+        err.to_string().contains("is not valid JSON"),
+        "expected the corrupt-sidecar parse error, got: {}",
+        err,
+    );
+
+    // A fresh ReadWrite open fails the same way.
+    drop(db);
+    let err = Omnigraph::open(uri)
+        .await
+        .err()
+        .expect("expected open to fail because of the corrupt sidecar");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("01H000000000000000000000CC") && msg.contains("is not valid JSON"),
+        "expected the corrupt-sidecar parse error naming the file, got: {}",
+        msg,
+    );
+    // The file must remain on disk for inspection — never auto-deleted.
+    assert!(
+        list_recovery_dir(dir.path()).contains(&"01H000000000000000000000CC.json".to_string()),
+        "corrupt sidecar should remain on disk after refusal"
+    );
+
+    // Read-only open still works — the sweep is skipped entirely.
+    let _db = Omnigraph::open_read_only(uri).await.unwrap();
+}
+
+#[tokio::test]
 async fn read_only_open_skips_recovery_sweep() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();
