@@ -365,6 +365,13 @@ jobs:
       - name: Run RustFS CLI smoke
         run: cargo test --locked -p omnigraph-cli --test system_local local_cli_s3_end_to_end_init_load_read_flow -- --nocapture
 
+      - name: Run RustFS recovery-sidecar lifecycle
+        # Sidecar put/list/delete through S3StorageAdapter on a real
+        # bucket (the failpoint only wedges the publisher; the sidecar
+        # I/O is exercised for real). Name filter `s3_` matches the
+        # bucket-gated tests in the failpoints target only.
+        run: cargo test --locked -p omnigraph-engine --features failpoints --test failpoints s3_ -- --nocapture
+
       - name: Dump RustFS logs on failure
         if: failure()
         run: docker logs rustfs

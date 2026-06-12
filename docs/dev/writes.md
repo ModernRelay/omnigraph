@@ -259,6 +259,33 @@ publisher commit produces exactly one winner. The residual above is
 about *our* abandoned commits in the failure path, not about
 concurrency races.
 
+**Sidecar I/O failure semantics** (all sidecar I/O goes through the
+backend-generic `StorageAdapter`; the contracts below are pinned by the
+storage-fault failpoints `recovery.sidecar_{write,delete,list}` /
+`recovery.record_audit` and their tests in `tests/failpoints.rs` and
+`tests/recovery.rs`):
+
+- **Phase A put fails** (S3 PutObject / fs write): the writer aborts
+  before its first HEAD-advancing commit — no sidecar, no drift,
+  nothing to recover; a transient fault never wedges later writes.
+- **Phase D delete fails** (S3 DeleteObject): swallowed with a warning —
+  the write already published, so failing the caller would report an
+  error for a durable write. The stale sidecar is consumed by the next
+  write's entry heal (or the next open) via the stale-sidecar
+  audit-recovery path, recorded as `RolledForward`.
+- **`__recovery/` list fails** (S3 ListObjectsV2): loud at every
+  consumer — the write-entry heal fails the write, the open-time sweep
+  fails the open. Silently skipping recovery would be consumer
+  tolerance of drift.
+- **Corrupt / unparseable sidecar**: refused loudly by heal and open
+  alike; the file stays on disk for operator inspection (read-only
+  opens still work — the sweep is skipped there).
+- **Audit append fails after a roll-forward publish**: that recovery
+  attempt errors and keeps the sidecar; re-entry sees the
+  already-published manifest, records exactly one `RolledForward`
+  audit row, and deletes the sidecar (the retry tolerance documented
+  on `record_audit`).
+
 ## Conflict shape
 
 Concurrent writers to the same `(table, branch)` produce exactly one
