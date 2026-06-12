@@ -317,8 +317,8 @@ pub(crate) fn sidecar_uri(root_uri: &str, operation_id: &str) -> String {
 /// Write a sidecar atomically and return a handle for later deletion.
 ///
 /// The atomicity contract is inherited from [`StorageAdapter::write_text`]:
-/// LocalStorageAdapter publishes via temp-file + rename (atomic on POSIX);
-/// S3StorageAdapter writes via PutObject (atomic at the object level).
+/// the local backend publishes via a staged temp file + rename (atomic on
+/// POSIX); object stores write via PutObject (atomic at the object level).
 /// Both are sufficient for sidecar semantics — readers either see the
 /// complete sidecar or none.
 pub(crate) async fn write_sidecar(
@@ -1395,7 +1395,7 @@ pub(crate) fn new_sidecar(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::LocalStorageAdapter;
+    use crate::storage::ObjectStorageAdapter;
     use crate::table_store::TableStore;
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
@@ -1708,7 +1708,7 @@ mod tests {
     #[tokio::test]
     async fn list_sidecars_returns_empty_when_dir_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = LocalStorageAdapter::default();
+        let storage = ObjectStorageAdapter::local();
         let result = list_sidecars(dir.path().to_str().unwrap(), &storage)
             .await
             .unwrap();
@@ -1718,10 +1718,10 @@ mod tests {
     #[tokio::test]
     async fn write_then_list_then_delete_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        // Create the __recovery/ subdir so write_sidecar's parent exists
-        // (LocalStorageAdapter::write_text doesn't mkdir parents).
-        std::fs::create_dir(dir.path().join(RECOVERY_DIR_NAME)).unwrap();
-        let storage = LocalStorageAdapter::default();
+        // No pre-created __recovery/ subdir: the storage backend creates
+        // missing parents on put, which is what the first sidecar write
+        // of a fresh graph relies on.
+        let storage = ObjectStorageAdapter::local();
         let root = dir.path().to_str().unwrap();
 
         let sidecar = new_sidecar(
@@ -1752,7 +1752,7 @@ mod tests {
             "noise",
         )
         .unwrap();
-        let storage = LocalStorageAdapter::default();
+        let storage = ObjectStorageAdapter::local();
         let result = list_sidecars(dir.path().to_str().unwrap(), &storage)
             .await
             .unwrap();
@@ -1768,7 +1768,7 @@ mod tests {
     async fn list_sidecars_returns_deterministic_order() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(RECOVERY_DIR_NAME)).unwrap();
-        let storage = LocalStorageAdapter::default();
+        let storage = ObjectStorageAdapter::local();
         let root = dir.path().to_str().unwrap();
 
         // Write sidecars in REVERSE chronological order (newest first).

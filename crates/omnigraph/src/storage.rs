@@ -1,7 +1,7 @@
 use std::env;
 use std::fmt::Debug;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::TryStreamExt;
@@ -127,55 +127,6 @@ enum UriCodec {
 struct S3Location {
     bucket: String,
     key: String,
-}
-
-/// Backwards-compatible local constructor used by in-crate tests; delegates
-/// to the unified adapter. New code should use
-/// [`ObjectStorageAdapter::local`] or [`storage_for_uri`].
-#[derive(Debug, Default)]
-pub struct LocalStorageAdapter;
-
-static SHARED_LOCAL: LazyLock<ObjectStorageAdapter> = LazyLock::new(ObjectStorageAdapter::local);
-
-#[async_trait]
-impl StorageAdapter for LocalStorageAdapter {
-    async fn read_text(&self, uri: &str) -> Result<String> {
-        SHARED_LOCAL.read_text(uri).await
-    }
-    async fn write_text(&self, uri: &str, contents: &str) -> Result<()> {
-        SHARED_LOCAL.write_text(uri, contents).await
-    }
-    async fn write_text_if_absent(&self, uri: &str, contents: &str) -> Result<bool> {
-        SHARED_LOCAL.write_text_if_absent(uri, contents).await
-    }
-    async fn exists(&self, uri: &str) -> Result<bool> {
-        SHARED_LOCAL.exists(uri).await
-    }
-    async fn rename_text(&self, from_uri: &str, to_uri: &str) -> Result<()> {
-        SHARED_LOCAL.rename_text(from_uri, to_uri).await
-    }
-    async fn delete(&self, uri: &str) -> Result<()> {
-        SHARED_LOCAL.delete(uri).await
-    }
-    async fn list_dir(&self, dir_uri: &str) -> Result<Vec<String>> {
-        SHARED_LOCAL.list_dir(dir_uri).await
-    }
-    async fn read_text_versioned(&self, uri: &str) -> Result<(String, String)> {
-        SHARED_LOCAL.read_text_versioned(uri).await
-    }
-    async fn write_text_if_match(
-        &self,
-        uri: &str,
-        contents: &str,
-        expected_version: &str,
-    ) -> Result<Option<String>> {
-        SHARED_LOCAL
-            .write_text_if_match(uri, contents, expected_version)
-            .await
-    }
-    async fn delete_prefix(&self, prefix_uri: &str) -> Result<()> {
-        SHARED_LOCAL.delete_prefix(prefix_uri).await
-    }
 }
 
 impl ObjectStorageAdapter {
@@ -672,18 +623,160 @@ fn env_var_truthy(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The executable backend contract: every assertion here must hold for
+    /// EVERY backend (the divergence class this adapter closed was "two
+    /// implementations, one prose contract, no referee"). The S3 variant
+    /// runs bucket-gated in `tests/s3_storage.rs`
+    /// (`s3_adapter_conditional_writes_contract`).
+    async fn contract_suite(adapter: &dyn StorageAdapter, root: &str) {
+        // Write/read round-trip; replace is in-place and atomic.
+        let a = format!("{root}/contract/a.json");
+        adapter.write_text(&a, "v1").await.unwrap();
+        assert_eq!(adapter.read_text(&a).await.unwrap(), "v1");
+        adapter.write_text(&a, "v2").await.unwrap();
+        assert_eq!(adapter.read_text(&a).await.unwrap(), "v2");
+
+        // exists: object yes; missing no; non-empty prefix yes (the
+        // directory-shaped probe Lance dataset roots rely on).
+        assert!(adapter.exists(&a).await.unwrap());
+        assert!(
+            !adapter
+                .exists(&format!("{root}/contract/missing.json"))
+                .await
+                .unwrap()
+        );
+        assert!(adapter.exists(&format!("{root}/contract")).await.unwrap());
+
+        // if_absent: exactly one claim wins; the loser leaves the winner's
+        // object untouched.
+        let claim = format!("{root}/contract/claim.json");
+        assert!(adapter.write_text_if_absent(&claim, "first").await.unwrap());
+        assert!(!adapter.write_text_if_absent(&claim, "second").await.unwrap());
+        assert_eq!(adapter.read_text(&claim).await.unwrap(), "first");
+
+        // Versioned CAS: fresh token wins, stale token loses with Ok(None)
+        // (never a silent overwrite), missing object can't match.
+        let state = format!("{root}/contract/state.json");
+        adapter.write_text(&state, "s1").await.unwrap();
+        let (text, v1) = adapter.read_text_versioned(&state).await.unwrap();
+        assert_eq!(text, "s1");
+        let v2 = adapter
+            .write_text_if_match(&state, "s2", &v1)
+            .await
+            .unwrap()
+            .expect("fresh token must win");
+        assert_ne!(v2, v1);
+        assert!(
+            adapter
+                .write_text_if_match(&state, "s3", &v1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(adapter.read_text(&state).await.unwrap(), "s2");
+        assert!(
+            adapter
+                .write_text_if_match(&format!("{root}/contract/absent.json"), "x", &v1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // rename: destination is replaced; source is gone.
+        let src = format!("{root}/contract/src.json");
+        adapter.write_text(&src, "moved").await.unwrap();
+        adapter.rename_text(&src, &a).await.unwrap();
+        assert_eq!(adapter.read_text(&a).await.unwrap(), "moved");
+        assert!(!adapter.exists(&src).await.unwrap());
+
+        // list_dir: direct children only, no sibling-prefix bleed, output
+        // URIs round-trip verbatim into read_text, missing dir is empty.
+        let dir_uri = format!("{root}/contract/list");
+        adapter
+            .write_text(&format!("{dir_uri}/one.json"), "1")
+            .await
+            .unwrap();
+        adapter
+            .write_text(&format!("{dir_uri}/two.json"), "2")
+            .await
+            .unwrap();
+        adapter
+            .write_text(&format!("{dir_uri}/sub/three.json"), "3")
+            .await
+            .unwrap();
+        adapter
+            .write_text(&format!("{root}/contract/list_log/x.json"), "x")
+            .await
+            .unwrap();
+        let mut listed = adapter.list_dir(&dir_uri).await.unwrap();
+        listed.sort();
+        assert_eq!(
+            listed,
+            vec![
+                format!("{dir_uri}/one.json"),
+                format!("{dir_uri}/two.json")
+            ]
+        );
+        for uri in &listed {
+            adapter.read_text(uri).await.unwrap();
+        }
+        assert!(
+            adapter
+                .list_dir(&format!("{root}/contract/nope"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // delete: idempotent.
+        adapter.delete(&claim).await.unwrap();
+        adapter.delete(&claim).await.unwrap();
+        assert!(!adapter.exists(&claim).await.unwrap());
+
+        // delete_prefix: recursive + idempotent; nothing under the prefix
+        // (including local directory skeletons) survives.
+        adapter
+            .delete_prefix(&format!("{root}/contract"))
+            .await
+            .unwrap();
+        assert!(!adapter.exists(&a).await.unwrap());
+        assert!(!adapter.exists(&format!("{root}/contract")).await.unwrap());
+        adapter
+            .delete_prefix(&format!("{root}/contract"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn contract_suite_local() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = ObjectStorageAdapter::local();
+        contract_suite(&adapter, dir.path().to_str().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn contract_suite_in_memory() {
+        // InMemory implements true conditional updates, so this runs the
+        // strong-CAS path (ETag tokens + PutMode::Update) without a bucket.
+        let adapter = ObjectStorageAdapter::in_memory();
+        contract_suite(&adapter, "mem-root").await;
+    }
 
     /// `write_text_if_absent` must make the contents visible to any
     /// subsequent reader before it returns — callers acknowledge
     /// success the moment it resolves (cluster state bootstrap reads
     /// the file back; init ownership claims depend on it).
-    /// Regression: the buffered `tokio::fs::File` write was not
-    /// flushed, so the bytes could still be in flight on the blocking
-    /// pool while a reader saw an empty or partial file.
+    /// Regression: the previous hand-rolled local adapter wrote through a
+    /// buffered `tokio::fs::File` without flushing, so the bytes could
+    /// still be in flight on the blocking pool while a reader saw an empty
+    /// or partial file. Reads back through `std::fs` deliberately —
+    /// cross-API visibility is the point.
     #[tokio::test]
     async fn local_write_text_if_absent_is_read_visible_on_return() {
         let dir = tempfile::tempdir().unwrap();
-        let adapter = LocalStorageAdapter;
+        let adapter = ObjectStorageAdapter::local();
         let payload = "x".repeat(8 * 1024);
         for i in 0..1000 {
             let path = dir.path().join(format!("obj-{i}.json"));
@@ -697,67 +790,75 @@ mod tests {
                  contents reached the file"
             );
         }
-        // No-replace contract: a second claim loses and the winner's
-        // content is untouched.
-        let path = dir.path().join("obj-0.json");
-        let uri = format!("{}", path.display());
-        assert!(!adapter.write_text_if_absent(&uri, "loser").await.unwrap());
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap().len(),
-            payload.len(),
-            "a losing if-absent claim must not disturb the existing object"
-        );
     }
 
+    /// Object-store semantics on the local filesystem: only objects exist.
+    /// An empty directory is not an object and not a non-empty prefix —
+    /// callers that genuinely probe local directories use std::fs.
     #[tokio::test]
-    async fn local_versioned_cas_roundtrip() {
+    async fn local_exists_is_object_semantics_for_directories() {
         let dir = tempfile::tempdir().unwrap();
-        let uri = format!("{}/state.json", dir.path().display());
-        let adapter = LocalStorageAdapter;
-        adapter.write_text(&uri, "v1").await.unwrap();
-        let (text, version) = adapter.read_text_versioned(&uri).await.unwrap();
-        assert_eq!(text, "v1");
-
-        // Matching token replaces and returns the next token.
-        let next = adapter
-            .write_text_if_match(&uri, "v2", &version)
-            .await
-            .unwrap()
-            .expect("fresh token must win");
-        assert_ne!(next, version);
-        // The stale token must lose (CAS-lost is Ok(None), never silent).
+        let probe = dir.path().join("maybe-dataset");
+        let adapter = ObjectStorageAdapter::local();
+        std::fs::create_dir(&probe).unwrap();
         assert!(
-            adapter
-                .write_text_if_match(&uri, "v3", &version)
-                .await
-                .unwrap()
-                .is_none()
+            !adapter.exists(probe.to_str().unwrap()).await.unwrap(),
+            "an empty directory is not an object"
         );
-        let (text, _) = adapter.read_text_versioned(&uri).await.unwrap();
-        assert_eq!(text, "v2");
-        // Missing object: precondition can't hold.
-        let missing = format!("{}/absent.json", dir.path().display());
+        std::fs::write(probe.join("1.manifest"), "m").unwrap();
         assert!(
-            adapter
-                .write_text_if_match(&missing, "x", &version)
-                .await
-                .unwrap()
-                .is_none()
+            adapter.exists(probe.to_str().unwrap()).await.unwrap(),
+            "a non-empty prefix exists (the Lance dataset-root probe shape)"
         );
     }
 
+    /// list_dir output is anchored on the INPUT dir_uri, so `file://`
+    /// anchors and paths with spaces round-trip byte-identically into
+    /// read_text — the cluster store passes file://-schemed roots.
     #[tokio::test]
-    async fn local_delete_prefix_is_recursive_and_idempotent() {
+    async fn local_list_round_trips_file_scheme_and_spaces() {
         let dir = tempfile::tempdir().unwrap();
-        let root = format!("{}/tree", dir.path().display());
-        let adapter = LocalStorageAdapter;
-        adapter.write_text(&format!("{root}/a.txt"), "a").await.unwrap();
-        adapter.write_text(&format!("{root}/sub/b.txt"), "b").await.unwrap();
-        adapter.delete_prefix(&root).await.unwrap();
-        assert!(!adapter.exists(&format!("{root}/a.txt")).await.unwrap());
-        adapter.delete_prefix(&root).await.unwrap(); // absent -> Ok
+        let root = dir.path().join("with space");
+        let adapter = ObjectStorageAdapter::local();
+        let plain = format!("{}/x.json", root.display());
+        adapter.write_text(&plain, "x").await.unwrap();
+
+        let listed = adapter.list_dir(root.to_str().unwrap()).await.unwrap();
+        assert_eq!(listed, vec![plain.clone()]);
+        assert_eq!(adapter.read_text(&listed[0]).await.unwrap(), "x");
+
+        let file_anchor = format!("file://{}", root.display());
+        let listed = adapter.list_dir(&file_anchor).await.unwrap();
+        assert_eq!(listed, vec![format!("{file_anchor}/x.json")]);
+        assert_eq!(adapter.read_text(&listed[0]).await.unwrap(), "x");
     }
-    use super::*;
+
+    /// Relative and dot-segment paths are lexically absolutized before
+    /// hitting the object-path layer (which rejects them) — the CLI passes
+    /// `./graph.omni`-shaped URIs verbatim.
+    #[tokio::test]
+    async fn local_paths_with_dot_segments_are_absolutized() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = ObjectStorageAdapter::local();
+        let uri = format!("{}/sub/../dotted.json", dir.path().display());
+        adapter.write_text(&uri, "x").await.unwrap();
+        assert_eq!(adapter.read_text(&uri).await.unwrap(), "x");
+        assert!(dir.path().join("dotted.json").exists());
+    }
+
+    /// Upstream local rename creates missing destination parents — more
+    /// lenient than the previous bare fs::rename; pinned so an upstream
+    /// regression is loud.
+    #[tokio::test]
+    async fn local_rename_creates_missing_destination_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = ObjectStorageAdapter::local();
+        let src = format!("{}/src.json", dir.path().display());
+        adapter.write_text(&src, "x").await.unwrap();
+        let dst = format!("{}/new-sub/dst.json", dir.path().display());
+        adapter.rename_text(&src, &dst).await.unwrap();
+        assert_eq!(adapter.read_text(&dst).await.unwrap(), "x");
+    }
 
     #[test]
     fn storage_backend_selection_is_scheme_aware() {
@@ -811,15 +912,4 @@ mod tests {
         assert_eq!(location.key, "graph/_schema.pg");
     }
 
-    #[tokio::test]
-    async fn local_write_text_if_absent_creates_once_without_overwrite() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().join("claim.txt");
-        let uri = uri.to_str().unwrap();
-        let storage = LocalStorageAdapter;
-
-        assert!(storage.write_text_if_absent(uri, "first").await.unwrap());
-        assert!(!storage.write_text_if_absent(uri, "second").await.unwrap());
-        assert_eq!(storage.read_text(uri).await.unwrap(), "first");
-    }
 }

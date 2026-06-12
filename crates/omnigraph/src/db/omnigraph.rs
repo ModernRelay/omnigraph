@@ -1989,7 +1989,7 @@ mod tests {
     use serde_json::Value;
     use std::sync::{Arc, Mutex};
 
-    use crate::storage::{LocalStorageAdapter, StorageAdapter, join_uri};
+    use crate::storage::{ObjectStorageAdapter, StorageAdapter, join_uri};
 
     const TEST_SCHEMA: &str = r#"
 node Person {
@@ -2005,14 +2005,27 @@ edge Knows: Person -> Person {
 edge WorksAt: Person -> Company
 "#;
 
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     struct RecordingStorageAdapter {
-        inner: LocalStorageAdapter,
+        inner: ObjectStorageAdapter,
         reads: Mutex<Vec<String>>,
         writes: Mutex<Vec<String>>,
         exists_checks: Mutex<Vec<String>>,
         renames: Mutex<Vec<(String, String)>>,
         deletes: Mutex<Vec<String>>,
+    }
+
+    impl Default for RecordingStorageAdapter {
+        fn default() -> Self {
+            Self {
+                inner: ObjectStorageAdapter::local(),
+                reads: Mutex::default(),
+                writes: Mutex::default(),
+                exists_checks: Mutex::default(),
+                renames: Mutex::default(),
+                deletes: Mutex::default(),
+            }
+        }
     }
 
     impl RecordingStorageAdapter {
@@ -2090,7 +2103,7 @@ edge WorksAt: Person -> Company
 
     #[derive(Debug)]
     struct InitRaceStorageAdapter {
-        inner: LocalStorageAdapter,
+        inner: ObjectStorageAdapter,
         root: String,
         barrier: Arc<tokio::sync::Barrier>,
     }
@@ -2155,7 +2168,7 @@ edge WorksAt: Person -> Company
         let uri = dir.path().to_str().unwrap().to_string();
         let root = normalize_root_uri(&uri).unwrap();
         let storage: Arc<dyn StorageAdapter> = Arc::new(InitRaceStorageAdapter {
-            inner: LocalStorageAdapter,
+            inner: ObjectStorageAdapter::local(),
             root,
             barrier: Arc::new(tokio::sync::Barrier::new(2)),
         });
