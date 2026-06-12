@@ -366,11 +366,18 @@ jobs:
         run: cargo test --locked -p omnigraph-cli --test system_local local_cli_s3_end_to_end_init_load_read_flow -- --nocapture
 
       - name: Run RustFS recovery-sidecar lifecycle
-        # Sidecar put/list/delete through S3StorageAdapter on a real
-        # bucket (the failpoint only wedges the publisher; the sidecar
-        # I/O is exercised for real). Name filter `s3_` matches the
-        # bucket-gated tests in the failpoints target only.
-        run: cargo test --locked -p omnigraph-engine --features failpoints --test failpoints s3_ -- --nocapture
+        # Sidecar put/list/delete through the S3 storage backend on a
+        # real bucket (the failpoint only wedges the publisher; the
+        # sidecar I/O is exercised for real). Name filter `s3_` matches
+        # the bucket-gated tests in the failpoints target only; the
+        # grep guards against the filter going vacuous (cargo passes
+        # with 0 tests matched) if those tests are ever renamed.
+        run: |
+          output=$(cargo test --locked -p omnigraph-engine --features failpoints --test failpoints s3_ -- --nocapture 2>&1); status=$?
+          echo "$output"
+          [ "$status" -eq 0 ] || exit "$status"
+          echo "$output" | grep -Eq "test result: ok\. [1-9][0-9]* passed" \
+            || { echo "::error::filter 's3_' matched no tests — vacuous pass"; exit 1; }
 
       - name: Dump RustFS logs on failure
         if: failure()

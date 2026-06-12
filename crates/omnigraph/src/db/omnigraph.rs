@@ -813,6 +813,15 @@ impl Omnigraph {
             // write its sidecar + staging between the empty check and
             // the reconcile (the same race, through a smaller window).
             // Queue before coordinator — the documented lock order.
+            //
+            // Liveness note: with a pending NON-SchemaApply sidecar
+            // (e.g. a Mutation residual), this gate skips the standalone
+            // reconcile and the heal below reconciles only per
+            // SchemaApply sidecar — so pre-sidecar-era orphaned staging
+            // residue waits for the NEXT refresh after the sidecars are
+            // consumed. Convergence holds, one pass late. Do not "fix"
+            // by re-running the reconcile unserialized here: that is
+            // exactly the live-apply race this block exists to close.
             let _serial = self
                 .write_queue
                 .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
