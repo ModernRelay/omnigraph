@@ -599,6 +599,42 @@ fn env_var_truthy(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
 
+    /// `write_text_if_absent` must make the contents visible to any
+    /// subsequent reader before it returns — callers acknowledge
+    /// success the moment it resolves (cluster state bootstrap reads
+    /// the file back; init ownership claims depend on it).
+    /// Regression: the buffered `tokio::fs::File` write was not
+    /// flushed, so the bytes could still be in flight on the blocking
+    /// pool while a reader saw an empty or partial file.
+    #[tokio::test]
+    async fn local_write_text_if_absent_is_read_visible_on_return() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = LocalStorageAdapter;
+        let payload = "x".repeat(8 * 1024);
+        for i in 0..1000 {
+            let path = dir.path().join(format!("obj-{i}.json"));
+            let uri = format!("{}", path.display());
+            assert!(adapter.write_text_if_absent(&uri, &payload).await.unwrap());
+            let read = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                read.len(),
+                payload.len(),
+                "iteration {i}: write_text_if_absent returned before its \
+                 contents reached the file"
+            );
+        }
+        // No-replace contract: a second claim loses and the winner's
+        // content is untouched.
+        let path = dir.path().join("obj-0.json");
+        let uri = format!("{}", path.display());
+        assert!(!adapter.write_text_if_absent(&uri, "loser").await.unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().len(),
+            payload.len(),
+            "a losing if-absent claim must not disturb the existing object"
+        );
+    }
+
     #[tokio::test]
     async fn local_versioned_cas_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
