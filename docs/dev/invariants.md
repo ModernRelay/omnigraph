@@ -148,6 +148,18 @@ them explicit.
   Remove the skip when the upstream Lance fix lands — the
   `lance_surface_guards.rs::compact_files_still_fails_on_blob_columns` guard
   turns red on that bump to force it.
+- **Recovery is serialized against live writers in-process only:** the
+  write-entry heal (and `refresh`) serialize against a live writer's sidecar
+  lifetime via the per-`(table, branch)` write queues plus the schema-apply
+  serialization key — all in-process primitives. A recovery pass in one
+  process cannot serialize against a live writer in another (the open-time
+  sweep has the same exposure, and always has): it may roll a live foreign
+  writer's sidecar forward, which degrades to publisher-CAS contention for
+  data writes but can race the schema-staging promotion for a foreign live
+  schema apply. Multi-process writers on one graph are already documented
+  one-winner-CAS territory; closing this fully needs a cross-process
+  serialization primitive (e.g. lease-based use of the schema-apply lock
+  branch) — design it before promoting multi-process write topologies.
 - **Local `write_text_if_match` is not a cross-process CAS:** object-store
   backends use a true conditional put (ETag If-Match; the in-memory test
   backend too), but upstream `object_store` leaves `PutMode::Update`

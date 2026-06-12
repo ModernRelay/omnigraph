@@ -436,19 +436,30 @@ where
     // per-table acquisitions are uncontended. They exist for symmetry
     // with future MR-870 recovery, which will need queue acquisition
     // before any `Dataset::restore` it issues for SchemaApply sidecars.
-    let schema_apply_queue_keys: Vec<(String, Option<String>)> = recovery_pins
+    let mut schema_apply_queue_keys: Vec<(String, Option<String>)> = recovery_pins
         .iter()
         .map(|pin| (pin.table_key.clone(), pin.table_branch.clone()))
         .collect();
+    // The serialization key the write-entry heal acquires before touching
+    // schema staging or a SchemaApply sidecar. Per-table keys alone don't
+    // cover a registration-only migration (no pins, but a sidecar and
+    // staging files on disk) — without this, a concurrent write's heal can
+    // promote this apply's staging files and publish its registrations out
+    // from under it. Acquired whenever a sidecar will be written, held
+    // through Phase D (the guards live to the end of this function).
+    let writes_sidecar = !(recovery_pins.is_empty()
+        && sidecar_registrations.is_empty()
+        && sidecar_tombstones.is_empty());
+    if writes_sidecar {
+        schema_apply_queue_keys
+            .push(crate::db::manifest::schema_apply_serial_queue_key());
+    }
     let _schema_apply_queue_guards = db
         .write_queue()
         .acquire_many(&schema_apply_queue_keys)
         .await;
 
-    let recovery_handle = if recovery_pins.is_empty()
-        && sidecar_registrations.is_empty()
-        && sidecar_tombstones.is_empty()
-    {
+    let recovery_handle = if !writes_sidecar {
         None
     } else {
         // `branch=None` because schema_apply publishes against main —

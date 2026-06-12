@@ -789,6 +789,16 @@ impl Omnigraph {
     /// [`refresh_coordinator_only`](Self::refresh_coordinator_only) to
     /// avoid the recovery sweep racing their own sidecar.
     pub async fn refresh(&self) -> Result<()> {
+        // Standalone schema-staging reconcile ONLY when no recovery
+        // sidecar exists (legacy/manual staging residue). When sidecars
+        // exist, the heal below owns the reconcile — per SchemaApply
+        // sidecar, under that sidecar's queue guards — because an
+        // unserialized reconcile can promote a LIVE schema apply's
+        // staging files from under it, and a pre-promoted result would
+        // make the heal's own guarded reconcile see clean staging and
+        // wrongly defer the sidecar. The no-sidecar case cannot race a
+        // live apply: its sidecar is on disk before its staging files.
+        //
         // Scope the coord write guard to the schema-state section only.
         // `reload_schema_if_source_changed` (below) acquires
         // `self.coordinator.read().await` when the on-disk schema source
@@ -797,22 +807,35 @@ impl Omnigraph {
         // Pinned by `composite_flow_schema_apply_then_branch_ops_no_deadlock_in_refresh`.
         // The heal also takes the lock itself (queues → coordinator
         // order), so it must run after this guard is released.
-        let schema_state_recovery = {
-            let mut coord = self.coordinator.write().await;
-            coord.refresh().await?;
-            recover_schema_state_files(
-                &self.root_uri,
-                Arc::clone(&self.storage),
-                &coord.snapshot(),
-            )
-            .await?
-        }; // ← write guard released before the heal's queue acquisition
+        {
+            // Hold the schema-apply serialization key across the
+            // list-then-reconcile pair: without it, a live apply can
+            // write its sidecar + staging between the empty check and
+            // the reconcile (the same race, through a smaller window).
+            // Queue before coordinator — the documented lock order.
+            let _serial = self
+                .write_queue
+                .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+                .await;
+            if crate::db::manifest::list_sidecars(&self.root_uri, self.storage.as_ref())
+                .await?
+                .is_empty()
+            {
+                let mut coord = self.coordinator.write().await;
+                coord.refresh().await?;
+                recover_schema_state_files(
+                    &self.root_uri,
+                    Arc::clone(&self.storage),
+                    &coord.snapshot(),
+                )
+                .await?;
+            }
+        } // ← guards released before the heal's queue acquisition
         crate::db::manifest::heal_pending_sidecars_roll_forward(
             &self.root_uri,
             Arc::clone(&self.storage),
             &self.coordinator,
             &self.write_queue,
-            Some(schema_state_recovery),
         )
         .await?;
         self.reload_schema_if_source_changed().await?;
@@ -839,7 +862,6 @@ impl Omnigraph {
             Arc::clone(&self.storage),
             &self.coordinator,
             &self.write_queue,
-            None,
         )
         .await?;
         if processed {

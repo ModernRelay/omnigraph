@@ -37,7 +37,7 @@ pub(crate) use recovery::{
     RecoveryMode, RecoverySidecar, RecoverySidecarHandle, SidecarKind, SidecarTablePin,
     SidecarTableRegistration, SidecarTombstone, delete_sidecar, has_schema_apply_sidecar,
     heal_pending_sidecars_roll_forward, list_sidecars, new_sidecar, recover_manifest_drift,
-    write_sidecar,
+    schema_apply_serial_queue_key, write_sidecar,
 };
 pub use state::SubTableEntry;
 #[cfg(test)]

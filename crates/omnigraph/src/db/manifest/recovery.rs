@@ -572,11 +572,11 @@ pub(crate) async fn restore_table_to_version(
 /// Lock order is queues → coordinator, matching every writer's
 /// commit→publish path.
 ///
-/// `schema_state_recovery`: callers that already ran
-/// `recover_schema_state_files` (refresh) pass the result so a
-/// SchemaApply sidecar whose staging rename completed in the same pass
-/// stays roll-forward-eligible; write-entry callers pass `None` and the
-/// reconcile runs lazily, only when sidecars were found.
+/// The schema-staging reconcile runs lazily, per SchemaApply sidecar,
+/// AFTER that sidecar's queue guards are held and its existence is
+/// re-confirmed — never up front. An up-front reconcile can promote a
+/// LIVE schema apply's staging files and steal its commit (pinned by
+/// `tests/failpoints.rs::heal_does_not_promote_live_schema_apply_staging`).
 ///
 /// Returns `true` when at least one sidecar was processed (the caller
 /// should invalidate per-snapshot caches).
@@ -585,40 +585,33 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
     storage: std::sync::Arc<dyn StorageAdapter>,
     coordinator: &tokio::sync::RwLock<GraphCoordinator>,
     write_queue: &crate::db::write_queue::WriteQueueManager,
-    schema_state_recovery: Option<SchemaStateRecovery>,
 ) -> Result<bool> {
     let sidecars = list_sidecars(root_uri, storage.as_ref()).await?;
     if sidecars.is_empty() {
         return Ok(false);
     }
-    // Schema-staging reconcile before any SchemaApply sidecar is
-    // classified — same ordering as open and refresh (a SchemaApply
-    // roll-forward must not publish the manifest while the staging
-    // files remain unrenamed).
-    let schema_state_recovery = match schema_state_recovery {
-        Some(recovery) => recovery,
-        None => {
-            let mut coord = coordinator.write().await;
-            coord.refresh().await?;
-            let snapshot = coord.snapshot();
-            crate::db::schema_state::recover_schema_state_files(
-                root_uri,
-                std::sync::Arc::clone(&storage),
-                &snapshot,
-            )
-            .await?
-        }
-    };
     let mut processed_any = false;
     for sidecar in sidecars {
         // Serialize against a possibly-live writer (see fn docs). Guards
         // are scoped per sidecar so two sidecars never hold queues
         // simultaneously (no cross-sidecar lock-order surface).
-        let queue_keys: Vec<crate::db::write_queue::TableQueueKey> = sidecar
+        let mut queue_keys: Vec<crate::db::write_queue::TableQueueKey> = sidecar
             .tables
             .iter()
             .map(|pin| (pin.table_key.clone(), pin.table_branch.clone()))
             .collect();
+        let is_schema_apply = matches!(sidecar.writer_kind, SidecarKind::SchemaApply);
+        if is_schema_apply {
+            // A SchemaApply sidecar's per-table pins don't cover a
+            // registration-only migration (no existing tables touched,
+            // but staging files + a sidecar on disk). The schema-apply
+            // writer holds this serialization key from before its
+            // sidecar write until after its sidecar delete, so blocking
+            // on it — then re-checking sidecar existence — guarantees
+            // the writer is gone before the reconcile below mutates
+            // schema staging.
+            queue_keys.push(schema_apply_serial_queue_key());
+        }
         let _guards = write_queue.acquire_many(&queue_keys).await;
         // Re-check after the wait: the writer we blocked on may have
         // completed Phase C and deleted its sidecar.
@@ -628,6 +621,28 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
         {
             continue;
         }
+        // Schema-staging reconcile, per SchemaApply sidecar, UNDER the
+        // sidecar's guards: a sidecar still on disk after the queue wait
+        // belongs to a dead writer, so promoting its staging files can no
+        // longer race the live apply's own renames or steal its commit.
+        // It also re-runs per sidecar, so a multi-sidecar pass never
+        // classifies against a reconcile result an earlier roll-forward
+        // staled. Non-SchemaApply sidecars never consult the value.
+        let schema_state_recovery = if is_schema_apply {
+            let snapshot = {
+                let mut coord = coordinator.write().await;
+                coord.refresh().await?;
+                coord.snapshot()
+            };
+            crate::db::schema_state::recover_schema_state_files(
+                root_uri,
+                std::sync::Arc::clone(&storage),
+                &snapshot,
+            )
+            .await?
+        } else {
+            SchemaStateRecovery::Noop
+        };
         // Fresh per-branch snapshot — same rationale as
         // `recover_manifest_drift`: classify against the branch the
         // sidecar's writer targeted, refreshed after any prior
@@ -661,6 +676,16 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
     // post-heal manifest.
     coordinator.write().await.refresh().await?;
     Ok(processed_any)
+}
+
+/// The write-queue key serializing schema-apply's sidecar lifecycle
+/// against the write-entry heal. The schema-apply writer acquires it
+/// (alongside its per-table keys) from before `write_sidecar` until
+/// after `delete_sidecar`; the heal acquires it before reconciling
+/// schema staging or processing a SchemaApply sidecar. The name cannot
+/// collide with real table keys (those are `node:`/`edge:`-prefixed).
+pub(crate) fn schema_apply_serial_queue_key() -> crate::db::write_queue::TableQueueKey {
+    ("__schema_apply__".to_string(), None)
 }
 
 /// Open-time recovery sweep — the entry point invoked from
