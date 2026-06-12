@@ -865,6 +865,12 @@ impl Omnigraph {
         )
         .await?;
         if processed {
+            // A rolled-forward SchemaApply sidecar moved disk + manifest
+            // to the new schema (staging promoted, registrations
+            // published); the in-memory catalog must follow or the very
+            // write that triggered the heal validates against the stale
+            // schema. Same post-heal step as `refresh`.
+            self.reload_schema_if_source_changed().await?;
             self.runtime_cache.invalidate_all().await;
         }
         Ok(())
