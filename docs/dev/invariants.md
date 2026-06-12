@@ -108,7 +108,7 @@ Use it this way:
 | Index lifecycle | `ensure_indices` is explicit today; reconciler-based convergence is roadmap | [indexes.md](../user/indexes.md), [maintenance.md](../user/maintenance.md) |
 | Traversal IDs | Runtime still builds `TypeIndex`; Lance stable row-id based graph IDs are roadmap | [architecture.md](architecture.md), [query-language.md](../user/query-language.md) |
 | Auth | Bearer token hashing and server-side actor resolution are implemented at the HTTP boundary | [server.md](../user/server.md), [policy.md](../user/policy.md) |
-| Tests | Tempdir-backed Lance tests are the current substrate; there is no `MemStorage` test backend | [testing.md](testing.md) |
+| Tests | Tempdir-backed Lance tests are the current substrate; the storage adapter has an in-memory backend for adapter-level contract tests, but Lance datasets bypass it | [testing.md](testing.md) |
 
 The branch-delete reconciler is authority-derived: it reclaims orphaned forks
 today and degrades to a no-op if Lance ships an atomic multi-dataset branch
@@ -148,6 +148,17 @@ them explicit.
   Remove the skip when the upstream Lance fix lands — the
   `lance_surface_guards.rs::compact_files_still_fails_on_blob_columns` guard
   turns red on that bump to force it.
+- **Local `write_text_if_match` is not a cross-process CAS:** object-store
+  backends use a true conditional put (ETag If-Match; the in-memory test
+  backend too), but upstream `object_store` leaves `PutMode::Update`
+  unimplemented for `LocalFileSystem`, so the local path emulates CAS with
+  a content-token compare followed by an atomic replace — a check-then-act
+  gap plus content-token ABA. Every current caller goes through the cluster
+  lock protocol first, which makes this safe. A lock-free caller would get
+  S3-correct but local-racy behavior — the same divergence shape as the
+  acknowledged-before-visible bug this branch fixed. Close it (local CAS
+  primitive, or a trait-level lock requirement) before admitting any
+  lock-free `if_match` caller.
 - **Manifest→commit-graph publish atomicity:** a graph commit advances
   `__manifest` (the visibility authority) and then appends `_graph_commits` as
   two separate writes (`commit_updates_with_actor_with_expected`, failpoint

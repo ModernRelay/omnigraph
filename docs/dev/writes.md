@@ -286,6 +286,17 @@ storage-fault failpoints `recovery.sidecar_{write,delete,list}` /
   audit row, and deletes the sidecar (the retry tolerance documented
   on `record_audit`).
 
+Backend notes (the adapter is one implementation over `object_store`
+for every backend): local writes stage through `name#<digits>` temp
+files that the backend filters from listings and refuses to address —
+crash residue of that shape is invisible to the sweep, harmless, and
+reclaimed by `delete_prefix`/manual cleanup. Storage errors are
+backend-wrapped text without a typed NotFound discriminant — callers
+that need missing-vs-error (the cluster store) probe `exists()` first.
+`exists()` itself is object-store semantics everywhere: only objects
+(or non-empty prefixes) exist, and a permission failure is a loud
+error, not a silent `false`.
+
 ## Conflict shape
 
 Concurrent writers to the same `(table, branch)` produce exactly one

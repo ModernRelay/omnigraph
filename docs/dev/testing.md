@@ -50,7 +50,7 @@ The engine's `tests/` is the principal coverage surface; most graph-shaped behav
 - **CLI** — `crates/omnigraph-cli/tests/support/mod.rs`: `Command`-style wrapper for invoking `omnigraph`, server-process spawning, fixture resolution, output assertion helpers.
 - **Server** — no shared helpers; server tests call the `Omnigraph` engine API directly and exercise endpoints over the wire.
 
-> Note: there is **no `MemStorage` or in-memory backend** today. Tests use `tempfile::tempdir()` for local FS. If you find yourself needing one for layer isolation, that's an architectural ask — keep it explicit in [docs/dev/invariants.md](invariants.md) under known gaps.
+> Note: the storage adapter has an in-memory backend (`ObjectStorageAdapter::in_memory()`, full contract including true conditional updates) used by the adapter contract tests in `storage.rs`. It covers only the text-object layer (sidecars, schema staging, cluster state) — **Lance datasets bypass the adapter**, so engine integration tests still use `tempfile::tempdir()`. An in-memory Lance substrate remains an architectural ask — keep it explicit in [docs/dev/invariants.md](invariants.md) under known gaps.
 
 ## Failpoints (fault injection)
 
