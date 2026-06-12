@@ -114,7 +114,19 @@ impl StorageAdapter for LocalStorageAdapter {
                 tokio::fs::create_dir_all(parent).await?;
             }
         }
-        tokio::fs::write(&path, contents).await?;
+        // Publish atomically: complete temp file, then rename into
+        // place. A reader at `path` sees the old object or the new one,
+        // never a truncated in-progress write — the same object-level
+        // atomic visibility the S3 adapter gets from PutObject, which
+        // callers (sidecar protocol, cluster state) assume. Plain
+        // `tokio::fs::write(&path, ..)` would expose an empty/partial
+        // object between create-truncate and the final byte.
+        let tmp = path.with_extension(format!("tmp.{}", ulid::Ulid::new()));
+        tokio::fs::write(&tmp, contents).await?;
+        if let Err(err) = tokio::fs::rename(&tmp, &path).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(err.into());
+        }
         Ok(())
     }
 
@@ -125,21 +137,26 @@ impl StorageAdapter for LocalStorageAdapter {
                 tokio::fs::create_dir_all(parent).await?;
             }
         }
-        let mut file = match tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .await
-        {
-            Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
-            Err(err) => return Err(err.into()),
-        };
-        if let Err(err) = file.write_all(contents.as_bytes()).await {
-            let _ = tokio::fs::remove_file(&path).await;
-            return Err(err.into());
+        // Atomic no-replace publish: complete temp file, then
+        // `hard_link` it to the destination — link fails with
+        // AlreadyExists if the destination exists, so exactly one of N
+        // concurrent claimants wins, and the winner's object is fully
+        // readable at the instant it becomes visible. The previous
+        // `create_new` + buffered `File::write_all` shape had two bugs:
+        // the claim was visible (as an empty file) before the contents,
+        // and `write_all` could resolve before the bytes left tokio's
+        // internal buffer, acknowledging a write a same-thread reader
+        // could not yet see (pinned by
+        // `local_write_text_if_absent_is_read_visible_on_return`).
+        let tmp = path.with_extension(format!("tmp.{}", ulid::Ulid::new()));
+        tokio::fs::write(&tmp, contents).await?;
+        let linked = tokio::fs::hard_link(&tmp, &path).await;
+        let _ = tokio::fs::remove_file(&tmp).await;
+        match linked {
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(err) => Err(err.into()),
         }
-        Ok(true)
     }
 
     async fn exists(&self, uri: &str) -> Result<bool> {

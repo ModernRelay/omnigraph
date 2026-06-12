@@ -317,7 +317,7 @@ pub(crate) fn sidecar_uri(root_uri: &str, operation_id: &str) -> String {
 /// Write a sidecar atomically and return a handle for later deletion.
 ///
 /// The atomicity contract is inherited from [`StorageAdapter::write_text`]:
-/// LocalStorageAdapter writes via `tokio::fs::write` (whole-file replace);
+/// LocalStorageAdapter publishes via temp-file + rename (atomic on POSIX);
 /// S3StorageAdapter writes via PutObject (atomic at the object level).
 /// Both are sufficient for sidecar semantics — readers either see the
 /// complete sidecar or none.
