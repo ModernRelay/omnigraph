@@ -169,31 +169,16 @@ impl ClusterStore {
             .map_err(|err| err.to_string())
     }
 
-    /// JSON object write with the strongest atomicity the backend offers:
-    /// temp + rename on the filesystem (no torn JSON after a crash; the
-    /// pre-port behavior), a single atomic PUT on object stores (where
-    /// copy+delete would be weaker, not stronger).
+    /// JSON object write. Atomic visibility is the storage adapter's
+    /// contract on every backend (staged temp + rename on the filesystem,
+    /// a single atomic PUT on object stores) — no torn JSON after a crash,
+    /// no per-backend branch needed here.
     async fn put_json(&self, relative: &str, payload: &str) -> Result<(), String> {
         let target = self.uri(relative);
-        match self.kind() {
-            StorageKind::Local => {
-                let tmp = format!("{target}.tmp.{}", Ulid::new());
-                self.adapter
-                    .write_text(&tmp, payload)
-                    .await
-                    .map_err(|err| err.to_string())?;
-                if let Err(err) = self.adapter.rename_text(&tmp, &target).await {
-                    let _ = self.adapter.delete(&tmp).await;
-                    return Err(err.to_string());
-                }
-                Ok(())
-            }
-            StorageKind::S3 => self
-                .adapter
-                .write_text(&target, payload)
-                .await
-                .map_err(|err| err.to_string()),
-        }
+        self.adapter
+            .write_text(&target, payload)
+            .await
+            .map_err(|err| err.to_string())
     }
 
     /// Shared list-and-parse for the sidecar/approval directories: id
