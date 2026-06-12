@@ -682,7 +682,7 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
                 coord.snapshot()
             }
         };
-        process_sidecar(
+        if process_sidecar(
             root_uri,
             storage.as_ref(),
             &branch_snapshot,
@@ -690,8 +690,10 @@ pub(crate) async fn heal_pending_sidecars_roll_forward(
             RecoveryMode::RollForwardOnly,
             schema_state_recovery,
         )
-        .await?;
-        processed_any = true;
+        .await?
+        {
+            processed_any = true;
+        }
     }
     // Re-read coordinator state so the caller's handle observes the
     // post-heal manifest.
@@ -721,22 +723,33 @@ async fn discard_orphaned_branch_sidecar(
         branch = sidecar.branch.as_deref().unwrap_or("<none>"),
         "recovery: discarding sidecar for a deleted branch (drift unreachable; audit recorded)"
     );
-    let mut graph = CommitGraph::open(root_uri).await?;
-    let graph_commit_id = graph
-        .append_commit(None, manifest_version, Some(RECOVERY_ACTOR))
-        .await?;
     let mut audit = RecoveryAudit::open(root_uri).await?;
-    audit
-        .append(RecoveryAuditRecord {
-            graph_commit_id,
-            recovery_kind: RecoveryKind::OrphanedBranchDiscarded,
-            recovery_for_actor: sidecar.actor_id.clone(),
-            operation_id: sidecar.operation_id.clone(),
-            sidecar_writer_kind: format!("{:?}", sidecar.writer_kind),
-            per_table_outcomes: Vec::new(),
-            created_at: now_micros()?,
-        })
-        .await?;
+    // Idempotency across a Phase D delete fault: the audit row + commit
+    // land before the sidecar delete, so a failed delete re-enters here
+    // with the audit already durable. Append only once per operation —
+    // the retry's sole remaining job is finishing the delete. (Cold
+    // path: the list scan runs only when an orphaned sidecar exists.)
+    let already_recorded = audit.list().await?.iter().any(|record| {
+        record.operation_id == sidecar.operation_id
+            && record.recovery_kind == RecoveryKind::OrphanedBranchDiscarded
+    });
+    if !already_recorded {
+        let mut graph = CommitGraph::open(root_uri).await?;
+        let graph_commit_id = graph
+            .append_commit(None, manifest_version, Some(RECOVERY_ACTOR))
+            .await?;
+        audit
+            .append(RecoveryAuditRecord {
+                graph_commit_id,
+                recovery_kind: RecoveryKind::OrphanedBranchDiscarded,
+                recovery_for_actor: sidecar.actor_id.clone(),
+                operation_id: sidecar.operation_id.clone(),
+                sidecar_writer_kind: format!("{:?}", sidecar.writer_kind),
+                per_table_outcomes: Vec::new(),
+                created_at: now_micros()?,
+            })
+            .await?;
+    }
     let handle = RecoverySidecarHandle {
         operation_id: sidecar.operation_id.clone(),
         sidecar_uri: sidecar_uri(root_uri, &sidecar.operation_id),
@@ -847,7 +860,11 @@ async fn process_sidecar(
     sidecar: &RecoverySidecar,
     mode: RecoveryMode,
     schema_state_recovery: SchemaStateRecovery,
-) -> Result<()> {
+) -> Result<bool> {
+    // Returns whether durable state changed (roll-forward, roll-back, or
+    // stale-sidecar audit recovery). `false` = the sidecar was deferred
+    // untouched -- callers must not treat that as a completed heal (no
+    // schema reload / cache invalidation is warranted).
     let mut states = Vec::with_capacity(sidecar.tables.len());
     for pin in &sidecar.tables {
         let lance_head = open_lance_head(&pin.table_path, pin.table_branch.as_deref()).await?;
@@ -891,7 +908,7 @@ async fn process_sidecar(
                     writer_kind = ?sidecar.writer_kind,
                     "recovery: deferring sidecar with invariant violation to next ReadWrite open"
                 );
-                Ok(())
+                Ok(false)
             }
         },
         SidecarDecision::RollBack => {
@@ -937,7 +954,8 @@ async fn process_sidecar(
                 return record_audit_recovery_rollforward(
                     root_uri, storage, snapshot, sidecar, &states,
                 )
-                .await;
+                .await
+                .map(|()| true);
             }
             if matches!(mode, RecoveryMode::RollForwardOnly) {
                 // In-process recovery cannot run Dataset::restore safely
@@ -949,14 +967,16 @@ async fn process_sidecar(
                     writer_kind = ?sidecar.writer_kind,
                     "recovery: deferring rollback-eligible sidecar to next ReadWrite open"
                 );
-                return Ok(());
+                return Ok(false);
             }
             warn!(
                 operation_id = sidecar.operation_id.as_str(),
                 writer_kind = ?sidecar.writer_kind,
                 "recovery: rolling back sidecar (mixed or unexpected state)"
             );
-            roll_back_sidecar(root_uri, storage, snapshot, sidecar, &states).await
+            roll_back_sidecar(root_uri, storage, snapshot, sidecar, &states)
+                .await
+                .map(|()| true)
         }
         SidecarDecision::RollForward => {
             if matches!(sidecar.writer_kind, SidecarKind::SchemaApply)
@@ -969,7 +989,9 @@ async fn process_sidecar(
                             "recovery: rolling back SchemaApply sidecar because schema staging \
                              files were not promoted in this recovery pass"
                         );
-                        roll_back_sidecar(root_uri, storage, snapshot, sidecar, &states).await
+                        roll_back_sidecar(root_uri, storage, snapshot, sidecar, &states)
+                            .await
+                            .map(|()| true)
                     }
                     RecoveryMode::RollForwardOnly => {
                         warn!(
@@ -977,7 +999,7 @@ async fn process_sidecar(
                             "recovery: deferring SchemaApply sidecar because schema staging files \
                              were not promoted in this recovery pass"
                         );
-                        Ok(())
+                        Ok(false)
                     }
                 };
             }
@@ -1024,7 +1046,7 @@ async fn process_sidecar(
             )
             .await?;
             delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
-            Ok(())
+            Ok(true)
         }
     }
 }
