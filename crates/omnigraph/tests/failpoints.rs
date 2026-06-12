@@ -1943,6 +1943,85 @@ async fn branch_merge_after_finalize_publisher_failure_heals_without_reopen() {
     assert_eq!(helpers::count_rows(&db, "node:Person").await, 3);
 }
 
+/// A concurrent write's entry heal must NOT promote a LIVE schema
+/// apply's staging files. The apply pauses just after writing its
+/// staging files (sidecar on disk from Phase A, staging on disk,
+/// manifest not yet committed); a load on the same handle fires the
+/// heal in that window. If the heal's schema-staging reconcile runs
+/// unserialized, it promotes the staging files from under the live
+/// apply — putting the NEW catalog live against the OLD manifest — and
+/// the resumed apply's own renames then fail on the missing sources:
+/// an error (and a corrupted catalog) for an otherwise-healthy apply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn heal_does_not_promote_live_schema_apply_staging() {
+    use omnigraph::loader::LoadMode;
+    use std::sync::Arc;
+
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+
+    let db = Arc::new(Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap());
+
+    // Pause the apply right after its staging files land (its sidecar is
+    // already on disk from Phase A; the manifest commit has not run).
+    let failpoint = ScopedFailPoint::new("schema_apply.after_staging_write", "pause");
+
+    let apply_db = Arc::clone(&db);
+    let desired = format!("{}\nnode Tag {{ name: String @key }}\n", helpers::TEST_SCHEMA);
+    let apply = tokio::spawn(async move { apply_db.apply_schema(&desired).await });
+
+    // Wait until the apply is parked in the window: staging on disk.
+    let staging_pg = dir.path().join("_schema.pg.staging");
+    for _ in 0..500 {
+        if staging_pg.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(staging_pg.exists(), "schema apply never reached the paused window");
+
+    // Concurrent load on the same handle: its entry heal runs while the
+    // apply is paused. The load itself may fail (schema apply in
+    // progress) — what matters is what its heal does to the live apply.
+    let load_db = Arc::clone(&db);
+    let load = tokio::spawn(async move {
+        load_db
+            .load_as(
+                "main",
+                None,
+                "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":30}}\n",
+                LoadMode::Merge,
+                None,
+            )
+            .await
+    });
+
+    // Give the load's heal time to act inside the window. Broken code
+    // completes the load here (its heal promoted the staging files and
+    // stole the apply's commit); fixed code leaves the load blocked on
+    // the schema-apply serialization key until the apply finishes.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    drop(failpoint);
+
+    let apply_result = apply.await.unwrap();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), load)
+        .await
+        .expect("load must complete once the apply releases its guards")
+        .unwrap();
+    apply_result.expect(
+        "a concurrent write's heal must not promote the live schema \
+         apply's staging files out from under it",
+    );
+
+    // The migration landed and nothing recovery-shaped remains.
+    assert_eq!(helpers::count_rows(&db, "node:Tag").await, 0);
+    let recovery_dir = dir.path().join("__recovery");
+    if recovery_dir.exists() {
+        assert_eq!(std::fs::read_dir(&recovery_dir).unwrap().count(), 0);
+    }
+}
+
 /// Refresh-time recovery must NOT call `Dataset::restore` — it can
 /// silently orphan a concurrent writer's commit. Sidecars that would
 /// require rollback must be left on disk for the next ReadWrite open.
