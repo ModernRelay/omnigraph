@@ -22,6 +22,7 @@ roles:
       compiler.
     members:
       - aaltshuler
+      - ragnorc
 
   docs:
     description: >
@@ -29,6 +30,7 @@ roles:
       AGENTS.md, CLAUDE.md symlink, SECURITY.md).
     members:
       - aaltshuler
+      - ragnorc
 
 # Path → role mapping. GitHub CODEOWNERS uses "last match wins"
 # semantics — when multiple patterns match a file, only the last
