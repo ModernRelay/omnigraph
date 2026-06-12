@@ -1356,8 +1356,8 @@ async fn sidecar_write_failure_aborts_load_with_no_head_advance() {
 
 /// Real-backend coverage of the sidecar lifecycle: the same-handle heal
 /// scenario on an S3-compatible store, exercising sidecar put / list /
-/// delete through `S3StorageAdapter` (object_store) instead of the
-/// local-FS adapter. Skips unless `OMNIGRAPH_S3_TEST_BUCKET` is set
+/// delete through the S3 object-store backend instead of the
+/// local filesystem backend. Skips unless `OMNIGRAPH_S3_TEST_BUCKET` is set
 /// (same gate as `s3_storage.rs`); CI runs it against RustFS.
 #[tokio::test]
 async fn s3_load_recovers_after_publisher_failure_without_reopen() {

@@ -104,8 +104,8 @@ The split — L2 owns the cross-dataset catalog; L1 owns the per-dataset interna
 
 | Scheme | Backend | Notes |
 |---|---|---|
-| local path / `file://` | `LocalStorageAdapter` (tokio) | Normalized to absolute paths |
-| `s3://bucket/prefix` | `S3StorageAdapter` (object_store) | Honors `AWS_ENDPOINT_URL_S3`, `AWS_ALLOW_HTTP`, `AWS_S3_FORCE_PATH_STYLE` |
+| local path / `file://` | `ObjectStorageAdapter` over `object_store::LocalFileSystem` | Normalized to absolute paths; relative and dot-segment paths are lexically absolutized |
+| `s3://bucket/prefix` | `ObjectStorageAdapter` over `object_store` S3 | Honors `AWS_ENDPOINT_URL_S3`, `AWS_ALLOW_HTTP`, `AWS_S3_FORCE_PATH_STYLE` |
 | `http(s)://host:port` | HTTP client to `omnigraph-server` | Used by CLI as a target, not a storage backend |
 
 ## Object-store env vars (S3-compatible)
