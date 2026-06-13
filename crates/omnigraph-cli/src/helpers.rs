@@ -513,6 +513,67 @@ pub(crate) fn resolve_local_uri(
     Ok(resolve_local_graph(config, cli_uri, cli_target, operation)?.uri)
 }
 
+/// Resolve a storage-plane verb's target to a direct storage URI (RFC-010
+/// Slice 3). `--cluster <dir|uri> --cluster-graph <id>` resolves the graph's
+/// storage URI from the **served cluster state** (the truth a `--cluster`
+/// server serves); otherwise the ordinary positional-URI / `--target` path.
+/// clap enforces both-or-neither and exclusion with `uri`/`--target`, so the
+/// mismatched arm is defensive.
+pub(crate) async fn resolve_storage_uri(
+    config: &OmnigraphConfig,
+    cli_uri: Option<String>,
+    cli_target: Option<&str>,
+    cluster: Option<&str>,
+    cluster_graph: Option<&str>,
+    operation: &str,
+) -> Result<String> {
+    match (cluster, cluster_graph) {
+        (Some(cluster), Some(graph_id)) => resolve_cluster_graph_uri(cluster, graph_id).await,
+        (None, None) => resolve_local_uri(config, cli_uri, cli_target, operation),
+        _ => bail!("--cluster and --cluster-graph must be given together"),
+    }
+}
+
+/// Look up a graph's storage URI in a cluster's served snapshot. Mirrors the
+/// server's `--cluster` dispatch (a `://` arg reads the storage root directly,
+/// config-free; otherwise it's a config directory). An unserved graph is a loud
+/// error pointing at `cluster apply`.
+async fn resolve_cluster_graph_uri(cluster: &str, graph_id: &str) -> Result<String> {
+    let snapshot = if cluster.contains("://") {
+        omnigraph_cluster::read_serving_snapshot_from_storage(cluster).await
+    } else {
+        omnigraph_cluster::read_serving_snapshot(cluster).await
+    }
+    .map_err(|diagnostics| {
+        color_eyre::eyre::eyre!(
+            "could not read cluster `{cluster}`: {}",
+            diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    })?;
+
+    let graph = snapshot
+        .graphs
+        .iter()
+        .find(|g| g.graph_id == graph_id)
+        .ok_or_else(|| {
+            let available = snapshot
+                .graphs
+                .iter()
+                .map(|g| g.graph_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            color_eyre::eyre::eyre!(
+                "graph `{graph_id}` is not served by cluster `{cluster}` (served graphs: [{available}]); \
+                 declare it in cluster.yaml and run `cluster apply`, or check the id"
+            )
+        })?;
+    Ok(graph.root.to_string_lossy().into_owned())
+}
+
 pub(crate) fn resolve_branch(
     config: &OmnigraphConfig,
     cli_branch: Option<String>,

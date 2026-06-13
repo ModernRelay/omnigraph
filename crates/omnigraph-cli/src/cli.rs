@@ -238,6 +238,13 @@ pub(crate) enum Command {
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Cluster directory or storage-root URI; with --cluster-graph, resolves
+        /// the graph's storage URI from the served cluster state.
+        #[arg(long, conflicts_with_all = ["uri", "target"], requires = "cluster_graph")]
+        cluster: Option<String>,
+        /// Graph id within --cluster.
+        #[arg(long, requires = "cluster")]
+        cluster_graph: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -249,6 +256,13 @@ pub(crate) enum Command {
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Cluster directory or storage-root URI; with --cluster-graph, resolves
+        /// the graph's storage URI from the served cluster state.
+        #[arg(long, conflicts_with_all = ["uri", "target"], requires = "cluster_graph")]
+        cluster: Option<String>,
+        /// Graph id within --cluster.
+        #[arg(long, requires = "cluster")]
+        cluster_graph: Option<String>,
         /// Publish verified maintenance drift. Without this flag, repair only
         /// previews what it would do.
         #[arg(long)]
@@ -268,6 +282,13 @@ pub(crate) enum Command {
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Cluster directory or storage-root URI; with --cluster-graph, resolves
+        /// the graph's storage URI from the served cluster state.
+        #[arg(long, conflicts_with_all = ["uri", "target"], requires = "cluster_graph")]
+        cluster: Option<String>,
+        /// Graph id within --cluster.
+        #[arg(long, requires = "cluster")]
+        cluster_graph: Option<String>,
         /// Number of recent versions to keep per table. Either `--keep` or
         /// `--older-than` (or both) must be set.
         #[arg(long)]

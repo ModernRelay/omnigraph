@@ -950,3 +950,109 @@ graphs:
     assert!(!leaked.contains("phantom") && !leaked.contains("9999"), "{leaked}");
 }
 
+
+// ── RFC-010 Slice 3: cluster-managed maintenance addressing + init signpost ──
+
+/// Stand up an applied, served cluster with the `knowledge` graph and return
+/// its directory guard. Mirrors the e2e setup (fixture → init → import → apply).
+fn applied_knowledge_cluster() -> tempfile::TempDir {
+    let temp = tempdir().unwrap();
+    write_cluster_config_fixture(temp.path());
+    init_cluster_derived_graph(temp.path());
+    let import = cluster_json(temp.path(), "import");
+    assert_eq!(import["ok"], true, "{import}");
+    let apply = cluster_json(temp.path(), "apply");
+    assert_eq!(apply["converged"], true, "{apply}");
+    temp
+}
+
+#[test]
+fn optimize_resolves_a_cluster_graph_by_id() {
+    let temp = applied_knowledge_cluster();
+    // No hand-typed storage path: address the graph by cluster dir + id.
+    let out = output_success(
+        cli()
+            .arg("optimize")
+            .arg("--cluster")
+            .arg(temp.path())
+            .arg("--cluster-graph")
+            .arg("knowledge")
+            .arg("--json"),
+    );
+    let payload = parse_stdout_json(&out);
+    assert!(
+        payload["tables"].as_array().is_some(),
+        "optimize did not run against the resolved cluster graph: {payload}"
+    );
+}
+
+#[test]
+fn optimize_unknown_cluster_graph_id_errors() {
+    let temp = applied_knowledge_cluster();
+    let out = output_failure(
+        cli()
+            .arg("optimize")
+            .arg("--cluster")
+            .arg(temp.path())
+            .arg("--cluster-graph")
+            .arg("does-not-exist")
+            .arg("--json"),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("is not served by cluster") && stderr.contains("cluster apply"),
+        "expected an unserved-graph error pointing at cluster apply; got: {stderr}"
+    );
+}
+
+#[test]
+fn cluster_flag_requires_cluster_graph() {
+    // clap enforces both-or-neither.
+    let out = output_failure(
+        cli()
+            .arg("optimize")
+            .arg("--cluster")
+            .arg(".")
+            .arg("--json"),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cluster-graph") || stderr.contains("required"),
+        "expected --cluster to require --cluster-graph; got: {stderr}"
+    );
+}
+
+#[test]
+fn init_refuses_a_cluster_managed_path_and_signposts_cluster_apply() {
+    let temp = applied_knowledge_cluster();
+    // Hand-init a NEW graph into the established cluster's storage layout.
+    let out = output_failure(
+        cli()
+            .arg("init")
+            .arg("--schema")
+            .arg(temp.path().join("people.pg"))
+            .arg(temp.path().join("graphs").join("sneaky.omni")),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cluster apply"),
+        "init into a cluster-managed path should signpost `cluster apply`; got: {stderr}"
+    );
+    // And it did not create the graph.
+    assert!(!temp.path().join("graphs").join("sneaky.omni").exists());
+}
+
+#[test]
+fn init_outside_a_cluster_still_works() {
+    // Regression guard: ordinary init (no cluster layout) is unaffected.
+    let temp = tempdir().unwrap();
+    let schema = fixture("test.pg");
+    let out = output_success(
+        cli()
+            .arg("init")
+            .arg("--schema")
+            .arg(&schema)
+            .arg(temp.path().join("plain.omni")),
+    );
+    assert!(stdout_string(&out).contains("initialized"));
+}

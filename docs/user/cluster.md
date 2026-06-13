@@ -251,12 +251,28 @@ with an in-flight apply.
   loads). It just no longer describes the deployment — a server boots from
   one source or the other, never a merge of both.
 
+## 7. Maintaining a cluster graph
+
+Storage maintenance (`optimize` / `repair` / `cleanup`) is **not** a control-plane
+operation — it runs out-of-band, with direct storage access, against the graph's
+roots. Address a cluster graph by name instead of hand-typing its storage path:
+
+```bash
+omnigraph optimize --cluster ./company-brain --cluster-graph knowledge
+omnigraph cleanup  --cluster ./company-brain --cluster-graph knowledge --keep 10 --confirm
+# --cluster also takes the storage-root URI directly (config-free):
+omnigraph optimize --cluster s3://bucket/clusters/company-brain --cluster-graph knowledge
+```
+
+The graph's storage URI is resolved from the **served cluster state** (the same
+truth a `--cluster` server boots from); a graph that hasn't been applied yet is
+not resolvable. Run these from a host with storage access — there are no server
+routes for them. Conversely, **`init` refuses** a cluster-managed path: graphs in
+a cluster are created by `cluster apply`, not by hand.
+
 ## What the control plane does not do (yet)
 
 - **No hot reload** — applied changes serve on the next restart.
-- **No S3-hosted cluster directories** — the config dir, ledger, catalog,
-  and derived graph roots are local-filesystem paths today. (Individual
-  *graphs* on S3 are a server feature outside cluster mode.)
 - **No data operations** — rows move through `omnigraph load / ingest /
   mutate` against the graph roots, with branches and merges as usual.
 - **Stored-query exposure is all-or-nothing per cluster** — every applied
