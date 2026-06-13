@@ -1000,8 +1000,8 @@ fn optimize_unknown_cluster_graph_id_errors() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("is not served by cluster") && stderr.contains("cluster apply"),
-        "expected an unserved-graph error pointing at cluster apply; got: {stderr}"
+        stderr.contains("is not applied in cluster") && stderr.contains("cluster apply"),
+        "expected an unapplied-graph error pointing at cluster apply; got: {stderr}"
     );
 }
 
@@ -1055,4 +1055,33 @@ fn init_outside_a_cluster_still_works() {
             .arg(temp.path().join("plain.omni")),
     );
     assert!(stdout_string(&out).contains("initialized"));
+}
+
+#[test]
+fn optimize_by_cluster_works_when_catalog_payloads_are_degraded() {
+    // Robustness (Greptile, #221): maintenance resolves the graph URI from the
+    // state ledger alone, so an unrelated corrupt/missing catalog payload (or a
+    // pending recovery sweep) does NOT block it — unlike the full serving-snapshot
+    // read. This is what keeps `repair --cluster` usable on a degraded cluster.
+    let temp = applied_knowledge_cluster();
+    // Remove the verified catalog payloads (queries/policies) — a serving read
+    // would refuse with a catalog-payload diagnostic; the ledger-only resolve
+    // must not care.
+    let resources = temp.path().join("__cluster").join("resources");
+    if resources.exists() {
+        fs::remove_dir_all(&resources).unwrap();
+    }
+    let out = output_success(
+        cli()
+            .arg("optimize")
+            .arg("--cluster")
+            .arg(temp.path())
+            .arg("--cluster-graph")
+            .arg("knowledge")
+            .arg("--json"),
+    );
+    assert!(
+        parse_stdout_json(&out)["tables"].as_array().is_some(),
+        "optimize should resolve via the ledger despite degraded catalog payloads"
+    );
 }

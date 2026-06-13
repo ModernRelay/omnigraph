@@ -534,44 +534,14 @@ pub(crate) async fn resolve_storage_uri(
     }
 }
 
-/// Look up a graph's storage URI in a cluster's served snapshot. Mirrors the
-/// server's `--cluster` dispatch (a `://` arg reads the storage root directly,
-/// config-free; otherwise it's a config directory). An unserved graph is a loud
-/// error pointing at `cluster apply`.
+/// Look up a graph's storage URI from a cluster's applied state ledger. Uses
+/// the lightweight `resolve_graph_storage_uri` (NOT the full serving-snapshot
+/// validation), so maintenance — especially `repair` — works even when an
+/// unrelated catalog payload is corrupt or a recovery sweep is pending.
 async fn resolve_cluster_graph_uri(cluster: &str, graph_id: &str) -> Result<String> {
-    let snapshot = if cluster.contains("://") {
-        omnigraph_cluster::read_serving_snapshot_from_storage(cluster).await
-    } else {
-        omnigraph_cluster::read_serving_snapshot(cluster).await
-    }
-    .map_err(|diagnostics| {
-        color_eyre::eyre::eyre!(
-            "could not read cluster `{cluster}`: {}",
-            diagnostics
-                .iter()
-                .map(|d| d.message.clone())
-                .collect::<Vec<_>>()
-                .join("; ")
-        )
-    })?;
-
-    let graph = snapshot
-        .graphs
-        .iter()
-        .find(|g| g.graph_id == graph_id)
-        .ok_or_else(|| {
-            let available = snapshot
-                .graphs
-                .iter()
-                .map(|g| g.graph_id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            color_eyre::eyre::eyre!(
-                "graph `{graph_id}` is not served by cluster `{cluster}` (served graphs: [{available}]); \
-                 declare it in cluster.yaml and run `cluster apply`, or check the id"
-            )
-        })?;
-    Ok(graph.root.to_string_lossy().into_owned())
+    omnigraph_cluster::resolve_graph_storage_uri(cluster, graph_id)
+        .await
+        .map_err(|diagnostic| color_eyre::eyre::eyre!("{}", diagnostic.message))
 }
 
 pub(crate) fn resolve_branch(

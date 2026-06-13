@@ -98,6 +98,55 @@ pub async fn cluster_root_for_graph_uri(graph_uri: &str) -> Option<String> {
         .then(|| store.display_root().to_string())
 }
 
+/// Resolve a graph's **storage URI** (`<root>/graphs/<id>.omni`) from a cluster's
+/// applied state ledger — the lightweight path for storage-plane maintenance
+/// (`optimize`/`repair`/`cleanup`).
+///
+/// Unlike [`read_serving_snapshot`], this deliberately does NOT validate catalog
+/// payloads or recovery readiness: maintenance only needs the derivable graph
+/// root, and must not be blocked by an unrelated corrupt policy/query blob or a
+/// pending recovery sweep — a degraded cluster is exactly when an operator
+/// reaches for `repair`. It reads the state ledger, confirms the graph is in the
+/// applied revision, and returns `graph_root(id)`.
+///
+/// `cluster` is a config directory or a storage-root URI (`s3://…`, config-free),
+/// mirroring the server's `--cluster` dispatch.
+pub async fn resolve_graph_storage_uri(cluster: &str, graph_id: &str) -> Result<String, Diagnostic> {
+    let backend = if cluster.contains("://") {
+        ClusterStore::for_storage_root(cluster)?
+    } else {
+        ClusterStore::for_config_dir(Path::new(cluster))
+    };
+    let mut observations = backend.observations();
+    let snapshot = backend.read_state(&mut observations).await?;
+    let state = snapshot.state.ok_or_else(|| {
+        Diagnostic::error(
+            "cluster_state_missing",
+            CLUSTER_STATE_FILE,
+            format!("cluster `{cluster}` has no applied state; run `cluster apply` first"),
+        )
+    })?;
+    let address = format!("graph.{graph_id}");
+    if !state.applied_revision.resources.contains_key(&address) {
+        let applied: Vec<&str> = state
+            .applied_revision
+            .resources
+            .keys()
+            .filter_map(|a| a.strip_prefix("graph."))
+            .collect();
+        return Err(Diagnostic::error(
+            "graph_not_applied",
+            address,
+            format!(
+                "graph `{graph_id}` is not applied in cluster `{cluster}` (applied graphs: [{}]); \
+                 declare it in cluster.yaml and run `cluster apply`, or check the id",
+                applied.join(", ")
+            ),
+        ));
+    }
+    Ok(backend.graph_root(graph_id))
+}
+
 /// Split `<root>/graphs/<id>.omni` → `<root>`, gating on the exact cluster
 /// graph-layout shape (a single `<id>` segment, no nested path). `None` for
 /// anything else — no I/O is done for non-cluster-shaped URIs.
