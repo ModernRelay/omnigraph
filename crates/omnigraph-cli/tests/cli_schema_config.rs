@@ -121,7 +121,7 @@ fn schema_plan_with_server_flag_errors_wrong_plane() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("`schema plan` is a storage-plane command")
-            && stderr.contains("Use --target <name> or a storage URI."),
+            && stderr.contains("Use --target <name>, a storage URI, or --cluster <dir> --cluster-graph <id>."),
         "schema plan wrong-plane message not found; got: {stderr}"
     );
 }

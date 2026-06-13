@@ -2,7 +2,7 @@
 
 `db/omnigraph/optimize.rs` and `db/omnigraph/repair.rs`.
 
-**Addressing (RFC-010).** `optimize`, `repair`, and `cleanup` are **storage-plane** CLI commands: they run with direct storage access against a positional `URI` or `--target`, never through a server, and reject `--server` / `--graph` or a `--target` that resolves to a remote (`http(s)://`) URL with a declared error. There are no server routes for them by design — to maintain a server-backed graph, run them out-of-band against the graph's storage URI. See the *Command planes* section of [cli-reference.md](cli-reference.md).
+**Addressing (RFC-010).** `optimize`, `repair`, and `cleanup` are **storage-plane** CLI commands: they run with direct storage access against a positional `URI`, `--target`, or **`--cluster <dir|s3://…> --cluster-graph <id>`** (which resolves the graph's storage URI from the served cluster state, so you needn't know the `<storage>/graphs/<id>.omni` layout). They never run through a server, and reject `--server` / `--graph` or a `--target` that resolves to a remote (`http(s)://`) URL with a declared error. There are no server routes for them by design — to maintain a server-backed graph, run them out-of-band against the graph's storage URI. See the *Command planes* section of [cli-reference.md](cli-reference.md).
 
 ## `optimize_all_tables(db)` — non-destructive
 

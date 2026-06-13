@@ -513,6 +513,37 @@ pub(crate) fn resolve_local_uri(
     Ok(resolve_local_graph(config, cli_uri, cli_target, operation)?.uri)
 }
 
+/// Resolve a storage-plane verb's target to a direct storage URI (RFC-010
+/// Slice 3). `--cluster <dir|uri> --cluster-graph <id>` resolves the graph's
+/// storage URI from the **served cluster state** (the truth a `--cluster`
+/// server serves); otherwise the ordinary positional-URI / `--target` path.
+/// clap enforces both-or-neither and exclusion with `uri`/`--target`, so the
+/// mismatched arm is defensive.
+pub(crate) async fn resolve_storage_uri(
+    config: &OmnigraphConfig,
+    cli_uri: Option<String>,
+    cli_target: Option<&str>,
+    cluster: Option<&str>,
+    cluster_graph: Option<&str>,
+    operation: &str,
+) -> Result<String> {
+    match (cluster, cluster_graph) {
+        (Some(cluster), Some(graph_id)) => resolve_cluster_graph_uri(cluster, graph_id).await,
+        (None, None) => resolve_local_uri(config, cli_uri, cli_target, operation),
+        _ => bail!("--cluster and --cluster-graph must be given together"),
+    }
+}
+
+/// Look up a graph's storage URI from a cluster's applied state ledger. Uses
+/// the lightweight `resolve_graph_storage_uri` (NOT the full serving-snapshot
+/// validation), so maintenance — especially `repair` — works even when an
+/// unrelated catalog payload is corrupt or a recovery sweep is pending.
+async fn resolve_cluster_graph_uri(cluster: &str, graph_id: &str) -> Result<String> {
+    omnigraph_cluster::resolve_graph_storage_uri(cluster, graph_id)
+        .await
+        .map_err(|diagnostic| color_eyre::eyre::eyre!("{}", diagnostic.message))
+}
+
 pub(crate) fn resolve_branch(
     config: &OmnigraphConfig,
     cli_branch: Option<String>,
