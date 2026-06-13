@@ -88,9 +88,15 @@ async fn date_and_datetime_literal_filters_execute() {
     let q = r#"
 query born_ge() { match { $m: Metric  $m.born >= date("2024-01-01") } return { $m.name } }
 query seen_lt() { match { $m: Metric  $m.seen < datetime("2024-01-01T00:00:00Z") } return { $m.name } }
+query born_eq() { match { $m: Metric { born: date("2024-06-01") } } return { $m.name } }
+query seen_eq() { match { $m: Metric { seen: datetime("2024-06-01T12:00:00Z") } } return { $m.name } }
 "#;
     // born: m1 2024-06, m3 2025 >= 2024-01-01
     assert_eq!(sorted_metric_names(&mut db, q, "born_ge").await, vec!["m1", "m3"]);
     // seen: m2 2023, m4 2022 < 2024-01-01
     assert_eq!(sorted_metric_names(&mut db, q, "seen_lt").await, vec!["m2", "m4"]);
+    // Inline-binding equality exercises the Lance-pushdown arm with a typed
+    // Date32/Date64 literal: the epoch conversion must select exactly m1.
+    assert_eq!(sorted_metric_names(&mut db, q, "born_eq").await, vec!["m1"]);
+    assert_eq!(sorted_metric_names(&mut db, q, "seen_eq").await, vec!["m1"]);
 }

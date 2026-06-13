@@ -2073,11 +2073,24 @@ fn literal_to_expr(lit: &Literal) -> Option<datafusion::prelude::Expr> {
         Literal::Integer(n) => df_lit(*n),
         Literal::Float(f) => df_lit(*f),
         Literal::Bool(b) => df_lit(*b),
-        // Date/DateTime stored as strings; pass through as string literals
-        // — Lance/DataFusion handles the comparison against typed columns
-        // via implicit cast, matching the existing string-SQL behavior.
-        Literal::Date(s) => df_lit(s.clone()),
-        Literal::DateTime(s) => df_lit(s.clone()),
+        // Date/DateTime columns are physically Date32/Date64 (see the loader's
+        // `to_arrow`). Lower the literal to the matching TYPED Arrow scalar so
+        // the predicate stays a direct column comparison and the persisted
+        // BTREE is used. A Utf8 literal would force DataFusion to coerce one
+        // side; if it casts the column (`CAST(col AS Utf8)`) the scalar index
+        // is defeated and the scan degrades to a full filtered read. This
+        // matches the already-typed in-memory comparison arm in
+        // `projection.rs::literal_to_array`. On a malformed literal, fall back
+        // to the Utf8 string so pushdown behavior never regresses (the
+        // in-memory path surfaces the parse error if it is load-bearing).
+        Literal::Date(s) => match crate::loader::parse_date32_literal(s) {
+            Ok(days) => df_lit(datafusion::scalar::ScalarValue::Date32(Some(days))),
+            Err(_) => df_lit(s.clone()),
+        },
+        Literal::DateTime(s) => match crate::loader::parse_date64_literal(s) {
+            Ok(ms) => df_lit(datafusion::scalar::ScalarValue::Date64(Some(ms))),
+            Err(_) => df_lit(s.clone()),
+        },
         Literal::List(_) => return None,
     })
 }
@@ -2283,5 +2296,44 @@ mod expand_chooser_tests {
         assert_eq!(choose_expand_mode(&i), ExpandMode::IndexedScan);
         i.effective_max_hops = 5; // as if the cross-type cap were not applied
         assert_eq!(choose_expand_mode(&i), ExpandMode::Csr);
+    }
+}
+
+#[cfg(test)]
+mod literal_lowering_tests {
+    use super::*;
+    use datafusion::prelude::Expr;
+    use datafusion::scalar::ScalarValue;
+
+    // Date/DateTime filter literals must lower to TYPED Arrow scalars
+    // (Date32 / Date64), not Utf8 strings. A Utf8 literal against a typed
+    // Date column forces DataFusion to coerce one side; if it casts the
+    // column (`CAST(col AS Utf8)`) the persisted BTREE is defeated and the
+    // scan falls back to a full filtered read. A typed literal keeps the
+    // predicate a direct column comparison so the scalar index is used.
+    #[test]
+    fn date_literals_lower_to_typed_arrow_scalars() {
+        let dt = literal_to_expr(&Literal::DateTime("2024-06-01T12:00:00Z".into())).unwrap();
+        assert!(
+            matches!(dt, Expr::Literal(ScalarValue::Date64(Some(_)), ..)),
+            "DateTime literal must lower to a typed Date64 scalar, got {dt:?}"
+        );
+        let d = literal_to_expr(&Literal::Date("2024-06-01".into())).unwrap();
+        assert!(
+            matches!(d, Expr::Literal(ScalarValue::Date32(Some(_)), ..)),
+            "Date literal must lower to a typed Date32 scalar, got {d:?}"
+        );
+    }
+
+    // A malformed date string must not panic or error in the (infallible)
+    // lowering: it falls back to the Utf8 literal so pushdown behavior never
+    // regresses (the in-memory path surfaces the parse error if it matters).
+    #[test]
+    fn malformed_date_literal_falls_back_to_string() {
+        let bad = literal_to_expr(&Literal::DateTime("not-a-date".into())).unwrap();
+        assert!(
+            matches!(bad, Expr::Literal(ScalarValue::Utf8(Some(_)), ..)),
+            "malformed DateTime literal should fall back to a Utf8 literal, got {bad:?}"
+        );
     }
 }
