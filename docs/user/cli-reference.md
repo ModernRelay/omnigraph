@@ -28,6 +28,21 @@ Top-level command families and subcommands. Graph-targeting commands accept a po
 | `policy validate \| test \| explain` | Cedar tooling. Selects `cli.graph`, else `server.graph`, else top-level `policy.file` |
 | `version` / `-v` | print `omnigraph 0.3.x` |
 
+## Command planes
+
+Every command lives on one **plane**, which determines how it reaches a graph and which addressing flags apply (RFC-010):
+
+- **Data plane** — `query`, `mutate`, `load`, `ingest`, `branch *`, `snapshot`, `export`, `commit *`, `schema show`, `schema apply` (and `graphs list`, remote-only today). Run against a graph **embedded or via a server**: accept a positional `URI` / `--target` / `--server` (+ `--graph` for multi-graph servers).
+- **Storage / maintenance plane** — `init`, `optimize`, `repair`, `cleanup`, `schema plan`, `queries validate`, `lint`. Run with **direct storage access** (`file://` / `s3://`), never through a server. They accept a positional `URI` or `--target`, but **not** `--server` / `--graph`, and a `--target` that resolves to a remote (`http(s)://`) server is rejected. (`init` takes only a positional `URI` today — no `--target`.)
+- **Control plane** — `cluster *`. Operates on a cluster directory via `--config <dir>`.
+
+These restrictions are enforced and reported, not silent:
+
+- A data-plane addressing flag on a non-data verb fails loudly, e.g.: ``optimize is a storage-plane command; --server/--graph address the data plane and do not apply. Use --target <name> or a storage URI.``
+- A storage-plane verb pointed at a remote target fails loudly, e.g.: ``optimize is a storage-plane command and needs direct storage access; the resolved target is a remote server (https://…). Pass the graph's file:// or s3:// URI.``
+
+To maintain a server-backed graph, run the maintenance verbs from a host with storage access against the graph's storage URI (or `--target`), out-of-band from the serving process — there are no server routes for `optimize` / `repair` / `cleanup` by design.
+
 ## Config surfaces
 
 Two config surfaces with single owners (RFC-007/RFC-008), plus a zero-config

@@ -586,7 +586,7 @@ query list_people() {
     // RFC-010 Slice 1: the storage-plane verbs now share one declared message
     // (was: "query lint is only supported against local graph URIs …").
     assert!(
-        stderr.contains("`query lint` is a storage-plane command and needs direct storage access")
+        stderr.contains("`lint` is a storage-plane command and needs direct storage access")
             && stderr.contains("remote server"),
         "storage-plane remote-target message not found; got: {stderr}"
     );
@@ -615,7 +615,7 @@ query list_people() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("query lint requires --schema <schema.pg> or a resolvable graph target")
+        stderr.contains("lint requires --schema <schema.pg> or a resolvable graph target")
     );
 }
 
