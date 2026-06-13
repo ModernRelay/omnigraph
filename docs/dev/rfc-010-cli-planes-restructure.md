@@ -44,18 +44,25 @@ three different ways:
 
 | Plane | Verbs | Reaches the graph by | Addressing surface |
 |---|---|---|---|
-| **Data** | `query`, `mutate`, `load`, `ingest`, `branch *`, `snapshot`, `export`, `commit *`, `schema show/apply`, `graphs list` | embedded engine **or** HTTP server (one `GraphClient`, 15 call sites) | positional URI **or** `--target` / `--graph` / `--server` (config aliases) |
-| **Storage / maintenance** | `init`, `optimize`, `repair`, `cleanup`, `schema plan`, `queries validate` | embedded engine **only**, directly on storage (`file://` or `s3://`) | positional URI **or** `--target` — **no `--server` / `--graph`** |
+| **Data** | `query`, `mutate`, `load`, `ingest`, `branch *`, `snapshot`, `export`, `commit *`, `schema show/apply` (and `graphs list`, **remote-only today** — see note) | embedded engine **or** HTTP server (one `GraphClient`) | positional URI **or** `--target` / `--graph` / `--server` (config aliases) |
+| **Storage / maintenance** | `init`, `optimize`, `repair`, `cleanup`, `schema plan`, `queries validate` | embedded engine **only**, directly on storage (`file://` or `s3://`) | positional URI **or** `--target` — **no `--server` / `--graph`** (except `init`, which today takes **only a required positional URI** — no `--target`) |
 | **Control** | `cluster validate/plan/apply/approve/status/refresh/import/force-unlock` | a cluster **directory** (`file://` or `s3://`), not a graph URI | `--config <dir>` |
 
 ### What's confusing (validated facts)
 
 1. **Two names for one graph.** Data verbs resolve `--server prod --graph
-   knowledge` through `apply_server_flag` (16 call sites). Maintenance verbs use
+   knowledge` through `GraphClient::resolve*` (the embedded/remote fork collapsed
+   in RFC-009 Phases 3a–3c; only the two `GraphClient` factories call
+   `apply_server_flag`). Maintenance verbs instead use
    `resolve_uri`/`resolve_local_uri` and accept only a positional URI or
    `--target` — so to compact the graph you *query* as `--server prod --graph
    knowledge` you must *type* `s3://bucket/knowledge.omni`. One graph, two
    addressing vocabularies.
+
+   > **Note (`graphs list`).** It is routed through `GraphClient` only to share
+   > the addressing/token resolver; its embedded arm fails loudly, so it is
+   > **remote-only today** (the later capability table and *Relationship to
+   > RFC-009* record it as remote-now / embedded-cluster-later).
 
 2. **Plane restrictions are accidental, not declared.** `graphs list` is
    server-only and `optimize`/`repair`/`cleanup`/`init` are storage-only purely
@@ -198,9 +205,19 @@ not quietly consult both and invent a precedence. The rule:
 - A maintenance verb's `--target` resolves through the **operator/legacy**
   config and its URI must already be **direct storage**; a target that resolves
   to a remote (`http(s)://`) URL **fails loudly** (see the example above).
-- **Cluster-managed graphs are addressed explicitly** via `--cluster <dir>
-  --graph <id>`, so reading cluster state is an intentional mode — never an
-  implicit fallback between operator config and `cluster.yaml`.
+- **Cluster-managed graphs are addressed explicitly** via a cluster-root +
+  graph-id pair (spelled `--cluster <dir> --graph <id>` for illustration), so
+  reading cluster state is an intentional mode — never an implicit fallback
+  between operator config and `cluster.yaml`.
+
+  > **Flag-shape caveat (deferred).** `--graph` is *already* a global flag that
+  > `requires = "server"` and appends `/graphs/<id>` to a **remote** URL — a
+  > different meaning, and clap won't permit `--graph` without `--server`. So the
+  > cluster-maintenance addressing needs either a distinct flag (e.g.
+  > `--cluster-graph <id>`) or an explicit global-flag migration. This is why
+  > the cluster-managed resolver is **deferred to a later slice** (it also rides
+  > the applied-state-vs-declared-config open question below); the
+  > operator/legacy `--target` path lands first.
 
 ### A declared, per-subcommand capability surface (RFC-009 Phase 4, expanded)
 
@@ -379,3 +396,54 @@ Testing notes for the implementation slice:
   and those strings become observable behavior.
 
   **Resolution (accepted):** captured as the *Test plan* section.
+
+## Verification comments (Codex, 2026-06-13)
+
+Follow-up verification against the current CLI/server code found a few
+remaining current-state nits. These are doc-shape issues, not objections to the
+proposal:
+
+1. **Current-state table overstates `graphs list`.** The table under *Current
+   state of affairs* still lists `graphs list` with data verbs that reach the
+   graph by embedded engine or HTTP. Current code routes it through `GraphClient`
+   only to share the resolver, but the embedded arm fails loudly; the later
+   RFC text correctly says remote today / embedded-cluster later. Make the
+   current-state row match that.
+
+   **Resolution (accepted):** the Data row now marks `graphs list` **remote-only
+   today**, with a note that it rides `GraphClient` only to share the resolver.
+
+2. **Current-state table overstates `init` addressing.** `init` is grouped with
+   maintenance verbs whose addressing surface is positional URI or `--target`.
+   Current `init` only accepts a required positional URI and has no `--target`
+   or config path. The proposal can add that capability, but the current-state
+   table should not describe it as already present.
+
+   **Resolution (accepted):** the Storage row now calls out that `init` takes
+   **only a required positional URI** today (no `--target`); adding `--target` to
+   `init` is part of the proposal, entangled with the `init`→`cluster apply`
+   signpost, not current state.
+
+3. **`apply_server_flag` call-site count is stale.** The text says data verbs
+   resolve `--server prod --graph knowledge` through `apply_server_flag` at
+   16 call sites. Current code has the fork collapsed: data verbs call
+   `GraphClient::resolve*`, and only the two `GraphClient` factories call
+   `apply_server_flag`. Rephrase the verified fact around `GraphClient`, not
+   the old pre-collapse call-site count.
+
+   **Resolution (accepted):** validated-fact #1 now describes the post-collapse
+   reality (`GraphClient::resolve*`; the two factories call `apply_server_flag`),
+   dropping the stale count.
+
+4. **`--cluster <dir> --graph <id>` collides with today's global `--graph`
+   semantics.** The target ergonomics section proposes that flag shape for
+   maintenance, but current `--graph` is a global flag that requires
+   `--server` and appends `/graphs/<id>` to a remote server URL. Either choose
+   a separate cluster-maintenance graph flag shape, or call out the clap/global
+   flag migration explicitly as part of the implementation.
+
+   **Resolution (accepted):** the *Authority rule* now carries a flag-shape
+   caveat — the cluster-managed resolver (and its flag shape, e.g.
+   `--cluster-graph` vs a `--graph` migration) is **deferred to a later slice**;
+   the operator/legacy `--target` path lands first. The illustrative
+   `--cluster <dir> --graph <id>` spelling is marked as not-final.

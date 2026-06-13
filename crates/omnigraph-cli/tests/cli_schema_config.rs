@@ -73,6 +73,28 @@ fn schema_plan_json_reports_supported_additive_change() {
 }
 
 #[test]
+fn schema_plan_with_server_flag_errors_wrong_plane() {
+    // RFC-010 Slice 1: `schema plan` is storage-plane while `schema show/apply`
+    // are data-plane — the guard rejects --server on plan with the per-subcommand
+    // label (proving command_plane/command_label descend into the nested enum).
+    let output = output_failure(
+        cli()
+            .arg("schema")
+            .arg("plan")
+            .arg("--schema")
+            .arg(fixture("test.pg"))
+            .arg("--server")
+            .arg("prod"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`schema plan` is a storage-plane command")
+            && stderr.contains("Use --target <name> or a storage URI."),
+        "schema plan wrong-plane message not found; got: {stderr}"
+    );
+}
+
+#[test]
 fn schema_plan_json_reports_unsupported_type_change() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());

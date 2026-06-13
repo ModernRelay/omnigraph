@@ -2,6 +2,8 @@
 
 `db/omnigraph/optimize.rs` and `db/omnigraph/repair.rs`.
 
+**Addressing (RFC-010).** `optimize`, `repair`, and `cleanup` are **storage-plane** CLI commands: they run with direct storage access against a positional `URI` or `--target`, never through a server, and reject `--server` / `--graph` or a `--target` that resolves to a remote (`http(s)://`) URL with a declared error. There are no server routes for them by design — to maintain a server-backed graph, run them out-of-band against the graph's storage URI. See the *Command planes* section of [cli-reference.md](cli-reference.md).
+
 ## `optimize_all_tables(db)` — non-destructive
 
 - Lance `compact_files()` then `optimize_indices()` on every node + edge table on `main`, then **publishes the resulting version to the `__manifest`** so the manifest's `table_version` tracks the compacted-and-reindexed Lance HEAD. Reads pin the manifest version, so without this publish the work would be invisible to readers *and* would break the HEAD-vs-manifest precondition of the next schema apply / strict update/delete ("stale view … refresh and retry"). The publish advances the graph version (a system-attributed commit) only for tables that actually changed.

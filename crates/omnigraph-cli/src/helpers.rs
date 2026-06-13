@@ -464,8 +464,11 @@ pub(crate) fn resolve_local_graph(
     let graph = resolve_cli_graph(config, cli_uri, cli_target)?;
     if graph.is_remote {
         bail!(
-            "{} is only supported against local graph URIs in this milestone",
-            operation
+            "`{}` is a storage-plane command and needs direct storage access; \
+             the resolved target is a remote server ({}). Pass the graph's \
+             file:// or s3:// URI.",
+            operation,
+            graph.uri
         );
     }
     Ok(graph)
@@ -751,10 +754,10 @@ pub(crate) async fn execute_query_lint(
     let has_graph_target =
         cli_uri.is_some() || cli_target.is_some() || config.cli_graph_name().is_some();
     if !has_graph_target {
-        bail!("query lint requires --schema <schema.pg> or a resolvable graph target");
+        bail!("lint requires --schema <schema.pg> or a resolvable graph target");
     }
 
-    let uri = resolve_local_uri(config, cli_uri, cli_target, "query lint")?;
+    let uri = resolve_local_uri(config, cli_uri, cli_target, "lint")?;
     let db = Omnigraph::open(&uri).await?;
     Ok(lint_query_file(
         &db.catalog(),
