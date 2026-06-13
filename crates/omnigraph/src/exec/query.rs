@@ -2114,19 +2114,36 @@ fn literal_to_expr_coerced(
 /// (`projection.rs::evaluate_filter`) so the two arms agree. Returns `None` on
 /// any failure (unbuildable literal, incompatible cast) — the caller then falls
 /// back to the natural-type literal.
+///
+/// Lossless-only for integer targets: typecheck permits numeric cross-type
+/// comparisons (`types_compatible`), so a fractional float or out-of-range
+/// integer can reach here. Casting those to a narrower integer would truncate
+/// (`2.7 -> 2`) or overflow to null, silently changing which rows match. We
+/// round-trip the cast and, on mismatch, return `None` so the caller keeps the
+/// natural literal — correct via DataFusion coercion, the index just goes unused
+/// for that out-of-domain predicate. Float targets are exempt: narrowing
+/// `F64 -> F32` is the column's own precision domain, not a value error.
 fn literal_to_typed_expr(
     lit: &Literal,
     target: &arrow_schema::DataType,
 ) -> Option<datafusion::prelude::Expr> {
     use datafusion::prelude::lit as df_lit;
+    use datafusion::scalar::ScalarValue;
+
     let arr = super::projection::literal_to_array(lit, 1).ok()?;
-    let casted = if arr.data_type() == target {
-        arr
-    } else {
-        arrow_cast::cast::cast(&arr, target).ok()?
-    };
-    let scalar = datafusion::scalar::ScalarValue::try_from_array(&casted, 0).ok()?;
-    Some(df_lit(scalar))
+    if arr.data_type() == target {
+        return Some(df_lit(ScalarValue::try_from_array(&arr, 0).ok()?));
+    }
+    let casted = arrow_cast::cast::cast(&arr, target).ok()?;
+    if target.is_integer() {
+        let back = arrow_cast::cast::cast(&casted, arr.data_type()).ok()?;
+        let original = ScalarValue::try_from_array(&arr, 0).ok()?;
+        let round_tripped = ScalarValue::try_from_array(&back, 0).ok()?;
+        if original != round_tripped {
+            return None;
+        }
+    }
+    Some(df_lit(ScalarValue::try_from_array(&casted, 0).ok()?))
 }
 
 /// Convert a Literal to a DataFusion `Expr` in its NATURAL Arrow type. This is
@@ -2438,6 +2455,56 @@ mod literal_lowering_tests {
         assert!(
             matches!(f32_lit, Expr::Literal(ScalarValue::Float32(Some(_)), ..)),
             "float literal vs Float32 column must lower to Float32, got {f32_lit:?}"
+        );
+    }
+
+    // Lossless guard: a fractional float against an integer column must NOT
+    // truncate (2.7 -> 2). Fall back to the natural Float64 so the comparison
+    // stays exact (no integer equals 2.7).
+    #[test]
+    fn fractional_float_vs_int_column_falls_back_not_truncate() {
+        use arrow_schema::DataType;
+        let e = literal_to_expr_coerced(&Literal::Float(2.7), Some(&DataType::Int32)).unwrap();
+        assert!(
+            matches!(e, Expr::Literal(ScalarValue::Float64(Some(_)), ..)),
+            "fractional float vs Int32 must fall back to natural Float64, got {e:?}"
+        );
+    }
+
+    // A whole-number float IS lossless against an integer column, so it coerces.
+    #[test]
+    fn whole_float_vs_int_column_coerces() {
+        use arrow_schema::DataType;
+        let e = literal_to_expr_coerced(&Literal::Float(2.0), Some(&DataType::Int32)).unwrap();
+        assert!(
+            matches!(e, Expr::Literal(ScalarValue::Int32(Some(2)), ..)),
+            "whole-number float vs Int32 is lossless and must coerce to Int32(2), got {e:?}"
+        );
+    }
+
+    // Lossless guard: an integer literal outside the column's range must NOT
+    // overflow to null; fall back to the natural Int64 (correct via DataFusion).
+    #[test]
+    fn out_of_range_int_vs_narrow_column_falls_back() {
+        use arrow_schema::DataType;
+        let e = literal_to_expr_coerced(&Literal::Integer(3_000_000_000), Some(&DataType::Int32))
+            .unwrap();
+        assert!(
+            matches!(e, Expr::Literal(ScalarValue::Int64(Some(3_000_000_000)), ..)),
+            "out-of-range integer vs Int32 must fall back to natural Int64, got {e:?}"
+        );
+    }
+
+    // Float targets are exempt from the lossless guard: narrowing to the column's
+    // own precision is the correct comparison domain, even when the value is not
+    // exactly representable in F32 (0.1).
+    #[test]
+    fn float_vs_f32_column_coerces_even_when_not_exactly_representable() {
+        use arrow_schema::DataType;
+        let e = literal_to_expr_coerced(&Literal::Float(0.1), Some(&DataType::Float32)).unwrap();
+        assert!(
+            matches!(e, Expr::Literal(ScalarValue::Float32(Some(_)), ..)),
+            "float target must coerce 0.1 to Float32 (exempt from lossless guard), got {e:?}"
         );
     }
 

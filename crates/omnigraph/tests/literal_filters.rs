@@ -93,6 +93,25 @@ query count_ge() { match { $m: Metric  $m.count >= 3 } return { $m.name } }
     );
 }
 
+// A fractional float against an integer column must not be truncated by the
+// pushdown coercion (`2.7 -> 2` would wrongly match the count=2 row). The
+// lossless guard falls back to the natural Float64 literal, so `count = 2.7`
+// matches no integer and returns no rows.
+#[tokio::test]
+async fn fractional_float_equality_on_int_column_returns_no_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = metric_db(&dir).await;
+    let q = r#"
+query count_frac() { match { $m: Metric { count: 2.7 } } return { $m.name } }
+"#;
+    assert!(
+        sorted_metric_names(&mut db, q, "count_frac")
+            .await
+            .is_empty(),
+        "count = 2.7 must match no integer rows (no truncation to count = 2)"
+    );
+}
+
 #[tokio::test]
 async fn bool_literal_filters_execute() {
     let dir = tempfile::tempdir().unwrap();
