@@ -28,7 +28,7 @@ mod store;
 use store::{ClusterStore, StateLockGuard, StateSnapshot};
 pub use types::*;
 use types::*;
-pub use serve::{ServingGraph, ServingPolicy, ServingQuery, ServingSnapshot, read_serving_snapshot, read_serving_snapshot_from_storage};
+pub use serve::{ServingGraph, ServingPolicy, ServingQuery, ServingSnapshot, cluster_root_for_graph_uri, read_serving_snapshot, read_serving_snapshot_from_storage};
 use config::{QueriesDecl, observe_declared_graphs, validate_cluster_header, future_field_diagnostics, initial_import_state, observe_live_graph, preview_schema_migration, state_resource_digests, graph_address, policy_address, query_address, schema_address, load_desired, normalize_policy_target, parse_cluster_config, resolve_config_path, resolve_query_decls, validate_id, validate_query_source};
 use diff::{FailedGraphOrigin, ResourceKind, append_policy_binding_changes, approved_resources, classify_changes, compute_approvals, compute_blast_radius, demote_dependents_of_failed_graphs, diff_resources, resource_kind};
 use sweep::{mark_approvals_consumed, record_approval_consumed, sweep_recovery_sidecars, tombstone_graph_subtree, warn_pending_recovery_sidecars};

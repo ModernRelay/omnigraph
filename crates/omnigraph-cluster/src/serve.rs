@@ -79,6 +79,38 @@ pub async fn read_serving_snapshot_from_storage(
     read_snapshot_with_store(backend).await
 }
 
+/// Cluster root for a graph **storage URI** of the cluster layout
+/// (`<root>/graphs/<id>.omni`), if `<root>` is actually a cluster (holds
+/// `__cluster/state.json`); otherwise `None`. Used by the CLI to refuse
+/// `init` into a cluster-managed location — graphs there are created by
+/// `cluster apply`, not `init`.
+///
+/// Cheap by construction: a URI that does not match the `<root>/graphs/<id>.omni`
+/// shape returns `None` without any I/O, so ordinary `init` targets
+/// (`./kb.omni`, `s3://bucket/kb.omni`) never probe storage. Works for
+/// `file://` and `s3://` via the storage adapter.
+pub async fn cluster_root_for_graph_uri(graph_uri: &str) -> Option<String> {
+    let root = cluster_root_of_graph_layout(graph_uri)?;
+    let store = ClusterStore::for_storage_root(&root).ok()?;
+    store
+        .has_state()
+        .await
+        .then(|| store.display_root().to_string())
+}
+
+/// Split `<root>/graphs/<id>.omni` → `<root>`, gating on the exact cluster
+/// graph-layout shape (a single `<id>` segment, no nested path). `None` for
+/// anything else — no I/O is done for non-cluster-shaped URIs.
+fn cluster_root_of_graph_layout(graph_uri: &str) -> Option<String> {
+    let trimmed = graph_uri.trim_end_matches('/');
+    let rest = trimmed.strip_suffix(".omni")?;
+    let (root, id) = rest.rsplit_once("/graphs/")?;
+    if root.is_empty() || id.is_empty() || id.contains('/') {
+        return None;
+    }
+    Some(root.to_string())
+}
+
 async fn read_snapshot_with_store(
     backend: ClusterStore,
 ) -> Result<ServingSnapshot, Vec<Diagnostic>> {
@@ -184,5 +216,52 @@ async fn read_snapshot_with_store(
         queries,
         policies,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graph_layout_gating_does_no_io_for_non_cluster_shapes() {
+        // Only `<root>/graphs/<id>.omni` matches; everything else is None.
+        assert_eq!(
+            cluster_root_of_graph_layout("/data/cluster/graphs/kb.omni").as_deref(),
+            Some("/data/cluster")
+        );
+        assert_eq!(
+            cluster_root_of_graph_layout("s3://bucket/prefix/graphs/kb.omni").as_deref(),
+            Some("s3://bucket/prefix")
+        );
+        assert_eq!(cluster_root_of_graph_layout("./kb.omni"), None);
+        assert_eq!(cluster_root_of_graph_layout("s3://bucket/kb.omni"), None);
+        // nested id under graphs/ is not the cluster layout
+        assert_eq!(cluster_root_of_graph_layout("/c/graphs/a/b.omni"), None);
+        // not a .omni graph
+        assert_eq!(cluster_root_of_graph_layout("/c/graphs/kb"), None);
+    }
+
+    #[tokio::test]
+    async fn cluster_root_detected_only_when_state_ledger_present() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("graphs")).unwrap();
+        let graph_uri = format!("{}/graphs/kb.omni", root.to_string_lossy());
+
+        // No __cluster/state.json yet → not a cluster.
+        assert_eq!(cluster_root_for_graph_uri(&graph_uri).await, None);
+
+        // Lay down the state ledger → now it's a cluster-managed location.
+        std::fs::create_dir_all(root.join("__cluster")).unwrap();
+        std::fs::write(root.join(CLUSTER_STATE_FILE), "{}").unwrap();
+        let detected = cluster_root_for_graph_uri(&graph_uri).await;
+        assert!(detected.is_some(), "expected cluster root to be detected");
+
+        // A non-cluster-shaped target never probes and is always None.
+        assert_eq!(
+            cluster_root_for_graph_uri(&format!("{}/plain.omni", root.to_string_lossy())).await,
+            None
+        );
+    }
 }
 
