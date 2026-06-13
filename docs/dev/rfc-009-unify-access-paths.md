@@ -90,7 +90,7 @@ default-deny by design — the harness encodes this), and inline execution's
 unbound-param matches-all vs the invoke path's hard error is a cross-path
 asymmetry, filed as #207 and pinned (not repaired) by the matrix.
 
-### Phase 2 — One wire-DTO crate
+### Phase 2 — One wire-DTO crate *(landed)*
 
 Move the HTTP request/response types and the single `engine result → DTO`
 mapping per verb into a shared crate (working name `omnigraph-api-types`),
@@ -121,6 +121,15 @@ Boundary note: this does NOT violate "transport/auth stay at the boundary"
 neither axum nor the engine's internals. The engine crate does not depend on
 it — the `engine result → DTO` mapping lives in the shared crate (or the CLI/
 server side), taking engine result types as input.
+
+**Phase 2 outcome (landed):** `crates/omnigraph-api-types` holds the wire
+DTOs + their `engine-result → DTO` mappings; `omnigraph-server::api` is a
+`pub use` re-export (so `openapi.json` is byte-identical — the referee
+passed with zero diff), and the CLI consumes the crate directly. One
+deliberate refinement of the original sketch: `LoadOutput` is a rendered
+CLI output type, not a wire DTO, so it stayed CLI-side — both its mappings
+(local `LoadResult`, remote `IngestOutput`) now sit together in
+`output.rs`. The parity matrix passed textually unchanged.
 
 ### Phase 3 — `GraphClient` trait, two implementations
 
