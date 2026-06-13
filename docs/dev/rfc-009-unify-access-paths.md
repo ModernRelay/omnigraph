@@ -68,7 +68,7 @@ anything moves — mirroring the storage collapse, where the pinned contract
 tests gated the swap, and the test-monolith modularization (#192/#193), which
 makes Phase 3 tractable: the CLI dispatch is 1,184 lines today, not 4,200.
 
-### Phase 1 — Parity matrix (the referee; do first, no refactor)
+### Phase 1 — Parity matrix (the referee; do first, no refactor) *(landed)*
 
 A CLI integration test (extend the `system_local.rs` harness, which already
 spawns both binaries): one fixture graph; for every forked verb, run the
@@ -80,6 +80,15 @@ shared error cases.
 This pins today's behavior so Phase 3 can't silently change it, and catches
 every future fork drift. It also incidentally covers utoipa annotation↔route
 mismatches (a lying `#[utoipa::path]` makes the remote leg 404).
+
+**Phase 1 outcome (landed):** `crates/omnigraph-cli/tests/parity_matrix.rs`
+— 11 rows green with an **empty divergence ledger**: with matched Cedar
+policy on both arms, embedded and remote agree on every forked verb's
+scrubbed JSON and exit codes. Two findings along the way: like-for-like
+requires the same policy bundle on both arms (a tokens-only server is
+default-deny by design — the harness encodes this), and inline execution's
+unbound-param matches-all vs the invoke path's hard error is a cross-path
+asymmetry, filed as #207 and pinned (not repaired) by the matrix.
 
 ### Phase 2 — One wire-DTO crate
 

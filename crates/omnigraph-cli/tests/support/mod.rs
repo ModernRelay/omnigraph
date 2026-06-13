@@ -688,3 +688,170 @@ pub fn queries_test_config(graph_uri: &str, entry: &str, gq_file: &str) -> Strin
         graph_uri.replace('\'', "''")
     )
 }
+
+// ---- RFC-009 Phase 1: parity-matrix harness ----
+
+/// Twin graphs for embedded-vs-remote comparison: the same loaded fixture
+/// copied to two roots, so write verbs can run once per arm on identical
+/// state. Returns (tempdir-guard, local_graph, remote_graph).
+pub fn twin_graphs() -> (TempDir, PathBuf, PathBuf) {
+    let temp = tempdir().unwrap();
+    let seed = temp.path().join("seed");
+    fs::create_dir_all(&seed).unwrap();
+    let graph = seed.join("server.omni");
+    init_graph(&graph);
+    load_fixture(&graph);
+    let local = temp.path().join("local.omni");
+    let remote = temp.path().join("remote.omni");
+    copy_dir(&graph, &local);
+    copy_dir(&graph, &remote);
+    (temp, local, remote)
+}
+
+pub fn copy_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// Scrub declared-volatile fields (RFC-009 Phase 1 allowlist) so the rest
+/// of the JSON must match exactly. Key-based, recursive; both arms get the
+/// same placeholders. Everything NOT listed here is contract.
+pub fn scrub_volatile(value: &mut serde_json::Value) {
+    const VOLATILE_KEYS: &[&str] = &[
+        // identity-bearing per-instance values
+        "commit_id", "id", "parent_id", "merge_parent_id", "snapshot",
+        // wall-clock
+        "committed_at", "created_at", "timestamp",
+        // transport / location
+        "uri", "path",
+    ];
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, val) in map.iter_mut() {
+                if VOLATILE_KEYS.contains(&key.as_str()) && !val.is_null() {
+                    *val = serde_json::Value::String(format!("<volatile:{key}>"));
+                } else {
+                    scrub_volatile(val);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                scrub_volatile(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub const PARITY_ACTOR: &str = "act-parity";
+pub const PARITY_TOKEN: &str = "parity-tok";
+
+/// Identical Cedar bundle for BOTH arms — like-for-like enforcement is part
+/// of the parity contract (a bare local arm is permissive while a
+/// tokens-only server is default-deny; comparing those would measure
+/// configuration, not the fork).
+pub fn parity_policy_yaml() -> String {
+    r#"version: 1
+groups:
+  parity: ["act-parity"]
+protected_branches: []
+rules:
+  - id: reads
+    allow:
+      actors: { group: parity }
+      actions: [read, export, invoke_query]
+  - id: read-scope
+    allow:
+      actors: { group: parity }
+      actions: [read, export]
+      branch_scope: any
+  - id: writes
+    allow:
+      actors: { group: parity }
+      actions: [change]
+      branch_scope: any
+  - id: branching
+    allow:
+      actors: { group: parity }
+      actions: [schema_apply, branch_create, branch_delete, branch_merge]
+      target_branch_scope: any
+"#
+    .to_string()
+}
+
+/// Per-arm config files carrying the same policy. Both arms address the
+/// graph by positional URI, so the TOP-LEVEL policy.file applies on each
+/// side (single-graph semantics).
+pub fn parity_configs(root: &Path, _local_graph: &Path, remote_graph: &Path) -> (PathBuf, PathBuf) {
+    let policy = root.join("parity.policy.yaml");
+    fs::write(&policy, parity_policy_yaml()).unwrap();
+    let local_cfg = root.join("local.omnigraph.yaml");
+    fs::write(
+        &local_cfg,
+        format!("policy:\n  file: {}\n", policy.display()),
+    )
+    .unwrap();
+    let server_cfg = root.join("server.omnigraph.yaml");
+    fs::write(
+        &server_cfg,
+        format!(
+            "server:\n  graph: parity\ngraphs:\n  parity:\n    uri: {}\n    policy:\n      file: {}\n",
+            remote_graph.display(),
+            policy.display()
+        ),
+    )
+    .unwrap();
+    (local_cfg, server_cfg)
+}
+
+/// Run one CLI invocation per arm with identical verb args: locally against
+/// `local_graph` (--as actor) and remotely against a server URL whose token
+/// resolves to the same actor. Returns raw Outputs for exit-code + JSON
+/// comparison by the caller.
+pub fn run_both(
+    local_graph: &Path,
+    server_url: &str,
+    args: &[&str],
+) -> (std::process::Output, std::process::Output) {
+    run_both_with_config(local_graph, None, server_url, args)
+}
+
+pub fn run_both_with_config(
+    local_graph: &Path,
+    local_config: Option<&Path>,
+    server_url: &str,
+    args: &[&str],
+) -> (std::process::Output, std::process::Output) {
+    let mut local = cli();
+    local.arg(args[0]).arg(local_graph).args(&args[1..]).arg("--as").arg(PARITY_ACTOR);
+    if let Some(config) = local_config {
+        local.arg("--config").arg(config);
+    }
+    let local_out = local.output().unwrap();
+
+    let mut remote = cli();
+    remote
+        .env("OMNIGRAPH_BEARER_TOKEN", PARITY_TOKEN)
+        .arg(args[0])
+        .arg(server_url)
+        .args(&args[1..]);
+    let remote_out = remote.output().unwrap();
+    (local_out, remote_out)
+}
+
+/// Parse, scrub, and pretty-print for diffable assertion messages.
+pub fn scrubbed_json(output: &std::process::Output) -> String {
+    let mut value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|e| panic!("non-JSON stdout ({e}): {output:?}"));
+    scrub_volatile(&mut value);
+    serde_json::to_string_pretty(&value).unwrap()
+}
