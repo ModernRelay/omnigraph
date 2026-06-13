@@ -4561,6 +4561,7 @@ dependencies = [
  "color-eyre",
  "lance",
  "lance-index",
+ "omnigraph-api-types",
  "omnigraph-cluster",
  "omnigraph-compiler",
  "omnigraph-engine",

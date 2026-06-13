@@ -21,7 +21,7 @@ pub(crate) struct LoadOutput {
 pub(crate) fn load_output_from_tables(
     uri: &str,
     branch: &str,
-    mode: CliLoadMode,
+    mode: &'static str,
     output: &IngestOutput,
 ) -> LoadOutput {
     let mut nodes_loaded = 0;
@@ -40,13 +40,38 @@ pub(crate) fn load_output_from_tables(
     LoadOutput {
         uri: uri.to_string(),
         branch: branch.to_string(),
-        mode: mode.as_str(),
+        mode,
         base_branch: output.base_branch.clone(),
         branch_created: output.branch_created,
         nodes_loaded,
         edges_loaded,
         node_types_loaded,
         edge_types_loaded,
+    }
+}
+
+/// The local arm's twin of `load_output_from_tables`: build the same
+/// `LoadOutput` from the engine `LoadResult` directly (the remote arm only
+/// has the wire `IngestOutput`'s table list; the local arm has the full
+/// result). Both load mappings live here, next to the struct — RFC-009
+/// Phase 2's "one place" for the `-> LoadOutput` mapping that used to fork
+/// between this file and main.rs's inline construction.
+pub(crate) fn load_output_from_result(
+    uri: &str,
+    branch: &str,
+    mode: &'static str,
+    result: &omnigraph::loader::LoadResult,
+) -> LoadOutput {
+    LoadOutput {
+        uri: uri.to_string(),
+        branch: branch.to_string(),
+        mode,
+        base_branch: result.base_branch.clone(),
+        branch_created: result.branch_created,
+        nodes_loaded: result.nodes_loaded.values().sum(),
+        edges_loaded: result.edges_loaded.values().sum(),
+        node_types_loaded: result.nodes_loaded.len(),
+        edge_types_loaded: result.edges_loaded.len(),
     }
 }
 
