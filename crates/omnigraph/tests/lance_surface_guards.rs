@@ -36,6 +36,7 @@ use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode,
 use lance::index::DatasetIndexExt;
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
+use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::ScalarIndexParams;
 use lance_namespace::LanceNamespace;
 use lance_table::io::commit::ManifestNamingScheme;
@@ -540,4 +541,109 @@ async fn fragment_deletion_metadata_is_available() {
          (got {count:?}); the artifact coverage model cannot cheaply detect \
          per-fragment deletions and would need to read the deletion vector.",
     );
+}
+
+// --- Guard 14: Dataset::optimize_indices signature ----------------------------
+//
+// `db/omnigraph/optimize.rs::optimize_one_table` calls
+// `ds.optimize_indices(&OptimizeOptions::default())` (via `DatasetIndexExt`) to
+// fold appended/compacted fragments back into existing indexes. If Lance
+// changes the receiver, the options type, or the return shape, this fails to
+// compile. Compile-only.
+
+#[allow(
+    dead_code,
+    unreachable_code,
+    unused_variables,
+    unused_mut,
+    clippy::diverging_sub_expression
+)]
+async fn _compile_optimize_indices_signature() -> lance::Result<()> {
+    let mut ds: Dataset = unimplemented!();
+    let options = OptimizeOptions::default();
+    // `&mut self`, `&OptimizeOptions`, returns `Result<()>` (mutates in place
+    // and commits — there is no uncommitted variant in this Lance, which is why
+    // optimize treats it as an inline-commit residual under a recovery sidecar).
+    let _: () = ds.optimize_indices(&options).await?;
+    Ok(())
+}
+
+// --- Guard 15: optimize_indices extends fragment coverage ----------------------
+//
+// PR3's reindex assumes `optimize_indices` folds fragments appended AFTER an
+// index was built into that index (incremental merge, not retrain). This pins
+// that Lance behavior at the surface layer so a regression turns red here, the
+// first smoke check on a Lance bump, before the slower engine suite.
+
+#[tokio::test]
+async fn optimize_indices_extends_fragment_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard_optimize_indices.lance");
+    let uri = uri.to_str().unwrap();
+
+    // Fragment 0: alice, bob. Build a BTREE over `value` covering only it.
+    let mut ds = fresh_dataset(uri).await;
+    ds.create_index_builder(&["value"], IndexType::BTree, &ScalarIndexParams::default())
+        .replace(true)
+        .await
+        .unwrap();
+
+    // Append a second fragment the existing index does not cover.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("value", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["carol"])),
+            Arc::new(Int32Array::from(vec![3])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Append,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    Dataset::write(reader, uri, Some(params)).await.unwrap();
+
+    let mut ds = Dataset::open(uri).await.unwrap();
+    assert!(
+        value_index_uncovered_count(&ds).await > 0,
+        "appended fragment should be uncovered by the BTREE before optimize_indices"
+    );
+
+    ds.optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        value_index_uncovered_count(&ds).await,
+        0,
+        "optimize_indices must fold the appended fragment into the existing index \
+         (incremental coverage); if this regresses, PR3's reindex no longer keeps \
+         coverage current — revisit db/omnigraph/optimize.rs and docs/dev/lance.md."
+    );
+}
+
+/// Count current fragments not covered by the single-column `value` BTREE —
+/// mirrors `TableStore::has_unindexed_fragments` (load_indices +
+/// `fragment_bitmap.contains`), pinned by Guard 11.
+async fn value_index_uncovered_count(ds: &Dataset) -> usize {
+    let indices = ds.load_indices().await.unwrap();
+    let frag_ids: Vec<u32> = ds.fragments().iter().map(|f| f.id as u32).collect();
+    let value_fid = ds.schema().field("value").unwrap().id;
+    for index in indices.iter() {
+        if index.fields.len() == 1 && index.fields[0] == value_fid {
+            if let Some(bitmap) = index.fragment_bitmap.as_ref() {
+                return frag_ids.iter().filter(|id| !bitmap.contains(**id)).count();
+            }
+        }
+    }
+    // No `value` index found — treat as fully uncovered so a missing index
+    // is never mistaken for full coverage.
+    frag_ids.len()
 }
