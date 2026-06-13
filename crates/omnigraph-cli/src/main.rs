@@ -23,8 +23,8 @@ use omnigraph_compiler::{
     json_params_to_param_map, lint_query_file,
 };
 use omnigraph_api_types::{
-    ChangeOutput, CommitOutput, ErrorOutput, ExportRequest, GraphListResponse, IngestOutput,
-    ReadOutput, SchemaApplyOutput, SnapshotTableOutput,
+    ChangeOutput, CommitOutput, ErrorOutput, IngestOutput, ReadOutput, SchemaApplyOutput,
+    SnapshotTableOutput,
 };
 use omnigraph_server::queries::{QueryRegistry, check, format_check_breakages};
 use omnigraph_server::{
@@ -525,11 +525,13 @@ async fn main() -> Result<()> {
             table_keys,
         } => {
             let config = load_cli_config(config.as_ref())?;
-            let uri =
-                apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
-            let bearer_token =
-                resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-            let uri = resolve_uri(&config, uri, target.as_deref())?;
+            let client = client::GraphClient::resolve(
+                &config,
+                cli.server.as_deref(),
+                cli.graph.as_deref(),
+                uri,
+                target.as_deref(),
+            )?;
             let branch = resolve_branch(&config, branch, None, "main");
             if jsonl {
                 eprintln!("warning: --jsonl is deprecated; `omnigraph export` always emits JSONL");
@@ -537,21 +539,9 @@ async fn main() -> Result<()> {
 
             let stdout = io::stdout();
             let mut stdout = stdout.lock();
-            if is_remote_uri(&uri) {
-                execute_export_remote_to_writer(
-                    &http_client,
-                    &uri,
-                    &branch,
-                    &type_names,
-                    &table_keys,
-                    bearer_token.as_deref(),
-                    &mut stdout,
-                )
+            client
+                .export(&branch, &type_names, &table_keys, &mut stdout)
                 .await?;
-            } else {
-                execute_export_to_writer(&uri, &branch, &type_names, &table_keys, &mut stdout)
-                    .await?;
-            }
         }
         Command::Query {
             uri,
@@ -1047,26 +1037,14 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_cli_config(config.as_ref())?;
-                let uri =
-                    apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
-                let bearer_token =
-                    resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-                let uri = resolve_uri(&config, uri, target.as_deref())?;
-                if !is_remote_uri(&uri) {
-                    bail!(
-                        "`omnigraph graphs list` requires a remote multi-graph server URL \
-                         (http:// or https://). To enumerate local graphs, read `omnigraph.yaml` \
-                         directly."
-                    );
-                }
-                let payload = remote_json::<GraphListResponse>(
-                    &http_client,
-                    Method::GET,
-                    remote_url(&uri, "/graphs"),
-                    None,
-                    bearer_token.as_deref(),
-                )
-                .await?;
+                let client = client::GraphClient::resolve(
+                    &config,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    uri,
+                    target.as_deref(),
+                )?;
+                let payload = client.list_graphs().await?;
                 if json {
                     print_json(&payload)?;
                 } else {

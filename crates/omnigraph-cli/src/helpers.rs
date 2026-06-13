@@ -678,22 +678,6 @@ pub(crate) fn normalize_legacy_alias_uri(
 }
 
 
-pub(crate) fn inferred_config_path(uri: &str) -> Result<PathBuf> {
-    if uri.contains("://") {
-        return Ok(omnigraph_server::config::default_config_path());
-    }
-
-    let path = Path::new(uri);
-    let base = if path.is_absolute() {
-        path.parent()
-            .map(Path::to_path_buf)
-            .unwrap_or(std::env::current_dir()?)
-    } else {
-        std::env::current_dir()?.join(path.parent().unwrap_or_else(|| Path::new(".")))
-    };
-    Ok(base.join(omnigraph_server::config::DEFAULT_CONFIG_FILE))
-}
-
 pub(crate) fn read_target_from_cli(branch: Option<String>, snapshot: Option<String>) -> ReadTarget {
     if let Some(snapshot) = snapshot {
         ReadTarget::snapshot(SnapshotId::new(snapshot))
@@ -996,55 +980,6 @@ pub(crate) fn legacy_change_request_body(
         body["params"] = params.clone();
     }
     body
-}
-
-pub(crate) async fn execute_export_to_writer<W: Write>(
-    uri: &str,
-    branch: &str,
-    type_names: &[String],
-    table_keys: &[String],
-    writer: &mut W,
-) -> Result<()> {
-    let db = Omnigraph::open(uri).await?;
-    db.export_jsonl_to_writer(branch, type_names, table_keys, writer)
-        .await?;
-    writer.flush()?;
-    Ok(())
-}
-
-pub(crate) async fn execute_export_remote_to_writer<W: Write>(
-    client: &reqwest::Client,
-    uri: &str,
-    branch: &str,
-    type_names: &[String],
-    table_keys: &[String],
-    bearer_token: Option<&str>,
-    writer: &mut W,
-) -> Result<()> {
-    let request = apply_bearer_token(
-        client.request(Method::POST, remote_url(uri, "/export")),
-        bearer_token,
-    )
-    .json(&ExportRequest {
-        branch: Some(branch.to_string()),
-        type_names: type_names.to_vec(),
-        table_keys: table_keys.to_vec(),
-    });
-    let mut response = request.send().await?;
-    let status = response.status();
-    if !status.is_success() {
-        let text = response.text().await?;
-        if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
-            bail!(error.error);
-        }
-        bail!("server returned {}: {}", status, text);
-    }
-
-    while let Some(chunk) = response.chunk().await? {
-        writer.write_all(&chunk)?;
-    }
-    writer.flush()?;
-    Ok(())
 }
 
 pub(crate) fn rewrite_deprecated_argv(args: Vec<OsString>) -> Vec<OsString> {

@@ -21,14 +21,17 @@
 //! `apply_schema` catalog-validator closure that is not object-safe.
 //! Same one-body-two-impls collapse, less ceremony.
 
+use std::io::Write;
+
 use color_eyre::Result;
+use color_eyre::eyre::bail;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph_api_types::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, CommitListOutput, CommitOutput,
-    IngestOutput, IngestRequest, ReadOutput, ReadRequest, SchemaApplyOutput, SchemaApplyRequest,
-    SchemaOutput, SnapshotOutput, commit_output, ingest_output, read_output, schema_apply_output,
-    snapshot_payload,
+    ErrorOutput, ExportRequest, GraphListResponse, IngestOutput, IngestRequest, ReadOutput,
+    ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput, commit_output,
+    ingest_output, read_output, schema_apply_output, snapshot_payload,
 };
 use omnigraph_compiler::catalog::Catalog;
 use reqwest::Method;
@@ -36,7 +39,7 @@ use serde_json::Value;
 
 use crate::cli::CliLoadMode;
 use crate::helpers::{
-    ResolvedCliGraph, apply_server_flag, build_http_client, is_remote_uri,
+    ResolvedCliGraph, apply_bearer_token, apply_server_flag, build_http_client, is_remote_uri,
     legacy_change_request_body, open_local_db_with_policy, query_params_from_json, remote_branch_url,
     remote_json, remote_url, resolve_cli_actor, resolve_cli_graph, resolve_remote_bearer_token,
     select_named_query,
@@ -613,6 +616,88 @@ impl GraphClient {
                     .await?;
                 Ok(schema_apply_output(uri, result))
             }
+        }
+    }
+
+    /// `export` — stream the branch as JSONL into `writer`. The streaming
+    /// shape (a `W: Write`, not a returned DTO) is why this lands in 3c
+    /// rather than 3b. Opens WITHOUT policy (like reads), so it is reached
+    /// via `resolve()`; the Embedded arm opens bare. The Remote arm streams
+    /// the chunked response body straight through (no buffering the whole
+    /// export in memory).
+    pub(crate) async fn export<W: Write>(
+        &self,
+        branch: &str,
+        type_names: &[String],
+        table_keys: &[String],
+        writer: &mut W,
+    ) -> Result<()> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+            } => {
+                let request = apply_bearer_token(
+                    http.request(Method::POST, remote_url(base_url, "/export")),
+                    token.as_deref(),
+                )
+                .json(&ExportRequest {
+                    branch: Some(branch.to_string()),
+                    type_names: type_names.to_vec(),
+                    table_keys: table_keys.to_vec(),
+                });
+                let mut response = request.send().await?;
+                let status = response.status();
+                if !status.is_success() {
+                    let text = response.text().await?;
+                    if let Ok(error) = serde_json::from_str::<ErrorOutput>(&text) {
+                        bail!(error.error);
+                    }
+                    bail!("server returned {}: {}", status, text);
+                }
+                while let Some(chunk) = response.chunk().await? {
+                    writer.write_all(&chunk)?;
+                }
+                writer.flush()?;
+                Ok(())
+            }
+            GraphClient::Embedded { uri, .. } => {
+                let db = Omnigraph::open(uri).await?;
+                db.export_jsonl_to_writer(branch, type_names, table_keys, writer)
+                    .await?;
+                writer.flush()?;
+                Ok(())
+            }
+        }
+    }
+
+    /// `graphs list` — enumerate the graphs a remote multi-graph server
+    /// serves (`GET /graphs`). Remote-only by design: there is no local
+    /// enumeration endpoint, so the Embedded arm fails loudly pointing the
+    /// operator at `omnigraph.yaml`. Routing it through the enum still buys
+    /// the shared `resolve()` addressing/token preamble.
+    pub(crate) async fn list_graphs(&self) -> Result<GraphListResponse> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+            } => {
+                remote_json(
+                    http,
+                    Method::GET,
+                    remote_url(base_url, "/graphs"),
+                    None,
+                    token.as_deref(),
+                )
+                .await
+            }
+            GraphClient::Embedded { .. } => bail!(
+                "`omnigraph graphs list` requires a remote multi-graph server URL \
+                 (http:// or https://). To enumerate local graphs, read `omnigraph.yaml` \
+                 directly."
+            ),
         }
     }
 }
