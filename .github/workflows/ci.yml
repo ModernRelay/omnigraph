@@ -128,6 +128,23 @@ jobs:
   test:
     name: Test Workspace
     needs: classify_changes
+    # PR latency: the full workspace + failpoints build/test is the slowest
+    # gate (~15min warm, up to the 75min ceiling cold) and dominated PR
+    # turnaround. It now runs only on push to `main` (post-merge), on tags,
+    # and on manual `workflow_dispatch` — NOT on pull_request. Trade-off
+    # accepted deliberately: a regression is caught on the `main` run after
+    # merge rather than before it, so `main` can briefly go red. Mitigations:
+    # (1) `Test Workspace` is removed from required PR checks in
+    #     `.github/branch-protection.json` (a required check that never
+    #     reports would leave every PR permanently pending);
+    # (2) run the full suite locally before merging risky changes
+    #     (`cargo test --workspace --locked`), or trigger this workflow via
+    #     the Actions "Run workflow" button (workflow_dispatch) on your branch;
+    # (3) openapi.json is no longer auto-regenerated on PRs (that step lived
+    #     here) — regenerate it locally for server/API changes
+    #     (`OMNIGRAPH_UPDATE_OPENAPI=1 cargo test -p omnigraph-server --test openapi`)
+    #     or the strict drift check fails the post-merge `main` run.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     # 75, not 45: a cold rust-cache (every Cargo.lock change) costs a full
     # workspace + failpoints-feature build on a 2-core runner, which now
@@ -274,6 +291,9 @@ jobs:
 
   rustfs_integration:
     name: RustFS S3 Integration
+    # `needs: test` means this is push-/dispatch-only too: on pull_request the
+    # `test` job is skipped, so this dependent is skipped with it. S3
+    # integration runs post-merge on `main`, alongside the workspace suite.
     needs:
       - classify_changes
       - test

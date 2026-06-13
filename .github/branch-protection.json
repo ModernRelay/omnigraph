@@ -5,7 +5,6 @@
     "contexts": [
       "Classify Changes",
       "Check AGENTS.md Links",
-      "Test Workspace",
       "Test omnigraph-server --features aws",
       "CODEOWNERS matches source",
       "CODEOWNERS not hand-edited"

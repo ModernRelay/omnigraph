@@ -979,77 +979,6 @@ pub(crate) fn execute_queries_list(
     Ok(())
 }
 
-pub(crate) async fn execute_read(
-    uri: &str,
-    query_source: &str,
-    query_name: Option<&str>,
-    target: ReadTarget,
-    params_json: Option<&Value>,
-) -> Result<ReadOutput> {
-    let (selected_name, query_params) = select_named_query(query_source, query_name)?;
-    let params = query_params_from_json(&query_params, params_json)?;
-    let db = Omnigraph::open(uri).await?;
-    let result = db
-        .query(target.clone(), query_source, &selected_name, &params)
-        .await?;
-    Ok(read_output(selected_name, &target, result))
-}
-
-pub(crate) async fn execute_read_remote(
-    client: &reqwest::Client,
-    uri: &str,
-    query_source: &str,
-    query_name: Option<&str>,
-    target: ReadTarget,
-    params_json: Option<&Value>,
-    bearer_token: Option<&str>,
-) -> Result<ReadOutput> {
-    let (branch, snapshot) = match &target {
-        ReadTarget::Branch(branch) => (Some(branch.clone()), None),
-        ReadTarget::Snapshot(snapshot) => (None, Some(snapshot.as_str().to_string())),
-    };
-    remote_json(
-        client,
-        Method::POST,
-        remote_url(uri, "/read"),
-        Some(serde_json::to_value(ReadRequest {
-            query_source: query_source.to_string(),
-            query_name: query_name.map(ToOwned::to_owned),
-            params: params_json.cloned(),
-            branch,
-            snapshot,
-        })?),
-        bearer_token,
-    )
-    .await
-}
-
-pub(crate) async fn execute_change(
-    graph: &ResolvedCliGraph,
-    query_source: &str,
-    query_name: Option<&str>,
-    branch: &str,
-    params_json: Option<&Value>,
-    config: &OmnigraphConfig,
-    cli_as_actor: Option<&str>,
-) -> Result<ChangeOutput> {
-    let (selected_name, query_params) = select_named_query(query_source, query_name)?;
-    let params = query_params_from_json(&query_params, params_json)?;
-    let db = open_local_db_with_policy(graph).await?;
-    let actor = resolve_cli_actor(cli_as_actor, config)?;
-    let actor = actor.as_deref();
-    let result = db
-        .mutate_as(branch, query_source, &selected_name, &params, actor)
-        .await?;
-    Ok(ChangeOutput {
-        branch: branch.to_string(),
-        query_name: selected_name,
-        affected_nodes: result.affected_nodes,
-        affected_edges: result.affected_edges,
-        actor_id: actor.map(String::from),
-    })
-}
-
 pub(crate) fn legacy_change_request_body(
     query_source: &str,
     query_name: Option<&str>,
@@ -1067,30 +996,6 @@ pub(crate) fn legacy_change_request_body(
         body["params"] = params.clone();
     }
     body
-}
-
-pub(crate) async fn execute_change_remote(
-    client: &reqwest::Client,
-    uri: &str,
-    query_source: &str,
-    query_name: Option<&str>,
-    branch: &str,
-    params_json: Option<&Value>,
-    bearer_token: Option<&str>,
-) -> Result<ChangeOutput> {
-    remote_json(
-        client,
-        Method::POST,
-        remote_url(uri, "/change"),
-        Some(legacy_change_request_body(
-            query_source,
-            query_name,
-            branch,
-            params_json,
-        )),
-        bearer_token,
-    )
-    .await
 }
 
 pub(crate) async fn execute_export_to_writer<W: Write>(
