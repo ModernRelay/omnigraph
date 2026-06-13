@@ -188,6 +188,13 @@ impl Omnigraph {
             actor_id,
         )?;
         self.ensure_schema_state_valid().await?;
+        // Converge any pending recovery sidecar (a previously failed
+        // writer's Phase B → Phase C residual) before staging anything:
+        // without this, sidecar-covered drift wedges every load on the
+        // commit-time drift guard until a process restart — `repair`
+        // refuses while a sidecar is pending. One `list_dir` when no
+        // sidecars exist (the steady state).
+        self.heal_pending_recovery_sidecars().await?;
         // Reject internal `__run__*` / system-prefixed branches at the
         // public write boundary. Direct-publish paths assert this
         // explicitly so a caller can't write to legacy or system

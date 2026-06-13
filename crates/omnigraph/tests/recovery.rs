@@ -135,6 +135,218 @@ async fn recovery_refuses_unknown_schema_version_on_open() {
 }
 
 #[tokio::test]
+async fn recovery_refuses_corrupt_sidecar_on_open_and_write() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+
+    // A truncated/garbage sidecar — e.g. a crashed writer or a partial
+    // local-FS write (S3 PutObject is atomic; local fs::write is not).
+    write_sidecar_file(dir.path(), "01H000000000000000000000CC", "{not json");
+
+    // A live handle's write-entry heal must surface the parse failure
+    // loudly instead of proceeding over a sidecar it cannot interpret.
+    let err = load_jsonl(
+        &mut db,
+        r#"{"type":"Person","data":{"name":"Alice","age":30}}
+"#,
+        LoadMode::Merge,
+    )
+    .await
+    .err()
+    .expect("expected the write to fail on the corrupt sidecar");
+    assert!(
+        err.to_string().contains("is not valid JSON"),
+        "expected the corrupt-sidecar parse error, got: {}",
+        err,
+    );
+
+    // A fresh ReadWrite open fails the same way.
+    drop(db);
+    let err = Omnigraph::open(uri)
+        .await
+        .err()
+        .expect("expected open to fail because of the corrupt sidecar");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("01H000000000000000000000CC") && msg.contains("is not valid JSON"),
+        "expected the corrupt-sidecar parse error naming the file, got: {}",
+        msg,
+    );
+    // The file must remain on disk for inspection — never auto-deleted.
+    assert!(
+        list_recovery_dir(dir.path()).contains(&"01H000000000000000000000CC.json".to_string()),
+        "corrupt sidecar should remain on disk after refusal"
+    );
+
+    // Read-only open still works — the sweep is skipped entirely.
+    let _db = Omnigraph::open_read_only(uri).await.unwrap();
+}
+
+/// The commit-time drift guard's advice must be branch-aware: a pending
+/// sidecar on ANOTHER branch does not cover this branch's drift. With a
+/// deferred feature-branch sidecar on disk and genuinely uncovered drift
+/// on main, the main write must still point at `omnigraph repair` — a
+/// read-write reopen recovers the sidecar but cannot repair main's
+/// uncovered drift.
+#[tokio::test]
+async fn drift_guard_advice_ignores_other_branch_sidecars() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":30}}\n",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    db.branch_create("feature").await.unwrap();
+    // A real feature write forks Person's Lance dataset onto the branch
+    // (the heal classifies a feature sidecar against the forked head).
+    db.mutate(
+        "feature",
+        helpers::MUTATION_QUERIES,
+        "insert_person",
+        &helpers::mixed_params(&[("$name", "eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+
+    // A sidecar pinning node:Person ON FEATURE, shaped so the write-entry
+    // heal defers it (head < expected_version classifies as an invariant
+    // violation; roll-forward-only mode leaves it for the next ReadWrite
+    // open) — it persists through the write attempt below.
+    let person_uri = node_table_uri(uri, "Person");
+    let sidecar_json = format!(
+        r#"{{
+        "schema_version": 1,
+        "operation_id": "01H000000000000000000000XB",
+        "started_at": "0",
+        "branch": "feature",
+        "actor_id": null,
+        "writer_kind": "Mutation",
+        "tables": [
+            {{
+                "table_key": "node:Person",
+                "table_path": "{person_uri}",
+                "expected_version": 999,
+                "post_commit_pin": 1000,
+                "table_branch": "feature"
+            }}
+        ]
+    }}"#
+    );
+    write_sidecar_file(dir.path(), "01H000000000000000000000XB", &sidecar_json);
+
+    // Genuinely uncovered drift on MAIN's Person (raw Lance write
+    // bypassing the manifest — the `omnigraph repair` class).
+    let mut ds = Dataset::open(&person_uri).await.unwrap();
+    let _ = helpers::lance_delete_inline(&mut ds, "1 = 2").await;
+
+    let err = load_jsonl(
+        &mut db,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Bob\",\"age\":25}}\n",
+        LoadMode::Merge,
+    )
+    .await
+    .err()
+    .expect("uncovered main drift must fail the write");
+    assert!(
+        err.to_string().contains("run `omnigraph repair`"),
+        "a feature-branch sidecar must not flip main's uncovered-drift \
+         advice to the reopen path; got: {err}"
+    );
+}
+
+/// A deferred sidecar pinned to a branch that is subsequently DELETED
+/// must not wedge the graph: the branch's tree and forks are reclaimed,
+/// so the pinned drift is unreachable and the sidecar is provably moot.
+/// Both the write-entry heal and the open-time sweep must classify it
+/// as orphaned (audit + discard) instead of failing to open the dead
+/// branch on every write and every ReadWrite open — a terminal state,
+/// since `repair` refuses while a sidecar is pending.
+#[tokio::test]
+async fn deleted_branch_sidecar_does_not_wedge_writes_or_open() {
+    use omnigraph::loader::{LoadMode, load_jsonl};
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = Omnigraph::init(&uri, TEST_SCHEMA).await.unwrap();
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Alice\",\"age\":30}}\n",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    db.branch_create("feature").await.unwrap();
+    db.mutate(
+        "feature",
+        helpers::MUTATION_QUERIES,
+        "insert_person",
+        &helpers::mixed_params(&[("$name", "eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+
+    // A rollback-eligible (deferred) sidecar pinned to feature — shaped
+    // so every roll-forward-only pass leaves it on disk.
+    let person_uri = node_table_uri(&uri, "Person");
+    let sidecar_json = format!(
+        r#"{{
+        "schema_version": 1,
+        "operation_id": "01H000000000000000000000DB",
+        "started_at": "0",
+        "branch": "feature",
+        "actor_id": null,
+        "writer_kind": "Mutation",
+        "tables": [
+            {{
+                "table_key": "node:Person",
+                "table_path": "{person_uri}",
+                "expected_version": 999,
+                "post_commit_pin": 1000,
+                "table_branch": "feature"
+            }}
+        ]
+    }}"#
+    );
+    write_sidecar_file(dir.path(), "01H000000000000000000000DB", &sidecar_json);
+
+    // Branch delete defers the rollback-eligible sidecar and proceeds —
+    // the sidecar now references a branch that no longer exists.
+    db.branch_delete("feature").await.unwrap();
+
+    // The next write's heal must classify the orphan and discard it,
+    // not fail opening the dead branch.
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Person\",\"data\":{\"name\":\"Bob\",\"age\":25}}\n",
+        LoadMode::Merge,
+    )
+    .await
+    .expect("a write after deleting a sidecar-pinned branch must succeed");
+    assert_eq!(
+        list_recovery_dir(dir.path()).len(),
+        0,
+        "the orphaned sidecar must be discarded (with an audit row), not left to wedge"
+    );
+
+    // And a fresh ReadWrite open must succeed too (the sweep shares the
+    // same classification).
+    drop(db);
+    let db = Omnigraph::open(&uri)
+        .await
+        .expect("ReadWrite open after deleting a sidecar-pinned branch must succeed");
+    assert_eq!(helpers::count_rows(&db, "node:Person").await, 2);
+}
+
+#[tokio::test]
 async fn read_only_open_skips_recovery_sweep() {
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap();

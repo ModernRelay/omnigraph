@@ -42,10 +42,12 @@ Use it this way:
 
 5. **Recovery is part of the commit protocol.** Writers that can advance Lance
    HEAD before manifest publish must write `__recovery/{ulid}.json` sidecars.
-   `Omnigraph::open` in read-write mode runs the all-or-nothing sweep, and
-   `refresh` runs roll-forward-only recovery for long-lived processes. Do not
-   add a new writer kind without sidecar coverage or an explicit proof that no
-   Lance HEAD can move before manifest publish.
+   `Omnigraph::open` in read-write mode runs the all-or-nothing sweep; the
+   write entry points (`load_as`, `mutate_as`, `apply_schema_as`,
+   `branch_merge_as`) and `refresh` run roll-forward-only recovery in-process,
+   so a long-lived process converges on its next write rather than at restart. Do not add a new writer kind without
+   sidecar coverage or an explicit proof that no Lance HEAD can move before
+   manifest publish.
 
 6. **Strong consistency is the default.** Reads are snapshot-isolated, writes
    are durable before acknowledgement, and branch reads observe the current
@@ -106,7 +108,7 @@ Use it this way:
 | Index lifecycle | `ensure_indices` is explicit today; reconciler-based convergence is roadmap | [indexes.md](../user/indexes.md), [maintenance.md](../user/maintenance.md) |
 | Traversal IDs | Runtime still builds `TypeIndex`; Lance stable row-id based graph IDs are roadmap | [architecture.md](architecture.md), [query-language.md](../user/query-language.md) |
 | Auth | Bearer token hashing and server-side actor resolution are implemented at the HTTP boundary | [server.md](../user/server.md), [policy.md](../user/policy.md) |
-| Tests | Tempdir-backed Lance tests are the current substrate; there is no `MemStorage` test backend | [testing.md](testing.md) |
+| Tests | Tempdir-backed Lance tests are the current substrate; the storage adapter has an in-memory backend for adapter-level contract tests, but Lance datasets bypass it | [testing.md](testing.md) |
 
 The branch-delete reconciler is authority-derived: it reclaims orphaned forks
 today and degrades to a no-op if Lance ships an atomic multi-dataset branch
@@ -146,6 +148,29 @@ them explicit.
   Remove the skip when the upstream Lance fix lands — the
   `lance_surface_guards.rs::compact_files_still_fails_on_blob_columns` guard
   turns red on that bump to force it.
+- **Recovery is serialized against live writers in-process only:** the
+  write-entry heal (and `refresh`) serialize against a live writer's sidecar
+  lifetime via the per-`(table, branch)` write queues plus the schema-apply
+  serialization key — all in-process primitives. A recovery pass in one
+  process cannot serialize against a live writer in another (the open-time
+  sweep has the same exposure, and always has): it may roll a live foreign
+  writer's sidecar forward, which degrades to publisher-CAS contention for
+  data writes but can race the schema-staging promotion for a foreign live
+  schema apply. Multi-process writers on one graph are already documented
+  one-winner-CAS territory; closing this fully needs a cross-process
+  serialization primitive (e.g. lease-based use of the schema-apply lock
+  branch) — design it before promoting multi-process write topologies.
+- **Local `write_text_if_match` is not a cross-process CAS:** object-store
+  backends use a true conditional put (ETag If-Match; the in-memory test
+  backend too), but upstream `object_store` leaves `PutMode::Update`
+  unimplemented for `LocalFileSystem`, so the local path emulates CAS with
+  a content-token compare followed by an atomic replace — a check-then-act
+  gap plus content-token ABA. Every current caller goes through the cluster
+  lock protocol first, which makes this safe. A lock-free caller would get
+  S3-correct but local-racy behavior — the same divergence shape as the
+  acknowledged-before-visible bug this branch fixed. Close it (local CAS
+  primitive, or a trait-level lock requirement) before admitting any
+  lock-free `if_match` caller.
 - **Manifest→commit-graph publish atomicity:** a graph commit advances
   `__manifest` (the visibility authority) and then appends `_graph_commits` as
   two separate writes (`commit_updates_with_actor_with_expected`, failpoint

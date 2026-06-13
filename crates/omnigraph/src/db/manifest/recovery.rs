@@ -28,10 +28,11 @@
 //!   CreateIndex/Merge — see `check_restore_txn` at lance-6.0.1
 //!   `src/io/commit/conflict_resolver.rs:986`. The hazard is documented
 //!   by `tests/staged_writes.rs::lance_restore_loses_to_concurrent_append_via_orphaning`.
-//!   This module sidesteps the hazard by running recovery only at
-//!   `Omnigraph::open` (before any other writers can race). A future
-//!   continuous in-process recovery reconciler will need to guard via
-//!   per-(table_key, branch) queue acquisition.
+//!   The open-time sweep sidesteps the hazard by running before any
+//!   other writers can race; the in-process heal
+//!   ([`heal_pending_sidecars_roll_forward`]) never restores (roll-
+//!   forward only) and guards via per-(table_key, branch) queue
+//!   acquisition.
 
 use std::collections::HashMap;
 
@@ -316,8 +317,8 @@ pub(crate) fn sidecar_uri(root_uri: &str, operation_id: &str) -> String {
 /// Write a sidecar atomically and return a handle for later deletion.
 ///
 /// The atomicity contract is inherited from [`StorageAdapter::write_text`]:
-/// LocalStorageAdapter writes via `tokio::fs::write` (whole-file replace);
-/// S3StorageAdapter writes via PutObject (atomic at the object level).
+/// the local backend publishes via a staged temp file + rename (atomic on
+/// POSIX); object stores write via PutObject (atomic at the object level).
 /// Both are sufficient for sidecar semantics — readers either see the
 /// complete sidecar or none.
 pub(crate) async fn write_sidecar(
@@ -325,6 +326,9 @@ pub(crate) async fn write_sidecar(
     storage: &dyn StorageAdapter,
     sidecar: &RecoverySidecar,
 ) -> Result<RecoverySidecarHandle> {
+    // Failpoint: models a storage put failure (S3 PutObject / fs write)
+    // in Phase A — every writer must abort before any HEAD advance.
+    crate::failpoints::maybe_fail("recovery.sidecar_write")?;
     debug_assert_eq!(sidecar.schema_version, SIDECAR_SCHEMA_VERSION);
     let uri = sidecar_uri(root_uri, &sidecar.operation_id);
     let json = serde_json::to_string_pretty(sidecar).map_err(|err| {
@@ -342,6 +346,10 @@ pub(crate) async fn delete_sidecar(
     handle: &RecoverySidecarHandle,
     storage: &dyn StorageAdapter,
 ) -> Result<()> {
+    // Failpoint: models a storage delete failure (S3 DeleteObject) in
+    // Phase D — callers swallow it (the write already published) and the
+    // stale sidecar is healed by the next write or open.
+    crate::failpoints::maybe_fail("recovery.sidecar_delete")?;
     storage.delete(&handle.sidecar_uri).await
 }
 
@@ -356,6 +364,10 @@ pub(crate) async fn list_sidecars(
     root_uri: &str,
     storage: &dyn StorageAdapter,
 ) -> Result<Vec<RecoverySidecar>> {
+    // Failpoint: models a storage list failure (S3 ListObjectsV2) — every
+    // consumer (open-time sweep, write-entry heal) must fail loudly
+    // rather than silently skipping recovery.
+    crate::failpoints::maybe_fail("recovery.sidecar_list")?;
     let dir = recovery_dir_uri(root_uri);
     let mut uris = storage.list_dir(&dir).await?;
     // Sort by URI so the sweep processes sidecars deterministically.
@@ -534,6 +546,240 @@ pub(crate) async fn restore_table_to_version(
     Ok(())
 }
 
+/// In-process heal for pending recovery sidecars — the entry point for
+/// long-lived handles (`Omnigraph::refresh` and the staged-write entry
+/// points `load_as` / `mutate_as`).
+///
+/// Steady-state cost is one `list_dir` of `__recovery/` (typically
+/// empty → immediate return), so write entry points can afford to call
+/// this on every request. When sidecars exist, each is processed in
+/// `RecoveryMode::RollForwardOnly`: the common Phase B → Phase C
+/// residual (per-table `commit_staged` landed, manifest publish did
+/// not) rolls forward in-process; rollback-eligible or invariant-
+/// violating sidecars are deferred to the next ReadWrite open, exactly
+/// as `Omnigraph::refresh` documents.
+///
+/// Concurrency: unlike the open-time sweep, this runs while other
+/// writers may be in flight. Every sidecar writer (mutation/load
+/// finalize, schema_apply, branch_merge, ensure_indices, optimize)
+/// acquires its per-`(table_key, table_branch)` write queues *before*
+/// `write_sidecar` and holds them until after `delete_sidecar` — so
+/// acquiring the same queues here blocks until that writer either
+/// finished (sidecar deleted; the existence re-check skips it) or died
+/// (sidecar is genuinely orphaned; safe to process). Without this, the
+/// heal could observe a live writer's sidecar in its commit→publish
+/// window, roll it forward, and fail that writer's own publish CAS.
+/// Lock order is queues → coordinator, matching every writer's
+/// commit→publish path.
+///
+/// The schema-staging reconcile runs lazily, per SchemaApply sidecar,
+/// AFTER that sidecar's queue guards are held and its existence is
+/// re-confirmed — never up front. An up-front reconcile can promote a
+/// LIVE schema apply's staging files and steal its commit (pinned by
+/// `tests/failpoints.rs::heal_does_not_promote_live_schema_apply_staging`).
+///
+/// Returns `true` when at least one sidecar was processed (the caller
+/// should invalidate per-snapshot caches).
+pub(crate) async fn heal_pending_sidecars_roll_forward(
+    root_uri: &str,
+    storage: std::sync::Arc<dyn StorageAdapter>,
+    coordinator: &tokio::sync::RwLock<GraphCoordinator>,
+    write_queue: &crate::db::write_queue::WriteQueueManager,
+) -> Result<bool> {
+    let sidecars = list_sidecars(root_uri, storage.as_ref()).await?;
+    if sidecars.is_empty() {
+        return Ok(false);
+    }
+    let mut processed_any = false;
+    for sidecar in sidecars {
+        // Serialize against a possibly-live writer (see fn docs). Guards
+        // are scoped per sidecar so two sidecars never hold queues
+        // simultaneously (no cross-sidecar lock-order surface).
+        let mut queue_keys: Vec<crate::db::write_queue::TableQueueKey> = sidecar
+            .tables
+            .iter()
+            .map(|pin| (pin.table_key.clone(), pin.table_branch.clone()))
+            .collect();
+        let is_schema_apply = matches!(sidecar.writer_kind, SidecarKind::SchemaApply);
+        if is_schema_apply {
+            // A SchemaApply sidecar's per-table pins don't cover a
+            // registration-only migration (no existing tables touched,
+            // but staging files + a sidecar on disk). The schema-apply
+            // writer holds this serialization key from before its
+            // sidecar write until after its sidecar delete, so blocking
+            // on it — then re-checking sidecar existence — guarantees
+            // the writer is gone before the reconcile below mutates
+            // schema staging.
+            queue_keys.push(schema_apply_serial_queue_key());
+        }
+        let _guards = write_queue.acquire_many(&queue_keys).await;
+        // Re-check after the wait: the writer we blocked on may have
+        // completed Phase C and deleted its sidecar.
+        if !storage
+            .exists(&sidecar_uri(root_uri, &sidecar.operation_id))
+            .await?
+        {
+            continue;
+        }
+        // Schema-staging reconcile, per SchemaApply sidecar, UNDER the
+        // sidecar's guards: a sidecar still on disk after the queue wait
+        // belongs to a dead writer, so promoting its staging files can no
+        // longer race the live apply's own renames or steal its commit.
+        // It also re-runs per sidecar, so a multi-sidecar pass never
+        // classifies against a reconcile result an earlier roll-forward
+        // staled. Non-SchemaApply sidecars never consult the value.
+        let schema_state_recovery = if is_schema_apply {
+            let snapshot = {
+                let mut coord = coordinator.write().await;
+                coord.refresh().await?;
+                coord.snapshot()
+            };
+            crate::db::schema_state::recover_schema_state_files(
+                root_uri,
+                std::sync::Arc::clone(&storage),
+                &snapshot,
+            )
+            .await?
+        } else {
+            SchemaStateRecovery::Noop
+        };
+        // Fresh per-branch snapshot — same rationale as
+        // `recover_manifest_drift`: classify against the branch the
+        // sidecar's writer targeted, refreshed after any prior
+        // sidecar's roll-forward.
+        let branch_snapshot = match sidecar.branch.as_deref() {
+            Some(b) => {
+                // Orphan check against the manifest's branch list (the
+                // authority) BEFORE opening: a deferred sidecar whose
+                // branch was deleted would otherwise wedge every write
+                // on the dead-branch open.
+                let (branch_exists, main_version) = {
+                    let mut coord = coordinator.write().await;
+                    coord.refresh().await?;
+                    let exists = coord.all_branches().await?.iter().any(|name| name == b);
+                    (exists, coord.snapshot().version())
+                };
+                if !branch_exists {
+                    discard_orphaned_branch_sidecar(
+                        root_uri,
+                        storage.as_ref(),
+                        &sidecar,
+                        main_version,
+                    )
+                    .await?;
+                    processed_any = true;
+                    continue;
+                }
+                let mut branch_coord =
+                    GraphCoordinator::open_branch(root_uri, b, std::sync::Arc::clone(&storage))
+                        .await?;
+                branch_coord.refresh().await?;
+                branch_coord.snapshot()
+            }
+            None => {
+                let mut coord = coordinator.write().await;
+                coord.refresh().await?;
+                coord.snapshot()
+            }
+        };
+        if process_sidecar(
+            root_uri,
+            storage.as_ref(),
+            &branch_snapshot,
+            &sidecar,
+            RecoveryMode::RollForwardOnly,
+            schema_state_recovery,
+        )
+        .await?
+        {
+            processed_any = true;
+        }
+    }
+    // Re-read coordinator state so the caller's handle observes the
+    // post-heal manifest.
+    coordinator.write().await.refresh().await?;
+    Ok(processed_any)
+}
+
+/// Discard a sidecar whose branch no longer exists in the manifest (the
+/// authority — callers must key the orphan classification off the branch
+/// LIST, never off a `Not found` from an open, which could be a transient
+/// storage error masking real recovery intent). The branch's tree and
+/// per-table forks are already reclaimed, so the drift the sidecar pins is
+/// unreachable and the sidecar is provably moot; leaving it would wedge
+/// every heal (write entry) and every ReadWrite open on a dead-branch
+/// open, with `repair` refusing while it pends. Records an
+/// `OrphanedBranchDiscarded` audit row (commit appended on main — the
+/// sidecar's own branch has no commit graph anymore).
+async fn discard_orphaned_branch_sidecar(
+    root_uri: &str,
+    storage: &dyn StorageAdapter,
+    sidecar: &RecoverySidecar,
+    manifest_version: u64,
+) -> Result<()> {
+    warn!(
+        operation_id = sidecar.operation_id.as_str(),
+        writer_kind = ?sidecar.writer_kind,
+        branch = sidecar.branch.as_deref().unwrap_or("<none>"),
+        "recovery: discarding sidecar for a deleted branch (drift unreachable; audit recorded)"
+    );
+    let mut audit = RecoveryAudit::open(root_uri).await?;
+    // Idempotency across a Phase D delete fault: the audit row + commit
+    // land before the sidecar delete, so a failed delete re-enters here
+    // with the audit already durable. Append only once per operation —
+    // the retry's sole remaining job is finishing the delete. (Cold
+    // path: the list scan runs only when an orphaned sidecar exists.)
+    //
+    // Documented residual: the commit append and the audit append are
+    // two writes. A failure BETWEEN them leaves a recovery commit with
+    // no audit row; the retry (keyed on the audit row, the operator-
+    // facing record) appends a second commit before the audit lands —
+    // bounded commit-graph noise, audit row still exactly-once. Same
+    // not-atomic-pair-write tolerance as `record_audit` and the
+    // manifest→commit-graph Known Gap; keying on commit rows instead
+    // would need an operation_id column on `_graph_commits`, and
+    // audit-before-commit would dangle the `graph_commit_id` join.
+    let already_recorded = audit.list().await?.iter().any(|record| {
+        record.operation_id == sidecar.operation_id
+            && record.recovery_kind == RecoveryKind::OrphanedBranchDiscarded
+    });
+    if !already_recorded {
+        let mut graph = CommitGraph::open(root_uri).await?;
+        let graph_commit_id = graph
+            .append_commit(None, manifest_version, Some(RECOVERY_ACTOR))
+            .await?;
+        // Failpoint: the residual window above — commit appended, audit
+        // not yet durable.
+        crate::failpoints::maybe_fail("recovery.orphan_discard_audit_append")?;
+        audit
+            .append(RecoveryAuditRecord {
+                graph_commit_id,
+                recovery_kind: RecoveryKind::OrphanedBranchDiscarded,
+                recovery_for_actor: sidecar.actor_id.clone(),
+                operation_id: sidecar.operation_id.clone(),
+                sidecar_writer_kind: format!("{:?}", sidecar.writer_kind),
+                per_table_outcomes: Vec::new(),
+                created_at: now_micros()?,
+            })
+            .await?;
+    }
+    let handle = RecoverySidecarHandle {
+        operation_id: sidecar.operation_id.clone(),
+        sidecar_uri: sidecar_uri(root_uri, &sidecar.operation_id),
+    };
+    delete_sidecar(&handle, storage).await
+}
+
+/// The write-queue key serializing schema-apply's sidecar lifecycle
+/// against the write-entry heal. The schema-apply writer acquires it
+/// (alongside its per-table keys) from before `write_sidecar` until
+/// after `delete_sidecar`; the heal acquires it before reconciling
+/// schema staging or processing a SchemaApply sidecar. The name cannot
+/// collide with real table keys (those are `node:`/`edge:`-prefixed).
+pub(crate) fn schema_apply_serial_queue_key() -> crate::db::write_queue::TableQueueKey {
+    ("__schema_apply__".to_string(), None)
+}
+
 /// Open-time recovery sweep — the entry point invoked from
 /// `Omnigraph::open` (gated on `OpenMode::ReadWrite`).
 ///
@@ -549,9 +795,10 @@ pub(crate) async fn restore_table_to_version(
 ///
 /// Concurrency: today recovery runs synchronously in `Omnigraph::open`
 /// *before* the engine is wrapped in the server's `Arc<RwLock<Omnigraph>>`.
-/// No request handlers can race. A future per-(table_key, branch) writer
-/// queue model (paired with a background reconciler) will need to acquire
-/// queues before the sweep restores or publishes.
+/// No request handlers can race, so this sweep does NOT acquire write
+/// queues. In-process callers (refresh, write entry points) must use
+/// [`heal_pending_sidecars_roll_forward`] instead, which serializes
+/// against live writers via per-(table_key, branch) queue acquisition.
 pub(crate) async fn recover_manifest_drift(
     root_uri: &str,
     storage: std::sync::Arc<dyn StorageAdapter>,
@@ -578,6 +825,21 @@ pub(crate) async fn recover_manifest_drift(
     for sidecar in sidecars {
         let branch_snapshot = match sidecar.branch.as_deref() {
             Some(b) => {
+                // Orphan check against the manifest's branch list (the
+                // authority) BEFORE opening — same classification as the
+                // write-entry heal: a deferred sidecar whose branch was
+                // deleted would otherwise fail every ReadWrite open.
+                coordinator.refresh().await?;
+                if !coordinator.all_branches().await?.iter().any(|name| name == b) {
+                    discard_orphaned_branch_sidecar(
+                        root_uri,
+                        storage.as_ref(),
+                        &sidecar,
+                        coordinator.snapshot().version(),
+                    )
+                    .await?;
+                    continue;
+                }
                 let mut branch_coord =
                     GraphCoordinator::open_branch(root_uri, b, std::sync::Arc::clone(&storage))
                         .await?;
@@ -611,7 +873,11 @@ async fn process_sidecar(
     sidecar: &RecoverySidecar,
     mode: RecoveryMode,
     schema_state_recovery: SchemaStateRecovery,
-) -> Result<()> {
+) -> Result<bool> {
+    // Returns whether durable state changed (roll-forward, roll-back, or
+    // stale-sidecar audit recovery). `false` = the sidecar was deferred
+    // untouched -- callers must not treat that as a completed heal (no
+    // schema reload / cache invalidation is warranted).
     let mut states = Vec::with_capacity(sidecar.tables.len());
     for pin in &sidecar.tables {
         let lance_head = open_lance_head(&pin.table_path, pin.table_branch.as_deref()).await?;
@@ -655,7 +921,7 @@ async fn process_sidecar(
                     writer_kind = ?sidecar.writer_kind,
                     "recovery: deferring sidecar with invariant violation to next ReadWrite open"
                 );
-                Ok(())
+                Ok(false)
             }
         },
         SidecarDecision::RollBack => {
@@ -701,7 +967,8 @@ async fn process_sidecar(
                 return record_audit_recovery_rollforward(
                     root_uri, storage, snapshot, sidecar, &states,
                 )
-                .await;
+                .await
+                .map(|()| true);
             }
             if matches!(mode, RecoveryMode::RollForwardOnly) {
                 // In-process recovery cannot run Dataset::restore safely
@@ -713,14 +980,16 @@ async fn process_sidecar(
                     writer_kind = ?sidecar.writer_kind,
                     "recovery: deferring rollback-eligible sidecar to next ReadWrite open"
                 );
-                return Ok(());
+                return Ok(false);
             }
             warn!(
                 operation_id = sidecar.operation_id.as_str(),
                 writer_kind = ?sidecar.writer_kind,
                 "recovery: rolling back sidecar (mixed or unexpected state)"
             );
-            roll_back_sidecar(root_uri, storage, snapshot, sidecar, &states).await
+            roll_back_sidecar(root_uri, storage, snapshot, sidecar, &states)
+                .await
+                .map(|()| true)
         }
         SidecarDecision::RollForward => {
             if matches!(sidecar.writer_kind, SidecarKind::SchemaApply)
@@ -733,7 +1002,9 @@ async fn process_sidecar(
                             "recovery: rolling back SchemaApply sidecar because schema staging \
                              files were not promoted in this recovery pass"
                         );
-                        roll_back_sidecar(root_uri, storage, snapshot, sidecar, &states).await
+                        roll_back_sidecar(root_uri, storage, snapshot, sidecar, &states)
+                            .await
+                            .map(|()| true)
                     }
                     RecoveryMode::RollForwardOnly => {
                         warn!(
@@ -741,7 +1012,7 @@ async fn process_sidecar(
                             "recovery: deferring SchemaApply sidecar because schema staging files \
                              were not promoted in this recovery pass"
                         );
-                        Ok(())
+                        Ok(false)
                     }
                 };
             }
@@ -788,7 +1059,7 @@ async fn process_sidecar(
             )
             .await?;
             delete_sidecar_by_operation_id(root_uri, storage, &sidecar.operation_id).await?;
-            Ok(())
+            Ok(true)
         }
     }
 }
@@ -1134,6 +1405,11 @@ async fn record_audit(
     kind: RecoveryKind,
     outcomes: Vec<TableOutcome>,
 ) -> Result<()> {
+    // Failpoint: models an audit write failure after the roll-forward /
+    // roll-back publish already landed — the sweep aborts, the sidecar
+    // stays, and re-entry records the audit row (see the retry note in
+    // the doc comment above).
+    crate::failpoints::maybe_fail("recovery.record_audit")?;
     // Non-main recovery commits must be appended on the sidecar branch's
     // commit graph, otherwise parent_commit_id comes from the global
     // main head. BranchMerge additionally records the source branch's
@@ -1260,7 +1536,7 @@ pub(crate) fn new_sidecar(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::LocalStorageAdapter;
+    use crate::storage::ObjectStorageAdapter;
     use crate::table_store::TableStore;
     use arrow_array::{Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
@@ -1573,7 +1849,7 @@ mod tests {
     #[tokio::test]
     async fn list_sidecars_returns_empty_when_dir_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = LocalStorageAdapter::default();
+        let storage = ObjectStorageAdapter::local();
         let result = list_sidecars(dir.path().to_str().unwrap(), &storage)
             .await
             .unwrap();
@@ -1583,10 +1859,10 @@ mod tests {
     #[tokio::test]
     async fn write_then_list_then_delete_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        // Create the __recovery/ subdir so write_sidecar's parent exists
-        // (LocalStorageAdapter::write_text doesn't mkdir parents).
-        std::fs::create_dir(dir.path().join(RECOVERY_DIR_NAME)).unwrap();
-        let storage = LocalStorageAdapter::default();
+        // No pre-created __recovery/ subdir: the storage backend creates
+        // missing parents on put, which is what the first sidecar write
+        // of a fresh graph relies on.
+        let storage = ObjectStorageAdapter::local();
         let root = dir.path().to_str().unwrap();
 
         let sidecar = new_sidecar(
@@ -1617,7 +1893,7 @@ mod tests {
             "noise",
         )
         .unwrap();
-        let storage = LocalStorageAdapter::default();
+        let storage = ObjectStorageAdapter::local();
         let result = list_sidecars(dir.path().to_str().unwrap(), &storage)
             .await
             .unwrap();
@@ -1633,7 +1909,7 @@ mod tests {
     async fn list_sidecars_returns_deterministic_order() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(RECOVERY_DIR_NAME)).unwrap();
-        let storage = LocalStorageAdapter::default();
+        let storage = ObjectStorageAdapter::local();
         let root = dir.path().to_str().unwrap();
 
         // Write sidecars in REVERSE chronological order (newest first).

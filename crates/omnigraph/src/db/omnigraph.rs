@@ -378,10 +378,11 @@ impl Omnigraph {
                 recover_schema_state_files(&root, Arc::clone(&storage), &coordinator.snapshot())
                     .await?;
             // Recovery sweep: close the Phase B → Phase C residual on
-            // any sidecar left over from a crashed writer. Continuous
-            // in-process recovery for long-running servers (no restart
-            // required between Phase B failure and recovery) is a
-            // separate background-reconciler effort.
+            // any sidecar left over from a crashed writer. Long-running
+            // processes additionally converge in-process: the staged-
+            // write entry points and `refresh` run the roll-forward-only
+            // heal (`heal_pending_sidecars_roll_forward`); only
+            // rollback-eligible sidecars wait for this open-time sweep.
             crate::db::manifest::recover_manifest_drift(
                 &root,
                 Arc::clone(&storage),
@@ -755,7 +756,7 @@ impl Omnigraph {
     ///
     /// Composition mirrors `Omnigraph::open_with_storage_and_mode`'s
     /// recovery sequence, in the same order, with one restriction: the
-    /// manifest-drift sweep runs in `RollForwardOnly` mode (rollback /
+    /// manifest-drift heal runs in `RollForwardOnly` mode (rollback /
     /// abort cases defer to the next ReadWrite open because
     /// `Dataset::restore` is unsafe under concurrency). Each step:
     ///
@@ -767,46 +768,120 @@ impl Omnigraph {
     ///    SchemaApply roll-forward doesn't publish the manifest while
     ///    the staging files remain unrenamed (which would corrupt the
     ///    graph: data on new schema, catalog on old).
-    /// 3. `recover_manifest_drift(... RollForwardOnly)` — close the
+    /// 3. `heal_pending_sidecars_roll_forward` — close the
     ///    finalize→publisher residual via roll-forward; defer rollback
-    ///    work to next ReadWrite open.
+    ///    work to next ReadWrite open. Serializes against live writers
+    ///    by acquiring each sidecar's per-(table_key, branch) write
+    ///    queues, so refresh never rolls forward an in-flight writer's
+    ///    sidecar from under it.
     /// 4. `runtime_cache.invalidate_all` — drop stale per-snapshot caches.
     ///
     /// Steady state cost: one `list_dir` of `__recovery/` (typically
     /// returns empty → early return for both passes). No additional
     /// Lance reads.
     ///
-    /// Engine-internal callers that already hold an in-flight sidecar
-    /// (e.g. `schema_apply` mid-write) MUST use
+    /// The staged-write entry points (`load_as`, `mutate_as`) run the
+    /// same heal via
+    /// [`heal_pending_recovery_sidecars`](Self::heal_pending_recovery_sidecars),
+    /// so a long-lived server converges on the next write without an
+    /// explicit refresh. Engine-internal callers that already hold an
+    /// in-flight sidecar (e.g. `schema_apply` mid-write) MUST use
     /// [`refresh_coordinator_only`](Self::refresh_coordinator_only) to
     /// avoid the recovery sweep racing their own sidecar.
     pub async fn refresh(&self) -> Result<()> {
-        // Scope the coord write guard to the recovery section only.
+        // Standalone schema-staging reconcile ONLY when no recovery
+        // sidecar exists (legacy/manual staging residue). When sidecars
+        // exist, the heal below owns the reconcile — per SchemaApply
+        // sidecar, under that sidecar's queue guards — because an
+        // unserialized reconcile can promote a LIVE schema apply's
+        // staging files from under it, and a pre-promoted result would
+        // make the heal's own guarded reconcile see clean staging and
+        // wrongly defer the sidecar. The no-sidecar case cannot race a
+        // live apply: its sidecar is on disk before its staging files.
+        //
+        // Scope the coord write guard to the schema-state section only.
         // `reload_schema_if_source_changed` (below) acquires
         // `self.coordinator.read().await` when the on-disk schema source
         // has drifted from the cached `schema_source`. Tokio's RwLock is
         // not reentrant, so holding the write across that call deadlocks.
         // Pinned by `composite_flow_schema_apply_then_branch_ops_no_deadlock_in_refresh`.
+        // The heal also takes the lock itself (queues → coordinator
+        // order), so it must run after this guard is released.
         {
-            let mut coord = self.coordinator.write().await;
-            coord.refresh().await?;
-            let schema_state_recovery = recover_schema_state_files(
-                &self.root_uri,
-                Arc::clone(&self.storage),
-                &coord.snapshot(),
-            )
-            .await?;
-            crate::db::manifest::recover_manifest_drift(
-                &self.root_uri,
-                Arc::clone(&self.storage),
-                &mut *coord,
-                crate::db::manifest::RecoveryMode::RollForwardOnly,
-                schema_state_recovery,
-            )
-            .await?;
-        } // ← write guard released before reload's read acquisition
+            // Hold the schema-apply serialization key across the
+            // list-then-reconcile pair: without it, a live apply can
+            // write its sidecar + staging between the empty check and
+            // the reconcile (the same race, through a smaller window).
+            // Queue before coordinator — the documented lock order.
+            //
+            // Liveness note: with a pending NON-SchemaApply sidecar
+            // (e.g. a Mutation residual), this gate skips the standalone
+            // reconcile and the heal below reconciles only per
+            // SchemaApply sidecar — so pre-sidecar-era orphaned staging
+            // residue waits for the NEXT refresh after the sidecars are
+            // consumed. Convergence holds, one pass late. Do not "fix"
+            // by re-running the reconcile unserialized here: that is
+            // exactly the live-apply race this block exists to close.
+            let _serial = self
+                .write_queue
+                .acquire(&crate::db::manifest::schema_apply_serial_queue_key())
+                .await;
+            if crate::db::manifest::list_sidecars(&self.root_uri, self.storage.as_ref())
+                .await?
+                .is_empty()
+            {
+                let mut coord = self.coordinator.write().await;
+                coord.refresh().await?;
+                recover_schema_state_files(
+                    &self.root_uri,
+                    Arc::clone(&self.storage),
+                    &coord.snapshot(),
+                )
+                .await?;
+            }
+        } // ← guards released before the heal's queue acquisition
+        crate::db::manifest::heal_pending_sidecars_roll_forward(
+            &self.root_uri,
+            Arc::clone(&self.storage),
+            &self.coordinator,
+            &self.write_queue,
+        )
+        .await?;
         self.reload_schema_if_source_changed().await?;
         self.runtime_cache.invalidate_all().await;
+        Ok(())
+    }
+
+    /// Write-entry heal: converge any pending recovery sidecars (a
+    /// previously failed writer's Phase B → Phase C residual) before
+    /// starting a new staged write, so a long-lived process (the HTTP
+    /// server, an embedded handle) recovers on its next write instead
+    /// of wedging every write on the commit-time drift guard until
+    /// restart. Roll-forward only; rollback-eligible sidecars defer to
+    /// the next ReadWrite open exactly as [`refresh`](Self::refresh)
+    /// does.
+    ///
+    /// Steady-state cost: one `list_dir` of `__recovery/` (typically
+    /// empty → immediate return). See
+    /// `recovery::heal_pending_sidecars_roll_forward` for the
+    /// concurrency contract (per-table write-queue acquisition).
+    pub(crate) async fn heal_pending_recovery_sidecars(&self) -> Result<()> {
+        let processed = crate::db::manifest::heal_pending_sidecars_roll_forward(
+            &self.root_uri,
+            Arc::clone(&self.storage),
+            &self.coordinator,
+            &self.write_queue,
+        )
+        .await?;
+        if processed {
+            // A rolled-forward SchemaApply sidecar moved disk + manifest
+            // to the new schema (staging promoted, registrations
+            // published); the in-memory catalog must follow or the very
+            // write that triggered the heal validates against the stale
+            // schema. Same post-heal step as `refresh`.
+            self.reload_schema_if_source_changed().await?;
+            self.runtime_cache.invalidate_all().await;
+        }
         Ok(())
     }
 
@@ -1951,7 +2026,7 @@ mod tests {
     use serde_json::Value;
     use std::sync::{Arc, Mutex};
 
-    use crate::storage::{LocalStorageAdapter, StorageAdapter, join_uri};
+    use crate::storage::{ObjectStorageAdapter, StorageAdapter, join_uri};
 
     const TEST_SCHEMA: &str = r#"
 node Person {
@@ -1967,14 +2042,27 @@ edge Knows: Person -> Person {
 edge WorksAt: Person -> Company
 "#;
 
-    #[derive(Debug, Default)]
+    #[derive(Debug)]
     struct RecordingStorageAdapter {
-        inner: LocalStorageAdapter,
+        inner: ObjectStorageAdapter,
         reads: Mutex<Vec<String>>,
         writes: Mutex<Vec<String>>,
         exists_checks: Mutex<Vec<String>>,
         renames: Mutex<Vec<(String, String)>>,
         deletes: Mutex<Vec<String>>,
+    }
+
+    impl Default for RecordingStorageAdapter {
+        fn default() -> Self {
+            Self {
+                inner: ObjectStorageAdapter::local(),
+                reads: Mutex::default(),
+                writes: Mutex::default(),
+                exists_checks: Mutex::default(),
+                renames: Mutex::default(),
+                deletes: Mutex::default(),
+            }
+        }
     }
 
     impl RecordingStorageAdapter {
@@ -2052,7 +2140,7 @@ edge WorksAt: Person -> Company
 
     #[derive(Debug)]
     struct InitRaceStorageAdapter {
-        inner: LocalStorageAdapter,
+        inner: ObjectStorageAdapter,
         root: String,
         barrier: Arc<tokio::sync::Barrier>,
     }
@@ -2117,7 +2205,7 @@ edge WorksAt: Person -> Company
         let uri = dir.path().to_str().unwrap().to_string();
         let root = normalize_root_uri(&uri).unwrap();
         let storage: Arc<dyn StorageAdapter> = Arc::new(InitRaceStorageAdapter {
-            inner: LocalStorageAdapter,
+            inner: ObjectStorageAdapter::local(),
             root,
             barrier: Arc::new(tokio::sync::Barrier::new(2)),
         });

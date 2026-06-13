@@ -1950,13 +1950,29 @@ graphs:
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn refresh_flags_unreadable_payload_as_error() {
         let dir = fixture();
         init_derived_graph(dir.path()).await;
         let blob = converge_fixture(dir.path()).await;
-        // A same-named directory yields a non-NotFound IO error portably.
-        fs::remove_file(&blob).unwrap();
-        fs::create_dir(&blob).unwrap();
+        // Make the payload unreadable without removing it: permission
+        // denied is a genuine non-NotFound IO error. (A same-named
+        // directory no longer triggers this path: object-store semantics
+        // classify a directory at an object path as NotFound — "only
+        // objects exist" — which is the missing-payload case, not the
+        // unreadable one.)
+        let mut perms = fs::metadata(&blob).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o000);
+        fs::set_permissions(&blob, perms).unwrap();
+        // Root reads straight through mode 000 (container dev runners
+        // commonly run as root): skip rather than fail — the contract
+        // under test needs a genuine permission error.
+        if fs::read(&blob).is_ok() {
+            eprintln!(
+                "skipping refresh_flags_unreadable_payload_as_error:                  running as root (mode 000 is still readable)"
+            );
+            return;
+        }
 
         let out = refresh_config_dir(dir.path()).await;
         assert!(!out.ok);

@@ -215,25 +215,87 @@ Triggers for the residual: transient Lance write errors during finalize
 (object-store retry budget exhaustion, disk full); persistent publisher
 contention exceeding `PUBLISHER_RETRY_BUDGET = 5` retries.
 
-**Long-running servers**: `Omnigraph::refresh` runs roll-forward-only
-recovery in-process — the common Phase B → Phase C residual closes
-without a restart. The next mutation on the same handle (after refresh)
-no longer surfaces `ExpectedVersionMismatch` for the failed table.
+**Long-running servers**: the write entry points (`load_as`,
+`mutate_as`, `apply_schema_as`, `branch_merge_as`) and
+`Omnigraph::refresh` run roll-forward-only recovery in-process
+(`recovery::heal_pending_sidecars_roll_forward`) — the common
+Phase B → Phase C residual closes on the next write, without a
+restart and without an explicit refresh. The heal lists `__recovery/`
+(one `list_dir`; empty in the steady state) and, per sidecar, acquires
+the same per-`(table_key, table_branch)` write queues every sidecar
+writer holds from before `write_sidecar` until after `delete_sidecar` —
+so it serializes against a live writer instead of rolling its
+in-flight sidecar forward from under it (a sidecar whose queues can be
+acquired belongs to a writer that finished or died; an existence
+re-check after the wait skips the finished case). Lock order is
+queues → coordinator, matching every writer's commit→publish path.
+Pinned by the four
+`tests/failpoints.rs::*_after_finalize_publisher_failure_heals_without_reopen`
+tests (load, mutation, schema apply, branch merge). The maintenance
+entries need the heal for more than liveness: without it, a schema
+apply re-plans rewrites from the manifest pin and orphans the drifted
+Phase-B commit (dropping its rows), and a branch merge publishes the
+drift as an unattributed side effect — both while the stale sidecar
+lingers to misclassify later.
 Sidecars that would require a `Dataset::restore` (mixed / unexpected
 state) are deferred to the next `OpenMode::ReadWrite` open: restore is
 unsafe under concurrency because Lance's `check_restore_txn` accepts
 the restore against in-flight Append/Update/Delete commits and
 silently orphans them (pinned by
 `tests/staged_writes.rs::lance_restore_loses_to_concurrent_append_via_orphaning`).
+When such a deferred sidecar blocks a write, the commit-time drift
+guard says so explicitly ("a pending recovery sidecar requires
+rollback — reopen the graph read-write") instead of pointing at
+`omnigraph repair`, which refuses while a sidecar is pending.
 Continuous in-process recovery for the rollback path is the goal of a
-future background reconciler with per-(table, branch) writer-queue
-acquisition.
+future background reconciler. `ensure_indices` does not heal at entry
+itself — it runs inside the load / schema-apply flows after their
+entry heal, and its strict preconditions still fail loudly on drift
+when invoked directly.
 
 The publisher-CAS contract is unchanged: a *concurrent writer* that
 advances any of our touched tables between snapshot capture and
 publisher commit produces exactly one winner. The residual above is
 about *our* abandoned commits in the failure path, not about
 concurrency races.
+
+**Sidecar I/O failure semantics** (all sidecar I/O goes through the
+backend-generic `StorageAdapter`; the contracts below are pinned by the
+storage-fault failpoints `recovery.sidecar_{write,delete,list}` /
+`recovery.record_audit` and their tests in `tests/failpoints.rs` and
+`tests/recovery.rs`):
+
+- **Phase A put fails** (S3 PutObject / fs write): the writer aborts
+  before its first HEAD-advancing commit — no sidecar, no drift,
+  nothing to recover; a transient fault never wedges later writes.
+- **Phase D delete fails** (S3 DeleteObject): swallowed with a warning —
+  the write already published, so failing the caller would report an
+  error for a durable write. The stale sidecar is consumed by the next
+  write's entry heal (or the next open) via the stale-sidecar
+  audit-recovery path, recorded as `RolledForward`.
+- **`__recovery/` list fails** (S3 ListObjectsV2): loud at every
+  consumer — the write-entry heal fails the write, the open-time sweep
+  fails the open. Silently skipping recovery would be consumer
+  tolerance of drift.
+- **Corrupt / unparseable sidecar**: refused loudly by heal and open
+  alike; the file stays on disk for operator inspection (read-only
+  opens still work — the sweep is skipped there).
+- **Audit append fails after a roll-forward publish**: that recovery
+  attempt errors and keeps the sidecar; re-entry sees the
+  already-published manifest, records exactly one `RolledForward`
+  audit row, and deletes the sidecar (the retry tolerance documented
+  on `record_audit`).
+
+Backend notes (the adapter is one implementation over `object_store`
+for every backend): local writes stage through `name#<digits>` temp
+files that the backend filters from listings and refuses to address —
+crash residue of that shape is invisible to the sweep, harmless, and
+reclaimed by `delete_prefix`/manual cleanup. Storage errors are
+backend-wrapped text without a typed NotFound discriminant — callers
+that need missing-vs-error (the cluster store) probe `exists()` first.
+`exists()` itself is object-store semantics everywhere: only objects
+(or non-empty prefixes) exist, and a permission failure is a loud
+error, not a silent `false`.
 
 ## Conflict shape
 
