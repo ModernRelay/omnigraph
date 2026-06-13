@@ -72,7 +72,11 @@ fn evaluate_expr(batch: &RecordBatch, expr: &IRExpr, params: &ParamMap) -> Resul
 }
 
 /// Create a constant array from a literal value.
-fn literal_to_array(lit: &Literal, num_rows: usize) -> Result<ArrayRef> {
+///
+/// `pub(super)` so the pushdown arm (`query.rs::literal_to_typed_expr`) can build
+/// a literal in the same natural Arrow type and cast it to the column type through
+/// the identical `arrow_cast` path used here, keeping the two filter arms in sync.
+pub(super) fn literal_to_array(lit: &Literal, num_rows: usize) -> Result<ArrayRef> {
     Ok(match lit {
         Literal::Null => arrow_array::new_null_array(&DataType::Utf8, num_rows),
         Literal::String(s) => Arc::new(StringArray::from(vec![s.as_str(); num_rows])) as ArrayRef,

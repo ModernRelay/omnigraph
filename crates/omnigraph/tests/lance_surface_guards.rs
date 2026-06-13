@@ -647,3 +647,94 @@ async fn value_index_uncovered_count(ds: &Dataset) -> usize {
     // is never mistaken for full coverage.
     frag_ids.len()
 }
+
+// --- Guard 16: scalar index use requires a literal matching the column type ---
+//
+// Pins the substrate behavior the pushdown literal-coercion fix relies on
+// (`query.rs::literal_to_typed_expr`): Lance uses the BTREE only when the filter
+// is `column OP literal` with a matching type. A width-mismatched literal makes
+// DataFusion widen and cast the COLUMN (`CAST(n32 AS Int64)`), which drops the
+// scalar index and full-scans. Temporal columns are immune (DataFusion casts the
+// Utf8 LITERAL to the date type, not the column). If a Lance/DataFusion bump
+// changes either coercion direction, this turns red — re-validate the fix.
+#[tokio::test]
+async fn scalar_index_use_requires_matched_literal_type() {
+    use datafusion::physical_plan::displayable;
+    use datafusion::prelude::{col, lit};
+    use datafusion::scalar::ScalarValue;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("probe_literal_type.lance");
+    let uri = uri.to_str().unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("n32", DataType::Int32, false),
+        Field::new("d32", DataType::Date32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
+            Arc::new(Int32Array::from(vec![1, 5, 9, 13])),
+            Arc::new(arrow_array::Date32Array::from(vec![19000, 19723, 20000, 20500])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let mut ds = Dataset::write(reader, uri, Some(params)).await.unwrap();
+    for c in ["n32", "d32"] {
+        ds.create_index_builder(&[c], IndexType::BTree, &ScalarIndexParams::default())
+            .replace(true)
+            .await
+            .unwrap();
+    }
+
+    async fn plan_str(ds: &Dataset, filter: datafusion::prelude::Expr) -> String {
+        let mut scanner = ds.scan();
+        scanner.filter_expr(filter);
+        let plan = scanner.create_plan().await.unwrap();
+        format!("{}", displayable(plan.as_ref()).indent(true))
+    }
+
+    // (label, filter, expect_index_used)
+    let cases = [
+        ("n32 = 5i32 (matched Int32)", col("n32").eq(lit(5i32)), true),
+        ("n32 = 5i64 (widened Int64)", col("n32").eq(lit(5i64)), false),
+        (
+            "d32 = Date32 (matched)",
+            col("d32").eq(lit(ScalarValue::Date32(Some(19723)))),
+            true,
+        ),
+        (
+            "d32 = '2024-01-01' (Utf8 vs Date32)",
+            col("d32").eq(lit("2024-01-01")),
+            true,
+        ),
+    ];
+
+    for (label, filter, expect_index) in cases {
+        let s = plan_str(&ds, filter).await;
+        let uses_index = s.contains("ScalarIndexQuery");
+        assert_eq!(
+            uses_index, expect_index,
+            "[{label}] expected scalar-index use = {expect_index}, got {uses_index}.\n\
+             A change here means Lance/DataFusion shifted its coercion or index \
+             pushdown; re-validate query.rs::literal_to_typed_expr.\nplan:\n{s}"
+        );
+    }
+
+    // The widened case must show the index-defeating column CAST (the precise
+    // shape the fix avoids by coercing the literal to the column type).
+    let widened = plan_str(&ds, col("n32").eq(lit(5i64))).await;
+    assert!(
+        widened.contains("CAST(n32 AS Int64)"),
+        "expected a column-side cast in the widened plan, got:\n{widened}"
+    );
+}
