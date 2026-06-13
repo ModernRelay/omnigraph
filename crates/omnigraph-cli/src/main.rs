@@ -23,12 +23,11 @@ use omnigraph_compiler::{
     json_params_to_param_map, lint_query_file,
 };
 use omnigraph_api_types::{
-    BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
-    BranchMergeOutput, BranchMergeRequest, ChangeOutput, CommitListOutput, CommitOutput,
+    BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput,
+    BranchMergeOutput, BranchMergeRequest, ChangeOutput, CommitOutput,
     ErrorOutput, ExportRequest, GraphListResponse, IngestOutput, IngestRequest, ReadOutput,
-    ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput,
-    SnapshotTableOutput, commit_output, ingest_output, read_output, schema_apply_output,
-    snapshot_payload,
+    ReadRequest, SchemaApplyOutput, SchemaApplyRequest,
+    SnapshotTableOutput, ingest_output, read_output, schema_apply_output,
 };
 use omnigraph_server::queries::{QueryRegistry, check, format_check_breakages};
 use omnigraph_server::{
@@ -50,6 +49,7 @@ use embed::{EmbedArgs, EmbedOutput, execute_embed};
 use read_format::{ReadRenderOptions, render_read};
 
 mod cli;
+mod client;
 mod helpers;
 mod output;
 use cli::*;
@@ -325,27 +325,14 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_cli_config(config.as_ref())?;
-                let uri =
-                    apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
-                let bearer_token =
-                    resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-                let graph = resolve_cli_graph(&config, uri, target.as_deref())?;
-                let uri = graph.uri.clone();
-                let payload = if graph.is_remote {
-                    remote_json::<BranchListOutput>(
-                        &http_client,
-                        Method::GET,
-                        remote_url(&uri, "/branches"),
-                        None,
-                        bearer_token.as_deref(),
-                    )
-                    .await?
-                } else {
-                    let db = Omnigraph::open(&uri).await?;
-                    let mut branches = db.branch_list().await?;
-                    branches.sort();
-                    BranchListOutput { branches }
-                };
+                let client = client::GraphClient::resolve(
+                    &config,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    uri,
+                    target.as_deref(),
+                )?;
+                let payload = client.branch_list().await?;
                 if json {
                     print_json(&payload)?;
                 } else {
@@ -455,37 +442,18 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_cli_config(config.as_ref())?;
-                let uri =
-                    apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
-                let bearer_token =
-                    resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-                let uri = resolve_uri(&config, uri, target.as_deref())?;
-                let commits = if is_remote_uri(&uri) {
-                    remote_json::<CommitListOutput>(
-                        &http_client,
-                        Method::GET,
-                        if let Some(branch) = branch.as_deref() {
-                            format!("{}?branch={}", remote_url(&uri, "/commits"), branch)
-                        } else {
-                            remote_url(&uri, "/commits")
-                        },
-                        None,
-                        bearer_token.as_deref(),
-                    )
-                    .await?
-                    .commits
-                } else {
-                    let db = Omnigraph::open(&uri).await?;
-                    db.list_commits(branch.as_deref())
-                        .await?
-                        .iter()
-                        .map(commit_output)
-                        .collect::<Vec<_>>()
-                };
+                let client = client::GraphClient::resolve(
+                    &config,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    uri,
+                    target.as_deref(),
+                )?;
+                let payload = client.list_commits(branch.as_deref()).await?;
                 if json {
-                    print_json(&CommitListOutput { commits })?;
+                    print_json(&payload)?;
                 } else {
-                    print_commit_list_human(&commits);
+                    print_commit_list_human(&payload.commits);
                 }
             }
             CommitCommand::Show {
@@ -496,24 +464,14 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_cli_config(config.as_ref())?;
-                let uri =
-                    apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
-                let bearer_token =
-                    resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-                let uri = resolve_uri(&config, uri, target.as_deref())?;
-                let commit = if is_remote_uri(&uri) {
-                    remote_json::<CommitOutput>(
-                        &http_client,
-                        Method::GET,
-                        remote_url(&uri, &format!("/commits/{}", commit_id)),
-                        None,
-                        bearer_token.as_deref(),
-                    )
-                    .await?
-                } else {
-                    let db = Omnigraph::open(&uri).await?;
-                    commit_output(&db.get_commit(&commit_id).await?)
-                };
+                let client = client::GraphClient::resolve(
+                    &config,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    uri,
+                    target.as_deref(),
+                )?;
+                let commit = client.get_commit(&commit_id).await?;
                 if json {
                     print_json(&commit)?;
                 } else {
@@ -620,26 +578,14 @@ async fn main() -> Result<()> {
                 json,
             } => {
                 let config = load_cli_config(config.as_ref())?;
-                let uri =
-                    apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
-                let bearer_token =
-                    resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-                let uri = resolve_uri(&config, uri, target.as_deref())?;
-                let output = if is_remote_uri(&uri) {
-                    remote_json::<SchemaOutput>(
-                        &http_client,
-                        Method::GET,
-                        remote_url(&uri, "/schema"),
-                        None,
-                        bearer_token.as_deref(),
-                    )
-                    .await?
-                } else {
-                    let db = Omnigraph::open(&uri).await?;
-                    SchemaOutput {
-                        schema_source: db.schema_source().to_string(),
-                    }
-                };
+                let client = client::GraphClient::resolve(
+                    &config,
+                    cli.server.as_deref(),
+                    cli.graph.as_deref(),
+                    uri,
+                    target.as_deref(),
+                )?;
+                let output = client.schema_source().await?;
                 if json {
                     print_json(&output)?;
                 } else {
@@ -686,27 +632,15 @@ async fn main() -> Result<()> {
             json,
         } => {
             let config = load_cli_config(config.as_ref())?;
-            let uri =
-                apply_server_flag(cli.server.as_deref(), cli.graph.as_deref(), uri, target.as_deref())?;
-            let bearer_token =
-                resolve_remote_bearer_token(&config, uri.as_deref(), target.as_deref())?;
-            let uri = resolve_uri(&config, uri, target.as_deref())?;
+            let client = client::GraphClient::resolve(
+                &config,
+                cli.server.as_deref(),
+                cli.graph.as_deref(),
+                uri,
+                target.as_deref(),
+            )?;
             let branch = resolve_branch(&config, branch, None, "main");
-            let payload = if is_remote_uri(&uri) {
-                remote_json::<SnapshotOutput>(
-                    &http_client,
-                    Method::GET,
-                    format!("{}?branch={}", remote_url(&uri, "/snapshot"), branch),
-                    None,
-                    bearer_token.as_deref(),
-                )
-                .await?
-            } else {
-                let db = Omnigraph::open(&uri).await?;
-                let snapshot = db.snapshot_of(ReadTarget::branch(branch.as_str())).await?;
-                snapshot_payload(&branch, &snapshot)
-            };
-
+            let payload = client.snapshot(&branch).await?;
             if json {
                 print_json(&payload)?;
             } else {
