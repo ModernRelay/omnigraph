@@ -15,9 +15,9 @@ pub(crate) const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
 #[command(after_help = "\
 COMMANDS BY PLANE:\n  \
 Data — run against a graph, embedded or via --server (query, mutate, load, \
-branch, snapshot, export, commit, schema, graphs).\n  \
+branch, snapshot, export, commit, schema [plan: storage], graphs).\n  \
 Storage — direct storage or local files; reject --server (init, optimize, \
-repair, cleanup, lint, queries).\n  \
+repair, cleanup, lint, queries [list: session]).\n  \
 Control — manage a cluster directory via --config (cluster).\n  \
 Session — no graph; local config & tooling (policy, embed, login, logout, \
 config, version).\n\
