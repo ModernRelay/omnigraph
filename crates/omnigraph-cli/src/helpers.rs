@@ -754,10 +754,10 @@ pub(crate) async fn execute_query_lint(
     let has_graph_target =
         cli_uri.is_some() || cli_target.is_some() || config.cli_graph_name().is_some();
     if !has_graph_target {
-        bail!("query lint requires --schema <schema.pg> or a resolvable graph target");
+        bail!("lint requires --schema <schema.pg> or a resolvable graph target");
     }
 
-    let uri = resolve_local_uri(config, cli_uri, cli_target, "query lint")?;
+    let uri = resolve_local_uri(config, cli_uri, cli_target, "lint")?;
     let db = Omnigraph::open(&uri).await?;
     Ok(lint_query_file(
         &db.catalog(),
