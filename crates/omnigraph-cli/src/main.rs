@@ -22,7 +22,7 @@ use omnigraph_compiler::{
     QueryLintSeverity, QueryLintStatus, SchemaMigrationPlan, SchemaMigrationStep, build_catalog,
     json_params_to_param_map, lint_query_file,
 };
-use omnigraph_server::api::{
+use omnigraph_api_types::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, CommitListOutput, CommitOutput,
     ErrorOutput, ExportRequest, GraphListResponse, IngestOutput, IngestRequest, ReadOutput,
@@ -188,7 +188,7 @@ async fn main() -> Result<()> {
                     bearer_token.as_deref(),
                 )
                 .await?;
-                load_output_from_tables(&uri, &branch, mode, &output)
+                load_output_from_tables(&uri, &branch, mode.as_str(), &output)
             } else {
                 let db = open_local_db_with_policy(&graph).await?;
                 let actor = resolve_cli_actor(cli.as_actor.as_deref(), &config)?;
@@ -202,17 +202,7 @@ async fn main() -> Result<()> {
                         actor,
                     )
                     .await?;
-                LoadOutput {
-                    uri: uri.clone(),
-                    branch: branch.clone(),
-                    mode: mode.as_str(),
-                    base_branch: result.base_branch.clone(),
-                    branch_created: result.branch_created,
-                    nodes_loaded: result.nodes_loaded.values().sum(),
-                    edges_loaded: result.edges_loaded.values().sum(),
-                    node_types_loaded: result.nodes_loaded.len(),
-                    edge_types_loaded: result.edges_loaded.len(),
-                }
+                load_output_from_result(&uri, &branch, mode.as_str(), &result)
             };
             if json {
                 print_json(&payload)?;
