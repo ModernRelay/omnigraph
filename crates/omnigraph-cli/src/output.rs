@@ -812,10 +812,6 @@ pub(crate) fn print_policy_explain(decision: &PolicyDecision, actor_id: &str, re
     println!("message: {}", decision.message);
 }
 
-pub(crate) fn yaml_string(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
 #[derive(serde::Serialize)]
 pub(crate) struct QueriesIssue {
     pub(crate) query: String,

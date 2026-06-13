@@ -179,6 +179,35 @@ fn parity_load() {
     assert_parity("load", &l, &r);
 }
 
+#[test]
+fn parity_export() {
+    let p = parity();
+    let (l, r) = p.run(&["export"]);
+    // export emits a JSONL STREAM, not a single `--json` document, so the
+    // scrubbed-single-doc `assert_parity` doesn't apply — compare line-wise.
+    // The twin graphs are byte-copies of one loaded fixture, so rows carry
+    // identical ids/versions and need no scrubbing; sort the lines so any
+    // cross-arm row-ordering difference doesn't masquerade as a divergence.
+    assert_eq!(
+        l.status.code(),
+        r.status.code(),
+        "export: exit codes diverge\nlocal {l:?}\nremote {r:?}"
+    );
+    assert!(l.status.success(), "export local arm failed: {l:?}");
+    let mut local_lines: Vec<&str> = std::str::from_utf8(&l.stdout).unwrap().lines().collect();
+    let mut remote_lines: Vec<&str> = std::str::from_utf8(&r.stdout).unwrap().lines().collect();
+    assert!(
+        !local_lines.is_empty(),
+        "export produced no rows — the parity check would be vacuous"
+    );
+    local_lines.sort_unstable();
+    remote_lines.sort_unstable();
+    assert_eq!(
+        local_lines, remote_lines,
+        "export: JSONL streams diverge (left=local, right=remote)"
+    );
+}
+
 // ---- error parity: exit codes must match for shared failure cases ----
 
 #[test]
