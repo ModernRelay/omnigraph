@@ -25,6 +25,38 @@ fn version_command_prints_current_cli_version() {
 }
 
 #[test]
+fn help_groups_commands_by_plane() {
+    // RFC-010 Slice 2: `--help` clusters commands by plane (declaration order
+    // in the Command enum) and explains the planes in an after_help legend.
+    // Pinned lightly — the legend phrase + the cluster ordering — to avoid
+    // brittle full-text assertions on clap's help body.
+    let output = output_success(cli().arg("--help"));
+    let stdout = stdout_string(&output);
+
+    assert!(
+        stdout.contains("COMMANDS BY PLANE"),
+        "plane legend (after_help) missing from --help:\n{stdout}"
+    );
+
+    // The Commands list precedes the legend, so first occurrences sit in the
+    // list and must appear in plane order: a data verb, then a storage verb,
+    // then the control verb.
+    let pos = |needle: &str| {
+        stdout
+            .find(needle)
+            .unwrap_or_else(|| panic!("'{needle}' not found in --help:\n{stdout}"))
+    };
+    assert!(
+        pos("query") < pos("optimize"),
+        "data commands should be listed before storage commands"
+    );
+    assert!(
+        pos("optimize") < pos("cluster"),
+        "storage commands should be listed before the control command"
+    );
+}
+
+#[test]
 fn init_creates_graph_successfully_on_missing_local_directory() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());

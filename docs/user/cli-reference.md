@@ -43,6 +43,8 @@ These restrictions are enforced and reported, not silent:
 
 To maintain a server-backed graph, run the maintenance verbs from a host with storage access against the graph's storage URI (or `--target`), out-of-band from the serving process — there are no server routes for `optimize` / `repair` / `cleanup` by design.
 
+`omnigraph --help` lists commands **clustered by plane** (data → storage → control → session) with a plane legend at the bottom.
+
 ## Config surfaces
 
 Two config surfaces with single owners (RFC-007/RFC-008), plus a zero-config
