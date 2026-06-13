@@ -464,8 +464,11 @@ pub(crate) fn resolve_local_graph(
     let graph = resolve_cli_graph(config, cli_uri, cli_target)?;
     if graph.is_remote {
         bail!(
-            "{} is only supported against local graph URIs in this milestone",
-            operation
+            "`{}` is a storage-plane command and needs direct storage access; \
+             the resolved target is a remote server ({}). Pass the graph's \
+             file:// or s3:// URI.",
+            operation,
+            graph.uri
         );
     }
     Ok(graph)

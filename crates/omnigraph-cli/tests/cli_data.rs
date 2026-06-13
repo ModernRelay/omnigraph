@@ -143,6 +143,47 @@ fn embed_seed_preserves_non_entity_rows() {
 }
 
 #[test]
+fn optimize_json_succeeds_on_local_graph() {
+    // Happy path for the resolve_local_uri swap (RFC-010 Slice 1): a positional
+    // local path still resolves and runs embedded.
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+
+    let output = output_success(cli().arg("optimize").arg("--json").arg(&graph));
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(payload["tables"].as_array().is_some());
+}
+
+#[test]
+fn optimize_with_server_flag_errors_wrong_plane() {
+    // RFC-010 Slice 1: --server is a data-plane addressing flag; on a
+    // storage-plane verb the guard rejects it loudly (was: silently ignored).
+    let output = output_failure(cli().arg("optimize").arg("--server").arg("prod"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`optimize` is a storage-plane command")
+            && stderr.contains("--server/--graph address the data plane and do not apply")
+            && stderr.contains("Use --target <name> or a storage URI."),
+        "wrong-plane guard message not found; got: {stderr}"
+    );
+}
+
+#[test]
+fn optimize_with_remote_target_errors_storage_plane() {
+    // RFC-010 Slice 1: a maintenance verb pointed at a remote URI fails loudly
+    // and declaratively (was: whatever Omnigraph::open said about an https URI).
+    let output = output_failure(cli().arg("optimize").arg("https://graph.example.invalid"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`optimize` is a storage-plane command and needs direct storage access")
+            && stderr.contains("remote server"),
+        "storage-plane remote-target message not found; got: {stderr}"
+    );
+}
+
+#[test]
 fn repair_json_reports_noop_on_clean_graph() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
@@ -542,8 +583,12 @@ query list_people() {
             .arg("http://127.0.0.1:8080"),
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // RFC-010 Slice 1: the storage-plane verbs now share one declared message
+    // (was: "query lint is only supported against local graph URIs …").
     assert!(
-        stderr.contains("query lint is only supported against local graph URIs in this milestone")
+        stderr.contains("`query lint` is a storage-plane command and needs direct storage access")
+            && stderr.contains("remote server"),
+        "storage-plane remote-target message not found; got: {stderr}"
     );
 }
 
