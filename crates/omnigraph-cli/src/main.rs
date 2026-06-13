@@ -49,6 +49,7 @@ mod cli;
 mod client;
 mod helpers;
 mod output;
+mod planes;
 use cli::*;
 use helpers::*;
 use output::*;
@@ -70,6 +71,10 @@ async fn main() -> Result<()> {
         Cli::from_arg_matches(&matches)?
     };
     let http_client = build_http_client()?;
+    // RFC-010 Slice 1: reject data-plane addressing flags (--server/--graph) on
+    // a verb that doesn't live on the data plane, from one declared table —
+    // before any per-command dispatch.
+    planes::guard_addressing(&cli)?;
     match cli.command {
         Command::Config { command } => match command {
             ConfigCommand::Migrate { config, write, json } => {
@@ -781,7 +786,7 @@ async fn main() -> Result<()> {
             json,
         } => {
             let config = load_cli_config(config.as_ref())?;
-            let uri = resolve_uri(&config, uri, target.as_deref())?;
+            let uri = resolve_local_uri(&config, uri, target.as_deref(), "optimize")?;
             let db = Omnigraph::open(&uri).await?;
             let stats = db.optimize().await?;
             if json {
@@ -823,7 +828,7 @@ async fn main() -> Result<()> {
             json,
         } => {
             let config = load_cli_config(config.as_ref())?;
-            let uri = resolve_uri(&config, uri, target.as_deref())?;
+            let uri = resolve_local_uri(&config, uri, target.as_deref(), "repair")?;
             let db = Omnigraph::open(&uri).await?;
             let stats = db
                 .repair(omnigraph::db::RepairOptions { confirm, force })
@@ -907,7 +912,7 @@ async fn main() -> Result<()> {
             json,
         } => {
             let config = load_cli_config(config.as_ref())?;
-            let uri = resolve_uri(&config, uri, target.as_deref())?;
+            let uri = resolve_local_uri(&config, uri, target.as_deref(), "cleanup")?;
 
             let older_than_dur = older_than.as_deref().map(parse_duration_arg).transpose()?;
 
