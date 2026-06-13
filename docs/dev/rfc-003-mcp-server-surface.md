@@ -666,6 +666,51 @@ per-graph stored-query tools and would break isolation — hence per-graph routi
 future server-level flat `/mcp` (bearer-only, no handle, server-scoped tools only)
 would live in the `management` group, but is not built speculatively.
 
+### 15.1 Multi-graph model
+
+omnigraph's MCP is **per-graph**: one isolated MCP server per graph, with the graph
+identity in the **URL path**, never in tool arguments or output. In multi-graph mode
+the router nests the whole protected group under `/graphs/{graph_id}` (`lib.rs:978`),
+so each `/graphs/{id}/mcp` endpoint's `initialize` / `tools/list` / `tools/call` /
+`resources/*` operate only on that graph and can never list or touch another graph's
+tools.
+
+- **Discovery is REST-only, not an MCP tool.** `graphs_list` / `omnigraph://graphs`
+  are deliberately absent from MCP. Which graphs exist is answered by `GET /graphs`
+  (multi-mode only) → `GraphListResponse { graphs: [{ graph_id, uri }] }`
+  (`api.rs:703`), gated by the server-scoped `GraphList` Cedar action and
+  **default-denied without a server policy** (the registry — graph ids + storage URIs
+  — is never leaked until an operator authorizes it). An operator discovers graphs via
+  REST, then points each MCP client connection at the relevant `/graphs/{id}/mcp`; no
+  single MCP connection ever sees the full graph list.
+
+- **Clients configure one connection per graph.** Tool ids are identical across graphs
+  (each is its own server), so the **connection name is the namespace**: a client that
+  auto-prefixes yields `og-sales_graph_query` vs `og-hr_graph_query`.
+
+  ```bash
+  claude mcp add og-sales --transport http https://host/graphs/sales/mcp --header "Authorization: Bearer …"
+  claude mcp add og-hr    --transport http https://host/graphs/hr/mcp    --header "Authorization: Bearer …"
+  ```
+
+- **Stored queries are per-graph state.** Each graph owns its registry
+  (`GraphHandle.queries`, `registry.rs:55`), loaded from that graph's declaration
+  (`cluster.yaml graphs.<id>.queries`). So a query is exposed only on its own graph's
+  endpoint; the same query *name* may exist on multiple graphs with different
+  definitions (no cross-graph collision — different servers). `effective_tool_name()`
+  uniqueness is enforced **per graph** at registry load (`duplicate_tool_name`), not
+  across graphs. The projection mode (`per_query` vs `meta`, §9.2) is chosen from
+  *that graph's* exposed-query count, so a small graph can show one typed tool per
+  query while a large graph on the same server uses the `stored_query_list` +
+  `stored_query_run` meta pair. `InvokeQuery` is evaluated against *that graph's*
+  `handle.policy`, so an actor can be allowed stored queries on one graph and denied
+  on another, independently. The per-graph catalog is also discoverable over REST at
+  `GET /graphs/{id}/queries`.
+
+So `tools/list` on `/graphs/sales/mcp` returns sales' built-ins + sales' stored
+queries; the same call on `/graphs/hr/mcp` returns hr's — two disjoint catalogs, each
+Cedar-filtered to the actor.
+
 ## 16. Tests & verification
 
 MCP tests land in a new `crates/omnigraph-server/tests/mcp.rs` suite (black-box over
