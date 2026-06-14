@@ -527,17 +527,24 @@ impl StagedMutation {
         }
         // Reuse the caller's guards (fork path) when handed in, else acquire
         // our own. When reusing, every key we would acquire MUST already be
-        // covered — re-acquiring a held non-re-entrant key would deadlock.
+        // covered — re-acquiring a held non-re-entrant key would deadlock, and
+        // a key we'd need but DON'T hold would commit unserialized. This is a
+        // load-bearing safety invariant, so it is checked in ALL builds (not a
+        // debug_assert) and fails the write loudly+safely rather than silently
+        // proceeding unguarded if a future execution path ever touches a table
+        // outside the caller's pre-computed set.
         let guards = match held_guards {
             Some((acquired_keys, guards)) => {
-                debug_assert!(
-                    {
-                        let held: std::collections::HashSet<&(String, Option<String>)> =
-                            acquired_keys.iter().collect();
-                        queue_keys.iter().all(|k| held.contains(k))
-                    },
-                    "commit_all: held_guards must cover every touched-table queue key"
-                );
+                let held: std::collections::HashSet<&(String, Option<String>)> =
+                    acquired_keys.iter().collect();
+                if let Some(missing) = queue_keys.iter().find(|k| !held.contains(k)) {
+                    return Err(OmniError::manifest_internal(format!(
+                        "commit_all: pre-held write-queue guards do not cover touched table \
+                         '{}' on branch {:?} — the caller's up-front acquisition set diverged \
+                         from the staged/inline set (a touched-table-set bug)",
+                        missing.0, missing.1
+                    )));
+                }
                 guards
             }
             None => db.write_queue().acquire_many(&queue_keys).await,

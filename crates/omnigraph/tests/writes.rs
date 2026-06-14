@@ -1599,3 +1599,50 @@ async fn first_write_self_heals_manifest_unreferenced_fork_on_live_branch() {
          (feature={feature_people}, main={main_people})"
     );
 }
+
+// A node delete cascades to every edge table touching that node, forking those
+// edge tables during execution. The up-front fork-queue acquisition must cover
+// those cascade-forked edges, not just the node table named in the IR — else
+// commit_all's held-guard coverage check fails the write (and, before the
+// coverage check was promoted out of debug-only, edge commits would slip
+// through unserialized). This drives the new code via a DELETE (the only
+// cascading op), on a branch, as the FIRST write (so it actually forks).
+#[tokio::test]
+async fn branch_cascade_delete_forks_node_and_edges_under_held_queues() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+
+    // Baseline inherited from main (Alice has 2 Knows + 1 WorksAt edge).
+    let main_people = count_rows(&db, "node:Person").await;
+    let main_knows = count_rows(&db, "edge:Knows").await;
+
+    // First write to `feature` is `delete Person Alice`, whose cascade forks
+    // node:Person AND edge:Knows + edge:WorksAt. Pre-fix the up-front set held
+    // only node:Person, so commit_all's coverage check rejected the write.
+    mutate_branch(
+        &mut db,
+        "feature",
+        MUTATION_QUERIES,
+        "remove_person",
+        &mixed_params(&[("$name", "Alice")], &[]),
+    )
+    .await
+    .expect("branch cascade-delete must hold queues for cascade-forked edge tables");
+
+    // Alice and her edges are gone on feature; main is untouched.
+    assert_eq!(
+        count_rows_branch(&db, "feature", "node:Person").await,
+        main_people - 1,
+        "feature should have Alice removed from the inherited set"
+    );
+    assert!(
+        count_rows_branch(&db, "feature", "edge:Knows").await < main_knows,
+        "feature should have Alice's cascade-deleted Knows edges removed"
+    );
+    assert_eq!(
+        count_rows(&db, "node:Person").await,
+        main_people,
+        "main must be untouched by the branch delete"
+    );
+}

@@ -881,34 +881,46 @@ impl Omnigraph {
         Ok(ir)
     }
 
-    /// The set of `(node|edge):{type}` table keys a mutation IR touches, as
-    /// they will be keyed in `MutationStaging`/`commit_all`. Mirrors the
-    /// node-vs-edge dispatch the execute paths use (`node_types` first, then
-    /// `edge_types`), so the keys match what `commit_all` recomputes.
-    /// Unknown types are skipped (the execute path surfaces the error);
-    /// they must not be locked. Sorted + deduped for one-shot
-    /// `acquire_many`. Used by the up-front fork-queue acquisition.
+    /// The COMPLETE set of `(node|edge):{type}` table keys a mutation IR can
+    /// touch at execution time, keyed as `MutationStaging`/`commit_all` key
+    /// them. Must be a superset of everything execution forks/commits, since
+    /// it drives the up-front fork-queue acquisition and `commit_all`'s
+    /// held-guard coverage check — a miss means an unserialized fork/commit.
+    ///
+    /// The set is a pure function of (IR ops + catalog). For each op it mirrors
+    /// the execute path's node-vs-edge dispatch (`node_types` first, then
+    /// `edge_types`). A `delete <Node>` additionally **cascades** to every edge
+    /// type whose endpoint is that node (see `execute_delete_node`), forking
+    /// those edge tables during execution — so they are included here, derived
+    /// the same way the executor derives them (`from_type`/`to_type` match).
+    /// Unknown types are skipped (the execute path surfaces the error).
+    /// Sorted + deduped for one-shot `acquire_many`.
     fn touched_table_keys(&self, ir: &omnigraph_compiler::ir::MutationIR) -> Vec<String> {
         use omnigraph_compiler::ir::MutationOpIR;
         let catalog = self.catalog();
-        let mut keys: Vec<String> = ir
-            .ops
-            .iter()
-            .filter_map(|op| {
-                let type_name = match op {
-                    MutationOpIR::Insert { type_name, .. }
-                    | MutationOpIR::Update { type_name, .. }
-                    | MutationOpIR::Delete { type_name, .. } => type_name,
-                };
-                if catalog.node_types.contains_key(type_name) {
-                    Some(format!("node:{type_name}"))
-                } else if catalog.edge_types.contains_key(type_name) {
-                    Some(format!("edge:{type_name}"))
-                } else {
-                    None
+        let mut keys: Vec<String> = Vec::new();
+        for op in &ir.ops {
+            let type_name = match op {
+                MutationOpIR::Insert { type_name, .. }
+                | MutationOpIR::Update { type_name, .. }
+                | MutationOpIR::Delete { type_name, .. } => type_name,
+            };
+            if catalog.node_types.contains_key(type_name) {
+                keys.push(format!("node:{type_name}"));
+                // A node delete cascades to every edge touching this node type,
+                // forking those edge tables. Include them so the up-front
+                // acquisition covers the cascade (mirrors execute_delete_node).
+                if matches!(op, MutationOpIR::Delete { .. }) {
+                    for (edge_name, edge_type) in &catalog.edge_types {
+                        if edge_type.from_type == *type_name || edge_type.to_type == *type_name {
+                            keys.push(format!("edge:{edge_name}"));
+                        }
+                    }
                 }
-            })
-            .collect();
+            } else if catalog.edge_types.contains_key(type_name) {
+                keys.push(format!("edge:{type_name}"));
+            }
+        }
         keys.sort();
         keys.dedup();
         keys
