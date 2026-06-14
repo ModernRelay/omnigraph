@@ -432,10 +432,10 @@ where
     // manifest publish via `commit_changes_with_actor` below.
     //
     // Schema-apply already holds the graph-wide `__schema_apply_lock__`
-    // sentinel branch, so under PR 1b's intermediate state these
-    // per-table acquisitions are uncontended. They exist for symmetry
-    // with future MR-870 recovery, which will need queue acquisition
-    // before any `Dataset::restore` it issues for SchemaApply sidecars.
+    // sentinel branch, so these per-table acquisitions are uncontended in
+    // practice. They exist for symmetry with the recovery reconciler, which
+    // acquires the same queues before any `Dataset::restore` it issues for
+    // SchemaApply sidecars.
     let mut schema_apply_queue_keys: Vec<(String, Option<String>)> = recovery_pins
         .iter()
         .map(|pin| (pin.table_key.clone(), pin.table_branch.clone()))
