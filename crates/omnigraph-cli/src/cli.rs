@@ -41,6 +41,20 @@ pub(crate) struct Cli {
     #[arg(long, global = true, value_name = "GRAPH_ID", requires = "server")]
     pub(crate) graph: Option<String>,
 
+    /// Select a named scope bundle (RFC-011) from `profiles:` in
+    /// ~/.omnigraph/config.yaml: fills in this command's omitted addressing
+    /// (server/cluster/store + default graph). Falls back to
+    /// $OMNIGRAPH_PROFILE. Config data, not state — every command resolves
+    /// scope fresh.
+    #[arg(long, global = true, value_name = "NAME")]
+    pub(crate) profile: Option<String>,
+
+    /// Address a single graph's storage directly (RFC-011): a `file://` /
+    /// `s3://` store URI. Explicit, ad-hoc direct access — bypasses any
+    /// server. Exclusive with a positional URI / `--target` / `--server`.
+    #[arg(long, global = true, value_name = "URI")]
+    pub(crate) store: Option<String>,
+
     #[command(subcommand)]
     pub(crate) command: Command,
 }

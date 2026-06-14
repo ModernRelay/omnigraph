@@ -49,6 +49,7 @@ mod cli;
 mod client;
 mod helpers;
 mod output;
+mod scope;
 mod planes;
 use cli::*;
 use helpers::*;
@@ -185,6 +186,8 @@ async fn main() -> Result<()> {
                 uri,
                 target.as_deref(),
                 cli.as_actor.as_deref(),
+                cli.profile.as_deref(),
+                cli.store.as_deref(),
             )?;
             let branch = resolve_branch(&config, branch, None, "main");
             let payload = client
@@ -219,6 +222,8 @@ async fn main() -> Result<()> {
                 uri,
                 target.as_deref(),
                 cli.as_actor.as_deref(),
+                cli.profile.as_deref(),
+                cli.store.as_deref(),
             )?;
             let branch = resolve_branch(&config, branch, None, "main");
             let from = resolve_branch(&config, from, None, "main");
@@ -248,6 +253,8 @@ async fn main() -> Result<()> {
                     uri,
                     target.as_deref(),
                     cli.as_actor.as_deref(),
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
                 )?;
                 let from = resolve_branch(&config, from, None, "main");
                 let payload = client.branch_create_from(&from, &name).await?;
@@ -270,6 +277,8 @@ async fn main() -> Result<()> {
                     cli.graph.as_deref(),
                     uri,
                     target.as_deref(),
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
                 )?;
                 let payload = client.branch_list().await?;
                 if json {
@@ -295,6 +304,8 @@ async fn main() -> Result<()> {
                     uri,
                     target.as_deref(),
                     cli.as_actor.as_deref(),
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
                 )?;
                 let payload = client.branch_delete(&name).await?;
                 if json {
@@ -319,6 +330,8 @@ async fn main() -> Result<()> {
                     uri,
                     target.as_deref(),
                     cli.as_actor.as_deref(),
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
                 )?;
                 let into = resolve_branch(&config, into, None, "main");
                 let payload = client.branch_merge(&source, &into).await?;
@@ -349,6 +362,8 @@ async fn main() -> Result<()> {
                     cli.graph.as_deref(),
                     uri,
                     target.as_deref(),
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
                 )?;
                 let payload = client.list_commits(branch.as_deref()).await?;
                 if json {
@@ -371,6 +386,8 @@ async fn main() -> Result<()> {
                     cli.graph.as_deref(),
                     uri,
                     target.as_deref(),
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
                 )?;
                 let commit = client.get_commit(&commit_id).await?;
                 if json {
@@ -427,6 +444,8 @@ async fn main() -> Result<()> {
                     uri,
                     target.as_deref(),
                     cli.as_actor.as_deref(),
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
                 )?;
                 let schema_source = fs::read_to_string(&schema)?;
                 // The stored-query registry check is an embedded-only concern
@@ -467,6 +486,8 @@ async fn main() -> Result<()> {
                     cli.graph.as_deref(),
                     uri,
                     target.as_deref(),
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
                 )?;
                 let output = client.schema_source().await?;
                 if json {
@@ -521,6 +542,8 @@ async fn main() -> Result<()> {
                 cli.graph.as_deref(),
                 uri,
                 target.as_deref(),
+                cli.profile.as_deref(),
+                cli.store.as_deref(),
             )?;
             let branch = resolve_branch(&config, branch, None, "main");
             let payload = client.snapshot(&branch).await?;
@@ -546,6 +569,8 @@ async fn main() -> Result<()> {
                 cli.graph.as_deref(),
                 uri,
                 target.as_deref(),
+                cli.profile.as_deref(),
+                cli.store.as_deref(),
             )?;
             let branch = resolve_branch(&config, branch, None, "main");
             if jsonl {
@@ -636,6 +661,8 @@ async fn main() -> Result<()> {
                 cli.graph.as_deref(),
                 uri,
                 target_name,
+                cli.profile.as_deref(),
+                cli.store.as_deref(),
             )?;
             let query_source = resolve_query_source(
                 &config,
@@ -714,6 +741,8 @@ async fn main() -> Result<()> {
                 uri,
                 target_name,
                 cli.as_actor.as_deref(),
+                cli.profile.as_deref(),
+                cli.store.as_deref(),
             )?;
             let query_source = resolve_query_source(
                 &config,
@@ -798,15 +827,41 @@ async fn main() -> Result<()> {
             json,
         } => {
             let config = load_cli_config(config.as_ref())?;
-            let uri = resolve_storage_uri(
-                &config,
-                uri,
-                target.as_deref(),
-                cluster.as_deref(),
-                cluster_graph.as_deref(),
-                "optimize",
-            )
-            .await?;
+            let uri = if uri.is_some() || target.is_some() || cluster.is_some() {
+                resolve_storage_uri(
+                    &config,
+                    uri,
+                    target.as_deref(),
+                    cluster.as_deref(),
+                    cluster_graph.as_deref(),
+                    "optimize",
+                )
+                .await?
+            } else {
+                // RFC-011: no explicit per-command address — consult the scope
+                // (a --profile cluster binding, --store, or operator defaults).
+                let scope = scope::resolve_scope(
+                    &operator::load_operator_config()?,
+                    planes::Plane::Storage,
+                    scope::ScopeFlags {
+                        profile: cli.profile.as_deref(),
+                        store: cli.store.as_deref(),
+                        server: None,
+                        graph: cli.graph.as_deref(),
+                        uri: None,
+                        target: None,
+                    },
+                )?;
+                resolve_storage_uri(
+                    &config,
+                    scope.uri,
+                    scope.target.as_deref(),
+                    scope.cluster.as_deref(),
+                    scope.cluster_graph.as_deref(),
+                    "optimize",
+                )
+                .await?
+            };
             let db = Omnigraph::open(&uri).await?;
             let stats = db.optimize().await?;
             if json {
@@ -850,15 +905,40 @@ async fn main() -> Result<()> {
             json,
         } => {
             let config = load_cli_config(config.as_ref())?;
-            let uri = resolve_storage_uri(
-                &config,
-                uri,
-                target.as_deref(),
-                cluster.as_deref(),
-                cluster_graph.as_deref(),
-                "repair",
-            )
-            .await?;
+            let uri = if uri.is_some() || target.is_some() || cluster.is_some() {
+                resolve_storage_uri(
+                    &config,
+                    uri,
+                    target.as_deref(),
+                    cluster.as_deref(),
+                    cluster_graph.as_deref(),
+                    "repair",
+                )
+                .await?
+            } else {
+                // RFC-011: no explicit per-command address — consult the scope.
+                let scope = scope::resolve_scope(
+                    &operator::load_operator_config()?,
+                    planes::Plane::Storage,
+                    scope::ScopeFlags {
+                        profile: cli.profile.as_deref(),
+                        store: cli.store.as_deref(),
+                        server: None,
+                        graph: cli.graph.as_deref(),
+                        uri: None,
+                        target: None,
+                    },
+                )?;
+                resolve_storage_uri(
+                    &config,
+                    scope.uri,
+                    scope.target.as_deref(),
+                    scope.cluster.as_deref(),
+                    scope.cluster_graph.as_deref(),
+                    "repair",
+                )
+                .await?
+            };
             let db = Omnigraph::open(&uri).await?;
             let stats = db
                 .repair(omnigraph::db::RepairOptions { confirm, force })
@@ -944,15 +1024,40 @@ async fn main() -> Result<()> {
             json,
         } => {
             let config = load_cli_config(config.as_ref())?;
-            let uri = resolve_storage_uri(
-                &config,
-                uri,
-                target.as_deref(),
-                cluster.as_deref(),
-                cluster_graph.as_deref(),
-                "cleanup",
-            )
-            .await?;
+            let uri = if uri.is_some() || target.is_some() || cluster.is_some() {
+                resolve_storage_uri(
+                    &config,
+                    uri,
+                    target.as_deref(),
+                    cluster.as_deref(),
+                    cluster_graph.as_deref(),
+                    "cleanup",
+                )
+                .await?
+            } else {
+                // RFC-011: no explicit per-command address — consult the scope.
+                let scope = scope::resolve_scope(
+                    &operator::load_operator_config()?,
+                    planes::Plane::Storage,
+                    scope::ScopeFlags {
+                        profile: cli.profile.as_deref(),
+                        store: cli.store.as_deref(),
+                        server: None,
+                        graph: cli.graph.as_deref(),
+                        uri: None,
+                        target: None,
+                    },
+                )?;
+                resolve_storage_uri(
+                    &config,
+                    scope.uri,
+                    scope.target.as_deref(),
+                    scope.cluster.as_deref(),
+                    scope.cluster_graph.as_deref(),
+                    "cleanup",
+                )
+                .await?
+            };
 
             let older_than_dur = older_than.as_deref().map(parse_duration_arg).transpose()?;
 
@@ -1088,6 +1193,8 @@ async fn main() -> Result<()> {
                     cli.graph.as_deref(),
                     uri,
                     target.as_deref(),
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
                 )?;
                 let payload = client.list_graphs().await?;
                 if json {

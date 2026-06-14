@@ -2,7 +2,7 @@
 
 A reference for the `omnigraph` binary's command surface and `omnigraph.yaml` schema. For a quick-start guide, see [cli.md](index.md).
 
-Top-level command families and subcommands. Graph-targeting commands accept a positional `URI`, `--uri`, a `--target <name>` resolved against `omnigraph.yaml`, or `--server <name>` (an operator-defined server from `~/.omnigraph/config.yaml`, optionally with `--graph <id>` for multi-graph servers; exclusive with the other forms); `cluster` commands use `--config <dir>`.
+Top-level command families and subcommands. Graph-targeting commands accept a positional `URI`, `--uri`, a `--target <name>` resolved against `omnigraph.yaml`, `--server <name>` (an operator-defined server from `~/.omnigraph/config.yaml`, optionally with `--graph <id>` for multi-graph servers; exclusive with the other forms), `--store <uri>` (a single graph's storage directly), or `--profile <name>` / `$OMNIGRAPH_PROFILE` (a named scope bundle; see [Scopes & profiles](#scopes--profiles-rfc-011)); `cluster` commands use `--config <dir>`.
 
 ## Top-level commands
 
@@ -71,11 +71,41 @@ servers:                # operator-owned endpoints; names key the credentials
     url: https://graph.example.com     # no tokens in this file, ever
 defaults:
   output: table         # read format default, below --json/--format/alias/legacy
+  server: prod          # the everyday scope when no address is given (RFC-011)
+  default_graph: knowledge   # graph selected in a server/cluster scope
+clusters:               # admin-only: managed-cluster storage roots (RFC-011).
+  brain:                #   the ONLY place a storage root lives in this file.
+    root: s3://acme/clusters/brain
+profiles:               # named scope bundles (RFC-011); pick with --profile
+  staging: { server: staging, default_graph: knowledge }   # a served scope
+  brain-admin: { cluster: brain, default_graph: knowledge } # a direct cluster scope
 ```
 
 Absent file = empty layer. Unknown keys warn and load (a file written for a
 newer CLI works on an older one). `$OMNIGRAPH_CONFIG=<path>` stands in for
 `--config` (the flag wins) in both the CLI and the server.
+
+#### Scopes & profiles (RFC-011)
+
+A command resolves a **scope** — a server, a cluster, or a store — then selects a
+graph in it; the served-vs-direct access path is derived from the scope, not
+toggled. The scope comes from one of (highest precedence first): an explicit
+address (a positional URI, `--target`, `--server`, or `--store <uri>`); a named
+`--profile <name>` (or `$OMNIGRAPH_PROFILE`); or the flat `defaults.server` +
+`defaults.default_graph`. A **profile** binds exactly one of `server` / `cluster`
+/ `store` plus an optional default graph — config data, not state: every command
+resolves its scope fresh, there is no sticky "current" mode.
+
+- `--store <uri>` addresses a single graph's storage directly (ad-hoc / break-glass).
+- A `cluster`-bound profile reaches `optimize` / `repair` / `cleanup` for a managed
+  graph (resolving its storage root from `clusters:`), the same as
+  `--cluster <root> --cluster-graph <id>`.
+- A `server`-bound scope on a maintenance verb, or a `cluster`-bound scope on a
+  data verb, is rejected with a message pointing at the right addressing.
+
+This model **coexists** with the legacy addressing (`--uri` / `--target` /
+`--cluster-graph` / `omnigraph.yaml`) — nothing is removed yet; an explicit legacy
+address always wins.
 
 #### Credentials keyed by server name
 
