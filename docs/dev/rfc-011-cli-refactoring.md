@@ -19,9 +19,9 @@ Refactor the CLI around one coherent model once `omnigraph.yaml` is gone. The
 shape:
 
 - **One ontology** (store, server, cluster; cluster config vs operator config;
-  catalog; context; capability) where each term names exactly one concept.
+  catalog; profile; capability) where each term names exactly one concept.
 - **Addressing = scope + `--graph`, with the access path *derived*.** A command
-  resolves a *scope* (operator defaults, an optional named *context*, or one
+  resolves a *scope* (operator defaults, an optional named *profile*, or one
   explicit primitive address — `--store` / `--server` / `--cluster`), selects a
   graph inside it with `--graph`, and the **served-vs-direct access path falls out
   of the scope's bindings × the verb's capability** — it is never a per-command
@@ -30,7 +30,7 @@ shape:
   is a *server* (a bearer token, no bucket credentials). Reading or writing a
   remote store/cluster directly is an explicit, credentialed, admin/break-glass
   act — never the default, never baked into everyday operator config.
-- **The CLI is stateless per command.** No `current_context` pointer, no
+- **The CLI is stateless per command.** No `current_profile` pointer, no
   `USE`-style mode; every command is fully determined by its flags + static
   config. You *select* a graph, you do not *switch into* one.
 - **Definitions are named; payloads are passed.** Queries (`.gq`) and schema
@@ -91,12 +91,12 @@ Every term is one concept. The rest of this RFC uses them precisely.
   catalog is the applied result.)*
 - **Operator config** — `~/.omnigraph/config.yaml`, your **personal** file:
   identity (actor), default graph, named servers/clusters, output prefs, optional
-  contexts. Declares *who I am*, never what the system is.
-- **Context** — an optional named bundle of **defaults inside the operator
+  profiles. Declares *who I am*, never what the system is.
+- **Profile** — an optional named bundle of **defaults inside the operator
   config** (one of {cluster, server, store} + a default graph). Config data,
   **not state**: selecting one fills in omitted flags for a command; it does not
-  put you "in" a mode. Chosen per command (`--context <name>`) or per shell
-  (`OMNIGRAPH_CONTEXT`).
+  put you "in" a mode. Chosen per command (`--profile <name>`) or per shell
+  (`OMNIGRAPH_PROFILE`).
 - **Credential** — a bearer token keyed to a **server name**, resolved via
   `OMNIGRAPH_TOKEN_<NAME>` or `~/.omnigraph/credentials` (`0600`); sent only to
   the server it is keyed to. (Per RFC-007 — the operator config holds endpoints,
@@ -117,7 +117,7 @@ Every term is one concept. The rest of this RFC uses them precisely.
 ### How a command resolves
 
 - **Scope** — the resolved environment a command addresses: operator defaults, a
-  named context, or one explicit primitive address.
+  named profile, or one explicit primitive address.
 - **Access path** — **served** (through a server) or **direct** (open storage
   in-process). Derived from scope × capability; see "Access path" below.
 - **Capability** — what a verb requires: `any`, `served`, `direct`, `control`,
@@ -132,12 +132,12 @@ Every term is one concept. The rest of this RFC uses them precisely.
 
 - **Exactly two config surfaces:** **cluster config** (team) and **operator
   config** (personal). Nothing else is "a config."
-- A **context is not a third config** — it lives *inside* the operator config, and
+- A **profile is not a third config** — it lives *inside* the operator config, and
   it is **defaults, not state**.
 - A **catalog is not config** — it is the *applied state* the cluster owns.
 - A **store is one graph; a cluster is many graphs** + catalog + control state.
 - A **graph is the logical thing**; store/server/cluster are ways to reach it.
-- "State" elsewhere is not the context: *graph state* is committed data in Lance;
+- "State" elsewhere is not the profile: *graph state* is committed data in Lance;
   *cluster state* is the applied control-plane ledger. Neither is operator config.
 
 ## Design
@@ -153,7 +153,7 @@ Every command answers four orthogonal questions — kept orthogonal here:
 
 | Axis | Question | Today | Target |
 |---|---|---|---|
-| Scope | which environment? | `omnigraph.yaml` defaults / `--target` | operator defaults · `--context` · one primitive |
+| Scope | which environment? | `omnigraph.yaml` defaults / `--target` | operator defaults · `--profile` · one primitive |
 | Target shape | whole scope or one graph? | implicit in command family | declared per verb |
 | Graph | which graph in it? | tangled into the address | `--graph` only for graph-scoped server/cluster verbs |
 | Access path | served or direct? | inferred from scheme / target | **derived** from scope × capability |
@@ -161,7 +161,7 @@ Every command answers four orthogonal questions — kept orthogonal here:
 
 ### A scope binds one entity — and served is the default
 
-A scope (a context, the flat defaults, or one primitive flag) binds **exactly one
+A scope (a profile, the flat defaults, or one primitive flag) binds **exactly one
 of** {server, cluster, store}. Server and cluster scopes may contain many graphs
 and can carry a `default_graph`; a store scope is already one graph and does not
 accept `--graph`. They differ by privilege, and **the everyday default is a
@@ -259,7 +259,7 @@ The CLI validates through verb capability, not plane jargon:
 | `served` | requires an HTTP server; may be graph-scoped or scope-scoped | `graphs list`, `queries list` |
 | `direct` | graph-scoped storage-native or graph-backed validation; no server form exists | `init`, `optimize`, `repair`, `cleanup`, `schema plan`, graph-backed `lint` |
 | `control` | cluster-scoped catalog/control-plane work; addresses the cluster, not a single raw store | `cluster *`, `queries validate` |
-| `local` | does not address a graph or scope | `config`, `context`, `lint --query ... --schema ...` |
+| `local` | does not address a graph or scope | `config`, `profile`, `lint --query ... --schema ...` |
 
 `any` does **not** mean "the user picks": the resolver picks from the scope.
 Internally the exhaustive `command_plane` match (`planes.rs`) stays as the drift
@@ -297,7 +297,7 @@ control/catalog check against the cluster-owned query definitions. A bare
    a **literal** — `--server https://…`, `--store s3://…` — bypasses it. Per
    Decision 2: a value containing `://` is a literal, otherwise a config-name
    lookup.)*
-3. Else if `--context <name>` (or `OMNIGRAPH_CONTEXT`) selects a context, use it.
+3. Else if `--profile <name>` (or `OMNIGRAPH_PROFILE`) selects a profile, use it.
 4. Else use the operator config's flat defaults. Error only if neither resolves.
    *(No sticky "current" pointer — each command resolves scope fresh.)*
 5. Resolve the graph only for **graph-scoped** verbs. Server/cluster scopes:
@@ -342,7 +342,7 @@ defaults:
 servers:
   prod:    { url: https://graph.example.com }    # token keyed by name (RFC-007); no creds here
   staging: { url: https://staging.example.com }
-contexts:                                          # optional, only for multiple environments
+profiles:                                          # optional, only for multiple environments
   staging: { server: staging, default_graph: knowledge }
 ```
 
@@ -353,7 +353,7 @@ storage explicitly.
 **Maintainer — opts into a cluster root (and has bucket credentials):**
 
 ```yaml
-contexts:
+profiles:
   brain-admin: { cluster: brain, default_graph: knowledge }   # direct; admin/control/maintenance
 clusters:
   brain: { root: s3://acme/clusters/brain }                   # the s3:// root lives ONLY here
@@ -376,10 +376,10 @@ Assume the everyday flat defaults: server `prod`, default graph `knowledge`.
 | …with params | `omnigraph query find_people --params '{"title":"Eng"}'` | served |
 | Another graph in scope | `omnigraph query find_people --graph archive` | served |
 | Write | `omnigraph load --data batch.jsonl --mode append` | served |
-| A different environment | `omnigraph --context staging query find_people` | served |
+| A different environment | `omnigraph --profile staging query find_people` | served |
 | One-off server, no config | `omnigraph query find_people --server https://graph.example.com --graph knowledge` | served |
 | Maintain (admin, explicit storage) | `omnigraph optimize --cluster s3://acme/clusters/brain --graph knowledge` | direct (privileged) |
-| Maintain (admin, via admin context) | `omnigraph --context brain-admin optimize --graph knowledge` | direct (privileged) |
+| Maintain (admin, via admin profile) | `omnigraph --profile brain-admin optimize --graph knowledge` | direct (privileged) |
 | List catalog queries | `omnigraph queries list` | served |
 | Validate cluster query catalog | `omnigraph queries validate --cluster s3://acme/clusters/brain` | control (privileged) |
 | Offline query lint | `omnigraph lint --query new.gq --schema schema.pg` | local |
@@ -407,7 +407,7 @@ files, `--cluster-graph`, scheme inference). **After** = this model.
 | Another graph | `omnigraph query --target archive --query find.gq --name find_people` | `omnigraph query find_people --graph archive` |
 | Load | `omnigraph load --data b.jsonl --mode append --target knowledge` | `omnigraph load --data b.jsonl --mode append` |
 | Maintain (admin) | `omnigraph optimize --cluster brain --cluster-graph knowledge` | `omnigraph optimize --cluster s3://acme/clusters/brain --graph knowledge` |
-| Another environment | edit `omnigraph.yaml`, or re-address with full URIs | `--context staging …` or `OMNIGRAPH_CONTEXT=staging` |
+| Another environment | edit `omnigraph.yaml`, or re-address with full URIs | `--profile staging …` or `OMNIGRAPH_PROFILE=staging` |
 | One-off remote | `omnigraph query --uri https://… --query find.gq` *(scheme→remote)* | `omnigraph query find_people --server https://… --graph knowledge` |
 | Raw storage of a served graph | `omnigraph query s3://…/knowledge.omni --query find.gq` *(looks like a normal query)* | `omnigraph query --file find.gq --store s3://…/knowledge.omni` *(explicit bypass)* |
 
@@ -463,7 +463,7 @@ staged and release-noted.
   this RFC only makes the split explicit.
 - **No new transport.** Addressing surface, not protocol.
 - **No positional sigil grammar** (`@server/graph`, `%cluster/graph`). Considered
-  and rejected: explicit flags are more discoverable; contexts already give
+  and rejected: explicit flags are more discoverable; profiles already give
   brevity. Revisit only on demonstrated expert-terseness demand.
 
 ## Decisions
@@ -472,7 +472,7 @@ The questions this RFC opened are resolved as follows. Two are explicitly
 deferred (see below); they do not block the model.
 
 1. **Local-dev path → embedded `--store` scope.** Local dev runs the engine
-   in-process against a `--store <file>` (or a store-scoped context); `omnigraph
+   in-process against a `--store <file>` (or a store-scoped profile); `omnigraph
    serve` stays available but is not required. Consistent with embedded ≡ remote
    (RFC-009).
 2. **Primitives are one flag, typed by content.** `--server` and `--cluster`
@@ -487,11 +487,11 @@ deferred (see below); they do not block the model.
 4. **Aliases live under an `alias` namespace** — `omnigraph alias <name> [args]`,
    never bare top-level. An alias can therefore neither shadow nor be shadowed by a
    built-in (current or future) verb.
-6. **Context merge: scope wholesale, prefs layered.** The entity binding +
-   `default_graph` come *wholesale* from the active scope (a context, or flat
+6. **Profile merge: scope wholesale, prefs layered.** The entity binding +
+   `default_graph` come *wholesale* from the active scope (a profile, or flat
    defaults if none) — never per-key merged across the entity dimension (that would
    yield "server *and* cluster"). Only non-scope preferences (`output`, table
-   layout) take flat defaults as a base. Precedence: explicit flag > context > flat
+   layout) take flat defaults as a base. Precedence: explicit flag > profile > flat
    defaults.
 7. **No default graph → error + list candidates.** A graph-scoped verb with no
    `--graph`, no `default_graph`, and >1 graph in scope errors and lists candidates
@@ -524,19 +524,19 @@ Non-blocking; settle when convenient.
 
 - **D5 — combined admin scope.** A scope binds one entity; admins read via a
   server scope and maintain via `--cluster`. A `deployments: { … }` object
-  (server + cluster validated coherent, referenced by a context) is revisited only
+  (server + cluster validated coherent, referenced by a profile) is revisited only
   if admin ergonomics demand it — and Decision 11 largely removes the need.
-- **D8 — the `context` command surface.** `context list` / `context show`
+- **D8 — the `profile` command surface.** `profile list` / `profile show`
   (read-only inspection) are additive diagnostics, shippable anytime; they don't
-  touch the grammar or resolution. The *no sticky `context use`* constraint holds
+  touch the grammar or resolution. The *no sticky `profile use`* constraint holds
   regardless — it is a design principle, not a command.
 
 ## Safety
 
-Dropping the sticky `current_context` pointer removes the main footgun — a
+Dropping the sticky `current_profile` pointer removes the main footgun — a
 destructive command silently inheriting a "current" environment from an earlier
 session. Because each command resolves scope fresh, what is on the command line is
-what runs. Two guards remain (a flat default or `OMNIGRAPH_CONTEXT` can still point
+what runs. Two guards remain (a flat default or `OMNIGRAPH_PROFILE` can still point
 at prod): echo the resolved scope + access path on writes, and require
 confirmation (or `--yes`) for destructive verbs when the resolved scope is not
 local (Decision 9). The most dangerous direct writes (`cleanup`, overwrite
@@ -557,7 +557,7 @@ normal operator's setup mostly cannot issue them by accident at all.
   default — narrowing the blast radius of a leaked operator config.
 - **§6 strong consistency:** both paths are snapshot-isolated per query; this RFC
   changes addressing, not isolation.
-- **Deny-list (no state that drifts):** contexts and aliases are static config
+- **Deny-list (no state that drifts):** profiles and aliases are static config
   sugar that resolve to canonical scopes; they declare nothing the cluster or
   server doesn't already own. No sticky session state is introduced.
 - No Hard Invariant is weakened; the change is CLI surface + config removal.
@@ -612,7 +612,7 @@ omnigraph
 │
 └─ local — no graph
    ├─ policy { validate | test | explain }   offline Cedar tooling
-   ├─ context { list | show }                read-only; NO mutating `use` (no sticky state)
+   ├─ profile { list | show }                read-only; NO mutating `use` (no sticky state)
    ├─ alias <name> [args]                    personal shortcut; expands to its bound stored-query call (D4)
    ├─ config { migrate }                     finish the omnigraph.yaml split (RFC-008)
    ├─ login / logout                         per-server bearer credentials
@@ -631,13 +631,13 @@ no `--cluster-graph`, no `--uri` scheme-dispatch, no `--via`.
 
 | Form | Resolves to | Access | Privilege |
 |---|---|---|---|
-| **server scope** — operator default, a `--context`, or `--server <url\|name>` | a served endpoint + keyed token | served | everyday (bearer token) |
-| **cluster scope** — an admin context, or `--cluster <root>` | a managed cluster's storage + catalog | direct | privileged (bucket creds) |
+| **server scope** — operator default, a `--profile`, or `--server <url\|name>` | a served endpoint + keyed token | served | everyday (bearer token) |
+| **cluster scope** — an admin profile, or `--cluster <root>` | a managed cluster's storage + catalog | direct | privileged (bucket creds) |
 | **store scope** — `--store <uri>` | one graph's storage (no catalog) | direct | local-dev (file) / break-glass (s3) |
 | **`--graph <id>`** | selects the graph for graph-scoped verbs in server/cluster scopes; invalid for store scopes and scope-scoped verbs | — | — |
 
-Resolution: explicit primitive (`--server`/`--cluster`/`--store`) → `--context` /
-`OMNIGRAPH_CONTEXT` → operator flat defaults. Access path is then derived from the
+Resolution: explicit primitive (`--server`/`--cluster`/`--store`) → `--profile` /
+`OMNIGRAPH_PROFILE` → operator flat defaults. Access path is then derived from the
 scope kind × the verb's capability (see the Resolution rule); it is never inferred
 from a URI scheme and never toggled.
 
@@ -653,7 +653,7 @@ from a URI scheme and never toggled.
 | `cluster *` | Control | **control** (unchanged) |
 | `policy *`/`embed`/`login`/`logout`/`config`/`version`/offline `lint --query --schema` | Session | **`local`** |
 | `ingest`; `--target`; `--cluster-graph`; `--uri http` dispatch | present | **removed** |
-| — | — | **added:** `context { list | show }` (read-only) |
+| — | — | **added:** `profile { list | show }` (read-only) |
 
 Cross-capability families: `schema` (`plan` is `direct`, `show`/`apply` are
 `any`), `queries` (`list` is `served`, `validate` is `control`), and `lint`

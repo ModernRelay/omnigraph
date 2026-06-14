@@ -40,7 +40,7 @@ use serde_json::Value;
 use crate::cli::CliLoadMode;
 use crate::helpers::{
     ResolvedCliGraph, apply_bearer_token, apply_server_flag, build_http_client, is_remote_uri,
-    legacy_change_request_body, open_local_db_with_policy, query_params_from_json, remote_branch_url,
+    legacy_change_request_body, open_local_db_with_policy, query_params_from_json,
     remote_json, remote_url, resolve_cli_actor, resolve_cli_graph, resolve_remote_bearer_token,
     select_named_query,
 };
@@ -173,7 +173,7 @@ impl GraphClient {
                 remote_json(
                     http,
                     Method::GET,
-                    remote_url(base_url, "/branches"),
+                    remote_url(base_url, &["branches"], &[])?,
                     None,
                     token.as_deref(),
                 )
@@ -198,7 +198,7 @@ impl GraphClient {
                 remote_json(
                     http,
                     Method::GET,
-                    format!("{}?branch={}", remote_url(base_url, "/snapshot"), branch),
+                    remote_url(base_url, &["snapshot"], &[("branch", branch)])?,
                     None,
                     token.as_deref(),
                 )
@@ -222,7 +222,7 @@ impl GraphClient {
                 remote_json(
                     http,
                     Method::GET,
-                    remote_url(base_url, "/schema"),
+                    remote_url(base_url, &["schema"], &[])?,
                     None,
                     token.as_deref(),
                 )
@@ -245,8 +245,8 @@ impl GraphClient {
                 token,
             } => {
                 let url = match branch {
-                    Some(branch) => format!("{}?branch={}", remote_url(base_url, "/commits"), branch),
-                    None => remote_url(base_url, "/commits"),
+                    Some(branch) => remote_url(base_url, &["commits"], &[("branch", branch)])?,
+                    None => remote_url(base_url, &["commits"], &[])?,
                 };
                 remote_json(http, Method::GET, url, None, token.as_deref()).await
             }
@@ -273,7 +273,7 @@ impl GraphClient {
                 remote_json(
                     http,
                     Method::GET,
-                    remote_url(base_url, &format!("/commits/{commit_id}")),
+                    remote_url(base_url, &["commits", commit_id], &[])?,
                     None,
                     token.as_deref(),
                 )
@@ -310,7 +310,7 @@ impl GraphClient {
                 let output = remote_json::<IngestOutput>(
                     http,
                     Method::POST,
-                    remote_url(base_url, "/load"),
+                    remote_url(base_url, &["load"], &[])?,
                     Some(serde_json::to_value(IngestRequest {
                         branch: Some(branch.to_string()),
                         from: from.map(ToOwned::to_owned),
@@ -354,7 +354,7 @@ impl GraphClient {
                 remote_json(
                     http,
                     Method::POST,
-                    remote_url(base_url, "/ingest"),
+                    remote_url(base_url, &["ingest"], &[])?,
                     Some(serde_json::to_value(IngestRequest {
                         branch: Some(branch.to_string()),
                         from: Some(from.to_string()),
@@ -393,7 +393,7 @@ impl GraphClient {
                 remote_json(
                     http,
                     Method::POST,
-                    remote_url(base_url, "/change"),
+                    remote_url(base_url, &["change"], &[])?,
                     Some(legacy_change_request_body(
                         query_source,
                         query_name,
@@ -446,7 +446,7 @@ impl GraphClient {
                 remote_json(
                     http,
                     Method::POST,
-                    remote_url(base_url, "/read"),
+                    remote_url(base_url, &["read"], &[])?,
                     Some(serde_json::to_value(ReadRequest {
                         query_source: query_source.to_string(),
                         query_name: query_name.map(ToOwned::to_owned),
@@ -484,7 +484,7 @@ impl GraphClient {
                 remote_json(
                     http,
                     Method::POST,
-                    remote_url(base_url, "/branches"),
+                    remote_url(base_url, &["branches"], &[])?,
                     Some(serde_json::to_value(BranchCreateRequest {
                         from: Some(from.to_string()),
                         name: name.to_string(),
@@ -518,7 +518,7 @@ impl GraphClient {
                 remote_json(
                     http,
                     Method::DELETE,
-                    remote_branch_url(base_url, name)?,
+                    remote_url(base_url, &["branches", name], &[])?,
                     None,
                     token.as_deref(),
                 )
@@ -547,7 +547,7 @@ impl GraphClient {
                 remote_json(
                     http,
                     Method::POST,
-                    remote_url(base_url, "/branches/merge"),
+                    remote_url(base_url, &["branches", "merge"], &[])?,
                     Some(serde_json::to_value(BranchMergeRequest {
                         source: source.to_string(),
                         target: Some(into.to_string()),
@@ -598,7 +598,7 @@ impl GraphClient {
                 remote_json::<SchemaApplyOutput>(
                     http,
                     Method::POST,
-                    remote_url(base_url, "/schema/apply"),
+                    remote_url(base_url, &["schema", "apply"], &[])?,
                     Some(serde_json::to_value(SchemaApplyRequest {
                         schema_source: schema_source.to_string(),
                         allow_data_loss,
@@ -642,7 +642,7 @@ impl GraphClient {
                 token,
             } => {
                 let request = apply_bearer_token(
-                    http.request(Method::POST, remote_url(base_url, "/export")),
+                    http.request(Method::POST, remote_url(base_url, &["export"], &[])?),
                     token.as_deref(),
                 )
                 .json(&ExportRequest {
@@ -690,7 +690,7 @@ impl GraphClient {
                 remote_json(
                     http,
                     Method::GET,
-                    remote_url(base_url, "/graphs"),
+                    remote_url(base_url, &["graphs"], &[])?,
                     None,
                     token.as_deref(),
                 )
