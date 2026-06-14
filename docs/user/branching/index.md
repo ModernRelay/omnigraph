@@ -43,11 +43,9 @@ Notes:
 
 ## L2 — Snapshots & time travel
 
-- `snapshot()` — current snapshot for the bound branch; cached.
-- `snapshot_of(target)` — snapshot at a `ReadTarget` (branch | snapshot id).
-- `snapshot_at_version(v: u64)` — historical snapshot from any manifest version.
-- `entity_at(table_key, id, version)` — single-entity time travel without building a full snapshot.
-- A `Snapshot` is a `(version, HashMap<table_key, SubTableEntry>)` — cheap to build, snapshot-isolated cross-table reads.
+Reading a branch at a past version, or a single entity at a past version, is
+covered on the [time travel](time-travel.md) page. Merging branches and the
+conflict kinds are on the [merge](merge.md) page.
 
 ## L2 — Internal system branches
 

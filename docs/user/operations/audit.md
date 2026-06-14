@@ -1,7 +1,46 @@
-# Audit / Actor tracking
+# Audit & Actor Tracking
 
-- `Omnigraph::audit_actor_id: Option<String>` is the actor in effect.
-- `_as` variants of every write API let callers override the actor: `mutate_as`, `load_as`, `branch_merge_as`, `apply_schema_as`, etc.
-- Actor IDs are persisted on `GraphCommit.actor_id` with split storage in `_graph_commit_actors.lance` (the commit graph is split into `_graph_commits.lance` for the linkage and `_graph_commit_actors.lance` for the actor map).
-- HTTP server uses the bearer-token actor automatically. The CLI resolves one actor chain everywhere: `--as` > legacy `cli.actor` in `omnigraph.yaml` > `operator.actor` in `~/.omnigraph/config.yaml` > none (RFC-007).
-- Pre-v0.4.0 graphs also stored actor IDs on `RunRecord.actor_id` in `_graph_runs.lance` / `_graph_run_actors.lance`. The Run state machine was removed in MR-771; those files are inert post-v0.4.0. The v2→v3 manifest migration sweeps any stale `__run__*` branches on first write-open (MR-770); the inert dataset bytes remain until a `delete_prefix` primitive lands.
+Every write in OmniGraph records **who made it**. The actor id is persisted on the
+graph commit, so the commit history is an audit trail of which actor changed the
+graph and when.
+
+## Where the actor comes from
+
+The actor is resolved differently depending on the front end, but it always lands
+on the commit:
+
+- **HTTP server** — the actor is resolved **server-side from the bearer token**. A
+  client cannot set its own actor id; it is derived from the authenticated token.
+  See [policy](policy.md) for how tokens map to actors.
+- **CLI / embedded** — the actor is self-declared through one resolution chain:
+
+  1. `--as <actor>` on the command,
+  2. then `operator.actor` in `~/.omnigraph/config.yaml` (see the
+     [CLI reference](../cli/reference.md)),
+  3. otherwise none.
+
+This difference is intentional: storage credentials imply a self-declared actor,
+while a server resolves the actor from a token it trusts.
+
+## Reading the audit trail
+
+Actor ids are stored on each commit in the [commit graph](../branching/index.md).
+List commits to see who made each change:
+
+```bash
+omnigraph commit list graph.omni
+```
+
+System-initiated writes use reserved actor ids — for example, automatic recovery
+of an interrupted write records `omnigraph:recovery`, so operator changes and
+machine repairs are distinguishable in the history:
+
+```bash
+omnigraph commit list --filter actor=omnigraph:recovery graph.omni
+```
+
+## What is tracked
+
+Every successful publish — load, change, branch merge, and schema apply — appends a
+commit carrying the resolving actor. Because publishes are atomic, the actor on a
+commit is exactly the actor responsible for that whole change.
