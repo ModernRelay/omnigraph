@@ -87,7 +87,7 @@ impl GraphClient {
         // target straight through, so existing invocations are unchanged.
         let scope = crate::scope::resolve_scope(
             &crate::operator::load_operator_config()?,
-            crate::planes::Plane::Data,
+            crate::planes::Capability::Any,
             crate::scope::ScopeFlags { profile, store, server, graph, uri, target },
         )?;
         let (server, graph, uri, target) = (
@@ -134,7 +134,7 @@ impl GraphClient {
         // through unchanged.
         let scope = crate::scope::resolve_scope(
             &crate::operator::load_operator_config()?,
-            crate::planes::Plane::Data,
+            crate::planes::Capability::Any,
             crate::scope::ScopeFlags { profile, store, server, graph, uri, target },
         )?;
         let (server, graph, uri, target) = (

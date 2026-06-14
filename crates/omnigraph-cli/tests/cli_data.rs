@@ -164,10 +164,10 @@ fn optimize_with_server_flag_errors_wrong_plane() {
     let output = output_failure(cli().arg("optimize").arg("--server").arg("prod"));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("`optimize` is a storage-plane command")
-            && stderr.contains("--server/--graph address the data plane and do not apply")
+        stderr.contains("`optimize` is a direct (storage-native) command")
+            && stderr.contains("--server/--graph address a served graph and do not apply")
             && stderr.contains("Use --target <name>, a storage URI, or --cluster <dir> --cluster-graph <id>."),
-        "wrong-plane guard message not found; got: {stderr}"
+        "wrong-capability guard message not found; got: {stderr}"
     );
 }
 
@@ -178,9 +178,9 @@ fn optimize_with_remote_target_errors_storage_plane() {
     let output = output_failure(cli().arg("optimize").arg("https://graph.example.invalid"));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("`optimize` is a storage-plane command and needs direct storage access")
+        stderr.contains("`optimize` is a direct (storage-native) command and needs direct storage access")
             && stderr.contains("remote server"),
-        "storage-plane remote-target message not found; got: {stderr}"
+        "direct remote-target message not found; got: {stderr}"
     );
 }
 
@@ -584,12 +584,12 @@ query list_people() {
             .arg("http://127.0.0.1:8080"),
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // RFC-010 Slice 1: the storage-plane verbs now share one declared message
+    // RFC-010/011: the direct (storage-native) verbs share one declared message
     // (was: "query lint is only supported against local graph URIs …").
     assert!(
-        stderr.contains("`lint` is a storage-plane command and needs direct storage access")
+        stderr.contains("`lint` is a direct (storage-native) command and needs direct storage access")
             && stderr.contains("remote server"),
-        "storage-plane remote-target message not found; got: {stderr}"
+        "direct remote-target message not found; got: {stderr}"
     );
 }
 

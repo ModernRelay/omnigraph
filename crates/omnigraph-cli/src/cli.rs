@@ -9,19 +9,20 @@ pub(crate) const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
 #[command(name = "omnigraph")]
 #[command(about = "Omnigraph graph database CLI")]
 #[command(version = env!("CARGO_PKG_VERSION"), disable_version_flag = true)]
-// Subcommands are listed grouped by plane (clap renders them in declaration
-// order). clap can't print labeled headings between subcommand groups, so this
-// legend names the planes; the grouping is the variant order in `Command`.
+// Subcommands render in declaration order (clap can't print labeled headings
+// between groups), so this legend names the capability each command needs —
+// the user-facing vocabulary (RFC-011). `Plane` stays the internal classifier.
 #[command(after_help = "\
-COMMANDS BY PLANE:\n  \
-Data — run against a graph, embedded or via --server (query, mutate, load, \
-branch, snapshot, export, commit, schema [plan: storage], graphs).\n  \
-Storage — direct storage or local files; reject --server (init, optimize, \
-repair, cleanup, lint, queries [list: session]).\n  \
-Control — manage a cluster directory via --config (cluster).\n  \
-Session — no graph; local config & tooling (policy, embed, login, logout, \
-config, version).\n\
-See the 'Command planes' section of the CLI reference for which flags apply where.")]
+COMMANDS BY CAPABILITY:\n  \
+any — run against a graph, served (--server / --profile) or embedded (--store / a \
+URI): query, mutate, load, branch, snapshot, export, commit, schema show/apply.\n  \
+served — require a server: graphs.\n  \
+direct — direct storage access; reject --server (init, optimize, repair, cleanup, \
+schema plan, lint, queries validate).\n  \
+control — manage a cluster via --config: cluster.\n  \
+local — no graph; local config & tooling: policy, embed, login, logout, config, \
+version, queries list.\n\
+See the 'Command capabilities' section of the CLI reference for which flags apply where.")]
 pub(crate) struct Cli {
     /// Actor id for direct-engine writes; overrides `cli.actor`. No effect on
     /// remote writes (the server resolves the actor from the bearer token).

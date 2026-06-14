@@ -842,7 +842,7 @@ async fn main() -> Result<()> {
                 // (a --profile cluster binding, --store, or operator defaults).
                 let scope = scope::resolve_scope(
                     &operator::load_operator_config()?,
-                    planes::Plane::Storage,
+                    planes::Capability::Direct,
                     scope::ScopeFlags {
                         profile: cli.profile.as_deref(),
                         store: cli.store.as_deref(),
@@ -919,7 +919,7 @@ async fn main() -> Result<()> {
                 // RFC-011: no explicit per-command address — consult the scope.
                 let scope = scope::resolve_scope(
                     &operator::load_operator_config()?,
-                    planes::Plane::Storage,
+                    planes::Capability::Direct,
                     scope::ScopeFlags {
                         profile: cli.profile.as_deref(),
                         store: cli.store.as_deref(),
@@ -1038,7 +1038,7 @@ async fn main() -> Result<()> {
                 // RFC-011: no explicit per-command address — consult the scope.
                 let scope = scope::resolve_scope(
                     &operator::load_operator_config()?,
-                    planes::Plane::Storage,
+                    planes::Capability::Direct,
                     scope::ScopeFlags {
                         profile: cli.profile.as_deref(),
                         store: cli.store.as_deref(),

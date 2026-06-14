@@ -10,7 +10,7 @@
 //! invocations are unaffected.
 //!
 //! The access path (served vs direct) is never chosen here; it falls out of the
-//! scope's binding × the verb's plane. The plane→scope capability check rejects
+//! scope's binding × the verb's capability. The capability→scope check rejects
 //! mismatches (e.g. a server scope on a maintenance verb) only on the *new*
 //! resolution paths.
 
@@ -20,7 +20,7 @@ use color_eyre::Result;
 use color_eyre::eyre::{bail, eyre};
 
 use crate::operator::{OperatorConfig, ScopeBinding};
-use crate::planes::Plane;
+use crate::planes::Capability;
 
 pub(crate) const PROFILE_ENV: &str = "OMNIGRAPH_PROFILE";
 
@@ -48,14 +48,14 @@ pub(crate) struct ScopeFlags<'a> {
     pub(crate) target: Option<&'a str>,
 }
 
-/// Resolve the scope for a command on `plane`. Precedence (RFC-011):
+/// Resolve the scope for a command with `capability`. Precedence (RFC-011):
 /// 1. explicit legacy/primitive address (`uri`/`target`/`--server`/`--store`) → passthrough;
 /// 2. `--profile` / `OMNIGRAPH_PROFILE`;
 /// 3. flat `defaults.server` + `defaults.default_graph`;
 /// 4. nothing — downstream behaves as today.
 pub(crate) fn resolve_scope(
     op: &OperatorConfig,
-    plane: Plane,
+    capability: Capability,
     flags: ScopeFlags<'_>,
 ) -> Result<ResolvedScope> {
     // 1. Any explicit address wins; reproduce today's behavior untouched.
@@ -85,7 +85,7 @@ pub(crate) fn resolve_scope(
             .graph
             .map(str::to_string)
             .or_else(|| profile.default_graph.clone());
-        return scope_from_binding(op, plane, binding, graph, &format!("profile '{name}'"));
+        return scope_from_binding(op, capability, binding, graph, &format!("profile '{name}'"));
     }
 
     // 3. Flat default server scope.
@@ -96,7 +96,7 @@ pub(crate) fn resolve_scope(
             .or_else(|| op.default_graph().map(str::to_string));
         return scope_from_binding(
             op,
-            plane,
+            capability,
             ScopeBinding::Server(server.to_string()),
             graph,
             "operator defaults",
@@ -108,20 +108,20 @@ pub(crate) fn resolve_scope(
     Ok(ResolvedScope::default())
 }
 
-/// Map a resolved binding to the effective tuple, enforcing scope × plane
+/// Map a resolved binding to the effective tuple, enforcing scope × capability
 /// capability (RFC-011): a server scope is served (data only); a cluster scope
 /// is privileged direct (maintenance/control only); a store scope is direct
 /// (either).
 fn scope_from_binding(
     op: &OperatorConfig,
-    plane: Plane,
+    capability: Capability,
     binding: ScopeBinding,
     graph: Option<String>,
     source: &str,
 ) -> Result<ResolvedScope> {
     match binding {
         ScopeBinding::Server(server) => {
-            if plane == Plane::Storage {
+            if capability == Capability::Direct {
                 bail!(
                     "this command needs direct storage access, but {source} resolves a \
                      server scope; name storage explicitly with --store <uri> (or a \
@@ -135,7 +135,7 @@ fn scope_from_binding(
             })
         }
         ScopeBinding::Cluster(cluster) => {
-            if plane == Plane::Data {
+            if capability == Capability::Any {
                 bail!(
                     "{source} resolves a cluster scope, which is maintenance-only; run \
                      data commands through a server, or use --store <uri> for ad-hoc \
@@ -200,7 +200,7 @@ mod tests {
         // A positional URI given → profile/defaults are ignored entirely.
         let scope = resolve_scope(
             &op,
-            Plane::Data,
+            Capability::Any,
             ScopeFlags {
                 uri: Some("graph.omni".into()),
                 ..flags()
@@ -216,7 +216,7 @@ mod tests {
         let op = OperatorConfig::default();
         let scope = resolve_scope(
             &op,
-            Plane::Data,
+            Capability::Any,
             ScopeFlags {
                 store: Some("s3://b/g.omni"),
                 ..flags()
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn flat_default_server_drives_data_verbs() {
         let op = cfg("defaults:\n  server: prod\n  default_graph: knowledge\nservers:\n  prod:\n    url: https://x\n");
-        let scope = resolve_scope(&op, Plane::Data, flags()).unwrap();
+        let scope = resolve_scope(&op, Capability::Any, flags()).unwrap();
         assert_eq!(scope.server.as_deref(), Some("prod"));
         assert_eq!(scope.graph.as_deref(), Some("knowledge"));
     }
@@ -241,7 +241,7 @@ mod tests {
         );
         let scope = resolve_scope(
             &op,
-            Plane::Data,
+            Capability::Any,
             ScopeFlags {
                 profile: Some("staging"),
                 graph: Some("archive"),
@@ -260,7 +260,7 @@ mod tests {
         );
         let scope = resolve_scope(
             &op,
-            Plane::Storage,
+            Capability::Direct,
             ScopeFlags {
                 profile: Some("admin"),
                 ..flags()
@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn server_scope_on_maintenance_verb_errors() {
         let op = cfg("defaults:\n  server: prod\nservers:\n  prod:\n    url: https://x\n");
-        let err = resolve_scope(&op, Plane::Storage, flags()).unwrap_err().to_string();
+        let err = resolve_scope(&op, Capability::Direct, flags()).unwrap_err().to_string();
         assert!(err.contains("direct storage access"), "{err}");
     }
 
@@ -285,7 +285,7 @@ mod tests {
         );
         let err = resolve_scope(
             &op,
-            Plane::Data,
+            Capability::Any,
             ScopeFlags {
                 profile: Some("admin"),
                 ..flags()
@@ -301,7 +301,7 @@ mod tests {
         let op = OperatorConfig::default();
         let err = resolve_scope(
             &op,
-            Plane::Data,
+            Capability::Any,
             ScopeFlags {
                 profile: Some("nope"),
                 ..flags()
@@ -315,7 +315,7 @@ mod tests {
     #[test]
     fn no_address_resolves_empty_for_legacy_fallthrough() {
         let op = OperatorConfig::default();
-        let scope = resolve_scope(&op, Plane::Data, flags()).unwrap();
+        let scope = resolve_scope(&op, Capability::Any, flags()).unwrap();
         assert_eq!(scope, ResolvedScope::default());
     }
 }

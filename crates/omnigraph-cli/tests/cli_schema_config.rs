@@ -25,22 +25,22 @@ fn version_command_prints_current_cli_version() {
 }
 
 #[test]
-fn help_groups_commands_by_plane() {
-    // RFC-010 Slice 2: `--help` clusters commands by plane (declaration order
-    // in the Command enum) and explains the planes in an after_help legend.
-    // Pinned lightly — the legend phrase + the cluster ordering — to avoid
-    // brittle full-text assertions on clap's help body.
+fn help_groups_commands_by_capability() {
+    // RFC-010 Slice 2 / RFC-011 Slice B: `--help` clusters commands (declaration
+    // order in the Command enum) and explains the capability each needs in an
+    // after_help legend. Pinned lightly — the legend phrase + the cluster
+    // ordering — to avoid brittle full-text assertions on clap's help body.
     let output = output_success(cli().arg("--help"));
     let stdout = stdout_string(&output);
 
     assert!(
-        stdout.contains("COMMANDS BY PLANE"),
-        "plane legend (after_help) missing from --help:\n{stdout}"
+        stdout.contains("COMMANDS BY CAPABILITY"),
+        "capability legend (after_help) missing from --help:\n{stdout}"
     );
 
     // The Commands list precedes the legend, so first occurrences sit in the
-    // list and must appear in plane order: a data verb, then a storage verb,
-    // then the control verb.
+    // list and must appear in order: an `any` data verb, then a `direct` verb,
+    // then the `control` verb.
     let pos = |needle: &str| {
         stdout
             .find(needle)
@@ -48,11 +48,11 @@ fn help_groups_commands_by_plane() {
     };
     assert!(
         pos("query") < pos("optimize"),
-        "data commands should be listed before storage commands"
+        "data (any) commands should be listed before direct commands"
     );
     assert!(
         pos("optimize") < pos("cluster"),
-        "storage commands should be listed before the control command"
+        "direct commands should be listed before the control command"
     );
 }
 
@@ -120,9 +120,9 @@ fn schema_plan_with_server_flag_errors_wrong_plane() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("`schema plan` is a storage-plane command")
+        stderr.contains("`schema plan` is a direct (storage-native) command")
             && stderr.contains("Use --target <name>, a storage URI, or --cluster <dir> --cluster-graph <id>."),
-        "schema plan wrong-plane message not found; got: {stderr}"
+        "schema plan wrong-capability message not found; got: {stderr}"
     );
 }
 
