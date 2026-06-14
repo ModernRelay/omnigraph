@@ -295,22 +295,42 @@ impl TableStore {
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         self.ensure_expected_version(&source_ds, table_key, source_version)?;
 
-        if source_ds
+        if let Err(create_err) = source_ds
             .create_branch(target_branch, source_version, None)
             .await
-            .is_err()
         {
-            // A branch ref for `target_branch` already exists on this table (a
-            // fully-formed manifest-unreferenced fork, or a phase-1-only Lance
-            // "zombie" — `create_branch` fails for both). The caller
-            // (`open_owned_dataset_for_branch_write`) has already re-read the
-            // live manifest under the held write queue and confirmed it does
-            // NOT place this table on `target_branch`, so the ref is reclaimable
-            // derived state, not authoritative. Return the typed signal and let
-            // the db layer reclaim + re-fork rather than guessing or hard-failing
-            // here. (A live committed fork is routed to a retryable conflict
-            // upstream, before we ever reach this fork path.)
-            return Ok(ForkOutcome::RefAlreadyExists);
+            // Disambiguate the failure: only a genuinely pre-existing ref is a
+            // reclaim candidate. Mapping EVERY create_branch failure to
+            // `RefAlreadyExists` would route a transient I/O / version / Lance
+            // internal error into the destructive reclaim path. So check whether
+            // the ref actually exists; if not, the failure is real — propagate
+            // it (preserving error fidelity) rather than force-deleting.
+            //
+            // `list_branches` reads `_refs/branches/` from the store, so it sees
+            // a fully-formed manifest-unreferenced fork (our common case — a
+            // create_branch that completed but whose manifest publish did not).
+            // It does NOT see a phase-1-only Lance "zombie" (tree dir written,
+            // no BranchContents) — but neither does `cleanup`'s reconciler, also
+            // list_branches-based. A zombie only forms if create_branch is
+            // interrupted *between its two internal phases* (a far narrower
+            // window than the manifest-publish gap), and it surfaces here as the
+            // propagated create error requiring manual reclaim. We deliberately
+            // do NOT force-delete on a not-found-ref failure: it is
+            // indistinguishable from a transient error on a fresh create, and
+            // force-deleting there is the destructive overreach this guard
+            // removes. The caller holds the per-(table, branch) write queue, so
+            // no in-process writer races this fork; a cross-process create
+            // between our check and now is the documented one-winner-CAS gap and
+            // propagates as a retryable error.
+            let ref_exists = source_ds
+                .list_branches()
+                .await
+                .map(|b| b.contains_key(target_branch))
+                .unwrap_or(false);
+            if ref_exists {
+                return Ok(ForkOutcome::RefAlreadyExists);
+            }
+            return Err(OmniError::Lance(create_err.to_string()));
         }
 
         let ds = self
