@@ -73,32 +73,38 @@ Full diagram and concurrency model: [docs/dev/architecture.md](docs/dev/architec
 | **Lance docs index — fetch upstream Lance docs by problem domain** | **[docs/dev/lance.md](docs/dev/lance.md)** |
 | **Test coverage map — what's covered, what helpers to reuse, before-every-task checklist** | **[docs/dev/testing.md](docs/dev/testing.md)** |
 | Architecture, L1/L2 framing, concurrency model | [docs/dev/architecture.md](docs/dev/architecture.md) |
-| Storage layout, `__manifest` schema, URI schemes, S3 env vars | [docs/user/storage.md](docs/user/concepts/storage.md) |
-| `.pg` schema language, types, constraints, annotations, migration planning | [docs/user/schema-language.md](docs/user/schema/index.md) |
-| Schema-lint codes (`OG-XXX-NNN`), families, severity, suppression | [docs/user/schema-lint.md](docs/user/schema/lint.md) |
-| `.gq` query language, MATCH/RETURN/ORDER, search funcs, mutations, IR ops, lint codes | [docs/user/query-language.md](docs/user/queries/index.md) |
-| Indexes (BTREE / inverted / vector / graph topology) | [docs/user/indexes.md](docs/user/search/indexes.md) |
-| Embeddings (compiler + engine clients, env vars, `@embed`) | [docs/user/embeddings.md](docs/user/search/embeddings.md) |
-| Branches, commit graph, snapshots, system branches | [docs/user/branches-commits.md](docs/user/branching/index.md) |
-| Transactions and atomicity (per-query atomic; branches as multi-query transactions) | [docs/user/transactions.md](docs/user/branching/transactions.md) |
+| Storage layout, `__manifest` schema, URI schemes, S3 env vars | [docs/user/concepts/storage.md](docs/user/concepts/storage.md) |
+| `.pg` schema language, types, constraints, annotations, migration planning | [docs/user/schema/index.md](docs/user/schema/index.md) |
+| Schema-lint codes (`OG-XXX-NNN`), families, severity, suppression | [docs/user/schema/lint.md](docs/user/schema/lint.md) |
+| `.gq` query language, MATCH/RETURN/ORDER, IR ops, lint codes | [docs/user/queries/index.md](docs/user/queries/index.md) |
+| Mutations — insert/update/delete, D2, atomicity | [docs/user/mutations/index.md](docs/user/mutations/index.md) |
+| Search funcs (`nearest`/`bm25`/`rrf`), hybrid ranking | [docs/user/search/index.md](docs/user/search/index.md) |
+| Indexes (BTREE / inverted / vector / graph topology) | [docs/user/search/indexes.md](docs/user/search/indexes.md) |
+| Embeddings (compiler + engine clients, env vars, `@embed`) | [docs/user/search/embeddings.md](docs/user/search/embeddings.md) |
+| Concepts — what OmniGraph is, L1/L2 framing | [docs/user/concepts/index.md](docs/user/concepts/index.md) |
+| Quickstart — init → load → query → branch | [docs/user/quickstart.md](docs/user/quickstart.md) |
+| Branches, commit graph, system branches | [docs/user/branching/index.md](docs/user/branching/index.md) |
+| Snapshots & time travel | [docs/user/branching/time-travel.md](docs/user/branching/time-travel.md) |
+| Three-way merge and conflict kinds (user-facing) | [docs/user/branching/merge.md](docs/user/branching/merge.md) |
+| Transactions and atomicity (per-query atomic; branches as multi-query transactions) | [docs/user/branching/transactions.md](docs/user/branching/transactions.md) |
 | Direct-publish write path (staging, D2, recovery sidecars; the former Run state machine) | [docs/dev/writes.md](docs/dev/writes.md) |
 | Three-way merge and conflict kinds | [docs/dev/merge.md](docs/dev/merge.md) |
-| Diff / change feed (`diff_between`, `diff_commits`) | [docs/user/changes.md](docs/user/branching/changes.md) |
+| Diff / change feed (`diff_between`, `diff_commits`) | [docs/user/branching/changes.md](docs/user/branching/changes.md) |
 | Query execution, mutation execution, bulk loader, `load` vs `ingest` | [docs/dev/execution.md](docs/dev/execution.md) |
-| `optimize` (compaction) and `cleanup` (version GC) | [docs/user/maintenance.md](docs/user/operations/maintenance.md) |
-| Cluster operator guide (deploy/manage clusters, approvals, recovery, serving) | [docs/user/cluster.md](docs/user/clusters/index.md) |
-| Cedar policy actions, scopes, CLI | [docs/user/policy.md](docs/user/operations/policy.md) |
-| HTTP server endpoints, auth, error model, body limits | [docs/user/server.md](docs/user/operations/server.md) |
-| CLI quick-start | [docs/user/cli.md](docs/user/cli/index.md) |
-| CLI command surface and config schemas (`~/.omnigraph/config.yaml`, legacy `omnigraph.yaml`) | [docs/user/cli-reference.md](docs/user/cli/reference.md) |
-| Audit / actor tracking | [docs/user/audit.md](docs/user/operations/audit.md) |
-| Error taxonomy and result serialization | [docs/user/errors.md](docs/user/operations/errors.md) |
+| `optimize` (compaction) and `cleanup` (version GC) | [docs/user/operations/maintenance.md](docs/user/operations/maintenance.md) |
+| Cluster operator guide (deploy/manage clusters, approvals, recovery, serving) | [docs/user/clusters/index.md](docs/user/clusters/index.md) |
+| Cedar policy actions, scopes, CLI | [docs/user/operations/policy.md](docs/user/operations/policy.md) |
+| HTTP server endpoints, auth, error model, body limits | [docs/user/operations/server.md](docs/user/operations/server.md) |
+| CLI quick-start | [docs/user/cli/index.md](docs/user/cli/index.md) |
+| CLI command surface and config schemas (`~/.omnigraph/config.yaml`, legacy `omnigraph.yaml`) | [docs/user/cli/reference.md](docs/user/cli/reference.md) |
+| Audit / actor tracking | [docs/user/operations/audit.md](docs/user/operations/audit.md) |
+| Error taxonomy and result serialization | [docs/user/operations/errors.md](docs/user/operations/errors.md) |
 | Install (binary / Homebrew / source / channels) | [docs/user/install.md](docs/user/install.md) |
 | Deployment (binary / container / RustFS bootstrap / auth / build variants) | [docs/user/deployment.md](docs/user/deployment.md) |
 | CI / release workflows | [docs/dev/ci.md](docs/dev/ci.md) |
 | Code ownership (CODEOWNERS source of truth, roles, regeneration) | [docs/dev/codeowners.md](docs/dev/codeowners.md) |
 | Branch protection policy (declarative, applied via `scripts/apply-branch-protection.sh`) | [docs/dev/branch-protection.md](docs/dev/branch-protection.md) |
-| Constants & tunables cheat sheet | [docs/user/constants.md](docs/user/reference/constants.md) |
+| Constants & tunables cheat sheet | [docs/user/reference/constants.md](docs/user/reference/constants.md) |
 | Per-version release notes | [docs/releases/](docs/releases/) |
 
 ---
@@ -257,7 +263,7 @@ omnigraph policy explain --actor act-alice --action change --branch main
 | Per-query atomic writes | — | In-memory `MutationStaging.pending` accumulator + `stage_*` / `commit_staged` per touched table at end-of-query + publisher CAS via `commit_with_expected` (single manifest commit per `mutate_as` / `load`); D₂ parse-time rule keeps inserts/updates and deletes from mixing |
 | Three-way row-level merge | — | `OrderedTableCursor` + `StagedTableWriter`, structured `MergeConflictKind` |
 | Change feeds | — | `diff_between` / `diff_commits` with manifest fast path + ID streaming |
-| Cedar policy | — | Per-graph actions plus server-scoped actions (see [docs/user/policy.md](docs/user/operations/policy.md) for the current list), branch / target_branch / protected scopes, validate/test/explain CLI. **Engine-wide enforcement** (MR-722): every `_as` writer (`apply_schema_as`, `mutate_as`, `load_as` — the deprecated `ingest_as` shims route through it — `branch_create_as` / `branch_create_from_as`, `branch_delete_as`, `branch_merge_as`) calls `Omnigraph::enforce(action, scope, actor)` — HTTP, CLI, embedded SDK all hit the same gate. |
+| Cedar policy | — | Per-graph actions plus server-scoped actions (see [docs/user/operations/policy.md](docs/user/operations/policy.md) for the current list), branch / target_branch / protected scopes, validate/test/explain CLI. **Engine-wide enforcement** (MR-722): every `_as` writer (`apply_schema_as`, `mutate_as`, `load_as` — the deprecated `ingest_as` shims route through it — `branch_create_as` / `branch_create_from_as`, `branch_delete_as`, `branch_merge_as`) calls `Omnigraph::enforce(action, scope, actor)` — HTTP, CLI, embedded SDK all hit the same gate. |
 | HTTP server | — | Axum, OpenAPI via utoipa, bearer auth (SHA-256, AWS Secrets Manager option), `authorize_request` at the HTTP boundary (resolves bearer→actor, applies admission control), NDJSON streaming export, **multi-graph mode (v0.6.0+) with cluster routes + read-only `GET /graphs` enumeration + per-graph + server-level Cedar policies. Multi-graph boots from a cluster directory (`--cluster`) or the legacy `omnigraph.yaml`; add/remove graphs via `cluster apply` (or by editing the legacy file) and restarting.** |
 | CLI with config | — | two-surface config (team `cluster.yaml` dir + per-operator `~/.omnigraph/config.yaml`; legacy `omnigraph.yaml` deprecated per RFC-008), aliases, multi-format output (json/jsonl/csv/kv/table) |
 | Audit / actor tracking | — | `_as` write APIs + actor map in commit graph |
@@ -282,7 +288,7 @@ Rules:
 7. **Re-verify before recommending.** If you cite a flag, env var, endpoint, or constant to the user or in code, grep for it in source first. Memory and docs go stale; the code is authoritative.
 8. **Keep AGENTS.md short.** This file is always loaded into agent context, so every added line has a recurring context-window cost. Prefer pointers and terse invariants here; put detail in `docs/`.
 9. **Keep AGENTS.md a map, not an encyclopedia.** New deep content goes into `docs/`. Add an entry to "Where to find each topic" instead of pasting prose into this file. The "Always-on rules" section is the exception — it's for invariants that should always be in scope.
-10. **Re-read on schema/query/IR changes.** Edits to `schema.pest`, `query.pest`, `ir/lower.rs`, `query/typecheck.rs`, or `query/lint.rs` should trigger a re-read of [docs/user/schema-language.md](docs/user/schema/index.md), [docs/user/query-language.md](docs/user/queries/index.md), and [docs/dev/execution.md](docs/dev/execution.md) to confirm they still describe reality.
+10. **Re-read on schema/query/IR changes.** Edits to `schema.pest`, `query.pest`, `ir/lower.rs`, `query/typecheck.rs`, or `query/lint.rs` should trigger a re-read of [docs/user/schema/index.md](docs/user/schema/index.md), [docs/user/queries/index.md](docs/user/queries/index.md), and [docs/dev/execution.md](docs/dev/execution.md) to confirm they still describe reality.
 11. **Always make smaller commits.** Each commit does one thing, compiles, and passes tests; mechanical refactors land separately from the behavior changes they enable.
 12. **Test-first for bug fixes.** When fixing an identified bug, write a regression test that reproduces the failure first. Confirm it fails against the current code with the predicted symptom (not an unrelated error). Then land the fix in a separate commit and confirm the test turns green. The test commit lands just before the fix commit so the red → green pair is visible in `git log` and a reviewer can check out the test commit alone and reproduce the failure.
 13. **Correct by design over symptomatic patches.** When a bug surfaces, identify the root cause and make the fix correct by construction. Don't patch the symptom. If the design admits the bug class, the fix is to close the class, not to add a guard around the latest instance. A symptomatic patch is acceptable only as a stop-gap, with an explicit note in the commit message and a follow-up issue tracking the design fix.
