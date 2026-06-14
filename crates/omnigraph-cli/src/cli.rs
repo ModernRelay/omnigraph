@@ -9,15 +9,24 @@ pub(crate) const DEFAULT_BEARER_TOKEN_ENV: &str = "OMNIGRAPH_BEARER_TOKEN";
 #[command(name = "omnigraph")]
 #[command(about = "Omnigraph graph database CLI")]
 #[command(version = env!("CARGO_PKG_VERSION"), disable_version_flag = true)]
+// Subcommands are listed grouped by plane (clap renders them in declaration
+// order). clap can't print labeled headings between subcommand groups, so this
+// legend names the planes; the grouping is the variant order in `Command`.
+#[command(after_help = "\
+COMMANDS BY PLANE:\n  \
+Data — run against a graph, embedded or via --server (query, mutate, load, \
+branch, snapshot, export, commit, schema [plan: storage], graphs).\n  \
+Storage — direct storage or local files; reject --server (init, optimize, \
+repair, cleanup, lint, queries [list: session]).\n  \
+Control — manage a cluster directory via --config (cluster).\n  \
+Session — no graph; local config & tooling (policy, embed, login, logout, \
+config, version).\n\
+See the 'Command planes' section of the CLI reference for which flags apply where.")]
 pub(crate) struct Cli {
-    /// Actor identity for direct-engine writes (MR-722). Overrides
-    /// `cli.actor` from `omnigraph.yaml`. When the configured policy
-    /// is in effect, Cedar evaluates this actor against the requested
-    /// action and scope; with policy configured but neither this flag
-    /// nor `cli.actor` set, the engine-layer footgun guard fires and
-    /// the write is denied (no silent bypass). Has no effect on remote
-    /// HTTP writes — those resolve their actor server-side from the
-    /// bearer token.
+    /// Actor id for direct-engine writes; overrides `cli.actor`. No effect on
+    /// remote writes (the server resolves the actor from the bearer token).
+    /// With a policy configured but no actor set, the write is denied — see
+    /// docs/user/policy.md.
     #[arg(long = "as", global = true, value_name = "ACTOR")]
     pub(crate) as_actor: Option<String>,
 
@@ -38,170 +47,7 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// Print the CLI version
-    Version,
-    /// Store a bearer token for a named server in ~/.omnigraph/credentials
-    /// (0600). Token from --token or one line on stdin:
-    /// `echo $TOKEN | omnigraph login prod`. The keyed token applies to
-    /// requests whose URL matches the server's `url` in the operator
-    /// config's `servers:` map.
-    Login {
-        /// Server name (keys the credential; declare its url under
-        /// `servers:` in ~/.omnigraph/config.yaml)
-        name: String,
-        /// The token. Prefer piping via stdin over this flag (shell
-        /// history).
-        #[arg(long)]
-        token: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Legacy-config tooling (RFC-008): split omnigraph.yaml into its
-    /// two destinations.
-    Config {
-        #[command(subcommand)]
-        command: ConfigCommand,
-    },
-    /// Remove a named server's stored credential. Idempotent.
-    Logout {
-        name: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Generate, clean, or refresh explicit seed embeddings
-    Embed(EmbedArgs),
-    /// Initialize a new graph from a schema
-    Init {
-        #[arg(long)]
-        schema: PathBuf,
-        /// Graph URI (local path or s3://)
-        uri: String,
-        /// Overwrite existing schema artifacts at the URI. Without
-        /// this flag, init refuses to touch a URI that already holds
-        /// `_schema.pg`, `_schema.ir.json`, or `__schema_state.json`
-        /// — closes the re-init footgun (MR-668 follow-up). With the
-        /// flag, the operator opts in to destructive semantics.
-        #[arg(long)]
-        force: bool,
-    },
-    /// Load data into a graph (local or remote)
-    Load {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
-        data: PathBuf,
-        /// Target branch (defaults to main). Without --from it must exist.
-        #[arg(long)]
-        branch: Option<String>,
-        /// Base branch to fork --branch from when it doesn't exist yet.
-        /// Without this flag a missing branch is an error, never a fork.
-        #[arg(long)]
-        from: Option<String>,
-        /// How existing rows are handled: overwrite | append | merge.
-        /// Required — overwrite is destructive, so there is no default.
-        #[arg(long)]
-        mode: CliLoadMode,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Deprecated alias of `load --from <base>` (defaults: --mode merge, --from main)
-    Ingest {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
-        data: PathBuf,
-        #[arg(long)]
-        branch: Option<String>,
-        #[arg(long)]
-        from: Option<String>,
-        #[arg(long, default_value = "merge")]
-        mode: CliLoadMode,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Branch operations
-    Branch {
-        #[command(subcommand)]
-        command: BranchCommand,
-    },
-    /// Schema planning operations
-    Schema {
-        #[command(subcommand)]
-        command: SchemaCommand,
-    },
-    /// Validate queries against a schema (offline) or repo (repo-backed).
-    ///
-    /// Canonical name is `lint` (matches the `omnigraph_compiler::lint`
-    /// module and the `OG-XXX-NNN` lint-code vocabulary). Replaces the
-    /// deprecated `omnigraph query lint` / `omnigraph query check` /
-    /// `omnigraph check` invocations — each is kept as an argv-level
-    /// shim that prints a one-line stderr warning and rewrites to
-    /// `omnigraph lint`. Aliases are deliberately *not* exposed via
-    /// clap's `visible_alias` because that would advertise two
-    /// equivalent canonical names, which agents emit interchangeably
-    /// (see MR-981).
-    Lint {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
-        query: PathBuf,
-        #[arg(long)]
-        schema: Option<PathBuf>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Operate on the server-side stored-query registry (`queries:`).
-    Queries {
-        #[command(subcommand)]
-        command: QueriesCommand,
-    },
-    /// Show graph snapshot
-    Snapshot {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
-        branch: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Export a full graph snapshot as JSONL
-    Export {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
-        branch: Option<String>,
-        #[arg(long, hide = true)]
-        jsonl: bool,
-        #[arg(long = "type")]
-        type_names: Vec<String>,
-        #[arg(long = "table")]
-        table_keys: Vec<String>,
-    },
-    /// Commit history operations
-    Commit {
-        #[command(subcommand)]
-        command: CommitCommand,
-    },
+    // ── Data plane ── run against a graph (embedded or via --server).
     /// Execute a read query against a branch or snapshot.
     ///
     /// Canonical read endpoint. The previous name `omnigraph read` is
@@ -274,10 +120,115 @@ pub(crate) enum Command {
         #[arg()]
         alias_args: Vec<String>,
     },
-    /// Policy administration and diagnostics
-    Policy {
+    /// Load data into a graph (local or remote)
+    Load {
+        /// Graph URI
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        data: PathBuf,
+        /// Target branch (defaults to main). Without --from it must exist.
+        #[arg(long)]
+        branch: Option<String>,
+        /// Base branch to fork --branch from when it doesn't exist yet.
+        /// Without this flag a missing branch is an error, never a fork.
+        #[arg(long)]
+        from: Option<String>,
+        /// How existing rows are handled: overwrite | append | merge.
+        /// Required — overwrite is destructive, so there is no default.
+        #[arg(long)]
+        mode: CliLoadMode,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Deprecated alias of `load --from <base>` (defaults: --mode merge, --from main)
+    #[command(hide = true)]
+    Ingest {
+        /// Graph URI
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long, default_value = "merge")]
+        mode: CliLoadMode,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Branch operations
+    Branch {
         #[command(subcommand)]
-        command: PolicyCommand,
+        command: BranchCommand,
+    },
+    /// Show graph snapshot
+    Snapshot {
+        /// Graph URI
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export a full graph snapshot as JSONL
+    Export {
+        /// Graph URI
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long, hide = true)]
+        jsonl: bool,
+        #[arg(long = "type")]
+        type_names: Vec<String>,
+        #[arg(long = "table")]
+        table_keys: Vec<String>,
+    },
+    /// Commit history operations
+    Commit {
+        #[command(subcommand)]
+        command: CommitCommand,
+    },
+    /// Schema planning operations
+    Schema {
+        #[command(subcommand)]
+        command: SchemaCommand,
+    },
+    /// Manage graphs on a multi-graph server (MR-668)
+    Graphs {
+        #[command(subcommand)]
+        command: GraphsCommand,
+    },
+
+    // ── Storage / local graph ops ── direct storage or local files; reject --server.
+    /// Initialize a new graph from a schema
+    Init {
+        #[arg(long)]
+        schema: PathBuf,
+        /// Graph URI (local path or s3://)
+        uri: String,
+        /// Overwrite existing schema artifacts at the URI. Without
+        /// this flag, init refuses to touch a URI that already holds
+        /// `_schema.pg`, `_schema.ir.json`, or `__schema_state.json`
+        /// — closes the re-init footgun (MR-668 follow-up). With the
+        /// flag, the operator opts in to destructive semantics.
+        #[arg(long)]
+        force: bool,
     },
     /// Compact small Lance fragments in every table of the graph
     Optimize {
@@ -287,6 +238,13 @@ pub(crate) enum Command {
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Cluster directory or storage-root URI; with --cluster-graph, resolves
+        /// the graph's storage URI from the served cluster state.
+        #[arg(long, conflicts_with_all = ["uri", "target"], requires = "cluster_graph")]
+        cluster: Option<String>,
+        /// Graph id within --cluster.
+        #[arg(long, requires = "cluster")]
+        cluster_graph: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -298,6 +256,13 @@ pub(crate) enum Command {
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Cluster directory or storage-root URI; with --cluster-graph, resolves
+        /// the graph's storage URI from the served cluster state.
+        #[arg(long, conflicts_with_all = ["uri", "target"], requires = "cluster_graph")]
+        cluster: Option<String>,
+        /// Graph id within --cluster.
+        #[arg(long, requires = "cluster")]
+        cluster_graph: Option<String>,
         /// Publish verified maintenance drift. Without this flag, repair only
         /// previews what it would do.
         #[arg(long)]
@@ -317,6 +282,13 @@ pub(crate) enum Command {
         target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Cluster directory or storage-root URI; with --cluster-graph, resolves
+        /// the graph's storage URI from the served cluster state.
+        #[arg(long, conflicts_with_all = ["uri", "target"], requires = "cluster_graph")]
+        cluster: Option<String>,
+        /// Graph id within --cluster.
+        #[arg(long, requires = "cluster")]
+        cluster_graph: Option<String>,
         /// Number of recent versions to keep per table. Either `--keep` or
         /// `--older-than` (or both) must be set.
         #[arg(long)]
@@ -331,16 +303,79 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Validate queries against a schema (offline) or repo (repo-backed).
+    ///
+    /// Canonical name is `lint` (matches the `omnigraph_compiler::lint`
+    /// module and the `OG-XXX-NNN` lint-code vocabulary). Replaces the
+    /// deprecated `omnigraph query lint` / `omnigraph query check` /
+    /// `omnigraph check` invocations — each is kept as an argv-level
+    /// shim that prints a one-line stderr warning and rewrites to
+    /// `omnigraph lint`. Aliases are deliberately *not* exposed via
+    /// clap's `visible_alias` because that would advertise two
+    /// equivalent canonical names, which agents emit interchangeably
+    /// (see MR-981).
+    Lint {
+        /// Graph URI
+        uri: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        query: PathBuf,
+        #[arg(long)]
+        schema: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Operate on the server-side stored-query registry (`queries:`).
+    Queries {
+        #[command(subcommand)]
+        command: QueriesCommand,
+    },
+
+    // ── Control plane ── manage a cluster directory (--config <dir>).
     /// Validate and plan read-only cluster configuration.
     Cluster {
         #[command(subcommand)]
         command: ClusterCommand,
     },
-    /// Manage graphs on a multi-graph server (MR-668)
-    Graphs {
+
+    // ── Session / config ── no graph addressing; local tooling.
+    /// Policy administration and diagnostics
+    Policy {
         #[command(subcommand)]
-        command: GraphsCommand,
+        command: PolicyCommand,
     },
+    /// Generate, clean, or refresh explicit seed embeddings
+    Embed(EmbedArgs),
+    /// Store a bearer token for a named server (0600 credentials file). Token
+    /// via --token or piped on stdin; see the CLI reference for token resolution.
+    Login {
+        /// Server name (keys the credential; declare its url under
+        /// `servers:` in ~/.omnigraph/config.yaml)
+        name: String,
+        /// The token. Prefer piping via stdin over this flag (shell
+        /// history).
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a named server's stored credential. Idempotent.
+    Logout {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Legacy-config tooling (RFC-008): split omnigraph.yaml into its
+    /// two destinations.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+    /// Print the CLI version
+    Version,
 }
 
 #[derive(Debug, Subcommand)]

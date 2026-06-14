@@ -304,10 +304,13 @@ impl GraphClient {
                 token,
             } => {
                 let data = std::fs::read_to_string(data)?;
+                // RFC-009 Phase 5: the canonical `load` verb targets the
+                // canonical `/load` route (the deprecated `ingest` verb below
+                // still rides `/ingest`).
                 let output = remote_json::<IngestOutput>(
                     http,
                     Method::POST,
-                    remote_url(base_url, "/ingest"),
+                    remote_url(base_url, "/load"),
                     Some(serde_json::to_value(IngestRequest {
                         branch: Some(branch.to_string()),
                         from: from.map(ToOwned::to_owned),

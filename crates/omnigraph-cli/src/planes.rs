@@ -139,7 +139,7 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
         // required positional URI), so its remediation drops the `--target` half.
         Plane::Storage => match cli.command {
             Command::Init { .. } => "Pass a storage URI.",
-            _ => "Use --target <name> or a storage URI.",
+            _ => "Use --target <name>, a storage URI, or --cluster <dir> --cluster-graph <id>.",
         },
         Plane::Control => "It operates on a cluster directory (pass --config <dir>).",
         Plane::Session => "It does not address a graph.",

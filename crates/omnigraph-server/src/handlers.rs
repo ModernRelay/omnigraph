@@ -1183,46 +1183,22 @@ pub(crate) async fn server_schema_apply(
     Ok(Json(schema_apply_output(handle.uri.as_str(), result)))
 }
 
-#[utoipa::path(
-    post,
-    path = "/ingest",
-    tag = "mutations",
-    operation_id = "ingest",
-    request_body = IngestRequest,
-    responses(
-        (status = 200, description = "Ingest results", body = IngestOutput),
-        (status = 400, description = "Bad request", body = ErrorOutput),
-        (status = 401, description = "Unauthorized", body = ErrorOutput),
-        (status = 403, description = "Forbidden", body = ErrorOutput),
-        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
-    ),
-    security(("bearer_token" = [])),
-)]
-/// Bulk-load NDJSON data into a branch.
-///
-/// `data` is NDJSON with one record per line. `mode` controls behavior on
-/// existing rows: `merge` upserts by id (default), `append` blindly inserts,
-/// `overwrite` replaces table contents. Branch creation is opt-in by
-/// presence of `from`: with `from` set, a missing `branch` is created from
-/// it; without `from`, `branch` must already exist — a missing branch is a
-/// 404, never an implicit fork. **Destructive** when `mode` is `overwrite`
-/// or when the load produces conflicting writes.
-pub(crate) async fn server_ingest(
-    State(state): State<AppState>,
-    Extension(handle): Extension<Arc<GraphHandle>>,
-    actor: Option<Extension<ResolvedActor>>,
-    Json(request): Json<IngestRequest>,
-) -> std::result::Result<Json<IngestOutput>, ApiError> {
+/// Shared body for `POST /load` (canonical) and `POST /ingest` (deprecated):
+/// branch-exists / fork-if-`from` check, Cedar authorization, admission, the
+/// bulk `load_as`, and the `IngestOutput` mapping.
+async fn run_ingest(
+    state: AppState,
+    handle: Arc<GraphHandle>,
+    actor: Option<&ResolvedActor>,
+    request: IngestRequest,
+) -> std::result::Result<IngestOutput, ApiError> {
     let branch = request.branch.unwrap_or_else(|| "main".to_string());
     let from = request.from;
     let mode = request.mode.unwrap_or(omnigraph::loader::LoadMode::Merge);
     let actor_arc = actor
-        .as_ref()
-        .map(|Extension(actor)| Arc::clone(&actor.actor_id))
+        .map(|actor| Arc::clone(&actor.actor_id))
         .unwrap_or_else(|| Arc::<str>::from("anonymous"));
-    let actor_id = actor
-        .as_ref()
-        .map(|Extension(actor)| actor.actor_id.as_ref());
+    let actor_id = actor.map(|actor| actor.actor_id.as_ref());
 
     let branch_exists = {
         let db = &handle.engine;
@@ -1244,7 +1220,7 @@ pub(crate) async fn server_ingest(
                 )));
             }
             Some(from) => authorize_request(
-                actor.as_ref().map(|Extension(actor)| actor),
+                actor,
                 handle.policy.as_deref(),
                 PolicyRequest {
                     action: PolicyAction::BranchCreate,
@@ -1255,7 +1231,7 @@ pub(crate) async fn server_ingest(
         }
     }
     authorize_request(
-        actor.as_ref().map(|Extension(actor)| actor),
+        actor,
         handle.policy.as_deref(),
         PolicyRequest {
             action: PolicyAction::Change,
@@ -1276,12 +1252,98 @@ pub(crate) async fn server_ingest(
             .map_err(ApiError::from_omni)?
     };
 
-    Ok(Json(ingest_output(
+    Ok(ingest_output(
         handle.uri.as_str(),
         &result,
         mode,
         actor_id.map(str::to_string),
-    )))
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/load",
+    tag = "mutations",
+    operation_id = "load",
+    request_body = IngestRequest,
+    responses(
+        (status = 200, description = "Load results", body = IngestOutput),
+        (status = 400, description = "Bad request", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+/// Bulk-load NDJSON data into a branch (canonical load endpoint).
+///
+/// `data` is NDJSON with one record per line. `mode` controls behavior on
+/// existing rows: `merge` upserts by id (default), `append` blindly inserts,
+/// `overwrite` replaces table contents. Branch creation is opt-in by
+/// presence of `from`: with `from` set, a missing `branch` is created from
+/// it; without `from`, `branch` must already exist — a missing branch is a
+/// 404, never an implicit fork. **Destructive** when `mode` is `overwrite`
+/// or when the load produces conflicting writes.
+///
+/// The legacy `POST /ingest` route has identical semantics and is kept as a
+/// deprecated alias.
+pub(crate) async fn server_load(
+    State(state): State<AppState>,
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    Json(request): Json<IngestRequest>,
+) -> std::result::Result<Json<IngestOutput>, ApiError> {
+    Ok(Json(
+        run_ingest(
+            state,
+            handle,
+            actor.as_ref().map(|Extension(actor)| actor),
+            request,
+        )
+        .await?,
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/ingest",
+    tag = "mutations",
+    operation_id = "ingest",
+    request_body = IngestRequest,
+    responses(
+        (status = 200, description = "Load results (response includes `Deprecation: true` + `Link: </load>; rel=\"successor-version\"`)", body = IngestOutput),
+        (status = 400, description = "Bad request", body = ErrorOutput),
+        (status = 401, description = "Unauthorized", body = ErrorOutput),
+        (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
+    ),
+    security(("bearer_token" = [])),
+)]
+#[deprecated(note = "use POST /load instead; /ingest is kept indefinitely for back-compat")]
+/// **Deprecated** — use [`POST /load`](#tag/mutations/operation/load) instead.
+///
+/// Bulk-load NDJSON data into a branch. Behavior is unchanged; the route is
+/// kept indefinitely for back-compat. New integrations should target
+/// `POST /load`, which has identical semantics. Responses from this route
+/// include `Deprecation: true` and `Link: </load>; rel="successor-version"`
+/// headers per RFC 9745 / RFC 8288 so SDKs and proxies can surface the signal.
+pub(crate) async fn server_ingest(
+    State(state): State<AppState>,
+    Extension(handle): Extension<Arc<GraphHandle>>,
+    actor: Option<Extension<ResolvedActor>>,
+    Json(request): Json<IngestRequest>,
+) -> std::result::Result<([(HeaderName, HeaderValue); 2], Json<IngestOutput>), ApiError> {
+    let output = run_ingest(
+        state,
+        handle,
+        actor.as_ref().map(|Extension(actor)| actor),
+        request,
+    )
+    .await?;
+    Ok((
+        deprecation_headers("</load>; rel=\"successor-version\""),
+        Json(output),
+    ))
 }
 
 #[utoipa::path(

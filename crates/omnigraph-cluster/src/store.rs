@@ -154,6 +154,21 @@ impl ClusterStore {
         }
     }
 
+    /// Display-form storage root (plain local path for `file://`, URI for S3).
+    pub(crate) fn display_root(&self) -> &str {
+        &self.display_root
+    }
+
+    /// Whether this root holds the cluster state ledger (`__cluster/state.json`)
+    /// — i.e. is an actual cluster, not just any directory. Probed via the
+    /// adapter (`file://` or `s3://`), failures read as "not a cluster".
+    pub(crate) async fn has_state(&self) -> bool {
+        self.adapter
+            .exists(&self.uri(CLUSTER_STATE_FILE))
+            .await
+            .unwrap_or(false)
+    }
+
     /// `read_text_versioned`, returning None for a missing object (probed
     /// via `exists` — the engine error type doesn't discriminate NotFound).
     async fn read_versioned_opt(&self, uri: &str) -> Result<Option<(String, String)>, String> {

@@ -147,6 +147,16 @@ async fn main() -> Result<()> {
             }
         }
         Command::Init { schema, uri, force } => {
+            // RFC-010 Slice 3: graphs inside an established cluster are created
+            // by `cluster apply` (which records ledger/recovery/approvals), not
+            // by hand-running `init` into the cluster's storage layout.
+            if let Some(root) = omnigraph_cluster::cluster_root_for_graph_uri(&uri).await {
+                bail!(
+                    "`{uri}` is inside cluster `{root}`. Graphs in a cluster are created by \
+                     `cluster apply` (which records ledger, recovery, and approvals), not `init`. \
+                     Declare the graph in cluster.yaml and run `cluster apply`."
+                );
+            }
             let schema_source = fs::read_to_string(&schema)?;
             ensure_local_graph_parent(&uri)?;
             Omnigraph::init_with_options(
@@ -783,10 +793,20 @@ async fn main() -> Result<()> {
             uri,
             target,
             config,
+            cluster,
+            cluster_graph,
             json,
         } => {
             let config = load_cli_config(config.as_ref())?;
-            let uri = resolve_local_uri(&config, uri, target.as_deref(), "optimize")?;
+            let uri = resolve_storage_uri(
+                &config,
+                uri,
+                target.as_deref(),
+                cluster.as_deref(),
+                cluster_graph.as_deref(),
+                "optimize",
+            )
+            .await?;
             let db = Omnigraph::open(&uri).await?;
             let stats = db.optimize().await?;
             if json {
@@ -823,12 +843,22 @@ async fn main() -> Result<()> {
             uri,
             target,
             config,
+            cluster,
+            cluster_graph,
             confirm,
             force,
             json,
         } => {
             let config = load_cli_config(config.as_ref())?;
-            let uri = resolve_local_uri(&config, uri, target.as_deref(), "repair")?;
+            let uri = resolve_storage_uri(
+                &config,
+                uri,
+                target.as_deref(),
+                cluster.as_deref(),
+                cluster_graph.as_deref(),
+                "repair",
+            )
+            .await?;
             let db = Omnigraph::open(&uri).await?;
             let stats = db
                 .repair(omnigraph::db::RepairOptions { confirm, force })
@@ -906,13 +936,23 @@ async fn main() -> Result<()> {
             uri,
             target,
             config,
+            cluster,
+            cluster_graph,
             keep,
             older_than,
             confirm,
             json,
         } => {
             let config = load_cli_config(config.as_ref())?;
-            let uri = resolve_local_uri(&config, uri, target.as_deref(), "cleanup")?;
+            let uri = resolve_storage_uri(
+                &config,
+                uri,
+                target.as_deref(),
+                cluster.as_deref(),
+                cluster_graph.as_deref(),
+                "cleanup",
+            )
+            .await?;
 
             let older_than_dur = older_than.as_deref().map(parse_duration_arg).transpose()?;
 

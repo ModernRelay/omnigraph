@@ -265,9 +265,9 @@ fn parity_errors_share_exit_codes() {
 //
 // - `graphs list`: server-only today; becomes Both-capability when the
 //   embedded arm enumerates the cluster catalog (RFC-009 open Q3, answered).
-// - `ingest`: deprecated alias of load; the remote `load` arm itself rides
-//   the deprecated /ingest route today (RFC-009 Phase 5 flips it to /load —
-//   this matrix's `parity_load` row is where that flip becomes visible).
+// - `ingest`: deprecated alias of load; its remote arm rides the deprecated
+//   /ingest route. The canonical `load` verb targets `/load` (RFC-009 Phase 5,
+//   landed) — `parity_load` exercises it on the remote arm.
 // - `init`, `optimize`, `repair`, `cleanup`, `cluster *`: storage-plane by
 //   design (must work with the server down); Phase 4 declares this.
 #[allow(dead_code)]

@@ -165,7 +165,7 @@ fn optimize_with_server_flag_errors_wrong_plane() {
     assert!(
         stderr.contains("`optimize` is a storage-plane command")
             && stderr.contains("--server/--graph address the data plane and do not apply")
-            && stderr.contains("Use --target <name> or a storage URI."),
+            && stderr.contains("Use --target <name>, a storage URI, or --cluster <dir> --cluster-graph <id>."),
         "wrong-plane guard message not found; got: {stderr}"
     );
 }
