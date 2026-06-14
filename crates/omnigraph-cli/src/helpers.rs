@@ -16,15 +16,41 @@ pub(crate) fn is_remote_uri(uri: &str) -> bool {
     uri.starts_with("http://") || uri.starts_with("https://")
 }
 
-pub(crate) fn remote_url(base: &str, path: &str) -> String {
-    format!("{}{}", base.trim_end_matches('/'), path)
-}
-
-pub(crate) fn remote_branch_url(base: &str, branch: &str) -> Result<String> {
-    let mut url = reqwest::Url::parse(&format!("{}/", base.trim_end_matches('/')))?;
+/// THE one way the CLI composes a remote request URL. Every remote call
+/// routes through here so URL assembly has a single mechanism instead of
+/// per-callsite string interpolation.
+///
+/// - `base` is the resolved server root (single-graph) or `…/graphs/{id}`
+///   (multi-graph).
+/// - `segments` are appended as individual percent-encoded path segments, so
+///   a dynamic component (branch name, commit id, query name) is always one
+///   safe segment — e.g. a branch `etl/zendesk/run-1` becomes `%2F`-escaped.
+/// - `query` pairs are percent-encoded values.
+///
+/// Trailing-slash normalization happens exactly once via `pop_if_empty`:
+/// `Url::parse` normalizes a path-less base (`http://host`) to a single empty
+/// trailing segment, and a `…/graphs/{id}/` base keeps its own. `extend`
+/// appends *after* the last segment, so without dropping a trailing empty one
+/// the join emits `…/graphs/{id}//branches/{name}` — the empty `//` segment
+/// misses the route and 404s. Because callers pass structured segments rather
+/// than a pre-joined string, neither a stray `//` nor an un-encoded dynamic
+/// component is representable here.
+pub(crate) fn remote_url(
+    base: &str,
+    segments: &[&str],
+    query: &[(&str, &str)],
+) -> Result<String> {
+    let mut url = reqwest::Url::parse(base.trim_end_matches('/'))?;
     url.path_segments_mut()
         .map_err(|_| color_eyre::eyre::eyre!("invalid remote base url"))?
-        .extend(["branches", branch]);
+        .pop_if_empty()
+        .extend(segments);
+    if !query.is_empty() {
+        let mut pairs = url.query_pairs_mut();
+        for (key, value) in query {
+            pairs.append_pair(key, value);
+        }
+    }
     Ok(url.to_string())
 }
 
@@ -340,7 +366,7 @@ pub(crate) async fn execute_operator_alias(
     remote_json(
         client,
         Method::POST,
-        remote_url(&uri, &format!("/queries/{}", alias.query)),
+        remote_url(&uri, &["queries", &alias.query], &[])?,
         body,
         bearer_token.as_deref(),
     )
@@ -1058,4 +1084,72 @@ pub(crate) fn rewrite_deprecated_argv(args: Vec<OsString>) -> Vec<OsString> {
         }
     }
     args
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `branch delete` interpolates the branch into the URL path. The composed
+    // path must be exactly `<base-path>/branches/<name>` with no empty `//`
+    // segment — an empty segment misses the
+    // `/graphs/{graph_id}/branches/{branch}` route and 404s.
+    #[test]
+    fn remote_url_multi_graph_base_has_no_double_slash() {
+        let url = remote_url("http://host/graphs/p9-os", &["branches", "tmpbranch"], &[]).unwrap();
+        assert_eq!(url, "http://host/graphs/p9-os/branches/tmpbranch");
+        assert!(
+            !url.contains("//branches"),
+            "double slash before branches: {url}"
+        );
+    }
+
+    #[test]
+    fn remote_url_single_graph_base_has_no_double_slash() {
+        let url = remote_url("http://host", &["branches", "tmpbranch"], &[]).unwrap();
+        assert_eq!(url, "http://host/branches/tmpbranch");
+    }
+
+    #[test]
+    fn remote_url_tolerates_trailing_slash_on_base() {
+        let url = remote_url("http://host/graphs/p9-os/", &["branches", "tmpbranch"], &[]).unwrap();
+        assert_eq!(url, "http://host/graphs/p9-os/branches/tmpbranch");
+    }
+
+    #[test]
+    fn remote_url_encodes_slashes_in_path_segment() {
+        let url = remote_url(
+            "http://host/graphs/p9-os",
+            &["branches", "etl/zendesk/run-1"],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "http://host/graphs/p9-os/branches/etl%2Fzendesk%2Frun-1"
+        );
+    }
+
+    // Sibling cases the unified builder closes by construction: a dynamic
+    // commit id in the path, and a branch name carried as a query value, are
+    // both percent-encoded instead of interpolated raw.
+    #[test]
+    fn remote_url_encodes_dynamic_path_segment_for_commits() {
+        let url = remote_url("http://host/graphs/p9-os", &["commits", "a/b c"], &[]).unwrap();
+        assert_eq!(url, "http://host/graphs/p9-os/commits/a%2Fb%20c");
+    }
+
+    #[test]
+    fn remote_url_encodes_query_values() {
+        let url = remote_url(
+            "http://host/graphs/p9-os",
+            &["snapshot"],
+            &[("branch", "feature&x=1")],
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "http://host/graphs/p9-os/snapshot?branch=feature%26x%3D1"
+        );
+    }
 }
