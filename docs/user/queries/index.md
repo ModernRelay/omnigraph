@@ -13,8 +13,11 @@ query <name>($p1: T1, $p2: T2?, …)
 
 Two body shapes:
 
-- **Read**: `match { … } return { … } [order { … }] [limit N]`
-- **Mutation**: one or more of `insert | update | delete` statements
+- **Read**: `match { … } return { … } [order { … }] [limit N]` — covered on this page.
+- **Mutation**: one or more of `insert | update | delete` statements — see [mutations](../mutations/index.md).
+
+Multi-modal search functions (`nearest`, `bm25`, `rrf`, …) used inside `match`,
+`return`, and `order` are documented on the [search](../search/index.md) page.
 
 Param types reuse all schema scalars; trailing `?` makes a param optional. The compiler reserves `$__nanograph_now` for `now()`.
 
@@ -25,21 +28,6 @@ Param types reuse all schema scalars; trailing `?` makes a param optional. The c
 - **Filter**: `<expr> <op> <expr>` with operators `>=`, `<=`, `!=`, `>`, `<`, `=`, and string `contains`.
 - **Negation**: `not { clause+ }` — desugars to anti-join over the inner pipeline.
 
-## Search clauses (multi-modal)
-
-Used inside MATCH or as expressions inside RETURN/ORDER:
-
-| Function | Purpose | Underlying Lance facility |
-|---|---|---|
-| `nearest($x.vec, $q)` | k-NN vector search (cosine) | Lance vector index (IVF / HNSW) |
-| `search(field, q)` | Generic FTS | Inverted index |
-| `fuzzy(field, q [, max_edits])` | Levenshtein-tolerant text search | Inverted index |
-| `match_text(field, q)` | Pattern match | Inverted index |
-| `bm25(field, q)` | BM25 scoring | Inverted index |
-| `rrf(rank_a, rank_b [, k])` | Reciprocal Rank Fusion of two rankings (default k=60) | OmniGraph fuses scored rankings |
-
-`nearest()` requires a `LIMIT`; the compiler resolves the query vector via the param map (or via the runtime embedding client when bound to a text input).
-
 ## RETURN clause
 
 `return { <expr> [as <alias>], … }` with expressions:
@@ -48,7 +36,7 @@ Used inside MATCH or as expressions inside RETURN/ORDER:
 - Literals: string, int, float, bool, list
 - `now()`
 - Aggregates: `count`, `sum`, `avg`, `min`, `max`
-- All search functions above (so you can return a score column)
+- [Search functions](../search/index.md) (so you can return a score column)
 - `AliasRef` — re-use a previous projection alias
 
 ## ORDER & LIMIT
@@ -58,21 +46,8 @@ Used inside MATCH or as expressions inside RETURN/ORDER:
 - **Total, deterministic order.** Rows with equal user-sort keys are broken by the bound entities' key columns (`<var>.id`, ascending) appended as a final tie-break, so the result is a *total* order — reproducible across runs, and `order … limit N` returns a deterministic top-N even when ties straddle the cutoff. (Aggregate results have no entity-key columns; their group rows are already distinct on the projected group keys.)
 - **NULL placement** is *nulls-first ascending, nulls-last descending* (i.e. `nulls_first = !descending`): a NULL sorts as if smaller than any value.
 
-## Mutation statements
-
-- `insert <Type> { prop: <value>, … }`
-- `update <Type> set { prop: <value>, … } where <prop> <op> <value>`
-- `delete <Type> where <prop> <op> <value>`
-
-`<value>` is a literal, `$param`, or `now()`. Multi-statement mutations execute atomically (added in v0.2.0).
-
-### D₂ — mixed insert/update + delete is rejected at parse time
-
-A single mutation query must be **either insert/update-only or delete-only**. Mixed → rejected before any I/O with the message:
-
-> `mutation '<name>' on the same query mixes inserts/updates and deletes; split into separate mutations: (1) inserts and updates, then (2) deletes. This restriction lifts when Lance exposes a two-phase delete API (tracked: MR-793 / Lance-upstream).`
-
-Reason: under the staged-write rewire (MR-794), inserts and updates accumulate in memory and commit at end-of-query, while deletes still inline-commit (Lance v6.0.1 has no public two-phase delete). Mixing creates ordering hazards (same-row insert→delete becomes a no-op because the staged insert isn't visible to delete; cascading deletes of just-inserted edges break referential integrity by silent design). Until the MR-A Lance v7 bump migrates `delete_where` to staged (`DeleteBuilder::execute_uncommitted` first ships in `v7.0.0-beta.10`), the parse-time rejection keeps both paths atomic and correct. See [docs/dev/writes.md](../../dev/writes.md), [docs/dev/lance.md](../../dev/lance.md), and [docs/dev/invariants.md](../../dev/invariants.md).
+Write statements (`insert` / `update` / `delete`) are documented on the
+[mutations](../mutations/index.md) page.
 
 ## IR (Intermediate Representation)
 

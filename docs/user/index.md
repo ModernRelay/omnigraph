@@ -12,6 +12,8 @@ start with install, then follow the section that matches your task.
 | Goal | Read |
 |---|---|
 | Install OmniGraph | [install.md](install.md) |
+| Run the core loop end to end | [quickstart.md](quickstart.md) |
+| Understand the model | [concepts/index.md](concepts/index.md) |
 | Run the CLI | [cli/index.md](cli/index.md) |
 | Look up every CLI flag and config field | [cli/reference.md](cli/reference.md) |
 
@@ -21,8 +23,9 @@ start with install, then follow the section that matches your task.
 |---|---|
 | Write schemas (the `.pg` language) | [schema/index.md](schema/index.md) |
 | Read schema-lint diagnostic codes | [schema/lint.md](schema/lint.md) |
-| Write queries and mutations (the `.gq` language) | [queries/index.md](queries/index.md) |
-| Use vector / full-text / hybrid search | [search/indexes.md](search/indexes.md) |
+| Write queries (the `.gq` language) | [queries/index.md](queries/index.md) |
+| Write data — inserts, updates, deletes | [mutations/index.md](mutations/index.md) |
+| Use vector / full-text / hybrid search | [search/index.md](search/index.md) |
 | Generate embeddings | [search/embeddings.md](search/embeddings.md) |
 | Build and use indexes | [search/indexes.md](search/indexes.md) |
 
@@ -30,7 +33,9 @@ start with install, then follow the section that matches your task.
 
 | Goal | Read |
 |---|---|
-| Work with branches, commits, and snapshots | [branching/index.md](branching/index.md) |
+| Work with branches and commits | [branching/index.md](branching/index.md) |
+| Read past versions (time travel) | [branching/time-travel.md](branching/time-travel.md) |
+| Merge branches and resolve conflicts | [branching/merge.md](branching/merge.md) |
 | Coordinate multi-query workflows | [branching/transactions.md](branching/transactions.md) |
 | Read diffs and change feeds | [branching/changes.md](branching/changes.md) |
 
@@ -56,6 +61,7 @@ start with install, then follow the section that matches your task.
 
 | Goal | Read |
 |---|---|
+| Understand the model and L1/L2 framing | [concepts/index.md](concepts/index.md) |
 | Understand graph layout and URI support | [concepts/storage.md](concepts/storage.md) |
 | Look up constants and tunables | [reference/constants.md](reference/constants.md) |
 
