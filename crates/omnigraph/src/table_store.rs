@@ -745,6 +745,7 @@ impl TableStore {
         let params = WriteParams {
             mode: WriteMode::Append,
             allow_external_blob_outside_bases: true,
+            auto_cleanup: None,
             ..Default::default()
         };
         ds.append(reader, Some(params))
@@ -764,6 +765,7 @@ impl TableStore {
                 let params = WriteParams {
                     mode: WriteMode::Append,
                     allow_external_blob_outside_bases: true,
+                    auto_cleanup: None,
                     ..Default::default()
                 };
                 ds.append(reader, Some(params))
@@ -777,6 +779,7 @@ impl TableStore {
                     enable_stable_row_ids: true,
                     data_storage_version: Some(LanceFileVersion::V2_2),
                     allow_external_blob_outside_bases: true,
+                    auto_cleanup: None,
                     ..Default::default()
                 };
                 Dataset::write(reader, dataset_uri, Some(params))
@@ -867,6 +870,7 @@ impl TableStore {
         let params = WriteParams {
             mode: WriteMode::Append,
             allow_external_blob_outside_bases: true,
+            auto_cleanup: None,
             ..Default::default()
         };
         let transaction = InsertBuilder::new(Arc::new(ds.clone()))
@@ -1087,6 +1091,7 @@ impl TableStore {
                 mode: WriteMode::Overwrite,
                 enable_stable_row_ids: true,
                 allow_external_blob_outside_bases: true,
+                auto_cleanup: None,
                 ..Default::default()
             };
             let transaction = InsertBuilder::new(Arc::new(ds.clone()))
@@ -1503,6 +1508,7 @@ impl TableStore {
             enable_stable_row_ids: true,
             data_storage_version: Some(LanceFileVersion::V2_2),
             allow_external_blob_outside_bases: true,
+            auto_cleanup: None,
             ..Default::default()
         };
         Dataset::write(reader, dataset_uri, Some(params))

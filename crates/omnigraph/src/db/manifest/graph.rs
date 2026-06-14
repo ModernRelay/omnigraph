@@ -31,6 +31,7 @@ pub(super) async fn init_manifest_graph(
         mode: WriteMode::Create,
         enable_stable_row_ids: true,
         data_storage_version: Some(LanceFileVersion::V2_2),
+        auto_cleanup: None,
         ..Default::default()
     };
     let manifest_path = manifest_uri(root);
@@ -127,6 +128,7 @@ async fn create_empty_dataset(uri: &str, schema: &SchemaRef) -> Result<Dataset> 
         enable_stable_row_ids: true,
         data_storage_version: Some(LanceFileVersion::V2_2),
         allow_external_blob_outside_bases: true,
+        auto_cleanup: None,
         ..Default::default()
     };
     Dataset::write(reader, uri, Some(params))
