@@ -7,47 +7,45 @@ Every node type and every edge type is its own Lance dataset:
 - **Columnar Arrow storage**: each property is a column; nullable per Arrow schema.
 - **Fragments**: data is partitioned into fragments; new writes create new fragments.
 - **Manifest versioning**: every commit produces a new dataset version; old versions remain readable.
-- **Stable row IDs**: `enable_stable_row_ids: true` is set on every Lance dataset OmniGraph creates — node and edge data tables, `__manifest`, `_graph_commits.lance`, `_graph_commit_recoveries.lance`, and any future system tables. This is an architectural invariant: the flag is one-way at dataset create per Lance's row-id-lineage spec, so a future change that introduces a Lance dataset must preserve it. Consequences: `_row_created_at_version` and `_row_last_updated_at_version` are available on every dataset (load-bearing for change-feed validators); `CreateIndex × Rewrite` is not a retryable conflict, so indices survive `omnigraph optimize` without needing the Fragment Reuse Index; readers must use a Lance build that recognises the flag (our pinned 4.0.0 is fine). Pre-0.4.x graphs created before this code path settled may have datasets without the flag and cannot be retrofitted in place — the supported path is dump-and-reload. The `stage_overwrite` rewrite path (used by `schema_apply`) preserves the flag through `Operation::Overwrite`; pinned by `stage_overwrite_preserves_stable_row_ids` in `crates/omnigraph/tests/staged_writes.rs`.
+- **Stable row IDs**: stable row IDs are enabled on every Lance dataset OmniGraph creates — node and edge data tables, `__manifest`, the commit-graph datasets, and any future system tables. This is an architectural invariant: the flag is one-way at dataset create, so a future change that introduces a Lance dataset must preserve it. Consequences: `_row_created_at_version` and `_row_last_updated_at_version` are available on every dataset (load-bearing for change-feed validators); indices survive `omnigraph optimize`. Pre-0.4.x graphs created before this code path settled may have datasets without the flag and cannot be retrofitted in place — the supported path is dump-and-reload. The rewrite path used by `schema_apply` preserves the flag.
 - **Append / delete / `merge_insert`**: native Lance write modes.
 - **Per-dataset branches** (Lance native): copy-on-write at the dataset level.
-- **Object-store agnostic**: file://, s3://, gs://, az://, http (read-only via Lance) — OmniGraph wires file:// and s3:// (`storage.rs`).
+- **Object-store agnostic**: file://, s3://, gs://, az://, http (read-only via Lance) — OmniGraph wires file:// and s3://.
 
 ## L2 — Multi-dataset coordination via `__manifest`
 
 OmniGraph is **not** a single Lance dataset; it is a *graph* of datasets coordinated through one append-only manifest table.
 
 - **Manifest table**: `__manifest/` Lance dataset.
-- **Layout** (`db/manifest/layout.rs`, `db/manifest/state.rs`):
+- **Layout**:
   - `nodes/{fnv1a64-hex(type_name)}` — one Lance dataset per node type
   - `edges/{fnv1a64-hex(edge_type_name)}` — one Lance dataset per edge type
   - `__manifest/` — the catalog of all sub-tables and their published versions
   - `_graph_commits.lance` / `_graph_commit_actors.lance` — the commit graph and its actor map
-  - (legacy `_graph_runs.lance` / `_graph_run_actors.lance` from pre-v0.4.0 graphs are inert; the run state machine was removed in MR-771. The v2→v3 manifest migration sweeps stale `__run__*` branches on first write-open; the inert dataset bytes themselves remain until a `delete_prefix` storage primitive lands)
+  - (legacy `_graph_runs.lance` / `_graph_run_actors.lance` from pre-v0.4.0 graphs are inert; the run state machine was removed. The internal schema migration sweeps stale `__run__*` branches on first write-open; the inert dataset bytes themselves remain until a prefix-delete storage primitive lands)
 - **Manifest row schema** (`object_id, object_type, location, metadata, base_objects, table_key, table_version, table_branch, row_count`):
   - `object_type` ∈ `table | table_version | table_tombstone`
   - `table_key` ∈ `node:<TypeName> | edge:<EdgeName>`
   - `table_branch` is `null` for the main lineage and the branch name otherwise
 - **Snapshot reconstruction**: latest visible `table_version` per `(table_key, table_branch)` minus tombstones — rows where `object_type = table_tombstone`, whose own `table_version` (acting as the tombstone version) is `>= the entry's table_version`.
-- **Atomic publish**: multi-dataset commits publish via a `ManifestBatchPublisher` so a single write to `__manifest` flips all the new sub-table versions visible at once.
-- **Row-level CAS on the merge-insert join key**: `object_id` carries `lance-schema:unenforced-primary-key=true` so Lance's bloom-filter conflict resolver rejects two concurrent commits that land the same `object_id` row. Without this annotation, Lance's transparent rebase would admit silent duplicates of `version:T@v=N` from racing publishers (see `.context/merge-insert-cas-granularity.md`).
-- **Optimistic concurrency control on publish**: `ManifestBatchPublisher::publish` accepts a `expected_table_versions: HashMap<table_key, u64>` map. Each entry asserts the manifest's current latest non-tombstoned version for that table is exactly what the caller observed; mismatches surface as `OmniError::Manifest` with `ManifestConflictDetails::ExpectedVersionMismatch { table_key, expected, actual }`. Empty map preserves the legacy "best-effort publish" semantics. The publisher uses `conflict_retries(0)` against Lance and owns retry itself (`PUBLISHER_RETRY_BUDGET = 5`), re-running the pre-check on each iteration so concurrent advances surface as `ExpectedVersionMismatch` rather than being silently rebased through.
+- **Atomic publish**: multi-dataset commits publish so that a single write to `__manifest` flips all the new sub-table versions visible at once.
+- **Row-level CAS on the merge-insert join key**: `object_id` carries an unenforced-primary-key annotation so Lance's bloom-filter conflict resolver rejects two concurrent commits that land the same `object_id` row. Without this annotation, Lance's transparent rebase would admit silent duplicates from racing publishers.
+- **Optimistic concurrency control on publish**: a publish asserts the manifest's current latest non-tombstoned version for each touched table is exactly what the caller observed; mismatches surface as an `ExpectedVersionMismatch` manifest conflict naming the table and the expected/actual versions. Concurrent advances surface as a conflict rather than being silently rebased through.
 
-### Internal schema versioning (`db/manifest/migrations.rs`)
+### Internal schema versioning
 
-The on-disk shape of `__manifest` is reconciled with the binary via a single stamp + dispatcher. `INTERNAL_MANIFEST_SCHEMA_VERSION` declares the shape this binary writes; the on-disk stamp `omnigraph:internal_schema_version` lives in the manifest dataset's schema-level metadata (Lance `update_schema_metadata`).
+The on-disk shape of `__manifest` is reconciled with the binary via a single version stamp held in the manifest dataset's schema-level metadata.
 
-- **`init_manifest_graph`** stamps the current version at creation, so newly initialized graphs never need migration.
-- **Publisher open-for-write path** (`load_publish_state`) calls `migrate_internal_schema(&mut dataset)` before reading state. When the on-disk stamp matches the binary, this is a single metadata read with no writes; otherwise the dispatcher walks `match`-arm steps forward (1→2, 2→3, …) until the stamp matches, then proceeds with the publish. Reads stay side-effect-free.
+- **Graph creation** stamps the current version, so newly initialized graphs never need migration.
+- **The open-for-write path** migrates the on-disk stamp before reading state. When the stamp matches the binary, this is a single metadata read with no writes; otherwise the migration walks steps forward (1→2, 2→3, …) until the stamp matches, then proceeds with the publish. Reads stay side-effect-free.
 - **Forward-version protection**: a stamp *higher* than the binary's known version triggers a clear "upgrade omnigraph first" error. An old binary cannot clobber a newer schema by silently treating "unknown stamp" as "missing stamp".
-- **Idempotency**: each migration step is safe to re-run. A crash between two metadata updates inside a single step leaves the partial state; the next open re-runs the step and the second update lands. The dispatcher itself is a cheap stamp-read on the steady-state path.
-
-Adding a new on-disk shape change is one constant bump (`INTERNAL_MANIFEST_SCHEMA_VERSION`), one match arm in `migrate_internal_schema`, and one test. No code outside this module branches on the stamp.
+- **Idempotency**: each migration step is safe to re-run. A crash between two metadata updates inside a single step leaves the partial state; the next open re-runs the step and the second update lands.
 
 | Stamp | Shape change |
 |---|---|
-| v1 (implicit, pre-stamp) | `__manifest.object_id` had no PK annotation; publisher had no row-level CAS protection. |
-| v2 | `__manifest.object_id` carries `lance-schema:unenforced-primary-key=true`; row-level CAS engaged. Stamped as `omnigraph:internal_schema_version=2`. |
-| v3 | One-time sweep of legacy `__run__*` staging branches (pre-v0.4.0 Run state machine, removed MR-771) off `__manifest`. Runs at `Omnigraph::open(ReadWrite)` and on publish. Stamped as `omnigraph:internal_schema_version=3`. |
+| v1 (implicit, pre-stamp) | `__manifest.object_id` had no PK annotation; no row-level CAS protection. |
+| v2 | `__manifest.object_id` carries an unenforced-primary-key annotation; row-level CAS engaged. |
+| v3 | One-time sweep of legacy `__run__*` staging branches (pre-v0.4.0 Run state machine, removed) off `__manifest`. Runs at read-write open and on publish. |
 
 ## On-disk layout
 
@@ -92,20 +90,20 @@ flowchart TB
 - **Graph root** is one directory (or S3 prefix). Everything below is part of one OmniGraph graph.
 - **`__manifest/`** is a Lance dataset whose rows describe which sub-table version is published at which graph-branch. Reading a snapshot starts here.
 - **`nodes/`** and **`edges/`** are sibling directories holding one Lance dataset per declared type. Names are `fnv1a64-hex` of the type name to keep paths fixed-length and case-safe.
-- **`_graph_commits.lance`** is an L2 dataset that records the graph-level commit DAG, with a paired `_graph_commit_actors.lance` for the actor map. (Pre-v0.4.0 graphs also have inert `_graph_runs.lance` / `_graph_run_actors.lance` from the removed Run state machine; the v2→v3 migration sweeps their stale `__run__*` branches, and the dataset bytes are reclaimed once `delete_prefix` lands.)
-- **`_graph_commit_recoveries.lance`** — one row per recovery sweep action. Joined to `_graph_commits.lance` by `graph_commit_id`; the linked commit row carries `actor_id=omnigraph:recovery`. Operators correlate recoveries with the original mutations they rolled forward / back via this join. See `crates/omnigraph/src/db/recovery_audit.rs`.
-- **`__recovery/{ulid}.json`** — transient sidecar files written by the five migrated writers (`MutationStaging::finalize`, `schema_apply`, `branch_merge`, `ensure_indices`, `optimize_all_tables`) before Phase B begins, deleted after Phase C succeeds. A sidecar persisting after process exit means the writer crashed in the Phase B → Phase C window; the next `Omnigraph::open` recovery sweep processes it. Steady-state directory is empty. See `crates/omnigraph/src/db/manifest/recovery.rs`.
+- **`_graph_commits.lance`** is an L2 dataset that records the graph-level commit DAG, with a paired `_graph_commit_actors.lance` for the actor map. (Pre-v0.4.0 graphs also have inert `_graph_runs.lance` / `_graph_run_actors.lance` from the removed Run state machine; the internal schema migration sweeps their stale `__run__*` branches, and the dataset bytes are reclaimed once a prefix-delete primitive lands.)
+- **`_graph_commit_recoveries.lance`** — one row per crash-recovery action. Joined to `_graph_commits.lance` by `graph_commit_id`; the linked commit row carries `actor_id=omnigraph:recovery`. Operators correlate recoveries with the original mutations they rolled forward / back via this join.
+- **`__recovery/{ulid}.json`** — transient sidecar files written by a writer before it advances the underlying dataset, deleted once the matching manifest publish succeeds. A sidecar persisting after process exit means the writer crashed mid-commit; the next read-write open processes it. Steady-state directory is empty.
 - **`_refs/branches/{name}.json`** is graph-level branch metadata — pointers from a branch name to the manifest version it heads.
 - **Inside each Lance dataset** (orange): the standard Lance directory layout. `_versions/{n}.manifest` records every commit; `data/` holds the actual Arrow fragments; `_indices/{uuid}/` holds index segments with their own `fragment_bitmap` for partial coverage; `_refs/` holds Lance-native per-dataset branches and tags.
 
 The split — L2 owns the cross-dataset catalog; L1 owns the per-dataset internals — means that schema work (which adds or removes datasets) updates `__manifest`, while data work (which adds fragments) updates `_versions/` inside the affected dataset and then bumps `__manifest`.
 
-## URI scheme support (`storage.rs`)
+## URI scheme support
 
 | Scheme | Backend | Notes |
 |---|---|---|
-| local path / `file://` | `ObjectStorageAdapter` over `object_store::LocalFileSystem` | Normalized to absolute paths; relative and dot-segment paths are lexically absolutized |
-| `s3://bucket/prefix` | `ObjectStorageAdapter` over `object_store` S3 | Honors `AWS_ENDPOINT_URL_S3`, `AWS_ALLOW_HTTP`, `AWS_S3_FORCE_PATH_STYLE` |
+| local path / `file://` | local filesystem | Normalized to absolute paths; relative and dot-segment paths are lexically absolutized |
+| `s3://bucket/prefix` | S3 object store | Honors `AWS_ENDPOINT_URL_S3`, `AWS_ALLOW_HTTP`, `AWS_S3_FORCE_PATH_STYLE` |
 | `http(s)://host:port` | HTTP client to `omnigraph-server` | Used by CLI as a target, not a storage backend |
 
 ## Object-store env vars (S3-compatible)

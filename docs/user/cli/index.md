@@ -106,7 +106,7 @@ omnigraph commit list graph.omni --json
 omnigraph commit show --uri graph.omni <commit-id> --json
 ```
 
-(The legacy `omnigraph run list/show/publish/abort` subcommands were removed in MR-771; mutations and loads publish atomically and the commit graph (`omnigraph commit list`) is the audit surface.)
+(Mutations and loads publish atomically; the commit graph (`omnigraph commit list`) is the audit surface.)
 
 `query lint` and `query check` are the same command surface. In v1, graph-backed
 lint uses local or `s3://` graph URIs; HTTP targets are only supported when you

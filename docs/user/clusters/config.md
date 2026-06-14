@@ -1,7 +1,5 @@
 # Cluster Config
 
-**Status:** Phase 5 — cluster-booted serving (`omnigraph-server --cluster`).
-
 > New to the cluster tooling? Start with the operator how-to guide,
 > [cluster.md](index.md) — this document is the reference.
 
