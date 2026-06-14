@@ -1540,3 +1540,62 @@ async fn second_sequential_update_on_same_row_succeeds() {
         "Alice's age must reflect the second update"
     );
 }
+
+// An interrupted first-write fork (create_branch succeeded, the manifest
+// publish did not) leaves a fully-formed Lance branch ref on the table that
+// the manifest never references — a "manifest-unreferenced fork". The branch
+// itself stays a valid manifest branch, so `cleanup`'s reconciler (keyed on
+// the manifest branch list) never reclaims it. Today the next write to that
+// table on that branch re-enters the fork path, `create_branch` collides, and
+// the engine wedges with "incomplete prior delete; run `omnigraph cleanup`".
+//
+// We forge that exact residue (a live `feature` branch + a directly-created
+// `feature` ref on the Person table the manifest doesn't reference) and assert
+// the next write — via both `load` and `mutate` — self-heals by reclaiming the
+// orphan fork and re-forking, rather than wedging. No process death / timing
+// needed: the forge is the post-crash state.
+#[tokio::test]
+async fn first_write_self_heals_manifest_unreferenced_fork_on_live_branch() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+
+    // Forge the manifest-unreferenced fork directly at the Lance layer.
+    let person_uri = node_table_uri(&uri, "Person");
+    {
+        let mut ds = lance::Dataset::open(&person_uri).await.unwrap();
+        let base = ds.version().version;
+        ds.create_branch("feature", base, None).await.unwrap();
+        assert!(
+            ds.list_branches().await.unwrap().contains_key("feature"),
+            "precondition: forged orphan fork present on Person"
+        );
+    }
+
+    // load → must self-heal, not wedge with "incomplete prior delete".
+    let row = r#"{"type":"Person","data":{"name":"Zoe","age":30}}"#;
+    db.load_as("feature", None, row, LoadMode::Merge, None)
+        .await
+        .expect("load onto a manifest-unreferenced fork must self-heal, not wedge");
+
+    // mutate → same path, must also self-heal.
+    mutate_branch(
+        &mut db,
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Yan")], &[("$age", 41)]),
+    )
+    .await
+    .expect("mutate onto a manifest-unreferenced fork must self-heal");
+
+    // The healed branch holds the new rows; main is untouched (still no Zoe/Yan).
+    let feature_people = count_rows_branch(&db, "feature", "node:Person").await;
+    let main_people = count_rows(&db, "node:Person").await;
+    assert!(
+        feature_people >= main_people + 2,
+        "feature must contain the two new rows on top of the inherited set \
+         (feature={feature_people}, main={main_people})"
+    );
+}
