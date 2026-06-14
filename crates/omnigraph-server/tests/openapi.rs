@@ -172,6 +172,7 @@ const EXPECTED_PATHS: &[&str] = &[
     "/queries/{name}",
     "/schema",
     "/schema/apply",
+    "/load",
     "/ingest",
     "/branches",
     "/branches/{branch}",
@@ -298,6 +299,32 @@ fn openapi_mutate_is_not_deprecated() {
 fn openapi_ingest_is_post() {
     let doc = openapi_json();
     assert!(doc["paths"]["/ingest"]["post"].is_object());
+}
+
+#[test]
+fn openapi_load_is_not_deprecated() {
+    // RFC-009 Phase 5: /load is the canonical bulk-load endpoint.
+    let doc = openapi_json();
+    assert!(doc["paths"]["/load"]["post"].is_object());
+    let deprecated = doc["paths"]["/load"]["post"]
+        .get("deprecated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    assert!(
+        !deprecated,
+        "/load is the canonical load endpoint and must not be deprecated"
+    );
+}
+
+#[test]
+fn openapi_ingest_is_deprecated() {
+    // RFC-009 Phase 5: /ingest is now the deprecated alias of /load.
+    let doc = openapi_json();
+    assert_eq!(
+        doc["paths"]["/ingest"]["post"]["deprecated"],
+        serde_json::Value::Bool(true),
+        "/ingest must be flagged deprecated now that /load is canonical"
+    );
 }
 
 #[test]
@@ -705,6 +732,7 @@ fn protected_endpoints_reference_bearer_token_security() {
         ("/schema/apply", "post"),
         ("/queries", "get"),
         ("/queries/{name}", "post"),
+        ("/load", "post"),
         ("/ingest", "post"),
         ("/export", "post"),
         ("/snapshot", "get"),

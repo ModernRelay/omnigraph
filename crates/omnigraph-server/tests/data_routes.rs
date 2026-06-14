@@ -621,6 +621,83 @@ async fn change_endpoint_emits_deprecation_headers() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn load_endpoint_loads_into_existing_branch() {
+    // Canonical bulk-load endpoint (RFC-009 Phase 5). Same wire shape as
+    // /ingest, no deprecation signal.
+    let (_temp, app) = app_for_loaded_graph().await;
+    let request = IngestRequest {
+        branch: Some("main".to_string()),
+        from: None,
+        mode: Some(LoadMode::Merge),
+        data: r#"{"type":"Person","data":{"name":"Loaded","age":7}}"#.to_string(),
+    };
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/load")
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers().get("deprecation").is_none(),
+        "POST /load must not advertise itself as deprecated"
+    );
+    let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(body["branch"], "main");
+    assert_eq!(body["tables"][0]["table_key"], "node:Person");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_endpoint_emits_deprecation_headers() {
+    // `/ingest` is the deprecated alias of `/load` (RFC-009 Phase 5): flagged
+    // at runtime per RFC 9745 (`Deprecation: true`) + RFC 8288 (`Link: </load>;
+    // rel="successor-version"`). The OpenAPI side is covered by
+    // `openapi_ingest_is_deprecated` in tests/openapi.rs.
+    let (_temp, app) = app_for_loaded_graph().await;
+    let request = IngestRequest {
+        branch: Some("main".to_string()),
+        from: None,
+        mode: Some(LoadMode::Merge),
+        data: r#"{"type":"Person","data":{"name":"Legacyer","age":33}}"#.to_string(),
+    };
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/ingest")
+                .method(Method::POST)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("deprecation")
+            .and_then(|v| v.to_str().ok()),
+        Some("true"),
+        "POST /ingest must advertise `Deprecation: true` (RFC 9745)"
+    );
+    assert_eq!(
+        response.headers().get("link").and_then(|v| v.to_str().ok()),
+        Some("</load>; rel=\"successor-version\""),
+        "POST /ingest must point at /load via `Link` rel=successor-version (RFC 8288)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn read_endpoint_emits_deprecation_headers() {
     // `/read` is kept indefinitely for byte-stable back-compat but flagged
     // at runtime per RFC 9745 + RFC 8288. Successor is `/query`.
