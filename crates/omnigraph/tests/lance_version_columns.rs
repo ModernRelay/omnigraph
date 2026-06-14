@@ -191,14 +191,16 @@ async fn lance_merge_insert_new_row_stamps_created_at_version() {
     let eve = rows.iter().find(|r| r.0 == "eve").unwrap();
     eprintln!("Eve: created_at_version={}, v1={}, v2={}", eve.2, v1, v2);
 
-    // Lance behavior (as of 3.0.1): merge_insert stamps new rows with
-    // _row_created_at_version = dataset_creation_version (v1), NOT the
-    // merge_insert commit version (v2). This is why Omnigraph's change
-    // detection uses _row_last_updated_at_version + ID set membership
-    // to classify inserts vs updates, not _row_created_at_version alone.
+    // Lance behavior (7.0.0, lance#6774): merge_insert stamps new INSERT
+    // rows with _row_created_at_version = the commit version (v2). Earlier
+    // Lance used a fallback of the dataset creation version; #6774 changed
+    // it so created_at reflects when the row actually entered the dataset.
+    // Omnigraph's change detection keys on _row_last_updated_at_version + ID
+    // set membership (see changes/mod.rs), so this stamping change leaves
+    // insert-vs-update classification unaffected.
     assert_eq!(
-        eve.2, v1,
-        "Lance merge_insert stamps new rows with created_at = dataset creation version, not commit version"
+        eve.2, v2,
+        "Lance merge_insert stamps new rows with created_at = commit version (lance#6774)"
     );
     assert_eq!(
         eve.3, v2,

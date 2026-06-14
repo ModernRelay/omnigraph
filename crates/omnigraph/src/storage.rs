@@ -9,7 +9,7 @@ use object_store::aws::AmazonS3Builder;
 use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
-use object_store::{DynObjectStore, ObjectStore, PutMode, PutPayload};
+use object_store::{DynObjectStore, ObjectStore, ObjectStoreExt, PutMode, PutPayload};
 use url::Url;
 
 use crate::error::{OmniError, Result};
