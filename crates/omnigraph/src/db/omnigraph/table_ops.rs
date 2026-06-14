@@ -310,6 +310,48 @@ pub(super) async fn ensure_indices_for_branch(db: &Omnigraph, branch: Option<&st
     Ok(())
 }
 
+/// The single scalar/vector index a node property receives from a one-column
+/// `@index`/`@key` declaration, or `None` when the property type is not
+/// indexable here (a list column or `Blob`).
+///
+/// Shared by `build_indices_on_dataset_for_catalog` (which builds the index)
+/// and `needs_index_work_node` (which checks coverage to decide recovery-
+/// sidecar pinning) so the two cannot drift: an enum or orderable scalar the
+/// builder gives a BTREE must also be reported as "needs work" until that
+/// BTREE exists, or the HEAD-advancing build would run without sidecar cover.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NodePropIndexKind {
+    Btree,
+    Fts,
+    Vector,
+}
+
+fn node_prop_index_kind(prop_type: &PropType) -> Option<NodePropIndexKind> {
+    if prop_type.list {
+        return None;
+    }
+    // Enums are physically `String` but filtered by equality, so they take a
+    // scalar BTREE, not an FTS inverted index (Lance never consults an inverted
+    // index for `=`/range). Free-text Strings keep FTS for
+    // `search()`/`match_text`/`bm25`.
+    let is_enum = prop_type.enum_values.is_some();
+    match prop_type.scalar {
+        ScalarType::String if !is_enum => Some(NodePropIndexKind::Fts),
+        ScalarType::Vector(_) => Some(NodePropIndexKind::Vector),
+        ScalarType::String
+        | ScalarType::DateTime
+        | ScalarType::Date
+        | ScalarType::I32
+        | ScalarType::I64
+        | ScalarType::U32
+        | ScalarType::U64
+        | ScalarType::F32
+        | ScalarType::F64
+        | ScalarType::Bool => Some(NodePropIndexKind::Btree),
+        ScalarType::Blob => None,
+    }
+}
+
 /// Returns true if the node table is missing at least one declared
 /// scalar/vector index that `build_indices_on_dataset_for_catalog` would
 /// build AND has at least one row (the ensure_indices loop has
@@ -318,11 +360,12 @@ pub(super) async fn ensure_indices_for_branch(db: &Omnigraph, branch: Option<&st
 /// would force `NoMovement` classification on recovery and trigger the
 /// all-or-nothing rollback of sibling tables' legitimate index work).
 ///
-/// Per the actual `build_indices_on_dataset_for_catalog` implementation
-/// (this file, ~line 419-491), nodes get BTree (id) + per-prop FTS
-/// (@search String) + per-prop Vector indices; edges get BTree only
-/// (id, src, dst). The two helpers mirror that asymmetry — see the
-/// `needs_index_work_edge` doc comment.
+/// Per `build_indices_on_dataset_for_catalog`, nodes get BTree (id) plus, for
+/// each one-column `@index`/`@key` property, the index `node_prop_index_kind`
+/// assigns: a scalar BTREE for enums and orderable scalars
+/// (DateTime/Date/numeric/Bool), FTS for free-text Strings, or a Vector index.
+/// Edges get BTree only (id, src, dst). This helper and the builder share
+/// `node_prop_index_kind` so they cannot drift — see its doc comment.
 async fn needs_index_work_node(
     db: &Omnigraph,
     type_name: &str,
@@ -359,14 +402,23 @@ async fn needs_index_work_node(
         let Some(prop_type) = node_type.properties.get(prop_name) else {
             continue;
         };
-        if matches!(prop_type.scalar, ScalarType::String) && !prop_type.list {
-            if !db.storage().has_fts_index(&ds, prop_name).await? {
-                return Ok(true);
+        match node_prop_index_kind(prop_type) {
+            Some(NodePropIndexKind::Fts) => {
+                if !db.storage().has_fts_index(&ds, prop_name).await? {
+                    return Ok(true);
+                }
             }
-        } else if matches!(prop_type.scalar, ScalarType::Vector(_)) && !prop_type.list {
-            if !db.storage().has_vector_index(&ds, prop_name).await? {
-                return Ok(true);
+            Some(NodePropIndexKind::Vector) => {
+                if !db.storage().has_vector_index(&ds, prop_name).await? {
+                    return Ok(true);
+                }
             }
+            Some(NodePropIndexKind::Btree) => {
+                if !db.storage().has_btree_index(&ds, prop_name).await? {
+                    return Ok(true);
+                }
+            }
+            None => {}
         }
     }
     Ok(false)
@@ -615,30 +667,44 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
                 }
                 let prop_name = &index_cols[0];
                 if let Some(prop_type) = node_type.properties.get(prop_name) {
-                    if matches!(prop_type.scalar, ScalarType::String) && !prop_type.list {
-                        if !db.storage().has_fts_index(ds, prop_name).await? {
-                            stage_and_commit_inverted(db, table_key, ds, prop_name.as_str())
-                                .await?;
+                    match node_prop_index_kind(prop_type) {
+                        Some(NodePropIndexKind::Fts) => {
+                            if !db.storage().has_fts_index(ds, prop_name).await? {
+                                stage_and_commit_inverted(db, table_key, ds, prop_name.as_str())
+                                    .await?;
+                            }
                         }
-                    } else if matches!(prop_type.scalar, ScalarType::Vector(_)) && !prop_type.list {
-                        if !db.storage().has_vector_index(ds, prop_name).await? {
-                            // Inline-commit residual: lance-6.0.1 does not
-                            // expose `build_index_metadata_from_segments` as
-                            // `pub`, so vector indices cannot be staged from
-                            // outside the lance crate. Document at the call
-                            // site; companion ticket to lance-format/lance#6658.
-                            let new_snap = db
-                                .storage_inline_residual()
-                                .create_vector_index(ds.clone(), prop_name.as_str())
-                                .await
-                                .map_err(|e| {
-                                    OmniError::Lance(format!(
-                                        "create Vector index on {}({}): {}",
-                                        table_key, prop_name, e
-                                    ))
-                                })?;
-                            *ds = new_snap;
+                        Some(NodePropIndexKind::Vector) => {
+                            if !db.storage().has_vector_index(ds, prop_name).await? {
+                                // Inline-commit residual: lance-6.0.1 does not
+                                // expose `build_index_metadata_from_segments` as
+                                // `pub`, so vector indices cannot be staged from
+                                // outside the lance crate. Document at the call
+                                // site; companion ticket to lance-format/lance#6658.
+                                let new_snap = db
+                                    .storage_inline_residual()
+                                    .create_vector_index(ds.clone(), prop_name.as_str())
+                                    .await
+                                    .map_err(|e| {
+                                        OmniError::Lance(format!(
+                                            "create Vector index on {}({}): {}",
+                                            table_key, prop_name, e
+                                        ))
+                                    })?;
+                                *ds = new_snap;
+                            }
                         }
+                        // Enum + orderable scalars (DateTime/Date/numeric/Bool)
+                        // get a BTREE so `=`, range, IN, and IS NULL are index-
+                        // accelerated instead of degrading to a full scan.
+                        Some(NodePropIndexKind::Btree) => {
+                            if !db.storage().has_btree_index(ds, prop_name).await? {
+                                stage_and_commit_btree(db, table_key, ds, &[prop_name.as_str()])
+                                    .await?;
+                            }
+                        }
+                        // List or Blob column: not indexable as a scalar here.
+                        None => {}
                     }
                 }
             }

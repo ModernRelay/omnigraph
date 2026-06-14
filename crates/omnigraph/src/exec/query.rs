@@ -1289,10 +1289,12 @@ async fn expand_hydrate_and_align(
     params: &ParamMap,
 ) -> Result<()> {
     // Pushable destination filters are applied by `hydrate_nodes`; the rest
-    // (`ir_filter_to_expr` → None) are applied in memory after hconcat.
+    // (`ir_filter_to_expr` → None) are applied in memory after hconcat. The
+    // schema arg only affects a pushable literal's TYPE, never Some-vs-None, so
+    // `None` here yields the same pushable/non-pushable split as `hydrate_nodes`.
     let non_pushable: Vec<&IRFilter> = dst_filters
         .iter()
-        .filter(|f| ir_filter_to_expr(f, params).is_none())
+        .filter(|f| ir_filter_to_expr(f, params, None).is_none())
         .collect();
 
     // Unique destination ids (first-seen order) for one batched hydration.
@@ -1506,7 +1508,8 @@ async fn hydrate_nodes(
     // `id IN (ids)` AND any pushable destination filters, as a structured Expr.
     let id_list: Vec<datafusion::prelude::Expr> = ids.iter().map(|id| lit(id.clone())).collect();
     let mut filter_expr = col("id").in_list(id_list, false);
-    if let Some(dst_expr) = build_lance_filter_expr(dst_filters, params) {
+    if let Some(dst_expr) = build_lance_filter_expr(dst_filters, params, Some(&node_type.arrow_schema))
+    {
         filter_expr = filter_expr.and(dst_expr);
     }
 
@@ -1747,21 +1750,23 @@ async fn execute_node_scan(
     let table_key = format!("node:{}", type_name);
     let ds = snapshot.open(&table_key).await?;
 
+    let node_type = &catalog.node_types[type_name];
+
     // Lower the IR filters to a DataFusion `Expr` and apply via
     // `Scanner::filter_expr` inside the configure closure. The string
     // pushdown path (`build_lance_filter` → `scanner.filter(&str)`) is
     // gone for node scans — structured Expr unlocks `CompOp::Contains`
     // pushdown (via `array_has`) and lets DF 53's optimizer rules
     // (vectorized IN-list, PhysicalExprSimplifier, CASE-NULL shortcut)
-    // reach our predicates. Other call sites that still take string SQL
-    // (hydrate_nodes for the Expand pushdown, count_rows, the mutation
-    // delete path) migrate in follow-up MRs.
-    let filter_expr = build_lance_filter_expr(filters, params);
+    // reach our predicates. Passing the node's `arrow_schema` lets the lowering
+    // coerce literals to each column's exact type so narrow-numeric BTREEs are
+    // used. Other call sites that still take string SQL (count_rows, the
+    // mutation delete path) migrate in follow-up MRs.
+    let filter_expr = build_lance_filter_expr(filters, params, Some(&node_type.arrow_schema));
 
     // Blob columns must be excluded from scan when a filter is present
     // (Lance bug: BlobsDescriptions + filter triggers a projection assertion).
     // We exclude blob columns and add metadata post-scan via take_blobs_by_indices.
-    let node_type = &catalog.node_types[type_name];
     let has_blobs = !node_type.blob_properties.is_empty();
     let non_blob_cols: Vec<&str> = node_type
         .arrow_schema
@@ -1990,13 +1995,14 @@ pub(super) fn literal_to_sql(lit: &Literal) -> String {
 pub(super) fn build_lance_filter_expr(
     filters: &[IRFilter],
     params: &ParamMap,
+    schema: Option<&Schema>,
 ) -> Option<datafusion::prelude::Expr> {
     use datafusion::logical_expr::Operator;
     use datafusion::prelude::Expr;
 
     let mut acc: Option<Expr> = None;
     for f in filters {
-        let Some(e) = ir_filter_to_expr(f, params) else {
+        let Some(e) = ir_filter_to_expr(f, params, schema) else {
             continue;
         };
         acc = Some(match acc {
@@ -2017,6 +2023,7 @@ pub(super) fn build_lance_filter_expr(
 pub(super) fn ir_filter_to_expr(
     filter: &IRFilter,
     params: &ParamMap,
+    schema: Option<&Schema>,
 ) -> Option<datafusion::prelude::Expr> {
     use datafusion::functions_nested::expr_fn::array_has;
 
@@ -2027,14 +2034,22 @@ pub(super) fn ir_filter_to_expr(
     // List-contains: `prop CONTAINS value` lowers to `array_has(prop, value)`.
     // This is the case the old SQL-string pushdown had to return None for
     // ("Can't pushdown list contains"); with structured Expr it pushes down fine.
+    // (Element-type coercion for the contained value is deferred — list columns
+    // are not scalar-indexed, so the index-eligibility concern below does not apply.)
     if matches!(filter.op, CompOp::Contains) {
-        let left = ir_expr_to_expr(&filter.left, params)?;
-        let right = ir_expr_to_expr(&filter.right, params)?;
+        let left = ir_expr_to_expr(&filter.left, params, None)?;
+        let right = ir_expr_to_expr(&filter.right, params, None)?;
         return Some(array_has(left, right));
     }
 
-    let left = ir_expr_to_expr(&filter.left, params)?;
-    let right = ir_expr_to_expr(&filter.right, params)?;
+    // A literal/param operand is coerced to the OTHER operand's column type so
+    // the predicate stays a direct `col OP literal` and the scalar index is used.
+    // Without this, DataFusion widens a narrow column (`CAST(col AS Int64)`),
+    // which defeats the BTREE (validated by `probe_scalar_index_use_under_literal_type`).
+    let left_col_type = prop_data_type(&filter.left, schema);
+    let right_col_type = prop_data_type(&filter.right, schema);
+    let left = ir_expr_to_expr(&filter.left, params, right_col_type.as_ref())?;
+    let right = ir_expr_to_expr(&filter.right, params, left_col_type.as_ref())?;
     Some(match filter.op {
         CompOp::Eq => left.eq(right),
         CompOp::Ne => left.not_eq(right),
@@ -2052,19 +2067,91 @@ pub(super) fn ir_filter_to_expr(
 pub(super) fn ir_expr_to_expr(
     expr: &IRExpr,
     params: &ParamMap,
+    target: Option<&arrow_schema::DataType>,
 ) -> Option<datafusion::prelude::Expr> {
-    use datafusion::prelude::{col, lit};
+    use datafusion::prelude::col;
     match expr {
         IRExpr::PropAccess { property, .. } => Some(col(property)),
-        IRExpr::Literal(l) => literal_to_expr(l),
-        IRExpr::Param(name) => params.get(name).and_then(literal_to_expr),
+        IRExpr::Literal(l) => literal_to_expr_coerced(l, target),
+        IRExpr::Param(name) => params
+            .get(name)
+            .and_then(|l| literal_to_expr_coerced(l, target)),
         _ => None,
     }
 }
 
-/// Convert a Literal to a DataFusion `Expr`. Returns `None` for List
-/// (which the existing SQL path also can't pushdown — falls through to
-/// post-scan in-memory application).
+/// The Arrow type of a `PropAccess` operand, looked up in the scan's schema, or
+/// `None` if the expr is not a column or the schema/field is unavailable.
+fn prop_data_type(expr: &IRExpr, schema: Option<&Schema>) -> Option<arrow_schema::DataType> {
+    match expr {
+        IRExpr::PropAccess { property, .. } => schema?
+            .field_with_name(property)
+            .ok()
+            .map(|f| f.data_type().clone()),
+        _ => None,
+    }
+}
+
+/// Lower a literal for pushdown, coercing it to `target` (the comparison
+/// column's Arrow type) when known. Falls back to the natural-type
+/// `literal_to_expr` on a missing target or any coercion failure, so a filter is
+/// never demoted to `None` by coercion (a node scan has no in-memory fallback for
+/// inline filters — see `execute_node_scan`).
+fn literal_to_expr_coerced(
+    lit: &Literal,
+    target: Option<&arrow_schema::DataType>,
+) -> Option<datafusion::prelude::Expr> {
+    if let Some(target) = target {
+        if let Some(e) = literal_to_typed_expr(lit, target) {
+            return Some(e);
+        }
+    }
+    literal_to_expr(lit)
+}
+
+/// Build a literal as a typed Arrow scalar matching `target`, reusing the same
+/// `literal_to_array` + `arrow_cast` path as the in-memory arm
+/// (`projection.rs::evaluate_filter`) so the two arms agree. Returns `None` on
+/// any failure (unbuildable literal, incompatible cast) — the caller then falls
+/// back to the natural-type literal.
+///
+/// Lossless-only for integer targets: typecheck permits numeric cross-type
+/// comparisons (`types_compatible`), so a fractional float or out-of-range
+/// integer can reach here. Casting those to a narrower integer would truncate
+/// (`2.7 -> 2`) or overflow to null, silently changing which rows match. We
+/// round-trip the cast and, on mismatch, return `None` so the caller keeps the
+/// natural literal — correct via DataFusion coercion, the index just goes unused
+/// for that out-of-domain predicate. Float targets are exempt: narrowing
+/// `F64 -> F32` is the column's own precision domain, not a value error.
+fn literal_to_typed_expr(
+    lit: &Literal,
+    target: &arrow_schema::DataType,
+) -> Option<datafusion::prelude::Expr> {
+    use datafusion::prelude::lit as df_lit;
+    use datafusion::scalar::ScalarValue;
+
+    let arr = super::projection::literal_to_array(lit, 1).ok()?;
+    if arr.data_type() == target {
+        return Some(df_lit(ScalarValue::try_from_array(&arr, 0).ok()?));
+    }
+    let casted = arrow_cast::cast::cast(&arr, target).ok()?;
+    if target.is_integer() {
+        let back = arrow_cast::cast::cast(&casted, arr.data_type()).ok()?;
+        let original = ScalarValue::try_from_array(&arr, 0).ok()?;
+        let round_tripped = ScalarValue::try_from_array(&back, 0).ok()?;
+        if original != round_tripped {
+            return None;
+        }
+    }
+    Some(df_lit(ScalarValue::try_from_array(&casted, 0).ok()?))
+}
+
+/// Convert a Literal to a DataFusion `Expr` in its NATURAL Arrow type. This is
+/// the fallback used when the comparison column's type is unknown (no schema) or
+/// when coercion to it fails; the typed, column-matched coercion that keeps
+/// scalar indexes usable lives in `literal_to_typed_expr`. Returns `None` for
+/// List (the SQL path also could not pushdown it — falls through to post-scan
+/// in-memory application).
 fn literal_to_expr(lit: &Literal) -> Option<datafusion::prelude::Expr> {
     use datafusion::prelude::lit as df_lit;
     Some(match lit {
@@ -2073,9 +2160,12 @@ fn literal_to_expr(lit: &Literal) -> Option<datafusion::prelude::Expr> {
         Literal::Integer(n) => df_lit(*n),
         Literal::Float(f) => df_lit(*f),
         Literal::Bool(b) => df_lit(*b),
-        // Date/DateTime stored as strings; pass through as string literals
-        // — Lance/DataFusion handles the comparison against typed columns
-        // via implicit cast, matching the existing string-SQL behavior.
+        // Date/DateTime pass through as strings here. Against a typed Date
+        // column DataFusion casts the LITERAL (`CAST(Utf8 AS Date32)`), which is
+        // index-safe (proven by `scalar_index_use_requires_matched_literal_type`).
+        // At real pushdown sites the schema is known, so `literal_to_typed_expr`
+        // produces a typed Date32/Date64 anyway; this branch is only the
+        // no-schema fallback.
         Literal::Date(s) => df_lit(s.clone()),
         Literal::DateTime(s) => df_lit(s.clone()),
         Literal::List(_) => return None,
@@ -2283,5 +2373,207 @@ mod expand_chooser_tests {
         assert_eq!(choose_expand_mode(&i), ExpandMode::IndexedScan);
         i.effective_max_hops = 5; // as if the cross-type cap were not applied
         assert_eq!(choose_expand_mode(&i), ExpandMode::Csr);
+    }
+}
+
+#[cfg(test)]
+mod literal_lowering_tests {
+    use super::*;
+    use datafusion::prelude::Expr;
+    use datafusion::scalar::ScalarValue;
+
+    // With the column type known, the generic coercion types a date literal to
+    // the column's Date32/Date64 (the live pushdown path). Without a target it
+    // is the natural Utf8 fallback, which is still index-safe for dates because
+    // DataFusion casts the LITERAL, not the column (proven by
+    // `lance_surface_guards::scalar_index_use_requires_matched_literal_type`).
+    #[test]
+    fn date_literals_coerce_to_typed_arrow_scalars() {
+        use arrow_schema::DataType;
+        let dt = literal_to_expr_coerced(
+            &Literal::DateTime("2024-06-01T12:00:00Z".into()),
+            Some(&DataType::Date64),
+        )
+        .unwrap();
+        assert!(
+            matches!(dt, Expr::Literal(ScalarValue::Date64(Some(_)), ..)),
+            "DateTime vs Date64 column must coerce to a typed Date64, got {dt:?}"
+        );
+        let d = literal_to_expr_coerced(&Literal::Date("2024-06-01".into()), Some(&DataType::Date32))
+            .unwrap();
+        assert!(
+            matches!(d, Expr::Literal(ScalarValue::Date32(Some(_)), ..)),
+            "Date vs Date32 column must coerce to a typed Date32, got {d:?}"
+        );
+        let nat = literal_to_expr_coerced(&Literal::Date("2024-06-01".into()), None).unwrap();
+        assert!(
+            matches!(nat, Expr::Literal(ScalarValue::Utf8(Some(_)), ..)),
+            "no target should keep the natural Utf8 date literal, got {nat:?}"
+        );
+    }
+
+    // A malformed date string makes coercion fail, so it falls back to the
+    // natural Utf8 literal rather than dropping the predicate to None.
+    #[test]
+    fn malformed_date_literal_falls_back_to_string() {
+        use arrow_schema::DataType;
+        let bad = literal_to_expr_coerced(
+            &Literal::DateTime("not-a-date".into()),
+            Some(&DataType::Date64),
+        )
+        .unwrap();
+        assert!(
+            matches!(bad, Expr::Literal(ScalarValue::Utf8(Some(_)), ..)),
+            "malformed DateTime literal should fall back to a Utf8 literal, got {bad:?}"
+        );
+    }
+
+    // With a column target, a literal lowers to the column's EXACT Arrow type
+    // (not its natural width), so DataFusion does not widen and cast the column
+    // — keeping the scalar BTREE usable. See
+    // `lance_surface_guards::scalar_index_use_requires_matched_literal_type`.
+    #[test]
+    fn integer_literal_coerces_to_narrow_column_type() {
+        use arrow_schema::DataType;
+        let i32_lit = literal_to_expr_coerced(&Literal::Integer(5), Some(&DataType::Int32)).unwrap();
+        assert!(
+            matches!(i32_lit, Expr::Literal(ScalarValue::Int32(Some(5)), ..)),
+            "integer literal vs Int32 column must lower to Int32, got {i32_lit:?}"
+        );
+        let u32_lit = literal_to_expr_coerced(&Literal::Integer(7), Some(&DataType::UInt32)).unwrap();
+        assert!(
+            matches!(u32_lit, Expr::Literal(ScalarValue::UInt32(Some(7)), ..)),
+            "integer literal vs UInt32 column must lower to UInt32, got {u32_lit:?}"
+        );
+    }
+
+    #[test]
+    fn float_literal_coerces_to_f32_column_type() {
+        use arrow_schema::DataType;
+        let f32_lit =
+            literal_to_expr_coerced(&Literal::Float(1.5), Some(&DataType::Float32)).unwrap();
+        assert!(
+            matches!(f32_lit, Expr::Literal(ScalarValue::Float32(Some(_)), ..)),
+            "float literal vs Float32 column must lower to Float32, got {f32_lit:?}"
+        );
+    }
+
+    // Lossless guard: a fractional float against an integer column must NOT
+    // truncate (2.7 -> 2). Fall back to the natural Float64 so the comparison
+    // stays exact (no integer equals 2.7).
+    #[test]
+    fn fractional_float_vs_int_column_falls_back_not_truncate() {
+        use arrow_schema::DataType;
+        let e = literal_to_expr_coerced(&Literal::Float(2.7), Some(&DataType::Int32)).unwrap();
+        assert!(
+            matches!(e, Expr::Literal(ScalarValue::Float64(Some(_)), ..)),
+            "fractional float vs Int32 must fall back to natural Float64, got {e:?}"
+        );
+    }
+
+    // A whole-number float IS lossless against an integer column, so it coerces.
+    #[test]
+    fn whole_float_vs_int_column_coerces() {
+        use arrow_schema::DataType;
+        let e = literal_to_expr_coerced(&Literal::Float(2.0), Some(&DataType::Int32)).unwrap();
+        assert!(
+            matches!(e, Expr::Literal(ScalarValue::Int32(Some(2)), ..)),
+            "whole-number float vs Int32 is lossless and must coerce to Int32(2), got {e:?}"
+        );
+    }
+
+    // Lossless guard: an integer literal outside the column's range must NOT
+    // overflow to null; fall back to the natural Int64 (correct via DataFusion).
+    #[test]
+    fn out_of_range_int_vs_narrow_column_falls_back() {
+        use arrow_schema::DataType;
+        let e = literal_to_expr_coerced(&Literal::Integer(3_000_000_000), Some(&DataType::Int32))
+            .unwrap();
+        assert!(
+            matches!(e, Expr::Literal(ScalarValue::Int64(Some(3_000_000_000)), ..)),
+            "out-of-range integer vs Int32 must fall back to natural Int64, got {e:?}"
+        );
+    }
+
+    // Float targets are exempt from the lossless guard: narrowing to the column's
+    // own precision is the correct comparison domain, even when the value is not
+    // exactly representable in F32 (0.1).
+    #[test]
+    fn float_vs_f32_column_coerces_even_when_not_exactly_representable() {
+        use arrow_schema::DataType;
+        let e = literal_to_expr_coerced(&Literal::Float(0.1), Some(&DataType::Float32)).unwrap();
+        assert!(
+            matches!(e, Expr::Literal(ScalarValue::Float32(Some(_)), ..)),
+            "float target must coerce 0.1 to Float32 (exempt from lossless guard), got {e:?}"
+        );
+    }
+
+    // No target (caller without a schema) keeps the natural width — the existing
+    // fallback, so behavior never regresses where the column type is unknown.
+    #[test]
+    fn literal_without_target_keeps_natural_width() {
+        let nat = literal_to_expr_coerced(&Literal::Integer(5), None).unwrap();
+        assert!(
+            matches!(nat, Expr::Literal(ScalarValue::Int64(Some(5)), ..)),
+            "no target should keep the natural Int64 width, got {nat:?}"
+        );
+    }
+
+    // True if either operand of a binary comparison is an Int32 literal.
+    fn binary_has_int32_literal(e: &Expr) -> bool {
+        if let Expr::BinaryExpr(b) = e {
+            [b.left.as_ref(), b.right.as_ref()]
+                .iter()
+                .any(|side| matches!(side, Expr::Literal(ScalarValue::Int32(Some(_)), ..)))
+        } else {
+            false
+        }
+    }
+
+    fn int32_schema() -> arrow_schema::Schema {
+        use arrow_schema::{DataType, Field};
+        arrow_schema::Schema::new(vec![Field::new("count", DataType::Int32, true)])
+    }
+
+    fn count_prop() -> IRExpr {
+        IRExpr::PropAccess {
+            variable: "m".into(),
+            property: "count".into(),
+        }
+    }
+
+    // Coercion is operator-independent: a range comparison's literal coerces to
+    // the column type just like equality does, so range filters on a narrow
+    // numeric column keep the BTREE.
+    #[test]
+    fn ir_filter_coerces_literal_for_range_op() {
+        let schema = int32_schema();
+        let filter = IRFilter {
+            left: count_prop(),
+            op: CompOp::Ge,
+            right: IRExpr::Literal(Literal::Integer(2)),
+        };
+        let expr = ir_filter_to_expr(&filter, &ParamMap::new(), Some(&schema)).unwrap();
+        assert!(
+            binary_has_int32_literal(&expr),
+            "range-op literal must coerce to the Int32 column type, got {expr:?}"
+        );
+    }
+
+    // The column may be on either side; the literal coerces to the opposite
+    // operand's column type regardless of order (`5 < count`).
+    #[test]
+    fn ir_filter_coerces_literal_when_column_is_on_the_right() {
+        let schema = int32_schema();
+        let filter = IRFilter {
+            left: IRExpr::Literal(Literal::Integer(2)),
+            op: CompOp::Lt,
+            right: count_prop(),
+        };
+        let expr = ir_filter_to_expr(&filter, &ParamMap::new(), Some(&schema)).unwrap();
+        assert!(
+            binary_has_int32_literal(&expr),
+            "reversed-operand literal must coerce to the Int32 column type, got {expr:?}"
+        );
     }
 }
