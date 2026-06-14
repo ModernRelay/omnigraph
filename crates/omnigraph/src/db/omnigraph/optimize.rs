@@ -731,13 +731,39 @@ pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconci
                 .write_queue()
                 .acquire(&(table_key.clone(), Some(branch.clone())))
                 .await;
-            let still_orphan = match db.fresh_snapshot_for_branch(Some(&branch)).await {
-                Ok(snap) => snap
-                    .entry(&table_key)
-                    .map(|e| e.table_branch.as_deref() != Some(branch.as_str()))
-                    .unwrap_or(true),
-                // Branch absent from the manifest entirely (origin 1) → orphan.
-                Err(_) => true,
+            let still_orphan = if !live_branches.contains(&branch) {
+                // Origin 1: the branch is absent from the manifest authority
+                // entirely — a confirmed orphan. No live writer can hold this
+                // branch's queue (you cannot first-write to a branch the
+                // manifest does not have), so no fresh re-check is needed.
+                true
+            } else {
+                // Origin 2: a LIVE branch whose manifest snapshot does not (yet)
+                // place this table on it. A fresh read tells us whether an
+                // in-process writer published a legitimate fork while we waited
+                // on the queue. On a TRANSIENT read failure we must NOT destroy
+                // the ref — skip and let a later cleanup converge, matching the
+                // write-path reclaim (which aborts on the same error). Treating
+                // a read error as "still orphan" here would let a transient
+                // manifest hiccup delete a fork the manifest considers live.
+                match db.fresh_snapshot_for_branch(Some(&branch)).await {
+                    Ok(snap) => snap
+                        .entry(&table_key)
+                        .map(|e| e.table_branch.as_deref() != Some(branch.as_str()))
+                        .unwrap_or(true),
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "omnigraph::cleanup",
+                            table = %table_key,
+                            branch = %branch,
+                            error = %err,
+                            "fresh re-check failed during reconcile; skipping to avoid \
+                             destroying a possibly-live fork (will retry next cleanup)",
+                        );
+                        stats.failures.push((table_key.clone(), err.to_string()));
+                        false
+                    }
+                }
             };
             if !still_orphan {
                 continue;
