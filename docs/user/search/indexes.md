@@ -23,4 +23,4 @@ This is OmniGraph-specific (not Lance):
 - `CsrIndex`: Compressed Sparse Row representation of edges per edge type — `offsets[i]..offsets[i+1]` slices into `targets`.
 - `GraphIndex { type_indices, csr (out), csc (in) }` — built on demand from a snapshot's edge tables, **lazily**: only when an `Expand` the planner routes to the CSR path (dense / large frontier) or an `AntiJoin` actually needs it.
 - Cached in `RuntimeCache::graph_indices` (LRU, max 8 entries, keyed by snapshot id + edge table versions).
-- Selective `Expand`s resolve neighbors from the persisted `src`/`dst` BTREE instead (one indexed scan per hop) and never trigger the CSR build; see [query-language](query-language.md) → Expand. Pure scans, and queries served entirely by the indexed traversal path, skip it.
+- Selective `Expand`s resolve neighbors from the persisted `src`/`dst` BTREE instead (one indexed scan per hop) and never trigger the CSR build; see [query-language](../queries/index.md) → Expand. Pure scans, and queries served entirely by the indexed traversal path, skip it.

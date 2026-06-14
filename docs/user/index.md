@@ -2,44 +2,62 @@
 
 **Audience:** users, CLI users, HTTP clients, and self-hosting operators
 
-This is the public-facing entry point. These docs should describe behavior,
-commands, configuration, and operational contracts without requiring knowledge
-of MRs, internal recovery mechanics, or contributor-only invariants.
+This is the public-facing entry point. These docs describe behavior, commands,
+configuration, and operational contracts without requiring knowledge of internal
+recovery mechanics or contributor-only invariants. They are organized by topic —
+start with install, then follow the section that matches your task.
 
-## Start Here
+## Start here
 
 | Goal | Read |
 |---|---|
 | Install OmniGraph | [install.md](install.md) |
-| Run the CLI locally | [cli.md](cli.md) |
-| Look up every CLI flag and config field | [cli-reference.md](cli-reference.md) |
-| Deploy and operate a cluster (how-to guide) | [cluster.md](cluster.md) |
-| Validate and plan cluster config | [cluster-config.md](cluster-config.md) |
-| Write schemas | [schema-language.md](schema-language.md) |
-| Read schema-lint diagnostic codes | [schema-lint.md](schema-lint.md) |
-| Write queries and mutations | [query-language.md](query-language.md) |
-| Use embeddings | [embeddings.md](embeddings.md) |
+| Run the CLI | [cli/index.md](cli/index.md) |
+| Look up every CLI flag and config field | [cli/reference.md](cli/reference.md) |
 
-## Operate A Graph
+## Schema & queries
 
 | Goal | Read |
 |---|---|
-| Understand graph layout and URI support | [storage.md](storage.md) |
-| Work with branches, commits, and snapshots | [branches-commits.md](branches-commits.md) |
-| Coordinate multi-query workflows | [transactions.md](transactions.md) |
-| Read diffs and change feeds | [changes.md](changes.md) |
-| Build and use indexes | [indexes.md](indexes.md) |
-| Compact and clean old versions | [maintenance.md](maintenance.md) |
-| Interpret errors and output formats | [errors.md](errors.md) |
+| Write schemas (the `.pg` language) | [schema/index.md](schema/index.md) |
+| Read schema-lint diagnostic codes | [schema/lint.md](schema/lint.md) |
+| Write queries and mutations (the `.gq` language) | [queries/index.md](queries/index.md) |
+| Use vector / full-text / hybrid search | [search/indexes.md](search/indexes.md) |
+| Generate embeddings | [search/embeddings.md](search/embeddings.md) |
+| Build and use indexes | [search/indexes.md](search/indexes.md) |
 
-## Run The Server
+## Branching & version control
+
+| Goal | Read |
+|---|---|
+| Work with branches, commits, and snapshots | [branching/index.md](branching/index.md) |
+| Coordinate multi-query workflows | [branching/transactions.md](branching/transactions.md) |
+| Read diffs and change feeds | [branching/changes.md](branching/changes.md) |
+
+## Operations
 
 | Goal | Read |
 |---|---|
 | Deploy the binary or container | [deployment.md](deployment.md) |
-| Use HTTP endpoints | [server.md](server.md) |
-| Configure Cedar authorization | [policy.md](policy.md) |
-| Track actors and audit behavior | [audit.md](audit.md) |
+| Use HTTP endpoints | [operations/server.md](operations/server.md) |
+| Compact, repair, and clean old versions | [operations/maintenance.md](operations/maintenance.md) |
+| Configure Cedar authorization | [operations/policy.md](operations/policy.md) |
+| Track actors and audit behavior | [operations/audit.md](operations/audit.md) |
+| Interpret errors and output formats | [operations/errors.md](operations/errors.md) |
+
+## Clusters
+
+| Goal | Read |
+|---|---|
+| Deploy and operate a cluster (how-to) | [clusters/index.md](clusters/index.md) |
+| Reference every `cluster.yaml` key and command | [clusters/config.md](clusters/config.md) |
+
+## Concepts & reference
+
+| Goal | Read |
+|---|---|
+| Understand graph layout and URI support | [concepts/storage.md](concepts/storage.md) |
+| Look up constants and tunables | [reference/constants.md](reference/constants.md) |
 
 ## Releases
 
@@ -48,7 +66,6 @@ changes between versions, not for contributor design history.
 
 ## Boundary
 
-User docs should focus on stable behavior. If a paragraph needs to explain
-internal sidecars, Lance API blockers, MR numbers, test strategy, or review
-rules, it probably belongs in [docs/dev/index.md](../dev/index.md) or a developer-area document
-instead.
+User docs focus on stable behavior. If a paragraph needs to explain internal
+sidecars, Lance API blockers, or test strategy, it probably belongs in
+[docs/dev/index.md](../dev/index.md) or a developer-area document instead.

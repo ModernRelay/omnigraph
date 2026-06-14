@@ -7,8 +7,8 @@ destructive changes, and recovering from crashes.
 
 It is a **how-to**. The reference for every `cluster.yaml` key, command flag,
 state-file field, and diagnostic code is
-[cluster-config.md](cluster-config.md); the HTTP surface is
-[server.md](server.md).
+[cluster-config.md](config.md); the HTTP surface is
+[server.md](../operations/server.md).
 
 ## The model in one paragraph
 
@@ -102,7 +102,7 @@ curl -H 'authorization: Bearer s3cret' \
 
 Bearer tokens and the bind address are deliberately *not* cluster facts —
 they are per-replica, set by flag or environment
-([server.md](server.md#modes) for the token sources).
+([server.md](../operations/server.md#modes) for the token sources).
 
 ## 2. The day-2 loop: edit → plan → apply → restart
 
@@ -237,7 +237,7 @@ with an in-flight apply.
   directory; boot is read-only. Roll out a change by `apply` once, then
   restarting replicas (serving is static per process — there is no hot
   reload yet). Container/cloud recipes (AWS ECS+EFS, Railway volumes):
-  [deployment.md](deployment.md#cluster-mode-in-containers-aws-railway).
+  [deployment.md](../deployment.md#cluster-mode-in-containers-aws-railway).
 - **The directory is the deployable unit**: config, catalog, ledger,
   approvals, and graph data all live under it. Back it up as a whole;
   version the *config files* (not `__cluster/` or `graphs/`) in git.
@@ -282,4 +282,4 @@ a cluster are created by `cluster apply`, not by hand.
   reserved and rejected loudly.
 
 For the full reference — every key, flag, status, disposition, and
-diagnostic — see [cluster-config.md](cluster-config.md).
+diagnostic — see [cluster-config.md](config.md).

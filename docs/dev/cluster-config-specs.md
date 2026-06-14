@@ -3,11 +3,11 @@
 **Status:** Draft / thinking-in-progress
 **Type:** Architecture direction
 **Date:** 2026-06-07
-**Relationship:** generalizes today's `omnigraph.yaml` graph/query/policy configuration surface ([CLI reference](../user/cli-reference.md), [server docs](../user/server.md)) into a future cluster control plane. The distilled rules are in [cluster-axioms.md](cluster-axioms.md); detailed downstream implementation spec and blast-radius assessment in [cluster-config-implementation-spec.md](cluster-config-implementation-spec.md). This is a proposed architecture, not an implemented RFC.
+**Relationship:** generalizes today's `omnigraph.yaml` graph/query/policy configuration surface ([CLI reference](../user/cli/reference.md), [server docs](../user/operations/server.md)) into a future cluster control plane. The distilled rules are in [cluster-axioms.md](cluster-axioms.md); detailed downstream implementation spec and blast-radius assessment in [cluster-config-implementation-spec.md](cluster-config-implementation-spec.md). This is a proposed architecture, not an implemented RFC.
 
 > **Implementation status.** The examples below describe the full target schema.
 > Stage 2B only accepts the read-only subset documented in
-> [cluster-config.md](../user/cluster-config.md). Future-phase fields such as
+> [cluster-config.md](../user/clusters/config.md). Future-phase fields such as
 > `env_file`, `apply`, `providers`, `pipelines`, `embeddings`, `ui`, `aliases`,
 > and `bindings` are intentionally rejected with typed diagnostics until their
 > reconciler semantics are implemented.

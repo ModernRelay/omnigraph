@@ -348,4 +348,4 @@ Callers move at their own pace. The envelope upgrades + URL rename ship in v0.6.
 - RFC 8288 (`Link` relations, `successor-version`)
 - MCP spec: [modelcontextprotocol.io](https://modelcontextprotocol.io)
 - [invariants.md](./invariants.md) — substrate boundaries this work respects
-- [../user/server.md](../user/server.md) — current HTTP surface (post-MR-656 picks up the `/query`+`/mutate` rename and deprecation)
+- [../user/server.md](../user/operations/server.md) — current HTTP surface (post-MR-656 picks up the `/query`+`/mutate` rename and deprecation)

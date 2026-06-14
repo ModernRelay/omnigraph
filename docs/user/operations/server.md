@@ -21,7 +21,7 @@ revision** (`state.json` + content-addressed blobs) instead of
 `omnigraph.yaml` — an exclusive boot source: combining it with `<URI>`,
 `--target`, or `--config` is a startup error, and `omnigraph.yaml` is never
 read in this mode. Always multi-graph routing. See
-[cluster-config.md](cluster-config.md#serving-from-the-cluster-the-mode-switch)
+[cluster-config.md](../clusters/config.md#serving-from-the-cluster-the-mode-switch)
 for what is read and the fail-fast readiness rules. `--bind`,
 `--unauthenticated`, and the bearer-token env vars work identically.
 
@@ -36,7 +36,7 @@ Mode inference:
 
 ### Stored-query validation at startup
 
-If a graph declares a `queries:` registry (see [cli-reference](cli-reference.md)), the server **loads and type-checks every stored query against that graph's live schema at startup** and **refuses to boot** if any query references a type or property the schema lacks — the same fail-loud posture as a malformed policy file, so schema drift surfaces at the deploy boundary rather than at invocation. Two MCP-exposed queries claiming the same tool name is likewise a boot error. Non-blocking advisories (e.g. an MCP-exposed query with a vector parameter an agent cannot supply) are logged. Validate offline before deploying with `omnigraph queries validate`. Discover the exposed queries as a typed tool catalog with `GET /queries`, and invoke one over HTTP with `POST /queries/{name}` (both below).
+If a graph declares a `queries:` registry (see [cli-reference](../cli/reference.md)), the server **loads and type-checks every stored query against that graph's live schema at startup** and **refuses to boot** if any query references a type or property the schema lacks — the same fail-loud posture as a malformed policy file, so schema drift surfaces at the deploy boundary rather than at invocation. Two MCP-exposed queries claiming the same tool name is likewise a boot error. Non-blocking advisories (e.g. an MCP-exposed query with a vector parameter an agent cannot supply) are logged. Validate offline before deploying with `omnigraph queries validate`. Discover the exposed queries as a typed tool catalog with `GET /queries`, and invoke one over HTTP with `POST /queries/{name}` (both below).
 
 ## Endpoint inventory
 
@@ -209,7 +209,7 @@ admission-gated.
   policy file without tokens is also rejected at startup. In open mode
   `/openapi.json` strips the security scheme.
 
-See [deployment.md](deployment.md) for token-source operational details.
+See [deployment.md](../deployment.md) for token-source operational details.
 
 ## Tracing & observability
 

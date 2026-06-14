@@ -327,14 +327,14 @@ pub fn classify_server_runtime_state(
             "server has no bearer tokens and no policy file configured. This is a fully \
              open server — pass `--unauthenticated` (or set OMNIGRAPH_UNAUTHENTICATED=1) \
              if you actually want that, otherwise configure bearer tokens (see \
-             docs/user/server.md) and/or `policy.file` in omnigraph.yaml."
+             docs/user/operations/server.md) and/or `policy.file` in omnigraph.yaml."
         ),
         (false, false, true) => Ok(ServerRuntimeState::Open),
         (true, false, _) => Ok(ServerRuntimeState::DefaultDeny),
         (false, true, _) => bail!(
             "policy file is configured but no bearer tokens — every request would 401 \
              because no token can ever match. Configure at least one bearer token (see \
-             docs/user/server.md), or remove the policy file. To deny all unauthenticated \
+             docs/user/operations/server.md), or remove the policy file. To deny all unauthenticated \
              traffic deliberately, configure tokens plus a deny-all Cedar rule — that \
              produces meaningful 403s with policy-decision logging instead of silent 401s."
         ),
