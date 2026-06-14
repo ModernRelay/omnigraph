@@ -10,7 +10,9 @@ use lance_namespace::models::{
 };
 use lance_namespace::{Error as LanceNamespaceError, LanceNamespace, NamespaceError};
 use lance_table::io::commit::ManifestNamingScheme;
-use object_store::{Error as ObjectStoreError, ObjectStore as _, PutMode, PutOptions, path::Path};
+use object_store::{
+    Error as ObjectStoreError, ObjectStore as _, ObjectStoreExt, PutMode, PutOptions, path::Path,
+};
 
 use crate::error::{OmniError, Result};
 

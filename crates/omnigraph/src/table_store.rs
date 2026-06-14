@@ -775,6 +775,8 @@ impl TableStore {
         let params = WriteParams {
             mode: WriteMode::Append,
             allow_external_blob_outside_bases: true,
+            auto_cleanup: None,
+            skip_auto_cleanup: true,
             ..Default::default()
         };
         ds.append(reader, Some(params))
@@ -794,6 +796,8 @@ impl TableStore {
                 let params = WriteParams {
                     mode: WriteMode::Append,
                     allow_external_blob_outside_bases: true,
+                    auto_cleanup: None,
+                    skip_auto_cleanup: true,
                     ..Default::default()
                 };
                 ds.append(reader, Some(params))
@@ -807,6 +811,8 @@ impl TableStore {
                     enable_stable_row_ids: true,
                     data_storage_version: Some(LanceFileVersion::V2_2),
                     allow_external_blob_outside_bases: true,
+                    auto_cleanup: None,
+                    skip_auto_cleanup: true,
                     ..Default::default()
                 };
                 Dataset::write(reader, dataset_uri, Some(params))
@@ -897,6 +903,8 @@ impl TableStore {
         let params = WriteParams {
             mode: WriteMode::Append,
             allow_external_blob_outside_bases: true,
+            auto_cleanup: None,
+            skip_auto_cleanup: true,
             ..Default::default()
         };
         let transaction = InsertBuilder::new(Arc::new(ds.clone()))
@@ -1070,7 +1078,16 @@ impl TableStore {
         ds: Arc<Dataset>,
         transaction: Transaction,
     ) -> Result<Dataset> {
+        // Skip Lance's auto-cleanup hook on every commit. OmniGraph owns version
+        // GC explicitly (optimize.rs::cleanup_all_tables); Lance's hook fires off
+        // the *dataset's stored* `lance.auto_cleanup.*` config, which graphs
+        // created before the v7 bump (6.0.1 defaulted auto_cleanup ON) still
+        // carry — so `WriteParams::auto_cleanup = None` alone does NOT stop it on
+        // upgraded graphs. Skipping here covers the staged write path (the main
+        // data path) for new and legacy datasets alike, preventing Lance from
+        // GC'ing versions the __manifest still pins for snapshots/time-travel.
         CommitBuilder::new(ds)
+            .with_skip_auto_cleanup(true)
             .execute(transaction)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))
@@ -1117,6 +1134,8 @@ impl TableStore {
                 mode: WriteMode::Overwrite,
                 enable_stable_row_ids: true,
                 allow_external_blob_outside_bases: true,
+                auto_cleanup: None,
+                skip_auto_cleanup: true,
                 ..Default::default()
             };
             let transaction = InsertBuilder::new(Arc::new(ds.clone()))
@@ -1533,6 +1552,8 @@ impl TableStore {
             enable_stable_row_ids: true,
             data_storage_version: Some(LanceFileVersion::V2_2),
             allow_external_blob_outside_bases: true,
+            auto_cleanup: None,
+            skip_auto_cleanup: true,
             ..Default::default()
         };
         Dataset::write(reader, dataset_uri, Some(params))

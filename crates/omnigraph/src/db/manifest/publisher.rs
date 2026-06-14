@@ -381,6 +381,12 @@ impl GraphNamespacePublisher {
         // the publisher loop above, where each attempt re-runs the pre-check.
         merge_builder.conflict_retries(0);
         merge_builder.use_index(false);
+        // Skip Lance's auto-cleanup hook: `__manifest` versions are the snapshot
+        // / time-travel authority and must never be GC'd by Lance's per-commit
+        // hook. A `__manifest` created before the v7 bump (6.0.1 defaulted
+        // auto_cleanup ON) still carries the stored config, so this skip is
+        // load-bearing on upgraded graphs, not just defensive.
+        merge_builder.skip_auto_cleanup(true);
         let (new_dataset, _stats) = merge_builder
             .try_build()
             .map_err(|e| OmniError::Lance(e.to_string()))?
