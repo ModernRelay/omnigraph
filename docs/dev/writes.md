@@ -305,7 +305,7 @@ success and one failure. The losing writer's error is
 `ManifestConflictDetails::ExpectedVersionMismatch { table_key, expected,
 actual }`. The HTTP server maps this to **409 Conflict** with body
 `{"error": "...", "code": "conflict", "manifest_conflict": { "table_key":
-"...", "expected": N, "actual": M }}` — see [docs/user/server.md](../user/server.md).
+"...", "expected": N, "actual": M }}` — see [docs/user/server.md](../user/operations/server.md).
 
 ## Audit
 

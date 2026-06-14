@@ -2,7 +2,7 @@
 
 OmniGraph does not have `BEGIN` / `COMMIT` / `ROLLBACK`. Branches do that job. This page explains the model, when to use which primitive, and shows worked examples for the patterns that come up most.
 
-The architectural rule lives in [`docs/dev/invariants.md`](../dev/invariants.md):
+The architectural rule lives in [`docs/dev/invariants.md`](../../dev/invariants.md):
 
 > **Mutations publish at one boundary.** A `mutate_as` or `load` operation
 > accumulates constructive writes, commits each touched table at the end, then
@@ -161,8 +161,8 @@ This is the workflow MR-797 / agentic loops are designed around: **branches are 
 
 ## See also
 
-- [`docs/user/branches-commits.md`](branches-commits.md) — branch and commit-graph mechanics.
-- [`docs/dev/merge.md`](../dev/merge.md) — three-way merge details and conflict kinds.
-- [`docs/user/query-language.md`](query-language.md) — `.gq` syntax for the multi-statement queries used above.
-- [`docs/dev/writes.md`](../dev/writes.md) — the per-query commit pipeline that gives single-query atomicity.
-- [`docs/dev/invariants.md`](../dev/invariants.md) — the architectural rule.
+- [`docs/user/branches-commits.md`](index.md) — branch and commit-graph mechanics.
+- [`docs/dev/merge.md`](../../dev/merge.md) — three-way merge details and conflict kinds.
+- [`docs/user/query-language.md`](../queries/index.md) — `.gq` syntax for the multi-statement queries used above.
+- [`docs/dev/writes.md`](../../dev/writes.md) — the per-query commit pipeline that gives single-query atomicity.
+- [`docs/dev/invariants.md`](../../dev/invariants.md) — the architectural rule.

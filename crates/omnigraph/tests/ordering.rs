@@ -7,7 +7,7 @@
 //! keys yield a TOTAL, deterministic order (and `ORDER … LIMIT` is
 //! deterministic). NULL placement is `nulls_first = !descending` (NULLs first
 //! under ASC, last under DESC). Both are documented in
-//! `docs/user/query-language.md`.
+//! `docs/user/queries/index.md`.
 
 mod helpers;
 

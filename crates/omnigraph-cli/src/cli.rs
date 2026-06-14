@@ -26,7 +26,7 @@ pub(crate) struct Cli {
     /// Actor id for direct-engine writes; overrides `cli.actor`. No effect on
     /// remote writes (the server resolves the actor from the bearer token).
     /// With a policy configured but no actor set, the write is denied — see
-    /// docs/user/policy.md.
+    /// docs/user/operations/policy.md.
     #[arg(long = "as", global = true, value_name = "ACTOR")]
     pub(crate) as_actor: Option<String>,
 

@@ -1,6 +1,6 @@
 # CLI Reference (`omnigraph`)
 
-A reference for the `omnigraph` binary's command surface and `omnigraph.yaml` schema. For a quick-start guide, see [cli.md](cli.md).
+A reference for the `omnigraph` binary's command surface and `omnigraph.yaml` schema. For a quick-start guide, see [cli.md](index.md).
 
 Top-level command families and subcommands. Graph-targeting commands accept a positional `URI`, `--uri`, a `--target <name>` resolved against `omnigraph.yaml`, or `--server <name>` (an operator-defined server from `~/.omnigraph/config.yaml`, optionally with `--graph <id>` for multi-graph servers; exclusive with the other forms); `cluster` commands use `--config <dir>`.
 
@@ -8,7 +8,7 @@ Top-level command families and subcommands. Graph-targeting commands accept a po
 
 | Command | Purpose |
 |---|---|
-| `init` | `--schema <pg>` → initialize a graph (no longer scaffolds `omnigraph.yaml` — RFC-008; start cluster configs from the [cluster.md](cluster.md) quick-start or `config migrate`) |
+| `init` | `--schema <pg>` → initialize a graph (no longer scaffolds `omnigraph.yaml` — RFC-008; start cluster configs from the [cluster.md](../clusters/index.md) quick-start or `config migrate`) |
 | `load` | bulk load a branch, local or remote (`--mode overwrite\|append\|merge` is **required** — overwrite is destructive, so there is no default). Without `--from` the target branch must exist; `--from <base>` forks a missing `--branch` from `<base>` first |
 | `ingest` | deprecated alias of `load --from <base>` (defaults: `--from main --mode merge`); prints a one-line warning to stderr |
 | `query` (alias: `read`) | run named read query; source via `--query <path>`, `-e`/`--query-string <GQ>`, or `--alias <name>` (exactly one). `read` is the deprecated previous name and prints a one-line warning to stderr |
@@ -53,7 +53,7 @@ tier:
 
 | Surface | Owner | Location | Declares |
 |---|---|---|---|
-| Cluster config | the team, in a repo | `cluster.yaml` + checkout ([cluster-config.md](cluster-config.md)) | what the system **is**: graphs, schemas, queries, policies, storage |
+| Cluster config | the team, in a repo | `cluster.yaml` + checkout ([cluster-config.md](../clusters/config.md)) | what the system **is**: graphs, schemas, queries, policies, storage |
 | Operator config | one person | `~/.omnigraph/config.yaml` (override dir with `$OMNIGRAPH_HOME`) | who **I** am: identity, ergonomics |
 | Flags / env | per invocation | — | everything, explicitly |
 
@@ -204,7 +204,7 @@ creates one only when it is missing. Both observe declared graphs read-only at
 `<config-dir>/graphs/<graph-id>.omni`. External state backends, graph/schema
 apply, automatic stale-lock breaking, `plan --refresh`, pipelines, UI specs,
 embeddings, aliases, and bindings are reserved for later stages. See
-[cluster-config.md](cluster-config.md).
+[cluster-config.md](../clusters/config.md).
 
 ## Output formats (`query` command, alias: `read`)
 

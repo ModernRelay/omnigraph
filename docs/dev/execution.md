@@ -177,4 +177,4 @@ For all three modes, a mid-load failure (RI / cardinality violation, validation 
 
 ## Embeddings during load
 
-If a node type has `@embed` properties, the loader calls the engine embedding client (Gemini, RETRIEVAL_DOCUMENT) per row to populate the vector column. See [embeddings.md](../user/embeddings.md).
+If a node type has `@embed` properties, the loader calls the engine embedding client (Gemini, RETRIEVAL_DOCUMENT) per row to populate the vector column. See [embeddings.md](../user/search/embeddings.md).
