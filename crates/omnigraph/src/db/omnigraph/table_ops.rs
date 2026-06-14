@@ -547,15 +547,23 @@ pub(super) async fn fork_dataset_from_entry_state(
 
 /// Reclaim a manifest-unreferenced fork and re-fork in its place.
 ///
-/// Reached only when `fork_branch_from_state` reported `RefAlreadyExists`
-/// AND the caller already proved (live-manifest authority re-check, under the
-/// held per-`(table, active_branch)` write queue) that the manifest does not
-/// place this table on `active_branch`. So the leftover ref is reclaimable
-/// derived state: drop it (idempotent `force_delete_branch`) and re-fork,
-/// exactly once. A second collision means a concurrent *foreign-process*
-/// writer recreated the ref (in-process is impossible while we hold the
-/// queue) — the documented one-winner-CAS gap — so surface a retryable
-/// conflict; on retry the winner's fork is visible and the no-fork path runs.
+/// Reached when `fork_branch_from_state` reports `RefAlreadyExists`. This is a
+/// destructive op (it force-deletes a Lance branch ref), so it owns its own
+/// safety precondition rather than trusting the caller's: it re-derives, from
+/// a FRESH manifest read, that the manifest does not place this table on
+/// `active_branch`. The caller's earlier proof may have come from the
+/// coordinator's *cached* branch snapshot (`resolved_branch_target` returns
+/// the cache when the handle is bound to `active_branch` — an embedded handle
+/// on the branch, or `branch_merge`'s target swap); trusting it could
+/// force-delete a fork a concurrent writer just legitimately published. Only
+/// once fresh authority confirms the ref is unreferenced does it drop the ref
+/// (idempotent `force_delete_branch`) and re-fork, exactly once.
+///
+/// If fresh authority shows the table IS on `active_branch` (a legitimate
+/// concurrent fork), or a second collision occurs after reclaim (a foreign-
+/// process writer recreated the ref — the documented one-winner-CAS gap), it
+/// surfaces a retryable conflict; on retry the winner's fork is visible and
+/// the no-fork path runs.
 pub(super) async fn reclaim_orphaned_fork_and_refork(
     db: &Omnigraph,
     table_key: &str,
@@ -564,16 +572,34 @@ pub(super) async fn reclaim_orphaned_fork_and_refork(
     source_version: u64,
     active_branch: &str,
 ) -> Result<SnapshotHandle> {
+    // Self-validate against FRESH authority before destroying anything.
+    // `fresh_snapshot_for_branch` bypasses the coordinator cache. If a
+    // legitimate fork now exists, this ref is not an orphan — refuse (retryable)
+    // rather than strand the manifest at a version the recreated ref won't have.
+    let fresh = db.fresh_snapshot_for_branch(Some(active_branch)).await?;
+    if let Some(entry) = fresh.entry(table_key) {
+        if entry.table_branch.as_deref() == Some(active_branch) {
+            return Err(OmniError::manifest_expected_version_mismatch(
+                table_key,
+                source_version,
+                entry.table_version,
+            ));
+        }
+    }
+
     crate::failpoints::maybe_fail("fork.before_reclaim")?;
     db.storage()
         .force_delete_branch(full_path, active_branch)
         .await
         .map_err(|e| {
             // Lance refuses to delete a branch with dependent child branches
-            // even under force (`refs.rs` RefConflict "referenced by N
-            // versions"). Unreachable for a leaf first-write fork, but surface
-            // it actionably instead of looping.
-            if e.to_string().contains("referenced by") {
+            // even under force (RefConflict). Unreachable for a leaf first-write
+            // fork (the cleanup reconciler also drops children before parents),
+            // but surface it actionably if it ever happens. We match loosely on
+            // "referenc" rather than the exact prose, which is not a Lance API
+            // contract; a typed RefConflict variant through `force_delete_branch`
+            // is the durable follow-up.
+            if e.to_string().contains("referenc") {
                 OmniError::manifest_conflict(format!(
                     "branch '{active_branch}' cannot reclaim the leftover fork for \
                      table '{table_key}' because it has dependent child branches; \
@@ -596,7 +622,7 @@ pub(super) async fn reclaim_orphaned_fork_and_refork(
     {
         crate::storage_layer::ForkOutcome::Created(ds) => Ok(ds),
         crate::storage_layer::ForkOutcome::RefAlreadyExists => {
-            let live = db.snapshot_for_branch(Some(active_branch)).await?;
+            let live = db.fresh_snapshot_for_branch(Some(active_branch)).await?;
             let actual = live
                 .entry(table_key)
                 .map(|e| e.table_version)
