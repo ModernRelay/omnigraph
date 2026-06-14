@@ -2,14 +2,14 @@
 
 OmniGraph has **two** embedding clients with different defaults and purposes.
 
-## Compiler-side client (`omnigraph-compiler/src/embedding.rs`) — query-time normalization
+## Compiler-side client — query-time normalization
 
 - Default model: `text-embedding-3-small` (OpenAI-style schema)
 - Env: `NANOGRAPH_EMBED_MODEL`, `OPENAI_API_KEY`, `OPENAI_BASE_URL` (default `https://api.openai.com/v1`), `NANOGRAPH_EMBEDDINGS_MOCK`, `NANOGRAPH_EMBED_TIMEOUT_MS=30000`, `NANOGRAPH_EMBED_RETRY_ATTEMPTS=4`, `NANOGRAPH_EMBED_RETRY_BACKOFF_MS=200`
 - Methods: `embed_text(input, expected_dim)`, `embed_texts(inputs, expected_dim)`
 - Mock mode: deterministic FNV-1a + xorshift64 → L2-normalized vectors
 
-## Engine-side client (`omnigraph/src/embedding.rs`) — runtime ingest
+## Engine-side client — runtime ingest
 
 - Model: `gemini-embedding-2-preview`
 - Env: `GEMINI_API_KEY`, `OMNIGRAPH_GEMINI_BASE_URL` (default Google generativelanguage v1beta), `OMNIGRAPH_EMBED_TIMEOUT_MS=30000`, `OMNIGRAPH_EMBED_RETRY_ATTEMPTS=4`, `OMNIGRAPH_EMBED_RETRY_BACKOFF_MS=200`, `OMNIGRAPH_EMBEDDINGS_MOCK`

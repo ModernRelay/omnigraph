@@ -90,7 +90,7 @@ Three writers have been migrated onto staged primitives:
   fragments appended afterward into an *existing* index is `optimize`'s
   `optimize_indices` pass — an inline-commit residual, not a staged write (Lance
   exposes no uncommitted index-optimize), covered by the optimize recovery
-  sidecar (see [maintenance.md](../user/maintenance.md)).
+  sidecar (see [maintenance.md](../user/operations/maintenance.md)).
 * **`branch_merge::publish_rewritten_merge_table`**
   (`exec/merge.rs`) — merge_insert now uses `stage_merge_insert` +
   `commit_staged`. Deletes stay inline (Lance #6658 residual).
@@ -312,7 +312,7 @@ success and one failure. The losing writer's error is
 `ManifestConflictDetails::ExpectedVersionMismatch { table_key, expected,
 actual }`. The HTTP server maps this to **409 Conflict** with body
 `{"error": "...", "code": "conflict", "manifest_conflict": { "table_key":
-"...", "expected": N, "actual": M }}` — see [docs/user/server.md](../user/server.md).
+"...", "expected": N, "actual": M }}` — see [docs/user/server.md](../user/operations/server.md).
 
 ## Audit
 

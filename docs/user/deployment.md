@@ -17,7 +17,7 @@ The server also has two **boot sources**: `omnigraph.yaml` (graph targets
 declared in the per-operator config) or a **cluster directory**
 (`omnigraph-server --cluster <dir>`), which serves the cluster control
 plane's applied revision — see
-[cluster-config.md](cluster-config.md#serving-from-the-cluster-the-mode-switch).
+[cluster-config.md](clusters/config.md#serving-from-the-cluster-the-mode-switch).
 The two are exclusive per deployment; switching is a restart with a different
 flag.
 
@@ -47,8 +47,7 @@ omnigraph-server s3://my-bucket/graphs/example/releases/2026-04-10-v0.1.0 \
 
 ## Cluster Mode in Containers (AWS, Railway)
 
-A cluster-booted deployment has **two shapes** since the `storage:` root
-(RFC-006):
+A cluster-booted deployment has **two shapes** since the `storage:` root:
 
 - **Bucket, no volume (preferred for cloud)** — the cluster's ledger,
   catalog, and graph data live under an object-storage root

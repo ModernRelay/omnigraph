@@ -763,7 +763,7 @@ fn traversal_indexed_override() -> Option<bool> {
 
 /// Max source-row frontier for which Expand uses the BTREE-indexed path.
 /// Larger frontiers fall back to the in-memory CSR (dense / whole-graph). See
-/// `docs/user/constants.md`.
+/// `docs/user/reference/constants.md`.
 const DEFAULT_EXPAND_INDEXED_MAX_FRONTIER: usize = 1024;
 /// Max hop count for the indexed path (each hop is one indexed scan; very deep
 /// traversals fan out toward whole-graph and are better served by CSR).

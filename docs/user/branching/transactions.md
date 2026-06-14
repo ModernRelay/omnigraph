@@ -2,7 +2,7 @@
 
 OmniGraph does not have `BEGIN` / `COMMIT` / `ROLLBACK`. Branches do that job. This page explains the model, when to use which primitive, and shows worked examples for the patterns that come up most.
 
-The architectural rule lives in [`docs/dev/invariants.md`](../dev/invariants.md):
+The architectural rule lives in [`docs/dev/invariants.md`](../../dev/invariants.md):
 
 > **Mutations publish at one boundary.** A `mutate_as` or `load` operation
 > accumulates constructive writes, commits each touched table at the end, then
@@ -107,7 +107,7 @@ Properties:
 - Each query on the branch is its own publisher commit — so they're individually atomic. Per-query CAS works on branches just like on main.
 - The branch lives on disk. Process crash mid-workflow? Re-open and resume.
 - Multiple agents can work on different branches in parallel without blocking each other.
-- The merge is a three-way merge at the row level. Conflicts surface as `OmniError::MergeConflicts(Vec<MergeConflict>)`, with structured kinds (`DivergentInsert`, `DivergentUpdate`, `DeleteVsUpdate`, …) so callers can handle them programmatically.
+- The merge is a three-way merge at the row level. Conflicts surface as structured merge-conflict kinds (`DivergentInsert`, `DivergentUpdate`, `DeleteVsUpdate`, …) so callers can handle them programmatically.
 
 ### 4. Coordinating multiple agents
 
@@ -129,14 +129,14 @@ omnigraph branch merge agent-b/work --into main graph.omni
 
 Each agent sees a consistent snapshot of `main` at the time it forked. The first merge to `main` lands as a fast-forward (or a no-op if no concurrent change). The second merge runs three-way: rows touched by both branches surface as `MergeConflict`s for the caller to resolve.
 
-This is the workflow MR-797 / agentic loops are designed around: **branches are the unit of "an agent's working set."**
+This is the workflow agentic loops are designed around: **branches are the unit of "an agent's working set."**
 
 ## Failure modes
 
 | Scenario | What happens | Caller action |
 |---|---|---|
 | Single query fails mid-flight | Publisher never publishes; target unchanged | Read the error, decide whether to retry |
-| Concurrent writers race the same `(table, branch)` | Publisher CAS rejects the loser with `ManifestConflictDetails::ExpectedVersionMismatch` | Refresh handle, retry the query |
+| Concurrent writers race the same `(table, branch)` | Publisher CAS rejects the loser with a version-mismatch conflict | Refresh handle, retry the query |
 | Branch with N successful mutations, then merge fails (three-way conflict) | Each individual mutation already committed on the branch; merge surfaces `MergeConflicts` | Inspect, decide whether to keep working on the branch, abandon it (`branch_delete`), or resolve and re-merge |
 | Process crashes mid-branch-workflow | Each completed mutation on the branch is durable | Re-open the graph, continue where you left off |
 
@@ -161,8 +161,8 @@ This is the workflow MR-797 / agentic loops are designed around: **branches are 
 
 ## See also
 
-- [`docs/user/branches-commits.md`](branches-commits.md) — branch and commit-graph mechanics.
-- [`docs/dev/merge.md`](../dev/merge.md) — three-way merge details and conflict kinds.
-- [`docs/user/query-language.md`](query-language.md) — `.gq` syntax for the multi-statement queries used above.
-- [`docs/dev/writes.md`](../dev/writes.md) — the per-query commit pipeline that gives single-query atomicity.
-- [`docs/dev/invariants.md`](../dev/invariants.md) — the architectural rule.
+- [`docs/user/branches-commits.md`](index.md) — branch and commit-graph mechanics.
+- [`docs/dev/merge.md`](../../dev/merge.md) — three-way merge details and conflict kinds.
+- [`docs/user/query-language.md`](../queries/index.md) — `.gq` syntax for the multi-statement queries used above.
+- [`docs/dev/writes.md`](../../dev/writes.md) — the per-query commit pipeline that gives single-query atomicity.
+- [`docs/dev/invariants.md`](../../dev/invariants.md) — the architectural rule.
