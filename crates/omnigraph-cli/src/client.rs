@@ -79,7 +79,23 @@ impl GraphClient {
         graph: Option<&str>,
         uri: Option<String>,
         target: Option<&str>,
+        profile: Option<&str>,
+        store: Option<&str>,
     ) -> Result<Self> {
+        // RFC-011: a scope (profile / --store / operator defaults) may stand in
+        // for omitted addressing. The explicit branch passes server/graph/uri/
+        // target straight through, so existing invocations are unchanged.
+        let scope = crate::scope::resolve_scope(
+            &crate::operator::load_operator_config()?,
+            crate::planes::Plane::Data,
+            crate::scope::ScopeFlags { profile, store, server, graph, uri, target },
+        )?;
+        let (server, graph, uri, target) = (
+            scope.server.as_deref(),
+            scope.graph.as_deref(),
+            scope.uri,
+            scope.target.as_deref(),
+        );
         let uri = apply_server_flag(server, graph, uri, target)?;
         let token = resolve_remote_bearer_token(config, uri.as_deref(), target)?;
         let uri = crate::helpers::resolve_uri(config, uri, target)?;
@@ -111,7 +127,22 @@ impl GraphClient {
         uri: Option<String>,
         target: Option<&str>,
         cli_as: Option<&str>,
+        profile: Option<&str>,
+        store: Option<&str>,
     ) -> Result<Self> {
+        // RFC-011 scope translation (see `resolve`); explicit addressing passes
+        // through unchanged.
+        let scope = crate::scope::resolve_scope(
+            &crate::operator::load_operator_config()?,
+            crate::planes::Plane::Data,
+            crate::scope::ScopeFlags { profile, store, server, graph, uri, target },
+        )?;
+        let (server, graph, uri, target) = (
+            scope.server.as_deref(),
+            scope.graph.as_deref(),
+            scope.uri,
+            scope.target.as_deref(),
+        );
         let uri = apply_server_flag(server, graph, uri, target)?;
         let token = resolve_remote_bearer_token(config, uri.as_deref(), target)?;
         let resolved = resolve_cli_graph(config, uri, target)?;
