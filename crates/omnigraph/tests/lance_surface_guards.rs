@@ -541,3 +541,80 @@ async fn fragment_deletion_metadata_is_available() {
          per-fragment deletions and would need to read the deletion vector.",
     );
 }
+
+// --- Guard 14: BTREE scalar-index range-boundary correctness (lance#6796) ----
+//
+// lance#6796 (issue #6792) fixed a BTREE range-query bound-inclusiveness bug:
+// `price <= 10 AND price > 5` returned the wrong boundary row (5.0 instead of
+// 10.0). OmniGraph builds BTREE scalar indexes (`ensure_indices`) and pushes
+// range filters, so it was exposed on 6.0.1. This reproduces the exact #6792
+// shape (5 rows + an explicit BTREE drives the index path even on tiny data,
+// per the upstream repro) and pins the corrected inclusive-`<=` / exclusive-`>`
+// semantics. It turns red if a future Lance regression reintroduces the bug.
+#[tokio::test]
+async fn btree_range_query_boundary_is_correct() {
+    use arrow_array::Float64Array;
+    use futures::TryStreamExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard14.lance");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("price", DataType::Float64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"])),
+            Arc::new(Float64Array::from(vec![1.0, 5.0, 10.0, 15.0, 20.0])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let mut ds = Dataset::write(reader, uri.to_str().unwrap(), Some(params))
+        .await
+        .unwrap();
+
+    // Build the BTREE on the numeric column so the range filter resolves through
+    // the scalar index (the path lance#6796 fixed).
+    ds.create_index_builder(&["price"], IndexType::BTree, &ScalarIndexParams::default())
+        .replace(true)
+        .await
+        .unwrap();
+
+    let mut scanner = ds.scan();
+    scanner.filter("price <= 10.0 AND price > 5.0").unwrap();
+    let batches: Vec<RecordBatch> = scanner
+        .try_into_stream()
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    let mut got: Vec<f64> = Vec::new();
+    for b in &batches {
+        let col = b
+            .column_by_name("price")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        for i in 0..col.len() {
+            got.push(col.value(i));
+        }
+    }
+    got.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(
+        got,
+        vec![10.0],
+        "BTREE range `price <= 10 AND price > 5` must return exactly [10.0] \
+         (lance#6796 / issue #6792 boundary fix); got {got:?}. If this regressed, \
+         Lance reintroduced the range-bound inclusiveness bug.",
+    );
+}
