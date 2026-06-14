@@ -1046,3 +1046,54 @@ async fn lance_restore_loses_to_concurrent_append_via_orphaning() {
     let v2_ids = collect_ids(&v2_batches);
     assert_eq!(v2_ids, vec!["alice".to_string(), "bob".to_string()]);
 }
+
+/// Regression for PR #229: `commit_staged` must skip Lance's per-commit
+/// auto-cleanup hook. A graph created BEFORE the v7 bump (6.0.1 defaulted
+/// `WriteParams::auto_cleanup` ON) carries `lance.auto_cleanup.*` config on its
+/// datasets that `auto_cleanup = None` on new writes cannot retroactively clear;
+/// Lance's hook fires off that *stored* config at commit time. Without the skip,
+/// the engine's own writes would GC the versions `__manifest` pins for
+/// snapshots/time-travel. (The substrate negative control — that the config
+/// really does GC without the skip — lives in
+/// `lance_surface_guards.rs::skip_auto_cleanup_suppresses_version_gc`.)
+#[tokio::test]
+async fn commit_staged_skips_auto_cleanup_so_pinned_versions_survive() {
+    use std::collections::HashMap;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("{}/people.lance", dir.path().to_str().unwrap());
+    let store = TableStore::new(dir.path().to_str().unwrap());
+
+    let mut ds = TableStore::write_dataset(&uri, person_batch(&[("seed", Some(0))]))
+        .await
+        .unwrap();
+    let v1 = ds.version().version;
+
+    // Simulate a pre-bump dataset: aggressive legacy auto_cleanup config (fire on
+    // every commit, delete anything older than now).
+    let mut cfg = HashMap::new();
+    cfg.insert("lance.auto_cleanup.interval".to_string(), "1".to_string());
+    cfg.insert("lance.auto_cleanup.older_than".to_string(), "0ms".to_string());
+    ds.update_config(cfg).await.unwrap();
+
+    // Several writes through the engine's staged commit path.
+    for i in 0..5i32 {
+        let name = format!("p{i}");
+        let staged = store
+            .stage_append(&ds, person_batch(&[(name.as_str(), Some(i))]), &[])
+            .await
+            .unwrap();
+        ds = store
+            .commit_staged(Arc::new(ds.clone()), staged.transaction)
+            .await
+            .unwrap();
+    }
+
+    // `commit_staged` sets `with_skip_auto_cleanup(true)`, so the legacy config
+    // must NOT have GC'd the `__manifest`-pinned create version.
+    assert!(
+        ds.checkout_version(v1).await.is_ok(),
+        "commit_staged must skip Lance auto-cleanup so a pre-bump graph's pinned \
+         v{v1} survives; it was GC'd"
+    );
+}

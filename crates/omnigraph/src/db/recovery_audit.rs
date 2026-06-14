@@ -190,6 +190,7 @@ async fn create_recoveries_dataset(root_uri: &str) -> Result<Dataset> {
         enable_stable_row_ids: true,
         data_storage_version: Some(LanceFileVersion::V2_2),
         auto_cleanup: None,
+        skip_auto_cleanup: true,
         ..Default::default()
     };
     match Dataset::write(reader, &uri as &str, Some(params)).await {

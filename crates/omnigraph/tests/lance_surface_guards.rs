@@ -32,7 +32,10 @@ use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::optimize::{CompactionOptions, compact_files};
 use lance::dataset::transaction::Operation;
 use lance::dataset::write::delete::DeleteResult;
-use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
+use lance::dataset::{
+    CommitBuilder, InsertBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode,
+    WriteParams,
+};
 use lance::index::DatasetIndexExt;
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
@@ -813,5 +816,105 @@ async fn btree_range_query_boundary_is_correct() {
         "BTREE range `price <= 10 AND price > 5` must return exactly [10.0] \
          (lance#6796 / issue #6792 boundary fix); got {got:?}. If this regressed, \
          Lance reintroduced the range-bound inclusiveness bug.",
+    );
+}
+
+// --- Guard 18: skip_auto_cleanup suppresses version GC (lance#6755 / PR #229) --
+//
+// After the v7 bump, OmniGraph relies on `CommitBuilder::with_skip_auto_cleanup`
+// (`commit_staged`) and `MergeInsertBuilder::skip_auto_cleanup` (the `__manifest`
+// publisher) to stop Lance's per-commit auto-cleanup hook from GC'ing versions
+// the `__manifest` pins for snapshots/time-travel. This is load-bearing for
+// graphs created BEFORE the bump: 6.0.1 defaulted `WriteParams::auto_cleanup` ON,
+// so those datasets carry `lance.auto_cleanup.*` config that `auto_cleanup = None`
+// on new writes cannot retroactively clear — only the per-commit skip stops it.
+//
+// Pins both halves: WITHOUT the skip the aggressive config GCs v1; WITH the skip
+// (the exact call `commit_staged` makes) v1 survives.
+#[tokio::test]
+async fn skip_auto_cleanup_suppresses_version_gc() {
+    use std::collections::HashMap;
+
+    // The cleanup config 6.0.1 stored by default, made aggressive: fire on every
+    // commit, delete anything older than now.
+    async fn set_legacy_cleanup(ds: &mut Dataset) {
+        let mut cfg = HashMap::new();
+        cfg.insert("lance.auto_cleanup.interval".to_string(), "1".to_string());
+        cfg.insert("lance.auto_cleanup.older_than".to_string(), "0ms".to_string());
+        ds.update_config(cfg).await.unwrap();
+    }
+    fn row(i: i32) -> (Arc<Schema>, RecordBatch) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![format!("k{i}")])),
+                Arc::new(Int32Array::from(vec![i])),
+            ],
+        )
+        .unwrap();
+        (schema, batch)
+    }
+
+    // Negative control: WITHOUT skip, the legacy config GCs the pinned v1.
+    let ctrl = tempfile::tempdir().unwrap();
+    let curi = ctrl.path().join("g18_ctrl.lance");
+    let curi = curi.to_str().unwrap();
+    let mut ds = fresh_dataset(curi).await;
+    let v1 = ds.version().version;
+    set_legacy_cleanup(&mut ds).await;
+    for i in 0..5 {
+        let (schema, batch) = row(i);
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        ds.append(
+            reader,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    }
+    assert!(
+        ds.checkout_version(v1).await.is_err(),
+        "negative control: without skip_auto_cleanup, the legacy auto_cleanup \
+         config should have GC'd pinned v{v1}; if this fails the config is not \
+         firing and the positive assertion below proves nothing."
+    );
+
+    // The guarantee: WITH the per-commit skip, v1 survives. Mirrors
+    // `TableStore::commit_staged` (InsertBuilder::execute_uncommitted +
+    // CommitBuilder::with_skip_auto_cleanup(true)).
+    let keep = tempfile::tempdir().unwrap();
+    let kuri = keep.path().join("g18.lance");
+    let kuri = kuri.to_str().unwrap();
+    let mut ds = fresh_dataset(kuri).await;
+    let v1 = ds.version().version;
+    set_legacy_cleanup(&mut ds).await;
+    for i in 0..5 {
+        let (_schema, batch) = row(i);
+        let tx = InsertBuilder::new(Arc::new(ds.clone()))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute_uncommitted(vec![batch])
+            .await
+            .unwrap();
+        ds = CommitBuilder::new(Arc::new(ds.clone()))
+            .with_skip_auto_cleanup(true)
+            .execute(tx)
+            .await
+            .unwrap();
+    }
+    assert!(
+        ds.checkout_version(v1).await.is_ok(),
+        "v{v1} was GC'd despite CommitBuilder::with_skip_auto_cleanup(true) — the \
+         commit_staged / publisher skip is the only thing protecting \
+         __manifest-pinned versions on upgraded (pre-bump) graphs."
     );
 }
