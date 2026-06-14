@@ -1,7 +1,5 @@
 # Schema Language (`.pg`)
 
-Pest grammar at `crates/omnigraph-compiler/src/schema/schema.pest`. AST at `schema/ast.rs`. Catalog at `catalog/mod.rs`.
-
 ## Top-level declarations
 
 - `interface <Name> { property* }` — reusable property contracts.
@@ -47,37 +45,28 @@ Edge bodies only allow `@unique` and `@index`.
 
 - `@<ident>` or `@<ident>(<literal>)` on any declaration or property.
 - Known annotations:
-  - `@embed` on a Vector property — names the *source* property whose text gets embedded into this vector at ingest (`embed_sources` map in NodeType).
+  - `@embed` on a Vector property — names the *source* property whose text gets embedded into this vector at ingest.
   - `@description("…")`, `@instruction("…")` on query declarations (carried through to clients).
 - Custom annotations are accepted by the parser and surfaced in catalog metadata; unrecognized annotations don't fail compilation.
 
-## Catalog construction
+## Table layout
 
-- Pass 0: collect interfaces.
-- Pass 1: collect nodes, expand `implements`, build constraint and `@embed` mappings, build the Arrow schema for each node table (`id: Utf8` plus all properties; blob columns get `LargeBinary`).
-- Pass 2: collect edges, validate that `from_type` / `to_type` exist, normalize edge names case-insensitively for lookup, validate constraints for edges. Edge Arrow schema: `id: Utf8, src: Utf8, dst: Utf8` plus edge properties.
-
-## Schema IR & stable type IDs
-
-- `SCHEMA_IR_VERSION = 1` (`catalog/schema_ir.rs`).
-- Each interface/node/edge currently gets a `stable_type_id` from a kind+name hash.
-- Rename-preserving accepted IDs are an architectural invariant, but the current hash-on-name implementation is a known gap until migration carries IDs across `@rename_from`.
-- Serialized as JSON for diff/migration plans.
+- Each node type compiles to a table with an `id: Utf8` column plus all declared properties (blob columns are stored as `LargeBinary`); `implements` clauses expand the interface's properties into the node.
+- Each edge type compiles to a table with `id: Utf8, src: Utf8, dst: Utf8` plus the edge's own properties. Edge endpoint types (`from`/`to`) must exist, and edge names are matched case-insensitively.
 
 ## Schema migration planning
 
-`plan_schema_migration(accepted, desired) -> SchemaMigrationPlan { supported, steps[] }` with step types:
+A migration plan compares the accepted schema against the desired one and reports whether the change is supported plus the ordered steps it requires:
 
-- `AddType { type_kind, name }`
-- `RenameType { type_kind, from, to }`
-- `AddProperty { type_kind, type_name, property_name, property_type }`
-- `RenameProperty { type_kind, type_name, from, to }`
-- `AddConstraint { type_kind, type_name, constraint }`
-- `UpdateTypeMetadata { … annotations }`
-- `UpdatePropertyMetadata { … annotations }`
-- `UnsupportedChange { entity, reason }` (forces `supported=false`)
+- Add a type
+- Rename a type
+- Add a property
+- Rename a property
+- Add a constraint
+- Update type or property metadata (annotations)
+- Unsupported change (reports the entity and reason; forces the plan to unsupported)
 
-`apply_schema()` returns `SchemaApplyResult { supported, applied, manifest_version, steps }` and is gated by an internal `__schema_apply_lock__` system branch so concurrent schema applies serialize.
+Applying a plan reports whether it was supported, the steps applied, and the resulting manifest version. Concurrent schema applies serialize so they can't interleave.
 
 ## Destructive drops — `--allow-data-loss`
 

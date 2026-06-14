@@ -1,10 +1,10 @@
 # HTTP Server (`omnigraph-server`)
 
-Axum 0.8 + tokio + utoipa-generated OpenAPI. **Two modes** (v0.6.0+): single-graph (legacy) and multi-graph (MR-668), with **two boot sources** for multi mode: `omnigraph.yaml` or — exclusively — a cluster directory (`--cluster`, RFC-005). Mode is inferred from CLI args + config shape.
+Axum 0.8 + tokio + utoipa-generated OpenAPI. **Two modes** (v0.6.0+): single-graph and multi-graph, with **two boot sources** for multi mode: `omnigraph.yaml` or — exclusively — a cluster directory (`--cluster`). Mode is inferred from CLI args + config shape.
 
 ## Modes
 
-### Single-graph mode (legacy)
+### Single-graph mode
 
 `omnigraph-server <URI>` or `omnigraph-server --target <name> --config omnigraph.yaml`. Routes are flat — `/snapshot`, `/read`, `/branches`, etc.
 
@@ -14,10 +14,10 @@ Axum 0.8 + tokio + utoipa-generated OpenAPI. **Two modes** (v0.6.0+): single-gra
 
 `omnigraph-server --config omnigraph.yaml` with a non-empty `graphs:` map and **no** single-mode selector (no `server.graph`, no `<URI>`, no `--target`). The server opens every configured graph in parallel at startup (bounded concurrency = 4, fail-fast on the first open error). Routes are nested under `/graphs/{graph_id}/...`. Bare flat paths return 404 in multi mode.
 
-### Cluster-booted multi mode (Phase 5)
+### Cluster-booted multi mode
 
 `omnigraph-server --cluster <dir-or-uri>` boots from the cluster catalog's **applied
-revision** (`state.json` + content-addressed blobs) instead of
+revision** instead of
 `omnigraph.yaml` — an exclusive boot source: combining it with `<URI>`,
 `--target`, or `--config` is a startup error, and `omnigraph.yaml` is never
 read in this mode. Always multi-graph routing. See
@@ -42,34 +42,34 @@ If a graph declares a `queries:` registry (see [cli-reference](../cli/reference.
 
 Per-graph endpoints — same body shape across modes; URLs differ:
 
-| Method | Single-mode path | Multi-mode path | Auth | Action | Handler |
-|---|---|---|---|---|---|
-| GET | `/healthz` | `/healthz` | none | — | `server_health` |
-| GET | `/openapi.json` | `/openapi.json` | none | — | `server_openapi` (strips security if auth disabled; in multi mode emits cluster paths with `cluster_` operation-id prefix) |
-| GET | `/snapshot?branch=` | `/graphs/{id}/snapshot?branch=` | bearer + `read` | snapshot of branch | `server_snapshot` |
-| POST | `/query` | `/graphs/{id}/query` | bearer + `read` | inline read query (canonical; clean field names `query`/`name`; mutations → 400) | `server_query` |
-| POST | `/read` | `/graphs/{id}/read` | bearer + `read` | **deprecated** alias of `/query` (legacy field names `query_source`/`query_name`, byte-stable response; carries `Deprecation: true` + `Link: </query>; rel="successor-version"`) | `server_read` |
-| POST | `/export` | `/graphs/{id}/export` | bearer + `export` | NDJSON stream | `server_export` |
-| POST | `/mutate` | `/graphs/{id}/mutate` | bearer + `change` | mutation (canonical; `query`/`name`; accepts legacy `query_source`/`query_name` as serde aliases) | `server_mutate` |
-| POST | `/change` | `/graphs/{id}/change` | bearer + `change` | **deprecated** alias of `/mutate` (carries `Deprecation: true` + `Link: </mutate>; rel="successor-version"`) | `server_change` |
-| GET | `/queries` | `/graphs/{id}/queries` | bearer + `read` | list the `mcp.expose` stored queries as a typed tool catalog | `server_list_queries` |
-| POST | `/queries/{name}` | `/graphs/{id}/queries/{name}` | bearer + `invoke_query` (+ `change` for a stored mutation) | invoke a named query from the `queries:` registry; deny == 404 | `server_invoke_query` |
-| GET | `/schema` | `/graphs/{id}/schema` | bearer + `read` | get current `.pg` source | `server_schema_get` |
-| POST | `/schema/apply` | `/graphs/{id}/schema/apply` | bearer + `schema_apply` (target=`main`) | migrate | `server_schema_apply` |
-| POST | `/load` | `/graphs/{id}/load` | bearer + `branch_create` (only when `from` is set and the branch is created) + `change` | bulk load (canonical); branch creation is opt-in via `from` — without it a missing `branch` is a 404, never an implicit fork | `server_load` (32 MB body limit) |
-| POST | `/ingest` | `/graphs/{id}/ingest` | bearer + `branch_create` (only when `from` is set and the branch is created) + `change` | **deprecated** alias of `/load` (carries `Deprecation: true` + `Link: </load>; rel="successor-version"`) | `server_ingest` (32 MB body limit) |
-| GET | `/branches` | `/graphs/{id}/branches` | bearer + `read` | list branches | `server_branch_list` |
-| POST | `/branches` | `/graphs/{id}/branches` | bearer + `branch_create` | create | `server_branch_create` |
-| DELETE | `/branches/{branch}` | `/graphs/{id}/branches/{branch}` | bearer + `branch_delete` | delete | `server_branch_delete` |
-| POST | `/branches/merge` | `/graphs/{id}/branches/merge` | bearer + `branch_merge` | merge `source → target` | `server_branch_merge` |
-| GET | `/commits?branch=` | `/graphs/{id}/commits?branch=` | bearer + `read` | list | `server_commit_list` |
-| GET | `/commits/{commit_id}` | `/graphs/{id}/commits/{commit_id}` | bearer + `read` | show | `server_commit_show` |
+| Method | Single-mode path | Multi-mode path | Auth | Action |
+|---|---|---|---|---|
+| GET | `/healthz` | `/healthz` | none | — |
+| GET | `/openapi.json` | `/openapi.json` | none | — (strips security if auth disabled; in multi mode emits cluster paths with `cluster_` operation-id prefix) |
+| GET | `/snapshot?branch=` | `/graphs/{id}/snapshot?branch=` | bearer + `read` | snapshot of branch |
+| POST | `/query` | `/graphs/{id}/query` | bearer + `read` | inline read query (canonical; clean field names `query`/`name`; mutations → 400) |
+| POST | `/read` | `/graphs/{id}/read` | bearer + `read` | **deprecated** alias of `/query` (legacy field names `query_source`/`query_name`, byte-stable response; carries `Deprecation: true` + `Link: </query>; rel="successor-version"`) |
+| POST | `/export` | `/graphs/{id}/export` | bearer + `export` | NDJSON stream |
+| POST | `/mutate` | `/graphs/{id}/mutate` | bearer + `change` | mutation (canonical; `query`/`name`; accepts legacy `query_source`/`query_name` as serde aliases) |
+| POST | `/change` | `/graphs/{id}/change` | bearer + `change` | **deprecated** alias of `/mutate` (carries `Deprecation: true` + `Link: </mutate>; rel="successor-version"`) |
+| GET | `/queries` | `/graphs/{id}/queries` | bearer + `read` | list the `mcp.expose` stored queries as a typed tool catalog |
+| POST | `/queries/{name}` | `/graphs/{id}/queries/{name}` | bearer + `invoke_query` (+ `change` for a stored mutation) | invoke a named query from the `queries:` registry; deny == 404 |
+| GET | `/schema` | `/graphs/{id}/schema` | bearer + `read` | get current `.pg` source |
+| POST | `/schema/apply` | `/graphs/{id}/schema/apply` | bearer + `schema_apply` (target=`main`) | migrate |
+| POST | `/load` | `/graphs/{id}/load` | bearer + `branch_create` (only when `from` is set and the branch is created) + `change` | bulk load (canonical); branch creation is opt-in via `from` — without it a missing `branch` is a 404, never an implicit fork (32 MB body limit) |
+| POST | `/ingest` | `/graphs/{id}/ingest` | bearer + `branch_create` (only when `from` is set and the branch is created) + `change` | **deprecated** alias of `/load` (carries `Deprecation: true` + `Link: </load>; rel="successor-version"`) (32 MB body limit) |
+| GET | `/branches` | `/graphs/{id}/branches` | bearer + `read` | list branches |
+| POST | `/branches` | `/graphs/{id}/branches` | bearer + `branch_create` | create |
+| DELETE | `/branches/{branch}` | `/graphs/{id}/branches/{branch}` | bearer + `branch_delete` | delete |
+| POST | `/branches/merge` | `/graphs/{id}/branches/merge` | bearer + `branch_merge` | merge `source → target` |
+| GET | `/commits?branch=` | `/graphs/{id}/commits?branch=` | bearer + `read` | list |
+| GET | `/commits/{commit_id}` | `/graphs/{id}/commits/{commit_id}` | bearer + `read` | show |
 
 Server-level management endpoints (v0.6.0+):
 
-| Method | Path | Auth | Action | Handler |
-|---|---|---|---|---|
-| GET | `/graphs` | bearer + `graph_list` on `Server::"root"` | list registered graphs | `server_graphs_list` (405 in single mode) |
+| Method | Path | Auth | Action |
+|---|---|---|---|
+| GET | `/graphs` | bearer + `graph_list` on `Server::"root"` | list registered graphs (405 in single mode) |
 
 ### Stored-query catalog (`GET /queries`)
 
@@ -96,9 +96,8 @@ or remove graphs by stopping the server, editing the `graphs:` map in
 `omnigraph.yaml`, then restarting. The server treats `omnigraph.yaml`
 as operator-owned configuration and never writes it.
 
-A future release may introduce a managed registry (Lance-backed,
-catalog-style: reserve → init → publish with recovery sidecars) and
-re-expose runtime mutation on top of it.
+A future release may introduce a managed registry and re-expose runtime
+mutation on top of it.
 
 ## Inline read queries (`POST /query`)
 
@@ -154,7 +153,7 @@ Only `/export` streams (`application/x-ndjson`, MPSC channel + `Body::from_strea
 
 Uniform `ErrorOutput { error, code?, merge_conflicts[], manifest_conflict? }` with `code ∈ unauthorized | forbidden | bad_request | not_found | conflict | too_many_requests | internal`. Merge conflicts attach structured `MergeConflictOutput { table_key, row_id?, kind, message }`.
 
-`manifest_conflict` is set on **publisher CAS rejections** (HTTP 409): the
+`manifest_conflict` is set on **concurrent-write rejections** (HTTP 409): the
 caller's pre-write view of one table's manifest version was stale.
 `ManifestConflictOutput { table_key, expected, actual }` tells the client
 which table to refresh and retry. This is the conflict shape produced by
@@ -169,8 +168,8 @@ Disjoint
 `(table, branch)` writes from different actors now run concurrently,
 guarded only by the engine's per-(table, branch) write queue. To keep
 one heavy actor from exhausting shared capacity (Lance I/O, manifest
-churn, network), the server gates mutating handlers through a
-`WorkloadController` configured per-process from environment variables:
+churn, network), the server gates mutating handlers through per-process
+admission limits configured from environment variables:
 
 | Env var | Default | Purpose |
 |---|---|---|
@@ -199,7 +198,7 @@ admission-gated.
 ## Auth model (`bearer + SHA-256`)
 
 - Tokens are SHA-256 hashed on startup; plaintext is never persisted in memory.
-- Constant-time comparison via `subtle::ConstantTimeEq`.
+- Constant-time comparison.
 - Three sources, in precedence:
   1. `OMNIGRAPH_SERVER_BEARER_TOKENS_AWS_SECRET` — AWS Secrets Manager (build with `--features aws`)
   2. `OMNIGRAPH_SERVER_BEARER_TOKENS_FILE` or `OMNIGRAPH_SERVER_BEARER_TOKENS_JSON` — JSON `{actor_id: token, …}`

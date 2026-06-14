@@ -107,7 +107,7 @@ Properties:
 - Each query on the branch is its own publisher commit — so they're individually atomic. Per-query CAS works on branches just like on main.
 - The branch lives on disk. Process crash mid-workflow? Re-open and resume.
 - Multiple agents can work on different branches in parallel without blocking each other.
-- The merge is a three-way merge at the row level. Conflicts surface as `OmniError::MergeConflicts(Vec<MergeConflict>)`, with structured kinds (`DivergentInsert`, `DivergentUpdate`, `DeleteVsUpdate`, …) so callers can handle them programmatically.
+- The merge is a three-way merge at the row level. Conflicts surface as structured merge-conflict kinds (`DivergentInsert`, `DivergentUpdate`, `DeleteVsUpdate`, …) so callers can handle them programmatically.
 
 ### 4. Coordinating multiple agents
 
@@ -129,14 +129,14 @@ omnigraph branch merge agent-b/work --into main graph.omni
 
 Each agent sees a consistent snapshot of `main` at the time it forked. The first merge to `main` lands as a fast-forward (or a no-op if no concurrent change). The second merge runs three-way: rows touched by both branches surface as `MergeConflict`s for the caller to resolve.
 
-This is the workflow MR-797 / agentic loops are designed around: **branches are the unit of "an agent's working set."**
+This is the workflow agentic loops are designed around: **branches are the unit of "an agent's working set."**
 
 ## Failure modes
 
 | Scenario | What happens | Caller action |
 |---|---|---|
 | Single query fails mid-flight | Publisher never publishes; target unchanged | Read the error, decide whether to retry |
-| Concurrent writers race the same `(table, branch)` | Publisher CAS rejects the loser with `ManifestConflictDetails::ExpectedVersionMismatch` | Refresh handle, retry the query |
+| Concurrent writers race the same `(table, branch)` | Publisher CAS rejects the loser with a version-mismatch conflict | Refresh handle, retry the query |
 | Branch with N successful mutations, then merge fails (three-way conflict) | Each individual mutation already committed on the branch; merge surfaces `MergeConflicts` | Inspect, decide whether to keep working on the branch, abandon it (`branch_delete`), or resolve and re-merge |
 | Process crashes mid-branch-workflow | Each completed mutation on the branch is durable | Re-open the graph, continue where you left off |
 

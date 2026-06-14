@@ -1,6 +1,6 @@
 # Change Detection / Diff
 
-`changes/mod.rs`. Three-level algorithm:
+Diffing two read targets uses a three-level algorithm:
 
 1. **Manifest diff**: skip sub-tables whose `(table_version, table_branch)` is unchanged.
 2. **Lineage check**:
