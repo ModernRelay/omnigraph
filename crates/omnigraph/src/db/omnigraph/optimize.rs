@@ -32,6 +32,8 @@ use lance::dataset::cleanup::{CleanupPolicy, RemovalStats};
 use lance::dataset::optimize::{
     CompactionMetrics, CompactionOptions, compact_files, plan_compaction,
 };
+use lance::index::DatasetIndexExt;
+use lance_index::optimize::OptimizeOptions;
 
 use super::*;
 
@@ -361,16 +363,22 @@ async fn optimize_one_table(
     }
 
     // Precise "will it compact?" check — `plan_compaction` also accounts for
-    // deletion materialization (which can rewrite even a single fragment). A
-    // steady-state already-compacted table yields an empty plan and is never
-    // pinned in a sidecar (a zero-commit pin would classify NoMovement on
-    // recovery and force an all-or-nothing rollback). Uncovered pre-existing
-    // drift is skipped above and must go through explicit repair.
+    // deletion materialization (which can rewrite even a single fragment).
     let options = CompactionOptions::default();
     let plan = plan_compaction(&ds, &options)
         .await
         .map_err(|e| OmniError::Lance(e.to_string()))?;
-    if plan.num_tasks() == 0 {
+    let will_compact = plan.num_tasks() > 0;
+    // Even when there is nothing to compact, the table may still have index
+    // work: rows appended since the index was built (e.g. via `ingest --mode
+    // merge`) are scanned unindexed until folded in. Either compaction or stale
+    // index coverage is enough to enter the publish path. If NEITHER, this
+    // table is a no-op and must NOT be pinned in a sidecar — a zero-commit pin
+    // classifies NoMovement on recovery and forces an all-or-nothing rollback
+    // of sibling tables' legitimate work. Uncovered pre-existing manifest/HEAD
+    // drift is skipped above and must go through explicit repair.
+    let needs_reindex = TableStore::has_unindexed_fragments(&ds).await?;
+    if !will_compact && !needs_reindex {
         return Ok(TableOptimizeStats::compacted(
             table_key,
             &CompactionMetrics::default(),
@@ -378,8 +386,9 @@ async fn optimize_one_table(
         ));
     }
 
-    // Phase A: recovery sidecar BEFORE compaction advances the Lance HEAD, so a
-    // crash before the manifest publish rolls forward on next open.
+    // Phase A: recovery sidecar BEFORE any HEAD-advancing op (compaction or
+    // index optimize), so a crash before the manifest publish rolls forward on
+    // next open.
     let sidecar = crate::db::manifest::new_sidecar(
         crate::db::manifest::SidecarKind::Optimize,
         None,
@@ -398,11 +407,26 @@ async fn optimize_one_table(
     let handle =
         crate::db::manifest::write_sidecar(db.root_uri(), db.storage_adapter(), &sidecar).await?;
 
-    // Phase B: compaction (reserve-fragments + rewrite commits advance HEAD).
+    // Phase B: compaction (if any) then incremental index optimize — both
+    // advance Lance HEAD inside the sidecar window. `compact_files` rewrites
+    // fragments and drops them from existing index segments' coverage;
+    // `optimize_indices` folds the rewritten and any previously-unindexed
+    // fragments back in (Lance's incremental merge, not a full retrain). This
+    // is the same compact -> optimize_indices sequencing LanceDB's `optimize()`
+    // uses. `optimize_indices` is an inline-commit residual: lance-6.0.1
+    // exposes no uncommitted variant, so like `compact_files` it commits
+    // directly and relies on the sidecar for recovery.
     let version_before = ds.version().version;
-    let metrics: CompactionMetrics = compact_files(&mut ds, options, None)
+    let metrics: CompactionMetrics = if will_compact {
+        compact_files(&mut ds, options, None)
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+    } else {
+        CompactionMetrics::default()
+    };
+    ds.optimize_indices(&OptimizeOptions::default())
         .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+        .map_err(|e| OmniError::Lance(format!("optimize_indices on {}: {}", table_key, e)))?;
     let version_after = ds.version().version;
     let committed = version_after != version_before;
 

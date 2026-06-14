@@ -704,6 +704,36 @@ impl TableStore {
         Ok(IndexCoverage::Indexed)
     }
 
+    /// True if any non-system index on `ds` leaves at least one current
+    /// fragment uncovered, i.e. rows that the index does not yet account for
+    /// (appended after the index was built, or rewritten by compaction). Such
+    /// fragments are scanned unindexed until a reindex (`optimize_indices`)
+    /// folds them in. Returns false when every index covers every fragment, or
+    /// when the table has no (non-system) indices to optimize. A `None`
+    /// `fragment_bitmap` means Lance cannot report coverage for that index, so
+    /// we do not treat it as uncovered (mirrors `key_column_index_coverage`).
+    ///
+    /// Used by `optimize` to decide whether an otherwise-already-compacted
+    /// table still has index work to do.
+    pub async fn has_unindexed_fragments(ds: &Dataset) -> Result<bool> {
+        let indices = ds
+            .load_indices()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let frag_ids: Vec<u32> = ds.fragments().iter().map(|f| f.id as u32).collect();
+        for index in indices.iter() {
+            if is_system_index(index) {
+                continue;
+            }
+            if let Some(bitmap) = index.fragment_bitmap.as_ref() {
+                if frag_ids.iter().any(|id| !bitmap.contains(*id)) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     pub async fn count_rows(&self, ds: &Dataset, filter: Option<String>) -> Result<usize> {
         ds.count_rows(filter)
             .await

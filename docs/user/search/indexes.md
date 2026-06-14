@@ -4,9 +4,26 @@
 
 | Index | Use | Notes |
 |---|---|---|
-| **BTREE scalar** | range / equality on any scalar | created on `@key`, `@index(...)`, and on key columns by `ensure_indices()` |
-| **Inverted (FTS)** | `search`, `fuzzy`, `match_text`, `bm25` | created on text columns referenced by FTS queries |
+| **BTREE scalar** | `=` / range / `IN` / `IS NULL` on a scalar | always on the node `id` and edge `src`/`dst`; and on each one-column `@index`/`@key` property that is an **enum** or an **orderable scalar** (`DateTime`/`Date`/`I32`/`I64`/`U32`/`U64`/`F32`/`F64`/`Bool`) |
+| **Inverted (FTS)** | `search`, `fuzzy`, `match_text`, `bm25` | created on **free-text** (non-enum) `String` `@index`/`@key` columns |
 | **Vector** | `nearest()` k-NN | Lance picks IVF_PQ vs HNSW family by configuration; OmniGraph stores as FixedSizeList(Float32, dim) |
+
+The per-property index a column gets is decided by `node_prop_index_kind` (shared
+by the builder and the sidecar-pinning coverage check so they cannot drift):
+enums and orderable scalars → BTREE, free-text Strings → FTS, `Vector` → vector,
+list/`Blob` columns → none.
+
+> **Free-text Strings are not equality-indexed.** A non-enum `String` column
+> (including a `String @key` slug) gets an FTS inverted index, which Lance does
+> **not** consult for `=`/range — only for `search`/`match_text`/`bm25`. So an
+> equality filter on a free-text String falls back to a full scan. If you filter
+> a String identifier by equality on a large table, model it so the value is the
+> node id, or track it as a follow-up to also build a BTREE on such columns.
+
+> **Coverage and cost.** Each indexed column adds index files and build time, and
+> an index only covers the fragments it was built over. Rows appended after the
+> index was built (e.g. by `ingest --mode merge`) are scanned unindexed until a
+> reindex extends coverage; see [maintenance](maintenance.md) → `optimize`.
 
 ## L2 — OmniGraph orchestration
 

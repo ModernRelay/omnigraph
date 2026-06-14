@@ -16,7 +16,7 @@ use lance::dataset::scanner::ColumnOrdering;
 use lance::datatypes::BlobKind;
 use omnigraph_compiler::catalog::{Catalog, EdgeType, NodeType};
 use omnigraph_compiler::schema::parser::parse_schema;
-use omnigraph_compiler::types::ScalarType;
+use omnigraph_compiler::types::{PropType, ScalarType};
 use omnigraph_compiler::{
     DropMode, SchemaIR, SchemaMigrationPlan, SchemaMigrationStep, SchemaTypeKind,
     build_catalog_from_ir, build_schema_ir, plan_schema_migration,

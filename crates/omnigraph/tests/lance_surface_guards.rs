@@ -36,6 +36,7 @@ use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode,
 use lance::index::DatasetIndexExt;
 use lance_file::version::LanceFileVersion;
 use lance_index::IndexType;
+use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::ScalarIndexParams;
 use lance_namespace::LanceNamespace;
 use lance_table::io::commit::ManifestNamingScheme;
@@ -539,5 +540,201 @@ async fn fragment_deletion_metadata_is_available() {
         "PROBE: deletion_file.num_deleted_rows is not a populated metadata count \
          (got {count:?}); the artifact coverage model cannot cheaply detect \
          per-fragment deletions and would need to read the deletion vector.",
+    );
+}
+
+// --- Guard 14: Dataset::optimize_indices signature ----------------------------
+//
+// `db/omnigraph/optimize.rs::optimize_one_table` calls
+// `ds.optimize_indices(&OptimizeOptions::default())` (via `DatasetIndexExt`) to
+// fold appended/compacted fragments back into existing indexes. If Lance
+// changes the receiver, the options type, or the return shape, this fails to
+// compile. Compile-only.
+
+#[allow(
+    dead_code,
+    unreachable_code,
+    unused_variables,
+    unused_mut,
+    clippy::diverging_sub_expression
+)]
+async fn _compile_optimize_indices_signature() -> lance::Result<()> {
+    let mut ds: Dataset = unimplemented!();
+    let options = OptimizeOptions::default();
+    // `&mut self`, `&OptimizeOptions`, returns `Result<()>` (mutates in place
+    // and commits — there is no uncommitted variant in this Lance, which is why
+    // optimize treats it as an inline-commit residual under a recovery sidecar).
+    let _: () = ds.optimize_indices(&options).await?;
+    Ok(())
+}
+
+// --- Guard 15: optimize_indices extends fragment coverage ----------------------
+//
+// PR3's reindex assumes `optimize_indices` folds fragments appended AFTER an
+// index was built into that index (incremental merge, not retrain). This pins
+// that Lance behavior at the surface layer so a regression turns red here, the
+// first smoke check on a Lance bump, before the slower engine suite.
+
+#[tokio::test]
+async fn optimize_indices_extends_fragment_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("guard_optimize_indices.lance");
+    let uri = uri.to_str().unwrap();
+
+    // Fragment 0: alice, bob. Build a BTREE over `value` covering only it.
+    let mut ds = fresh_dataset(uri).await;
+    ds.create_index_builder(&["value"], IndexType::BTree, &ScalarIndexParams::default())
+        .replace(true)
+        .await
+        .unwrap();
+
+    // Append a second fragment the existing index does not cover.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("value", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["carol"])),
+            Arc::new(Int32Array::from(vec![3])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Append,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    Dataset::write(reader, uri, Some(params)).await.unwrap();
+
+    let mut ds = Dataset::open(uri).await.unwrap();
+    assert!(
+        value_index_uncovered_count(&ds).await > 0,
+        "appended fragment should be uncovered by the BTREE before optimize_indices"
+    );
+
+    ds.optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        value_index_uncovered_count(&ds).await,
+        0,
+        "optimize_indices must fold the appended fragment into the existing index \
+         (incremental coverage); if this regresses, PR3's reindex no longer keeps \
+         coverage current — revisit db/omnigraph/optimize.rs and docs/dev/lance.md."
+    );
+}
+
+/// Count current fragments not covered by the single-column `value` BTREE —
+/// mirrors `TableStore::has_unindexed_fragments` (load_indices +
+/// `fragment_bitmap.contains`), pinned by Guard 11.
+async fn value_index_uncovered_count(ds: &Dataset) -> usize {
+    let indices = ds.load_indices().await.unwrap();
+    let frag_ids: Vec<u32> = ds.fragments().iter().map(|f| f.id as u32).collect();
+    let value_fid = ds.schema().field("value").unwrap().id;
+    for index in indices.iter() {
+        if index.fields.len() == 1 && index.fields[0] == value_fid {
+            if let Some(bitmap) = index.fragment_bitmap.as_ref() {
+                return frag_ids.iter().filter(|id| !bitmap.contains(**id)).count();
+            }
+        }
+    }
+    // No `value` index found — treat as fully uncovered so a missing index
+    // is never mistaken for full coverage.
+    frag_ids.len()
+}
+
+// --- Guard 16: scalar index use requires a literal matching the column type ---
+//
+// Pins the substrate behavior the pushdown literal-coercion fix relies on
+// (`query.rs::literal_to_typed_expr`): Lance uses the BTREE only when the filter
+// is `column OP literal` with a matching type. A width-mismatched literal makes
+// DataFusion widen and cast the COLUMN (`CAST(n32 AS Int64)`), which drops the
+// scalar index and full-scans. Temporal columns are immune (DataFusion casts the
+// Utf8 LITERAL to the date type, not the column). If a Lance/DataFusion bump
+// changes either coercion direction, this turns red — re-validate the fix.
+#[tokio::test]
+async fn scalar_index_use_requires_matched_literal_type() {
+    use datafusion::physical_plan::displayable;
+    use datafusion::prelude::{col, lit};
+    use datafusion::scalar::ScalarValue;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("probe_literal_type.lance");
+    let uri = uri.to_str().unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("n32", DataType::Int32, false),
+        Field::new("d32", DataType::Date32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
+            Arc::new(Int32Array::from(vec![1, 5, 9, 13])),
+            Arc::new(arrow_array::Date32Array::from(vec![19000, 19723, 20000, 20500])),
+        ],
+    )
+    .unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let params = WriteParams {
+        mode: WriteMode::Create,
+        enable_stable_row_ids: true,
+        data_storage_version: Some(LanceFileVersion::V2_2),
+        ..Default::default()
+    };
+    let mut ds = Dataset::write(reader, uri, Some(params)).await.unwrap();
+    for c in ["n32", "d32"] {
+        ds.create_index_builder(&[c], IndexType::BTree, &ScalarIndexParams::default())
+            .replace(true)
+            .await
+            .unwrap();
+    }
+
+    async fn plan_str(ds: &Dataset, filter: datafusion::prelude::Expr) -> String {
+        let mut scanner = ds.scan();
+        scanner.filter_expr(filter);
+        let plan = scanner.create_plan().await.unwrap();
+        format!("{}", displayable(plan.as_ref()).indent(true))
+    }
+
+    // (label, filter, expect_index_used)
+    let cases = [
+        ("n32 = 5i32 (matched Int32)", col("n32").eq(lit(5i32)), true),
+        ("n32 = 5i64 (widened Int64)", col("n32").eq(lit(5i64)), false),
+        (
+            "d32 = Date32 (matched)",
+            col("d32").eq(lit(ScalarValue::Date32(Some(19723)))),
+            true,
+        ),
+        (
+            "d32 = '2024-01-01' (Utf8 vs Date32)",
+            col("d32").eq(lit("2024-01-01")),
+            true,
+        ),
+    ];
+
+    for (label, filter, expect_index) in cases {
+        let s = plan_str(&ds, filter).await;
+        let uses_index = s.contains("ScalarIndexQuery");
+        assert_eq!(
+            uses_index, expect_index,
+            "[{label}] expected scalar-index use = {expect_index}, got {uses_index}.\n\
+             A change here means Lance/DataFusion shifted its coercion or index \
+             pushdown; re-validate query.rs::literal_to_typed_expr.\nplan:\n{s}"
+        );
+    }
+
+    // The widened case must show the index-defeating column CAST (the precise
+    // shape the fix avoids by coercing the literal to the column type).
+    let widened = plan_str(&ds, col("n32").eq(lit(5i64))).await;
+    assert!(
+        widened.contains("CAST(n32 AS Int64)"),
+        "expected a column-side cast in the widened plan, got:\n{widened}"
     );
 }

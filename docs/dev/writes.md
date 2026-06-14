@@ -86,10 +86,17 @@ deferred to a follow-up cycle — tracked).
 Three writers have been migrated onto staged primitives:
 
 * **`ensure_indices`** (`db/omnigraph/table_ops.rs::build_indices_on_dataset_for_catalog`)
-  — scalar indices (BTree, Inverted) now use `stage_create_*_index` +
-  `commit_staged`. Vector indices stay inline (residual — Lance
-  `build_index_metadata_from_segments` is `pub(crate)` in 6.0.1;
-  companion ticket to lance-format/lance#6658 needed).
+  — scalar indices (BTree, Inverted) use `stage_create_*_index` +
+  `commit_staged`. Which index a `@index`/`@key` property gets is dispatched by
+  type via `node_prop_index_kind` (enum + orderable scalar → BTree, free-text
+  String → Inverted/FTS, Vector → vector). Vector indices stay inline (residual
+  — Lance `build_index_metadata_from_segments` is `pub(crate)` in 6.0.1;
+  companion ticket to lance-format/lance#6658 needed). This build is
+  existence-gated (it creates a *missing* index over current fragments); folding
+  fragments appended afterward into an *existing* index is `optimize`'s
+  `optimize_indices` pass — an inline-commit residual, not a staged write (Lance
+  exposes no uncommitted index-optimize), covered by the optimize recovery
+  sidecar (see [maintenance.md](../user/operations/maintenance.md)).
 * **`branch_merge::publish_rewritten_merge_table`**
   (`exec/merge.rs`) — merge_insert now uses `stage_merge_insert` +
   `commit_staged`. Deletes stay inline (Lance #6658 residual).

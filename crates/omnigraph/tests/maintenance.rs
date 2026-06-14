@@ -14,9 +14,11 @@ use omnigraph::db::{
     SkipReason,
 };
 use omnigraph::loader::{LoadMode, load_jsonl};
+use omnigraph::table_store::{IndexCoverage, TableStore};
 
 use helpers::{
     MUTATION_QUERIES, TEST_DATA, TEST_SCHEMA, count_rows, init_and_load, mixed_params, mutate_main,
+    snapshot_main,
 };
 
 /// Filesystem URI of a node sub-table, mirroring the engine's layout
@@ -129,6 +131,72 @@ async fn optimize_after_load_then_again_is_idempotent() {
             s.table_key
         );
     }
+}
+
+// PR3 (Workstream B): an existing scalar index does not cover fragments
+// appended after it was built (build_indices is existence-gated), so those
+// rows are scanned unindexed. `optimize` must fold them back in via Lance's
+// incremental `optimize_indices`, restoring full coverage.
+#[tokio::test]
+async fn optimize_reindexes_fragments_appended_after_index_build() {
+    const SCHEMA: &str = r#"
+node Doc {
+    slug: String @key
+    rank: I32 @index
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut db = Omnigraph::init(uri, SCHEMA).await.unwrap();
+
+    // First load builds the id + rank BTREEs over the initial fragment.
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"rank\":1}}\n\
+         {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"rank\":2}}",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    // A second load with NEW keys appends a fragment the existing BTREEs do not
+    // cover (the existence gate skips re-building an index that already exists).
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d3\",\"rank\":3}}\n\
+         {\"type\":\"Doc\",\"data\":{\"slug\":\"d4\",\"rank\":4}}",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    // Precondition: the appended fragment is unindexed.
+    {
+        let snap = snapshot_main(&db).await.unwrap();
+        let ds = snap.open("node:Doc").await.unwrap();
+        assert!(
+            TableStore::has_unindexed_fragments(&ds).await.unwrap(),
+            "appended fragment should be unindexed before optimize"
+        );
+    }
+
+    db.optimize().await.unwrap();
+
+    // Postcondition: optimize_indices folded the appended fragment in, so every
+    // index covers every fragment and `rank` reports fully Indexed.
+    let snap = snapshot_main(&db).await.unwrap();
+    let ds = snap.open("node:Doc").await.unwrap();
+    assert!(
+        !TableStore::has_unindexed_fragments(&ds).await.unwrap(),
+        "optimize must extend index coverage to all fragments"
+    );
+    assert_eq!(
+        TableStore::key_column_index_coverage(&ds, "rank")
+            .await
+            .unwrap(),
+        IndexCoverage::Indexed,
+        "rank BTREE must cover all fragments after optimize"
+    );
 }
 
 // Regression: `optimize` must not crash on a graph that has a `Blob` table.
