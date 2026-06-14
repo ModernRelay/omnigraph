@@ -19,6 +19,7 @@ node Metric {
     name: String @key
     score: F64?
     ratio: F32?
+    count: I32?
     active: Bool?
     born: Date?
     seen: DateTime?
@@ -26,10 +27,10 @@ node Metric {
 "#;
 
 // Seeds partition every predicate, so a dropped filter returns all 4 rows.
-const DATA: &str = r#"{"type":"Metric","data":{"name":"m1","score":2.5,"ratio":0.5,"active":true,"born":"2024-06-01","seen":"2024-06-01T12:00:00Z"}}
-{"type":"Metric","data":{"name":"m2","score":1.0,"ratio":0.25,"active":false,"born":"2023-01-01","seen":"2023-01-01T00:00:00Z"}}
-{"type":"Metric","data":{"name":"m3","score":3.0,"ratio":0.75,"active":true,"born":"2025-01-01","seen":"2025-01-01T00:00:00Z"}}
-{"type":"Metric","data":{"name":"m4","score":0.5,"ratio":0.1,"active":false,"born":"2022-12-31","seen":"2022-01-01T00:00:00Z"}}"#;
+const DATA: &str = r#"{"type":"Metric","data":{"name":"m1","score":2.5,"ratio":0.5,"count":1,"active":true,"born":"2024-06-01","seen":"2024-06-01T12:00:00Z"}}
+{"type":"Metric","data":{"name":"m2","score":1.0,"ratio":0.25,"count":2,"active":false,"born":"2023-01-01","seen":"2023-01-01T00:00:00Z"}}
+{"type":"Metric","data":{"name":"m3","score":3.0,"ratio":0.75,"count":3,"active":true,"born":"2025-01-01","seen":"2025-01-01T00:00:00Z"}}
+{"type":"Metric","data":{"name":"m4","score":0.5,"ratio":0.1,"count":4,"active":false,"born":"2022-12-31","seen":"2022-01-01T00:00:00Z"}}"#;
 
 async fn metric_db(dir: &tempfile::TempDir) -> Omnigraph {
     let uri = dir.path().to_str().unwrap();
@@ -67,6 +68,50 @@ query inline() { match { $m: Metric { score: 3.0 } } return { $m.name } }
     assert_eq!(sorted_metric_names(&mut db, q, "inline").await, vec!["m3"]);
 }
 
+// Inline-binding equality is the Lance-pushdown arm. With the literal coerced to
+// the column's exact Arrow type, a narrow-numeric column (I32) and an F32 column
+// must still select the right rows — the coercion changes the literal's type, not
+// the result set. (The index-use win this enables is pinned at the Lance-surface
+// layer by `lance_surface_guards::scalar_index_use_requires_matched_literal_type`.)
+#[tokio::test]
+async fn int_and_f32_literal_pushdown_coercion() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = metric_db(&dir).await;
+    let q = r#"
+query count_eq() { match { $m: Metric { count: 2 } } return { $m.name } }
+query ratio_eq() { match { $m: Metric { ratio: 0.25 } } return { $m.name } }
+query count_ge() { match { $m: Metric  $m.count >= 3 } return { $m.name } }
+"#;
+    // I32 column, integer literal coerced Int64 -> Int32: count == 2 is m2 only.
+    assert_eq!(sorted_metric_names(&mut db, q, "count_eq").await, vec!["m2"]);
+    // F32 column, float literal coerced Float64 -> Float32: ratio == 0.25 is m2.
+    assert_eq!(sorted_metric_names(&mut db, q, "ratio_eq").await, vec!["m2"]);
+    // Range on the I32 column: count 3,4 >= 3 -> m3, m4 (coercion is op-independent).
+    assert_eq!(
+        sorted_metric_names(&mut db, q, "count_ge").await,
+        vec!["m3", "m4"]
+    );
+}
+
+// A fractional float against an integer column must not be truncated by the
+// pushdown coercion (`2.7 -> 2` would wrongly match the count=2 row). The
+// lossless guard falls back to the natural Float64 literal, so `count = 2.7`
+// matches no integer and returns no rows.
+#[tokio::test]
+async fn fractional_float_equality_on_int_column_returns_no_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = metric_db(&dir).await;
+    let q = r#"
+query count_frac() { match { $m: Metric { count: 2.7 } } return { $m.name } }
+"#;
+    assert!(
+        sorted_metric_names(&mut db, q, "count_frac")
+            .await
+            .is_empty(),
+        "count = 2.7 must match no integer rows (no truncation to count = 2)"
+    );
+}
+
 #[tokio::test]
 async fn bool_literal_filters_execute() {
     let dir = tempfile::tempdir().unwrap();
@@ -88,9 +133,15 @@ async fn date_and_datetime_literal_filters_execute() {
     let q = r#"
 query born_ge() { match { $m: Metric  $m.born >= date("2024-01-01") } return { $m.name } }
 query seen_lt() { match { $m: Metric  $m.seen < datetime("2024-01-01T00:00:00Z") } return { $m.name } }
+query born_eq() { match { $m: Metric { born: date("2024-06-01") } } return { $m.name } }
+query seen_eq() { match { $m: Metric { seen: datetime("2024-06-01T12:00:00Z") } } return { $m.name } }
 "#;
     // born: m1 2024-06, m3 2025 >= 2024-01-01
     assert_eq!(sorted_metric_names(&mut db, q, "born_ge").await, vec!["m1", "m3"]);
     // seen: m2 2023, m4 2022 < 2024-01-01
     assert_eq!(sorted_metric_names(&mut db, q, "seen_lt").await, vec!["m2", "m4"]);
+    // Inline-binding equality exercises the Lance-pushdown arm with a typed
+    // Date32/Date64 literal: the epoch conversion must select exactly m1.
+    assert_eq!(sorted_metric_names(&mut db, q, "born_eq").await, vec!["m1"]);
+    assert_eq!(sorted_metric_names(&mut db, q, "seen_eq").await, vec!["m1"]);
 }
