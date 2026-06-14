@@ -3,6 +3,7 @@
 
 use std::fs;
 
+use assert_cmd::Command;
 use serde_json::Value;
 use tempfile::tempdir;
 
@@ -799,6 +800,59 @@ fn read_json_outputs_rows_for_named_query() {
     assert_eq!(payload["target"]["branch"], "main");
     assert_eq!(payload["row_count"], 1);
     assert_eq!(payload["rows"][0]["p.name"], "Alice");
+}
+
+#[test]
+fn read_via_store_flag_and_profile_match_positional_uri() {
+    // RFC-011 Slice A: the new scope addressing (--store, and a --profile that
+    // binds a store) drives a read identically to the legacy positional URI —
+    // the scope layer is additive, not a behavior change.
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+    let queries = fixture("test.gq");
+
+    let read_rows = |cmd: &mut Command| -> Value {
+        let output = output_success(
+            cmd.arg("--query")
+                .arg(&queries)
+                .arg("--name")
+                .arg("get_person")
+                .arg("--params")
+                .arg(r#"{"name":"Alice"}"#)
+                .arg("--json"),
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+
+    // Baseline: positional URI.
+    let baseline = read_rows(cli().arg("query").arg(&graph));
+    assert_eq!(baseline["rows"][0]["p.name"], "Alice");
+
+    // --store names the same graph directly.
+    let via_store = read_rows(cli().arg("query").arg("--store").arg(&graph));
+    assert_eq!(via_store["rows"], baseline["rows"]);
+
+    // A profile binding that store, selected with --profile (no positional).
+    let home = temp.path().join("op-home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("config.yaml"),
+        format!(
+            "profiles:\n  local:\n    store: '{}'\n",
+            graph.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let via_profile = read_rows(
+        cli()
+            .env("OMNIGRAPH_HOME", &home)
+            .arg("query")
+            .arg("--profile")
+            .arg("local"),
+    );
+    assert_eq!(via_profile["rows"], baseline["rows"]);
 }
 
 #[test]
