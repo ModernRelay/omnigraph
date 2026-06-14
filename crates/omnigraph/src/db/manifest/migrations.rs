@@ -113,20 +113,27 @@ pub(super) async fn migrate_internal_schema(dataset: &mut Dataset) -> Result<()>
 /// so the merge-insert conflict resolver enforces row-level CAS at commit
 /// time, then bump the stamp.
 ///
-/// Both steps are idempotent under retry: re-applying the field annotation
-/// at its current value is a no-op-ish bump in Lance, and the stamp is a
-/// simple key-value write. A crash between the two leaves the field set
-/// without a stamp; the next open re-runs this fn and only the stamp lands.
+/// Idempotent under crash-retry by construction. Lance 7 makes the unenforced
+/// primary key **immutable once set**: any write that touches the reserved
+/// `lance-schema:unenforced-primary-key` field metadata after the PK is set
+/// errors ("cannot be changed once set", `lance::dataset::transaction`), even
+/// re-applying the same value. A crash between the field-set and the stamp
+/// bump leaves the field set without a stamp, so the next open re-enters here
+/// with the PK already present — we must therefore set it only when absent.
+/// (Fresh graphs bake the PK into `manifest_schema()` at init and never run
+/// this migration; only genuine pre-v0.4.0 graphs do.)
 async fn migrate_v1_to_v2(dataset: &mut Dataset) -> Result<()> {
-    dataset
-        .update_field_metadata()
-        .update(
-            "object_id",
-            [(OBJECT_ID_PK_KEY.to_string(), "true".to_string())],
-        )
-        .map_err(|e| OmniError::Lance(e.to_string()))?
-        .await
-        .map_err(|e| OmniError::Lance(e.to_string()))?;
+    if dataset.schema().unenforced_primary_key().is_empty() {
+        dataset
+            .update_field_metadata()
+            .update(
+                "object_id",
+                [(OBJECT_ID_PK_KEY.to_string(), "true".to_string())],
+            )
+            .map_err(|e| OmniError::Lance(e.to_string()))?
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))?;
+    }
     set_stamp(dataset, 2).await
 }
 
