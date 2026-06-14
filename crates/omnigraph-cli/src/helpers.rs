@@ -1059,3 +1059,27 @@ pub(crate) fn rewrite_deprecated_argv(args: Vec<OsString>) -> Vec<OsString> {
     }
     args
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression for the `branch delete` 404: over a multi-graph
+    // `--server`/`--graph` target the composed URL must be exactly
+    // `<base>/branches/<name>` with no empty `//` segment. An empty segment
+    // misses the `/graphs/{graph_id}/branches/{branch}` route and 404s.
+    //
+    // This FAILS against the current `remote_branch_url`, which parses the base
+    // with a manually appended trailing slash and so emits
+    // `…/graphs/p9-os//branches/tmpbranch`. The fix (a unified, structured URL
+    // builder) turns it green.
+    #[test]
+    fn remote_branch_url_multi_graph_base_has_no_double_slash() {
+        let url = remote_branch_url("http://host/graphs/p9-os", "tmpbranch").unwrap();
+        assert_eq!(url, "http://host/graphs/p9-os/branches/tmpbranch");
+        assert!(
+            !url.contains("//branches"),
+            "double slash before branches: {url}"
+        );
+    }
+}
