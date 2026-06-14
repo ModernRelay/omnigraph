@@ -48,7 +48,8 @@ three real entities; the mismatch is the whole problem, and `omnigraph.yaml` is
 the carrier:
 
 1. **`--target` straddles kinds.** It resolves through the legacy
-   `omnigraph.yaml` `graphs:` map (`config.rs::resolve_target_uri`), and that
+   `omnigraph.yaml` `graphs:` map
+   (`omnigraph-server/src/config.rs:459`, `resolve_target_uri`), and that
    `.uri` can be a **storage location** (`file`/`s3`) *or* a **remote server**
    (`http`). One flag, two access paths with different capability and trust
    models. The wrong-plane guard's storage-plane remote rejection
@@ -126,7 +127,7 @@ Every term is one concept. The rest of this RFC uses them precisely.
   inside the scope), **scope-scoped** (operates on the whole server/cluster
   scope), or **local** (does not resolve scope or graph).
 - **Actor** — the identity a write is attributed to: server-resolved from the
-  bearer token (served), or `--as` ?? `operator.actor` (direct).
+  bearer token (served), or `--as`, else `operator.actor` (direct).
 
 ### The relationships that prevent confusion
 
@@ -182,6 +183,14 @@ server**:
   local dev; a **remote `s3://`** store is break-glass. No catalog (named queries
   do not resolve — the ad-hoc lane).
 
+**Admins live in two scopes by design.** Because a scope binds exactly one
+entity, a maintainer **reads** through a server scope and **maintains** through a
+cluster scope — `query`/`mutate` against a cluster scope error (it is
+maintenance-only). This is the intended privilege boundary, at a known ergonomic
+cost: an admin alternates between their everyday server default and
+`--profile <admin>` / `--cluster` for maintenance. A combined admin scope is
+deferred (D5); Decision 11 (server-side maintenance) removes most of the need.
+
 A scope names **one** thing, so there is no independent `server`+`cluster` pair
 that could disagree (the audit's coherence hazard is gone by construction — the
 default is just a server). And the storage root lives only where it must:
@@ -216,8 +225,8 @@ The two access paths are genuinely different — not two transports for one thin
   writes* to storage until its handle refreshes). No storage credentials needed.
 - **Direct** (open the Lance storage in-process): a **privileged** path — it needs
   your own storage credentials, so only an admin/maintainer (or a local-dev file
-  store) takes it. Actor self-declared (`--as` ?? `operator.actor`), reads **live
-  storage HEAD**. There is **no server-side identity/auth gate** — but engine-level
+  store) takes it. Actor self-declared (`--as`, else `operator.actor`), reads
+  **live storage HEAD**. There is **no server-side identity/auth gate** — but engine-level
   Cedar policy *is* still enforced when the graph selection provides a policy
   (enforcement is engine-wide; embedded `_as` writers call the same `enforce`).
   "Direct" means "no HTTP boundary," not "unpoliced."
@@ -226,6 +235,16 @@ Because they differ in authority, freshness, and availability, a graph reached v
 a server and that graph's raw storage are **different things you name
 differently** — not one identity you flip. Making the access path a per-command
 toggle (`--via`) is the `--target` mistake in new clothes; it is rejected.
+
+**Break-glass is read-biased.** Direct `--store` access to a graph an
+`omnigraph-server` is actively serving is safe for **reads/inspection**. Direct
+*writes* to a server-active store are **not** generally safe — they are the
+multi-process-writer case the engine does not yet serialize across processes (see
+[invariants.md](invariants.md) → "Recovery is serialized against live writers
+in-process only"). Until a cross-process write lease lands, a direct write to a
+served graph requires quiescing the server first (or accepting the documented
+one-winner-CAS / staging-promotion race). The model lets you *name* the store; it
+does not make a concurrent foreign write safe.
 
 > **The access path follows from the scope and the verb.** A **server** scope →
 > served (data/catalog). A **cluster** scope → direct control, maintenance, and
@@ -255,11 +274,24 @@ The CLI validates through verb capability, not plane jargon:
 
 | Capability | Meaning | Examples |
 |---|---|---|
-| `any` | graph-scoped data; served via a server scope; direct only against a **store** scope (local dev / break-glass); **errors on a cluster scope** | `query`, `mutate`, `load`, `export`, branch reads, `schema show/apply` |
+| `any` | graph-scoped data; served via a server scope; direct only against a **store** scope (local dev / break-glass); **errors on a cluster scope** | `query`, `mutate`, `load`, `export`, branch reads, `schema show`/`apply`* |
 | `served` | requires an HTTP server; may be graph-scoped or scope-scoped | `graphs list`, `queries list` |
-| `direct` | graph-scoped storage-native or graph-backed validation; no server form exists | `init`, `optimize`, `repair`, `cleanup`, `schema plan`, graph-backed `lint` |
+| `direct` | graph-scoped storage-native or graph-backed validation; no server form exists | `init`, `optimize`†, `repair`†, `cleanup`†, `schema plan`, graph-backed `lint` |
 | `control` | cluster-scoped catalog/control-plane work; addresses the cluster, not a single raw store | `cluster *`, `queries validate` |
 | `local` | does not address a graph or scope | `config`, `profile`, `lint --query ... --schema ...` |
+
+**† Provisional (Decision 11).** `optimize`/`cleanup`/`repair` are `direct`
+*today*, but the committed direction (Decision 11) moves them to server-managed
+jobs. To avoid release-noting a CLI shape we intend to deprecate, RFC-011 ships
+the **addressing model** as the stable contract and treats these three verbs'
+`direct` capability as **provisional** — the privileged-direct examples in this
+RFC illustrate the rule, they are not a long-term contract for those specific
+verbs. `init`, `schema plan`, and graph-backed `lint` remain durably `direct`.
+
+**\* `schema apply` is `any` only for standalone graphs.** A cluster-managed
+graph rejects `schema apply` and points at `cluster apply` (Decision 10), so in a
+cluster deployment schema evolution is a control-plane act; the served
+`schema apply` path covers only non-cluster (standalone) served graphs.
 
 `any` does **not** mean "the user picks": the resolver picks from the scope.
 Internally the exhaustive `command_plane` match (`planes.rs`) stays as the drift
@@ -315,7 +347,10 @@ control/catalog check against the cluster-owned query definitions. A bare
    - `any` verb → **served** if the scope is a server; **direct** against a
      **store** scope (ad-hoc); on a **cluster** scope, error — cluster is
      maintenance-only, so use a server for data or `--store` for ad-hoc.
-7. Reject mismatches with an error naming the missing axis.
+7. Reject mismatches with an error naming the missing axis. A `--store` pointed at
+   a cluster root (or `--cluster` at a single `.omni` store) fails at open time
+   with a kind-mismatch error — the flag *declares* the entity; the CLI does not
+   re-infer it from what the URI turns out to contain.
 
 Good errors:
 
@@ -366,6 +401,23 @@ skip config and name it per command:
 cluster stays the source of truth for the managed catalog; tokens live in the
 keyed credential store, never in this file.
 
+**Worked resolution (Decision 6 — scope wholesale, prefs layered).** With flat
+defaults `{ server: prod, default_graph: knowledge, output: table }` and
+`profiles.staging = { server: staging, default_graph: knowledge }`, the command
+`omnigraph --profile staging query find_people --graph archive` resolves to:
+
+- **scope** = the `staging` server — taken *wholesale* from the profile; `prod` is
+  **not** merged in (no "server *and* server" per-key blending);
+- **graph** = `archive` — the explicit `--graph` flag beats the profile's
+  `default_graph`;
+- **output** = `table` — a non-scope preference, layered from flat defaults since
+  the profile sets none;
+- **access path** = served — server scope × `any` verb.
+
+Precedence is **explicit flag > profile > flat defaults**, but the entity binding
+(`server`/`cluster`/`store` + `default_graph`) never per-key merges across the
+scope dimension; only preferences (`output`, table layout) layer.
+
 ### Command shape
 
 Assume the everyday flat defaults: server `prod`, default graph `knowledge`.
@@ -385,7 +437,7 @@ Assume the everyday flat defaults: server `prod`, default graph `knowledge`.
 | Offline query lint | `omnigraph lint --query new.gq --schema schema.pg` | local |
 | Graph-backed query lint | `omnigraph lint --query new.gq --cluster s3://acme/clusters/brain --graph knowledge` | direct (privileged) |
 | Local dev, no server | `omnigraph query -e 'match { … } return { … }' --store graph.omni` | direct (local file) |
-| Break-glass: raw storage of a served graph | `omnigraph query --file find.gq --store s3://acme/clusters/brain/graphs/knowledge.omni` | direct (privileged, rare) |
+| Break-glass: **read** raw storage of a served graph | `omnigraph query -e 'match { … } return { … }' --store s3://acme/clusters/brain/graphs/knowledge.omni` | direct (privileged, rare; reads — see "Break-glass is read-biased") |
 
 Note what the everyday rows are: **all served.** `optimize` does *not* appear in
 the default-scope rows — from a server scope it errors and points you to name
@@ -468,8 +520,9 @@ staged and release-noted.
 
 ## Decisions
 
-The questions this RFC opened are resolved as follows. Two are explicitly
-deferred (see below); they do not block the model.
+The questions this RFC opened are resolved as follows. Numbers 5 and 8 are
+deferred below as D5/D8, so the list runs 1–4, 6, 7, 9–11; the two deferrals do
+not block the model.
 
 1. **Local-dev path → embedded `--store` scope.** Local dev runs the engine
    in-process against a `--store <file>` (or a store-scoped profile); `omnigraph
@@ -715,7 +768,7 @@ argv-shim → `lint`; `get` aliases `schema show`; `ingest` is hidden but runs.
 | Form | Looks up in | Resolves to | Source |
 |---|---|---|---|
 | `<URI>` / `--uri` | nothing (explicit) | the literal URI | — |
-| `--target <name>` | `omnigraph.yaml` `graphs:` | that graph's `uri` (local / S3 / **http**) | `config.rs::resolve_target_uri` |
+| `--target <name>` | `omnigraph.yaml` `graphs:` | that graph's `uri` (local / S3 / **http**) | `omnigraph-server/src/config.rs:459` |
 | `--server <name>` (+`--graph`) | `~/.omnigraph/config.yaml` `servers:` | a remote server URL | `helpers.rs::resolve_server_flag` |
 | `--cluster <dir\|s3> --cluster-graph <id>` | served cluster state | the graph's storage URI | `helpers.rs` (RFC-010 Slice 3) |
 
