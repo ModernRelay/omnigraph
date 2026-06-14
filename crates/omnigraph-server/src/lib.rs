@@ -107,7 +107,10 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
         handlers::server_invoke_query,
         handlers::server_schema_apply,
         handlers::server_schema_get,
-        handlers::server_ingest,
+        handlers::server_load,
+        // deprecated; the #[deprecated] attribute on the handler surfaces as
+        // `deprecated: true` on the OpenAPI operation.
+        #[allow(deprecated)] handlers::server_ingest,
         handlers::server_branch_list,
         handlers::server_branch_create,
         handlers::server_branch_delete,
@@ -935,8 +938,19 @@ pub fn build_app(state: AppState) -> Router {
         .route("/schema", get(server_schema_get))
         .route("/schema/apply", post(server_schema_apply))
         .route(
+            "/load",
+            post(server_load).layer(DefaultBodyLimit::max(INGEST_REQUEST_BODY_LIMIT_BYTES)),
+        )
+        // /ingest is the deprecated alias of /load; its handler carries
+        // #[deprecated] (OpenAPI operation flagged) and emits RFC 9745
+        // Deprecation + RFC 8288 Link headers. Suppress the call-site warning.
+        .route(
             "/ingest",
-            post(server_ingest).layer(DefaultBodyLimit::max(INGEST_REQUEST_BODY_LIMIT_BYTES)),
+            post({
+                #[allow(deprecated)]
+                server_ingest
+            })
+            .layer(DefaultBodyLimit::max(INGEST_REQUEST_BODY_LIMIT_BYTES)),
         )
         .route(
             "/branches",

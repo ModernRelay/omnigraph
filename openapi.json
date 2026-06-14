@@ -670,8 +670,8 @@
         "tags": [
           "mutations"
         ],
-        "summary": "Bulk-load NDJSON data into a branch.",
-        "description": "`data` is NDJSON with one record per line. `mode` controls behavior on\nexisting rows: `merge` upserts by id (default), `append` blindly inserts,\n`overwrite` replaces table contents. Branch creation is opt-in by\npresence of `from`: with `from` set, a missing `branch` is created from\nit; without `from`, `branch` must already exist — a missing branch is a\n404, never an implicit fork. **Destructive** when `mode` is `overwrite`\nor when the load produces conflicting writes.",
+        "summary": "**Deprecated** — use [`POST /load`](#tag/mutations/operation/load) instead.",
+        "description": "Bulk-load NDJSON data into a branch. Behavior is unchanged; the route is\nkept indefinitely for back-compat. New integrations should target\n`POST /load`, which has identical semantics. Responses from this route\ninclude `Deprecation: true` and `Link: </load>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the signal.",
         "operationId": "ingest",
         "requestBody": {
           "content": {
@@ -685,7 +685,85 @@
         },
         "responses": {
           "200": {
-            "description": "Ingest results",
+            "description": "Load results (response includes `Deprecation: true` + `Link: </load>; rel=\"successor-version\"`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Per-actor admission cap exceeded; honor `Retry-After` header",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "deprecated": true,
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/load": {
+      "post": {
+        "tags": [
+          "mutations"
+        ],
+        "summary": "Bulk-load NDJSON data into a branch (canonical load endpoint).",
+        "description": "`data` is NDJSON with one record per line. `mode` controls behavior on\nexisting rows: `merge` upserts by id (default), `append` blindly inserts,\n`overwrite` replaces table contents. Branch creation is opt-in by\npresence of `from`: with `from` set, a missing `branch` is created from\nit; without `from`, `branch` must already exist — a missing branch is a\n404, never an implicit fork. **Destructive** when `mode` is `overwrite`\nor when the load produces conflicting writes.\n\nThe legacy `POST /ingest` route has identical semantics and is kept as a\ndeprecated alias.",
+        "operationId": "load",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IngestRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Load results",
             "content": {
               "application/json": {
                 "schema": {

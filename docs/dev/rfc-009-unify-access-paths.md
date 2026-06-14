@@ -161,15 +161,20 @@ and cluster commands must work with the server down) explicit in code.
 "Server" targets include operator-config named servers (RFC-007), not only
 literal `http(s)://` URIs.
 
-### Phase 5 — Route alignment
+### Phase 5 — Route alignment (landed)
 
-Add a canonical `/load` endpoint (the handler already exists behind the
-`/ingest` shim); point `RemoteClient` at it; keep `/ingest` on its existing
-deprecation path. While here, check whether the server uses `utoipa-axum`'s
-router-coupled registration (`OpenApiRouter`/`routes!`); if it hand-mounts
-routes beside `#[utoipa::path]` annotations, prefer migrating registration so
-path annotations and mount points are the same declaration (the modularization
-already hit one orphaned-attribute incident of exactly this class).
+Added a canonical `POST /load` (shared `run_ingest` body; the deprecated
+`/ingest` is now a thin alias carrying `#[deprecated]` + RFC 9745/8288
+`Deprecation`/`Link: </load>` headers, exactly mirroring `/mutate`↔`/change`)
+and pointed the CLI's remote `load` arm at it; `/ingest` stays on its
+deprecation path. `/load` reuses `IngestRequest`/`IngestOutput` (as canonical
+`/mutate` reuses `Change*`); a DTO rename is a separate change.
+
+Registration finding: the server **hand-mounts** routes (`.route(...)`) beside a
+manual `#[openapi(paths(...))]` list, not `utoipa-axum`'s `OpenApiRouter`/
+`routes!`. This PR followed the existing manual pattern (one `.route` + one
+`paths(...)` entry + the `#[utoipa::path]` annotation) rather than migrating
+registration — the migration is a worthwhile but orthogonal cleanup, deferred.
 
 ## Non-goals
 
