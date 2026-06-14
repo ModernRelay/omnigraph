@@ -575,27 +575,37 @@ pub struct BranchReconcileStats {
     pub failures: Vec<(String, String)>,
 }
 
-/// Drop every per-table and commit-graph Lance branch that the manifest no
-/// longer references.
+/// Drop every per-table and commit-graph Lance branch fork the manifest does
+/// not reference.
 ///
-/// Orphaned forks arise when a `branch_delete` flips the manifest authority
-/// (atomic) but a downstream best-effort reclaim does not complete. They are
-/// unreachable through any snapshot — no manifest entry can name them — yet
-/// they pin their `tree/{branch}/` storage and can block reusing the branch
-/// name. This is the guaranteed convergence backstop: it is idempotent and
-/// derived purely from the manifest authority, so it no-ops once everything is
-/// reconciled, and it would harmlessly find nothing if a future Lance atomic
-/// multi-dataset branch op prevented orphans from forming.
+/// Two origins produce a manifest-unreferenced fork:
+///   1. A `branch_delete` flips the manifest authority (atomic) but a
+///      downstream best-effort reclaim does not complete — the whole branch is
+///      gone from the manifest, but a `tree/{branch}/` ref lingers.
+///   2. A first-write fork (or a merge fork) creates the branch ref before the
+///      manifest publish, then the writer dies / is cancelled — the branch is
+///      still a live manifest branch, but the manifest's snapshot of it does
+///      not place *this table* on the branch.
 ///
-/// The keep-set is the full (unfiltered) manifest branch list, so system
-/// branches' forks are never reclaimed; `main`/default is not a named Lance
-/// branch and so is never a candidate. Referencing children are dropped before
-/// parents (Lance refuses to delete a referenced parent) by ordering longest
-/// branch names first.
+/// The write path self-heals (2) on the next write to the table
+/// (`reclaim_orphaned_fork_and_refork`); this is the guaranteed-convergence
+/// backstop that also covers (1) and any table the write path never revisits.
+///
+/// The orphan test is therefore **per-table**, not per-branch-name: a Lance
+/// branch `B` on table `T` is an orphan iff `B` is not a live manifest branch
+/// at all (origin 1) OR the manifest's branch-`B` snapshot does not place `T`
+/// on `B` (origin 2). A legitimately-forked table (`table_branch == Some(B)`)
+/// is kept. `main` and internal/system branches are never candidates. Lance
+/// refuses to force-delete a branch with referencing descendants, so children
+/// are dropped before parents (longest name first). Idempotent and authority-
+/// derived: no-ops once reconciled, and degrades to finding nothing if a future
+/// Lance atomic multi-dataset branch op prevents orphans from forming.
 pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconcileStats> {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
-    let keep: HashSet<String> = db
+    // Live manifest branches: the set whose per-table placements are
+    // authoritative. A branch absent here is a whole-branch (origin-1) orphan.
+    let live_branches: HashSet<String> = db
         .coordinator
         .read()
         .await
@@ -616,6 +626,9 @@ pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconci
         .collect();
 
     let mut stats = BranchReconcileStats::default();
+    // Per-branch snapshots are resolved once and cached across tables (few
+    // branches in practice); origin-2 detection consults the branch's own view.
+    let mut branch_snapshots: HashMap<String, crate::db::Snapshot> = HashMap::new();
 
     // Per-table fault isolation: one table's transient failure is recorded and
     // logged, never aborting the rest of the sweep.
@@ -634,7 +647,52 @@ pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconci
                 continue;
             }
         };
-        for branch in orphan_branches(listed, &keep) {
+
+        // Decide per (table, branch) whether the fork is an orphan.
+        let mut orphans: Vec<String> = Vec::new();
+        for branch in listed {
+            // `main` is not a named Lance branch; system/internal branches
+            // (e.g. the schema-apply lock) own legitimate forks — never touch.
+            if branch == "main" || crate::db::is_internal_system_branch(&branch) {
+                continue;
+            }
+            let is_orphan = if !live_branches.contains(&branch) {
+                true // origin 1: whole branch gone from the manifest
+            } else {
+                // origin 2: live branch, but does the manifest place THIS
+                // table on it? Resolve (and cache) the branch's snapshot.
+                if !branch_snapshots.contains_key(&branch) {
+                    match db.snapshot_for_branch(Some(&branch)).await {
+                        Ok(snap) => {
+                            branch_snapshots.insert(branch.clone(), snap);
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                target: "omnigraph::cleanup",
+                                table = %table_key,
+                                branch = %branch,
+                                error = %err,
+                                "resolving branch snapshot failed during reconcile; skipping",
+                            );
+                            stats.failures.push((table_key.clone(), err.to_string()));
+                            continue;
+                        }
+                    }
+                }
+                branch_snapshots[&branch]
+                    .entry(&table_key)
+                    .map(|e| e.table_branch.as_deref() != Some(branch.as_str()))
+                    .unwrap_or(true)
+            };
+            if is_orphan {
+                orphans.push(branch);
+            }
+        }
+        // Children before parents (longest name first) so Lance's referenced-
+        // parent RefConflict cannot block reclamation.
+        orphans.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+
+        for branch in orphans {
             let outcome = match crate::failpoints::maybe_fail("cleanup.reconcile_fork") {
                 Ok(()) => storage.force_delete_branch(&full_path, &branch).await,
                 Err(injected) => Err(injected),
@@ -655,9 +713,9 @@ pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconci
         }
     }
 
-    // Commit-graph orphans (best-effort: the dataset may not exist on a graph
-    // that has never committed; any failure is isolated and retried next time).
-    if let Err(err) = reconcile_commit_graph_orphans(db, &keep, &mut stats).await {
+    // Commit-graph orphans are whole-branch (not per-table), so the simple
+    // "branch name not in the live set" test still applies there.
+    if let Err(err) = reconcile_commit_graph_orphans(db, &live_branches, &mut stats).await {
         tracing::warn!(
             target: "omnigraph::cleanup",
             error = %err,
