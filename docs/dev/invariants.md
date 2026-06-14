@@ -132,13 +132,18 @@ them explicit.
   new writer cannot couple a write with a HEAD advance through the default
   surface. The dead legacy methods (`append_batch` on the trait,
   `merge_insert_batch{,es}`, `create_{btree,inverted}_index`) were removed. The
-  remaining residuals are `delete_where` (gated on MR-A — Lance v7.x bump)
-  and `create_vector_index` (gated on Lance #6666); see
-  [lance.md](lance.md) and [writes.md](writes.md). New write paths should use
-  the staged shape unless a documented Lance blocker applies.
+  remaining residuals are `delete_where` and `create_vector_index`. The Lance
+  6.0.1 → 7.0.0 bump landed, so the staged two-phase delete API
+  (`DeleteBuilder::execute_uncommitted`, Lance #6658) is now available and MR-A
+  is unblocked — but the migration itself is still pending, so `delete_where`
+  stays inline for now. `create_vector_index` remains gated on Lance #6666
+  (still open). See [lance.md](lance.md) and [writes.md](writes.md). New write
+  paths should use the staged shape unless a documented Lance blocker applies.
 - **Deletes and vector indexes:** `delete_where` and vector index creation still
-  advance Lance HEAD inline because the required public Lance APIs are missing.
-  Keep D2 and recovery coverage in place until those residuals are removed.
+  advance Lance HEAD inline. The public delete two-phase API now exists (Lance
+  #6658 shipped in 7.0.0), so the delete residual is unblocked pending the MR-A
+  migration; vector index creation is still blocked (Lance #6666 open). Keep D2
+  and recovery coverage in place until those residuals are removed.
 - **Blob-column compaction:** Lance `compact_files` mis-decodes blob-v2 columns
   under its forced `BlobHandling::AllBinary` read ("more fields in the schema
   than provided column indices"), so `optimize` skips any table with a `Blob`
