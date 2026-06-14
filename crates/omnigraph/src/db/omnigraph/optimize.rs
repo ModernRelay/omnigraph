@@ -717,6 +717,31 @@ pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconci
         orphans.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
 
         for branch in orphans {
+            // Serialize against in-process live writers before destroying a ref.
+            // A first-write fork holds the per-(table, branch) write queue from
+            // before the fork through the manifest publish; on a LIVE branch its
+            // in-flight fork looks exactly like an origin-2 orphan (manifest not
+            // yet advanced). Acquire the same queue so cleanup waits for any such
+            // writer, then RE-VALIDATE under the queue with a fresh read: if the
+            // writer published in the meantime (table now placed on the branch),
+            // it is no longer an orphan — skip it. (Cross-process writers remain
+            // the documented one-winner-CAS gap.) One key held at a time → no
+            // lock-order inversion against multi-table `acquire_many` writers.
+            let _guard = db
+                .write_queue()
+                .acquire(&(table_key.clone(), Some(branch.clone())))
+                .await;
+            let still_orphan = match db.fresh_snapshot_for_branch(Some(&branch)).await {
+                Ok(snap) => snap
+                    .entry(&table_key)
+                    .map(|e| e.table_branch.as_deref() != Some(branch.as_str()))
+                    .unwrap_or(true),
+                // Branch absent from the manifest entirely (origin 1) → orphan.
+                Err(_) => true,
+            };
+            if !still_orphan {
+                continue;
+            }
             let outcome = match crate::failpoints::maybe_fail("cleanup.reconcile_fork") {
                 Ok(()) => storage.force_delete_branch(&full_path, &branch).await,
                 Err(injected) => Err(injected),
