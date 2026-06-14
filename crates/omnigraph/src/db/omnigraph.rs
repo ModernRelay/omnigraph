@@ -113,10 +113,11 @@ pub struct Omnigraph {
     /// Read-heavy on schema introspection paths, written only by
     /// `apply_schema`. Same ArcSwap rationale as `catalog`.
     schema_source: Arc<ArcSwap<String>>,
-    /// Per-`(table_key, branch)` writer queues. Reachable from engine
-    /// internals (mutation finalize, schema_apply, branch_merge,
-    /// ensure_indices, delete_where) and from future MR-870 recovery
-    /// reconciler. PR 1b adds the field; callers acquire in commits 4+.
+    /// Per-`(table_key, branch)` writer queues — the engine's
+    /// write-serialization mechanism (the server holds the engine as a
+    /// lockless `Arc<Omnigraph>`). Reachable from engine internals
+    /// (mutation finalize, schema_apply, branch_merge, ensure_indices,
+    /// delete_where, the fork path, recovery reconciler).
     write_queue: Arc<crate::db::write_queue::WriteQueueManager>,
     /// Process-wide mutex held across the swap → operate → restore window
     /// in `branch_merge_impl`. Two concurrent merges with distinct targets
@@ -1479,6 +1480,13 @@ impl Omnigraph {
         table_ops::open_for_mutation_on_branch(self, branch, table_key, op_kind).await
     }
 
+    /// Fork `table_key` onto `active_branch` from the given source state,
+    /// self-healing a manifest-unreferenced leftover fork if one is in the
+    /// way. Callers that reach this MUST already hold the per-`(table_key,
+    /// active_branch)` write queue (so the reclaim cannot race an in-process
+    /// fork) and must have confirmed via the live manifest that the table is
+    /// not yet on `active_branch`. Both the first-write fork path
+    /// (`open_owned_dataset_for_branch_write`) and `branch_merge` satisfy this.
     pub(crate) async fn fork_dataset_from_entry_state(
         &self,
         table_key: &str,
@@ -1487,7 +1495,7 @@ impl Omnigraph {
         source_version: u64,
         active_branch: &str,
     ) -> Result<SnapshotHandle> {
-        table_ops::fork_dataset_from_entry_state(
+        match table_ops::fork_dataset_from_entry_state(
             self,
             table_key,
             full_path,
@@ -1495,7 +1503,21 @@ impl Omnigraph {
             source_version,
             active_branch,
         )
-        .await
+        .await?
+        {
+            crate::storage_layer::ForkOutcome::Created(ds) => Ok(ds),
+            crate::storage_layer::ForkOutcome::RefAlreadyExists => {
+                table_ops::reclaim_orphaned_fork_and_refork(
+                    self,
+                    table_key,
+                    full_path,
+                    source_branch,
+                    source_version,
+                    active_branch,
+                )
+                .await
+            }
+        }
     }
 
     pub(crate) async fn reopen_for_mutation(

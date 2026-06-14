@@ -160,6 +160,22 @@ them explicit.
   one-winner-CAS territory; closing this fully needs a cross-process
   serialization primitive (e.g. lease-based use of the schema-apply lock
   branch) — design it before promoting multi-process write topologies.
+- **Fork reclaim is in-process-safe only:** the first write to a table on a
+  branch forks it (a Lance `create_branch` that advances state before the
+  manifest publish). An interrupted fork (crash, or a cancelled request
+  future) leaves a manifest-unreferenced branch ref. The next write self-heals
+  it — `reclaim_orphaned_fork_and_refork` (`force_delete_branch` + re-fork)
+  — but reclaim is only safe because the writer holds the per-`(table,
+  branch)` write queue from before the fork through the publish AND re-checks
+  the live manifest under it, so no *in-process* writer can be mid-fork. A
+  reclaim cannot serialize against a foreign-*process* in-flight fork: it may
+  force-delete a peer's just-created ref, which makes that peer's commit fail
+  and retry — the same one-winner-CAS exposure as above, not corruption. The
+  reclaim never fires unless in-process-queue + manifest authority both prove
+  the ref is manifest-unreferenced. `cleanup`'s per-table reconciler
+  (`reconcile_orphaned_branches`) is the guaranteed backstop for any fork the
+  write path never revisits. Both degrade to a no-op if Lance ships an atomic
+  multi-dataset branch op.
 - **Local `write_text_if_match` is not a cross-process CAS:** object-store
   backends use a true conditional put (ETag If-Match; the in-memory test
   backend too), but upstream `object_store` leaves `PutMode::Update`

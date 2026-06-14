@@ -184,6 +184,22 @@ pub(crate) fn staged_handles_as_writes(handles: &[StagedHandle]) -> Vec<StagedWr
     handles.iter().map(|h| h.inner.clone()).collect()
 }
 
+/// Outcome of a per-table branch fork (`fork_branch_from_state`).
+///
+/// `RefAlreadyExists` means a Lance branch ref for the target already exists
+/// on the dataset, so `create_branch` could not create it cleanly. By the
+/// fork caller's contract — the caller re-checks the live manifest under the
+/// held per-`(table, branch)` write queue and only forks when the manifest
+/// does *not* place the table on the branch — such a ref is a
+/// manifest-unreferenced fork (the residue of an interrupted prior fork, or a
+/// delete+recreate), which the caller reclaims and re-forks. The fork
+/// operation does not editorialize ("incomplete prior delete"); it returns
+/// this typed signal and lets the db layer decide.
+pub(crate) enum ForkOutcome<D> {
+    Created(D),
+    RefAlreadyExists,
+}
+
 // ─── TableStorage trait ────────────────────────────────────────────────────
 
 /// Engine-internal trait covering every Lance dataset operation an
@@ -231,7 +247,7 @@ pub trait TableStorage: sealed::Sealed + Send + Sync + Debug {
         table_key: &str,
         source_version: u64,
         target_branch: &str,
-    ) -> Result<SnapshotHandle>;
+    ) -> Result<ForkOutcome<SnapshotHandle>>;
 
     async fn delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()>;
 
@@ -497,17 +513,22 @@ impl TableStorage for TableStore {
         table_key: &str,
         source_version: u64,
         target_branch: &str,
-    ) -> Result<SnapshotHandle> {
-        TableStore::fork_branch_from_state(
-            self,
-            dataset_uri,
-            source_branch,
-            table_key,
-            source_version,
-            target_branch,
+    ) -> Result<ForkOutcome<SnapshotHandle>> {
+        Ok(
+            match TableStore::fork_branch_from_state(
+                self,
+                dataset_uri,
+                source_branch,
+                table_key,
+                source_version,
+                target_branch,
+            )
+            .await?
+            {
+                ForkOutcome::Created(ds) => ForkOutcome::Created(SnapshotHandle::new(ds)),
+                ForkOutcome::RefAlreadyExists => ForkOutcome::RefAlreadyExists,
+            },
         )
-        .await
-        .map(SnapshotHandle::new)
     }
 
     async fn delete_branch(&self, dataset_uri: &str, branch: &str) -> Result<()> {

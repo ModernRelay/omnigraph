@@ -26,6 +26,7 @@ use std::sync::Arc;
 use crate::db::manifest::{TableVersionMetadata, open_table_head_for_write};
 use crate::db::{Snapshot, SubTableEntry};
 use crate::error::{OmniError, Result};
+use crate::storage_layer::ForkOutcome;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableState {
@@ -285,7 +286,7 @@ impl TableStore {
         table_key: &str,
         source_version: u64,
         target_branch: &str,
-    ) -> Result<Dataset> {
+    ) -> Result<ForkOutcome<Dataset>> {
         let mut source_ds = self
             .open_dataset_head(dataset_uri, source_branch)
             .await?
@@ -299,26 +300,24 @@ impl TableStore {
             .await
             .is_err()
         {
-            // The target branch ref already exists. The caller
-            // (`open_owned_dataset_for_branch_write`) re-reads the live manifest
-            // before forking and returns a retryable error when a concurrent
-            // writer legitimately holds the fork, so reaching here means the
-            // manifest does NOT reference this fork: it is an orphan from an
-            // incomplete prior `branch_delete`. Surface the actionable cleanup
-            // error rather than guessing from Lance branch versions.
-            return Err(OmniError::manifest_conflict(format!(
-                "branch '{}' has orphaned table state for '{}' from an incomplete \
-                 prior delete; run `omnigraph cleanup` to reclaim it before reusing \
-                 this branch name",
-                target_branch, table_key
-            )));
+            // A branch ref for `target_branch` already exists on this table (a
+            // fully-formed manifest-unreferenced fork, or a phase-1-only Lance
+            // "zombie" — `create_branch` fails for both). The caller
+            // (`open_owned_dataset_for_branch_write`) has already re-read the
+            // live manifest under the held write queue and confirmed it does
+            // NOT place this table on `target_branch`, so the ref is reclaimable
+            // derived state, not authoritative. Return the typed signal and let
+            // the db layer reclaim + re-fork rather than guessing or hard-failing
+            // here. (A live committed fork is routed to a retryable conflict
+            // upstream, before we ever reach this fork path.)
+            return Ok(ForkOutcome::RefAlreadyExists);
         }
 
         let ds = self
             .open_dataset_head(dataset_uri, Some(target_branch))
             .await?;
         self.ensure_expected_version(&ds, table_key, source_version)?;
-        Ok(ds)
+        Ok(ForkOutcome::Created(ds))
     }
 
     pub async fn scan_batches(&self, ds: &Dataset) -> Result<Vec<RecordBatch>> {

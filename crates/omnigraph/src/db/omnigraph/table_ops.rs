@@ -160,9 +160,8 @@ pub(super) async fn ensure_indices_for_branch(db: &Omnigraph, branch: Option<&st
     // that needs index work. Held across the per-table commit loop and
     // the manifest publish at the end of this function. Sorted-order
     // acquisition prevents lock-order inversion against concurrent
-    // multi-table writers (mutation finalize, branch_merge, future
-    // MR-870 recovery). Under PR 1b's intermediate state (global server
-    // RwLock still in place), this acquisition is uncontended.
+    // multi-table writers (mutation finalize, branch_merge, the fork
+    // path, recovery).
     let queue_keys: Vec<(String, Option<String>)> = recovery_pins
         .iter()
         .map(|pin| (pin.table_key.clone(), pin.table_branch.clone()))
@@ -499,8 +498,14 @@ pub(super) async fn open_owned_dataset_for_branch_write(
                     ));
                 }
             }
-            fork_dataset_from_entry_state(
-                db,
+            // The fork advances Lance state before the manifest publish. The
+            // caller holds the per-(table, active_branch) write queue from
+            // before this fork through the publish, so a leftover ref is a
+            // manifest-unreferenced fork (interrupted prior fork, or
+            // delete+recreate), not a live in-process fork. The wrapper
+            // self-heals it (reclaim + re-fork); see
+            // `Omnigraph::fork_dataset_from_entry_state`.
+            db.fork_dataset_from_entry_state(
                 table_key,
                 full_path,
                 source_branch,
@@ -528,7 +533,7 @@ pub(super) async fn fork_dataset_from_entry_state(
     source_branch: Option<&str>,
     source_version: u64,
     active_branch: &str,
-) -> Result<SnapshotHandle> {
+) -> Result<crate::storage_layer::ForkOutcome<SnapshotHandle>> {
     db.storage()
         .fork_branch_from_state(
             full_path,
@@ -538,6 +543,71 @@ pub(super) async fn fork_dataset_from_entry_state(
             active_branch,
         )
         .await
+}
+
+/// Reclaim a manifest-unreferenced fork and re-fork in its place.
+///
+/// Reached only when `fork_branch_from_state` reported `RefAlreadyExists`
+/// AND the caller already proved (live-manifest authority re-check, under the
+/// held per-`(table, active_branch)` write queue) that the manifest does not
+/// place this table on `active_branch`. So the leftover ref is reclaimable
+/// derived state: drop it (idempotent `force_delete_branch`) and re-fork,
+/// exactly once. A second collision means a concurrent *foreign-process*
+/// writer recreated the ref (in-process is impossible while we hold the
+/// queue) — the documented one-winner-CAS gap — so surface a retryable
+/// conflict; on retry the winner's fork is visible and the no-fork path runs.
+pub(super) async fn reclaim_orphaned_fork_and_refork(
+    db: &Omnigraph,
+    table_key: &str,
+    full_path: &str,
+    source_branch: Option<&str>,
+    source_version: u64,
+    active_branch: &str,
+) -> Result<SnapshotHandle> {
+    crate::failpoints::maybe_fail("fork.before_reclaim")?;
+    db.storage()
+        .force_delete_branch(full_path, active_branch)
+        .await
+        .map_err(|e| {
+            // Lance refuses to delete a branch with dependent child branches
+            // even under force (`refs.rs` RefConflict "referenced by N
+            // versions"). Unreachable for a leaf first-write fork, but surface
+            // it actionably instead of looping.
+            if e.to_string().contains("referenced by") {
+                OmniError::manifest_conflict(format!(
+                    "branch '{active_branch}' cannot reclaim the leftover fork for \
+                     table '{table_key}' because it has dependent child branches; \
+                     delete the child branches (or run `omnigraph cleanup`) first"
+                ))
+            } else {
+                e
+            }
+        })?;
+
+    match fork_dataset_from_entry_state(
+        db,
+        table_key,
+        full_path,
+        source_branch,
+        source_version,
+        active_branch,
+    )
+    .await?
+    {
+        crate::storage_layer::ForkOutcome::Created(ds) => Ok(ds),
+        crate::storage_layer::ForkOutcome::RefAlreadyExists => {
+            let live = db.snapshot_for_branch(Some(active_branch)).await?;
+            let actual = live
+                .entry(table_key)
+                .map(|e| e.table_version)
+                .unwrap_or(source_version);
+            Err(OmniError::manifest_expected_version_mismatch(
+                table_key,
+                source_version,
+                actual,
+            ))
+        }
+    }
 }
 
 pub(super) async fn reopen_for_mutation(

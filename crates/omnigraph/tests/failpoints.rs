@@ -127,12 +127,12 @@ async fn branch_delete_partial_failure_converges_via_cleanup() {
 }
 
 // Reusing a branch name whose delete left an orphaned fork (before `cleanup`
-// reconciles it) must fail with a clear, actionable error pointing at
-// `cleanup`, not the opaque `ExpectedVersionMismatch` that leaks from the fork
-// path. The recreate itself succeeds; the first write to the previously-forked
-// table is where the stale orphan collides.
+// reconciles it) must SELF-HEAL on the next write — the write reclaims the
+// manifest-unreferenced fork and re-forks, rather than wedging with "incomplete
+// prior delete; run cleanup". (This test was the inverse before the fork-as-
+// idempotent-reconcile fix; its flip is the signal the bug class is closed.)
 #[tokio::test]
-async fn recreate_over_orphaned_fork_before_cleanup_is_actionable() {
+async fn recreate_over_orphaned_fork_self_heals_without_cleanup() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
@@ -158,10 +158,10 @@ async fn recreate_over_orphaned_fork_before_cleanup_is_actionable() {
     }
 
     // Recreate the name and write to the previously-forked table WITHOUT a
-    // cleanup in between.
+    // cleanup in between. The write must self-heal the stale orphan fork.
     main.branch_create("feature").await.unwrap();
     let mut feature2 = Omnigraph::open(&uri).await.unwrap();
-    let err = helpers::mutate_branch(
+    helpers::mutate_branch(
         &mut feature2,
         "feature",
         MUTATION_QUERIES,
@@ -169,17 +169,18 @@ async fn recreate_over_orphaned_fork_before_cleanup_is_actionable() {
         &mixed_params(&[("$name", "Frank")], &[("$age", 41)]),
     )
     .await
-    .expect_err("write should collide with the stale orphaned fork");
+    .expect("recreate-over-orphan write must self-heal, not require cleanup");
 
-    let msg = err.to_string();
-    assert!(
-        msg.contains("cleanup")
-            && (msg.contains("orphan") || msg.contains("incomplete prior delete")),
-        "expected an actionable orphaned-fork error pointing at cleanup, got: {msg}"
-    );
-    assert!(
-        !msg.contains("expected manifest table version"),
-        "should not surface the opaque ExpectedVersionMismatch, got: {msg}"
+    // The recreated branch forks FRESH from main: the deleted branch's Eve is
+    // gone and only the new Frank is added on top of main's seed. A count of
+    // main + 2 would mean Eve resurrected from the stale fork (the bug).
+    let main_people = helpers::count_rows(&main, "node:Person").await;
+    let feature_people = helpers::count_rows_branch(&feature2, "feature", "node:Person").await;
+    assert_eq!(
+        feature_people,
+        main_people + 1,
+        "self-healed feature must fork fresh from main (+Frank only); \
+         main={main_people}, feature={feature_people} (main+2 ⇒ Eve resurrected)"
     );
 }
 
