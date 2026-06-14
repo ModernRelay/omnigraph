@@ -510,8 +510,9 @@ deferred (see below); they do not block the model.
    (and healthy-path `repair`) become server/cluster-managed async jobs —
    policy-gated, audited, single-coordinator — with `direct` retained only as
    break-glass (`repair` when the server is down). Runs out-of-band (a worker +
-   async job routes, the `POST …` / `GET …/{id}` shape of the bulk-data-plane RFC,
-   `docs/rfcs/0001-bulk-data-plane.md`), never inline in serving; `schema plan` is
+   async job routes, the `POST …` / `GET …/{id}` shape of the bulk-data-plane RFC
+   (`docs/rfcs/0001-bulk-data-plane.md`, PR #219, not yet merged)), never inline in
+   serving; `schema plan` is
    excluded (≈ `cluster plan` in cluster mode). The **mechanism** (job routes,
    worker, scheduling) is a follow-up RFC; until it lands the capability table above
    stands, and maintenance is `direct`. When it lands, the maintenance verbs'
@@ -590,7 +591,7 @@ omnigraph
 │  ├─ snapshot                  current per-table versions
 │  ├─ branch { create | list | delete | merge }    merge takes --into <target>
 │  ├─ commit { list | show }    inspect the commit graph
-│  └─ schema { show (alias: get) | apply }          apply in cluster mode → Open Q10
+│  └─ schema { show (alias: get) | apply }          cluster graphs evolve via cluster apply (Decision 10)
 │
 ├─ served — needs a server (errors on a store/cluster scope)
 │  ├─ graphs list               enumerate the graphs a server serves
@@ -612,6 +613,7 @@ omnigraph
 └─ local — no graph
    ├─ policy { validate | test | explain }   offline Cedar tooling
    ├─ context { list | show }                read-only; NO mutating `use` (no sticky state)
+   ├─ alias <name> [args]                    personal shortcut; expands to its bound stored-query call (D4)
    ├─ config { migrate }                     finish the omnigraph.yaml split (RFC-008)
    ├─ login / logout                         per-server bearer credentials
    ├─ embed                                  offline embedding pipeline
@@ -619,8 +621,8 @@ omnigraph
    └─ version  (-v)
 ```
 
-`*` `read`/`change` remain as deprecated aliases (warn on use); `ingest` is
-**removed** (it was a deprecated `load` alias). `get` aliases `schema show`.
+`*` `read`/`change` remain as deprecated aliases (warn on use); `ingest` and the
+`check`→`lint` argv-shim are **removed**. `get` aliases `schema show`.
 
 ### Addressing forms (end state)
 
