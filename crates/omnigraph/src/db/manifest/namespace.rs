@@ -16,21 +16,30 @@ use object_store::{
 
 use crate::error::{OmniError, Result};
 
-use super::layout::{
-    namespace_internal_error, open_manifest_dataset, table_id_to_key, table_uri_for_path,
-};
-use super::metadata::{
-    TableVersionMetadata, namespace_version_metadata, parse_namespace_version_request,
-};
+use super::layout::{namespace_internal_error, table_uri_for_path};
+#[cfg(test)]
+use super::layout::{open_manifest_dataset, table_id_to_key};
+use super::metadata::TableVersionMetadata;
+#[cfg(test)]
+use super::metadata::{namespace_version_metadata, parse_namespace_version_request};
+#[cfg(test)]
 use super::publisher::GraphNamespacePublisher;
+// The read namespace (BranchManifestNamespace) is test-only since Fix 2: reads
+// open sub-tables directly by location+version (SubTableEntry::open), so nothing
+// in production routes a read through the Lance namespace. The writes path uses
+// StagedTableNamespace. These items are retained to validate the namespace
+// contract in unit tests.
+#[cfg(test)]
 use super::state::{ManifestState, SubTableEntry, read_manifest_entries, read_manifest_state};
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct BranchManifestNamespace {
     root_uri: String,
     branch: Option<String>,
 }
 
+#[cfg(test)]
 impl BranchManifestNamespace {
     fn new(root_uri: &str, branch: Option<&str>) -> Self {
         Self {
@@ -137,6 +146,7 @@ impl StagedTableNamespace {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn branch_manifest_namespace(
     root_uri: &str,
     branch: Option<&str>,
@@ -175,21 +185,7 @@ async fn load_table_from_namespace(
         .map_err(|e| OmniError::Lance(e.to_string()))
 }
 
-pub(crate) async fn open_table_at_version_from_manifest(
-    root_uri: &str,
-    table_key: &str,
-    branch: Option<&str>,
-    version: u64,
-) -> Result<Dataset> {
-    load_table_from_namespace(
-        branch_manifest_namespace(root_uri, branch),
-        table_key,
-        branch,
-        Some(version),
-    )
-    .await
-}
-
+#[cfg(test)]
 #[async_trait]
 impl LanceNamespace for BranchManifestNamespace {
     fn namespace_id(&self) -> String {

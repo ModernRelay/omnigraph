@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::error::{OmniError, Result};
 use lance::Dataset;
+use lance::dataset::builder::DatasetBuilder;
 use lance_namespace::models::CreateTableVersionRequest;
 use omnigraph_compiler::catalog::Catalog;
 
@@ -24,11 +25,10 @@ mod recovery;
 mod state;
 
 use graph::{init_manifest_graph, open_manifest_graph, snapshot_state_at};
-use layout::{manifest_uri, open_manifest_dataset, type_name_hash};
+use layout::{manifest_uri, open_manifest_dataset, table_uri_for_path, type_name_hash};
 pub(crate) use metadata::TableVersionMetadata;
 #[cfg(test)]
 use metadata::{OMNIGRAPH_ROW_COUNT_KEY, table_version_metadata_for_state};
-use namespace::open_table_at_version_from_manifest;
 pub(crate) use namespace::open_table_head_for_write;
 #[cfg(test)]
 use namespace::{branch_manifest_namespace, staged_table_namespace};
@@ -132,14 +132,26 @@ pub(crate) enum ManifestChange {
 }
 
 impl SubTableEntry {
+    /// Open this sub-table at its pinned version directly by location (Fix 2),
+    /// without the Lance namespace — which would full-scan `__manifest` twice per
+    /// open (`describe_table` + `describe_table_version`). The resolved Snapshot
+    /// already holds the path, version, and branch. Branches are Lance native
+    /// branches, so `with_branch` resolves `{base}/tree/{branch}` from the base
+    /// URI; main uses `with_version`.
     pub(crate) async fn open(&self, root_uri: &str) -> Result<Dataset> {
-        open_table_at_version_from_manifest(
-            root_uri,
-            &self.table_key,
-            self.table_branch.as_deref(),
-            self.table_version,
-        )
-        .await
+        // The branch-qualified location is the dataset that physically holds this
+        // version: main at `{table_path}`, a branch at
+        // `{table_path}/tree/{branch}` (Lance native-branch storage). `with_version`
+        // then resolves the version within THAT dataset's `_versions` — a branch
+        // version lives under `tree/{branch}/_versions`, not the base. This
+        // matches the physical layout the namespace path resolved, without the
+        // per-open `__manifest` scan.
+        let location = table_uri_for_path(root_uri, &self.table_path, self.table_branch.as_deref());
+        DatasetBuilder::from_uri(&location)
+            .with_version(self.table_version)
+            .load()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))
     }
 }
 

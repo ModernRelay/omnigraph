@@ -138,6 +138,7 @@ impl TableVersionMetadata {
         request
     }
 
+    #[cfg(test)]
     pub(super) fn to_namespace_version(&self, version: u64) -> TableVersion {
         self.to_namespace_version_with_details(version, None, None)
     }

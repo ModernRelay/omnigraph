@@ -24,6 +24,7 @@ use lance::Dataset;
 use lance::Error as LanceError;
 use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched};
 use lance_namespace::NamespaceError;
+#[cfg(test)]
 use lance_namespace::models::CreateTableVersionRequest;
 
 use crate::error::{OmniError, Result};
@@ -37,8 +38,10 @@ use super::state::{
 };
 use super::{
     ManifestChange, OBJECT_TYPE_TABLE, OBJECT_TYPE_TABLE_TOMBSTONE, OBJECT_TYPE_TABLE_VERSION,
-    SubTableEntry, SubTableUpdate, TableRegistration, TableTombstone,
+    SubTableEntry, TableRegistration, TableTombstone,
 };
+#[cfg(test)]
+use super::SubTableUpdate;
 
 /// Bound on the publisher-level retry loop that wraps Lance's row-level CAS
 /// (`TooMuchWriteContention`). Lance's own `conflict_retries` is set to 0 in
@@ -396,6 +399,7 @@ impl GraphNamespacePublisher {
         Ok(Arc::try_unwrap(new_dataset).unwrap_or_else(|arc| (*arc).clone()))
     }
 
+    #[cfg(test)]
     pub(super) async fn publish_requests(
         &self,
         requests: &[CreateTableVersionRequest],
