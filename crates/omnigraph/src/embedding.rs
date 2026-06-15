@@ -134,7 +134,9 @@ impl EmbeddingConfig {
     fn mock() -> Self {
         Self {
             provider: Provider::Mock,
-            model: String::new(),
+            // Honor OMNIGRAPH_EMBED_MODEL so the same-space check is exercisable
+            // under mock; the mock vectors themselves don't depend on the model.
+            model: env_string("OMNIGRAPH_EMBED_MODEL").unwrap_or_default(),
             base_url: String::new(),
             api_key: String::new(),
         }

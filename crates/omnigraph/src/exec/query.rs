@@ -256,13 +256,29 @@ async fn resolve_nearest_query_vec(
     match lit {
         Literal::List(_) => literal_to_f32_vec(&lit),
         Literal::String(text) => {
-            let expected_dim = nearest_property_dimension(ir, catalog, variable, property)?;
+            let (expected_dim, recorded_model) =
+                nearest_property_dim_and_model(ir, catalog, variable, property)?;
             // Lazily resolve the per-handle client once, then reuse it across
             // queries (keeps the provider connection pool warm); a graph that
             // never embeds never builds a client and needs no provider key.
             let client = embedding
                 .get_or_try_init(|| async { EmbeddingClient::from_env() })
                 .await?;
+            // Same-space guarantee: if the property recorded the model that
+            // produced its stored vectors (`@embed("…", model="…")`), the query
+            // embedder must resolve to that same model — otherwise the comparison
+            // is across vector spaces. Reject loudly instead of ranking garbage.
+            if let Some(recorded) = &recorded_model {
+                let resolved = &client.config().model;
+                if resolved != recorded {
+                    return Err(OmniError::manifest(format!(
+                        "nearest() on '{property}': its stored vectors were embedded with model \
+                         '{recorded}', but the query embedder resolves to '{resolved}'. Set \
+                         OMNIGRAPH_EMBED_MODEL='{recorded}' (and the matching provider) or re-embed \
+                         the stored vectors."
+                    )));
+                }
+            }
             client.embed_query_text(&text, expected_dim).await
         }
         _ => Err(OmniError::manifest(
@@ -305,12 +321,14 @@ fn literal_to_f32_vec(lit: &Literal) -> Result<Vec<f32>> {
     }
 }
 
-fn nearest_property_dimension(
+/// Resolve the nearest() target property's vector dimension and the embedding
+/// model recorded for it via `@embed("…", model="…")` (`None` if unrecorded).
+fn nearest_property_dim_and_model(
     ir: &QueryIR,
     catalog: &Catalog,
     variable: &str,
     property: &str,
-) -> Result<usize> {
+) -> Result<(usize, Option<String>)> {
     let type_name = resolve_binding_type_name(&ir.pipeline, variable).ok_or_else(|| {
         OmniError::manifest_internal(format!(
             "nearest() variable '${}' is not bound to a node type in the lowered pipeline",
@@ -329,13 +347,20 @@ fn nearest_property_dimension(
             type_name, property
         ))
     })?;
-    match prop.scalar {
-        ScalarType::Vector(dim) if !prop.list => Ok(dim as usize),
-        _ => Err(OmniError::manifest_internal(format!(
-            "nearest() property '{}.{}' is not a scalar vector",
-            type_name, property
-        ))),
-    }
+    let dim = match prop.scalar {
+        ScalarType::Vector(dim) if !prop.list => dim as usize,
+        _ => {
+            return Err(OmniError::manifest_internal(format!(
+                "nearest() property '{}.{}' is not a scalar vector",
+                type_name, property
+            )));
+        }
+    };
+    let recorded_model = node_type
+        .embed_sources
+        .get(property)
+        .and_then(|embed| embed.model.clone());
+    Ok((dim, recorded_model))
 }
 
 fn resolve_binding_type_name<'a>(pipeline: &'a [IROp], variable: &str) -> Option<&'a str> {
