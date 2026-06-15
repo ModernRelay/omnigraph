@@ -1196,6 +1196,25 @@ pub(crate) async fn server_schema_apply(
         .await
         .map_err(ApiError::from_omni)?
     };
+    // Prompt index convergence (iss-848): schema apply records `@index` intent
+    // but defers the physical build. On a long-lived server, materialize it
+    // promptly rather than waiting for the next `optimize` cron — spawned
+    // detached so it never blocks or fails the apply response. Best-effort: a
+    // failure is logged and the index still converges on the next optimize.
+    // The CLI is one-shot, so it has no equivalent; its convergence path is the
+    // operator's optimize cadence.
+    if result.applied {
+        let engine = Arc::clone(&handle.engine);
+        tokio::spawn(async move {
+            if let Err(err) = engine.ensure_indices().await {
+                tracing::warn!(
+                    target: "omnigraph::server",
+                    error = %err,
+                    "post-apply ensure_indices failed; indexes will converge on the next optimize",
+                );
+            }
+        });
+    }
     Ok(Json(schema_apply_output(handle.uri.as_str(), result)))
 }
 

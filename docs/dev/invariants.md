@@ -15,6 +15,38 @@ Use it this way:
 - Keep implementation ledgers, roadmap detail, and historical MR notes in the
   per-area docs. This file is the filter, not the encyclopedia.
 
+## Governing principle: logical contract over physical state
+
+The hard invariants below are instances of one rule. Keep it in view whenever
+a change touches the boundary between what the graph *means* and how it is
+physically stored.
+
+> **Logical state is the contract. Physical state — index coverage, fragment
+> layout, compaction versions, staged writes — is derived, rebuildable, and may
+> be produced asynchronously. A physical operation must never fail a logical
+> one. Preconditions are checked against logical state; physical reconciliation
+> is idempotent and may lag or retry. Genuine logical conflicts still fail
+> loudly: the licence to lag covers physical convergence, not correctness.**
+
+Invariants that instantiate it: **2** (manifest-atomic visibility) and **5**
+(recovery is part of the commit protocol) — a partially-written physical layer
+never changes what a graph commit means; **7** (indexes are derived state) — a
+query is correct under partial index coverage, and expensive index work
+converges from manifest state instead of gating the write path; **13** (failures
+bounded and observable) — the licence to lag is not a licence to drop, so a
+physical step that cannot make progress is surfaced, not swallowed. Deny-list
+items that enforce it: synchronous inline vector/FTS index rebuilds on the
+commit path; state that drifts from Lance or the manifest when it can be
+derived; job queues for manifest-derivable state where a reconciler fits.
+
+The failure shape it rules out: a legitimate background operation on the
+physical layer (compaction, an index build, an interrupted staged write) is
+allowed to break a logical operation (a query's correctness, a migration's
+success, a branch's writability). The smell to watch for is a logical operation
+whose precondition is a *physical* fact — a cached file version, an index's
+existence, a fragment count. Make the precondition logical and let a reconciler
+converge the physical state.
+
 ## Hard Invariants
 
 1. **Respect the substrate.** Lance owns columnar storage, per-dataset
@@ -105,7 +137,7 @@ Use it this way:
 | Schema validation | Type checks, required fields, defaults, edge endpoint checks, and edge cardinality are enforced on write paths | [schema-language.md](../user/schema/index.md), [execution.md](execution.md) |
 | Unique constraints | Intra-batch and write-path checks exist; intake and branch-merge derive the composite key through one shared function (`loader::composite_unique_key`, a separator-free `Vec<String>` tuple) and fail loudly on an un-keyable column type rather than silently exempting it; full cross-version uniqueness against already-committed rows is still a gap | [schema-language.md](../user/schema/index.md) |
 | Storage trait | `TableStorage` (via `db.storage()`) is staged-only; the inline-commit residuals (`delete_where`, `create_vector_index`) are split onto a separate sealed `InlineCommitResidual` trait reached via `db.storage_inline_residual()` (MR-854), so §1 holds by construction; capability/stat surfaces are roadmap | [writes.md](writes.md), [architecture.md](architecture.md) |
-| Index lifecycle | Index *creation* per `@index`/`@key` property is dispatched by type (enum + orderable scalar → BTREE, free-text String → FTS, Vector → vector) via `node_prop_index_kind`; index *coverage maintenance* exists — `optimize` runs Lance `optimize_indices` after compaction to fold appended/rewritten fragments into existing indexes (still an explicit maintenance call, not yet a background reconciler) | [indexes.md](../user/search/indexes.md), [maintenance.md](../user/operations/maintenance.md) |
+| Index lifecycle | `@index`/`@key` declares *intent*; the physical index is derived state and never fails a logical op. `schema apply` builds no indexes (records intent only; index-only changes touch no table data). `load`/`mutate` build inline through one chokepoint (`build_indices_on_dataset_for_catalog`, type-dispatched by `node_prop_index_kind`: enum + orderable scalar → BTREE, free-text String → FTS, Vector → vector) that fault-isolates an untrainable Vector column into a *pending* index instead of aborting. `optimize`/`ensure_indices` is the reconciler: it creates declared-but-missing indexes and folds appended/rewritten fragments into existing ones (`optimize_indices`), reporting still-pending columns. Explicit maintenance call, not yet a background loop | [indexes.md](../user/search/indexes.md), [maintenance.md](../user/operations/maintenance.md) |
 | Traversal IDs | Runtime still builds `TypeIndex`; Lance stable row-id based graph IDs are roadmap | [architecture.md](architecture.md), [query-language.md](../user/queries/index.md) |
 | Auth | Bearer token hashing and server-side actor resolution are implemented at the HTTP boundary | [server.md](../user/operations/server.md), [policy.md](../user/operations/policy.md) |
 | Tests | Tempdir-backed Lance tests are the current substrate; the storage adapter has an in-memory backend for adapter-level contract tests, but Lance datasets bypass it | [testing.md](testing.md) |

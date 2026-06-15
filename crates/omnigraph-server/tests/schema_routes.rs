@@ -294,6 +294,11 @@ async fn schema_apply_route_can_add_index() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["applied"], true);
+    // iss-848: the /schema/apply route accepts the index-add and applies it as a
+    // metadata change — it records the `@index` intent in the catalog/IR but does
+    // NOT build the physical index inline (the build is deferred to
+    // ensure_indices/optimize; on this empty table nothing would build anyway).
+    // So the physical index count is unchanged by the apply.
     let reopened = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
     let snapshot = reopened
         .snapshot_of(ReadTarget::branch("main"))
@@ -301,7 +306,10 @@ async fn schema_apply_route_can_add_index() {
         .unwrap();
     let dataset = snapshot.open("node:Person").await.unwrap();
     let after_index_count = dataset.load_indices().await.unwrap().len();
-    assert!(after_index_count > before_index_count);
+    assert_eq!(
+        after_index_count, before_index_count,
+        "schema apply records @index intent but defers the physical build (iss-848)"
+    );
 }
 
 #[tokio::test]

@@ -2619,69 +2619,66 @@ async fn finalize_publisher_residual_does_not_drift_untouched_tables() {
 }
 
 /// Acceptance test: a stage-step failure in the staged-index path
-/// (`stage_create_btree_index` succeeded; `commit_staged` not yet
-/// called) leaves NO Lance-HEAD drift on the existing tables.
-/// Subsequent operations against those tables succeed without
-/// `ExpectedVersionMismatch`.
+/// (`stage_create_btree_index` succeeded; `commit_staged` not yet called)
+/// leaves NO Lance-HEAD drift, so other tables stay writable.
 ///
-/// Path: `apply_schema(v1 → v2)` adds a new node type. The
-/// `added_tables` loop in `schema_apply` creates the empty dataset and
-/// then calls `build_indices_on_dataset_for_catalog` →
-/// `stage_and_commit_btree(..., &["id"])`. The failpoint fires
-/// between `stage_create_btree_index` and `commit_staged`, so the
-/// staged segments are written under `_indices/<uuid>/` but Lance HEAD
-/// on the new dataset is unchanged at v=1. The schema-apply lock
-/// branch is released by `apply_schema`'s outer match. Existing
-/// tables (e.g. `node:Person`) are completely untouched by the new
-/// node's added_tables iteration — they're outside the failed apply
-/// path entirely — and we assert that mutations against them continue
-/// to work.
-///
-/// The orphan empty dataset from the failed apply is acceptable
-/// residual: it's unreferenced by `__manifest` and will be reclaimed
-/// by `cleanup_old_versions` (or removed when a future apply at the
-/// same target path resolves the rename).
+/// Under iss-848 schema apply no longer builds indexes inline — the build
+/// happens in the reconciler (`ensure_indices`/`optimize`) and at load. So this
+/// fires the failpoint where it lives now: an `ensure_indices` build of a BTREE
+/// that a prior apply declared (`@index`) but deferred. The failpoint fires
+/// between `stage_create_btree_index` and `commit_staged`, so the staged
+/// segment is written under `_indices/<uuid>/` but `node:Person`'s Lance HEAD is
+/// unchanged. `ensure_indices` fails and its EnsureIndices sidecar pins only
+/// Person at NoMovement (a clean no-op on the next open). A write to a
+/// different, unpinned table (`node:Company`) is unaffected: mutations/loads run
+/// a roll-forward-only heal and proceed — they do not refuse on a pending
+/// sidecar the way `optimize`/`repair` do — so the write succeeds with no drift.
 #[tokio::test]
 async fn ensure_indices_stage_btree_failure_leaves_existing_tables_writable() {
     let _scenario = FailScenario::setup();
     let dir = tempfile::tempdir().unwrap();
     let uri = dir.path().to_str().unwrap().to_string();
-
-    // Init with TEST_SCHEMA which declares Person + Knows. Indices on
-    // those tables get built during init.
     let mut db = Omnigraph::init(&uri, helpers::TEST_SCHEMA).await.unwrap();
 
-    // Apply a schema that adds a new node type. The added_tables loop
-    // will hit the failpoint between stage and commit on the new
-    // node:Project table's btree-on-id build. (TEST_SCHEMA already
-    // has Person + Company + Knows + WorksAt — pick a name that isn't
-    // already declared.)
-    let extended_schema = format!(
-        "{}\nnode Project {{ name: String @key }}\n",
-        helpers::TEST_SCHEMA
-    );
-
-    {
-        let _failpoint =
-            ScopedFailPoint::new("ensure_indices.post_stage_pre_commit_btree", "return");
-        let err = db.apply_schema(&extended_schema).await.unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("ensure_indices.post_stage_pre_commit_btree"),
-            "schema apply should fail with the synthetic failpoint error, got: {err}"
-        );
-    }
-
-    // Existing tables stayed at their pre-apply versions; subsequent
-    // mutations against them succeed (no Lance-HEAD drift).
+    // Seed a Person row — the load builds Person's id BTREE + name FTS.
     mutate_main(
         &mut db,
         helpers::MUTATION_QUERIES,
         "insert_person",
-        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+        &mixed_params(&[("$name", "Alice")], &[("$age", 30)]),
     )
     .await
-    .expect("Person mutation must succeed after the failed schema apply — existing tables are not drifted");
+    .expect("seed Person");
+
+    // Add `@index` on `age`: schema apply records the intent but defers the
+    // physical build (iss-848), so the BTREE on `age` is unbuilt.
+    let indexed_schema = helpers::TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
+    db.apply_schema(&indexed_schema)
+        .await
+        .expect("adding an @index is metadata-only and succeeds");
+
+    {
+        // ensure_indices builds the deferred `age` BTREE on Person; the failpoint
+        // fires between stage and commit, so Person's Lance HEAD does not move.
+        let _failpoint =
+            ScopedFailPoint::new("ensure_indices.post_stage_pre_commit_btree", "return");
+        let err = db.ensure_indices().await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("ensure_indices.post_stage_pre_commit_btree"),
+            "ensure_indices should fail with the synthetic failpoint error, got: {err}"
+        );
+    }
+
+    // A different, unpinned table is untouched by the failed index build.
+    use omnigraph::loader::{LoadMode, load_jsonl};
+    load_jsonl(
+        &mut db,
+        r#"{"type": "Company", "data": {"name": "Acme"}}"#,
+        LoadMode::Append,
+    )
+    .await
+    .expect("Company write on a table untouched by the failed ensure_indices should succeed");
 }
 
 fn assert_no_staging_files(graph: &std::path::Path) {

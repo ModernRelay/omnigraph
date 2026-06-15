@@ -770,6 +770,10 @@ async fn main() -> Result<()> {
                         "skipped": s.skipped.map(|r| r.as_str()),
                         "manifest_version": s.manifest_version,
                         "lance_head_version": s.lance_head_version,
+                        "pending_indexes": s.pending_indexes.iter().map(|p| serde_json::json!({
+                            "column": p.column,
+                            "reason": p.reason,
+                        })).collect::<Vec<_>>(),
                     })).collect::<Vec<_>>(),
                 });
                 print_json(&value)?;
@@ -785,6 +789,9 @@ async fn main() -> Result<()> {
                         );
                     } else {
                         println!("  {:<40} no-op", s.table_key);
+                    }
+                    for p in &s.pending_indexes {
+                        println!("    ↳ index pending on '{}': {}", p.column, p.reason);
                     }
                 }
             }

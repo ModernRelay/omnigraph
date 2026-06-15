@@ -40,6 +40,7 @@ pub use repair::{
     RepairAction, RepairClassification, RepairOptions, RepairStats, TableRepairStats,
 };
 pub use schema_apply::SchemaApplyOptions;
+pub use table_ops::PendingIndex;
 
 use super::commit_graph::GraphCommit;
 use super::manifest::{
@@ -1069,11 +1070,15 @@ impl Omnigraph {
     /// unbranched subtables keep inheriting `main`, while subtables inherited
     /// from an ancestor branch are first forked into the active branch before
     /// their index metadata is updated.
-    pub async fn ensure_indices(&self) -> Result<()> {
+    /// Returns the declared indexes that could not be materialized on this
+    /// pass (today: vector columns with no trainable vectors yet). They are
+    /// deferred, not errors; a later `ensure_indices`/`optimize` builds them
+    /// once the column is trainable. Reads stay correct (brute-force) meanwhile.
+    pub async fn ensure_indices(&self) -> Result<Vec<PendingIndex>> {
         table_ops::ensure_indices(self).await
     }
 
-    pub async fn ensure_indices_on(&self, branch: &str) -> Result<()> {
+    pub async fn ensure_indices_on(&self, branch: &str) -> Result<Vec<PendingIndex>> {
         table_ops::ensure_indices_on(self, branch).await
     }
 
@@ -1530,17 +1535,8 @@ impl Omnigraph {
         &self,
         table_key: &str,
         ds: &mut SnapshotHandle,
-    ) -> Result<()> {
+    ) -> Result<Vec<PendingIndex>> {
         table_ops::build_indices_on_dataset(self, table_key, ds).await
-    }
-
-    pub(crate) async fn build_indices_on_dataset_for_catalog(
-        &self,
-        catalog: &Catalog,
-        table_key: &str,
-        ds: &mut SnapshotHandle,
-    ) -> Result<()> {
-        table_ops::build_indices_on_dataset_for_catalog(self, catalog, table_key, ds).await
     }
 
     // Used only by in-tree tests (`#[cfg(test)]`); the runtime path now
@@ -2498,25 +2494,49 @@ edge WorksAt: Person -> Company
     }
 
     #[tokio::test]
-    async fn test_apply_schema_adds_index_for_existing_property() {
+    async fn test_apply_schema_defers_index_then_reconciler_builds_it() {
+        // iss-848: schema apply records the @index intent but builds nothing
+        // inline; a later ensure_indices materializes it once the table has
+        // rows. (Use `age`, which is unindexed in TEST_SCHEMA — `name @key` is
+        // already FTS-indexed at seed, so it can't show the deferral.)
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let mut db = Omnigraph::init(uri, TEST_SCHEMA).await.unwrap();
+        seed_person_row(&mut db, "Alice", Some(30)).await;
 
-        let desired = TEST_SCHEMA.replace("name: String @key", "name: String @key @index");
+        let desired = TEST_SCHEMA.replace("age: I32?", "age: I32? @index");
         db.apply_schema(&desired).await.unwrap();
 
+        // Apply built nothing — the BTREE on `age` is deferred.
         let snapshot = db.snapshot().await;
         let ds = db
             .storage()
             .open_snapshot_at_table(&snapshot, "node:Person")
             .await
             .unwrap();
-        assert!(db.storage().has_fts_index(&ds, "name").await.unwrap());
+        assert!(
+            !db.storage().has_btree_index(&ds, "age").await.unwrap(),
+            "apply must not build the index inline (deferred to the reconciler)"
+        );
+
+        // The reconciler materializes it (Person has a row).
+        db.ensure_indices().await.unwrap();
+        let snapshot = db.snapshot().await;
+        let ds = db
+            .storage()
+            .open_snapshot_at_table(&snapshot, "node:Person")
+            .await
+            .unwrap();
+        assert!(
+            db.storage().has_btree_index(&ds, "age").await.unwrap(),
+            "ensure_indices must build the deferred index"
+        );
     }
 
     #[tokio::test]
-    async fn test_apply_schema_rewrite_preserves_existing_indices() {
+    async fn test_apply_schema_rewrite_defers_index_then_reconciler_restores() {
+        // iss-848: an AddProperty rewrite writes a new dataset version without
+        // rebuilding indexes inline (deferred); ensure_indices restores them.
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let initial_schema = TEST_SCHEMA.replace("name: String @key", "name: String @key @index");
@@ -2529,6 +2549,8 @@ edge WorksAt: Person -> Company
         );
         db.apply_schema(&desired).await.unwrap();
 
+        // After the rewrite the reconciler restores index coverage.
+        db.ensure_indices().await.unwrap();
         let snapshot = db.snapshot().await;
         let ds = db
             .storage()

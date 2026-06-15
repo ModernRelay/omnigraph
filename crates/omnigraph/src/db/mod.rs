@@ -11,9 +11,9 @@ pub use graph_coordinator::{GraphCoordinator, ReadTarget, ResolvedTarget, Snapsh
 pub use manifest::{Snapshot, SubTableEntry, SubTableUpdate};
 pub(crate) use omnigraph::ensure_public_branch_ref;
 pub use omnigraph::{
-    CleanupPolicyOptions, InitOptions, MergeOutcome, Omnigraph, OpenMode, RepairAction,
-    RepairClassification, RepairOptions, RepairStats, SchemaApplyOptions, SchemaApplyResult,
-    SkipReason, TableCleanupStats, TableOptimizeStats, TableRepairStats,
+    CleanupPolicyOptions, InitOptions, MergeOutcome, Omnigraph, OpenMode, PendingIndex,
+    RepairAction, RepairClassification, RepairOptions, RepairStats, SchemaApplyOptions,
+    SchemaApplyResult, SkipReason, TableCleanupStats, TableOptimizeStats, TableRepairStats,
 };
 
 pub(crate) const SCHEMA_APPLY_LOCK_BRANCH: &str = "__schema_apply_lock__";

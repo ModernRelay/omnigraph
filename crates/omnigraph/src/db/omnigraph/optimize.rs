@@ -140,6 +140,12 @@ pub struct TableOptimizeStats {
     /// Lance HEAD version observed by optimize for drift skips. `None` for
     /// normal compaction/no-op/blob skips.
     pub lance_head_version: Option<u64>,
+    /// Declared `@index` columns on this table the reconciler could not build
+    /// this run, each with the `reason` (today: a vector column with no
+    /// trainable vectors yet). Empty on the common path. Reported, not fatal — a
+    /// later `optimize` retries; the `list_indices`/`indisvalid` analog so
+    /// operators can see which index is pending and why.
+    pub pending_indexes: Vec<super::PendingIndex>,
 }
 
 impl TableOptimizeStats {
@@ -153,6 +159,7 @@ impl TableOptimizeStats {
             skipped: None,
             manifest_version: None,
             lance_head_version: None,
+            pending_indexes: Vec::new(),
         }
     }
 
@@ -166,6 +173,7 @@ impl TableOptimizeStats {
             skipped: Some(reason),
             manifest_version: None,
             lance_head_version: None,
+            pending_indexes: Vec::new(),
         }
     }
 
@@ -183,6 +191,7 @@ impl TableOptimizeStats {
             skipped: Some(SkipReason::DriftNeedsRepair),
             manifest_version: Some(manifest_version),
             lance_head_version: Some(lance_head_version),
+            pending_indexes: Vec::new(),
         }
     }
 }
@@ -371,14 +380,26 @@ async fn optimize_one_table(
     let will_compact = plan.num_tasks() > 0;
     // Even when there is nothing to compact, the table may still have index
     // work: rows appended since the index was built (e.g. via `ingest --mode
-    // merge`) are scanned unindexed until folded in. Either compaction or stale
-    // index coverage is enough to enter the publish path. If NEITHER, this
-    // table is a no-op and must NOT be pinned in a sidecar — a zero-commit pin
-    // classifies NoMovement on recovery and forces an all-or-nothing rollback
-    // of sibling tables' legitimate work. Uncovered pre-existing manifest/HEAD
-    // drift is skipped above and must go through explicit repair.
+    // merge`) are scanned unindexed until folded in (needs_reindex), OR a
+    // declared `@index` was never built — schema apply records the intent but
+    // defers the physical build (iss-848), so optimize is the operator-facing
+    // reconciler that materializes it (needs_index_create). Any of the three is
+    // enough to enter the publish path. If NONE, this table is a no-op and must
+    // NOT be pinned in a sidecar — a zero-commit pin classifies NoMovement on
+    // recovery and forces an all-or-nothing rollback of sibling tables'
+    // legitimate work. Uncovered pre-existing manifest/HEAD drift is skipped
+    // above and goes through explicit repair, so this only runs on a healthy
+    // table under the per-table queue + sidecar.
     let needs_reindex = TableStore::has_unindexed_fragments(&ds).await?;
-    if !will_compact && !needs_reindex {
+    // needs_index_work_* checks "a declared index is missing AND row_count > 0",
+    // so empty tables stay no-ops (never pinned). It re-reads the head under the
+    // queue we already hold, so it is consistent with `ds`.
+    let needs_index_create = if let Some(type_name) = table_key.strip_prefix("node:") {
+        super::table_ops::needs_index_work_node(db, type_name, &table_key, &full_path, None).await?
+    } else {
+        super::table_ops::needs_index_work_edge(db, &table_key, &full_path, None).await?
+    };
+    if !will_compact && !needs_reindex && !needs_index_create {
         return Ok(TableOptimizeStats::compacted(
             table_key,
             &CompactionMetrics::default(),
@@ -427,7 +448,30 @@ async fn optimize_one_table(
     ds.optimize_indices(&OptimizeOptions::default())
         .await
         .map_err(|e| OmniError::Lance(format!("optimize_indices on {}: {}", table_key, e)))?;
-    let version_after = ds.version().version;
+
+    // Materialize any declared-but-missing index over the just-compacted layout,
+    // reusing the build chokepoint (idempotent: skips existing indexes; fault-
+    // isolates an untrainable vector column into `pending` rather than failing).
+    // Run it UNCONDITIONALLY now that we are past the no-op gate — not only when
+    // `needs_index_create`. A table can enter this path for compaction or
+    // reindex while its sole missing index is an untrainable Vector column
+    // (which `needs_index_work_*` does not count as buildable work); calling the
+    // build here is what surfaces that column in `pending_indexes`, so optimize
+    // can't compact a table yet silently drop the deferred-index signal.
+    // Idempotent + cheap when there is nothing to build. Vector index creation
+    // is an inline-commit residual; the Optimize sidecar's loose post_commit_pin
+    // covers the extra commits.
+    let catalog = db.catalog();
+    let mut snapshot = crate::storage_layer::SnapshotHandle::new(ds);
+    let pending_indexes: Vec<super::PendingIndex> =
+        super::table_ops::build_indices_on_dataset_for_catalog(
+            db,
+            &catalog,
+            &table_key,
+            &mut snapshot,
+        )
+        .await?;
+    let version_after = snapshot.dataset().version().version;
     let committed = version_after != version_before;
 
     // Pin the per-writer Phase B → Phase C residual for optimize: Lance HEAD has
@@ -438,9 +482,6 @@ async fn optimize_one_table(
     // expected = the version observed under the queue). On failure the sidecar
     // is intentionally left for the open-time recovery sweep to roll forward.
     if committed {
-        // Re-wrap the post-compaction dataset to read its state through the
-        // trait surface (`table_state` is a read; no HEAD advance).
-        let snapshot = crate::storage_layer::SnapshotHandle::new(ds);
         let state = db.storage().table_state(&full_path, &snapshot).await?;
         let update = crate::db::SubTableUpdate {
             table_key: table_key.clone(),
@@ -467,7 +508,9 @@ async fn optimize_one_table(
         );
     }
 
-    Ok(TableOptimizeStats::compacted(table_key, &metrics, committed))
+    let mut stat = TableOptimizeStats::compacted(table_key, &metrics, committed);
+    stat.pending_indexes = pending_indexes;
+    Ok(stat)
 }
 
 /// Run Lance `cleanup_old_versions` on every node + edge table on `main`,
