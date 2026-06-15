@@ -31,10 +31,10 @@ pub(crate) struct Cli {
     #[arg(long = "as", global = true, value_name = "ACTOR")]
     pub(crate) as_actor: Option<String>,
 
-    /// Target an operator-defined server by name (RFC-007): resolves to
-    /// its `url` from `servers:` in ~/.omnigraph/config.yaml. Exclusive
-    /// with a positional URI or `--target`.
-    #[arg(long, global = true, value_name = "NAME")]
+    /// Address a server by name (resolves to its `url` from `servers:` in
+    /// ~/.omnigraph/config.yaml) or by a literal `http(s)://` URL. Exclusive
+    /// with a positional URI.
+    #[arg(long, global = true, value_name = "NAME|URL")]
     pub(crate) server: Option<String>,
 
     /// Graph id on a multi-graph `--server` (appends `/graphs/<id>` to
@@ -52,7 +52,7 @@ pub(crate) struct Cli {
 
     /// Address a single graph's storage directly (RFC-011): a `file://` /
     /// `s3://` store URI. Explicit, ad-hoc direct access — bypasses any
-    /// server. Exclusive with a positional URI / `--target` / `--server`.
+    /// server. Exclusive with a positional URI / `--server`.
     #[arg(long, global = true, value_name = "URI")]
     pub(crate) store: Option<String>,
 
@@ -75,8 +75,6 @@ pub(crate) enum Command {
         uri: Option<String>,
         #[arg(hide = true)]
         legacy_uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long, conflicts_with_all = ["query", "query_string"])]
@@ -114,8 +112,6 @@ pub(crate) enum Command {
         #[arg(hide = true)]
         legacy_uri: Option<String>,
         #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long, conflicts_with_all = ["query", "query_string"])]
         alias: Option<String>,
@@ -140,8 +136,6 @@ pub(crate) enum Command {
         /// Graph URI
         uri: Option<String>,
         #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long)]
         data: PathBuf,
@@ -165,8 +159,6 @@ pub(crate) enum Command {
         /// Graph URI
         uri: Option<String>,
         #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long)]
         data: PathBuf,
@@ -189,8 +181,6 @@ pub(crate) enum Command {
         /// Graph URI
         uri: Option<String>,
         #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long)]
         branch: Option<String>,
@@ -201,8 +191,6 @@ pub(crate) enum Command {
     Export {
         /// Graph URI
         uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long)]
@@ -250,12 +238,10 @@ pub(crate) enum Command {
         /// Graph URI
         uri: Option<String>,
         #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
         config: Option<PathBuf>,
         /// Cluster directory or storage-root URI; with --cluster-graph, resolves
         /// the graph's storage URI from the served cluster state.
-        #[arg(long, conflicts_with_all = ["uri", "target"], requires = "cluster_graph")]
+        #[arg(long, conflicts_with = "uri", requires = "cluster_graph")]
         cluster: Option<String>,
         /// Graph id within --cluster.
         #[arg(long, requires = "cluster")]
@@ -268,12 +254,10 @@ pub(crate) enum Command {
         /// Graph URI
         uri: Option<String>,
         #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
         config: Option<PathBuf>,
         /// Cluster directory or storage-root URI; with --cluster-graph, resolves
         /// the graph's storage URI from the served cluster state.
-        #[arg(long, conflicts_with_all = ["uri", "target"], requires = "cluster_graph")]
+        #[arg(long, conflicts_with = "uri", requires = "cluster_graph")]
         cluster: Option<String>,
         /// Graph id within --cluster.
         #[arg(long, requires = "cluster")]
@@ -294,12 +278,10 @@ pub(crate) enum Command {
         /// Graph URI
         uri: Option<String>,
         #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
         config: Option<PathBuf>,
         /// Cluster directory or storage-root URI; with --cluster-graph, resolves
         /// the graph's storage URI from the served cluster state.
-        #[arg(long, conflicts_with_all = ["uri", "target"], requires = "cluster_graph")]
+        #[arg(long, conflicts_with = "uri", requires = "cluster_graph")]
         cluster: Option<String>,
         /// Graph id within --cluster.
         #[arg(long, requires = "cluster")]
@@ -332,8 +314,6 @@ pub(crate) enum Command {
     Lint {
         /// Graph URI
         uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long)]
@@ -489,8 +469,6 @@ pub(crate) enum GraphsCommand {
         #[arg(long)]
         uri: Option<String>,
         #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long)]
         json: bool,
@@ -505,8 +483,6 @@ pub(crate) enum BranchCommand {
         #[arg(long)]
         uri: Option<String>,
         #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long)]
         from: Option<String>,
@@ -520,8 +496,6 @@ pub(crate) enum BranchCommand {
         #[arg(long)]
         uri: Option<String>,
         #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long)]
         json: bool,
@@ -531,8 +505,6 @@ pub(crate) enum BranchCommand {
         /// Graph URI
         #[arg(long)]
         uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
         name: String,
@@ -544,8 +516,6 @@ pub(crate) enum BranchCommand {
         /// Graph URI
         #[arg(long)]
         uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
         source: String,
@@ -563,8 +533,6 @@ pub(crate) enum SchemaCommand {
         /// Graph URI
         uri: Option<String>,
         #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long)]
         schema: PathBuf,
@@ -580,8 +548,6 @@ pub(crate) enum SchemaCommand {
     Apply {
         /// Graph URI
         uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long)]
@@ -606,8 +572,6 @@ pub(crate) enum SchemaCommand {
         /// Graph URI
         uri: Option<String>,
         #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long)]
         json: bool,
@@ -622,8 +586,6 @@ pub(crate) enum CommitCommand {
         /// Graph URI
         uri: Option<String>,
         #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long)]
         branch: Option<String>,
@@ -635,8 +597,6 @@ pub(crate) enum CommitCommand {
         /// Graph URI
         #[arg(long)]
         uri: Option<String>,
-        #[arg(long)]
-        target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
         commit_id: String,
@@ -684,16 +644,12 @@ pub(crate) enum QueriesCommand {
         /// Graph URI
         uri: Option<String>,
         #[arg(long)]
-        target: Option<String>,
-        #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
     /// List the registered stored queries (name, MCP exposure, params).
     List {
-        #[arg(long)]
-        target: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long)]

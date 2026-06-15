@@ -91,28 +91,26 @@ impl GraphClient {
         server: Option<&str>,
         graph: Option<&str>,
         uri: Option<String>,
-        target: Option<&str>,
         profile: Option<&str>,
         store: Option<&str>,
     ) -> Result<Self> {
         // RFC-011: a scope (profile / --store / operator defaults) may stand in
-        // for omitted addressing. The explicit branch passes server/graph/uri/
-        // target straight through, so existing invocations are unchanged.
+        // for omitted addressing. The explicit branch passes server/graph/uri
+        // straight through, so existing invocations are unchanged.
         let scope = crate::scope::resolve_scope(
             &crate::operator::load_operator_config()?,
             crate::planes::Capability::Any,
-            crate::scope::ScopeFlags { profile, store, server, graph, uri, target },
+            crate::scope::ScopeFlags { profile, store, server, graph, uri },
         )?;
-        let (server, graph, uri, target) = (
+        let (server, graph, uri) = (
             scope.server.as_deref(),
             scope.graph.as_deref(),
             scope.uri,
-            scope.target.as_deref(),
         );
         let via_server = server.is_some();
-        let uri = apply_server_flag(server, graph, uri, target)?;
-        let token = resolve_remote_bearer_token(config, uri.as_deref(), target)?;
-        let uri = crate::helpers::resolve_uri(config, uri, target)?;
+        let uri = apply_server_flag(server, graph, uri)?;
+        let token = resolve_remote_bearer_token(config, uri.as_deref())?;
+        let uri = crate::helpers::resolve_uri(config, uri)?;
         reject_positional_remote(via_server, &uri)?;
         if is_remote_uri(&uri) {
             Ok(GraphClient::Remote {
@@ -140,7 +138,6 @@ impl GraphClient {
         server: Option<&str>,
         graph: Option<&str>,
         uri: Option<String>,
-        target: Option<&str>,
         cli_as: Option<&str>,
         profile: Option<&str>,
         store: Option<&str>,
@@ -150,18 +147,17 @@ impl GraphClient {
         let scope = crate::scope::resolve_scope(
             &crate::operator::load_operator_config()?,
             crate::planes::Capability::Any,
-            crate::scope::ScopeFlags { profile, store, server, graph, uri, target },
+            crate::scope::ScopeFlags { profile, store, server, graph, uri },
         )?;
-        let (server, graph, uri, target) = (
+        let (server, graph, uri) = (
             scope.server.as_deref(),
             scope.graph.as_deref(),
             scope.uri,
-            scope.target.as_deref(),
         );
         let via_server = server.is_some();
-        let uri = apply_server_flag(server, graph, uri, target)?;
-        let token = resolve_remote_bearer_token(config, uri.as_deref(), target)?;
-        let resolved = resolve_cli_graph(config, uri, target)?;
+        let uri = apply_server_flag(server, graph, uri)?;
+        let token = resolve_remote_bearer_token(config, uri.as_deref())?;
+        let resolved = resolve_cli_graph(config, uri)?;
         reject_positional_remote(via_server, &resolved.uri)?;
         if resolved.is_remote {
             // A served write resolves the actor server-side from the bearer

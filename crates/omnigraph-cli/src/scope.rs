@@ -32,24 +32,22 @@ pub(crate) struct ResolvedScope {
     pub(crate) server: Option<String>,
     pub(crate) graph: Option<String>,
     pub(crate) uri: Option<String>,
-    pub(crate) target: Option<String>,
     pub(crate) cluster: Option<String>,
     pub(crate) cluster_graph: Option<String>,
 }
 
 /// The raw addressing inputs for one command: the global scope flags plus the
-/// command's own positional/`--target` address.
+/// command's own positional URI.
 pub(crate) struct ScopeFlags<'a> {
     pub(crate) profile: Option<&'a str>,
     pub(crate) store: Option<&'a str>,
     pub(crate) server: Option<&'a str>,
     pub(crate) graph: Option<&'a str>,
     pub(crate) uri: Option<String>,
-    pub(crate) target: Option<&'a str>,
 }
 
 /// Resolve the scope for a command with `capability`. Precedence (RFC-011):
-/// 1. explicit legacy/primitive address (`uri`/`target`/`--server`/`--store`) → passthrough;
+/// 1. explicit primitive address (`uri`/`--server`/`--store`) → passthrough;
 /// 2. `--profile` / `OMNIGRAPH_PROFILE`;
 /// 3. flat `defaults.server` + `defaults.default_graph`;
 /// 4. nothing — downstream behaves as today.
@@ -60,13 +58,11 @@ pub(crate) fn resolve_scope(
 ) -> Result<ResolvedScope> {
     // 1. Any explicit address wins; reproduce today's behavior untouched.
     //    `--store` is an explicit store URI — fold it into `uri`.
-    if flags.uri.is_some() || flags.target.is_some() || flags.server.is_some() || flags.store.is_some()
-    {
+    if flags.uri.is_some() || flags.server.is_some() || flags.store.is_some() {
         return Ok(ResolvedScope {
             server: flags.server.map(str::to_string),
             graph: flags.graph.map(str::to_string),
             uri: flags.store.map(str::to_string).or(flags.uri),
-            target: flags.target.map(str::to_string),
             ..Default::default()
         });
     }
@@ -190,7 +186,6 @@ mod tests {
             server: None,
             graph: None,
             uri: None,
-            target: None,
         }
     }
 

@@ -170,7 +170,6 @@ async fn main() -> Result<()> {
         }
         Command::Load {
             uri,
-            target,
             config,
             data,
             branch,
@@ -184,7 +183,6 @@ async fn main() -> Result<()> {
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 uri,
-                target.as_deref(),
                 cli.as_actor.as_deref(),
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
@@ -201,7 +199,6 @@ async fn main() -> Result<()> {
         }
         Command::Ingest {
             uri,
-            target,
             config,
             data,
             branch,
@@ -220,7 +217,6 @@ async fn main() -> Result<()> {
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 uri,
-                target.as_deref(),
                 cli.as_actor.as_deref(),
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
@@ -239,7 +235,6 @@ async fn main() -> Result<()> {
         Command::Branch { command } => match command {
             BranchCommand::Create {
                 uri,
-                target,
                 config,
                 from,
                 name,
@@ -251,7 +246,6 @@ async fn main() -> Result<()> {
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
-                    target.as_deref(),
                     cli.as_actor.as_deref(),
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
@@ -266,7 +260,6 @@ async fn main() -> Result<()> {
             }
             BranchCommand::List {
                 uri,
-                target,
                 config,
                 json,
             } => {
@@ -276,7 +269,6 @@ async fn main() -> Result<()> {
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
-                    target.as_deref(),
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
                 )?;
@@ -291,7 +283,6 @@ async fn main() -> Result<()> {
             }
             BranchCommand::Delete {
                 uri,
-                target,
                 config,
                 name,
                 json,
@@ -302,7 +293,6 @@ async fn main() -> Result<()> {
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
-                    target.as_deref(),
                     cli.as_actor.as_deref(),
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
@@ -316,7 +306,6 @@ async fn main() -> Result<()> {
             }
             BranchCommand::Merge {
                 uri,
-                target,
                 config,
                 source,
                 into,
@@ -328,7 +317,6 @@ async fn main() -> Result<()> {
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
-                    target.as_deref(),
                     cli.as_actor.as_deref(),
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
@@ -350,7 +338,6 @@ async fn main() -> Result<()> {
         Command::Commit { command } => match command {
             CommitCommand::List {
                 uri,
-                target,
                 config,
                 branch,
                 json,
@@ -361,7 +348,6 @@ async fn main() -> Result<()> {
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
-                    target.as_deref(),
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
                 )?;
@@ -374,7 +360,6 @@ async fn main() -> Result<()> {
             }
             CommitCommand::Show {
                 uri,
-                target,
                 config,
                 commit_id,
                 json,
@@ -385,7 +370,6 @@ async fn main() -> Result<()> {
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
-                    target.as_deref(),
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
                 )?;
@@ -400,14 +384,13 @@ async fn main() -> Result<()> {
         Command::Schema { command } => match command {
             SchemaCommand::Plan {
                 uri,
-                target,
                 config,
                 schema,
                 json,
                 allow_data_loss,
             } => {
                 let config = load_cli_config(config.as_ref())?;
-                let uri = resolve_local_uri(&config, uri, target.as_deref(), "schema plan")?;
+                let uri = resolve_local_uri(&config, uri, "schema plan")?;
                 let schema_source = fs::read_to_string(&schema)?;
                 let db = Omnigraph::open(&uri).await?;
                 let plan = db
@@ -430,7 +413,6 @@ async fn main() -> Result<()> {
             }
             SchemaCommand::Apply {
                 uri,
-                target,
                 config,
                 schema,
                 json,
@@ -442,7 +424,6 @@ async fn main() -> Result<()> {
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
-                    target.as_deref(),
                     cli.as_actor.as_deref(),
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
@@ -475,7 +456,6 @@ async fn main() -> Result<()> {
             }
             SchemaCommand::Show {
                 uri,
-                target,
                 config,
                 json,
             } => {
@@ -485,7 +465,6 @@ async fn main() -> Result<()> {
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
-                    target.as_deref(),
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
                 )?;
@@ -499,7 +478,6 @@ async fn main() -> Result<()> {
         },
         Command::Lint {
             uri,
-            target,
             config,
             query,
             schema,
@@ -507,30 +485,27 @@ async fn main() -> Result<()> {
         } => {
             let config = load_cli_config(config.as_ref())?;
             let output =
-                execute_query_lint(&config, uri, target.as_deref(), schema.as_ref(), &query)
+                execute_query_lint(&config, uri, schema.as_ref(), &query)
                     .await?;
             finish_query_lint(&output, json)?;
         }
         Command::Queries { command } => match command {
             QueriesCommand::Validate {
                 uri,
-                target,
                 config,
                 json,
             } => {
-                execute_queries_validate(uri, target, config.as_ref(), json).await?;
+                execute_queries_validate(uri, config.as_ref(), json).await?;
             }
             QueriesCommand::List {
-                target,
                 config,
                 json,
             } => {
-                execute_queries_list(target, config.as_ref(), json)?;
+                execute_queries_list(config.as_ref(), json)?;
             }
         },
         Command::Snapshot {
             uri,
-            target,
             config,
             branch,
             json,
@@ -541,7 +516,6 @@ async fn main() -> Result<()> {
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 uri,
-                target.as_deref(),
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
             )?;
@@ -555,7 +529,6 @@ async fn main() -> Result<()> {
         }
         Command::Export {
             uri,
-            target,
             config,
             branch,
             jsonl,
@@ -568,7 +541,6 @@ async fn main() -> Result<()> {
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 uri,
-                target.as_deref(),
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
             )?;
@@ -586,7 +558,6 @@ async fn main() -> Result<()> {
         Command::Query {
             uri,
             legacy_uri,
-            target,
             config,
             alias,
             query,
@@ -644,23 +615,24 @@ async fn main() -> Result<()> {
             let alias = resolve_alias(&config, alias.as_deref(), AliasCommand::Read)?;
             let alias_name = alias.as_ref().map(|(name, _)| *name);
             let alias_config = alias.as_ref().map(|(_, alias)| *alias);
-            let target_available = target.is_some()
-                || alias_config
-                    .and_then(|alias| alias.graph.as_deref())
-                    .is_some()
-                || config.cli_graph_name().is_some();
+            let alias_graph = alias_config.and_then(|alias| alias.graph.as_deref());
+            let target_available = alias_graph.is_some() || config.cli_graph_name().is_some();
             let (legacy_uri, alias_args) =
                 normalize_legacy_alias_uri(legacy_uri, target_available, alias_name, alias_args);
-            let uri = uri.or(legacy_uri);
-            let target_name = target
-                .as_deref()
-                .or_else(|| alias_config.and_then(|alias| alias.graph.as_deref()));
+            // `--target` is gone; resolve an alias's legacy `graph` name to its
+            // URI (a positional URI still wins).
+            let uri = match uri.or(legacy_uri) {
+                Some(uri) => Some(uri),
+                None => match alias_graph {
+                    Some(name) => Some(config.resolve_target_uri(None, Some(name), None)?),
+                    None => None,
+                },
+            };
             let client = client::GraphClient::resolve(
                 &config,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 uri,
-                target_name,
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
             )?;
@@ -704,7 +676,6 @@ async fn main() -> Result<()> {
         Command::Mutate {
             uri,
             legacy_uri,
-            target,
             config,
             alias,
             query,
@@ -723,23 +694,24 @@ async fn main() -> Result<()> {
             let alias = resolve_alias(&config, alias.as_deref(), AliasCommand::Change)?;
             let alias_name = alias.as_ref().map(|(name, _)| *name);
             let alias_config = alias.as_ref().map(|(_, alias)| *alias);
-            let target_available = target.is_some()
-                || alias_config
-                    .and_then(|alias| alias.graph.as_deref())
-                    .is_some()
-                || config.cli_graph_name().is_some();
+            let alias_graph = alias_config.and_then(|alias| alias.graph.as_deref());
+            let target_available = alias_graph.is_some() || config.cli_graph_name().is_some();
             let (legacy_uri, alias_args) =
                 normalize_legacy_alias_uri(legacy_uri, target_available, alias_name, alias_args);
-            let uri = uri.or(legacy_uri);
-            let target_name = target
-                .as_deref()
-                .or_else(|| alias_config.and_then(|alias| alias.graph.as_deref()));
+            // `--target` is gone; resolve an alias's legacy `graph` name to its
+            // URI (a positional URI still wins).
+            let uri = match uri.or(legacy_uri) {
+                Some(uri) => Some(uri),
+                None => match alias_graph {
+                    Some(name) => Some(config.resolve_target_uri(None, Some(name), None)?),
+                    None => None,
+                },
+            };
             let client = client::GraphClient::resolve_with_policy(
                 &config,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 uri,
-                target_name,
                 cli.as_actor.as_deref(),
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
@@ -820,18 +792,16 @@ async fn main() -> Result<()> {
         },
         Command::Optimize {
             uri,
-            target,
             config,
             cluster,
             cluster_graph,
             json,
         } => {
             let config = load_cli_config(config.as_ref())?;
-            let uri = if uri.is_some() || target.is_some() || cluster.is_some() {
+            let uri = if uri.is_some() || cluster.is_some() {
                 resolve_storage_uri(
                     &config,
                     uri,
-                    target.as_deref(),
                     cluster.as_deref(),
                     cluster_graph.as_deref(),
                     "optimize",
@@ -849,13 +819,11 @@ async fn main() -> Result<()> {
                         server: None,
                         graph: cli.graph.as_deref(),
                         uri: None,
-                        target: None,
                     },
                 )?;
                 resolve_storage_uri(
                     &config,
                     scope.uri,
-                    scope.target.as_deref(),
                     scope.cluster.as_deref(),
                     scope.cluster_graph.as_deref(),
                     "optimize",
@@ -896,7 +864,6 @@ async fn main() -> Result<()> {
         }
         Command::Repair {
             uri,
-            target,
             config,
             cluster,
             cluster_graph,
@@ -905,11 +872,10 @@ async fn main() -> Result<()> {
             json,
         } => {
             let config = load_cli_config(config.as_ref())?;
-            let uri = if uri.is_some() || target.is_some() || cluster.is_some() {
+            let uri = if uri.is_some() || cluster.is_some() {
                 resolve_storage_uri(
                     &config,
                     uri,
-                    target.as_deref(),
                     cluster.as_deref(),
                     cluster_graph.as_deref(),
                     "repair",
@@ -926,13 +892,11 @@ async fn main() -> Result<()> {
                         server: None,
                         graph: cli.graph.as_deref(),
                         uri: None,
-                        target: None,
                     },
                 )?;
                 resolve_storage_uri(
                     &config,
                     scope.uri,
-                    scope.target.as_deref(),
                     scope.cluster.as_deref(),
                     scope.cluster_graph.as_deref(),
                     "repair",
@@ -1014,7 +978,6 @@ async fn main() -> Result<()> {
         }
         Command::Cleanup {
             uri,
-            target,
             config,
             cluster,
             cluster_graph,
@@ -1024,11 +987,10 @@ async fn main() -> Result<()> {
             json,
         } => {
             let config = load_cli_config(config.as_ref())?;
-            let uri = if uri.is_some() || target.is_some() || cluster.is_some() {
+            let uri = if uri.is_some() || cluster.is_some() {
                 resolve_storage_uri(
                     &config,
                     uri,
-                    target.as_deref(),
                     cluster.as_deref(),
                     cluster_graph.as_deref(),
                     "cleanup",
@@ -1045,13 +1007,11 @@ async fn main() -> Result<()> {
                         server: None,
                         graph: cli.graph.as_deref(),
                         uri: None,
-                        target: None,
                     },
                 )?;
                 resolve_storage_uri(
                     &config,
                     scope.uri,
-                    scope.target.as_deref(),
                     scope.cluster.as_deref(),
                     scope.cluster_graph.as_deref(),
                     "cleanup",
@@ -1182,7 +1142,6 @@ async fn main() -> Result<()> {
         Command::Graphs { command } => match command {
             GraphsCommand::List {
                 uri,
-                target,
                 config,
                 json,
             } => {
@@ -1192,7 +1151,6 @@ async fn main() -> Result<()> {
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
-                    target.as_deref(),
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
                 )?;

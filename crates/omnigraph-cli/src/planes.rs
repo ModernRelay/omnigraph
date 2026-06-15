@@ -192,11 +192,9 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
     }
     let label = command_label(&cli.command);
     let how = match capability {
-        // `init` is the one direct verb with no `--target` today (it takes a
-        // required positional URI), so its remediation drops the `--target` half.
         Capability::Direct => match cli.command {
             Command::Init { .. } => "Pass a storage URI.",
-            _ => "Use --target <name>, a storage URI, or --cluster <dir> --cluster-graph <id>.",
+            _ => "Pass a storage URI, or --cluster <dir> --cluster-graph <id>.",
         },
         Capability::Control => "It operates on a cluster (pass --config <dir>).",
         Capability::Local => "It does not address a graph.",
