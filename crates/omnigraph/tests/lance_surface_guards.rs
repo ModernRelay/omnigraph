@@ -918,3 +918,74 @@ async fn skip_auto_cleanup_suppresses_version_gc() {
          __manifest-pinned versions on upgraded (pre-bump) graphs."
     );
 }
+
+// --- Guard 19: unenforced primary key is immutable once set (lance v7) ------
+//
+// Lance 7 (`lance::dataset::transaction`) makes the unenforced PK reserved:
+// once `lance-schema:unenforced-primary-key` is set on a field, any later write
+// that touches that reserved key — even re-applying the SAME value — errors
+// "the unenforced primary key is a reserved key and cannot be changed once set".
+//
+// This is the upstream behavior that broke
+// `db/manifest/migrations.rs::migrate_v1_to_v2`'s crash-idempotency: a
+// pre-v0.4.0 graph that crashed after the field-set but before the stamp bump
+// re-enters the migration with the PK already present, and on Lance 6 the
+// re-apply was a no-op. The migration now guards the set on the manifest's
+// unenforced-PK field (`["object_id"]` → no-op, `[]` → set, anything else →
+// loud refusal). If Lance ever relaxes immutability (a re-set becomes a no-op
+// again), this guard goes red — revisit whether that field-guard is still
+// needed, and re-pin docs/dev/lance.md.
+#[tokio::test]
+async fn unenforced_primary_key_is_immutable_once_set() {
+    use lance::datatypes::LANCE_UNENFORCED_PRIMARY_KEY;
+
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("g19.lance");
+    let mut ds = fresh_dataset(uri.to_str().unwrap()).await;
+
+    // Precondition: no unenforced PK yet (mirrors a genuine pre-v0.4.0 manifest).
+    assert!(
+        ds.schema().unenforced_primary_key().is_empty(),
+        "fresh dataset should carry no unenforced primary key"
+    );
+
+    // First set succeeds — the genuine pre-v0.4.0 migration path. (Discard the
+    // returned &Schema so the &mut borrow ends before the next call.)
+    ds.update_field_metadata()
+        .update(
+            "id",
+            [(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string())],
+        )
+        .unwrap()
+        .await
+        .unwrap();
+    let pk: Vec<String> = ds
+        .schema()
+        .unenforced_primary_key()
+        .iter()
+        .map(|field| field.name.clone())
+        .collect();
+    assert_eq!(
+        pk,
+        ["id"],
+        "first set should install `id` as the unenforced PK"
+    );
+
+    // Re-applying the SAME reserved key now errors — the crash-retry hazard the
+    // migration's field-guard sidesteps.
+    let err = ds
+        .update_field_metadata()
+        .update(
+            "id",
+            [(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string())],
+        )
+        .unwrap()
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("cannot be changed once set"),
+        "Lance no longer rejects re-setting the unenforced PK (got: {err}); \
+         immutability relaxed — revisit migrate_v1_to_v2's field-guard and \
+         re-pin docs/dev/lance.md."
+    );
+}
