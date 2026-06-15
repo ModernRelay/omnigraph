@@ -337,12 +337,23 @@ async fn test_directory_namespace_direct_publish_cannot_replace_native_omnigraph
         .unwrap();
 
     // Lance 7: the native `DirectoryNamespace` no longer recognizes omnigraph's
-    // manifest-tracked tables. `check_table_status` reports the table absent
-    // (`lance-namespace-impls` dir.rs), so list / describe / create_table_version
-    // all return `TableNotFound`. The native path is fully decoupled from
-    // omnigraph's manifest authority: it cannot enumerate, inspect, or publish
-    // over omnigraph's tables. (Pre-v7 the native namespace could still *see* the
-    // published version but never replace the write path; v7 only widens the gap.)
+    // manifest-tracked tables, so list / describe / create_table_version all
+    // return `TableNotFound`. The mechanism is *contingent on omnigraph's legacy
+    // boolean PK key*, not an unconditional v7 property: v7's namespace eagerly
+    // rewrites any `__manifest` whose `object_id` lacks the new
+    // `lance-schema:unenforced-primary-key:position` key, omnigraph declares the
+    // PK with the legacy boolean key, and v7 forbids changing a PK once set — so
+    // `ensure_manifest_table_up_to_date` errors, the namespace silently falls
+    // back to directory listing (disabled here), and `check_table_status` reports
+    // the table absent. omnigraph keeps the boolean key deliberately: Lance
+    // honors it permanently (it maps to PK position 0) and one uniform on-disk
+    // format beats a new-vs-old split, since existing graphs can't be re-keyed to
+    // the position key under that same immutability rule. The decoupling is
+    // therefore an accepted, production-irrelevant tradeoff (omnigraph never uses
+    // the native namespace — its publisher writes `__manifest` via merge_insert
+    // and its reads go through its own `LanceNamespace` impls), and it only
+    // strengthens this guard's thesis: native tooling cannot enumerate, inspect,
+    // or publish over omnigraph's tables, let alone replace the write path.
     let assert_table_not_found = |what: &str, dbg: String| {
         assert!(
             dbg.contains("TableNotFound") && dbg.contains("node:Person"),
