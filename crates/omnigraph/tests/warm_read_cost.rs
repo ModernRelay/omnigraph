@@ -107,3 +107,82 @@ async fn external_commit_observed_by_warm_reader() {
         "warm reader must observe an external commit"
     );
 }
+
+// ── Finding A: drop the redundant per-query schema validation ─────────────────
+//
+// Every query runs `ensure_schema_state_valid`. It ran TWICE per query (once in
+// query()/run_query_at, once again in resolved_target/snapshot_at_version), each
+// reading 3 contract files + 2 existence probes (~10 storage ops). Finding A
+// removes the redundant caller, so validation runs once. (A cheaper source-only
+// probe was rejected: the codebase requires per-call detection of IR/state drift
+// on long-lived handles -- lifecycle::long_lived_handle_rejects_schema_ir_drift
+// -- which a source-only compare would miss.) Measured at the StorageAdapter
+// boundary with the counting decorator.
+
+/// A warm query validates the schema contract exactly once (3 reads + 2 exists),
+/// not twice. Fails before finding A, where query() and resolved_target each
+/// validate (6 read_text + 4 exists).
+#[tokio::test]
+async fn warm_query_validates_schema_contract_once() {
+    use omnigraph::instrumentation::CountingStorageAdapter;
+    use omnigraph::storage::storage_for_uri;
+
+    let dir = tempfile::tempdir().unwrap();
+    // Init through the standard path, then re-open behind a counting adapter to
+    // measure the per-query schema-contract storage reads (delta around the
+    // query excludes open-time reads).
+    let _ = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let (adapter, counts) = CountingStorageAdapter::new(storage_for_uri(uri).unwrap());
+    let db = Omnigraph::open_with_storage(uri, adapter).await.unwrap();
+
+    let before_read_text = counts.read_text();
+    let before_exists = counts.exists();
+    db.query(
+        ReadTarget::branch("main"),
+        TEST_QUERIES,
+        "total_people",
+        &params(&[]),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        counts.read_text() - before_read_text,
+        3,
+        "warm query should validate the schema contract once (3 reads), not twice"
+    );
+    assert_eq!(
+        counts.exists() - before_exists,
+        2,
+        "warm query should probe contract-file existence once (2 probes), not twice"
+    );
+}
+
+/// The cheap source-compare must still detect that the on-disk schema source has
+/// drifted from the validated contract and fail the read, rather than serving the
+/// stale-but-cached schema. Passes before and after finding A (regression guard
+/// for the documented weaker per-query guard).
+#[tokio::test]
+async fn schema_source_drift_is_caught_on_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let _writer = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let reader = Omnigraph::open(uri).await.unwrap();
+
+    // Drift the on-disk schema source behind the reader's back.
+    std::fs::write(dir.path().join("_schema.pg"), "this is not a valid schema {{{").unwrap();
+
+    let result = reader
+        .query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "total_people",
+            &params(&[]),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "a query must fail when the on-disk schema source has drifted from the validated contract"
+    );
+}
