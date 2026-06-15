@@ -100,7 +100,7 @@ impl GraphClient {
         let scope = crate::scope::resolve_scope(
             &crate::operator::load_operator_config()?,
             crate::planes::Capability::Any,
-            crate::scope::ScopeFlags { profile, store, server, graph, uri },
+            crate::scope::ScopeFlags { profile, store, server, cluster: None, graph, uri },
         )?;
         let (server, graph, uri) = (
             scope.server.as_deref(),
@@ -147,7 +147,7 @@ impl GraphClient {
         let scope = crate::scope::resolve_scope(
             &crate::operator::load_operator_config()?,
             crate::planes::Capability::Any,
-            crate::scope::ScopeFlags { profile, store, server, graph, uri },
+            crate::scope::ScopeFlags { profile, store, server, cluster: None, graph, uri },
         )?;
         let (server, graph, uri) = (
             scope.server.as_deref(),

@@ -165,9 +165,34 @@ fn optimize_with_server_flag_errors_wrong_plane() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("`optimize` is a direct (storage-native) command")
-            && stderr.contains("--server/--graph address a served graph and do not apply")
-            && stderr.contains("Pass a storage URI, or --cluster <dir> --cluster-graph <id>."),
+            && stderr.contains("--server addresses a served graph and does not apply")
+            && stderr.contains("Pass a storage URI, or --cluster <dir> --graph <id>."),
         "wrong-capability guard message not found; got: {stderr}"
+    );
+}
+
+#[test]
+fn graph_flag_on_a_positional_uri_errors() {
+    // RFC-011: `--graph` selects within a multi-graph scope (a server or
+    // cluster). A bare positional URI is already a single graph, so pairing it
+    // with `--graph` is a loud error, not a silently-dropped flag. (The guard
+    // lets `--graph` reach a data verb; the scope resolver is what rejects it.)
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    let output = output_failure(
+        cli()
+            .arg("query")
+            .arg(&graph)
+            .arg("--graph")
+            .arg("knowledge")
+            .arg("-e")
+            .arg("query q { Person { id } }"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("already a single graph"),
+        "expected --graph-on-positional-URI rejection; got: {stderr}"
     );
 }
 

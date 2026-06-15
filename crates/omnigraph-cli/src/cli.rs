@@ -37,9 +37,11 @@ pub(crate) struct Cli {
     #[arg(long, global = true, value_name = "NAME|URL")]
     pub(crate) server: Option<String>,
 
-    /// Graph id on a multi-graph `--server` (appends `/graphs/<id>` to
-    /// the server url). Requires --server.
-    #[arg(long, global = true, value_name = "GRAPH_ID", requires = "server")]
+    /// Select a graph within a multi-graph scope: on a `--server` it appends
+    /// `/graphs/<id>` to the server url; on a `--cluster` it picks which
+    /// cluster graph to maintain. Rejected on a single-graph address (a
+    /// positional URI / `--store`).
+    #[arg(long, global = true, value_name = "GRAPH_ID")]
     pub(crate) graph: Option<String>,
 
     /// Select a named scope bundle (RFC-011) from `profiles:` in
@@ -55,6 +57,14 @@ pub(crate) struct Cli {
     /// server. Exclusive with a positional URI / `--server`.
     #[arg(long, global = true, value_name = "URI")]
     pub(crate) store: Option<String>,
+
+    /// Address a cluster-managed graph's storage for maintenance (RFC-011):
+    /// a cluster directory or storage-root URI — named via `clusters:` in
+    /// ~/.omnigraph/config.yaml, or a literal `file://`/`s3://` root. Pair
+    /// with `--graph <id>` to select the graph. Used by optimize / repair /
+    /// cleanup; exclusive with a positional URI / `--store` / `--server`.
+    #[arg(long, global = true, value_name = "DIR|URI")]
+    pub(crate) cluster: Option<String>,
 
     #[command(subcommand)]
     pub(crate) command: Command,
@@ -239,13 +249,6 @@ pub(crate) enum Command {
         uri: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Cluster directory or storage-root URI; with --cluster-graph, resolves
-        /// the graph's storage URI from the served cluster state.
-        #[arg(long, conflicts_with = "uri", requires = "cluster_graph")]
-        cluster: Option<String>,
-        /// Graph id within --cluster.
-        #[arg(long, requires = "cluster")]
-        cluster_graph: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -255,13 +258,6 @@ pub(crate) enum Command {
         uri: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Cluster directory or storage-root URI; with --cluster-graph, resolves
-        /// the graph's storage URI from the served cluster state.
-        #[arg(long, conflicts_with = "uri", requires = "cluster_graph")]
-        cluster: Option<String>,
-        /// Graph id within --cluster.
-        #[arg(long, requires = "cluster")]
-        cluster_graph: Option<String>,
         /// Publish verified maintenance drift. Without this flag, repair only
         /// previews what it would do.
         #[arg(long)]
@@ -279,13 +275,6 @@ pub(crate) enum Command {
         uri: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Cluster directory or storage-root URI; with --cluster-graph, resolves
-        /// the graph's storage URI from the served cluster state.
-        #[arg(long, conflicts_with = "uri", requires = "cluster_graph")]
-        cluster: Option<String>,
-        /// Graph id within --cluster.
-        #[arg(long, requires = "cluster")]
-        cluster_graph: Option<String>,
         /// Number of recent versions to keep per table. Either `--keep` or
         /// `--older-than` (or both) must be set.
         #[arg(long)]

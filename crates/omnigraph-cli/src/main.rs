@@ -790,46 +790,18 @@ async fn main() -> Result<()> {
                 print_policy_explain(&decision, &actor, &request);
             }
         },
-        Command::Optimize {
-            uri,
-            config,
-            cluster,
-            cluster_graph,
-            json,
-        } => {
+        Command::Optimize { uri, config, json } => {
             let config = load_cli_config(config.as_ref())?;
-            let uri = if uri.is_some() || cluster.is_some() {
-                resolve_storage_uri(
-                    &config,
-                    uri,
-                    cluster.as_deref(),
-                    cluster_graph.as_deref(),
-                    "optimize",
-                )
-                .await?
-            } else {
-                // RFC-011: no explicit per-command address — consult the scope
-                // (a --profile cluster binding, --store, or operator defaults).
-                let scope = scope::resolve_scope(
-                    &operator::load_operator_config()?,
-                    planes::Capability::Direct,
-                    scope::ScopeFlags {
-                        profile: cli.profile.as_deref(),
-                        store: cli.store.as_deref(),
-                        server: None,
-                        graph: cli.graph.as_deref(),
-                        uri: None,
-                    },
-                )?;
-                resolve_storage_uri(
-                    &config,
-                    scope.uri,
-                    scope.cluster.as_deref(),
-                    scope.cluster_graph.as_deref(),
-                    "optimize",
-                )
-                .await?
-            };
+            let uri = resolve_maintenance_uri(
+                &config,
+                cli.profile.as_deref(),
+                cli.store.as_deref(),
+                cli.cluster.as_deref(),
+                cli.graph.as_deref(),
+                uri,
+                "optimize",
+            )
+            .await?;
             let db = Omnigraph::open(&uri).await?;
             let stats = db.optimize().await?;
             if json {
@@ -865,44 +837,21 @@ async fn main() -> Result<()> {
         Command::Repair {
             uri,
             config,
-            cluster,
-            cluster_graph,
             confirm,
             force,
             json,
         } => {
             let config = load_cli_config(config.as_ref())?;
-            let uri = if uri.is_some() || cluster.is_some() {
-                resolve_storage_uri(
-                    &config,
-                    uri,
-                    cluster.as_deref(),
-                    cluster_graph.as_deref(),
-                    "repair",
-                )
-                .await?
-            } else {
-                // RFC-011: no explicit per-command address — consult the scope.
-                let scope = scope::resolve_scope(
-                    &operator::load_operator_config()?,
-                    planes::Capability::Direct,
-                    scope::ScopeFlags {
-                        profile: cli.profile.as_deref(),
-                        store: cli.store.as_deref(),
-                        server: None,
-                        graph: cli.graph.as_deref(),
-                        uri: None,
-                    },
-                )?;
-                resolve_storage_uri(
-                    &config,
-                    scope.uri,
-                    scope.cluster.as_deref(),
-                    scope.cluster_graph.as_deref(),
-                    "repair",
-                )
-                .await?
-            };
+            let uri = resolve_maintenance_uri(
+                &config,
+                cli.profile.as_deref(),
+                cli.store.as_deref(),
+                cli.cluster.as_deref(),
+                cli.graph.as_deref(),
+                uri,
+                "repair",
+            )
+            .await?;
             let db = Omnigraph::open(&uri).await?;
             let stats = db
                 .repair(omnigraph::db::RepairOptions { confirm, force })
@@ -979,45 +928,22 @@ async fn main() -> Result<()> {
         Command::Cleanup {
             uri,
             config,
-            cluster,
-            cluster_graph,
             keep,
             older_than,
             confirm,
             json,
         } => {
             let config = load_cli_config(config.as_ref())?;
-            let uri = if uri.is_some() || cluster.is_some() {
-                resolve_storage_uri(
-                    &config,
-                    uri,
-                    cluster.as_deref(),
-                    cluster_graph.as_deref(),
-                    "cleanup",
-                )
-                .await?
-            } else {
-                // RFC-011: no explicit per-command address — consult the scope.
-                let scope = scope::resolve_scope(
-                    &operator::load_operator_config()?,
-                    planes::Capability::Direct,
-                    scope::ScopeFlags {
-                        profile: cli.profile.as_deref(),
-                        store: cli.store.as_deref(),
-                        server: None,
-                        graph: cli.graph.as_deref(),
-                        uri: None,
-                    },
-                )?;
-                resolve_storage_uri(
-                    &config,
-                    scope.uri,
-                    scope.cluster.as_deref(),
-                    scope.cluster_graph.as_deref(),
-                    "cleanup",
-                )
-                .await?
-            };
+            let uri = resolve_maintenance_uri(
+                &config,
+                cli.profile.as_deref(),
+                cli.store.as_deref(),
+                cli.cluster.as_deref(),
+                cli.graph.as_deref(),
+                uri,
+                "cleanup",
+            )
+            .await?;
 
             let older_than_dur = older_than.as_deref().map(parse_duration_arg).transpose()?;
 

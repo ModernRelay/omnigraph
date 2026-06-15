@@ -121,7 +121,7 @@ fn schema_plan_with_server_flag_errors_wrong_plane() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("`schema plan` is a direct (storage-native) command")
-            && stderr.contains("Pass a storage URI, or --cluster <dir> --cluster-graph <id>."),
+            && stderr.contains("Pass a storage URI."),
         "schema plan wrong-capability message not found; got: {stderr}"
     );
 }
