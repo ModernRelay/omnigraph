@@ -1323,9 +1323,9 @@ impl Omnigraph {
         // branch_merge writes only to the target branch.
         //
         // Held across the per-table publish loop and the manifest
-        // commit + record_merge_commit calls below. Under PR 1b's
-        // intermediate state (global server RwLock still in place),
-        // this acquisition is uncontended.
+        // commit + record_merge_commit calls below, so no concurrent
+        // writer to a touched (table, target_branch) can interleave
+        // between our commit_staged and our publish.
         let active_branch_for_keys = self.active_branch().await;
         let merge_queue_keys: Vec<(String, Option<String>)> = ordered_table_keys
             .iter()

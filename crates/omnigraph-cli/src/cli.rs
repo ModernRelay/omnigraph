@@ -644,7 +644,6 @@ impl From<CliLoadMode> for LoadMode {
         }
     }
 }
-
 impl CliLoadMode {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -654,4 +653,3 @@ impl CliLoadMode {
         }
     }
 }
-

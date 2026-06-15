@@ -1,12 +1,15 @@
-//! Per-`(table_key, branch)` writer queues — MR-686 scaffolding.
+//! Per-`(table_key, branch)` writer queues.
 //!
-//! Today every server-layer write serializes on the global
-//! `Arc<RwLock<Omnigraph>>` in `AppState`. MR-686 replaces that with
-//! per-`(table_key, branch_ref)` queues so disjoint-key writes proceed
-//! concurrently. This module owns the queue data structure; callers in
-//! `MutationStaging::commit_all`, `branch_merge`, `schema_apply`,
-//! `ensure_indices`, `delete_where`, and the future MR-870 recovery
-//! reconciler acquire guards before any per-table Lance commit.
+//! These queues are the engine's write-serialization mechanism: the server
+//! holds the engine as a lockless `Arc<Omnigraph>` (writes are `&self`), so
+//! disjoint-key writes proceed concurrently and only writes to the same
+//! `(table_key, branch_ref)` serialize here. This module owns the queue
+//! data structure; callers in `MutationStaging::commit_all`, `branch_merge`,
+//! `schema_apply`, `ensure_indices`, `delete_where`, the fork path (first
+//! write to a table on a branch — acquired before the fork, held through the
+//! manifest publish), and the recovery reconciler acquire guards before any
+//! per-table Lance commit. Serialization is in-process only; cross-process
+//! writers on one graph remain one-winner-CAS at the manifest publish.
 //!
 //! ## Why exclusive `tokio::sync::Mutex<()>` per key
 //!

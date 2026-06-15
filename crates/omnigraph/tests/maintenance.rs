@@ -844,6 +844,76 @@ async fn cleanup_reconciles_orphaned_branch_forks() {
     .unwrap();
 }
 
+// cleanup must reclaim a manifest-unreferenced fork even when the BRANCH is
+// still live (origin 2: an interrupted first-write fork), while KEEPING a table
+// that is legitimately forked on that same live branch. Before the per-table
+// authority broadening, the reconciler keyed only on the branch name and so
+// never reclaimed a fork on a live branch — the wedge the handoff hit.
+#[tokio::test]
+async fn cleanup_reconciles_live_branch_orphan_fork_but_keeps_legitimate_fork() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = init_and_load(&dir).await;
+
+    db.branch_create("feature").await.unwrap();
+
+    // Legitimately fork Company onto the live `feature` branch (a real write).
+    db.load_as(
+        "feature",
+        None,
+        r#"{"type":"Company","data":{"name":"Acme"}}"#,
+        LoadMode::Merge,
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Forge a manifest-unreferenced Person fork on the SAME live branch: the
+    // manifest's `feature` snapshot still places Person on main (Person was
+    // never written on feature), so this ref is an origin-2 orphan.
+    let person_uri = node_table_uri(&uri, "Person");
+    {
+        let mut ds = Dataset::open(&person_uri).await.unwrap();
+        let base = ds.version().version;
+        ds.create_branch("feature", base, None).await.unwrap();
+        assert!(
+            ds.list_branches().await.unwrap().contains_key("feature"),
+            "precondition: forged orphan Person fork present on the live branch"
+        );
+    }
+
+    let company_uri = node_table_uri(&uri, "Company");
+    let main_people = count_rows(&db, "node:Person").await;
+    let main_companies = count_rows(&db, "node:Company").await;
+
+    db.cleanup(CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+
+    // Origin-2 orphan reclaimed...
+    {
+        let ds = Dataset::open(&person_uri).await.unwrap();
+        assert!(
+            !ds.list_branches().await.unwrap().contains_key("feature"),
+            "cleanup must reclaim the manifest-unreferenced Person fork on the live branch"
+        );
+    }
+    // ...but the legitimate Company fork on the same live branch is kept.
+    {
+        let ds = Dataset::open(&company_uri).await.unwrap();
+        assert!(
+            ds.list_branches().await.unwrap().contains_key("feature"),
+            "cleanup must NOT reclaim a legitimately-forked table on a live branch"
+        );
+    }
+    // main is untouched.
+    assert_eq!(count_rows(&db, "node:Person").await, main_people);
+    assert_eq!(count_rows(&db, "node:Company").await, main_companies);
+}
+
 // Regression (iss-848): a table with rows but NULL vectors (the load-before-
 // embed window) must not abort index building. The vector (IVF) index cannot
 // train on 0 vectors, so `create_vector_index` errors with "KMeans cannot
@@ -876,9 +946,9 @@ async fn index_build_tolerates_null_vector_rows() {
 
     // Must not abort: the untrainable vector column is deferred, the sibling
     // BTREE on `n` still builds.
-    db.ensure_indices().await.expect(
-        "ensure_indices must not abort when a vector column has no trainable vectors yet",
-    );
+    db.ensure_indices()
+        .await
+        .expect("ensure_indices must not abort when a vector column has no trainable vectors yet");
 }
 
 // iss-848: `optimize` converges declared-but-unbuilt indexes. After an @index is
