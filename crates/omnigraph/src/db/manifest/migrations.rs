@@ -123,16 +123,36 @@ pub(super) async fn migrate_internal_schema(dataset: &mut Dataset) -> Result<()>
 /// (Fresh graphs bake the PK into `manifest_schema()` at init and never run
 /// this migration; only genuine pre-v0.4.0 graphs do.)
 async fn migrate_v1_to_v2(dataset: &mut Dataset) -> Result<()> {
-    if dataset.schema().unenforced_primary_key().is_empty() {
-        dataset
-            .update_field_metadata()
-            .update(
-                "object_id",
-                [(OBJECT_ID_PK_KEY.to_string(), "true".to_string())],
-            )
-            .map_err(|e| OmniError::Lance(e.to_string()))?
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+    // The guard is over the *specific* field, not just "any PK is set": skipping
+    // when `object_id` is already the PK is the idempotent crash-recovery path,
+    // but a manifest whose PK is some *other* field has the wrong CAS key — and
+    // Lance 7 won't let us change it. Refuse loudly rather than silently leave
+    // merge-insert conflict detection keyed on the wrong column.
+    let pk_fields: Vec<&str> = dataset
+        .schema()
+        .unenforced_primary_key()
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect();
+    match pk_fields.as_slice() {
+        ["object_id"] => {} // already migrated (or a crash re-entry) — idempotent no-op
+        [] => {
+            dataset
+                .update_field_metadata()
+                .update(
+                    "object_id",
+                    [(OBJECT_ID_PK_KEY.to_string(), "true".to_string())],
+                )
+                .map_err(|e| OmniError::Lance(e.to_string()))?
+                .await
+                .map_err(|e| OmniError::Lance(e.to_string()))?;
+        }
+        other => {
+            return Err(OmniError::manifest_internal(format!(
+                "__manifest unenforced primary key is {other:?}, expected [\"object_id\"]; \
+                 refusing to migrate a manifest with an unexpected CAS key"
+            )));
+        }
     }
     set_stamp(dataset, 2).await
 }
