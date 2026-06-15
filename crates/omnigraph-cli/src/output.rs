@@ -698,11 +698,16 @@ pub(crate) fn render_annotations(annotations: &[omnigraph_compiler::schema::ast:
         .iter()
         .map(|annotation| {
             let mut args: Vec<String> = Vec::new();
+            // Values are parsed via `decode_string_literal` (quotes stripped), so
+            // re-quote them as string literals on render — otherwise a value with
+            // non-ident chars (e.g. `model=openai/text-embedding-3-large`) fails to
+            // round-trip back through the schema parser (`annotation_kwarg` wants a
+            // quoted `literal`, not a bare token).
             if let Some(value) = &annotation.value {
-                args.push(value.clone());
+                args.push(format!("\"{}\"", value));
             }
             for (key, val) in &annotation.kwargs {
-                args.push(format!("{}={}", key, val));
+                args.push(format!("{}=\"{}\"", key, val));
             }
             if args.is_empty() {
                 format!("@{}", annotation.name)
@@ -917,5 +922,45 @@ pub(crate) fn resolve_table_render_options(config: &OmnigraphConfig) -> ReadRend
             .table_cell_layout
             .or(operator.defaults.table_cell_layout)
             .unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use omnigraph_compiler::schema::ast::Annotation;
+    use omnigraph_compiler::schema::parser::parse_schema;
+    use std::collections::BTreeMap;
+
+    use super::render_annotations;
+
+    #[test]
+    fn render_annotations_quotes_values_so_embed_round_trips() {
+        let mut kwargs = BTreeMap::new();
+        kwargs.insert(
+            "model".to_string(),
+            "openai/text-embedding-3-large".to_string(),
+        );
+        let embed = Annotation {
+            name: "embed".to_string(),
+            value: Some("title".to_string()),
+            kwargs,
+        };
+
+        let rendered = render_annotations(std::slice::from_ref(&embed));
+        assert_eq!(
+            rendered,
+            r#"@embed("title", model="openai/text-embedding-3-large")"#
+        );
+
+        // The bug: an unquoted `model=openai/text-embedding-3-large` is not a
+        // valid `annotation_kwarg` literal, so `schema show` output did not
+        // re-parse. The rendered form must round-trip through the grammar.
+        let schema = format!("node Doc {{\ntitle: String\nembedding: Vector(3) {rendered}\n}}\n");
+        let parsed = parse_schema(&schema);
+        assert!(
+            parsed.is_ok(),
+            "rendered @embed must re-parse: {:?}",
+            parsed.err()
+        );
     }
 }
