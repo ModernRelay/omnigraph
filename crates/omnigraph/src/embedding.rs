@@ -73,45 +73,12 @@ impl EmbeddingConfig {
             return Ok(Self::mock());
         }
 
-        // The default base URL and model depend on the provider *alias*, not just
-        // the wire shape: `openai-compatible` (and the unset default) point at the
-        // OpenRouter gateway, while `openai` points at OpenAI's own host.
-        // Each provider alias yields its full default profile — base URL, model,
-        // and the ordered api-key envs to try — so every alias-dependent default
-        // lives in one place. (Dispatching the key on the `Provider` enum would
-        // collapse `openai` and `openai-compatible` and send an OpenRouter key to
-        // OpenAI's host.) `openai` targets OpenAI directly and takes only
-        // `OPENAI_API_KEY`; the OpenRouter gateway default prefers
-        // `OPENROUTER_API_KEY`, falling back to `OPENAI_API_KEY`.
-        let (provider, default_base, default_model, key_envs): (Provider, &str, &str, &[&str]) =
-            match env_string("OMNIGRAPH_EMBED_PROVIDER").as_deref() {
-                None | Some("openai-compatible") => (
-                    Provider::OpenAiCompatible,
-                    DEFAULT_OPENROUTER_BASE_URL,
-                    DEFAULT_OPENROUTER_MODEL,
-                    &["OPENROUTER_API_KEY", "OPENAI_API_KEY"],
-                ),
-                Some("openai") => (
-                    Provider::OpenAiCompatible,
-                    DEFAULT_OPENAI_BASE_URL,
-                    DEFAULT_OPENAI_MODEL,
-                    &["OPENAI_API_KEY"],
-                ),
-                Some("gemini") => (
-                    Provider::Gemini,
-                    DEFAULT_GEMINI_BASE_URL,
-                    DEFAULT_GEMINI_MODEL,
-                    &["GEMINI_API_KEY"],
-                ),
-                Some("mock") => return Ok(Self::mock()),
-                Some(other) => {
-                    return Err(OmniError::manifest_internal(format!(
-                        "unknown OMNIGRAPH_EMBED_PROVIDER '{}' (expected openai-compatible|openai|gemini|mock)",
-                        other
-                    )));
-                }
-            };
+        let alias = env_string("OMNIGRAPH_EMBED_PROVIDER");
+        if alias.as_deref() == Some("mock") {
+            return Ok(Self::mock());
+        }
 
+        let (provider, default_base, default_model, key_envs) = provider_profile(alias.as_deref())?;
         let base_url = env_string("OMNIGRAPH_EMBED_BASE_URL")
             .unwrap_or_else(|| default_base.to_string())
             .trim_end_matches('/')
@@ -123,10 +90,37 @@ impl EmbeddingConfig {
             OmniError::manifest_internal(format!(
                 "{} is required for the {} embedding provider",
                 key_envs.join(" or "),
-                env_string("OMNIGRAPH_EMBED_PROVIDER").as_deref().unwrap_or("openai-compatible")
+                alias.as_deref().unwrap_or("openai-compatible")
             ))
         })?;
 
+        Ok(Self {
+            provider,
+            model,
+            base_url,
+            api_key,
+        })
+    }
+
+    /// Build a config from explicit parts — the cluster `embeddings` profile path
+    /// (RFC-012 Phase 5). `provider`/`base_url`/`model` default exactly as
+    /// `from_env` does (shared `provider_profile`); `api_key` is already resolved
+    /// (the cluster path resolves a `${NAME}` ref before calling this).
+    pub fn from_parts(
+        provider: Option<&str>,
+        base_url: Option<String>,
+        model: Option<String>,
+        api_key: String,
+    ) -> Result<Self> {
+        if provider == Some("mock") {
+            return Ok(Self::mock());
+        }
+        let (provider, default_base, default_model, _key_envs) = provider_profile(provider)?;
+        let base_url = base_url
+            .unwrap_or_else(|| default_base.to_string())
+            .trim_end_matches('/')
+            .to_string();
+        let model = model.unwrap_or_else(|| default_model.to_string());
         Ok(Self {
             provider,
             model,
@@ -570,6 +564,43 @@ fn parse_openai_error_message(body: &str) -> Option<String> {
         .filter(|msg| !msg.trim().is_empty())
 }
 
+/// Map a provider alias to `(provider, default base URL, default model, ordered
+/// api-key envs)`. Shared by `from_env` and `from_parts` so both apply identical
+/// defaults: `openai-compatible`/unset → the OpenRouter gateway, `openai` →
+/// OpenAI's own host. `mock` is handled by callers before this is reached. The
+/// `Provider` enum alone would collapse the two openai aliases, so the alias
+/// (not the enum) determines the key-env order here.
+fn provider_profile(
+    alias: Option<&str>,
+) -> Result<(Provider, &'static str, &'static str, &'static [&'static str])> {
+    Ok(match alias {
+        None | Some("openai-compatible") => (
+            Provider::OpenAiCompatible,
+            DEFAULT_OPENROUTER_BASE_URL,
+            DEFAULT_OPENROUTER_MODEL,
+            &["OPENROUTER_API_KEY", "OPENAI_API_KEY"],
+        ),
+        Some("openai") => (
+            Provider::OpenAiCompatible,
+            DEFAULT_OPENAI_BASE_URL,
+            DEFAULT_OPENAI_MODEL,
+            &["OPENAI_API_KEY"],
+        ),
+        Some("gemini") => (
+            Provider::Gemini,
+            DEFAULT_GEMINI_BASE_URL,
+            DEFAULT_GEMINI_MODEL,
+            &["GEMINI_API_KEY"],
+        ),
+        Some(other) => {
+            return Err(OmniError::manifest_internal(format!(
+                "unknown embedding provider '{}' (expected openai-compatible|openai|gemini|mock)",
+                other
+            )));
+        }
+    })
+}
+
 fn env_string(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -878,6 +909,37 @@ mod tests {
     }
 
     #[test]
+    fn from_parts_applies_provider_defaults_and_overrides() {
+        let openrouter = EmbeddingConfig::from_parts(None, None, None, "k".to_string()).unwrap();
+        assert_eq!(openrouter.provider, Provider::OpenAiCompatible);
+        assert_eq!(openrouter.base_url, DEFAULT_OPENROUTER_BASE_URL);
+        assert_eq!(openrouter.model, DEFAULT_OPENROUTER_MODEL);
+        assert_eq!(openrouter.api_key, "k");
+
+        let gemini =
+            EmbeddingConfig::from_parts(Some("gemini"), None, None, "g".to_string()).unwrap();
+        assert_eq!(gemini.provider, Provider::Gemini);
+        assert_eq!(gemini.base_url, DEFAULT_GEMINI_BASE_URL);
+
+        let overridden = EmbeddingConfig::from_parts(
+            Some("openai"),
+            Some("https://x/v1/".to_string()),
+            Some("custom".to_string()),
+            "k".to_string(),
+        )
+        .unwrap();
+        assert_eq!(overridden.base_url, "https://x/v1"); // trailing slash trimmed
+        assert_eq!(overridden.model, "custom");
+
+        let err =
+            EmbeddingConfig::from_parts(Some("cohere"), None, None, "k".to_string()).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown embedding provider"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
     #[serial]
     fn from_env_openai_compatible_prefers_openrouter_key() {
         let _guard = cleared_env(&[
@@ -921,7 +983,7 @@ mod tests {
     fn from_env_unknown_provider_errors() {
         let _guard = cleared_env(&[("OMNIGRAPH_EMBED_PROVIDER", Some("cohere"))]);
         let err = EmbeddingConfig::from_env().unwrap_err();
-        assert!(err.to_string().contains("unknown OMNIGRAPH_EMBED_PROVIDER"));
+        assert!(err.to_string().contains("unknown embedding provider"));
     }
 
     #[test]

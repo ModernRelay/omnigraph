@@ -400,6 +400,54 @@ pub(crate) struct GraphConfig {
     pub(crate) schema: PathBuf,
     #[serde(default)]
     pub(crate) queries: QueriesDecl,
+    /// Optional per-graph embedding provider profile (RFC-012 Phase 5).
+    #[serde(default)]
+    pub(crate) embeddings: Option<EmbeddingProfile>,
+}
+
+/// A graph's embedding provider profile (RFC-012 Phase 5). `provider`/`base_url`/
+/// `model` default exactly as the engine's `EmbeddingConfig::from_env` does;
+/// `api_key` is a `${NAME}` env reference resolved at serving boot, never an
+/// inline secret.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddingProfile {
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    pub api_key: String,
+}
+
+impl EmbeddingProfile {
+    /// Resolve into an engine `EmbeddingConfig`, reading the `${NAME}` api-key
+    /// reference from process env. Errors if `api_key` is not a `${NAME}`
+    /// reference or the named var is unset.
+    pub fn resolve(&self) -> Result<omnigraph::embedding::EmbeddingConfig, String> {
+        let api_key = resolve_secret_ref(&self.api_key)?;
+        omnigraph::embedding::EmbeddingConfig::from_parts(
+            self.provider.as_deref(),
+            self.base_url.clone(),
+            self.model.clone(),
+            api_key,
+        )
+        .map_err(|e| e.to_string())
+    }
+}
+
+/// Resolve a `${NAME}` secret reference from process env. Rejects an inline value
+/// (anything not wrapped in `${…}`) so secrets never sit in the cluster config.
+fn resolve_secret_ref(value: &str) -> Result<String, String> {
+    let name = value
+        .trim()
+        .strip_prefix("${")
+        .and_then(|s| s.strip_suffix('}'))
+        .ok_or_else(|| {
+            format!("embedding api_key must be a ${{NAME}} env reference, got '{}'", value.trim())
+        })?;
+    std::env::var(name).map_err(|_| format!("embedding api_key env var '{name}' is not set"))
 }
 
 /// How a graph declares its stored queries. Terraform-style: the `.gq`
@@ -517,4 +565,63 @@ pub(crate) struct SweepOutcome {
     /// Approval artifacts consumed by a roll-forward (delete row 7b): their
     /// files are rewritten with consumed_at only after the state write lands.
     pub(crate) consumed_approvals: Vec<String>,
+}
+
+#[cfg(test)]
+mod embedding_profile_tests {
+    use super::EmbeddingProfile;
+
+    #[test]
+    fn resolves_secret_from_env_and_applies_defaults() {
+        // SAFETY: a unique var name, no concurrent reader.
+        unsafe { std::env::set_var("OG_TEST_EMBED_KEY_A", "secret-x") };
+        let profile = EmbeddingProfile {
+            provider: Some("openai-compatible".to_string()),
+            base_url: None,
+            model: Some("m".to_string()),
+            api_key: "${OG_TEST_EMBED_KEY_A}".to_string(),
+        };
+        let config = profile.resolve().unwrap();
+        assert_eq!(config.api_key, "secret-x");
+        assert_eq!(config.model, "m");
+        unsafe { std::env::remove_var("OG_TEST_EMBED_KEY_A") };
+    }
+
+    #[test]
+    fn rejects_inline_api_key() {
+        let profile = EmbeddingProfile {
+            provider: None,
+            base_url: None,
+            model: None,
+            api_key: "sk-inline".to_string(),
+        };
+        let err = profile.resolve().unwrap_err();
+        assert!(err.contains("${NAME}"), "got: {err}");
+    }
+
+    #[test]
+    fn errors_on_unset_secret() {
+        let profile = EmbeddingProfile {
+            provider: None,
+            base_url: None,
+            model: None,
+            api_key: "${OG_TEST_DEFINITELY_UNSET_VAR}".to_string(),
+        };
+        let err = profile.resolve().unwrap_err();
+        assert!(err.contains("not set"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_unknown_provider() {
+        unsafe { std::env::set_var("OG_TEST_EMBED_KEY_B", "x") };
+        let profile = EmbeddingProfile {
+            provider: Some("cohere".to_string()),
+            base_url: None,
+            model: None,
+            api_key: "${OG_TEST_EMBED_KEY_B}".to_string(),
+        };
+        let err = profile.resolve().unwrap_err();
+        assert!(err.contains("unknown embedding provider"), "got: {err}");
+        unsafe { std::env::remove_var("OG_TEST_EMBED_KEY_B") };
+    }
 }
