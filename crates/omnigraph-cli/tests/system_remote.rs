@@ -131,10 +131,10 @@ query insert_person($name: String, $age: I32) {
     let local_read = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#)
@@ -147,7 +147,6 @@ query insert_person($name: String, $age: I32) {
             .arg(&config)
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#)
@@ -191,10 +190,10 @@ query insert_person($name: String, $age: I32) {
     let local_verify = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Mina"}"#)
@@ -394,7 +393,6 @@ query ordered_person($name: String) {
             .arg(&config)
             .arg("--query")
             .arg(&ordered_query)
-            .arg("--name")
             .arg("ordered_person")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#)
@@ -415,7 +413,6 @@ query ordered_person($name: String) {
             .arg(&config)
             .arg("--query")
             .arg(&ordered_query)
-            .arg("--name")
             .arg("ordered_person")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#)
@@ -514,7 +511,6 @@ query insert_person($name: String, $age: I32) {
             .arg(&config)
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Zoe"}"#)
@@ -550,6 +546,8 @@ fn remote_branch_delete_removes_branch() {
             .arg("--config")
             .arg(&config)
             .arg("feature")
+            // Served target is non-local → destructive-confirm gate (RFC-011 D9).
+            .arg("--yes")
             .arg("--json"),
     ));
     assert_eq!(deleted["name"], "feature");
@@ -602,7 +600,6 @@ query add_friend($from: String, $to: String) {
             .arg(&config)
             .arg("--query")
             .arg(&mutation_file)
-            .arg("--name")
             .arg("insert_person")
             .arg("--branch")
             .arg("feature")
@@ -617,7 +614,6 @@ query add_friend($from: String, $to: String) {
             .arg(&config)
             .arg("--query")
             .arg(&mutation_file)
-            .arg("--name")
             .arg("add_friend")
             .arg("--branch")
             .arg("feature")
@@ -684,10 +680,10 @@ query add_friend($from: String, $to: String) {
     let eve = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(&imported_graph)
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Eve"}"#)
@@ -745,7 +741,6 @@ fn remote_ingest_creates_review_branch_and_keeps_it_readable() {
             .arg(&config)
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--branch")
             .arg("feature-ingest")
@@ -873,7 +868,6 @@ fn remote_ingest_reuses_existing_branch_and_merges_updates() {
             .arg(&config)
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--branch")
             .arg("feature-ingest")
@@ -891,7 +885,6 @@ fn remote_ingest_reuses_existing_branch_and_merges_updates() {
             .arg(&config)
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--branch")
             .arg("feature-ingest")
@@ -1018,7 +1011,6 @@ query insert_person($name: String, $age: I32) {
             .arg(&client_config)
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"PolicyRemote"}"#)
@@ -1133,6 +1125,28 @@ auth:
         .map(|g| g["graph_id"].as_str().unwrap())
         .collect();
     assert_eq!(ids, vec!["alpha"]);
+
+    // RFC-011 D7: addressing the multi-graph server via `--server <url>` with no
+    // `--graph` errors and lists the candidate graphs (the resolver probes
+    // GET /graphs; the default-env token authorizes it).
+    let no_graph = cli()
+        .env("OMNIGRAPH_BEARER_TOKEN", "admin-token")
+        .arg("query")
+        .arg("--server")
+        .arg(&server.base_url)
+        .arg("-e")
+        .arg("query q { match { $p: Person { name: \"x\" } } return { $p.name } }")
+        .output()
+        .unwrap();
+    assert!(
+        !no_graph.status.success(),
+        "multi-graph server with no --graph must error"
+    );
+    let stderr = String::from_utf8_lossy(&no_graph.stderr);
+    assert!(
+        stderr.contains("alpha") && stderr.contains("--graph <id>"),
+        "expected a candidate-listing error naming alpha; got: {stderr}"
+    );
 
     drop(server);
 }

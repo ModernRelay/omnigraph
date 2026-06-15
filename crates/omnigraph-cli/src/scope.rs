@@ -42,6 +42,7 @@ pub(crate) struct ScopeFlags<'a> {
     pub(crate) profile: Option<&'a str>,
     pub(crate) store: Option<&'a str>,
     pub(crate) server: Option<&'a str>,
+    pub(crate) cluster: Option<&'a str>,
     pub(crate) graph: Option<&'a str>,
     pub(crate) uri: Option<String>,
 }
@@ -56,17 +57,49 @@ pub(crate) fn resolve_scope(
     capability: Capability,
     flags: ScopeFlags<'_>,
 ) -> Result<ResolvedScope> {
-    // `--store` is its own way to address a graph; combining it with a positional
-    // URI or `--server` is a contradiction, not a silent precedence.
-    if flags.store.is_some() && (flags.uri.is_some() || flags.server.is_some()) {
+    // At most one explicit scope primitive may address a command — a positional
+    // URI, `--store`, `--server`, or `--cluster` are mutually exclusive ways to
+    // name the graph. Combining them is a contradiction, not a silent precedence.
+    let primitives: Vec<&str> = [
+        flags.uri.as_deref().map(|_| "a positional URI"),
+        flags.store.map(|_| "--store"),
+        flags.server.map(|_| "--server"),
+        flags.cluster.map(|_| "--cluster"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if primitives.len() > 1 {
         bail!(
-            "--store is exclusive with a positional URI and --server — pick one way to \
-             address the graph"
+            "{} are mutually exclusive — pick one way to address the graph",
+            primitives.join(" and ")
         );
     }
-    // 1. Any explicit address wins; reproduce today's behavior untouched.
-    //    `--store` is an explicit store URI — fold it into `uri`.
+
+    // 1a. `--cluster` is the cluster scope primitive (maintenance): resolve its
+    //     root + select the graph with `--graph`.
+    if let Some(cluster) = flags.cluster {
+        return scope_from_binding(
+            op,
+            capability,
+            ScopeBinding::Cluster(cluster.to_string()),
+            flags.graph.map(str::to_string),
+            "--cluster",
+        );
+    }
+
+    // 1b. Any other explicit address wins; reproduce today's behavior untouched.
+    //     `--store` is an explicit store URI — fold it into `uri`.
     if flags.uri.is_some() || flags.server.is_some() || flags.store.is_some() {
+        // `--graph` selects within a multi-graph scope; a bare positional URI /
+        // `--store` is already a single graph, so a stray `--graph` is an error
+        // rather than a silently-dropped flag.
+        if flags.graph.is_some() && flags.server.is_none() {
+            bail!(
+                "--graph selects a graph within a server or cluster scope; a positional \
+                 URI / --store is already a single graph"
+            );
+        }
         return Ok(ResolvedScope {
             server: flags.server.map(str::to_string),
             graph: flags.graph.map(str::to_string),
@@ -107,6 +140,18 @@ pub(crate) fn resolve_scope(
         );
     }
 
+    // 3b. Flat default store scope — the zero-flag local-dev default (RFC-011).
+    //     Mutually exclusive with `defaults.server` (enforced at config load).
+    if let Some(store) = op.default_store() {
+        return scope_from_binding(
+            op,
+            capability,
+            ScopeBinding::Store(store.to_string()),
+            flags.graph.map(str::to_string),
+            "operator defaults",
+        );
+    }
+
     // 4. Nothing resolved — leave the tuple empty; downstream falls through to
     //    today's behavior (legacy `cli.graph` default or a no-address error).
     Ok(ResolvedScope::default())
@@ -128,8 +173,8 @@ fn scope_from_binding(
             if capability == Capability::Direct {
                 bail!(
                     "this command needs direct storage access, but {source} resolves a \
-                     server scope; name storage explicitly with --store <uri> (or a \
-                     --cluster/--cluster-graph for a managed graph)"
+                     server scope; name storage explicitly with --store <uri> (or \
+                     --cluster <dir> --graph <id> for a managed graph)"
                 );
             }
             Ok(ResolvedScope {
@@ -146,18 +191,20 @@ fn scope_from_binding(
                      direct access"
                 );
             }
-            // A cluster binding is a config name (resolved against `clusters:`)
-            // or a literal root URI.
-            let root = if let Some(root) = op.cluster_root(&cluster) {
-                root.to_string()
-            } else if cluster.contains("://") {
-                cluster
-            } else {
-                bail!(
-                    "unknown cluster '{cluster}' ({source}); define it under `clusters:` \
-                     in operator config, or use a literal root URI"
-                );
-            };
+            // A cluster value is a config name (resolved against `clusters:`)
+            // or a literal root: an `s3://`/`file://` URI or a local cluster
+            // directory. Only a configured name is rewritten; anything else is
+            // passed through to the cluster-state resolver verbatim, so a bare
+            // directory path keeps working as it did for per-command `--cluster`.
+            let root = op
+                .cluster_root(&cluster)
+                .map(str::to_string)
+                .unwrap_or(cluster);
+            // A cluster holds many graphs; maintenance addresses one at a time.
+            // When no `--graph`/`default_graph` is given, leave `cluster_graph`
+            // empty and defer to the async storage-URI resolver (RFC-011 D7),
+            // which enumerates the catalog: auto-use a sole graph, else error
+            // and list the candidates.
             Ok(ResolvedScope {
                 cluster: Some(root),
                 cluster_graph: graph,
@@ -192,6 +239,7 @@ mod tests {
             profile: None,
             store: None,
             server: None,
+            cluster: None,
             graph: None,
             uri: None,
         }
@@ -230,7 +278,7 @@ mod tests {
     }
 
     #[test]
-    fn store_is_exclusive_with_positional_uri_and_server() {
+    fn scope_primitives_are_mutually_exclusive() {
         let op = OperatorConfig::default();
         for flags in [
             ScopeFlags {
@@ -243,10 +291,126 @@ mod tests {
                 server: Some("prod"),
                 ..flags()
             },
+            ScopeFlags {
+                cluster: Some("./brain"),
+                uri: Some("file://other.omni".into()),
+                ..flags()
+            },
+            ScopeFlags {
+                cluster: Some("./brain"),
+                server: Some("prod"),
+                ..flags()
+            },
         ] {
-            let err = resolve_scope(&op, Capability::Any, flags).unwrap_err().to_string();
-            assert!(err.contains("--store is exclusive"), "{err}");
+            let err = resolve_scope(&op, Capability::Direct, flags)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("mutually exclusive"), "{err}");
         }
+    }
+
+    #[test]
+    fn cluster_flag_resolves_root_and_graph_for_maintenance() {
+        let op = cfg("clusters:\n  brain:\n    root: s3://acme/brain\n");
+        let scope = resolve_scope(
+            &op,
+            Capability::Direct,
+            ScopeFlags {
+                cluster: Some("brain"),
+                graph: Some("knowledge"),
+                ..flags()
+            },
+        )
+        .unwrap();
+        assert_eq!(scope.cluster.as_deref(), Some("s3://acme/brain"));
+        assert_eq!(scope.cluster_graph.as_deref(), Some("knowledge"));
+    }
+
+    #[test]
+    fn cluster_flag_accepts_a_literal_root_uri() {
+        let op = OperatorConfig::default();
+        let scope = resolve_scope(
+            &op,
+            Capability::Direct,
+            ScopeFlags {
+                cluster: Some("s3://bucket/clusters/brain"),
+                graph: Some("knowledge"),
+                ..flags()
+            },
+        )
+        .unwrap();
+        assert_eq!(scope.cluster.as_deref(), Some("s3://bucket/clusters/brain"));
+        assert_eq!(scope.cluster_graph.as_deref(), Some("knowledge"));
+    }
+
+    #[test]
+    fn cluster_scope_without_a_graph_defers_to_catalog_enumeration() {
+        // RFC-011 D7: with no `--graph`/`default_graph`, resolution no longer
+        // bails here — it resolves the cluster root and leaves `cluster_graph`
+        // empty, deferring to the async storage-URI resolver (which enumerates
+        // the catalog: auto-use a sole graph, else error listing candidates).
+        let op = cfg("clusters:\n  brain:\n    root: s3://acme/brain\n");
+        let scope = resolve_scope(
+            &op,
+            Capability::Direct,
+            ScopeFlags {
+                cluster: Some("brain"),
+                ..flags()
+            },
+        )
+        .unwrap();
+        assert_eq!(scope.cluster.as_deref(), Some("s3://acme/brain"));
+        assert_eq!(scope.cluster_graph, None);
+    }
+
+    #[test]
+    fn graph_on_a_bare_store_or_uri_is_rejected() {
+        let op = OperatorConfig::default();
+        for flags in [
+            ScopeFlags {
+                uri: Some("graph.omni".into()),
+                graph: Some("knowledge"),
+                ..flags()
+            },
+            ScopeFlags {
+                store: Some("s3://b/g.omni"),
+                graph: Some("knowledge"),
+                ..flags()
+            },
+        ] {
+            let err = resolve_scope(&op, Capability::Any, flags)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("already a single graph"), "{err}");
+        }
+    }
+
+    #[test]
+    fn flat_default_store_drives_local_verbs() {
+        // RFC-011: `defaults.store` is the zero-flag local default — no flags,
+        // no profile → the store URI resolves as the (single-graph) store scope.
+        let op = cfg("defaults:\n  store: file:///tmp/dev.omni\n");
+        let scope = resolve_scope(&op, Capability::Any, flags()).unwrap();
+        assert_eq!(scope.uri.as_deref(), Some("file:///tmp/dev.omni"));
+        assert_eq!(scope.server, None);
+    }
+
+    #[test]
+    fn flat_default_store_rejects_graph() {
+        // A store is already a single graph, so `--graph` against a default
+        // store is a loud error.
+        let op = cfg("defaults:\n  store: file:///tmp/dev.omni\n");
+        let err = resolve_scope(
+            &op,
+            Capability::Any,
+            ScopeFlags {
+                graph: Some("knowledge"),
+                ..flags()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("does not apply to a store scope"), "{err}");
     }
 
     #[test]
@@ -292,6 +456,27 @@ mod tests {
         .unwrap();
         assert_eq!(scope.cluster.as_deref(), Some("s3://acme/brain"));
         assert_eq!(scope.cluster_graph.as_deref(), Some("knowledge"));
+    }
+
+    #[test]
+    fn profile_cluster_scope_with_graph_override() {
+        // The deferral closed by this slice: a `--graph` flag overrides a
+        // profile cluster's default_graph, exactly as it does for a server scope.
+        let op = cfg(
+            "clusters:\n  brain:\n    root: s3://acme/brain\nprofiles:\n  admin:\n    cluster: brain\n    default_graph: knowledge\n",
+        );
+        let scope = resolve_scope(
+            &op,
+            Capability::Direct,
+            ScopeFlags {
+                profile: Some("admin"),
+                graph: Some("archive"),
+                ..flags()
+            },
+        )
+        .unwrap();
+        assert_eq!(scope.cluster.as_deref(), Some("s3://acme/brain"));
+        assert_eq!(scope.cluster_graph.as_deref(), Some("archive")); // flag beats profile default
     }
 
     #[test]

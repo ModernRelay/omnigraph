@@ -10,14 +10,82 @@
     "version": "0.7.0"
   },
   "paths": {
-    "/branches": {
+    "/graphs": {
+      "get": {
+        "tags": [
+          "management"
+        ],
+        "summary": "List every graph currently registered with this server (MR-668).",
+        "description": "Multi-graph mode only. In single mode, the route returns 405 — there's\nno registry to enumerate. Cedar-gated by the server-level policy via\nthe `graph_list` action against `Omnigraph::Server::\"root\"`.\n\nOrder: alphabetical by `graph_id` (server-sorted so clients see\ndeterministic output across requests).",
+        "operationId": "listGraphs",
+        "responses": {
+          "200": {
+            "description": "List of registered graphs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GraphListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "Method not allowed (single-graph mode)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorOutput"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_token": []
+          }
+        ]
+      }
+    },
+    "/graphs/{graph_id}/branches": {
       "get": {
         "tags": [
           "branches"
         ],
         "summary": "List all branches.",
         "description": "Returns branch names sorted alphabetically. Read-only.",
-        "operationId": "listBranches",
+        "operationId": "cluster_listBranches",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "List of branches",
@@ -62,7 +130,18 @@
         ],
         "summary": "Create a new branch.",
         "description": "Forks `name` off of `from` (defaults to `main`). The new branch shares\ntable data with its parent until it is mutated. Returns 409 if `name`\nalready exists.",
-        "operationId": "createBranch",
+        "operationId": "cluster_createBranch",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -142,14 +221,25 @@
         ]
       }
     },
-    "/branches/merge": {
+    "/graphs/{graph_id}/branches/merge": {
       "post": {
         "tags": [
           "branches"
         ],
         "summary": "Merge one branch into another.",
         "description": "Merges `source` into `target` (defaults to `main`). Outcome is one of\n`already_up_to_date`, `fast_forward`, or `merged`. Returns 409 with the\nlist of conflicts if the merge cannot be completed; the target is left\nunchanged in that case. **Destructive** to `target` on success.",
-        "operationId": "mergeBranches",
+        "operationId": "cluster_mergeBranches",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -229,15 +319,24 @@
         ]
       }
     },
-    "/branches/{branch}": {
+    "/graphs/{graph_id}/branches/{branch}": {
       "delete": {
         "tags": [
           "branches"
         ],
         "summary": "Delete a branch.",
         "description": "**Irreversible.** Removes the branch pointer; commits remain reachable\nonly if referenced by another branch. Returns 404 if the branch does not\nexist.",
-        "operationId": "deleteBranch",
+        "operationId": "cluster_deleteBranch",
         "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "name": "branch",
             "in": "path",
@@ -307,14 +406,25 @@
         ]
       }
     },
-    "/change": {
+    "/graphs/{graph_id}/change": {
       "post": {
         "tags": [
           "mutations"
         ],
         "summary": "**Deprecated** — use [`POST /mutate`](#tag/mutations/operation/mutate) instead.",
         "description": "Apply a GQ mutation to a branch. Behavior is unchanged; the route is\nkept indefinitely for back-compat. New integrations should target\n`POST /mutate`, which has identical semantics and a name that pairs\ncleanly with `POST /query`. Responses from this route include\n`Deprecation: true` and `Link: </mutate>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the\nsignal.",
-        "operationId": "change",
+        "operationId": "cluster_change",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -395,15 +505,24 @@
         ]
       }
     },
-    "/commits": {
+    "/graphs/{graph_id}/commits": {
       "get": {
         "tags": [
           "commits"
         ],
         "summary": "List commits.",
         "description": "Filter by `branch` to get the commits on a single branch (most recent\nfirst); omit to list across all branches. Read-only.",
-        "operationId": "listCommits",
+        "operationId": "cluster_listCommits",
         "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "name": "branch",
             "in": "query",
@@ -455,15 +574,24 @@
         ]
       }
     },
-    "/commits/{commit_id}": {
+    "/graphs/{graph_id}/commits/{commit_id}": {
       "get": {
         "tags": [
           "commits"
         ],
         "summary": "Get a single commit.",
         "description": "Returns the commit's manifest version, parent commit(s), and creation\nmetadata. Read-only.",
-        "operationId": "getCommit",
+        "operationId": "cluster_getCommit",
         "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "name": "commit_id",
             "in": "path",
@@ -523,14 +651,25 @@
         ]
       }
     },
-    "/export": {
+    "/graphs/{graph_id}/export": {
       "post": {
         "tags": [
           "queries"
         ],
         "summary": "Stream the contents of a branch as NDJSON.",
         "description": "Emits one JSON object per line (`application/x-ndjson`). Filter with\n`type_names` (node/edge type names) and/or `table_keys`; both empty\nstreams the entire branch. Suitable for large exports — the response is\nstreamed, not buffered. Read-only.",
-        "operationId": "export",
+        "operationId": "cluster_export",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -586,93 +725,25 @@
         ]
       }
     },
-    "/graphs": {
-      "get": {
-        "tags": [
-          "management"
-        ],
-        "summary": "List every graph currently registered with this server (MR-668).",
-        "description": "Multi-graph mode only. In single mode, the route returns 405 — there's\nno registry to enumerate. Cedar-gated by the server-level policy via\nthe `graph_list` action against `Omnigraph::Server::\"root\"`.\n\nOrder: alphabetical by `graph_id` (server-sorted so clients see\ndeterministic output across requests).",
-        "operationId": "listGraphs",
-        "responses": {
-          "200": {
-            "description": "List of registered graphs",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GraphListResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "Forbidden",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          },
-          "405": {
-            "description": "Method not allowed (single-graph mode)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorOutput"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer_token": []
-          }
-        ]
-      }
-    },
-    "/healthz": {
-      "get": {
-        "tags": [
-          "health"
-        ],
-        "summary": "Liveness probe.",
-        "description": "Returns server status and version. Unauthenticated; safe to call from any\ncaller. Use this to confirm the server is reachable before invoking other\nendpoints.",
-        "operationId": "health",
-        "responses": {
-          "200": {
-            "description": "Server is healthy",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HealthOutput"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/ingest": {
+    "/graphs/{graph_id}/ingest": {
       "post": {
         "tags": [
           "mutations"
         ],
         "summary": "**Deprecated** — use [`POST /load`](#tag/mutations/operation/load) instead.",
         "description": "Bulk-load NDJSON data into a branch. Behavior is unchanged; the route is\nkept indefinitely for back-compat. New integrations should target\n`POST /load`, which has identical semantics. Responses from this route\ninclude `Deprecation: true` and `Link: </load>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the signal.",
-        "operationId": "ingest",
+        "operationId": "cluster_ingest",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -743,14 +814,25 @@
         ]
       }
     },
-    "/load": {
+    "/graphs/{graph_id}/load": {
       "post": {
         "tags": [
           "mutations"
         ],
         "summary": "Bulk-load NDJSON data into a branch (canonical load endpoint).",
         "description": "`data` is NDJSON with one record per line. `mode` controls behavior on\nexisting rows: `merge` upserts by id (default), `append` blindly inserts,\n`overwrite` replaces table contents. Branch creation is opt-in by\npresence of `from`: with `from` set, a missing `branch` is created from\nit; without `from`, `branch` must already exist — a missing branch is a\n404, never an implicit fork. **Destructive** when `mode` is `overwrite`\nor when the load produces conflicting writes.\n\nThe legacy `POST /ingest` route has identical semantics and is kept as a\ndeprecated alias.",
-        "operationId": "load",
+        "operationId": "cluster_load",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -820,14 +902,25 @@
         ]
       }
     },
-    "/mutate": {
+    "/graphs/{graph_id}/mutate": {
       "post": {
         "tags": [
           "mutations"
         ],
         "summary": "Apply a GQ mutation to a branch (canonical mutation endpoint).",
         "description": "Writes to the named `branch` (defaults to `main`). Mutations are atomic\nper call and produce a new commit. Returns counts of nodes and edges\naffected. **Destructive**: on success the branch is updated; rejected\nmutations may still acquire locks briefly. Returns 409 on merge conflict.\n\nPairs with `POST /query` (read-only). The legacy `POST /change` route\nhas identical semantics and is kept as a deprecated alias.",
-        "operationId": "mutate",
+        "operationId": "cluster_mutate",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -907,14 +1000,25 @@
         ]
       }
     },
-    "/queries": {
+    "/graphs/{graph_id}/queries": {
       "get": {
         "tags": [
           "queries"
         ],
         "summary": "List the graph's exposed stored queries as a typed tool catalog.",
         "description": "Returns the `mcp.expose == true` subset of the `queries:` registry, each\nwith its MCP tool name, read/mutate flag, description/instruction, and\ntyped parameters — enough for a client to register them as tools without\nfetching `.gq` source. Read-gated; the catalog is graph-wide (branch\nindependent — `read` is authorized against `main`). **Not** Cedar-filtered\nper query yet, so it can list a query whose `invoke_query` the caller\nlacks (a known gap until per-query authorization lands).",
-        "operationId": "list_queries",
+        "operationId": "cluster_list_queries",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Stored-query catalog (the mcp.expose subset, with typed params)",
@@ -954,15 +1058,24 @@
         ]
       }
     },
-    "/queries/{name}": {
+    "/graphs/{graph_id}/queries/{name}": {
       "post": {
         "tags": [
           "queries"
         ],
         "summary": "Invoke a curated, server-side stored query by name.",
         "description": "The query source comes from the graph's `queries:` registry, not the\nrequest body — callers send only runtime inputs (`params`, `branch`,\n`snapshot`). Gated by the `invoke_query` Cedar action at the boundary;\na stored *mutation* additionally passes the engine's `change` gate\n(double-gated). An actor **without** `invoke_query` cannot tell a denied\nquery from a missing one — both return the same 404, so the catalog\ncan't be probed without the grant. Once `invoke_query` is held, the\ninner `read`/`change` gate may surface a 403 for an existing query the\nactor can't run (the intended double-gate signal).",
-        "operationId": "invoke_query",
+        "operationId": "cluster_invoke_query",
         "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "name": "name",
             "in": "path",
@@ -1078,14 +1191,25 @@
         ]
       }
     },
-    "/query": {
+    "/graphs/{graph_id}/query": {
       "post": {
         "tags": [
           "queries"
         ],
         "summary": "Execute an inline read query (friendlier-named alternative to `POST /read`).",
         "description": "Designed for ad-hoc exploration and AI-agent tool-use: short field\nnames (`query`, `name`) match the CLI `-e` flag and the GQ `query`\nkeyword. Mutations (`insert`/`update`/`delete`) are rejected with 400\n-- use `POST /mutate` (or its deprecated alias `POST /change`) for\nwrite queries. Otherwise behaves identically to `POST /read`: same\ntarget semantics (branch xor snapshot), same Cedar action (Read),\nsame response shape.",
-        "operationId": "query",
+        "operationId": "cluster_query",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -1145,14 +1269,25 @@
         ]
       }
     },
-    "/read": {
+    "/graphs/{graph_id}/read": {
       "post": {
         "tags": [
           "queries"
         ],
         "summary": "**Deprecated** — use [`POST /query`](#tag/queries/operation/query) instead.",
         "description": "Execute a GQ read query. Behavior is unchanged from prior releases; the\nroute is kept indefinitely for byte-stable back-compat. New integrations\nshould target `POST /query`, which has clean field names (`query` /\n`name`) and a 400-on-mutation guard. Responses from this route include\n`Deprecation: true` and `Link: </query>; rel=\"successor-version\"`\nheaders per RFC 9745 / RFC 8288 so SDKs and proxies can surface the\nsignal.",
-        "operationId": "read",
+        "operationId": "cluster_read",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -1213,14 +1348,25 @@
         ]
       }
     },
-    "/schema": {
+    "/graphs/{graph_id}/schema": {
       "get": {
         "tags": [
           "schema"
         ],
         "summary": "Read the current schema source.",
         "description": "Returns the project's schema as a single string in `.pg` source form.\nUseful for clients that want to introspect available types and tables\nbefore constructing GQ queries. Read-only.",
-        "operationId": "getSchema",
+        "operationId": "cluster_getSchema",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Current schema source",
@@ -1260,14 +1406,25 @@
         ]
       }
     },
-    "/schema/apply": {
+    "/graphs/{graph_id}/schema/apply": {
       "post": {
         "tags": [
           "mutations"
         ],
         "summary": "Apply a schema migration.",
         "description": "Diffs `schema_source` against the current schema and applies the resulting\nmigration steps (add/drop type, add/drop column, etc.). **Destructive**:\nsome steps drop data. Returns the list of steps applied; if `applied` is\nfalse the diff was unsupported and no changes were made.",
-        "operationId": "applySchema",
+        "operationId": "cluster_applySchema",
+        "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -1337,15 +1494,24 @@
         ]
       }
     },
-    "/snapshot": {
+    "/graphs/{graph_id}/snapshot": {
       "get": {
         "tags": [
           "snapshots"
         ],
         "summary": "Read the current snapshot of a branch.",
         "description": "Returns the manifest version plus per-table metadata (path, version, row\ncount) for every table on the branch. Defaults to `main` when `branch` is\nomitted. Read-only.",
-        "operationId": "getSnapshot",
+        "operationId": "cluster_getSnapshot",
         "parameters": [
+          {
+            "name": "graph_id",
+            "in": "path",
+            "description": "Graph id to route the request to.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "name": "branch",
             "in": "query",
@@ -1395,6 +1561,28 @@
             "bearer_token": []
           }
         ]
+      }
+    },
+    "/healthz": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Liveness probe.",
+        "description": "Returns server status and version. Unauthenticated; safe to call from any\ncaller. Use this to confirm the server is reachable before invoking other\nendpoints.",
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "Server is healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthOutput"
+                }
+              }
+            }
+          }
+        }
       }
     }
   },
@@ -1890,6 +2078,13 @@
               "null"
             ],
             "description": "Branch to run against. Defaults to `main`; for a stored mutation the\nwrite targets this branch."
+          },
+          "expect_mutation": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "The kind the caller expects (RFC-011 Decision 3): `Some(false)` for\n`omnigraph query <name>`, `Some(true)` for `omnigraph mutate <name>`.\nWhen set and it disagrees with the stored query's actual kind, the\nserver rejects the call (400) so the verb asserts the kind. `None`\n(the default) skips the check — preserving older clients and aliases."
           },
           "params": {
             "description": "JSON object whose keys match the stored query's declared parameters."

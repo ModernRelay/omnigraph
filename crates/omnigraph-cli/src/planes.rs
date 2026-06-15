@@ -106,6 +106,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
     match cmd {
         Command::Query { .. }
         | Command::Mutate { .. }
+        | Command::Alias { .. }
         | Command::Load { .. }
         | Command::Ingest { .. }
         | Command::Branch { .. }
@@ -168,6 +169,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Commit { .. } => "commit",
         Command::Query { .. } => "query",
         Command::Mutate { .. } => "mutate",
+        Command::Alias { .. } => "alias",
         Command::Policy { .. } => "policy",
         Command::Optimize { .. } => "optimize",
         Command::Repair { .. } => "repair",
@@ -177,35 +179,78 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
     }
 }
 
-/// Reject the data-plane addressing flags (`--server`/`--graph`) on any verb
-/// that does not live on the data plane. This replaces the old silent-ignore
-/// — e.g. `optimize --server prod` previously dropped `--server` and tried to
-/// resolve a default target, failing (if at all) with an unrelated message.
-/// Now it fails with one honest, declared error. RFC-010 Slice 1.
+/// The verbs that address an existing graph through a cluster scope
+/// (`--cluster <root> --graph <id>`): the storage-maintenance commands.
+/// `init` is storage-plane too but *creates* a graph (cluster graphs are born
+/// from `cluster apply`, not `init`), and `schema plan` / `lint` take a
+/// positional URI — none consume cluster addressing, so the guard rejects
+/// `--cluster`/`--graph` on them rather than silently dropping the flag.
+pub(crate) fn accepts_cluster_addressing(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Optimize { .. } | Command::Repair { .. } | Command::Cleanup { .. }
+    )
+}
+
+/// Reject a scope-addressing flag (`--server`/`--cluster`/`--graph`) on a verb
+/// that cannot consume it, rather than silently dropping it (the old behavior:
+/// e.g. `optimize --server prod` dropped `--server` and failed later with an
+/// unrelated message). Each flag has a distinct valid surface:
+/// - `--server` → served-graph scopes (`any`/`served`);
+/// - `--cluster` → the cluster-maintenance verbs (optimize/repair/cleanup);
+/// - `--graph` → any multi-graph scope: a served scope *or* a cluster one.
+/// RFC-010 Slice 1, generalized for RFC-011 cluster addressing.
 pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
-    if cli.server.is_none() && cli.graph.is_none() {
+    if cli.server.is_none() && cli.cluster.is_none() && cli.graph.is_none() {
         return Ok(());
     }
     let capability = command_capability(&cli.command);
-    if capability.accepts_server_addressing() {
-        return Ok(());
-    }
     let label = command_label(&cli.command);
-    let how = match capability {
-        Capability::Direct => match cli.command {
-            Command::Init { .. } => "Pass a storage URI.",
-            _ => "Pass a storage URI, or --cluster <dir> --cluster-graph <id>.",
+    let cluster_ok = accepts_cluster_addressing(&cli.command);
+
+    if cli.server.is_some() && !capability.accepts_server_addressing() {
+        bail!(
+            "`{label}` is a {} command; --server addresses a served graph and does not apply.{}",
+            capability.describe(),
+            remediation(capability, &cli.command),
+        );
+    }
+    if cli.cluster.is_some() && !cluster_ok {
+        bail!(
+            "`{label}` is a {} command; --cluster addresses a cluster-managed graph for \
+             maintenance (optimize/repair/cleanup) and does not apply.{}",
+            capability.describe(),
+            remediation(capability, &cli.command),
+        );
+    }
+    if cli.graph.is_some() && !(capability.accepts_server_addressing() || cluster_ok) {
+        bail!(
+            "`{label}` is a {} command; --graph selects a graph within a server or cluster \
+             scope and does not apply.{}",
+            capability.describe(),
+            remediation(capability, &cli.command),
+        );
+    }
+    Ok(())
+}
+
+/// The "what to do instead" tail for a wrong-address error, by capability.
+/// Includes its own leading space when non-empty so the caller appends it
+/// directly — an empty tail (the served-addressing capabilities, which only
+/// reach this fn for a misplaced `--cluster`/`--graph`) leaves no trailing space.
+fn remediation(capability: Capability, cmd: &Command) -> &'static str {
+    match capability {
+        Capability::Direct => match cmd {
+            Command::Init { .. } => " Pass a storage URI.",
+            Command::Optimize { .. } | Command::Repair { .. } | Command::Cleanup { .. } => {
+                " Pass a storage URI, or --cluster <dir> --graph <id>."
+            }
+            _ => " Pass a storage URI.",
         },
-        Capability::Control => "It operates on a cluster (pass --config <dir>).",
-        Capability::Local => "It does not address a graph.",
-        Capability::Any | Capability::Served => {
-            unreachable!("served-addressing capabilities returned early")
-        }
-    };
-    bail!(
-        "`{label}` is a {} command; --server/--graph address a served graph and do not apply. {how}",
-        capability.describe()
-    );
+        Capability::Control => " It operates on a cluster (pass --config <dir>).",
+        Capability::Local => " It does not address a graph.",
+        Capability::Any | Capability::Served => "",
+    }
 }
 
 #[cfg(test)]

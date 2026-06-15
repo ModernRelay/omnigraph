@@ -245,7 +245,7 @@ async fn concurrent_branch_ops_morphological_matrix() {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/branches")
+                    .uri(g("/branches"))
                     .method(Method::GET)
                     .body(Body::empty())
                     .unwrap(),
@@ -366,7 +366,7 @@ async fn concurrent_branch_ops_morphological_matrix() {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/snapshot?branch=main")
+                    .uri(g("/snapshot?branch=main"))
                     .method(Method::GET)
                     .body(Body::empty())
                     .unwrap(),
@@ -540,31 +540,15 @@ graphs:
 
 #[tokio::test]
 async fn cluster_boot_refusals() {
-    // Mutual exclusion with --config / URI.
+    // RFC-011 cluster-only: with no --cluster, boot refuses with the
+    // cluster-required remedy.
+    let err = omnigraph_server::load_server_settings(None, None, true)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("boots from a cluster"), "{err}");
+
     let temp = converged_cluster_dir("").await;
     let dir = temp.path().to_path_buf();
-    let err = omnigraph_server::load_server_settings(
-        Some(&dir.join("omnigraph.yaml")),
-        Some(&dir),
-        None,
-        None,
-        None,
-        true,
-    )
-    .await
-    .unwrap_err();
-    assert!(err.to_string().contains("exclusive boot source"), "{err}");
-    let err = omnigraph_server::load_server_settings(
-        None,
-        Some(&dir),
-        Some("file:///tmp/x.omni".to_string()),
-        None,
-        None,
-        true,
-    )
-    .await
-    .unwrap_err();
-    assert!(err.to_string().contains("exclusive boot source"), "{err}");
 
     // Tampered catalog blob refuses boot with the remedy.
     let blob_dir = dir.join("__cluster/resources/query/knowledge/find_person");

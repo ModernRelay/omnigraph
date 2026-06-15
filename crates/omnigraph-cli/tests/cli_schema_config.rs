@@ -121,7 +121,7 @@ fn schema_plan_with_server_flag_errors_wrong_plane() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("`schema plan` is a direct (storage-native) command")
-            && stderr.contains("Pass a storage URI, or --cluster <dir> --cluster-graph <id>."),
+            && stderr.contains("Pass a storage URI."),
         "schema plan wrong-capability message not found; got: {stderr}"
     );
 }
@@ -334,7 +334,13 @@ fn schema_apply_json_adds_index_for_existing_property() {
         let dataset = snapshot.open("node:Person").await.unwrap();
         dataset.load_indices().await.unwrap().len()
     });
-    assert!(after_index_count > before_index_count);
+    // iss-848: `schema apply` records the `@index` intent but defers the physical
+    // index build (materialized later by ensure_indices/optimize; on this empty
+    // table nothing builds anyway). So the physical index count is unchanged.
+    assert_eq!(
+        after_index_count, before_index_count,
+        "schema apply records @index intent but defers the physical build (iss-848)"
+    );
 }
 
 #[test]

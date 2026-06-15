@@ -1,7 +1,7 @@
 pub mod api;
 mod handlers;
 mod settings;
-pub use settings::{load_server_settings, classify_server_runtime_state, server_config_is_multi, ServerRuntimeState};
+pub use settings::{load_server_settings, classify_server_runtime_state, ServerRuntimeState};
 use settings::*;
 use handlers::*;
 pub mod auth;
@@ -122,6 +122,20 @@ fn hash_bearer_token(token: &str) -> BearerTokenHash {
 )]
 pub struct ApiDoc;
 
+/// The canonical served OpenAPI shape (RFC-011 cluster-only): the static
+/// `ApiDoc` with every protected path nested under `/graphs/{graph_id}/…`
+/// and `cluster_`-prefixed operation ids. `/healthz` and `/graphs` stay
+/// flat. This is the single source of nesting — both the runtime
+/// `server_openapi` handler and the committed `openapi.json` derive from
+/// it, so the published spec can never describe routes the server does
+/// not serve. The handler additionally strips security in open mode; the
+/// committed spec retains it.
+pub fn served_openapi() -> utoipa::openapi::OpenApi {
+    let mut doc = ApiDoc::openapi();
+    handlers::nest_paths_under_cluster_prefix(&mut doc);
+    doc
+}
+
 struct SecurityAddon;
 
 impl utoipa::Modify for SecurityAddon {
@@ -143,11 +157,10 @@ const SERVER_SOURCE_VERSION: Option<&str> = option_env!("OMNIGRAPH_SOURCE_VERSIO
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    /// Server topology + the graphs to open at startup. Single-mode
-    /// invocations (`omnigraph-server <URI>` or `--target <name>`)
-    /// produce `ServerConfigMode::Single`; multi-mode invocations
-    /// (`--config omnigraph.yaml` with a non-empty `graphs:` map and
-    /// no single-mode selector) produce `ServerConfigMode::Multi`.
+    /// Server topology + the graphs to open at startup. RFC-011
+    /// cluster-only: the server always boots from a cluster
+    /// (`--cluster <dir | s3://…>`) and serves N graphs under cluster
+    /// routes.
     pub mode: ServerConfigMode,
     pub bind: String,
     /// Operator opt-in for fully-unauthenticated dev mode (MR-723).
@@ -161,41 +174,25 @@ pub struct ServerConfig {
     pub allow_unauthenticated: bool,
 }
 
-/// What `load_server_settings` produces after applying the four-rule
-/// mode inference matrix (MR-668 decision 2).
+/// What `load_server_settings` produces. RFC-011 cluster-only: the
+/// server always boots from a cluster's applied revision into a
+/// multi-graph deployment (N ≥ 1 graphs).
 #[derive(Debug, Clone)]
 pub enum ServerConfigMode {
-    /// Legacy invocation — one graph at the given URI. Either:
-    ///   * `omnigraph-server <URI>` (CLI positional), or
-    ///   * `omnigraph-server --target <name> --config omnigraph.yaml`, or
-    ///   * `omnigraph-server --config omnigraph.yaml` with `server.graph`
-    ///     set to a named target.
-    Single {
-        uri: String,
-        /// Cedar graph resource id for the single graph. A named selection
-        /// uses the graph name; an anonymous URI uses the normalized URI to
-        /// preserve legacy single-graph policy identity.
-        graph_id: String,
-        /// Top-level `policy.file` (single-graph Cedar policy).
-        policy_file: Option<PathBuf>,
-        /// Top-level stored-query registry, loaded and identity-checked
-        /// at settings-build time; type-checked against the schema when
-        /// the engine opens.
-        queries: QueryRegistry,
-    },
-    /// Multi-graph invocation — `--config omnigraph.yaml` with a
-    /// non-empty `graphs:` map and no single-mode selector.
+    /// Cluster boot — `--cluster <dir | s3://…>` resolves the applied
+    /// revision into per-graph startup configs plus an optional
+    /// server-level policy.
     Multi {
         /// Per-graph startup configs, sorted by graph id (BTreeMap
         /// iteration order). The parallel-open loop iterates this.
         graphs: Vec<GraphStartupConfig>,
-        /// Path to the config file the server was started from. Kept on
-        /// the mode so future runtime mutation (deferred — see release
-        /// notes) can locate the source of truth without re-parsing CLI
-        /// args.
+        /// The cluster boot source (config directory or storage root).
+        /// Kept on the mode so future runtime mutation (deferred — see
+        /// release notes) can locate the source of truth without
+        /// re-parsing CLI args.
         config_path: PathBuf,
-        /// `server.policy.file` (server-level Cedar policy for the
-        /// management endpoints). Wired into `GET /graphs` authorization.
+        /// Server-level Cedar policy for the management endpoints
+        /// (`GET /graphs`). Wired into `GET /graphs` authorization.
         server_policy: Option<PolicySource>,
     },
 }
@@ -224,36 +221,25 @@ pub struct GraphStartupConfig {
     pub queries: QueryRegistry,
 }
 
-/// Runtime routing for the server. Single mode = legacy
-/// `omnigraph-server <URI>` invocation, one graph, flat HTTP routes.
-/// Multi mode = `--config omnigraph.yaml` with a non-empty `graphs:`
-/// map, N graphs, cluster routes (`/graphs/{graph_id}/...`). Mode is
-/// determined at startup by `load_server_settings`.
+/// Runtime routing for the server (RFC-011 cluster-only). Every
+/// deployment serves cluster routes (`/graphs/{graph_id}/...`) backed by
+/// a registry of N graphs (N ≥ 1). The single-graph convenience
+/// constructors build a one-graph registry keyed by `default`; the
+/// cluster boot path builds an N-graph registry. There is no longer a
+/// flat-route mode.
 ///
-/// In single mode the handle lives here directly — there is no
-/// registry, no sentinel key, no walk-and-assert. In multi mode the
-/// registry carries N handles and the middleware dispatches on the
-/// URL's `{graph_id}` segment.
+/// `config_path` is the boot source (the cluster directory or storage
+/// root); preserved here so future runtime mutation (deferred) can find
+/// the source of truth without re-parsing CLI args. The server treats
+/// the source as operator-owned and never writes it.
 ///
-/// Both modes share the same handler bodies — the routing middleware
+/// All handler bodies are mode-agnostic — the routing middleware
 /// (`resolve_graph_handle`) injects `Arc<GraphHandle>` as a request
-/// extension so handlers never see the routing discriminator.
+/// extension by looking up the `{graph_id}` URL segment in the registry.
 #[derive(Clone)]
-pub enum GraphRouting {
-    /// Single-graph deployment: one handle, flat routes (`/snapshot`,
-    /// `/read`, …). The `handle.uri` field carries the URI the engine
-    /// was opened from. Backward compatible with v0.6.0 deployments.
-    Single { handle: Arc<GraphHandle> },
-    /// Multi-graph deployment: many handles, cluster routes
-    /// (`/graphs/{graph_id}/...`). `config_path` is the `omnigraph.yaml`
-    /// the server reads at startup; preserved here so future runtime
-    /// mutation (deferred) can find the source of truth without
-    /// re-parsing CLI args. The server treats the file as
-    /// operator-owned and never writes it.
-    Multi {
-        registry: Arc<GraphRegistry>,
-        config_path: Option<PathBuf>,
-    },
+pub struct GraphRouting {
+    pub registry: Arc<GraphRegistry>,
+    pub config_path: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -499,11 +485,13 @@ impl AppState {
         ))
     }
 
-    /// Single-mode shared construction: wraps the bare engine + per-graph
-    /// policy in a `GraphHandle` carried directly by `GraphRouting::Single`.
-    /// Per-graph policy enforcement on the engine (MR-722) is re-applied
-    /// via `Omnigraph::with_policy` so HTTP and engine layers can never
-    /// diverge.
+    /// Single-graph convenience construction (RFC-011 cluster-only):
+    /// wraps the bare engine + per-graph policy in a `GraphHandle` keyed
+    /// by `default`, then builds a one-graph registry so the deployment
+    /// serves the same `/graphs/{graph_id}/...` cluster routes as any
+    /// other. Per-graph policy enforcement on the engine (MR-722) is
+    /// re-applied via `Omnigraph::with_policy` so HTTP and engine layers
+    /// can never diverge.
     fn build_single_mode(
         uri: String,
         db: Omnigraph,
@@ -522,18 +510,13 @@ impl AppState {
         } else {
             db
         };
-        // `GraphHandle.key` is required by the struct, but in single
-        // mode it is never a registry key (there's no registry) and
-        // never compared against user input (routes are flat, no
-        // `{graph_id}` parameter). The label appears only in tracing
-        // output from `resolve_graph_handle`. The literal below is a
-        // log label, not a routing key — when the future cluster
-        // catalog ships, single mode may carry the catalog-assigned
-        // id here instead.
+        // The convenience constructors address the single graph by the
+        // reserved id `default` — both the registry key and the URL
+        // segment (`/graphs/default/...`).
         let uri = normalize_root_uri(&uri).unwrap_or(uri);
-        let key = GraphKey::cluster(
-            GraphId::try_from("default").expect("'default' is a valid GraphId log label"),
-        );
+        let graph_id =
+            GraphId::try_from("default").expect("'default' is a valid GraphId");
+        let key = GraphKey::cluster(graph_id);
         let handle = Arc::new(GraphHandle {
             key,
             uri,
@@ -541,8 +524,15 @@ impl AppState {
             policy: policy_engine,
             queries,
         });
+        let registry = Arc::new(
+            GraphRegistry::from_handles(vec![handle])
+                .expect("a single handle never collides on graph id"),
+        );
         Self {
-            routing: GraphRouting::Single { handle },
+            routing: GraphRouting {
+                registry,
+                config_path: None,
+            },
             workload,
             bearer_tokens,
             server_policy: None,
@@ -566,7 +556,7 @@ impl AppState {
         let bearer_tokens = hash_bearer_tokens(bearer_tokens);
         let registry = Arc::new(GraphRegistry::from_handles(handles)?);
         Ok(Self {
-            routing: GraphRouting::Multi {
+            routing: GraphRouting {
                 registry,
                 config_path,
             },
@@ -578,9 +568,7 @@ impl AppState {
 
     /// Runtime routing accessor. Handlers don't typically inspect this —
     /// they extract `Arc<GraphHandle>` via the routing middleware — but
-    /// `build_app` matches on it to decide flat vs nested route
-    /// mounting, and a handful of management endpoints (`GET /graphs`,
-    /// the OpenAPI cluster rewrite) match on the discriminant.
+    /// `server_graphs_list` reads the registry through it.
     pub fn routing(&self) -> &GraphRouting {
         &self.routing
     }
@@ -594,13 +582,9 @@ impl AppState {
         }
         // Any per-graph policy also requires auth — otherwise the
         // policy gate would receive unauthenticated requests. Reading
-        // from `routing` is O(1) in both arms: single mode is a direct
-        // `handle.policy.is_some()` check, multi mode reads the
-        // cached `any_per_graph_policy` flag on the registry snapshot.
-        match &self.routing {
-            GraphRouting::Single { handle } => handle.policy.is_some(),
-            GraphRouting::Multi { registry, .. } => registry.snapshot_ref().any_per_graph_policy,
-        }
+        // the cached `any_per_graph_policy` flag off the registry
+        // snapshot is O(1).
+        self.routing.registry.snapshot_ref().any_per_graph_policy
     }
 
     fn authenticate_bearer_token(&self, provided_token: &str) -> Option<ResolvedActor> {
@@ -972,13 +956,9 @@ pub fn build_app(state: AppState) -> Router {
     // Management endpoints (`GET /graphs`) live alongside the per-graph
     // router. They go through bearer auth but NOT through
     // `resolve_graph_handle` — they operate on the registry directly.
-    // The endpoint is mounted in both modes; in single mode the handler
-    // returns 405 so clients see "resource exists, wrong context"
-    // rather than 404 "no such resource."
     //
     // Runtime add/remove (`POST /graphs`, `DELETE /graphs/{id}`) is not
-    // exposed in v0.6.0 — operators add graphs by editing
-    // `omnigraph.yaml` and restarting.
+    // exposed — operators run `cluster apply` and restart.
     let management = Router::new()
         .route("/graphs", get(server_graphs_list))
         .route_layer(middleware::from_fn_with_state(
@@ -986,15 +966,11 @@ pub fn build_app(state: AppState) -> Router {
             require_bearer_auth,
         ));
 
-    // Mount the protected routes differently per mode:
-    //   * Single → flat routes (legacy: `/snapshot`, `/read`, etc.)
-    //   * Multi  → nested under `/graphs/{graph_id}/...`
-    let protected: Router<AppState> = match state.routing() {
-        GraphRouting::Single { .. } => per_graph_protected.merge(management),
-        GraphRouting::Multi { .. } => Router::new()
-            .nest("/graphs/{graph_id}", per_graph_protected)
-            .merge(management),
-    };
+    // RFC-011 cluster-only: per-graph routes always nest under
+    // `/graphs/{graph_id}/...`; there are no flat single-graph routes.
+    let protected: Router<AppState> = Router::new()
+        .nest("/graphs/{graph_id}", per_graph_protected)
+        .merge(management);
 
     Router::new()
         .route("/healthz", get(server_health))
@@ -1015,7 +991,6 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
     // policy OR any per-graph policy file. Mirrors the
     // `requires_bearer_auth` semantics on AppState.
     let has_policy_configured = match &config.mode {
-        ServerConfigMode::Single { policy_file, .. } => policy_file.is_some(),
         ServerConfigMode::Multi {
             graphs,
             server_policy,
@@ -1043,29 +1018,6 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
 
     let bind = config.bind.clone();
     let state = match config.mode {
-        ServerConfigMode::Single {
-            uri,
-            graph_id,
-            policy_file,
-            queries,
-        } => {
-            let uri_for_log = uri.clone();
-            info!(
-                uri = %uri_for_log,
-                graph_id = %graph_id,
-                bind = %bind,
-                mode = "single",
-                "serving omnigraph"
-            );
-            AppState::open_single_with_queries_for_graph_id(
-                uri,
-                tokens,
-                policy_file.as_ref(),
-                queries,
-                Some(graph_id),
-            )
-            .await?
-        }
         ServerConfigMode::Multi {
             graphs,
             config_path,
@@ -1073,7 +1025,7 @@ pub async fn serve(config: ServerConfig) -> Result<()> {
         } => {
             info!(
                 bind = %bind,
-                mode = "multi",
+                mode = "cluster",
                 graph_count = graphs.len(),
                 config = %config_path.display(),
                 "serving omnigraph"
