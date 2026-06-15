@@ -91,8 +91,7 @@ pub(crate) struct OperatorServer {
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct OperatorIdentity {
     /// Default actor for every `--as` cascade (CLI direct-engine writes and
-    /// cluster commands alike): `--as` > legacy config actor (RFC-008
-    /// window) > this > none.
+    /// cluster commands alike): `--as` > this > none.
     pub(crate) actor: Option<String>,
     #[serde(flatten)]
     unknown: serde_yaml::Mapping,

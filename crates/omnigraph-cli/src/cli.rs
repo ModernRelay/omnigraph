@@ -352,8 +352,30 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect the scope profiles in ~/.omnigraph/config.yaml (read-only).
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
+    },
     /// Print the CLI version
     Version,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ProfileCommand {
+    /// List the profiles defined in ~/.omnigraph/config.yaml.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a profile's resolved scope. With no name, shows the active
+    /// (`$OMNIGRAPH_PROFILE`) profile, else the flat operator defaults.
+    Show {
+        /// Profile name (optional).
+        name: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

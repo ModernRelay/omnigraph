@@ -2069,3 +2069,143 @@ fn cli_fails_for_invalid_merge_requests() {
             .contains("distinct source and target")
     );
 }
+
+/// RFC-011 Decision 8: `profile list` / `profile show` inspect the operator
+/// config's profiles read-only. Hermetic via OMNIGRAPH_HOME.
+fn profile_home() -> tempfile::TempDir {
+    let home = tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.yaml"),
+        "operator:\n  actor: act-andrew\n\
+         defaults:\n  output: json\n  server: prod\n  default_graph: knowledge\n\
+         servers:\n  prod:\n    url: https://graph.example.com\n\
+         clusters:\n  brain:\n    root: s3://acme/clusters/brain\n\
+         profiles:\n\
+         \x20 staging:\n    server: prod\n    default_graph: kb\n\
+         \x20 brain-admin:\n    cluster: brain\n\
+         \x20 localdev:\n    store: file:///data/dev.omni\n\
+         \x20 broken:\n    server: a\n    store: b\n",
+    )
+    .unwrap();
+    home
+}
+
+#[test]
+fn profile_list_names_each_profile_with_its_binding_and_marks_active() {
+    let home = profile_home();
+    let out = output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .env("OMNIGRAPH_PROFILE", "staging")
+            .arg("profile")
+            .arg("list"),
+    );
+    let stdout = stdout_string(&out);
+    assert!(stdout.contains("staging (active)"), "{stdout}");
+    assert!(stdout.contains("server: prod"), "{stdout}");
+    assert!(stdout.contains("cluster: brain"), "{stdout}");
+    assert!(stdout.contains("store: file:///data/dev.omni"), "{stdout}");
+    // A malformed (two-scope) profile is reported, not a hard failure.
+    assert!(stdout.contains("broken") && stdout.contains("invalid:"), "{stdout}");
+}
+
+#[test]
+fn profile_list_json_shape() {
+    let home = profile_home();
+    let out = output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .arg("profile")
+            .arg("list")
+            .arg("--json"),
+    );
+    let items: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let brain = items
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "brain-admin")
+        .unwrap();
+    assert_eq!(brain["binding"], "cluster: brain");
+    assert_eq!(brain["active"], false);
+}
+
+#[test]
+fn profile_show_resolves_named_scope_endpoints() {
+    let home = profile_home();
+    // A cluster profile resolves its root.
+    let cluster = output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .arg("profile")
+            .arg("show")
+            .arg("brain-admin"),
+    );
+    let cs = stdout_string(&cluster);
+    assert!(cs.contains("scope:   cluster brain"), "{cs}");
+    assert!(cs.contains("endpoint: s3://acme/clusters/brain"), "{cs}");
+
+    // A store profile shows its URI as the endpoint.
+    let store = output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .arg("profile")
+            .arg("show")
+            .arg("localdev")
+            .arg("--json"),
+    );
+    let detail: Value = serde_json::from_slice(&store.stdout).unwrap();
+    assert_eq!(detail["scope_kind"], "store");
+    assert_eq!(detail["endpoint"], "file:///data/dev.omni");
+}
+
+#[test]
+fn profile_show_without_name_falls_back_to_flat_defaults() {
+    let home = profile_home();
+    let out = output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .arg("profile")
+            .arg("show")
+            .arg("--json"),
+    );
+    let detail: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(detail["name"], "(defaults)");
+    assert_eq!(detail["scope_kind"], "server");
+    assert_eq!(detail["endpoint"], "https://graph.example.com");
+    assert_eq!(detail["default_graph"], "knowledge");
+}
+
+#[test]
+fn profile_show_without_name_uses_active_env_profile() {
+    let home = profile_home();
+    let out = output_success(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .env("OMNIGRAPH_PROFILE", "brain-admin")
+            .arg("profile")
+            .arg("show")
+            .arg("--json"),
+    );
+    let detail: Value = serde_json::from_slice(&out.stdout).unwrap();
+    // No name arg, but $OMNIGRAPH_PROFILE selects brain-admin (not the flat defaults).
+    assert_eq!(detail["name"], "brain-admin");
+    assert_eq!(detail["scope_kind"], "cluster");
+    assert_eq!(detail["endpoint"], "s3://acme/clusters/brain");
+    // output_format renders as the canonical lowercase value name.
+    assert_eq!(detail["output_format"], "json");
+}
+
+#[test]
+fn profile_show_unknown_name_errors() {
+    let home = profile_home();
+    let out = output_failure(
+        cli()
+            .env("OMNIGRAPH_HOME", home.path())
+            .arg("profile")
+            .arg("show")
+            .arg("nope"),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unknown profile 'nope'"), "{stderr}");
+}
