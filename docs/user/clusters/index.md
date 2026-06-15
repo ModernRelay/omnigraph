@@ -258,10 +258,11 @@ operation — it runs out-of-band, with direct storage access, against the graph
 roots. Address a cluster graph by name instead of hand-typing its storage path:
 
 ```bash
-omnigraph optimize --cluster ./company-brain --cluster-graph knowledge
-omnigraph cleanup  --cluster ./company-brain --cluster-graph knowledge --keep 10 --confirm
-# --cluster also takes the storage-root URI directly (config-free):
-omnigraph optimize --cluster s3://bucket/clusters/company-brain --cluster-graph knowledge
+omnigraph optimize --cluster ./company-brain --graph knowledge
+omnigraph cleanup  --cluster ./company-brain --graph knowledge --keep 10 --confirm
+# --cluster also takes the storage-root URI directly (config-free), and a
+# `clusters:` name from ~/.omnigraph/config.yaml:
+omnigraph optimize --cluster s3://bucket/clusters/company-brain --graph knowledge
 ```
 
 The graph's storage URI is resolved from the **served cluster state** (the same
@@ -269,6 +270,16 @@ truth a `--cluster` server boots from); a graph that hasn't been applied yet is
 not resolvable. Run these from a host with storage access — there are no server
 routes for them. Conversely, **`init` refuses** a cluster-managed path: graphs in
 a cluster are created by `cluster apply`, not by hand.
+
+If the cluster has exactly **one** applied graph you can omit `--graph` — it is
+used automatically. With **several**, omitting `--graph` errors and lists the
+candidates (RFC-011 D7); it never picks one for you.
+
+Against an **`s3://`-backed cluster** the resolved graph storage is non-local, so a
+destructive `cleanup` additionally requires **`--yes`** (an interactive prompt
+otherwise, refusal without a TTY) on top of `--confirm` — see [cli-reference.md](../cli/reference.md)'s
+*Write diagnostics & destructive confirmation*. Every maintenance run also echoes
+its resolved target to stderr (suppress with `--quiet`).
 
 ## What the control plane does not do (yet)
 

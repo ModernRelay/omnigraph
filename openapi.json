@@ -1891,6 +1891,13 @@
             ],
             "description": "Branch to run against. Defaults to `main`; for a stored mutation the\nwrite targets this branch."
           },
+          "expect_mutation": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "The kind the caller expects (RFC-011 Decision 3): `Some(false)` for\n`omnigraph query <name>`, `Some(true)` for `omnigraph mutate <name>`.\nWhen set and it disagrees with the stored query's actual kind, the\nserver rejects the call (400) so the verb asserts the kind. `None`\n(the default) skips the check — preserving older clients and aliases."
+          },
           "params": {
             "description": "JSON object whose keys match the stored query's declared parameters."
           },

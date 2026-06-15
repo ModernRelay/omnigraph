@@ -231,10 +231,10 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
     let read_before = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#)
@@ -246,6 +246,7 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
     let change_payload = parse_stdout_json(&output_success(
         cli()
             .arg("change")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query")
             .arg(&mutation_file)
@@ -259,10 +260,10 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
     let read_after = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Eve"}"#)
@@ -277,6 +278,7 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
     let inline_change = parse_stdout_json(&output_success(
         cli()
             .arg("change")
+            .arg("--store")
             .arg(graph.path())
             .arg("-e")
             .arg("query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }")
@@ -291,6 +293,7 @@ fn local_cli_end_to_end_init_load_read_change_read_flow() {
     let inline_read = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query-string")
             .arg("query find($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.age } }")
@@ -322,6 +325,7 @@ fn local_cli_end_to_end_branch_change_merge_flow() {
     let change_payload = parse_stdout_json(&output_success(
         cli()
             .arg("change")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query")
             .arg(&mutation_file)
@@ -337,10 +341,10 @@ fn local_cli_end_to_end_branch_change_merge_flow() {
     let feature_read = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--branch")
             .arg("feature")
@@ -365,10 +369,10 @@ fn local_cli_end_to_end_branch_change_merge_flow() {
     let main_read = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Zoe"}"#)
@@ -435,10 +439,10 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
     let zoe = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--branch")
             .arg("feature-ingest")
@@ -452,10 +456,10 @@ fn local_cli_ingest_creates_review_branch_and_keeps_it_readable() {
     let bob = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--branch")
             .arg("feature-ingest")
@@ -629,10 +633,10 @@ fn local_cli_export_round_trips_full_branch_graph() {
     let eve = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(&imported_graph)
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Eve"}"#)
@@ -644,10 +648,10 @@ fn local_cli_export_round_trips_full_branch_graph() {
     let friends = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(&imported_graph)
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("friends_of")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#)
@@ -717,7 +721,6 @@ policy: {{}}
             .arg(&config)
             .arg("--query")
             .arg("test.gq")
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#)
@@ -779,6 +782,7 @@ fn local_cli_failed_change_keeps_target_state_unchanged() {
     let output = output_failure(
         cli()
             .arg("change")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query")
             .arg(&mutation_file)
@@ -791,10 +795,10 @@ fn local_cli_failed_change_keeps_target_state_unchanged() {
     let friends_payload = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("friends_of")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#)
@@ -865,7 +869,6 @@ query get_person($name: String) {
             .arg(&config)
             .arg("--query")
             .arg("local.gq")
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#)
@@ -974,10 +977,10 @@ query get_task($slug: String) {
     let filtered = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(&graph)
             .arg("--query")
             .arg(&queries)
-            .arg("--name")
             .arg("due_with_tag")
             .arg("--params")
             .arg(r#"{"deadline":"2026-04-02T00:00:00Z","tag":"launch"}"#)
@@ -999,10 +1002,10 @@ query get_task($slug: String) {
     let insert_payload = parse_stdout_json(&output_success(
         cli()
             .arg("change")
+            .arg("--store")
             .arg(&graph)
             .arg("--query")
             .arg(&queries)
-            .arg("--name")
             .arg("insert_task")
             .arg("--params")
             .arg(
@@ -1015,10 +1018,10 @@ query get_task($slug: String) {
     let update_payload = parse_stdout_json(&output_success(
         cli()
             .arg("change")
+            .arg("--store")
             .arg(&graph)
             .arg("--query")
             .arg(&queries)
-            .arg("--name")
             .arg("update_task")
             .arg("--params")
             .arg(r#"{"slug":"gamma","due_at":"2026-04-04T10:45:00Z","tags":["embed","released"],"scores":[13,21],"active_days":["2026-04-04","2026-04-05"]}"#)
@@ -1029,10 +1032,10 @@ query get_task($slug: String) {
     let gamma = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(&graph)
             .arg("--query")
             .arg(&queries)
-            .arg("--name")
             .arg("get_task")
             .arg("--params")
             .arg(r#"{"slug":"gamma"}"#)
@@ -1112,10 +1115,10 @@ query vector_search($q: String) {
     let result = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(&graph)
             .arg("--query")
             .arg(&queries)
-            .arg("--name")
             .arg("vector_search")
             .arg("--params")
             .arg(r#"{"q":"alpha"}"#)
@@ -1265,10 +1268,10 @@ fn local_cli_change_enforces_engine_layer_policy() {
     let verify = parse_stdout_json(&output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"RagnorOnMain"}"#)
@@ -1292,7 +1295,7 @@ fn local_cli_positional_uri_does_not_inherit_default_graph_policy() {
             .arg("change")
             .arg("--config")
             .arg(&config)
-            .arg("--uri")
+            .arg("--store")
             .arg(graph.path())
             .arg("--query")
             .arg(&mutation_file)
@@ -2343,7 +2346,6 @@ fn local_cli_keyed_credentials_authenticate_url_matched_server() {
             .arg(&server.base_url)
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#)
@@ -2480,12 +2482,11 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
         .unwrap();
     }
 
-    // The operator alias: name + positional arg, nothing else — server,
+    // The operator alias (RFC-011 D4): `alias <name> [args]` — server,
     // graph, stored query, and token all resolve from the operator layer.
     let output = cli()
         .env("OMNIGRAPH_HOME", operator_home.path())
-        .arg("query")
-        .arg("--alias")
+        .arg("alias")
         .arg("who")
         .arg("Alice")
         .arg("--json")
@@ -2515,6 +2516,45 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
         .unwrap();
     assert!(output.status.success(), "{output:?}");
 
+    // RFC-011 D3: invoke the STORED query by name (catalog lane, served-only).
+    // No `-e`/`--query` — the positional `find_person` is the catalog name.
+    let output = cli()
+        .env("OMNIGRAPH_HOME", operator_home.path())
+        .arg("query")
+        .arg("find_person")
+        .arg("--server")
+        .arg("dev")
+        .arg("--graph")
+        .arg("local")
+        .arg("--params")
+        .arg(r#"{"name":"Alice"}"#)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "by-name catalog invocation: {output:?}");
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["rows"][0]["p.name"], "Alice", "{payload}");
+
+    // The verb asserts kind: `mutate <a-read>` is rejected by the server.
+    let output = cli()
+        .env("OMNIGRAPH_HOME", operator_home.path())
+        .arg("mutate")
+        .arg("find_person")
+        .arg("--server")
+        .arg("dev")
+        .arg("--graph")
+        .arg("local")
+        .arg("--params")
+        .arg(r#"{"name":"Alice"}"#)
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "mutate on a read query must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("'find_person' is a read — use omnigraph query find_person"),
+        "expected a kind-mismatch error; got: {stderr}"
+    );
+
     // Unknown --server errors listing what IS defined.
     let output = cli()
         .env("OMNIGRAPH_HOME", operator_home.path())
@@ -2529,10 +2569,14 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unknown server 'nope'") && stderr.contains("dev"), "{stderr}");
 
-    // --server is exclusive with a positional URI.
+    // --server is exclusive with --store (two ways to address the graph).
+    // (RFC-011 D3: there is no positional URI anymore — the positional is a
+    // query name — so the double-addressing contradiction now surfaces between
+    // the two scope primitives.)
     let output = cli()
         .env("OMNIGRAPH_HOME", operator_home.path())
         .arg("query")
+        .arg("--store")
         .arg(&server.base_url)
         .arg("--server")
         .arg("dev")

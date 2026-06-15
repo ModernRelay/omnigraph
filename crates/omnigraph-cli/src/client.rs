@@ -29,7 +29,8 @@ use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph_api_types::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, CommitListOutput, CommitOutput,
-    ErrorOutput, ExportRequest, GraphListResponse, IngestOutput, IngestRequest, ReadOutput,
+    ErrorOutput, ExportRequest, GraphListResponse, IngestOutput, IngestRequest,
+    InvokeStoredQueryRequest, ReadOutput,
     ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput, commit_output,
     ingest_output, read_output, schema_apply_output, snapshot_payload,
 };
@@ -42,7 +43,7 @@ use crate::helpers::{
     ResolvedCliGraph, apply_bearer_token, apply_server_flag, build_http_client, is_remote_uri,
     legacy_change_request_body, open_local_db_with_policy, query_params_from_json,
     remote_json, remote_url, resolve_cli_actor, resolve_cli_graph, resolve_remote_bearer_token,
-    select_named_query,
+    resolve_server_flag, select_named_query,
 };
 use crate::output::{LoadOutput, load_output_from_result, load_output_from_tables};
 use omnigraph_server::config::OmnigraphConfig;
@@ -66,6 +67,44 @@ pub(crate) enum GraphClient {
     },
 }
 
+/// RFC-011 Decision 7: a server scope that selects no graph (no `--graph`, no
+/// `default_graph`) must not silently fall through to the bare server URL when
+/// the server is multi-graph. Best-effort probe `GET /graphs`: a populated list
+/// forces `--graph` (listing the candidates); a single-graph/flat server (405),
+/// a policy-gated `/graphs`, or an unreachable server all proceed — the bare URL
+/// is then correct, or the real request surfaces the failure. Only fires on the
+/// no-graph path, so a `--graph`/`default_graph` happy path does no extra I/O.
+async fn require_graph_for_multi_graph_server(
+    config: &OmnigraphConfig,
+    scope: &crate::scope::ResolvedScope,
+) -> Result<()> {
+    let (Some(server), None) = (scope.server.as_deref(), scope.graph.as_deref()) else {
+        return Ok(());
+    };
+    let Some(base) = resolve_server_flag(Some(server), None)? else {
+        return Ok(());
+    };
+    let token = resolve_remote_bearer_token(config, Some(&base))?;
+    let probe = GraphClient::Remote {
+        http: build_http_client()?,
+        base_url: base,
+        token,
+    };
+    if let Ok(resp) = probe.list_graphs().await {
+        if !resp.graphs.is_empty() {
+            let ids: Vec<&str> = resp.graphs.iter().map(|g| g.graph_id.as_str()).collect();
+            bail!(
+                "server scope '{server}' has {} {}: [{}]; pass --graph <id> to select one \
+                 (or set `default_graph` in your operator config)",
+                ids.len(),
+                if ids.len() == 1 { "graph" } else { "graphs" },
+                ids.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
 /// A remote graph must be addressed with `--server` (RFC-011): a positional or
 /// `--uri` `http(s)://` URL no longer auto-dispatches to a server. A remote URL
 /// produced by a server scope (`via_server`) is fine.
@@ -86,7 +125,7 @@ impl GraphClient {
     /// fork. Mirrors the read verbs' current preamble (`resolve_uri`
     /// path, not the policy-bearing `resolve_cli_graph`). Used by reads
     /// and `query` (which opens without policy, like the reads).
-    pub(crate) fn resolve(
+    pub(crate) async fn resolve(
         config: &OmnigraphConfig,
         server: Option<&str>,
         graph: Option<&str>,
@@ -100,8 +139,9 @@ impl GraphClient {
         let scope = crate::scope::resolve_scope(
             &crate::operator::load_operator_config()?,
             crate::planes::Capability::Any,
-            crate::scope::ScopeFlags { profile, store, server, graph, uri },
+            crate::scope::ScopeFlags { profile, store, server, cluster: None, graph, uri },
         )?;
+        require_graph_for_multi_graph_server(config, &scope).await?;
         let (server, graph, uri) = (
             scope.server.as_deref(),
             scope.graph.as_deref(),
@@ -133,7 +173,7 @@ impl GraphClient {
     /// resolved up front. The embedded arm then opens WITH policy. The
     /// resolution order matches the write arms exactly: server flag →
     /// bearer token → graph.
-    pub(crate) fn resolve_with_policy(
+    pub(crate) async fn resolve_with_policy(
         config: &OmnigraphConfig,
         server: Option<&str>,
         graph: Option<&str>,
@@ -147,8 +187,9 @@ impl GraphClient {
         let scope = crate::scope::resolve_scope(
             &crate::operator::load_operator_config()?,
             crate::planes::Capability::Any,
-            crate::scope::ScopeFlags { profile, store, server, graph, uri },
+            crate::scope::ScopeFlags { profile, store, server, cluster: None, graph, uri },
         )?;
+        require_graph_for_multi_graph_server(config, &scope).await?;
         let (server, graph, uri) = (
             scope.server.as_deref(),
             scope.graph.as_deref(),
@@ -520,6 +561,50 @@ impl GraphClient {
                     .await?;
                 Ok(read_output(selected_name, &target, result))
             }
+        }
+    }
+
+    /// `invoke_named` — run a stored query **by catalog name** (RFC-011 D3).
+    /// Served-only: the catalog is server-owned, so a `--store` (embedded)
+    /// scope has nothing to resolve the name against. `expect_mutation` carries
+    /// the verb's asserted kind; the server rejects a mismatch (400) before
+    /// running, so the response is exactly the expected envelope — the caller
+    /// deserializes it as the concrete `T` (`ReadOutput` for `query`,
+    /// `ChangeOutput` for `mutate`), sidestepping the untagged wire enum.
+    pub(crate) async fn invoke_named<T: serde::de::DeserializeOwned>(
+        &self,
+        name: &str,
+        expect_mutation: bool,
+        params_json: Option<&Value>,
+        branch: Option<String>,
+        snapshot: Option<String>,
+    ) -> Result<T> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+            } => {
+                let body = InvokeStoredQueryRequest {
+                    params: params_json.cloned(),
+                    branch,
+                    snapshot,
+                    expect_mutation: Some(expect_mutation),
+                };
+                remote_json(
+                    http,
+                    Method::POST,
+                    remote_url(base_url, &["queries", name], &[])?,
+                    Some(serde_json::to_value(body)?),
+                    token.as_deref(),
+                )
+                .await
+            }
+            GraphClient::Embedded { .. } => bail!(
+                "by-name invocation needs a server (the stored-query catalog is \
+                 server-owned); use -e '<gq>' or --query <file> for an ad-hoc query \
+                 against --store, or address a server with --server / --profile"
+            ),
         }
     }
 

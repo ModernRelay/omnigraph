@@ -37,9 +37,11 @@ pub(crate) struct Cli {
     #[arg(long, global = true, value_name = "NAME|URL")]
     pub(crate) server: Option<String>,
 
-    /// Graph id on a multi-graph `--server` (appends `/graphs/<id>` to
-    /// the server url). Requires --server.
-    #[arg(long, global = true, value_name = "GRAPH_ID", requires = "server")]
+    /// Select a graph within a multi-graph scope: on a `--server` it appends
+    /// `/graphs/<id>` to the server url; on a `--cluster` it picks which
+    /// cluster graph to maintain. Rejected on a single-graph address (a
+    /// positional URI / `--store`).
+    #[arg(long, global = true, value_name = "GRAPH_ID")]
     pub(crate) graph: Option<String>,
 
     /// Select a named scope bundle (RFC-011) from `profiles:` in
@@ -56,6 +58,26 @@ pub(crate) struct Cli {
     #[arg(long, global = true, value_name = "URI")]
     pub(crate) store: Option<String>,
 
+    /// Address a cluster-managed graph's storage for maintenance (RFC-011):
+    /// a cluster directory or storage-root URI — named via `clusters:` in
+    /// ~/.omnigraph/config.yaml, or a literal `file://`/`s3://` root. Pair
+    /// with `--graph <id>` to select the graph. Used by optimize / repair /
+    /// cleanup; exclusive with a positional URI / `--store` / `--server`.
+    #[arg(long, global = true, value_name = "DIR|URI")]
+    pub(crate) cluster: Option<String>,
+
+    /// Skip the confirmation prompt for a destructive write (`cleanup`,
+    /// overwrite `load`, `branch delete`) against a non-local scope (RFC-011
+    /// Decision 9). Without it, a non-local destructive write prompts on a TTY
+    /// and refuses (errors) when there is no TTY or `--json` is set.
+    #[arg(long, global = true)]
+    pub(crate) yes: bool,
+
+    /// Suppress the one-line resolved-write-target diagnostic that write
+    /// commands echo to stderr (RFC-011 Decision 9).
+    #[arg(long, global = true)]
+    pub(crate) quiet: bool,
+
     #[command(subcommand)]
     pub(crate) command: Command,
 }
@@ -70,22 +92,18 @@ pub(crate) enum Command {
     /// when used. Pairs with `omnigraph mutate` on the write side.
     #[command(visible_alias = "read")]
     Query {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        #[arg(hide = true)]
-        legacy_uri: Option<String>,
+        /// Query name. With no `--query`/`-e`, the stored query to invoke from
+        /// the catalog (served — addressed via --server/--profile). With
+        /// `--query`/`-e`, selects which query in that ad-hoc source to run.
+        name: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
-        #[arg(long, conflicts_with_all = ["query", "query_string"])]
-        alias: Option<String>,
-        #[arg(long, conflicts_with_all = ["alias", "query_string"])]
+        /// Ad-hoc query file (a `.gq` you're authoring / break-glass).
+        #[arg(long, conflicts_with = "query_string")]
         query: Option<PathBuf>,
-        /// Inline GQ source — alternative to `--query <path>` and `--alias <name>`.
-        #[arg(short = 'e', long = "query-string", value_name = "GQ", conflicts_with_all = ["query", "alias"])]
+        /// Inline ad-hoc GQ source — alternative to `--query <path>`.
+        #[arg(short = 'e', long = "query-string", value_name = "GQ", conflicts_with = "query")]
         query_string: Option<String>,
-        #[arg(long)]
-        name: Option<String>,
         #[command(flatten)]
         params: ParamsArgs,
         #[arg(long, conflicts_with = "snapshot")]
@@ -96,8 +114,6 @@ pub(crate) enum Command {
         format: Option<ReadOutputFormat>,
         #[arg(long, conflicts_with = "format")]
         json: bool,
-        #[arg()]
-        alias_args: Vec<String>,
     },
     /// Execute a graph mutation query against a branch.
     ///
@@ -106,30 +122,46 @@ pub(crate) enum Command {
     /// warning when used. Pairs with `omnigraph query` on the read side.
     #[command(visible_alias = "change")]
     Mutate {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        #[arg(hide = true)]
-        legacy_uri: Option<String>,
+        /// Query name. With no `--query`/`-e`, the stored mutation to invoke
+        /// from the catalog (served — addressed via --server/--profile). With
+        /// `--query`/`-e`, selects which query in that ad-hoc source to run.
+        name: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
-        #[arg(long, conflicts_with_all = ["query", "query_string"])]
-        alias: Option<String>,
-        #[arg(long, conflicts_with_all = ["alias", "query_string"])]
+        /// Ad-hoc mutation file (a `.gq` you're authoring / break-glass).
+        #[arg(long, conflicts_with = "query_string")]
         query: Option<PathBuf>,
-        /// Inline GQ source — alternative to `--query <path>` and `--alias <name>`.
-        #[arg(short = 'e', long = "query-string", value_name = "GQ", conflicts_with_all = ["query", "alias"])]
+        /// Inline ad-hoc GQ source — alternative to `--query <path>`.
+        #[arg(short = 'e', long = "query-string", value_name = "GQ", conflicts_with = "query")]
         query_string: Option<String>,
-        #[arg(long)]
-        name: Option<String>,
         #[command(flatten)]
         params: ParamsArgs,
         #[arg(long)]
         branch: Option<String>,
         #[arg(long)]
         json: bool,
-        #[arg()]
-        alias_args: Vec<String>,
+    },
+    /// Invoke an operator alias (RFC-011 Decision 4).
+    ///
+    /// An alias is a personal binding under `aliases:` in
+    /// ~/.omnigraph/config.yaml — name → (server, graph, stored-query name,
+    /// default params). `omnigraph alias <name> [args]` invokes the bound
+    /// stored query on its server. Living in its own namespace, an alias can
+    /// never shadow or be shadowed by a built-in verb. Replaces the removed
+    /// `--alias` flag on `query`/`mutate`.
+    Alias {
+        /// Alias name (a key under `aliases:` in ~/.omnigraph/config.yaml).
+        name: String,
+        /// Positional args bound to the alias's declared `args` params, in order.
+        args: Vec<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[command(flatten)]
+        params: ParamsArgs,
+        #[arg(long, conflicts_with = "json")]
+        format: Option<ReadOutputFormat>,
+        #[arg(long, conflicts_with = "format")]
+        json: bool,
     },
     /// Load data into a graph (local or remote)
     Load {
@@ -239,13 +271,6 @@ pub(crate) enum Command {
         uri: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Cluster directory or storage-root URI; with --cluster-graph, resolves
-        /// the graph's storage URI from the served cluster state.
-        #[arg(long, conflicts_with = "uri", requires = "cluster_graph")]
-        cluster: Option<String>,
-        /// Graph id within --cluster.
-        #[arg(long, requires = "cluster")]
-        cluster_graph: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -255,13 +280,6 @@ pub(crate) enum Command {
         uri: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Cluster directory or storage-root URI; with --cluster-graph, resolves
-        /// the graph's storage URI from the served cluster state.
-        #[arg(long, conflicts_with = "uri", requires = "cluster_graph")]
-        cluster: Option<String>,
-        /// Graph id within --cluster.
-        #[arg(long, requires = "cluster")]
-        cluster_graph: Option<String>,
         /// Publish verified maintenance drift. Without this flag, repair only
         /// previews what it would do.
         #[arg(long)]
@@ -279,13 +297,6 @@ pub(crate) enum Command {
         uri: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Cluster directory or storage-root URI; with --cluster-graph, resolves
-        /// the graph's storage URI from the served cluster state.
-        #[arg(long, conflicts_with = "uri", requires = "cluster_graph")]
-        cluster: Option<String>,
-        /// Graph id within --cluster.
-        #[arg(long, requires = "cluster")]
-        cluster_graph: Option<String>,
         /// Number of recent versions to keep per table. Either `--keep` or
         /// `--older-than` (or both) must be set.
         #[arg(long)]

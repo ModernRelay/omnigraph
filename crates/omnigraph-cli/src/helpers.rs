@@ -2,6 +2,8 @@
 //! remote HTTP, env/token handling, scaffolding (moved verbatim from
 //! main.rs in the modularization).
 
+use std::io::IsTerminal;
+
 use super::*;
 use crate::operator;
 
@@ -14,6 +16,59 @@ pub(crate) fn ensure_local_graph_parent(uri: &str) -> Result<()> {
 
 pub(crate) fn is_remote_uri(uri: &str) -> bool {
     uri.starts_with("http://") || uri.starts_with("https://")
+}
+
+/// Whether a resolved write target is *local* for the purposes of the RFC-011
+/// Decision 9 destructive-confirm gate: a bare path or a `file://` URI. Anything
+/// else carrying a scheme — `http(s)://` (served), `s3://` / `gs://` / … (object
+/// store) — is non-local and a destructive write against it requires explicit
+/// consent. Generalizes `is_remote_uri` (which only catches http(s)).
+pub(crate) fn uri_is_local(uri: &str) -> bool {
+    !uri.contains("://") || uri.starts_with("file://")
+}
+
+/// Echo the resolved write target + access path to stderr (RFC-011 Decision 9),
+/// unless `--quiet`. One line, e.g. `omnigraph load → file://g.omni (direct,
+/// local)`. stderr so `--json` consumers reading stdout are unaffected; the line
+/// legitimately differs embedded-vs-served (that visibility is the point).
+pub(crate) fn echo_write_target(quiet: bool, label: &str, uri: &str, served: bool) {
+    if quiet {
+        return;
+    }
+    let access = if served {
+        "served"
+    } else if uri_is_local(uri) {
+        "direct, local"
+    } else {
+        "direct, remote"
+    };
+    eprintln!("omnigraph {label} → {uri} ({access})");
+}
+
+/// Gate a destructive write (`cleanup`, overwrite `load`, `branch delete`)
+/// against a non-local scope (RFC-011 Decision 9). A local target needs no
+/// confirmation; otherwise `--yes` consents, an interactive TTY is prompted, and
+/// a non-TTY / `--json` run refuses rather than silently proceeding.
+pub(crate) fn confirm_destructive(label: &str, uri: &str, yes: bool, json: bool) -> Result<()> {
+    if uri_is_local(uri) || yes {
+        return Ok(());
+    }
+    if json || !std::io::stdin().is_terminal() {
+        bail!(
+            "refusing destructive `{label}` against non-local target {uri} without confirmation; \
+             pass --yes to confirm (an interactive TTY would be prompted instead)"
+        );
+    }
+    eprint!(
+        "About to run a destructive `{label}` against {uri} (not local). Type 'yes' to continue: "
+    );
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "yes" | "y" => Ok(()),
+        _ => bail!("aborted: destructive `{label}` not confirmed"),
+    }
 }
 
 /// THE one way the CLI composes a remote request URL. Every remote call
@@ -539,12 +594,50 @@ pub(crate) fn resolve_local_uri(
     Ok(resolve_local_graph(config, cli_uri, operation)?.uri)
 }
 
-/// Resolve a storage-plane verb's address to a direct storage URI (RFC-010
-/// Slice 3). `--cluster <dir|uri> --cluster-graph <id>` resolves the graph's
-/// storage URI from the **served cluster state** (the truth a `--cluster`
-/// server serves); otherwise the ordinary positional-URI path.
-/// clap enforces both-or-neither and exclusion with `uri`, so the mismatched
-/// arm is defensive.
+/// Resolve a maintenance verb's (optimize/repair/cleanup) address to a direct
+/// storage URI through the one RFC-011 scope path. Every primitive funnels
+/// here: a positional URI, `--store`, `--cluster <root> --graph <id>`, a
+/// `--profile` cluster binding, or operator defaults — all resolved at the
+/// `Direct` capability (so a server scope is rejected, a cluster scope is
+/// allowed), then mapped to a storage URI by `resolve_storage_uri`.
+pub(crate) async fn resolve_maintenance_uri(
+    config: &OmnigraphConfig,
+    profile: Option<&str>,
+    store: Option<&str>,
+    cluster: Option<&str>,
+    graph: Option<&str>,
+    cli_uri: Option<String>,
+    operation: &str,
+) -> Result<String> {
+    let scope = scope::resolve_scope(
+        &operator::load_operator_config()?,
+        planes::Capability::Direct,
+        scope::ScopeFlags {
+            profile,
+            store,
+            server: None,
+            cluster,
+            graph,
+            uri: cli_uri,
+        },
+    )?;
+    resolve_storage_uri(
+        config,
+        scope.uri,
+        scope.cluster.as_deref(),
+        scope.cluster_graph.as_deref(),
+        operation,
+    )
+    .await
+}
+
+/// Map a resolved direct address to a storage URI: a cluster scope
+/// (`--cluster <root> --graph <id>`, or a `--profile` cluster binding) resolves
+/// the graph's storage URI from the **served cluster state**; otherwise the
+/// ordinary positional-URI path. When a cluster scope carries no graph
+/// selection (RFC-011 D7), enumerate the catalog: a sole graph is used
+/// automatically, otherwise error and list the candidates so the operator can
+/// pass `--graph <id>`.
 pub(crate) async fn resolve_storage_uri(
     config: &OmnigraphConfig,
     cli_uri: Option<String>,
@@ -554,8 +647,32 @@ pub(crate) async fn resolve_storage_uri(
 ) -> Result<String> {
     match (cluster, cluster_graph) {
         (Some(cluster), Some(graph_id)) => resolve_cluster_graph_uri(cluster, graph_id).await,
+        (Some(cluster), None) => {
+            let graph_id = resolve_sole_cluster_graph(cluster).await?;
+            resolve_cluster_graph_uri(cluster, &graph_id).await
+        }
         (None, None) => resolve_local_uri(config, cli_uri, operation),
-        _ => bail!("--cluster and --cluster-graph must be given together"),
+        (None, Some(_)) => {
+            bail!("internal error: a graph was selected without a cluster scope")
+        }
+    }
+}
+
+/// Pick the graph for a cluster scope that has no `--graph`/`default_graph`
+/// (RFC-011 D7): exactly one applied graph → use it; zero → error; more than
+/// one → error and list the candidates. Never auto-picks among several.
+async fn resolve_sole_cluster_graph(cluster: &str) -> Result<String> {
+    let ids = omnigraph_cluster::cluster_graph_ids(cluster)
+        .await
+        .map_err(|diagnostic| color_eyre::eyre::eyre!("{}", diagnostic.message))?;
+    match ids.as_slice() {
+        [only] => Ok(only.clone()),
+        [] => bail!("cluster `{cluster}` has no applied graphs; run `cluster apply` first"),
+        many => bail!(
+            "cluster `{cluster}` has {} graphs: [{}]; pass --graph <id> to select one",
+            many.len(),
+            many.join(", ")
+        ),
     }
 }
 
@@ -637,44 +754,6 @@ pub(crate) fn parse_alias_value(value: &str) -> Value {
     serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()))
 }
 
-pub(crate) fn merged_params_json(
-    alias_name: Option<&str>,
-    alias_arg_names: &[String],
-    alias_arg_values: &[String],
-    explicit: Option<Value>,
-) -> Result<Option<Value>> {
-    if alias_arg_values.len() > alias_arg_names.len() {
-        let alias = alias_name.unwrap_or("<alias>");
-        bail!(
-            "alias '{}' expects at most {} args but got {}",
-            alias,
-            alias_arg_names.len(),
-            alias_arg_values.len()
-        );
-    }
-
-    let mut merged = serde_json::Map::new();
-    for (arg_name, arg_value) in alias_arg_names.iter().zip(alias_arg_values.iter()) {
-        merged.insert(arg_name.clone(), parse_alias_value(arg_value));
-    }
-
-    match explicit {
-        Some(Value::Object(object)) => {
-            for (key, value) in object {
-                merged.insert(key, value);
-            }
-        }
-        Some(_) => bail!("params JSON must be an object"),
-        None => {}
-    }
-
-    if merged.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(Value::Object(merged)))
-    }
-}
-
 /// The format cascade (RFC-007 §D3): `--json` > `--format` > alias format >
 /// legacy `cli.output_format` (RFC-008 window) > operator `defaults.output`
 /// > table.
@@ -698,43 +777,6 @@ pub(crate) fn resolve_read_format(
         .unwrap_or_default()
 }
 
-pub(crate) fn resolve_alias<'a>(
-    config: &'a OmnigraphConfig,
-    alias_name: Option<&'a str>,
-    expected: AliasCommand,
-) -> Result<Option<(&'a str, &'a omnigraph_server::AliasConfig)>> {
-    let Some(alias_name) = alias_name else {
-        return Ok(None);
-    };
-    let alias = config.alias(alias_name)?;
-    if alias.command != expected {
-        bail!(
-            "alias '{}' is a {:?} alias, not a {:?} alias",
-            alias_name,
-            alias.command,
-            expected
-        );
-    }
-    Ok(Some((alias_name, alias)))
-}
-
-pub(crate) fn normalize_legacy_alias_uri(
-    uri: Option<String>,
-    target_available: bool,
-    alias_name: Option<&str>,
-    mut alias_args: Vec<String>,
-) -> (Option<String>, Vec<String>) {
-    let Some(candidate) = uri else {
-        return (None, alias_args);
-    };
-
-    if alias_name.is_some() && target_available {
-        alias_args.insert(0, candidate);
-        return (None, alias_args);
-    }
-
-    (Some(candidate), alias_args)
-}
 
 
 pub(crate) fn read_target_from_cli(branch: Option<String>, snapshot: Option<String>) -> ReadTarget {
@@ -1074,6 +1116,40 @@ pub(crate) fn rewrite_deprecated_argv(args: Vec<OsString>) -> Vec<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // RFC-011 Decision 9: locality classifier for the destructive-confirm gate.
+    #[test]
+    fn uri_is_local_truth_table() {
+        // Local: bare path or file://.
+        assert!(uri_is_local("graph.omni"));
+        assert!(uri_is_local("/abs/path/graph.omni"));
+        assert!(uri_is_local("file:///tmp/graph.omni"));
+        // Non-local: served or object-store schemes.
+        assert!(!uri_is_local("http://host/graphs/g"));
+        assert!(!uri_is_local("https://host/graphs/g"));
+        assert!(!uri_is_local("s3://bucket/graph.omni"));
+        assert!(!uri_is_local("gs://bucket/graph.omni"));
+    }
+
+    // RFC-011 Decision 9: a non-local destructive write with `--json` (the CI
+    // shape — also covers the no-TTY case, since tests run without a terminal)
+    // refuses rather than proceeding; a local one and an explicit `--yes` pass.
+    #[test]
+    fn confirm_destructive_refuses_non_local_without_consent() {
+        let err = confirm_destructive("cleanup", "s3://b/g.omni", false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--yes"), "{err}");
+    }
+
+    #[test]
+    fn confirm_destructive_allows_local_and_explicit_yes() {
+        // Local needs no confirmation, even with --json.
+        assert!(confirm_destructive("cleanup", "file:///tmp/g.omni", false, true).is_ok());
+        assert!(confirm_destructive("branch delete", "graph.omni", false, true).is_ok());
+        // --yes consents to a non-local target.
+        assert!(confirm_destructive("cleanup", "s3://b/g.omni", true, true).is_ok());
+    }
 
     // RFC-011 Decision 2: `--server` accepts a literal URL (value with `://`),
     // bypassing the operator-config registry — so no config / OMNIGRAPH_HOME is
