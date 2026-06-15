@@ -20,9 +20,9 @@ the target column width and sent as Gemini `outputDimensionality` / OpenAI `dime
 
 | Variable | Meaning |
 |---|---|
-| `OMNIGRAPH_EMBED_PROVIDER` | `openai-compatible` (default) \| `gemini` \| `mock` |
-| `OMNIGRAPH_EMBED_BASE_URL` | endpoint base; default `https://openrouter.ai/api/v1` (openai-compatible) or `https://generativelanguage.googleapis.com/v1beta` (gemini) |
-| `OMNIGRAPH_EMBED_MODEL` | model id; default `openai/text-embedding-3-large` (openai-compatible) or `gemini-embedding-2` (gemini) |
+| `OMNIGRAPH_EMBED_PROVIDER` | `openai-compatible` (default, → OpenRouter) \| `openai` (→ OpenAI's own host) \| `gemini` \| `mock` |
+| `OMNIGRAPH_EMBED_BASE_URL` | endpoint base; defaults `https://openrouter.ai/api/v1` (`openai-compatible`/unset), `https://api.openai.com/v1` (`openai`), `https://generativelanguage.googleapis.com/v1beta` (`gemini`) |
+| `OMNIGRAPH_EMBED_MODEL` | model id; defaults `openai/text-embedding-3-large` (OpenRouter), `text-embedding-3-large` (`openai`), `gemini-embedding-2` (`gemini`) |
 | `OPENROUTER_API_KEY` / `OPENAI_API_KEY` | api key for `openai-compatible` (OpenRouter preferred) |
 | `GEMINI_API_KEY` | api key for `gemini` |
 | `OMNIGRAPH_EMBED_QUERY_DEADLINE_MS` | total wall-clock budget for one embed call across all retries (default `60000`; `0` = unbounded) |

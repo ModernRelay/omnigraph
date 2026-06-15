@@ -8,8 +8,10 @@ use tokio::time::sleep;
 
 use crate::error::{OmniError, Result};
 
-const DEFAULT_OPENAI_BASE_URL: &str = "https://openrouter.ai/api/v1";
-const DEFAULT_OPENAI_MODEL: &str = "openai/text-embedding-3-large";
+const DEFAULT_OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+const DEFAULT_OPENROUTER_MODEL: &str = "openai/text-embedding-3-large";
+const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+const DEFAULT_OPENAI_MODEL: &str = "text-embedding-3-large";
 const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const DEFAULT_GEMINI_MODEL: &str = "gemini-embedding-2";
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -33,24 +35,6 @@ pub enum Provider {
     Gemini,
     /// Deterministic, offline. No network, no key.
     Mock,
-}
-
-impl Provider {
-    fn default_base_url(self) -> &'static str {
-        match self {
-            Provider::OpenAiCompatible => DEFAULT_OPENAI_BASE_URL,
-            Provider::Gemini => DEFAULT_GEMINI_BASE_URL,
-            Provider::Mock => "",
-        }
-    }
-
-    fn default_model(self) -> &'static str {
-        match self {
-            Provider::OpenAiCompatible => DEFAULT_OPENAI_MODEL,
-            Provider::Gemini => DEFAULT_GEMINI_MODEL,
-            Provider::Mock => "",
-        }
-    }
 }
 
 /// Whether the text being embedded is a search query or a stored document.
@@ -89,24 +73,39 @@ impl EmbeddingConfig {
             return Ok(Self::mock());
         }
 
-        let provider = match env_string("OMNIGRAPH_EMBED_PROVIDER").as_deref() {
-            None | Some("openai-compatible") | Some("openai") => Provider::OpenAiCompatible,
-            Some("gemini") => Provider::Gemini,
-            Some("mock") => return Ok(Self::mock()),
-            Some(other) => {
-                return Err(OmniError::manifest_internal(format!(
-                    "unknown OMNIGRAPH_EMBED_PROVIDER '{}' (expected openai-compatible|gemini|mock)",
-                    other
-                )));
-            }
-        };
+        // The default base URL and model depend on the provider *alias*, not just
+        // the wire shape: `openai-compatible` (and the unset default) point at the
+        // OpenRouter gateway, while `openai` points at OpenAI's own host.
+        let (provider, default_base, default_model) =
+            match env_string("OMNIGRAPH_EMBED_PROVIDER").as_deref() {
+                None | Some("openai-compatible") => (
+                    Provider::OpenAiCompatible,
+                    DEFAULT_OPENROUTER_BASE_URL,
+                    DEFAULT_OPENROUTER_MODEL,
+                ),
+                Some("openai") => (
+                    Provider::OpenAiCompatible,
+                    DEFAULT_OPENAI_BASE_URL,
+                    DEFAULT_OPENAI_MODEL,
+                ),
+                Some("gemini") => {
+                    (Provider::Gemini, DEFAULT_GEMINI_BASE_URL, DEFAULT_GEMINI_MODEL)
+                }
+                Some("mock") => return Ok(Self::mock()),
+                Some(other) => {
+                    return Err(OmniError::manifest_internal(format!(
+                        "unknown OMNIGRAPH_EMBED_PROVIDER '{}' (expected openai-compatible|openai|gemini|mock)",
+                        other
+                    )));
+                }
+            };
 
         let base_url = env_string("OMNIGRAPH_EMBED_BASE_URL")
-            .unwrap_or_else(|| provider.default_base_url().to_string())
+            .unwrap_or_else(|| default_base.to_string())
             .trim_end_matches('/')
             .to_string();
         let model =
-            env_string("OMNIGRAPH_EMBED_MODEL").unwrap_or_else(|| provider.default_model().to_string());
+            env_string("OMNIGRAPH_EMBED_MODEL").unwrap_or_else(|| default_model.to_string());
 
         let api_key = match provider {
             Provider::OpenAiCompatible => env_string("OPENROUTER_API_KEY")
@@ -827,9 +826,23 @@ mod tests {
         let _guard = cleared_env(&[("OPENROUTER_API_KEY", Some("sk-test"))]);
         let config = EmbeddingConfig::from_env().unwrap();
         assert_eq!(config.provider, Provider::OpenAiCompatible);
-        assert_eq!(config.base_url, DEFAULT_OPENAI_BASE_URL);
-        assert_eq!(config.model, DEFAULT_OPENAI_MODEL);
+        assert_eq!(config.base_url, DEFAULT_OPENROUTER_BASE_URL);
+        assert_eq!(config.model, DEFAULT_OPENROUTER_MODEL);
         assert_eq!(config.api_key, "sk-test");
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_openai_alias_uses_openai_host_not_openrouter() {
+        let _guard = cleared_env(&[
+            ("OMNIGRAPH_EMBED_PROVIDER", Some("openai")),
+            ("OPENAI_API_KEY", Some("k")),
+        ]);
+        let config = EmbeddingConfig::from_env().unwrap();
+        assert_eq!(config.provider, Provider::OpenAiCompatible);
+        assert_eq!(config.base_url, DEFAULT_OPENAI_BASE_URL); // api.openai.com, not OpenRouter
+        assert_eq!(config.model, DEFAULT_OPENAI_MODEL); // text-embedding-3-large, no openai/ prefix
+        assert_eq!(config.api_key, "k");
     }
 
     #[test]

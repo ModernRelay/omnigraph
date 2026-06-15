@@ -83,8 +83,6 @@ impl EmbedMode {
 
 #[derive(Debug, Clone, Deserialize)]
 struct EmbedSpec {
-    #[serde(default)]
-    model: String,
     dimension: usize,
     types: BTreeMap<String, EmbedTypeSpec>,
 }
@@ -296,7 +294,14 @@ pub(crate) async fn run_embed_job(job: &EmbedJob) -> Result<EmbedOutput> {
         cleaned_rows,
         mode: job.mode.as_str(!job.selectors.is_empty()),
         dimension: job.spec.dimension,
-        model: job.spec.model.clone(),
+        // The embedding model is resolved solely from the provider config; the
+        // spec carries no model field, so there is no second source of truth to
+        // silently disagree with the API. Report what was actually used (empty
+        // for `--clean`, which builds no client).
+        model: client
+            .as_ref()
+            .map(|c| c.config().model.clone())
+            .unwrap_or_default(),
     })
 }
 
