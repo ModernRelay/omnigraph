@@ -3,6 +3,7 @@
 
 use std::fs;
 
+use assert_cmd::Command;
 use serde_json::Value;
 use tempfile::tempdir;
 
@@ -163,10 +164,10 @@ fn optimize_with_server_flag_errors_wrong_plane() {
     let output = output_failure(cli().arg("optimize").arg("--server").arg("prod"));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("`optimize` is a storage-plane command")
-            && stderr.contains("--server/--graph address the data plane and do not apply")
-            && stderr.contains("Use --target <name>, a storage URI, or --cluster <dir> --cluster-graph <id>."),
-        "wrong-plane guard message not found; got: {stderr}"
+        stderr.contains("`optimize` is a direct (storage-native) command")
+            && stderr.contains("--server/--graph address a served graph and do not apply")
+            && stderr.contains("Pass a storage URI, or --cluster <dir> --cluster-graph <id>."),
+        "wrong-capability guard message not found; got: {stderr}"
     );
 }
 
@@ -177,9 +178,9 @@ fn optimize_with_remote_target_errors_storage_plane() {
     let output = output_failure(cli().arg("optimize").arg("https://graph.example.invalid"));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("`optimize` is a storage-plane command and needs direct storage access")
+        stderr.contains("`optimize` is a direct (storage-native) command and needs direct storage access")
             && stderr.contains("remote server"),
-        "storage-plane remote-target message not found; got: {stderr}"
+        "direct remote-target message not found; got: {stderr}"
     );
 }
 
@@ -583,12 +584,12 @@ query list_people() {
             .arg("http://127.0.0.1:8080"),
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // RFC-010 Slice 1: the storage-plane verbs now share one declared message
+    // RFC-010/011: the direct (storage-native) verbs share one declared message
     // (was: "query lint is only supported against local graph URIs …").
     assert!(
-        stderr.contains("`lint` is a storage-plane command and needs direct storage access")
+        stderr.contains("`lint` is a direct (storage-native) command and needs direct storage access")
             && stderr.contains("remote server"),
-        "storage-plane remote-target message not found; got: {stderr}"
+        "direct remote-target message not found; got: {stderr}"
     );
 }
 
@@ -799,6 +800,59 @@ fn read_json_outputs_rows_for_named_query() {
     assert_eq!(payload["target"]["branch"], "main");
     assert_eq!(payload["row_count"], 1);
     assert_eq!(payload["rows"][0]["p.name"], "Alice");
+}
+
+#[test]
+fn read_via_store_flag_and_profile_match_positional_uri() {
+    // RFC-011 Slice A: the new scope addressing (--store, and a --profile that
+    // binds a store) drives a read identically to the legacy positional URI —
+    // the scope layer is additive, not a behavior change.
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+    let queries = fixture("test.gq");
+
+    let read_rows = |cmd: &mut Command| -> Value {
+        let output = output_success(
+            cmd.arg("--query")
+                .arg(&queries)
+                .arg("--name")
+                .arg("get_person")
+                .arg("--params")
+                .arg(r#"{"name":"Alice"}"#)
+                .arg("--json"),
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+
+    // Baseline: positional URI.
+    let baseline = read_rows(cli().arg("query").arg(&graph));
+    assert_eq!(baseline["rows"][0]["p.name"], "Alice");
+
+    // --store names the same graph directly.
+    let via_store = read_rows(cli().arg("query").arg("--store").arg(&graph));
+    assert_eq!(via_store["rows"], baseline["rows"]);
+
+    // A profile binding that store, selected with --profile (no positional).
+    let home = temp.path().join("op-home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("config.yaml"),
+        format!(
+            "profiles:\n  local:\n    store: '{}'\n",
+            graph.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let via_profile = read_rows(
+        cli()
+            .env("OMNIGRAPH_HOME", &home)
+            .arg("query")
+            .arg("--profile")
+            .arg("local"),
+    );
+    assert_eq!(via_profile["rows"], baseline["rows"]);
 }
 
 #[test]
@@ -1223,6 +1277,48 @@ fn read_supports_inline_query_string() {
     assert_eq!(payload["query_name"], "find");
     assert_eq!(payload["row_count"], 1);
     assert_eq!(payload["rows"][0]["p.name"], "Alice");
+}
+
+#[test]
+fn positional_http_uri_on_a_data_verb_is_rejected() {
+    // RFC-011: a positional/`--uri` http(s):// URL no longer dispatches to a
+    // remote server — that requires `--server <url>`.
+    let output = output_failure(
+        cli()
+            .arg("query")
+            .arg("http://127.0.0.1:1")
+            .arg("-e")
+            .arg("query q() { match { $p: Person { } } return { $p } }"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("must be addressed with `--server <url>`"),
+        "expected positional-remote rejection; got: {stderr}"
+    );
+}
+
+#[test]
+fn as_on_a_served_write_is_rejected() {
+    // RFC-011: a served write resolves the actor from the bearer token, so --as
+    // cannot set identity. It errors while building the remote client — before
+    // any HTTP call, so no server is needed.
+    let output = output_failure(
+        cli()
+            .arg("mutate")
+            .arg("--server")
+            .arg("http://127.0.0.1:1")
+            .arg("--as")
+            .arg("act-nope")
+            .arg("-e")
+            .arg("query add($name: String) { insert Person { name: $name } }")
+            .arg("--params")
+            .arg(r#"{"name":"X"}"#),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`--as` is not allowed on a served write"),
+        "expected --as-served rejection; got: {stderr}"
+    );
 }
 
 #[test]

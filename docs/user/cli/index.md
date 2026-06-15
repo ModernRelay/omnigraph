@@ -60,14 +60,16 @@ Read through the HTTP API:
 
 ```bash
 omnigraph query \
-  --target http://127.0.0.1:8080 \
+  --server http://127.0.0.1:8080 \
   --query queries.gq \
   --name get_person \
   --params '{"name":"Alice"}'
 ```
 
-If the server requires auth, set `OMNIGRAPH_SERVER_BEARER_TOKEN` on the server
-and configure the matching `bearer_token_env` in `omnigraph.yaml`.
+A server is addressed with `--server` (a name from `~/.omnigraph/config.yaml` or a
+literal URL); a positional `http(s)://` URI is rejected. If the server requires
+auth, set its bearer token and `omnigraph login <server>` (or
+`OMNIGRAPH_BEARER_TOKEN`).
 
 ## Multi-graph servers (v0.6.0+)
 

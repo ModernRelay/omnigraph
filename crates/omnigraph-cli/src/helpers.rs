@@ -245,8 +245,9 @@ pub(crate) fn normalize_policy_graph_uri(uri: &str) -> Result<String> {
 pub(crate) fn resolve_remote_bearer_token(
     config: &OmnigraphConfig,
     explicit_uri: Option<&str>,
-    explicit_target: Option<&str>,
 ) -> Result<Option<String>> {
+    // `--target` is gone; the legacy explicit-target name is always None.
+    let explicit_target: Option<&str> = None;
     // The keyed hop (RFC-007 §D4, gh-host model): when the effective remote
     // URL belongs to an operator-defined server, that server's keyed chain
     // applies first — OMNIGRAPH_TOKEN_<NAME> env, then the 0600 credentials
@@ -303,19 +304,26 @@ pub(crate) fn resolve_server_flag(
     let Some(server) = server else {
         return Ok(None);
     };
-    let operator_config = operator::load_operator_config()?;
-    let Some(entry) = operator_config.servers.get(server) else {
-        let known = operator_config
-            .servers
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join(", ");
-        color_eyre::eyre::bail!(
-            "unknown server '{server}' — servers defined in the operator config: [{known}] (add it under servers: in ~/.omnigraph/config.yaml)"
-        );
+    // RFC-011 Decision 2: a value containing `://` is a literal base URL
+    // (bypasses the operator-config registry); otherwise it is a config name.
+    let base_url = if server.contains("://") {
+        server.to_string()
+    } else {
+        let operator_config = operator::load_operator_config()?;
+        let Some(entry) = operator_config.servers.get(server) else {
+            let known = operator_config
+                .servers
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            color_eyre::eyre::bail!(
+                "unknown server '{server}' — servers defined in the operator config: [{known}] (add it under servers: in ~/.omnigraph/config.yaml)"
+            );
+        };
+        entry.url.clone()
     };
-    let base = entry.url.trim_end_matches('/');
+    let base = base_url.trim_end_matches('/');
     Ok(Some(match graph {
         Some(graph) => format!("{base}/graphs/{graph}"),
         None => base.to_string(),
@@ -336,7 +344,7 @@ pub(crate) async fn execute_operator_alias(
 ) -> Result<ReadOutput> {
     let uri = resolve_server_flag(Some(&alias.server), alias.graph.as_deref())?
         .expect("server name is present");
-    let bearer_token = resolve_remote_bearer_token(config, Some(&uri), None)?;
+    let bearer_token = resolve_remote_bearer_token(config, Some(&uri))?;
 
     let mut params = serde_json::Map::new();
     for (key, value) in &alias.params {
@@ -379,14 +387,13 @@ pub(crate) fn apply_server_flag(
     server: Option<&str>,
     graph: Option<&str>,
     uri: Option<String>,
-    target: Option<&str>,
 ) -> Result<Option<String>> {
     if server.is_none() {
         return Ok(uri);
     }
-    if uri.is_some() || target.is_some() {
+    if uri.is_some() {
         color_eyre::eyre::bail!(
-            "--server is exclusive with a positional URI and --target — pick one way to address the graph"
+            "--server is exclusive with a positional URI — pick one way to address the graph"
         );
     }
     resolve_server_flag(server, graph)
@@ -448,28 +455,23 @@ pub(crate) async fn remote_json<T: DeserializeOwned>(
     Ok(serde_json::from_str(&text)?)
 }
 
-pub(crate) fn resolve_uri(
-    config: &OmnigraphConfig,
-    cli_uri: Option<String>,
-    cli_target: Option<&str>,
-) -> Result<String> {
-    config.resolve_target_uri(cli_uri, cli_target, config.cli_graph_name())
+pub(crate) fn resolve_uri(config: &OmnigraphConfig, cli_uri: Option<String>) -> Result<String> {
+    // `--target` is gone; the second arg (the legacy explicit-target name) is
+    // always None. A bare command still falls back to `cli.graph` (the third arg).
+    config.resolve_target_uri(cli_uri, None, config.cli_graph_name())
 }
 
 pub(crate) fn resolve_cli_graph(
     config: &OmnigraphConfig,
     cli_uri: Option<String>,
-    cli_target: Option<&str>,
 ) -> Result<ResolvedCliGraph> {
     let selected = if cli_uri.is_some() {
         None
     } else {
-        cli_target
-            .map(str::to_string)
-            .or_else(|| config.cli_graph_name().map(str::to_string))
+        config.cli_graph_name().map(str::to_string)
     };
     config.resolve_graph_selection(selected.as_deref())?;
-    let uri = resolve_uri(config, cli_uri, cli_target)?;
+    let uri = resolve_uri(config, cli_uri)?;
     let normalized_uri = normalize_policy_graph_uri(&uri)?;
     let graph_id = graph_resource_id_for_selection(selected.as_deref(), &normalized_uri);
     Ok(ResolvedCliGraph {
@@ -484,15 +486,14 @@ pub(crate) fn resolve_cli_graph(
 pub(crate) fn resolve_local_graph(
     config: &OmnigraphConfig,
     cli_uri: Option<String>,
-    cli_target: Option<&str>,
     operation: &str,
 ) -> Result<ResolvedCliGraph> {
-    let graph = resolve_cli_graph(config, cli_uri, cli_target)?;
+    let graph = resolve_cli_graph(config, cli_uri)?;
     if graph.is_remote {
         bail!(
-            "`{}` is a storage-plane command and needs direct storage access; \
-             the resolved target is a remote server ({}). Pass the graph's \
-             file:// or s3:// URI.",
+            "`{}` is a direct (storage-native) command and needs direct storage \
+             access; the resolved target is a remote server ({}). Pass the \
+             graph's file:// or s3:// URI.",
             operation,
             graph.uri
         );
@@ -533,29 +534,27 @@ pub(crate) fn parse_duration_arg(s: &str) -> Result<std::time::Duration> {
 pub(crate) fn resolve_local_uri(
     config: &OmnigraphConfig,
     cli_uri: Option<String>,
-    cli_target: Option<&str>,
     operation: &str,
 ) -> Result<String> {
-    Ok(resolve_local_graph(config, cli_uri, cli_target, operation)?.uri)
+    Ok(resolve_local_graph(config, cli_uri, operation)?.uri)
 }
 
-/// Resolve a storage-plane verb's target to a direct storage URI (RFC-010
+/// Resolve a storage-plane verb's address to a direct storage URI (RFC-010
 /// Slice 3). `--cluster <dir|uri> --cluster-graph <id>` resolves the graph's
 /// storage URI from the **served cluster state** (the truth a `--cluster`
-/// server serves); otherwise the ordinary positional-URI / `--target` path.
-/// clap enforces both-or-neither and exclusion with `uri`/`--target`, so the
-/// mismatched arm is defensive.
+/// server serves); otherwise the ordinary positional-URI path.
+/// clap enforces both-or-neither and exclusion with `uri`, so the mismatched
+/// arm is defensive.
 pub(crate) async fn resolve_storage_uri(
     config: &OmnigraphConfig,
     cli_uri: Option<String>,
-    cli_target: Option<&str>,
     cluster: Option<&str>,
     cluster_graph: Option<&str>,
     operation: &str,
 ) -> Result<String> {
     match (cluster, cluster_graph) {
         (Some(cluster), Some(graph_id)) => resolve_cluster_graph_uri(cluster, graph_id).await,
-        (None, None) => resolve_local_uri(config, cli_uri, cli_target, operation),
+        (None, None) => resolve_local_uri(config, cli_uri, operation),
         _ => bail!("--cluster and --cluster-graph must be given together"),
     }
 }
@@ -786,7 +785,6 @@ pub(crate) fn query_params_from_json(
 pub(crate) async fn execute_query_lint(
     config: &OmnigraphConfig,
     cli_uri: Option<String>,
-    cli_target: Option<&str>,
     schema_path: Option<&PathBuf>,
     query_path: &PathBuf,
 ) -> Result<QueryLintOutput> {
@@ -808,13 +806,12 @@ pub(crate) async fn execute_query_lint(
         ));
     }
 
-    let has_graph_target =
-        cli_uri.is_some() || cli_target.is_some() || config.cli_graph_name().is_some();
+    let has_graph_target = cli_uri.is_some() || config.cli_graph_name().is_some();
     if !has_graph_target {
         bail!("lint requires --schema <schema.pg> or a resolvable graph target");
     }
 
-    let uri = resolve_local_uri(config, cli_uri, cli_target, "lint")?;
+    let uri = resolve_local_uri(config, cli_uri, "lint")?;
     let db = Omnigraph::open(&uri).await?;
     Ok(lint_query_file(
         &db.catalog(),
@@ -827,10 +824,9 @@ pub(crate) async fn execute_query_lint(
 pub(crate) fn resolve_selected_graph(
     config: &OmnigraphConfig,
     cli_uri: Option<String>,
-    cli_target: Option<&str>,
     operation: &str,
 ) -> Result<(String, Option<String>)> {
-    let graph = resolve_local_graph(config, cli_uri, cli_target, operation)?;
+    let graph = resolve_local_graph(config, cli_uri, operation)?;
     Ok((graph.uri, graph.selected))
 }
 
@@ -860,11 +856,8 @@ pub(crate) fn graph_query_registry_names(config: &OmnigraphConfig) -> Vec<&str> 
 
 pub(crate) fn resolve_registry_selection_for_list(
     config: &OmnigraphConfig,
-    target: Option<&str>,
 ) -> Result<Option<String>> {
-    let selected = target
-        .map(str::to_string)
-        .or_else(|| config.cli_graph_name().map(str::to_string));
+    let selected = config.cli_graph_name().map(str::to_string);
     if let Some(name) = selected.as_deref() {
         config.resolve_graph_selection(Some(name))?;
         return Ok(selected);
@@ -880,10 +873,9 @@ pub(crate) fn resolve_registry_selection_for_list(
     }
 
     bail!(
-        "stored-query registries are configured for graph{} {} but no graph was selected. Pass `--target {}` or set `cli.graph`.",
+        "stored-query registries are configured for graph{} {} but no graph was selected. Pass a positional URI or set `cli.graph`.",
         if graph_names.len() == 1 { "" } else { "s" },
         graph_names.join(", "),
-        graph_names[0],
     )
 }
 
@@ -903,15 +895,12 @@ pub(crate) fn validate_registry_for_catalog(
 
 pub(crate) async fn execute_queries_validate(
     uri: Option<String>,
-    target: Option<String>,
     config_path: Option<&PathBuf>,
     json: bool,
 ) -> Result<()> {
     let config = load_cli_config(config_path)?;
-    // One selection drives both the schema URI and the registry, so a
-    // positional URI and a `--target` can't validate different graphs.
-    let (uri, selected) =
-        resolve_selected_graph(&config, uri, target.as_deref(), "queries validate")?;
+    // One selection drives both the schema URI and the registry.
+    let (uri, selected) = resolve_selected_graph(&config, uri, "queries validate")?;
     let registry = load_registry_or_report(&config, selected.as_deref())?;
     let db = Omnigraph::open(&uri).await?;
     let report = check(&registry, &db.catalog());
@@ -961,13 +950,9 @@ pub(crate) async fn execute_queries_validate(
     Ok(())
 }
 
-pub(crate) fn execute_queries_list(
-    target: Option<String>,
-    config_path: Option<&PathBuf>,
-    json: bool,
-) -> Result<()> {
+pub(crate) fn execute_queries_list(config_path: Option<&PathBuf>, json: bool) -> Result<()> {
     let config = load_cli_config(config_path)?;
-    let selected = resolve_registry_selection_for_list(&config, target.as_deref())?;
+    let selected = resolve_registry_selection_for_list(&config)?;
     let registry = load_registry_or_report(&config, selected.as_deref())?;
 
     let output = QueriesListOutput {
@@ -1089,6 +1074,22 @@ pub(crate) fn rewrite_deprecated_argv(args: Vec<OsString>) -> Vec<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // RFC-011 Decision 2: `--server` accepts a literal URL (value with `://`),
+    // bypassing the operator-config registry — so no config / OMNIGRAPH_HOME is
+    // read on this path (hermetic).
+    #[test]
+    fn server_flag_accepts_a_literal_url() {
+        assert_eq!(
+            resolve_server_flag(Some("https://graph.example.com"), None).unwrap(),
+            Some("https://graph.example.com".to_string())
+        );
+        // trailing slash trimmed; `--graph` appends the multi-graph path.
+        assert_eq!(
+            resolve_server_flag(Some("https://graph.example.com/"), Some("knowledge")).unwrap(),
+            Some("https://graph.example.com/graphs/knowledge".to_string())
+        );
+    }
 
     // `branch delete` interpolates the branch into the URL path. The composed
     // path must be exactly `<base-path>/branches/<name>` with no empty `//`
