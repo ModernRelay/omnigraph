@@ -696,9 +696,19 @@ pub(crate) fn render_constraint(constraint: &omnigraph_compiler::schema::ast::Co
 pub(crate) fn render_annotations(annotations: &[omnigraph_compiler::schema::ast::Annotation]) -> String {
     annotations
         .iter()
-        .map(|annotation| match &annotation.value {
-            Some(value) => format!("@{}({})", annotation.name, value),
-            None => format!("@{}", annotation.name),
+        .map(|annotation| {
+            let mut args: Vec<String> = Vec::new();
+            if let Some(value) = &annotation.value {
+                args.push(value.clone());
+            }
+            for (key, val) in &annotation.kwargs {
+                args.push(format!("{}={}", key, val));
+            }
+            if args.is_empty() {
+                format!("@{}", annotation.name)
+            } else {
+                format!("@{}({})", annotation.name, args.join(", "))
+            }
         })
         .collect::<Vec<_>>()
         .join(", ")

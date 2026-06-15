@@ -1137,6 +1137,7 @@ node Person @description("new") {
             annotations: vec![Annotation {
                 name: "description".to_string(),
                 value: Some("new".to_string()),
+                kwargs: Default::default(),
             }],
         }));
     }

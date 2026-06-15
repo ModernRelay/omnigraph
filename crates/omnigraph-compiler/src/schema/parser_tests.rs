@@ -509,6 +509,66 @@ embedding: Vector(3) @embed(title)
 }
 
 #[test]
+fn test_parse_embed_annotation_with_model_kwarg() {
+    let input = r#"
+node Doc {
+title: String
+embedding: Vector(3) @embed("title", model="openai/text-embedding-3-large")
+}
+"#;
+    let schema = parse_schema(input).unwrap();
+    match &schema.declarations[0] {
+        SchemaDecl::Node(n) => {
+            let ann = &n.properties[1].annotations[0];
+            assert_eq!(ann.name, "embed");
+            assert_eq!(ann.value.as_deref(), Some("title"));
+            assert_eq!(
+                ann.kwargs.get("model").map(String::as_str),
+                Some("openai/text-embedding-3-large")
+            );
+        }
+        _ => panic!("expected Node"),
+    }
+}
+
+#[test]
+fn test_parse_embed_annotation_without_model_has_empty_kwargs() {
+    let input = r#"
+node Doc {
+title: String
+embedding: Vector(3) @embed("title")
+}
+"#;
+    let schema = parse_schema(input).unwrap();
+    match &schema.declarations[0] {
+        SchemaDecl::Node(n) => {
+            let ann = &n.properties[1].annotations[0];
+            assert!(ann.kwargs.is_empty());
+            // Empty kwargs must NOT serialize, so existing schemas' IR JSON (and
+            // thus the schema hash) stay byte-identical after this field is added.
+            let json = serde_json::to_string(ann).unwrap();
+            assert!(!json.contains("kwargs"), "unexpected kwargs in {json}");
+        }
+        _ => panic!("expected Node"),
+    }
+}
+
+#[test]
+fn test_parse_embed_annotation_rejects_unknown_kwarg() {
+    let input = r#"
+node Doc {
+title: String
+embedding: Vector(3) @embed("title", provider="openai")
+}
+"#;
+    let err = parse_schema(input).unwrap_err();
+    assert!(
+        err.to_string().contains("only 'model' is supported"),
+        "got: {err}"
+    );
+}
+
+#[test]
 fn test_parse_edge_no_body() {
     let input = "edge WorksAt: Person -> Company\n";
     let schema = parse_schema(input).unwrap();
