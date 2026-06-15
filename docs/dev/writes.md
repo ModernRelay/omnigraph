@@ -124,8 +124,9 @@ an untouched table no longer fails the apply, and a compaction of a touched
 table serializes behind it. Deterministic proof:
 `schema_apply_succeeds_under_concurrent_write_to_untouched_table` and
 `concurrent_optimize_on_touched_table_serializes_behind_schema_apply`
-(`tests/failpoints.rs`, via the `schema_apply.after_queue_acquire_pre_snapshot`
-and `schema_apply.post_snapshot_pre_commit` failpoints).
+(`tests/failpoints.rs`, both via the `schema_apply.post_snapshot_pre_commit`
+failpoint — parked there the apply holds the touched-table queues, and the
+recovery sidecar on disk is the deterministic "apply is parked" signal).
 
 Three writers have been migrated onto staged primitives:
 

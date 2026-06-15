@@ -391,8 +391,6 @@ where
         .acquire_many(&schema_apply_queue_keys)
         .await;
 
-    crate::failpoints::maybe_fail("schema_apply.after_queue_acquire_pre_snapshot")?;
-
     // Snapshot under the held queues. refresh_coordinator_only re-reads the
     // manifest HEAD first (acquire_many may have waited on a prior writer that
     // advanced a touched table), so the pinned versions are exactly current;

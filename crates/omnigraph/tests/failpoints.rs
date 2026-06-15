@@ -2638,10 +2638,10 @@ async fn schema_apply_succeeds_under_concurrent_write_to_untouched_table() {
 ///
 /// A concurrent `optimize` of a table the apply TOUCHES must serialize behind
 /// the apply, not race it. The apply acquires the touched-table write queues
-/// before snapshotting; while it holds them (parked here just after the
-/// acquire), an optimize cannot make progress on that table. Once the apply
-/// finishes and drops its guards, the optimize proceeds over the post-apply
-/// layout.
+/// before snapshotting and holds them to end-of-function; while it holds them
+/// (parked just before the publish), an optimize cannot make progress on that
+/// table. Once the apply finishes and drops its guards, the optimize proceeds
+/// over the post-apply layout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_optimize_on_touched_table_serializes_behind_schema_apply() {
     use std::sync::Arc;
@@ -2664,10 +2664,12 @@ async fn concurrent_optimize_on_touched_table_serializes_behind_schema_apply() {
         .unwrap();
     }
 
-    // Park the apply right after it acquires the touched-table queues, before
-    // the snapshot — the window where it holds node:Person's write queue.
-    let failpoint =
-        ScopedFailPoint::new("schema_apply.after_queue_acquire_pre_snapshot", "pause");
+    // Park the apply just before the publish. The touched-table queues are
+    // acquired BEFORE the snapshot and held to end-of-function, so at this park
+    // point the apply provably holds node:Person's queue. Park here (not at the
+    // pre-snapshot point) so we have a deterministic "apply is parked holding
+    // the queue" signal: the recovery sidecar, written after the snapshot.
+    let failpoint = ScopedFailPoint::new("schema_apply.post_snapshot_pre_commit", "pause");
 
     let apply_db = Arc::clone(&db);
     let desired = helpers::TEST_SCHEMA.replace(
@@ -2676,14 +2678,34 @@ async fn concurrent_optimize_on_touched_table_serializes_behind_schema_apply() {
     );
     let apply = tokio::spawn(async move { apply_db.apply_schema(&desired).await });
 
-    // Give the apply time to reach the parked window (it now holds the queue).
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // Deterministic barrier (no sleep race): the apply's recovery sidecar lands
+    // after the snapshot — hence after the queue acquire — and before this park
+    // point. Once it exists, the apply is holding node:Person's queue.
+    let recovery_dir = dir.path().join("__recovery");
+    for _ in 0..500 {
+        if recovery_dir.exists()
+            && std::fs::read_dir(&recovery_dir)
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        recovery_dir.exists() && std::fs::read_dir(&recovery_dir).unwrap().next().is_some(),
+        "schema apply never reached the post-snapshot parked window"
+    );
 
-    // optimize on a clone tries to compact node:Person → blocks on its queue.
+    // optimize on a clone tries to compact node:Person → blocks on the queue the
+    // parked apply holds. It cannot finish until the apply releases (the drop
+    // below), so this is robust regardless of CI speed — the apply is already
+    // parked holding the queue before optimize starts.
     let opt_db = Arc::clone(&db);
     let optimize = tokio::spawn(async move { opt_db.optimize().await });
 
-    // While the apply holds the queue, optimize cannot finish.
+    // Give optimize time to reach the queue-acquire and block, then confirm it
+    // has NOT completed while the apply holds the queue.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert!(
         !optimize.is_finished(),
@@ -2703,7 +2725,7 @@ async fn concurrent_optimize_on_touched_table_serializes_behind_schema_apply() {
         .unwrap()
         .expect("optimize must succeed over the post-apply layout");
 
-    let recovery_dir = dir.path().join("__recovery");
+    // Both ops completed and cleaned up their recovery sidecars.
     if recovery_dir.exists() {
         assert_eq!(std::fs::read_dir(&recovery_dir).unwrap().count(), 0);
     }
