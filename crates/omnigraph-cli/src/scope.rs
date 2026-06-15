@@ -56,6 +56,14 @@ pub(crate) fn resolve_scope(
     capability: Capability,
     flags: ScopeFlags<'_>,
 ) -> Result<ResolvedScope> {
+    // `--store` is its own way to address a graph; combining it with a positional
+    // URI or `--server` is a contradiction, not a silent precedence.
+    if flags.store.is_some() && (flags.uri.is_some() || flags.server.is_some()) {
+        bail!(
+            "--store is exclusive with a positional URI and --server — pick one way to \
+             address the graph"
+        );
+    }
     // 1. Any explicit address wins; reproduce today's behavior untouched.
     //    `--store` is an explicit store URI — fold it into `uri`.
     if flags.uri.is_some() || flags.server.is_some() || flags.store.is_some() {
@@ -219,6 +227,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(scope.uri.as_deref(), Some("s3://b/g.omni"));
+    }
+
+    #[test]
+    fn store_is_exclusive_with_positional_uri_and_server() {
+        let op = OperatorConfig::default();
+        for flags in [
+            ScopeFlags {
+                store: Some("s3://b/g.omni"),
+                uri: Some("file://other.omni".into()),
+                ..flags()
+            },
+            ScopeFlags {
+                store: Some("s3://b/g.omni"),
+                server: Some("prod"),
+                ..flags()
+            },
+        ] {
+            let err = resolve_scope(&op, Capability::Any, flags).unwrap_err().to_string();
+            assert!(err.contains("--store is exclusive"), "{err}");
+        }
     }
 
     #[test]

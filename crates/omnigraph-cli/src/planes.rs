@@ -232,6 +232,9 @@ mod tests {
         let cap = |args: &[&str]| {
             command_capability(&Cli::try_parse_from(args).unwrap().command)
         };
+        // The one Data→Served refinement — if the `graphs` guard were deleted,
+        // every other assertion here would still pass.
+        assert_eq!(cap(&["omnigraph", "graphs", "list"]), Capability::Served);
         assert_eq!(cap(&["omnigraph", "optimize", "graph.omni"]), Capability::Direct);
         assert_eq!(cap(&["omnigraph", "schema", "plan", "--schema", "s.pg", "graph.omni"]), Capability::Direct);
         assert_eq!(cap(&["omnigraph", "cluster", "status", "--config", "."]), Capability::Control);
