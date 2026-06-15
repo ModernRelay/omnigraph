@@ -843,3 +843,40 @@ async fn cleanup_reconciles_orphaned_branch_forks() {
     .await
     .unwrap();
 }
+
+// Regression (iss-848): a table with rows but NULL vectors (the load-before-
+// embed window) must not abort index building. The vector (IVF) index cannot
+// train on 0 vectors, so `create_vector_index` errors with "KMeans cannot
+// train 1 centroids with 0 vectors". `build_indices_on_dataset_for_catalog`
+// is the chokepoint every caller funnels through (load/mutate via
+// prepare_updates_for_commit, ensure_indices, optimize, schema apply, merge),
+// so per-index fault isolation there must defer that one column (pending) and
+// still build the sibling scalar indexes, instead of propagating the error.
+// This exercises both the load path (which builds indices inline) and the
+// ensure_indices reconciler. Pre-fix this fails at the load step.
+#[tokio::test]
+async fn index_build_tolerates_null_vector_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let schema = "node Doc {\n    \
+        slug: String @key\n    \
+        n: I64 @index\n    \
+        embedding: Vector(8)? @index\n\
+        }\n";
+    let mut db = Omnigraph::init(uri, schema).await.unwrap();
+    // Rows present, embeddings null (loaded but not yet embedded).
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"n\":1}}\n\
+         {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"n\":2}}",
+        LoadMode::Merge,
+    )
+    .await
+    .expect("load rows with null embeddings");
+
+    // Must not abort: the untrainable vector column is deferred, the sibling
+    // BTREE on `n` still builds.
+    db.ensure_indices().await.expect(
+        "ensure_indices must not abort when a vector column has no trainable vectors yet",
+    );
+}
