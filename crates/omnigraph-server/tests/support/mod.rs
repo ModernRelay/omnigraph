@@ -248,9 +248,17 @@ rules:
 pub const FIND_PERSON_GQ: &str =
     "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.age } }";
 
+/// RFC-011 cluster-only: the single-graph convenience apps built by the
+/// `app_for_loaded_graph*` helpers serve the graph under the reserved id
+/// `default`. This prefixes a flat per-graph path (e.g. `/snapshot`) with
+/// the cluster route prefix so tests address `/graphs/default/snapshot`.
+pub fn g(path: &str) -> String {
+    format!("/graphs/default{path}")
+}
+
 pub fn invoke_request(name: &str, token: &str, body: Value) -> Request<Body> {
     Request::builder()
-        .uri(format!("/queries/{name}"))
+        .uri(g(&format!("/queries/{name}")))
         .method(Method::POST)
         .header("content-type", "application/json")
         .header("authorization", format!("Bearer {token}"))
@@ -265,7 +273,7 @@ pub fn invoke_request_bytes(
     content_type: Option<&str>,
 ) -> Request<Body> {
     let mut builder = Request::builder()
-        .uri(format!("/queries/{name}"))
+        .uri(g(&format!("/queries/{name}")))
         .method(Method::POST)
         .header("authorization", format!("Bearer {token}"));
     if let Some(content_type) = content_type {
@@ -656,7 +664,7 @@ pub mod matrix {
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .uri("/branches")
+                        .uri(g("/branches"))
                         .method(Method::POST)
                         .header("content-type", "application/json")
                         .body(Body::from(body))
@@ -686,7 +694,7 @@ pub mod matrix {
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .uri("/change")
+                        .uri(g("/change"))
                         .method(Method::POST)
                         .header("content-type", "application/json")
                         .body(Body::from(body))
@@ -728,7 +736,7 @@ pub mod matrix {
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .uri(format!("/snapshot?branch={}", branch))
+                        .uri(g(&format!("/snapshot?branch={}", branch)))
                         .method(Method::GET)
                         .body(Body::empty())
                         .unwrap(),
@@ -766,7 +774,7 @@ pub mod matrix {
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .uri("/read")
+                        .uri(g("/read"))
                         .method(Method::POST)
                         .header("content-type", "application/json")
                         .body(Body::from(body))
@@ -833,7 +841,7 @@ pub mod matrix {
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .uri("/change")
+                        .uri(g("/change"))
                         .method(Method::POST)
                         .header("content-type", "application/json")
                         .body(Body::from(body))
@@ -874,7 +882,7 @@ pub mod matrix {
                 let response = app
                     .oneshot(
                         Request::builder()
-                            .uri("/branches/merge")
+                            .uri(g("/branches/merge"))
                             .method(Method::POST)
                             .header("content-type", "application/json")
                             .body(Body::from(body))
@@ -910,7 +918,7 @@ pub mod matrix {
                 let response = app
                     .oneshot(
                         Request::builder()
-                            .uri("/change")
+                            .uri(g("/change"))
                             .method(Method::POST)
                             .header("content-type", "application/json")
                             .body(Body::from(body))
@@ -943,7 +951,7 @@ pub mod matrix {
                 let response = app
                     .oneshot(
                         Request::builder()
-                            .uri("/branches")
+                            .uri(g("/branches"))
                             .method(Method::POST)
                             .header("content-type", "application/json")
                             .body(Body::from(body))
@@ -970,7 +978,7 @@ pub mod matrix {
                 let response = app
                     .oneshot(
                         Request::builder()
-                            .uri(format!("/branches/{}", name))
+                            .uri(g(&format!("/branches/{}", name)))
                             .method(Method::DELETE)
                             .body(Body::empty())
                             .unwrap(),
@@ -1091,7 +1099,7 @@ pub async fn http_change_decision(
     let (status, _body) = json_response(
         &app,
         Request::builder()
-            .uri("/change")
+            .uri(g("/change"))
             .method(Method::POST)
             .header(AUTHORIZATION, format!("Bearer {token}"))
             .header("content-type", "application/json")
@@ -1141,7 +1149,7 @@ pub async fn http_merge_decision(
     let (status, _body) = json_response(
         &app,
         Request::builder()
-            .uri("/branches/merge")
+            .uri(g("/branches/merge"))
             .method(Method::POST)
             .header(AUTHORIZATION, format!("Bearer {token}"))
             .header("content-type", "application/json")
@@ -1191,5 +1199,5 @@ graphs:
 }
 
 pub async fn cluster_settings(dir: &Path) -> color_eyre::eyre::Result<omnigraph_server::ServerConfig> {
-    omnigraph_server::load_server_settings(None, Some(&dir.to_path_buf()), None, None, None, true).await
+    omnigraph_server::load_server_settings(Some(&dir.to_path_buf()), None, true).await
 }

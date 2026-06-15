@@ -51,16 +51,7 @@ pub(crate) async fn server_graphs_list(
     State(state): State<AppState>,
     actor: Option<Extension<ResolvedActor>>,
 ) -> std::result::Result<Json<GraphListResponse>, ApiError> {
-    // 405 in single mode — there's no registry to enumerate, and the
-    // legacy URL surface didn't expose this endpoint.
-    let registry = match state.routing() {
-        GraphRouting::Single { .. } => {
-            return Err(ApiError::method_not_allowed(
-                "GET /graphs is only available in multi-graph mode",
-            ));
-        }
-        GraphRouting::Multi { registry, .. } => registry,
-    };
+    let registry = &state.routing().registry;
 
     // Server-level Cedar gate. `state.server_policy` is loaded from
     // `server.policy.file` in `omnigraph.yaml` at startup. When no
@@ -93,16 +84,14 @@ pub(crate) async fn server_graphs_list(
 }
 
 pub(crate) async fn server_openapi(State(state): State<AppState>) -> Json<utoipa::openapi::OpenApi> {
-    let mut doc = ApiDoc::openapi();
+    // `served_openapi` is the single nesting source — the protected
+    // routes always live under `/graphs/{graph_id}/...` (public/management
+    // paths `/healthz`, `/graphs` stay flat). Building from it here means
+    // the runtime spec and the committed `openapi.json` share one nesting
+    // pass and can't drift.
+    let mut doc = crate::served_openapi();
     if !state.requires_bearer_auth() {
         strip_security(&mut doc);
-    }
-    // MR-668: in multi mode, the protected routes live under
-    // `/graphs/{graph_id}/...`. Rewrite the doc so the spec matches
-    // the routes the router actually serves. Public paths (`/healthz`)
-    // stay flat in both modes.
-    if matches!(state.routing(), GraphRouting::Multi { .. }) {
-        nest_paths_under_cluster_prefix(&mut doc);
     }
     Json(doc)
 }
@@ -248,16 +237,11 @@ pub(crate) async fn require_bearer_auth(
     Ok(next.run(request).await)
 }
 
-/// Routing middleware (MR-668). Resolves the active graph for the
-/// request and injects `Arc<GraphHandle>` as an extension so handlers can
-/// extract it via `Extension<Arc<GraphHandle>>`.
+/// Routing middleware (RFC-011 cluster-only). Resolves the active graph
+/// for the request and injects `Arc<GraphHandle>` as an extension so
+/// handlers can extract it via `Extension<Arc<GraphHandle>>`.
 ///
-/// **Single mode**: the routing field holds the single handle directly.
-/// Routes are flat; every request resolves to that handle, regardless
-/// of the URI path. No registry walk, no sentinel key, no
-/// programmer-error guard.
-///
-/// **Multi mode**: routes are nested under `/graphs/{graph_id}/...`. The
+/// Routes are always nested under `/graphs/{graph_id}/...`. The
 /// middleware extracts `{graph_id}` from the URI path and looks it up in
 /// the registry. Returns 404 if the graph is not registered.
 ///
@@ -268,39 +252,33 @@ pub(crate) async fn resolve_graph_handle(
     mut request: Request,
     next: Next,
 ) -> std::result::Result<Response, ApiError> {
-    let handle = match &state.routing {
-        GraphRouting::Single { handle } => Arc::clone(handle),
-        GraphRouting::Multi { registry, .. } => {
-            // `Router::nest("/graphs/{graph_id}", inner)` rewrites
-            // `request.uri().path()` to the inner suffix (e.g. `/snapshot`).
-            // The pre-rewrite URI is preserved in the `OriginalUri`
-            // request extension by axum's router; we read from there to
-            // extract `{graph_id}`. Fall back to the current URI only if
-            // the extension is missing, which shouldn't happen for
-            // nested routes but is safe defensive code.
-            let original_path: String = request
-                .extensions()
-                .get::<OriginalUri>()
-                .map(|OriginalUri(uri)| uri.path().to_string())
-                .unwrap_or_else(|| request.uri().path().to_string());
-            let graph_id_str = original_path
-                .strip_prefix("/graphs/")
-                .and_then(|rest| rest.split('/').next())
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    ApiError::bad_request(
-                        "cluster route missing /graphs/{graph_id} prefix".to_string(),
-                    )
-                })?;
-            let graph_id = GraphId::try_from(graph_id_str.to_string())
-                .map_err(|err| ApiError::bad_request(err.to_string()))?;
-            let key = GraphKey::cluster(graph_id.clone());
-            match registry.get(&key) {
-                RegistryLookup::Ready(handle) => handle,
-                RegistryLookup::Gone => {
-                    return Err(ApiError::not_found(format!("graph '{graph_id}' not found")));
-                }
-            }
+    let registry = &state.routing.registry;
+    // `Router::nest("/graphs/{graph_id}", inner)` rewrites
+    // `request.uri().path()` to the inner suffix (e.g. `/snapshot`).
+    // The pre-rewrite URI is preserved in the `OriginalUri`
+    // request extension by axum's router; we read from there to
+    // extract `{graph_id}`. Fall back to the current URI only if
+    // the extension is missing, which shouldn't happen for
+    // nested routes but is safe defensive code.
+    let original_path: String = request
+        .extensions()
+        .get::<OriginalUri>()
+        .map(|OriginalUri(uri)| uri.path().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string());
+    let graph_id_str = original_path
+        .strip_prefix("/graphs/")
+        .and_then(|rest| rest.split('/').next())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ApiError::bad_request("cluster route missing /graphs/{graph_id} prefix".to_string())
+        })?;
+    let graph_id = GraphId::try_from(graph_id_str.to_string())
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    let key = GraphKey::cluster(graph_id.clone());
+    let handle = match registry.get(&key) {
+        RegistryLookup::Ready(handle) => handle,
+        RegistryLookup::Gone => {
+            return Err(ApiError::not_found(format!("graph '{graph_id}' not found")));
         }
     };
 

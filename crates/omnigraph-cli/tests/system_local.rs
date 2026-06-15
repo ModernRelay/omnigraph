@@ -2319,9 +2319,12 @@ fn cluster_server_boot_ignores_local_config_in_cwd() {
 /// 3), and `logout` revokes.
 #[test]
 fn local_cli_keyed_credentials_authenticate_url_matched_server() {
-    let graph = SystemGraph::loaded();
-    let server = spawn_server_with_env(
-        graph.path(),
+    // RFC-011 cluster-only: the server boots from a converged cluster
+    // serving the fixture graph under id `local`; tokens-only boot is
+    // default-deny, which still permits `read`.
+    let cluster = converged_loaded_cluster("local", None);
+    let server = spawn_server_with_cluster_env(
+        cluster.path(),
         &[("OMNIGRAPH_SERVER_BEARER_TOKEN", "secret-tok")],
     );
     let operator_home = tempfile::tempdir().unwrap();
@@ -2344,6 +2347,8 @@ fn local_cli_keyed_credentials_authenticate_url_matched_server() {
             .arg("read")
             .arg("--server")
             .arg(&server.base_url)
+            .arg("--graph")
+            .arg("local")
             .arg("--query")
             .arg(fixture("test.gq"))
             .arg("get_person")
@@ -2432,26 +2437,40 @@ fn local_cli_keyed_credentials_authenticate_url_matched_server() {
 /// stored queries) end to end, with the keyed credential from PR 2.
 #[test]
 fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
-    let graph = SystemGraph::loaded();
-    graph.write_query(
-        "stored-find-person.gq",
+    // RFC-011 cluster-only: build a converged cluster serving graph `local`
+    // with a stored query `find_person` and a per-graph policy granting the
+    // operator invoke_query + read (invoke_query is policy-gated — anti-probing
+    // 404 without the grant).
+    let cluster = tempfile::tempdir().unwrap();
+    fs::copy(fixture("test.pg"), cluster.path().join("local.pg")).unwrap();
+    fs::write(
+        cluster.path().join("find-person.gq"),
         "query find_person($name: String) { match { $p: Person { name: $name } } return { $p.name } }",
-    );
-    // invoke_query is policy-gated (anti-probing 404 without the grant),
-    // so the server gets a per-graph bundle granting it to the operator.
-    graph.write_file(
-        "graph.policy.yaml",
+    )
+    .unwrap();
+    fs::write(
+        cluster.path().join("graph.policy.yaml"),
         "version: 1\ngroups:\n  ops: [\"act-op\"]\nprotected_branches: [main]\nrules:\n  - id: allow-invoke\n    allow:\n      actors: { group: ops }\n      actions: [invoke_query]\n  - id: allow-read\n    allow:\n      actors: { group: ops }\n      actions: [read]\n      branch_scope: any\n",
+    )
+    .unwrap();
+    fs::write(
+        cluster.path().join("cluster.yaml"),
+        "version: 1\nmetadata:\n  name: alias-sys\nstate:\n  backend: cluster\n  lock: true\ngraphs:\n  local:\n    schema: ./local.pg\n    queries:\n      find_person:\n        file: ./find-person.gq\npolicies:\n  graph:\n    file: ./graph.policy.yaml\n    applies_to: [local]\n",
+    )
+    .unwrap();
+    output_success(cli().arg("cluster").arg("import").arg("--config").arg(cluster.path()));
+    output_success(cli().arg("cluster").arg("apply").arg("--config").arg(cluster.path()));
+    output_success(
+        cli()
+            .arg("load")
+            .arg("--data")
+            .arg(fixture("test.jsonl"))
+            .arg("--mode")
+            .arg("overwrite")
+            .arg(cluster.path().join("graphs").join("local.omni")),
     );
-    let config = graph.write_config(
-        "omnigraph-server.yaml",
-        &format!(
-            "graphs:\n  local:\n    uri: {}\n    policy:\n      file: ./graph.policy.yaml\n    queries:\n      find_person:\n        file: ./stored-find-person.gq\n",
-            yaml_string(&graph.path().to_string_lossy())
-        ),
-    );
-    let server = spawn_server_with_config_env(
-        &config,
+    let server = spawn_server_with_cluster_env(
+        cluster.path(),
         &[(
             "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
             r#"{"act-op":"srv-tok"}"#,
