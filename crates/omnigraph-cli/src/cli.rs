@@ -21,7 +21,7 @@ direct — direct storage access; reject --server (init, optimize, repair, clean
 schema plan, lint).\n  \
 control — manage or inspect a cluster (cluster via --config; policy & queries via \
 --cluster).\n  \
-local — no graph; local config & tooling: embed, login, logout, config, version.\n\
+local — no graph; local config & tooling: embed, login, logout, profile, version.\n\
 See the 'Command capabilities' section of the CLI reference for which flags apply where.")]
 pub(crate) struct Cli {
     /// Actor id for direct-engine writes; overrides `cli.actor`. No effect on
