@@ -5,7 +5,6 @@ pub use settings::{load_server_settings, classify_server_runtime_state, ServerRu
 use settings::*;
 use handlers::*;
 pub mod auth;
-pub mod config;
 pub mod graph_id;
 pub mod identity;
 pub mod policy;
@@ -46,11 +45,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
-pub use config::{
-    AliasCommand, AliasConfig, CliDefaults, DEFAULT_CONFIG_FILE, OmnigraphConfig, PolicySettings,
-    ProjectConfig, QueryDefaults, ServerDefaults, TargetConfig, graph_resource_id_for_selection,
-    load_config,
-};
 use futures::stream;
 use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph::error::{ManifestConflictDetails, ManifestErrorKind, OmniError};
@@ -878,18 +872,6 @@ fn validate_and_attach(
         Some(Arc::new(queries))
     })
 }
-
-/// Format every load error (parse / identity failure) into a multi-line
-/// boot-abort message.
-fn format_registry_load_errors(label: &str, errors: &[queries::LoadError]) -> String {
-    let joined = errors
-        .iter()
-        .map(|e| e.to_string())
-        .collect::<Vec<_>>()
-        .join("\n  ");
-    format!("graph '{label}': stored-query registry failed to load:\n  {joined}")
-}
-
 
 pub fn build_app(state: AppState) -> Router {
     // The per-graph protected routes, identical in single + multi mode.

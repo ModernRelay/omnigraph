@@ -24,8 +24,7 @@ use omnigraph_api_types::{
 };
 use omnigraph_server::queries::{QueryRegistry, check};
 use omnigraph_server::{
-    PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest,
-    PolicyTestConfig, graph_resource_id_for_selection,
+    PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest, PolicyTestConfig,
 };
 use reqwest::Method;
 use reqwest::header::AUTHORIZATION;
