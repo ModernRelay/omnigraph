@@ -880,3 +880,58 @@ async fn index_build_tolerates_null_vector_rows() {
         "ensure_indices must not abort when a vector column has no trainable vectors yet",
     );
 }
+
+// iss-848: `optimize` converges declared-but-unbuilt indexes. After an @index is
+// added post-data (a metadata-only apply that defers the physical build), the
+// column is unindexed and reads scan. `optimize` — the operator's reconciler,
+// run on a cron — must materialize it, by composing the ensure_indices
+// reconciler after the compaction sweep. Pre-iss-848 optimize only maintained
+// coverage of EXISTING indexes (optimize_indices) and never created missing ones.
+#[tokio::test]
+async fn optimize_materializes_index_declared_but_unbuilt() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let v1 = "node Doc {\n    slug: String @key\n    rank: I32\n}\n";
+    let mut db = Omnigraph::init(uri, v1).await.unwrap();
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"rank\":1}}\n\
+         {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"rank\":2}}",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    // Add @index on `rank` after data exists: a metadata-only apply that defers
+    // the physical build (iss-848), so the column is declared-indexed but unbuilt.
+    let v2 = "node Doc {\n    slug: String @key\n    rank: I32 @index\n}\n";
+    db.apply_schema(v2).await.expect("index-only apply");
+
+    // Precondition: `rank` is declared @index but unbuilt -> reads degrade.
+    {
+        let snap = snapshot_main(&db).await.unwrap();
+        let ds = snap.open("node:Doc").await.unwrap();
+        assert!(
+            matches!(
+                TableStore::key_column_index_coverage(&ds, "rank")
+                    .await
+                    .unwrap(),
+                IndexCoverage::Degraded { .. }
+            ),
+            "rank must be unindexed after the deferred apply"
+        );
+    }
+
+    db.optimize().await.unwrap();
+
+    // Postcondition: optimize's reconciler materialized the declared index.
+    let snap = snapshot_main(&db).await.unwrap();
+    let ds = snap.open("node:Doc").await.unwrap();
+    assert_eq!(
+        TableStore::key_column_index_coverage(&ds, "rank")
+            .await
+            .unwrap(),
+        IndexCoverage::Indexed,
+        "optimize must build the declared-but-unbuilt rank index"
+    );
+}
