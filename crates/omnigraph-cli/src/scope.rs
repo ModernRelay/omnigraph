@@ -140,6 +140,18 @@ pub(crate) fn resolve_scope(
         );
     }
 
+    // 3b. Flat default store scope — the zero-flag local-dev default (RFC-011).
+    //     Mutually exclusive with `defaults.server` (enforced at config load).
+    if let Some(store) = op.default_store() {
+        return scope_from_binding(
+            op,
+            capability,
+            ScopeBinding::Store(store.to_string()),
+            flags.graph.map(str::to_string),
+            "operator defaults",
+        );
+    }
+
     // 4. Nothing resolved — leave the tuple empty; downstream falls through to
     //    today's behavior (legacy `cli.graph` default or a no-address error).
     Ok(ResolvedScope::default())
@@ -371,6 +383,34 @@ mod tests {
                 .to_string();
             assert!(err.contains("already a single graph"), "{err}");
         }
+    }
+
+    #[test]
+    fn flat_default_store_drives_local_verbs() {
+        // RFC-011: `defaults.store` is the zero-flag local default — no flags,
+        // no profile → the store URI resolves as the (single-graph) store scope.
+        let op = cfg("defaults:\n  store: file:///tmp/dev.omni\n");
+        let scope = resolve_scope(&op, Capability::Any, flags()).unwrap();
+        assert_eq!(scope.uri.as_deref(), Some("file:///tmp/dev.omni"));
+        assert_eq!(scope.server, None);
+    }
+
+    #[test]
+    fn flat_default_store_rejects_graph() {
+        // A store is already a single graph, so `--graph` against a default
+        // store is a loud error.
+        let op = cfg("defaults:\n  store: file:///tmp/dev.omni\n");
+        let err = resolve_scope(
+            &op,
+            Capability::Any,
+            ScopeFlags {
+                graph: Some("knowledge"),
+                ..flags()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("does not apply to a store scope"), "{err}");
     }
 
     #[test]
