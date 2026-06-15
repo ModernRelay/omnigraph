@@ -2,6 +2,30 @@ use super::*;
 
 use super::projection::{apply_filter, apply_ordering, project_return};
 
+/// Bundles the per-handle embedding client cell with the optional injected
+/// config (RFC-012 Phase 5) so the lazy init uses the injected config when
+/// present, else `EmbeddingClient::from_env()`. Threaded through the query path
+/// in place of the bare cell, preserving laziness (a graph that never embeds
+/// builds no client and needs no key).
+pub(crate) struct EmbeddingResolver<'a> {
+    cell: &'a tokio::sync::OnceCell<EmbeddingClient>,
+    config: Option<&'a crate::embedding::EmbeddingConfig>,
+}
+
+impl EmbeddingResolver<'_> {
+    async fn resolve(&self) -> Result<&EmbeddingClient> {
+        let config = self.config.cloned();
+        self.cell
+            .get_or_try_init(|| async move {
+                match config {
+                    Some(cfg) => EmbeddingClient::new(cfg),
+                    None => EmbeddingClient::from_env(),
+                }
+            })
+            .await
+    }
+}
+
 impl Omnigraph {
     /// Run a named query against an explicit branch or snapshot target.
     pub async fn query(
@@ -37,7 +61,10 @@ impl Omnigraph {
             &resolved.snapshot,
             &graph_index,
             &catalog,
-            self.embedding_cell(),
+            &EmbeddingResolver {
+                cell: self.embedding_cell(),
+                config: self.embedding_config_ref(),
+            },
         )
         .await
     }
@@ -86,7 +113,10 @@ impl Omnigraph {
             &snapshot,
             &graph_index,
             &catalog,
-            self.embedding_cell(),
+            &EmbeddingResolver {
+                cell: self.embedding_cell(),
+                config: self.embedding_config_ref(),
+            },
         )
         .await
     }
@@ -118,7 +148,7 @@ async fn extract_search_mode(
     ir: &QueryIR,
     params: &ParamMap,
     catalog: &Catalog,
-    embedding: &tokio::sync::OnceCell<EmbeddingClient>,
+    embedding: &EmbeddingResolver<'_>,
 ) -> Result<SearchMode> {
     if ir.order_by.is_empty() {
         return Ok(SearchMode::default());
@@ -201,7 +231,7 @@ async fn extract_sub_search_mode(
     params: &ParamMap,
     catalog: &Catalog,
     limit: Option<u64>,
-    embedding: &tokio::sync::OnceCell<EmbeddingClient>,
+    embedding: &EmbeddingResolver<'_>,
 ) -> Result<SearchMode> {
     match expr {
         IRExpr::Nearest {
@@ -250,7 +280,7 @@ async fn resolve_nearest_query_vec(
     property: &str,
     expr: &IRExpr,
     params: &ParamMap,
-    embedding: &tokio::sync::OnceCell<EmbeddingClient>,
+    embedding: &EmbeddingResolver<'_>,
 ) -> Result<Vec<f32>> {
     let lit = resolve_literal_or_param(expr, params)?;
     match lit {
@@ -261,9 +291,7 @@ async fn resolve_nearest_query_vec(
             // Lazily resolve the per-handle client once, then reuse it across
             // queries (keeps the provider connection pool warm); a graph that
             // never embeds never builds a client and needs no provider key.
-            let client = embedding
-                .get_or_try_init(|| async { EmbeddingClient::from_env() })
-                .await?;
+            let client = embedding.resolve().await?;
             // Same-space guarantee: if the property recorded the model that
             // produced its stored vectors (`@embed("…", model="…")`), the query
             // embedder must resolve to that same model — otherwise the comparison
@@ -392,7 +420,7 @@ pub async fn execute_query(
     snapshot: &Snapshot,
     graph_index: &GraphIndexHandle<'_>,
     catalog: &Catalog,
-    embedding: &tokio::sync::OnceCell<EmbeddingClient>,
+    embedding: &EmbeddingResolver<'_>,
 ) -> Result<QueryResult> {
     let search_mode = extract_search_mode(ir, params, catalog, embedding).await?;
 

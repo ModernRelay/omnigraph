@@ -162,6 +162,11 @@ pub struct Omnigraph {
     /// avoids the per-query `from_env()` rebuild and keeps the provider HTTP
     /// connection pool warm. `OnceCell` guarantees a single initialization.
     embedding: Arc<tokio::sync::OnceCell<crate::embedding::EmbeddingClient>>,
+    /// Optional pre-resolved embedding config (RFC-012 Phase 5), injected from a
+    /// cluster `graphs.<id>.embeddings` profile via [`Omnigraph::with_embedding_config`].
+    /// When set, the embedding cell builds its client from this instead of
+    /// `EmbeddingClient::from_env()`; `None` keeps the env fallback.
+    embedding_config: Option<Arc<crate::embedding::EmbeddingConfig>>,
 }
 
 /// Whether [`Omnigraph::open`] runs the open-time recovery sweep.
@@ -326,6 +331,7 @@ impl Omnigraph {
             merge_exclusive: Arc::new(tokio::sync::Mutex::new(())),
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
+            embedding_config: None,
         })
     }
 
@@ -426,6 +432,7 @@ impl Omnigraph {
             merge_exclusive: Arc::new(tokio::sync::Mutex::new(())),
             policy: None,
             embedding: Arc::new(tokio::sync::OnceCell::new()),
+            embedding_config: None,
         })
     }
 
@@ -480,6 +487,23 @@ impl Omnigraph {
         &self,
     ) -> &tokio::sync::OnceCell<crate::embedding::EmbeddingClient> {
         &self.embedding
+    }
+
+    /// Install a pre-resolved embedding config (RFC-012 Phase 5). Builder-style,
+    /// mirroring [`Omnigraph::with_policy`]: a graph served from a cluster
+    /// `embeddings` profile injects it here; an embedded/CLI caller that doesn't
+    /// call this keeps the `EmbeddingClient::from_env()` fallback.
+    pub fn with_embedding_config(
+        mut self,
+        config: Arc<crate::embedding::EmbeddingConfig>,
+    ) -> Self {
+        self.embedding_config = Some(config);
+        self
+    }
+
+    /// The injected embedding config, if any (see the `embedding_config` field).
+    pub(crate) fn embedding_config_ref(&self) -> Option<&crate::embedding::EmbeddingConfig> {
+        self.embedding_config.as_deref()
     }
 
     /// Engine-layer policy enforcement gate (MR-722 chassis core).
