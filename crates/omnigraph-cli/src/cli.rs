@@ -66,6 +66,18 @@ pub(crate) struct Cli {
     #[arg(long, global = true, value_name = "DIR|URI")]
     pub(crate) cluster: Option<String>,
 
+    /// Skip the confirmation prompt for a destructive write (`cleanup`,
+    /// overwrite `load`, `branch delete`) against a non-local scope (RFC-011
+    /// Decision 9). Without it, a non-local destructive write prompts on a TTY
+    /// and refuses (errors) when there is no TTY or `--json` is set.
+    #[arg(long, global = true)]
+    pub(crate) yes: bool,
+
+    /// Suppress the one-line resolved-write-target diagnostic that write
+    /// commands echo to stderr (RFC-011 Decision 9).
+    #[arg(long, global = true)]
+    pub(crate) quiet: bool,
+
     #[command(subcommand)]
     pub(crate) command: Command,
 }

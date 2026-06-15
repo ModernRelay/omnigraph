@@ -2,6 +2,8 @@
 //! remote HTTP, env/token handling, scaffolding (moved verbatim from
 //! main.rs in the modularization).
 
+use std::io::IsTerminal;
+
 use super::*;
 use crate::operator;
 
@@ -14,6 +16,59 @@ pub(crate) fn ensure_local_graph_parent(uri: &str) -> Result<()> {
 
 pub(crate) fn is_remote_uri(uri: &str) -> bool {
     uri.starts_with("http://") || uri.starts_with("https://")
+}
+
+/// Whether a resolved write target is *local* for the purposes of the RFC-011
+/// Decision 9 destructive-confirm gate: a bare path or a `file://` URI. Anything
+/// else carrying a scheme — `http(s)://` (served), `s3://` / `gs://` / … (object
+/// store) — is non-local and a destructive write against it requires explicit
+/// consent. Generalizes `is_remote_uri` (which only catches http(s)).
+pub(crate) fn uri_is_local(uri: &str) -> bool {
+    !uri.contains("://") || uri.starts_with("file://")
+}
+
+/// Echo the resolved write target + access path to stderr (RFC-011 Decision 9),
+/// unless `--quiet`. One line, e.g. `omnigraph load → file://g.omni (direct,
+/// local)`. stderr so `--json` consumers reading stdout are unaffected; the line
+/// legitimately differs embedded-vs-served (that visibility is the point).
+pub(crate) fn echo_write_target(quiet: bool, label: &str, uri: &str, served: bool) {
+    if quiet {
+        return;
+    }
+    let access = if served {
+        "served"
+    } else if uri_is_local(uri) {
+        "direct, local"
+    } else {
+        "direct, remote"
+    };
+    eprintln!("omnigraph {label} → {uri} ({access})");
+}
+
+/// Gate a destructive write (`cleanup`, overwrite `load`, `branch delete`)
+/// against a non-local scope (RFC-011 Decision 9). A local target needs no
+/// confirmation; otherwise `--yes` consents, an interactive TTY is prompted, and
+/// a non-TTY / `--json` run refuses rather than silently proceeding.
+pub(crate) fn confirm_destructive(label: &str, uri: &str, yes: bool, json: bool) -> Result<()> {
+    if uri_is_local(uri) || yes {
+        return Ok(());
+    }
+    if json || !std::io::stdin().is_terminal() {
+        bail!(
+            "refusing destructive `{label}` against non-local target {uri} without confirmation; \
+             pass --yes to confirm (an interactive TTY would be prompted instead)"
+        );
+    }
+    eprint!(
+        "About to run a destructive `{label}` against {uri} (not local). Type 'yes' to continue: "
+    );
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "yes" | "y" => Ok(()),
+        _ => bail!("aborted: destructive `{label}` not confirmed"),
+    }
 }
 
 /// THE one way the CLI composes a remote request URL. Every remote call
@@ -1111,6 +1166,40 @@ pub(crate) fn rewrite_deprecated_argv(args: Vec<OsString>) -> Vec<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // RFC-011 Decision 9: locality classifier for the destructive-confirm gate.
+    #[test]
+    fn uri_is_local_truth_table() {
+        // Local: bare path or file://.
+        assert!(uri_is_local("graph.omni"));
+        assert!(uri_is_local("/abs/path/graph.omni"));
+        assert!(uri_is_local("file:///tmp/graph.omni"));
+        // Non-local: served or object-store schemes.
+        assert!(!uri_is_local("http://host/graphs/g"));
+        assert!(!uri_is_local("https://host/graphs/g"));
+        assert!(!uri_is_local("s3://bucket/graph.omni"));
+        assert!(!uri_is_local("gs://bucket/graph.omni"));
+    }
+
+    // RFC-011 Decision 9: a non-local destructive write with `--json` (the CI
+    // shape — also covers the no-TTY case, since tests run without a terminal)
+    // refuses rather than proceeding; a local one and an explicit `--yes` pass.
+    #[test]
+    fn confirm_destructive_refuses_non_local_without_consent() {
+        let err = confirm_destructive("cleanup", "s3://b/g.omni", false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--yes"), "{err}");
+    }
+
+    #[test]
+    fn confirm_destructive_allows_local_and_explicit_yes() {
+        // Local needs no confirmation, even with --json.
+        assert!(confirm_destructive("cleanup", "file:///tmp/g.omni", false, true).is_ok());
+        assert!(confirm_destructive("branch delete", "graph.omni", false, true).is_ok());
+        // --yes consents to a non-local target.
+        assert!(confirm_destructive("cleanup", "s3://b/g.omni", true, true).is_ok());
+    }
 
     // RFC-011 Decision 2: `--server` accepts a literal URL (value with `://`),
     // bypassing the operator-config registry — so no config / OMNIGRAPH_HOME is

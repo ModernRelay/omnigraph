@@ -23,7 +23,7 @@ Top-level command families and subcommands. Graph-targeting commands accept a po
 | `cluster validate \| plan \| apply \| approve \| status \| refresh \| import \| force-unlock` | declarative cluster control plane. `validate` checks a local `cluster.yaml` folder and referenced schema/query/policy files; `plan` diffs it against local JSON state at `__cluster/state.json`, annotates dispositions, and embeds real schema-migration previews; `apply` converges the cluster — stored-query/policy catalog writes (content-addressed under `__cluster/resources/`), graph creates, schema updates (soft drops only; `--as` records the actor), and graph deletes behind a digest-bound approval from `cluster approve <resource> --as <actor>` (`apply`/`approve` default the actor from the per-operator `omnigraph.yaml`'s `cli.actor` when `--as` is omitted; nothing else in that file affects cluster commands); what apply converges is what an `omnigraph-server --cluster <dir>` deployment serves on its next restart (omnigraph.yaml deployments are unaffected); `status` reads the state ledger; `refresh`/`import` explicitly update local JSON state from read-only graph observations; `force-unlock <LOCK_ID>` manually removes a held local state lock by exact id |
 | `optimize` | non-destructive Lance compaction (skips tables with `Blob` columns or uncovered drift; `--json` reports `skipped`) |
 | `repair [--confirm] [--force]` | preview or explicitly publish uncovered manifest/head drift. `--confirm` heals verified maintenance drift and exits non-zero if suspicious/unverifiable drift is refused; `--force --confirm` publishes suspicious/unverifiable drift after operator review |
-| `cleanup --keep N --older-than 7d --confirm` | destructive version GC |
+| `cleanup --keep N --older-than 7d --confirm` | destructive version GC (`--confirm` to execute; also needs `--yes` against a non-local `s3://` target — see *Write diagnostics & destructive confirmation*) |
 | `embed` | offline JSONL embedding pipeline |
 | `policy validate \| test \| explain` | Cedar tooling. Selects `cli.graph`, else `server.graph`, else top-level `policy.file` |
 | `version` / `-v` | print `omnigraph 0.3.x` |
@@ -48,6 +48,15 @@ These restrictions are enforced and reported, not silent:
 To maintain a server-backed graph, run the `direct` verbs from a host with storage access against the graph's storage URI (a positional URI, or `--cluster … --graph …`), out-of-band from the serving process — there are no server routes for `optimize` / `repair` / `cleanup` by design.
 
 `omnigraph --help` lists commands with a **capability legend** at the bottom (any / served / direct / control / local).
+
+## Write diagnostics & destructive confirmation
+
+Two global flags make writes self-documenting and guard the dangerous ones (RFC-011 Decision 9):
+
+- **Every write echoes its resolved target to stderr** — `omnigraph load → s3://acme/brain/graphs/knowledge.omni (direct, remote)` — so you catch a scope that resolved somewhere unexpected (e.g. *prod*) before it lands. Applies to `load`, `ingest`, `mutate`, `branch create|delete|merge`, `schema apply`, `optimize`, `repair`, `cleanup`. The line is stderr, so `--json` consumers reading stdout are unaffected; suppress it with **`--quiet`**.
+- **Destructive writes against a non-local scope require confirmation.** `cleanup`, overwrite `load` (`--mode overwrite`), and `branch delete` proceed freely against a local (`file://`) graph, but when the resolved target is **not local** (a served `http(s)://` graph or an `s3://` store/cluster) they require explicit consent: pass **`--yes`** to confirm, an interactive terminal is prompted, and a non-interactive run (no TTY, or `--json`) **refuses with an error** rather than silently destroying. `cleanup` still also requires its existing `--confirm` (preview→execute); `--yes` is the additional non-local consent.
+
+A "local" target is a bare path or a `file://` URI; `http(s)://`, `s3://`, and other object-store schemes are non-local.
 
 ## Config surfaces
 
