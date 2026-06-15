@@ -676,22 +676,48 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
                         }
                         Some(NodePropIndexKind::Vector) => {
                             if !db.storage().has_vector_index(ds, prop_name).await? {
-                                // Inline-commit residual: lance-6.0.1 does not
-                                // expose `build_index_metadata_from_segments` as
-                                // `pub`, so vector indices cannot be staged from
-                                // outside the lance crate. Document at the call
-                                // site; companion ticket to lance-format/lance#6658.
-                                let new_snap = db
-                                    .storage_inline_residual()
-                                    .create_vector_index(ds.clone(), prop_name.as_str())
-                                    .await
-                                    .map_err(|e| {
-                                        OmniError::Lance(format!(
-                                            "create Vector index on {}({}): {}",
-                                            table_key, prop_name, e
-                                        ))
-                                    })?;
-                                *ds = new_snap;
+                                // A vector (IVF) index trains k-means centroids
+                                // over the column, so Lance cannot build it on an
+                                // empty table — it errors "Creating empty vector
+                                // indices with train=False is not yet implemented".
+                                // Treat an untrainable column as a *pending* index
+                                // and skip it, rather than aborting the whole schema
+                                // migration (and its sibling indexes) on a dormant
+                                // declared-but-unbuilt vector index. This mirrors the
+                                // `row_count > 0` guard in `ensure_indices_for_branch`
+                                // and the branch-merge index rebuild; the pending
+                                // index is materialized by a later `ensure_indices` /
+                                // `optimize` once the table has rows. Full decoupling
+                                // — intent recorded at apply, an idempotent reconciler
+                                // converging coverage and treating below-training-size
+                                // as pending — is dev-graph iss-848; that work also
+                                // closes the residual rows-present-but-vectors-null
+                                // window this total-row-count guard leaves open.
+                                if db.storage().count_rows(ds, None).await? == 0 {
+                                    tracing::info!(
+                                        target: "omnigraph::schema_apply",
+                                        table = %table_key,
+                                        column = %prop_name,
+                                        "deferring Vector index on empty table; it will \
+                                         build once the table has rows",
+                                    );
+                                } else {
+                                    // Inline-commit residual: lance does not expose
+                                    // `build_index_metadata_from_segments` as `pub`, so
+                                    // vector indices cannot be staged from outside the
+                                    // lance crate (dev-graph iss-951 / lance#6666).
+                                    let new_snap = db
+                                        .storage_inline_residual()
+                                        .create_vector_index(ds.clone(), prop_name.as_str())
+                                        .await
+                                        .map_err(|e| {
+                                            OmniError::Lance(format!(
+                                                "create Vector index on {}({}): {}",
+                                                table_key, prop_name, e
+                                            ))
+                                        })?;
+                                    *ds = new_snap;
+                                }
                             }
                         }
                         // Enum + orderable scalars (DateTime/Date/numeric/Bool)
