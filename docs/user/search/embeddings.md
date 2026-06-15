@@ -1,28 +1,31 @@
 # Embeddings
 
-OmniGraph has **two** embedding clients with different defaults and purposes.
+OmniGraph embeds text through a **single engine-side client** (Google Gemini). It is used in two places: the
+query-time auto-embed of a string passed to `nearest($v, "string")`, and the offline `omnigraph embed` file
+pipeline. Both paths use the same client, so query vectors and CLI-produced document vectors share one model
+and one vector space.
 
-## Compiler-side client — query-time normalization
-
-- Default model: `text-embedding-3-small` (OpenAI-style schema)
-- Env: `NANOGRAPH_EMBED_MODEL`, `OPENAI_API_KEY`, `OPENAI_BASE_URL` (default `https://api.openai.com/v1`), `NANOGRAPH_EMBEDDINGS_MOCK`, `NANOGRAPH_EMBED_TIMEOUT_MS=30000`, `NANOGRAPH_EMBED_RETRY_ATTEMPTS=4`, `NANOGRAPH_EMBED_RETRY_BACKOFF_MS=200`
-- Methods: `embed_text(input, expected_dim)`, `embed_texts(inputs, expected_dim)`
-- Mock mode: deterministic FNV-1a + xorshift64 → L2-normalized vectors
-
-## Engine-side client — runtime ingest
+## Engine embedding client
 
 - Model: `gemini-embedding-2-preview`
 - Env: `GEMINI_API_KEY`, `OMNIGRAPH_GEMINI_BASE_URL` (default Google generativelanguage v1beta), `OMNIGRAPH_EMBED_TIMEOUT_MS=30000`, `OMNIGRAPH_EMBED_RETRY_ATTEMPTS=4`, `OMNIGRAPH_EMBED_RETRY_BACKOFF_MS=200`, `OMNIGRAPH_EMBEDDINGS_MOCK`
-- Two task types: `embed_query_text` (RETRIEVAL_QUERY) and `embed_document_text` (RETRIEVAL_DOCUMENT)
+- Two task types: `embed_query_text` (RETRIEVAL_QUERY) for query strings and `embed_document_text` (RETRIEVAL_DOCUMENT) for stored documents
 - Exponential backoff with retryable detection (timeouts, 429, 5xx)
+- Vectors are stored as L2-normalized `FixedSizeList(Float32, dim)`; the requested dimension is driven by the target column width
 
-## Schema integration
+## `@embed` schema annotation
 
-Mark a Vector property with `@embed("source_text_property")`. At ingest, the engine pulls the source text and writes the embedding into the vector column. Stored as L2-normalized FixedSizeList(Float32, dim).
+Mark a Vector property with `@embed("source_text_property")`. Today this is a **catalog annotation** consumed
+by the query typechecker and linter: it records which String property is the embedding source and lets
+`nearest($v, "string")` auto-embed a query string for comparison against that vector column.
+
+**It does not embed at ingest.** Stored vectors are supplied directly in your load data, or pre-filled by the
+offline `omnigraph embed` pipeline below. (Ingest-time execution of `@embed` is a planned enhancement; until
+it ships, populate the vector column yourself.)
 
 ## CLI `omnigraph embed` (offline file pipeline)
 
-Operates on **JSONL files** (not on a graph). Three modes (mutually exclusive):
+Operates on **JSONL files** (not on a graph), using the same engine client. Three modes (mutually exclusive):
 
 - (default) `fill_missing` — only embed rows whose target field is empty
 - `--reembed-all` — overwrite all

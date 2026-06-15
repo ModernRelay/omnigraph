@@ -80,7 +80,7 @@ Full diagram and concurrency model: [docs/dev/architecture.md](docs/dev/architec
 | Mutations — insert/update/delete, D2, atomicity | [docs/user/mutations/index.md](docs/user/mutations/index.md) |
 | Search funcs (`nearest`/`bm25`/`rrf`), hybrid ranking | [docs/user/search/index.md](docs/user/search/index.md) |
 | Indexes (BTREE / inverted / vector / graph topology) | [docs/user/search/indexes.md](docs/user/search/indexes.md) |
-| Embeddings (compiler + engine clients, env vars, `@embed`) | [docs/user/search/embeddings.md](docs/user/search/embeddings.md) |
+| Embeddings (engine client, env vars, `@embed`) | [docs/user/search/embeddings.md](docs/user/search/embeddings.md) |
 | Concepts — what OmniGraph is, L1/L2 framing | [docs/user/concepts/index.md](docs/user/concepts/index.md) |
 | Quickstart — init → load → query → branch | [docs/user/quickstart.md](docs/user/quickstart.md) |
 | Branches, commit graph, system branches | [docs/user/branching/index.md](docs/user/branching/index.md) |
