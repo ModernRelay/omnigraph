@@ -271,6 +271,12 @@ not resolvable. Run these from a host with storage access — there are no serve
 routes for them. Conversely, **`init` refuses** a cluster-managed path: graphs in
 a cluster are created by `cluster apply`, not by hand.
 
+Against an **`s3://`-backed cluster** the resolved graph storage is non-local, so a
+destructive `cleanup` additionally requires **`--yes`** (an interactive prompt
+otherwise, refusal without a TTY) on top of `--confirm` — see [cli-reference.md](../cli/reference.md)'s
+*Write diagnostics & destructive confirmation*. Every maintenance run also echoes
+its resolved target to stderr (suppress with `--quiet`).
+
 ## What the control plane does not do (yet)
 
 - **No hot reload** — applied changes serve on the next restart.
