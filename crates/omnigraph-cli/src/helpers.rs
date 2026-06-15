@@ -303,19 +303,26 @@ pub(crate) fn resolve_server_flag(
     let Some(server) = server else {
         return Ok(None);
     };
-    let operator_config = operator::load_operator_config()?;
-    let Some(entry) = operator_config.servers.get(server) else {
-        let known = operator_config
-            .servers
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join(", ");
-        color_eyre::eyre::bail!(
-            "unknown server '{server}' — servers defined in the operator config: [{known}] (add it under servers: in ~/.omnigraph/config.yaml)"
-        );
+    // RFC-011 Decision 2: a value containing `://` is a literal base URL
+    // (bypasses the operator-config registry); otherwise it is a config name.
+    let base_url = if server.contains("://") {
+        server.to_string()
+    } else {
+        let operator_config = operator::load_operator_config()?;
+        let Some(entry) = operator_config.servers.get(server) else {
+            let known = operator_config
+                .servers
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            color_eyre::eyre::bail!(
+                "unknown server '{server}' — servers defined in the operator config: [{known}] (add it under servers: in ~/.omnigraph/config.yaml)"
+            );
+        };
+        entry.url.clone()
     };
-    let base = entry.url.trim_end_matches('/');
+    let base = base_url.trim_end_matches('/');
     Ok(Some(match graph {
         Some(graph) => format!("{base}/graphs/{graph}"),
         None => base.to_string(),
@@ -1089,6 +1096,22 @@ pub(crate) fn rewrite_deprecated_argv(args: Vec<OsString>) -> Vec<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // RFC-011 Decision 2: `--server` accepts a literal URL (value with `://`),
+    // bypassing the operator-config registry — so no config / OMNIGRAPH_HOME is
+    // read on this path (hermetic).
+    #[test]
+    fn server_flag_accepts_a_literal_url() {
+        assert_eq!(
+            resolve_server_flag(Some("https://graph.example.com"), None).unwrap(),
+            Some("https://graph.example.com".to_string())
+        );
+        // trailing slash trimmed; `--graph` appends the multi-graph path.
+        assert_eq!(
+            resolve_server_flag(Some("https://graph.example.com/"), Some("knowledge")).unwrap(),
+            Some("https://graph.example.com/graphs/knowledge".to_string())
+        );
+    }
 
     // `branch delete` interpolates the branch into the URL path. The composed
     // path must be exactly `<base-path>/branches/<name>` with no empty `//`
