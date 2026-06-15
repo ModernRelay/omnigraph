@@ -144,6 +144,7 @@ These are architectural rules that need to be in scope on every change. They're 
 4. **Bearer-token plaintext never persists in process memory.** Tokens are hashed at startup; auth uses constant-time comparison; the actor id is server-resolved from the hash match and must not be settable by the client.
 5. **Reads always see the current index state for the branch they're reading.** Indexes track the branch head, not historical snapshots. If you change index lifecycle, preserve this guarantee.
 6. **Stable type IDs survive renames.** Schema migration relies on identity that's stable across rename — don't mint new IDs on rename.
+7. **Logical contract over physical state.** Physical state (index coverage, fragment layout, compaction versions, staged writes) is derived and rebuildable; it must never fail a logical operation. Check preconditions against logical state and let reconciliation converge the physical state idempotently — genuine logical conflicts still fail loudly. This is the rule rules 1–6 instantiate; full statement and applications in [docs/dev/invariants.md](docs/dev/invariants.md).
 
 ### Deny-list (fast-pass review filter — full reasoning in [docs/dev/invariants.md](docs/dev/invariants.md))
 
