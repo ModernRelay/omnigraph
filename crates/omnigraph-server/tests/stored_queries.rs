@@ -83,6 +83,58 @@ async fn invoke_stored_read_returns_rows() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn invoke_with_mismatched_expected_kind_is_rejected() {
+    // RFC-011 D3: the CLI verb asserts the stored query's kind via
+    // `expect_mutation`. Invoking a read with `expect_mutation: true`
+    // (i.e. `omnigraph mutate <a-read>`) is a 400 naming the right verb.
+    let (_temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, false)],
+        &[("act-invoke", "t-invoke")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    let (status, body) = json_response(
+        &app,
+        invoke_request(
+            "find_person",
+            "t-invoke",
+            json!({ "expect_mutation": true, "params": { "name": "Alice" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("'find_person' is a read — use omnigraph query find_person"),
+        "expected a kind-mismatch error; body: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invoke_with_matching_expected_kind_runs() {
+    // The matching assertion (`omnigraph query <a-read>`) passes through.
+    let (_temp, app) = app_with_stored_queries(
+        &[("find_person", FIND_PERSON_GQ, false)],
+        &[("act-invoke", "t-invoke")],
+        INVOKE_POLICY_YAML,
+    )
+    .await;
+    let (status, body) = json_response(
+        &app,
+        invoke_request(
+            "find_person",
+            "t-invoke",
+            json!({ "expect_mutation": false, "params": { "name": "Alice" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "matching kind should run; body: {body}");
+    assert_eq!(body["query_name"], "find_person");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn invoke_stored_read_accepts_absent_or_empty_body() {
     let no_param_query = "query list_people() { match { $p: Person } return { $p.name } }";
     let (_temp, app) = app_with_stored_queries(
