@@ -500,6 +500,12 @@ impl Omnigraph {
     }
 
     pub(crate) async fn ensure_schema_state_valid(&self) -> Result<()> {
+        // Full per-call validation is intentional: a long-lived handle must
+        // detect external drift of the schema source, IR, OR state on its next
+        // operation (see lifecycle::long_lived_handle_rejects_schema_* tests). A
+        // source-only fast path would miss IR/state drift when _schema.pg is
+        // unchanged, so the only safe latency win is not calling this twice per
+        // query (finding A removes the redundant caller in exec/query.rs).
         validate_schema_contract(self.uri(), Arc::clone(&self.storage)).await
     }
 
