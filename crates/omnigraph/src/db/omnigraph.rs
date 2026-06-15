@@ -40,6 +40,7 @@ pub use repair::{
     RepairAction, RepairClassification, RepairOptions, RepairStats, TableRepairStats,
 };
 pub use schema_apply::SchemaApplyOptions;
+pub use table_ops::PendingIndex;
 
 use super::commit_graph::GraphCommit;
 use super::manifest::{
@@ -1069,11 +1070,15 @@ impl Omnigraph {
     /// unbranched subtables keep inheriting `main`, while subtables inherited
     /// from an ancestor branch are first forked into the active branch before
     /// their index metadata is updated.
-    pub async fn ensure_indices(&self) -> Result<()> {
+    /// Returns the declared indexes that could not be materialized on this
+    /// pass (today: vector columns with no trainable vectors yet). They are
+    /// deferred, not errors; a later `ensure_indices`/`optimize` builds them
+    /// once the column is trainable. Reads stay correct (brute-force) meanwhile.
+    pub async fn ensure_indices(&self) -> Result<Vec<PendingIndex>> {
         table_ops::ensure_indices(self).await
     }
 
-    pub async fn ensure_indices_on(&self, branch: &str) -> Result<()> {
+    pub async fn ensure_indices_on(&self, branch: &str) -> Result<Vec<PendingIndex>> {
         table_ops::ensure_indices_on(self, branch).await
     }
 
@@ -1530,7 +1535,7 @@ impl Omnigraph {
         &self,
         table_key: &str,
         ds: &mut SnapshotHandle,
-    ) -> Result<()> {
+    ) -> Result<Vec<PendingIndex>> {
         table_ops::build_indices_on_dataset(self, table_key, ds).await
     }
 
@@ -1539,7 +1544,7 @@ impl Omnigraph {
         catalog: &Catalog,
         table_key: &str,
         ds: &mut SnapshotHandle,
-    ) -> Result<()> {
+    ) -> Result<Vec<PendingIndex>> {
         table_ops::build_indices_on_dataset_for_catalog(self, catalog, table_key, ds).await
     }
 

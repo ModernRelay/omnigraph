@@ -21,7 +21,7 @@ pub(super) async fn graph_index_for_resolved(
     db.runtime_cache.graph_index(resolved, &catalog).await
 }
 
-pub(super) async fn ensure_indices(db: &Omnigraph) -> Result<()> {
+pub(super) async fn ensure_indices(db: &Omnigraph) -> Result<Vec<PendingIndex>> {
     let current_branch = db
         .coordinator
         .read()
@@ -31,7 +31,7 @@ pub(super) async fn ensure_indices(db: &Omnigraph) -> Result<()> {
     ensure_indices_for_branch(db, current_branch.as_deref()).await
 }
 
-pub(super) async fn ensure_indices_on(db: &Omnigraph, branch: &str) -> Result<()> {
+pub(super) async fn ensure_indices_on(db: &Omnigraph, branch: &str) -> Result<Vec<PendingIndex>> {
     let branch = normalize_branch_name(branch)?;
     ensure_indices_for_branch(db, branch.as_deref()).await
 }
@@ -73,12 +73,16 @@ pub(super) async fn failpoint_publish_table_head_without_index_rebuild_for_test(
     .await
 }
 
-pub(super) async fn ensure_indices_for_branch(db: &Omnigraph, branch: Option<&str>) -> Result<()> {
+pub(super) async fn ensure_indices_for_branch(
+    db: &Omnigraph,
+    branch: Option<&str>,
+) -> Result<Vec<PendingIndex>> {
     db.ensure_schema_state_valid().await?;
     db.ensure_schema_apply_idle("ensure_indices").await?;
     let resolved = db.resolved_branch_target(branch).await?;
     let snapshot = resolved.snapshot;
     let mut updates = Vec::new();
+    let mut pending = Vec::new();
     let active_branch = resolved.branch;
     let catalog = db.catalog();
 
@@ -217,7 +221,7 @@ pub(super) async fn ensure_indices_for_branch(db: &Omnigraph, branch: Option<&st
         };
         let row_count = db.storage().count_rows(&ds, None).await.unwrap_or(0);
         if row_count > 0 {
-            build_indices_on_dataset(db, &table_key, &mut ds).await?;
+            pending.extend(build_indices_on_dataset(db, &table_key, &mut ds).await?);
         }
 
         let state = db.storage().table_state(&full_path, &ds).await?;
@@ -265,7 +269,7 @@ pub(super) async fn ensure_indices_for_branch(db: &Omnigraph, branch: Option<&st
         };
         let row_count = db.storage().count_rows(&ds, None).await.unwrap_or(0);
         if row_count > 0 {
-            build_indices_on_dataset(db, &table_key, &mut ds).await?;
+            pending.extend(build_indices_on_dataset(db, &table_key, &mut ds).await?);
         }
 
         let state = db.storage().table_state(&full_path, &ds).await?;
@@ -307,7 +311,7 @@ pub(super) async fn ensure_indices_for_branch(db: &Omnigraph, branch: Option<&st
         }
     }
 
-    Ok(())
+    Ok(pending)
 }
 
 /// The single scalar/vector index a node property receives from a one-column
@@ -632,11 +636,25 @@ pub(super) async fn open_dataset_at_state(
         .await
 }
 
+/// A declared index the builder could not materialize on this pass. Today the
+/// only such case is a vector (IVF) column with no trainable vectors yet
+/// (KMeans needs >=1 vector), e.g. the load-before-embed window. Reported, not
+/// fatal: a later `ensure_indices`/`optimize` retries once the column is
+/// buildable, and reads stay correct via brute-force meanwhile. Surfacing
+/// pending index *status* rather than failing the operation is the database
+/// norm (Postgres `indisvalid`, LanceDB `list_indices`).
+#[derive(Debug, Clone)]
+pub struct PendingIndex {
+    pub table_key: String,
+    pub column: String,
+    pub reason: String,
+}
+
 pub(super) async fn build_indices_on_dataset(
     db: &Omnigraph,
     table_key: &str,
     ds: &mut SnapshotHandle,
-) -> Result<()> {
+) -> Result<Vec<PendingIndex>> {
     let catalog = db.catalog();
     build_indices_on_dataset_for_catalog(db, &catalog, table_key, ds).await
 }
@@ -646,8 +664,9 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
     catalog: &Catalog,
     table_key: &str,
     ds: &mut SnapshotHandle,
-) -> Result<()> {
+) -> Result<Vec<PendingIndex>> {
     if let Some(type_name) = table_key.strip_prefix("node:") {
+        let mut pending = Vec::new();
         if !db.storage().has_btree_index(ds, "id").await? {
             stage_and_commit_btree(db, table_key, ds, &["id"]).await?;
         }
@@ -676,47 +695,46 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
                         }
                         Some(NodePropIndexKind::Vector) => {
                             if !db.storage().has_vector_index(ds, prop_name).await? {
-                                // A vector (IVF) index trains k-means centroids
-                                // over the column, so Lance cannot build it on an
-                                // empty table — it errors "Creating empty vector
-                                // indices with train=False is not yet implemented".
-                                // Treat an untrainable column as a *pending* index
-                                // and skip it, rather than aborting the whole schema
-                                // migration (and its sibling indexes) on a dormant
-                                // declared-but-unbuilt vector index. This mirrors the
-                                // `row_count > 0` guard in `ensure_indices_for_branch`
-                                // and the branch-merge index rebuild; the pending
-                                // index is materialized by a later `ensure_indices` /
-                                // `optimize` once the table has rows. Full decoupling
-                                // — intent recorded at apply, an idempotent reconciler
-                                // converging coverage and treating below-training-size
-                                // as pending — is dev-graph iss-848; that work also
-                                // closes the residual rows-present-but-vectors-null
-                                // window this total-row-count guard leaves open.
-                                if db.storage().count_rows(ds, None).await? == 0 {
-                                    tracing::info!(
-                                        target: "omnigraph::schema_apply",
-                                        table = %table_key,
-                                        column = %prop_name,
-                                        "deferring Vector index on empty table; it will \
-                                         build once the table has rows",
-                                    );
-                                } else {
-                                    // Inline-commit residual: lance does not expose
-                                    // `build_index_metadata_from_segments` as `pub`, so
-                                    // vector indices cannot be staged from outside the
-                                    // lance crate (dev-graph iss-951 / lance#6666).
-                                    let new_snap = db
-                                        .storage_inline_residual()
-                                        .create_vector_index(ds.clone(), prop_name.as_str())
-                                        .await
-                                        .map_err(|e| {
-                                            OmniError::Lance(format!(
-                                                "create Vector index on {}({}): {}",
-                                                table_key, prop_name, e
-                                            ))
-                                        })?;
-                                    *ds = new_snap;
+                                // A vector (IVF) index trains k-means centroids over
+                                // the column, so Lance cannot build it until the
+                                // column has at least one vector (KMeans errors
+                                // "cannot train N centroids with 0 vectors"). Treat an
+                                // untrainable column as a *pending* index: record it,
+                                // log, and continue building the sibling indexes,
+                                // rather than aborting the operation. This function is
+                                // the chokepoint every write path funnels through
+                                // (load/mutate via prepare_updates_for_commit, schema
+                                // apply, ensure_indices, optimize, merge), so isolating
+                                // the failure here realizes the governing principle —
+                                // physical index state never fails a logical operation
+                                // — for all of them. A later ensure_indices/optimize
+                                // materializes the index once the column is trainable;
+                                // reads use brute-force meanwhile. Vector index
+                                // creation stays an inline-commit residual until
+                                // lance#6666 ships a staged API (dev-graph iss-951).
+                                match db
+                                    .storage_inline_residual()
+                                    .create_vector_index(ds.clone(), prop_name.as_str())
+                                    .await
+                                {
+                                    Ok(new_snap) => *ds = new_snap,
+                                    Err(e) => {
+                                        let reason = e.to_string();
+                                        tracing::warn!(
+                                            target: "omnigraph::index",
+                                            table = %table_key,
+                                            column = %prop_name,
+                                            reason = %reason,
+                                            "deferring Vector index (column not yet \
+                                             trainable); a later ensure_indices/optimize \
+                                             will build it once it has vectors",
+                                        );
+                                        pending.push(PendingIndex {
+                                            table_key: table_key.to_string(),
+                                            column: prop_name.clone(),
+                                            reason,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -735,7 +753,7 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
                 }
             }
         }
-        return Ok(());
+        return Ok(pending);
     }
 
     if table_key.starts_with("edge:") {
@@ -748,7 +766,9 @@ pub(super) async fn build_indices_on_dataset_for_catalog(
         if !db.storage().has_btree_index(ds, "dst").await? {
             stage_and_commit_btree(db, table_key, ds, &["dst"]).await?;
         }
-        return Ok(());
+        // Edge tables only get BTree (id/src/dst), which build at any
+        // cardinality; no pending state is possible here.
+        return Ok(Vec::new());
     }
 
     Err(OmniError::manifest(format!(
@@ -870,7 +890,11 @@ async fn prepare_updates_for_commit(
                 crate::db::MutationOpKind::SchemaRewrite,
             )
             .await?;
-            build_indices_on_dataset(db, &prepared_update.table_key, &mut ds).await?;
+            // Any column not yet buildable (e.g. a vector column whose rows
+            // have null embeddings) is deferred and logged inside
+            // build_indices; a later ensure_indices/optimize materializes it.
+            // The load/mutate/merge commit must not fail on it.
+            let _pending = build_indices_on_dataset(db, &prepared_update.table_key, &mut ds).await?;
             let state = db.storage().table_state(&full_path, &ds).await?;
             prepared_update.table_version = state.version;
             prepared_update.row_count = state.row_count;
