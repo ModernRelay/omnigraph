@@ -53,9 +53,12 @@ query find_people($title: String) {
 Run it:
 
 ```bash
-omnigraph read --query queries.gq --name find_people \
-  --params '{"title":"Engineer"}' --format table graph.omni
+omnigraph query find_people --query queries.gq \
+  --params '{"title":"Engineer"}' --format table --store graph.omni
 ```
+
+The query name is positional; `--query` points at the `.gq` source and
+`--store` addresses the graph's storage directly.
 
 The [query language](queries/index.md) covers `match`/`return`/`order`, and
 [search](search/index.md) covers vector and full-text search.

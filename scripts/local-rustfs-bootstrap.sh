@@ -26,7 +26,10 @@ AWS_S3_FORCE_PATH_STYLE="${AWS_S3_FORCE_PATH_STYLE:-true}"
 FORCE_BUILD="${FORCE_BUILD:-0}"
 RESET_REPO="${RESET_REPO:-0}"
 
-REPO_URI="s3://$BUCKET/$PREFIX"
+STORAGE_URI="s3://$BUCKET/$PREFIX"
+GRAPH_ID="${GRAPH_ID:-context}"
+GRAPH_URI="$STORAGE_URI/graphs/$GRAPH_ID.omni"
+CLUSTER_DIR="$WORKDIR/cluster"
 SERVER_LOG="$WORKDIR/omnigraph-server.log"
 SERVER_PID_FILE="$WORKDIR/omnigraph-server.pid"
 BIN_DIR=""
@@ -294,44 +297,48 @@ ensure_bucket() {
     s3api create-bucket --bucket "$BUCKET" >/dev/null 2>&1 || true
 }
 
-graph_prefix_has_objects() {
-  local key_count
-  key_count="$("$AWS_BIN" --endpoint-url "$AWS_ENDPOINT_URL_S3" \
-    s3api list-objects-v2 \
-    --bucket "$BUCKET" \
-    --prefix "$PREFIX/" \
-    --max-keys 1 \
-    --query 'KeyCount' \
-    --output text 2>/dev/null || true)"
-
-  [ -n "$key_count" ] && [ "$key_count" != "None" ] && [ "$key_count" != "0" ]
-}
-
-reset_graph_prefix() {
-  log "Removing existing objects under $REPO_URI"
+reset_cluster() {
+  log "Removing existing cluster objects under $STORAGE_URI and local config $CLUSTER_DIR"
   "$AWS_BIN" --endpoint-url "$AWS_ENDPOINT_URL_S3" \
-    s3 rm "s3://$BUCKET/$PREFIX" --recursive >/dev/null
+    s3 rm "$STORAGE_URI" --recursive >/dev/null 2>&1 || true
+  rm -rf "$CLUSTER_DIR"
 }
 
-initialize_graph() {
-  if "$BIN_DIR/omnigraph" snapshot "$REPO_URI" --json >/dev/null 2>&1; then
-    log "Reusing existing graph at $REPO_URI"
-    return
+prepare_cluster_config() {
+  log "Writing cluster config to $CLUSTER_DIR"
+  mkdir -p "$CLUSTER_DIR"
+  cp "$FIXTURE_DIR/context.pg" "$CLUSTER_DIR/context.pg"
+  cat >"$CLUSTER_DIR/cluster.yaml" <<YAML
+version: 1
+storage: $STORAGE_URI
+metadata:
+  name: $BUCKET
+graphs:
+  $GRAPH_ID:
+    schema: context.pg
+YAML
+}
+
+apply_cluster() {
+  log "Validating cluster config"
+  "$BIN_DIR/omnigraph" cluster validate --config "$CLUSTER_DIR"
+
+  # `cluster apply` requires an existing state ledger; create it once.
+  if ! "$BIN_DIR/omnigraph" cluster status --config "$CLUSTER_DIR" >/dev/null 2>&1; then
+    log "Importing cluster state ledger"
+    "$BIN_DIR/omnigraph" cluster import --config "$CLUSTER_DIR"
   fi
 
-  if graph_prefix_has_objects; then
-    if [ "$RESET_REPO" = "1" ]; then
-      reset_graph_prefix
-    else
-      die "found existing objects under $REPO_URI but could not open an Omnigraph graph there. This usually means a previous bootstrap left a partially initialized prefix. Rerun with RESET_REPO=1 to delete that prefix and recreate it, or set PREFIX to a new value."
-    fi
-  fi
+  log "Applying cluster (creates graph '$GRAPH_ID' at $GRAPH_URI)"
+  "$BIN_DIR/omnigraph" cluster apply --config "$CLUSTER_DIR" --as bootstrap
+}
 
-  log "Initializing graph at $REPO_URI"
-  "$BIN_DIR/omnigraph" init --schema "$FIXTURE_DIR/context.pg" "$REPO_URI"
-
-  log "Loading context fixture into $REPO_URI"
-  "$BIN_DIR/omnigraph" load --data "$FIXTURE_DIR/context.jsonl" "$REPO_URI"
+load_fixture() {
+  log "Loading context fixture into $GRAPH_URI"
+  "$BIN_DIR/omnigraph" load \
+    --data "$FIXTURE_DIR/context.jsonl" \
+    --mode overwrite \
+    "$GRAPH_URI"
 }
 
 start_server() {
@@ -344,7 +351,7 @@ start_server() {
   fi
 
   log "Starting omnigraph-server on $BIND"
-  nohup "$BIN_DIR/omnigraph-server" "$REPO_URI" --bind "$BIND" >"$SERVER_LOG" 2>&1 &
+  nohup "$BIN_DIR/omnigraph-server" --cluster "$CLUSTER_DIR" --bind "$BIND" --unauthenticated >"$SERVER_LOG" 2>&1 &
   echo "$!" > "$SERVER_PID_FILE"
 }
 
@@ -380,16 +387,19 @@ Omnigraph local RustFS demo is up.
 Server:
   $base_url
 
-Graph URI:
-  $REPO_URI
+Cluster config:
+  $CLUSTER_DIR
+
+Graph (derived root):
+  $GRAPH_URI
 
 RustFS console:
   http://127.0.0.1:9001
 
 Useful commands:
   curl -fsSL "$base_url/healthz"
-  curl -fsSL "$base_url/snapshot?branch=main"
-  "$BIN_DIR/omnigraph" snapshot "$REPO_URI" --json
+  curl -fsSL "$base_url/graphs/$GRAPH_ID/snapshot?branch=main"
+  "$BIN_DIR/omnigraph" snapshot "$GRAPH_URI" --json
   tail -f "$SERVER_LOG"
   kill \$(cat "$SERVER_PID_FILE")
   docker logs -f "$RUSTFS_CONTAINER_NAME"
@@ -417,7 +427,10 @@ main() {
   start_rustfs
   wait_for_rustfs
   ensure_bucket
-  initialize_graph
+  [ "$RESET_REPO" = "1" ] && reset_cluster
+  prepare_cluster_config
+  apply_cluster
+  load_fixture
   start_server
   print_summary "$(wait_for_server)"
 }
