@@ -93,9 +93,10 @@ async fn require_graph_for_multi_graph_server(
         if !resp.graphs.is_empty() {
             let ids: Vec<&str> = resp.graphs.iter().map(|g| g.graph_id.as_str()).collect();
             bail!(
-                "server scope '{server}' has {} graphs: [{}]; pass --graph <id> to select one \
+                "server scope '{server}' has {} {}: [{}]; pass --graph <id> to select one \
                  (or set `default_graph` in your operator config)",
                 ids.len(),
+                if ids.len() == 1 { "graph" } else { "graphs" },
                 ids.join(", ")
             );
         }
