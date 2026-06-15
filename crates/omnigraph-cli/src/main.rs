@@ -25,7 +25,7 @@ use omnigraph_api_types::{
 use omnigraph_server::queries::{QueryRegistry, check};
 use omnigraph_server::{
     PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest,
-    PolicyTestConfig, ReadOutputFormat, graph_resource_id_for_selection, load_config,
+    PolicyTestConfig, graph_resource_id_for_selection, load_config,
 };
 use reqwest::Method;
 use reqwest::header::AUTHORIZATION;
@@ -39,7 +39,7 @@ mod operator;
 mod read_format;
 
 use embed::{EmbedArgs, EmbedOutput, execute_embed};
-use read_format::{ReadRenderOptions, render_read};
+use read_format::{ReadOutputFormat, ReadRenderOptions, render_read};
 
 mod cli;
 mod client;

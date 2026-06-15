@@ -48,8 +48,8 @@ use axum::{Json, Router};
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
 pub use config::{
     AliasCommand, AliasConfig, CliDefaults, DEFAULT_CONFIG_FILE, OmnigraphConfig, PolicySettings,
-    ProjectConfig, QueryDefaults, ReadOutputFormat, ServerDefaults, TableCellLayout, TargetConfig,
-    graph_resource_id_for_selection, load_config,
+    ProjectConfig, QueryDefaults, ServerDefaults, TargetConfig, graph_resource_id_for_selection,
+    load_config,
 };
 use futures::stream;
 use omnigraph::db::{Omnigraph, ReadTarget};
