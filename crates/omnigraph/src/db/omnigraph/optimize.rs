@@ -452,21 +452,25 @@ async fn optimize_one_table(
     // Materialize any declared-but-missing index over the just-compacted layout,
     // reusing the build chokepoint (idempotent: skips existing indexes; fault-
     // isolates an untrainable vector column into `pending` rather than failing).
-    // Vector index creation is an inline-commit residual; the Optimize sidecar's
-    // loose post_commit_pin already covers the extra commits this adds.
+    // Run it UNCONDITIONALLY now that we are past the no-op gate — not only when
+    // `needs_index_create`. A table can enter this path for compaction or
+    // reindex while its sole missing index is an untrainable Vector column
+    // (which `needs_index_work_*` does not count as buildable work); calling the
+    // build here is what surfaces that column in `pending_indexes`, so optimize
+    // can't compact a table yet silently drop the deferred-index signal.
+    // Idempotent + cheap when there is nothing to build. Vector index creation
+    // is an inline-commit residual; the Optimize sidecar's loose post_commit_pin
+    // covers the extra commits.
+    let catalog = db.catalog();
     let mut snapshot = crate::storage_layer::SnapshotHandle::new(ds);
-    let pending_indexes: Vec<super::PendingIndex> = if needs_index_create {
-        let catalog = db.catalog();
+    let pending_indexes: Vec<super::PendingIndex> =
         super::table_ops::build_indices_on_dataset_for_catalog(
             db,
             &catalog,
             &table_key,
             &mut snapshot,
         )
-        .await?
-    } else {
-        Vec::new()
-    };
+        .await?;
     let version_after = snapshot.dataset().version().version;
     let committed = version_after != version_before;
 
