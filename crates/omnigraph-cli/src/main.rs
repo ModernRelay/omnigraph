@@ -383,6 +383,24 @@ async fn main() -> Result<()> {
                     cli.store.as_deref(),
                 )
                 .await?;
+                // RFC-011 Decision 10: a graph managed by a cluster evolves via
+                // `cluster apply` (ledger/recovery/approvals), not a direct
+                // `schema apply` against its storage root — that would bypass the
+                // ledger. Mirrors `init`'s refusal. Only the embedded path can
+                // address a storage root; a served apply (`--server`) is the
+                // server's concern.
+                if !client.is_remote() {
+                    if let Some(root) =
+                        omnigraph_cluster::cluster_root_for_graph_uri(client.uri()).await
+                    {
+                        bail!(
+                            "`{}` is inside cluster `{root}`. A graph in a cluster evolves via \
+                             `cluster apply` (which records ledger, recovery, and approvals), not \
+                             `schema apply`. Update the schema in cluster.yaml and run `cluster apply`.",
+                            client.uri()
+                        );
+                    }
+                }
                 let schema_source = fs::read_to_string(&schema)?;
                 // The embedded (direct-store) arm carries no stored-query
                 // registry — the registry is cluster-owned (RFC-011), so a
