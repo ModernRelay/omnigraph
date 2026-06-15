@@ -1198,3 +1198,78 @@ pub(super) async fn ensure_commit_graph_initialized(db: &Omnigraph) -> Result<()
 pub(super) async fn invalidate_graph_index(db: &Omnigraph) {
     db.runtime_cache.invalidate_all().await;
 }
+
+#[cfg(test)]
+mod classify_fork_ref_tests {
+    //! Direct coverage of [`classify_fork_ref`] — the single fresh-authority
+    //! decision both fork-ref reclaim sites (write-path reclaim + cleanup
+    //! reconciler) route through. Pins each deterministic status so reverting
+    //! the fresh-authority logic at either site fails here. (The `Indeterminate`
+    //! arm needs an injected transient read and is covered under the
+    //! `failpoints` suite.)
+    use super::*;
+    use crate::db::Omnigraph;
+    use crate::loader::LoadMode;
+
+    const SCHEMA: &str = "node Person { name: String @key }\nnode Company { name: String @key }\n";
+
+    /// On-disk dataset path for a node table, taken from the manifest entry
+    /// (the same path the engine uses) so the test forges against the real ref.
+    async fn node_path(db: &Omnigraph, branch: &str, table_key: &str) -> String {
+        let snap = db.snapshot_for_branch(Some(branch)).await.unwrap();
+        let entry = snap.entry(table_key).unwrap();
+        format!("{}/{}", db.root_uri, entry.table_path)
+    }
+
+    #[tokio::test]
+    async fn classify_distinguishes_legitimate_unreferenced_and_ghost() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap();
+        db.branch_create("feature").await.unwrap();
+
+        // Legitimate: a real write forks Company onto `feature`, and the
+        // manifest places Company on `feature`.
+        db.load_as(
+            "feature",
+            None,
+            r#"{"type":"Company","data":{"name":"Acme"}}"#,
+            LoadMode::Merge,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            classify_fork_ref(&db, "node:Company", "feature").await,
+            ForkRefStatus::Legitimate,
+            "a manifest-placed fork must classify as Legitimate (never destroyed)"
+        );
+
+        // Orphan (manifest-unreferenced): forge a `feature` ref on Person, which
+        // the manifest's `feature` snapshot still places on main.
+        let person = node_path(&db, "feature", "node:Person").await;
+        {
+            let mut ds = lance::Dataset::open(&person).await.unwrap();
+            let v = ds.version().version;
+            ds.create_branch("feature", v, None).await.unwrap();
+        }
+        assert_eq!(
+            classify_fork_ref(&db, "node:Person", "feature").await,
+            ForkRefStatus::Orphan,
+            "a ref the manifest does not place on the branch must classify as Orphan"
+        );
+
+        // Orphan (ghost): a ref for a branch the manifest does not have at all.
+        {
+            let mut ds = lance::Dataset::open(&person).await.unwrap();
+            let v = ds.version().version;
+            ds.create_branch("ghost", v, None).await.unwrap();
+        }
+        assert_eq!(
+            classify_fork_ref(&db, "node:Person", "ghost").await,
+            ForkRefStatus::Orphan,
+            "a ref for a branch absent from the manifest must classify as Orphan"
+        );
+    }
+}
