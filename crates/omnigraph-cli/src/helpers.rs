@@ -490,9 +490,9 @@ pub(crate) fn resolve_local_graph(
     let graph = resolve_cli_graph(config, cli_uri, cli_target)?;
     if graph.is_remote {
         bail!(
-            "`{}` is a storage-plane command and needs direct storage access; \
-             the resolved target is a remote server ({}). Pass the graph's \
-             file:// or s3:// URI.",
+            "`{}` is a direct (storage-native) command and needs direct storage \
+             access; the resolved target is a remote server ({}). Pass the \
+             graph's file:// or s3:// URI.",
             operation,
             graph.uri
         );
