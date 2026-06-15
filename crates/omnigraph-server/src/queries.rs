@@ -13,7 +13,6 @@
 //! Renaming either is a breaking change to callers, by design.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::sync::Arc;
 
 use omnigraph_compiler::catalog::Catalog;
@@ -21,8 +20,6 @@ use omnigraph_compiler::query::ast::QueryDecl;
 use omnigraph_compiler::query::parser::parse_query;
 use omnigraph_compiler::query::typecheck::typecheck_query_decl;
 use omnigraph_compiler::types::{PropType, ScalarType};
-
-use crate::config::{OmnigraphConfig, QueryEntry};
 
 /// One loaded stored query. `source` is the full `.gq` file text — the
 /// invocation handler hands it to `run_query` / `run_mutate` verbatim,
@@ -68,8 +65,9 @@ pub struct QueryRegistry {
     by_name: BTreeMap<String, StoredQuery>,
 }
 
-/// In-memory registry entry before file I/O. Used by [`QueryRegistry::load`]
-/// (after reading each `.gq` from disk) and directly by tests.
+/// In-memory registry spec: a query's name + already-read `.gq` source. The
+/// input to [`QueryRegistry::from_specs`] — built by the server's cluster boot
+/// and by the CLI's `queries` tooling from a cluster serving snapshot.
 #[derive(Debug, Clone)]
 pub struct RegistrySpec {
     pub name: String,
@@ -166,47 +164,6 @@ impl QueryRegistry {
             Ok(Self { by_name })
         } else {
             Err(errors)
-        }
-    }
-
-    /// Read each registry entry's `.gq` file from disk and build the
-    /// registry. `entries` is either the top-level `queries` map (single
-    /// mode) or a graph's `queries` map (multi mode); `config` resolves
-    /// each entry's relative `file:` path against `base_dir`.
-    pub fn load(
-        config: &OmnigraphConfig,
-        entries: &BTreeMap<String, QueryEntry>,
-    ) -> Result<Self, Vec<LoadError>> {
-        let mut specs = Vec::with_capacity(entries.len());
-        let mut errors = Vec::new();
-        for (name, entry) in entries {
-            let path = config.resolve_query_file(&entry.file);
-            match fs::read_to_string(&path) {
-                Ok(source) => specs.push(RegistrySpec {
-                    name: name.clone(),
-                    source,
-                    expose: entry.mcp.expose,
-                    tool_name: entry.mcp.tool_name.clone(),
-                }),
-                Err(err) => errors.push(LoadError {
-                    query: Some(name.clone()),
-                    message: format!("cannot read '{}': {err}", path.display()),
-                }),
-            }
-        }
-
-        // Parse/identity/uniqueness-check the readable specs even when some
-        // files failed to read, so every broken entry (I/O, parse, identity,
-        // tool-name collision) surfaces in one pass rather than one per
-        // restart. I/O errors come first (in `entries` key order), then the
-        // spec errors. A non-empty `errors` always fails the load.
-        match Self::from_specs(specs) {
-            Ok(registry) if errors.is_empty() => Ok(registry),
-            Ok(_) => Err(errors),
-            Err(spec_errors) => {
-                errors.extend(spec_errors);
-                Err(errors)
-            }
         }
     }
 
@@ -653,36 +610,4 @@ embedding: Vector(4)
         assert!(entry2.params.is_empty(), "no declared params → empty list");
     }
 
-    // --- load() error collection (file I/O + parse in one pass) ---
-
-    #[test]
-    fn load_collects_io_and_parse_errors_in_one_pass() {
-        use crate::config::load_config;
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            temp.path().join("good.gq"),
-            "query good() { match { $u: User } return { $u.name } }",
-        )
-        .unwrap();
-        std::fs::write(temp.path().join("broken.gq"), "query broken( {{ not valid").unwrap();
-        // `missing.gq` is deliberately not written (an I/O failure).
-        std::fs::write(
-            temp.path().join("omnigraph.yaml"),
-            "queries:\n  good:\n    file: ./good.gq\n  \
-             missing:\n    file: ./missing.gq\n  broken:\n    file: ./broken.gq\n",
-        )
-        .unwrap();
-        let config = load_config(Some(&temp.path().join("omnigraph.yaml"))).unwrap();
-
-        let errors = QueryRegistry::load(&config, config.query_entries()).unwrap_err();
-        let joined = errors.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("\n");
-        // Both the missing file AND the parse error surface in one pass —
-        // the I/O failure must not mask the parse failure.
-        assert!(joined.contains("missing"), "I/O error must surface: {joined}");
-        assert!(
-            joined.contains("broken") && joined.contains("parse error"),
-            "the parse error in a readable file must surface in the same pass: {joined}"
-        );
-        assert!(!joined.contains("'good'"), "the valid entry is not an error: {joined}");
-    }
 }

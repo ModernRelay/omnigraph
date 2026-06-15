@@ -13,13 +13,10 @@ Omnigraph supports two broad deployment shapes:
 
 The server binary and container image expose the same HTTP surface.
 
-The server also has two **boot sources**: `omnigraph.yaml` (graph targets
-declared in the per-operator config) or a **cluster directory**
-(`omnigraph-server --cluster <dir>`), which serves the cluster control
+The server has a single **boot source**: a **cluster directory**
+(`omnigraph-server --cluster <dir | s3://…>`), which serves the cluster control
 plane's applied revision — see
 [cluster-config.md](clusters/config.md#serving-from-the-cluster-the-mode-switch).
-The two are exclusive per deployment; switching is a restart with a different
-flag.
 
 ## Binary Deployment
 

@@ -78,20 +78,26 @@ literal URL); a positional `http(s)://` URI is rejected. If the server requires
 auth, set its bearer token and `omnigraph login <server>` (or
 `OMNIGRAPH_BEARER_TOKEN`).
 
-## Multi-graph servers (v0.6.0+)
+## Multi-graph servers
 
-Against a multi-graph server (started with `--config omnigraph.yaml` referencing a non-empty `graphs:` map), use `omnigraph graphs list` to enumerate the registered graphs. The server must configure bearer tokens and `server.policy.file` with a rule that allows `graph_list`; `/graphs` is closed by default even when the server runs with `--unauthenticated`.
+A server boots from a cluster directory (`omnigraph-server --cluster <dir>`) and
+serves every graph the cluster declares. Use `omnigraph graphs list` to enumerate
+them. The cluster's server-level policy must allow `graph_list`; `/graphs` is
+closed by default even when the server runs with `--unauthenticated`.
 
 ```bash
 OMNIGRAPH_BEARER_TOKEN=admin-token \
-  omnigraph graphs list --uri http://server.example.com --json
+  omnigraph graphs list --server http://server.example.com --json
 ```
 
-For config-driven clients, set the remote graph's `bearer_token_env` to an environment variable containing a token whose actor is authorized by `server.policy.file`.
+For an operator-defined server, store its token with `omnigraph login <name>` (or
+`OMNIGRAPH_TOKEN_<NAME>`); the actor must be authorized by the cluster's
+server-level policy.
 
-`list` rejects local URI targets — it's for remote multi-graph servers only.
+`list` rejects local (`--store`) targets — it's for remote multi-graph servers only.
 
-Runtime add/remove is **not** in v0.6.0. To add a graph, stop the server, add a `graphs.<id>` entry to `omnigraph.yaml`, then restart. To remove, stop the server, delete the entry, restart.
+Runtime add/remove via API is not exposed. To add or remove a graph, edit the
+cluster's `cluster.yaml`, run `omnigraph cluster apply`, then restart the server.
 
 Per-graph addressing: select a graph on a multi-graph server with `--graph`:
 
@@ -107,9 +113,9 @@ omnigraph check --query queries.gq graph.omni --json
 
 omnigraph schema plan --schema next.pg graph.omni --json
 omnigraph schema apply --schema next.pg graph.omni --json
-omnigraph policy validate --config omnigraph.yaml
-omnigraph policy test --config omnigraph.yaml
-omnigraph policy explain --config omnigraph.yaml --actor act-alice --action read --branch main
+omnigraph policy validate --cluster ./company-brain --graph knowledge
+omnigraph policy test    --cluster ./company-brain --graph knowledge --tests policy.tests.yaml
+omnigraph policy explain --cluster ./company-brain --graph knowledge --actor act-alice --action read --branch main
 
 omnigraph commit list graph.omni --json
 omnigraph commit show --uri graph.omni <commit-id> --json
@@ -123,33 +129,28 @@ also pass `--schema`.
 
 ## Config
 
-`omnigraph.yaml` lets the CLI and server share named graphs, defaults, and
-query roots:
+Configuration has two surfaces with single owners (see the
+[CLI reference](reference.md#config-surfaces) for the full schema):
+
+- **`~/.omnigraph/config.yaml`** — your personal operator config: default actor
+  (`--as`), named servers + credentials, clusters, profiles, aliases, and
+  default scope (`defaults.server` / `defaults.store` / `default_graph`). It
+  decides *who you are* and *what you address by default*.
+- **`cluster.yaml`** (a team-owned cluster directory) — declares *what the system
+  is*: graphs, schemas, stored queries, policies, and storage. A server boots
+  from it (`--cluster <dir>`); see the [cluster guide](../clusters/index.md).
 
 ```yaml
-graphs:
-  local:
-    uri: demo.omni
+# ~/.omnigraph/config.yaml
+operator:
+  actor: act-andrew
+servers:
   dev:
-    uri: http://127.0.0.1:8080
-    bearer_token_env: OMNIGRAPH_BEARER_TOKEN
-
-cli:
-  graph: local
-  branch: main
-
-query:
-  roots:
-    - queries
-    - .
+    url: http://127.0.0.1:8080
+defaults:
+  server: dev
+  default_graph: knowledge
 ```
-
-The config file can also define:
-
-- server bind defaults
-- auth env files
-- query aliases for common read and change commands
-- `policy.file` for Cedar authorization rules
 
 When policy is enabled, `schema apply` is authorized through the
 `schema_apply` action and is typically limited to admins on protected `main`.
@@ -168,6 +169,6 @@ one-line warning to stderr and otherwise behave identically.
 | `omnigraph query lint`   | `omnigraph lint`    | Same flags. The argv-level shim rewrites `query lint` to `lint`. |
 | `omnigraph query check`  | `omnigraph check`   | `check` is a visible alias of `omnigraph lint`. |
 
-The `command:` field in `aliases.<name>` in `omnigraph.yaml` accepts both
-`read` / `change` (legacy) and `query` / `mutate` (canonical); the two
+The `command:` field in `aliases.<name>` in `~/.omnigraph/config.yaml` accepts
+both `read` / `change` (legacy) and `query` / `mutate` (canonical); the two
 spellings are interchangeable on the wire via serde aliases.

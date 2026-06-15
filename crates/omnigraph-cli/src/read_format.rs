@@ -1,8 +1,30 @@
+use clap::ValueEnum;
 use color_eyre::eyre::Result;
-use omnigraph_server::ReadOutputFormat;
 use omnigraph_server::api::ReadOutput;
-use omnigraph_server::config::TableCellLayout;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+
+/// Output rendering format for read-shaped commands (`read`/`query`/`alias`).
+/// A CLI presentation concern — lives here, not in the server.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadOutputFormat {
+    #[default]
+    Table,
+    Kv,
+    Csv,
+    Jsonl,
+    Json,
+}
+
+/// How an over-wide table cell is laid out when rendering `--format table`.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum TableCellLayout {
+    #[default]
+    Truncate,
+    Wrap,
+}
 
 pub struct ReadRenderOptions {
     pub max_column_width: usize,

@@ -21,7 +21,7 @@ use color_eyre::Result;
 use color_eyre::eyre::{bail, eyre};
 use serde::Deserialize;
 
-use omnigraph_server::config::ReadOutputFormat;
+use crate::read_format::{ReadOutputFormat, TableCellLayout};
 
 pub(crate) const OPERATOR_HOME_ENV: &str = "OMNIGRAPH_HOME";
 pub(crate) const OPERATOR_DIR: &str = ".omnigraph";
@@ -102,10 +102,9 @@ pub(crate) struct OperatorIdentity {
 pub(crate) struct OperatorDefaults {
     /// Default read output format, below every more-specific source.
     pub(crate) output: Option<ReadOutputFormat>,
-    /// Table rendering preferences (below the legacy cli.table_* keys
-    /// during the RFC-008 window).
+    /// Table rendering preferences for `--format table`.
     pub(crate) table_max_column_width: Option<usize>,
-    pub(crate) table_cell_layout: Option<omnigraph_server::config::TableCellLayout>,
+    pub(crate) table_cell_layout: Option<TableCellLayout>,
     /// Default server scope (RFC-011): the everyday addressing when no
     /// `--profile` / primitive / legacy address is given. Names an entry
     /// under `servers:`. Mutually exclusive with `store` — a scope binds one

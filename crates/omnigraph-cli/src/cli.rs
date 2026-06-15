@@ -352,12 +352,6 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Legacy-config tooling (RFC-008): split omnigraph.yaml into its
-    /// two destinations.
-    Config {
-        #[command(subcommand)]
-        command: ConfigCommand,
-    },
     /// Print the CLI version
     Version,
 }
@@ -650,7 +644,6 @@ impl From<CliLoadMode> for LoadMode {
         }
     }
 }
-
 impl CliLoadMode {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -659,22 +652,4 @@ impl CliLoadMode {
             CliLoadMode::Merge => "merge",
         }
     }
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum ConfigCommand {
-    /// Propose (and with --write, apply) the RFC-008 split of a legacy
-    /// omnigraph.yaml: team half -> a ready-to-review cluster.yaml,
-    /// personal half -> ~/.omnigraph/config.yaml (key-level merge,
-    /// existing entries always win). Touches nothing without --write.
-    Migrate {
-        /// Path to the legacy omnigraph.yaml (default: ./omnigraph.yaml)
-        #[arg(long)]
-        config: Option<PathBuf>,
-        /// Apply the split instead of only printing it
-        #[arg(long)]
-        write: bool,
-        #[arg(long)]
-        json: bool,
-    },
 }
