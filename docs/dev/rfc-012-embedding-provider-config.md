@@ -187,8 +187,9 @@ provider). This is the only behaviour that closes P3 by construction.
 
 ### NFR floor (independent of the provider work)
 
-- **Deadline:** wrap the query-time embed in a total-operation deadline (`OMNIGRAPH_EMBED_QUERY_DEADLINE_MS`)
-  so a degraded provider cannot hang a read for the current ~121 s worst case (4 × 30 s timeout + backoff).
+- **Deadline:** wrap every embed call (query or document) in a total-operation deadline
+  (`OMNIGRAPH_EMBED_DEADLINE_MS`) so a degraded provider cannot hang the caller for the current ~121 s worst
+  case (4 × 30 s timeout + backoff).
 - **Observability:** `tracing` span per embed call (provider, model, dim, attempts, outcome, elapsed; `warn!`
   per retry; token usage when the provider returns it). The subsystem has zero instrumentation today.
 - **Single normalization:** one `normalize_vector` (the dead client carried a divergent second copy; removed

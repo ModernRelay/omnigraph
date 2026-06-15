@@ -25,7 +25,7 @@ the target column width and sent as Gemini `outputDimensionality` / OpenAI `dime
 | `OMNIGRAPH_EMBED_MODEL` | model id; defaults `openai/text-embedding-3-large` (OpenRouter), `text-embedding-3-large` (`openai`), `gemini-embedding-2` (`gemini`) |
 | `OPENROUTER_API_KEY` / `OPENAI_API_KEY` | api key for `openai-compatible` (OpenRouter preferred) |
 | `GEMINI_API_KEY` | api key for `gemini` |
-| `OMNIGRAPH_EMBED_QUERY_DEADLINE_MS` | total wall-clock budget for one embed call across all retries (default `60000`; `0` = unbounded) |
+| `OMNIGRAPH_EMBED_DEADLINE_MS` | total wall-clock budget for one embed call across all retries (default `60000`; `0` = unbounded) |
 | `OMNIGRAPH_EMBED_TIMEOUT_MS` | per-request HTTP timeout (default `30000`) |
 | `OMNIGRAPH_EMBED_RETRY_ATTEMPTS` / `OMNIGRAPH_EMBED_RETRY_BACKOFF_MS` | retry policy (defaults `4` / `200`) |
 | `OMNIGRAPH_EMBEDDINGS_MOCK` | set truthy to force the deterministic mock provider |
@@ -35,7 +35,7 @@ The default zero-config path is OpenRouter: set `OPENROUTER_API_KEY` and run. Re
 
 ### Behavior notes
 
-- **Bounded latency.** Each embed call is wrapped in `OMNIGRAPH_EMBED_QUERY_DEADLINE_MS`, so a degraded
+- **Bounded latency.** Each embed call is wrapped in `OMNIGRAPH_EMBED_DEADLINE_MS`, so a degraded
   provider cannot hang a read for the full retry envelope.
 - **Reuse.** The query path builds the client once per graph handle (on the first `nearest($v, "string")`
   that needs embedding) and reuses it, keeping the provider connection pool warm. A graph that never embeds
