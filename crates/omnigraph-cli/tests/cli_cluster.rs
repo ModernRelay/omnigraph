@@ -683,51 +683,8 @@ fn cluster_apply_locked_exits_nonzero() {
     assert!(!temp.path().join("__cluster/resources").exists());
 }
 
-#[test]
-fn cluster_apply_uses_cli_actor_from_local_config() {
-    let temp = tempdir().unwrap();
-    write_cluster_config_fixture(temp.path());
-    fs::write(
-        temp.path().join("omnigraph.yaml"),
-        "cli:\n  actor: act-local\n",
-    )
-    .unwrap();
-    // Phase 1: import once (setup, not under test).
-    let output = cli()
-        .current_dir(temp.path())
-        .arg("cluster")
-        .arg("import")
-        .arg("--config")
-        .arg(temp.path())
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{output:?}");
-
-    // Phase 2: apply alone, capturing the echoed actor (idempotent re-runs).
-    let apply = |extra: &[&str]| {
-        let mut command = cli();
-        command.current_dir(temp.path());
-        for arg in extra {
-            command.arg(arg);
-        }
-        let output = command
-            .arg("cluster")
-            .arg("apply")
-            .arg("--config")
-            .arg(temp.path())
-            .arg("--json")
-            .output()
-            .unwrap();
-        let json: serde_json::Value =
-            serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
-        json["actor"].clone()
-    };
-    assert_eq!(apply(&[]), "act-local", "cli.actor is the no-flag default");
-    assert_eq!(apply(&["--as", "andrew"]), "andrew", "--as overrides cli.actor");
-}
-
-/// RFC-007 PR 1: the operator layer joins the actor chain —
-/// `--as` > legacy `cli.actor` (RFC-008 window) > `operator.actor` > none.
+/// RFC-011: the actor chain is `--as` > `operator.actor` > none. The CLI no
+/// longer reads omnigraph.yaml `cli.actor`.
 #[test]
 fn cluster_apply_uses_operator_actor_from_omnigraph_home() {
     let temp = tempdir().unwrap();
@@ -771,41 +728,31 @@ fn cluster_apply_uses_operator_actor_from_omnigraph_home() {
         json["actor"].clone()
     };
 
-    // No --as, no omnigraph.yaml: the operator identity applies.
+    // No --as: the operator identity applies.
     assert_eq!(
         apply(&[]),
         "act-operator",
-        "operator.actor is the no-flag, no-legacy-config default"
+        "operator.actor is the no-flag default"
     );
-    // --as still wins over everything.
+    // --as still wins over the operator layer.
     assert_eq!(apply(&["--as", "andrew"]), "andrew");
-
-    // A legacy cli.actor (RFC-008 window) outranks the operator layer.
-    fs::write(
-        temp.path().join("omnigraph.yaml"),
-        "cli:\n  actor: act-legacy\n",
-    )
-    .unwrap();
-    assert_eq!(
-        apply(&[]),
-        "act-legacy",
-        "legacy cli.actor wins over operator.actor during the deprecation window"
-    );
 }
 
 #[test]
-fn cluster_approve_uses_cli_actor_fallback() {
+fn cluster_approve_uses_operator_actor_fallback() {
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
+    let operator_home = tempdir().unwrap();
     fs::write(
-        temp.path().join("omnigraph.yaml"),
-        "cli:\n  actor: act-local\n",
+        operator_home.path().join("config.yaml"),
+        "operator:\n  actor: act-operator\n",
     )
     .unwrap();
     // Converge, then remove the graph so a gated delete is pending.
     for command in ["import", "apply"] {
         let output = cli()
             .current_dir(temp.path())
+            .env("OMNIGRAPH_HOME", operator_home.path())
             .arg("cluster")
             .arg(command)
             .arg("--config")
@@ -818,6 +765,7 @@ fn cluster_approve_uses_cli_actor_fallback() {
 
     let output = cli()
         .current_dir(temp.path())
+        .env("OMNIGRAPH_HOME", operator_home.path())
         .arg("cluster")
         .arg("approve")
         .arg("graph.knowledge")
@@ -829,14 +777,17 @@ fn cluster_approve_uses_cli_actor_fallback() {
     assert!(output.status.success(), "{output:?}");
     let json: serde_json::Value =
         serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).unwrap();
-    assert_eq!(json["approved_by"], "act-local");
+    assert_eq!(json["approved_by"], "act-operator");
 
-    // With neither flag nor config: refused with the actionable message.
+    // With neither flag nor operator config: refused with the actionable
+    // message (an approval without an approver is meaningless).
     let bare = tempdir().unwrap();
     write_cluster_config_fixture(bare.path());
+    let bare_home = tempdir().unwrap();
     let output = output_failure(
         cli()
             .current_dir(bare.path())
+            .env("OMNIGRAPH_HOME", bare_home.path())
             .arg("cluster")
             .arg("approve")
             .arg("graph.knowledge")
@@ -845,11 +796,13 @@ fn cluster_approve_uses_cli_actor_fallback() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--as"), "{stderr}");
-    assert!(stderr.contains("cli.actor"), "{stderr}");
 }
 
 #[test]
-fn cluster_commands_ignore_malformed_local_config() {
+fn cluster_commands_ignore_legacy_omnigraph_yaml() {
+    // RFC-011: the CLI never reads omnigraph.yaml for cluster commands — a
+    // present (even malformed) legacy file is inert. The actor falls back to
+    // `operator.actor`, then to none (no loud failure on absence).
     let temp = tempdir().unwrap();
     write_cluster_config_fixture(temp.path());
     fs::write(temp.path().join("omnigraph.yaml"), "{{{{ not yaml").unwrap();
@@ -873,14 +826,11 @@ fn cluster_commands_ignore_malformed_local_config() {
             "cluster {command} touched omnigraph.yaml"
         );
     }
-    // import + apply with an explicit --as: the config is never loaded.
-    for (command, args) in [("import", vec![]), ("apply", vec!["--as", "andrew"])] {
-        let mut invocation = cli();
-        invocation.current_dir(temp.path());
-        for arg in &args {
-            invocation.arg(arg);
-        }
-        let output = invocation
+    // import + apply (no --as, no operator config): the legacy file is never
+    // loaded and the no-actor apply succeeds (actor defaults to none).
+    for command in ["import", "apply"] {
+        let output = cli()
+            .current_dir(temp.path())
             .arg("cluster")
             .arg(command)
             .arg("--config")
@@ -893,20 +843,6 @@ fn cluster_commands_ignore_malformed_local_config() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    // Only the no-flag actor lookup is allowed to fail, and loudly.
-    let output = output_failure(
-        cli()
-            .current_dir(temp.path())
-            .arg("cluster")
-            .arg("apply")
-            .arg("--config")
-            .arg(temp.path()),
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("omnigraph.yaml") && stderr.contains("--as"),
-        "the actor-default config read must fail loudly and actionably: {stderr}"
-    );
 }
 
 #[test]

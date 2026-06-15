@@ -25,13 +25,12 @@ const KNOWN_DIVERGENCES: &[&str] = &[
     // populated by the rows below as they are written
 ];
 
-/// One matched setup per row: twin graphs + the SAME Cedar bundle on both
-/// arms (the local arm via --config top-level policy.file; the server via
-/// its config). Returns everything a row needs.
+/// One matched setup per row: twin graphs + the parity Cedar bundle on the
+/// served arm. The local (`--store`) arm carries no policy (RFC-011); the
+/// bundle is permissive for `act-parity`, so the arms still agree.
 struct Parity {
     _temp: TempDir,
     local: std::path::PathBuf,
-    local_cfg: std::path::PathBuf,
     server: TestServer,
 }
 
@@ -40,7 +39,7 @@ fn parity() -> Parity {
     // RFC-011 cluster-only: the remote arm is served from a converged
     // cluster directory (one graph, id `parity`), seeded with the same
     // fixture data as the local twin.
-    let (local_cfg, cluster_dir) = parity_configs(temp.path(), &local, &remote);
+    let cluster_dir = parity_configs(temp.path(), &local, &remote);
     let server = spawn_server_with_cluster_env(
         &cluster_dir,
         &[(
@@ -51,14 +50,13 @@ fn parity() -> Parity {
     Parity {
         _temp: temp,
         local,
-        local_cfg,
         server,
     }
 }
 
 impl Parity {
     fn run(&self, args: &[&str]) -> (std::process::Output, std::process::Output) {
-        run_both_with_config(&self.local, Some(&self.local_cfg), &self.server.base_url, args)
+        run_both(&self.local, &self.server.base_url, args)
     }
 }
 

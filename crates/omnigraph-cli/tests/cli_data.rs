@@ -599,13 +599,15 @@ query list_people() {
 }
 
 #[test]
-fn query_lint_can_resolve_graph_and_query_from_config() {
+fn query_lint_can_resolve_graph_from_store_scope() {
+    // RFC-011: lint resolves its graph target through `--store` (the direct
+    // scope), not omnigraph.yaml's cli.graph; the .gq path is plain cwd-relative.
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
-    let config_path = temp.path().join("omnigraph.yaml");
     init_graph(&graph);
+    let query_path = temp.path().join("queries.gq");
     write_query_file(
-        &temp.path().join("queries.gq"),
+        &query_path,
         r#"
 query list_people() {
     match { $p: Person }
@@ -613,16 +615,15 @@ query list_people() {
 }
 "#,
     );
-    write_config(&config_path, &local_yaml_config(&graph));
 
     let output = output_success(
         cli()
             .arg("query")
             .arg("lint")
             .arg("--query")
-            .arg("queries.gq")
-            .arg("--config")
-            .arg(&config_path)
+            .arg(&query_path)
+            .arg("--store")
+            .arg(&graph)
             .arg("--json"),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -690,7 +691,9 @@ query list_people() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("lint requires --schema <schema.pg> or a resolvable graph target")
+        stderr.contains("lint requires --schema <schema.pg>")
+            || stderr.contains("no graph addressed"),
+        "expected a schema-or-graph-target requirement; got: {stderr}"
     );
 }
 
@@ -987,43 +990,38 @@ fn export_jsonl_outputs_source_rows_for_selected_branch_and_type() {
     );
 }
 
+// RFC-011: `policy validate|test|explain` source the Cedar bundle from a
+// converged cluster's applied policies (`--cluster <dir>` + `--graph <id>`),
+// not omnigraph.yaml's policy.file.
+
 #[test]
-fn policy_validate_accepts_valid_policy_file() {
-    let temp = tempdir().unwrap();
-    let (config, _) = write_policy_config_fixture(temp.path());
+fn policy_validate_accepts_cluster_bundle() {
+    let cluster = converged_loaded_cluster("knowledge", Some(POLICY_YAML));
 
     let output = output_success(
         cli()
             .arg("policy")
             .arg("validate")
-            .arg("--config")
-            .arg(&config),
+            .arg("--cluster")
+            .arg(cluster.path())
+            .arg("--graph")
+            .arg("knowledge"),
     );
     let stdout = stdout_string(&output);
 
     assert!(stdout.contains("policy valid:"));
-    assert!(stdout.contains("policy.yaml"));
     assert!(stdout.contains("[2 actors]"));
 }
 
 #[test]
-fn policy_validate_fails_for_invalid_policy_file() {
-    let temp = tempdir().unwrap();
-    let config = temp.path().join("omnigraph.yaml");
-    let policy = temp.path().join("policy.yaml");
-    fs::write(
-        &config,
-        r#"
-project:
-  name: policy-test-graph
-policy:
-  file: ./policy.yaml
-"#,
-    )
-    .unwrap();
-    fs::write(
-        &policy,
-        r#"
+fn policy_validate_fails_for_invalid_cluster_bundle() {
+    // The cluster does not validate a policy bundle's internal rules, so an
+    // applied-but-malformed bundle reaches `policy validate`, which compiles it
+    // and surfaces the error (here: a duplicate rule id).
+    let cluster = converged_loaded_cluster(
+        "knowledge",
+        Some(
+            r#"
 version: 1
 groups:
   team: [act-andrew]
@@ -1039,26 +1037,42 @@ rules:
       actions: [export]
       branch_scope: any
 "#,
-    )
-    .unwrap();
+        ),
+    );
 
     let output = output_failure(
         cli()
             .arg("policy")
             .arg("validate")
-            .arg("--config")
-            .arg(&config),
+            .arg("--cluster")
+            .arg(cluster.path())
+            .arg("--graph")
+            .arg("knowledge"),
     );
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("duplicate policy rule id"));
+    assert!(
+        stderr.contains("duplicate policy rule id"),
+        "expected a duplicate-rule error; got: {stderr}"
+    );
 }
 
 #[test]
-fn policy_test_runs_declarative_cases() {
-    let temp = tempdir().unwrap();
-    let (config, _) = write_policy_config_fixture(temp.path());
+fn policy_test_runs_declarative_cases_against_cluster_bundle() {
+    let cluster = converged_loaded_cluster("knowledge", Some(POLICY_YAML));
+    let tests = cluster.path().join("policy.tests.yaml");
+    fs::write(&tests, POLICY_TESTS_YAML).unwrap();
 
-    let output = output_success(cli().arg("policy").arg("test").arg("--config").arg(&config));
+    let output = output_success(
+        cli()
+            .arg("policy")
+            .arg("test")
+            .arg("--cluster")
+            .arg(cluster.path())
+            .arg("--graph")
+            .arg("knowledge")
+            .arg("--tests")
+            .arg(&tests),
+    );
     let stdout = stdout_string(&output);
 
     assert!(stdout.contains("policy tests passed: 2 cases"));
@@ -1066,15 +1080,16 @@ fn policy_test_runs_declarative_cases() {
 
 #[test]
 fn policy_explain_reports_decision_and_matched_rule() {
-    let temp = tempdir().unwrap();
-    let (config, _) = write_policy_config_fixture(temp.path());
+    let cluster = converged_loaded_cluster("knowledge", Some(POLICY_YAML));
 
     let allow = output_success(
         cli()
             .arg("policy")
             .arg("explain")
-            .arg("--config")
-            .arg(&config)
+            .arg("--cluster")
+            .arg(cluster.path())
+            .arg("--graph")
+            .arg("knowledge")
             .arg("--actor")
             .arg("act-andrew")
             .arg("--action")
@@ -1090,8 +1105,10 @@ fn policy_explain_reports_decision_and_matched_rule() {
         cli()
             .arg("policy")
             .arg("explain")
-            .arg("--config")
-            .arg(&config)
+            .arg("--cluster")
+            .arg(cluster.path())
+            .arg("--graph")
+            .arg("knowledge")
             .arg("--actor")
             .arg("act-bruno")
             .arg("--action")
@@ -1105,19 +1122,24 @@ fn policy_explain_reports_decision_and_matched_rule() {
 }
 
 #[test]
-fn read_can_resolve_uri_from_config() {
+fn read_resolves_uri_from_default_store_scope() {
+    // RFC-011: a zero-flag read resolves its graph from `defaults.store` in the
+    // operator config (the local-dev default scope) — no omnigraph.yaml.
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
-    let config = temp.path().join("omnigraph.yaml");
     init_graph(&graph);
     load_fixture(&graph);
-    write_config(&config, &local_yaml_config(&graph));
+    let home = tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.yaml"),
+        format!("defaults:\n  store: {}\n", graph.to_string_lossy()),
+    )
+    .unwrap();
 
     let output = output_success(
         cli()
+            .env("OMNIGRAPH_HOME", home.path())
             .arg("read")
-            .arg("--config")
-            .arg(&config)
             .arg("--query")
             .arg(fixture("test.gq"))
             .arg("get_person")
@@ -1278,13 +1300,13 @@ query insert_person($name: String, $age: I32) {
 }
 
 #[test]
-fn change_can_resolve_uri_and_branch_from_config() {
+fn change_resolves_uri_and_default_branch_from_store_scope() {
+    // RFC-011: a mutate resolves its graph from `--store` and defaults the
+    // branch to main (no omnigraph.yaml cli.graph / cli.branch).
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
-    let config = temp.path().join("omnigraph.yaml");
     init_graph(&graph);
     load_fixture(&graph);
-    write_config(&config, &local_yaml_config(&graph));
     let mutation_file = temp.path().join("config-mutations.gq");
     write_query_file(
         &mutation_file,
@@ -1298,8 +1320,8 @@ query insert_person($name: String, $age: I32) {
     let output = output_success(
         cli()
             .arg("change")
-            .arg("--config")
-            .arg(&config)
+            .arg("--store")
+            .arg(&graph)
             .arg("--query")
             .arg(&mutation_file)
             .arg("--params")
@@ -1896,19 +1918,17 @@ fn snapshot_json_returns_manifest_version_and_tables() {
 }
 
 #[test]
-fn snapshot_can_resolve_uri_from_config() {
+fn snapshot_resolves_uri_from_store_scope() {
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
-    let config = temp.path().join("omnigraph.yaml");
     init_graph(&graph);
     load_fixture(&graph);
-    write_config(&config, &local_yaml_config(&graph));
 
     let output = output_success(
         cli()
             .arg("snapshot")
-            .arg("--config")
-            .arg(&config)
+            .arg("--store")
+            .arg(&graph)
             .arg("--json"),
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();

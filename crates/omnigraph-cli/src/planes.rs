@@ -82,9 +82,7 @@ impl Capability {
 /// classifier) plus the one Data→Served refinement: `graphs` is remote-only.
 ///
 /// This reflects *current enforced behavior*, so messages stay truthful:
-/// `queries list` is `Local` (reads config today) and `queries validate` is
-/// `Direct` (opens a graph directly today). Both converge to the RFC end-state
-/// (served / control) only when later slices re-route them.
+/// `queries`/`policy` read a cluster's applied state (`Control`).
 pub(crate) fn command_capability(cmd: &Command) -> Capability {
     if let Command::Graphs { .. } = cmd {
         return Capability::Served;
@@ -120,20 +118,18 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         Command::Schema {
             command: SchemaCommand::Plan { .. },
         } => Plane::Storage,
-        Command::Queries {
-            command: QueriesCommand::Validate { .. },
-        } => Plane::Storage,
-        Command::Queries {
-            command: QueriesCommand::List { .. },
-        } => Plane::Session,
+        // `queries` and `policy` tooling now source their inputs from a
+        // cluster's applied state (`--cluster`), so they live on the control
+        // plane (RFC-011 — omnigraph.yaml excised from the CLI).
+        Command::Queries { .. } => Plane::Control,
+        Command::Policy { .. } => Plane::Control,
         Command::Init { .. }
         | Command::Optimize { .. }
         | Command::Repair { .. }
         | Command::Cleanup { .. }
         | Command::Lint { .. } => Plane::Storage,
         Command::Cluster { .. } => Plane::Control,
-        Command::Policy { .. }
-        | Command::Embed(_)
+        Command::Embed(_)
         | Command::Login { .. }
         | Command::Logout { .. }
         | Command::Config { .. }
@@ -188,7 +184,17 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
 pub(crate) fn accepts_cluster_addressing(cmd: &Command) -> bool {
     matches!(
         cmd,
-        Command::Optimize { .. } | Command::Repair { .. } | Command::Cleanup { .. }
+        Command::Optimize { .. }
+            | Command::Repair { .. }
+            | Command::Cleanup { .. }
+            // `lint` can type-check a `.gq` against a cluster graph's schema
+            // (RFC-011): `--cluster <dir> --graph <id>`.
+            | Command::Lint { .. }
+            // The policy/queries tooling addresses a cluster's applied state
+            // (RFC-011): `--cluster <dir>` selects the cluster, `--graph <id>`
+            // picks a graph's bundle/registry within it.
+            | Command::Policy { .. }
+            | Command::Queries { .. }
     )
 }
 
@@ -284,7 +290,12 @@ mod tests {
         assert_eq!(cap(&["omnigraph", "schema", "plan", "--schema", "s.pg", "graph.omni"]), Capability::Direct);
         assert_eq!(cap(&["omnigraph", "cluster", "status", "--config", "."]), Capability::Control);
         assert_eq!(cap(&["omnigraph", "version"]), Capability::Local);
-        assert_eq!(cap(&["omnigraph", "queries", "list"]), Capability::Local);
+        // `queries`/`policy` tooling reads cluster state now (control plane).
+        assert_eq!(cap(&["omnigraph", "queries", "list"]), Capability::Control);
+        assert_eq!(
+            cap(&["omnigraph", "policy", "validate"]),
+            Capability::Control
+        );
     }
 
     #[test]
