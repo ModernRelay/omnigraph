@@ -164,9 +164,8 @@ pub(super) async fn ensure_indices_for_branch(
     // that needs index work. Held across the per-table commit loop and
     // the manifest publish at the end of this function. Sorted-order
     // acquisition prevents lock-order inversion against concurrent
-    // multi-table writers (mutation finalize, branch_merge, future
-    // MR-870 recovery). Under PR 1b's intermediate state (global server
-    // RwLock still in place), this acquisition is uncontended.
+    // multi-table writers (mutation finalize, branch_merge, the fork
+    // path, recovery).
     let queue_keys: Vec<(String, Option<String>)> = recovery_pins
         .iter()
         .map(|pin| (pin.table_key.clone(), pin.table_branch.clone()))
@@ -582,8 +581,14 @@ pub(super) async fn open_owned_dataset_for_branch_write(
                     ));
                 }
             }
-            fork_dataset_from_entry_state(
-                db,
+            // The fork advances Lance state before the manifest publish. The
+            // caller holds the per-(table, active_branch) write queue from
+            // before this fork through the publish, so a leftover ref is a
+            // manifest-unreferenced fork (interrupted prior fork, or
+            // delete+recreate), not a live in-process fork. The wrapper
+            // self-heals it (reclaim + re-fork); see
+            // `Omnigraph::fork_dataset_from_entry_state`.
+            db.fork_dataset_from_entry_state(
                 table_key,
                 full_path,
                 source_branch,
@@ -611,7 +616,7 @@ pub(super) async fn fork_dataset_from_entry_state(
     source_branch: Option<&str>,
     source_version: u64,
     active_branch: &str,
-) -> Result<SnapshotHandle> {
+) -> Result<crate::storage_layer::ForkOutcome<SnapshotHandle>> {
     db.storage()
         .fork_branch_from_state(
             full_path,
@@ -621,6 +626,172 @@ pub(super) async fn fork_dataset_from_entry_state(
             active_branch,
         )
         .await
+}
+
+/// Classification of a Lance branch ref `B` on table `T` against FRESH manifest
+/// authority — the single decision both fork-ref reclaim sites share: the
+/// write-path reclaim ([`reclaim_orphaned_fork_and_refork`]) and the cleanup
+/// reconciler (`optimize::reconcile_orphaned_branches`). Having one classifier
+/// keeps the two destructive sites from drifting (the bug history: each was
+/// hardened separately and the other lagged).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForkRefStatus {
+    /// The manifest places `T` on `B` — a legitimate fork. Never destroy.
+    Legitimate,
+    /// The manifest does not reference this fork (`T` not on `B`, or `B` absent
+    /// from the manifest entirely). Reclaimable.
+    Orphan,
+    /// Fresh authority could not be established (a transient read failure on a
+    /// live branch). Ambiguous — do not destroy; the caller retries / converges.
+    Indeterminate,
+}
+
+/// Classify a fork ref from FRESH manifest authority (bypasses the coordinator
+/// cache). MUST be called with the per-`(table, branch)` write queue held, so
+/// the classification is stable against in-process writers for the caller's
+/// critical section. Both reclaim sites map the result to their own action
+/// (write path: reclaim vs retryable; cleanup: delete vs skip), but the
+/// destroy-only-on-`Orphan` rule is enforced here, once.
+pub(crate) async fn classify_fork_ref(
+    db: &Omnigraph,
+    table_key: &str,
+    branch: &str,
+) -> ForkRefStatus {
+    // `classify.fresh_read` failpoint: simulate a transient failure of the
+    // fresh-authority read (no-op without the `failpoints` feature). Lets a
+    // test exercise the Indeterminate path — a read failure on a live branch
+    // must classify as Indeterminate (skip), never Orphan (destroy).
+    let fresh = match crate::failpoints::maybe_fail("classify.fresh_read") {
+        Ok(()) => db.fresh_snapshot_for_branch(Some(branch)).await,
+        Err(injected) => Err(injected),
+    };
+    match fresh {
+        Ok(snap) => {
+            let placed = snap
+                .entry(table_key)
+                .map(|e| e.table_branch.as_deref() == Some(branch))
+                .unwrap_or(false);
+            if placed {
+                ForkRefStatus::Legitimate
+            } else {
+                // Branch resolves but the manifest does not place this table on
+                // it — a manifest-unreferenced fork.
+                ForkRefStatus::Orphan
+            }
+        }
+        // Branch did not resolve. `all_branches` lists `_refs/branches/` live, so
+        // absent there = genuinely no such manifest branch (origin-1 orphan);
+        // present (or a list error) = transient read — never destroy on that.
+        Err(_) => match db.coordinator.read().await.all_branches().await {
+            Ok(fresh) if !fresh.iter().any(|b| b == branch) => ForkRefStatus::Orphan,
+            _ => ForkRefStatus::Indeterminate,
+        },
+    }
+}
+
+/// Reclaim a manifest-unreferenced fork and re-fork in its place.
+///
+/// Reached when `fork_branch_from_state` reports `RefAlreadyExists`. This is a
+/// destructive op (it force-deletes a Lance branch ref), so it owns its own
+/// safety precondition rather than trusting the caller's: it re-derives, via
+/// [`classify_fork_ref`], that the manifest does not place this table on
+/// `active_branch`. The caller's earlier proof may have come from the
+/// coordinator's *cached* branch snapshot (`resolved_branch_target` returns
+/// the cache when the handle is bound to `active_branch` — an embedded handle
+/// on the branch, or `branch_merge`'s target swap); trusting it could
+/// force-delete a fork a concurrent writer just legitimately published. Only
+/// once fresh authority confirms the ref is unreferenced does it drop the ref
+/// (idempotent `force_delete_branch`) and re-fork, exactly once.
+///
+/// If fresh authority shows the table IS on `active_branch` (a legitimate
+/// concurrent fork), or a second collision occurs after reclaim (a foreign-
+/// process writer recreated the ref — the documented one-winner-CAS gap), it
+/// surfaces a retryable conflict; on retry the winner's fork is visible and
+/// the no-fork path runs.
+pub(super) async fn reclaim_orphaned_fork_and_refork(
+    db: &Omnigraph,
+    table_key: &str,
+    full_path: &str,
+    source_branch: Option<&str>,
+    source_version: u64,
+    active_branch: &str,
+) -> Result<SnapshotHandle> {
+    // Self-validate against FRESH authority before destroying anything. Only an
+    // Orphan is reclaimable; a Legitimate status (a concurrent writer published
+    // a real fork despite the caller's possibly-cached proof) or an
+    // Indeterminate one (transient read) surfaces a retryable conflict rather
+    // than stranding the manifest at a version the recreated ref won't have.
+    match classify_fork_ref(db, table_key, active_branch).await {
+        ForkRefStatus::Orphan => {}
+        ForkRefStatus::Legitimate => {
+            let actual = db
+                .fresh_snapshot_for_branch(Some(active_branch))
+                .await
+                .ok()
+                .and_then(|s| s.entry(table_key).map(|e| e.table_version))
+                .unwrap_or(source_version);
+            return Err(OmniError::manifest_expected_version_mismatch(
+                table_key,
+                source_version,
+                actual,
+            ));
+        }
+        ForkRefStatus::Indeterminate => {
+            return Err(OmniError::manifest_conflict(format!(
+                "could not verify whether branch '{active_branch}' still owns an orphaned \
+                 fork for table '{table_key}' because fresh manifest authority was \
+                 unavailable; refresh and retry"
+            )));
+        }
+    }
+
+    crate::failpoints::maybe_fail("fork.before_reclaim")?;
+    db.storage()
+        .force_delete_branch(full_path, active_branch)
+        .await
+        .map_err(|e| {
+            // Lance refuses to delete a branch with dependent child branches
+            // even under force (RefConflict). Unreachable for a leaf first-write
+            // fork (the cleanup reconciler also drops children before parents),
+            // but surface it actionably if it ever happens. We match loosely on
+            // "referenc" rather than the exact prose, which is not a Lance API
+            // contract; a typed RefConflict variant through `force_delete_branch`
+            // is the durable follow-up.
+            if e.to_string().contains("referenc") {
+                OmniError::manifest_conflict(format!(
+                    "branch '{active_branch}' cannot reclaim the leftover fork for \
+                     table '{table_key}' because it has dependent child branches; \
+                     delete the child branches (or run `omnigraph cleanup`) first"
+                ))
+            } else {
+                e
+            }
+        })?;
+
+    match fork_dataset_from_entry_state(
+        db,
+        table_key,
+        full_path,
+        source_branch,
+        source_version,
+        active_branch,
+    )
+    .await?
+    {
+        crate::storage_layer::ForkOutcome::Created(ds) => Ok(ds),
+        crate::storage_layer::ForkOutcome::RefAlreadyExists => {
+            let live = db.fresh_snapshot_for_branch(Some(active_branch)).await?;
+            let actual = live
+                .entry(table_key)
+                .map(|e| e.table_version)
+                .unwrap_or(source_version);
+            Err(OmniError::manifest_expected_version_mismatch(
+                table_key,
+                source_version,
+                actual,
+            ))
+        }
+    }
 }
 
 pub(super) async fn reopen_for_mutation(
@@ -1126,4 +1297,79 @@ pub(super) async fn ensure_commit_graph_initialized(db: &Omnigraph) -> Result<()
 
 pub(super) async fn invalidate_graph_index(db: &Omnigraph) {
     db.runtime_cache.invalidate_all().await;
+}
+
+#[cfg(test)]
+mod classify_fork_ref_tests {
+    //! Direct coverage of [`classify_fork_ref`] — the single fresh-authority
+    //! decision both fork-ref reclaim sites (write-path reclaim + cleanup
+    //! reconciler) route through. Pins each deterministic status so reverting
+    //! the fresh-authority logic at either site fails here. (The `Indeterminate`
+    //! arm needs an injected transient read and is covered under the
+    //! `failpoints` suite.)
+    use super::*;
+    use crate::db::Omnigraph;
+    use crate::loader::LoadMode;
+
+    const SCHEMA: &str = "node Person { name: String @key }\nnode Company { name: String @key }\n";
+
+    /// On-disk dataset path for a node table, taken from the manifest entry
+    /// (the same path the engine uses) so the test forges against the real ref.
+    async fn node_path(db: &Omnigraph, branch: &str, table_key: &str) -> String {
+        let snap = db.snapshot_for_branch(Some(branch)).await.unwrap();
+        let entry = snap.entry(table_key).unwrap();
+        format!("{}/{}", db.root_uri, entry.table_path)
+    }
+
+    #[tokio::test]
+    async fn classify_distinguishes_legitimate_unreferenced_and_ghost() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Omnigraph::init(dir.path().to_str().unwrap(), SCHEMA)
+            .await
+            .unwrap();
+        db.branch_create("feature").await.unwrap();
+
+        // Legitimate: a real write forks Company onto `feature`, and the
+        // manifest places Company on `feature`.
+        db.load_as(
+            "feature",
+            None,
+            r#"{"type":"Company","data":{"name":"Acme"}}"#,
+            LoadMode::Merge,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            classify_fork_ref(&db, "node:Company", "feature").await,
+            ForkRefStatus::Legitimate,
+            "a manifest-placed fork must classify as Legitimate (never destroyed)"
+        );
+
+        // Orphan (manifest-unreferenced): forge a `feature` ref on Person, which
+        // the manifest's `feature` snapshot still places on main.
+        let person = node_path(&db, "feature", "node:Person").await;
+        {
+            let mut ds = lance::Dataset::open(&person).await.unwrap();
+            let v = ds.version().version;
+            ds.create_branch("feature", v, None).await.unwrap();
+        }
+        assert_eq!(
+            classify_fork_ref(&db, "node:Person", "feature").await,
+            ForkRefStatus::Orphan,
+            "a ref the manifest does not place on the branch must classify as Orphan"
+        );
+
+        // Orphan (ghost): a ref for a branch the manifest does not have at all.
+        {
+            let mut ds = lance::Dataset::open(&person).await.unwrap();
+            let v = ds.version().version;
+            ds.create_branch("ghost", v, None).await.unwrap();
+        }
+        assert_eq!(
+            classify_fork_ref(&db, "node:Person", "ghost").await,
+            ForkRefStatus::Orphan,
+            "a ref for a branch absent from the manifest must classify as Orphan"
+        );
+    }
 }

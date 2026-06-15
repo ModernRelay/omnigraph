@@ -561,4 +561,3 @@ fn graphs_list_against_local_uri_errors_with_remote_only_message() {
         "expected a remote-server rejection in stderr; got:\n{stderr}"
     );
 }
-

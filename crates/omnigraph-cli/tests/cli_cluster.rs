@@ -1040,6 +1040,47 @@ fn init_refuses_a_cluster_managed_path_and_signposts_cluster_apply() {
 }
 
 #[test]
+fn schema_apply_refuses_a_cluster_managed_graph_and_signposts_cluster_apply() {
+    // RFC-011 Decision 10: a direct `schema apply` against a cluster-managed
+    // graph's storage root would bypass the ledger/recovery/approvals, so it is
+    // refused and points at `cluster apply` (mirrors `init`'s refusal).
+    let temp = applied_knowledge_cluster();
+    // A schema that WOULD change the graph (adds `bio`) — so the no-mutation
+    // assertion below is meaningful, not a no-op re-apply.
+    fs::write(
+        temp.path().join("people_v2.pg"),
+        "node Person {\n  name: String @key\n  age: I32?\n  bio: String?\n}\n",
+    )
+    .unwrap();
+    let out = output_failure(
+        cli()
+            .arg("schema")
+            .arg("apply")
+            .arg("--schema")
+            .arg(temp.path().join("people_v2.pg"))
+            .arg("--store")
+            .arg(temp.path().join("graphs").join("knowledge.omni")),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cluster apply"),
+        "schema apply against a cluster-managed graph should signpost `cluster apply`; got: {stderr}"
+    );
+    // And it bailed BEFORE mutating: the live schema still lacks `bio`.
+    let show = output_success(
+        cli()
+            .arg("schema")
+            .arg("show")
+            .arg(temp.path().join("graphs").join("knowledge.omni")),
+    );
+    assert!(
+        !stdout_string(&show).contains("bio"),
+        "the refused apply must not have changed the live schema; got: {}",
+        stdout_string(&show)
+    );
+}
+
+#[test]
 fn init_outside_a_cluster_still_works() {
     // Regression guard: ordinary init (no cluster layout) is unaffected.
     let temp = tempdir().unwrap();

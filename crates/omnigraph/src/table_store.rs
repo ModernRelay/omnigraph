@@ -26,6 +26,7 @@ use std::sync::Arc;
 use crate::db::manifest::{TableVersionMetadata, open_table_head_for_write};
 use crate::db::{Snapshot, SubTableEntry};
 use crate::error::{OmniError, Result};
+use crate::storage_layer::ForkOutcome;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableState {
@@ -285,7 +286,7 @@ impl TableStore {
         table_key: &str,
         source_version: u64,
         target_branch: &str,
-    ) -> Result<Dataset> {
+    ) -> Result<ForkOutcome<Dataset>> {
         let mut source_ds = self
             .open_dataset_head(dataset_uri, source_branch)
             .await?
@@ -294,31 +295,49 @@ impl TableStore {
             .map_err(|e| OmniError::Lance(e.to_string()))?;
         self.ensure_expected_version(&source_ds, table_key, source_version)?;
 
-        if source_ds
+        if let Err(create_err) = source_ds
             .create_branch(target_branch, source_version, None)
             .await
-            .is_err()
         {
-            // The target branch ref already exists. The caller
-            // (`open_owned_dataset_for_branch_write`) re-reads the live manifest
-            // before forking and returns a retryable error when a concurrent
-            // writer legitimately holds the fork, so reaching here means the
-            // manifest does NOT reference this fork: it is an orphan from an
-            // incomplete prior `branch_delete`. Surface the actionable cleanup
-            // error rather than guessing from Lance branch versions.
-            return Err(OmniError::manifest_conflict(format!(
-                "branch '{}' has orphaned table state for '{}' from an incomplete \
-                 prior delete; run `omnigraph cleanup` to reclaim it before reusing \
-                 this branch name",
-                target_branch, table_key
-            )));
+            // Disambiguate the failure: only a genuinely pre-existing ref is a
+            // reclaim candidate. Mapping EVERY create_branch failure to
+            // `RefAlreadyExists` would route a transient I/O / version / Lance
+            // internal error into the destructive reclaim path. So check whether
+            // the ref actually exists; if not, the failure is real — propagate
+            // it (preserving error fidelity) rather than force-deleting.
+            //
+            // `list_branches` reads `_refs/branches/` from the store, so it sees
+            // a fully-formed manifest-unreferenced fork (our common case — a
+            // create_branch that completed but whose manifest publish did not).
+            // It does NOT see a phase-1-only Lance "zombie" (tree dir written,
+            // no BranchContents) — but neither does `cleanup`'s reconciler, also
+            // list_branches-based. A zombie only forms if create_branch is
+            // interrupted *between its two internal phases* (a far narrower
+            // window than the manifest-publish gap), and it surfaces here as the
+            // propagated create error requiring manual reclaim. We deliberately
+            // do NOT force-delete on a not-found-ref failure: it is
+            // indistinguishable from a transient error on a fresh create, and
+            // force-deleting there is the destructive overreach this guard
+            // removes. The caller holds the per-(table, branch) write queue, so
+            // no in-process writer races this fork; a cross-process create
+            // between our check and now is the documented one-winner-CAS gap and
+            // propagates as a retryable error.
+            let ref_exists = source_ds
+                .list_branches()
+                .await
+                .map(|b| b.contains_key(target_branch))
+                .unwrap_or(false);
+            if ref_exists {
+                return Ok(ForkOutcome::RefAlreadyExists);
+            }
+            return Err(OmniError::Lance(create_err.to_string()));
         }
 
         let ds = self
             .open_dataset_head(dataset_uri, Some(target_branch))
             .await?;
         self.ensure_expected_version(&ds, table_key, source_version)?;
-        Ok(ds)
+        Ok(ForkOutcome::Created(ds))
     }
 
     pub async fn scan_batches(&self, ds: &Dataset) -> Result<Vec<RecordBatch>> {
