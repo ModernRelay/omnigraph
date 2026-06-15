@@ -84,7 +84,10 @@ servers:                # operator-owned endpoints; names key the credentials
     url: https://graph.example.com     # no tokens in this file, ever
 defaults:
   output: table         # read format default, below --json/--format/alias/legacy
-  server: prod          # the everyday scope when no address is given (RFC-011)
+  server: prod          # the everyday SERVED scope when no address is given (RFC-011)
+  # store: file:///data/dev.omni   # OR a zero-flag LOCAL default (mutually
+  #                                #   exclusive with `server`); the local-dev
+  #                                #   counterpart of `server`
   default_graph: knowledge   # graph selected in a server/cluster scope
 clusters:               # admin-only: managed-cluster storage roots (RFC-011).
   brain:                #   the ONLY place a storage root lives in this file.
@@ -105,9 +108,11 @@ graph in it; the served-vs-direct access path is derived from the scope, not
 toggled. The scope comes from one of (highest precedence first): an explicit
 address (a positional URI, `--server`, or `--store <uri>`); a named
 `--profile <name>` (or `$OMNIGRAPH_PROFILE`); or the flat `defaults.server` +
-`defaults.default_graph`. A **profile** binds exactly one of `server` / `cluster`
-/ `store` plus an optional default graph — config data, not state: every command
-resolves its scope fresh, there is no sticky "current" mode.
+`defaults.default_graph` (a served default) **or** `defaults.store` (a zero-flag
+*local* default — mutually exclusive with `defaults.server`). A **profile** binds
+exactly one of `server` / `cluster` / `store` plus an optional default graph —
+config data, not state: every command resolves its scope fresh, there is no
+sticky "current" mode.
 
 - `--store <uri>` addresses a single graph's storage directly (ad-hoc / break-glass).
 - A `cluster`-bound profile reaches `optimize` / `repair` / `cleanup` for a managed

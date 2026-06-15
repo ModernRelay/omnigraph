@@ -18,7 +18,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use color_eyre::Result;
-use color_eyre::eyre::eyre;
+use color_eyre::eyre::{bail, eyre};
 use serde::Deserialize;
 
 use omnigraph_server::config::ReadOutputFormat;
@@ -108,8 +108,14 @@ pub(crate) struct OperatorDefaults {
     pub(crate) table_cell_layout: Option<omnigraph_server::config::TableCellLayout>,
     /// Default server scope (RFC-011): the everyday addressing when no
     /// `--profile` / primitive / legacy address is given. Names an entry
-    /// under `servers:`.
+    /// under `servers:`. Mutually exclusive with `store` — a scope binds one
+    /// entity.
     pub(crate) server: Option<String>,
+    /// Default **store** scope (RFC-011): a `file://` / `s3://` graph storage
+    /// URI used as the zero-flag local default for graph commands when no
+    /// `--profile` / primitive address is given. The local-dev counterpart of
+    /// `server`; mutually exclusive with it.
+    pub(crate) store: Option<String>,
     /// Default graph selected within a server/cluster scope when no
     /// `--graph` is passed (RFC-011).
     pub(crate) default_graph: Option<String>,
@@ -202,9 +208,27 @@ impl OperatorConfig {
         self.defaults.server.as_deref()
     }
 
+    /// The flat-default store scope URI, if set (RFC-011) — the zero-flag
+    /// local-dev default.
+    pub(crate) fn default_store(&self) -> Option<&str> {
+        self.defaults.store.as_deref()
+    }
+
     /// The flat-default graph within a server/cluster scope, if set (RFC-011).
     pub(crate) fn default_graph(&self) -> Option<&str> {
         self.defaults.default_graph.as_deref()
+    }
+
+    /// A scope binds one entity (Decision 6): `defaults.server` and
+    /// `defaults.store` are mutually exclusive.
+    fn validate_defaults(&self) -> Result<()> {
+        if self.defaults.server.is_some() && self.defaults.store.is_some() {
+            bail!(
+                "operator config `defaults` sets both `server` and `store` — a default scope \
+                 binds one entity; keep one (use a `profile` if you need both)"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -282,6 +306,7 @@ pub(crate) fn load_operator_config_at(path: &Path) -> Result<OperatorConfig> {
     for warning in config.unknown_key_warnings() {
         eprintln!("warning: {warning} in operator config '{}'", path.display());
     }
+    config.validate_defaults()?;
     Ok(config)
 }
 
@@ -558,6 +583,29 @@ mod tests {
         let config = load_operator_config_at(&path).unwrap();
         assert_eq!(config.actor(), Some("act-andrew"));
         assert_eq!(config.output(), Some(ReadOutputFormat::Json));
+    }
+
+    #[test]
+    fn defaults_store_parses_and_is_accessible() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(&path, "defaults:\n  store: file:///tmp/dev.omni\n").unwrap();
+        let config = load_operator_config_at(&path).unwrap();
+        assert_eq!(config.default_store(), Some("file:///tmp/dev.omni"));
+        assert_eq!(config.default_server(), None);
+    }
+
+    #[test]
+    fn defaults_server_and_store_together_is_a_loud_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(
+            &path,
+            "defaults:\n  server: prod\n  store: file:///tmp/dev.omni\n",
+        )
+        .unwrap();
+        let err = load_operator_config_at(&path).unwrap_err().to_string();
+        assert!(err.contains("binds one entity"), "{err}");
     }
 
     #[test]
