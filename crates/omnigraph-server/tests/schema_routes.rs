@@ -778,29 +778,27 @@ async fn schema_apply_route_additive_property_preserves_existing_rows() {
     // AddProperty wasn't pinned with a row-count check anywhere.
     // Load N rows, apply schema adding nullable property, verify
     // every row is still readable and the new column is null.
-    let (temp, app) = app_for_graph_with_auth_tokens_and_policy(
-        &fs::read_to_string(fixture("test.pg")).unwrap(),
+    let (temp, app) = app_for_loaded_graph_with_auth_tokens_and_policy(
         &[("act-ragnor", "admin-token")],
         SCHEMA_APPLY_POLICY_YAML,
     )
     .await;
     let graph = graph_path(temp.path());
 
-    // Standard fixture data: 4 Persons + 1 Company. Load it.
+    // Standard fixture data is loaded before the app is built, so the server
+    // handle applies schema from the same manifest it is serving.
     let pre_count = {
         let db = Omnigraph::open(graph.to_str().unwrap()).await.unwrap();
-        db.load(
-            "main",
-            &fs::read_to_string(fixture("test.jsonl")).unwrap(),
-            LoadMode::Append,
-        )
-        .await
-        .unwrap();
         let snap = db
             .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
             .await
             .unwrap();
-        snap.entry("node:Person").expect("Person").row_count
+        snap.open("node:Person")
+            .await
+            .expect("Person")
+            .count_rows(None)
+            .await
+            .unwrap()
     };
     assert!(pre_count > 0, "fixture should have loaded Person rows");
 
@@ -830,7 +828,13 @@ async fn schema_apply_route_additive_property_preserves_existing_rows() {
         .snapshot_of(omnigraph::db::ReadTarget::branch("main"))
         .await
         .unwrap();
-    let post_count = snap.entry("node:Person").expect("Person").row_count;
+    let post_count = snap
+        .open("node:Person")
+        .await
+        .expect("Person")
+        .count_rows(None)
+        .await
+        .unwrap();
     assert_eq!(
         post_count, pre_count,
         "AddProperty should preserve row count",
