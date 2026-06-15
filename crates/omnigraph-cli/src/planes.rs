@@ -106,6 +106,7 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
     match cmd {
         Command::Query { .. }
         | Command::Mutate { .. }
+        | Command::Alias { .. }
         | Command::Load { .. }
         | Command::Ingest { .. }
         | Command::Branch { .. }
@@ -168,6 +169,7 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Commit { .. } => "commit",
         Command::Query { .. } => "query",
         Command::Mutate { .. } => "mutate",
+        Command::Alias { .. } => "alias",
         Command::Policy { .. } => "policy",
         Command::Optimize { .. } => "optimize",
         Command::Repair { .. } => "repair",

@@ -729,44 +729,6 @@ pub(crate) fn parse_alias_value(value: &str) -> Value {
     serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()))
 }
 
-pub(crate) fn merged_params_json(
-    alias_name: Option<&str>,
-    alias_arg_names: &[String],
-    alias_arg_values: &[String],
-    explicit: Option<Value>,
-) -> Result<Option<Value>> {
-    if alias_arg_values.len() > alias_arg_names.len() {
-        let alias = alias_name.unwrap_or("<alias>");
-        bail!(
-            "alias '{}' expects at most {} args but got {}",
-            alias,
-            alias_arg_names.len(),
-            alias_arg_values.len()
-        );
-    }
-
-    let mut merged = serde_json::Map::new();
-    for (arg_name, arg_value) in alias_arg_names.iter().zip(alias_arg_values.iter()) {
-        merged.insert(arg_name.clone(), parse_alias_value(arg_value));
-    }
-
-    match explicit {
-        Some(Value::Object(object)) => {
-            for (key, value) in object {
-                merged.insert(key, value);
-            }
-        }
-        Some(_) => bail!("params JSON must be an object"),
-        None => {}
-    }
-
-    if merged.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(Value::Object(merged)))
-    }
-}
-
 /// The format cascade (RFC-007 §D3): `--json` > `--format` > alias format >
 /// legacy `cli.output_format` (RFC-008 window) > operator `defaults.output`
 /// > table.
@@ -790,43 +752,6 @@ pub(crate) fn resolve_read_format(
         .unwrap_or_default()
 }
 
-pub(crate) fn resolve_alias<'a>(
-    config: &'a OmnigraphConfig,
-    alias_name: Option<&'a str>,
-    expected: AliasCommand,
-) -> Result<Option<(&'a str, &'a omnigraph_server::AliasConfig)>> {
-    let Some(alias_name) = alias_name else {
-        return Ok(None);
-    };
-    let alias = config.alias(alias_name)?;
-    if alias.command != expected {
-        bail!(
-            "alias '{}' is a {:?} alias, not a {:?} alias",
-            alias_name,
-            alias.command,
-            expected
-        );
-    }
-    Ok(Some((alias_name, alias)))
-}
-
-pub(crate) fn normalize_legacy_alias_uri(
-    uri: Option<String>,
-    target_available: bool,
-    alias_name: Option<&str>,
-    mut alias_args: Vec<String>,
-) -> (Option<String>, Vec<String>) {
-    let Some(candidate) = uri else {
-        return (None, alias_args);
-    };
-
-    if alias_name.is_some() && target_available {
-        alias_args.insert(0, candidate);
-        return (None, alias_args);
-    }
-
-    (Some(candidate), alias_args)
-}
 
 
 pub(crate) fn read_target_from_cli(branch: Option<String>, snapshot: Option<String>) -> ReadTarget {

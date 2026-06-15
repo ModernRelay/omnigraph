@@ -99,12 +99,10 @@ pub(crate) enum Command {
         legacy_uri: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
-        #[arg(long, conflicts_with_all = ["query", "query_string"])]
-        alias: Option<String>,
-        #[arg(long, conflicts_with_all = ["alias", "query_string"])]
+        #[arg(long, conflicts_with = "query_string")]
         query: Option<PathBuf>,
-        /// Inline GQ source — alternative to `--query <path>` and `--alias <name>`.
-        #[arg(short = 'e', long = "query-string", value_name = "GQ", conflicts_with_all = ["query", "alias"])]
+        /// Inline GQ source — alternative to `--query <path>`.
+        #[arg(short = 'e', long = "query-string", value_name = "GQ", conflicts_with = "query")]
         query_string: Option<String>,
         #[arg(long)]
         name: Option<String>,
@@ -118,8 +116,6 @@ pub(crate) enum Command {
         format: Option<ReadOutputFormat>,
         #[arg(long, conflicts_with = "format")]
         json: bool,
-        #[arg()]
-        alias_args: Vec<String>,
     },
     /// Execute a graph mutation query against a branch.
     ///
@@ -135,12 +131,10 @@ pub(crate) enum Command {
         legacy_uri: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
-        #[arg(long, conflicts_with_all = ["query", "query_string"])]
-        alias: Option<String>,
-        #[arg(long, conflicts_with_all = ["alias", "query_string"])]
+        #[arg(long, conflicts_with = "query_string")]
         query: Option<PathBuf>,
-        /// Inline GQ source — alternative to `--query <path>` and `--alias <name>`.
-        #[arg(short = 'e', long = "query-string", value_name = "GQ", conflicts_with_all = ["query", "alias"])]
+        /// Inline GQ source — alternative to `--query <path>`.
+        #[arg(short = 'e', long = "query-string", value_name = "GQ", conflicts_with = "query")]
         query_string: Option<String>,
         #[arg(long)]
         name: Option<String>,
@@ -150,8 +144,28 @@ pub(crate) enum Command {
         branch: Option<String>,
         #[arg(long)]
         json: bool,
-        #[arg()]
-        alias_args: Vec<String>,
+    },
+    /// Invoke an operator alias (RFC-011 Decision 4).
+    ///
+    /// An alias is a personal binding under `aliases:` in
+    /// ~/.omnigraph/config.yaml — name → (server, graph, stored-query name,
+    /// default params). `omnigraph alias <name> [args]` invokes the bound
+    /// stored query on its server. Living in its own namespace, an alias can
+    /// never shadow or be shadowed by a built-in verb. Replaces the removed
+    /// `--alias` flag on `query`/`mutate`.
+    Alias {
+        /// Alias name (a key under `aliases:` in ~/.omnigraph/config.yaml).
+        name: String,
+        /// Positional args bound to the alias's declared `args` params, in order.
+        args: Vec<String>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[command(flatten)]
+        params: ParamsArgs,
+        #[arg(long, conflicts_with = "json")]
+        format: Option<ReadOutputFormat>,
+        #[arg(long, conflicts_with = "format")]
+        json: bool,
     },
     /// Load data into a graph (local or remote)
     Load {

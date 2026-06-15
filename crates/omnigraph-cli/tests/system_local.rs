@@ -2480,12 +2480,11 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
         .unwrap();
     }
 
-    // The operator alias: name + positional arg, nothing else — server,
+    // The operator alias (RFC-011 D4): `alias <name> [args]` — server,
     // graph, stored query, and token all resolve from the operator layer.
     let output = cli()
         .env("OMNIGRAPH_HOME", operator_home.path())
-        .arg("query")
-        .arg("--alias")
+        .arg("alias")
         .arg("who")
         .arg("Alice")
         .arg("--json")

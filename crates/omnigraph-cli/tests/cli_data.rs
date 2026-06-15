@@ -505,10 +505,9 @@ query list_people() {
 
 #[test]
 fn deprecated_read_and_change_subcommands_emit_warnings() {
-    // Both subcommands require `--query`/`--query-string`/`--alias`, so
-    // invoking them with no args will exit non-zero. That's fine --
-    // we only care that the deprecation warning is printed before the
-    // argument-required error.
+    // Both subcommands require `--query`/`--query-string`, so invoking them
+    // with no args will exit non-zero. That's fine -- we only care that the
+    // deprecation warning is printed before the argument-required error.
     let output = cli().arg("read").output().unwrap();
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
