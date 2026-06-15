@@ -119,6 +119,16 @@ pub(crate) fn bearer_token_from_env(var_name: &str) -> Option<String> {
     normalize_bearer_token(std::env::var(var_name).ok())
 }
 
+/// The Cedar resource id for a graph selection: the explicit graph name when one
+/// is given, else the normalized URI (the anonymous fallback). Used by the
+/// `policy` tooling to address a graph's bundle.
+pub(crate) fn graph_resource_id_for_selection(
+    selected_graph: Option<&str>,
+    normalized_uri: &str,
+) -> String {
+    selected_graph.unwrap_or(normalized_uri).to_string()
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedCliGraph {
     pub(crate) uri: String,
@@ -990,6 +1000,18 @@ pub(crate) fn rewrite_deprecated_argv(args: Vec<OsString>) -> Vec<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graph_resource_id_for_selection_uses_name_or_anonymous_uri() {
+        assert_eq!(
+            graph_resource_id_for_selection(Some("local"), "/tmp/graph.omni"),
+            "local"
+        );
+        assert_eq!(
+            graph_resource_id_for_selection(None, "/tmp/graph.omni"),
+            "/tmp/graph.omni"
+        );
+    }
 
     // RFC-011 Decision 9: locality classifier for the destructive-confirm gate.
     #[test]

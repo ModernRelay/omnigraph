@@ -132,7 +132,6 @@ pub(crate) fn command_plane(cmd: &Command) -> Plane {
         Command::Embed(_)
         | Command::Login { .. }
         | Command::Logout { .. }
-        | Command::Config { .. }
         | Command::Version => Plane::Session,
     }
 }
@@ -144,7 +143,6 @@ pub(crate) fn command_label(cmd: &Command) -> &'static str {
         Command::Version => "version",
         Command::Login { .. } => "login",
         Command::Logout { .. } => "logout",
-        Command::Config { .. } => "config",
         Command::Embed(_) => "embed",
         Command::Init { .. } => "init",
         Command::Load { .. } => "load",
