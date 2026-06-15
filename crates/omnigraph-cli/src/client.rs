@@ -29,7 +29,8 @@ use omnigraph::db::{Omnigraph, ReadTarget};
 use omnigraph_api_types::{
     BranchCreateOutput, BranchCreateRequest, BranchDeleteOutput, BranchListOutput,
     BranchMergeOutput, BranchMergeRequest, ChangeOutput, CommitListOutput, CommitOutput,
-    ErrorOutput, ExportRequest, GraphListResponse, IngestOutput, IngestRequest, ReadOutput,
+    ErrorOutput, ExportRequest, GraphListResponse, IngestOutput, IngestRequest,
+    InvokeStoredQueryRequest, ReadOutput,
     ReadRequest, SchemaApplyOutput, SchemaApplyRequest, SchemaOutput, SnapshotOutput, commit_output,
     ingest_output, read_output, schema_apply_output, snapshot_payload,
 };
@@ -560,6 +561,50 @@ impl GraphClient {
                     .await?;
                 Ok(read_output(selected_name, &target, result))
             }
+        }
+    }
+
+    /// `invoke_named` — run a stored query **by catalog name** (RFC-011 D3).
+    /// Served-only: the catalog is server-owned, so a `--store` (embedded)
+    /// scope has nothing to resolve the name against. `expect_mutation` carries
+    /// the verb's asserted kind; the server rejects a mismatch (400) before
+    /// running, so the response is exactly the expected envelope — the caller
+    /// deserializes it as the concrete `T` (`ReadOutput` for `query`,
+    /// `ChangeOutput` for `mutate`), sidestepping the untagged wire enum.
+    pub(crate) async fn invoke_named<T: serde::de::DeserializeOwned>(
+        &self,
+        name: &str,
+        expect_mutation: bool,
+        params_json: Option<&Value>,
+        branch: Option<String>,
+        snapshot: Option<String>,
+    ) -> Result<T> {
+        match self {
+            GraphClient::Remote {
+                http,
+                base_url,
+                token,
+            } => {
+                let body = InvokeStoredQueryRequest {
+                    params: params_json.cloned(),
+                    branch,
+                    snapshot,
+                    expect_mutation: Some(expect_mutation),
+                };
+                remote_json(
+                    http,
+                    Method::POST,
+                    remote_url(base_url, &["queries", name], &[])?,
+                    Some(serde_json::to_value(body)?),
+                    token.as_deref(),
+                )
+                .await
+            }
+            GraphClient::Embedded { .. } => bail!(
+                "by-name invocation needs a server (the stored-query catalog is \
+                 server-owned); use -e '<gq>' or --query <file> for an ad-hoc query \
+                 against --store, or address a server with --server / --profile"
+            ),
         }
     }
 

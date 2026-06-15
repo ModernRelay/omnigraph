@@ -578,75 +578,96 @@ async fn main() -> Result<()> {
                 .await?;
         }
         Command::Query {
-            uri,
-            legacy_uri,
+            name,
             config,
             query,
             query_string,
-            name,
             params,
             branch,
             snapshot,
             format,
             json,
         } => {
-            if query.is_none() && query_string.is_none() {
-                bail!("provide a query: --query <file> or -e '<inline gq>'");
-            }
-
             let config = load_cli_config(config.as_ref())?;
             let client = client::GraphClient::resolve(
                 &config,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
-                uri.or(legacy_uri),
+                None,
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
             )
             .await?;
-            let query_source =
-                resolve_query_source(&config, query.as_ref(), query_string.as_deref(), None)?;
             let params_json = load_params_json(&params)?;
             let target = resolve_read_target(&config, branch, snapshot, None)?;
-            let output = client
-                .query(target, &query_source, name.as_deref(), params_json.as_ref())
-                .await?;
+            let output: ReadOutput = if query.is_some() || query_string.is_some() {
+                // Ad-hoc lane: run the source; the positional `name` selects
+                // within it when it holds more than one query.
+                let query_source =
+                    resolve_query_source(&config, query.as_ref(), query_string.as_deref(), None)?;
+                client
+                    .query(target, &query_source, name.as_deref(), params_json.as_ref())
+                    .await?
+            } else {
+                // Catalog lane (served-only): invoke the stored query by name.
+                let Some(name) = name else {
+                    bail!(
+                        "provide a query name to invoke from the catalog, or -e '<gq>' / \
+                         --query <file> for an ad-hoc query"
+                    );
+                };
+                let (branch, snapshot) = match &target {
+                    ReadTarget::Branch(b) => (Some(b.clone()), None),
+                    ReadTarget::Snapshot(s) => (None, Some(s.as_str().to_string())),
+                };
+                client
+                    .invoke_named(&name, false, params_json.as_ref(), branch, snapshot)
+                    .await?
+            };
             let format = resolve_read_format(&config, format, json, None);
             print_read_output(&output, format, &config)?;
         }
         Command::Mutate {
-            uri,
-            legacy_uri,
+            name,
             config,
             query,
             query_string,
-            name,
             params,
             branch,
             json,
         } => {
-            if query.is_none() && query_string.is_none() {
-                bail!("provide a mutation query: --query <file> or -e '<inline gq>'");
-            }
-
             let config = load_cli_config(config.as_ref())?;
             let client = client::GraphClient::resolve_with_policy(
                 &config,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
-                uri.or(legacy_uri),
+                None,
                 cli.as_actor.as_deref(),
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
             )
             .await?;
-            let query_source =
-                resolve_query_source(&config, query.as_ref(), query_string.as_deref(), None)?;
             let params_json = load_params_json(&params)?;
             let branch = resolve_branch(&config, branch, None, "main");
-            let output = client
-                .mutate(&branch, &query_source, name.as_deref(), params_json.as_ref())
-                .await?;
+            let output: ChangeOutput = if query.is_some() || query_string.is_some() {
+                // Ad-hoc lane: run the source; positional `name` selects within it.
+                let query_source =
+                    resolve_query_source(&config, query.as_ref(), query_string.as_deref(), None)?;
+                client
+                    .mutate(&branch, &query_source, name.as_deref(), params_json.as_ref())
+                    .await?
+            } else {
+                // Catalog lane (served-only): invoke the stored mutation by name.
+                let Some(name) = name else {
+                    bail!(
+                        "provide a mutation name to invoke from the catalog, or -e '<gq>' / \
+                         --query <file> for an ad-hoc mutation"
+                    );
+                };
+                client
+                    .invoke_named(&name, true, params_json.as_ref(), Some(branch), None)
+                    .await?
+            };
             if json {
                 print_json(&output)?;
             } else {

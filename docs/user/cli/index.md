@@ -6,35 +6,43 @@
 omnigraph init --schema schema.pg graph.omni
 omnigraph load --data data.jsonl --mode overwrite graph.omni
 omnigraph snapshot graph.omni --branch main --json
-omnigraph query  --uri graph.omni --query queries.gq --name get_person --params '{"name":"Alice"}'
-omnigraph mutate --uri graph.omni --query queries.gq --name insert_person --params '{"name":"Mina","age":28}'
+# Invoke a stored query BY NAME from the catalog (served — addressed by scope):
+omnigraph query  get_person    --params '{"name":"Alice"}'
+omnigraph mutate insert_person --params '{"name":"Mina","age":28}'
 ```
 
 `omnigraph query` is the canonical read command (pairs with `POST /query`);
 `omnigraph mutate` is the canonical write command (pairs with `POST /mutate`).
-The previous names `omnigraph read` and `omnigraph change` keep working as
-visible aliases — invocations emit a one-line deprecation warning to stderr
-and otherwise behave identically. See [Deprecated names](#deprecated-names)
-for the migration table.
+The positional argument is the **stored-query name**, invoked from the served
+catalog (RFC-011 D3) — the graph is addressed by scope (`--server` / `--profile`
+/ defaults), and the verb asserts the query's kind (`query` rejects a stored
+mutation, and vice-versa). The previous names `omnigraph read` and
+`omnigraph change` keep working as visible aliases — invocations emit a one-line
+deprecation warning to stderr. See [Deprecated names](#deprecated-names).
 
-For ad-hoc reads and mutations (REPLs, AI agents, one-off scripts), pass the
-GQ source inline with `-e` / `--query-string` instead of a file path:
+For **ad-hoc** reads and mutations (REPLs, AI agents, one-off scripts, local dev),
+pass the GQ source with `-e` / `--query-string` (inline) or `--query <path>` (a
+file), and address a graph's storage directly with `--store`. By-name catalog
+invocation is served-only — a bare `--store` has no catalog, so it's the ad-hoc
+lane:
 
 ```bash
-omnigraph query --uri graph.omni \
+omnigraph query --store graph.omni \
   -e 'query find($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.age } }' \
   --params '{"name":"Alice"}'
 
-omnigraph mutate --uri graph.omni \
+omnigraph mutate --store graph.omni \
   -e 'query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }' \
   --params '{"name":"Inline","age":42}'
+
+# A multi-query file: the positional selects which query to run.
+omnigraph query --store graph.omni --query queries.gq get_person --params '{"name":"Alice"}'
 ```
 
-`-e` is mutually exclusive with `--query <path>`; exactly one of the two must be
-provided. (Operator aliases moved to their own `omnigraph alias <name>`
-subcommand — RFC-011 D4.) The inline source travels through the same
-parser, lint, params binding, and commit machinery as a file-based query —
-only the source loader changes.
+`-e` is mutually exclusive with `--query <path>`. With either, the positional
+name (optional) selects which query in the source to run. The inline source
+travels through the same parser, lint, params binding, and commit machinery as a
+file-based query — only the source loader changes.
 
 ## Branching And Reviewable Data Flows
 
@@ -57,13 +65,11 @@ Serve a graph:
 omnigraph-server graph.omni --bind 127.0.0.1:8080
 ```
 
-Read through the HTTP API:
+Read through the HTTP API — invoke a stored query by name from the catalog:
 
 ```bash
-omnigraph query \
+omnigraph query get_person \
   --server http://127.0.0.1:8080 \
-  --query queries.gq \
-  --name get_person \
   --params '{"name":"Alice"}'
 ```
 
@@ -87,10 +93,10 @@ For config-driven clients, set the remote graph's `bearer_token_env` to an envir
 
 Runtime add/remove is **not** in v0.6.0. To add a graph, stop the server, add a `graphs.<id>` entry to `omnigraph.yaml`, then restart. To remove, stop the server, delete the entry, restart.
 
-Per-graph URLs: hit a graph's cluster route from any subcommand by pointing `--uri` at it:
+Per-graph addressing: select a graph on a multi-graph server with `--graph`:
 
 ```bash
-omnigraph read --uri http://server.example.com/graphs/beta --query q.gq ...
+omnigraph query get_person --server http://server.example.com --graph beta --params '{"name":"Ada"}'
 ```
 
 ## Runs, Policy, And Diagnostics

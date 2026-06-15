@@ -980,6 +980,22 @@ pub(crate) async fn server_invoke_query(
     let query_name = stored.name.clone();
     let is_mutation = stored.is_mutation();
 
+    // RFC-011 D3: the CLI verb asserts the stored query's kind. `query <name>`
+    // sends `expect_mutation: false`, `mutate <name>` sends `true`; a mismatch
+    // is rejected here so the wrong verb errors instead of silently running.
+    if let Some(expected) = req.expect_mutation {
+        if expected != is_mutation {
+            let (actual, verb) = if is_mutation {
+                ("mutation", "mutate")
+            } else {
+                ("read", "query")
+            };
+            return Err(ApiError::bad_request(format!(
+                "'{query_name}' is a {actual} — use omnigraph {verb} {query_name}"
+            )));
+        }
+    }
+
     info!(
         graph = %handle.uri,
         actor = ?actor_ref.map(|a| a.actor_id.as_ref()),
