@@ -736,3 +736,62 @@ edge Knows: Person -> Person {
     // current contract, the data is *unreachable* via omnigraph
     // (no manifest entry), which is the user-facing guarantee.
 }
+
+// Regression (bug 3 / dev-graph iss-848): a `Vector @index` on a 0-row table
+// must not abort an otherwise-valid schema apply. A vector (IVF) index trains
+// k-means centroids over the column's vectors, so Lance cannot build it on 0
+// vectors — it errors with "Creating empty vector indices with train=False is
+// not yet implemented". When a *later* migration touches that table (here, an
+// unrelated scalar `@index` on `body`), schema apply reconciles the table's
+// whole index set, which previously tried to materialize the dormant vector
+// index and aborted the entire migration (all-or-nothing). The build is now
+// deferred (pending) when the column is untrainable, instead of failing the
+// migration. The dormant index is materialized by a later `ensure_indices` /
+// `optimize` once the table has rows. Full decoupling — intent recorded at
+// apply, an async reconciler converges physical coverage — is iss-848.
+#[tokio::test]
+async fn apply_schema_defers_vector_index_on_empty_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+
+    // init does not build indices, so the declared-but-unbuilt vector index
+    // sits harmless on the empty table (this is how it survived earlier
+    // applies that never touched the table).
+    // `slug` is the user @key; omnigraph injects its own internal `id` column,
+    // so the key field must not be named `id`.
+    let v1 = "node Doc {\n    \
+        slug: String @key\n    \
+        body: String?\n    \
+        embedding: Vector(8) @index\n\
+        }\n";
+    let mut db = Omnigraph::init(uri, v1).await.unwrap();
+
+    // Add an *unrelated* scalar @index on `body`. This routes Doc through
+    // schema apply's index reconcile, which must NOT abort on the untrainable
+    // empty vector index.
+    let v2 = "node Doc {\n    \
+        slug: String @key\n    \
+        body: String? @index\n    \
+        embedding: Vector(8) @index\n\
+        }\n";
+    let result = db.apply_schema(v2).await.expect(
+        "schema apply must succeed: an empty-table vector @index is deferred, not fatal",
+    );
+    assert!(result.applied, "the scalar @index change must apply");
+
+    // The deferred vector index is not dropped — once the table has a
+    // trainable vector, `ensure_indices` materializes it without error. (If
+    // the guard wrongly skipped a non-empty column, this would still be
+    // unindexed; if it wrongly tried to build on empty, the apply above would
+    // have failed.)
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Doc","data":{"slug":"d1","body":"hello","embedding":[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("loading a Doc with an embedding must succeed");
+    db.ensure_indices()
+        .await
+        .expect("the deferred vector index must build once the table has a trainable vector");
+}
