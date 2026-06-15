@@ -2,7 +2,6 @@
 //! Moved verbatim from tests/cli.rs in the modularization.
 
 
-use serde_json::Value;
 use tempfile::tempdir;
 
 mod support;
@@ -57,141 +56,42 @@ query list_people() {
     assert_eq!(stdout_string(&lint_output), stdout_string(&check_output));
 }
 
+// Legacy `omnigraph.yaml` `aliases:` invoked via the `--alias` flag were
+// removed in RFC-011 D4 — operator aliases now live under `omnigraph alias
+// <name>` (the happy path is covered by system_local's operator-alias e2e).
+// The legacy file-alias path has no CLI entry point.
+
 #[test]
-fn read_alias_from_yaml_config_runs_with_kv_output() {
-    let temp = tempdir().unwrap();
-    let graph = graph_path(temp.path());
-    let config = temp.path().join("omnigraph.yaml");
-    let query = temp.path().join("aliases.gq");
-    init_graph(&graph);
-    load_fixture(&graph);
-    write_query_file(
-        &query,
-        &std::fs::read_to_string(fixture("test.gq")).unwrap(),
+fn alias_flag_is_removed_from_query() {
+    // RFC-011 D4: `--alias` no longer exists on query/mutate; use `alias <name>`.
+    let output = output_failure(cli().arg("query").arg("--alias").arg("who"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unexpected argument") && stderr.contains("--alias"),
+        "expected clap to reject --alias on query; got: {stderr}"
     );
-    write_config(
-        &config,
-        &format!(
-            "{}aliases:\n  owner:\n    command: read\n    query: aliases.gq\n    name: get_person\n    args: [name]\n    format: kv\n",
-            local_yaml_config(&graph)
-        ),
-    );
-
-    let output = output_success(
-        cli()
-            .arg("read")
-            .arg("--config")
-            .arg(&config)
-            .arg("--alias")
-            .arg("owner")
-            .arg("Alice"),
-    );
-    let stdout = stdout_string(&output);
-
-    assert!(stdout.contains("row 1"));
-    assert!(stdout.contains("p.name: Alice"));
 }
 
 #[test]
-fn read_alias_uses_alias_target_without_cli_default_and_accepts_url_like_arg() {
-    let temp = tempdir().unwrap();
-    let graph = graph_path(temp.path());
-    let config = temp.path().join("omnigraph.yaml");
-    let query = temp.path().join("aliases.gq");
-    let data = temp.path().join("url-like.jsonl");
-    init_graph(&graph);
-    write_jsonl(
-        &data,
-        r#"{"type":"Person","data":{"name":"https://example.com","age":30}}"#,
-    );
-    output_success(
+fn alias_unknown_name_errors_listing_defined() {
+    // Hermetic: an unknown alias fails before any network, listing defined ones.
+    let home = tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.yaml"),
+        "servers:\n  dev:\n    url: https://x\naliases:\n  who:\n    server: dev\n    query: find_person\n",
+    )
+    .unwrap();
+    let output = output_failure(
         cli()
-            .arg("load")
-            .arg("--mode")
-            .arg("overwrite")
-            .arg("--data")
-            .arg(&data)
-            .arg(&graph),
+            .env("OMNIGRAPH_HOME", home.path())
+            .arg("alias")
+            .arg("nope"),
     );
-    write_query_file(
-        &query,
-        &std::fs::read_to_string(fixture("test.gq")).unwrap(),
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown alias 'nope'") && stderr.contains("who"),
+        "expected an unknown-alias error listing defined aliases; got: {stderr}"
     );
-    write_config(
-        &config,
-        &format!(
-            "graphs:\n  local:\n    uri: '{}'\nquery:\n  roots:\n    - .\npolicy: {{}}\naliases:\n  owner:\n    command: read\n    query: aliases.gq\n    name: get_person\n    args: [name]\n    graph: local\n    format: kv\n",
-            graph.to_string_lossy()
-        ),
-    );
-
-    let output = output_success(
-        cli()
-            .arg("read")
-            .arg("--config")
-            .arg(&config)
-            .arg("--alias")
-            .arg("owner")
-            .arg("https://example.com"),
-    );
-    let stdout = stdout_string(&output);
-
-    assert!(stdout.contains("row 1"));
-    assert!(stdout.contains("p.name: https://example.com"));
-}
-
-#[test]
-fn change_alias_from_yaml_config_persists_changes() {
-    let temp = tempdir().unwrap();
-    let graph = graph_path(temp.path());
-    let config = temp.path().join("omnigraph.yaml");
-    let query = temp.path().join("mutations.gq");
-    init_graph(&graph);
-    load_fixture(&graph);
-    write_query_file(
-        &query,
-        r#"
-query insert_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
-}
-"#,
-    );
-    write_config(
-        &config,
-        &format!(
-            "{}aliases:\n  add_person:\n    command: change\n    query: mutations.gq\n    name: insert_person\n    args: [name, age]\n",
-            local_yaml_config(&graph)
-        ),
-    );
-
-    let output = output_success(
-        cli()
-            .arg("change")
-            .arg("--config")
-            .arg(&config)
-            .arg("--alias")
-            .arg("add_person")
-            .arg("Eve")
-            .arg("29")
-            .arg("--json"),
-    );
-    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(payload["affected_nodes"], 1);
-
-    let verify = output_success(
-        cli()
-            .arg("read")
-            .arg(&graph)
-            .arg("--query")
-            .arg(fixture("test.gq"))
-            .arg("--name")
-            .arg("get_person")
-            .arg("--params")
-            .arg(r#"{"name":"Eve"}"#)
-            .arg("--json"),
-    );
-    let verify_payload: Value = serde_json::from_slice(&verify.stdout).unwrap();
-    assert_eq!(verify_payload["row_count"], 1);
 }
 
 #[test]
