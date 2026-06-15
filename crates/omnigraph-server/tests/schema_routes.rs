@@ -2,6 +2,7 @@
 //! Moved verbatim from tests/server.rs in the modularization.
 
 use std::fs;
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
@@ -11,7 +12,7 @@ use omnigraph::loader::LoadMode;
 use omnigraph_server::api::{
     ChangeRequest, ErrorOutput, ReadRequest, SchemaApplyRequest, SchemaOutput,
 };
-use omnigraph_server::{AppState, build_app};
+use omnigraph_server::{AppState, GraphHandle, GraphId, GraphKey, build_app, workload};
 use serde_json::json;
 
 
@@ -51,6 +52,60 @@ async fn schema_apply_route_updates_graph_for_authorized_admin() {
         reopened.catalog().node_types["Person"]
             .properties
             .contains_key("nickname")
+    );
+}
+
+#[tokio::test]
+async fn schema_apply_route_refuses_cluster_backed_server_mode() {
+    let temp = init_graph_with_schema(&fs::read_to_string(fixture("test.pg")).unwrap()).await;
+    let graph = graph_path(temp.path());
+    let graph_uri = graph.to_string_lossy().to_string();
+    let engine = Omnigraph::open(&graph_uri).await.unwrap();
+    let handle = Arc::new(GraphHandle {
+        key: GraphKey::cluster(GraphId::try_from("default").unwrap()),
+        uri: graph_uri.clone(),
+        engine: Arc::new(engine),
+        policy: None,
+        queries: None,
+    });
+    let state = AppState::new_multi(
+        vec![handle],
+        Vec::new(),
+        None,
+        workload::WorkloadController::from_env(),
+        Some(temp.path().join("cluster.yaml")),
+    )
+    .unwrap();
+    let app = build_app(state);
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(g("/schema/apply"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&SchemaApplyRequest {
+                schema_source: additive_schema_with_nickname(),
+                ..Default::default()
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+    let (status, payload) = json_response(&app, request).await;
+
+    assert_eq!(status, StatusCode::CONFLICT, "body: {payload}");
+    assert!(
+        payload["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cluster apply"),
+        "body: {payload}"
+    );
+    let reopened = Omnigraph::open(&graph_uri).await.unwrap();
+    assert!(
+        !reopened.catalog().node_types["Person"]
+            .properties
+            .contains_key("nickname"),
+        "cluster-backed schema apply must not mutate the graph"
     );
 }
 

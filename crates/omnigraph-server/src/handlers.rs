@@ -53,14 +53,13 @@ pub(crate) async fn server_graphs_list(
 ) -> std::result::Result<Json<GraphListResponse>, ApiError> {
     let registry = &state.routing().registry;
 
-    // Server-level Cedar gate. `state.server_policy` is loaded from
-    // `server.policy.file` in `omnigraph.yaml` at startup. When no
-    // server policy is configured, `authorize_request_server` falls
-    // through to the MR-723 default-deny semantics (every non-Read
-    // action denied for an authenticated actor). `GraphList` is not
-    // `Read`, so without a server policy the request gets 403 — which
-    // is the right default (don't leak the registry until the operator
-    // explicitly authorizes it).
+    // Server-level Cedar gate. `state.server_policy` is loaded from the
+    // cluster-scoped policy bundle at startup. When no server policy is
+    // configured, `authorize_request_server` falls through to the MR-723
+    // default-deny semantics (every non-Read action denied for an
+    // authenticated actor). `GraphList` is not `Read`, so without a server
+    // policy the request gets 403 — which is the right default (don't leak
+    // the registry until the operator explicitly authorizes it).
     authorize_request(
         actor.as_ref().map(|Extension(actor)| actor),
         state.server_policy.as_deref(),
@@ -360,22 +359,25 @@ pub(crate) fn authorize(
         // runtime state means the docstring contract on
         // `server_graphs_list` ("don't leak the registry until the
         // operator explicitly authorizes it") holds uniformly; the
-        // operator's only path to enabling it is configuring an
-        // explicit `server.policy.file` in omnigraph.yaml.
+        // operator's only path to enabling it is configuring a
+        // cluster-scoped policy bundle, applying the cluster, and
+        // restarting the server.
         if request.action.resource_kind() == PolicyResourceKind::Server {
             return Ok(Authz::Denied(
-                "server-scoped actions require an explicit `server.policy.file` \
-                 configured in omnigraph.yaml — the management surface is closed \
-                 by default in every runtime state, including --unauthenticated, \
-                 so that server topology is never exposed without operator opt-in."
+                "server-scoped actions require an explicit cluster policy bundle \
+                 applied with `omnigraph cluster apply` and served after restart — \
+                 the management surface is closed by default in every runtime state, \
+                 including --unauthenticated, so that server topology is never exposed \
+                 without operator opt-in."
                     .to_string(),
             ));
         }
         if actor.is_some() && request.action != PolicyAction::Read {
             return Ok(Authz::Denied(
                 "server runs in default-deny mode (bearer tokens configured but no \
-                 policy file). Only `read` actions are permitted; configure \
-                 `policy.file` in omnigraph.yaml to enable other actions."
+                 applied policy bundle). Only `read` actions are permitted; configure \
+                 a graph or cluster policy bundle in the cluster config, run \
+                 `omnigraph cluster apply`, and restart the server to enable other actions."
                     .to_string(),
             ));
         }
@@ -488,7 +490,7 @@ pub(crate) fn deprecation_headers(successor_link: &'static str) -> [(HeaderName,
     operation_id = "read",
     request_body = ReadRequest,
     responses(
-        (status = 200, description = "Query results (response includes `Deprecation: true` + `Link: </query>; rel=\"successor-version\"`)", body = ReadOutput),
+        (status = 200, description = "Query results (response includes `Deprecation: true` + `Link: <query>; rel=\"successor-version\"`)", body = ReadOutput),
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
@@ -502,7 +504,7 @@ pub(crate) fn deprecation_headers(successor_link: &'static str) -> [(HeaderName,
 /// route is kept indefinitely for byte-stable back-compat. New integrations
 /// should target `POST /query`, which has clean field names (`query` /
 /// `name`) and a 400-on-mutation guard. Responses from this route include
-/// `Deprecation: true` and `Link: </query>; rel="successor-version"`
+/// `Deprecation: true` and `Link: <query>; rel="successor-version"`
 /// headers per RFC 9745 / RFC 8288 so SDKs and proxies can surface the
 /// signal.
 pub(crate) async fn server_read(
@@ -522,7 +524,7 @@ pub(crate) async fn server_read(
     )
     .await?;
     Ok((
-        deprecation_headers("</query>; rel=\"successor-version\""),
+        deprecation_headers("<query>; rel=\"successor-version\""),
         Json(api::read_output(selected_name, &target, result)),
     ))
 }
@@ -771,7 +773,7 @@ pub(crate) async fn run_query(
     operation_id = "change",
     request_body = ChangeRequest,
     responses(
-        (status = 200, description = "Mutation results (response includes `Deprecation: true` + `Link: </mutate>; rel=\"successor-version\"`)", body = ChangeOutput),
+        (status = 200, description = "Mutation results (response includes `Deprecation: true` + `Link: <mutate>; rel=\"successor-version\"`)", body = ChangeOutput),
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
@@ -787,7 +789,7 @@ pub(crate) async fn run_query(
 /// kept indefinitely for back-compat. New integrations should target
 /// `POST /mutate`, which has identical semantics and a name that pairs
 /// cleanly with `POST /query`. Responses from this route include
-/// `Deprecation: true` and `Link: </mutate>; rel="successor-version"`
+/// `Deprecation: true` and `Link: <mutate>; rel="successor-version"`
 /// headers per RFC 9745 / RFC 8288 so SDKs and proxies can surface the
 /// signal.
 pub(crate) async fn server_change(
@@ -808,7 +810,7 @@ pub(crate) async fn server_change(
     )
     .await?;
     Ok((
-        deprecation_headers("</mutate>; rel=\"successor-version\""),
+        deprecation_headers("<mutate>; rel=\"successor-version\""),
         Json(output),
     ))
 }
@@ -1111,11 +1113,15 @@ pub(crate) async fn server_schema_get(
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
+        (status = 409, description = "Schema apply is disabled for cluster-backed serving; use `omnigraph cluster apply` and restart", body = ErrorOutput),
         (status = 429, description = "Per-actor admission cap exceeded; honor `Retry-After` header", body = ErrorOutput),
     ),
     security(("bearer_token" = [])),
 )]
 /// Apply a schema migration.
+///
+/// Cluster-backed servers reject this route with `409 Conflict`; operators
+/// must apply schema changes through `omnigraph cluster apply` and restart.
 ///
 /// Diffs `schema_source` against the current schema and applies the resulting
 /// migration steps (add/drop type, add/drop column, etc.). **Destructive**:
@@ -1127,6 +1133,13 @@ pub(crate) async fn server_schema_apply(
     actor: Option<Extension<ResolvedActor>>,
     Json(request): Json<SchemaApplyRequest>,
 ) -> std::result::Result<Json<SchemaApplyOutput>, ApiError> {
+    if state.routing().config_path.is_some() {
+        return Err(ApiError::conflict(
+            "server-side schema apply is disabled for cluster-backed serving; \
+             update the cluster config, run `omnigraph cluster apply`, and restart \
+             the server.",
+        ));
+    }
     let actor_arc = actor
         .as_ref()
         .map(|Extension(actor)| Arc::clone(&actor.actor_id))
@@ -1324,7 +1337,7 @@ pub(crate) async fn server_load(
     operation_id = "ingest",
     request_body = IngestRequest,
     responses(
-        (status = 200, description = "Load results (response includes `Deprecation: true` + `Link: </load>; rel=\"successor-version\"`)", body = IngestOutput),
+        (status = 200, description = "Load results (response includes `Deprecation: true` + `Link: <load>; rel=\"successor-version\"`)", body = IngestOutput),
         (status = 400, description = "Bad request", body = ErrorOutput),
         (status = 401, description = "Unauthorized", body = ErrorOutput),
         (status = 403, description = "Forbidden", body = ErrorOutput),
@@ -1338,7 +1351,7 @@ pub(crate) async fn server_load(
 /// Bulk-load NDJSON data into a branch. Behavior is unchanged; the route is
 /// kept indefinitely for back-compat. New integrations should target
 /// `POST /load`, which has identical semantics. Responses from this route
-/// include `Deprecation: true` and `Link: </load>; rel="successor-version"`
+/// include `Deprecation: true` and `Link: <load>; rel="successor-version"`
 /// headers per RFC 9745 / RFC 8288 so SDKs and proxies can surface the signal.
 pub(crate) async fn server_ingest(
     State(state): State<AppState>,
@@ -1354,7 +1367,7 @@ pub(crate) async fn server_ingest(
     )
     .await?;
     Ok((
-        deprecation_headers("</load>; rel=\"successor-version\""),
+        deprecation_headers("<load>; rel=\"successor-version\""),
         Json(output),
     ))
 }
@@ -1738,4 +1751,3 @@ pub(crate) fn query_params_from_json(
     json_params_to_param_map(params_json, query_params, JsonParamMode::Standard)
         .map_err(|err| color_eyre::eyre::eyre!(err.to_string()))
 }
-

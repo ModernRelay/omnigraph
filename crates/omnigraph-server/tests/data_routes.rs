@@ -580,7 +580,7 @@ async fn mutate_endpoint_runs_inline_mutation() {
 #[tokio::test(flavor = "multi_thread")]
 async fn change_endpoint_emits_deprecation_headers() {
     // `/change` is kept indefinitely for back-compat but flagged at runtime
-    // per RFC 9745 (`Deprecation: true`) + RFC 8288 (`Link: </mutate>;
+    // per RFC 9745 (`Deprecation: true`) + RFC 8288 (`Link: <mutate>;
     // rel="successor-version"`). The OpenAPI side is covered by
     // `openapi_change_is_deprecated` in tests/openapi.rs.
     let (_temp, app) = app_for_loaded_graph().await;
@@ -615,7 +615,7 @@ async fn change_endpoint_emits_deprecation_headers() {
     );
     assert_eq!(
         response.headers().get("link").and_then(|v| v.to_str().ok()),
-        Some("</mutate>; rel=\"successor-version\""),
+        Some("<mutate>; rel=\"successor-version\""),
         "POST /change must point at /mutate via `Link` rel=successor-version (RFC 8288)"
     );
 }
@@ -658,7 +658,7 @@ async fn load_endpoint_loads_into_existing_branch() {
 #[tokio::test(flavor = "multi_thread")]
 async fn ingest_endpoint_emits_deprecation_headers() {
     // `/ingest` is the deprecated alias of `/load` (RFC-009 Phase 5): flagged
-    // at runtime per RFC 9745 (`Deprecation: true`) + RFC 8288 (`Link: </load>;
+    // at runtime per RFC 9745 (`Deprecation: true`) + RFC 8288 (`Link: <load>;
     // rel="successor-version"`). The OpenAPI side is covered by
     // `openapi_ingest_is_deprecated` in tests/openapi.rs.
     let (_temp, app) = app_for_loaded_graph().await;
@@ -692,7 +692,7 @@ async fn ingest_endpoint_emits_deprecation_headers() {
     );
     assert_eq!(
         response.headers().get("link").and_then(|v| v.to_str().ok()),
-        Some("</load>; rel=\"successor-version\""),
+        Some("<load>; rel=\"successor-version\""),
         "POST /ingest must point at /load via `Link` rel=successor-version (RFC 8288)"
     );
 }
@@ -734,7 +734,7 @@ async fn read_endpoint_emits_deprecation_headers() {
     );
     assert_eq!(
         response.headers().get("link").and_then(|v| v.to_str().ok()),
-        Some("</query>; rel=\"successor-version\""),
+        Some("<query>; rel=\"successor-version\""),
         "POST /read must point at /query via `Link` rel=successor-version (RFC 8288)"
     );
 }

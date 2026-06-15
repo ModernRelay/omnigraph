@@ -180,7 +180,7 @@ Rust stable workspace (edition 2024). `protoc` is a build dependency (`brew inst
 cargo build --workspace --locked              # build everything
 cargo test  --workspace --locked              # the canonical CI gate (matches CI exactly)
 cargo run -p omnigraph-cli -- <args>          # run the `omnigraph` CLI from source
-cargo run -p omnigraph-server -- <uri> --bind 0.0.0.0:8080   # run the server from source
+cargo run -p omnigraph-server -- --cluster <dir|s3://...> --bind 0.0.0.0:8080   # run the server from source
 
 # Run one crate / one test file / one test fn
 cargo test -p omnigraph-engine --test traversal           # one integration-test file (see docs/dev/testing.md)
@@ -232,10 +232,10 @@ omnigraph cleanup  --keep 10 --older-than 7d --confirm s3://my-bucket/graph.omni
 
 # Stand up the HTTP server (token from env)
 OMNIGRAPH_SERVER_BEARER_TOKEN=xxxx \
-  omnigraph-server s3://my-bucket/graph.omni --bind 0.0.0.0:8080
+  omnigraph-server --cluster s3://my-bucket/cluster --bind 0.0.0.0:8080
 
 # Cedar policy explain
-omnigraph policy explain --actor act-alice --action change --branch main
+omnigraph policy explain --cluster ./company-brain --graph knowledge --actor act-alice --action change --branch main
 ```
 
 ---

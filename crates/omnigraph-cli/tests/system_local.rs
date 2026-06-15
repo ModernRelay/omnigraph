@@ -2483,13 +2483,18 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
     )
     .unwrap();
     fs::write(
+        cluster.path().join("insert-person.gq"),
+        "query insert_person($name: String) { insert Person { name: $name, age: 41 } }",
+    )
+    .unwrap();
+    fs::write(
         cluster.path().join("graph.policy.yaml"),
-        "version: 1\ngroups:\n  ops: [\"act-op\"]\nprotected_branches: [main]\nrules:\n  - id: allow-invoke\n    allow:\n      actors: { group: ops }\n      actions: [invoke_query]\n  - id: allow-read\n    allow:\n      actors: { group: ops }\n      actions: [read]\n      branch_scope: any\n",
+        "version: 1\ngroups:\n  ops: [\"act-op\"]\nprotected_branches: [main]\nrules:\n  - id: allow-invoke\n    allow:\n      actors: { group: ops }\n      actions: [invoke_query]\n  - id: allow-read\n    allow:\n      actors: { group: ops }\n      actions: [read]\n      branch_scope: any\n  - id: allow-change\n    allow:\n      actors: { group: ops }\n      actions: [change]\n      branch_scope: any\n",
     )
     .unwrap();
     fs::write(
         cluster.path().join("cluster.yaml"),
-        "version: 1\nmetadata:\n  name: alias-sys\nstate:\n  backend: cluster\n  lock: true\ngraphs:\n  local:\n    schema: ./local.pg\n    queries:\n      find_person:\n        file: ./find-person.gq\npolicies:\n  graph:\n    file: ./graph.policy.yaml\n    applies_to: [local]\n",
+        "version: 1\nmetadata:\n  name: alias-sys\nstate:\n  backend: cluster\n  lock: true\ngraphs:\n  local:\n    schema: ./local.pg\n    queries:\n      find_person:\n        file: ./find-person.gq\n      insert_person:\n        file: ./insert-person.gq\npolicies:\n  graph:\n    file: ./graph.policy.yaml\n    applies_to: [local]\n",
     )
     .unwrap();
     output_success(cli().arg("cluster").arg("import").arg("--config").arg(cluster.path()));
@@ -2515,7 +2520,7 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
     fs::write(
         operator_home.path().join("config.yaml"),
         format!(
-            "servers:\n  dev:\n    url: {}\naliases:\n  who:\n    server: dev\n    graph: local\n    query: find_person\n    args: [name]\n",
+            "servers:\n  dev:\n    url: {}\naliases:\n  who:\n    server: dev\n    graph: local\n    query: find_person\n    args: [name]\n  create_person:\n    server: dev\n    graph: local\n    query: insert_person\n    args: [name]\n",
             server.base_url
         ),
     )
@@ -2551,6 +2556,46 @@ fn local_cli_operator_alias_and_server_flag_invoke_stored_query() {
     );
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(payload["rows"][0]["p.name"], "Alice", "{payload}");
+
+    // Operator aliases are read-only conveniences: a binding to a stored
+    // mutation must be rejected before the server executes it.
+    let output = cli()
+        .env("OMNIGRAPH_HOME", operator_home.path())
+        .arg("alias")
+        .arg("create_person")
+        .arg("AliasGuardPerson")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "mutation alias must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("'insert_person' is a mutation")
+            && stderr.contains("omnigraph mutate insert_person"),
+        "expected mutation-kind mismatch; got: {stderr}"
+    );
+    let output = cli()
+        .env("OMNIGRAPH_HOME", operator_home.path())
+        .arg("query")
+        .arg("find_person")
+        .arg("--server")
+        .arg("dev")
+        .arg("--graph")
+        .arg("local")
+        .arg("--params")
+        .arg(r#"{"name":"AliasGuardPerson"}"#)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "post-alias read should succeed: {output:?}"
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        payload["rows"].as_array().unwrap().len(),
+        0,
+        "mutation alias must not insert AliasGuardPerson: {payload}"
+    );
 
     // --server/--graph: the same stored query via explicit targeting.
     let output = cli()

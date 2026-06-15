@@ -2127,7 +2127,26 @@ fn profile_list_json_shape() {
         .find(|p| p["name"] == "brain-admin")
         .unwrap();
     assert_eq!(brain["binding"], "cluster: brain");
+    assert_eq!(brain["scope_kind"], "cluster");
+    assert_eq!(brain["target"], "brain");
+    assert_eq!(brain["valid"], true);
+    assert!(brain["error"].is_null());
     assert_eq!(brain["active"], false);
+    let broken = items
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "broken")
+        .unwrap();
+    assert_eq!(broken["scope_kind"], "invalid");
+    assert_eq!(broken["valid"], false);
+    assert!(broken["target"].is_null());
+    assert!(
+        broken["error"]
+            .as_str()
+            .unwrap()
+            .contains("profile 'broken'")
+    );
 }
 
 #[test]
