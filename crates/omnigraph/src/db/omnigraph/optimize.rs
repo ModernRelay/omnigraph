@@ -141,10 +141,11 @@ pub struct TableOptimizeStats {
     /// normal compaction/no-op/blob skips.
     pub lance_head_version: Option<u64>,
     /// Declared `@index` columns on this table the reconciler could not build
-    /// this run (today: a vector column with no trainable vectors yet). Empty
-    /// on the common path. Reported, not fatal — a later `optimize` retries; the
-    /// `list_indices`/`indisvalid` analog so operators can see what is pending.
-    pub pending_indexes: Vec<String>,
+    /// this run, each with the `reason` (today: a vector column with no
+    /// trainable vectors yet). Empty on the common path. Reported, not fatal — a
+    /// later `optimize` retries; the `list_indices`/`indisvalid` analog so
+    /// operators can see which index is pending and why.
+    pub pending_indexes: Vec<super::PendingIndex>,
 }
 
 impl TableOptimizeStats {
@@ -454,7 +455,7 @@ async fn optimize_one_table(
     // Vector index creation is an inline-commit residual; the Optimize sidecar's
     // loose post_commit_pin already covers the extra commits this adds.
     let mut snapshot = crate::storage_layer::SnapshotHandle::new(ds);
-    let pending_indexes: Vec<String> = if needs_index_create {
+    let pending_indexes: Vec<super::PendingIndex> = if needs_index_create {
         let catalog = db.catalog();
         super::table_ops::build_indices_on_dataset_for_catalog(
             db,
@@ -463,9 +464,6 @@ async fn optimize_one_table(
             &mut snapshot,
         )
         .await?
-        .into_iter()
-        .map(|p| p.column)
-        .collect()
     } else {
         Vec::new()
     };
