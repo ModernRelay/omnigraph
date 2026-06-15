@@ -935,3 +935,60 @@ async fn optimize_materializes_index_declared_but_unbuilt() {
         "optimize must build the declared-but-unbuilt rank index"
     );
 }
+
+// iss-848 (PR review): the rename path also defers index building. A RenameType
+// migration writes the renamed table as a new dataset with the existing rows
+// but no indexes (its inline build was removed). optimize must then materialize
+// the declared index on the renamed table.
+#[tokio::test]
+async fn optimize_materializes_index_after_type_rename() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let v1 = "node Doc {\n    slug: String @key\n    rank: I32 @index\n}\n";
+    let mut db = Omnigraph::init(uri, v1).await.unwrap();
+    load_jsonl(
+        &mut db,
+        "{\"type\":\"Doc\",\"data\":{\"slug\":\"d1\",\"rank\":1}}\n\
+         {\"type\":\"Doc\",\"data\":{\"slug\":\"d2\",\"rank\":2}}",
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    // Rename Doc -> Item; rows are preserved on the new table key.
+    let v2 = "node Item @rename_from(\"Doc\") {\n    slug: String @key\n    rank: I32 @index\n}\n";
+    let result = db.apply_schema(v2).await.expect("rename apply");
+    assert!(result.applied);
+    assert_eq!(
+        count_rows(&db, "node:Item").await,
+        2,
+        "rename must preserve rows"
+    );
+
+    // Post-rename the renamed table's declared rank index is unbuilt (deferred).
+    {
+        let snap = snapshot_main(&db).await.unwrap();
+        let ds = snap.open("node:Item").await.unwrap();
+        assert!(
+            matches!(
+                TableStore::key_column_index_coverage(&ds, "rank")
+                    .await
+                    .unwrap(),
+                IndexCoverage::Degraded { .. }
+            ),
+            "rank must be unindexed immediately after the rename"
+        );
+    }
+
+    db.optimize().await.unwrap();
+
+    let snap = snapshot_main(&db).await.unwrap();
+    let ds = snap.open("node:Item").await.unwrap();
+    assert_eq!(
+        TableStore::key_column_index_coverage(&ds, "rank")
+            .await
+            .unwrap(),
+        IndexCoverage::Indexed,
+        "optimize must build the renamed table's deferred rank index"
+    );
+}
