@@ -370,7 +370,7 @@ fn node_prop_index_kind(prop_type: &PropType) -> Option<NodePropIndexKind> {
 /// (DateTime/Date/numeric/Bool), FTS for free-text Strings, or a Vector index.
 /// Edges get BTree only (id, src, dst). This helper and the builder share
 /// `node_prop_index_kind` so they cannot drift — see its doc comment.
-async fn needs_index_work_node(
+pub(super) async fn needs_index_work_node(
     db: &Omnigraph,
     type_name: &str,
     table_key: &str,
@@ -438,7 +438,7 @@ async fn needs_index_work_node(
 ///
 /// Empty edge tables are skipped by the ensure_indices loop the same
 /// way node tables are; see `needs_index_work_node`.
-async fn needs_index_work_edge(
+pub(super) async fn needs_index_work_edge(
     db: &Omnigraph,
     table_key: &str,
     full_path: &str,
