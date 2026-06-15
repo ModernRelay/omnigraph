@@ -1,15 +1,11 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
-
 use clap::{Arg, ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
-use color_eyre::eyre::{Result, WrapErr, bail};
+use color_eyre::eyre::{Result, bail};
 use omnigraph::db::{Omnigraph, ReadTarget, SnapshotId};
 use omnigraph::loader::LoadMode;
-use omnigraph::storage::normalize_root_uri;
 use omnigraph_cluster::{
     ApplyOptions, ApplyOutput, ApproveOutput, DiagnosticSeverity, ForceUnlockOutput, PlanOutput, StateSyncOutput, StatusOutput,
     ValidateOutput, apply_config_dir_with_options, approve_config_dir, force_unlock_config_dir, import_config_dir, plan_config_dir,
@@ -26,9 +22,9 @@ use omnigraph_api_types::{
     ChangeOutput, CommitOutput, ErrorOutput, IngestOutput, ReadOutput, SchemaApplyOutput,
     SnapshotTableOutput,
 };
-use omnigraph_server::queries::{QueryRegistry, check, format_check_breakages};
+use omnigraph_server::queries::{QueryRegistry, check};
 use omnigraph_server::{
-    OmnigraphConfig, PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest,
+    PolicyAction, PolicyDecision, PolicyEngine, PolicyRequest,
     PolicyTestConfig, ReadOutputFormat, graph_resource_id_for_selection, load_config,
 };
 use reqwest::Method;
@@ -170,16 +166,13 @@ async fn main() -> Result<()> {
         }
         Command::Load {
             uri,
-            config,
             data,
             branch,
             from,
             mode,
             json,
         } => {
-            let config = load_cli_config(config.as_ref())?;
             let client = client::GraphClient::resolve_with_policy(
-                &config,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 uri,
@@ -188,7 +181,7 @@ async fn main() -> Result<()> {
                 cli.store.as_deref(),
             )
             .await?;
-            let branch = resolve_branch(&config, branch, None, "main");
+            let branch = resolve_branch(branch, None, "main");
             if matches!(mode, CliLoadMode::Overwrite) {
                 confirm_destructive("load --mode overwrite", client.uri(), cli.yes, json)?;
             }
@@ -204,7 +197,6 @@ async fn main() -> Result<()> {
         }
         Command::Ingest {
             uri,
-            config,
             data,
             branch,
             from,
@@ -216,9 +208,7 @@ async fn main() -> Result<()> {
                 "warning: `omnigraph ingest` is deprecated and will be removed in a future release; \
                  use `omnigraph load --from <base> --mode <mode>` (ingest defaults: --from main --mode merge)"
             );
-            let config = load_cli_config(config.as_ref())?;
             let client = client::GraphClient::resolve_with_policy(
-                &config,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 uri,
@@ -227,8 +217,8 @@ async fn main() -> Result<()> {
                 cli.store.as_deref(),
             )
             .await?;
-            let branch = resolve_branch(&config, branch, None, "main");
-            let from = resolve_branch(&config, from, None, "main");
+            let branch = resolve_branch(branch, None, "main");
+            let from = resolve_branch(from, None, "main");
             echo_write_target(cli.quiet, "ingest", client.uri(), client.is_remote());
             let payload = client
                 .ingest(&branch, &from, &data.to_string_lossy(), mode)
@@ -242,14 +232,11 @@ async fn main() -> Result<()> {
         Command::Branch { command } => match command {
             BranchCommand::Create {
                 uri,
-                config,
                 from,
                 name,
                 json,
             } => {
-                let config = load_cli_config(config.as_ref())?;
                 let client = client::GraphClient::resolve_with_policy(
-                    &config,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
@@ -258,7 +245,7 @@ async fn main() -> Result<()> {
                     cli.store.as_deref(),
                 )
                 .await?;
-                let from = resolve_branch(&config, from, None, "main");
+                let from = resolve_branch(from, None, "main");
                 echo_write_target(cli.quiet, "branch create", client.uri(), client.is_remote());
                 let payload = client.branch_create_from(&from, &name).await?;
                 if json {
@@ -269,12 +256,9 @@ async fn main() -> Result<()> {
             }
             BranchCommand::List {
                 uri,
-                config,
                 json,
             } => {
-                let config = load_cli_config(config.as_ref())?;
                 let client = client::GraphClient::resolve(
-                    &config,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
@@ -293,13 +277,10 @@ async fn main() -> Result<()> {
             }
             BranchCommand::Delete {
                 uri,
-                config,
                 name,
                 json,
             } => {
-                let config = load_cli_config(config.as_ref())?;
                 let client = client::GraphClient::resolve_with_policy(
-                    &config,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
@@ -319,14 +300,11 @@ async fn main() -> Result<()> {
             }
             BranchCommand::Merge {
                 uri,
-                config,
                 source,
                 into,
                 json,
             } => {
-                let config = load_cli_config(config.as_ref())?;
                 let client = client::GraphClient::resolve_with_policy(
-                    &config,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
@@ -335,7 +313,7 @@ async fn main() -> Result<()> {
                     cli.store.as_deref(),
                 )
                 .await?;
-                let into = resolve_branch(&config, into, None, "main");
+                let into = resolve_branch(into, None, "main");
                 echo_write_target(cli.quiet, "branch merge", client.uri(), client.is_remote());
                 let payload = client.branch_merge(&source, &into).await?;
                 if json {
@@ -353,13 +331,10 @@ async fn main() -> Result<()> {
         Command::Commit { command } => match command {
             CommitCommand::List {
                 uri,
-                config,
                 branch,
                 json,
             } => {
-                let config = load_cli_config(config.as_ref())?;
                 let client = client::GraphClient::resolve(
-                    &config,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
@@ -376,13 +351,10 @@ async fn main() -> Result<()> {
             }
             CommitCommand::Show {
                 uri,
-                config,
                 commit_id,
                 json,
             } => {
-                let config = load_cli_config(config.as_ref())?;
                 let client = client::GraphClient::resolve(
-                    &config,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
@@ -401,13 +373,19 @@ async fn main() -> Result<()> {
         Command::Schema { command } => match command {
             SchemaCommand::Plan {
                 uri,
-                config,
                 schema,
                 json,
                 allow_data_loss,
             } => {
-                let config = load_cli_config(config.as_ref())?;
-                let uri = resolve_local_uri(&config, uri, "schema plan")?;
+                let uri = resolve_maintenance_uri(
+                    cli.profile.as_deref(),
+                    cli.store.as_deref(),
+                    cli.cluster.as_deref(),
+                    cli.graph.as_deref(),
+                    uri,
+                    "schema plan",
+                )
+                .await?;
                 let schema_source = fs::read_to_string(&schema)?;
                 let db = Omnigraph::open(&uri).await?;
                 let plan = db
@@ -430,14 +408,11 @@ async fn main() -> Result<()> {
             }
             SchemaCommand::Apply {
                 uri,
-                config,
                 schema,
                 json,
                 allow_data_loss,
             } => {
-                let config = load_cli_config(config.as_ref())?;
                 let client = client::GraphClient::resolve_with_policy(
-                    &config,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
@@ -447,25 +422,14 @@ async fn main() -> Result<()> {
                 )
                 .await?;
                 let schema_source = fs::read_to_string(&schema)?;
-                // The stored-query registry check is an embedded-only concern
-                // (the remote arm ignores the validator — the server runs its
-                // own check); build it only for the local path so the remote
-                // path keeps its no-registry-load behavior.
-                let registry = if client.is_remote() {
-                    None
-                } else {
-                    let registry = load_registry_or_report(&config, client.selected())?;
-                    (!registry.is_empty()).then_some(registry)
-                };
-                let label = client.selected().unwrap_or(client.uri()).to_string();
+                // The embedded (direct-store) arm carries no stored-query
+                // registry — the registry is cluster-owned (RFC-011), so a
+                // direct apply has nothing to validate against. The served arm
+                // runs the server's own catalog check. So the validator is a
+                // no-op here on both arms.
                 echo_write_target(cli.quiet, "schema apply", client.uri(), client.is_remote());
                 let output = client
-                    .apply_schema(&schema_source, allow_data_loss, |catalog| {
-                        if let Some(registry) = registry.as_ref() {
-                            validate_registry_for_catalog(registry, catalog, &label)?;
-                        }
-                        Ok(())
-                    })
+                    .apply_schema(&schema_source, allow_data_loss, |_catalog| Ok(()))
                     .await?;
                 if json {
                     print_json(&output)?;
@@ -475,12 +439,9 @@ async fn main() -> Result<()> {
             }
             SchemaCommand::Show {
                 uri,
-                config,
                 json,
             } => {
-                let config = load_cli_config(config.as_ref())?;
                 let client = client::GraphClient::resolve(
-                    &config,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
@@ -498,41 +459,50 @@ async fn main() -> Result<()> {
         },
         Command::Lint {
             uri,
-            config,
             query,
             schema,
             json,
         } => {
-            let config = load_cli_config(config.as_ref())?;
-            let output =
-                execute_query_lint(&config, uri, schema.as_ref(), &query)
-                    .await?;
+            // A graph target (when `--schema` is absent) resolves through the
+            // direct scope path (positional URI / --store / --profile /
+            // defaults.store). Offline (`--schema`) needs no graph, so leave
+            // the uri unresolved in that case.
+            let graph_uri = if schema.is_some() {
+                uri
+            } else {
+                Some(
+                    resolve_maintenance_uri(
+                        cli.profile.as_deref(),
+                        cli.store.as_deref(),
+                        cli.cluster.as_deref(),
+                        cli.graph.as_deref(),
+                        uri,
+                        "lint",
+                    )
+                    .await?,
+                )
+            };
+            let output = execute_query_lint(graph_uri, schema.as_ref(), &query).await?;
             finish_query_lint(&output, json)?;
         }
-        Command::Queries { command } => match command {
-            QueriesCommand::Validate {
-                uri,
-                config,
-                json,
-            } => {
-                execute_queries_validate(uri, config.as_ref(), json).await?;
+        Command::Queries { command } => {
+            let cluster =
+                require_cluster_scope(cli.cluster.as_deref(), cli.profile.as_deref(), "queries")?;
+            match command {
+                QueriesCommand::Validate { json } => {
+                    execute_queries_validate(&cluster, cli.graph.as_deref(), json).await?;
+                }
+                QueriesCommand::List { json } => {
+                    execute_queries_list(&cluster, cli.graph.as_deref(), json).await?;
+                }
             }
-            QueriesCommand::List {
-                config,
-                json,
-            } => {
-                execute_queries_list(config.as_ref(), json)?;
-            }
-        },
+        }
         Command::Snapshot {
             uri,
-            config,
             branch,
             json,
         } => {
-            let config = load_cli_config(config.as_ref())?;
             let client = client::GraphClient::resolve(
-                &config,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 uri,
@@ -540,7 +510,7 @@ async fn main() -> Result<()> {
                 cli.store.as_deref(),
             )
             .await?;
-            let branch = resolve_branch(&config, branch, None, "main");
+            let branch = resolve_branch(branch, None, "main");
             let payload = client.snapshot(&branch).await?;
             if json {
                 print_json(&payload)?;
@@ -550,15 +520,12 @@ async fn main() -> Result<()> {
         }
         Command::Export {
             uri,
-            config,
             branch,
             jsonl,
             type_names,
             table_keys,
         } => {
-            let config = load_cli_config(config.as_ref())?;
             let client = client::GraphClient::resolve(
-                &config,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 uri,
@@ -566,7 +533,7 @@ async fn main() -> Result<()> {
                 cli.store.as_deref(),
             )
             .await?;
-            let branch = resolve_branch(&config, branch, None, "main");
+            let branch = resolve_branch(branch, None, "main");
             if jsonl {
                 eprintln!("warning: --jsonl is deprecated; `omnigraph export` always emits JSONL");
             }
@@ -579,7 +546,6 @@ async fn main() -> Result<()> {
         }
         Command::Query {
             name,
-            config,
             query,
             query_string,
             params,
@@ -588,9 +554,7 @@ async fn main() -> Result<()> {
             format,
             json,
         } => {
-            let config = load_cli_config(config.as_ref())?;
             let client = client::GraphClient::resolve(
-                &config,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 None,
@@ -599,12 +563,12 @@ async fn main() -> Result<()> {
             )
             .await?;
             let params_json = load_params_json(&params)?;
-            let target = resolve_read_target(&config, branch, snapshot, None)?;
+            let target = resolve_read_target(branch, snapshot, None)?;
             let output: ReadOutput = if query.is_some() || query_string.is_some() {
                 // Ad-hoc lane: run the source; the positional `name` selects
                 // within it when it holds more than one query.
                 let query_source =
-                    resolve_query_source(&config, query.as_ref(), query_string.as_deref(), None)?;
+                    resolve_query_source(query.as_ref(), query_string.as_deref(), None)?;
                 client
                     .query(target, &query_source, name.as_deref(), params_json.as_ref())
                     .await?
@@ -624,21 +588,18 @@ async fn main() -> Result<()> {
                     .invoke_named(&name, false, params_json.as_ref(), branch, snapshot)
                     .await?
             };
-            let format = resolve_read_format(&config, format, json, None);
-            print_read_output(&output, format, &config)?;
+            let format = resolve_read_format(format, json, None);
+            print_read_output(&output, format)?;
         }
         Command::Mutate {
             name,
-            config,
             query,
             query_string,
             params,
             branch,
             json,
         } => {
-            let config = load_cli_config(config.as_ref())?;
             let client = client::GraphClient::resolve_with_policy(
-                &config,
                 cli.server.as_deref(),
                 cli.graph.as_deref(),
                 None,
@@ -648,11 +609,11 @@ async fn main() -> Result<()> {
             )
             .await?;
             let params_json = load_params_json(&params)?;
-            let branch = resolve_branch(&config, branch, None, "main");
+            let branch = resolve_branch(branch, None, "main");
             let output: ChangeOutput = if query.is_some() || query_string.is_some() {
                 // Ad-hoc lane: run the source; positional `name` selects within it.
                 let query_source =
-                    resolve_query_source(&config, query.as_ref(), query_string.as_deref(), None)?;
+                    resolve_query_source(query.as_ref(), query_string.as_deref(), None)?;
                 client
                     .mutate(&branch, &query_source, name.as_deref(), params_json.as_ref())
                     .await?
@@ -677,12 +638,10 @@ async fn main() -> Result<()> {
         Command::Alias {
             name,
             args,
-            config,
             params,
             format,
             json,
         } => {
-            let config = load_cli_config(config.as_ref())?;
             let operator_config = crate::operator::load_operator_config()?;
             let Some(operator_alias) = operator_config.aliases.get(&name) else {
                 let defined: Vec<&str> =
@@ -695,59 +654,64 @@ async fn main() -> Result<()> {
             };
             let output = execute_operator_alias(
                 &http_client,
-                &config,
                 &name,
                 operator_alias,
                 &args,
                 load_params_json(&params)?,
             )
             .await?;
-            let format = resolve_read_format(&config, format, json, operator_alias.format);
-            print_read_output(&output, format, &config)?;
+            let format = resolve_read_format(format, json, operator_alias.format);
+            print_read_output(&output, format)?;
         }
-        Command::Policy { command } => match command {
-            PolicyCommand::Validate { config } => {
-                let config = load_cli_config(config.as_ref())?;
-                let context = resolve_policy_context(&config)?;
-                let engine = resolve_policy_engine(&context)?;
-                println!(
-                    "policy valid: {} [{} actors]",
-                    context.policy_file.display(),
-                    engine.known_actor_count()
-                );
-            }
-            PolicyCommand::Test { config } => {
-                let config = load_cli_config(config.as_ref())?;
-                let context = resolve_policy_context(&config)?;
-                let engine = resolve_policy_engine(&context)?;
-                let tests_path = resolve_policy_tests_path(&context);
-                let tests = PolicyTestConfig::load(&tests_path)?;
-                engine.run_tests(&tests)?;
-                println!("policy tests passed: {} cases", tests.cases.len());
-            }
-            PolicyCommand::Explain {
-                config,
-                actor,
-                action,
-                branch,
-                target_branch,
-            } => {
-                let config = load_cli_config(config.as_ref())?;
-                let context = resolve_policy_context(&config)?;
-                let engine = resolve_policy_engine(&context)?;
-                let request = PolicyRequest {
+        Command::Policy { command } => {
+            // Policy tooling sources the Cedar bundle(s) from the cluster's
+            // applied policies (RFC-011): --cluster <dir>, + the global --graph
+            // to pick a graph's bundle when several apply.
+            let cluster =
+                require_cluster_scope(cli.cluster.as_deref(), cli.profile.as_deref(), "policy")?;
+            let graph = cli.graph.as_deref();
+            let graph_id = match graph {
+                Some(id) => graph_resource_id_for_selection(Some(id), ""),
+                None => graph_resource_id_for_selection(None, "default"),
+            };
+            let policies = read_cluster_policies(&cluster).await?;
+            match command {
+                PolicyCommand::Validate {} => {
+                    let bundle = select_cluster_policy(&cluster, &policies, graph)?;
+                    let engine = PolicyEngine::load_graph_from_source(&bundle.source, &graph_id)?;
+                    println!(
+                        "policy valid: bundle '{}' [{} actors]",
+                        bundle.name,
+                        engine.known_actor_count()
+                    );
+                }
+                PolicyCommand::Test { tests } => {
+                    let bundle = select_cluster_policy(&cluster, &policies, graph)?;
+                    let engine = PolicyEngine::load_graph_from_source(&bundle.source, &graph_id)?;
+                    let tests = PolicyTestConfig::load(&tests)?;
+                    engine.run_tests(&tests)?;
+                    println!("policy tests passed: {} cases", tests.cases.len());
+                }
+                PolicyCommand::Explain {
+                    actor,
                     action,
                     branch,
                     target_branch,
-                };
-                let decision = engine.authorize(&actor, &request)?;
-                print_policy_explain(&decision, &actor, &request);
+                } => {
+                    let bundle = select_cluster_policy(&cluster, &policies, graph)?;
+                    let engine = PolicyEngine::load_graph_from_source(&bundle.source, &graph_id)?;
+                    let request = PolicyRequest {
+                        action,
+                        branch,
+                        target_branch,
+                    };
+                    let decision = engine.authorize(&actor, &request)?;
+                    print_policy_explain(&decision, &actor, &request);
+                }
             }
-        },
-        Command::Optimize { uri, config, json } => {
-            let config = load_cli_config(config.as_ref())?;
+        }
+        Command::Optimize { uri, json } => {
             let uri = resolve_maintenance_uri(
-                &config,
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
                 cli.cluster.as_deref(),
@@ -798,14 +762,11 @@ async fn main() -> Result<()> {
         }
         Command::Repair {
             uri,
-            config,
             confirm,
             force,
             json,
         } => {
-            let config = load_cli_config(config.as_ref())?;
             let uri = resolve_maintenance_uri(
-                &config,
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
                 cli.cluster.as_deref(),
@@ -890,15 +851,12 @@ async fn main() -> Result<()> {
         }
         Command::Cleanup {
             uri,
-            config,
             keep,
             older_than,
             confirm,
             json,
         } => {
-            let config = load_cli_config(config.as_ref())?;
             let uri = resolve_maintenance_uri(
-                &config,
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
                 cli.cluster.as_deref(),
@@ -1036,12 +994,9 @@ async fn main() -> Result<()> {
         Command::Graphs { command } => match command {
             GraphsCommand::List {
                 uri,
-                config,
                 json,
             } => {
-                let config = load_cli_config(config.as_ref())?;
                 let client = client::GraphClient::resolve(
-                    &config,
                     cli.server.as_deref(),
                     cli.graph.as_deref(),
                     uri,
