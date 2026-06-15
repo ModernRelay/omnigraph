@@ -795,3 +795,49 @@ async fn apply_schema_defers_vector_index_on_empty_table() {
         .await
         .expect("the deferred vector index must build once the table has a trainable vector");
 }
+
+// iss-848: adding an `@index` to an existing column is a pure metadata change.
+// Schema apply records the intent (the catalog/IR now declares the index) but
+// must NOT build the index inline, so the table's data and manifest version are
+// untouched. The physical index is materialized later by ensure_indices /
+// optimize. Pre-iss-848 the indexed_tables block built the index inline and
+// bumped the table version.
+#[tokio::test]
+async fn index_only_constraint_apply_touches_no_table_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let v1 = "node Doc {\n    slug: String @key\n    n: I64\n}\n";
+    let mut db = Omnigraph::init(uri, v1).await.unwrap();
+    load_jsonl(
+        &mut db,
+        r#"{"type":"Doc","data":{"slug":"d1","n":1}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .expect("load a Doc");
+
+    let before = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entry("node:Doc")
+        .unwrap()
+        .table_version;
+
+    // Add an @index on the existing `n` column.
+    let v2 = "node Doc {\n    slug: String @key\n    n: I64 @index\n}\n";
+    let result = db.apply_schema(v2).await.expect("index-only apply must succeed");
+    assert!(result.applied, "the @index addition must apply");
+
+    let after = db
+        .snapshot_of(ReadTarget::branch("main"))
+        .await
+        .unwrap()
+        .entry("node:Doc")
+        .unwrap()
+        .table_version;
+    assert_eq!(
+        before, after,
+        "adding an @index must not bump the table version (no inline index build)"
+    );
+}
