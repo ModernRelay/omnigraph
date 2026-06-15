@@ -2,7 +2,7 @@
 
 A reference for the `omnigraph` binary's command surface and `omnigraph.yaml` schema. For a quick-start guide, see [cli.md](index.md).
 
-Top-level command families and subcommands. Graph-targeting commands accept a positional `file://`/`s3://` URI, `--server <name|url>` (an operator-defined server from `~/.omnigraph/config.yaml` by name, or a literal `http(s)://` URL, optionally with `--graph <id>` for multi-graph servers; exclusive with a positional URI), `--store <uri>` (a single graph's storage directly), or `--profile <name>` / `$OMNIGRAPH_PROFILE` (a named scope bundle; see [Scopes & profiles](#scopes--profiles-rfc-011)); `cluster` commands use `--config <dir>`. A remote server is addressed only with `--server` — a positional `http(s)://` URI is rejected.
+Top-level command families and subcommands. Graph-targeting commands accept a positional `file://`/`s3://` URI, `--server <name|url>` (an operator-defined server from `~/.omnigraph/config.yaml` by name, or a literal `http(s)://` URL, optionally with `--graph <id>` for multi-graph servers; exclusive with a positional URI), `--store <uri>` (a single graph's storage directly), or `--profile <name>` / `$OMNIGRAPH_PROFILE` (a named scope bundle; see [Scopes & profiles](#scopes--profiles-rfc-011)); `cluster` commands use `--config <dir>`. A remote server is addressed only with `--server` — a positional `http(s)://` URI is rejected. **`query`/`mutate` are the exception**: their positional is a stored-query *name* (RFC-011 D3), not a graph URI, so they address the graph only via `--store`/`--server`/`--profile`/defaults.
 
 ## Top-level commands
 
@@ -11,8 +11,8 @@ Top-level command families and subcommands. Graph-targeting commands accept a po
 | `init` | `--schema <pg>` → initialize a graph (no longer scaffolds `omnigraph.yaml`; start cluster configs from the [cluster.md](../clusters/index.md) quick-start or `config migrate`) |
 | `load` | bulk load a branch, local or remote (`--mode overwrite\|append\|merge` is **required** — overwrite is destructive, so there is no default). Without `--from` the target branch must exist; `--from <base>` forks a missing `--branch` from `<base>` first |
 | `ingest` | deprecated alias of `load --from <base>` (defaults: `--from main --mode merge`); prints a one-line warning to stderr |
-| `query` (alias: `read`) | run a read query; source via `--query <path>` or `-e`/`--query-string <GQ>`. `read` is the deprecated previous name and prints a one-line warning to stderr |
-| `mutate` (alias: `change`) | run a mutation query; same `--query` / `-e` source as `query`. `change` is the deprecated previous name and prints a one-line warning to stderr |
+| `query <name>` (alias: `read`) | run a read query. **Catalog lane** (default): `<name>` is a stored query invoked **by name** from the served catalog (served-only — address with `--server`/`--profile`; the verb asserts the query is a read). **Ad-hoc lane**: with `--query <path>` or `-e`/`--query-string <GQ>`, runs that source (the positional `<name>` then selects which query in it). No positional graph URI — address via `--store`/`--server`/`--profile`. `read` is the deprecated previous name (one-line stderr warning) |
+| `mutate <name>` (alias: `change`) | run a mutation query; same catalog (by-name, served-only, verb asserts mutation) / ad-hoc (`--query`/`-e`) lanes as `query`. `change` is the deprecated previous name (one-line stderr warning) |
 | `alias <name> [args]` | invoke an operator alias — a personal binding (under `aliases:` in `~/.omnigraph/config.yaml`) to a stored query on a named server (RFC-011 D4; replaces the removed `--alias` flag) |
 | `snapshot` | print current snapshot (per-table version + row count) |
 | `export` | dump to JSONL on stdout (`--type T`, `--table K` filters) |
