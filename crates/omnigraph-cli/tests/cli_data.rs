@@ -172,6 +172,32 @@ fn optimize_with_server_flag_errors_wrong_plane() {
 }
 
 #[test]
+fn wrong_address_guard_message_has_no_trailing_space() {
+    // The remediation tail is empty for served-addressing capabilities, so a
+    // misplaced --cluster on a data verb must not leave "… does not apply. "
+    // with a dangling space (error text is observable contract). NO_COLOR keeps
+    // the assertion off ANSI styling.
+    let output = output_failure(
+        cli()
+            .env("NO_COLOR", "1")
+            .arg("query")
+            .arg("--cluster")
+            .arg("./brain")
+            .arg("-e")
+            .arg("query q { Person { id } }"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("and does not apply."),
+        "expected the wrong-address message; got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("and does not apply. "),
+        "trailing space after the message; got: {stderr}"
+    );
+}
+
+#[test]
 fn graph_flag_on_a_positional_uri_errors() {
     // RFC-011: `--graph` selects within a multi-graph scope (a server or
     // cluster). A bare positional URI is already a single graph, so pairing it

@@ -208,7 +208,7 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
 
     if cli.server.is_some() && !capability.accepts_server_addressing() {
         bail!(
-            "`{label}` is a {} command; --server addresses a served graph and does not apply. {}",
+            "`{label}` is a {} command; --server addresses a served graph and does not apply.{}",
             capability.describe(),
             remediation(capability, &cli.command),
         );
@@ -216,7 +216,7 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
     if cli.cluster.is_some() && !cluster_ok {
         bail!(
             "`{label}` is a {} command; --cluster addresses a cluster-managed graph for \
-             maintenance (optimize/repair/cleanup) and does not apply. {}",
+             maintenance (optimize/repair/cleanup) and does not apply.{}",
             capability.describe(),
             remediation(capability, &cli.command),
         );
@@ -224,7 +224,7 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
     if cli.graph.is_some() && !(capability.accepts_server_addressing() || cluster_ok) {
         bail!(
             "`{label}` is a {} command; --graph selects a graph within a server or cluster \
-             scope and does not apply. {}",
+             scope and does not apply.{}",
             capability.describe(),
             remediation(capability, &cli.command),
         );
@@ -233,17 +233,20 @@ pub(crate) fn guard_addressing(cli: &Cli) -> Result<()> {
 }
 
 /// The "what to do instead" tail for a wrong-address error, by capability.
+/// Includes its own leading space when non-empty so the caller appends it
+/// directly — an empty tail (the served-addressing capabilities, which only
+/// reach this fn for a misplaced `--cluster`/`--graph`) leaves no trailing space.
 fn remediation(capability: Capability, cmd: &Command) -> &'static str {
     match capability {
         Capability::Direct => match cmd {
-            Command::Init { .. } => "Pass a storage URI.",
+            Command::Init { .. } => " Pass a storage URI.",
             Command::Optimize { .. } | Command::Repair { .. } | Command::Cleanup { .. } => {
-                "Pass a storage URI, or --cluster <dir> --graph <id>."
+                " Pass a storage URI, or --cluster <dir> --graph <id>."
             }
-            _ => "Pass a storage URI.",
+            _ => " Pass a storage URI.",
         },
-        Capability::Control => "It operates on a cluster (pass --config <dir>).",
-        Capability::Local => "It does not address a graph.",
+        Capability::Control => " It operates on a cluster (pass --config <dir>).",
+        Capability::Local => " It does not address a graph.",
         Capability::Any | Capability::Served => "",
     }
 }
