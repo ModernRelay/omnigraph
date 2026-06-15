@@ -113,7 +113,16 @@ impl EmbeddingConfig {
         api_key: String,
     ) -> Result<Self> {
         if provider == Some("mock") {
-            return Ok(Self::mock());
+            // An explicit `model` (e.g. a cluster `embeddings` profile) is
+            // authoritative — it is what the same-space check compares against —
+            // so honor it; fall back to `mock()`'s env-based model only when the
+            // caller supplied none. Without this, a profile's `model` is silently
+            // dropped and the same-space check resolves to OMNIGRAPH_EMBED_MODEL.
+            let mut config = Self::mock();
+            if let Some(model) = model {
+                config.model = model;
+            }
+            return Ok(config);
         }
         let (provider, default_base, default_model, _key_envs) = provider_profile(provider)?;
         let base_url = base_url
@@ -937,6 +946,25 @@ mod tests {
             err.to_string().contains("unknown embedding provider"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn from_parts_mock_honors_an_explicit_model() {
+        // A cluster `embeddings` profile that sets `provider: mock, model: X`
+        // must resolve to model X — it is what the query-time same-space check
+        // compares against. Env cleared so the assertion isolates the arg.
+        let _guard = cleared_env(&[]);
+        let pinned =
+            EmbeddingConfig::from_parts(Some("mock"), None, Some("recorded-x".to_string()), String::new())
+                .unwrap();
+        assert_eq!(pinned.provider, Provider::Mock);
+        assert_eq!(pinned.model, "recorded-x");
+        // With no explicit model, mock falls back to its env-based default (here
+        // empty, since the env is cleared).
+        let bare = EmbeddingConfig::from_parts(Some("mock"), None, None, String::new()).unwrap();
+        assert_eq!(bare.provider, Provider::Mock);
+        assert_eq!(bare.model, "");
     }
 
     #[test]
