@@ -1111,6 +1111,11 @@ query vector_search($q: String) {
 
     let result = parse_stdout_json(&output_success(
         cli()
+            // Stored vectors above were produced with gemini-embedding-2-preview;
+            // pin the query-time embedder to the same provider/model so the
+            // auto-embedded `$q` lands in the same vector space.
+            .env("OMNIGRAPH_EMBED_PROVIDER", "gemini")
+            .env("OMNIGRAPH_EMBED_MODEL", "gemini-embedding-2-preview")
             .arg("read")
             .arg(&graph)
             .arg("--query")

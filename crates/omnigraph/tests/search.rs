@@ -510,9 +510,14 @@ async fn explicit_vector_nearest_does_not_require_gemini_credentials() {
 
 #[tokio::test]
 #[serial]
-async fn string_nearest_requires_gemini_credentials_when_mock_is_disabled() {
+async fn string_nearest_requires_provider_credentials_when_mock_is_disabled() {
+    // With mock off and no provider key, the default (openai-compatible)
+    // provider fails loudly rather than silently producing garbage vectors.
     let _guard = EnvGuard::set(&[
         ("OMNIGRAPH_EMBEDDINGS_MOCK", None),
+        ("OMNIGRAPH_EMBED_PROVIDER", None),
+        ("OPENROUTER_API_KEY", None),
+        ("OPENAI_API_KEY", None),
         ("GEMINI_API_KEY", None),
     ]);
 
@@ -528,7 +533,11 @@ async fn string_nearest_requires_gemini_credentials_when_mock_is_disabled() {
     .await
     .unwrap_err();
 
-    assert!(err.to_string().contains("GEMINI_API_KEY"));
+    assert!(
+        err.to_string()
+            .contains("OPENROUTER_API_KEY or OPENAI_API_KEY"),
+        "unexpected error: {err}"
+    );
 }
 
 // ─── BM25 search ────────────────────────────────────────────────────────────
