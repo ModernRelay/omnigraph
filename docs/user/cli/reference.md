@@ -11,8 +11,9 @@ Top-level command families and subcommands. Graph-targeting commands accept a po
 | `init` | `--schema <pg>` → initialize a graph (no longer scaffolds `omnigraph.yaml`; start cluster configs from the [cluster.md](../clusters/index.md) quick-start or `config migrate`) |
 | `load` | bulk load a branch, local or remote (`--mode overwrite\|append\|merge` is **required** — overwrite is destructive, so there is no default). Without `--from` the target branch must exist; `--from <base>` forks a missing `--branch` from `<base>` first |
 | `ingest` | deprecated alias of `load --from <base>` (defaults: `--from main --mode merge`); prints a one-line warning to stderr |
-| `query` (alias: `read`) | run named read query; source via `--query <path>`, `-e`/`--query-string <GQ>`, or `--alias <name>` (exactly one). `read` is the deprecated previous name and prints a one-line warning to stderr |
-| `mutate` (alias: `change`) | run mutation query; same `--query` / `-e` / `--alias` mutual-exclusion as `query`. `change` is the deprecated previous name and prints a one-line warning to stderr |
+| `query` (alias: `read`) | run a read query; source via `--query <path>` or `-e`/`--query-string <GQ>`. `read` is the deprecated previous name and prints a one-line warning to stderr |
+| `mutate` (alias: `change`) | run a mutation query; same `--query` / `-e` source as `query`. `change` is the deprecated previous name and prints a one-line warning to stderr |
+| `alias <name> [args]` | invoke an operator alias — a personal binding (under `aliases:` in `~/.omnigraph/config.yaml`) to a stored query on a named server (RFC-011 D4; replaces the removed `--alias` flag) |
 | `snapshot` | print current snapshot (per-table version + row count) |
 | `export` | dump to JSONL on stdout (`--type T`, `--table K` filters) |
 | `branch create \| list \| delete \| merge` | branching ops |
@@ -146,10 +147,12 @@ aliases:
     format: table
 ```
 
-`omnigraph query --alias triage 2026-06-01` invokes
+`omnigraph alias triage 2026-06-01` invokes
 `POST <server>/graphs/spike/queries/weekly_triage` with the keyed
-credential. A legacy `omnigraph.yaml` alias with the same name wins during
-the deprecation window (with a warning).
+credential. Aliases live in their own `alias` namespace (RFC-011 Decision 4),
+so an alias can never shadow — or be shadowed by — a built-in verb. (The old
+`--alias <name>` flag on `query`/`mutate` was removed; legacy `omnigraph.yaml`
+`aliases:` no longer have a CLI entry point.)
 
 A remote command whose URL prefix-matches an operator server's `url` (the
 `gh` host model — no flags needed) resolves its token through:
@@ -199,14 +202,11 @@ query:
   roots: [<dir>, …]   # search path for .gq files
 auth:
   env_file: .env.omni
-aliases:
-  <alias>:
-    # accepted values: `read` / `query` (read alias), `change` / `mutate`
-    # (write alias). `query` and `mutate` are recommended; `read` and
-    # `change` remain accepted forever for back-compat.
-    command: read|change|query|mutate
-    query: <path-to-.gq>
-    name: <query-name>
+aliases:                          # legacy file-aliases — parsed but no longer
+  <alias>:                        # reachable from the CLI (RFC-011 D4 removed
+    command: read|change|query|mutate   # the `--alias` flag). Use operator
+    query: <path-to-.gq>                # aliases (`~/.omnigraph/config.yaml`
+    name: <query-name>                  # `aliases:`) via `omnigraph alias <name>`.
     args: [<positional-name>, …]
     graph: <name>
     branch: <name>

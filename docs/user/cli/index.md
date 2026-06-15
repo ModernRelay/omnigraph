@@ -30,8 +30,9 @@ omnigraph mutate --uri graph.omni \
   --params '{"name":"Inline","age":42}'
 ```
 
-`-e` is mutually exclusive with `--query <path>` and `--alias <name>`; exactly
-one of the three must be provided. The inline source travels through the same
+`-e` is mutually exclusive with `--query <path>`; exactly one of the two must be
+provided. (Operator aliases moved to their own `omnigraph alias <name>`
+subcommand — RFC-011 D4.) The inline source travels through the same
 parser, lint, params binding, and commit machinery as a file-based query —
 only the source loader changes.
 
