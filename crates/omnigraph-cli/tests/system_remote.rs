@@ -550,6 +550,8 @@ fn remote_branch_delete_removes_branch() {
             .arg("--config")
             .arg(&config)
             .arg("feature")
+            // Served target is non-local → destructive-confirm gate (RFC-011 D9).
+            .arg("--yes")
             .arg("--json"),
     ));
     assert_eq!(deleted["name"], "feature");

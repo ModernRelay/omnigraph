@@ -1565,6 +1565,160 @@ fn branch_delete_rejects_main() {
     assert!(stderr.contains("cannot delete branch 'main'"));
 }
 
+// ── RFC-011 Decision 9: write diagnostics + non-local destructive-confirm ──
+
+#[test]
+fn write_echoes_resolved_target_to_stderr() {
+    // Every write echoes its resolved target + access path to stderr; --json
+    // (stdout) is unaffected. A local load → "(direct, local)".
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    let data = fixture("test.jsonl");
+    let output = output_success(
+        cli()
+            .arg("load")
+            .arg("--mode")
+            .arg("append")
+            .arg("--data")
+            .arg(&data)
+            .arg(&graph)
+            .arg("--json"),
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("omnigraph load →") && stderr.contains("(direct, local)"),
+        "missing write-target echo; stderr: {stderr}"
+    );
+    // stdout still parses as JSON — the echo went to stderr.
+    let _: Value = serde_json::from_slice(&output.stdout).unwrap();
+}
+
+#[test]
+fn quiet_suppresses_the_write_target_echo() {
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    let data = fixture("test.jsonl");
+    let output = output_success(
+        cli()
+            .arg("--quiet")
+            .arg("load")
+            .arg("--mode")
+            .arg("append")
+            .arg("--data")
+            .arg(&data)
+            .arg(&graph),
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("omnigraph load →"),
+        "--quiet should suppress the echo; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn branch_delete_against_non_local_scope_refuses_without_yes() {
+    // No bucket needed: the confirm gate fires before the graph is opened.
+    let output = output_failure(
+        cli()
+            .arg("branch")
+            .arg("delete")
+            .arg("--store")
+            .arg("s3://fake-bucket/g.omni")
+            .arg("feature")
+            .arg("--json"),
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("refusing destructive `branch delete`") && stderr.contains("--yes"),
+        "expected a non-local destructive refusal; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn branch_delete_against_non_local_scope_passes_gate_with_yes() {
+    // With --yes the gate is bypassed; the command then fails for an unrelated
+    // reason (the fake bucket can't be opened), so the refusal must be ABSENT.
+    let output = output_failure(
+        cli()
+            .arg("branch")
+            .arg("delete")
+            .arg("--store")
+            .arg("s3://fake-bucket/g.omni")
+            .arg("feature")
+            .arg("--yes")
+            .arg("--json"),
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("refusing destructive"),
+        "--yes should bypass the confirm gate; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn overwrite_load_against_non_local_scope_refuses_without_yes() {
+    let output = output_failure(
+        cli()
+            .arg("load")
+            .arg("--mode")
+            .arg("overwrite")
+            .arg("--data")
+            .arg(fixture("test.jsonl"))
+            .arg("--store")
+            .arg("s3://fake-bucket/g.omni")
+            .arg("--json"),
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("refusing destructive `load --mode overwrite`"),
+        "expected a non-local overwrite refusal; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn cleanup_against_non_local_scope_refuses_without_yes() {
+    // Past the --confirm preview gate, a non-local cleanup still needs --yes.
+    let output = output_failure(
+        cli()
+            .arg("cleanup")
+            .arg("--store")
+            .arg("s3://fake-bucket/g.omni")
+            .arg("--keep")
+            .arg("5")
+            .arg("--confirm")
+            .arg("--json"),
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("refusing destructive `cleanup`"),
+        "expected a non-local cleanup refusal; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn cleanup_against_local_scope_executes_with_confirm() {
+    // Local cleanup needs no --yes; --confirm alone executes (and echoes).
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    load_fixture(&graph);
+    let output = output_success(
+        cli()
+            .arg("cleanup")
+            .arg("--keep")
+            .arg("1")
+            .arg("--confirm")
+            .arg(&graph)
+            .arg("--json"),
+    );
+    let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(payload["tables"].as_array().is_some(), "{payload}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("omnigraph cleanup →"), "stderr: {stderr}");
+}
+
 #[test]
 fn branch_merge_defaults_target_to_main() {
     let temp = tempdir().unwrap();

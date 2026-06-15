@@ -142,7 +142,10 @@ fn parity_branch_create_delete() {
     let (l, r) = p.run(&["branch", "create", "--from", "main", "parity-branch", "--json"],
     );
     assert_parity("branch create", &l, &r);
-    let (l, r) = p.run(&["branch", "delete", "parity-branch", "--json"],
+    // `branch delete` is destructive: the served (remote) arm is non-local and
+    // requires consent (RFC-011 Decision 9), so the row passes `--yes` to test
+    // the operation itself, not the safety gate. The local arm ignores `--yes`.
+    let (l, r) = p.run(&["branch", "delete", "parity-branch", "--yes", "--json"],
     );
     assert_parity("branch delete", &l, &r);
 }
