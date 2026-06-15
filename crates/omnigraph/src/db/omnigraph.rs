@@ -156,6 +156,12 @@ pub struct Omnigraph {
     /// `apply_schema_as` consults this field (PR #2 proof-of-concept);
     /// PR #3 fans the `enforce()` call out to the remaining writers.
     policy: Option<Arc<dyn omnigraph_policy::PolicyChecker>>,
+    /// Lazily-built, reused-across-queries embedding client. Built on the first
+    /// `nearest($v, "string")` that needs server-side embedding (so a graph that
+    /// never embeds needs no provider key), then shared by every later query —
+    /// avoids the per-query `from_env()` rebuild and keeps the provider HTTP
+    /// connection pool warm. `OnceCell` guarantees a single initialization.
+    embedding: Arc<tokio::sync::OnceCell<crate::embedding::EmbeddingClient>>,
 }
 
 /// Whether [`Omnigraph::open`] runs the open-time recovery sweep.
@@ -319,6 +325,7 @@ impl Omnigraph {
             write_queue: Arc::new(crate::db::write_queue::WriteQueueManager::new()),
             merge_exclusive: Arc::new(tokio::sync::Mutex::new(())),
             policy: None,
+            embedding: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
 
@@ -418,6 +425,7 @@ impl Omnigraph {
             write_queue: Arc::new(crate::db::write_queue::WriteQueueManager::new()),
             merge_exclusive: Arc::new(tokio::sync::Mutex::new(())),
             policy: None,
+            embedding: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
 
@@ -463,6 +471,15 @@ impl Omnigraph {
     pub fn with_policy(mut self, checker: Arc<dyn omnigraph_policy::PolicyChecker>) -> Self {
         self.policy = Some(checker);
         self
+    }
+
+    /// The lazily-initialized, reused-across-queries embedding client cell
+    /// (see the `embedding` field doc). The query executor resolves the client
+    /// through this on the first `nearest($v, "string")` that needs embedding.
+    pub(crate) fn embedding_cell(
+        &self,
+    ) -> &tokio::sync::OnceCell<crate::embedding::EmbeddingClient> {
+        &self.embedding
     }
 
     /// Engine-layer policy enforcement gate (MR-722 chassis core).
