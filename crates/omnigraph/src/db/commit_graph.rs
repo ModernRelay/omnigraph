@@ -79,10 +79,14 @@ impl CommitGraph {
 
     pub async fn open(root_uri: &str) -> Result<Self> {
         let root = root_uri.trim_end_matches('/');
-        let dataset = Dataset::open(&graph_commits_uri(root))
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
-        let actor_dataset = Dataset::open(&graph_commit_actors_uri(root)).await.ok();
+        let wrapper = crate::instrumentation::commit_graph_wrapper();
+        let dataset =
+            crate::instrumentation::open_dataset_tracked(&graph_commits_uri(root), wrapper.clone())
+                .await?;
+        let actor_dataset =
+            crate::instrumentation::open_dataset_tracked(&graph_commit_actors_uri(root), wrapper)
+                .await
+                .ok();
         let actor_by_commit_id = match &actor_dataset {
             Some(dataset) => load_commit_actor_cache(dataset).await?,
             None => HashMap::new(),
@@ -101,14 +105,18 @@ impl CommitGraph {
 
     pub async fn open_at_branch(root_uri: &str, branch: &str) -> Result<Self> {
         let root = root_uri.trim_end_matches('/');
-        let dataset = Dataset::open(&graph_commits_uri(root))
-            .await
-            .map_err(|e| OmniError::Lance(e.to_string()))?;
+        let wrapper = crate::instrumentation::commit_graph_wrapper();
+        let dataset =
+            crate::instrumentation::open_dataset_tracked(&graph_commits_uri(root), wrapper.clone())
+                .await?;
         let dataset = dataset
             .checkout_branch(branch)
             .await
             .map_err(|e| OmniError::Lance(e.to_string()))?;
-        let actor_dataset = Dataset::open(&graph_commit_actors_uri(root)).await.ok();
+        let actor_dataset =
+            crate::instrumentation::open_dataset_tracked(&graph_commit_actors_uri(root), wrapper)
+                .await
+                .ok();
         let actor_by_commit_id = match &actor_dataset {
             Some(dataset) => load_commit_actor_cache(dataset).await?,
             None => HashMap::new(),

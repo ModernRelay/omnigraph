@@ -336,9 +336,10 @@ impl Omnigraph {
         Self::open_with_storage_and_mode(uri, storage_for_uri(uri)?, OpenMode::ReadOnly).await
     }
 
-    /// `open_with_storage` retained for existing callers (init/test paths).
-    /// Defaults to `OpenMode::ReadWrite`.
-    pub(crate) async fn open_with_storage(
+    /// Open with a caller-supplied [`StorageAdapter`]. Used by init/test paths
+    /// and by embedding/test consumers that wrap storage (e.g. a counting
+    /// decorator for IO-budget tests). Defaults to `OpenMode::ReadWrite`.
+    pub async fn open_with_storage(
         uri: &str,
         storage: Arc<dyn StorageAdapter>,
     ) -> Result<Self> {
