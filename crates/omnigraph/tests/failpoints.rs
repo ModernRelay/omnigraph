@@ -331,6 +331,68 @@ async fn cleanup_reclaims_orphaned_commit_graph_branch() {
     }
 }
 
+// `classify_fork_ref` returns `Indeterminate` when the fresh-authority read
+// fails on a LIVE branch — and a destructive caller must SKIP, never delete, on
+// that ambiguity. Here the reconciler has a genuine origin-2 orphan candidate
+// (a manifest-unreferenced Person fork on the live `feature` branch), but the
+// `classify.fresh_read` failpoint makes the fresh re-check fail: cleanup must
+// leave the ref in place (cannot confirm it is unreferenced), then reclaim it on
+// the next run once the read succeeds. This pins the Indeterminate arm and the
+// don't-destroy-on-ambiguity rule end-to-end through cleanup.
+#[tokio::test]
+async fn reconcile_skips_fork_when_fresh_recheck_is_unavailable_then_converges() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let mut db = helpers::init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+
+    // Forge a manifest-unreferenced Person fork on the live `feature` branch —
+    // a genuine orphan the reconciler would normally reclaim.
+    let person_uri = node_table_uri(&uri, "Person");
+    {
+        let mut ds = lance::Dataset::open(&person_uri).await.unwrap();
+        let base = ds.version().version;
+        ds.create_branch("feature", base, None).await.unwrap();
+        assert!(
+            ds.list_branches().await.unwrap().contains_key("feature"),
+            "precondition: forged orphan fork present"
+        );
+    }
+
+    // With the fresh re-check failing, the fork's status is Indeterminate (the
+    // branch is live but unreadable) → cleanup must SKIP it, not delete.
+    {
+        let _fp = ScopedFailPoint::new("classify.fresh_read", "return");
+        db.cleanup(omnigraph::db::CleanupPolicyOptions {
+            keep_versions: Some(1),
+            older_than: None,
+        })
+        .await
+        .unwrap();
+        let ds = lance::Dataset::open(&person_uri).await.unwrap();
+        assert!(
+            ds.list_branches().await.unwrap().contains_key("feature"),
+            "reconcile must NOT delete a fork whose fresh re-check is inconclusive"
+        );
+    }
+
+    // Read succeeds now → cleanup confirms the orphan and reclaims it (converges).
+    db.cleanup(omnigraph::db::CleanupPolicyOptions {
+        keep_versions: Some(1),
+        older_than: None,
+    })
+    .await
+    .unwrap();
+    {
+        let ds = lance::Dataset::open(&person_uri).await.unwrap();
+        assert!(
+            !ds.list_branches().await.unwrap().contains_key("feature"),
+            "next cleanup (fresh read available) must reclaim the confirmed orphan"
+        );
+    }
+}
+
 // A branch_delete whose best-effort commit-graph reclaim fails leaves a
 // commit-graph "zombie" branch. Recreating that name must heal the zombie and
 // succeed (branch_create force-deletes a stale commit-graph ref since the

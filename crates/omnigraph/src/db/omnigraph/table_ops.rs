@@ -626,7 +626,15 @@ pub(crate) async fn classify_fork_ref(
     table_key: &str,
     branch: &str,
 ) -> ForkRefStatus {
-    match db.fresh_snapshot_for_branch(Some(branch)).await {
+    // `classify.fresh_read` failpoint: simulate a transient failure of the
+    // fresh-authority read (no-op without the `failpoints` feature). Lets a
+    // test exercise the Indeterminate path — a read failure on a live branch
+    // must classify as Indeterminate (skip), never Orphan (destroy).
+    let fresh = match crate::failpoints::maybe_fail("classify.fresh_read") {
+        Ok(()) => db.fresh_snapshot_for_branch(Some(branch)).await,
+        Err(injected) => Err(injected),
+    };
+    match fresh {
         Ok(snap) => {
             let placed = snap
                 .entry(table_key)
