@@ -3,6 +3,7 @@ mod support;
 use std::env;
 use std::fs;
 
+use omnigraph::db::Omnigraph;
 use reqwest::blocking::Client;
 use serde_json::Value;
 
@@ -2090,22 +2091,16 @@ fn local_cluster_full_lifecycle_declare_serve_evolve_delete() {
     }
 
     // Out-of-band drift: the live graph evolves behind the cluster's back;
-    // refresh observes it, apply converges it back to the declared schema.
-    std::fs::write(
-        dir.join("rogue.pg"),
-        "\nnode Person {\n  name: String @key\n  bio: String?\n  rogue: String?\n}\n",
-    )
-    .unwrap();
-    let output = cli()
-        .arg("schema")
-        .arg("apply")
-        .arg(dir.join("graphs/knowledge.omni"))
-        .arg("--schema")
-        .arg(dir.join("rogue.pg"))
-        .arg("--json")
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "out-of-band schema apply failed");
+    // refresh observes it, apply converges it back to the declared schema. RFC-011
+    // D10 makes the CLI `schema apply` refuse a cluster-managed graph, so a true
+    // bypass is a direct engine apply against the storage root.
+    let rogue_pg = "\nnode Person {\n  name: String @key\n  bio: String?\n  rogue: String?\n}\n";
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let db = Omnigraph::open(dir.join("graphs/knowledge.omni").to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        db.apply_schema(rogue_pg).await.unwrap();
+    });
     let refresh = cluster_cli(dir, &["refresh"]);
     assert_eq!(
         refresh["resource_statuses"]["schema.knowledge"]["status"],

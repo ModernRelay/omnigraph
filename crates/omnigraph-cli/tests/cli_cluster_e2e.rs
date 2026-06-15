@@ -3,6 +3,7 @@
 
 use std::fs;
 
+use omnigraph::db::Omnigraph;
 use tempfile::tempdir;
 
 mod support;
@@ -236,27 +237,28 @@ fn cluster_e2e_out_of_band_schema_drift_then_apply_converges_it() {
     let apply = cluster_json(temp.path(), "apply");
     assert_eq!(apply["converged"], true, "{apply}");
 
-    // Out-of-band: the live graph evolves, cluster.yaml stays put.
-    fs::write(
-        temp.path().join("people_v2.pg"),
-        r#"
+    // Out-of-band: the live graph evolves while cluster.yaml stays put. RFC-011
+    // D10 makes the CLI `schema apply` refuse a cluster-managed graph, so this
+    // simulates a true bypass — a direct engine apply against the storage root,
+    // exactly the drift the control plane must still detect and converge.
+    let people_v2 = r#"
 node Person {
   name: String @key
   age: I32?
   bio: String?
 }
-"#,
-    )
-    .unwrap();
-    output_success(
-        cli()
-            .arg("schema")
-            .arg("apply")
-            .arg(temp.path().join("graphs/knowledge.omni"))
-            .arg("--schema")
-            .arg(temp.path().join("people_v2.pg"))
-            .arg("--json"),
-    );
+"#;
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let db = Omnigraph::open(
+            temp.path()
+                .join("graphs/knowledge.omni")
+                .to_string_lossy()
+                .as_ref(),
+        )
+        .await
+        .unwrap();
+        db.apply_schema(people_v2).await.unwrap();
+    });
 
     // Drift is visible...
     let refresh = cluster_json(temp.path(), "refresh");
