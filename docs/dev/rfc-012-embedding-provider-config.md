@@ -217,6 +217,10 @@ the design constraint; deferred to its own RFC/phase.
 | **5 — Cluster provider wiring** | un-reserve `providers.embedding`; `${NAME}` resolution | provider profile resolved from `cluster.yaml`; legacy `omnigraph.yaml` untouched |
 | later | ingest-time `@embed` (Shape C) | separate RFC |
 
+**Status:** Phases 1–4 are implemented (`@embed("…", model="…")` is recorded in the schema IR and validated at
+query time with a typed same-space error; an unrecorded `@embed` keeps working with no check). Phase 5 (cluster
+`providers.embedding` wiring) and ingest-time `@embed` remain.
+
 ## Invariants & deny-list check
 
 - **Invariant 9 (integrity failures are loud):** strengthened — query-time identity mismatch becomes a typed

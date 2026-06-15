@@ -45,7 +45,7 @@ Edge bodies only allow `@unique` and `@index`.
 
 - `@<ident>` or `@<ident>(<literal>)` on any declaration or property.
 - Known annotations:
-  - `@embed("source_property")` on a Vector property — records which String property is the embedding source for query-time `nearest($v, "string")` auto-embedding. It is a catalog annotation; it does **not** populate the vector at ingest (supply vectors in load data, or pre-fill via the offline `omnigraph embed` pipeline).
+  - `@embed("source_property")` on a Vector property — records which String property is the embedding source for query-time `nearest($v, "string")` auto-embedding. It is a catalog annotation; it does **not** populate the vector at ingest (supply vectors in load data, or pre-fill via the offline `omnigraph embed` pipeline). An optional `model="…"` kwarg (`@embed("source_property", model="openai/text-embedding-3-large")`) records the embedding model so a `nearest()` query whose embedder uses a different model is rejected loudly; `model` is the only supported kwarg. See [search/embeddings.md](../search/embeddings.md).
   - `@description("…")`, `@instruction("…")` on query declarations (carried through to clients).
 - Custom annotations are accepted by the parser and surfaced in catalog metadata; unrecognized annotations don't fail compilation.
 
