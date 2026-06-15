@@ -12,7 +12,7 @@
 - **Requires a recovered graph.** `optimize` refuses (errors) when a pending crash-recovery operation is present — operating on an unrecovered graph could publish a partial write that recovery would roll back. Reopen the graph to run recovery, then re-run `optimize`.
 - **Uncovered drift is skipped, not interpreted.** If a table's underlying version is ahead of the version recorded in `__manifest` and no crash-recovery record covers that movement, `optimize` reports `skipped: DriftNeedsRepair` with the manifest/head versions and leaves the table untouched. Run `omnigraph repair` to classify and explicitly publish that drift.
 - Bounded by `OMNIGRAPH_MAINTENANCE_CONCURRENCY` (default 8).
-- Returns per-table stats: `table_key, fragments_removed, fragments_added, committed, skipped, manifest_version, lance_head_version`.
+- Returns per-table stats: `table_key, fragments_removed, fragments_added, committed, skipped, manifest_version, lance_head_version, pending_indexes` (the last lists any declared `@index` column the reconciler could not build this run, with the reason — e.g. a vector column with no trainable vectors yet).
 - **Blob tables are skipped.** A table that declares any `Blob` property is not compacted: it is reported with `skipped: BlobColumnsUnsupportedByLance` (and logged) instead of compacted, and the rest of the sweep proceeds normally. **Reads and writes are unaffected** — only compaction is. Consequence: fragment count and deleted-row space on blob tables are not reclaimed; query results are never affected. A skipped blob table is also **not reindexed** in the same sweep (the skip happens before the reindex step), so its index coverage on appended rows is not refreshed by `optimize` today.
 
 ## `repair` — explicit
