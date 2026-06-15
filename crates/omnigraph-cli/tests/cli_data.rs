@@ -1280,6 +1280,30 @@ fn read_supports_inline_query_string() {
 }
 
 #[test]
+fn as_on_a_served_write_is_rejected() {
+    // RFC-011: a served write resolves the actor from the bearer token, so --as
+    // cannot set identity. It errors while building the remote client — before
+    // any HTTP call, so no server is needed.
+    let output = output_failure(
+        cli()
+            .arg("mutate")
+            .arg("--server")
+            .arg("http://127.0.0.1:1")
+            .arg("--as")
+            .arg("act-nope")
+            .arg("-e")
+            .arg("query add($name: String) { insert Person { name: $name } }")
+            .arg("--params")
+            .arg(r#"{"name":"X"}"#),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`--as` is not allowed on a served write"),
+        "expected --as-served rejection; got: {stderr}"
+    );
+}
+
+#[test]
 fn change_supports_inline_query_string() {
     let temp = tempdir().unwrap();
     let repo = graph_path(temp.path());

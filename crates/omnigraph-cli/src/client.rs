@@ -147,6 +147,15 @@ impl GraphClient {
         let token = resolve_remote_bearer_token(config, uri.as_deref(), target)?;
         let resolved = resolve_cli_graph(config, uri, target)?;
         if resolved.is_remote {
+            // A served write resolves the actor server-side from the bearer
+            // token; `--as` cannot set identity here and is rejected.
+            if cli_as.is_some() {
+                bail!(
+                    "`--as` is not allowed on a served write — the server resolves the actor \
+                     from the bearer token. Remove `--as`, or run the write directly against \
+                     storage with `--store <uri>`."
+                );
+            }
             Ok(GraphClient::Remote {
                 http: build_http_client()?,
                 base_url: resolved.uri,
