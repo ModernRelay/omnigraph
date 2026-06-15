@@ -220,12 +220,20 @@ impl OperatorConfig {
     }
 
     /// A scope binds one entity (Decision 6): `defaults.server` and
-    /// `defaults.store` are mutually exclusive.
+    /// `defaults.store` are mutually exclusive, and a `store` (already a single
+    /// graph) cannot carry a `default_graph`. Both are refused loudly rather
+    /// than silently dropped.
     fn validate_defaults(&self) -> Result<()> {
         if self.defaults.server.is_some() && self.defaults.store.is_some() {
             bail!(
                 "operator config `defaults` sets both `server` and `store` — a default scope \
                  binds one entity; keep one (use a `profile` if you need both)"
+            );
+        }
+        if self.defaults.store.is_some() && self.defaults.default_graph.is_some() {
+            bail!(
+                "operator config `defaults` sets both `store` and `default_graph` — a store is \
+                 already a single graph; drop `default_graph` (it applies only to a server/cluster scope)"
             );
         }
         Ok(())
@@ -606,6 +614,19 @@ mod tests {
         .unwrap();
         let err = load_operator_config_at(&path).unwrap_err().to_string();
         assert!(err.contains("binds one entity"), "{err}");
+    }
+
+    #[test]
+    fn defaults_store_with_default_graph_is_a_loud_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(
+            &path,
+            "defaults:\n  store: file:///tmp/dev.omni\n  default_graph: knowledge\n",
+        )
+        .unwrap();
+        let err = load_operator_config_at(&path).unwrap_err().to_string();
+        assert!(err.contains("already a single graph"), "{err}");
     }
 
     #[test]
