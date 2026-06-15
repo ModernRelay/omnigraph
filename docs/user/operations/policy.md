@@ -105,7 +105,7 @@ is validated/tested/explained as the anonymous policy.
 - `omnigraph policy validate` — parse + count actors, exit 1 on parse error.
 - `omnigraph policy test` — run cases in `policy.tests.yaml`, exit 1 on any expectation mismatch.
 - `omnigraph policy explain --actor … --action … [--branch …] [--target-branch …]` — show decision and matched rule.
-- `omnigraph --as <ACTOR> <subcommand>` — set the actor for the duration of one invocation. Effective for `change`, `load` (and its deprecated `ingest` alias), `branch create|delete|merge`, and `schema apply` against local URIs. No-op against remote HTTP URIs (actor is bearer-token-resolved server-side).
+- `omnigraph --as <ACTOR> <subcommand>` — set the actor for the duration of one invocation. Effective for `change`, `load` (and its deprecated `ingest` alias), `branch create|delete|merge`, and `schema apply` against a direct (`--store`) graph. **Rejected** on a served write (`--server`): the actor is bearer-token-resolved server-side, so `--as` can't set it there.
 
 ## Enforcement
 

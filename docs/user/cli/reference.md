@@ -2,7 +2,7 @@
 
 A reference for the `omnigraph` binary's command surface and `omnigraph.yaml` schema. For a quick-start guide, see [cli.md](index.md).
 
-Top-level command families and subcommands. Graph-targeting commands accept a positional `URI`, `--uri`, a `--target <name>` resolved against `omnigraph.yaml`, `--server <name>` (an operator-defined server from `~/.omnigraph/config.yaml`, optionally with `--graph <id>` for multi-graph servers; exclusive with the other forms), `--store <uri>` (a single graph's storage directly), or `--profile <name>` / `$OMNIGRAPH_PROFILE` (a named scope bundle; see [Scopes & profiles](#scopes--profiles-rfc-011)); `cluster` commands use `--config <dir>`.
+Top-level command families and subcommands. Graph-targeting commands accept a positional `file://`/`s3://` URI, `--server <name|url>` (an operator-defined server from `~/.omnigraph/config.yaml` by name, or a literal `http(s)://` URL, optionally with `--graph <id>` for multi-graph servers; exclusive with a positional URI), `--store <uri>` (a single graph's storage directly), or `--profile <name>` / `$OMNIGRAPH_PROFILE` (a named scope bundle; see [Scopes & profiles](#scopes--profiles-rfc-011)); `cluster` commands use `--config <dir>`. A remote server is addressed only with `--server` — a positional `http(s)://` URI is rejected.
 
 ## Top-level commands
 
@@ -32,19 +32,20 @@ Top-level command families and subcommands. Graph-targeting commands accept a po
 
 Every command declares the **capability** it needs — what it requires to reach a graph — which determines the addressing flags that apply:
 
-- **`any`** — `query`, `mutate`, `load`, `ingest`, `branch *`, `snapshot`, `export`, `commit *`, `schema show`, `schema apply`. Run against a graph **served (via a server) or embedded (direct against a store)**: accept a positional `URI` / `--target` / `--server` (+ `--graph` for multi-graph servers) / `--store` / `--profile`.
+- **`any`** — `query`, `mutate`, `load`, `ingest`, `branch *`, `snapshot`, `export`, `commit *`, `schema show`, `schema apply`. Run against a graph **served (via a server) or embedded (direct against a store)**: accept a positional `file://`/`s3://` URI, `--server <name|url>` (+ `--graph <id>` for multi-graph servers), `--store <uri>`, or `--profile <name>`. A remote server is addressed with `--server` — a positional `http(s)://` URI does **not** dispatch to one.
 - **`served`** — `graphs list`. Requires a server (accepts `--server` / `--profile`).
-- **`direct`** — `init`, `optimize`, `repair`, `cleanup`, `schema plan`, `queries validate`, `lint`. Need **direct storage access** (`file://` / `s3://`), never through a server. They accept a positional `URI` or `--target`, but **not** `--server` / `--graph`, and a `--target` that resolves to a remote (`http(s)://`) server is rejected. (`init` takes only a positional `URI` today — no `--target`.) `optimize` / `repair` / `cleanup` also accept **`--cluster <dir|s3://…> --cluster-graph <id>`**, which resolves the graph's storage URI from the served cluster state (so you needn't know the `<storage>/graphs/<id>.omni` layout).
+- **`direct`** — `init`, `optimize`, `repair`, `cleanup`, `schema plan`, `queries validate`, `lint`. Need **direct storage access** (`file://` / `s3://`), never through a server. They accept a positional `URI`, but **not** `--server` / `--graph`, and a remote (`http(s)://`) URI is rejected. `optimize` / `repair` / `cleanup` also accept **`--cluster <dir|s3://…> --cluster-graph <id>`**, which resolves the graph's storage URI from the served cluster state (so you needn't know the `<storage>/graphs/<id>.omni` layout).
 - **`control`** — `cluster *`. Operates on a cluster directory via `--config <dir>`.
 - **`local`** — `policy *`, `embed`, `login`, `logout`, `config`, `version`, `queries list`. Address no graph.
 
 These restrictions are enforced and reported, not silent:
 
-- A served-graph flag (`--server` / `--graph`) on a verb that doesn't reach a graph through a server fails loudly, e.g.: ``optimize is a direct (storage-native) command; --server/--graph address a served graph and do not apply. Use --target <name>, a storage URI, or --cluster <dir> --cluster-graph <id>.``
-- A `direct` verb pointed at a remote target fails loudly, e.g.: ``optimize is a direct (storage-native) command and needs direct storage access; the resolved target is a remote server (https://…). Pass the graph's file:// or s3:// URI.``
+- A served-graph flag (`--server` / `--graph`) on a verb that doesn't reach a graph through a server fails loudly, e.g.: ``optimize is a direct (storage-native) command; --server/--graph address a served graph and do not apply. Pass a storage URI, or --cluster <dir> --cluster-graph <id>.``
+- A `direct` verb pointed at a remote URI fails loudly, e.g.: ``optimize is a direct (storage-native) command and needs direct storage access; the resolved target is a remote server (https://…). Pass the graph's file:// or s3:// URI.``
+- A data verb pointed at a positional `http(s)://` URI fails loudly: ``a remote graph must be addressed with --server <url> — a positional (or --uri) http(s):// URL no longer dispatches to a server.``
 - `init` into an **established cluster's** storage layout (`<root>/graphs/<id>.omni` where `<root>` holds `__cluster/state.json`) is refused — graphs in a cluster are created by `cluster apply` (which records ledger / recovery / approvals), not `init`.
 
-To maintain a server-backed graph, run the `direct` verbs from a host with storage access against the graph's storage URI (`--target`, or `--cluster … --cluster-graph …`), out-of-band from the serving process — there are no server routes for `optimize` / `repair` / `cleanup` by design.
+To maintain a server-backed graph, run the `direct` verbs from a host with storage access against the graph's storage URI (a positional URI, or `--cluster … --cluster-graph …`), out-of-band from the serving process — there are no server routes for `optimize` / `repair` / `cleanup` by design.
 
 `omnigraph --help` lists commands with a **capability legend** at the bottom (any / served / direct / control / local).
 
@@ -92,7 +93,7 @@ newer CLI works on an older one). `$OMNIGRAPH_CONFIG=<path>` stands in for
 A command resolves a **scope** — a server, a cluster, or a store — then selects a
 graph in it; the served-vs-direct access path is derived from the scope, not
 toggled. The scope comes from one of (highest precedence first): an explicit
-address (a positional URI, `--target`, `--server`, or `--store <uri>`); a named
+address (a positional URI, `--server`, or `--store <uri>`); a named
 `--profile <name>` (or `$OMNIGRAPH_PROFILE`); or the flat `defaults.server` +
 `defaults.default_graph`. A **profile** binds exactly one of `server` / `cluster`
 / `store` plus an optional default graph — config data, not state: every command
@@ -105,9 +106,9 @@ resolves its scope fresh, there is no sticky "current" mode.
 - A `server`-bound scope on a maintenance verb, or a `cluster`-bound scope on a
   data verb, is rejected with a message pointing at the right addressing.
 
-This model **coexists** with the legacy addressing (`--uri` / `--target` /
-`--cluster-graph` / `omnigraph.yaml`) — nothing is removed yet; an explicit legacy
-address always wins.
+`--target` and the positional-`http(s)://`→remote dispatch have been **removed**;
+the remaining legacy surfaces (`--cluster-graph`, `omnigraph.yaml`'s `cli.graph`
+default) still work and an explicit address always wins.
 
 #### Credentials keyed by server name
 
