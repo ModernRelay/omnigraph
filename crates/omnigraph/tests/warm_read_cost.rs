@@ -44,7 +44,7 @@ async fn warm_same_branch_read_does_no_resolution_opens() {
     // Deep history: warm-read resolution cost must be flat in commit count.
     commit_many(&mut db, 20).await;
 
-    let (probes_in, _manifest, commit_graph, probe_count) = probes();
+    let (probes_in, manifest, commit_graph, probe_count) = probes();
     with_query_io_probes(
         probes_in,
         db.query(
@@ -57,14 +57,17 @@ async fn warm_same_branch_read_does_no_resolution_opens() {
     .await
     .unwrap();
 
-    // Fix 1's guarantee: the warm read reuses the coordinator instead of
-    // re-opening it. A coordinator re-open opens BOTH the commit graph and
-    // __manifest, so commit_graph == 0 proves neither resolution scan happened,
-    // even at commit-history depth (pre-Fix-1 this is a deep commit-graph scan).
-    // Exactly one cheap version probe replaces the re-open.
-    //
-    // The query's residual `_manifest` read_iops are the per-table namespace
-    // describe_table scans (Fix 2 removes those); they are not from resolution.
+    // A warm same-branch read opens nothing from the internal tables, even at
+    // commit-history depth. Fix 1 reuses the coordinator (no re-open: 0
+    // commit-graph opens, exactly 1 cheap version probe). Fix 2 opens the touched
+    // data table by location+version instead of via the namespace, so the
+    // per-table __manifest scan is gone too. Pre-fix, each of these is a deep scan
+    // of an internal table that grows with commit count.
+    assert_eq!(
+        manifest.stats().read_iops,
+        0,
+        "warm same-branch read must not scan __manifest (resolution or per-table)"
+    );
     assert_eq!(
         commit_graph.stats().read_iops,
         0,
@@ -74,6 +77,36 @@ async fn warm_same_branch_read_does_no_resolution_opens() {
         probe_count.load(Ordering::Relaxed),
         1,
         "warm same-branch read performs exactly one version probe"
+    );
+}
+
+/// A multi-table query (a traversal touching Person, WorksAt, and Company) scans
+/// `__manifest` zero times. Fix 2 opens every touched table by location+version,
+/// so manifest IO no longer scales with the number of tables — pre-Fix-2 each
+/// table cost two full `__manifest` scans (`describe_table` +
+/// `describe_table_version`), which is the "2 tables = 2×" multi-table tax.
+#[tokio::test]
+async fn multi_table_query_does_no_manifest_scans() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+
+    let (probes_in, manifest, _commit_graph, _probe) = probes();
+    with_query_io_probes(
+        probes_in,
+        db.query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "age_stats",
+            &params(&[]),
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        manifest.stats().read_iops,
+        0,
+        "a multi-table read must not scan __manifest once per touched table"
     );
 }
 
