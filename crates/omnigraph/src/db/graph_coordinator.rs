@@ -182,6 +182,21 @@ impl GraphCoordinator {
         Ok(())
     }
 
+    /// Cheap freshness probe: the latest manifest version on disk. Records the
+    /// probe for cost instrumentation. Reads compare this against `version()`.
+    pub async fn probe_latest_version(&self) -> Result<u64> {
+        crate::instrumentation::record_probe();
+        self.manifest.probe_latest_version().await
+    }
+
+    /// Refresh only the manifest (not the commit graph). The read path uses this
+    /// on a stale same-branch probe: a read pins its snapshot by manifest version
+    /// and never needs the commit graph, so a full `refresh` (which also scans
+    /// the commit graph) would be wasted IO.
+    pub async fn refresh_manifest_only(&mut self) -> Result<()> {
+        self.manifest.refresh().await
+    }
+
     pub async fn branch_list(&self) -> Result<Vec<String>> {
         self.manifest.list_branches().await.map(|branches| {
             branches

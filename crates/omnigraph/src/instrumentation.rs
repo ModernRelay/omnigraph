@@ -67,7 +67,6 @@ pub(crate) fn commit_graph_wrapper() -> Option<Arc<dyn WrappingObjectStore>> {
 
 /// Record one version-probe invocation against the active per-query probes.
 /// No-op when no probes are installed (production).
-#[allow(dead_code)] // wired by Fix 1 (the version probe)
 pub(crate) fn record_probe() {
     let _ = current(|p| p.probe_count.fetch_add(1, Ordering::Relaxed));
 }

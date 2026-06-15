@@ -359,6 +359,16 @@ impl ManifestCoordinator {
         self.dataset.version().version
     }
 
+    /// Latest committed manifest version on disk (one object-store op, no row
+    /// scan). The freshness probe for warm reuse: compare against `version()`
+    /// (the held handle's pinned version) to decide whether to refresh.
+    pub async fn probe_latest_version(&self) -> Result<u64> {
+        self.dataset
+            .latest_version_id()
+            .await
+            .map_err(|e| OmniError::Lance(e.to_string()))
+    }
+
     pub fn active_branch(&self) -> Option<&str> {
         self.active_branch.as_deref()
     }

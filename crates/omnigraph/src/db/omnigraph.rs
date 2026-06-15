@@ -935,11 +935,41 @@ impl Omnigraph {
         target: impl Into<ReadTarget>,
     ) -> Result<ResolvedTarget> {
         self.ensure_schema_state_valid().await?;
-        self.coordinator
-            .read()
-            .await
-            .resolve_target(&target.into())
-            .await
+        let target = target.into();
+
+        // Same-branch reads reuse the warm coordinator, gated by a cheap version
+        // probe (invariant 6: strong consistency, never a blind warm read).
+        // Reads do not need the commit graph (the manifest version is the
+        // visibility authority, invariant 2), so the id is synthetic and no
+        // commit-graph scan happens on this path.
+        if let ReadTarget::Branch(branch) = &target {
+            let normalized = normalize_branch_name(branch)?;
+            {
+                let coord = self.coordinator.read().await;
+                if normalized.as_deref() != coord.current_branch() {
+                    // Different branch: cold resolve (opens that branch).
+                    return coord.resolve_target(&target).await;
+                }
+                if coord.probe_latest_version().await? == coord.version() {
+                    return Ok(warm_resolved_target(&coord, &target));
+                }
+                // Stale: refresh under the write lock below.
+            }
+            let mut coord = self.coordinator.write().await;
+            if normalized.as_deref() == coord.current_branch() {
+                // Re-check after taking the write lock; another writer may have
+                // refreshed (tokio RwLock has no read->write upgrade).
+                if coord.probe_latest_version().await? != coord.version() {
+                    coord.refresh_manifest_only().await?;
+                }
+                return Ok(warm_resolved_target(&coord, &target));
+            }
+            // Branch changed while waiting for the write lock: cold resolve.
+            return coord.resolve_target(&target).await;
+        }
+
+        // Snapshot target: resolve through the commit graph as before.
+        self.coordinator.read().await.resolve_target(&target).await
     }
 
     // ─── Change detection ────────────────────────────────────────────────
@@ -1616,6 +1646,19 @@ pub(crate) fn normalize_branch_name(branch: &str) -> Result<Option<String>> {
         return Ok(None);
     }
     Ok(Some(branch.to_string()))
+}
+
+/// Build a `ResolvedTarget` from the warm coordinator without opening the commit
+/// graph. The live branch snapshot is pinned by the manifest version, so the id
+/// is synthetic `(branch, version)`; nothing on the read path needs a real commit
+/// ULID (only `RuntimeCache` keys on the id, where synthetic is consistent).
+fn warm_resolved_target(coord: &GraphCoordinator, requested: &ReadTarget) -> ResolvedTarget {
+    ResolvedTarget {
+        requested: requested.clone(),
+        branch: coord.current_branch().map(str::to_string),
+        snapshot_id: SnapshotId::synthetic(coord.current_branch(), coord.version()),
+        snapshot: coord.snapshot(),
+    }
 }
 
 pub(crate) fn ensure_public_branch_ref(branch: &str, operation: &str) -> Result<()> {
