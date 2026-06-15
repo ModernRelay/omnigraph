@@ -189,15 +189,13 @@ fn scope_from_binding(
                 .map(str::to_string)
                 .unwrap_or(cluster);
             // A cluster holds many graphs; maintenance addresses one at a time.
-            let Some(graph) = graph else {
-                bail!(
-                    "{source} resolves a cluster scope; pass --graph <id> to select which \
-                     graph to maintain"
-                );
-            };
+            // When no `--graph`/`default_graph` is given, leave `cluster_graph`
+            // empty and defer to the async storage-URI resolver (RFC-011 D7),
+            // which enumerates the catalog: auto-use a sole graph, else error
+            // and list the candidates.
             Ok(ResolvedScope {
                 cluster: Some(root),
-                cluster_graph: Some(graph),
+                cluster_graph: graph,
                 ..Default::default()
             })
         }
@@ -334,9 +332,13 @@ mod tests {
     }
 
     #[test]
-    fn cluster_scope_without_a_graph_is_a_loud_error() {
+    fn cluster_scope_without_a_graph_defers_to_catalog_enumeration() {
+        // RFC-011 D7: with no `--graph`/`default_graph`, resolution no longer
+        // bails here — it resolves the cluster root and leaves `cluster_graph`
+        // empty, deferring to the async storage-URI resolver (which enumerates
+        // the catalog: auto-use a sole graph, else error listing candidates).
         let op = cfg("clusters:\n  brain:\n    root: s3://acme/brain\n");
-        let err = resolve_scope(
+        let scope = resolve_scope(
             &op,
             Capability::Direct,
             ScopeFlags {
@@ -344,9 +346,9 @@ mod tests {
                 ..flags()
             },
         )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("--graph <id>"), "{err}");
+        .unwrap();
+        assert_eq!(scope.cluster.as_deref(), Some("s3://acme/brain"));
+        assert_eq!(scope.cluster_graph, None);
     }
 
     #[test]

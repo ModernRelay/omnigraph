@@ -632,11 +632,12 @@ pub(crate) async fn resolve_maintenance_uri(
 }
 
 /// Map a resolved direct address to a storage URI: a cluster scope
-/// (`--cluster <root> --graph <id>`, or a `--profile` cluster binding)
-/// resolves the graph's storage URI from the **served cluster state** (the
-/// truth a `--cluster` server serves); otherwise the ordinary positional-URI
-/// path. The scope resolver guarantees a cluster scope always carries a graph,
-/// so the mismatched arm is defensive.
+/// (`--cluster <root> --graph <id>`, or a `--profile` cluster binding) resolves
+/// the graph's storage URI from the **served cluster state**; otherwise the
+/// ordinary positional-URI path. When a cluster scope carries no graph
+/// selection (RFC-011 D7), enumerate the catalog: a sole graph is used
+/// automatically, otherwise error and list the candidates so the operator can
+/// pass `--graph <id>`.
 pub(crate) async fn resolve_storage_uri(
     config: &OmnigraphConfig,
     cli_uri: Option<String>,
@@ -646,8 +647,32 @@ pub(crate) async fn resolve_storage_uri(
 ) -> Result<String> {
     match (cluster, cluster_graph) {
         (Some(cluster), Some(graph_id)) => resolve_cluster_graph_uri(cluster, graph_id).await,
+        (Some(cluster), None) => {
+            let graph_id = resolve_sole_cluster_graph(cluster).await?;
+            resolve_cluster_graph_uri(cluster, &graph_id).await
+        }
         (None, None) => resolve_local_uri(config, cli_uri, operation),
-        _ => bail!("internal error: a cluster scope was resolved without a graph id"),
+        (None, Some(_)) => {
+            bail!("internal error: a graph was selected without a cluster scope")
+        }
+    }
+}
+
+/// Pick the graph for a cluster scope that has no `--graph`/`default_graph`
+/// (RFC-011 D7): exactly one applied graph → use it; zero → error; more than
+/// one → error and list the candidates. Never auto-picks among several.
+async fn resolve_sole_cluster_graph(cluster: &str) -> Result<String> {
+    let ids = omnigraph_cluster::cluster_graph_ids(cluster)
+        .await
+        .map_err(|diagnostic| color_eyre::eyre::eyre!("{}", diagnostic.message))?;
+    match ids.as_slice() {
+        [only] => Ok(only.clone()),
+        [] => bail!("cluster `{cluster}` has no applied graphs; run `cluster apply` first"),
+        many => bail!(
+            "cluster `{cluster}` has {} graphs: [{}]; pass --graph <id> to select one",
+            many.len(),
+            many.join(", ")
+        ),
     }
 }
 

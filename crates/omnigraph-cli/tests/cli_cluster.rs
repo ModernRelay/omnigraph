@@ -1006,21 +1006,80 @@ fn optimize_unknown_cluster_graph_id_errors() {
 }
 
 #[test]
-fn cluster_without_graph_demands_a_graph_selector() {
-    // A cluster holds many graphs; `--cluster` alone can't pick one. The scope
-    // resolver demands `--graph <id>` (replacing the old `--cluster-graph`
-    // requirement) before it ever touches cluster state.
+fn optimize_auto_uses_the_sole_cluster_graph() {
+    // RFC-011 D7: a cluster with exactly one applied graph needs no --graph —
+    // the resolver enumerates the catalog and uses the only candidate.
+    let temp = applied_knowledge_cluster();
+    let out = output_success(
+        cli()
+            .arg("optimize")
+            .arg("--cluster")
+            .arg(temp.path())
+            .arg("--json"),
+    );
+    assert!(
+        parse_stdout_json(&out)["tables"].as_array().is_some(),
+        "optimize should auto-resolve the sole cluster graph"
+    );
+}
+
+/// Stand up an applied cluster with two graphs (`knowledge`, `archive`).
+fn applied_two_graph_cluster() -> tempfile::TempDir {
+    let temp = tempdir().unwrap();
+    let root = temp.path();
+    fs::write(
+        root.join("people.pg"),
+        "node Person {\n  name: String @key\n  age: I32?\n}\n",
+    )
+    .unwrap();
+    fs::write(root.join("base.policy.yaml"), "rules: []\n").unwrap();
+    fs::write(
+        root.join("cluster.yaml"),
+        r#"
+version: 1
+metadata:
+  name: two-graph
+state:
+  backend: cluster
+  lock: true
+graphs:
+  knowledge:
+    schema: ./people.pg
+  archive:
+    schema: ./people.pg
+policies:
+  base:
+    file: ./base.policy.yaml
+    applies_to: [knowledge, archive]
+"#,
+    )
+    .unwrap();
+    init_named_cluster_graph(root, "knowledge", "people.pg");
+    init_named_cluster_graph(root, "archive", "people.pg");
+    assert_eq!(cluster_json(root, "import")["ok"], true);
+    assert_eq!(cluster_json(root, "apply")["converged"], true);
+    temp
+}
+
+#[test]
+fn optimize_on_multi_graph_cluster_without_graph_lists_candidates() {
+    // RFC-011 D7: >1 graph and no --graph → error naming every candidate,
+    // never an auto-pick.
+    let temp = applied_two_graph_cluster();
     let out = output_failure(
         cli()
             .arg("optimize")
             .arg("--cluster")
-            .arg(".")
+            .arg(temp.path())
             .arg("--json"),
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("--graph <id>"),
-        "expected --cluster to demand --graph; got: {stderr}"
+        stderr.contains("2 graphs")
+            && stderr.contains("archive")
+            && stderr.contains("knowledge")
+            && stderr.contains("--graph <id>"),
+        "expected a candidate-listing error; got: {stderr}"
     );
 }
 

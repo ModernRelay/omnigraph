@@ -112,28 +112,13 @@ pub async fn cluster_root_for_graph_uri(graph_uri: &str) -> Option<String> {
 /// `cluster` is a config directory or a storage-root URI (`s3://…`, config-free),
 /// mirroring the server's `--cluster` dispatch.
 pub async fn resolve_graph_storage_uri(cluster: &str, graph_id: &str) -> Result<String, Diagnostic> {
-    let backend = if cluster.contains("://") {
-        ClusterStore::for_storage_root(cluster)?
-    } else {
-        ClusterStore::for_config_dir(Path::new(cluster))
-    };
+    let backend = open_cluster_backend(cluster)?;
     let mut observations = backend.observations();
     let snapshot = backend.read_state(&mut observations).await?;
-    let state = snapshot.state.ok_or_else(|| {
-        Diagnostic::error(
-            "cluster_state_missing",
-            CLUSTER_STATE_FILE,
-            format!("cluster `{cluster}` has no applied state; run `cluster apply` first"),
-        )
-    })?;
+    let state = snapshot.state.ok_or_else(|| missing_state_diagnostic(cluster))?;
     let address = format!("graph.{graph_id}");
     if !state.applied_revision.resources.contains_key(&address) {
-        let applied: Vec<&str> = state
-            .applied_revision
-            .resources
-            .keys()
-            .filter_map(|a| a.strip_prefix("graph."))
-            .collect();
+        let applied = applied_graph_ids(&state);
         return Err(Diagnostic::error(
             "graph_not_applied",
             address,
@@ -145,6 +130,46 @@ pub async fn resolve_graph_storage_uri(cluster: &str, graph_id: &str) -> Result<
         ));
     }
     Ok(backend.graph_root(graph_id))
+}
+
+/// List the graph ids applied in a cluster's served state (sorted). Reads the
+/// ledger only — no catalog validation — like `resolve_graph_storage_uri`, so
+/// it works on a degraded cluster. Used to enumerate candidates when no
+/// `--graph` is selected (RFC-011 Decision 7).
+pub async fn cluster_graph_ids(cluster: &str) -> Result<Vec<String>, Diagnostic> {
+    let backend = open_cluster_backend(cluster)?;
+    let mut observations = backend.observations();
+    let snapshot = backend.read_state(&mut observations).await?;
+    let state = snapshot.state.ok_or_else(|| missing_state_diagnostic(cluster))?;
+    Ok(applied_graph_ids(&state))
+}
+
+fn open_cluster_backend(cluster: &str) -> Result<ClusterStore, Diagnostic> {
+    if cluster.contains("://") {
+        ClusterStore::for_storage_root(cluster)
+    } else {
+        Ok(ClusterStore::for_config_dir(Path::new(cluster)))
+    }
+}
+
+fn missing_state_diagnostic(cluster: &str) -> Diagnostic {
+    Diagnostic::error(
+        "cluster_state_missing",
+        CLUSTER_STATE_FILE,
+        format!("cluster `{cluster}` has no applied state; run `cluster apply` first"),
+    )
+}
+
+fn applied_graph_ids(state: &crate::types::ClusterState) -> Vec<String> {
+    let mut ids: Vec<String> = state
+        .applied_revision
+        .resources
+        .keys()
+        .filter_map(|a| a.strip_prefix("graph."))
+        .map(str::to_string)
+        .collect();
+    ids.sort();
+    ids
 }
 
 /// Split `<root>/graphs/<id>.omni` → `<root>`, gating on the exact cluster

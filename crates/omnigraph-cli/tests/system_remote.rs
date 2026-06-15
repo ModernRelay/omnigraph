@@ -1136,5 +1136,27 @@ auth:
         .collect();
     assert_eq!(ids, vec!["alpha"]);
 
+    // RFC-011 D7: addressing the multi-graph server via `--server <url>` with no
+    // `--graph` errors and lists the candidate graphs (the resolver probes
+    // GET /graphs; the default-env token authorizes it).
+    let no_graph = cli()
+        .env("OMNIGRAPH_BEARER_TOKEN", "admin-token")
+        .arg("query")
+        .arg("--server")
+        .arg(&server.base_url)
+        .arg("-e")
+        .arg("query q { match { $p: Person { name: \"x\" } } return { $p.name } }")
+        .output()
+        .unwrap();
+    assert!(
+        !no_graph.status.success(),
+        "multi-graph server with no --graph must error"
+    );
+    let stderr = String::from_utf8_lossy(&no_graph.stderr);
+    assert!(
+        stderr.contains("alpha") && stderr.contains("--graph <id>"),
+        "expected a candidate-listing error naming alpha; got: {stderr}"
+    );
+
     drop(server);
 }
