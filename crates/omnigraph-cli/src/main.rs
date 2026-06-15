@@ -188,6 +188,10 @@ async fn main() -> Result<()> {
                 cli.store.as_deref(),
             )?;
             let branch = resolve_branch(&config, branch, None, "main");
+            if matches!(mode, CliLoadMode::Overwrite) {
+                confirm_destructive("load --mode overwrite", client.uri(), cli.yes, json)?;
+            }
+            echo_write_target(cli.quiet, "load", client.uri(), client.is_remote());
             let payload = client
                 .load(&branch, from.as_deref(), &data.to_string_lossy(), mode)
                 .await?;
@@ -223,6 +227,7 @@ async fn main() -> Result<()> {
             )?;
             let branch = resolve_branch(&config, branch, None, "main");
             let from = resolve_branch(&config, from, None, "main");
+            echo_write_target(cli.quiet, "ingest", client.uri(), client.is_remote());
             let payload = client
                 .ingest(&branch, &from, &data.to_string_lossy(), mode)
                 .await?;
@@ -251,6 +256,7 @@ async fn main() -> Result<()> {
                     cli.store.as_deref(),
                 )?;
                 let from = resolve_branch(&config, from, None, "main");
+                echo_write_target(cli.quiet, "branch create", client.uri(), client.is_remote());
                 let payload = client.branch_create_from(&from, &name).await?;
                 if json {
                     print_json(&payload)?;
@@ -297,6 +303,8 @@ async fn main() -> Result<()> {
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
                 )?;
+                confirm_destructive("branch delete", client.uri(), cli.yes, json)?;
+                echo_write_target(cli.quiet, "branch delete", client.uri(), client.is_remote());
                 let payload = client.branch_delete(&name).await?;
                 if json {
                     print_json(&payload)?;
@@ -322,6 +330,7 @@ async fn main() -> Result<()> {
                     cli.store.as_deref(),
                 )?;
                 let into = resolve_branch(&config, into, None, "main");
+                echo_write_target(cli.quiet, "branch merge", client.uri(), client.is_remote());
                 let payload = client.branch_merge(&source, &into).await?;
                 if json {
                     print_json(&payload)?;
@@ -440,6 +449,7 @@ async fn main() -> Result<()> {
                     (!registry.is_empty()).then_some(registry)
                 };
                 let label = client.selected().unwrap_or(client.uri()).to_string();
+                echo_write_target(cli.quiet, "schema apply", client.uri(), client.is_remote());
                 let output = client
                     .apply_schema(&schema_source, allow_data_loss, |catalog| {
                         if let Some(registry) = registry.as_ref() {
@@ -802,6 +812,7 @@ async fn main() -> Result<()> {
                 "optimize",
             )
             .await?;
+            echo_write_target(cli.quiet, "optimize", &uri, false);
             let db = Omnigraph::open(&uri).await?;
             let stats = db.optimize().await?;
             if json {
@@ -852,6 +863,7 @@ async fn main() -> Result<()> {
                 "repair",
             )
             .await?;
+            echo_write_target(cli.quiet, "repair", &uri, false);
             let db = Omnigraph::open(&uri).await?;
             let stats = db
                 .repair(omnigraph::db::RepairOptions { confirm, force })
@@ -967,6 +979,11 @@ async fn main() -> Result<()> {
                 );
                 return Ok(());
             }
+            // Past the preview gate: a real destructive run. Against a non-local
+            // scope this additionally requires --yes (or an interactive yes), so
+            // `cleanup --confirm s3://…` in CI refuses rather than destroying.
+            confirm_destructive("cleanup", &uri, cli.yes, json)?;
+            echo_write_target(cli.quiet, "cleanup", &uri, false);
 
             let options = omnigraph::db::CleanupPolicyOptions {
                 keep_versions: keep,
