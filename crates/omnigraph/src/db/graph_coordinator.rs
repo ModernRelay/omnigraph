@@ -498,6 +498,42 @@ impl GraphCoordinator {
         })
     }
 
+    pub(crate) async fn commit_manifest_changes_with_expected(
+        &mut self,
+        changes: &[ManifestChange],
+        expected_table_versions: &HashMap<String, u64>,
+    ) -> Result<u64> {
+        let manifest_version = self
+            .manifest
+            .commit_changes_with_expected(changes, expected_table_versions)
+            .await?;
+        failpoints::maybe_fail("graph_publish.after_manifest_commit")?;
+        Ok(manifest_version)
+    }
+
+    /// Like [`commit_changes_with_actor`], but fences the publish with
+    /// per-table expected versions (publisher-level OCC). Each entry asserts
+    /// the manifest's current latest non-tombstoned `table_version` for that
+    /// `table_key` matches what the caller observed; a mismatch surfaces as
+    /// `OmniError::Manifest` with `ManifestConflictDetails::ExpectedVersionMismatch`
+    /// rather than publishing onto moved state. Used by schema apply as the
+    /// cross-process backstop for the in-process write-queue serialization.
+    pub(crate) async fn commit_changes_with_expected_with_actor(
+        &mut self,
+        changes: &[ManifestChange],
+        expected_table_versions: &HashMap<String, u64>,
+        actor_id: Option<&str>,
+    ) -> Result<PublishedSnapshot> {
+        let manifest_version = self
+            .commit_manifest_changes_with_expected(changes, expected_table_versions)
+            .await?;
+        let snapshot_id = self.record_graph_commit(manifest_version, actor_id).await?;
+        Ok(PublishedSnapshot {
+            manifest_version,
+            _snapshot_id: snapshot_id,
+        })
+    }
+
     pub(crate) async fn record_graph_commit(
         &mut self,
         manifest_version: u64,
