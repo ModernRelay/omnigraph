@@ -40,22 +40,20 @@ use serde_json::Value;
 
 use crate::cli::CliLoadMode;
 use crate::helpers::{
-    ResolvedCliGraph, apply_bearer_token, apply_server_flag, build_http_client, is_remote_uri,
-    legacy_change_request_body, open_local_db_with_policy, query_params_from_json,
+    apply_bearer_token, apply_server_flag, build_http_client, is_remote_uri,
+    legacy_change_request_body, query_params_from_json,
     remote_json, remote_url, resolve_cli_actor, resolve_cli_graph, resolve_remote_bearer_token,
     resolve_server_flag, select_named_query,
 };
 use crate::output::{LoadOutput, load_output_from_result, load_output_from_tables};
-use omnigraph_server::config::OmnigraphConfig;
 
 pub(crate) enum GraphClient {
-    /// Local engine at `uri`. Reads (`resolve()`) leave `graph`/`actor`
-    /// empty and open without policy; writes (`resolve_with_policy()`)
-    /// fill them, opening through `open_local_db_with_policy` and
-    /// attributing the resolved actor.
+    /// Local engine at `uri`. Reads (`resolve()`) leave `actor` empty;
+    /// writes (`resolve_with_policy()`) attribute the resolved actor.
+    /// Direct-store access carries no Cedar policy (RFC-011: policy lives
+    /// in the cluster/server, not in per-operator addressing).
     Embedded {
         uri: String,
-        graph: Option<ResolvedCliGraph>,
         actor: Option<String>,
     },
     /// Remote HTTP server. The actor is resolved server-side from the
@@ -75,7 +73,6 @@ pub(crate) enum GraphClient {
 /// is then correct, or the real request surfaces the failure. Only fires on the
 /// no-graph path, so a `--graph`/`default_graph` happy path does no extra I/O.
 async fn require_graph_for_multi_graph_server(
-    config: &OmnigraphConfig,
     scope: &crate::scope::ResolvedScope,
 ) -> Result<()> {
     let (Some(server), None) = (scope.server.as_deref(), scope.graph.as_deref()) else {
@@ -84,7 +81,7 @@ async fn require_graph_for_multi_graph_server(
     let Some(base) = resolve_server_flag(Some(server), None)? else {
         return Ok(());
     };
-    let token = resolve_remote_bearer_token(config, Some(&base))?;
+    let token = resolve_remote_bearer_token(Some(&base))?;
     let probe = GraphClient::Remote {
         http: build_http_client()?,
         base_url: base,
@@ -126,7 +123,6 @@ impl GraphClient {
     /// path, not the policy-bearing `resolve_cli_graph`). Used by reads
     /// and `query` (which opens without policy, like the reads).
     pub(crate) async fn resolve(
-        config: &OmnigraphConfig,
         server: Option<&str>,
         graph: Option<&str>,
         uri: Option<String>,
@@ -141,7 +137,7 @@ impl GraphClient {
             crate::planes::Capability::Any,
             crate::scope::ScopeFlags { profile, store, server, cluster: None, graph, uri },
         )?;
-        require_graph_for_multi_graph_server(config, &scope).await?;
+        require_graph_for_multi_graph_server(&scope).await?;
         let (server, graph, uri) = (
             scope.server.as_deref(),
             scope.graph.as_deref(),
@@ -149,8 +145,8 @@ impl GraphClient {
         );
         let via_server = server.is_some();
         let uri = apply_server_flag(server, graph, uri)?;
-        let token = resolve_remote_bearer_token(config, uri.as_deref())?;
-        let uri = crate::helpers::resolve_uri(config, uri)?;
+        let token = resolve_remote_bearer_token(uri.as_deref())?;
+        let uri = crate::helpers::resolve_uri(uri)?;
         reject_positional_remote(via_server, &uri)?;
         if is_remote_uri(&uri) {
             Ok(GraphClient::Remote {
@@ -159,11 +155,7 @@ impl GraphClient {
                 token,
             })
         } else {
-            Ok(GraphClient::Embedded {
-                uri,
-                graph: None,
-                actor: None,
-            })
+            Ok(GraphClient::Embedded { uri, actor: None })
         }
     }
 
@@ -174,7 +166,6 @@ impl GraphClient {
     /// resolution order matches the write arms exactly: server flag →
     /// bearer token → graph.
     pub(crate) async fn resolve_with_policy(
-        config: &OmnigraphConfig,
         server: Option<&str>,
         graph: Option<&str>,
         uri: Option<String>,
@@ -189,7 +180,7 @@ impl GraphClient {
             crate::planes::Capability::Any,
             crate::scope::ScopeFlags { profile, store, server, cluster: None, graph, uri },
         )?;
-        require_graph_for_multi_graph_server(config, &scope).await?;
+        require_graph_for_multi_graph_server(&scope).await?;
         let (server, graph, uri) = (
             scope.server.as_deref(),
             scope.graph.as_deref(),
@@ -197,8 +188,8 @@ impl GraphClient {
         );
         let via_server = server.is_some();
         let uri = apply_server_flag(server, graph, uri)?;
-        let token = resolve_remote_bearer_token(config, uri.as_deref())?;
-        let resolved = resolve_cli_graph(config, uri)?;
+        let token = resolve_remote_bearer_token(uri.as_deref())?;
+        let resolved = resolve_cli_graph(uri)?;
         reject_positional_remote(via_server, &resolved.uri)?;
         if resolved.is_remote {
             // A served write resolves the actor server-side from the bearer
@@ -216,10 +207,9 @@ impl GraphClient {
                 token,
             })
         } else {
-            let actor = resolve_cli_actor(cli_as, config)?;
+            let actor = resolve_cli_actor(cli_as)?;
             Ok(GraphClient::Embedded {
-                uri: resolved.uri.clone(),
-                graph: Some(resolved),
+                uri: resolved.uri,
                 actor,
             })
         }
@@ -233,28 +223,15 @@ impl GraphClient {
         }
     }
 
-    /// The selected graph name, when a policy-bearing embedded client was
-    /// resolved against a named graph. `None` for remote and for reads.
-    pub(crate) fn selected(&self) -> Option<&str> {
-        match self {
-            GraphClient::Embedded { graph, .. } => graph.as_ref().and_then(ResolvedCliGraph::selected),
-            GraphClient::Remote { .. } => None,
-        }
-    }
-
     pub(crate) fn is_remote(&self) -> bool {
         matches!(self, GraphClient::Remote { .. })
     }
 
-    /// Open the local engine the way the resolved client demands: with
-    /// policy when a `graph` context is present (write path), bare
-    /// otherwise (read/`query` path). Captures today's two open paths in
-    /// one place so each verb stays a single match arm.
-    async fn open_embedded(uri: &str, graph: &Option<ResolvedCliGraph>) -> Result<Omnigraph> {
-        match graph {
-            Some(graph) => open_local_db_with_policy(graph).await,
-            None => Ok(Omnigraph::open(uri).await?),
-        }
+    /// Open the local engine. Direct-store access carries no Cedar policy
+    /// (RFC-011), so both read and write paths open bare; the actor is still
+    /// attributed on the write via the `_as` engine APIs.
+    async fn open_embedded(uri: &str) -> Result<Omnigraph> {
+        Ok(Omnigraph::open(uri).await?)
     }
 
     pub(crate) async fn branch_list(&self) -> Result<BranchListOutput> {
@@ -416,8 +393,8 @@ impl GraphClient {
                 .await?;
                 Ok(load_output_from_tables(base_url, branch, mode.as_str(), &output))
             }
-            GraphClient::Embedded { uri, graph, actor } => {
-                let db = Self::open_embedded(uri, graph).await?;
+            GraphClient::Embedded { uri, actor } => {
+                let db = Self::open_embedded(uri).await?;
                 let result = db
                     .load_file_as(branch, from, data, mode.into(), actor.as_deref())
                     .await?;
@@ -459,8 +436,8 @@ impl GraphClient {
                 )
                 .await
             }
-            GraphClient::Embedded { uri, graph, actor } => {
-                let db = Self::open_embedded(uri, graph).await?;
+            GraphClient::Embedded { uri, actor } => {
+                let db = Self::open_embedded(uri).await?;
                 let result = db
                     .load_file_as(branch, Some(from), data, mode.into(), actor.as_deref())
                     .await?;
@@ -498,10 +475,10 @@ impl GraphClient {
                 )
                 .await
             }
-            GraphClient::Embedded { uri, graph, actor } => {
+            GraphClient::Embedded { uri, actor } => {
                 let (selected_name, query_params) = select_named_query(query_source, query_name)?;
                 let params = query_params_from_json(&query_params, params_json)?;
-                let db = Self::open_embedded(uri, graph).await?;
+                let db = Self::open_embedded(uri).await?;
                 let actor = actor.as_deref();
                 let result = db
                     .mutate_as(branch, query_source, &selected_name, &params, actor)
@@ -552,10 +529,10 @@ impl GraphClient {
                 )
                 .await
             }
-            GraphClient::Embedded { uri, graph, .. } => {
+            GraphClient::Embedded { uri, .. } => {
                 let (selected_name, query_params) = select_named_query(query_source, query_name)?;
                 let params = query_params_from_json(&query_params, params_json)?;
-                let db = Self::open_embedded(uri, graph).await?;
+                let db = Self::open_embedded(uri).await?;
                 let result = db
                     .query(target.clone(), query_source, &selected_name, &params)
                     .await?;
@@ -631,8 +608,8 @@ impl GraphClient {
                 )
                 .await
             }
-            GraphClient::Embedded { uri, graph, actor } => {
-                let db = Self::open_embedded(uri, graph).await?;
+            GraphClient::Embedded { uri, actor } => {
+                let db = Self::open_embedded(uri).await?;
                 let actor = actor.as_deref();
                 db.branch_create_from_as(ReadTarget::branch(from), name, actor)
                     .await?;
@@ -662,8 +639,8 @@ impl GraphClient {
                 )
                 .await
             }
-            GraphClient::Embedded { uri, graph, actor } => {
-                let db = Self::open_embedded(uri, graph).await?;
+            GraphClient::Embedded { uri, actor } => {
+                let db = Self::open_embedded(uri).await?;
                 let actor = actor.as_deref();
                 db.branch_delete_as(name, actor).await?;
                 Ok(BranchDeleteOutput {
@@ -694,8 +671,8 @@ impl GraphClient {
                 )
                 .await
             }
-            GraphClient::Embedded { uri, graph, actor } => {
-                let db = Self::open_embedded(uri, graph).await?;
+            GraphClient::Embedded { uri, actor } => {
+                let db = Self::open_embedded(uri).await?;
                 let actor = actor.as_deref();
                 let outcome = db.branch_merge_as(source, into, actor).await?;
                 Ok(BranchMergeOutput {
@@ -745,8 +722,8 @@ impl GraphClient {
                 )
                 .await
             }
-            GraphClient::Embedded { uri, graph, actor } => {
-                let db = Self::open_embedded(uri, graph).await?;
+            GraphClient::Embedded { uri, actor } => {
+                let db = Self::open_embedded(uri).await?;
                 let result = db
                     .apply_schema_as_with_catalog_check(
                         schema_source,
@@ -815,9 +792,9 @@ impl GraphClient {
 
     /// `graphs list` — enumerate the graphs a remote multi-graph server
     /// serves (`GET /graphs`). Remote-only by design: there is no local
-    /// enumeration endpoint, so the Embedded arm fails loudly pointing the
-    /// operator at `omnigraph.yaml`. Routing it through the enum still buys
-    /// the shared `resolve()` addressing/token preamble.
+    /// enumeration endpoint, so the Embedded arm fails loudly. Routing it
+    /// through the enum still buys the shared `resolve()` addressing/token
+    /// preamble.
     pub(crate) async fn list_graphs(&self) -> Result<GraphListResponse> {
         match self {
             GraphClient::Remote {
@@ -835,9 +812,9 @@ impl GraphClient {
                 .await
             }
             GraphClient::Embedded { .. } => bail!(
-                "`omnigraph graphs list` requires a remote multi-graph server URL \
-                 (http:// or https://). To enumerate local graphs, read `omnigraph.yaml` \
-                 directly."
+                "`omnigraph graphs list` requires a remote multi-graph server \
+                 (--server <url>). To enumerate the graphs in a cluster, run \
+                 `omnigraph cluster status --config <dir>`."
             ),
         }
     }

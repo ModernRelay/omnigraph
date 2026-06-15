@@ -850,34 +850,24 @@ rules:
 /// server is cluster-only, so a graph selector is required).
 pub const PARITY_GRAPH_ID: &str = "parity";
 
-/// Build both arms' configuration (RFC-011 cluster-only server).
+/// Build the remote arm's configuration (RFC-011 cluster-only server).
 ///
-/// * Local arm: a `--config` file carrying the TOP-LEVEL `policy.file`
-///   (single-graph embedded semantics), used as-is by `run_both_with_config`.
-/// * Remote arm: a converged cluster directory whose single graph (id
-///   `parity`) carries the SAME Cedar bundle (bound to the graph scope).
-///   The cluster's derived graph root (`<dir>/graphs/parity.omni`) is
-///   seeded with the SAME fixture data as the local twin so the two arms
-///   compare like-for-like.
+/// The remote arm is served from a converged cluster directory whose single
+/// graph (id `parity`) carries the parity Cedar bundle (bound to the graph
+/// scope). The cluster's derived graph root (`<dir>/graphs/parity.omni`) is
+/// seeded with the SAME fixture data as the local twin so the two arms compare
+/// like-for-like. The local (`--store`) arm carries no Cedar policy (RFC-011),
+/// which is fine because the parity bundle is permissive for `act-parity`.
 ///
 /// `local_graph` is overwritten with a byte-for-byte copy of the cluster's
 /// seeded served graph so identity-bearing values that are NOT scrubbed
 /// (e.g. `graph_commit_id`, edge `id`s in export) match across the arms —
 /// the served graph is the source of truth and the local twin mirrors it.
 ///
-/// Returns `(local_config_path, cluster_dir)`. The caller spawns the
-/// server with `--cluster <cluster_dir>`.
-pub fn parity_configs(root: &Path, local_graph: &Path, _remote_graph: &Path) -> (PathBuf, PathBuf) {
+/// Returns the `cluster_dir`. The caller spawns the server with `--cluster`.
+pub fn parity_configs(root: &Path, local_graph: &Path, _remote_graph: &Path) -> PathBuf {
     let policy = root.join("parity.policy.yaml");
     fs::write(&policy, parity_policy_yaml()).unwrap();
-
-    // Local arm config: top-level single-graph policy.
-    let local_cfg = root.join("local.omnigraph.yaml");
-    fs::write(
-        &local_cfg,
-        format!("policy:\n  file: {}\n", policy.display()),
-    )
-    .unwrap();
 
     // Remote arm: a cluster directory the server boots from. One graph
     // (`parity`), schema = the shared fixture, policy bound to the graph.
@@ -942,7 +932,7 @@ policies:
     }
     copy_dir(&served_root, local_graph);
 
-    (local_cfg, cluster_dir)
+    cluster_dir
 }
 
 /// Run one CLI invocation per arm with identical verb args: locally against
@@ -954,20 +944,13 @@ pub fn run_both(
     server_url: &str,
     args: &[&str],
 ) -> (std::process::Output, std::process::Output) {
-    run_both_with_config(local_graph, None, server_url, args)
-}
-
-pub fn run_both_with_config(
-    local_graph: &Path,
-    local_config: Option<&Path>,
-    server_url: &str,
-    args: &[&str],
-) -> (std::process::Output, std::process::Output) {
     // Address both arms with GLOBAL flags (`--store` / `--server`) appended after
     // the verb + its args, so the address is placed correctly regardless of
     // subcommand nesting (a positional graph only works for top-level verbs;
     // `schema show <graph>` etc. need the global flag). Local = embedded store,
-    // remote = served.
+    // remote = served. RFC-011: a direct (`--store`) write carries no Cedar
+    // policy — the parity policy is permissive for `act-parity` on the served
+    // arm, so the two arms still agree.
     let mut local = cli();
     local
         .args(args)
@@ -975,9 +958,6 @@ pub fn run_both_with_config(
         .arg(local_graph)
         .arg("--as")
         .arg(PARITY_ACTOR);
-    if let Some(config) = local_config {
-        local.arg("--config").arg(config);
-    }
     let local_out = local.output().unwrap();
 
     let mut remote = cli();

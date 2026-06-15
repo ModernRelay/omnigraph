@@ -18,10 +18,10 @@ any — run against a graph, served (--server / --profile) or embedded (--store 
 URI): query, mutate, load, branch, snapshot, export, commit, schema show/apply.\n  \
 served — require a server: graphs.\n  \
 direct — direct storage access; reject --server (init, optimize, repair, cleanup, \
-schema plan, lint, queries validate).\n  \
-control — manage a cluster via --config: cluster.\n  \
-local — no graph; local config & tooling: policy, embed, login, logout, config, \
-version, queries list.\n\
+schema plan, lint).\n  \
+control — manage or inspect a cluster (cluster via --config; policy & queries via \
+--cluster).\n  \
+local — no graph; local config & tooling: embed, login, logout, config, version.\n\
 See the 'Command capabilities' section of the CLI reference for which flags apply where.")]
 pub(crate) struct Cli {
     /// Actor id for direct-engine writes; overrides `cli.actor`. No effect on
@@ -96,8 +96,6 @@ pub(crate) enum Command {
         /// the catalog (served — addressed via --server/--profile). With
         /// `--query`/`-e`, selects which query in that ad-hoc source to run.
         name: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
         /// Ad-hoc query file (a `.gq` you're authoring / break-glass).
         #[arg(long, conflicts_with = "query_string")]
         query: Option<PathBuf>,
@@ -126,8 +124,6 @@ pub(crate) enum Command {
         /// from the catalog (served — addressed via --server/--profile). With
         /// `--query`/`-e`, selects which query in that ad-hoc source to run.
         name: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
         /// Ad-hoc mutation file (a `.gq` you're authoring / break-glass).
         #[arg(long, conflicts_with = "query_string")]
         query: Option<PathBuf>,
@@ -154,8 +150,6 @@ pub(crate) enum Command {
         name: String,
         /// Positional args bound to the alias's declared `args` params, in order.
         args: Vec<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
         #[command(flatten)]
         params: ParamsArgs,
         #[arg(long, conflicts_with = "json")]
@@ -167,8 +161,6 @@ pub(crate) enum Command {
     Load {
         /// Graph URI
         uri: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
         #[arg(long)]
         data: PathBuf,
         /// Target branch (defaults to main). Without --from it must exist.
@@ -191,8 +183,6 @@ pub(crate) enum Command {
         /// Graph URI
         uri: Option<String>,
         #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
         data: PathBuf,
         #[arg(long)]
         branch: Option<String>,
@@ -213,8 +203,6 @@ pub(crate) enum Command {
         /// Graph URI
         uri: Option<String>,
         #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
         branch: Option<String>,
         #[arg(long)]
         json: bool,
@@ -223,8 +211,6 @@ pub(crate) enum Command {
     Export {
         /// Graph URI
         uri: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
         #[arg(long)]
         branch: Option<String>,
         #[arg(long, hide = true)]
@@ -270,16 +256,12 @@ pub(crate) enum Command {
         /// Graph URI
         uri: Option<String>,
         #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
         json: bool,
     },
     /// Classify and explicitly repair manifest/head drift
     Repair {
         /// Graph URI
         uri: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
         /// Publish verified maintenance drift. Without this flag, repair only
         /// previews what it would do.
         #[arg(long)]
@@ -295,8 +277,6 @@ pub(crate) enum Command {
     Cleanup {
         /// Graph URI
         uri: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
         /// Number of recent versions to keep per table. Either `--keep` or
         /// `--older-than` (or both) must be set.
         #[arg(long)]
@@ -325,8 +305,6 @@ pub(crate) enum Command {
     Lint {
         /// Graph URI
         uri: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
         #[arg(long)]
         query: PathBuf,
         #[arg(long)]
@@ -480,8 +458,6 @@ pub(crate) enum GraphsCommand {
         #[arg(long)]
         uri: Option<String>,
         #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
         json: bool,
     },
 }
@@ -494,8 +470,6 @@ pub(crate) enum BranchCommand {
         #[arg(long)]
         uri: Option<String>,
         #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
         from: Option<String>,
         name: String,
         #[arg(long)]
@@ -507,8 +481,6 @@ pub(crate) enum BranchCommand {
         #[arg(long)]
         uri: Option<String>,
         #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
         json: bool,
     },
     /// Delete a branch
@@ -516,8 +488,6 @@ pub(crate) enum BranchCommand {
         /// Graph URI
         #[arg(long)]
         uri: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
         name: String,
         #[arg(long)]
         json: bool,
@@ -527,8 +497,6 @@ pub(crate) enum BranchCommand {
         /// Graph URI
         #[arg(long)]
         uri: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
         source: String,
         #[arg(long)]
         into: Option<String>,
@@ -544,8 +512,6 @@ pub(crate) enum SchemaCommand {
         /// Graph URI
         uri: Option<String>,
         #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
         schema: PathBuf,
         #[arg(long)]
         json: bool,
@@ -559,8 +525,6 @@ pub(crate) enum SchemaCommand {
     Apply {
         /// Graph URI
         uri: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
         #[arg(long)]
         schema: PathBuf,
         #[arg(long)]
@@ -583,8 +547,6 @@ pub(crate) enum SchemaCommand {
         /// Graph URI
         uri: Option<String>,
         #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
         json: bool,
     },
 }
@@ -597,8 +559,6 @@ pub(crate) enum CommitCommand {
         /// Graph URI
         uri: Option<String>,
         #[arg(long)]
-        config: Option<PathBuf>,
-        #[arg(long)]
         branch: Option<String>,
         #[arg(long)]
         json: bool,
@@ -608,8 +568,6 @@ pub(crate) enum CommitCommand {
         /// Graph URI
         #[arg(long)]
         uri: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
         commit_id: String,
         #[arg(long)]
         json: bool,
@@ -618,20 +576,24 @@ pub(crate) enum CommitCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum PolicyCommand {
-    /// Validate policy YAML and compiled Cedar policy state
-    Validate {
-        #[arg(long)]
-        config: Option<PathBuf>,
-    },
-    /// Run declarative policy tests from policy.tests.yaml
+    /// Compile and validate the Cedar policy bundle(s) applied in a cluster.
+    ///
+    /// Sources the bundle(s) from the cluster's applied policies
+    /// (`--cluster <dir>`); pass the global `--graph <id>` to pick one
+    /// graph's bundle when several apply.
+    Validate {},
+    /// Run declarative policy tests against a cluster's applied bundle.
+    ///
+    /// The cluster model has no per-bundle tests file, so the cases are
+    /// supplied explicitly with `--tests <file>` and checked against the
+    /// bundle selected by `--cluster` (+ optional `--graph`).
     Test {
+        /// Path to a policy.tests.yaml file.
         #[arg(long)]
-        config: Option<PathBuf>,
+        tests: PathBuf,
     },
-    /// Explain one policy decision locally
+    /// Explain one policy decision against a cluster's applied bundle.
     Explain {
-        #[arg(long)]
-        config: Option<PathBuf>,
         #[arg(long)]
         actor: String,
         #[arg(long)]
@@ -645,24 +607,19 @@ pub(crate) enum PolicyCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum QueriesCommand {
-    /// Type-check the stored-query registry against the live schema.
+    /// Type-check a cluster's stored-query registry against its schemas.
     ///
-    /// Distinct from `omnigraph lint` (which lints one `.gq` file):
-    /// this validates the whole `queries:` registry — opening the graph
-    /// to read its schema and confirming every stored query still
-    /// type-checks. Exits non-zero on any breakage.
+    /// Distinct from `omnigraph lint` (which lints one `.gq` file): this
+    /// validates the whole `queries:` registry of a cluster (`--cluster
+    /// <dir>`, optional `--graph <id>`) by reading each graph's applied
+    /// schema and confirming every stored query still type-checks. Exits
+    /// non-zero on any breakage.
     Validate {
-        /// Graph URI
-        uri: Option<String>,
-        #[arg(long)]
-        config: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
-    /// List the registered stored queries (name, MCP exposure, params).
+    /// List a cluster's registered stored queries (name, params).
     List {
-        #[arg(long)]
-        config: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
