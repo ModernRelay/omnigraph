@@ -971,21 +971,23 @@ async fn unenforced_primary_key_is_immutable_once_set() {
         "first set should install `id` as the unenforced PK"
     );
 
-    // Re-applying the SAME reserved key now errors — the crash-retry hazard the
-    // migration's field-guard sidesteps.
-    let err = ds
-        .update_field_metadata()
-        .update(
-            "id",
-            [(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string())],
-        )
-        .unwrap()
-        .await
-        .unwrap_err();
+    // Re-applying the SAME reserved key must still error. Normalize the sync
+    // validation stage (`.update()`) and the async commit stage (`.await`) into
+    // one Result so the actionable diagnostic below fires whichever stage Lance
+    // enforces immutability at — and even if a future Lance relaxes it to `Ok`.
+    // Bare `.unwrap()` / `.unwrap_err()` would instead panic with a generic
+    // message in those cases, defeating the guard's purpose.
+    let outcome: lance::Result<()> = match ds.update_field_metadata().update(
+        "id",
+        [(LANCE_UNENFORCED_PRIMARY_KEY.to_string(), "true".to_string())],
+    ) {
+        Ok(builder) => builder.await.map(|_| ()),
+        Err(e) => Err(e),
+    };
     assert!(
-        err.to_string().contains("cannot be changed once set"),
-        "Lance no longer rejects re-setting the unenforced PK (got: {err}); \
-         immutability relaxed — revisit migrate_v1_to_v2's field-guard and \
-         re-pin docs/dev/lance.md."
+        matches!(&outcome, Err(e) if e.to_string().contains("cannot be changed once set")),
+        "Lance no longer rejects re-setting the unenforced PK as immutable \
+         (got: {outcome:?}); immutability relaxed or moved off the commit path \
+         — revisit migrate_v1_to_v2's field-guard and re-pin docs/dev/lance.md."
     );
 }
