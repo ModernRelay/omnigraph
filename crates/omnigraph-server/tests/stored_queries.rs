@@ -324,7 +324,7 @@ async fn list_queries_returns_only_exposed_with_typed_params() {
         INVOKE_POLICY_YAML,
     )
     .await;
-    let (status, body) = json_response(&app, get_request("/queries", "t-invoke")).await;
+    let (status, body) = json_response(&app, get_request(&g("/queries"), "t-invoke")).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
 
     let entries = body["queries"].as_array().unwrap();
@@ -355,7 +355,7 @@ async fn list_queries_is_read_gated_so_a_non_invoker_can_list() {
         INVOKE_POLICY_YAML,
     )
     .await;
-    let (status, body) = json_response(&app, get_request("/queries", "t-noinvoke")).await;
+    let (status, body) = json_response(&app, get_request(&g("/queries"), "t-noinvoke")).await;
     assert_eq!(status, StatusCode::OK, "read-gated catalog; body: {body}");
     let names: Vec<&str> = body["queries"]
         .as_array()
@@ -372,7 +372,7 @@ async fn list_queries_is_read_gated_so_a_non_invoker_can_list() {
 #[tokio::test(flavor = "multi_thread")]
 async fn list_queries_is_empty_when_no_registry() {
     let (_temp, app) = app_for_loaded_graph_with_auth("demo-token").await;
-    let (status, body) = json_response(&app, get_request("/queries", "demo-token")).await;
+    let (status, body) = json_response(&app, get_request(&g("/queries"), "demo-token")).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert!(
         body["queries"].as_array().unwrap().is_empty(),

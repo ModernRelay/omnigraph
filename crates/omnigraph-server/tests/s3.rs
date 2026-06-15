@@ -43,7 +43,7 @@ async fn server_opens_s3_graph_directly_and_serves_snapshot_and_read() {
     let (snapshot_status, snapshot_body) = json_response(
         &app,
         Request::builder()
-            .uri("/snapshot")
+            .uri(g("/snapshot"))
             .method(Method::GET)
             .header("authorization", "Bearer s3-token")
             .body(Body::empty())
@@ -63,7 +63,7 @@ async fn server_opens_s3_graph_directly_and_serves_snapshot_and_read() {
     let (read_status, read_body) = json_response(
         &app,
         Request::builder()
-            .uri("/read")
+            .uri(g("/read"))
             .method(Method::POST)
             .header("authorization", "Bearer s3-token")
             .header("content-type", "application/json")
@@ -134,10 +134,7 @@ async fn server_boots_cluster_from_bare_storage_uri_and_serves_query() {
     }
 
     let settings = omnigraph_server::load_server_settings(
-        None,
         Some(&std::path::PathBuf::from(&root)),
-        None,
-        None,
         None,
         true,
     )

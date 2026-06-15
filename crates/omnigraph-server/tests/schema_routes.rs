@@ -30,7 +30,7 @@ async fn schema_apply_route_updates_graph_for_authorized_admin() {
 
     let request = Request::builder()
         .method(Method::POST)
-        .uri("/schema/apply")
+        .uri(g("/schema/apply"))
         .header("content-type", "application/json")
         .header("authorization", "Bearer admin-token")
         .body(Body::from(
@@ -65,7 +65,7 @@ async fn schema_apply_route_rejects_stored_query_breakage_before_publish() {
 
     let request = Request::builder()
         .method(Method::POST)
-        .uri("/schema/apply")
+        .uri(g("/schema/apply"))
         .header("content-type", "application/json")
         .header("authorization", "Bearer admin-token")
         .body(Body::from(
@@ -115,7 +115,7 @@ async fn schema_apply_route_noop_keeps_valid_stored_query_registry() {
 
     let request = Request::builder()
         .method(Method::POST)
-        .uri("/schema/apply")
+        .uri(g("/schema/apply"))
         .header("content-type", "application/json")
         .header("authorization", "Bearer admin-token")
         .body(Body::from(
@@ -142,7 +142,7 @@ async fn schema_apply_route_requires_schema_apply_policy_permission() {
 
     let request = Request::builder()
         .method(Method::POST)
-        .uri("/schema/apply")
+        .uri(g("/schema/apply"))
         .header("content-type", "application/json")
         .header("authorization", "Bearer admin-token")
         .body(Body::from(
@@ -173,7 +173,7 @@ async fn schema_apply_route_requires_bearer_token_when_policy_enabled() {
 
     let request = Request::builder()
         .method(Method::POST)
-        .uri("/schema/apply")
+        .uri(g("/schema/apply"))
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::to_vec(&SchemaApplyRequest {
@@ -203,7 +203,7 @@ async fn schema_apply_route_can_rename_type() {
 
     let request = Request::builder()
         .method(Method::POST)
-        .uri("/schema/apply")
+        .uri(g("/schema/apply"))
         .header("content-type", "application/json")
         .header("authorization", "Bearer admin-token")
         .body(Body::from(
@@ -239,7 +239,7 @@ async fn schema_apply_route_can_rename_property() {
 
     let request = Request::builder()
         .method(Method::POST)
-        .uri("/schema/apply")
+        .uri(g("/schema/apply"))
         .header("content-type", "application/json")
         .header("authorization", "Bearer admin-token")
         .body(Body::from(
@@ -279,7 +279,7 @@ async fn schema_apply_route_can_add_index() {
 
     let request = Request::builder()
         .method(Method::POST)
-        .uri("/schema/apply")
+        .uri(g("/schema/apply"))
         .header("content-type", "application/json")
         .header("authorization", "Bearer admin-token")
         .body(Body::from(
@@ -315,7 +315,7 @@ async fn schema_apply_route_rejects_unsupported_plan() {
 
     let request = Request::builder()
         .method(Method::POST)
-        .uri("/schema/apply")
+        .uri(g("/schema/apply"))
         .header("content-type", "application/json")
         .header("authorization", "Bearer admin-token")
         .body(Body::from(
@@ -356,7 +356,7 @@ async fn schema_apply_route_rejects_when_non_main_branch_exists() {
 
     let request = Request::builder()
         .method(Method::POST)
-        .uri("/schema/apply")
+        .uri(g("/schema/apply"))
         .header("content-type", "application/json")
         .header("authorization", "Bearer admin-token")
         .body(Body::from(
@@ -385,7 +385,7 @@ async fn schema_drift_returns_conflict_for_snapshot_read_and_change() {
     let (snapshot_status, snapshot_body) = json_response(
         &app,
         Request::builder()
-            .uri("/snapshot?branch=main")
+            .uri(g("/snapshot?branch=main"))
             .method(Method::GET)
             .body(Body::empty())
             .unwrap(),
@@ -413,7 +413,7 @@ async fn schema_drift_returns_conflict_for_snapshot_read_and_change() {
     let (read_status, read_body) = json_response(
         &app,
         Request::builder()
-            .uri("/read")
+            .uri(g("/read"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&read).unwrap()))
@@ -441,7 +441,7 @@ async fn schema_drift_returns_conflict_for_snapshot_read_and_change() {
     let (change_status, change_body) = json_response(
         &app,
         Request::builder()
-            .uri("/change")
+            .uri(g("/change"))
             .method(Method::POST)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&change).unwrap()))
@@ -467,7 +467,7 @@ async fn schema_route_returns_current_source() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/schema")
+            .uri(g("/schema"))
             .method(Method::GET)
             .body(Body::empty())
             .unwrap(),
@@ -486,7 +486,7 @@ async fn schema_route_requires_bearer_token_when_auth_configured() {
     let (missing_status, missing_body) = json_response(
         &app,
         Request::builder()
-            .uri("/schema")
+            .uri(g("/schema"))
             .method(Method::GET)
             .body(Body::empty())
             .unwrap(),
@@ -502,7 +502,7 @@ async fn schema_route_requires_bearer_token_when_auth_configured() {
     let (ok_status, ok_body) = json_response(
         &app,
         Request::builder()
-            .uri("/schema")
+            .uri(g("/schema"))
             .method(Method::GET)
             .header("authorization", "Bearer demo-token")
             .body(Body::empty())
@@ -533,7 +533,7 @@ async fn schema_route_denied_when_actor_lacks_read_permission() {
     let (status, body) = json_response(
         &app,
         Request::builder()
-            .uri("/schema")
+            .uri(g("/schema"))
             .method(Method::GET)
             .header("authorization", "Bearer team-token")
             .body(Body::empty())
@@ -574,7 +574,7 @@ async fn schema_apply_route_soft_drops_property_via_http() {
         &app,
         Request::builder()
             .method(Method::POST)
-            .uri("/schema/apply")
+            .uri(g("/schema/apply"))
             .header("content-type", "application/json")
             .header("authorization", "Bearer admin-token")
             .body(Body::from(
@@ -631,7 +631,7 @@ async fn schema_apply_route_soft_drops_node_type_via_http() {
         &app,
         Request::builder()
             .method(Method::POST)
-            .uri("/schema/apply")
+            .uri(g("/schema/apply"))
             .header("content-type", "application/json")
             .header("authorization", "Bearer admin-token")
             .body(Body::from(
@@ -683,7 +683,7 @@ async fn schema_apply_route_hard_drops_property_with_allow_data_loss() {
         &app,
         Request::builder()
             .method(Method::POST)
-            .uri("/schema/apply")
+            .uri(g("/schema/apply"))
             .header("content-type", "application/json")
             .header("authorization", "Bearer admin-token")
             .body(Body::from(
@@ -738,7 +738,7 @@ async fn schema_apply_route_keeps_drops_soft_without_flag() {
         &app,
         Request::builder()
             .method(Method::POST)
-            .uri("/schema/apply")
+            .uri(g("/schema/apply"))
             .header("content-type", "application/json")
             .header("authorization", "Bearer admin-token")
             .body(Body::from(
@@ -800,7 +800,7 @@ async fn schema_apply_route_additive_property_preserves_existing_rows() {
         &app,
         Request::builder()
             .method(Method::POST)
-            .uri("/schema/apply")
+            .uri(g("/schema/apply"))
             .header("content-type", "application/json")
             .header("authorization", "Bearer admin-token")
             .body(Body::from(

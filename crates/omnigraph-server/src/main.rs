@@ -8,16 +8,10 @@ use omnigraph_server::{ServerConfig, init_tracing, load_server_settings, serve};
 #[command(name = "omnigraph-server")]
 #[command(about = "HTTP server for the Omnigraph graph database")]
 struct Cli {
-    /// Graph URI
-    uri: Option<String>,
-    #[arg(long)]
-    target: Option<String>,
-    #[arg(long)]
-    config: Option<PathBuf>,
     /// Boot from a cluster: either a config directory (storage resolved
     /// through cluster.yaml) or a storage-root URI directly
     /// (s3://bucket/prefix — config-free serving from the bucket).
-    /// Exclusive: cannot combine with <URI>, --target, or --config.
+    /// The server's only boot source (RFC-011 cluster-only).
     #[arg(long)]
     cluster: Option<PathBuf>,
     #[arg(long)]
@@ -36,14 +30,7 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
-    let settings: ServerConfig = load_server_settings(
-        cli.config.as_ref(),
-        cli.cluster.as_ref(),
-        cli.uri,
-        cli.target,
-        cli.bind,
-        cli.unauthenticated,
-    )
-    .await?;
+    let settings: ServerConfig =
+        load_server_settings(cli.cluster.as_ref(), cli.bind, cli.unauthenticated).await?;
     serve(settings).await
 }

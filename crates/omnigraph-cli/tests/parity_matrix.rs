@@ -37,9 +37,12 @@ struct Parity {
 
 fn parity() -> Parity {
     let (temp, local, remote) = twin_graphs();
-    let (local_cfg, server_cfg) = parity_configs(temp.path(), &local, &remote);
-    let server = spawn_server_with_config_env(
-        &server_cfg,
+    // RFC-011 cluster-only: the remote arm is served from a converged
+    // cluster directory (one graph, id `parity`), seeded with the same
+    // fixture data as the local twin.
+    let (local_cfg, cluster_dir) = parity_configs(temp.path(), &local, &remote);
+    let server = spawn_server_with_cluster_env(
+        &cluster_dir,
         &[(
             "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
             r#"{"act-parity":"parity-tok"}"#,
