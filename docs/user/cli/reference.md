@@ -115,6 +115,14 @@ resolves its scope fresh, there is no sticky "current" mode.
   `--cluster <root> --graph <id>`. A `--graph` flag overrides the profile's default.
 - A `server`-bound scope on a maintenance verb, or a `cluster`-bound scope on a
   data verb, is rejected with a message pointing at the right addressing.
+- **No graph selected (RFC-011 D7).** When a scope has no `--graph` and no
+  `default_graph`, the CLI never silently picks:
+  - **Cluster scope** — exactly **one** applied graph is used automatically;
+    **several** errors and lists the candidates (from the served catalog).
+  - **Server scope** — a multi-graph server (any non-empty `GET /graphs`, even a
+    single entry) errors and lists the candidates: you must pass `--graph <id>`.
+    A single-graph / flat server (405 on `/graphs`), or one whose `/graphs` is
+    policy-gated or unreachable, uses its bare URL as before.
 
 `--target`, `--cluster-graph`, and the positional-`http(s)://`→remote dispatch
 have been **removed** (`--graph` is now the one graph selector across server and

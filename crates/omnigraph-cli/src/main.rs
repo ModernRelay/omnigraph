@@ -186,7 +186,8 @@ async fn main() -> Result<()> {
                 cli.as_actor.as_deref(),
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
-            )?;
+            )
+            .await?;
             let branch = resolve_branch(&config, branch, None, "main");
             if matches!(mode, CliLoadMode::Overwrite) {
                 confirm_destructive("load --mode overwrite", client.uri(), cli.yes, json)?;
@@ -224,7 +225,8 @@ async fn main() -> Result<()> {
                 cli.as_actor.as_deref(),
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
-            )?;
+            )
+            .await?;
             let branch = resolve_branch(&config, branch, None, "main");
             let from = resolve_branch(&config, from, None, "main");
             echo_write_target(cli.quiet, "ingest", client.uri(), client.is_remote());
@@ -254,7 +256,8 @@ async fn main() -> Result<()> {
                     cli.as_actor.as_deref(),
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
-                )?;
+                )
+                .await?;
                 let from = resolve_branch(&config, from, None, "main");
                 echo_write_target(cli.quiet, "branch create", client.uri(), client.is_remote());
                 let payload = client.branch_create_from(&from, &name).await?;
@@ -277,7 +280,8 @@ async fn main() -> Result<()> {
                     uri,
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
-                )?;
+                )
+                .await?;
                 let payload = client.branch_list().await?;
                 if json {
                     print_json(&payload)?;
@@ -302,7 +306,8 @@ async fn main() -> Result<()> {
                     cli.as_actor.as_deref(),
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
-                )?;
+                )
+                .await?;
                 confirm_destructive("branch delete", client.uri(), cli.yes, json)?;
                 echo_write_target(cli.quiet, "branch delete", client.uri(), client.is_remote());
                 let payload = client.branch_delete(&name).await?;
@@ -328,7 +333,8 @@ async fn main() -> Result<()> {
                     cli.as_actor.as_deref(),
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
-                )?;
+                )
+                .await?;
                 let into = resolve_branch(&config, into, None, "main");
                 echo_write_target(cli.quiet, "branch merge", client.uri(), client.is_remote());
                 let payload = client.branch_merge(&source, &into).await?;
@@ -359,7 +365,8 @@ async fn main() -> Result<()> {
                     uri,
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
-                )?;
+                )
+                .await?;
                 let payload = client.list_commits(branch.as_deref()).await?;
                 if json {
                     print_json(&payload)?;
@@ -381,7 +388,8 @@ async fn main() -> Result<()> {
                     uri,
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
-                )?;
+                )
+                .await?;
                 let commit = client.get_commit(&commit_id).await?;
                 if json {
                     print_json(&commit)?;
@@ -436,7 +444,8 @@ async fn main() -> Result<()> {
                     cli.as_actor.as_deref(),
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
-                )?;
+                )
+                .await?;
                 let schema_source = fs::read_to_string(&schema)?;
                 // The stored-query registry check is an embedded-only concern
                 // (the remote arm ignores the validator — the server runs its
@@ -477,7 +486,8 @@ async fn main() -> Result<()> {
                     uri,
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
-                )?;
+                )
+                .await?;
                 let output = client.schema_source().await?;
                 if json {
                     print_json(&output)?;
@@ -528,7 +538,8 @@ async fn main() -> Result<()> {
                 uri,
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
-            )?;
+            )
+            .await?;
             let branch = resolve_branch(&config, branch, None, "main");
             let payload = client.snapshot(&branch).await?;
             if json {
@@ -553,7 +564,8 @@ async fn main() -> Result<()> {
                 uri,
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
-            )?;
+            )
+            .await?;
             let branch = resolve_branch(&config, branch, None, "main");
             if jsonl {
                 eprintln!("warning: --jsonl is deprecated; `omnigraph export` always emits JSONL");
@@ -590,7 +602,8 @@ async fn main() -> Result<()> {
                 uri.or(legacy_uri),
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
-            )?;
+            )
+            .await?;
             let query_source =
                 resolve_query_source(&config, query.as_ref(), query_string.as_deref(), None)?;
             let params_json = load_params_json(&params)?;
@@ -625,7 +638,8 @@ async fn main() -> Result<()> {
                 cli.as_actor.as_deref(),
                 cli.profile.as_deref(),
                 cli.store.as_deref(),
-            )?;
+            )
+            .await?;
             let query_source =
                 resolve_query_source(&config, query.as_ref(), query_string.as_deref(), None)?;
             let params_json = load_params_json(&params)?;
@@ -1005,7 +1019,8 @@ async fn main() -> Result<()> {
                     uri,
                     cli.profile.as_deref(),
                     cli.store.as_deref(),
-                )?;
+                )
+                .await?;
                 let payload = client.list_graphs().await?;
                 if json {
                     print_json(&payload)?;

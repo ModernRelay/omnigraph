@@ -42,7 +42,7 @@ use crate::helpers::{
     ResolvedCliGraph, apply_bearer_token, apply_server_flag, build_http_client, is_remote_uri,
     legacy_change_request_body, open_local_db_with_policy, query_params_from_json,
     remote_json, remote_url, resolve_cli_actor, resolve_cli_graph, resolve_remote_bearer_token,
-    select_named_query,
+    resolve_server_flag, select_named_query,
 };
 use crate::output::{LoadOutput, load_output_from_result, load_output_from_tables};
 use omnigraph_server::config::OmnigraphConfig;
@@ -66,6 +66,44 @@ pub(crate) enum GraphClient {
     },
 }
 
+/// RFC-011 Decision 7: a server scope that selects no graph (no `--graph`, no
+/// `default_graph`) must not silently fall through to the bare server URL when
+/// the server is multi-graph. Best-effort probe `GET /graphs`: a populated list
+/// forces `--graph` (listing the candidates); a single-graph/flat server (405),
+/// a policy-gated `/graphs`, or an unreachable server all proceed — the bare URL
+/// is then correct, or the real request surfaces the failure. Only fires on the
+/// no-graph path, so a `--graph`/`default_graph` happy path does no extra I/O.
+async fn require_graph_for_multi_graph_server(
+    config: &OmnigraphConfig,
+    scope: &crate::scope::ResolvedScope,
+) -> Result<()> {
+    let (Some(server), None) = (scope.server.as_deref(), scope.graph.as_deref()) else {
+        return Ok(());
+    };
+    let Some(base) = resolve_server_flag(Some(server), None)? else {
+        return Ok(());
+    };
+    let token = resolve_remote_bearer_token(config, Some(&base))?;
+    let probe = GraphClient::Remote {
+        http: build_http_client()?,
+        base_url: base,
+        token,
+    };
+    if let Ok(resp) = probe.list_graphs().await {
+        if !resp.graphs.is_empty() {
+            let ids: Vec<&str> = resp.graphs.iter().map(|g| g.graph_id.as_str()).collect();
+            bail!(
+                "server scope '{server}' has {} {}: [{}]; pass --graph <id> to select one \
+                 (or set `default_graph` in your operator config)",
+                ids.len(),
+                if ids.len() == 1 { "graph" } else { "graphs" },
+                ids.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
 /// A remote graph must be addressed with `--server` (RFC-011): a positional or
 /// `--uri` `http(s)://` URL no longer auto-dispatches to a server. A remote URL
 /// produced by a server scope (`via_server`) is fine.
@@ -86,7 +124,7 @@ impl GraphClient {
     /// fork. Mirrors the read verbs' current preamble (`resolve_uri`
     /// path, not the policy-bearing `resolve_cli_graph`). Used by reads
     /// and `query` (which opens without policy, like the reads).
-    pub(crate) fn resolve(
+    pub(crate) async fn resolve(
         config: &OmnigraphConfig,
         server: Option<&str>,
         graph: Option<&str>,
@@ -102,6 +140,7 @@ impl GraphClient {
             crate::planes::Capability::Any,
             crate::scope::ScopeFlags { profile, store, server, cluster: None, graph, uri },
         )?;
+        require_graph_for_multi_graph_server(config, &scope).await?;
         let (server, graph, uri) = (
             scope.server.as_deref(),
             scope.graph.as_deref(),
@@ -133,7 +172,7 @@ impl GraphClient {
     /// resolved up front. The embedded arm then opens WITH policy. The
     /// resolution order matches the write arms exactly: server flag →
     /// bearer token → graph.
-    pub(crate) fn resolve_with_policy(
+    pub(crate) async fn resolve_with_policy(
         config: &OmnigraphConfig,
         server: Option<&str>,
         graph: Option<&str>,
@@ -149,6 +188,7 @@ impl GraphClient {
             crate::planes::Capability::Any,
             crate::scope::ScopeFlags { profile, store, server, cluster: None, graph, uri },
         )?;
+        require_graph_for_multi_graph_server(config, &scope).await?;
         let (server, graph, uri) = (
             scope.server.as_deref(),
             scope.graph.as_deref(),
