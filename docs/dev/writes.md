@@ -77,6 +77,50 @@ The trait is the canonical surface for new engine code; existing call
 sites still use the inherent `TableStore` methods (mechanical migration
 deferred to a follow-up cycle — tracked).
 
+### Schema apply concurrency: queue-before-snapshot, per-table CAS, no global lease
+
+`apply_schema_with_lock` (`db/omnigraph/schema_apply.rs`) follows the same
+queue-before-read order `optimize` uses, so a concurrent compaction no longer
+false-fails a migration (bug 4 / iss-schema-apply-optimize-occ):
+
+1. **Classify the plan snapshot-free.** `classify_plan_steps` derives the
+   touched-table sets (added / renamed / rewritten / dropped, plus property
+   renames and the edge-touch flag) purely from the plan via `schema_table_key`
+   — no manifest snapshot.
+2. **Acquire the touched-existing-table write queues *before* the snapshot.**
+   The set is `rewritten ∪ rename-source ∪ dropped` — the existing tables the
+   apply rewrites in place or tombstones. New tables (added types, rename
+   targets) have no existing dataset to race against, so they aren't acquired.
+   The schema-apply serial key (`__schema_apply__`) is added whenever a sidecar
+   will be written. `acquire_many` sorts + dedupes, so lock order is identical
+   for every caller (the serial key sorts before any `node:`/`edge:` key;
+   optimize's single-key acquire is a subset) — no inversion.
+3. **Snapshot under the held queues.** A `refresh_coordinator_only` re-reads
+   HEAD first so the pinned versions are exactly current. While the queues are
+   held, no in-process optimize/mutate can move a touched table, so the
+   per-table preconditions (`ensure_snapshot_entry_head_matches` in the
+   rewrite/rename loops) pass by construction.
+4. **Publish with a per-table expected-version CAS.**
+   `commit_changes_with_expected_with_actor` fences the publish with the
+   snapshot versions of every touched-existing table. The held queues make this
+   pass in-process; the CAS is the loud cross-process backstop (the
+   acknowledged in-process-only recovery-serialization gap) — a foreign mover
+   surfaces as a typed `ExpectedVersionMismatch` rather than a publish onto
+   moved state.
+
+The old graph-global **"write lease"** check — comparing the whole manifest
+version against the pre-apply version right before the publish — is **gone**.
+It false-failed an apply whenever a concurrent compaction of an *untouched*
+table advanced the global manifest version, even though that commit is a
+disjoint manifest row the publisher rebases onto cleanly. "Operations that
+don't conflict semantically no longer conflict mechanically": a compaction of
+an untouched table no longer fails the apply, and a compaction of a touched
+table serializes behind it. Deterministic proof:
+`schema_apply_succeeds_under_concurrent_write_to_untouched_table` and
+`concurrent_optimize_on_touched_table_serializes_behind_schema_apply`
+(`tests/failpoints.rs`, via the `schema_apply.after_queue_acquire_pre_snapshot`
+and `schema_apply.post_snapshot_pre_commit` failpoints).
+
 Three writers have been migrated onto staged primitives:
 
 * **`ensure_indices`** (`db/omnigraph/table_ops.rs::build_indices_on_dataset_for_catalog`)
