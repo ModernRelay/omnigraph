@@ -258,10 +258,11 @@ operation — it runs out-of-band, with direct storage access, against the graph
 roots. Address a cluster graph by name instead of hand-typing its storage path:
 
 ```bash
-omnigraph optimize --cluster ./company-brain --cluster-graph knowledge
-omnigraph cleanup  --cluster ./company-brain --cluster-graph knowledge --keep 10 --confirm
-# --cluster also takes the storage-root URI directly (config-free):
-omnigraph optimize --cluster s3://bucket/clusters/company-brain --cluster-graph knowledge
+omnigraph optimize --cluster ./company-brain --graph knowledge
+omnigraph cleanup  --cluster ./company-brain --graph knowledge --keep 10 --confirm
+# --cluster also takes the storage-root URI directly (config-free), and a
+# `clusters:` name from ~/.omnigraph/config.yaml:
+omnigraph optimize --cluster s3://bucket/clusters/company-brain --graph knowledge
 ```
 
 The graph's storage URI is resolved from the **served cluster state** (the same

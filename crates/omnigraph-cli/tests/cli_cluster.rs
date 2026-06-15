@@ -975,7 +975,7 @@ fn optimize_resolves_a_cluster_graph_by_id() {
             .arg("optimize")
             .arg("--cluster")
             .arg(temp.path())
-            .arg("--cluster-graph")
+            .arg("--graph")
             .arg("knowledge")
             .arg("--json"),
     );
@@ -994,7 +994,7 @@ fn optimize_unknown_cluster_graph_id_errors() {
             .arg("optimize")
             .arg("--cluster")
             .arg(temp.path())
-            .arg("--cluster-graph")
+            .arg("--graph")
             .arg("does-not-exist")
             .arg("--json"),
     );
@@ -1006,8 +1006,10 @@ fn optimize_unknown_cluster_graph_id_errors() {
 }
 
 #[test]
-fn cluster_flag_requires_cluster_graph() {
-    // clap enforces both-or-neither.
+fn cluster_without_graph_demands_a_graph_selector() {
+    // A cluster holds many graphs; `--cluster` alone can't pick one. The scope
+    // resolver demands `--graph <id>` (replacing the old `--cluster-graph`
+    // requirement) before it ever touches cluster state.
     let out = output_failure(
         cli()
             .arg("optimize")
@@ -1017,8 +1019,8 @@ fn cluster_flag_requires_cluster_graph() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("cluster-graph") || stderr.contains("required"),
-        "expected --cluster to require --cluster-graph; got: {stderr}"
+        stderr.contains("--graph <id>"),
+        "expected --cluster to demand --graph; got: {stderr}"
     );
 }
 
@@ -1076,7 +1078,7 @@ fn optimize_by_cluster_works_when_catalog_payloads_are_degraded() {
             .arg("optimize")
             .arg("--cluster")
             .arg(temp.path())
-            .arg("--cluster-graph")
+            .arg("--graph")
             .arg("knowledge")
             .arg("--json"),
     );

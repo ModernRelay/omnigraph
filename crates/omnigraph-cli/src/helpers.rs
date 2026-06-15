@@ -539,12 +539,49 @@ pub(crate) fn resolve_local_uri(
     Ok(resolve_local_graph(config, cli_uri, operation)?.uri)
 }
 
-/// Resolve a storage-plane verb's address to a direct storage URI (RFC-010
-/// Slice 3). `--cluster <dir|uri> --cluster-graph <id>` resolves the graph's
-/// storage URI from the **served cluster state** (the truth a `--cluster`
-/// server serves); otherwise the ordinary positional-URI path.
-/// clap enforces both-or-neither and exclusion with `uri`, so the mismatched
-/// arm is defensive.
+/// Resolve a maintenance verb's (optimize/repair/cleanup) address to a direct
+/// storage URI through the one RFC-011 scope path. Every primitive funnels
+/// here: a positional URI, `--store`, `--cluster <root> --graph <id>`, a
+/// `--profile` cluster binding, or operator defaults — all resolved at the
+/// `Direct` capability (so a server scope is rejected, a cluster scope is
+/// allowed), then mapped to a storage URI by `resolve_storage_uri`.
+pub(crate) async fn resolve_maintenance_uri(
+    config: &OmnigraphConfig,
+    profile: Option<&str>,
+    store: Option<&str>,
+    cluster: Option<&str>,
+    graph: Option<&str>,
+    cli_uri: Option<String>,
+    operation: &str,
+) -> Result<String> {
+    let scope = scope::resolve_scope(
+        &operator::load_operator_config()?,
+        planes::Capability::Direct,
+        scope::ScopeFlags {
+            profile,
+            store,
+            server: None,
+            cluster,
+            graph,
+            uri: cli_uri,
+        },
+    )?;
+    resolve_storage_uri(
+        config,
+        scope.uri,
+        scope.cluster.as_deref(),
+        scope.cluster_graph.as_deref(),
+        operation,
+    )
+    .await
+}
+
+/// Map a resolved direct address to a storage URI: a cluster scope
+/// (`--cluster <root> --graph <id>`, or a `--profile` cluster binding)
+/// resolves the graph's storage URI from the **served cluster state** (the
+/// truth a `--cluster` server serves); otherwise the ordinary positional-URI
+/// path. The scope resolver guarantees a cluster scope always carries a graph,
+/// so the mismatched arm is defensive.
 pub(crate) async fn resolve_storage_uri(
     config: &OmnigraphConfig,
     cli_uri: Option<String>,
@@ -555,7 +592,7 @@ pub(crate) async fn resolve_storage_uri(
     match (cluster, cluster_graph) {
         (Some(cluster), Some(graph_id)) => resolve_cluster_graph_uri(cluster, graph_id).await,
         (None, None) => resolve_local_uri(config, cli_uri, operation),
-        _ => bail!("--cluster and --cluster-graph must be given together"),
+        _ => bail!("internal error: a cluster scope was resolved without a graph id"),
     }
 }
 
