@@ -721,18 +721,28 @@ pub(super) async fn reclaim_orphaned_fork_and_refork(
     // a real fork despite the caller's possibly-cached proof) or an
     // Indeterminate one (transient read) surfaces a retryable conflict rather
     // than stranding the manifest at a version the recreated ref won't have.
-    if classify_fork_ref(db, table_key, active_branch).await != ForkRefStatus::Orphan {
-        let actual = db
-            .fresh_snapshot_for_branch(Some(active_branch))
-            .await
-            .ok()
-            .and_then(|s| s.entry(table_key).map(|e| e.table_version))
-            .unwrap_or(source_version);
-        return Err(OmniError::manifest_expected_version_mismatch(
-            table_key,
-            source_version,
-            actual,
-        ));
+    match classify_fork_ref(db, table_key, active_branch).await {
+        ForkRefStatus::Orphan => {}
+        ForkRefStatus::Legitimate => {
+            let actual = db
+                .fresh_snapshot_for_branch(Some(active_branch))
+                .await
+                .ok()
+                .and_then(|s| s.entry(table_key).map(|e| e.table_version))
+                .unwrap_or(source_version);
+            return Err(OmniError::manifest_expected_version_mismatch(
+                table_key,
+                source_version,
+                actual,
+            ));
+        }
+        ForkRefStatus::Indeterminate => {
+            return Err(OmniError::manifest_conflict(format!(
+                "could not verify whether branch '{active_branch}' still owns an orphaned \
+                 fork for table '{table_key}' because fresh manifest authority was \
+                 unavailable; refresh and retry"
+            )));
+        }
     }
 
     crate::failpoints::maybe_fail("fork.before_reclaim")?;

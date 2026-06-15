@@ -5,7 +5,9 @@ mod helpers;
 use fail::FailScenario;
 use futures::FutureExt;
 use omnigraph::db::Omnigraph;
+use omnigraph::error::{ManifestErrorKind, OmniError};
 use omnigraph::failpoints::ScopedFailPoint;
+use omnigraph::loader::LoadMode;
 
 use helpers::recovery::{
     FollowUpMutation, RecoveryExpectation, TableExpectation, assert_post_recovery_invariants,
@@ -182,6 +184,68 @@ async fn recreate_over_orphaned_fork_self_heals_without_cleanup() {
         "self-healed feature must fork fresh from main (+Frank only); \
          main={main_people}, feature={feature_people} (main+2 ⇒ Eve resurrected)"
     );
+}
+
+// The write-path orphan reclaim shares the same fresh-authority classifier as
+// cleanup. If that classifier is Indeterminate (transient read on a live
+// branch), the write must return a clear retryable authority-read conflict and
+// leave the ref in place. It must not squeeze the ambiguity through
+// ExpectedVersionMismatch with expected == actual, which lies about the cause.
+#[tokio::test]
+async fn recreate_over_orphaned_fork_reports_indeterminate_authority_read() {
+    let _scenario = FailScenario::setup();
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap().to_string();
+    let db = helpers::init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+
+    let person_uri = node_table_uri(&uri, "Person");
+    {
+        let mut ds = lance::Dataset::open(&person_uri).await.unwrap();
+        let base = ds.version().version;
+        ds.create_branch("feature", base, None).await.unwrap();
+    }
+
+    let row = r#"{"type":"Person","data":{"name":"Grace","age":37}}"#;
+    {
+        let _fp = ScopedFailPoint::new("classify.fresh_read", "return");
+        let err = db
+            .load_as("feature", None, row, LoadMode::Merge, None)
+            .await
+            .expect_err("indeterminate authority read must fail retryably");
+
+        match &err {
+            OmniError::Manifest(manifest) => {
+                assert_eq!(manifest.kind, ManifestErrorKind::Conflict);
+                assert!(
+                    manifest.details.is_none(),
+                    "indeterminate authority read is not an expected-version mismatch: {manifest:?}"
+                );
+            }
+            other => panic!("expected manifest conflict, got {other:?}"),
+        }
+        let message = err.to_string();
+        assert!(
+            message.contains("could not verify")
+                && message.contains("fresh manifest authority was unavailable")
+                && message.contains("refresh and retry"),
+            "error should name the unavailable authority read, got: {message}"
+        );
+        assert!(
+            !message.contains("expected manifest table version"),
+            "indeterminate authority must not be reported as a version mismatch: {message}"
+        );
+
+        let ds = lance::Dataset::open(&person_uri).await.unwrap();
+        assert!(
+            ds.list_branches().await.unwrap().contains_key("feature"),
+            "ambiguous orphan status must leave the fork for a later retry"
+        );
+    }
+
+    db.load_as("feature", None, row, LoadMode::Merge, None)
+        .await
+        .expect("when fresh authority is available, the orphan is reclaimed and write converges");
 }
 
 // cleanup is the guaranteed convergence backstop, so one table's transient
