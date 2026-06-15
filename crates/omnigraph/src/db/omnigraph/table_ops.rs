@@ -597,12 +597,65 @@ pub(super) async fn fork_dataset_from_entry_state(
         .await
 }
 
+/// Classification of a Lance branch ref `B` on table `T` against FRESH manifest
+/// authority — the single decision both fork-ref reclaim sites share: the
+/// write-path reclaim ([`reclaim_orphaned_fork_and_refork`]) and the cleanup
+/// reconciler (`optimize::reconcile_orphaned_branches`). Having one classifier
+/// keeps the two destructive sites from drifting (the bug history: each was
+/// hardened separately and the other lagged).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForkRefStatus {
+    /// The manifest places `T` on `B` — a legitimate fork. Never destroy.
+    Legitimate,
+    /// The manifest does not reference this fork (`T` not on `B`, or `B` absent
+    /// from the manifest entirely). Reclaimable.
+    Orphan,
+    /// Fresh authority could not be established (a transient read failure on a
+    /// live branch). Ambiguous — do not destroy; the caller retries / converges.
+    Indeterminate,
+}
+
+/// Classify a fork ref from FRESH manifest authority (bypasses the coordinator
+/// cache). MUST be called with the per-`(table, branch)` write queue held, so
+/// the classification is stable against in-process writers for the caller's
+/// critical section. Both reclaim sites map the result to their own action
+/// (write path: reclaim vs retryable; cleanup: delete vs skip), but the
+/// destroy-only-on-`Orphan` rule is enforced here, once.
+pub(crate) async fn classify_fork_ref(
+    db: &Omnigraph,
+    table_key: &str,
+    branch: &str,
+) -> ForkRefStatus {
+    match db.fresh_snapshot_for_branch(Some(branch)).await {
+        Ok(snap) => {
+            let placed = snap
+                .entry(table_key)
+                .map(|e| e.table_branch.as_deref() == Some(branch))
+                .unwrap_or(false);
+            if placed {
+                ForkRefStatus::Legitimate
+            } else {
+                // Branch resolves but the manifest does not place this table on
+                // it — a manifest-unreferenced fork.
+                ForkRefStatus::Orphan
+            }
+        }
+        // Branch did not resolve. `all_branches` lists `_refs/branches/` live, so
+        // absent there = genuinely no such manifest branch (origin-1 orphan);
+        // present (or a list error) = transient read — never destroy on that.
+        Err(_) => match db.coordinator.read().await.all_branches().await {
+            Ok(fresh) if !fresh.iter().any(|b| b == branch) => ForkRefStatus::Orphan,
+            _ => ForkRefStatus::Indeterminate,
+        },
+    }
+}
+
 /// Reclaim a manifest-unreferenced fork and re-fork in its place.
 ///
 /// Reached when `fork_branch_from_state` reports `RefAlreadyExists`. This is a
 /// destructive op (it force-deletes a Lance branch ref), so it owns its own
-/// safety precondition rather than trusting the caller's: it re-derives, from
-/// a FRESH manifest read, that the manifest does not place this table on
+/// safety precondition rather than trusting the caller's: it re-derives, via
+/// [`classify_fork_ref`], that the manifest does not place this table on
 /// `active_branch`. The caller's earlier proof may have come from the
 /// coordinator's *cached* branch snapshot (`resolved_branch_target` returns
 /// the cache when the handle is bound to `active_branch` — an embedded handle
@@ -624,19 +677,23 @@ pub(super) async fn reclaim_orphaned_fork_and_refork(
     source_version: u64,
     active_branch: &str,
 ) -> Result<SnapshotHandle> {
-    // Self-validate against FRESH authority before destroying anything.
-    // `fresh_snapshot_for_branch` bypasses the coordinator cache. If a
-    // legitimate fork now exists, this ref is not an orphan — refuse (retryable)
-    // rather than strand the manifest at a version the recreated ref won't have.
-    let fresh = db.fresh_snapshot_for_branch(Some(active_branch)).await?;
-    if let Some(entry) = fresh.entry(table_key) {
-        if entry.table_branch.as_deref() == Some(active_branch) {
-            return Err(OmniError::manifest_expected_version_mismatch(
-                table_key,
-                source_version,
-                entry.table_version,
-            ));
-        }
+    // Self-validate against FRESH authority before destroying anything. Only an
+    // Orphan is reclaimable; a Legitimate status (a concurrent writer published
+    // a real fork despite the caller's possibly-cached proof) or an
+    // Indeterminate one (transient read) surfaces a retryable conflict rather
+    // than stranding the manifest at a version the recreated ref won't have.
+    if classify_fork_ref(db, table_key, active_branch).await != ForkRefStatus::Orphan {
+        let actual = db
+            .fresh_snapshot_for_branch(Some(active_branch))
+            .await
+            .ok()
+            .and_then(|s| s.entry(table_key).map(|e| e.table_version))
+            .unwrap_or(source_version);
+        return Err(OmniError::manifest_expected_version_mismatch(
+            table_key,
+            source_version,
+            actual,
+        ));
     }
 
     crate::failpoints::maybe_fail("fork.before_reclaim")?;

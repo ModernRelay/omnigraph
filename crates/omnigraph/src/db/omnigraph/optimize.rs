@@ -731,42 +731,33 @@ pub async fn reconcile_orphaned_branches(db: &Omnigraph) -> Result<BranchReconci
                 .write_queue()
                 .acquire(&(table_key.clone(), Some(branch.clone())))
                 .await;
-            let still_orphan = if !live_branches.contains(&branch) {
-                // Origin 1: the branch is absent from the manifest authority
-                // entirely — a confirmed orphan. No live writer can hold this
-                // branch's queue (you cannot first-write to a branch the
-                // manifest does not have), so no fresh re-check is needed.
-                true
-            } else {
-                // Origin 2: a LIVE branch whose manifest snapshot does not (yet)
-                // place this table on it. A fresh read tells us whether an
-                // in-process writer published a legitimate fork while we waited
-                // on the queue. On a TRANSIENT read failure we must NOT destroy
-                // the ref — skip and let a later cleanup converge, matching the
-                // write-path reclaim (which aborts on the same error). Treating
-                // a read error as "still orphan" here would let a transient
-                // manifest hiccup delete a fork the manifest considers live.
-                match db.fresh_snapshot_for_branch(Some(&branch)).await {
-                    Ok(snap) => snap
-                        .entry(&table_key)
-                        .map(|e| e.table_branch.as_deref() != Some(branch.as_str()))
-                        .unwrap_or(true),
-                    Err(err) => {
-                        tracing::warn!(
-                            target: "omnigraph::cleanup",
-                            table = %table_key,
-                            branch = %branch,
-                            error = %err,
-                            "fresh re-check failed during reconcile; skipping to avoid \
-                             destroying a possibly-live fork (will retry next cleanup)",
-                        );
-                        stats.failures.push((table_key.clone(), err.to_string()));
-                        false
-                    }
+            // Decide under the queue from FRESH authority via the shared
+            // classifier (same decision the write-path reclaim uses) — never
+            // from the sweep-start `live_branches` capture. A branch created
+            // AFTER that capture is absent from the stale set yet may already
+            // carry a legitimately-published fork (an in-process writer held
+            // this queue through its fork+publish; we just waited on it), so a
+            // stale "origin-1 ⇒ delete" shortcut would destroy a live fork.
+            // Only `Orphan` is reclaimed; `Indeterminate` (transient read) is
+            // skipped and recorded. (Cross-process writers remain the documented
+            // one-winner-CAS gap.) One key held at a time → no lock-order
+            // inversion vs multi-table `acquire_many` writers.
+            match super::table_ops::classify_fork_ref(db, &table_key, &branch).await {
+                super::table_ops::ForkRefStatus::Orphan => {}
+                super::table_ops::ForkRefStatus::Legitimate => continue,
+                super::table_ops::ForkRefStatus::Indeterminate => {
+                    tracing::warn!(
+                        target: "omnigraph::cleanup",
+                        table = %table_key,
+                        branch = %branch,
+                        "fresh re-check inconclusive during reconcile; skipping to avoid \
+                         destroying a possibly-live fork (will retry next cleanup)",
+                    );
+                    stats
+                        .failures
+                        .push((table_key.clone(), format!("indeterminate fork status for {branch}")));
+                    continue;
                 }
-            };
-            if !still_orphan {
-                continue;
             }
             let outcome = match crate::failpoints::maybe_fail("cleanup.reconcile_fork") {
                 Ok(()) => storage.force_delete_branch(&full_path, &branch).await,

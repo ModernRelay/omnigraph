@@ -195,7 +195,11 @@ pub(crate) fn staged_handles_as_writes(handles: &[StagedHandle]) -> Vec<StagedWr
 /// delete+recreate), which the caller reclaims and re-forks. The fork
 /// operation does not editorialize ("incomplete prior delete"); it returns
 /// this typed signal and lets the db layer decide.
-pub(crate) enum ForkOutcome<D> {
+// `pub` (not `pub(crate)`) to match the visibility of the sealed
+// `TableStorage::fork_branch_from_state` that returns it (and the already-`pub`
+// `SnapshotHandle`); avoids a private-interfaces warning. The trait is sealed,
+// so this widening does not let external code construct or branch on it.
+pub enum ForkOutcome<D> {
     Created(D),
     RefAlreadyExists,
 }
