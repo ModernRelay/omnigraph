@@ -65,8 +65,9 @@ pub struct QueryRegistry {
     by_name: BTreeMap<String, StoredQuery>,
 }
 
-/// In-memory registry entry before file I/O. Used by [`QueryRegistry::load`]
-/// (after reading each `.gq` from disk) and directly by tests.
+/// In-memory registry spec: a query's name + already-read `.gq` source. The
+/// input to [`QueryRegistry::from_specs`] — built by the server's cluster boot
+/// and by the CLI's `queries` tooling from a cluster serving snapshot.
 #[derive(Debug, Clone)]
 pub struct RegistrySpec {
     pub name: String,

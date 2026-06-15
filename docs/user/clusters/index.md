@@ -117,7 +117,7 @@ omnigraph cluster apply --config company-brain --as andrew
 
 `--as <actor>` attributes the run: it is recorded in recovery sidecars and
 audit entries and threaded into the engine's commit history. Set
-`cli: { actor: <you> }` in your per-operator `omnigraph.yaml` to make it the
+`operator: { actor: <you> }` in your `~/.omnigraph/config.yaml` to make it the
 default when `--as` is omitted (the flag always wins; `approve` requires one
 of the two).
 
@@ -244,12 +244,12 @@ with an in-flight apply.
 - **CI-driven convergence**: `validate` and `plan --json` are read-only and
   safe in pipelines; gate `apply --as ci` on plan review. Approvals are the
   human step by design — keep `cluster approve` out of automation.
-- **`omnigraph.yaml` still has a job**: per-operator settings — your
-  `cli.actor` default for `--as`, CLI defaults, credentials, and data-plane
-  ergonomics (address a cluster graph by its derived root like
-  `company-brain/graphs/knowledge.omni` with `--store` for loads). It just no
-  longer describes the deployment — a server boots from one source or the
-  other, never a merge of both.
+- **`~/.omnigraph/config.yaml` is the per-operator config**: your
+  `operator.actor` default for `--as`, named servers/clusters, credentials,
+  profiles, and data-plane ergonomics (address a cluster graph by its derived
+  root like `company-brain/graphs/knowledge.omni` with `--store` for loads). The
+  cluster directory's `cluster.yaml` is the **sole deployment declaration** — the
+  server boots from the cluster only.
 
 ## 7. Maintaining a cluster graph
 
