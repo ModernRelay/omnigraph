@@ -219,3 +219,111 @@ async fn schema_source_drift_is_caught_on_read() {
         "a query must fail when the on-disk schema source has drifted from the validated contract"
     );
 }
+
+// ── Morphological-matrix coverage: branch-warm + stale-refresh cells ──────────
+
+/// A WARM read on a non-main branch (handle synced to that branch) also scans
+/// `__manifest` zero times. Exercises Fix 2's branch-owned-table open
+/// (`{table_path}/tree/{branch}` + with_version) on Fix 1's warm path — the cell
+/// that regressed when the open used `with_branch` against the base.
+#[tokio::test]
+async fn warm_branch_read_does_no_manifest_scans() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = init_and_load(&dir).await;
+    db.branch_create("feature").await.unwrap();
+    // Write to the branch so its tables are branch-owned (under tree/feature).
+    db.mutate(
+        "feature",
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Eve")], &[("$age", 22)]),
+    )
+    .await
+    .unwrap();
+    // Bind the handle's coordinator to the branch so reads of it take the warm path.
+    db.sync_branch("feature").await.unwrap();
+
+    let (probes_in, manifest, commit_graph, probe_count) = probes();
+    with_query_io_probes(
+        probes_in,
+        db.query(
+            ReadTarget::branch("feature"),
+            TEST_QUERIES,
+            "total_people",
+            &params(&[]),
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        manifest.stats().read_iops,
+        0,
+        "warm branch read must not scan __manifest (branch-owned table opened by location)"
+    );
+    assert_eq!(
+        commit_graph.stats().read_iops,
+        0,
+        "warm branch read must not open the commit graph"
+    );
+    assert_eq!(
+        probe_count.load(Ordering::Relaxed),
+        1,
+        "warm branch read performs exactly one version probe"
+    );
+}
+
+/// When an external writer advances the manifest, the reader's next query takes
+/// the STALE path: it re-reads the manifest (read_iops > 0) but never scans the
+/// commit graph (`refresh_manifest_only`), unlike a full coordinator refresh.
+/// Pins Fix 1's manifest-only refresh.
+#[tokio::test]
+async fn stale_read_refreshes_manifest_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = init_and_load(&dir).await;
+    let uri = dir.path().to_str().unwrap();
+    let reader = Omnigraph::open(uri).await.unwrap();
+    // Establish the reader's warm coordinator.
+    reader
+        .query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "total_people",
+            &params(&[]),
+        )
+        .await
+        .unwrap();
+
+    // External commit advances the on-disk manifest behind the reader.
+    mutate_main(
+        &mut writer,
+        MUTATION_QUERIES,
+        "insert_person",
+        &mixed_params(&[("$name", "Frank")], &[("$age", 33)]),
+    )
+    .await
+    .unwrap();
+
+    let (probes_in, manifest, commit_graph, _probe) = probes();
+    with_query_io_probes(
+        probes_in,
+        reader.query(
+            ReadTarget::branch("main"),
+            TEST_QUERIES,
+            "total_people",
+            &params(&[]),
+        ),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        manifest.stats().read_iops > 0,
+        "stale read must re-read the manifest"
+    );
+    assert_eq!(
+        commit_graph.stats().read_iops,
+        0,
+        "stale refresh must be manifest-only (no commit-graph scan)"
+    );
+}
