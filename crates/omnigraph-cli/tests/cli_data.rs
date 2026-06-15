@@ -200,15 +200,17 @@ fn wrong_address_guard_message_has_no_trailing_space() {
 #[test]
 fn graph_flag_on_a_positional_uri_errors() {
     // RFC-011: `--graph` selects within a multi-graph scope (a server or
-    // cluster). A bare positional URI is already a single graph, so pairing it
-    // with `--graph` is a loud error, not a silently-dropped flag. (The guard
-    // lets `--graph` reach a data verb; the scope resolver is what rejects it.)
+    // cluster). An explicit `--store <uri>` is already a single graph, so
+    // pairing it with `--graph` is a loud error, not a silently-dropped flag.
+    // (The guard lets `--graph` reach a data verb; the scope resolver rejects
+    // it.)
     let temp = tempdir().unwrap();
     let graph = graph_path(temp.path());
     init_graph(&graph);
     let output = output_failure(
         cli()
             .arg("query")
+            .arg("--store")
             .arg(&graph)
             .arg("--graph")
             .arg("knowledge")
@@ -218,7 +220,29 @@ fn graph_flag_on_a_positional_uri_errors() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("already a single graph"),
-        "expected --graph-on-positional-URI rejection; got: {stderr}"
+        "expected --graph-on-explicit-store rejection; got: {stderr}"
+    );
+}
+
+#[test]
+fn query_by_name_against_a_store_needs_a_server() {
+    // RFC-011 D3: by-name (catalog) invocation is served-only — the catalog is
+    // server-owned, so a bare `--store` has nothing to resolve the name
+    // against. The ad-hoc lane (`-e`/`--query`) is the local alternative.
+    let temp = tempdir().unwrap();
+    let graph = graph_path(temp.path());
+    init_graph(&graph);
+    let output = output_failure(
+        cli()
+            .arg("query")
+            .arg("find_people")
+            .arg("--store")
+            .arg(&graph),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("needs a server"),
+        "expected a served-only by-name error; got: {stderr}"
     );
 }
 
@@ -835,10 +859,10 @@ fn read_json_outputs_rows_for_named_query() {
     let output = output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(&graph)
             .arg("--query")
             .arg(&queries)
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#)
@@ -867,7 +891,6 @@ fn read_via_store_flag_and_profile_match_positional_uri() {
         let output = output_success(
             cmd.arg("--query")
                 .arg(&queries)
-                .arg("--name")
                 .arg("get_person")
                 .arg("--params")
                 .arg(r#"{"name":"Alice"}"#)
@@ -876,8 +899,8 @@ fn read_via_store_flag_and_profile_match_positional_uri() {
         serde_json::from_slice(&output.stdout).unwrap()
     };
 
-    // Baseline: positional URI.
-    let baseline = read_rows(cli().arg("query").arg(&graph));
+    // Baseline: --store names the graph.
+    let baseline = read_rows(cli().arg("query").arg("--store").arg(&graph));
     assert_eq!(baseline["rows"][0]["p.name"], "Alice");
 
     // --store names the same graph directly.
@@ -1097,7 +1120,6 @@ fn read_can_resolve_uri_from_config() {
             .arg(&config)
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#)
@@ -1117,10 +1139,10 @@ fn read_csv_format_outputs_header_and_row_values() {
     let output = output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(&graph)
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#)
@@ -1154,10 +1176,10 @@ fn read_uses_operator_default_output_format() {
         command
             .env("OMNIGRAPH_HOME", operator_home.path())
             .arg("read")
+            .arg("--store")
             .arg(&graph)
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#);
@@ -1189,10 +1211,10 @@ fn read_jsonl_format_outputs_metadata_header_first() {
     let output = output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(&graph)
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Alice"}"#)
@@ -1224,6 +1246,7 @@ query insert_person($name: String, $age: I32) {
     let output = output_success(
         cli()
             .arg("change")
+            .arg("--store")
             .arg(&graph)
             .arg("--query")
             .arg(&mutation_file)
@@ -1240,10 +1263,10 @@ query insert_person($name: String, $age: I32) {
     let verify = output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(&graph)
             .arg("--query")
             .arg(fixture("test.gq"))
-            .arg("--name")
             .arg("get_person")
             .arg("--params")
             .arg(r#"{"name":"Eve"}"#)
@@ -1298,6 +1321,7 @@ fn read_requires_name_for_multi_query_files() {
     let output = output_failure(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(&graph)
             .arg("--query")
             .arg(fixture("test.gq")),
@@ -1316,6 +1340,7 @@ fn read_supports_inline_query_string() {
     let output = output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(&repo)
             .arg("-e")
             .arg("query find($name: String) { match { $p: Person { name: $name } } return { $p.name, $p.age } }")
@@ -1331,11 +1356,12 @@ fn read_supports_inline_query_string() {
 
 #[test]
 fn positional_http_uri_on_a_data_verb_is_rejected() {
-    // RFC-011: a positional/`--uri` http(s):// URL no longer dispatches to a
-    // remote server — that requires `--server <url>`.
+    // RFC-011: a `--store` http(s):// URL no longer dispatches to a remote
+    // server — that requires `--server <url>`.
     let output = output_failure(
         cli()
             .arg("query")
+            .arg("--store")
             .arg("http://127.0.0.1:1")
             .arg("-e")
             .arg("query q() { match { $p: Person { } } return { $p } }"),
@@ -1343,7 +1369,7 @@ fn positional_http_uri_on_a_data_verb_is_rejected() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("must be addressed with `--server <url>`"),
-        "expected positional-remote rejection; got: {stderr}"
+        "expected store-remote rejection; got: {stderr}"
     );
 }
 
@@ -1381,6 +1407,7 @@ fn change_supports_inline_query_string() {
     let output = output_success(
         cli()
             .arg("change")
+            .arg("--store")
             .arg(&repo)
             .arg("--query-string")
             .arg("query add($name: String, $age: I32) { insert Person { name: $name, age: $age } }")
@@ -1395,6 +1422,7 @@ fn change_supports_inline_query_string() {
     let verify = output_success(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(&repo)
             .arg("-e")
             .arg("query find($name: String) { match { $p: Person { name: $name } } return { $p.name } }")
@@ -1416,6 +1444,7 @@ fn read_rejects_query_string_combined_with_query() {
     let output = output_failure(
         cli()
             .arg("read")
+            .arg("--store")
             .arg(&repo)
             .arg("--query")
             .arg(fixture("test.gq"))
@@ -1436,7 +1465,7 @@ fn read_rejects_empty_query_string() {
     init_graph(&repo);
     load_fixture(&repo);
 
-    let output = output_failure(cli().arg("read").arg(&repo).arg("-e").arg(""));
+    let output = output_failure(cli().arg("read").arg("--store").arg(&repo).arg("-e").arg(""));
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
         stderr.contains("must not be empty"),

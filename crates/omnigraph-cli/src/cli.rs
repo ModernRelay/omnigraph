@@ -92,20 +92,18 @@ pub(crate) enum Command {
     /// when used. Pairs with `omnigraph mutate` on the write side.
     #[command(visible_alias = "read")]
     Query {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        #[arg(hide = true)]
-        legacy_uri: Option<String>,
+        /// Query name. With no `--query`/`-e`, the stored query to invoke from
+        /// the catalog (served — addressed via --server/--profile). With
+        /// `--query`/`-e`, selects which query in that ad-hoc source to run.
+        name: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Ad-hoc query file (a `.gq` you're authoring / break-glass).
         #[arg(long, conflicts_with = "query_string")]
         query: Option<PathBuf>,
-        /// Inline GQ source — alternative to `--query <path>`.
+        /// Inline ad-hoc GQ source — alternative to `--query <path>`.
         #[arg(short = 'e', long = "query-string", value_name = "GQ", conflicts_with = "query")]
         query_string: Option<String>,
-        #[arg(long)]
-        name: Option<String>,
         #[command(flatten)]
         params: ParamsArgs,
         #[arg(long, conflicts_with = "snapshot")]
@@ -124,20 +122,18 @@ pub(crate) enum Command {
     /// warning when used. Pairs with `omnigraph query` on the read side.
     #[command(visible_alias = "change")]
     Mutate {
-        /// Graph URI
-        #[arg(long)]
-        uri: Option<String>,
-        #[arg(hide = true)]
-        legacy_uri: Option<String>,
+        /// Query name. With no `--query`/`-e`, the stored mutation to invoke
+        /// from the catalog (served — addressed via --server/--profile). With
+        /// `--query`/`-e`, selects which query in that ad-hoc source to run.
+        name: Option<String>,
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Ad-hoc mutation file (a `.gq` you're authoring / break-glass).
         #[arg(long, conflicts_with = "query_string")]
         query: Option<PathBuf>,
-        /// Inline GQ source — alternative to `--query <path>`.
+        /// Inline ad-hoc GQ source — alternative to `--query <path>`.
         #[arg(short = 'e', long = "query-string", value_name = "GQ", conflicts_with = "query")]
         query_string: Option<String>,
-        #[arg(long)]
-        name: Option<String>,
         #[command(flatten)]
         params: ParamsArgs,
         #[arg(long)]
