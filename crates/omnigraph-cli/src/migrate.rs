@@ -66,7 +66,7 @@ pub(crate) fn build_report(config: &OmnigraphConfig, source: &Path) -> MigrateRe
     if config.cli.graph.is_some() {
         dropped.push(DroppedKey {
             key: "cli.graph".into(),
-            reason: "no operator default-target yet — address graphs explicitly via --target/--server (RFC-002 locator territory)".into(),
+            reason: "address graphs explicitly via --store/--server, or set defaults.default_graph in the operator config".into(),
         });
     }
     if config.cli.branch.is_some() {

@@ -66,6 +66,19 @@ pub(crate) enum GraphClient {
     },
 }
 
+/// A remote graph must be addressed with `--server` (RFC-011): a positional or
+/// `--uri` `http(s)://` URL no longer auto-dispatches to a server. A remote URL
+/// produced by a server scope (`via_server`) is fine.
+fn reject_positional_remote(via_server: bool, uri: &str) -> Result<()> {
+    if !via_server && is_remote_uri(uri) {
+        bail!(
+            "a remote graph must be addressed with `--server <url>` — a positional \
+             (or `--uri`) http(s):// URL no longer dispatches to a server"
+        );
+    }
+    Ok(())
+}
+
 impl GraphClient {
     /// Resolve the addressing (positional URI / `--target` / `--server`)
     /// and credential once, then pick the variant by URI scheme — the
@@ -78,27 +91,27 @@ impl GraphClient {
         server: Option<&str>,
         graph: Option<&str>,
         uri: Option<String>,
-        target: Option<&str>,
         profile: Option<&str>,
         store: Option<&str>,
     ) -> Result<Self> {
         // RFC-011: a scope (profile / --store / operator defaults) may stand in
-        // for omitted addressing. The explicit branch passes server/graph/uri/
-        // target straight through, so existing invocations are unchanged.
+        // for omitted addressing. The explicit branch passes server/graph/uri
+        // straight through, so existing invocations are unchanged.
         let scope = crate::scope::resolve_scope(
             &crate::operator::load_operator_config()?,
             crate::planes::Capability::Any,
-            crate::scope::ScopeFlags { profile, store, server, graph, uri, target },
+            crate::scope::ScopeFlags { profile, store, server, graph, uri },
         )?;
-        let (server, graph, uri, target) = (
+        let (server, graph, uri) = (
             scope.server.as_deref(),
             scope.graph.as_deref(),
             scope.uri,
-            scope.target.as_deref(),
         );
-        let uri = apply_server_flag(server, graph, uri, target)?;
-        let token = resolve_remote_bearer_token(config, uri.as_deref(), target)?;
-        let uri = crate::helpers::resolve_uri(config, uri, target)?;
+        let via_server = server.is_some();
+        let uri = apply_server_flag(server, graph, uri)?;
+        let token = resolve_remote_bearer_token(config, uri.as_deref())?;
+        let uri = crate::helpers::resolve_uri(config, uri)?;
+        reject_positional_remote(via_server, &uri)?;
         if is_remote_uri(&uri) {
             Ok(GraphClient::Remote {
                 http: build_http_client()?,
@@ -125,7 +138,6 @@ impl GraphClient {
         server: Option<&str>,
         graph: Option<&str>,
         uri: Option<String>,
-        target: Option<&str>,
         cli_as: Option<&str>,
         profile: Option<&str>,
         store: Option<&str>,
@@ -135,18 +147,28 @@ impl GraphClient {
         let scope = crate::scope::resolve_scope(
             &crate::operator::load_operator_config()?,
             crate::planes::Capability::Any,
-            crate::scope::ScopeFlags { profile, store, server, graph, uri, target },
+            crate::scope::ScopeFlags { profile, store, server, graph, uri },
         )?;
-        let (server, graph, uri, target) = (
+        let (server, graph, uri) = (
             scope.server.as_deref(),
             scope.graph.as_deref(),
             scope.uri,
-            scope.target.as_deref(),
         );
-        let uri = apply_server_flag(server, graph, uri, target)?;
-        let token = resolve_remote_bearer_token(config, uri.as_deref(), target)?;
-        let resolved = resolve_cli_graph(config, uri, target)?;
+        let via_server = server.is_some();
+        let uri = apply_server_flag(server, graph, uri)?;
+        let token = resolve_remote_bearer_token(config, uri.as_deref())?;
+        let resolved = resolve_cli_graph(config, uri)?;
+        reject_positional_remote(via_server, &resolved.uri)?;
         if resolved.is_remote {
+            // A served write resolves the actor server-side from the bearer
+            // token; `--as` cannot set identity here and is rejected.
+            if cli_as.is_some() {
+                bail!(
+                    "`--as` is not allowed on a served write — the server resolves the actor \
+                     from the bearer token. Remove `--as`, or run the write directly against \
+                     storage with `--store <uri>`."
+                );
+            }
             Ok(GraphClient::Remote {
                 http: build_http_client()?,
                 base_url: resolved.uri,

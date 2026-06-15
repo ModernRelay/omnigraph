@@ -831,8 +831,18 @@ pub fn run_both_with_config(
     server_url: &str,
     args: &[&str],
 ) -> (std::process::Output, std::process::Output) {
+    // Address both arms with GLOBAL flags (`--store` / `--server`) appended after
+    // the verb + its args, so the address is placed correctly regardless of
+    // subcommand nesting (a positional graph only works for top-level verbs;
+    // `schema show <graph>` etc. need the global flag). Local = embedded store,
+    // remote = served.
     let mut local = cli();
-    local.arg(args[0]).arg(local_graph).args(&args[1..]).arg("--as").arg(PARITY_ACTOR);
+    local
+        .args(args)
+        .arg("--store")
+        .arg(local_graph)
+        .arg("--as")
+        .arg(PARITY_ACTOR);
     if let Some(config) = local_config {
         local.arg("--config").arg(config);
     }
@@ -841,9 +851,9 @@ pub fn run_both_with_config(
     let mut remote = cli();
     remote
         .env("OMNIGRAPH_BEARER_TOKEN", PARITY_TOKEN)
-        .arg(args[0])
-        .arg(server_url)
-        .args(&args[1..]);
+        .args(args)
+        .arg("--server")
+        .arg(server_url);
     let remote_out = remote.output().unwrap();
     (local_out, remote_out)
 }

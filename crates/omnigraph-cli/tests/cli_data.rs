@@ -166,7 +166,7 @@ fn optimize_with_server_flag_errors_wrong_plane() {
     assert!(
         stderr.contains("`optimize` is a direct (storage-native) command")
             && stderr.contains("--server/--graph address a served graph and do not apply")
-            && stderr.contains("Use --target <name>, a storage URI, or --cluster <dir> --cluster-graph <id>."),
+            && stderr.contains("Pass a storage URI, or --cluster <dir> --cluster-graph <id>."),
         "wrong-capability guard message not found; got: {stderr}"
     );
 }
@@ -1277,6 +1277,48 @@ fn read_supports_inline_query_string() {
     assert_eq!(payload["query_name"], "find");
     assert_eq!(payload["row_count"], 1);
     assert_eq!(payload["rows"][0]["p.name"], "Alice");
+}
+
+#[test]
+fn positional_http_uri_on_a_data_verb_is_rejected() {
+    // RFC-011: a positional/`--uri` http(s):// URL no longer dispatches to a
+    // remote server — that requires `--server <url>`.
+    let output = output_failure(
+        cli()
+            .arg("query")
+            .arg("http://127.0.0.1:1")
+            .arg("-e")
+            .arg("query q() { match { $p: Person { } } return { $p } }"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("must be addressed with `--server <url>`"),
+        "expected positional-remote rejection; got: {stderr}"
+    );
+}
+
+#[test]
+fn as_on_a_served_write_is_rejected() {
+    // RFC-011: a served write resolves the actor from the bearer token, so --as
+    // cannot set identity. It errors while building the remote client — before
+    // any HTTP call, so no server is needed.
+    let output = output_failure(
+        cli()
+            .arg("mutate")
+            .arg("--server")
+            .arg("http://127.0.0.1:1")
+            .arg("--as")
+            .arg("act-nope")
+            .arg("-e")
+            .arg("query add($name: String) { insert Person { name: $name } }")
+            .arg("--params")
+            .arg(r#"{"name":"X"}"#),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`--as` is not allowed on a served write"),
+        "expected --as-served rejection; got: {stderr}"
+    );
 }
 
 #[test]

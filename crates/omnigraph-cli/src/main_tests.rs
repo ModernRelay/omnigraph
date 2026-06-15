@@ -209,13 +209,7 @@ cli:
         let config = load_config(Some(&config_path)).unwrap();
 
         assert_eq!(
-            resolve_remote_bearer_token(&config, None, Some("demo"))
-                .unwrap()
-                .as_deref(),
-            Some("scoped-token")
-        );
-        assert_eq!(
-            resolve_remote_bearer_token(&config, Some("https://override.example.com"), None)
+            resolve_remote_bearer_token(&config, Some("https://override.example.com"))
                 .unwrap()
                 .as_deref(),
             Some("global-token")
@@ -369,12 +363,16 @@ graphs:
     uri: s3://bucket/prod-graph/
     policy:
       file: ./prod-policy.yaml
+cli:
+  graph: prod
 "#,
         )
         .unwrap();
 
         let config = load_config(Some(&config_path)).unwrap();
-        let graph = resolve_cli_graph(&config, None, Some("prod")).unwrap();
+        // `--target` is removed; the `cli.graph` default drives the same
+        // graph-key (not project name / URI) selection.
+        let graph = resolve_cli_graph(&config, None).unwrap();
         assert_eq!(graph.selected(), Some("prod"));
         assert_eq!(graph.graph_id, "prod");
         assert_eq!(graph.uri, "s3://bucket/prod-graph/");
@@ -405,7 +403,6 @@ cli:
         let local_graph = resolve_cli_graph(
             &config,
             Some(format!("file://{}", local_graph_path.display())),
-            None,
         )
         .unwrap();
         assert_eq!(local_graph.selected(), None);
@@ -418,7 +415,6 @@ cli:
         let s3_graph = resolve_cli_graph(
             &config,
             Some("s3://bucket/anonymous-graph/".to_string()),
-            None,
         )
         .unwrap();
         assert_eq!(s3_graph.selected(), None);

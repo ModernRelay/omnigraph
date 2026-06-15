@@ -51,9 +51,9 @@ The exact contract:
   implicit current-directory search runs (mode-inference rule 0). Boot from
   cluster state XOR `omnigraph.yaml`, never a merge.
 - **The other direction is ergonomics, not coupling**: a per-operator
-  `omnigraph.yaml` may point `graphs.<name>.uri` at a cluster's derived root
-  (`company-brain/graphs/knowledge.omni`) so data-plane commands can use
-  `--target <name>` — an ordinary local path, no special handling.
+  data-plane commands address a cluster graph by its derived storage root
+  (`company-brain/graphs/knowledge.omni`) with `--store <uri>` — an ordinary
+  local path, no special handling.
 
 ## Supported `cluster.yaml`
 

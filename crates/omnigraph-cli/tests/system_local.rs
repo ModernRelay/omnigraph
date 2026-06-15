@@ -2339,6 +2339,7 @@ fn local_cli_keyed_credentials_authenticate_url_matched_server() {
         }
         command
             .arg("read")
+            .arg("--server")
             .arg(&server.base_url)
             .arg("--query")
             .arg(fixture("test.gq"))

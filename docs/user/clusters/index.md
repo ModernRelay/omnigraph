@@ -246,10 +246,10 @@ with an in-flight apply.
   human step by design — keep `cluster approve` out of automation.
 - **`omnigraph.yaml` still has a job**: per-operator settings — your
   `cli.actor` default for `--as`, CLI defaults, credentials, and data-plane
-  ergonomics (point `graphs.<name>.uri` at a derived root like
-  `company-brain/graphs/knowledge.omni` to use `--target <name>` for
-  loads). It just no longer describes the deployment — a server boots from
-  one source or the other, never a merge of both.
+  ergonomics (address a cluster graph by its derived root like
+  `company-brain/graphs/knowledge.omni` with `--store` for loads). It just no
+  longer describes the deployment — a server boots from one source or the
+  other, never a merge of both.
 
 ## 7. Maintaining a cluster graph
 

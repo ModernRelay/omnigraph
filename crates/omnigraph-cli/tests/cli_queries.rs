@@ -323,7 +323,7 @@ fn queries_list_requires_graph_selection_for_per_graph_only_registries() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("local") && stderr.contains("--target local"),
+        stderr.contains("local") && stderr.contains("set `cli.graph`"),
         "error must name the graph and give a concrete selection hint; stderr:\n{stderr}"
     );
 }
@@ -357,12 +357,12 @@ fn queries_list_without_graph_selection_lists_top_level_registry() {
 }
 
 #[test]
-fn queries_list_unknown_target_errors() {
+fn queries_list_unknown_cli_graph_errors() {
     // `queries list` opens no graph URI, so unknown-graph validation can't ride
     // along on URI resolution the way it does for every other command. An
-    // unknown `--target` must still error (naming the graph) instead of
-    // silently falling back to the top-level registry and showing the wrong
-    // (or empty) catalog.
+    // unknown `cli.graph` selection must still error (naming the graph) instead
+    // of silently falling back to the top-level registry and showing the wrong
+    // (or empty) catalog. (`--target` was removed; `cli.graph` drives selection.)
     let graph = SystemGraph::loaded();
     graph.write_query(
         "find_person.gq",
@@ -370,21 +370,12 @@ fn queries_list_unknown_target_errors() {
     );
     let config = graph.write_config(
         "omnigraph.yaml",
-        &queries_test_config(
-            &graph.path().to_string_lossy(),
-            "find_person",
-            "find_person.gq",
+        &format!(
+            "graphs:\n  local:\n    uri: '{}'\n    queries:\n      find_person:\n        file: ./find_person.gq\ncli:\n  graph: nonexistent\npolicy: {{}}\n",
+            graph.path().to_string_lossy().replace('\'', "''"),
         ),
     );
-    let output = output_failure(
-        cli()
-            .arg("queries")
-            .arg("list")
-            .arg("--target")
-            .arg("nonexistent")
-            .arg("--config")
-            .arg(&config),
-    );
+    let output = output_failure(cli().arg("queries").arg("list").arg("--config").arg(&config));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("nonexistent"),
