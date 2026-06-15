@@ -1280,6 +1280,24 @@ fn read_supports_inline_query_string() {
 }
 
 #[test]
+fn positional_http_uri_on_a_data_verb_is_rejected() {
+    // RFC-011: a positional/`--uri` http(s):// URL no longer dispatches to a
+    // remote server — that requires `--server <url>`.
+    let output = output_failure(
+        cli()
+            .arg("query")
+            .arg("http://127.0.0.1:1")
+            .arg("-e")
+            .arg("query q() { match { $p: Person { } } return { $p } }"),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("must be addressed with `--server <url>`"),
+        "expected positional-remote rejection; got: {stderr}"
+    );
+}
+
+#[test]
 fn as_on_a_served_write_is_rejected() {
     // RFC-011: a served write resolves the actor from the bearer token, so --as
     // cannot set identity. It errors while building the remote client — before
