@@ -271,6 +271,10 @@ not resolvable. Run these from a host with storage access — there are no serve
 routes for them. Conversely, **`init` refuses** a cluster-managed path: graphs in
 a cluster are created by `cluster apply`, not by hand.
 
+If the cluster has exactly **one** applied graph you can omit `--graph` — it is
+used automatically. With **several**, omitting `--graph` errors and lists the
+candidates (RFC-011 D7); it never picks one for you.
+
 Against an **`s3://`-backed cluster** the resolved graph storage is non-local, so a
 destructive `cleanup` additionally requires **`--yes`** (an interactive prompt
 otherwise, refusal without a TTY) on top of `--confirm` — see [cli-reference.md](../cli/reference.md)'s
