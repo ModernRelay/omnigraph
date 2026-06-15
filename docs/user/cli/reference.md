@@ -26,6 +26,7 @@ Top-level command families and subcommands. Graph-targeting commands accept a po
 | `cleanup --keep N --older-than 7d --confirm` | destructive version GC (`--confirm` to execute; also needs `--yes` against a non-local `s3://` target — see *Write diagnostics & destructive confirmation*) |
 | `embed` | offline JSONL embedding pipeline |
 | `policy validate \| test \| explain` | Cedar tooling against a cluster's applied policies (`--cluster <dir>`; `--graph <id>` picks a graph's bundle when several apply). `test` takes `--tests <file>`; `explain` takes `--actor`/`--action`/`--branch`/`--target-branch` |
+| `profile list \| show [<name>]` | read-only inspection of `~/.omnigraph/config.yaml` profiles. `list` shows each profile's binding (server/cluster/store) + default graph and marks the `$OMNIGRAPH_PROFILE`-active one; `show` resolves one profile's scope (endpoint + default graph), defaulting to the active profile, else the flat operator defaults |
 | `version` / `-v` | print `omnigraph 0.3.x` |
 
 ## Command capabilities
@@ -106,7 +107,8 @@ address (a positional URI, `--server`, or `--store <uri>`); a named
 *local* default — mutually exclusive with `defaults.server`). A **profile** binds
 exactly one of `server` / `cluster` / `store` plus an optional default graph —
 config data, not state: every command resolves its scope fresh, there is no
-sticky "current" mode.
+sticky "current" mode. Inspect what is defined with `omnigraph profile list` and
+`omnigraph profile show [<name>]` (read-only).
 
 - `--store <uri>` addresses a single graph's storage directly (ad-hoc / break-glass).
 - A `cluster`-bound profile reaches `optimize` / `repair` / `cleanup` for a managed

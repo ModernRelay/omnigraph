@@ -94,6 +94,95 @@ async fn main() -> Result<()> {
             let path = crate::operator::remove_credential(&name)?;
             finish_logout(&name, &path, json)?;
         }
+        Command::Profile { command } => {
+            use crate::operator::ScopeBinding;
+            let op = crate::operator::load_operator_config()?;
+            let active = std::env::var(scope::PROFILE_ENV)
+                .ok()
+                .filter(|s| !s.is_empty());
+            match command {
+                ProfileCommand::List { json } => {
+                    let items: Vec<ProfileListItem> = op
+                        .profiles
+                        .iter()
+                        .map(|(name, profile)| {
+                            let binding = match profile.binding(name) {
+                                Ok(ScopeBinding::Server(s)) => format!("server: {s}"),
+                                Ok(ScopeBinding::Cluster(c)) => format!("cluster: {c}"),
+                                Ok(ScopeBinding::Store(u)) => format!("store: {u}"),
+                                Err(e) => format!("invalid: {e}"),
+                            };
+                            ProfileListItem {
+                                name: name.clone(),
+                                binding,
+                                default_graph: profile.default_graph.clone(),
+                                active: active.as_deref() == Some(name.as_str()),
+                            }
+                        })
+                        .collect();
+                    print_profile_list(&items, json)?;
+                }
+                ProfileCommand::Show { name, json } => {
+                    let detail = match name.or(active) {
+                        Some(name) => {
+                            let profile = op.profile(&name).ok_or_else(|| {
+                                color_eyre::eyre::eyre!(
+                                    "unknown profile '{name}' (not defined under `profiles:`)"
+                                )
+                            })?;
+                            let (kind, target, endpoint) = match profile.binding(&name)? {
+                                ScopeBinding::Server(s) => {
+                                    let endpoint = op.servers.get(&s).map(|sv| sv.url.clone());
+                                    ("server", Some(s), endpoint)
+                                }
+                                ScopeBinding::Cluster(c) => {
+                                    let endpoint = op.cluster_root(&c).map(str::to_string);
+                                    ("cluster", Some(c), endpoint)
+                                }
+                                ScopeBinding::Store(u) => ("store", Some(u.clone()), Some(u)),
+                            };
+                            ProfileDetail {
+                                name,
+                                scope_kind: kind.to_string(),
+                                target,
+                                endpoint,
+                                default_graph: profile
+                                    .default_graph
+                                    .clone()
+                                    .or_else(|| op.default_graph().map(str::to_string)),
+                                output_format: op
+                                    .output()
+                                    .and_then(|f| f.to_possible_value())
+                                    .map(|v| v.get_name().to_string()),
+                            }
+                        }
+                        // No name and no active profile: the flat operator defaults.
+                        None => {
+                            let (kind, target, endpoint) = if let Some(s) = op.default_server() {
+                                let endpoint = op.servers.get(s).map(|sv| sv.url.clone());
+                                ("server", Some(s.to_string()), endpoint)
+                            } else if let Some(u) = op.default_store() {
+                                ("store", Some(u.to_string()), Some(u.to_string()))
+                            } else {
+                                ("none", None, None)
+                            };
+                            ProfileDetail {
+                                name: "(defaults)".to_string(),
+                                scope_kind: kind.to_string(),
+                                target,
+                                endpoint,
+                                default_graph: op.default_graph().map(str::to_string),
+                                output_format: op
+                                    .output()
+                                    .and_then(|f| f.to_possible_value())
+                                    .map(|v| v.get_name().to_string()),
+                            }
+                        }
+                    };
+                    print_profile_detail(&detail, json)?;
+                }
+            }
+        }
         Command::Version => {
             println!("omnigraph {}", env!("CARGO_PKG_VERSION"));
         }
