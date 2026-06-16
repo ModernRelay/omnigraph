@@ -1,11 +1,29 @@
-# Omnigraph
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/omnigraph-wordmark-dark.svg">
+    <img alt="OMNIGRAPH" src="assets/omnigraph-wordmark.svg" width="420">
+  </picture>
+</p>
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](rust-toolchain.toml)
-[![Crates.io](https://img.shields.io/crates/v/omnigraph-cli.svg)](https://crates.io/crates/omnigraph-cli)
+<p align="center">
+  <strong>Lakehouse graph database for context assembly &amp; multi-agent coordination</strong><br>
+  <sub>Multimodal retrieval · Git-style branching · object-storage native</sub>
+</p>
 
-**Lakehouse graph db for context assembly & multi-agent coordination**\
-Multimodal retrieval, Git-style branching, object storage-native
+<p align="center">
+  <a href="docs/user/quickstart.md">Quickstart</a> &nbsp;·&nbsp;
+  <a href="docs/user/clusters/index.md">Docs</a> &nbsp;·&nbsp;
+  <a href="https://github.com/ModernRelay/omnigraph-cookbooks">Cookbooks</a> &nbsp;·&nbsp;
+  <a href="docs/user/cli/reference.md">CLI</a>
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-1b1b1f?style=flat-square&labelColor=1b1b1f"></a>
+  <a href="https://crates.io/crates/omnigraph-cli"><img alt="crates.io" src="https://img.shields.io/crates/v/omnigraph-cli?style=flat-square&color=d71921&labelColor=1b1b1f"></a>
+  <a href="rust-toolchain.toml"><img alt="Rust" src="https://img.shields.io/badge/rust-stable-1b1b1f?style=flat-square&labelColor=1b1b1f"></a>
+</p>
+
+<hr>
 
 Omnigraph is the operational state and coordination layer for fleets of agents.\
 Run it as a server, declared as code; hundreds of agents operate and enrich the graph on parallel isolated branches, and every change is reviewed and merged safely.
@@ -137,25 +155,22 @@ containers, AWS/Railway, auth, and the full `AWS_*` contract.
 
 ## Query and mutate
 
-Point the CLI at a running server and a graph. Stored queries and mutations run
-**by name** from the catalog; branch and merge run across the whole graph, so a
-fleet of agents can write in isolation and have changes reviewed before they
-land on `main`.
+Set a default server and graph once in `~/.omnigraph/config.yaml`, and the
+everyday commands stay short. Stored queries and mutations run **by name**:
 
 ```bash
-# Stored query / mutation, parameters as JSON
-omnigraph query  search_docs --server https://graph.internal:8080 --graph knowledge --params '{"q":"AI safety"}'
-omnigraph mutate add_person  --server https://graph.internal:8080 --graph knowledge --params '{"name":"Mina","team":"Research"}'
+omnigraph query  search_docs --params '{"q":"AI safety"}'
+omnigraph mutate add_person  --params '{"name":"Mina"}'
 
-# An agent enriches on its own branch; you review, then merge
-omnigraph branch create --from main agent/ingest-42 --server https://graph.internal:8080 --graph knowledge
-omnigraph branch merge  agent/ingest-42 --into main --server https://graph.internal:8080 --graph knowledge
+# Branch, review, merge across the whole graph; agents write in isolation
+omnigraph branch create --from main agent/ingest-42
+omnigraph branch merge  agent/ingest-42 --into main
 ```
 
-Name the server (and a default graph) once in `~/.omnigraph/config.yaml` (with
-operator identity and credentials), and the `--server`/`--graph` flags drop
-away: `omnigraph query search_docs --params '{"q":"…"}'`. See the
-[CLI reference](docs/user/cli/reference.md).
+An **alias** is shorter still: bind a server, graph, and stored query to one
+name, then `omnigraph alias triage` runs it. For an ad-hoc target, any command
+still takes `--server <name|url> --graph <id>` (or `--store <uri>` for a local
+graph). See the [CLI reference](docs/user/cli/reference.md).
 
 ## Security & governance
 
