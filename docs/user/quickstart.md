@@ -12,8 +12,8 @@ A schema (`.pg`) declares your node and edge types. Save this as `schema.pg`:
 
 ```
 node Person {
-  name: String,
-  title: String?,
+  name: String
+  title: String?
 }
 ```
 

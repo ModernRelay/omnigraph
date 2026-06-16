@@ -79,13 +79,15 @@ omnigraph branch create --from main review/new-hires --store ./graph.omni
 omnigraph branch merge  review/new-hires --into main --store ./graph.omni
 ```
 
-**Storage backends** — the same flow runs on any backend; change only the graph address:
+**Storage backends** — the same flow runs on any backend; only the graph address changes:
 
-| Backend | Use it for | Address |
+| Backend | Use it for | Graph address |
 |---|---|---|
-| **Embedded** (local filesystem) | dev, demos, single machine — the default | `--store ./graph.omni` |
-| **Object storage** (AWS S3, R2, GCS-S3) | shared, multi-host, durable | `--store s3://bucket/graph.omni` + the `AWS_*` env |
+| **Embedded** (local filesystem) | dev, demos, single machine — the default | `./graph.omni` |
+| **Object storage** (AWS S3, R2, GCS-S3) | shared, multi-host, durable | `s3://bucket/graph.omni` (+ the `AWS_*` env) |
 | **RustFS / MinIO** | rehearse the S3 path locally, no cloud account | `s3://…` against a local endpoint → [deployment guide](docs/user/deployment.md#testing-against-s3-locally) |
+
+`init` takes the address as its positional argument (`omnigraph init --schema schema.pg <address>`); `load`, `query`, and `branch` take it via `--store <address>`.
 
 For a **served, multi-graph deployment** (the cluster model), see [Common Commands](#common-commands) below.
 
