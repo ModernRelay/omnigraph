@@ -1,18 +1,29 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/omnigraph-wordmark-dark.svg">
-    <img alt="OMNIGRAPH" src="assets/omnigraph-wordmark.svg" width="380">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/omnigraph-hero-dark.svg">
+    <img alt="OMNIGRAPH" src="assets/omnigraph-hero.svg" width="760">
   </picture>
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-yellow.svg"></a>
-  <a href="rust-toolchain.toml"><img alt="Rust" src="https://img.shields.io/badge/rust-stable-orange.svg"></a>
-  <a href="https://crates.io/crates/omnigraph-cli"><img alt="Crates.io" src="https://img.shields.io/crates/v/omnigraph-cli.svg"></a>
+  <strong>Lakehouse graph database for context assembly &amp; multi-agent coordination</strong><br>
+  <sub>Multimodal retrieval · Git-style branching · object-storage native</sub>
 </p>
 
-**Lakehouse graph db for context assembly & multi-agent coordination**\
-Multimodal retrieval, Git-style branching, object storage-native
+<p align="center">
+  <a href="docs/user/quickstart.md">Quickstart</a> &nbsp;·&nbsp;
+  <a href="docs/user/clusters/index.md">Docs</a> &nbsp;·&nbsp;
+  <a href="https://github.com/ModernRelay/omnigraph-cookbooks">Cookbooks</a> &nbsp;·&nbsp;
+  <a href="docs/user/cli/reference.md">CLI</a>
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-1b1b1f?style=flat-square&labelColor=1b1b1f"></a>
+  <a href="https://crates.io/crates/omnigraph-cli"><img alt="crates.io" src="https://img.shields.io/crates/v/omnigraph-cli?style=flat-square&color=d71921&labelColor=1b1b1f"></a>
+  <a href="rust-toolchain.toml"><img alt="Rust" src="https://img.shields.io/badge/rust-stable-1b1b1f?style=flat-square&labelColor=1b1b1f"></a>
+</p>
+
+<hr>
 
 Omnigraph is the operational state and coordination layer for fleets of agents.\
 Run it as a server, declared as code; hundreds of agents operate and enrich the graph on parallel isolated branches, and every change is reviewed and merged safely.
