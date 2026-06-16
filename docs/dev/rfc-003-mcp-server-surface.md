@@ -17,7 +17,12 @@ RFC-011 cluster-only server, RFC-009 canonical `POST /load`, RFC-012 embeddings)
 `file:line` and `Reuses` citation below was re-checked against the merged tree; the
 deltas are folded in (cluster-only routing in [§15](#15-routing--reuses-build_app),
 the DTO crate move in [§9](#9-stored-query-projection), `/ingest`→`/load`, and the
-per-query `expose`/`tool_name` deferral in [§17](#17-decisions--rollout)).
+per-query `expose`/`tool_name` deferral in [§17](#17-decisions--rollout)). An external
+review pass (8 findings) was then folded in as **correct-by-design** fixes, not point
+patches — the schema generator is locked to the engine coercer by an equivalence test
+(§9.1), Origin is fail-closed by a single host-policy constructor (§7), the list seam is
+non-paginated by contract (§6), and name collisions fail at validate-time (§9.3); the
+resolved decisions are catalogued in [§17](#17-decisions--rollout).
 
 **Validated against** (re-checked 2026-06-13): MCP protocol revision **`2025-11-25`**
 (modelcontextprotocol.io), the official Rust SDK **`rmcp 1.7.0`** (crates.io /
@@ -38,8 +43,9 @@ operations as MCP **tools** and **resources** for LLM clients. Two tool populati
 share one projection path:
 
 1. **Built-in operational tools** — graph read/mutate, schema get/apply, branch
-   create/delete/merge/list, commit list/get, NDJSON load, and a `health` liveness
-   tool, plus resources `omnigraph://schema` and `omnigraph://branches`.
+   create/delete/merge/list, commit list/get, NDJSON load, and a graph-scoped
+   `graph_health` liveness tool, plus resources `omnigraph://schema` and
+   `omnigraph://branches`.
 2. **Dynamic stored-query tools** — projected from the graph's loaded stored-query
    registry: either one typed tool per query (small catalogs) or a
    discovery + execute meta-tool pair (large catalogs) — see [§9](#9-stored-query-projection).
@@ -95,8 +101,9 @@ unsupported one is a `400`. Revision `2025-06-18` is the floor we rely on for tw
 features: **structured tool output** (`outputSchema` + `structuredContent`) and the
 **OAuth Resource-Server** model. From `2025-11-25` we adopt: **input-validation
 errors as tool-execution errors** (SEP-1303), **JSON Schema 2020-12** as the default
-dialect, **`403` on invalid `Origin`**, and **`WWW-Authenticate` made optional** with
-a `.well-known` fallback.
+dialect, **`403` on a present-but-disallowed `Origin`** (validated **fail-closed** by a
+single host-policy constructor — §7, not a config-presence default), and
+**`WWW-Authenticate` made optional** with a `.well-known` fallback.
 
 **Transport shape (stateless Streamable HTTP).** The server exposes one endpoint that
 accepts `POST` (and answers `GET`/`DELETE` with `405 + Allow: POST`). For a JSON-RPC
@@ -176,6 +183,17 @@ pub trait McpBackend: Clone + Send + Sync + 'static {
 }
 ```
 
+**The list seam is non-paginated by contract — deliberately.** `list_tools` /
+`list_resources` return the *full* set, so `McpService` always emits `nextCursor:
+null`. This is correct-by-design for this surface, not an oversight: the catalog is
+bounded — built-ins are a fixed ~dozen, and a large stored-query catalog is bounded by
+the `meta` projection mode (§9.2), which collapses N queries into two tools rather than
+leaning on `tools/list` paging. The trait return type (`Vec<T>`) *is* the contract; the
+doc must not claim pagination the signature can't express (§12, §16 are aligned to this
+— no `tools/list`/`resources/list` cursor). If a future surface genuinely needs paging,
+that is a seam-signature change (`-> ListToolsResult` with a cursor), made together
+with the capability — never a doc promise ahead of the type.
+
 `&http::request::Parts` is the decoupling mechanism. The crate hands the backend the
 request parts; the backend reads **its own** types out of `parts.extensions`. The
 crate never names an omnigraph type, so it is reusable and auth stays decoupled (§8).
@@ -195,9 +213,34 @@ use rmcp::transport::streamable_http_server::{
     session::never::NeverSessionManager,     // stateless ⇒ reject all session ops
 };
 
+// Host + Origin posture as a TOTAL choice — there is no `None ⇒ skip` state to leak
+// into a fail-open default. `OriginPolicy` is the by-design closure for the Origin
+// class: every deployment lands in exactly one arm, chosen once by `from_bind`.
+pub enum OriginPolicy {
+    Allow(Vec<String>),  // browser clients from these origins; any OTHER present Origin → 403
+    DenyBrowsers,        // no browser clients expected; ANY present Origin → 403 (non-browser MCP clients send none)
+    Unchecked,           // explicit opt-out (loopback dev / trusted network) — never the remote default
+}
 pub struct McpHostPolicy {
-    pub allowed_hosts:   Option<Vec<String>>,   // None ⇒ accept any Host (rely on bearer + Origin)
-    pub allowed_origins: Option<Vec<String>>,   // None/empty ⇒ Origin check off (non-browser clients send none)
+    pub allowed_hosts: Option<Vec<String>>,   // None ⇒ accept any Host (DNS-rebinding defense relaxed for a known-public bind)
+    pub origin:        OriginPolicy,          // no Option — a total decision
+}
+
+impl McpHostPolicy {
+    // The ONLY constructor. Host and Origin posture are derived together from the
+    // bind + config, fail-closed: a remote bind with no configured origins is
+    // `DenyBrowsers` (a present Origin is rejected), NOT "skip". A caller cannot
+    // construct a fail-open policy because the struct has no skip-by-absence state.
+    pub fn from_bind(bind: &SocketAddr, public_hosts: &[String], browser_origins: &[String]) -> Self {
+        let loopback = bind.ip().is_loopback();
+        Self {
+            allowed_hosts: if loopback { Some(vec!["127.0.0.1".into(), "localhost".into()]) }
+                           else if public_hosts.is_empty() { None } else { Some(public_hosts.to_vec()) },
+            origin: if !browser_origins.is_empty() { OriginPolicy::Allow(browser_origins.to_vec()) }
+                    else if loopback { OriginPolicy::Unchecked }     // local dev convenience only
+                    else { OriginPolicy::DenyBrowsers },             // remote default: fail-closed
+        }
+    }
 }
 
 pub fn mcp_router<B: McpBackend>(backend: B, body_limit: usize, hosts: McpHostPolicy) -> axum::Router {
@@ -207,11 +250,16 @@ pub fn mcp_router<B: McpBackend>(backend: B, body_limit: usize, hosts: McpHostPo
     let mut config = StreamableHttpServerConfig::default()
         .with_stateful_mode(false)
         .with_json_response(true);
-    config = match hosts.allowed_hosts {
-        Some(list) => config.with_allowed_hosts(list),
+    config = match &hosts.allowed_hosts {
+        Some(list) => config.with_allowed_hosts(list.clone()),
         None        => config.disable_allowed_hosts(),     // accept any Host
     };
-    if let Some(origins) = hosts.allowed_origins { config = config.with_allowed_origins(origins); }
+    // rmcp validates Origin ONLY when allowed_origins is non-empty (empty ⇒ rmcp skips),
+    // so DenyBrowsers cannot be expressed by handing rmcp a list. We therefore enforce
+    // OriginPolicy in a thin pre-layer that 403s a disallowed present Origin BEFORE rmcp
+    // — making fail-closed independent of rmcp's empty-list semantics (the root cause of
+    // the original fail-open default). `Allow` also configures rmcp as defense-in-depth.
+    if let OriginPolicy::Allow(origins) = &hosts.origin { config = config.with_allowed_origins(origins.clone()); }
 
     // service_factory returns Result<S, io::Error>; NeverSessionManager pairs with stateless mode.
     let svc = StreamableHttpService::new(
@@ -222,6 +270,7 @@ pub fn mcp_router<B: McpBackend>(backend: B, body_limit: usize, hosts: McpHostPo
 
     axum::Router::new()
         .route_service("/mcp", svc)
+        .layer(origin_guard(hosts.origin))   // fail-closed Origin enforcement (no-op only for Unchecked)
         // rmcp reads the body directly (not via an axum extractor), so axum's
         // DefaultBodyLimit does NOT bound /mcp — the tower-http layer does.
         .layer(tower_http::limit::RequestBodyLimitLayer::new(body_limit))
@@ -236,18 +285,25 @@ the handler, `ctx.extensions.get::<http::request::Parts>()` returns those parts.
 
 **Conformance the stateless transport gives for free** (verified in rmcp 1.7
 `tower.rs`): `GET`/`DELETE /mcp → 405` with `Allow: POST`; a disallowed `Host` →
-`403`; a present-but-invalid `Origin` → `403` (Origin checked only when
-`allowed_origins` is non-empty); `MCP-Protocol-Version` → `400` on unsupported,
-default `2025-03-26` when absent. **No conformance middleware is needed.**
+`403`; `MCP-Protocol-Version` → `400` on unsupported, default `2025-03-26` when absent.
+The one thing rmcp does **not** give for free is fail-closed Origin: rmcp checks
+`Origin` only when `allowed_origins` is non-empty, so an empty list is *fail-open*.
+`origin_guard` (above) closes that — a present, disallowed `Origin` → `403` regardless
+of rmcp's empty-list behavior. That layer is the only added middleware.
 
-**Host/Origin policy is derived from the deployment, never a fixed default.** rmcp's
-default `allowed_hosts` is loopback-only — correct for local dev (DNS-rebinding
-defense) but it would `403` every remote client. `omnigraph-server` computes
-`McpHostPolicy` once at startup from `--bind`: loopback bind → keep the loopback
-allow-list; non-loopback bind → allow the configured public host(s), else disable
-Host-allowlisting and log it (bearer + `Origin` are the real controls). `Origin`
-validation defaults off (non-browser MCP clients send no `Origin`) and is enabled for
-browser-based clients.
+**Host/Origin policy is fail-closed by construction, derived from the deployment.**
+rmcp's default `allowed_hosts` is loopback-only — correct for local dev (DNS-rebinding
+defense) but it would `403` every remote client. `McpHostPolicy::from_bind` (the single
+constructor) computes both axes once at startup from `--bind` + config: loopback bind →
+loopback Host allow-list + `OriginPolicy::Unchecked` (dev convenience); non-loopback
+bind → the configured public host(s) (else Host-allowlisting disabled, logged — bearer
+is the real control), and **`OriginPolicy::DenyBrowsers` by default** (any present
+`Origin` → `403`) unless `browser_origins` are configured (`OriginPolicy::Allow`). The
+key by-design property: `OriginPolicy` has **no "absent ⇒ skip" state** and there is no
+other way to build the policy, so a remote deployment cannot accidentally run fail-open
+— closing the bug class rather than flipping a default. Non-browser MCP clients (the
+Phase-1 tier) send no `Origin` and are unaffected; only a forged browser `Origin` is
+rejected.
 
 ## 8. Auth & identity — `Reuses` the server's middleware
 
@@ -355,16 +411,24 @@ per-query metadata. The projection reads `handle.queries` and is agnostic to the
 declaration source. (The legacy single-graph `omnigraph.yaml queries:` map is removed
 — RFC-011 made the server cluster-only; there is no other declaration source.)
 
-### 9.1 `ParamDescriptor → JSON Schema` (`New`)
+### 9.1 `ParamDescriptor → JSON Schema` (`New`, shared projection + equivalence test)
 
-JSON Schema 2020-12. The `Vector` dimension is an `Option<u32>` on the descriptor:
-when present, constrain the array length; when absent, **omit** `minItems`/`maxItems`
-(never emit `0`, which would reject all input).
+JSON Schema 2020-12. **The schema generator is the engine's input contract, not a
+second copy of it.** The authority for what a param accepts is the runtime coercer
+`json_value_to_literal_typed` (`crates/omnigraph-compiler/src/query_input.rs`); a
+hand-written schema in the MCP crate is a parallel encoding that *will* drift — the
+review found two drifts at once (Blob, nullable), and BigInt/Date/Vector are latent
+siblings of the same class. So the projection lives **next to the DTO it projects**, in
+`omnigraph-api-types` (where `ParamKind`/`ParamDescriptor` already live and are
+`ToSchema`), is the single mapping both OpenAPI and MCP consume, and is **locked to the
+coercer by an equivalence test** — drift becomes a CI failure, not a shipped bug.
 
 ```rust
-// New — crates/omnigraph-server/src/mcp/schema.rs
+// New — crates/omnigraph-api-types/src/lib.rs (next to ParamKind/ParamDescriptor)
 use serde_json::{json, Value};
 
+// Exhaustive, wildcard-free: adding a ParamKind is a COMPILE error until its arm
+// (and its equivalence-test corpus row) exist — closing "new kind, wrong/default schema".
 fn scalar_schema(kind: ParamKind) -> Value {
     match kind {
         ParamKind::String   => json!({ "type": "string" }),
@@ -374,13 +438,16 @@ fn scalar_schema(kind: ParamKind) -> Value {
         ParamKind::Float    => json!({ "type": "number" }),
         ParamKind::Date     => json!({ "type": "string", "format": "date" }),
         ParamKind::DateTime => json!({ "type": "string", "format": "date-time" }),
-        ParamKind::Blob     => json!({ "type": "string", "contentEncoding": "base64" }),
-        ParamKind::Vector | ParamKind::List => unreachable!("composite kinds handled in param_schema"),
+        // FIX (③): the coercer takes Blob as a blob-URI STRING ("expected blob URI
+        // string", query_input.rs:449; DTO doc api-types:354) — NOT base64-decoded bytes.
+        ParamKind::Blob     => json!({ "type": "string", "format": "uri" }),
+        ParamKind::Vector | ParamKind::List => unreachable!("composite kinds handled in param_json_schema"),
     }
 }
 
-fn param_schema(p: &ParamDescriptor) -> Value {
-    match p.kind {
+// The one entry point the MCP crate calls — applies the nullable rule uniformly.
+pub fn param_json_schema(p: &ParamDescriptor) -> Value {
+    let base = match p.kind {
         ParamKind::Vector => {
             let mut s = json!({ "type": "array", "items": { "type": "number" } });
             if let Some(dim) = p.vector_dim { s["minItems"] = json!(dim); s["maxItems"] = json!(dim); }
@@ -388,16 +455,40 @@ fn param_schema(p: &ParamDescriptor) -> Value {
         }
         ParamKind::List => json!({ "type": "array", "items": p.item_kind.map(scalar_schema).unwrap_or_else(|| json!({"type":"string"})) }),
         scalar => scalar_schema(scalar),
-    }
+    };
+    // FIX (④): the coercer accepts explicit `null` for a nullable param AND its
+    // omission (query_input.rs:273,296). `required` alone only covers omission; a
+    // strictly-validating client (or SEP-1303 input validation) would reject `null`
+    // against the bare scalar. Allow null at the schema level for nullable params.
+    if p.nullable { json!({ "anyOf": [ base, { "type": "null" } ] }) } else { base }
 }
 ```
+
+**The lock — an equivalence test (the by-design closure), in the compiler crate** (it
+sees both the coercer and `param_json_schema`): for a fixed accept/reject corpus per
+`ParamKind` (incl. a blob-URI string, a base64 blob *that must now validate as a plain
+string*, `null` for nullable vs non-nullable, an over/under-length vector), assert
+`schema_accepts(v) == json_value_to_literal_typed(name, v, kind, mode).is_ok()`. Any
+future arm that diverges from the engine — base64 creeping back, a missing null-union, a
+new kind without a schema — turns the test red. That test, not reviewer vigilance, is
+what makes the schema correct *by construction*.
 
 ### 9.2 Two projection modes (small vs large catalogs)
 
 Tool-overload is real: model accuracy degrades sharply as a single client's tool
 count climbs past a few dozen, and clients that don't defer tool loading (e.g.
 OpenCode) pay the full `tools/list` token cost. So the projection has two modes,
-selected per graph by a `mcp.stored_query_mode` setting (default `auto`):
+selected per graph by a `stored_query_mode` setting (default `auto`).
+
+**Where the setting lives (by-design, ⑥).** There is no free-floating `mcp.*` key.
+`stored_query_mode` and its threshold belong to the **same per-graph `mcp:` metadata
+block** that will hold `expose`/`tool_name` (the cluster Phase-6 surface, §D5 bridge —
+see [§17](#17-decisions--rollout)) — one mcp-config home, one validator, validated at
+`cluster validate`/boot with the rest of the registry. That sequences it correctly: the
+knob cannot land before the surface that holds it exists, and it can't drift into a
+second config location. Until Phase 6, the mode is **not configurable** — every graph
+runs `auto` (the count-based default below), which is the safe, documented behavior.
+The modes themselves:
 
 - **`per_query` (small/stable catalogs).** One tool per `expose: true` query, named by
   `effective_tool_name()`, with a fully typed `input_schema`. This is the richest
@@ -420,16 +511,30 @@ mirroring `POST /queries/{name}`:
 ```jsonc
 { "type": "object",
   "properties": {
-    "params":   { "type": "object", "properties": { /* per-param param_schema(...) */ }, "required": [ /* nullable == false */ ] },
+    "params":   { "type": "object", "properties": { /* per-param param_json_schema(...) */ }, "required": [ /* names where nullable == false */ ] },
     "branch":   { "type": "string" },
     "snapshot": { "type": "string" }      // omit for mutation tools — mutation-against-snapshot is unrepresentable
   },
   "additionalProperties": false }
 ```
 
+`required` lists only non-nullable param names; a nullable param is both absent from
+`required` **and** carries the `null`-union from `param_json_schema` (§9.1), so omitting
+it *and* passing explicit `null` both validate — matching the coercer.
+
 Knobs (`branch`/`snapshot`) and the query's own params live in separate namespaces, so
-a query parameter literally named `branch`/`snapshot` cannot collide. A stored tool
-whose `effective_tool_name()` collides with a built-in is skipped (built-ins win).
+a query parameter literally named `branch`/`snapshot` cannot collide.
+
+**Built-in vs stored name collision is a load-time error, never a silent skip (⑦).**
+The earlier "a colliding stored tool is skipped (built-ins win)" is a silent failure —
+a query an operator published just vanishes from the catalog at projection time, which
+the deny-list in [docs/dev/invariants.md](invariants.md) forbids. By-design fix: fold
+the built-in tool names (a stable closed set from the `Builtin` enum, §10) into the
+**same per-graph uniqueness check the registry already runs** at load
+(`duplicate_tool_name`, today stored-vs-stored only). A stored `effective_tool_name()`
+that shadows a built-in then fails `cluster validate`/server boot **loudly**, before
+serving — a runtime-shadowed query becomes structurally impossible rather than silently
+dropped.
 
 ## 10. Tool catalog + Cedar mapping — `Reuses` `PolicyAction`
 
@@ -446,9 +551,16 @@ pub enum PolicyAction {
 }
 ```
 
+A tool's scope is **derived from where it is mounted, not asserted independently**:
+MCP mounts only under `/graphs/{graph_id}/mcp` (§15), so every MCP tool is graph-scoped
+by construction. There is no server-scoped MCP tool — a "server-scoped tool on a
+per-graph mount" is unrepresentable (⑧). Server-level liveness stays on REST
+`GET /healthz`; the MCP liveness tool is graph-scoped `graph_health` (confirms *this
+graph's* handle is live) and needs no Cedar gate.
+
 | MCP tool | Scope | Cedar action |
 |---|---|---|
-| `health` | server | none (liveness/version) |
+| `graph_health` | graph | none (liveness/version) |
 | `graph_snapshot`, `schema_get`, `branch_list`, `commit_list`, `commit_get` | graph | `Read` |
 | `graph_query` (ad-hoc read) | graph | `Read` (`run_query` self-authorizes) |
 | `graph_mutate` (ad-hoc write) | graph | `Change` |
@@ -583,8 +695,10 @@ choices this RFC adopts:
 4. **Progressive disclosure for large catalogs** — the `meta` projection mode (§9.2)
    keeps `tools/list` small (`stored_query_list` + `stored_query_run`), the same
    `search` + `execute` shape code-mode runtimes prefer.
-5. **Pagination** on every list-style result (cursor-based) so a code-mode run fetches
-   and filters incrementally without context blow-up.
+5. **Bounded `tools/list` instead of pagination.** The list seam is non-paginated by
+   contract (§6); a large catalog is bounded by the `meta` mode (§9.2), not by cursor
+   paging. This keeps the seam type honest (no `nextCursor` the `Vec<T>` return can't
+   carry) while still preventing context blow-up on big query catalogs.
 6. **Schemas as resources** (§14) — expose the graph schema (and per-query param
    schemas) as MCP resources, the on-demand channel code-mode clients pull from.
 7. **Auth in the transport only** — never require secrets as tool *arguments* (that
@@ -610,7 +724,7 @@ HTTP+SSE.
 | **VS Code** (Copilot agent) | Streamable HTTP | static header **and** OAuth | needs VS Code ≥ 1.101 for remote + OAuth; auto-detects `401` → sign-in. |
 | **OpenCode** | remote HTTP | static header **and** OAuth (auto, DCR) | `mcp` block in `opencode.json`; auto-prefixes tools `omnigraph_…`; **no progressive disclosure** → keep the static surface tight (favors `meta` mode at scale). |
 | **Claude Messages API** (`mcp_servers`) | Streamable HTTP (+SSE) | pre-acquired token via `authorization_token` | forwards a token; never runs OAuth. Static bearer fits directly. Pin the beta header you target. |
-| **OpenAI Responses API** (`mcp` tool) | Streamable HTTP (+SSE) | arbitrary `headers` (static bearer) or pre-acquired `authorization` | forwards a token; never runs OAuth. `require_approval` gates tool calls. |
+| **OpenAI Responses API** (`mcp` tool) | Streamable HTTP (+SSE) | pre-acquired token via the dedicated `authorization` field | forwards the token on `Authorization` (static bearer fits directly); never runs OAuth. `require_approval` gates tool calls. (Current docs expose `authorization`, not a free-form `headers` object — ⑤.) |
 | **ChatGPT** (developer mode/connectors) | Streamable HTTP (+SSE) | OAuth, **No-Auth**, or Mixed | beta; OAuth is the clean path. |
 | **Claude Desktop** (custom connectors) | Streamable HTTP (+SSE) | **OAuth 2.1 or authless** | no static-header field — bearer-only deployments are unreachable without a gateway. |
 | **Claude.ai web** (custom connectors) | Streamable HTTP (+SSE) | **OAuth 2.1 + RFC 9728** (or authless) | server **must** serve RFC-9728 PRM; no static-header field. |
@@ -743,9 +857,13 @@ MCP tests land in a new `crates/omnigraph-server/tests/mcp.rs` suite (black-box 
 `build_app`); stored-query *projection* tests extend `stored_queries.rs`.
 
 - **Protocol:** `initialize` + advertised `{tools, resources}` caps; `tools/list`
-  shape + pagination; `tools/call` happy path; `GET /mcp → 405`;
-  `MCP-Protocol-Version` 400/default; `Origin → 403`; unknown/denied tool →
-  identical `-32602`.
+  returns the full bounded set with **no `nextCursor`** (the non-paginated contract,
+  §6); `tools/call` happy path; `GET /mcp → 405`; `MCP-Protocol-Version` 400/default;
+  unknown/denied tool → identical `-32602`.
+- **Origin (fail-closed, ①):** remote bind, no configured origins → a present
+  `Origin` is `403` (`DenyBrowsers`); **absent** `Origin` → `200` (non-browser clients);
+  a configured-allowed `Origin` → `200`; a present non-allowed `Origin` under
+  `OriginPolicy::Allow` → `403`. Asserts `origin_guard`, not rmcp's empty-list path.
 - **Cedar:** a read-only actor sees read tools but not writers; a denied call masks
   byte-identically to an unknown one; stored queries appear only with `invoke_query`;
   the double-gate (an `invoke_query`-only actor sees a stored tool but the call
@@ -753,9 +871,16 @@ MCP tests land in a new `crates/omnigraph-server/tests/mcp.rs` suite (black-box 
 - **Dispatch:** a `graph_mutate` writes end-to-end (proves the actor/handle extension
   passthrough); a malformed query → `isError:true`, not a protocol error; `graph_load`
   with a missing branch and no `from` → `isError` (404), with `from` → forks.
-- **Schema generation:** table-driven over every `ParamKind` incl. nullable, list, and
-  `vector` **with and without `vector_dim`** (the absent-dim path omits
-  `minItems`/`maxItems`).
+- **Schema/engine equivalence (the by-design lock, ③④):** the corpus test in the
+  compiler crate asserting `param_json_schema` accepts *exactly* what
+  `json_value_to_literal_typed` accepts, per `ParamKind` — incl. **Blob as a URI string
+  (a base64 blob validates only as a plain string, never decoded)**, **explicit `null`
+  for a nullable param vs rejection for a non-nullable one**, list items, and `vector`
+  **with and without `vector_dim`** (absent-dim omits `minItems`/`maxItems`). A drifted
+  arm turns this red.
+- **Tool-name collision (⑦):** a stored query whose `effective_tool_name()` equals a
+  built-in fails `cluster validate`/boot with a loud error — it is never silently
+  skipped or served.
 - **Structured output:** `outputSchema` present and `structuredContent` validates
   against it; the text mirror is present; never emits `structuredContent: null`.
 - **Projection modes:** `per_query` below the threshold, `meta` at/above it, with the
@@ -788,6 +913,19 @@ populator; domain-qualified `snake_case` tool ids; annotations set explicitly; c
 `structuredContent` + `outputSchema` (with a text mirror) for typed results;
 `vector_dim: Option<u32>` handled with omit-on-absent; auth consumed as a resolved
 actor, validated per-request, never passed through.
+
+**Locked (correct-by-design fixes from the external review pass):** one shared
+`param_json_schema` in `omnigraph-api-types` (Blob → URI string, nullable → `null`-union)
+co-located with the coercer and pinned by a schema/engine **equivalence test** — schema
+drift is a CI failure, not a shipped bug (③④); a **non-paginated list seam by contract**
+— `meta` mode bounds large catalogs, the seam type carries no `nextCursor` it can't honor
+(②); a single fail-closed **`McpHostPolicy::from_bind`** with a total `OriginPolicy`
+(no absent-⇒-skip state; remote default `DenyBrowsers` enforced by `origin_guard`) (①);
+built-in/stored **name collisions rejected at `cluster validate`/boot**, never silently
+skipped (⑦); `stored_query_mode` folded into the one per-graph `mcp:` block (Phase 6),
+not a floating key (⑥); MCP scope **derived from the per-graph mount**, so `graph_health`
+replaces a server-scoped `health` (⑧). The OpenAI row is corrected to the `authorization`
+field (⑤, doc-only).
 
 **Open / deferred:**
 - **OAuth 2.1 + RFC 9728 (MR-956)** — additive Phase 2; PRM advertisement config-gated
