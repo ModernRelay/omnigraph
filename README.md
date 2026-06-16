@@ -13,12 +13,14 @@ parallel isolated branches, and every change is reviewed and merged safely.
 
 ## Key capabilities
 
-- **A graph server you run, declared as code** — a `cluster.yaml` declares graphs, schemas, stored queries, embedding providers, and policies. `cluster apply` converges it; `omnigraph-server` boots from it and brings every graph online at `/graphs/{id}/…`.
-- **Built for fleets of agents** — hundreds of agents enrich the graph on **parallel isolated branches**; changes are reviewed and merged safely, Git-style, across the whole graph.
-- **Multimodal retrieval for context assembly** — graph traversal + vector ANN + full-text + Reciprocal Rank Fusion in **one** query runtime.
-- **Security as code** — Cedar policy enforced **server-side on every mutation**, per-graph and server-wide; bearer auth; actor/audit tracking.
-- **Runs on your infrastructure** — any S3-compatible object store: **on-prem via RustFS / MinIO**, or AWS S3 / R2 / GCS. VPC, on-prem, hybrid — your data never leaves your store.
-- **Open, versioned storage** — [`Lance`](https://github.com/lance-format/lance) columnar format: branchable, time-travelable, with native blob-as-data (docs, images, video).
+| Capability | What it gives you |
+|---|---|
+| **Declared as code** | A `cluster.yaml` declares graphs, schemas, stored queries, embedding providers, and policies; `cluster apply` converges it and `omnigraph-server` brings every graph online at `/graphs/{id}/…`. |
+| **Built for fleets of agents** | Hundreds of agents enrich the graph on **parallel isolated branches**; changes are reviewed and merged safely, Git-style, across the whole graph. |
+| **Multimodal retrieval** | Graph traversal + vector ANN + full-text + Reciprocal Rank Fusion in **one** query runtime, for context assembly. |
+| **Security as code** | Cedar policy enforced **server-side on every mutation**, per-graph and server-wide; bearer auth; actor/audit tracking. |
+| **Runs on your infrastructure** | Any S3-compatible object store — **on-prem via RustFS / MinIO**, or AWS S3 / R2 / GCS. VPC, on-prem, hybrid; your data never leaves your store. |
+| **Open, versioned storage** | [`Lance`](https://github.com/lance-format/lance) columnar format: branchable, time-travelable, with native blob-as-data (docs, images, video). |
 
 ## What you can build
 
