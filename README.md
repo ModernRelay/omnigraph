@@ -4,12 +4,11 @@
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](rust-toolchain.toml)
 [![Crates.io](https://img.shields.io/crates/v/omnigraph-cli.svg)](https://crates.io/crates/omnigraph-cli)
 
-**Lakehouse graph db for context assembly & multi-agent coordination**
+**Lakehouse graph db for context assembly & multi-agent coordination**\
 Multimodal retrieval, Git-style branching, object storage-native
 
-Omnigraph is the operational state and coordination layer for fleets of agents.
-Run it as a server, declared as code; hundreds of agents operate and enrich the graph on
-parallel isolated branches, and every change is reviewed and merged safely.
+Omnigraph is the operational state and coordination layer for fleets of agents.\
+Run it as a server, declared as code; hundreds of agents operate and enrich the graph on parallel isolated branches, and every change is reviewed and merged safely.
 
 ## Key capabilities
 
